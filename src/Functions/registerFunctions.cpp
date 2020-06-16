@@ -1,3 +1,5 @@
+#include <Common/config.h>
+
 #include <Functions/FunctionFactory.h>
 
 
@@ -37,6 +39,12 @@ void registerFunctionsIntrospection(FunctionFactory &);
 void registerFunctionsNull(FunctionFactory &);
 void registerFunctionsJSON(FunctionFactory &);
 void registerFunctionsConsistentHashing(FunctionFactory & factory);
+#if USE_SSL
+void registerFunctionAESEncrypt(FunctionFactory & factory);
+void registerFunctionAESDecrypt(FunctionFactory & factory);
+void registerFunctionAESEncryptMysql(FunctionFactory & factory);
+void registerFunctionAESDecryptMysql(FunctionFactory & factory);
+#endif
 
 
 void registerFunctions()
@@ -76,6 +84,12 @@ void registerFunctions()
     registerFunctionsJSON(factory);
     registerFunctionsIntrospection(factory);
     registerFunctionsConsistentHashing(factory);
+#if USE_SSL
+    registerFunctionAESEncrypt(factory);
+    registerFunctionAESDecrypt(factory);
+    registerFunctionAESEncryptMysql(factory);
+    registerFunctionAESDecryptMysql(factory);
+#endif
 }
 
 }

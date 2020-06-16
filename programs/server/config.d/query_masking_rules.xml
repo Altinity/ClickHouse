@@ -15,5 +15,14 @@
             <regexp>TOPSECRET.TOPSECRET</regexp>
             <replace>[hidden]</replace>
         </rule>
+
+        <rule>
+            <name>hide AES encrypt/decrypt arguments</name>
+            <regexp>(aes_\w+)\s*\(\s*(?:'(?:\\'|.)+'|.*?)\s*\)</regexp>
+            <!-- or more secure, but also more invasive:
+                (aes_\w+)\s*\(.*\)
+            -->
+            <replace>\1(???)</replace>
+        </rule>
     </query_masking_rules>
 </yandex>

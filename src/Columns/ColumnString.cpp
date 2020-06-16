@@ -420,4 +420,10 @@ void ColumnString::protect()
     getOffsets().protect();
 }
 
+void ColumnString::validate() const
+{
+    if (!offsets.empty() && offsets.back() != chars.size())
+        throw Exception("ColumnString validation failed: size mismatch (internal logical error)" + std::to_string(offsets.back()) + " != " + std::to_string(chars.size()), ErrorCodes::LOGICAL_ERROR);
+}
+
 }
