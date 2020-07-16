@@ -8,7 +8,7 @@
 namespace
 {
 
-struct AesDecryptMySQLModeImpl
+struct DecryptMySQLModeImpl
 {
     static constexpr auto name = "aes_decrypt_mysql";
     static constexpr auto compatibility_mode = OpenSSLDetails::CompatibilityMode::MySQL;
@@ -21,7 +21,7 @@ namespace DB
 
 void registerFunctionAESDecryptMysql(FunctionFactory & factory)
 {
-    factory.registerFunction<FunctionAESDecrypt<AesDecryptMySQLModeImpl>>();
+    factory.registerFunction<FunctionDecrypt<DecryptMySQLModeImpl>>();
 }
 
 }

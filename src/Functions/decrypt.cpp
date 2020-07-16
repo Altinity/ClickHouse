@@ -8,9 +8,9 @@
 namespace
 {
 
-struct AesEncryptImpl
+struct DecryptImpl
 {
-    static constexpr auto name = "aes_encrypt";
+    static constexpr auto name = "decrypt";
     static constexpr auto compatibility_mode = OpenSSLDetails::CompatibilityMode::OpenSSL;
 };
 
@@ -19,9 +19,9 @@ struct AesEncryptImpl
 namespace DB
 {
 
-void registerFunctionAESEncrypt(FunctionFactory & factory)
+void registerFunctionDecrypt(FunctionFactory & factory)
 {
-    factory.registerFunction<FunctionAESEncrypt<AesEncryptImpl>>();
+    factory.registerFunction<FunctionDecrypt<DecryptImpl>>();
 }
 
 }

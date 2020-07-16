@@ -133,12 +133,12 @@ inline void validateIV(const StringRef & iv_value, const size_t cipher_iv_size)
 namespace DB
 {
 template <typename Impl>
-class FunctionAESEncrypt : public IFunction
+class FunctionEncrypt : public IFunction
 {
 public:
     static constexpr OpenSSLDetails::CompatibilityMode compatibility_mode = Impl::compatibility_mode;
     static constexpr auto name = Impl::name;
-    static FunctionPtr create(const Context &) { return std::make_shared<FunctionAESEncrypt>(); }
+    static FunctionPtr create(const Context &) { return std::make_shared<FunctionEncrypt>(); }
 
 private:
     using CipherMode = OpenSSLDetails::CipherMode;
@@ -151,9 +151,9 @@ private:
     {
         validateFunctionArgumentTypes(*this, arguments,
             FunctionArgumentDescriptors{
+                {"mode", isStringOrFixedString, isColumnConst, "encryption mode"},
                 {"input", nullptr, nullptr, "plaintext"},
                 {"key", isStringOrFixedString, nullptr, "encryption key binary string"},
-                {"mode", isStringOrFixedString, isColumnConst, "encryption mode"},
             },
             FunctionArgumentDescriptors{
                 {"IV", isStringOrFixedString, nullptr, "Initialization vector binary string"},
@@ -172,7 +172,7 @@ private:
     {
         using namespace OpenSSLDetails;
 
-        const auto mode = block.getByPosition(arguments[2]).column->getDataAt(0);
+        const auto mode = block.getByPosition(arguments[0]).column->getDataAt(0);
 
         if (mode.size == 0 || !std::string_view(mode).starts_with("aes-"))
             throw Exception("Invalid mode: " + mode.toString(), ErrorCodes::BAD_ARGUMENTS);
@@ -183,26 +183,26 @@ private:
 
         const auto cipher_mode = EVP_CIPHER_mode(evp_cipher);
 
-        const auto input_column = block.getByPosition(arguments[0]).column;
-        const auto key_column = block.getByPosition(arguments[1]).column;
+        const auto input_column = block.getByPosition(arguments[1]).column;
+        const auto key_column = block.getByPosition(arguments[2]).column;
 
         OpenSSLDetails::validateCipherMode<compatibility_mode>(evp_cipher);
 
         ColumnPtr result_column;
         if (arguments.size() <= 3)
-            result_column = do_encrypt(evp_cipher, input_rows_count, input_column, key_column, nullptr, nullptr);
+            result_column = doEncrypt(evp_cipher, input_rows_count, input_column, key_column, nullptr, nullptr);
         else
         {
             const auto iv_column = block.getByPosition(arguments[3]).column;
             if (arguments.size() <= 4)
-                result_column = do_encrypt(evp_cipher, input_rows_count, input_column, key_column, iv_column, nullptr);
+                result_column = doEncrypt(evp_cipher, input_rows_count, input_column, key_column, iv_column, nullptr);
             else
             {
                 if (cipher_mode != EVP_CIPH_GCM_MODE)
                     throw Exception("AAD can be only set for GCM-mode", ErrorCodes::BAD_ARGUMENTS);
 
                 const auto aad_column = block.getByPosition(arguments[4]).column;
-                result_column = do_encrypt(evp_cipher, input_rows_count, input_column, key_column, iv_column, aad_column);
+                result_column = doEncrypt(evp_cipher, input_rows_count, input_column, key_column, iv_column, aad_column);
             }
         }
 
@@ -210,7 +210,7 @@ private:
     }
 
     template <typename InputColumnType, typename KeyColumnType, typename IvColumnType, typename AadColumnType>
-    static ColumnPtr do_encrypt(const EVP_CIPHER * evp_cipher,
+    static ColumnPtr doEncrypt(const EVP_CIPHER * evp_cipher,
                     size_t input_rows_count,
                     const InputColumnType & input_column,
                     const KeyColumnType & key_column,
@@ -219,17 +219,17 @@ private:
     {
         if constexpr (compatibility_mode == OpenSSLDetails::CompatibilityMode::MySQL)
         {
-            return do_encryptImpl<CipherMode::MySQLCompatibility>(evp_cipher, input_rows_count, input_column, key_column, iv_column, aad_column);
+            return doEncryptImpl<CipherMode::MySQLCompatibility>(evp_cipher, input_rows_count, input_column, key_column, iv_column, aad_column);
         }
         else
         {
             if (EVP_CIPHER_mode(evp_cipher) == EVP_CIPH_GCM_MODE)
             {
-                return do_encryptImpl<CipherMode::RFC5116_AEAD_AES_GCM>(evp_cipher, input_rows_count, input_column, key_column, iv_column, aad_column);
+                return doEncryptImpl<CipherMode::RFC5116_AEAD_AES_GCM>(evp_cipher, input_rows_count, input_column, key_column, iv_column, aad_column);
             }
             else
             {
-                return do_encryptImpl<CipherMode::OpenSSLCompatibility>(evp_cipher, input_rows_count, input_column, key_column, iv_column, aad_column);
+                return doEncryptImpl<CipherMode::OpenSSLCompatibility>(evp_cipher, input_rows_count, input_column, key_column, iv_column, aad_column);
             }
         }
 
@@ -237,7 +237,7 @@ private:
     }
 
     template <CipherMode mode, typename InputColumnType, typename KeyColumnType, typename IvColumnType, typename AadColumnType>
-    static ColumnPtr do_encryptImpl(const EVP_CIPHER * evp_cipher,
+    static ColumnPtr doEncryptImpl(const EVP_CIPHER * evp_cipher,
                     size_t input_rows_count,
                     const InputColumnType & input_column,
                     const KeyColumnType & key_column,
@@ -374,12 +374,12 @@ private:
 
 /// AES_decrypt(string, key, block_mode[, init_vector])
 template <typename Impl>
-class FunctionAESDecrypt : public IFunction
+class FunctionDecrypt : public IFunction
 {
 public:
     static constexpr OpenSSLDetails::CompatibilityMode compatibility_mode = Impl::compatibility_mode;
     static constexpr auto name = Impl::name;
-    static FunctionPtr create(const Context &) { return std::make_shared<FunctionAESDecrypt>(); }
+    static FunctionPtr create(const Context &) { return std::make_shared<FunctionDecrypt>(); }
 
 private:
     using CipherMode = OpenSSLDetails::CipherMode;
@@ -392,9 +392,9 @@ private:
     {
         validateFunctionArgumentTypes(*this, arguments,
             FunctionArgumentDescriptors{
+                {"mode", isStringOrFixedString, isColumnConst, "decryption mode"},
                 {"input", nullptr, nullptr, "ciphertext"},
                 {"key", isStringOrFixedString, nullptr, "decryption key binary string"},
-                {"mode", isStringOrFixedString, isColumnConst, "decryption mode"},
             },
             FunctionArgumentDescriptors{
                 {"IV", isStringOrFixedString, nullptr, "Initialization vector binary string"},
@@ -413,7 +413,7 @@ private:
     {
         using namespace OpenSSLDetails;
 
-        const auto mode = block.getByPosition(arguments[2]).column->getDataAt(0);
+        const auto mode = block.getByPosition(arguments[0]).column->getDataAt(0);
 
         if (mode.size == 0 || !std::string_view(mode).starts_with("aes-"))
             throw Exception("Invalid mode: " + mode.toString(), ErrorCodes::BAD_ARGUMENTS);
@@ -424,24 +424,24 @@ private:
 
         OpenSSLDetails::validateCipherMode<compatibility_mode>(evp_cipher);
 
-        const auto input_column = block.getByPosition(arguments[0]).column;
-        const auto key_column = block.getByPosition(arguments[1]).column;
+        const auto input_column = block.getByPosition(arguments[1]).column;
+        const auto key_column = block.getByPosition(arguments[2]).column;
 
         ColumnPtr result_column;
         if (arguments.size() <= 3)
-            result_column = do_decrypt(evp_cipher, input_rows_count, input_column, key_column, nullptr, nullptr);
+            result_column = doDecrypt(evp_cipher, input_rows_count, input_column, key_column, nullptr, nullptr);
         else
         {
             const auto iv_column = block.getByPosition(arguments[3]).column;
             if (arguments.size() <= 4)
-                result_column = do_decrypt(evp_cipher, input_rows_count, input_column, key_column, iv_column, nullptr);
+                result_column = doDecrypt(evp_cipher, input_rows_count, input_column, key_column, iv_column, nullptr);
             else
             {
                 if (EVP_CIPHER_mode(evp_cipher) != EVP_CIPH_GCM_MODE)
                     throw Exception("AAD can be only set for GCM-mode", ErrorCodes::BAD_ARGUMENTS);
 
                 const auto aad_column = block.getByPosition(arguments[4]).column;
-                result_column = do_decrypt(evp_cipher, input_rows_count, input_column, key_column, iv_column, aad_column);
+                result_column = doDecrypt(evp_cipher, input_rows_count, input_column, key_column, iv_column, aad_column);
             }
         }
 
@@ -449,7 +449,7 @@ private:
     }
 
     template <typename InputColumnType, typename KeyColumnType, typename IvColumnType, typename AadColumnType>
-    static ColumnPtr do_decrypt(const EVP_CIPHER * evp_cipher,
+    static ColumnPtr doDecrypt(const EVP_CIPHER * evp_cipher,
                     size_t input_rows_count,
                     const InputColumnType & input_column,
                     const KeyColumnType & key_column,
@@ -458,18 +458,18 @@ private:
     {
         if constexpr (compatibility_mode == OpenSSLDetails::CompatibilityMode::MySQL)
         {
-            return do_decryptImpl<CipherMode::MySQLCompatibility>(evp_cipher, input_rows_count, input_column, key_column, iv_column, aad_column);
+            return doDecryptImpl<CipherMode::MySQLCompatibility>(evp_cipher, input_rows_count, input_column, key_column, iv_column, aad_column);
         }
         else
         {
             const auto cipher_mode = EVP_CIPHER_mode(evp_cipher);
             if (cipher_mode == EVP_CIPH_GCM_MODE)
             {
-                return do_decryptImpl<CipherMode::RFC5116_AEAD_AES_GCM>(evp_cipher, input_rows_count, input_column, key_column, iv_column, aad_column);
+                return doDecryptImpl<CipherMode::RFC5116_AEAD_AES_GCM>(evp_cipher, input_rows_count, input_column, key_column, iv_column, aad_column);
             }
             else
             {
-                return do_decryptImpl<CipherMode::OpenSSLCompatibility>(evp_cipher, input_rows_count, input_column, key_column, iv_column, aad_column);
+                return doDecryptImpl<CipherMode::OpenSSLCompatibility>(evp_cipher, input_rows_count, input_column, key_column, iv_column, aad_column);
             }
         }
 
@@ -477,7 +477,7 @@ private:
     }
 
     template <CipherMode mode, typename InputColumnType, typename KeyColumnType, typename IvColumnType, typename AadColumnType>
-    static ColumnPtr do_decryptImpl(const EVP_CIPHER * evp_cipher,
+    static ColumnPtr doDecryptImpl(const EVP_CIPHER * evp_cipher,
                     size_t input_rows_count,
                     const InputColumnType & input_column,
                     const KeyColumnType & key_column,
@@ -511,7 +511,7 @@ private:
             // Pre-fill result column with values to prevent MSAN from dropping dead on
             // aes-X-ecb mode with "WARNING: MemorySanitizer: use-of-uninitialized-value".
             // This is most likely to be caused by the underlying assembler implementation:
-            // see crypto/aes/aesni-x86_64.s aesni_ecb_encrypt
+            // see crypto/aes/aesni-x86_64.s, function aesni_ecb_encrypt
             // which msan seems to fail instrument correctly.
             decrypted_result_column_data.resize_fill(resulting_size, 0xFF);
 #else

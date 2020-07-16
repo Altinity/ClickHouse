@@ -40,8 +40,8 @@ void registerFunctionsNull(FunctionFactory &);
 void registerFunctionsJSON(FunctionFactory &);
 void registerFunctionsConsistentHashing(FunctionFactory & factory);
 #if USE_SSL
-void registerFunctionAESEncrypt(FunctionFactory & factory);
-void registerFunctionAESDecrypt(FunctionFactory & factory);
+void registerFunctionEncrypt(FunctionFactory & factory);
+void registerFunctionDecrypt(FunctionFactory & factory);
 void registerFunctionAESEncryptMysql(FunctionFactory & factory);
 void registerFunctionAESDecryptMysql(FunctionFactory & factory);
 #endif
@@ -85,8 +85,8 @@ void registerFunctions()
     registerFunctionsIntrospection(factory);
     registerFunctionsConsistentHashing(factory);
 #if USE_SSL
-    registerFunctionAESEncrypt(factory);
-    registerFunctionAESDecrypt(factory);
+    registerFunctionEncrypt(factory);
+    registerFunctionDecrypt(factory);
     registerFunctionAESEncryptMysql(factory);
     registerFunctionAESDecryptMysql(factory);
 #endif
