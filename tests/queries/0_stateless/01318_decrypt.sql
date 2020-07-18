@@ -9,24 +9,59 @@
 
 -- error cases
 SELECT aes_decrypt_mysql(); --{serverError 42} not enough arguments
+SELECT aes_decrypt_mysql('aes-128-ecb'); --{serverError 42} not enough arguments
+SELECT aes_decrypt_mysql('aes-128-ecb', 'text'); --{serverError 42} not enough arguments
+
+
+-- Mode
+SELECT aes_decrypt_mysql(789, 'text', 'key'); --{serverError 43} bad mode type
+SELECT aes_decrypt_mysql('blah blah blah', 'text', 'key'); -- {serverError 36} garbage mode value
+SELECT aes_decrypt_mysql('des-ede3-ecb', 'text', 'key'); -- {serverError 36} bad mode value of valid cipher name
+SELECT aes_decrypt_mysql('aes-128-gcm', 'text', 'key'); -- {serverError 36} mode is not supported by _mysql-functions
+
+SELECT decrypt(789, 'text', 'key'); --{serverError 43} bad mode type
+SELECT decrypt('blah blah blah', 'text', 'key'); -- {serverError 36} garbage mode value
+SELECT decrypt('des-ede3-ecb', 'text', 'key'); -- {serverError 36} bad mode value of valid cipher name
+
+
+-- Key
 SELECT aes_decrypt_mysql('aes-128-ecb', 'text', 456); --{serverError 43} bad key type
-SELECT aes_decrypt_mysql('text', 'key', 789); --{serverError 43} bad mode type
-SELECT aes_decrypt_mysql('aes-128-ecb', 'text', 'key', 1011); --{serverError 43} bad IV type
-SELECT aes_decrypt_mysql('aes-128-ecb', 'text', 'key', 'IV', 1213); --{serverError 43} bad AAD type
-SELECT aes_decrypt_mysql('aes-128-gcm', 'text', 'key'); --{serverError 36} bad mode
+SELECT aes_decrypt_mysql('aes-128-ecb', 'text', 'key'); -- {serverError 36} key is too short
 
-SELECT aes_decrypt_mysql('text', 'key', 'des-ede3-ecb'); --{serverError 36} bad mode value
-SELECT aes_decrypt_mysql('aes-128-ecb', 'text', 'key'); --{serverError 36} bad key length
+SELECT decrypt('aes-128-ecb', 'text'); --{serverError 42} key is missing
+SELECT decrypt('aes-128-ecb', 'text', 456); --{serverError 43} bad key type
+SELECT decrypt('aes-128-ecb', 'text', 'key'); -- {serverError 36} key is too short
+SELECT decrypt('aes-128-ecb', 'text', 'keykeykeykeykeykeykeykeykeykeykeykey'); -- {serverError 36} key is to long
 
-SELECT decrypt('aes-128-gcm', 'hello there', '012345678901234', '01234567'); -- {serverError 36} key is too short 
-SELECT decrypt('aes-128-gcm', 'hello there', '01234567890123456', '01234567'); -- {serverError 36} key is too long
-SELECT decrypt('aes-128-gcm', 'hello there', '0123456789012345', '0123456'); -- {serverError 36} IV is too short
-SELECT decrypt('aes-128-gcm', 'hello there', '0123456789012345', '0123456789101112131415161718192021222324252627282930'); -- {serverError 36} ciphertext is too short
 
--- SELECT decrypt('aes-128-cfb1', 'hello there', '1111111111111111');
--- SELECT decrypt('aes-128-ofb', 'hello there', '1111111111111111');
--- SELECT decrypt('aes-128-ctr', 'hello there', '1111111111111111');
+-- IV
+SELECT aes_decrypt_mysql('aes-128-ecb', 'text', 'key', 1011); --{serverError 43} bad IV type 6
+SELECT aes_decrypt_mysql('aes-128-ecb', 'text', 'key', 'iv'); --{serverError 36} IV is too short 4
 
+SELECT decrypt('aes-128-cbc', 'text', 'keykeykeykeykeyk', 1011); --{serverError 43} bad IV type 1
+SELECT decrypt('aes-128-cbc', 'text', 'keykeykeykeykeyk', 'iviviviviviviviviviviviviviviviviviviviviv'); --{serverError 36} IV is too long 3
+SELECT decrypt('aes-128-cbc', 'text', 'keykeykeykeykeyk', 'iv'); --{serverError 36} IV is too short 2
+
+
+--AAD
+SELECT aes_decrypt_mysql('aes-128-ecb', 'text', 'key', 'IV', 1213); --{serverError 42} too many arguments
+
+SELECT decrypt('aes-128-ecb', 'text', 'key', 'IV', 1213); --{serverError 43} bad AAD type
+SELECT decrypt('aes-128-gcm', 'text', 'key', 'IV', 1213); --{serverError 43} bad AAD type
+
+
+-- decrypting invalid cipher text, should cause an error or produce garbage
+SELECT ignore(decrypt('aes-128-ecb', 'hello there', '1111111111111111')); -- {serverError 454} 1
+SELECT ignore(decrypt('aes-128-cbc', 'hello there', '1111111111111111')); -- {serverError 454} 2
+SELECT ignore(decrypt('aes-128-cfb1', 'hello there', '1111111111111111')); -- GIGO
+SELECT ignore(decrypt('aes-128-ofb', 'hello there', '1111111111111111')); -- GIGO
+SELECT ignore(decrypt('aes-128-ctr', 'hello there', '1111111111111111')); -- GIGO
+SELECT decrypt('aes-128-ctr', '', '1111111111111111') == '';
+
+
+-----------------------------------------------------------------------------------------
+-- Validate against predefined ciphertext,plaintext,key and IV for MySQL compatibility mode
+-----------------------------------------------------------------------------------------
 CREATE TABLE encryption_test
 (
     input String,

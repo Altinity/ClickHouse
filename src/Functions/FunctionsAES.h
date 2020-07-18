@@ -30,7 +30,7 @@ namespace ErrorCodes
 
 namespace OpenSSLDetails
 {
-[[noreturn]] void onError(std::string prefix = {});
+[[noreturn]] void onError(std::string error_message);
 StringRef foldEncryptionKeyInMySQLCompatitableMode(size_t cipher_key_size, const StringRef & key, std::array<char, EVP_MAX_KEY_LENGTH> & folded_key);
 const EVP_CIPHER * getCipherByName(const StringRef & name);
 
@@ -149,16 +149,25 @@ private:
 
     DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
     {
+        auto optional_args = FunctionArgumentDescriptors{
+            {"IV", isStringOrFixedString, nullptr, "Initialization vector binary string"},
+        };
+
+        if constexpr (compatibility_mode == OpenSSLDetails::CompatibilityMode::OpenSSL)
+        {
+            optional_args.emplace_back(FunctionArgumentDescriptor{
+                "AAD", isStringOrFixedString, nullptr, "Additional authenticated data binary string for GCM mode"
+            });
+        }
+
         validateFunctionArgumentTypes(*this, arguments,
             FunctionArgumentDescriptors{
-                {"mode", isStringOrFixedString, isColumnConst, "encryption mode"},
+                {"mode", isStringOrFixedString, isColumnConst, "encryption mode string"},
                 {"input", nullptr, nullptr, "plaintext"},
                 {"key", isStringOrFixedString, nullptr, "encryption key binary string"},
             },
-            FunctionArgumentDescriptors{
-                {"IV", isStringOrFixedString, nullptr, "Initialization vector binary string"},
-                {"AAD", isStringOrFixedString, nullptr, "Additional authenticated data binary string for GCM mode"},
-            });
+            optional_args
+        );
 
         return std::make_shared<DataTypeString>();
     }
@@ -194,8 +203,13 @@ private:
         else
         {
             const auto iv_column = block.getByPosition(arguments[3]).column;
+            if (compatibility_mode != OpenSSLDetails::CompatibilityMode::MySQL && EVP_CIPHER_iv_length(evp_cipher) == 0)
+                throw Exception(mode.toString() + " does not support IV", ErrorCodes::BAD_ARGUMENTS);
+
             if (arguments.size() <= 4)
+            {
                 result_column = doEncrypt(evp_cipher, input_rows_count, input_column, key_column, iv_column, nullptr);
+            }
             else
             {
                 if (cipher_mode != EVP_CIPH_GCM_MODE)
@@ -298,7 +312,7 @@ private:
             {
                 // 1.a.1: Init CTX with custom IV length and optionally with AAD
                 if (EVP_EncryptInit_ex(evp_ctx, evp_cipher, nullptr, nullptr, nullptr) != 1)
-                    onError();
+                    onError("Failed to initialize encryption context with cipher");
 
                 if (EVP_CIPHER_CTX_ctrl(evp_ctx, EVP_CTRL_AEAD_SET_IVLEN, iv_value.size, nullptr) != 1)
                     onError("Failed to set custom IV length to " + std::to_string(iv_value.size));
@@ -306,7 +320,7 @@ private:
                 if (EVP_EncryptInit_ex(evp_ctx, nullptr, nullptr,
                         reinterpret_cast<const unsigned char*>(key_value.data),
                         reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
-                    onError();
+                    onError("Failed to set key and IV");
 
                 // 1.a.2 Set AAD
                 if constexpr (!std::is_same_v<nullptr_t, std::decay_t<AadColumnType>>)
@@ -334,13 +348,13 @@ private:
             if (EVP_EncryptUpdate(evp_ctx,
                     reinterpret_cast<unsigned char*>(encrypted), &output_len,
                     reinterpret_cast<const unsigned char*>(input_value.data), static_cast<int>(input_value.size)) != 1)
-                onError();
+                onError("Failed to encrypt");
             encrypted += output_len;
 
             // 3: retrieve encrypted data (ciphertext)
             if (EVP_EncryptFinal_ex(evp_ctx,
                     reinterpret_cast<unsigned char*>(encrypted), &output_len) != 1)
-                onError();
+                onError("Failed to fetch ciphertext");
             encrypted += output_len;
 
             // 4: optionally retrieve a tag and append it to the ciphertext (RFC5116):
@@ -357,7 +371,7 @@ private:
             encrypted_result_column_offsets.push_back(encrypted - encrypted_result_column_data.data());
 
             if (EVP_CIPHER_CTX_reset(evp_ctx) != 1)
-                onError();
+                onError("Failed to reset context");
         }
 
         // in case of block size of 1, we overestimate buffer required for encrypted data, fix it up.
@@ -390,16 +404,25 @@ private:
 
     DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
     {
+        auto optional_args = FunctionArgumentDescriptors{
+            {"IV", isStringOrFixedString, nullptr, "Initialization vector binary string"},
+        };
+
+        if constexpr (compatibility_mode == OpenSSLDetails::CompatibilityMode::OpenSSL)
+        {
+            optional_args.emplace_back(FunctionArgumentDescriptor{
+                "AAD", isStringOrFixedString, nullptr, "Additional authenticated data binary string for GCM mode"
+            });
+        }
+
         validateFunctionArgumentTypes(*this, arguments,
             FunctionArgumentDescriptors{
-                {"mode", isStringOrFixedString, isColumnConst, "decryption mode"},
+                {"mode", isStringOrFixedString, isColumnConst, "decryption mode string"},
                 {"input", nullptr, nullptr, "ciphertext"},
                 {"key", isStringOrFixedString, nullptr, "decryption key binary string"},
             },
-            FunctionArgumentDescriptors{
-                {"IV", isStringOrFixedString, nullptr, "Initialization vector binary string"},
-                {"AAD", isStringOrFixedString, nullptr, "Additional authenticated data binary string for GCM mode"},
-            });
+            optional_args
+        );
 
         return std::make_shared<DataTypeString>();
     }
@@ -433,8 +456,13 @@ private:
         else
         {
             const auto iv_column = block.getByPosition(arguments[3]).column;
+            if (compatibility_mode != OpenSSLDetails::CompatibilityMode::MySQL && EVP_CIPHER_iv_length(evp_cipher) == 0)
+                throw Exception(mode.toString() + " does not support IV", ErrorCodes::BAD_ARGUMENTS);
+
             if (arguments.size() <= 4)
+            {
                 result_column = doDecrypt(evp_cipher, input_rows_count, input_column, key_column, iv_column, nullptr);
+            }
             else
             {
                 if (EVP_CIPHER_mode(evp_cipher) != EVP_CIPH_GCM_MODE)
@@ -547,7 +575,7 @@ private:
             {
                 // 1.a.1 : Init CTX with custom IV length and optionally with AAD
                 if (EVP_DecryptInit_ex(evp_ctx, evp_cipher, nullptr, nullptr, nullptr) != 1)
-                    onError();
+                    onError("Failed to initialize cipher context");
 
                 if (EVP_CIPHER_CTX_ctrl(evp_ctx, EVP_CTRL_AEAD_SET_IVLEN, iv_value.size, nullptr) != 1)
                     onError("Failed to set custom IV length to " + std::to_string(iv_value.size));
@@ -555,7 +583,7 @@ private:
                 if (EVP_DecryptInit_ex(evp_ctx, nullptr, nullptr,
                         reinterpret_cast<const unsigned char*>(key_value.data),
                         reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
-                    onError();
+                    onError("Failed to set key and IV");
 
                 // 1.a.2: Set AAD if present
                 if constexpr (!std::is_same_v<nullptr_t, std::decay_t<AadColumnType>>)
@@ -583,7 +611,7 @@ private:
             if (EVP_DecryptUpdate(evp_ctx,
                     reinterpret_cast<unsigned char*>(decrypted), &output_len,
                     reinterpret_cast<const unsigned char*>(input_value.data), static_cast<int>(input_value.size)) != 1)
-                onError();
+                onError("Failed to decrypt");
             decrypted += output_len;
 
             // 3: optionally get tag from the ciphertext (RFC5116) and feed it to the context
@@ -597,7 +625,7 @@ private:
             // 4: retrieve encrypted data (ciphertext)
             if (EVP_DecryptFinal_ex(evp_ctx,
                     reinterpret_cast<unsigned char*>(decrypted), &output_len) != 1)
-                onError();
+                onError("Failed to decrypt");
             decrypted += output_len;
 
             *decrypted = '\0';
@@ -606,7 +634,7 @@ private:
             decrypted_result_column_offsets.push_back(decrypted - decrypted_result_column_data.data());
 
             if (EVP_CIPHER_CTX_reset(evp_ctx) != 1)
-                onError();
+                onError("Failed to reset context");
         }
 
         // in case we overestimate buffer required for decrypted data, fix it up.

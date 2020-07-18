@@ -16,18 +16,9 @@ namespace ErrorCodes
 
 namespace OpenSSLDetails
 {
-void onError(std::string prefix)
+void onError(std::string error_message)
 {
-    std::string error_message(std::move(prefix));
-    if (error_message.length() != 0)
-        error_message += ": ";
-
-    ERR_print_errors_cb([](const char *str, size_t len, void * msg) -> auto
-    {
-        reinterpret_cast<std::string *>(msg)->append(str, len);
-        return 1;
-    }, &error_message);
-
+    error_message += ". OpenSSL error code: " + std::to_string(ERR_get_error());
     throw DB::Exception(error_message, DB::ErrorCodes::OPENSSL_ERROR);
 }
 
