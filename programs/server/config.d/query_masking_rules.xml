@@ -17,8 +17,8 @@
         </rule>
 
         <rule>
-            <name>hide AES encrypt/decrypt arguments</name>
-            <regexp>(aes_\w+)\s*\(\s*(?:'(?:\\'|.)+'|.*?)\s*\)</regexp>
+            <name>hide encrypt/decrypt arguments</name>
+            <regexp>((?:aes_)?(?:encrypt|decrypt)(?:_mysql)?)\s*\(\s*(?:'(?:\\'|.)+'|.*?)\s*\)</regexp>
             <!-- or more secure, but also more invasive:
                 (aes_\w+)\s*\(.*\)
             -->

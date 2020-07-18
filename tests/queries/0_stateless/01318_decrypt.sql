@@ -7,7 +7,9 @@
 -- meaning that whole key is used, but effective key length is still determined by mode.
 -- when key doesn't exceed the default mode length, ecryption result equals with AES_encypt()
 
+-----------------------------------------------------------------------------------------
 -- error cases
+-----------------------------------------------------------------------------------------
 SELECT aes_decrypt_mysql(); --{serverError 42} not enough arguments
 SELECT aes_decrypt_mysql('aes-128-ecb'); --{serverError 42} not enough arguments
 SELECT aes_decrypt_mysql('aes-128-ecb', 'text'); --{serverError 42} not enough arguments
