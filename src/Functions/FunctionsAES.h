@@ -12,6 +12,7 @@
 #include <Functions/FunctionHelpers.h>
 
 #include <openssl/evp.h>
+#include <openssl/engine.h>
 
 #include <string_view>
 #include <unordered_map>
@@ -32,7 +33,9 @@ namespace OpenSSLDetails
 {
 [[noreturn]] void onError(std::string error_message);
 StringRef foldEncryptionKeyInMySQLCompatitableMode(size_t cipher_key_size, const StringRef & key, std::array<char, EVP_MAX_KEY_LENGTH> & folded_key);
-const EVP_CIPHER * getCipherByName(const StringRef & name);
+
+using CipherPtr = std::unique_ptr<EVP_CIPHER, decltype(&::EVP_CIPHER_free)>;
+CipherPtr getCipherByName(const StringRef & name);
 
 enum class CompatibilityMode
 {
@@ -146,6 +149,8 @@ private:
     String getName() const override { return name; }
     bool isVariadic() const override { return true; }
     size_t getNumberOfArguments() const override { return 0; }
+    ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {0}; }
+    bool useDefaultImplementationForConstants() const override { return true; }
 
     DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
     {
@@ -172,12 +177,7 @@ private:
         return std::make_shared<DataTypeString>();
     }
 
-    void executeImplDryRun(Block & block, const ColumnNumbers & /*arguments*/, size_t result, size_t /*input_rows_count*/) override
-    {
-        block.getByPosition(result).column = block.getByPosition(result).type->createColumn();
-    }
-
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t input_rows_count) override
+    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t input_rows_count) const override
     {
         using namespace OpenSSLDetails;
 
@@ -186,9 +186,10 @@ private:
         if (mode.size == 0 || !std::string_view(mode).starts_with("aes-"))
             throw Exception("Invalid mode: " + mode.toString(), ErrorCodes::BAD_ARGUMENTS);
 
-        const auto * evp_cipher = getCipherByName(mode);
-        if (evp_cipher == nullptr)
+        auto cipher = getCipherByName(mode);
+        if (cipher == nullptr)
             throw Exception("Invalid mode: " + mode.toString(), ErrorCodes::BAD_ARGUMENTS);
+        const EVP_CIPHER * evp_cipher = cipher.get();
 
         const auto cipher_mode = EVP_CIPHER_mode(evp_cipher);
 
@@ -369,9 +370,6 @@ private:
             ++encrypted;
 
             encrypted_result_column_offsets.push_back(encrypted - encrypted_result_column_data.data());
-
-            if (EVP_CIPHER_CTX_reset(evp_ctx) != 1)
-                onError("Failed to reset context");
         }
 
         // in case of block size of 1, we overestimate buffer required for encrypted data, fix it up.
@@ -401,6 +399,8 @@ private:
     String getName() const override { return name; }
     bool isVariadic() const override { return true; }
     size_t getNumberOfArguments() const override { return 0; }
+    ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {0}; }
+    bool useDefaultImplementationForConstants() const override { return true; }
 
     DataTypePtr getReturnTypeImpl(const ColumnsWithTypeAndName & arguments) const override
     {
@@ -427,23 +427,18 @@ private:
         return std::make_shared<DataTypeString>();
     }
 
-    void executeImplDryRun(Block & block, const ColumnNumbers & /*arguments*/, size_t result, size_t /*input_rows_count*/) override
-    {
-        block.getByPosition(result).column = block.getByPosition(result).type->createColumn();
-    }
-
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t input_rows_count) override
+    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t input_rows_count) const override
     {
         using namespace OpenSSLDetails;
 
         const auto mode = block.getByPosition(arguments[0]).column->getDataAt(0);
-
         if (mode.size == 0 || !std::string_view(mode).starts_with("aes-"))
             throw Exception("Invalid mode: " + mode.toString(), ErrorCodes::BAD_ARGUMENTS);
 
-        const auto * evp_cipher = getCipherByName(mode);
-        if (evp_cipher == nullptr)
+        auto cipher = getCipherByName(mode);
+        if (cipher == nullptr)
             throw Exception("Invalid mode: " + mode.toString(), ErrorCodes::BAD_ARGUMENTS);
+        const EVP_CIPHER * evp_cipher = cipher.get();
 
         OpenSSLDetails::validateCipherMode<compatibility_mode>(evp_cipher);
 
@@ -573,13 +568,14 @@ private:
             // 1: Init CTX
             if constexpr (mode == CipherMode::RFC5116_AEAD_AES_GCM)
             {
-                // 1.a.1 : Init CTX with custom IV length and optionally with AAD
                 if (EVP_DecryptInit_ex(evp_ctx, evp_cipher, nullptr, nullptr, nullptr) != 1)
-                    onError("Failed to initialize cipher context");
+                    onError("Failed to initialize cipher context 1");
 
+                // 1.a.1 : Set custom IV length
                 if (EVP_CIPHER_CTX_ctrl(evp_ctx, EVP_CTRL_AEAD_SET_IVLEN, iv_value.size, nullptr) != 1)
                     onError("Failed to set custom IV length to " + std::to_string(iv_value.size));
 
+                // 1.a.1 : Init CTX with key and IV
                 if (EVP_DecryptInit_ex(evp_ctx, nullptr, nullptr,
                         reinterpret_cast<const unsigned char*>(key_value.data),
                         reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
@@ -633,8 +629,6 @@ private:
 
             decrypted_result_column_offsets.push_back(decrypted - decrypted_result_column_data.data());
 
-            if (EVP_CIPHER_CTX_reset(evp_ctx) != 1)
-                onError("Failed to reset context");
         }
 
         // in case we overestimate buffer required for decrypted data, fix it up.
