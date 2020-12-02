@@ -2,7 +2,7 @@
 
 ClickHouse is an open-source column-oriented database management system that allows generating analytical data reports in real time.
 
-## Useful Links
+## Useful Links Test
 
 * [Official website](https://clickhouse.tech/) has quick high-level overview of ClickHouse on main page.
 * [Tutorial](https://clickhouse.tech/docs/en/getting_started/tutorial/) shows how to set up and query small ClickHouse cluster.
@@ -15,6 +15,6 @@ ClickHouse is an open-source column-oriented database management system that all
 * [Contacts](https://clickhouse.tech/#contacts) can help to get your questions answered if there are any.
 * You can also [fill this form](https://clickhouse.tech/#meet) to meet Yandex ClickHouse team in person.
 
-## Upcoming Events		
+## Upcoming Events		 
 
 * [ClickHouse at ByteDance (in Chinese)](https://mp.weixin.qq.com/s/Em-HjPylO8D7WPui4RREAQ) on August 28, 2020.
