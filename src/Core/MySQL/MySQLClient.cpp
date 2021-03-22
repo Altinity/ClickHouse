@@ -6,6 +6,7 @@
 #include <Core/MySQL/PacketsProtocolText.h>
 #include <Core/MySQL/PacketsReplication.h>
 #include <Core/MySQL/MySQLReplication.h>
+#include <Poco/String.h>
 
 namespace DB
 {
@@ -132,11 +133,19 @@ void MySQLClient::ping()
     writeCommand(Command::COM_PING, "");
 }
 
-void MySQLClient::startBinlogDump(UInt32 slave_id, String replicate_db, String binlog_file_name, UInt64 binlog_pos)
+void MySQLClient::setBinlogChecksum(const String & binlog_checksum)
 {
-    /// Set binlog checksum to CRC32.
-    String checksum = "CRC32";
-    writeCommand(Command::COM_QUERY, "SET @master_binlog_checksum = '" + checksum + "'");
+    replication.setChecksumSignatureLength(Poco::toUpper(binlog_checksum) == "NONE" ? 0 : 4);
+}
+
+void MySQLClient::startBinlogDumpGTID(UInt32 slave_id, String replicate_db, String gtid_str, const String & binlog_checksum)
+{
+    /// Maybe CRC32 or NONE. mysqlbinlog.cc use NONE, see its below comments:
+    /// Make a notice to the server that this client is checksum-aware.
+    /// It does not need the first fake Rotate necessary checksummed.
+    writeCommand(Command::COM_QUERY, "SET @master_binlog_checksum = 'CRC32'");
+
+    setBinlogChecksum(binlog_checksum);
 
     /// Set heartbeat 1s.
     UInt64 period_ns = (1 * 1e9);
@@ -145,12 +154,16 @@ void MySQLClient::startBinlogDump(UInt32 slave_id, String replicate_db, String b
     // Register slave.
     registerSlaveOnMaster(slave_id);
 
+    /// Set GTID Sets.
+    GTIDSets gtid_sets;
+    gtid_sets.parse(gtid_str);
+    replication.setGTIDSets(gtid_sets);
+
     /// Set Filter rule to replication.
     replication.setReplicateDatabase(replicate_db);
 
-    binlog_pos = binlog_pos < 4 ? 4 : binlog_pos;
-    BinlogDump binlog_dump(binlog_pos, binlog_file_name, slave_id);
-    packet_endpoint->sendPacket<BinlogDump>(binlog_dump, true);
+    BinlogDumpGTID binlog_dump(slave_id, gtid_sets.toPayload());
+    packet_endpoint->sendPacket<BinlogDumpGTID>(binlog_dump, true);
 }
 
 BinlogEventPtr MySQLClient::readOneBinlogEvent(UInt64 milliseconds)

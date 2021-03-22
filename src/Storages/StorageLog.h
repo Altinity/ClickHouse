@@ -27,7 +27,7 @@ public:
     Pipe read(
         const Names & column_names,
         const StorageMetadataPtr & metadata_snapshot,
-        const SelectQueryInfo & query_info,
+        SelectQueryInfo & query_info,
         const Context & context,
         QueryProcessingStage::Enum processed_stage,
         size_t max_block_size,
@@ -41,6 +41,7 @@ public:
 
     void truncate(const ASTPtr &, const StorageMetadataPtr & metadata_snapshot, const Context &, TableExclusiveLockHolder &) override;
 
+    bool storesDataOnDisk() const override { return true; }
     Strings getDataPaths() const override { return {DB::fullPath(disk, table_path)}; }
 
 protected:
@@ -83,7 +84,7 @@ private:
     DiskPtr disk;
     String table_path;
 
-    mutable std::shared_mutex rwlock;
+    mutable std::shared_timed_mutex rwlock;
 
     Files files;
 
@@ -104,7 +105,7 @@ private:
     /// Read marks files if they are not already read.
     /// It is done lazily, so that with a large number of tables, the server starts quickly.
     /// You can not call with a write locked `rwlock`.
-    void loadMarks();
+    void loadMarks(std::chrono::seconds lock_timeout);
 
     /** For normal columns, the number of rows in the block is specified in the marks.
       * For array columns and nested structures, there are more than one group of marks that correspond to different files

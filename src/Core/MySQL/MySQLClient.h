@@ -1,5 +1,5 @@
 #pragma once
-#include <Core/Types.h>
+#include <common/types.h>
 #include <Core/MySQL/MySQLReplication.h>
 #include <IO/ReadBufferFromPocoSocket.h>
 #include <IO/ReadHelpers.h>
@@ -29,7 +29,13 @@ public:
     void disconnect();
     void ping();
 
-    void startBinlogDump(UInt32 slave_id, String replicate_db, String binlog_file_name, UInt64 binlog_pos);
+    void setBinlogChecksum(const String & binlog_checksum);
+
+    /// Start replication stream by GTID.
+    /// replicate_db: replication database schema, events from other databases will be ignored.
+    /// gtid: executed gtid sets format like 'hhhhhhhh-hhhh-hhhh-hhhh-hhhhhhhhhhhh:x-y'.
+    void startBinlogDumpGTID(UInt32 slave_id, String replicate_db, String gtid, const String & binlog_checksum);
+
     BinlogEventPtr readOneBinlogEvent(UInt64 milliseconds = 0);
     Position getPosition() const { return replication.getPosition(); }
 

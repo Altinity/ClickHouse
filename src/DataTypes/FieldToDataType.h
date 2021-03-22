@@ -26,13 +26,14 @@ public:
     DataTypePtr operator() (const String & x) const;
     DataTypePtr operator() (const Array & x) const;
     DataTypePtr operator() (const Tuple & tuple) const;
+    DataTypePtr operator() (const Map & map) const;
     DataTypePtr operator() (const DecimalField<Decimal32> & x) const;
     DataTypePtr operator() (const DecimalField<Decimal64> & x) const;
     DataTypePtr operator() (const DecimalField<Decimal128> & x) const;
     DataTypePtr operator() (const DecimalField<Decimal256> & x) const;
     DataTypePtr operator() (const AggregateFunctionStateData & x) const;
-    DataTypePtr operator() (const bUInt256 & x) const;
-    DataTypePtr operator() (const bInt256 & x) const;
+    DataTypePtr operator() (const UInt256 & x) const;
+    DataTypePtr operator() (const Int256 & x) const;
 };
 
 }

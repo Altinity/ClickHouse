@@ -1,7 +1,7 @@
 #pragma once
 
 #include <Core/Defines.h>
-#include <Core/Types.h>
+#include <common/types.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/Exception.h>
 #include <Disks/Executor.h>
@@ -148,9 +148,7 @@ public:
     virtual std::unique_ptr<WriteBufferFromFileBase> writeFile(
         const String & path,
         size_t buf_size = DBMS_DEFAULT_BUFFER_SIZE,
-        WriteMode mode = WriteMode::Rewrite,
-        size_t estimated_size = 0,
-        size_t aio_threshold = 0) = 0;
+        WriteMode mode = WriteMode::Rewrite) = 0;
 
     /// Remove file or directory. Throws exception if file doesn't exists or if directory is not empty.
     virtual void remove(const String & path) = 0;
@@ -177,16 +175,28 @@ public:
     /// Create hardlink from `src_path` to `dst_path`.
     virtual void createHardLink(const String & src_path, const String & dst_path) = 0;
 
+    /// Wrapper for POSIX open
+    virtual int open(const String & path, mode_t mode) const = 0;
+
+    /// Wrapper for POSIX close
+    virtual void close(int fd) const = 0;
+
+    /// Wrapper for POSIX fsync
+    virtual void sync(int fd) const = 0;
+
     /// Truncate file to specified size.
     virtual void truncateFile(const String & path, size_t size);
 
     /// Return disk type - "local", "s3", etc.
     virtual const String getType() const = 0;
 
-private:
-    /// Returns executor to perform asynchronous operations.
-    Executor & getExecutor() { return *executor; }
+    /// Invoked when Global Context is shutdown.
+    virtual void shutdown() { }
 
+    /// Returns executor to perform asynchronous operations.
+    virtual Executor & getExecutor() { return *executor; }
+
+private:
     std::unique_ptr<Executor> executor;
 };
 

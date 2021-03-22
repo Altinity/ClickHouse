@@ -1,11 +1,13 @@
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnTuple.h>
+#include <Columns/ColumnMap.h>
 #include <Columns/ColumnsNumber.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeTuple.h>
+#include <DataTypes/DataTypeMap.h>
 #include <DataTypes/FieldToDataType.h>
 #include <Processors/Formats/IRowInputFormat.h>
 #include <Functions/FunctionFactory.h>
@@ -15,6 +17,7 @@
 #include <Interpreters/Context.h>
 #include <Interpreters/convertFieldToType.h>
 #include <Interpreters/ExpressionActions.h>
+#include <Interpreters/castColumn.h>
 #include <IO/ReadHelpers.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
@@ -46,6 +49,7 @@ struct SpecialParserType
     bool is_nullable = false;
     bool is_array = false;
     bool is_tuple = false;
+    bool is_map = false;
     /// Type and nullability
     std::vector<std::pair<Field::Types::Which, bool>> nested_types;
 
@@ -118,6 +122,10 @@ static void fillLiteralInfo(DataTypes & nested_types, LiteralInfo & info)
         else if (type_info.isTuple())
         {
             field_type = Field::Types::Tuple;
+        }
+        else if (type_info.isMap())
+        {
+            field_type = Field::Types::Map;
         }
         else
             throw Exception("Unexpected literal type inside Array: " + nested_type->getName() + ". It's a bug",
@@ -196,6 +204,13 @@ private:
                 if (not_null == array.end())
                     return true;
             }
+            else if (literal->value.getType() == Field::Types::Map)
+            {
+                const Map & map = literal->value.get<Map>();
+                if (map.size() % 2)
+                    return false;
+            }
+
             String column_name = "_dummy_" + std::to_string(replaced_literals.size());
             replaced_literals.emplace_back(literal, column_name, force_nullable);
             setDataType(replaced_literals.back());
@@ -242,6 +257,15 @@ private:
             auto nested_types = assert_cast<const DataTypeTuple &>(*info.type).getElements();
             fillLiteralInfo(nested_types, info);
             info.type = std::make_shared<DataTypeTuple>(nested_types);
+        }
+        else if (field_type == Field::Types::Map)
+        {
+            info.special_parser.is_map = true;
+
+            info.type = applyVisitor(FieldToDataType(), info.literal->value);
+            auto nested_types = assert_cast<const DataTypeMap &>(*info.type).getKeyValueTypes();
+            fillLiteralInfo(nested_types, info);
+            info.type = std::make_shared<DataTypeMap>(nested_types);
         }
         else
             throw Exception(String("Unexpected literal type ") + info.literal->value.getTypeName() + ". It's a bug",
@@ -453,17 +477,19 @@ bool ConstantExpressionTemplate::parseLiteralAndAssertType(ReadBuffer & istr, co
     /// If literal does not fit entirely in the buffer, parsing error will happen.
     /// However, it's possible to deduce new template (or use template from cache) after error like it was template mismatch.
 
-    if (type_info.is_array || type_info.is_tuple)
+    if (type_info.is_array || type_info.is_tuple || type_info.is_map)
     {
         /// TODO faster way to check types without using Parsers
         ParserArrayOfLiterals parser_array;
         ParserTupleOfLiterals parser_tuple;
+        ParserMapOfLiterals parser_map;
 
         Tokens tokens_number(istr.position(), istr.buffer().end());
         IParser::Pos iterator(tokens_number, settings.max_parser_depth);
         Expected expected;
         ASTPtr ast;
-        if (!parser_array.parse(iterator, ast, expected) && !parser_tuple.parse(iterator, ast, expected))
+        if (!parser_array.parse(iterator, ast, expected) && !parser_tuple.parse(iterator, ast, expected)
+            && !parser_map.parse(iterator, ast, expected))
             return false;
 
         istr.position() = const_cast<char *>(iterator->begin);
@@ -474,8 +500,10 @@ bool ConstantExpressionTemplate::parseLiteralAndAssertType(ReadBuffer & istr, co
         DataTypes nested_types;
         if (type_info.is_array)
             nested_types = { assert_cast<const DataTypeArray &>(*collection_type).getNestedType() };
-        else
+        else if (type_info.is_tuple)
             nested_types = assert_cast<const DataTypeTuple &>(*collection_type).getElements();
+        else
+            nested_types = assert_cast<const DataTypeMap &>(*collection_type).getKeyValueTypes();
 
         for (size_t i = 0; i < nested_types.size(); ++i)
         {
@@ -554,7 +582,7 @@ bool ConstantExpressionTemplate::parseLiteralAndAssertType(ReadBuffer & istr, co
     }
 }
 
-ColumnPtr ConstantExpressionTemplate::evaluateAll(BlockMissingValues & nulls, size_t column_idx, size_t offset)
+ColumnPtr ConstantExpressionTemplate::evaluateAll(BlockMissingValues & nulls, size_t column_idx, const DataTypePtr & expected_type, size_t offset)
 {
     Block evaluated = structure->literals.cloneWithColumns(std::move(columns));
     columns = structure->literals.cloneEmptyColumns();
@@ -572,12 +600,13 @@ ColumnPtr ConstantExpressionTemplate::evaluateAll(BlockMissingValues & nulls, si
                         ErrorCodes::LOGICAL_ERROR);
 
     rows_count = 0;
-    ColumnPtr res = evaluated.getByName(structure->result_column_name).column->convertToFullColumnIfConst();
+    auto res = evaluated.getByName(structure->result_column_name);
+    res.column = res.column->convertToFullColumnIfConst();
     if (!structure->null_as_default)
-        return res;
+        return castColumn(res, expected_type);
 
     /// Extract column with evaluated expression and mask for NULLs
-    const auto & tuple = assert_cast<const ColumnTuple &>(*res);
+    const auto & tuple = assert_cast<const ColumnTuple &>(*res.column);
     if (tuple.tupleSize() != 2)
         throw Exception("Invalid tuple size, it'a a bug", ErrorCodes::LOGICAL_ERROR);
     const auto & is_null = assert_cast<const ColumnUInt8 &>(tuple.getColumn(1));
@@ -586,7 +615,9 @@ ColumnPtr ConstantExpressionTemplate::evaluateAll(BlockMissingValues & nulls, si
         if (is_null.getUInt(i))
             nulls.setBit(column_idx, offset + i);
 
-    return tuple.getColumnPtr(0);
+    res.column = tuple.getColumnPtr(0);
+    res.type = assert_cast<const DataTypeTuple &>(*res.type).getElements()[0];
+    return castColumn(res, expected_type);
 }
 
 void ConstantExpressionTemplate::TemplateStructure::addNodesToCastResult(const IDataType & result_column_type, ASTPtr & expr, bool null_as_default)
@@ -599,7 +630,7 @@ void ConstantExpressionTemplate::TemplateStructure::addNodesToCastResult(const I
         expr = makeASTFunction("assumeNotNull", std::move(expr));
     }
 
-    expr = makeASTFunction("CAST", std::move(expr), std::make_shared<ASTLiteral>(result_column_type.getName()));
+    expr = makeASTFunction("cast", std::move(expr), std::make_shared<ASTLiteral>(result_column_type.getName()));
 
     if (null_as_default)
     {

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../shell_config.sh
 . "$CURDIR"/../shell_config.sh
 
 $CLICKHOUSE_CLIENT --query "drop table if exists ttl_01280_1"
@@ -25,7 +26,7 @@ insert into ttl_01280_1 values (3, 1, 0, 8, now());"
 
 sleep 2
 optimize "ttl_01280_1"
-$CLICKHOUSE_CLIENT --query "select a, b, x, y from ttl_01280_1"
+$CLICKHOUSE_CLIENT --query "select a, b, x, y from ttl_01280_1 ORDER BY a, b, x, y"
 
 $CLICKHOUSE_CLIENT --query "drop table if exists ttl_01280_2"
 
@@ -43,7 +44,7 @@ insert into ttl_01280_2 values (3, 1, array(2, 4, 5), 8, now());"
 
 sleep 2
 optimize "ttl_01280_2"
-$CLICKHOUSE_CLIENT --query "select a, b, x, y from ttl_01280_2"
+$CLICKHOUSE_CLIENT --query "select a, b, x, y from ttl_01280_2 ORDER BY a, b, x, y"
 
 $CLICKHOUSE_CLIENT --query "drop table if exists ttl_01280_3"
 
@@ -61,7 +62,7 @@ insert into ttl_01280_3 values (3, 5, 5, 8, now());"
 
 sleep 2
 optimize "ttl_01280_3"
-$CLICKHOUSE_CLIENT --query "select a, b, x, y from ttl_01280_3"
+$CLICKHOUSE_CLIENT --query "select a, b, x, y from ttl_01280_3 ORDER BY a, b, x, y"
 
 $CLICKHOUSE_CLIENT --query "drop table if exists ttl_01280_4"
 
@@ -75,7 +76,7 @@ insert into ttl_01280_4 values (1, 5, 4, 9, now())"
 
 sleep 2
 optimize "ttl_01280_4"
-$CLICKHOUSE_CLIENT --query "select a, b, x, y from ttl_01280_4"
+$CLICKHOUSE_CLIENT --query "select a, b, x, y from ttl_01280_4 ORDER BY a, b, x, y"
 
 $CLICKHOUSE_CLIENT --query "drop table if exists ttl_01280_5"
 
@@ -87,7 +88,7 @@ insert into ttl_01280_5 values (1, 5, 4, 5, now());"
 
 sleep 2
 optimize "ttl_01280_5"
-$CLICKHOUSE_CLIENT --query "select a, b, x, y from ttl_01280_5"
+$CLICKHOUSE_CLIENT --query "select a, b, x, y from ttl_01280_5 ORDER BY a, b, x, y"
 
 $CLICKHOUSE_CLIENT --query "drop table if exists ttl_01280_6"
 
@@ -100,4 +101,11 @@ insert into ttl_01280_6 values (1, 5, 3, 5, now())"
 
 sleep 2
 optimize "ttl_01280_6"
-$CLICKHOUSE_CLIENT --query "select a, b, x, y from ttl_01280_6"
+$CLICKHOUSE_CLIENT --query "select a, b, x, y from ttl_01280_6 ORDER BY a, b, x, y"
+
+$CLICKHOUSE_CLIENT -q "DROP TABLE ttl_01280_1"
+$CLICKHOUSE_CLIENT -q "DROP TABLE ttl_01280_2"
+$CLICKHOUSE_CLIENT -q "DROP TABLE ttl_01280_3"
+$CLICKHOUSE_CLIENT -q "DROP TABLE ttl_01280_4"
+$CLICKHOUSE_CLIENT -q "DROP TABLE ttl_01280_5"
+$CLICKHOUSE_CLIENT -q "DROP TABLE ttl_01280_6"

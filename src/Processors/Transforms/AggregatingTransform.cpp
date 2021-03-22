@@ -1,6 +1,5 @@
 #include <Processors/Transforms/AggregatingTransform.h>
 
-#include <Common/ClickHouseRevision.h>
 #include <DataStreams/NativeBlockInputStream.h>
 #include <Processors/ISource.h>
 #include <Processors/Pipe.h>
@@ -56,7 +55,7 @@ namespace
     public:
         SourceFromNativeStream(const Block & header, const std::string & path)
                 : ISource(header), file_in(path), compressed_in(file_in),
-                  block_in(std::make_shared<NativeBlockInputStream>(compressed_in, ClickHouseRevision::get()))
+                  block_in(std::make_shared<NativeBlockInputStream>(compressed_in, DBMS_TCP_PROTOCOL_VERSION))
         {
             block_in->readPrefix();
         }
@@ -380,6 +379,7 @@ private:
 
         for (size_t thread = 0; thread < num_threads; ++thread)
         {
+            /// Select Arena to avoid race conditions
             Arena * arena = first->aggregates_pools.at(thread).get();
             auto source = std::make_shared<ConvertingAggregatedToChunksSource>(
                     params, data, shared_data, arena);
@@ -508,7 +508,7 @@ Processors AggregatingTransform::expandPipeline()
 
 void AggregatingTransform::consume(Chunk chunk)
 {
-    UInt64 num_rows = chunk.getNumRows();
+    const UInt64 num_rows = chunk.getNumRows();
 
     if (num_rows == 0 && params->params.empty_result_for_aggregation_by_empty_set)
         return;
@@ -519,7 +519,7 @@ void AggregatingTransform::consume(Chunk chunk)
         is_consume_started = true;
     }
 
-    src_rows += chunk.getNumRows();
+    src_rows += num_rows;
     src_bytes += chunk.bytes();
 
     if (!params->aggregator.executeOnBlock(chunk.detachColumns(), num_rows, variants, key_columns, aggregate_columns, no_more_keys))

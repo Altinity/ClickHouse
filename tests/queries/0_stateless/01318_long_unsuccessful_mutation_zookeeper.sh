@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../shell_config.sh
 . "$CURDIR"/../shell_config.sh
 
 $CLICKHOUSE_CLIENT --query "DROP TABLE IF EXISTS mutation_table"
@@ -10,7 +11,7 @@ $CLICKHOUSE_CLIENT --query "
         key UInt64,
         value String
     )
-    ENGINE = ReplicatedMergeTree('/clickhouse/tables/mutation_table', '1')
+    ENGINE = ReplicatedMergeTree('/clickhouse/tables/test_01318/mutation_table', '1')
     ORDER BY key
     PARTITION BY key % 10
 "

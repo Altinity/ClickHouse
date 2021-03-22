@@ -35,12 +35,13 @@ ValuesBlockInputFormat::ValuesBlockInputFormat(ReadBuffer & in_, const Block & h
           attempts_to_deduce_template(num_columns), attempts_to_deduce_template_cached(num_columns),
           rows_parsed_using_template(num_columns), templates(num_columns), types(header_.getDataTypes())
 {
-    /// In this format, BOM at beginning of stream cannot be confused with value, so it is safe to skip it.
-    skipBOMIfExists(buf);
 }
 
 Chunk ValuesBlockInputFormat::generate()
 {
+    if (total_rows == 0)
+        readPrefix();
+
     const Block & header = getPort().getHeader();
     MutableColumns columns = header.cloneEmptyColumns();
     block_missing_values.clear();
@@ -53,8 +54,6 @@ Chunk ValuesBlockInputFormat::generate()
             if (buf.eof() || *buf.position() == ';')
                 break;
             readRow(columns, rows_in_block);
-            if (params.callback)
-                params.callback();
         }
         catch (Exception & e)
         {
@@ -69,11 +68,13 @@ Chunk ValuesBlockInputFormat::generate()
     {
         if (!templates[i] || !templates[i]->rowsCount())
             continue;
+
+        const auto & expected_type = header.getByPosition(i).type;
         if (columns[i]->empty())
-            columns[i] = IColumn::mutate(templates[i]->evaluateAll(block_missing_values, i));
+            columns[i] = IColumn::mutate(templates[i]->evaluateAll(block_missing_values, i, expected_type));
         else
         {
-            ColumnPtr evaluated = templates[i]->evaluateAll(block_missing_values, i, columns[i]->size());
+            ColumnPtr evaluated = templates[i]->evaluateAll(block_missing_values, i, expected_type, columns[i]->size());
             columns[i]->insertRangeFrom(*evaluated, 0, evaluated->size());
         }
     }
@@ -131,13 +132,16 @@ bool ValuesBlockInputFormat::tryParseExpressionUsingTemplate(MutableColumnPtr & 
         return true;
     }
 
+    const auto & header = getPort().getHeader();
+    const auto & expected_type = header.getByPosition(column_idx).type;
+
     /// Expression in the current row is not match template deduced on the first row.
     /// Evaluate expressions, which were parsed using this template.
     if (column->empty())
-        column = IColumn::mutate(templates[column_idx]->evaluateAll(block_missing_values, column_idx));
+        column = IColumn::mutate(templates[column_idx]->evaluateAll(block_missing_values, column_idx, expected_type));
     else
     {
-        ColumnPtr evaluated = templates[column_idx]->evaluateAll(block_missing_values, column_idx, column->size());
+        ColumnPtr evaluated = templates[column_idx]->evaluateAll(block_missing_values, column_idx, expected_type, column->size());
         column->insertRangeFrom(*evaluated, 0, evaluated->size());
     }
     /// Do not use this template anymore
@@ -403,6 +407,12 @@ bool ValuesBlockInputFormat::shouldDeduceNewTemplate(size_t column_idx)
         return true;
     }
     return false;
+}
+
+void ValuesBlockInputFormat::readPrefix()
+{
+    /// In this format, BOM at beginning of stream cannot be confused with value, so it is safe to skip it.
+    skipBOMIfExists(buf);
 }
 
 void ValuesBlockInputFormat::readSuffix()

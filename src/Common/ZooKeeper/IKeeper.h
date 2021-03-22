@@ -1,6 +1,6 @@
 #pragma once
 
-#include <Core/Types.h>
+#include <common/types.h>
 #include <Common/Exception.h>
 
 #include <vector>
@@ -391,6 +391,9 @@ public:
     virtual void multi(
         const Requests & requests,
         MultiCallback callback) = 0;
+
+    /// Expire session and finish all pending requests
+    virtual void finalize() = 0;
 };
 
 }

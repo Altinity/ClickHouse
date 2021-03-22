@@ -16,7 +16,6 @@
 
 #include <Common/ThreadPool.h>
 #include <Common/UInt128.h>
-#include <Common/LRUCache.h>
 #include <Common/ColumnsHashing.h>
 #include <Common/assert_cast.h>
 #include <Common/filesystemHelpers.h>
@@ -79,7 +78,7 @@ using AggregatedDataWithShortStringKey = StringHashMap<AggregateDataPtr>;
 using AggregatedDataWithStringKey = HashMapWithSavedHash<StringRef, AggregateDataPtr>;
 
 using AggregatedDataWithKeys128 = HashMap<UInt128, AggregateDataPtr, UInt128HashCRC32>;
-using AggregatedDataWithKeys256 = HashMap<UInt256, AggregateDataPtr, UInt256HashCRC32>;
+using AggregatedDataWithKeys256 = HashMap<DummyUInt256, AggregateDataPtr, UInt256HashCRC32>;
 
 using AggregatedDataWithUInt32KeyTwoLevel = TwoLevelHashMap<UInt32, AggregateDataPtr, HashCRC32<UInt32>>;
 using AggregatedDataWithUInt64KeyTwoLevel = TwoLevelHashMap<UInt64, AggregateDataPtr, HashCRC32<UInt64>>;
@@ -89,7 +88,7 @@ using AggregatedDataWithShortStringKeyTwoLevel = TwoLevelStringHashMap<Aggregate
 using AggregatedDataWithStringKeyTwoLevel = TwoLevelHashMapWithSavedHash<StringRef, AggregateDataPtr>;
 
 using AggregatedDataWithKeys128TwoLevel = TwoLevelHashMap<UInt128, AggregateDataPtr, UInt128HashCRC32>;
-using AggregatedDataWithKeys256TwoLevel = TwoLevelHashMap<UInt256, AggregateDataPtr, UInt256HashCRC32>;
+using AggregatedDataWithKeys256TwoLevel = TwoLevelHashMap<DummyUInt256, AggregateDataPtr, UInt256HashCRC32>;
 
 /** Variants with better hash function, using more than 32 bits for hash.
   * Using for merging phase of external aggregation, where number of keys may be far greater than 4 billion,
@@ -101,7 +100,7 @@ using AggregatedDataWithKeys256TwoLevel = TwoLevelHashMap<UInt256, AggregateData
 using AggregatedDataWithUInt64KeyHash64 = HashMap<UInt64, AggregateDataPtr, DefaultHash<UInt64>>;
 using AggregatedDataWithStringKeyHash64 = HashMapWithSavedHash<StringRef, AggregateDataPtr, StringRefHash64>;
 using AggregatedDataWithKeys128Hash64 = HashMap<UInt128, AggregateDataPtr, UInt128Hash>;
-using AggregatedDataWithKeys256Hash64 = HashMap<UInt256, AggregateDataPtr, UInt256Hash>;
+using AggregatedDataWithKeys256Hash64 = HashMap<DummyUInt256, AggregateDataPtr, UInt256Hash>;
 
 template <typename Base>
 struct AggregationDataWithNullKey : public Base
@@ -228,7 +227,7 @@ struct AggregationMethodString
 
     static void insertKeyIntoColumns(const StringRef & key, MutableColumns & key_columns, const Sizes &)
     {
-        key_columns[0]->insertData(key.data, key.size);
+        static_cast<ColumnString *>(key_columns[0].get())->insertData(key.data, key.size);
     }
 };
 
@@ -254,7 +253,7 @@ struct AggregationMethodStringNoCache
 
     static void insertKeyIntoColumns(const StringRef & key, MutableColumns & key_columns, const Sizes &)
     {
-        key_columns[0]->insertData(key.data, key.size);
+        static_cast<ColumnString *>(key_columns[0].get())->insertData(key.data, key.size);
     }
 };
 
@@ -280,7 +279,7 @@ struct AggregationMethodFixedString
 
     static void insertKeyIntoColumns(const StringRef & key, MutableColumns & key_columns, const Sizes &)
     {
-        key_columns[0]->insertData(key.data, key.size);
+        static_cast<ColumnFixedString *>(key_columns[0].get())->insertData(key.data, key.size);
     }
 };
 
@@ -305,7 +304,7 @@ struct AggregationMethodFixedStringNoCache
 
     static void insertKeyIntoColumns(const StringRef & key, MutableColumns & key_columns, const Sizes &)
     {
-        key_columns[0]->insertData(key.data, key.size);
+        static_cast<ColumnFixedString *>(key_columns[0].get())->insertData(key.data, key.size);
     }
 };
 
@@ -929,9 +928,6 @@ public:
 
     Aggregator(const Params & params_);
 
-    /// Aggregate the source. Get the result in the form of one of the data structures.
-    void execute(const BlockInputStreamPtr & stream, AggregatedDataVariants & result);
-
     using AggregateColumns = std::vector<ColumnRawPtrs>;
     using AggregateColumnsData = std::vector<ColumnAggregateFunction::Container *>;
     using AggregateColumnsConstData = std::vector<const ColumnAggregateFunction::Container *>;
@@ -955,15 +951,7 @@ public:
       */
     BlocksList convertToBlocks(AggregatedDataVariants & data_variants, bool final, size_t max_threads) const;
 
-    /** Merge several aggregation data structures and output the result as a block stream.
-      */
-    std::unique_ptr<IBlockInputStream> mergeAndConvertToBlocks(ManyAggregatedDataVariants & data_variants, bool final, size_t max_threads) const;
     ManyAggregatedDataVariants prepareVariantsToMerge(ManyAggregatedDataVariants & data_variants) const;
-
-    /** Merge the stream of partially aggregated blocks into one data structure.
-      * (Pre-aggregate several blocks that represent the result of independent aggregations from remote servers.)
-      */
-    void mergeStream(const BlockInputStreamPtr & stream, AggregatedDataVariants & result, size_t max_threads);
 
     using BucketToBlocks = std::map<Int32, BlocksList>;
     /// Merge partially aggregated blocks separated to buckets into one data structure.
@@ -1013,7 +1001,6 @@ public:
 
 protected:
     friend struct AggregatedDataVariants;
-    friend class MergingAndConvertingBlockInputStream;
     friend class ConvertingAggregatedToChunksTransform;
     friend class ConvertingAggregatedToChunksSource;
     friend class AggregatingInOrderTransform;
@@ -1213,6 +1200,7 @@ protected:
     Block convertOneBucketToBlock(
         AggregatedDataVariants & data_variants,
         Method & method,
+        Arena * arena,
         bool final,
         size_t bucket) const;
 
