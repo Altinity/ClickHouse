@@ -419,8 +419,9 @@ bool NO_INLINE decompressImpl(
      size_t dest_size)
 {
     const UInt8 * ip = reinterpret_cast<const UInt8 *>(source);
-    const UInt8 * const input_end = ip + source_size;
     UInt8 * op = reinterpret_cast<UInt8 *>(dest);
+    const UInt8 * const input_end = ip + source_size;
+    UInt8 * const output_begin = op;
     UInt8 * const output_end = op + dest_size;
 
     /// Unrolling with clang is doing >10% performance degrade.
@@ -486,6 +487,9 @@ bool NO_INLINE decompressImpl(
         ip += 2;
         const UInt8 * match = op - offset;
 
+        if (unlikely(match < output_begin))
+            return false;
+
         /// Get match length.
 
         length = token & 0x0F;
@@ -539,7 +543,7 @@ bool NO_INLINE decompressImpl(
 }
 
 
-void decompress(
+bool decompress(
     const char * const source,
     char * const dest,
     size_t source_size,
@@ -547,7 +551,7 @@ void decompress(
     PerformanceStatistics & statistics [[maybe_unused]])
 {
     if (source_size == 0 || dest_size == 0)
-        return;
+        return true;
 
     /// Don't run timer if the block is too small.
     if (dest_size >= 32768)
@@ -557,24 +561,27 @@ void decompress(
         /// Run the selected method and measure time.
 
         Stopwatch watch;
+        bool success = true;
         if (best_variant == 0)
-            decompressImpl<16, true>(source, dest, source_size, dest_size);
+            success = decompressImpl<16, true>(source, dest, source_size, dest_size);
         if (best_variant == 1)
-            decompressImpl<16, false>(source, dest, source_size, dest_size);
+            success = decompressImpl<16, false>(source, dest, source_size, dest_size);
         if (best_variant == 2)
-            decompressImpl<8, true>(source, dest, source_size, dest_size);
+            success = decompressImpl<8, true>(source, dest, source_size, dest_size);
         if (best_variant == 3)
-            decompressImpl<32, false>(source, dest, source_size, dest_size);
+            success = decompressImpl<32, false>(source, dest, source_size, dest_size);
 
         watch.stop();
 
         /// Update performance statistics.
 
         statistics.data[best_variant].update(watch.elapsedSeconds(), dest_size);
+
+        return success;
     }
     else
     {
-        decompressImpl<8, false>(source, dest, source_size, dest_size);
+        return decompressImpl<8, false>(source, dest, source_size, dest_size);
     }
 }
 
