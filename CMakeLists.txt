@@ -271,12 +271,6 @@ endif()
 
 include(cmake/cpu_features.cmake)
 
-option(ARCH_NATIVE "Add -march=native compiler flag. This makes your binaries non-portable but more performant code may be generated.")
-
-if (ARCH_NATIVE)
-    set (COMPILER_FLAGS "${COMPILER_FLAGS} -march=native")
-endif ()
-
 # Asynchronous unwind tables are needed for Query Profiler.
 # They are already by default on some platforms but possibly not on all platforms.
 # Enable it explicitly.
@@ -583,7 +577,7 @@ macro (add_executable target)
     # invoke built-in add_executable
     # explicitly acquire and interpose malloc symbols by clickhouse_malloc
     # if GLIBC_COMPATIBILITY is ON and ENABLE_THINLTO is on than provide memcpy symbol explicitly to neutrialize thinlto's libcall generation.
-    if (GLIBC_COMPATIBILITY AND ENABLE_THINLTO)
+    if (ARCH_AMD64 AND GLIBC_COMPATIBILITY AND ENABLE_THINLTO)
         _add_executable (${ARGV} $<TARGET_OBJECTS:clickhouse_malloc> $<TARGET_OBJECTS:memcpy>)
     else ()
         _add_executable (${ARGV} $<TARGET_OBJECTS:clickhouse_malloc>)
