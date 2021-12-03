@@ -1,10 +1,10 @@
-# docker build -t clickhouse/stateless-test .
-FROM clickhouse/test-base
+# docker build -t yandex/clickhouse-stateless-test .
+FROM arm-clickhouse-test-base:21.8
 
 ARG odbc_driver_url="https://github.com/ClickHouse/clickhouse-odbc/releases/download/v1.1.4.20200302/clickhouse-odbc-1.1.4-Linux.tar.gz"
 
-RUN echo "deb [trusted=yes] http://repo.mysql.com/apt/ubuntu/ bionic mysql-5.7" >> /etc/apt/sources.list \
-    && apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 8C718D3B5072E1F5
+# RUN echo "deb [trusted=yes] http://repo.mysql.com/apt/ubuntu/ bionic mysql-5.7" >> /etc/apt/sources.list \
+#     && apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 8C718D3B5072E1F5
 
 RUN apt-get update -y \
     && env DEBIAN_FRONTEND=noninteractive \
@@ -30,7 +30,7 @@ RUN apt-get update -y \
             tree \
             unixodbc \
             wget \
-            mysql-client=5.7* \
+            mysql-client=8.0* \
             postgresql-client
 
 RUN pip3 install numpy scipy pandas
@@ -50,4 +50,5 @@ ENV MAX_RUN_TIME=0
 
 COPY run.sh /
 COPY process_functional_tests_result.py /
+
 CMD ["/bin/bash", "/run.sh"]

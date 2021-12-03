@@ -1,5 +1,5 @@
-# docker build -t clickhouse/stateful-test .
-FROM clickhouse/stateless-test
+# docker build -t yandex/clickhouse-stateful-test .
+FROM registry.gitlab.com/altinity-qa/clickhouse/cicd/release/arm-test-stateless:21.8
 
 RUN apt-get update -y \
     && env DEBIAN_FRONTEND=noninteractive \

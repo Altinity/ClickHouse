@@ -3,10 +3,8 @@ FROM ubuntu:20.04
 
 ENV DEBIAN_FRONTEND=noninteractive LLVM_VERSION=11
 
-RUN sed -i 's|http://archive|http://ru.archive|g' /etc/apt/sources.list
-
 RUN apt-get update \
-    && apt-get install ca-certificates lsb-release wget gnupg apt-transport-https \
+    && apt-get install apt-utils ca-certificates lsb-release wget gnupg apt-transport-https \
         --yes --no-install-recommends --verbose-versions \
     && export LLVM_PUBKEY_HASH="bda960a8da687a275a2078d43c111d66b1c6a893a3275271beedf266c1ff4a0cdecb429c7a5cccf9f486ea7aa43fd27f" \
     && wget -nv -O /tmp/llvm-snapshot.gpg.key https://apt.llvm.org/llvm-snapshot.gpg.key \
@@ -26,12 +24,13 @@ RUN apt-get update \
         software-properties-common \
         --yes --no-install-recommends
 
+RUN apt-get clean
 # Special dpkg-deb (https://github.com/ClickHouse-Extras/dpkg) version which is able
 # to compress files using pigz (https://zlib.net/pigz/) instead of gzip.
 # Significantly increase deb packaging speed and compatible with old systems
-RUN curl -O https://clickhouse-datasets.s3.yandex.net/utils/1/dpkg-deb \
-    && chmod +x dpkg-deb \
-    && cp dpkg-deb /usr/bin
+# RUN curl -O https://clickhouse-datasets.s3.yandex.net/utils/1/dpkg-deb \
+#     && chmod +x dpkg-deb \
+#     && cp dpkg-deb /usr/bin
 
 RUN apt-get update \
     && apt-get install \

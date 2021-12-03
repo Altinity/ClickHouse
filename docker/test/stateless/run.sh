@@ -12,6 +12,10 @@ dpkg -i package_folder/clickhouse-test_*.deb
 # install test configs
 /usr/share/clickhouse-test/config/install.sh
 
+echo "Enable IPv4"
+sed -i 's/::/0.0.0.0/g' /etc/clickhouse-server/config.d/listen.xml
+sed -i 's/::/0.0.0.0/g' /usr/share/clickhouse-test/config/config.d/listen.xml
+
 # For flaky check we also enable thread fuzzer
 if [ "$NUM_TRIES" -gt "1" ]; then
     export THREAD_FUZZER_CPU_TIME_PERIOD_US=1000
@@ -90,7 +94,7 @@ function run_tests()
     fi
 
     clickhouse-test --testname --shard --zookeeper --hung-check --print-time \
-            --use-skip-list --test-runs "$NUM_TRIES" "${ADDITIONAL_OPTIONS[@]}" 2>&1 \
+            --use-skip-list --test-runs "$NUM_TRIES" "${ADDITIONAL_OPTIONS[@]}" --skip 01639_distributed_sync_insert_zero 2>&1 \
         | ts '%Y-%m-%d %H:%M:%S' \
         | tee -a test_output/test_result.txt
 }
