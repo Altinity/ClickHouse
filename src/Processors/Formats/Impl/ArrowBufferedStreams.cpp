@@ -11,6 +11,9 @@
 
 #include <sys/stat.h>
 
+#ifdef HAS_RESERVED_IDENTIFIER
+#pragma clang diagnostic ignored "-Wreserved-identifier"
+#endif
 
 namespace DB
 {

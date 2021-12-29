@@ -454,6 +454,7 @@ public:
     virtual ~IColumn() = default;
     IColumn() = default;
     IColumn(const IColumn &) = default;
+    IColumn& operator= (const IColumn &) = default;
 
     /** Print column name, size, and recursively print all subcolumns.
       */

@@ -2,6 +2,10 @@
 
 #include <common/types.h>
 
+#ifdef HAS_RESERVED_IDENTIFIER
+#pragma clang diagnostic ignored "-Wreserved-identifier"
+#endif
+
 /* This file contains macros and helpers for writing platform-dependent code.
  *
  * Macros DECLARE_<Arch>_SPECIFIC_CODE will wrap code inside it into the

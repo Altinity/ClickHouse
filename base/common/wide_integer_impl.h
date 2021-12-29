@@ -11,6 +11,9 @@
 #include <cassert>
 #include <limits>
 
+#ifdef HAS_RESERVED_IDENTIFIER
+#pragma clang diagnostic ignored "-Wreserved-identifier"
+#endif
 
 namespace wide
 {
