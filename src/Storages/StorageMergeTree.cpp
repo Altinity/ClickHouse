@@ -105,6 +105,7 @@ void StorageMergeTree::startup()
     clearOldPartsFromFilesystem();
     clearOldWriteAheadLogs();
     clearEmptyParts();
+    clearOldDeletedMasks();
 
     /// Temporary directories contain incomplete results of merges (after forced restart)
     ///  and don't allow to reinitialize them, so delete each of them immediately
@@ -1104,6 +1105,7 @@ bool StorageMergeTree::scheduleDataProcessingJob(BackgroundJobsAssignee & assign
                 cleared_count += clearOldWriteAheadLogs();
                 cleared_count += clearOldMutations();
                 cleared_count += clearEmptyParts();
+                cleared_count += clearOldDeletedMasks(false);
                 return cleared_count;
                 /// TODO maybe take into account number of cleared objects when calculating backoff
             }, common_assignee_trigger, getStorageID()), /* need_trigger */ false);
