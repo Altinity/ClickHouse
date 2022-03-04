@@ -301,6 +301,8 @@ private:
     /// A flag, used to distinguish between user query and internal query to a database engine (MaterializedPostgreSQL).
     bool is_internal_query = false;
 
+    /// A flag, used to distinguish between internal lightweight mutation and normal query.
+    bool from_lightweight_mutation = false;
 
 public:
     // Top-level OpenTelemetry trace context for the query. Makes sense only for a query context.
@@ -825,6 +827,9 @@ public:
 
     bool isInternalQuery() const { return is_internal_query; }
     void setInternalQuery(bool internal) { is_internal_query = internal; }
+
+    bool isFromLightWeightMutation() const { return from_lightweight_mutation; }
+    void setFromLightWeightMutation(bool lightweight) { from_lightweight_mutation = lightweight; }
 
     ActionLocksManagerPtr getActionLocksManager();
 

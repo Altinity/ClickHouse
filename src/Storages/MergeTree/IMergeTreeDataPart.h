@@ -429,6 +429,17 @@ public:
     /// Required for distinguish different copies of the same part on remote FS.
     String getUniqueId() const;
 
+    /// Prefix name for deleted rows mask bitmap file
+    static inline constexpr auto DELETED_ROW_MARK_PREFIX_NAME = "deleted_row_mask_";
+
+    String getLightWeightDeletedMaskFileName() const;
+
+    /// Get the content of light weight bitmap file
+    String readLightWeightDeletedMaskFile() const;
+
+    /// There is light weight bitmap file only when part has non-zero lightweight_mutation.
+    bool hasLightWeight() const { return info.lightweight_mutation > 0; }
+
 protected:
 
     /// Total size of all columns, calculated once in calcuateColumnSizesOnDisk

@@ -20,6 +20,8 @@ struct MergeTreeReaderSettings
     bool save_marks_in_cache = false;
     /// Validate checksums on reading (should be always enabled in production).
     bool checksum_on_read = true;
+    /// Do not apply deleted mask for internal select from lightweight mutation
+    bool from_lightweight_mutation = false;
 };
 
 struct MergeTreeWriterSettings

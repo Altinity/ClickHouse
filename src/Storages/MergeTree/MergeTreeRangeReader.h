@@ -73,6 +73,10 @@ public:
         /// Skip extra rows to current_offset and perform actual reading
         size_t finalize(Columns & columns);
 
+        /// Current position from the begging of file in rows, not including the num_delayed_rows
+        /// Used for light weight deleted mask.
+        size_t positionBeforeRead() const;
+
         bool isFinished() const { return is_finished; }
 
     private:
@@ -199,6 +203,9 @@ public:
 
         Block block_before_prewhere;
 
+        /// Similar as filter that you need to apply to newly-read columns
+        ColumnPtr deleted_mask_filter_holder;
+
     private:
         RangesInfo started_ranges;
         /// The number of rows read from each granule.
@@ -236,6 +243,7 @@ private:
     ReadResult startReadingChain(size_t max_rows, MarkRanges & ranges);
     Columns continueReadingChain(ReadResult & result, size_t & num_rows);
     void executePrewhereActionsAndFilterColumns(ReadResult & result);
+    void executeDeletedRowMaskFilterColumns(ReadResult & result);
 
     IMergeTreeReader * merge_tree_reader = nullptr;
     const MergeTreeIndexGranularity * index_granularity = nullptr;

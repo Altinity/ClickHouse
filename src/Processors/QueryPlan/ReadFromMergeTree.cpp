@@ -53,6 +53,7 @@ static MergeTreeReaderSettings getMergeTreeReaderSettings(const ContextPtr & con
         .read_settings = context->getReadSettings(),
         .save_marks_in_cache = true,
         .checksum_on_read = settings.checksum_on_read,
+        .from_lightweight_mutation = context->isFromLightWeightMutation();
     };
 }
 
