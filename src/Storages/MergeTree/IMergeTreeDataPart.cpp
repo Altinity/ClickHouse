@@ -619,6 +619,7 @@ void IMergeTreeDataPart::loadColumnsChecksumsIndexes(bool require_columns_checks
 
     loadUUID();
     loadColumns(require_columns_checksums);
+    loadDeleteRowMask();
     loadChecksums(require_columns_checksums);
     loadIndexGranularity();
     calculateColumnsAndSecondaryIndicesSizesOnDisk();
@@ -1041,6 +1042,25 @@ void IMergeTreeDataPart::loadUUID()
         if (uuid == UUIDHelpers::Nil)
             throw Exception("Unexpected empty " + String(UUID_FILE_NAME) + " in part: " + name, ErrorCodes::LOGICAL_ERROR);
     }
+}
+
+void IMergeTreeDataPart::loadDeleteRowMask()
+{
+    String path = fs::path(getFullRelativePath());
+    Int64 lightweight_muatation = 0;
+    for (auto it = volume->getDisk()->iterateDirectory(path); it->isValid(); it->next())
+    {
+        if (startsWith(it->name(), "deleted_row_mask_"))
+        {
+            Int64 lightweight_version = 0;
+            ReadBufferFromString file_name_buf(it->name());
+            file_name_buf >> "deleted_row_mask_" >> lightweight_version >> ".txt";
+            if (lightweight_version > lightweight_muatation)
+                lightweight_muatation = lightweight_version;
+            LOG_DEBUG(storage.log, "Loading lightweight_muatation: deleted_row_mask_{}.txt entry", lightweight_version);
+        }
+    }
+    info.lightweight_mutation = lightweight_muatation;
 }
 
 void IMergeTreeDataPart::loadColumns(bool require)

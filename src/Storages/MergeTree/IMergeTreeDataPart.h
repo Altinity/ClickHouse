@@ -183,7 +183,7 @@ public:
     const MergeTreeData & storage;
 
     String name;
-    MergeTreePartInfo info;
+    mutable MergeTreePartInfo info;
 
     /// Part unique identifier.
     /// The intention is to use it for identifying cases where the same part is
@@ -480,6 +480,9 @@ private:
 
     /// Reads columns names and types from columns.txt
     void loadColumns(bool require);
+
+    /// Reads deleted row mask from deleted_row_mask_<lightweight_mutation_id>.txt
+    void loadDeleteRowMask();
 
     /// If checksums.txt exists, reads file's checksums (and sizes) from it
     void loadChecksums(bool require);
