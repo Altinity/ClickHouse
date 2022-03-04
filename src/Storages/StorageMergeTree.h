@@ -79,6 +79,8 @@ public:
 
     void mutate(const MutationCommands & commands, ContextPtr context) override;
 
+    void mutate(const MutationCommands & commands, ContextPtr context, MutationType type);
+
     /// Return introspection information about currently processing or recently processed mutations.
     std::vector<MergeTreeMutationStatus> getMutationsStatus() const override;
 
@@ -162,7 +164,7 @@ private:
 
     /// Allocate block number for new mutation, write mutation to disk
     /// and into in-memory structures. Wake up merge-mutation task.
-    Int64 startMutation(const MutationCommands & commands, String & mutation_file_name);
+    Int64 startMutation(const MutationCommands & commands, String & mutation_file_name,MutationType type);
     /// Wait until mutation with version will finish mutation for all parts
     void waitForMutation(Int64 version, const String & file_name);
 

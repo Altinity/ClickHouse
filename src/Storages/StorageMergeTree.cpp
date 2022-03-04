@@ -317,7 +317,7 @@ void StorageMergeTree::alter(
             DatabaseCatalog::instance().getDatabase(table_id.database_name)->alterTable(local_context, table_id, new_metadata);
 
             if (!maybe_mutation_commands.empty())
-                mutation_version = startMutation(maybe_mutation_commands, mutation_file_name);
+                mutation_version = startMutation(maybe_mutation_commands, mutation_file_name,MutationType::Ordinary);
         }
 
         /// Always execute required mutations synchronously, because alters
@@ -414,7 +414,7 @@ CurrentlyMergingPartsTagger::~CurrentlyMergingPartsTagger()
     storage.currently_processing_in_background_condition.notify_all();
 }
 
-Int64 StorageMergeTree::startMutation(const MutationCommands & commands, String & mutation_file_name)
+Int64 StorageMergeTree::startMutation(const MutationCommands & commands, String & mutation_file_name, MutationType type)
 {
     /// Choose any disk, because when we load mutations we search them at each disk
     /// where storage can be placed. See loadMutations().
@@ -423,7 +423,7 @@ Int64 StorageMergeTree::startMutation(const MutationCommands & commands, String 
     {
         std::lock_guard lock(currently_processing_in_background_mutex);
 
-        MergeTreeMutationEntry entry(commands, disk, relative_data_path, insert_increment.get());
+        MergeTreeMutationEntry entry(commands, disk, relative_data_path, insert_increment.get(),type);
         version = increment.get();
         entry.commit(version);
         mutation_file_name = entry.file_name;
@@ -513,11 +513,25 @@ void StorageMergeTree::waitForMutation(Int64 version, const String & file_name)
 
 void StorageMergeTree::mutate(const MutationCommands & commands, ContextPtr query_context)
 {
+    MutationCommands lightweight_commands;
+    MutationCommands ordinary_commands;
+    for (auto command: commands){
+        if (command.type == MutationCommand::DELETE || command.type == MutationCommand::UPDATE)
+            lightweight_commands.emplace_back(std::move(command));
+        else
+            ordinary_commands.emplace_back(std::move(command));
+    }
+    mutate(lightweight_commands, query_context, MutationType::Lightweight);
+    mutate(ordinary_commands, query_context, MutationType::Ordinary);
+}
+
+void StorageMergeTree::mutate(const MutationCommands & commands, ContextPtr query_context, MutationType type)
+{
     /// Validate partition IDs (if any) before starting mutation
     getPartitionIdsAffectedByCommands(commands, query_context);
 
     String mutation_file_name;
-    Int64 version = startMutation(commands, mutation_file_name);
+    Int64 version = startMutation(commands, mutation_file_name, type);
 
     if (query_context->getSettingsRef().mutations_sync > 0)
         waitForMutation(version, mutation_file_name);
@@ -598,6 +612,7 @@ std::vector<MergeTreeMutationStatus> StorageMergeTree::getMutationsStatus() cons
             formatAST(*command.ast, buf, false, true);
             result.push_back(MergeTreeMutationStatus
             {
+                entry.type,
                 entry.file_name,
                 buf.str(),
                 entry.create_time,
