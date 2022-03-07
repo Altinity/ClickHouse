@@ -600,6 +600,8 @@ public:
     /// Does not takes underlying Storage (if any) into account.
     virtual std::optional<UInt64> lifetimeBytes() const { return {}; }
 
+    /// Return true if there are lightweight parts.
+    virtual bool hasLightWeight() const { return false; }
 private:
     /// Lock required for alter queries (lockForAlter).
     /// Allows to execute only one simultaneous alter query.

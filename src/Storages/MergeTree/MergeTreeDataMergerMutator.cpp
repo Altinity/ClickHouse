@@ -29,11 +29,13 @@
 #include <Processors/Transforms/ExpressionTransform.h>
 #include <Processors/Transforms/MaterializingTransform.h>
 #include <Interpreters/MutationsInterpreter.h>
+#include <Interpreters/InterpreterInsertQuery.h>
 #include <Interpreters/Context.h>
 #include <Common/interpolate.h>
 #include <Common/typeid_cast.h>
 #include <Common/escapeForFileName.h>
 #include <Parsers/queryToString.h>
+#include <Parsers/ASTIdentifier.h>
 
 #include <cmath>
 #include <ctime>
@@ -67,7 +69,6 @@ MergeTreeDataMergerMutator::MergeTreeDataMergerMutator(MergeTreeData & data_, si
     : data(data_), max_tasks_count(max_tasks_count_), log(&Poco::Logger::get(data.getLogName() + " (MergerMutator)"))
 {
 }
-
 
 UInt64 MergeTreeDataMergerMutator::getMaxSourcePartsSizeForMerge() const
 {

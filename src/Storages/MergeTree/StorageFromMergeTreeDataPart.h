@@ -78,6 +78,11 @@ public:
         return parts.front()->storage.getSettings()->materialize_ttl_recalculate_only;
     }
 
+    bool hasNonAppliedMask() const
+    {
+        return parts.front()->hasLightWeight() && !parts.front()->is_empty_bitmap;
+    }
+
 protected:
     /// Used in part mutation.
     StorageFromMergeTreeDataPart(const MergeTreeData::DataPartPtr & part_)
