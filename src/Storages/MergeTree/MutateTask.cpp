@@ -1294,6 +1294,8 @@ public:
             case State::NEED_FINALIZE:
             {
                 finalize();
+
+                state = State::SUCCESS;
                 return true;
             }
             case State::SUCCESS:
