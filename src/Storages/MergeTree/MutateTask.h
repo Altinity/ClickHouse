@@ -43,6 +43,8 @@ public:
         return promise.get_future();
     }
 
+    bool hasNewPart();
+
 private:
 
     bool prepare();
