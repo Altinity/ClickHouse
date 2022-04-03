@@ -2,22 +2,24 @@
 import sys
 from testflows.core import *
 
+
 append_path(sys.path, ".")
+
 
 from helpers.common import Pool, join, run_scenario
 from helpers.argparser import argparser
 
+
 @TestModule
 @Name("clickhouse")
 @ArgumentParser(argparser)
-def regression(self, local, clickhouse_binary_path, stress=None, parallel=None):
+def regression(self, local, clickhouse_binary_path, stress=None):
     """ClickHouse regression.
     """
     top().terminating = False
-    args = {"local": local, "clickhouse_binary_path": clickhouse_binary_path, "stress": stress, "parallel": parallel}
+    args = {"local": local, "clickhouse_binary_path": clickhouse_binary_path, "stress": stress}
 
     self.context.stress = stress
-    self.context.parallel = parallel
 
     tasks = []
     with Pool(8) as pool:
@@ -33,6 +35,7 @@ def regression(self, local, clickhouse_binary_path, stress=None, parallel=None):
             run_scenario(pool, tasks, Feature(test=load("extended_precision_data_types.regression", "regression")), args)
         finally:
             join(tasks)
+
 
 if main():
     regression()
