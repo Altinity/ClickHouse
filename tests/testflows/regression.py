@@ -13,13 +13,14 @@ from helpers.argparser import argparser
 @TestModule
 @Name("clickhouse")
 @ArgumentParser(argparser)
-def regression(self, local, clickhouse_binary_path, stress=None):
+def regression(self, local, clickhouse_binary_path, stress=None, parallel=True):
     """ClickHouse regression.
     """
     top().terminating = False
-    args = {"local": local, "clickhouse_binary_path": clickhouse_binary_path, "stress": stress}
+    args = {"local": local, "clickhouse_binary_path": clickhouse_binary_path, "stress": stress, "parallel": parallel}
 
     self.context.stress = stress
+    self.context.parallel = parallel
 
     tasks = []
     with Pool(8) as pool:

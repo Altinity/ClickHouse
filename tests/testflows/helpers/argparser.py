@@ -1,5 +1,14 @@
 import os
 
+
+def onoff(v):
+    if v in ["yes", "1", "on"]:
+        return True
+    elif v in ["no", "0", "off"]:
+        return False
+    raise ValueError(f"invalid {v}")
+
+
 def argparser(parser):
     """Default argument parser for regressions.
     """
