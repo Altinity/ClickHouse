@@ -416,7 +416,7 @@ namespace DB
                 auto indexes_column = createAndFillColumnWithIndexesData(arrow_indexes_column);
 
                 auto new_column_lc = ColumnLowCardinality::create(dict_values, std::move(indexes_column));
-                column_lc = std::move(*new_column_lc);
+                column_lc = std::move(const_cast<ColumnLowCardinality&>(*new_column_lc));
                 break;
             }
 #    define DISPATCH(ARROW_NUMERIC_TYPE, CPP_NUMERIC_TYPE) \

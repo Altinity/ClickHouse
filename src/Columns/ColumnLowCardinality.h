@@ -31,6 +31,12 @@ class ColumnLowCardinality final : public COWHelper<IColumn, ColumnLowCardinalit
     ColumnLowCardinality(const ColumnLowCardinality & other) = default;
 
 public:
+    ColumnLowCardinality() = delete;
+    ColumnLowCardinality(ColumnLowCardinality &&) = default;
+    ColumnLowCardinality& operator= (const ColumnLowCardinality &) = delete;
+    ColumnLowCardinality& operator= (ColumnLowCardinality &&) = default;
+    virtual ~ColumnLowCardinality() override = default;
+
     /** Create immutable column using immutable arguments. This arguments may be shared with other columns.
       * Use IColumn::mutate in order to make mutable column and mutate shared nested columns.
       */
@@ -241,9 +247,14 @@ public:
     {
     public:
         Index();
-        Index(const Index & other) = default;
         explicit Index(MutableColumnPtr && positions_);
         explicit Index(ColumnPtr positions_);
+
+        Index(const Index &) = default;
+        Index(Index &&) = default;
+        Index& operator= (const Index &) = default;
+        Index& operator= (Index &&) = default;
+        ~Index() = default;
 
         const ColumnPtr & getPositions() const { return positions; }
         WrappedPtr & getPositionsPtr() { return positions; }
@@ -294,7 +305,6 @@ private:
     class Dictionary
     {
     public:
-        Dictionary(const Dictionary & other) = default;
         explicit Dictionary(MutableColumnPtr && column_unique, bool is_shared);
         explicit Dictionary(ColumnPtr column_unique, bool is_shared);
 
