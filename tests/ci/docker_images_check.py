@@ -384,8 +384,8 @@ def main():
 
     if args.push:
         subprocess.check_output(  # pylint: disable=unexpected-keyword-arg
-            "docker login --username 'robotclickhouse' --password-stdin",
-            input=get_parameter_from_ssm("dockerhub_robot_password"),
+            "docker login --username 'arthurpassos' --password-stdin",
+            input=get_parameter_from_ssm("arthur-altinity-dockerhub-password"),
             encoding="utf-8",
             shell=True,
         )
