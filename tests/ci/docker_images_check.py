@@ -232,7 +232,6 @@ def build_and_push_one_image(
         from_tag_arg = f"--build-arg FROM_TAG={version_string} "
 
     with open(build_log, "wb") as bl:
-    
         cmd = (
             "docker buildx build --builder default "
             f"{from_tag_arg}"
