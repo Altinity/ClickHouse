@@ -379,7 +379,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    image_name = f"clickhouse/{IMAGE_TYPE}-builder"
+    image_name = f"altinityinfra/{IMAGE_TYPE}-builder"
 
     ch_root = args.clickhouse_repo_path
 
