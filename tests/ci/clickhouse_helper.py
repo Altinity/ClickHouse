@@ -37,12 +37,8 @@ class ClickHouseHelper:
                     url, params=params, data=json_str, headers=auth
                 )
             except Exception as e:
-                logging.warning(
-                    "Received exception while sending data to %s on %s attempt: %s",
-                    url,
-                    i,
-                    e,
-                )
+                error = f"Received exception while sending data to {url} on {i} attempt: {e}"
+                logging.warning(error)
                 continue
 
             logging.info("Response content '%s'", response.content)
@@ -142,7 +138,7 @@ def prepare_tests_results_for_clickhouse(
     check_name,
 ):
 
-    pull_request_url = "https://github.com/ClickHouse/ClickHouse/commits/master"
+    pull_request_url = "https://github.com/Altinity/ClickHouse/commits/master"
     base_ref = "master"
     head_ref = "master"
     base_repo = pr_info.repo_full_name
