@@ -2,7 +2,7 @@ version: '2.3'
 
 services:
   clickhouse:
-    image: ${IMAGE_DEPENDENCY_PROXY}clickhouse/clickhouse-integration-test:28741
+    image: altinityinfra/integration-test
     init: true
     expose:
       - "9000"

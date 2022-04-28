@@ -2,7 +2,7 @@ version: '2.3'
 
 services:
   clickhouse:
-    build:
+    image: altinityinfra/integration-test
       context: .
       dockerfile: Dockerfile
     init: true
