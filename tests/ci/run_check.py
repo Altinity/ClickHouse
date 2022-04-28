@@ -56,6 +56,7 @@ LABELS = {
         "Not for changelog",
     ],
     "pr-performance": ["Performance Improvement"],
+        "arthurpassos" # Altinity
 }
 
 CATEGORY_TO_LABEL = {c: lb for lb, categories in LABELS.items() for c in categories}
