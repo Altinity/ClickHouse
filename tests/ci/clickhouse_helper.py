@@ -18,8 +18,10 @@ class ClickHouseHelper:
 
         self.url = url
         self.auth = {
-            "X-ClickHouse-User": get_parameter_from_ssm("clickhouse-test-stat-login"),
-            "X-ClickHouse-Key": get_parameter_from_ssm("clickhouse-test-stat-password"),
+            "X-ClickHouse-User": get_parameter_from_ssm("clickhouse-test-stat-login2"),
+            "X-ClickHouse-Key": get_parameter_from_ssm(""),
+                    "clickhouse-test-stat-password"
+                ),
         }
 
     @staticmethod
@@ -142,7 +144,7 @@ def prepare_tests_results_for_clickhouse(
     check_name,
 ):
 
-    pull_request_url = "https://github.com/ClickHouse/ClickHouse/commits/master"
+    pull_request_url = "https://github.com/Altinity/ClickHouse/commits/master"
     base_ref = "master"
     head_ref = "master"
     base_repo = pr_info.repo_full_name
