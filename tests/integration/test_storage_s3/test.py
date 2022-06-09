@@ -420,7 +420,6 @@ def run_s3_mocks(cluster):
     logging.info("Starting s3 mocks")
     mocks = (
         ("mock_s3.py", "resolver", "8080"),
-        ("unstable_server.py", "resolver", "8081"),
         ("echo.py", "resolver", "8082"),
     )
     for mock_filename, container, port in mocks:
