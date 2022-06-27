@@ -19,7 +19,7 @@ CONFIG_DIR_IN_REPO = "programs/server"
 INTERGATION_DIR_IN_REPO = "tests/integration"
 SRC_DIR_IN_REPO = "src"
 
-DIND_INTEGRATION_TESTS_IMAGE_NAME = "altinityinfra/integration-tests-runner"
+DIND_INTEGRATION_TESTS_IMAGE_NAME = "clickmouse/integration-tests-runner:165-8c38fb80260c55518ad1c855801b2116e3e20039-fix"
 
 def check_args_and_update_paths(args):
     if args.clickhouse_root:
@@ -300,7 +300,7 @@ if __name__ == "__main__":
         opts=' '.join(args.pytest_args).replace('\'', '\\\''),
         tests_list=' '.join(args.tests_list),
         dockerd_internal_volume=dockerd_internal_volume,
-        img=DIND_INTEGRATION_TESTS_IMAGE_NAME + ":" + args.docker_image_version,
+        img=DIND_INTEGRATION_TESTS_IMAGE_NAME,# + ":" + args.docker_image_version,
         name=CONTAINER_NAME,
         command=args.command
     )
