@@ -146,10 +146,12 @@ if __name__ == "__main__":
 
     gh = Github(get_best_robot_token())
 
-    rerun_helper = RerunHelper(gh, pr_info, check_name_with_group)
-    if rerun_helper.is_already_finished_by_status():
-        logging.info("Check is already finished according to github status, exiting")
-        sys.exit(0)
+    # Always re-run, even if it finished in previous run.
+    # gh = Github(get_best_robot_token())
+    # rerun_helper = RerunHelper(gh, pr_info, check_name_with_group)
+    # if rerun_helper.is_already_finished_by_status():
+    #     logging.info("Check is already finished according to github status, exiting")
+    #     sys.exit(0)
 
     images = get_images_with_versions(reports_path, IMAGES)
     images_with_versions = {i.name: i.version for i in images}
