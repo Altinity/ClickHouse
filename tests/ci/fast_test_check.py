@@ -98,7 +98,7 @@ if __name__ == "__main__":
         logging.info("Check is already finished according to github status, exiting")
         sys.exit(0)
 
-    docker_image = get_image_with_version(temp_path, "clickhouse/fasttest")
+    docker_image = get_image_with_version(temp_path, "altinityinfra/fasttest")
 
     s3_helper = S3Helper("https://s3.amazonaws.com")
 

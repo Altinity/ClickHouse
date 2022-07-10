@@ -20,7 +20,7 @@ from stopwatch import Stopwatch
 from rerun_helper import RerunHelper
 
 
-DOCKER_IMAGE = "clickhouse/split-build-smoke-test"
+DOCKER_IMAGE = "altinityinfra/split-build-smoke-test"
 DOWNLOAD_RETRIES_COUNT = 5
 RESULT_LOG_NAME = "run.log"
 CHECK_NAME = "Split build smoke test (actions)"

@@ -83,7 +83,7 @@ if __name__ == "__main__":
     if not os.path.exists(temp_path):
         os.makedirs(temp_path)
 
-    docker_image = get_image_with_version(temp_path, "clickhouse/style-test")
+    docker_image = get_image_with_version(temp_path, "altinityinfra/style-test")
     s3_helper = S3Helper("https://s3.amazonaws.com")
 
     cmd = (

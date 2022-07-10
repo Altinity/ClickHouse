@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--image-repo",
         type=str,
-        default="clickhouse/clickhouse-server",
+        default="altinityinfra/clickhouse-server",
         help="image name on docker hub",
     )
     parser.add_argument(

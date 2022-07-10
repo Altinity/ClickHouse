@@ -119,21 +119,5 @@
     "docker/test/keeper-jepsen": {
         "name": "altinityinfra/keeper-jepsen-test",
         "dependent": []
-    },
-    "docker/docs/builder": {
-        "name": "altinityinfra/docs-builder",
-        "only_amd64": true,
-        "dependent": [
-            "docker/docs/check",
-            "docker/docs/release"
-        ]
-    },
-    "docker/docs/check": {
-        "name": "altinityinfra/docs-check",
-        "dependent": []
-    },
-    "docker/docs/release": {
-        "name": "altinityinfra/docs-release",
-        "dependent": []
     }
 }

@@ -2,7 +2,7 @@
 # docker build -t clickhouse/stateful-test .
 ARG FROM_TAG=latest
 # TODO consider replacing clickhouse with altinityinfra dockerhub account
-FROM clickhouse/stateless-test:$FROM_TAG
+FROM altinityinfra/stateless-test:$FROM_TAG
 
 RUN apt-get update -y \
     && env DEBIAN_FRONTEND=noninteractive \

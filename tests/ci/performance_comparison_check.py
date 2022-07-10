@@ -20,7 +20,7 @@ from commit_status_helper import get_commit, post_commit_status
 from tee_popen import TeePopen
 from rerun_helper import RerunHelper
 
-IMAGE_NAME = "clickhouse/performance-comparison"
+IMAGE_NAME = "altinityinfra/performance-comparison"
 
 
 def get_run_command(
