@@ -1,8 +1,8 @@
 import os
 import uuid
 import time
+import platform
 import xml.etree.ElementTree as xmltree
-import packaging.version as pkg_version
 from collections import namedtuple
 
 import testflows.settings as settings
@@ -12,6 +12,11 @@ from testflows.core.name import basename, parentname
 from testflows._core.testtype import TestSubType
 
 
+def current_cpu():
+    """Return current cpu architecture."""
+    return platform.processor()
+
+
 def check_clickhouse_version(version):
     """Compare ClickHouse version."""
 
@@ -19,34 +24,39 @@ def check_clickhouse_version(version):
         if getattr(test.context, "clickhouse_version", None) is None:
             return False
 
-        clickhouse_version = pkg_version.parse(str(test.context.clickhouse_version))
+        version_list = version.translate({ord(i): None for i in "<>="}).split(".")
+        clickhouse_version_list = test.context.clickhouse_version.split(".")
+
+        index = None
+
+        for i in clickhouse_version_list:
+            if i.isnumeric():
+                continue
+            index = clickhouse_version_list.index(i)
+
+        index = (
+            min(len(version_list), len(clickhouse_version_list))
+            if index is None
+            else min(len(version_list), index)
+        )
+
+        version_list = [int(i) for i in version_list[0:index]]
+        clickhouse_version_list = [int(i) for i in clickhouse_version_list[0:index]]
 
         if version.startswith("=="):
-            return clickhouse_version == pkg_version.parse(
-                str(version.split("==", 1)[-1])
-            )
+            return clickhouse_version_list == version_list
         elif version.startswith(">="):
-            return clickhouse_version >= pkg_version.parse(
-                str(version.split(">=", 1)[-1])
-            )
+            return clickhouse_version_list >= version_list
         elif version.startswith("<="):
-            return clickhouse_version <= pkg_version.parse(
-                str(version.split("<=", 1)[-1])
-            )
+            return clickhouse_version_list <= version_list
         elif version.startswith("="):
-            return clickhouse_version == pkg_version.parse(
-                str(version.split("=", 1)[-1])
-            )
+            return clickhouse_version_list == version_list
         elif version.startswith(">"):
-            return clickhouse_version > pkg_version.parse(
-                str(version.split(">", 1)[-1])
-            )
+            return clickhouse_version_list > version_list
         elif version.startswith("<"):
-            return clickhouse_version < pkg_version.parse(
-                str(version.split("<", 1)[-1])
-            )
+            return clickhouse_version_list < version_list
         else:
-            return clickhouse_version == pkg_version.parse(str(version))
+            return clickhouse_version_list == version_list
 
     return check
 
@@ -186,7 +196,7 @@ def create_xml_config_content(
     uid = getuid()
     path = os.path.join(config_d_dir, config_file)
     name = config_file
-    root = xmltree.Element("clickhouse")
+    root = xmltree.Element("yandex")
     root.append(xmltree.Comment(text=f"config uid: {uid}"))
 
     def create_xml_tree(entries, root):
@@ -389,15 +399,24 @@ def add_config(
 
         with Then("I wait for config reload message in the log file"):
             if restart:
-                bash.expect(
-                    f"ConfigReloader: Loaded config '/etc/clickhouse-server/config.xml', performed update on configuration",
+                choice = bash.expect(
+                    (
+                        f"(ConfigReloader: Loaded config '/etc/clickhouse-server/config.xml', performed update on configuration)|"
+                        f"(ConfigReloader: Error updating configuration from '/etc/clickhouse-server/config.xml')"
+                    ),
                     timeout=timeout,
                 )
             else:
-                bash.expect(
-                    f"ConfigReloader: Loaded config '/etc/clickhouse-server/{config.preprocessed_name}', performed update on configuration",
+                choice = bash.expect(
+                    (
+                        f"(ConfigReloader: Loaded config '/etc/clickhouse-server/{config.preprocessed_name}', performed update on configuration)|"
+                        f"(ConfigReloader: Error updating configuration from '/etc/clickhouse-server/{config.preprocessed_name}')"
+                    ),
                     timeout=timeout,
                 )
+            if choice.group(2):
+                bash.expect(".+\n", timeout=5, expect_timeout=True)
+                fail("ConfigReloader: Error updating configuration")
 
     try:
         with Given(f"{config.name}"):
@@ -456,7 +475,7 @@ def add_config(
                         wait_for_config_to_be_loaded()
 
 
-@TestStep(When)
+@TestStep(Given)
 def copy(
     self,
     dest_node,
@@ -477,8 +496,12 @@ def copy(
 
     assert cmd.exitcode == 0, error()
     contents = cmd.output
-
-    dest_node.command(f"cat << {eof} > {dest_path}\n{contents}\n{eof}")
+    try:
+        dest_node.command(f"cat << {eof} > {dest_path}\n{contents}\n{eof}")
+        yield dest_path
+    finally:
+        with Finally(f"I delete {dest_path}"):
+            dest_node.command(f"rm -rf {dest_path}")
 
 
 @TestStep(Given)

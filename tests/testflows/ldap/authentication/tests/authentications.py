@@ -900,7 +900,7 @@ def repeat_requests(self, server, iterations, vcd_value, rbac=False, timeout=600
 @TestScenario
 @Tags("verification_cooldown")
 @Requirements(RQ_SRS_007_LDAP_Authentication_VerificationCooldown_Performance("1.0"))
-def verification_cooldown_performance(self, server, rbac=False, iterations=5000):
+def verification_cooldown_performance(self, server, rbac=False, iterations=500):
     """Check that login performance is better when the verification cooldown
     parameter is set to a positive value when comparing to the case when
     the verification cooldown parameter is turned off.

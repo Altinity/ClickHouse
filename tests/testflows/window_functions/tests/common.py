@@ -5,8 +5,56 @@ import tempfile
 
 from testflows.core import *
 from testflows.core.name import basename, parentname
+from testflows._core.name import sep
 from testflows._core.testtype import TestSubType
 from testflows.asserts import values, error, snapshot
+
+from helpers.common import check_clickhouse_version, getuid
+
+interval_periods = [
+    "SECOND",
+    "MINUTE",
+    "HOUR",
+    "DAY",
+    "WEEK",
+    "MONTH",
+    "QUARTER",
+    "YEAR",
+]
+
+
+def windows(order_by):
+    return [
+        # frame with all rows
+        ""
+        # rows
+        "ROWS BETWEEN CURRENT ROW AND CURRENT ROW",
+        "ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING",
+        "ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING",
+        "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+        "ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING",
+        "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
+        "ROWS BETWEEN 1 PRECEDING AND CURRENT ROW",
+        "ROWS BETWEEN 1 PRECEDING AND UNBOUNDED FOLLOWING",
+        "ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING",
+        "ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING",
+        # range
+        "RANGE BETWEEN CURRENT ROW AND CURRENT ROW",
+        "RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING",
+        "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+        "RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
+        # range with order by
+        f"ORDER BY {order_by} RANGE BETWEEN CURRENT ROW AND CURRENT ROW",
+        f"ORDER BY {order_by} RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING",
+        f"ORDER BY {order_by} RANGE BETWEEN CURRENT ROW AND 1 FOLLOWING",
+        f"ORDER BY {order_by} RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+        f"ORDER BY {order_by} RANGE BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING",
+        f"ORDER BY {order_by} RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING",
+        f"ORDER BY {order_by} RANGE BETWEEN 1 PRECEDING AND CURRENT ROW",
+        f"ORDER BY {order_by} RANGE BETWEEN 1 PRECEDING AND UNBOUNDED FOLLOWING",
+        f"ORDER BY {order_by} RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING",
+        f"ORDER BY {order_by} RANGE BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING",
+    ]
 
 
 def window_frame_error():
@@ -44,8 +92,12 @@ def syntax_error():
     return (62, "Exception: Syntax error")
 
 
-def groups_frame_error():
-    return (48, "Exception: Window frame 'Groups' is not implemented")
+def groups_frame_error(test):
+    return (
+        (48, "Exception: Window frame 'GROUPS' is not implemented")
+        if check_clickhouse_version("<21.11")(test)
+        else (48, "Exception: Window frame 'Groups' is not implemented")
+    )
 
 
 def getuid():
@@ -70,15 +122,33 @@ def convert_output(s):
 
 
 def execute_query(
-    sql, expected=None, exitcode=None, message=None, format="TabSeparatedWithNames"
+    sql,
+    expected=None,
+    exitcode=None,
+    message=None,
+    no_checks=False,
+    snapshot_name=None,
+    format="TabSeparatedWithNames",
 ):
     """Execute SQL query and compare the output to the snapshot."""
-    name = basename(current().name)
+    if snapshot_name is None:
+        snapshot_name = (
+            "/window functions"
+            + current()
+            .name.replace(f"{sep}non distributed{sep}", ":")
+            .replace(f"{sep}distributed{sep}", ":")
+            .split("/window functions", 1)[-1]
+        )
 
     with When("I execute query", description=sql):
         r = current().context.node.query(
-            sql + " FORMAT " + format, exitcode=exitcode, message=message
+            sql + " FORMAT " + format,
+            exitcode=exitcode,
+            message=message,
+            no_checks=no_checks,
         )
+        if no_checks:
+            return r
 
     if message is None:
         if expected is not None:
@@ -91,7 +161,7 @@ def execute_query(
                         snapshot(
                             "\n" + r.output.strip() + "\n",
                             "tests",
-                            name=name,
+                            name=snapshot_name,
                             encoder=str,
                         )
                     ), error()
@@ -206,6 +276,76 @@ def datetimes_table(self, name="datetimes", distributed=False):
             for row in data:
                 sql = f"INSERT INTO {name} VALUES {row}"
                 self.context.node.query(sql)
+
+    return table
+
+
+@TestStep(Given)
+def datetimes_table_from_data_query(
+    self, data_query, name="datetimes2", distributed=False
+):
+    """Create datetimes table that is populated
+    automatically based on the passed SELECT data generating query.
+
+    For example,
+
+    ```data_query=("SELECT number AS id, "
+                   "toDate('2020-01-01') + number AS f_date, "
+                   "toDate32('2020-01-01') + number AS f_date32, "
+                   "toDateTime('2020-01-01', 'CET') + number AS f_timestamptz, "
+                   "toDateTime('2020-01-01') + number AS f_timestamp, "
+                   "toDateTime64('2020-01-01', 9, 'CET') + number AS f_timestamp64tz, "
+                   "toDateTime64('2020-01-01', 9) + number AS f_timestamp64 "
+                   "FROM numbers(10)")
+    ```
+    """
+    table = None
+
+    if not distributed:
+        with By("creating table"):
+            sql = """
+            CREATE TABLE {name} (
+                id UInt32,
+                f_date Date,
+                --f_date32 Date32,
+                f_timestamptz DateTime('CET'),
+                f_timestamp DateTime,
+                f_timestamp64tz DateTime64(9, 'CET'),
+                f_timestamp64 DateTime64
+            ) ENGINE = MergeTree() ORDER BY tuple()
+            """
+            table = create_table(name=name, statement=sql)
+
+        with And("populating table with data"):
+            sql = f"INSERT INTO {name} {data_query}"
+            self.context.node.query(sql)
+
+    else:
+        with By("creating table"):
+            sql = """
+            CREATE TABLE {name} ON CLUSTER sharded_cluster (
+                id UInt32,
+                f_timestamptz DateTime('CET'),
+                f_timestamp DateTime
+            ) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{{shard}}/{name}', '{{replica}}') ORDER BY tuple()
+            """
+            create_table(
+                name=name + "_source", statement=sql, on_cluster="sharded_cluster"
+            )
+
+        with And("a distributed table"):
+            sql = (
+                "CREATE TABLE {name} AS "
+                + name
+                + "_source"
+                + " ENGINE = Distributed(sharded_cluster, default, "
+                + f"{name + '_source'}, id % toUInt8(getMacro('shard')))"
+            )
+            table = create_table(name=name, statement=sql)
+
+        with And("populating table with data"):
+            sql = f"INSERT INTO {name} {data_query}"
+            self.context.node.query(sql)
 
     return table
 
@@ -465,3 +605,53 @@ def create_table(self, name, statement, on_cluster=False):
                 node.query(f"DROP TABLE IF EXISTS {name} ON CLUSTER {on_cluster}")
             else:
                 node.query(f"DROP TABLE IF EXISTS {name}")
+
+
+@TestStep(Given)
+def allow_experimental_window_functions(self):
+    """Set allow_experimental_window_functions = 1"""
+    setting = ("allow_experimental_window_functions", 1)
+    default_query_settings = None
+
+    try:
+        with By(
+            "adding allow_experimental_window_functions to the default query settings"
+        ):
+            default_query_settings = getsattr(
+                current().context, "default_query_settings", []
+            )
+            default_query_settings.append(setting)
+        yield
+    finally:
+        with Finally(
+            "I remove allow_experimental_window_functions from the default query settings"
+        ):
+            if default_query_settings:
+                try:
+                    default_query_settings.pop(default_query_settings.index(setting))
+                except ValueError:
+                    pass
+
+
+@TestStep(Given)
+def allow_distributed_product_mode(self):
+    """Set distributed_product_mode = 'allow'"""
+    setting = ("distributed_product_mode", "allow")
+    default_query_settings = None
+
+    try:
+        with By("adding distributed_product_mode to the default query settings"):
+            default_query_settings = getsattr(
+                current().context, "default_query_settings", []
+            )
+            default_query_settings.append(setting)
+        yield
+    finally:
+        with Finally(
+            "I remove distributed_product_mode from the default query settings"
+        ):
+            if default_query_settings:
+                try:
+                    default_query_settings.pop(default_query_settings.index(setting))
+                except ValueError:
+                    pass
