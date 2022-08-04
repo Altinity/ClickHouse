@@ -179,7 +179,7 @@ jobs:
   DockerServerImages:
     needs:
       - BuilderDebRelease
-      - BuilderDebAarch64
+      # - BuilderDebAarch64 - currently we do not build aarch images
     runs-on: [self-hosted, style-checker]
     steps:
       - name: Clear repository
