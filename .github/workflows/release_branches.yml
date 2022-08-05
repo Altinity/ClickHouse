@@ -1,5 +1,7 @@
 name: ReleaseCI
 
+# Just a comment to have something to commit
+
 env:
   # Force the stdout and stderr streams to be unbuffered
   PYTHONUNBUFFERED: 1
