@@ -172,9 +172,9 @@ class VersionType:
 
 def validate_version(version: str):
     parts = version.split(".")
-    if len(parts) != 4:
+    if len(parts) < 4:
         raise ValueError(f"{version} does not contain 4 parts")
-    for part in parts:
+    for part in parts[:4]:
         int(part)
 
 
@@ -222,7 +222,7 @@ def get_version_from_repo(
 def get_version_from_string(version: str) -> ClickHouseVersion:
     validate_version(version)
     parts = version.split(".")
-    return ClickHouseVersion(parts[0], parts[1], parts[2], -1, git, parts[3])
+    return ClickHouseVersion(parts[0], parts[1], parts[2], -1, git, parts[3], parts[4] if len(parts) >= 4 else None)
 
 
 def get_version_from_tag(tag: str) -> ClickHouseVersion:
