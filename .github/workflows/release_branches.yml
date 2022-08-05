@@ -1,6 +1,6 @@
 name: ReleaseCI
 
-# Just a comment to have something to commit
+# Just a comment to have something to commit, with a bit more stuff
 
 env:
   # Force the stdout and stderr streams to be unbuffered
