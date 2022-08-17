@@ -42,12 +42,14 @@ LibraryBridgeHelper::LibraryBridgeHelper(
 {
     bridge_port = config.getUInt("library_bridge.port", DEFAULT_PORT);
     bridge_host = config.getString("library_bridge.host", DEFAULT_HOST);
+        
 }
 
 
 Poco::URI LibraryBridgeHelper::createRequestURI(const String & method) const
 {
     auto uri = getMainURI();
+    
     uri.addQueryParameter("dictionary_id", toString(dictionary_id));
     uri.addQueryParameter("method", method);
     return uri;
