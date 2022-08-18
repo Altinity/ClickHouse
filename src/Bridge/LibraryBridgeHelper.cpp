@@ -1,4 +1,3 @@
-
 #include "LibraryBridgeHelper.h"
 
 #include <Formats/formatBlock.h>
