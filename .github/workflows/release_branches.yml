@@ -12,9 +12,10 @@ on: # yamllint disable-line rule:truthy
       - opened
     branches:
       - '**/22.3*'
-  release:
-    types:
-      - published
+#  release:
+#    types:
+#      - published
+#      - prereleased
   push:
     branches:
        # any 22.3 family release
