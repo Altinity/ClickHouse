@@ -79,10 +79,13 @@ def clear_ip_tables_and_restart_daemons():
 
 class ClickhouseTestFlowsTestsRunner:
     def __init__(self, result_path, params):
+        self.image_versions = self.params["docker_images_with_versions"]
         self.result_path = result_path
         self.params = params
         self.start_time = time.time()
-        self.soft_deadline_time = self.start_time + (TASK_TIMEOUT - MAX_TIME_IN_SANDBOX)
+        self.disable_net_host = (
+            "disable_net_host" in self.params and self.params["disable_net_host"]
+        )
 
     def path(self):
         return self.result_path
@@ -147,8 +150,55 @@ class ClickhouseTestFlowsTestsRunner:
             shell=True,
         )
 
+    def _get_runner_opts(self):
+        result = []
+        if self.disable_net_host:
+            result.append("--disable-net-host")
+        return " ".join(result)
+
+    @staticmethod
+    def get_images_names():
+        return [
+            "altinityinfra/testflows-runner",
+        ]
+
+    def get_image_version(self, name: str):
+        if name in self.image_versions:
+            return self.image_versions[name]
+        logging.warn(
+            "Cannot find image %s in params list %s", name, self.image_versions
+        )
+        return "latest"
+
+    def get_image_with_version(self, name):
+        if name in self.image_versions:
+            return name + ":" + self.image_versions[name]
+        logging.warn(
+            "Cannot find image %s in params list %s", name, self.image_versions
+        )
+        if ":" not in name:
+            return name + ":latest"
+        return name
+
     def _get_runner_image_cmd(self, repo_path):
-        return "clickhouse/testflows-runner"
+        image_cmd = ""
+        if self._can_run_with(
+            os.path.join(repo_path, "tests/testflows", "runner"),
+            "--docker-image-version",
+        ):
+            for img in self.get_images_names():
+                if img == "altinityinfra/testflows-runner":
+                    runner_version = self.get_image_version(img)
+                    logging.info(
+                        "Can run with custom docker image version %s", runner_version
+                    )
+                    image_cmd += " --docker-image-version={} ".format(runner_version)
+                else:
+                    logging.info(f"Cannot run with custom docker compose image version :( for {img}")
+        else:
+            image_cmd = ""
+            logging.info("Cannot run with custom docker image version :(")
+        return image_cmd
 
     def run_impl(self, repo_path, build_path):
         self._install_clickhouse(build_path)
@@ -157,30 +207,27 @@ class ClickhouseTestFlowsTestsRunner:
             subprocess.check_output("sudo iptables -L", shell=True),
         )
 
-        test_results = []
-        result_state = "success"
-        failed_sum = 0
-        passed_sum = 0
-        other_sum = 0
-        # FIXME: implement running testflows image and collection of counts
-        status_text = "fail: {}, passed: {}, other: {}".format(
-            failed_sum, passed_sum, other_sum
+        image_cmd = self._get_runner_image_cmd(repo_path)
+
+        cmd = (f"cd {repo_path}/tests/testflows && timeout -s 9 10h "
+            f"./runner {self._get_runner_opts()} {image_cmd}")
+
+        log_basename = ".log"
+        log_path = os.path.join(repo_path, "tests/testflows", log_basename)
+        with open(log_path, "w") as log:
+            logging.info("Executing cmd: %s", cmd)
+            retcode = subprocess.Popen(
+                cmd, shell=True, stderr=log, stdout=log
+            ).wait()
+            if retcode == 0:
+                logging.info("Run successfully")
+            else:
+                logging.info("Some tests failed")
+
+        log_result_path = os.path.join(
+            str(self.path()), "testflows_run" + log_basename
         )
-
-        if self.soft_deadline_time < time.time():
-            status_text = "Timeout, " + status_text
-            result_state = "failure"
-
-        return result_state, status_text, test_results, []
-
-
-def write_results(results_file, status_file, results, status):
-    with open(results_file, "w") as f:
-        out = csv.writer(f, delimiter="\t")
-        out.writerows(results)
-    with open(status_file, "w") as f:
-        out = csv.writer(f, delimiter="\t")
-        out.writerow(status)
+        shutil.copy(log_path, log_result_path)
 
 
 if __name__ == "__main__":
@@ -195,11 +242,5 @@ if __name__ == "__main__":
     runner = ClickhouseTestFlowsTestsRunner(result_path, params)
 
     logging.info("Running tests")
-    state, description, test_results, _ = runner.run_impl(repo_path, build_path)
+    runner.run_impl(repo_path, build_path)
     logging.info("Tests finished")
-
-    status = (state, description)
-    out_results_file = os.path.join(str(runner.path()), "test_results.tsv")
-    out_status_file = os.path.join(str(runner.path()), "check_status.tsv")
-    write_results(out_results_file, out_status_file, test_results, status)
-    logging.info("Results written")
