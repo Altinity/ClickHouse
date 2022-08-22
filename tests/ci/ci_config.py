@@ -299,7 +299,7 @@ CI_CONFIG = {
         "Split build smoke test (actions)": {
             "required_build": "binary_splitted",
         },
-        "Testflows check (actions)": {
+        "TestFlows tests (release, actions)": {
             "required_build": "package_release",
         },
         "Unit tests (release-gcc, actions)": {
