@@ -79,13 +79,13 @@ def clear_ip_tables_and_restart_daemons():
 
 class ClickhouseTestFlowsTestsRunner:
     def __init__(self, result_path, params):
-        self.image_versions = self.params["docker_images_with_versions"]
         self.result_path = result_path
         self.params = params
         self.start_time = time.time()
         self.disable_net_host = (
             "disable_net_host" in self.params and self.params["disable_net_host"]
         )
+        self.image_versions = self.params["docker_images_with_versions"]
 
     def path(self):
         return self.result_path
