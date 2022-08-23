@@ -215,8 +215,8 @@ class ClickhouseTestFlowsTestsRunner:
         test_log_path = os.path.join(repo_path, "tests/testflows", "test.log")
 
         cmd = (
-            f"(set -o pipefail && cd {repo_path}/tests/testflows && timeout -s 9 10h "
-            f"./runner {self._get_runner_opts()} {image_cmd} | tee {log_path})"
+            f"set -o pipefail && cd {repo_path}/tests/testflows && timeout -s 9 10h "
+            f"./runner {self._get_runner_opts()} {image_cmd} | tee {log_path}"
         )
 
         logging.info("Executing cmd: %s", cmd)
