@@ -194,7 +194,9 @@ class ClickhouseTestFlowsTestsRunner:
                     )
                     image_cmd += " --docker-image-version={} ".format(runner_version)
                 else:
-                    logging.info(f"Cannot run with custom docker compose image version :( for {img}")
+                    logging.info(
+                        f"Cannot run with custom docker compose image version :( for {img}"
+                    )
         else:
             image_cmd = ""
             logging.info("Cannot run with custom docker image version :(")
@@ -209,25 +211,25 @@ class ClickhouseTestFlowsTestsRunner:
 
         image_cmd = self._get_runner_image_cmd(repo_path)
 
-        cmd = (f"cd {repo_path}/tests/testflows && timeout -s 9 10h "
-            f"./runner {self._get_runner_opts()} {image_cmd}")
+        log_path = os.path.join(repo_path, "tests/testflows", "run.log")
+        test_log_path = os.path.join(repo_path, "tests/testflows", "test.log")
 
-        log_basename = ".log"
-        log_path = os.path.join(repo_path, "tests/testflows", log_basename)
-        with open(log_path, "w") as log:
-            logging.info("Executing cmd: %s", cmd)
-            retcode = subprocess.Popen(
-                cmd, shell=True, stderr=log, stdout=log
-            ).wait()
-            if retcode == 0:
-                logging.info("Run successfully")
-            else:
-                logging.info("Some tests failed")
-
-        log_result_path = os.path.join(
-            str(self.path()), "testflows_run" + log_basename
+        cmd = (
+            f"(set -o pipefail && cd {repo_path}/tests/testflows && timeout -s 9 10h "
+            f"./runner {self._get_runner_opts()} {image_cmd} | tee {log_path})"
         )
-        shutil.copy(log_path, log_result_path)
+
+        logging.info("Executing cmd: %s", cmd)
+        retcode = subprocess.Popen(
+            cmd, shell=True, stderr=subprocess.STDOUT, stdout=subprocess.STDOUT
+        ).wait()
+        if retcode == 0:
+            logging.info("Run successfully")
+        else:
+            logging.info("Some tests failed")
+
+        shutil.copy(log_path, os.path.join(str(self.path()), "run.log"))
+        shutil.copy(test_log_path, os.path.join(str(self.path()), "raw.log"))
 
 
 if __name__ == "__main__":
