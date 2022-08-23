@@ -15,6 +15,7 @@ from get_robot_token import get_best_robot_token
 from pr_info import PRInfo
 from build_download_helper import download_all_deb_packages
 from upload_result_helper import upload_results
+from docker_pull_helper import get_images_with_versions
 from commit_status_helper import post_commit_status
 from clickhouse_helper import (
     ClickHouseHelper,
@@ -25,13 +26,20 @@ from stopwatch import Stopwatch
 from rerun_helper import RerunHelper
 from tee_popen import TeePopen
 
+# When update, update
+# testflows/ci-runner.py:ClickhouseTestFlowsTestsRunner.get_images_names too
+IMAGES = [
+    "altinityinfra/testflows-runner",
+]
 
-def get_json_params_dict(check_name, pr_info):
+
+def get_json_params_dict(check_name, pr_info, docker_images):
     return {
         "context_name": check_name,
         "commit": pr_info.sha,
         "pull_request": pr_info.number,
         "pr_info": {"changed_files": list(pr_info.changed_files)},
+        "docker_images_with_versions": docker_images,
     }
 
 
@@ -111,6 +119,8 @@ if __name__ == "__main__":
         logging.info("Check is already finished according to github status, exiting")
         sys.exit(0)
 
+    images = get_images_with_versions(reports_path, IMAGES)
+    images_with_versions = {i.name: i.version for i in images}
     result_path = os.path.join(temp_path, "output_dir")
     if not os.path.exists(result_path):
         os.makedirs(result_path)
@@ -130,12 +140,7 @@ if __name__ == "__main__":
     json_path = os.path.join(work_path, "params.json")
     with open(json_path, "w", encoding="utf-8") as json_params:
         json_params.write(
-            json.dumps(
-                get_json_params_dict(
-                    check_name,
-                    pr_info,
-                )
-            )
+            json.dumps(get_json_params_dict(check_name, pr_info, images_with_versions))
         )
 
     output_path_log = os.path.join(result_path, "main_script_log.txt")
