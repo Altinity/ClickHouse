@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 from collections import defaultdict
-import csv
+import sys
 import json
 import logging
 import os
@@ -215,13 +215,13 @@ class ClickhouseTestFlowsTestsRunner:
         test_log_path = os.path.join(repo_path, "tests/testflows", "test.log")
 
         cmd = (
-            f"set -o pipefail && cd {repo_path}/tests/testflows && timeout -s 9 10h "
-            f"./runner {self._get_runner_opts()} {image_cmd} | tee {log_path}"
+            f"bash -c \"set -o pipefail && cd {repo_path}/tests/testflows && timeout -s 9 10h "
+            f"./runner {self._get_runner_opts()} {image_cmd} | tee {log_path}\""
         )
 
         logging.info("Executing cmd: %s", cmd)
         retcode = subprocess.Popen(
-            cmd, shell=True, stderr=subprocess.STDOUT, stdout=subprocess.STDOUT
+            cmd, shell=True, stderr=sys.stdout, stdout=sys.stdout
         ).wait()
         if retcode == 0:
             logging.info("Run successfully")
