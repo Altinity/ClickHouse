@@ -222,7 +222,7 @@ def from_subquery(self):
 @TestScenario
 def groups_frame(self):
     """Check using `GROUPS` frame."""
-    exitcode, message = groups_frame_error()
+    exitcode, message = groups_frame_error(self)
 
     expected = convert_output(
         """

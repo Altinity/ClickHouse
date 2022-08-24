@@ -2,7 +2,7 @@ version: '2.3'
 
 services:
   clickhouse:
-    image: registry.gitlab.com/altinity-public/container-images/test/clickhouse-integration-test:21.12
+    image: registry.gitlab.com/altinity-public/container-images/test/clickhouse-integration-test:8.9.2022
     privileged: true
     expose:
       - "9000"

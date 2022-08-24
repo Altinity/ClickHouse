@@ -2,6 +2,7 @@
 # Software Requirements Specification
 
 ## Table of Contents
+
 * 1 [Revision History](#revision-history)
 * 2 [Introduction](#introduction)
 * 3 [Terminology](#terminology)
@@ -397,6 +398,9 @@
     * 5.19.2 [RQ.SRS-006.RBAC.Select.Column](#rqsrs-006rbacselectcolumn)
     * 5.19.3 [RQ.SRS-006.RBAC.Select.Cluster](#rqsrs-006rbacselectcluster)
     * 5.19.4 [RQ.SRS-006.RBAC.Select.TableEngines](#rqsrs-006rbacselecttableengines)
+    * 5.19.5 [Table Functions](#table-functions)
+      * 5.19.5.1 [RQ.SRS-006.RBAC.Select.TableFunctions.Remote](#rqsrs-006rbacselecttablefunctionsremote)
+      * 5.19.5.2 [RQ.SRS-006.RBAC.Select.TableFunctions.Cluster](#rqsrs-006rbacselecttablefunctionscluster)
   * 5.20 [Insert](#insert)
     * 5.20.1 [RQ.SRS-006.RBAC.Insert](#rqsrs-006rbacinsert)
     * 5.20.2 [RQ.SRS-006.RBAC.Insert.Column](#rqsrs-006rbacinsertcolumn)
@@ -459,20 +463,33 @@
       * 5.21.10.2 [RQ.SRS-006.RBAC.Privileges.AlterMove.Grant](#rqsrs-006rbacprivilegesaltermovegrant)
       * 5.21.10.3 [RQ.SRS-006.RBAC.Privileges.AlterMove.Revoke](#rqsrs-006rbacprivilegesaltermoverevoke)
       * 5.21.10.4 [RQ.SRS-006.RBAC.Privileges.AlterMove.TableEngines](#rqsrs-006rbacprivilegesaltermovetableengines)
+    * 5.21.11 [Alter Projection](#alter-projection)
+      * 5.21.11.1 [RQ.SRS-006.RBAC.Privileges.AlterProjection](#rqsrs-006rbacprivilegesalterprojection)
+      * 5.21.11.2 [RQ.SRS-006.RBAC.Privileges.AlterProjection.Add](#rqsrs-006rbacprivilegesalterprojectionadd)
+      * 5.21.11.3 [RQ.SRS-006.RBAC.Privileges.AlterProjection.Drop](#rqsrs-006rbacprivilegesalterprojectiondrop)
+      * 5.21.11.4 [RQ.SRS-006.RBAC.Privileges.AlterProjection.Materialize](#rqsrs-006rbacprivilegesalterprojectionmaterialize)
+      * 5.21.11.5 [RQ.SRS-006.RBAC.Privileges.AlterProjection.Clear](#rqsrs-006rbacprivilegesalterprojectionclear)
+    * 5.21.12 [Alter Database](#alter-database)
+      * 5.21.12.1 [RQ.SRS-006.RBAC.Privileges.AlterDatabase](#rqsrs-006rbacprivilegesalterdatabase)
+      * 5.21.12.2 [RQ.SRS-006.RBAC.Privileges.AlterDatabase.Settings](#rqsrs-006rbacprivilegesalterdatabasesettings)
   * 5.22 [Create](#create)
-    * 5.22.1 [RQ.SRS-006.RBAC.Privileges.CreateTable](#rqsrs-006rbacprivilegescreatetable)
-    * 5.22.2 [RQ.SRS-006.RBAC.Privileges.CreateDatabase](#rqsrs-006rbacprivilegescreatedatabase)
-    * 5.22.3 [RQ.SRS-006.RBAC.Privileges.CreateDictionary](#rqsrs-006rbacprivilegescreatedictionary)
-    * 5.22.4 [RQ.SRS-006.RBAC.Privileges.CreateTemporaryTable](#rqsrs-006rbacprivilegescreatetemporarytable)
+    * 5.22.1 [RQ.SRS-006.RBAC.Privileges.Create](#rqsrs-006rbacprivilegescreate)
+    * 5.22.2 [RQ.SRS-006.RBAC.Privileges.CreateTable](#rqsrs-006rbacprivilegescreatetable)
+    * 5.22.3 [RQ.SRS-006.RBAC.Privileges.CreateDatabase](#rqsrs-006rbacprivilegescreatedatabase)
+    * 5.22.4 [RQ.SRS-006.RBAC.Privileges.CreateDictionary](#rqsrs-006rbacprivilegescreatedictionary)
+    * 5.22.5 [RQ.SRS-006.RBAC.Privileges.CreateTemporaryTable](#rqsrs-006rbacprivilegescreatetemporarytable)
+    * 5.22.6 [RQ.SRS-006.RBAC.Privileges.CreateFunction](#rqsrs-006rbacprivilegescreatefunction)
   * 5.23 [Attach](#attach)
     * 5.23.1 [RQ.SRS-006.RBAC.Privileges.AttachDatabase](#rqsrs-006rbacprivilegesattachdatabase)
     * 5.23.2 [RQ.SRS-006.RBAC.Privileges.AttachDictionary](#rqsrs-006rbacprivilegesattachdictionary)
     * 5.23.3 [RQ.SRS-006.RBAC.Privileges.AttachTemporaryTable](#rqsrs-006rbacprivilegesattachtemporarytable)
     * 5.23.4 [RQ.SRS-006.RBAC.Privileges.AttachTable](#rqsrs-006rbacprivilegesattachtable)
   * 5.24 [Drop](#drop)
-    * 5.24.1 [RQ.SRS-006.RBAC.Privileges.DropTable](#rqsrs-006rbacprivilegesdroptable)
-    * 5.24.2 [RQ.SRS-006.RBAC.Privileges.DropDatabase](#rqsrs-006rbacprivilegesdropdatabase)
-    * 5.24.3 [RQ.SRS-006.RBAC.Privileges.DropDictionary](#rqsrs-006rbacprivilegesdropdictionary)
+    * 5.24.1 [RQ.SRS-006.RBAC.Privileges.Drop](#rqsrs-006rbacprivilegesdrop)
+    * 5.24.2 [RQ.SRS-006.RBAC.Privileges.DropTable](#rqsrs-006rbacprivilegesdroptable)
+    * 5.24.3 [RQ.SRS-006.RBAC.Privileges.DropDatabase](#rqsrs-006rbacprivilegesdropdatabase)
+    * 5.24.4 [RQ.SRS-006.RBAC.Privileges.DropDictionary](#rqsrs-006rbacprivilegesdropdictionary)
+    * 5.24.5 [RQ.SRS-006.RBAC.Privileges.DropFunction](#rqsrs-006rbacprivilegesdropfunction)
   * 5.25 [Detach](#detach)
     * 5.25.1 [RQ.SRS-006.RBAC.Privileges.DetachTable](#rqsrs-006rbacprivilegesdetachtable)
     * 5.25.2 [RQ.SRS-006.RBAC.Privileges.DetachView](#rqsrs-006rbacprivilegesdetachview)
@@ -550,32 +567,41 @@
   * 5.33 [Introspection](#introspection)
     * 5.33.1 [RQ.SRS-006.RBAC.Privileges.Introspection](#rqsrs-006rbacprivilegesintrospection)
     * 5.33.2 [RQ.SRS-006.RBAC.Privileges.Introspection.addressToLine](#rqsrs-006rbacprivilegesintrospectionaddresstoline)
-    * 5.33.3 [RQ.SRS-006.RBAC.Privileges.Introspection.addressToSymbol](#rqsrs-006rbacprivilegesintrospectionaddresstosymbol)
-    * 5.33.4 [RQ.SRS-006.RBAC.Privileges.Introspection.demangle](#rqsrs-006rbacprivilegesintrospectiondemangle)
+    * 5.33.3 [RQ.SRS-006.RBAC.Privileges.Introspection.addressToLineWithInlines](#rqsrs-006rbacprivilegesintrospectionaddresstolinewithinlines)
+    * 5.33.4 [RQ.SRS-006.RBAC.Privileges.Introspection.addressToSymbol](#rqsrs-006rbacprivilegesintrospectionaddresstosymbol)
+    * 5.33.5 [RQ.SRS-006.RBAC.Privileges.Introspection.demangle](#rqsrs-006rbacprivilegesintrospectiondemangle)
   * 5.34 [System](#system)
     * 5.34.1 [RQ.SRS-006.RBAC.Privileges.System.Shutdown](#rqsrs-006rbacprivilegessystemshutdown)
     * 5.34.2 [RQ.SRS-006.RBAC.Privileges.System.DropCache](#rqsrs-006rbacprivilegessystemdropcache)
     * 5.34.3 [RQ.SRS-006.RBAC.Privileges.System.DropCache.DNS](#rqsrs-006rbacprivilegessystemdropcachedns)
     * 5.34.4 [RQ.SRS-006.RBAC.Privileges.System.DropCache.Mark](#rqsrs-006rbacprivilegessystemdropcachemark)
     * 5.34.5 [RQ.SRS-006.RBAC.Privileges.System.DropCache.Uncompressed](#rqsrs-006rbacprivilegessystemdropcacheuncompressed)
-    * 5.34.6 [RQ.SRS-006.RBAC.Privileges.System.Reload](#rqsrs-006rbacprivilegessystemreload)
-    * 5.34.7 [RQ.SRS-006.RBAC.Privileges.System.Reload.Config](#rqsrs-006rbacprivilegessystemreloadconfig)
-    * 5.34.8 [RQ.SRS-006.RBAC.Privileges.System.Reload.Dictionary](#rqsrs-006rbacprivilegessystemreloaddictionary)
-    * 5.34.9 [RQ.SRS-006.RBAC.Privileges.System.Reload.Dictionaries](#rqsrs-006rbacprivilegessystemreloaddictionaries)
-    * 5.34.10 [RQ.SRS-006.RBAC.Privileges.System.Reload.EmbeddedDictionaries](#rqsrs-006rbacprivilegessystemreloadembeddeddictionaries)
-    * 5.34.11 [RQ.SRS-006.RBAC.Privileges.System.Merges](#rqsrs-006rbacprivilegessystemmerges)
-    * 5.34.12 [RQ.SRS-006.RBAC.Privileges.System.TTLMerges](#rqsrs-006rbacprivilegessystemttlmerges)
-    * 5.34.13 [RQ.SRS-006.RBAC.Privileges.System.Fetches](#rqsrs-006rbacprivilegessystemfetches)
-    * 5.34.14 [RQ.SRS-006.RBAC.Privileges.System.Moves](#rqsrs-006rbacprivilegessystemmoves)
-    * 5.34.15 [RQ.SRS-006.RBAC.Privileges.System.Sends](#rqsrs-006rbacprivilegessystemsends)
-    * 5.34.16 [RQ.SRS-006.RBAC.Privileges.System.Sends.Distributed](#rqsrs-006rbacprivilegessystemsendsdistributed)
-    * 5.34.17 [RQ.SRS-006.RBAC.Privileges.System.Sends.Replicated](#rqsrs-006rbacprivilegessystemsendsreplicated)
-    * 5.34.18 [RQ.SRS-006.RBAC.Privileges.System.ReplicationQueues](#rqsrs-006rbacprivilegessystemreplicationqueues)
-    * 5.34.19 [RQ.SRS-006.RBAC.Privileges.System.SyncReplica](#rqsrs-006rbacprivilegessystemsyncreplica)
-    * 5.34.20 [RQ.SRS-006.RBAC.Privileges.System.RestartReplica](#rqsrs-006rbacprivilegessystemrestartreplica)
-    * 5.34.21 [RQ.SRS-006.RBAC.Privileges.System.Flush](#rqsrs-006rbacprivilegessystemflush)
-    * 5.34.22 [RQ.SRS-006.RBAC.Privileges.System.Flush.Distributed](#rqsrs-006rbacprivilegessystemflushdistributed)
-    * 5.34.23 [RQ.SRS-006.RBAC.Privileges.System.Flush.Logs](#rqsrs-006rbacprivilegessystemflushlogs)
+    * 5.34.6 [RQ.SRS-006.RBAC.Privileges.System.DropCache.Mmap](#rqsrs-006rbacprivilegessystemdropcachemmap)
+    * 5.34.7 [RQ.SRS-006.RBAC.Privileges.System.DropCache.CompiledExpression](#rqsrs-006rbacprivilegessystemdropcachecompiledexpression)
+    * 5.34.8 [RQ.SRS-006.RBAC.Privileges.System.Reload](#rqsrs-006rbacprivilegessystemreload)
+    * 5.34.9 [RQ.SRS-006.RBAC.Privileges.System.Reload.Config](#rqsrs-006rbacprivilegessystemreloadconfig)
+    * 5.34.10 [RQ.SRS-006.RBAC.Privileges.System.Reload.Dictionary](#rqsrs-006rbacprivilegessystemreloaddictionary)
+    * 5.34.11 [RQ.SRS-006.RBAC.Privileges.System.Reload.Dictionaries](#rqsrs-006rbacprivilegessystemreloaddictionaries)
+    * 5.34.12 [RQ.SRS-006.RBAC.Privileges.System.Reload.EmbeddedDictionaries](#rqsrs-006rbacprivilegessystemreloadembeddeddictionaries)
+    * 5.34.13 [RQ.SRS-006.RBAC.Privileges.System.Reload.Symbols](#rqsrs-006rbacprivilegessystemreloadsymbols)
+    * 5.34.14 [RQ.SRS-006.RBAC.Privileges.System.Reload.Function](#rqsrs-006rbacprivilegessystemreloadfunction)
+    * 5.34.15 [RQ.SRS-006.RBAC.Privileges.System.RestartDisk](#rqsrs-006rbacprivilegessystemrestartdisk)
+    * 5.34.16 [RQ.SRS-006.RBAC.Privileges.System.ThreadFuzzer](#rqsrs-006rbacprivilegessystemthreadfuzzer)
+    * 5.34.17 [RQ.SRS-006.RBAC.Privileges.System.Merges](#rqsrs-006rbacprivilegessystemmerges)
+    * 5.34.18 [RQ.SRS-006.RBAC.Privileges.System.TTLMerges](#rqsrs-006rbacprivilegessystemttlmerges)
+    * 5.34.19 [RQ.SRS-006.RBAC.Privileges.System.Fetches](#rqsrs-006rbacprivilegessystemfetches)
+    * 5.34.20 [RQ.SRS-006.RBAC.Privileges.System.Moves](#rqsrs-006rbacprivilegessystemmoves)
+    * 5.34.21 [RQ.SRS-006.RBAC.Privileges.System.Sends](#rqsrs-006rbacprivilegessystemsends)
+    * 5.34.22 [RQ.SRS-006.RBAC.Privileges.System.Sends.Distributed](#rqsrs-006rbacprivilegessystemsendsdistributed)
+    * 5.34.23 [RQ.SRS-006.RBAC.Privileges.System.Sends.Replicated](#rqsrs-006rbacprivilegessystemsendsreplicated)
+    * 5.34.24 [RQ.SRS-006.RBAC.Privileges.System.ReplicationQueues](#rqsrs-006rbacprivilegessystemreplicationqueues)
+    * 5.34.25 [RQ.SRS-006.RBAC.Privileges.System.SyncReplica](#rqsrs-006rbacprivilegessystemsyncreplica)
+    * 5.34.26 [RQ.SRS-006.RBAC.Privileges.System.RestartReplica](#rqsrs-006rbacprivilegessystemrestartreplica)
+    * 5.34.27 [RQ.SRS-006.RBAC.Privileges.System.DropReplica](#rqsrs-006rbacprivilegessystemdropreplica)
+    * 5.34.28 [RQ.SRS-006.RBAC.Privileges.System.RestoreReplica](#rqsrs-006rbacprivilegessystemrestorereplica)
+    * 5.34.29 [RQ.SRS-006.RBAC.Privileges.System.Flush](#rqsrs-006rbacprivilegessystemflush)
+    * 5.34.30 [RQ.SRS-006.RBAC.Privileges.System.Flush.Distributed](#rqsrs-006rbacprivilegessystemflushdistributed)
+    * 5.34.31 [RQ.SRS-006.RBAC.Privileges.System.Flush.Logs](#rqsrs-006rbacprivilegessystemflushlogs)
   * 5.35 [Sources](#sources)
     * 5.35.1 [RQ.SRS-006.RBAC.Privileges.Sources](#rqsrs-006rbacprivilegessources)
     * 5.35.2 [RQ.SRS-006.RBAC.Privileges.Sources.File](#rqsrs-006rbacprivilegessourcesfile)
@@ -586,6 +612,9 @@
     * 5.35.7 [RQ.SRS-006.RBAC.Privileges.Sources.JDBC](#rqsrs-006rbacprivilegessourcesjdbc)
     * 5.35.8 [RQ.SRS-006.RBAC.Privileges.Sources.HDFS](#rqsrs-006rbacprivilegessourceshdfs)
     * 5.35.9 [RQ.SRS-006.RBAC.Privileges.Sources.S3](#rqsrs-006rbacprivilegessourcess3)
+    * 5.35.10 [RQ.SRS-006.RBAC.Privileges.Sources.Mongo](#rqsrs-006rbacprivilegessourcesmongo)
+    * 5.35.11 [RQ.SRS-006.RBAC.Privileges.Sources.Postgres](#rqsrs-006rbacprivilegessourcespostgres)
+    * 5.35.12 [RQ.SRS-006.RBAC.Privileges.Sources.Sqlite](#rqsrs-006rbacprivilegessourcessqlite)
   * 5.36 [RQ.SRS-006.RBAC.Privileges.GrantOption](#rqsrs-006rbacprivilegesgrantoption)
   * 5.37 [RQ.SRS-006.RBAC.Privileges.All](#rqsrs-006rbacprivilegesall)
   * 5.38 [RQ.SRS-006.RBAC.Privileges.RoleAll](#rqsrs-006rbacprivilegesroleall)
@@ -3222,6 +3251,21 @@ on tables created using the following engines
 * ReplicatedVersionedCollapsingMergeTree
 * ReplicatedGraphiteMergeTree
 
+#### Table Functions
+
+##### RQ.SRS-006.RBAC.Select.TableFunctions.Remote
+version: 1.0
+
+[ClickHouse] SHALL only execute `SELECT FROM remote()` query if
+the user has **REMOTE**, **CREATE TEMPORARY TABLE** and **SELECT** privileges.
+
+
+##### RQ.SRS-006.RBAC.Select.TableFunctions.Cluster
+version: 1.0
+
+[ClickHouse] SHALL only execute `SELECT FROM cluster()` query if
+the user has **REMOTE**, **CREATE TEMPORARY TABLE** and **SELECT** privileges.
+
 ### Insert
 
 #### RQ.SRS-006.RBAC.Insert
@@ -3278,7 +3322,7 @@ version: 1.0
 
 [ClickHouse] SHALL support controlling access to the **alter column** privilege
 for a database or a specific table to one or more **users** or **roles**.
-Any `ALTER TABLE ... ADD|DROP|CLEAR|COMMENT|MODIFY COLUMN` statements SHALL
+Any `ALTER TABLE ... ADD|DROP|CLEAR|COMMENT|MODIFY|MATERIALIZE COLUMN` statements SHALL
 return an error, unless the user has the **alter column** privilege for
 the destination table either because of the explicit grant or through one of
 the roles assigned to the user.
@@ -3300,7 +3344,7 @@ version: 1.0
 
 [ClickHouse] SHALL support granting or revoking **alter column** privilege
 for one or more specified columns in a table to one or more **users** or **roles**.
-Any `ALTER TABLE ... ADD|DROP|CLEAR|COMMENT|MODIFY COLUMN` statements SHALL return an error,
+Any `ALTER TABLE ... ADD|DROP|CLEAR|COMMENT|MODIFY|MATERIALIZE COLUMN` statements SHALL return an error,
 unless the user has the **alter column** privilege for the destination column
 either because of the explicit grant or through one of the roles assigned to the user.
 
@@ -3309,7 +3353,7 @@ version: 1.0
 
 [ClickHouse] SHALL support granting or revoking **alter column** privilege
 on a specified cluster to one or more **users** or **roles**.
-Any `ALTER TABLE ... ADD|DROP|CLEAR|COMMENT|MODIFY COLUMN`
+Any `ALTER TABLE ... ADD|DROP|CLEAR|COMMENT|MODIFY|MATERIALIZE COLUMN`
 statements SHALL succeed only on nodes where the table exists and privilege was granted.
 
 ##### RQ.SRS-006.RBAC.Privileges.AlterColumn.TableEngines
@@ -3735,7 +3779,60 @@ on tables created using the following engines
 * ReplicatedVersionedCollapsingMergeTree
 * ReplicatedGraphiteMergeTree
 
+#### Alter Projection
+
+##### RQ.SRS-006.RBAC.Privileges.AlterProjection
+version: 1.0
+
+[ClickHouse] SHALL support granting and revoking `ALTER PROJECTION` privilege,
+which permits users to **add**, **drop**, **materialize**, and **clear** projections.
+
+##### RQ.SRS-006.RBAC.Privileges.AlterProjection.Add
+version: 1.0
+
+[ClickHouse] SHALL support granting and revoking `ALTER ADD PROJECTION` privilege,
+which permits users to **add** projections.
+
+##### RQ.SRS-006.RBAC.Privileges.AlterProjection.Drop
+version: 1.0
+
+[ClickHouse] SHALL support granting and revoking `ALTER DROP PROJECTION` privilege,
+which permits users to **drop** projections.
+
+##### RQ.SRS-006.RBAC.Privileges.AlterProjection.Materialize
+version: 1.0
+
+[ClickHouse] SHALL support granting and revoking `ALTER MATERIALIZE PROJECTION` privilege,
+which permits users to **materialize** projections.
+
+##### RQ.SRS-006.RBAC.Privileges.AlterProjection.Clear
+version: 1.0
+
+[ClickHouse] SHALL support granting and revoking `ALTER CLEAR PROJECTION` privilege,
+which permits users to **clear** projections.
+
+#### Alter Database
+
+##### RQ.SRS-006.RBAC.Privileges.AlterDatabase
+version: 1.0
+
+[ClickHouse] SHALL support granting and revoking `ALTER DATABASE` privilege,
+which permits users to **alter** a database.
+
+##### RQ.SRS-006.RBAC.Privileges.AlterDatabase.Settings
+version: 1.0
+
+[ClickHouse] SHALL support granting and revoking `ALTER DATABASE SETTINGS` privilege,
+which permits users to **alter** the settings of a database.
+
 ### Create
+
+#### RQ.SRS-006.RBAC.Privileges.Create
+version: 1.0
+
+[ClickHouse] SHALL support granting and revoking `CREATE` privilege,
+which permits users to **create** tables, databases, dictionaries,  and temporary tables.
+This privilege does NOT grant the permission to create users, roles, or quotas, row policies, or settings profiles.
 
 #### RQ.SRS-006.RBAC.Privileges.CreateTable
 version: 1.0
@@ -3773,6 +3870,12 @@ version: 1.0
 [ClickHouse] SHALL successfully execute `CREATE TEMPORARY TABLE` statement if and only if the user has **create temporary table** privilege on the table,
 either directly or through a role.
 
+#### RQ.SRS-006.RBAC.Privileges.CreateFunction
+version: 1.0
+
+[ClickHouse] SHALL successfully execute `CREATE FUNCTION` statement if and only if the user has **create function** privilege,
+either directly or through a role.
+
 ### Attach
 
 #### RQ.SRS-006.RBAC.Privileges.AttachDatabase
@@ -3801,6 +3904,13 @@ either directly or through a role.
 
 ### Drop
 
+#### RQ.SRS-006.RBAC.Privileges.Drop
+version: 1.0
+
+[ClickHouse] SHALL support granting and revoking `DROP` privilege,
+which permits users to **drop** tables, databases, dictionaries,  and temporary tables.
+This privilege does NOT grant the permission to create users, roles, or quotas, row policies, or settings profiles.
+
 #### RQ.SRS-006.RBAC.Privileges.DropTable
 version: 1.0
 
@@ -3817,6 +3927,12 @@ either directly or through a role.
 version: 1.0
 
 [ClickHouse] SHALL successfully execute `DROP DICTIONARY` statement if and only if the user has **drop dictionary** privilege on the dictionary,
+either directly or through a role.
+
+#### RQ.SRS-006.RBAC.Privileges.DropFunction
+version: 1.0
+
+[ClickHouse] SHALL successfully execute `DROP FUNCTION` statement if and only if the user has **drop function** privilege,
 either directly or through a role.
 
 ### Detach
@@ -4258,6 +4374,12 @@ version: 1.0
 [ClickHouse] SHALL successfully execute `addressToLine` statement if and only if
 the user has **introspection** privilege, either directly or through a role.
 
+#### RQ.SRS-006.RBAC.Privileges.Introspection.addressToLineWithInlines
+version: 1.0
+
+[ClickHouse] SHALL successfully execute `addressToLineWithInlines` statement if and only if
+the user has **introspection** privilege, either directly or through a role.
+
 #### RQ.SRS-006.RBAC.Privileges.Introspection.addressToSymbol
 version: 1.0
 
@@ -4305,6 +4427,20 @@ version: 1.0
 the user is granted `SYSTEM`, `SYSTEM DROP CACHE`, `DROP CACHE`, `SYSTEM DROP UNCOMPRESSED CACHE`,
 `SYSTEM DROP UNCOMPRESSED`, `DROP UNCOMPRESSED CACHE`, or `DROP UNCOMPRESSED`.
 
+#### RQ.SRS-006.RBAC.Privileges.System.DropCache.Mmap
+version: 1.0
+
+[ClickHouse] SHALL successfully grant `SYSTEM DROP MMAP CACHE` privilege when
+the user is granted `SYSTEM`, `SYSTEM DROP CACHE`, `DROP CACHE`, `SYSTEM DROP MMAP CACHE`,
+`SYSTEM DROP MMAP`, `DROP MMAP CACHE`, or `DROP MMAP`.
+
+#### RQ.SRS-006.RBAC.Privileges.System.DropCache.CompiledExpression
+version: 1.0
+
+[ClickHouse] SHALL successfully grant `SYSTEM DROP COMPILED EXPRESSION CACHE` privilege when
+the user is granted `SYSTEM`, `SYSTEM DROP CACHE`, `DROP CACHE`, `SYSTEM DROP COMPILED EXPRESSION CACHE`,
+`SYSTEM DROP COMPILED EXPRESSION`, or `DROP COMPILED EXPRESSION CACHE`
+
 #### RQ.SRS-006.RBAC.Privileges.System.Reload
 version: 1.0
 
@@ -4334,6 +4470,30 @@ version: 1.0
 
 [ClickHouse] SHALL successfully grant `SYSTEM RELOAD EMBEDDED DICTIONARIES` privilege when
 the user is granted `SYSTEM`, `SYSTEM RELOAD`, `SYSTEM RELOAD DICTIONARY ON *.*`, or `SYSTEM RELOAD EMBEDDED DICTIONARIES`.
+
+#### RQ.SRS-006.RBAC.Privileges.System.Reload.Symbols
+version: 1.0
+
+[ClickHouse] SHALL successfully grant `SYSTEM RELOAD SYMBOLS` privilege when
+the user is granted `SYSTEM`, `SYSTEM RELOAD`, or `SYSTEM RELOAD SYMBOLS`.
+
+#### RQ.SRS-006.RBAC.Privileges.System.Reload.Function
+version: 1.0
+
+[ClickHouse] SHALL successfully grant `SYSTEM RELOAD FUNCTION` privilege when
+the user is granted `SYSTEM`, `SYSTEM RELOAD`, or `SYSTEM RELOAD FUNCTION`.
+
+#### RQ.SRS-006.RBAC.Privileges.System.RestartDisk
+version: 1.0
+
+[ClickHouse] SHALL successfully grant `SYSTEM RESTART DISK` privilege when
+the user is granted `SYSTEM RESTART DISK`.
+
+#### RQ.SRS-006.RBAC.Privileges.System.ThreadFuzzer
+version: 1.0
+
+[ClickHouse] SHALL successfully grant `SYSTEM THREAD FUZZER` privilege when
+the user is granted `SYSTEM THREAD FUZZER`.
 
 #### RQ.SRS-006.RBAC.Privileges.System.Merges
 version: 1.0
@@ -4397,6 +4557,18 @@ version: 1.0
 
 [ClickHouse] SHALL successfully grant `SYSTEM RESTART REPLICA` privilege when
 the user is granted `SYSTEM`, `SYSTEM RESTART REPLICA`, or `RESTART REPLICA`.
+
+#### RQ.SRS-006.RBAC.Privileges.System.DropReplica
+version: 1.0
+
+[ClickHouse] SHALL successfully grant `SYSTEM DROP REPLICA` privilege when
+the user is granted `SYSTEM`, `SYSTEM DROP REPLICA`, or `DROP REPLICA`.
+
+#### RQ.SRS-006.RBAC.Privileges.System.RestoreReplica
+version: 1.0
+
+[ClickHouse] SHALL successfully grant `SYSTEM RESTORE REPLICA` privilege when
+the user is granted `SYSTEM`, `SYSTEM RESTORE REPLICA`, or `RESTORE REPLICA`.
 
 #### RQ.SRS-006.RBAC.Privileges.System.Flush
 version: 1.0
@@ -4471,6 +4643,24 @@ version: 1.0
 
 [ClickHouse] SHALL support the use of `S3` source by a user if and only if
 the user has `S3` or `SOURCES` privileges granted to them directly or through a role.
+
+#### RQ.SRS-006.RBAC.Privileges.Sources.Mongo
+version: 1.0
+
+[ClickHouse] SHALL support the use of `MONGO` source by a user if and only if
+the user has `MONGO` or `SOURCES` privileges granted to them directly or through a role.
+
+#### RQ.SRS-006.RBAC.Privileges.Sources.Postgres
+version: 1.0
+
+[ClickHouse] SHALL support the use of `POSTGRES` source by a user if and only if
+the user has `POSTGRES` or `SOURCES` privileges granted to them directly or through a role.
+
+#### RQ.SRS-006.RBAC.Privileges.Sources.Sqlite
+version: 1.0
+
+[ClickHouse] SHALL support the use of `SQLITE` source by a user if and only if
+the user has `SQLITE` or `SOURCES` privileges granted to them directly or through a role.
 
 ### RQ.SRS-006.RBAC.Privileges.GrantOption
 version: 1.0

@@ -16,7 +16,7 @@ def in_normal_range(dt: datetime.datetime):
 
 def years_range(stress=False, padding=(0, 0)):
     """Returns a set of year values used for testing."""
-    return range(1925 + padding[0], 2283 - padding[1]) if stress else (1927, 2000, 2281)
+    return range(1925 + padding[0], 2238 - padding[1]) if stress else (1927, 2000, 2236)
 
 
 def timezones_range(stress=False):
@@ -124,7 +124,7 @@ def exec_query(self, request, expected=None, exitcode=None):
             assert r.exitcode == exitcode, error()
 
 
-@TestStep
+@TestOutline
 def walk_datetime_in_incrementing_steps(
     self, date, hrs_range=(0, 24), step=1, timezone="UTC", precision=0
 ):
@@ -137,39 +137,27 @@ def walk_datetime_in_incrementing_steps(
     """
 
     stress = self.context.stress
+
     secs = f"00{'.' * (precision > 0)}{'0' * precision}"
 
-    with Pool(2) as pool:
-        try:
-            with When(
-                f"I loop through datetime range {hrs_range} starting from {date} in {step}min increments"
-            ):
-                for hrs in (
-                    range(*hrs_range) if stress else (hrs_range[0], hrs_range[1] - 1)
-                ):
-                    for mins in range(0, 60, step) if stress else (0, 59):
-                        datetime = (
-                            f"{date} {str(hrs).zfill(2)}:{str(mins).zfill(2)}:{secs}"
-                        )
-                        expected = datetime
+    with When(
+        f"I loop through datetime range {hrs_range} starting from {date} in {step} min increments"
+    ):
+        for hrs in range(*hrs_range) if stress else (hrs_range[0], hrs_range[1] - 1):
+            for mins in range(0, 60, step) if stress else (0, 59):
+                datetime = f"{date} {str(hrs).zfill(2)}:{str(mins).zfill(2)}:{secs}"
+                expected = datetime
 
-                        with When(f"time is {datetime}"):
-                            Test(
-                                name=f"{hrs}:{mins}:{secs}",
-                                test=select_check_datetime,
-                                parallel=True,
-                                executor=pool,
-                            )(
-                                datetime=datetime,
-                                precision=precision,
-                                timezone=timezone,
-                                expected=expected,
-                            )
-        finally:
-            join()
+                with When(f"time is {datetime}"):
+                    select_check_datetime(
+                        datetime=datetime,
+                        precision=precision,
+                        timezone=timezone,
+                        expected=expected,
+                    )
 
 
-@TestStep
+@TestOutline
 def walk_datetime_in_decrementing_steps(
     self, date, hrs_range=(23, 0), step=1, timezone="UTC", precision=0
 ):
@@ -182,34 +170,23 @@ def walk_datetime_in_decrementing_steps(
     :param step: step in minutes
     :param timezone: String
     """
+
     stress = self.context.stress
+
     secs = f"00{'.' * (precision > 0)}{'0' * precision}"
 
-    with Pool(2) as pool:
-        try:
-            with When(
-                f"I loop through datetime range {hrs_range} starting from {date} in {step}min decrements"
-            ):
-                for hrs in (
-                    range(*hrs_range, -1) if stress else (hrs_range[1], hrs_range[0])
-                ):
-                    for mins in range(59, 0, -step) if stress else (59, 0):
-                        datetime = (
-                            f"{date} {str(hrs).zfill(2)}:{str(mins).zfill(2)}:{secs}"
-                        )
-                        expected = datetime
+    with When(
+        f"I loop through datetime range {hrs_range} starting from {date} in {step}min decrements"
+    ):
+        for hrs in range(*hrs_range, -1) if stress else (hrs_range[1], hrs_range[0]):
+            for mins in range(59, 0, -step) if stress else (59, 0):
+                datetime = f"{date} {str(hrs).zfill(2)}:{str(mins).zfill(2)}:{secs}"
+                expected = datetime
 
-                        with When(f"time is {datetime}"):
-                            Test(
-                                name=f"{hrs}:{mins}:{secs}",
-                                test=select_check_datetime,
-                                parallel=True,
-                                executor=pool,
-                            )(
-                                datetime=datetime,
-                                precision=precision,
-                                timezone=timezone,
-                                expected=expected,
-                            )
-        finally:
-            join()
+                with When(f"time is {datetime}"):
+                    select_check_datetime(
+                        datetime=datetime,
+                        precision=precision,
+                        timezone=timezone,
+                        expected=expected,
+                    )

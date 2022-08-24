@@ -198,4 +198,4 @@ def feature(self, node="clickhouse1"):
     self.context.node = self.context.cluster.node(node)
 
     for scenario in loads(current_module(), Scenario, Suite):
-        Scenario(run=scenario)
+        Scenario(run=scenario, flags=TE)

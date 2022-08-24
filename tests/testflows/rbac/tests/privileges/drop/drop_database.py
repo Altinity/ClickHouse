@@ -71,8 +71,10 @@ def privilege_check(grant_target_name, user_name, node=None):
             with Given("I have a database"):
                 node.query(f"CREATE DATABASE {db_name}")
 
-            with When("I grant drop database privilege"):
-                node.query(f"GRANT DROP DATABASE ON {db_name}.* TO {grant_target_name}")
+            with When(f"I grant {current().context.privilege} privilege"):
+                node.query(
+                    f"GRANT {current().context.privilege} ON *.* TO {grant_target_name}"
+                )
 
             with Then("I attempt to drop a database"):
                 node.query(f"DROP DATABASE {db_name}", settings=[("user", user_name)])
@@ -88,12 +90,14 @@ def privilege_check(grant_target_name, user_name, node=None):
             with Given("I have a database"):
                 node.query(f"CREATE DATABASE {db_name}")
 
-            with When("I grant the drop database privilege"):
-                node.query(f"GRANT DROP DATABASE ON {db_name}.* TO {grant_target_name}")
-
-            with And("I revoke the drop database privilege"):
+            with When(f"I grant the {current().context.privilege} privilege"):
                 node.query(
-                    f"REVOKE DROP DATABASE ON {db_name}.* FROM {grant_target_name}"
+                    f"GRANT {current().context.privilege} ON *.* TO {grant_target_name}"
+                )
+
+            with And(f"I revoke the {current().context.privilege} privilege"):
+                node.query(
+                    f"REVOKE {current().context.privilege} ON *.* FROM {grant_target_name}"
                 )
 
             with Then("I attempt to drop a database"):
@@ -103,48 +107,6 @@ def privilege_check(grant_target_name, user_name, node=None):
                     exitcode=exitcode,
                     message=message,
                 )
-
-        finally:
-            with Finally("I drop the database"):
-                node.query(f"DROP DATABASE IF EXISTS {db_name}")
-
-    with Scenario("user with revoked ALL privilege"):
-        db_name = f"db_{getuid()}"
-
-        try:
-            with Given("I have a database"):
-                node.query(f"CREATE DATABASE {db_name}")
-
-            with When("I grant the drop database privilege"):
-                node.query(f"GRANT DROP DATABASE ON {db_name}.* TO {grant_target_name}")
-
-            with And("I revoke ALL privilege"):
-                node.query(f"REVOKE ALL ON *.* FROM {grant_target_name}")
-
-            with Then("I attempt to drop a database"):
-                node.query(
-                    f"DROP DATABASE {db_name}",
-                    settings=[("user", user_name)],
-                    exitcode=exitcode,
-                    message=message,
-                )
-
-        finally:
-            with Finally("I drop the database"):
-                node.query(f"DROP DATABASE IF EXISTS {db_name}")
-
-    with Scenario("user with ALL privilege"):
-        db_name = f"db_{getuid()}"
-
-        try:
-            with Given("I have a database"):
-                node.query(f"CREATE DATABASE {db_name}")
-
-            with When("I grant ALL privilege"):
-                node.query(f"GRANT ALL ON *.* TO {grant_target_name}")
-
-            with Then("I attempt to drop a database"):
-                node.query(f"DROP DATABASE {db_name}", settings=[("user", user_name)])
 
         finally:
             with Finally("I drop the database"):
@@ -154,6 +116,7 @@ def privilege_check(grant_target_name, user_name, node=None):
 @TestFeature
 @Requirements(
     RQ_SRS_006_RBAC_Privileges_DropDatabase("1.0"),
+    RQ_SRS_006_RBAC_Privileges_Drop("1.0"),
     RQ_SRS_006_RBAC_Privileges_All("1.0"),
     RQ_SRS_006_RBAC_Privileges_None("1.0"),
 )
@@ -167,8 +130,10 @@ def feature(self, node="clickhouse1", stress=None, parallel=None):
     if stress is not None:
         self.context.stress = stress
 
-    with Suite(
-        test=privilege_granted_directly_or_via_role,
-        setup=instrument_clickhouse_server_log,
-    ):
-        privilege_granted_directly_or_via_role()
+    for current().context.privilege in ["ALL", "DROP", "DROP DATABASE"]:
+        with Suite(
+            f" {current().context.privilege} privilege",
+            test=privilege_granted_directly_or_via_role,
+            setup=instrument_clickhouse_server_log,
+        ):
+            privilege_granted_directly_or_via_role()

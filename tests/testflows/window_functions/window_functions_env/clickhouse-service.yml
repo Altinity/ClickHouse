@@ -2,14 +2,16 @@ version: '2.3'
 
 services:
   clickhouse:
-    image: altinityinfra/integration-test
+    image: ${IMAGE_DEPENDENCY_PROXY}clickhouse/clickhouse-integration-test:28741
     expose:
       - "9000"
       - "9009"
       - "8123"
     volumes:
-      - "${CLICKHOUSE_TESTS_DIR}/configs/clickhouse/config.d:/etc/clickhouse-server/config.d"
-      - "${CLICKHOUSE_TESTS_DIR}/configs/clickhouse/users.d:/etc/clickhouse-server/users.d"
+      - "${CLICKHOUSE_TESTS_DIR}/configs/clickhouse/config.d/logs.xml:/etc/clickhouse-server/config.d/logs.xml"
+      - "${CLICKHOUSE_TESTS_DIR}/configs/clickhouse/config.d/remote.xml:/etc/clickhouse-server/config.d/remote.xml"
+      - "${CLICKHOUSE_TESTS_DIR}/configs/clickhouse/config.d/zookeeper.xml:/etc/clickhouse-server/config.d/zookeeper.xml"
+      - "${CLICKHOUSE_TESTS_DIR}/configs/clickhouse/config.d/macros.xml:/etc/clickhouse-server/config.d/macros.xml"
       - "${CLICKHOUSE_TESTS_DIR}/configs/clickhouse/config.xml:/etc/clickhouse-server/config.xml"
       - "${CLICKHOUSE_TESTS_DIR}/configs/clickhouse/users.xml:/etc/clickhouse-server/users.xml"
       - "${CLICKHOUSE_TESTS_SERVER_BIN_PATH:-/usr/bin/clickhouse}:/usr/bin/clickhouse"

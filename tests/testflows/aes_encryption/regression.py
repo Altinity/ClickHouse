@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from gettext import find
 import os
 import sys
 from testflows.core import *
@@ -13,8 +14,13 @@ issue_18249 = "https://github.com/ClickHouse/ClickHouse/issues/18249"
 issue_18250 = "https://github.com/ClickHouse/ClickHouse/issues/18250"
 issue_18251 = "https://github.com/ClickHouse/ClickHouse/issues/18251"
 issue_24029 = "https://github.com/ClickHouse/ClickHouse/issues/24029"
+issue_39987 = "https://github.com/ClickHouse/ClickHouse/issues/39987"
 
 xfails = {
+    # decrypt
+    "/aes encryption/decrypt/invalid parameters/null in ciphertext": [
+        (Fail, issue_39987)
+    ],
     # encrypt
     "encrypt/invalid key or iv length for mode/mode=\"'aes-???-gcm'\", key_len=??, iv_len=12, aad=True/iv is too short": [
         (Fail, "known issue")
@@ -81,23 +87,30 @@ xfails = {
     RQ_SRS008_AES_Functions("1.0"), RQ_SRS008_AES_Functions_DifferentModes("1.0")
 )
 @XFails(xfails)
-def regression(
-    self, local, clickhouse_binary_path, clickhouse_version=None, stress=None
-):
+def regression(self, local, clickhouse_binary_path, clickhouse_version, stress=None):
     """ClickHouse AES encryption functions regression module."""
     nodes = {
         "clickhouse": ("clickhouse1", "clickhouse2", "clickhouse3"),
     }
 
+    self.context.clickhouse_version = clickhouse_version
+
     if stress is not None:
         self.context.stress = stress
-    self.context.clickhouse_version = clickhouse_version
+
+    from platform import processor as current_cpu
+
+    folder_name = os.path.basename(current_dir())
+    if current_cpu() == "aarch64":
+        env = f"{folder_name}_env_arm64"
+    else:
+        env = f"{folder_name}_env"
 
     with Cluster(
         local,
         clickhouse_binary_path,
         nodes=nodes,
-        docker_compose_project_dir=os.path.join(current_dir(), "aes_encryption_env"),
+        docker_compose_project_dir=os.path.join(current_dir(), env),
     ) as cluster:
         self.context.cluster = cluster
 

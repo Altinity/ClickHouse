@@ -80,9 +80,17 @@ def execute_query(
     else:
         with Then("I check output against snapshot"):
             with values() as that:
+                snapshot_name = (
+                    "tests.pre22.3"
+                    if check_clickhouse_version("<22.3")(current())
+                    else "tests.post22.3"
+                )
                 assert that(
                     snapshot(
-                        "\n" + r.output.strip() + "\n", "tests", name=name, encoder=str
+                        "\n" + r.output.strip() + "\n",
+                        snapshot_name,
+                        name=name,
+                        encoder=str,
                     )
                 ), error()
 
