@@ -18,7 +18,7 @@ issue_39987 = "https://github.com/ClickHouse/ClickHouse/issues/39987"
 
 xfails = {
     # decrypt
-    "/aes encryption/decrypt/invalid parameters/null in ciphertext": [
+    "decrypt/invalid parameters/null in ciphertext": [
         (Fail, issue_39987)
     ],
     # encrypt
