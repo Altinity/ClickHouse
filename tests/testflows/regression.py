@@ -21,46 +21,28 @@ def regression(self, local, clickhouse_binary_path, clickhouse_version, stress=N
 
     self.context.stress = stress
 
-    with Pool(4) as pool:
-        try:
-            Feature(
-                test=load("aes_encryption.regression", "regression"),
-                parallel=True,
-                executor=pool,
-            )(**args)
-            Feature(
-                test=load("datetime64_extended_range.regression", "regression"),
-                parallel=True,
-                executor=pool,
-            )(**args)
-            Feature(
-                test=load("example.regression", "regression"),
-                parallel=True,
-                executor=pool,
-            )(**args)
-            Feature(
-                test=load("extended_precision_data_types.regression", "regression"),
-                parallel=True,
-                executor=pool,
-            )(**args)
-            Feature(
-                test=load("ldap.regression", "regression"), parallel=True, executor=pool
-            )(**args)
-            Feature(
-                test=load("map_type.regression", "regression"),
-                parallel=True,
-                executor=pool,
-            )(**args)
-            Feature(
-                test=load("rbac.regression", "regression"), parallel=True, executor=pool
-            )(**args)
-            Feature(
-                test=load("window_functions.regression", "regression"),
-                parallel=True,
-                executor=pool,
-            )(**args)
-        finally:
-            join()
+    Feature(test=load("aes_encryption.regression", "regression"), parallel=True)(**args)
+    Feature(
+        test=load("datetime64_extended_range.regression", "regression"), parallel=True
+    )(**args)
+    Feature(test=load("example.regression", "regression"), parallel=True)(**args)
+    Feature(
+        test=load("extended_precision_data_types.regression", "regression"),
+        parallel=True,
+    )(**args)
+    join()
+
+    Feature(test=load("ldap.regression", "regression"))(**args)
+
+    Feature(
+        test=load("map_type.regression", "regression"),
+        parallel=True,
+        executor=pool,
+    )(**args)
+    Feature(test=load("rbac.regression", "regression"), parallel=True)(**args)
+    Feature(test=load("window_functions.regression", "regression"), parallel=True)(
+        **args
+    )
 
 
 if main():
