@@ -76,6 +76,15 @@ RUN set -x \
   && echo 'dockremap:165536:65536' >> /etc/subuid \
     && echo 'dockremap:165536:65536' >> /etc/subgid
 
+RUN pip3 install pytz==2020.1 \
+  python-dateutil==2.8.1 \
+  minio==7.1.3 \
+  boto3==1.24.52 \
+  numpy==1.21.4 \
+  pyarrow==7.0.0 \
+  pandas==1.4.1 \
+  awscli==1.24.9
+
 VOLUME /var/lib/docker
 EXPOSE 2375
 ENTRYPOINT ["dockerd-entrypoint.sh"]
