@@ -482,7 +482,7 @@ RQ_SRS_014_LDAP_RoleMapping_Configuration_Server_BindDN = Requirement(
         "For example, \n"
         "\n"
         "```xml\n"
-        "<clickhouse>\n"
+        "<yandex>\n"
         "    <ldap_servers>\n"
         "        <my_ldap_server>\n"
         "            <!-- ... -->\n"
@@ -490,7 +490,7 @@ RQ_SRS_014_LDAP_RoleMapping_Configuration_Server_BindDN = Requirement(
         "            <!-- ... -->\n"
         "        </my_ldap_server>\n"
         "    </ldap_servers>\n"
-        "</clickhouse>\n"
+        "</yandex>\n"
         "```\n"
         "\n"
     ),
@@ -633,7 +633,7 @@ RQ_SRS_014_LDAP_RoleMapping_Configuration_UserDirectory_RoleMapping_Syntax = Req
         "For example,\n"
         "\n"
         "```xml\n"
-        "<clickhouse>\n"
+        "<yandex>\n"
         "    <user_directories>\n"
         "        <ldap>\n"
         "            <!-- ... -->\n"
@@ -646,7 +646,7 @@ RQ_SRS_014_LDAP_RoleMapping_Configuration_UserDirectory_RoleMapping_Syntax = Req
         "            </role_mapping>\n"
         "        </ldap>\n"
         "    </user_directories>\n"
-        "</clickhouse>\n"
+        "</yandex>\n"
         "```\n"
         "\n"
     ),
@@ -979,7 +979,7 @@ RQ_SRS_014_LDAP_ClusterWithAndWithoutSecret_DistributedTable = Requirement(
         "For example,\n"
         "\n"
         "```xml\n"
-        "<clickhouse>\n"
+        "<yandex>\n"
         "    <remote_servers>\n"
         "        <cluster>\n"
         "            <secret>qwerty123</secret>\n"
@@ -999,13 +999,13 @@ RQ_SRS_014_LDAP_ClusterWithAndWithoutSecret_DistributedTable = Requirement(
         "            </shard>\n"
         "        </cluster>\n"
         "    </remote_servers>\n"
-        "</clickhouse>\n"
+        "</yandex>\n"
         "```\n"
         "\n"
         "or \n"
         "\n"
         "```xml\n"
-        "<clickhouse>\n"
+        "<yandex>\n"
         "    <remote_servers>\n"
         "        <cluster>\n"
         "            <shard>\n"
@@ -1024,7 +1024,7 @@ RQ_SRS_014_LDAP_ClusterWithAndWithoutSecret_DistributedTable = Requirement(
         "            </shard>\n"
         "        </cluster>\n"
         "    </remote_servers>\n"
-        "</clickhouse>\n"
+        "</yandex>\n"
         "```\n"
         "\n"
     ),
@@ -1669,7 +1669,7 @@ with the actual user name during each authentication attempt.
 For example, 
 
 ```xml
-<clickhouse>
+<yandex>
     <ldap_servers>
         <my_ldap_server>
             <!-- ... -->
@@ -1677,7 +1677,7 @@ For example,
             <!-- ... -->
         </my_ldap_server>
     </ldap_servers>
-</clickhouse>
+</yandex>
 ```
 
 ##### RQ.SRS-014.LDAP.RoleMapping.Configuration.Server.BindDN.ConflictWith.AuthDN
@@ -1760,7 +1760,7 @@ of the `config.xml`.
 For example,
 
 ```xml
-<clickhouse>
+<yandex>
     <user_directories>
         <ldap>
             <!-- ... -->
@@ -1773,7 +1773,7 @@ For example,
             </role_mapping>
         </ldap>
     </user_directories>
-</clickhouse>
+</yandex>
 ```
 
 #### Special Characters Escaping
@@ -1924,7 +1924,7 @@ cluster is configured with and without `<secret>`.
 For example,
 
 ```xml
-<clickhouse>
+<yandex>
     <remote_servers>
         <cluster>
             <secret>qwerty123</secret>
@@ -1944,13 +1944,13 @@ For example,
             </shard>
         </cluster>
     </remote_servers>
-</clickhouse>
+</yandex>
 ```
 
 or 
 
 ```xml
-<clickhouse>
+<yandex>
     <remote_servers>
         <cluster>
             <shard>
@@ -1969,7 +1969,7 @@ or
             </shard>
         </cluster>
     </remote_servers>
-</clickhouse>
+</yandex>
 ```
 
 ## References

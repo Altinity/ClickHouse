@@ -38,7 +38,7 @@ RUN apt-get update \
 ENV TZ=Europe/Moscow
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-RUN pip3 install urllib3 testflows==1.7.20 docker-compose==1.29.2 docker==5.0.0 dicttoxml kazoo tzlocal==2.1 pytz python-dateutil numpy
+RUN pip3 install urllib3 testflows==1.9.15 docker-compose==1.29.2 docker==5.0.0 dicttoxml kazoo tzlocal==2.1 pytz python-dateutil numpy
 
 ENV DOCKER_CHANNEL stable
 ENV DOCKER_VERSION 20.10.6
@@ -76,7 +76,16 @@ RUN set -x \
   && echo 'dockremap:165536:65536' >> /etc/subuid \
     && echo 'dockremap:165536:65536' >> /etc/subgid
 
+RUN pip3 install pytz==2020.1 \
+  python-dateutil==2.8.1 \
+  minio==7.1.3 \
+  boto3==1.24.52 \
+  numpy==1.21.4 \
+  pyarrow==7.0.0 \
+  pandas==1.4.1 \
+  awscli==1.24.9
+
 VOLUME /var/lib/docker
 EXPOSE 2375
 ENTRYPOINT ["dockerd-entrypoint.sh"]
-CMD ["sh", "-c", "python3 regression.py --no-color -o new-fails --local --clickhouse-binary-path ${CLICKHOUSE_TESTS_SERVER_BIN_PATH} --log test.log ${TESTFLOWS_OPTS}; cat test.log | tfs report results --format json > results.json; /usr/local/bin/process_testflows_result.py || echo -e 'failure\tCannot parse results' > check_status.tsv; find * -type f | grep _instances | grep clickhouse-server | xargs -n1 tar -rvf clickhouse_logs.tar; gzip -9 clickhouse_logs.tar"]
+CMD ["sh", "-c", "python3 regression.py --test-to-end --no-color -o classic --local --clickhouse-binary-path ${CLICKHOUSE_TESTS_SERVER_BIN_PATH} --log test.log ${TESTFLOWS_OPTS}; cat test.log | tfs report results --format json > results.json; /usr/local/bin/process_testflows_result.py || echo -e 'failure\tCannot parse results' > check_status.tsv; find * -type f | grep _instances | grep clickhouse-server | xargs -n1 tar -rvf clickhouse_logs.tar; gzip -9 clickhouse_logs.tar"]

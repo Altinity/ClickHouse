@@ -121,7 +121,7 @@ def config(self, privilege, grant_target_name, user_name, node=None):
         with When(f"I grant {privilege} on the table"):
             node.query(f"GRANT {privilege} ON *.* TO {grant_target_name}")
 
-        with Then("I check the user is bale to execute SYSTEM RELOAD CONFIG"):
+        with Then("I check the user is able to execute SYSTEM RELOAD CONFIG"):
             node.query("SYSTEM RELOAD CONFIG", settings=[("user", f"{user_name}")])
 
     with Scenario("SYSTEM RELOAD CONFIG with revoked privilege"):
@@ -248,7 +248,7 @@ def dictionary(self, privilege, grant_target_name, user_name, node=None):
             with When(f"I grant {privilege} on the table"):
                 node.query(f"GRANT {privilege} ON *.* TO {grant_target_name}")
 
-            with Then("I check the user is bale to execute SYSTEM RELOAD DICTIONARY"):
+            with Then("I check the user is able to execute SYSTEM RELOAD DICTIONARY"):
                 node.query(
                     f"SYSTEM RELOAD DICTIONARY default.{dict_name}",
                     settings=[("user", f"{user_name}")],
@@ -373,7 +373,7 @@ def dictionaries(self, privilege, grant_target_name, user_name, node=None):
         with When(f"I grant {privilege} on the table"):
             node.query(f"GRANT {privilege} ON *.* TO {grant_target_name}")
 
-        with Then("I check the user is bale to execute SYSTEM RELOAD DICTIONARIES"):
+        with Then("I check the user is able to execute SYSTEM RELOAD DICTIONARIES"):
             node.query(
                 "SYSTEM RELOAD DICTIONARIES", settings=[("user", f"{user_name}")]
             )
@@ -494,7 +494,7 @@ def embedded_dictionaries(self, privilege, grant_target_name, user_name, node=No
             node.query(f"GRANT {privilege} ON *.* TO {grant_target_name}")
 
         with Then(
-            "I check the user is bale to execute SYSTEM RELOAD EMBEDDED DICTIONARIES"
+            "I check the user is able to execute SYSTEM RELOAD EMBEDDED DICTIONARIES"
         ):
             node.query(
                 "SYSTEM RELOAD EMBEDDED DICTIONARIES",
@@ -514,6 +514,272 @@ def embedded_dictionaries(self, privilege, grant_target_name, user_name, node=No
         ):
             node.query(
                 "SYSTEM RELOAD EMBEDDED DICTIONARIES",
+                settings=[("user", f"{user_name}")],
+                exitcode=exitcode,
+                message=message,
+            )
+
+
+@TestSuite
+def function_privileges_granted_directly(self, node=None):
+    """Check that a user is able to execute `SYSTEM RELOAD FUNCTION` if and only if
+    they have `SYSTEM RELOAD FUNCTION` privilege granted directly.
+    """
+    user_name = f"user_{getuid()}"
+
+    if node is None:
+        node = self.context.node
+
+    with user(node, f"{user_name}"):
+
+        Suite(
+            run=function,
+            examples=Examples(
+                "privilege grant_target_name user_name",
+                [
+                    tuple(list(row) + [user_name, user_name])
+                    for row in function.examples
+                ],
+                args=Args(name="check privilege={privilege}", format_name=True),
+            ),
+        )
+
+
+@TestSuite
+def function_privileges_granted_via_role(self, node=None):
+    """Check that a user is able to execute `SYSTEM RELOAD FUNCTION` if and only if
+    they have `SYSTEM RELOAD FUNCTION` privilege granted via role.
+    """
+    user_name = f"user_{getuid()}"
+    role_name = f"role_{getuid()}"
+
+    if node is None:
+        node = self.context.node
+
+    with user(node, f"{user_name}"), role(node, f"{role_name}"):
+
+        with When("I grant the role to the user"):
+            node.query(f"GRANT {role_name} TO {user_name}")
+
+        Suite(
+            run=function,
+            examples=Examples(
+                "privilege grant_target_name user_name",
+                [
+                    tuple(list(row) + [role_name, user_name])
+                    for row in function.examples
+                ],
+                args=Args(name="check privilege={privilege}", format_name=True),
+            ),
+        )
+
+
+@TestOutline(Suite)
+@Requirements(
+    RQ_SRS_006_RBAC_Privileges_System_Reload_Function("1.0"),
+)
+@Examples(
+    "privilege",
+    [
+        ("ALL",),
+        ("SYSTEM",),
+        ("SYSTEM RELOAD",),
+        ("SYSTEM RELOAD FUNCTION",),
+    ],
+)
+def function(self, privilege, grant_target_name, user_name, node=None):
+    """Run checks for `SYSTEM RELOAD FUNCTION` privilege."""
+    exitcode, message = errors.not_enough_privileges(name=user_name)
+    func_name = f"func_{getuid()}"
+
+    if node is None:
+        node = self.context.node
+
+    try:
+        with Given("I have a function"):
+            node.query(f"CREATE FUNCTION {func_name} AS (x) -> 2*x;")
+
+        with Scenario("SYSTEM RELOAD FUNCTION without privilege"):
+
+            with When("I grant the user NONE privilege"):
+                node.query(f"GRANT NONE TO {grant_target_name}")
+
+            with And("I grant the user USAGE privilege"):
+                node.query(f"GRANT USAGE ON *.* TO {grant_target_name}")
+
+            with Then("I check the user is unable to execute SYSTEM RELOAD FUNCTIONS"):
+                node.query(
+                    "SYSTEM RELOAD FUNCTIONS",
+                    settings=[("user", f"{user_name}")],
+                    exitcode=exitcode,
+                    message=message,
+                )
+
+            # with And(
+            #     "I check the user is unable to execute SYSTEM RELOAD FUNCTION on a specific function"
+            # ):
+            #     node.query(
+            #         f"SYSTEM RELOAD FUNCTION {func_name}",
+            #         settings=[("user", f"{user_name}")],
+            #         exitcode=exitcode,
+            #         message=message,
+            #     )
+
+        with Scenario("SYSTEM RELOAD FUNCTION with privilege"):
+
+            with When(f"I grant {privilege} on the table"):
+                node.query(f"GRANT {privilege} ON *.* TO {grant_target_name}")
+
+            with Then("I check the user is able to execute SYSTEM RELOAD FUNCTIONS"):
+                node.query(
+                    "SYSTEM RELOAD FUNCTIONS",
+                    settings=[("user", f"{user_name}")],
+                )
+
+            # with And(
+            #     "I check the user is able to execute SYSTEM RELOAD FUNCTION on a specific function"
+            # ):
+            #     node.query(
+            #         f"SYSTEM RELOAD FUNCTION {func_name}",
+            #         settings=[("user", f"{user_name}")],
+            #     )
+
+        with Scenario("SYSTEM RELOAD FUNCTION with revoked privilege"):
+
+            with When(f"I grant {privilege} on the table"):
+                node.query(f"GRANT {privilege} ON *.* TO {grant_target_name}")
+
+            with And(f"I revoke {privilege} on the table"):
+                node.query(f"REVOKE {privilege} ON *.* FROM {grant_target_name}")
+
+            with Then("I check the user is unable to execute SYSTEM RELOAD FUNCTIONS"):
+                node.query(
+                    "SYSTEM RELOAD FUNCTIONS",
+                    settings=[("user", f"{user_name}")],
+                    exitcode=exitcode,
+                    message=message,
+                )
+
+            # with And(
+            #     "I check the user is unable to execute SYSTEM RELOAD FUNCTION on a specific function"
+            # ):
+            #     node.query(
+            #         f"SYSTEM RELOAD FUNCTION {func_name}",
+            #         settings=[("user", f"{user_name}")],
+            #         exitcode=exitcode,
+            #         message=message,
+            #     )
+    finally:
+        with Finally("I drop the function"):
+            node.query(f"DROP FUNCTION IF EXISTS {func_name}")
+
+
+@TestSuite
+def symbols_privileges_granted_directly(self, node=None):
+    """Check that a user is able to execute `SYSTEM RELOAD SYMBOLS` if and only if
+    they have `SYSTEM RELOAD SYMBOLS` privilege granted directly.
+    """
+    user_name = f"user_{getuid()}"
+
+    if node is None:
+        node = self.context.node
+
+    with user(node, f"{user_name}"):
+
+        Suite(
+            run=symbols,
+            examples=Examples(
+                "privilege grant_target_name user_name",
+                [tuple(list(row) + [user_name, user_name]) for row in symbols.examples],
+                args=Args(name="check privilege={privilege}", format_name=True),
+            ),
+        )
+
+
+@TestSuite
+def symbols_privileges_granted_via_role(self, node=None):
+    """Check that a user is able to execute `SYSTEM RELOAD SYMBOLS` if and only if
+    they have `SYSTEM RELOAD SYMBOLS` privilege granted via role.
+    """
+    user_name = f"user_{getuid()}"
+    role_name = f"role_{getuid()}"
+
+    if node is None:
+        node = self.context.node
+
+    with user(node, f"{user_name}"), role(node, f"{role_name}"):
+
+        with When("I grant the role to the user"):
+            node.query(f"GRANT {role_name} TO {user_name}")
+
+        Suite(
+            run=symbols,
+            examples=Examples(
+                "privilege grant_target_name user_name",
+                [tuple(list(row) + [role_name, user_name]) for row in symbols.examples],
+                args=Args(name="check privilege={privilege}", format_name=True),
+            ),
+        )
+
+
+@TestOutline(Suite)
+@Requirements(
+    RQ_SRS_006_RBAC_Privileges_System_Reload_Symbols("1.0"),
+)
+@Examples(
+    "privilege",
+    [
+        ("ALL",),
+        ("SYSTEM",),
+        ("SYSTEM RELOAD",),
+        ("SYSTEM RELOAD SYMBOLS",),
+    ],
+)
+def symbols(self, privilege, grant_target_name, user_name, node=None):
+    """Run checks for `SYSTEM RELOAD SYMBOLS` privilege."""
+    exitcode, message = errors.not_enough_privileges(name=user_name)
+
+    if node is None:
+        node = self.context.node
+
+    with Scenario("SYSTEM RELOAD SYMBOLS without privilege"):
+
+        with When("I grant the user NONE privilege"):
+            node.query(f"GRANT NONE TO {grant_target_name}")
+
+        with And("I grant the user USAGE privilege"):
+            node.query(f"GRANT USAGE ON *.* TO {grant_target_name}")
+
+        with Then("I check the user is unable to execute SYSTEM RELOAD SYMBOLS"):
+            node.query(
+                "SYSTEM RELOAD SYMBOLS",
+                settings=[("user", f"{user_name}")],
+                exitcode=exitcode,
+                message=message,
+            )
+
+    with Scenario("SYSTEM RELOAD SYMBOLS with privilege"):
+
+        with When(f"I grant {privilege} on the table"):
+            node.query(f"GRANT {privilege} ON *.* TO {grant_target_name}")
+
+        with Then("I check the user is able to execute SYSTEM RELOAD SYMBOLS"):
+            node.query(
+                "SYSTEM RELOAD SYMBOLS",
+                settings=[("user", f"{user_name}")],
+            )
+
+    with Scenario("SYSTEM RELOAD SYMBOLS with revoked privilege"):
+
+        with When(f"I grant {privilege} on the table"):
+            node.query(f"GRANT {privilege} ON *.* TO {grant_target_name}")
+
+        with And(f"I revoke {privilege} on the table"):
+            node.query(f"REVOKE {privilege} ON *.* FROM {grant_target_name}")
+
+        with Then("I check the user is unable to execute SYSTEM RELOAD SYMBOLS"):
+            node.query(
+                "SYSTEM RELOAD SYMBOLS",
                 settings=[("user", f"{user_name}")],
                 exitcode=exitcode,
                 message=message,
@@ -559,5 +825,21 @@ def feature(self, node="clickhouse1"):
     )
     Suite(
         run=embedded_dictionaries_privileges_granted_via_role,
+        setup=instrument_clickhouse_server_log,
+    )
+    Suite(
+        run=function_privileges_granted_directly,
+        setup=instrument_clickhouse_server_log,
+    )
+    Suite(
+        run=function_privileges_granted_via_role,
+        setup=instrument_clickhouse_server_log,
+    )
+    Suite(
+        run=symbols_privileges_granted_directly,
+        setup=instrument_clickhouse_server_log,
+    )
+    Suite(
+        run=symbols_privileges_granted_via_role,
         setup=instrument_clickhouse_server_log,
     )

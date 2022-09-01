@@ -917,7 +917,7 @@ RQ_SRS_007_LDAP_Configuration_Server_Syntax = Requirement(
         "configuration file or of any configuration file inside the `config.d` directory.\n"
         "\n"
         "```xml\n"
-        "<clickhouse>\n"
+        "<yandex>\n"
         "    <my_ldap_server>\n"
         "        <host>localhost</host>\n"
         "        <port>636</port>\n"
@@ -933,7 +933,7 @@ RQ_SRS_007_LDAP_Configuration_Server_Syntax = Requirement(
         "        <tls_ca_cert_dir>/path/to/tls_ca_cert_dir</tls_ca_cert_dir>\n"
         "        <tls_cipher_suite>ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:AES256-GCM-SHA384</tls_cipher_suite>\n"
         "    </my_ldap_server>\n"
-        "</clickhouse>\n"
+        "</yandex>\n"
         "```\n"
         "\n"
     ),
@@ -975,7 +975,7 @@ RQ_SRS_007_LDAP_Configuration_User_Syntax = Requirement(
         "an [LDAP] server inside the `users.xml` file or any configuration file inside the `users.d` directory.\n"
         "\n"
         "```xml\n"
-        "<clickhouse>\n"
+        "<yandex>\n"
         "    <users>\n"
         "        <user_name>\n"
         "            <ldap>\n"
@@ -983,7 +983,7 @@ RQ_SRS_007_LDAP_Configuration_User_Syntax = Requirement(
         "            </ldap>\n"
         "        </user_name>\n"
         "    </users>\n"
-        "</clickhouse>\n"
+        "</yandex>\n"
         "```\n"
         "\n"
     ),
@@ -2092,7 +2092,7 @@ version: 2.0
 configuration file or of any configuration file inside the `config.d` directory.
 
 ```xml
-<clickhouse>
+<yandex>
     <my_ldap_server>
         <host>localhost</host>
         <port>636</port>
@@ -2108,7 +2108,7 @@ configuration file or of any configuration file inside the `config.d` directory.
         <tls_ca_cert_dir>/path/to/tls_ca_cert_dir</tls_ca_cert_dir>
         <tls_cipher_suite>ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:AES256-GCM-SHA384</tls_cipher_suite>
     </my_ldap_server>
-</clickhouse>
+</yandex>
 ```
 
 #### RQ.SRS-007.LDAP.Configuration.User.RBAC
@@ -2128,7 +2128,7 @@ version: 1.0
 an [LDAP] server inside the `users.xml` file or any configuration file inside the `users.d` directory.
 
 ```xml
-<clickhouse>
+<yandex>
     <users>
         <user_name>
             <ldap>
@@ -2136,7 +2136,7 @@ an [LDAP] server inside the `users.xml` file or any configuration file inside th
             </ldap>
         </user_name>
     </users>
-</clickhouse>
+</yandex>
 ```
 
 #### RQ.SRS-007.LDAP.Configuration.User.Name.Empty

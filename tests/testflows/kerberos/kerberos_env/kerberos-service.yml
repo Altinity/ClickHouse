@@ -2,7 +2,7 @@ version: '2.3'
 
 services:
     kerberos:
-        image: zvonand/docker-krb5-server:1.0.0
+        image: registry.gitlab.com/altinity-public/container-images/docker-krb5-server:1.0
         expose:
             - "88"
             - "464"

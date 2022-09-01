@@ -42,9 +42,7 @@ xfails = {
 @Specifications(SRS_007_ClickHouse_Authentication_of_Users_via_LDAP)
 @Requirements(RQ_SRS_007_LDAP_Authentication("1.0"))
 @XFails(xfails)
-def regression(
-    self, local, clickhouse_binary_path, clickhouse_version=None, stress=None
-):
+def regression(self, local, clickhouse_binary_path, clickhouse_version, stress=None):
     """ClickHouse integration with LDAP regression module."""
     nodes = {
         "clickhouse": ("clickhouse1", "clickhouse2", "clickhouse3"),
