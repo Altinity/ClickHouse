@@ -5,6 +5,8 @@ import json
 import time
 import subprocess
 import logging
+import traceback
+import platform
 
 
 class DockerImage:
@@ -42,12 +44,13 @@ def get_images_with_versions(reports_path, required_image, pull=True):
 
     docker_images = []
     for image_name in required_image:
-        docker_image = DockerImage(image_name)
+        docker_image = image_name if isinstance(image_name, DockerImage) else DockerImage(image_name)
         if image_name in images:
             docker_image.version = images[image_name]
         docker_images.append(docker_image)
 
     if pull:
+        latest_error = None
         for docker_image in docker_images:
             for i in range(10):
                 try:
@@ -60,7 +63,17 @@ def get_images_with_versions(reports_path, required_image, pull=True):
                     break
                 except Exception as ex:
                     time.sleep(i * 3)
-                    logging.info("Got execption pulling docker %s", ex)
+                    logging.info("Got exception pulling docker %s", ex)
+                    latest_error = traceback.format_exc()
+
+                    # TODO (vnemkov): remove once we have a docker proxy set up.
+                    # Upstream uses some sort of proxy that routes plain images to amd64/aarch64 variants,
+                    # here we do the same manually.
+                    machine_arch = {'x86_64': 'amd64'}[platform.machine().lower()]
+                    if not docker_image.version.endswith(machine_arch):
+                        docker_image.version = f'{docker_image.version}-{machine_arch}'
+                        logging.debug('Trying to fetch machine-specific docker image as %s', docker_image)
+
             else:
                 raise Exception(
                     f"Cannot pull dockerhub for image docker pull {docker_image} because of {latest_error}"
@@ -71,3 +84,19 @@ def get_images_with_versions(reports_path, required_image, pull=True):
 
 def get_image_with_version(reports_path, image, pull=True):
     return get_images_with_versions(reports_path, [image], pull)[0]
+
+def docker_image(name):
+    s = name.split(':')
+    return DockerImage(s[0], s[1] if len(s) > 1 else None)
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
+    def parse_args():
+        import argparse
+        arg_parser = argparse.ArgumentParser()
+        arg_parser.add_argument('--image', type=docker_image, nargs='+')
+        arg_parser.add_argument('--pull', type=bool, default=True)
+        return arg_parser.parse_args()
+
+    args = parse_args()
+    get_images_with_versions('.', args.image, args.pull)
