@@ -5,13 +5,13 @@ env:
   PYTHONUNBUFFERED: 1
 
 on: # yamllint disable-line rule:truthy
-  pull_request:
-    types:
-      - synchronize
-      - reopened
-      - opened
-    branches:
-      - '**/22.3*'
+#  pull_request:
+#    types:
+#      - synchronize
+#      - reopened
+#      - opened
+#    branches:
+#      - '**/22.3*'
 #  release:
 #    types:
 #      - published
