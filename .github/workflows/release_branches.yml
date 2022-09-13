@@ -5,19 +5,19 @@ env:
   PYTHONUNBUFFERED: 1
 
 on: # yamllint disable-line rule:truthy
-  pull_request:
-    types:
-      - synchronize
-      - reopened
-      - opened
-    branches:
-      - '**/22.3*'
-  release:
-    types:
-      - published
+  # pull_request:
+  #   types:
+  #     - synchronize
+  #     - reopened
+  #     - opened
+  #   branches:
+  #     - '**/22.3*'
+  # release:
+  #   types:
+  #     - published
   push:
      branches:
-     # Anything/22.3 (e.g customizations/22.3)
+     # Anything/22.3 (e.g customizations/22.3 or releases/22.3.10)
       - '**/22.3*'
 
 jobs:
