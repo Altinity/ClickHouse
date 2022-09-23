@@ -5,6 +5,7 @@ from datetime64_extended_range.common import *
 from datetime64_extended_range.tests.common import *
 
 import pytz
+import datetime
 import itertools
 
 
@@ -62,7 +63,7 @@ def extended_range_end(self, precision=3):
         )
 
 
-@TestScenario
+@TestOutline(Scenario)
 @Requirements(
     RQ_SRS_010_DateTime64_ExtendedRange_NormalRange_Start_BeforeEpochForTimeZone("1.0")
 )
@@ -79,7 +80,7 @@ def timezone_local_below_normal_range(self):
         )
 
 
-@TestScenario
+@TestOutline(Scenario)
 @Requirements(
     RQ_SRS_010_DateTime64_ExtendedRange_NormalRange_End_AfterEpochForTimeZone("1.0")
 )
@@ -146,10 +147,20 @@ def timezones_support(self):
                         exec_query(request=query, expected=f"{dt_str}")
 
 
+@TestScenario
+@Requirements(RQ_SRS_010_DateTime64_ExtendedRange_Transform("1.0"))
+def transform(self):
+    """Simple check that transform can accept DateTime64 as argument."""
+    with When("forming a toTimeZone ClickHouse query"):
+        query = "SELECT transform('a', ['a', 'b'], [toDateTime64(0, 3, 'UTC'), toDateTime(1, 3, 'UTC')], toDateTime64(0,3))"
+    with Then(f"I execute query", flags=TE):
+        exec_query(request=query, expected="1970-01-01 00:00:00.000")
+
+
 @TestFeature
 def generic(self, node="clickhouse1"):
     """Check the basic operations with DateTime64"""
     self.context.node = self.context.cluster.node(node)
 
     for scenario in loads(current_module(), Scenario, Suite):
-        Scenario(run=scenario)
+        Scenario(run=scenario, flags=TE)

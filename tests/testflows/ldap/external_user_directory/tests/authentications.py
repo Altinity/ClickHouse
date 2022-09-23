@@ -1274,7 +1274,7 @@ def repeat_requests(self, server, iterations, vcd_value, rbac=False):
         "1.0"
     )
 )
-def verification_cooldown_performance(self, server, rbac=False, iterations=5000):
+def verification_cooldown_performance(self, server, rbac=False, iterations=500):
     """Check login performance when the verification cooldown
     parameter is set to a positive value when comparing to the case when
     the verification cooldown parameter is turned off.

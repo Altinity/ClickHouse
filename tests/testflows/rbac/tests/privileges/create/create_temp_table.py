@@ -66,9 +66,9 @@ def privilege_check(grant_target_name, user_name, node=None):
         temp_table_name = f"temp_table_{getuid()}"
 
         try:
-            with When("I grant create temporary table privilege"):
+            with When(f"I grant the {current().context.privilege} privilege"):
                 node.query(
-                    f"GRANT CREATE TEMPORARY TABLE ON *.* TO {grant_target_name}"
+                    f"GRANT {current().context.privilege} ON *.* TO {grant_target_name}"
                 )
 
             with Then("I attempt to create aa temporary table"):
@@ -85,14 +85,14 @@ def privilege_check(grant_target_name, user_name, node=None):
         temp_table_name = f"temp_table_{getuid()}"
 
         try:
-            with When("I grant the create temporary table privilege"):
+            with When(f"I grant the {current().context.privilege} privilege"):
                 node.query(
-                    f"GRANT CREATE TEMPORARY TABLE ON *.* TO {grant_target_name}"
+                    f"GRANT {current().context.privilege} ON *.* TO {grant_target_name}"
                 )
 
-            with And("I revoke the create temporary table privilege"):
+            with And(f"I revoke the {current().context.privilege} privilege"):
                 node.query(
-                    f"REVOKE CREATE TEMPORARY TABLE ON *.* FROM {grant_target_name}"
+                    f"REVOKE {current().context.privilege} ON *.* FROM {grant_target_name}"
                 )
 
             with Then("I attempt to create a temporary table"):
@@ -101,47 +101,6 @@ def privilege_check(grant_target_name, user_name, node=None):
                     settings=[("user", user_name)],
                     exitcode=exitcode,
                     message=message,
-                )
-
-        finally:
-            with Finally("I drop the temporary table"):
-                node.query(f"DROP TEMPORARY TABLE IF EXISTS {temp_table_name}")
-
-    with Scenario("user with revoked ALL privilege"):
-        temp_table_name = f"temp_table_{getuid()}"
-
-        try:
-            with When("I grant the create temporary table privilege"):
-                node.query(
-                    f"GRANT CREATE TEMPORARY TABLE ON *.* TO {grant_target_name}"
-                )
-
-            with And("I revoke ALL privilege"):
-                node.query(f"REVOKE ALL ON *.* FROM {grant_target_name}")
-
-            with Then("I attempt to create a temporary table"):
-                node.query(
-                    f"CREATE TEMPORARY TABLE {temp_table_name} (x Int8)",
-                    settings=[("user", user_name)],
-                    exitcode=exitcode,
-                    message=message,
-                )
-
-        finally:
-            with Finally("I drop the temporary table"):
-                node.query(f"DROP TEMPORARY TABLE IF EXISTS {temp_table_name}")
-
-    with Scenario("user with ALL privilege"):
-        temp_table_name = f"temp_table_{getuid()}"
-
-        try:
-            with When("I grant ALL privilege"):
-                node.query(f"GRANT ALL ON *.* TO {grant_target_name}")
-
-            with Then("I attempt to create aa temporary table"):
-                node.query(
-                    f"CREATE TEMPORARY TABLE {temp_table_name} (x Int8)",
-                    settings=[("user", user_name)],
                 )
 
         finally:
@@ -165,8 +124,10 @@ def feature(self, node="clickhouse1", stress=None, parallel=None):
     if stress is not None:
         self.context.stress = stress
 
-    with Suite(
-        test=privilege_granted_directly_or_via_role,
-        setup=instrument_clickhouse_server_log,
-    ):
-        privilege_granted_directly_or_via_role()
+    for current().context.privilege in ["ALL", "CREATE", "CREATE TEMPORARY TABLE"]:
+        with Suite(
+            f" {current().context.privilege} privilege",
+            test=privilege_granted_directly_or_via_role,
+            setup=instrument_clickhouse_server_log,
+        ):
+            privilege_granted_directly_or_via_role()

@@ -94,10 +94,11 @@ def invalid_ciphertext(self):
                                 no_checks=True,
                                 step=By,
                             )
-                        with Then("exitcode is not zero"):
-                            assert r.exitcode in [198, 36]
-                        with And("exception is present in the output"):
-                            assert "DB::Exception:" in r.output
+                        if check_clickhouse_version("<21.12")(self):
+                            with Then("exitcode is not zero"):
+                                assert r.exitcode in [198, 36]
+                            with And("exception is present in the output"):
+                                assert "DB::Exception:" in r.output
 
 
 @TestScenario
@@ -302,6 +303,15 @@ def invalid_parameters(self):
                 exitcode=36,
                 message="DB::Exception: Invalid mode: AES-128-ECB",
             )
+
+    with Example("null in ciphertext"):
+        decrypt(
+            ciphertext="[6555, 555, 555, 9223372036854775807, 1048576, NULL]",
+            key="'0123456789123456'",
+            mode="'aes-128-ecb'",
+            exitcode=198,
+            message="DB::Exception: Failed to decrypt",
+        )
 
 
 @TestOutline(Scenario)

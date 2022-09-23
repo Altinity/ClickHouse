@@ -1206,6 +1206,227 @@ def dict(self, node=None):
             node.query(f"DROP TABLE IF EXISTS {table_name}")
 
 
+@TestScenario
+def remote(self, node=None):
+    """Check that row policies do not only allow access from the source node."""
+    user_name = f"user_{getuid()}"
+    table_name = f"table_{getuid()}"
+    dist_table_name = f"dist_table_{getuid()}"
+    pol_name = f"pol_{getuid()}"
+    exitcode, message = errors.not_enough_privileges(name=f"{user_name}")
+
+    if node is None:
+        node = self.context.node
+
+    node2 = self.context.cluster.node("clickhouse2")
+    node3 = self.context.cluster.node("clickhouse3")
+
+    try:
+        with Given("I have a table on a cluster with two nodes on seperate shards"):
+            node.query(
+                f"CREATE TABLE {table_name} ON CLUSTER sharded_cluster12 (x UInt8) ENGINE=Memory"
+            )
+
+        with And("I have a distributed table"):
+            node.query(
+                f"CREATE TABLE {dist_table_name} ON CLUSTER sharded_cluster (x UInt8) ENGINE=Distributed(sharded_cluster12, default, {table_name})"
+            )
+
+        with And(f"I have a user {user_name} on three nodes on seperate shards"):
+            node.query(f"CREATE USER {user_name} ON CLUSTER sharded_cluster")
+
+        with And("I have some data in the table on clickhouse1"):
+            node.query(f"INSERT INTO {table_name} VALUES (1),(2)")
+
+        with And("I have a row policy on clickhouse1"):
+            node.query(
+                f"CREATE ROW POLICY {pol_name} ON {table_name} AS PERMISSIVE USING x=1 TO {user_name}"
+            )
+
+        with And(
+            f"The user {user_name} has SELECT privilege on {table_name} and {dist_table_name}"
+        ):
+            node.query(
+                f"GRANT SELECT ON default.{table_name} TO {user_name} ON CLUSTER sharded_cluster"
+            )
+            node.query(
+                f"GRANT SELECT ON default.{dist_table_name} TO {user_name} ON CLUSTER sharded_cluster"
+            )
+
+        with When(
+            f"I select from the table as the user to set a baseline for comparison"
+        ):
+            expected = node.query(
+                f"SELECT * FROM {table_name}", settings=[("user", f"{user_name}")]
+            ).output
+            assert expected == "1", error()
+
+        with Then(f"I compare it with SELECT from {dist_table_name}"):
+            output = node.query(
+                f"SELECT * FROM {dist_table_name}", settings=[("user", f"{user_name}")]
+            ).output
+            assert output == expected, error()
+
+        with And(
+            "I grant CREATE TEMPORARY TABLE and cluster privileges to the user on all nodes"
+        ):
+            node.query(
+                f"GRANT CREATE TEMPORARY TABLE ON *.* TO {user_name} ON CLUSTER sharded_cluster"
+            )
+            node.query(f"GRANT REMOTE ON *.* TO {user_name} ON CLUSTER sharded_cluster")
+
+        with When(f"I select from the cluster table as {user_name}"):
+            output = node.query(
+                f"SELECT * FROM cluster(sharded_cluster12, default.{table_name})",
+                settings=[("user", user_name)],
+            ).output
+            assert output == expected, error()
+
+        with And(f"I select from the remote table as {user_name}"):
+            output = node.query(
+                f"SELECT * FROM remote(sharded_cluster12, default.{table_name})",
+                settings=[("user", user_name)],
+            ).output
+            assert output == expected, error()
+
+        with And(f"I select from the cluster table as {user_name} from clickhouse2"):
+            output = node2.query(
+                f"SELECT * FROM cluster(sharded_cluster12, default.{table_name})",
+                settings=[("user", user_name)],
+            ).output
+            assert output == expected, error()
+
+        with And(f"I select from the remote table as {user_name} from clickhouse2"):
+            output = node2.query(
+                f"SELECT * FROM remote(sharded_cluster12, default.{table_name})",
+                settings=[("user", user_name)],
+            ).output
+            assert output == expected, error()
+
+        with And(f"I SELECT from {dist_table_name} from clickhouse2"):
+            output = node2.query(
+                f"SELECT * FROM {dist_table_name}", settings=[("user", f"{user_name}")]
+            ).output
+            assert output == expected, error()
+
+        with And(f"I select from the cluster table as {user_name} from clickhouse3"):
+            output = node3.query(
+                f"SELECT * FROM cluster(sharded_cluster12, default.{table_name})",
+                settings=[("user", user_name)],
+            ).output
+            assert output == expected, error()
+
+        with And(f"I select from the remote table as {user_name} from clickhouse3"):
+            output = node3.query(
+                f"SELECT * FROM remote(sharded_cluster12, default.{table_name})",
+                settings=[("user", user_name)],
+            ).output
+            assert output == expected, error()
+
+        with And(f"I SELECT from {dist_table_name} from clickhouse3"):
+            output = node3.query(
+                f"SELECT * FROM {dist_table_name}", settings=[("user", f"{user_name}")]
+            ).output
+            assert output == expected, error()
+
+    finally:
+        with Finally(f"I drop the table {table_name} from the cluster", flags=TE):
+            node.query(
+                f"DROP TABLE IF EXISTS {table_name} ON CLUSTER sharded_cluster12"
+            )
+
+        with And(f"I drop the table {dist_table_name} from the cluster", flags=TE):
+            node.query(
+                f"DROP TABLE IF EXISTS {dist_table_name} ON CLUSTER sharded_cluster"
+            )
+
+        with And(f"I drop the user {user_name} from the cluster", flags=TE):
+            node.query(f"DROP USER IF EXISTS {user_name} ON CLUSTER sharded_cluster")
+
+
+@TestScenario
+def postgresql(self):
+    """Check that row policies apply correctly to postgresql."""
+    node = self.context.node
+    table_name = f"table_{getuid()}"
+    pol_name = f"pol_{getuid()}"
+    user_name = f"user_{getuid()}"
+
+    try:
+        with Given("I have a table"):
+            node.query(
+                f"CREATE TABLE {table_name} (x UInt32) ENGINE=MergeTree ORDER BY x;"
+            )
+
+        with And("I have a user"):
+            node.query(
+                f"CREATE USER {user_name} IDENTIFIED WITH plaintext_password BY 'x'"
+            )
+
+        with And("The user has select privilege on the table."):
+            node.query(f"GRANT SELECT ON default.{table_name} TO {user_name}")
+
+        with When("I insert into the table"):
+            node.query(f"INSERT INTO {table_name} SELECT * FROM numbers(10)")
+
+        with And("I have a row policy"):
+            node.query(
+                f"CREATE ROW POLICY {pol_name} ON default.{table_name} FOR SELECT USING x = 2 TO {user_name}"
+            )
+
+        with Then("I select from table using postgress"):
+            psql_out = node.command(
+                f"PGPASSWORD=x psql -p 9005 -h 127.0.0.1 -U {user_name} default -c'SELECT * FROM {table_name}'"
+            ).output
+            assert psql_out == " x \n---\n 2\n(1 row)", error()
+
+    finally:
+        with Finally("I drop the user"):
+            node.query(f"DROP USER IF EXISTS {user_name}")
+
+        with And("I drop the table"):
+            node.query(f"DROP TABLE IF EXISTS {table_name}")
+
+
+@TestScenario
+def mysql(self):
+    """Check that row policies apply correctly to mysql."""
+    node = self.context.node
+    table_name = f"table_{getuid()}"
+    pol_name = f"pol_{getuid()}"
+    user_name = f"user_{getuid()}"
+
+    try:
+        with Given("I have a table"):
+            node.query(
+                f"CREATE TABLE {table_name} (x UInt32) ENGINE=MergeTree ORDER BY x;"
+            )
+
+        with When("I insert into the table"):
+            node.query(f"INSERT INTO {table_name} SELECT * FROM numbers(10)")
+
+        with And("I have a row policy"):
+            node.query(
+                f"CREATE ROW POLICY {pol_name} ON default.{table_name} FOR SELECT USING x = 2 TO default"
+            )
+
+        with Then("I select from table using mysql"):
+            msql_out = (
+                self.context.cluster.node("mysql1")
+                .command(
+                    f"mysql -h clickhouse1 -P 9004 -D default -u default -e 'SELECT * FROM {table_name}'"
+                )
+                .output
+            )
+            assert (
+                msql_out == "+------+\n| x    |\n+------+\n|    2 |\n+------+"
+            ), error()
+
+    finally:
+        with Finally("I drop the table"):
+            node.query(f"DROP TABLE IF EXISTS {table_name}")
+
+
 @TestFeature
 @Name("create row policy")
 @Requirements(
@@ -1249,3 +1470,6 @@ def feature(self, node="clickhouse1"):
     Scenario(run=no_table, setup=instrument_clickhouse_server_log)
     Scenario(run=policy_before_table, setup=instrument_clickhouse_server_log)
     Scenario(run=dict, setup=instrument_clickhouse_server_log)
+    Scenario(run=remote, setup=instrument_clickhouse_server_log)
+    Scenario(run=postgresql, setup=instrument_clickhouse_server_log)
+    Scenario(run=mysql, setup=instrument_clickhouse_server_log)

@@ -8,6 +8,7 @@ append_path(sys.path, "..")
 
 from helpers.cluster import Cluster
 from helpers.argparser import argparser
+from helpers.common import check_clickhouse_version
 from map_type.requirements import SRS018_ClickHouse_Map_Data_Type
 
 xfails = {
@@ -136,32 +137,59 @@ xfails = {
     "tests/table map with value integer/UInt64": [
         (Fail, "new bug due to JSON changes")
     ],
+    "tests/:/:": [(Fail, "debug")],
 }
 
 xflags = {}
+
+ffails = {
+    "/clickhouse/map type/tests/table map unsupported types/nullable map": (
+        XFail,
+        "type supported in 21.12",
+        (lambda test: check_clickhouse_version(">=21.12")(test)),
+    ),
+    "/clickhouse/map type/tests/table map unsupported types/map with nothing type for key and value": (
+        XFail,
+        "type supported in 21.12",
+        (lambda test: check_clickhouse_version(">=21.12")(test)),
+    ),
+    "/clickhouse/map type/tests/table map invalid key/integer when key is string": (
+        XFail,
+        "type supported in 21.12",
+        (lambda test: check_clickhouse_version(">=21.12")(test)),
+    ),
+}
 
 
 @TestModule
 @ArgumentParser(argparser)
 @XFails(xfails)
 @XFlags(xflags)
+@FFails(ffails)
 @Name("map type")
 @Specifications(SRS018_ClickHouse_Map_Data_Type)
-def regression(
-    self, local, clickhouse_binary_path, clickhouser_version=None, stress=None
-):
+def regression(self, local, clickhouse_binary_path, clickhouse_version, stress=None):
     """Map type regression."""
     nodes = {"clickhouse": ("clickhouse1", "clickhouse2", "clickhouse3")}
 
+    self.context.clickhouse_version = clickhouse_version
+
     if stress is not None:
         self.context.stress = stress
-    self.context.clickhouse_version = clickhouse_version
+
+    from platform import processor as current_cpu
+
+    folder_name = os.path.basename(current_dir())
+    if current_cpu() == "aarch64":
+        env = f"{folder_name}_env_arm64"
+    else:
+        env = f"{folder_name}_env"
 
     with Cluster(
         local,
         clickhouse_binary_path,
         nodes=nodes,
-        docker_compose_project_dir=os.path.join(current_dir(), "map_type_env"),
+        docker_compose_project_dir=os.path.join(current_dir(), env),
     ) as cluster:
         self.context.cluster = cluster
 

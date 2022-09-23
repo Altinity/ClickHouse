@@ -149,6 +149,59 @@ def create_with_all_privilege(self, grant_target_name, user_name, node=None):
 
 
 @TestScenario
+@Requirements(RQ_SRS_006_RBAC_Privileges_All("1.0"))
+def create_with_create_privilege_granted_directly_or_via_role(self, node=None):
+    """Check that user is able to create a table with CREATE privilege, either granted directly or through a role."""
+    user_name = f"user_{getuid()}"
+    role_name = f"role_{getuid()}"
+
+    if node is None:
+        node = self.context.node
+
+    with user(node, f"{user_name}"):
+
+        Scenario(
+            test=create_with_create_privilege,
+            name="create with CREATE privilege granted directly",
+        )(grant_target_name=user_name, user_name=user_name)
+
+    with user(node, f"{user_name}"), role(node, f"{role_name}"):
+
+        with When("I grant the role to the user"):
+            node.query(f"GRANT {role_name} TO {user_name}")
+
+        Scenario(
+            test=create_with_create_privilege,
+            name="create with CREATE privilege granted through a role",
+        )(grant_target_name=role_name, user_name=user_name)
+
+
+@TestOutline
+def create_with_create_privilege(self, grant_target_name, user_name, node=None):
+    """Check that user is able to create a table with the CREATE privilege."""
+    table_name = f"table_{getuid()}"
+
+    if node is None:
+        node = self.context.node
+    try:
+        with Given("I don't have a table"):
+            node.query(f"DROP TABLE IF EXISTS {table_name}")
+
+        with When("I grant CREATE privilege"):
+            node.query(f"GRANT CREATE ON *.* TO {grant_target_name}")
+
+        with Then("I try to create a table without privilege as the user"):
+            node.query(
+                f"CREATE TABLE {table_name} (x Int8) ENGINE = Memory",
+                settings=[("user", f"{user_name}")],
+            )
+
+    finally:
+        with Then("I drop the table"):
+            node.query(f"DROP TABLE IF EXISTS {table_name}")
+
+
+@TestScenario
 def create_with_revoked_create_table_privilege_revoked_directly_or_from_role(
     self, node=None
 ):

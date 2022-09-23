@@ -7,7 +7,7 @@ def argparser(parser):
         "--local",
         action="store_true",
         help="run regression in local mode",
-        default=False,
+        default=True,
     )
 
     parser.add_argument(

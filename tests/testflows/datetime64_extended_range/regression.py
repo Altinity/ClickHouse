@@ -9,6 +9,7 @@ from helpers.cluster import Cluster
 from helpers.argparser import argparser
 from datetime64_extended_range.requirements import *
 from datetime64_extended_range.common import *
+from datetime64_extended_range.requirements import RQ_SRS_010_DateTime64_ExtendedRange
 
 # cross-outs
 # https://github.com/ClickHouse/ClickHouse/issues/16581#issuecomment-804360350: 128 and 256-bit types are not supported for now
@@ -23,6 +24,7 @@ from datetime64_extended_range.common import *
 # https://github.com/ClickHouse/ClickHouse/issues/22930 : toWeek()
 # https://github.com/ClickHouse/ClickHouse/issues/22948 : toYearWeek()
 # https://github.com/ClickHouse/ClickHouse/issues/22959 : toUnixTimestamp64*() wrong fractal seconds treatment
+# https://github.com/ClickHouse/ClickHouse/issues/34831 : DateTime64 to Arrow format mistreats negative timestamps
 
 # For `reference times` test it is unclear how to evaluate correctness - majority of test cases are correct, and ONLY
 # Juba and Monrovia timezones are damaged - probably, due to wrong DST shifts lookup tables
@@ -85,38 +87,52 @@ xfails = {
     "type conversion/from unix timestamp64 */:": [
         (Fail, "https://github.com/ClickHouse/ClickHouse/issues/22959")
     ],
-    "type conversion/to int 8 16 32 64 128 256/:": [
-        (
-            Fail,
-            "https://github.com/ClickHouse/ClickHouse/issues/16581#issuecomment-804360350",
-        )
-    ],
     "reference times/:": [(Fail, "check procedure unclear")],
-    # need to investigate
-    "type conversion/to datetime/cast=True": [(Fail, "need to investigate")],
-    "date time funcs/today": [(Fail, "need to investigate")],
+    "generic/transform/:": [
+        (Fail, "https://github.com/ClickHouse/ClickHouse/issues/32387")
+    ],
+    "format conversion/arrow format/:": [
+        (Fail, "https://github.com/ClickHouse/ClickHouse/issues/34831")
+    ],
+    "type conversion/to datetime/:": [(Fail, "needs to be investigated")],
+}
+
+ffails = {
+    "type conversion/to date32/:": (
+        XFail,
+        "toDate32 not implemented before 21.10",
+        (lambda test: check_clickhouse_version("<21.10")(test)),
+    )
 }
 
 
 @TestModule
 @Name("datetime64 extended range")
 @ArgumentParser(argparser)
-@Specifications(SRS_010_ClickHouse_DateTime64_Extended_Range)
+@Specifications(QA_SRS010_ClickHouse_DateTime64_Extended_Range)
 @Requirements(
     RQ_SRS_010_DateTime64_ExtendedRange("1.0"),
 )
 @XFails(xfails)
-def regression(
-    self, local, clickhouse_binary_path, clickhouse_version=None, stress=False
-):
+@FFails(ffails)
+def regression(self, local, clickhouse_binary_path, clickhouse_version, stress=False):
     """ClickHouse DateTime64 Extended Range regression module."""
     nodes = {
         "clickhouse": ("clickhouse1", "clickhouse2", "clickhouse3"),
     }
 
+    self.context.clickhouse_version = clickhouse_version
+
     if stress is not None:
         self.context.stress = stress
-    self.context.clickhouse_version = clickhouse_version
+
+    from platform import processor as current_cpu
+
+    folder_name = os.path.basename(current_dir())
+    if current_cpu() == "aarch64":
+        env = f"{folder_name}_env_arm64"
+    else:
+        env = f"{folder_name}_env"
 
     with Cluster(
         local,
@@ -162,6 +178,14 @@ def regression(
                     run=load(
                         "datetime64_extended_range.tests.type_conversion",
                         "type_conversion",
+                    ),
+                    parallel=True,
+                    executor=pool,
+                )
+                Scenario(
+                    run=load(
+                        "datetime64_extended_range.tests.format_conversion",
+                        "format_conversion",
                     ),
                     parallel=True,
                     executor=pool,

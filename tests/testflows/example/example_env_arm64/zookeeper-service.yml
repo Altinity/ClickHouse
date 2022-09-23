@@ -2,7 +2,7 @@ version: '2.3'
 
 services:
   zookeeper:
-    image: zookeeper:3.6.2
+    image: ${IMAGE_DEPENDENCY_PROXY}arm64v8/zookeeper:3.6.2
     expose:
       - "2181"
     environment:

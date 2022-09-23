@@ -196,6 +196,15 @@
         * 3.8.2.2.1 [RQ.SRS-019.ClickHouse.WindowFunctions.AggregateFunctions.Combinators](#rqsrs-019clickhousewindowfunctionsaggregatefunctionscombinators)
       * 3.8.2.3 [Parametric](#parametric)
         * 3.8.2.3.1 [RQ.SRS-019.ClickHouse.WindowFunctions.AggregateFunctions.Parametric](#rqsrs-019clickhousewindowfunctionsaggregatefunctionsparametric)
+      * 3.8.2.4 [Time Decayed](#time-decayed)
+        * 3.8.2.4.1 [RQ.SRS-019.ClickHouse.WindowFunctions.ExponentialTimeDecayed](#rqsrs-019clickhousewindowfunctionsexponentialtimedecayed)
+        * 3.8.2.4.2 [RQ.SRS-019.ClickHouse.WindowFunctions.ExponentialTimeDecayed.ExponentialTimeDecayedSum](#rqsrs-019clickhousewindowfunctionsexponentialtimedecayedexponentialtimedecayedsum)
+        * 3.8.2.4.3 [RQ.SRS-019.ClickHouse.WindowFunctions.ExponentialTimeDecayed.ExponentialTimeDecayedMax](#rqsrs-019clickhousewindowfunctionsexponentialtimedecayedexponentialtimedecayedmax)
+        * 3.8.2.4.4 [RQ.SRS-019.ClickHouse.WindowFunctions.ExponentialTimeDecayed.ExponentialTimeDecayedCount](#rqsrs-019clickhousewindowfunctionsexponentialtimedecayedexponentialtimedecayedcount)
+        * 3.8.2.4.5 [RQ.SRS-019.ClickHouse.WindowFunctions.ExponentialTimeDecayed.ExponentialTimeDecayedAvg](#rqsrs-019clickhousewindowfunctionsexponentialtimedecayedexponentialtimedecayedavg)
+    * 3.8.3 [Specific](#specific)
+      * 3.8.3.1 [Non-negative Derivative](#non-negative-derivative)
+        * 3.8.3.1.1 [RQ.SRS-019.ClickHouse.WindowFunctions.Specific.NonNegativeDerivative](#rqsrs-019clickhousewindowfunctionsspecificnonnegativederivative)
 * 4 [References](#references)
 
 
@@ -2330,6 +2339,124 @@ version: 1.0
 * [retention](https://clickhouse.com/docs/en/sql-reference/aggregate-functions/parametric-functions/#retention)
 * [uniqUpTo(N)(x)](https://clickhouse.com/docs/en/sql-reference/aggregate-functions/parametric-functions/#uniquptonx)
 * [sumMapFiltered(keys_to_keep)(keys, values)](https://clickhouse.com/docs/en/sql-reference/aggregate-functions/parametric-functions/#summapfilteredkeys-to-keepkeys-values)
+
+##### Time Decayed
+
+###### RQ.SRS-019.ClickHouse.WindowFunctions.ExponentialTimeDecayed
+version: 1.0
+
+[ClickHouse] SHALL support using exponential time decayed aggregate functions over windows.
+
+* exponentialTimeDecayedSum
+* exponentialTimeDecayedMax
+* exponentialTimeDecayedCount
+* exponentialTimeDecayedAvg
+
+###### RQ.SRS-019.ClickHouse.WindowFunctions.ExponentialTimeDecayed.ExponentialTimeDecayedSum
+version: 1.0
+
+[ClickHouse] SHALL support `exponentialTimeDecayedSum` window function
+that SHALL take a decay length parameter, a datetime input column and a numeric input column.
+
+It SHALL update as 
+
+`time_gap = current_time - previous_time`
+
+and 
+
+`current_output = current_input + previous_output * exp(-time_gap / decay_length)`
+
+The function SHALL have the following syntax
+
+```sql
+exponentialTimeDecayedSum(<decay length parameter>)(<numeric input>, <datetime input>)
+```
+
+###### RQ.SRS-019.ClickHouse.WindowFunctions.ExponentialTimeDecayed.ExponentialTimeDecayedMax
+version: 1.0
+
+[ClickHouse] SHALL support `exponentialTimeDecayedMax` window function
+that SHALL take a decay length parameter, a datetime input column and a numeric input column.
+
+It SHALL update as 
+
+`time_gap = current_time - previous_time`
+
+and
+
+`current_output = max(current_input, previous_output * exp(-time_gap / decay_length))`
+
+The function SHALL have the following syntax
+
+```sql
+exponentialTimeDecayedSum(<decay length parameter>)(<numeric input>, <datetime input>)
+```
+
+###### RQ.SRS-019.ClickHouse.WindowFunctions.ExponentialTimeDecayed.ExponentialTimeDecayedCount
+version: 1.0
+
+[ClickHouse] SHALL support `exponentialTimeDecayedCount` window function
+that SHALL take a decay length parameter, a datetime input column.
+
+It SHALL update as 
+
+`time_gap = current_time - previous_time`
+
+and
+
+`current_output = 1 + previous_count * exp(-time_gap / decay_length))`
+
+The function SHALL have the following syntax
+
+```sql
+exponentialTimeDecayedSum(<decay length parameter>)(<datetime input>)
+```
+
+###### RQ.SRS-019.ClickHouse.WindowFunctions.ExponentialTimeDecayed.ExponentialTimeDecayedAvg
+version: 1.0
+
+[ClickHouse] SHALL support `exponentialTimeDecayedAvg` window function
+that SHALL take a decay length parameter, a datetime input column and a numeric input column.
+
+It SHALL update as 
+
+`time_gap = current_time - previous_time`
+
+and 
+
+`current_count = 1 + previous_count * exp(-time_gap / decay_length))`
+
+and
+
+`current_output = (current_input + previous_output * exp(-time_gap / decay_length)) / current_count`
+
+The function SHALL have the following syntax
+
+```sql
+exponentialTimeDecayedSum(<decay length parameter>)(<numeric input>, <datetime input>)
+```
+
+#### Specific
+
+##### Non-negative Derivative
+
+###### RQ.SRS-019.ClickHouse.WindowFunctions.Specific.NonNegativeDerivative
+version: 1.0
+
+[ClickHouse] SHALL support `nonNegativeDerivative` window function that SHALL have
+the following syntax:
+
+```SQL
+nonNegativeDerivative(metric_column, timestamp_column[, INTERVAL X UNITS])
+```
+
+which SHALL calculate non-negative derivative for given `metric_column` by `timestamp_column`.
+The `INTERVAL` argument MAY be omitted, the default SHALL be `INTERVAL 1 SECOND`.
+
+The computed value SHALL be the following for each row:
+
+- `0` for $`1_{st}`$ row,
+- $`{metric_i - metric_{i-1} \over timestamp_i - timestamp_{i-1}}  * interval`$ for $`i_{th}`$ row.
 
 ## References
 
