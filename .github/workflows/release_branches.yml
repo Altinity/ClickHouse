@@ -49,6 +49,7 @@ jobs:
       - name: Images check
         run: |
           cd "$GITHUB_WORKSPACE/tests/ci"
+          pip install pygithub
           python3 docker_images_check.py --suffix amd64
       - name: Upload images files to artifacts
         uses: actions/upload-artifact@v2
