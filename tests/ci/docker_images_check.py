@@ -244,6 +244,20 @@ def build_and_push_one_image(
             f"--cache-from type=registry,ref={image.repo}:{additional_cache}"
         )
 
+    ## Explicitly specify arch of the docker image, because for some reason it was behaving like if
+    ## TARGET_ARCH was set to `aarch64` for `amd64` image, and failed during the build.
+    arch = None
+    try:
+        arch = version_string.split('-')[-1]
+        if not arch in ['amd64', 'aarch64']:
+            raise Exception(f'Invalid arch in version: {arch}')
+    except Exception as e:
+        logging.debug(f'Failed to get arch from %s : %s', version_string, e)
+    if arch is not None:
+        arch = f'--build-arg TARGET_ARCH={arch} '
+
+    logging.debug(f'Arch value: {arch}')
+
     with open(build_log, "wb") as bl:
         cmd = (
             "docker buildx build --builder default "
@@ -268,6 +282,7 @@ def build_and_push_one_image(
             # - do something crazy
             f"--tag {image.repo}:latest "
             f"{push_arg}"
+            f"{arch}"
             f"--progress plain {image.full_path}"
         )
         logging.info("Docker command to run: %s", cmd)
