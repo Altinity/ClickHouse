@@ -51,11 +51,18 @@ jobs:
           cd "$GITHUB_WORKSPACE/tests/ci"
           pip install pygithub boto3 unidiff
           python3 docker_images_check.py --suffix amd64
-      - name: Upload images files to artifacts
+          cp ${{ runner.temp }}/docker_images_check/changed_images_amd64.json ${{ runner.temp }}/docker_images_check/changed_images.json
+          cat ${{ runner.temp }}/docker_images_check/changed_images.json
+      - name: Upload amd64 images files to artifacts
         uses: actions/upload-artifact@v2
         with:
           name: changed_images_amd64
           path: ${{ runner.temp }}/docker_images_check/changed_images_amd64.json
+      - name: Upload images files to artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: changed_images
+          path: ${{ runner.temp }}/docker_images_check/changed_images.json
   # DockerHubPush:
   #   needs:
   #     - DockerHubPushAmd64
