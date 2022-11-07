@@ -66,13 +66,13 @@ def get_images_with_versions(reports_path, required_image, pull=True):
                     logging.info("Got exception pulling docker %s", ex)
                     latest_error = traceback.format_exc()
 
-                    # TODO (vnemkov): remove once we have a docker proxy set up.
-                    # Upstream uses some sort of proxy that routes plain images to amd64/aarch64 variants,
-                    # here we do the same manually.
-                    machine_arch = {'x86_64': 'amd64'}[platform.machine().lower()]
-                    if not docker_image.version.endswith(machine_arch):
-                        docker_image.version = f'{docker_image.version}-{machine_arch}'
-                        logging.debug('Trying to fetch machine-specific docker image as %s', docker_image)
+                    # # TODO (vnemkov): remove once we have a docker proxy set up.
+                    # # Upstream uses some sort of proxy that routes plain images to amd64/aarch64 variants,
+                    # # here we do the same manually.
+                    # machine_arch = {'x86_64': 'amd64'}[platform.machine().lower()]
+                    # if not docker_image.version.endswith(machine_arch):
+                    #     docker_image.version = f'{docker_image.version}-{machine_arch}'
+                    #     logging.debug('Trying to fetch machine-specific docker image as %s', docker_image)
 
             else:
                 raise Exception(
