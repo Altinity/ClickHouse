@@ -46,7 +46,22 @@ def get_images_with_versions(reports_path, required_image, pull=True):
     for image_name in required_image:
         docker_image = image_name if isinstance(image_name, DockerImage) else DockerImage(image_name)
         if image_name in images:
-            docker_image.version = images[image_name]
+            image_version = images[image_name]
+            # NOTE(vnemkov): For some reason we can get version as list of versions,
+            # in this case choose one that has commit hash and hence is the longest string.
+            # E.g. from ['latest-amd64', '0-amd64', '0-473d8f560fc78c6cdaabb960a537ca5ab49f795f-amd64']
+            # choose '0-473d8f560fc78c6cdaabb960a537ca5ab49f795f-amd64' since it 100% points to proper commit.
+            if isinstance(image_version, list):
+                max_len = 0
+                max_len_version = ''
+                for version in image_version:
+                    if len(version) > max_len:
+                        max_len = len(version)
+                        max_len_version = version
+                logging.debug(f"selected version {max_len_version} from {image_version}")
+                image_version = max_len_version
+
+            docker_image.version = image_version
         docker_images.append(docker_image)
 
     if pull:
