@@ -3,7 +3,6 @@ import logging
 
 def main():
     logging.basicConfig(level=logging.INFO)
-    stopwatch = Stopwatch()
 
     print(f"hello ${gpg_key}")
 
