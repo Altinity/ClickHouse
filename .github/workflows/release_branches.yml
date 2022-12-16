@@ -475,6 +475,11 @@ jobs:
       - uses: actions/download-artifact@v3
         with:
           name: ${{ env.BUILD_URLS }}
+      - name: Clear repository
+        run: |
+          sudo rm -fr "$GITHUB_WORKSPACE" && mkdir "$GITHUB_WORKSPACE"
+      - name: Check out repository code
+        uses: actions/checkout@v2
       - name: Sign release
         env:
           gpg_key: ${{ secrets.AKEY }}
