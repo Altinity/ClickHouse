@@ -38,25 +38,25 @@ jobs:
         with:
           name: changed_images_aarch64
           path: ${{ runner.temp }}/docker_images_check/changed_images_aarch64.json
-  DockerHubPushAmd64:
-    runs-on: [self-hosted, style-checker]
-    steps:
-      - name: Clear repository
-        run: |
-          sudo rm -fr "$GITHUB_WORKSPACE" && mkdir "$GITHUB_WORKSPACE"
-      - name: Check out repository code
-        uses: actions/checkout@v2
-      - name: Images check
-        run: |
-          cd "$GITHUB_WORKSPACE/tests/ci"
-          python3 docker_images_check.py --suffix amd64
-      - name: Upload images files to artifacts
-        uses: actions/upload-artifact@v2
-        with:
-          name: changed_images_amd64
-          path: ${{ runner.temp }}/docker_images_check/changed_images_amd64.json
+#  DockerHubPushAmd64:
+#    runs-on: [self-hosted, style-checker]
+#    steps:
+#      - name: Clear repository
+#        run: |
+#          sudo rm -fr "$GITHUB_WORKSPACE" && mkdir "$GITHUB_WORKSPACE"
+#      - name: Check out repository code
+#        uses: actions/checkout@v2
+#      - name: Images check
+#        run: |
+#          cd "$GITHUB_WORKSPACE/tests/ci"
+#          python3 docker_images_check.py --suffix amd64
+#      - name: Upload images files to artifacts
+#        uses: actions/upload-artifact@v2
+#        with:
+#          name: changed_images_amd64
+#          path: ${{ runner.temp }}/docker_images_check/changed_images_amd64.json
   DockerHubPush:
-    needs: [DockerHubPushAmd64, DockerHubPushAarch64]
+    needs: [DockerHubPushAarch64]
     runs-on: [self-hosted, style-checker]
     steps:
       - name: Clear repository
