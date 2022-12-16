@@ -465,30 +465,21 @@ jobs:
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
-          TEMP_PATH=${{runner.temp}}/sign_release
-          REPO_COPY=${{runner.temp}}/sign_release/ClickHouse
           EOF
-      - name: Download json reports
-        uses: actions/download-artifact@v2
-        with:
-          path: ${{ env.REPORTS_PATH }}
-      - uses: actions/download-artifact@v3
-        with:
-          name: ${{ env.BUILD_URLS }}
       - name: Clear repository
         run: |
           sudo rm -fr "$GITHUB_WORKSPACE" && mkdir "$GITHUB_WORKSPACE"
       - name: Check out repository code
         uses: actions/checkout@v2
+      - uses: actions/download-artifact@v3
+        with:
+          name: ${{ env.BUILD_URLS }}
       - name: Sign release
         env:
           gpg_key: ${{ secrets.AKEY }}
           gpg_passphrase: ${{ secrets.GPGPASSPHRASE }}
         run: |
-          sudo rm -fr "$TEMP_PATH"
-          mkdir -p "$TEMP_PATH"
-          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
-          cd "$TEMP_PATH/tests/ci"
+          cd "$GITHUB_WORKSPACE/tests/ci"
           python3 sign_release.py
       - name: Cleanup
         if: always()
