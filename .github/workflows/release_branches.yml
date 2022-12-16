@@ -466,7 +466,7 @@ jobs:
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
           TEMP_PATH=${{runner.temp}}/sign_release
-          REPO_COPY=${{runner.temp}}/build_check/ClickHouse
+          REPO_COPY=${{runner.temp}}/sign_release/ClickHouse
           EOF
       - name: Download json reports
         uses: actions/download-artifact@v2
@@ -488,7 +488,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
           mkdir -p "$TEMP_PATH"
           cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
-          cd "$REPO_COPY/tests/ci"
+          cd "$TEMP_PATH/tests/ci"
           python3 sign_release.py
       - name: Cleanup
         if: always()
