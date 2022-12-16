@@ -2,7 +2,7 @@ def main():
     logging.basicConfig(level=logging.INFO)
     stopwatch = Stopwatch()
 
-    print("Hi, testing\n")
+    print(f"hello ${gpg_key}")
 
 if __name__ == "__main__":
     main()
