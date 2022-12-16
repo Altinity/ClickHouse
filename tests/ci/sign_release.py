@@ -1,3 +1,6 @@
+import sys
+import logging
+
 def main():
     logging.basicConfig(level=logging.INFO)
     stopwatch = Stopwatch()
