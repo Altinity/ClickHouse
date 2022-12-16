@@ -477,9 +477,6 @@ jobs:
         with:
           path: ${{ env.REPORTS_PATH }}
       - name: Sign release
-        with:
-          gpg_key: ${{ secrets.AKEY }}
-          gpg_passphrase: ${{ secrets.GPGPASSPHRASE }}
         run: |
           python3 sign_release.py
       - name: Cleanup
