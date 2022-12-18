@@ -6,5 +6,7 @@ from env_helper import GPG_BINARY_SIGNING_KEY
 def main():
     logging.basicConfig(level=logging.INFO)
 
+    print("hello")
+
 if __name__ == "__main__":
     main()
