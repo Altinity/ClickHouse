@@ -44,6 +44,7 @@ def main():
         subprocess.check_call(
             f"dpkg -x {full_path} {packages_path} && rm {full_path}", shell=True
         )
+        print(f"aaa: {full_path}")
 
 if __name__ == "__main__":
     main()
