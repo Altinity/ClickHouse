@@ -497,14 +497,15 @@ jobs:
   FinishCheck:
     needs:
       - DockerHubPush
-      - DockerServerImages
-      - BuilderReport
-      - MarkReleaseReady
-      - FunctionalStatelessTestRelease
-      - FunctionalStatefulTestRelease
-      - IntegrationTestsRelease0
-      - IntegrationTestsRelease1
-      - TestFlowsTestsRelease
+#      - DockerServerImages
+#      - BuilderReport
+#      - MarkReleaseReady
+#      - FunctionalStatelessTestRelease
+#      - FunctionalStatefulTestRelease
+#      - IntegrationTestsRelease0
+#      - IntegrationTestsRelease1
+#      - TestFlowsTestsRelease
+      - SignRelease
       - CompatibilityCheck
     runs-on: [self-hosted, style-checker]
     steps:
