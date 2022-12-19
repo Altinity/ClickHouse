@@ -8,7 +8,7 @@ import subprocess
 from s3_helper import S3Helper
 from get_robot_token import get_best_robot_token
 from pr_info import PRInfo
-from build_download_helper import download_builds
+from build_download_helper import download_builds_filter
 from rerun_helper import RerunHelper
 from docker_pull_helper import get_images_with_versions
 
@@ -37,7 +37,7 @@ def main():
     #         "clickhouse-common-static_" in url or "clickhouse-server_" in url
     #     )
 
-    download_builds(CHECK_NAME, reports_path, packages_path)
+    download_builds_filter(CHECK_NAME, reports_path, packages_path)
 
     for f in os.listdir(packages_path):
         full_path = os.path.join(packages_path, f)
