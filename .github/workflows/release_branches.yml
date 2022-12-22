@@ -15,10 +15,9 @@ on: # yamllint disable-line rule:truthy
   release:
     types:
       - published
-  # push:
-  #   branches:
-  #     # Anything/22.3 (e.g customizations/22.3)
-  #     - '**/22.3*'
+  push:
+    branches:
+      - 'releases/22.3*'
 
 jobs:
   DockerHubPushAarch64:
