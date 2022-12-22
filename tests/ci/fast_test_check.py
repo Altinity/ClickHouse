@@ -98,7 +98,7 @@ if __name__ == "__main__":
         logging.info("Check is already finished according to github status, exiting")
         sys.exit(0)
 
-    docker_image = get_image_with_version(temp_path, "clickhouse/fasttest")
+    docker_image = get_image_with_version(temp_path, "altinityinfra/fasttest")
 
     s3_helper = S3Helper("https://s3.amazonaws.com")
 
@@ -207,11 +207,11 @@ if __name__ == "__main__":
         report_url,
         NAME,
     )
-    ch_helper.insert_events_into(db="default", table="checks", events=prepared_events)
+    ch_helper.insert_events_into(db="gh-data", table="checks", events=prepared_events)
 
     # Refuse other checks to run if fast test failed
     if state != "success":
-        if "force-tests" in pr_info.labels:
+        if "force-tests" in pr_info.labels and state != "error":
             print("'force-tests' enabled, will report success")
         else:
             sys.exit(1)

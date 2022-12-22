@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--image-repo",
         type=str,
-        default="clickhouse/clickhouse-server",
+        default="altinityinfra/clickhouse-server",
         help="image name on docker hub",
     )
     parser.add_argument(
@@ -308,8 +308,8 @@ def main():
 
     if args.push:
         subprocess.check_output(  # pylint: disable=unexpected-keyword-arg
-            "docker login --username 'robotclickhouse' --password-stdin",
-            input=get_parameter_from_ssm("dockerhub_robot_password"),
+            "docker login --username 'altinityinfra' --password-stdin",
+            input=get_parameter_from_ssm("dockerhub-password"),
             encoding="utf-8",
             shell=True,
         )
@@ -357,7 +357,7 @@ def main():
         NAME,
     )
     ch_helper = ClickHouseHelper()
-    ch_helper.insert_events_into(db="default", table="checks", events=prepared_events)
+    ch_helper.insert_events_into(db="gh-data", table="checks", events=prepared_events)
 
 
 if __name__ == "__main__":

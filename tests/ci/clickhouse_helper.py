@@ -18,7 +18,7 @@ class ClickHouseHelper:
 
         self.url = url
         self.auth = {
-            "X-ClickHouse-User": get_parameter_from_ssm("clickhouse-test-stat-login"),
+            "X-ClickHouse-User": get_parameter_from_ssm("clickhouse-test-stat-login2"),
             "X-ClickHouse-Key": get_parameter_from_ssm("clickhouse-test-stat-password"),
         }
 
@@ -37,12 +37,8 @@ class ClickHouseHelper:
                     url, params=params, data=json_str, headers=auth
                 )
             except Exception as e:
-                logging.warning(
-                    "Received exception while sending data to %s on %s attempt: %s",
-                    url,
-                    i,
-                    e,
-                )
+                error = f"Received exception while sending data to {url} on {i} attempt: {e}"
+                logging.error(error)
                 continue
 
             logging.info("Response content '%s'", response.content)
@@ -142,7 +138,7 @@ def prepare_tests_results_for_clickhouse(
     check_name,
 ):
 
-    pull_request_url = "https://github.com/ClickHouse/ClickHouse/commits/master"
+    pull_request_url = "https://github.com/Altinity/ClickHouse/commits/master"
     base_ref = "master"
     head_ref = "master"
     base_repo = pr_info.repo_full_name
@@ -201,7 +197,7 @@ WHERE
     AND pull_request_number = 0
 """
 
-        tests_data = clickhouse_helper.select_json_each_row("default", query)
+        tests_data = clickhouse_helper.select_json_each_row("gh-data", query)
         master_failed_tests = {row["test_name"] for row in tests_data}
         logging.info("Found flaky tests: %s", ", ".join(master_failed_tests))
 

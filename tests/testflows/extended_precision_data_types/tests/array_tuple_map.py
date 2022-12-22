@@ -2,6 +2,7 @@ import uuid
 
 from extended_precision_data_types.requirements import *
 from extended_precision_data_types.common import *
+from helpers.common import check_clickhouse_version
 
 
 def get_table_name():
@@ -477,11 +478,16 @@ def map_func(self, data_type, node=None):
         )
 
         exitcode, message = 0, None
-        if data_type.startswith("Decimal"):
-            exitcode, message = 44, "Exception:"
+        if data_type.startswith("Decimal") or check_clickhouse_version("<21.9")(self):
+            (exitcode, message) = (
+                (44, "Exception:")
+                if check_clickhouse_version("<22.3")(self)
+                else (43, "Exception:")
+            )
         node.query(sql, exitcode=exitcode, message=message)
 
     with Scenario(f"mapPopulateSeries with {data_type} on a table"):
+
         table_name = get_table_name()
 
         table(
@@ -496,10 +502,15 @@ def map_func(self, data_type, node=None):
 
             exitcode, message = 0, None
             if data_type.startswith("Decimal"):
-                exitcode, message = 44, "Exception:"
+                (exitcode, message) = (
+                    (44, "Exception:")
+                    if check_clickhouse_version("<22.3")(self)
+                    else (43, "Exception:")
+                )
             node.query(sql, exitcode=exitcode, message=message)
 
-        execute_query(f"SELECT * FROM {table_name} ORDER BY a ASC")
+        if check_clickhouse_version(">=21.9")(self):
+            execute_query(f"SELECT * FROM {table_name} ORDER BY a ASC")
 
     with Scenario(f"mapContains with {data_type}"):
         node.query(

@@ -1,4 +1,5 @@
 from testflows.core import *
+from helpers.common import check_clickhouse_version
 
 from window_functions.requirements import *
 from window_functions.tests.common import *
@@ -45,12 +46,21 @@ def error_window_function_in_where(self):
 @TestScenario
 def error_window_function_in_join(self):
     """Check that trying to use window function in `JOIN` returns an error."""
-    exitcode = 147
-    message = "DB::Exception: Cannot get JOIN keys from JOIN ON section: row_number() OVER (ORDER BY salary ASC) < 10"
+    note(self.context.clickhouse_version)
+
+    if self.context.distributed:
+        allow_distributed_product_mode()
+
+    exitcode = 48 if check_clickhouse_version("<21.9")(self) else 147
+    message = (
+        "DB::Exception: JOIN ON inequalities are not supported"
+        if check_clickhouse_version("<21.9")(self)
+        else "DB::Exception: Cannot get JOIN keys from JOIN ON section"
+    )
 
     sql = "SELECT * FROM empsalary INNER JOIN tenk1 ON row_number() OVER (ORDER BY salary) < 10"
 
-    with When("I execute query", description=sql):
+    with When(f"I execute query", description=sql):
         r = current().context.node.query(sql, exitcode=exitcode, message=message)
 
 
@@ -58,7 +68,7 @@ def error_window_function_in_join(self):
 def error_window_function_in_group_by(self):
     """Check that trying to use window function in `GROUP BY` returns an error."""
     exitcode = 47
-    message = "DB::Exception: Unknown identifier: row_number() OVER (ORDER BY salary ASC); there are columns"
+    message = "DB::Exception: Unknown identifier"
 
     sql = "SELECT rank() OVER (ORDER BY 1), count(*) FROM empsalary GROUP BY row_number() OVER (ORDER BY salary) < 10"
 

@@ -135,7 +135,7 @@ services:
   # dummy service which does nothing, but allows to postpone
   # 'docker-compose up -d' till all dependecies will go healthy
   all_services_ready:
-    image: hello-world
+    image: ${IMAGE_DEPENDENCY_PROXY}hello-world
     depends_on:
       clickhouse1:
         condition: service_healthy

@@ -32,6 +32,9 @@ issue_21083 = "https://github.com/ClickHouse/ClickHouse/issues/21083"
 issue_21084 = "https://github.com/ClickHouse/ClickHouse/issues/21084"
 issue_25413 = "https://github.com/ClickHouse/ClickHouse/issues/25413"
 issue_26746 = "https://github.com/ClickHouse/ClickHouse/issues/26746"
+issue_37389 = "https://github.com/ClickHouse/ClickHouse/issues/37389"
+issue_37580 = "https://github.com/ClickHouse/ClickHouse/issues/37580"
+issue_38716 = "https://github.com/ClickHouse/ClickHouse/issues/38716"
 
 xfails = {
     "syntax/show create quota/I show create quota current": [
@@ -184,6 +187,12 @@ xfails = {
     "views/live view/create with join subquery privilege granted directly or via role/create with join subquery, privilege granted through a role": [
         (Fail, issue_26746)
     ],
+    "privileges/table functions/cluster": [(Fail, issue_37389)],
+    "privileges/table functions/remote": [(Fail, issue_37389)],
+    "privileges/create row policy/remote": [(Fail, issue_37580)],
+    "privileges/system drop replica/:/drop replica/check privilege:/:": [
+        (Fail, issue_38716)
+    ],
 }
 
 xflags = {
@@ -209,6 +218,36 @@ ffails = {
             lambda test: check_clickhouse_version(">=21.9")(test)
             and check_clickhouse_version("<21.10")(test)
         ),
+    ),
+    "/clickhouse/rbac/privileges/system merges": (
+        XFail,
+        "Does not work on clickhouse 21.8",
+        (lambda test: check_clickhouse_version("<21.9")(test)),
+    ),
+    "/clickhouse/rbac/privileges/system ttl merges": (
+        XFail,
+        "Does not work on clickhouse 21.8",
+        (lambda test: check_clickhouse_version("<21.9")(test)),
+    ),
+    "/clickhouse/rbac/privileges/system moves": (
+        XFail,
+        "Does not work on clickhouse 21.8",
+        (lambda test: check_clickhouse_version("<21.9")(test)),
+    ),
+    "/clickhouse/rbac/privileges/system sends": (
+        XFail,
+        "Does not work on clickhouse 21.8",
+        (lambda test: check_clickhouse_version("<21.9")(test)),
+    ),
+    "/clickhouse/rbac/privileges/system fetches": (
+        XFail,
+        "Does not work on clickhouse 21.8",
+        (lambda test: check_clickhouse_version("<21.9")(test)),
+    ),
+    "/clickhouse/rbac/privileges/system replication queues": (
+        XFail,
+        "Does not work on clickhouse 21.8",
+        (lambda test: check_clickhouse_version("<21.9")(test)),
     ),
 }
 

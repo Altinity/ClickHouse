@@ -204,6 +204,11 @@ def feature(self):
                 executor=pool,
             )
             Feature(
+                run=load("rbac.tests.privileges.alter.alter_database", "feature"),
+                parallel=True,
+                executor=pool,
+            )
+            Feature(
                 run=load(
                     "rbac.tests.privileges.alter.alter_settings_profile", "feature"
                 ),
@@ -255,6 +260,11 @@ def feature(self):
                 run=load(
                     "rbac.tests.privileges.create.create_settings_profile", "feature"
                 ),
+                parallel=True,
+                executor=pool,
+            )
+            Feature(
+                run=load("rbac.tests.privileges.create.create_function", "feature"),
                 parallel=True,
                 executor=pool,
             )
@@ -317,6 +327,16 @@ def feature(self):
             )
             Feature(
                 run=load("rbac.tests.privileges.drop.drop_settings_profile", "feature"),
+                parallel=True,
+                executor=pool,
+            )
+            Feature(
+                run=load("rbac.tests.privileges.drop.drop_function", "feature"),
+                parallel=True,
+                executor=pool,
+            )
+            Feature(
+                run=load("rbac.tests.privileges.drop.drop_replica", "feature"),
                 parallel=True,
                 executor=pool,
             )
@@ -383,6 +403,11 @@ def feature(self):
                 executor=pool,
             )
             Feature(
+                run=load("rbac.tests.privileges.system.restore_replica", "feature"),
+                parallel=True,
+                executor=pool,
+            )
+            Feature(
                 run=load("rbac.tests.privileges.system.sends", "feature"),
                 parallel=True,
                 executor=pool,
@@ -394,6 +419,36 @@ def feature(self):
             )
             Feature(
                 run=load("rbac.tests.privileges.system.fetches", "feature"),
+                parallel=True,
+                executor=pool,
+            )
+            Feature(
+                run=load("rbac.tests.privileges.system.restart_disk", "feature"),
+                parallel=True,
+                executor=pool,
+            )
+            Feature(
+                run=load("rbac.tests.privileges.system.thread_fuzzer", "feature"),
+                parallel=True,
+                executor=pool,
+            )
+            Feature(
+                run=load("rbac.tests.privileges.table_functions", "feature"),
+                parallel=True,
+                executor=pool,
+            )
+            Feature(
+                run=load("rbac.tests.privileges.projections", "feature"),
+                parallel=True,
+                executor=pool,
+            )
+            Feature(
+                run=load("rbac.tests.privileges.grant_drop_user_race", "feature"),
+                parallel=True,
+                executor=pool,
+            )
+            Feature(
+                run=load("rbac.tests.privileges.race_condition", "feature"),
                 parallel=True,
                 executor=pool,
             )

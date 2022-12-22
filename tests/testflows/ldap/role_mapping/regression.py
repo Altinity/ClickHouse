@@ -38,9 +38,7 @@ ffails = {
 @Requirements(RQ_SRS_014_LDAP_RoleMapping("1.0"))
 @XFails(xfails)
 @FFails(ffails)
-def regression(
-    self, local, clickhouse_binary_path, clickhouse_version=None, stress=None
-):
+def regression(self, local, clickhouse_binary_path, clickhouse_version, stress=None):
     """ClickHouse LDAP role mapping regression module."""
     nodes = {
         "clickhouse": ("clickhouse1", "clickhouse2", "clickhouse3"),

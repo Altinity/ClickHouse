@@ -308,7 +308,7 @@ with the actual user name during each authentication attempt.
 For example, 
 
 ```xml
-<clickhouse>
+<yandex>
     <ldap_servers>
         <my_ldap_server>
             <!-- ... -->
@@ -316,7 +316,7 @@ For example,
             <!-- ... -->
         </my_ldap_server>
     </ldap_servers>
-</clickhouse>
+</yandex>
 ```
 
 ##### RQ.SRS-014.LDAP.RoleMapping.Configuration.Server.BindDN.ConflictWith.AuthDN
@@ -399,7 +399,7 @@ of the `config.xml`.
 For example,
 
 ```xml
-<clickhouse>
+<yandex>
     <user_directories>
         <ldap>
             <!-- ... -->
@@ -412,7 +412,7 @@ For example,
             </role_mapping>
         </ldap>
     </user_directories>
-</clickhouse>
+</yandex>
 ```
 
 #### Special Characters Escaping
@@ -563,7 +563,7 @@ cluster is configured with and without `<secret>`.
 For example,
 
 ```xml
-<clickhouse>
+<yandex>
     <remote_servers>
         <cluster>
             <secret>qwerty123</secret>
@@ -583,13 +583,13 @@ For example,
             </shard>
         </cluster>
     </remote_servers>
-</clickhouse>
+</yandex>
 ```
 
 or 
 
 ```xml
-<clickhouse>
+<yandex>
     <remote_servers>
         <cluster>
             <shard>
@@ -608,7 +608,7 @@ or
             </shard>
         </cluster>
     </remote_servers>
-</clickhouse>
+</yandex>
 ```
 
 ## References

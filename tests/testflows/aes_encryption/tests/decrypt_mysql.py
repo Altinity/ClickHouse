@@ -90,10 +90,12 @@ def invalid_ciphertext(self):
                                 no_checks=True,
                                 step=By,
                             )
-                        with Then("exitcode is not zero"):
-                            assert r.exitcode in [198, 36]
-                        with And("exception is present in the output"):
-                            assert "DB::Exception:" in r.output
+
+                        if check_clickhouse_version("<21.12")(self):
+                            with Then("exitcode is not zero"):
+                                assert r.exitcode in [198, 36]
+                            with And("exception is present in the output"):
+                                assert "DB::Exception:" in r.output
 
 
 @TestOutline(Scenario)

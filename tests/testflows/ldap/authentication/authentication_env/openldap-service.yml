@@ -2,7 +2,7 @@ version: '2.3'
 
 services:
   openldap:
-    image: osixia/openldap:1.4.0
+    image: ${IMAGE_DEPENDENCY_PROXY}osixia/openldap:1.4.0
     command: "--copy-service --loglevel debug"
     environment:
       LDAP_ORGANIZATION: "company"
@@ -22,7 +22,7 @@ services:
       - label:disable
 
   phpldapadmin:
-    image: osixia/phpldapadmin:0.9.0
+    image: ${IMAGE_DEPENDENCY_PROXY}osixia/phpldapadmin:0.9.0
     environment:
       PHPLDAPADMIN_HTTPS=false:
     healthcheck:

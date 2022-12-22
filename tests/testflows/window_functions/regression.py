@@ -12,6 +12,7 @@ from window_functions.requirements import (
     SRS019_ClickHouse_Window_Functions,
     RQ_SRS_019_ClickHouse_WindowFunctions,
 )
+from helpers.common import check_clickhouse_version
 
 xfails = {
     "tests/:/frame clause/range frame/between expr following and expr following without order by error": [
@@ -116,33 +117,82 @@ xfails = {
     "tests/:/funcs/lagInFrame/default offset": [
         (Fail, "https://github.com/ClickHouse/ClickHouse/issues/23902")
     ],
+    "tests/:/time decayed funcs/exponentialTimeDecayed:/check decay length with INTERVAL": [
+        (Fail, "not supported and should return an error")
+    ],
+    "tests/:/non-negative derivative func/check intervals/valid/:": [
+        (Fail, "bug, LOGICAL_ERROR that needs to be investigated")
+    ],
+    "tests/:/non-negative derivative func/valid metric types/:": [
+        (Fail, "bug, LOGICAL_ERROR that needs to be investigated")
+    ],
+    "tests/:/non-negative derivative func/valid timestamp types/:": [
+        (Fail, "bug, LOGICAL_ERROR that needs to be investigated")
+    ],
+    "tests/:/non-negative derivative func/check one row per partition": [
+        (Fail, "bug, LOGICAL_ERROR that needs to be investigated")
+    ],
+    "tests/:/non-negative derivative func/check over windows/:": [
+        (Fail, "bug, LOGICAL_ERROR that needs to be investigated")
+    ],
 }
 
 xflags = {}
+
+ffails = {
+    "tests/:/datatypes/low cardinality": (
+        Skip,
+        "Server crashes on 21.9 and 21.10",
+        (
+            lambda test: check_clickhouse_version(">=21.9")(test)
+            and check_clickhouse_version("<21.11")(test)
+        ),
+    ),
+    "tests/:/aggregate funcs/avgWeighted/:": (
+        Skip,
+        "Server crashes on 21.9",
+        (
+            lambda test: check_clickhouse_version(">=21.9")(test)
+            and check_clickhouse_version("<21.10")(test)
+        ),
+    ),
+    "tests/:/time decayed funcs": (
+        Skip,
+        "Not implemented before 21.11",
+        check_clickhouse_version("<21.11"),
+    ),
+    "tests/:/non-negative derivative func": (
+        Skip,
+        "Not implemented before 22.6",
+        check_clickhouse_version("<22.6"),
+    ),
+}
 
 
 @TestModule
 @ArgumentParser(argparser)
 @XFails(xfails)
 @XFlags(xflags)
+@FFails(ffails)
 @Name("window functions")
 @Specifications(SRS019_ClickHouse_Window_Functions)
 @Requirements(RQ_SRS_019_ClickHouse_WindowFunctions("1.0"))
-def regression(
-    self, local, clickhouse_binary_path, clickhouse_version=None, stress=None
-):
+def regression(self, local, clickhouse_binary_path, clickhouse_version, stress=None):
     """Window functions regression."""
     nodes = {"clickhouse": ("clickhouse1", "clickhouse2", "clickhouse3")}
 
+    self.context.clickhouse_version = clickhouse_version
+
     if stress is not None:
         self.context.stress = stress
-    self.context.clickhouse_version = clickhouse_version
 
     with Cluster(
         local,
         clickhouse_binary_path,
         nodes=nodes,
-        docker_compose_project_dir=os.path.join(current_dir(), "window_functions_env"),
+        docker_compose_project_dir=os.path.join(
+            current_dir(), os.path.basename(current_dir()) + "_env"
+        ),
     ) as cluster:
         self.context.cluster = cluster
 

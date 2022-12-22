@@ -369,6 +369,253 @@ def uncompressed_cache(self, privilege, grant_target_name, user_name, node=None)
             )
 
 
+@TestSuite
+def mmap_cache_privileges_granted_directly(self, node=None):
+    """Check that a user is able to execute `SYSTEM DROP MMAP CACHE` if and only if
+    they have `SYSTEM DROP MMAP CACHE` privilege granted directly.
+    """
+    user_name = f"user_{getuid()}"
+
+    if node is None:
+        node = self.context.node
+
+    with user(node, f"{user_name}"):
+
+        Suite(
+            run=mmap_cache,
+            examples=Examples(
+                "privilege grant_target_name user_name",
+                [
+                    tuple(list(row) + [user_name, user_name])
+                    for row in mmap_cache.examples
+                ],
+                args=Args(name="check privilege={privilege}", format_name=True),
+            ),
+        )
+
+
+@TestSuite
+def mmap_cache_privileges_granted_via_role(self, node=None):
+    """Check that a user is able to execute `SYSTEM DROP MMAP CACHE` if and only if
+    they have `SYSTEM DROP MMAP CACHE` privilege granted via role.
+    """
+    user_name = f"user_{getuid()}"
+    role_name = f"role_{getuid()}"
+
+    if node is None:
+        node = self.context.node
+
+    with user(node, f"{user_name}"), role(node, f"{role_name}"):
+
+        with When("I grant the role to the user"):
+            node.query(f"GRANT {role_name} TO {user_name}")
+
+        Suite(
+            run=mmap_cache,
+            examples=Examples(
+                "privilege grant_target_name user_name",
+                [
+                    tuple(list(row) + [role_name, user_name])
+                    for row in mmap_cache.examples
+                ],
+                args=Args(name="check privilege={privilege}", format_name=True),
+            ),
+        )
+
+
+@TestOutline(Suite)
+@Requirements(
+    RQ_SRS_006_RBAC_Privileges_System_DropCache_Mmap("1.0"),
+)
+@Examples(
+    "privilege",
+    [
+        ("ALL",),
+        ("SYSTEM",),
+        ("SYSTEM DROP CACHE",),
+        ("SYSTEM DROP MMAP CACHE",),
+        ("DROP CACHE",),
+        ("DROP MMAP CACHE",),
+        ("SYSTEM DROP MMAP",),
+        ("DROP MMAP",),
+    ],
+)
+def mmap_cache(self, privilege, grant_target_name, user_name, node=None):
+    """Run checks for `SYSTEM DROP MMAP CACHE` privilege."""
+    exitcode, message = errors.not_enough_privileges(name=user_name)
+
+    if node is None:
+        node = self.context.node
+
+    with Scenario("SYSTEM DROP MMAP CACHE without privilege"):
+
+        with When("I grant the user NONE privilege"):
+            node.query(f"GRANT NONE TO {grant_target_name}")
+
+        with And("I grant the user USAGE privilege"):
+            node.query(f"GRANT USAGE ON *.* TO {grant_target_name}")
+
+        with Then("I check the user is unable to execute SYSTEM DROP MMAP CACHE"):
+            node.query(
+                "SYSTEM DROP MMAP CACHE",
+                settings=[("user", f"{user_name}")],
+                exitcode=exitcode,
+                message=message,
+            )
+
+    with Scenario("SYSTEM DROP MMAP CACHE with privilege"):
+
+        with When(f"I grant {privilege} on the table"):
+            node.query(f"GRANT {privilege} ON *.* TO {grant_target_name}")
+
+        with Then("I check the user is bale to execute SYSTEM DROP MMAP CACHE"):
+            node.query("SYSTEM DROP MMAP CACHE", settings=[("user", f"{user_name}")])
+
+    with Scenario("SYSTEM DROP MMAP CACHE with revoked privilege"):
+
+        with When(f"I grant {privilege} on the table"):
+            node.query(f"GRANT {privilege} ON *.* TO {grant_target_name}")
+
+        with And(f"I revoke {privilege} on the table"):
+            node.query(f"REVOKE {privilege} ON *.* FROM {grant_target_name}")
+
+        with Then("I check the user is unable to execute SYSTEM DROP MMAP CACHE"):
+            node.query(
+                "SYSTEM DROP MMAP CACHE",
+                settings=[("user", f"{user_name}")],
+                exitcode=exitcode,
+                message=message,
+            )
+
+
+@TestSuite
+def compiled_expression_cache_privileges_granted_directly(self, node=None):
+    """Check that a user is able to execute `SYSTEM DROP COMPILED EXPRESSION CACHE` if and only if
+    they have `SYSTEM DROP COMPILED EXPRESSION CACHE` privilege granted directly.
+    """
+    user_name = f"user_{getuid()}"
+
+    if node is None:
+        node = self.context.node
+
+    with user(node, f"{user_name}"):
+
+        Suite(
+            run=compiled_expression_cache,
+            examples=Examples(
+                "privilege grant_target_name user_name",
+                [
+                    tuple(list(row) + [user_name, user_name])
+                    for row in compiled_expression_cache.examples
+                ],
+                args=Args(name="check privilege={privilege}", format_name=True),
+            ),
+        )
+
+
+@TestSuite
+def compiled_expression_cache_privileges_granted_via_role(self, node=None):
+    """Check that a user is able to execute `SYSTEM DROP COMPILED EXPRESSION CACHE` if and only if
+    they have `SYSTEM DROP COMPILED EXPRESSION CACHE` privilege granted via role.
+    """
+    user_name = f"user_{getuid()}"
+    role_name = f"role_{getuid()}"
+
+    if node is None:
+        node = self.context.node
+
+    with user(node, f"{user_name}"), role(node, f"{role_name}"):
+
+        with When("I grant the role to the user"):
+            node.query(f"GRANT {role_name} TO {user_name}")
+
+        Suite(
+            run=compiled_expression_cache,
+            examples=Examples(
+                "privilege grant_target_name user_name",
+                [
+                    tuple(list(row) + [role_name, user_name])
+                    for row in compiled_expression_cache.examples
+                ],
+                args=Args(name="check privilege={privilege}", format_name=True),
+            ),
+        )
+
+
+@TestOutline(Suite)
+@Requirements(
+    RQ_SRS_006_RBAC_Privileges_System_DropCache_CompiledExpression("1.0"),
+)
+@Examples(
+    "privilege",
+    [
+        ("ALL",),
+        ("SYSTEM",),
+        ("SYSTEM DROP CACHE",),
+        ("SYSTEM DROP COMPILED EXPRESSION CACHE",),
+        ("DROP CACHE",),
+        ("DROP COMPILED EXPRESSION CACHE",),
+        ("SYSTEM DROP COMPILED EXPRESSION",),
+        # ("DROP COMPILED EXPRESSION",),
+    ],
+)
+def compiled_expression_cache(self, privilege, grant_target_name, user_name, node=None):
+    """Run checks for `SYSTEM DROP COMPILED EXPRESSION CACHE` privilege."""
+    exitcode, message = errors.not_enough_privileges(name=user_name)
+
+    if node is None:
+        node = self.context.node
+
+    with Scenario("SYSTEM DROP COMPILED EXPRESSION CACHE without privilege"):
+
+        with When("I grant the user NONE privilege"):
+            node.query(f"GRANT NONE TO {grant_target_name}")
+
+        with And("I grant the user USAGE privilege"):
+            node.query(f"GRANT USAGE ON *.* TO {grant_target_name}")
+
+        with Then(
+            "I check the user is unable to execute SYSTEM DROP COMPILED EXPRESSION CACHE"
+        ):
+            node.query(
+                "SYSTEM DROP COMPILED EXPRESSION CACHE",
+                settings=[("user", f"{user_name}")],
+                exitcode=exitcode,
+                message=message,
+            )
+
+    with Scenario("SYSTEM DROP COMPILED EXPRESSION CACHE with privilege"):
+
+        with When(f"I grant {privilege} on the table"):
+            node.query(f"GRANT {privilege} ON *.* TO {grant_target_name}")
+
+        with Then(
+            "I check the user is bale to execute SYSTEM DROP COMPILED EXPRESSION CACHE"
+        ):
+            node.query(
+                "SYSTEM DROP COMPILED EXPRESSION CACHE",
+                settings=[("user", f"{user_name}")],
+            )
+
+    with Scenario("SYSTEM DROP COMPILED EXPRESSION CACHE with revoked privilege"):
+
+        with When(f"I grant {privilege} on the table"):
+            node.query(f"GRANT {privilege} ON *.* TO {grant_target_name}")
+
+        with And(f"I revoke {privilege} on the table"):
+            node.query(f"REVOKE {privilege} ON *.* FROM {grant_target_name}")
+
+        with Then(
+            "I check the user is unable to execute SYSTEM DROP COMPILED EXPRESSION CACHE"
+        ):
+            node.query(
+                "SYSTEM DROP COMPILED EXPRESSION CACHE",
+                settings=[("user", f"{user_name}")],
+                exitcode=exitcode,
+                message=message,
+            )
+
+
 @TestFeature
 @Name("system drop cache")
 @Requirements(
@@ -402,5 +649,21 @@ def feature(self, node="clickhouse1"):
     )
     Suite(
         run=uncompressed_cache_privileges_granted_via_role,
+        setup=instrument_clickhouse_server_log,
+    )
+    Suite(
+        run=mmap_cache_privileges_granted_directly,
+        setup=instrument_clickhouse_server_log,
+    )
+    Suite(
+        run=mmap_cache_privileges_granted_via_role,
+        setup=instrument_clickhouse_server_log,
+    )
+    Suite(
+        run=compiled_expression_cache_privileges_granted_directly,
+        setup=instrument_clickhouse_server_log,
+    )
+    Suite(
+        run=compiled_expression_cache_privileges_granted_via_role,
         setup=instrument_clickhouse_server_log,
     )

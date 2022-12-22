@@ -14,6 +14,7 @@ from testflows.asserts import error
 from testflows.connect import Shell as ShellBase
 from testflows.uexpect import ExpectTimeoutError
 from testflows._core.testtype import TestSubType
+from helpers.common import check_clickhouse_version, current_cpu
 
 MESSAGES_TO_RETRY = [
     "DB::Exception: ZooKeeper session has been expired",
@@ -72,7 +73,7 @@ class Node(object):
         """Close all active bashes to the node."""
         with self.cluster.lock:
             for key in list(self.cluster._bash.keys()):
-                if key.endswith(f"-{self.name}"):
+                if key[1].endswith(f"{self.name}"):
                     shell = self.cluster._bash.pop(key)
                     shell.__exit__(None, None, None)
 
@@ -169,8 +170,8 @@ class Node(object):
 class ClickHouseNode(Node):
     """Node with ClickHouse server."""
 
-    def thread_fuzzer(self):
-        with Given("exporting THREAD_FUZZER"):
+    def enable_thread_fuzzer(self):
+        with Given("enabling THREAD_FUZZER"):
             self.command("export THREAD_FUZZER_CPU_TIME_PERIOD_US=1000")
             self.command("export THREAD_FUZZER_SLEEP_PROBABILITY=0.1")
             self.command("export THREAD_FUZZER_SLEEP_TIME_US=100000")
@@ -230,7 +231,7 @@ class ClickHouseNode(Node):
             if current().context.clickhouse_version is None:
                 current().context.clickhouse_version = node_version
             else:
-                assert current().context.clickhouse_version == node_version, error()
+                assert check_clickhouse_version(f"={node_version}")(current()), error()
 
     def clickhouse_pid(self):
         """Return ClickHouse server pid if present
@@ -283,7 +284,7 @@ class ClickHouseNode(Node):
             raise RuntimeError(f"ClickHouse server already running with pid {pid}")
 
         if thread_fuzzer:
-            self.thread_fuzzer()
+            self.enable_thread_fuzzer()
 
         if user is None:
             with By("starting ClickHouse server process"):
@@ -521,6 +522,7 @@ class ClickHouseNode(Node):
         messages_to_retry=None,
         retry_delay=5,
         secure=False,
+        max_query_output_in_bytes="-0",
         *args,
         **kwargs,
     ):
@@ -537,11 +539,15 @@ class ClickHouseNode(Node):
                which retry should be triggered, default: MESSAGES_TO_RETRY
         :param retry_delay: number of seconds to sleep before retry, default: 5
         :param secure: use secure connection, default: False
+        :param max_query_output_in_bytes: truncate query output the specified number of bytes using 'head' command utility, default: -0 (do not truncate any output)
         """
         retry_count = max(0, int(retry_count))
         retry_delay = max(0, float(retry_delay))
         settings = list(settings or [])
         query_settings = list(settings)
+
+        if raise_on_exception:
+            steps = False
 
         if messages_to_retry is None:
             messages_to_retry = MESSAGES_TO_RETRY
@@ -557,10 +563,14 @@ class ClickHouseNode(Node):
             with tempfile.NamedTemporaryFile("w", encoding="utf-8") as query:
                 query.write(sql)
                 query.flush()
-                command = f'cat "{query.name}" | {self.cluster.docker_compose} exec -T {self.name} {client}'
+
+                client_options = ""
                 for setting in query_settings:
                     name, value = setting
-                    command += f' --{name} "{value}"'
+                    client_options += f' --{name} "{value}"'
+
+                command = f'cat "{query.name}" | {self.cluster.docker_compose} exec -T {self.name} bash -c "(set -o pipefail && {client}{client_options} 2>&1 | head -c {max_query_output_in_bytes})"'
+
                 description = f"""
                     echo -e \"{sql[:100]}...\" > {query.name}
                     {command}
@@ -576,10 +586,13 @@ class ClickHouseNode(Node):
                         self.cluster.close_bash(None)
                         raise
         else:
-            command = f'echo -e "{sql}" | {client}'
+            client_options = ""
             for setting in query_settings:
                 name, value = setting
-                command += f' --{name} "{value}"'
+                client_options += f' --{name} "{value}"'
+
+            command = f'(set -o pipefail && echo -e "{sql}" | {client}{client_options} 2>&1 | head -c {max_query_output_in_bytes})'
+
             with step(
                 "executing command", description=command, format_description=False
             ) if steps else NullStep():
@@ -644,6 +657,7 @@ class Cluster(object):
         docker_compose_project_dir=None,
         docker_compose_file="docker-compose.yml",
         environ=None,
+        thread_fuzzer=False,
     ):
 
         self._bash = {}
@@ -655,6 +669,8 @@ class Cluster(object):
         self.local = local
         self.nodes = nodes or {}
         self.docker_compose = docker_compose
+        self.thread_fuzzer = thread_fuzzer
+        self.running = False
 
         frame = inspect.currentframe().f_back
         caller_dir = os.path.dirname(os.path.abspath(frame.f_globals["__file__"]))
@@ -668,11 +684,20 @@ class Cluster(object):
         if not os.path.exists(self.configs_dir):
             raise TypeError(f"configs directory '{self.configs_dir}' does not exist")
 
-        if docker_compose_project_dir is None:
+        if not docker_compose_project_dir:
             raise TypeError("docker compose directory must be specified.")
 
+        if current_cpu() == "aarch64":
+            if not docker_compose_project_dir.endswith("_arm64"):
+                docker_compose_project_dir += f"_arm64"
+
+        if not os.path.exists(docker_compose_project_dir):
+            raise TypeError(
+                f"docker compose project directory '{docker_compose_project_dir}' does not exist"
+            )
+
         docker_compose_file_path = os.path.join(
-            docker_compose_project_dir or "", docker_compose_file
+            docker_compose_project_dir, docker_compose_file
         )
 
         if not os.path.exists(docker_compose_file_path):
@@ -680,25 +705,28 @@ class Cluster(object):
                 f"docker compose file '{docker_compose_file_path}' does not exist"
             )
 
-        if self.clickhouse_binary_path and self.clickhouse_binary_path.startswith(
-            "docker://"
-        ):
-            if current().context.clickhouse_version is None:
-                try:
-                    current().context.clickhouse_version = (
-                        self.clickhouse_binary_path.split(":")[2]
-                    )
-                    debug(
-                        f"auto setting clickhouse version to {current().context.clickhouse_version}"
-                    )
-                except IndexError:
-                    current().context.clickhouse_version = None
-            (
-                self.clickhouse_binary_path,
-                self.clickhouse_odbc_bridge_binary_path,
-            ) = self.get_clickhouse_binary_from_docker_container(
-                self.clickhouse_binary_path
-            )
+        if self.clickhouse_binary_path:
+            if self.clickhouse_binary_path.startswith("docker://"):
+                if current().context.clickhouse_version is None:
+                    parsed_version = ""
+                    for c in self.clickhouse_binary_path.rsplit(":", 1)[-1]:
+                        if c in ".0123456789":
+                            parsed_version += c
+                        else:
+                            break
+                    if parsed_version:
+                        if not (
+                            parsed_version.startswith(".")
+                            or parsed_version.endswith(".")
+                        ):
+                            current().context.clickhouse_version = parsed_version
+
+                (
+                    self.clickhouse_binary_path,
+                    self.clickhouse_odbc_bridge_binary_path,
+                ) = self.get_clickhouse_binary_from_docker_container(
+                    self.clickhouse_binary_path
+                )
 
         self.docker_compose += f' --ansi never --project-directory "{docker_compose_project_dir}" --file "{docker_compose_file_path}"'
         self.lock = threading.Lock()
@@ -754,18 +782,21 @@ class Cluster(object):
             return self._control_shell
 
         time_start = time.time()
+        i = -1
         while True:
-            try:
-                shell = Shell()
-                shell.timeout = 30
-                shell("echo 1")
-                break
-            except IOError:
-                raise
-            except Exception as exc:
-                shell.__exit__(None, None, None)
-                if time.time() - time_start > timeout:
-                    raise RuntimeError(f"failed to open control shell")
+            i += 1
+            with By(f"attempt #{i}"):
+                try:
+                    shell = Shell()
+                    shell.timeout = 30
+                    shell("echo 1")
+                    break
+                except IOError:
+                    raise
+                except Exception as exc:
+                    shell.__exit__(None, None, None)
+                    if time.time() - time_start > timeout:
+                        raise RuntimeError(f"failed to open control shell")
         self._control_shell = shell
         return self._control_shell
 
@@ -781,23 +812,26 @@ class Cluster(object):
         """Must be called with self.lock acquired."""
         container_id = None
         time_start = time.time()
+        i = -1
         while True:
-            try:
-                c = self.control_shell(
-                    f"{self.docker_compose} ps -q {node}", timeout=timeout
-                )
-                container_id = c.output.strip()
-                if c.exitcode == 0 and len(container_id) > 1:
-                    break
-            except IOError:
-                raise
-            except ExpectTimeoutError:
-                self.close_control_shell()
-                timeout = timeout - (time.time() - time_start)
-                if timeout <= 0:
-                    raise RuntimeError(
-                        f"failed to get docker container id for the {node} service"
+            i += 1
+            with By(f"attempt #{i}"):
+                try:
+                    c = self.control_shell(
+                        f"{self.docker_compose} ps -q {node}", timeout=timeout
                     )
+                    container_id = c.output.strip()
+                    if c.exitcode == 0 and len(container_id) > 1:
+                        break
+                except IOError:
+                    raise
+                except ExpectTimeoutError:
+                    self.close_control_shell()
+                    timeout = timeout - (time.time() - time_start)
+                    if timeout <= 0:
+                        raise RuntimeError(
+                            f"failed to get docker container id for the {node} service"
+                        )
         return container_id
 
     def shell(self, node, timeout=300):
@@ -809,29 +843,32 @@ class Cluster(object):
                 container_id = self.node_container_id(node=node, timeout=timeout)
 
         time_start = time.time()
+        i = -1
         while True:
-            try:
-                if node is None:
-                    shell = Shell()
-                else:
-                    shell = Shell(
-                        command=[
-                            "/bin/bash",
-                            "--noediting",
-                            "-c",
-                            f"docker exec -it {container_id} bash --noediting",
-                        ],
-                        name=node,
-                    )
-                shell.timeout = 30
-                shell("echo 1")
-                break
-            except IOError:
-                raise
-            except Exception as exc:
-                shell.__exit__(None, None, None)
-                if time.time() - time_start > timeout:
-                    raise RuntimeError(f"failed to open bash to node {node}")
+            i += 1
+            with By(f"attempt #{i}"):
+                try:
+                    if node is None:
+                        shell = Shell()
+                    else:
+                        shell = Shell(
+                            command=[
+                                "/bin/bash",
+                                "--noediting",
+                                "-c",
+                                f"docker exec -it {container_id} bash --noediting",
+                            ],
+                            name=node,
+                        )
+                    shell.timeout = 30
+                    shell("echo 1")
+                    break
+                except IOError:
+                    raise
+                except Exception as exc:
+                    shell.__exit__(None, None, None)
+                    if time.time() - time_start > timeout:
+                        raise RuntimeError(f"failed to open bash to node {node}")
 
         shell.timeout = timeout
         return shell
@@ -844,7 +881,7 @@ class Cluster(object):
         test = current()
 
         current_thread = threading.current_thread()
-        id = f"{current_thread.name}-{node}"
+        id = (current_thread.name, f"{node}")
 
         with self.lock:
             if self._bash.get(id) is None:
@@ -852,29 +889,34 @@ class Cluster(object):
                     container_id = self.node_container_id(node=node, timeout=timeout)
 
                 time_start = time.time()
+                i = -1
                 while True:
-                    try:
-                        if node is None:
-                            self._bash[id] = Shell()
-                        else:
-                            self._bash[id] = Shell(
-                                command=[
-                                    "/bin/bash",
-                                    "--noediting",
-                                    "-c",
-                                    f"docker exec -it {container_id} {command}",
-                                ],
-                                name=node,
-                            ).__enter__()
-                        self._bash[id].timeout = 30
-                        self._bash[id]("echo 1")
-                        break
-                    except IOError:
-                        raise
-                    except Exception as exc:
-                        self._bash[id].__exit__(None, None, None)
-                        if time.time() - time_start > timeout:
-                            raise RuntimeError(f"failed to open bash to node {node}")
+                    i += 1
+                    with By(f"attempt #{i}"):
+                        try:
+                            if node is None:
+                                self._bash[id] = Shell()
+                            else:
+                                self._bash[id] = Shell(
+                                    command=[
+                                        "/bin/bash",
+                                        "--noediting",
+                                        "-c",
+                                        f"docker exec -it {container_id} {command}",
+                                    ],
+                                    name=node,
+                                ).__enter__()
+                            self._bash[id].timeout = 30
+                            self._bash[id]("echo 1")
+                            break
+                        except IOError:
+                            raise
+                        except Exception as exc:
+                            self._bash[id].__exit__(None, None, None)
+                            if time.time() - time_start > timeout:
+                                raise RuntimeError(
+                                    f"failed to open bash to node {node}"
+                                )
 
                 if node is None:
                     for name, value in self.environ.items():
@@ -886,7 +928,7 @@ class Cluster(object):
                 active_thread_names = {thread.name for thread in threading.enumerate()}
 
                 for bash_id in list(self._bash.keys()):
-                    thread_name, node_name = bash_id.rsplit("-", 1)
+                    thread_name, node_name = bash_id
                     if thread_name not in active_thread_names:
                         self._bash[bash_id].__exit__(None, None, None)
                         del self._bash[bash_id]
@@ -895,7 +937,7 @@ class Cluster(object):
 
     def close_bash(self, node):
         current_thread = threading.current_thread()
-        id = f"{current_thread.name}-{node}"
+        id = (current_thread.name, f"{node}")
 
         with self.lock:
             if self._bash.get(id) is None:
@@ -929,7 +971,7 @@ class Cluster(object):
         """Bring cluster down by executing docker-compose down."""
 
         # add message to each clickhouse-server.log
-        if settings.debug:
+        if settings.debug and self.running:
             for node in self.nodes["clickhouse"]:
                 self.command(
                     node=node,
@@ -970,6 +1012,7 @@ class Cluster(object):
         return f"{os.path.join(self.temp_path(), name)}"
 
     def up(self, timeout=30 * 60):
+        """Bring cluster up."""
         if self.local:
             with Given("I am running in local mode"):
                 with Then("check --clickhouse-binary-path is specified"):
@@ -980,6 +1023,9 @@ class Cluster(object):
                     assert os.path.exists(self.clickhouse_binary_path)
 
             with And("I set all the necessary environment variables"):
+                self.environ["IMAGE_DEPENDENCY_PROXY"] = os.getenv(
+                    "IMAGE_DEPENDENCY_PROXY", ""
+                )
                 self.environ["COMPOSE_HTTP_TIMEOUT"] = "300"
                 self.environ[
                     "CLICKHOUSE_TESTS_SERVER_BIN_PATH"
@@ -1064,7 +1110,9 @@ class Cluster(object):
             for name in self.nodes["clickhouse"]:
                 self.node(name).wait_healthy()
                 if name.startswith("clickhouse"):
-                    self.node(name).start_clickhouse()
+                    self.node(name).start_clickhouse(thread_fuzzer=self.thread_fuzzer)
+
+        self.running = True
 
     def command(
         self,

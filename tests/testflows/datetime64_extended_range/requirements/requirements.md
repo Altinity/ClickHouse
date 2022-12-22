@@ -1,5 +1,23 @@
-# SRS-010 ClickHouse DateTime64 Extended Range
+# QA-SRS010 ClickHouse DateTime64 Extended Range
 # Software Requirements Specification
+
+(c) 2020 Altinity LTD. All Rights Reserved.
+
+**Document status:** Confidential
+
+**Author:** vzakaznikov, zvonand
+
+**Date:** August 10, 2020
+
+## Approval
+
+**Status:** -
+
+**Version:** -
+
+**Approved by:** -
+
+**Date:** -
 
 ## Table of Contents
 
@@ -22,98 +40,101 @@
       * 4.1.0.9 [RQ.SRS-010.DateTime64.ExtendedRange.NonExistentTime](#rqsrs-010datetime64extendedrangenonexistenttime)
       * 4.1.0.10 [RQ.SRS-010.DateTime64.ExtendedRange.Comparison](#rqsrs-010datetime64extendedrangecomparison)
       * 4.1.0.11 [RQ.SRS-010.DateTime64.ExtendedRange.SpecificTimestamps](#rqsrs-010datetime64extendedrangespecifictimestamps)
+      * 4.1.0.12 [RQ.SRS-010.DateTime64.ExtendedRange.Transform](#rqsrs-010datetime64extendedrangetransform)
   * 4.2 [Specific](#specific)
-      * 4.2.0.1 [RQ.SRS-010.DateTime64.ExtendedRange.Start](#rqsrs-010datetime64extendedrangestart)
-      * 4.2.0.2 [RQ.SRS-010.DateTime64.ExtendedRange.End](#rqsrs-010datetime64extendedrangeend)
-      * 4.2.0.3 [Non-Existent Time](#non-existent-time)
-        * 4.2.0.3.1 [RQ.SRS-010.DateTime64.ExtendedRange.NonExistentTime.InvalidDate](#rqsrs-010datetime64extendedrangenonexistenttimeinvaliddate)
-        * 4.2.0.3.2 [RQ.SRS-010.DateTime64.ExtendedRange.NonExistentTime.InvalidTime](#rqsrs-010datetime64extendedrangenonexistenttimeinvalidtime)
-        * 4.2.0.3.3 [RQ.SRS-010.DateTime64.ExtendedRange.NonExistentTime.TimeZoneSwitch](#rqsrs-010datetime64extendedrangenonexistenttimetimezoneswitch)
-        * 4.2.0.3.4 [RQ.SRS-010.DateTime64.ExtendedRange.NonExistentTime.DaylightSavingTime](#rqsrs-010datetime64extendedrangenonexistenttimedaylightsavingtime)
-        * 4.2.0.3.5 [RQ.SRS-010.DateTime64.ExtendedRange.NonExistentTime.DaylightSavingTime.Disappeared](#rqsrs-010datetime64extendedrangenonexistenttimedaylightsavingtimedisappeared)
-        * 4.2.0.3.6 [RQ.SRS-010.DateTime64.ExtendedRange.NonExistentTime.LeapSeconds](#rqsrs-010datetime64extendedrangenonexistenttimeleapseconds)
-      * 4.2.0.4 [Dates And Times Functions](#dates-and-times-functions)
-        * 4.2.0.4.1 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toTimeZone](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstotimezone)
-        * 4.2.0.4.2 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toYear](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstoyear)
-        * 4.2.0.4.3 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toQuarter](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstoquarter)
-        * 4.2.0.4.4 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toMonth](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstomonth)
-        * 4.2.0.4.5 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toDayOfYear](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstodayofyear)
-        * 4.2.0.4.6 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toDayOfMonth](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstodayofmonth)
-        * 4.2.0.4.7 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toDayOfWeek](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstodayofweek)
-        * 4.2.0.4.8 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toHour](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstohour)
-        * 4.2.0.4.9 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toMinute](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstominute)
-        * 4.2.0.4.10 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toSecond](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstosecond)
-        * 4.2.0.4.11 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toUnixTimestamp](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstounixtimestamp)
-        * 4.2.0.4.12 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfYear](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartofyear)
-        * 4.2.0.4.13 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfISOYear](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartofisoyear)
-        * 4.2.0.4.14 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfQuarter](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartofquarter)
-        * 4.2.0.4.15 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfMonth](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartofmonth)
-        * 4.2.0.4.16 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toMonday](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstomonday)
-        * 4.2.0.4.17 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfWeek](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartofweek)
-        * 4.2.0.4.18 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfDay](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartofday)
-        * 4.2.0.4.19 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfHour](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartofhour)
-        * 4.2.0.4.20 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfMinute](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartofminute)
-        * 4.2.0.4.21 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfSecond](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartofsecond)
-        * 4.2.0.4.22 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfFiveMinute](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartoffiveminute)
-        * 4.2.0.4.23 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfTenMinutes](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartoftenminutes)
-        * 4.2.0.4.24 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfFifteenMinutes](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartoffifteenminutes)
-        * 4.2.0.4.25 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfInterval](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartofinterval)
-        * 4.2.0.4.26 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toTime](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstotime)
-        * 4.2.0.4.27 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toRelativeYearNum](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstorelativeyearnum)
-        * 4.2.0.4.28 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toRelativeQuarterNum](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstorelativequarternum)
-        * 4.2.0.4.29 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toRelativeMonthNum](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstorelativemonthnum)
-        * 4.2.0.4.30 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toRelativeWeekNum](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstorelativeweeknum)
-        * 4.2.0.4.31 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toRelativeDayNum](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstorelativedaynum)
-        * 4.2.0.4.32 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toRelativeHourNum](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstorelativehournum)
-        * 4.2.0.4.33 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toRelativeMinuteNum](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstorelativeminutenum)
-        * 4.2.0.4.34 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toRelativeSecondNum](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstorelativesecondnum)
-        * 4.2.0.4.35 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toISOYear](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstoisoyear)
-        * 4.2.0.4.36 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toISOWeek](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstoisoweek)
-        * 4.2.0.4.37 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toWeek](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstoweek)
-        * 4.2.0.4.38 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toYearWeek](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstoyearweek)
-        * 4.2.0.4.39 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.now](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsnow)
-        * 4.2.0.4.40 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.today](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstoday)
-        * 4.2.0.4.41 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.yesterday](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsyesterday)
-        * 4.2.0.4.42 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.timeSlot](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstimeslot)
-        * 4.2.0.4.43 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toYYYYMM](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstoyyyymm)
-        * 4.2.0.4.44 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toYYYYMMDD](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstoyyyymmdd)
-        * 4.2.0.4.45 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toYYYYMMDDhhmmss](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstoyyyymmddhhmmss)
-        * 4.2.0.4.46 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.addYears](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsaddyears)
-        * 4.2.0.4.47 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.addMonths](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsaddmonths)
-        * 4.2.0.4.48 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.addWeeks](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsaddweeks)
-        * 4.2.0.4.49 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.addDays](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsadddays)
-        * 4.2.0.4.50 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.addHours](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsaddhours)
-        * 4.2.0.4.51 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.addMinutes](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsaddminutes)
-        * 4.2.0.4.52 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.addSeconds](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsaddseconds)
-        * 4.2.0.4.53 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.addQuarters](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsaddquarters)
-        * 4.2.0.4.54 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.subtractYears](#rqsrs-010datetime64extendedrangedatesandtimesfunctionssubtractyears)
-        * 4.2.0.4.55 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.subtractMonths](#rqsrs-010datetime64extendedrangedatesandtimesfunctionssubtractmonths)
-        * 4.2.0.4.56 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.subtractWeeks](#rqsrs-010datetime64extendedrangedatesandtimesfunctionssubtractweeks)
-        * 4.2.0.4.57 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.subtractDays](#rqsrs-010datetime64extendedrangedatesandtimesfunctionssubtractdays)
-        * 4.2.0.4.58 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.subtractHours](#rqsrs-010datetime64extendedrangedatesandtimesfunctionssubtracthours)
-        * 4.2.0.4.59 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.subtractMinutes](#rqsrs-010datetime64extendedrangedatesandtimesfunctionssubtractminutes)
-        * 4.2.0.4.60 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.subtractSeconds](#rqsrs-010datetime64extendedrangedatesandtimesfunctionssubtractseconds)
-        * 4.2.0.4.61 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.subtractQuarters](#rqsrs-010datetime64extendedrangedatesandtimesfunctionssubtractquarters)
-        * 4.2.0.4.62 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.dateDiff](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsdatediff)
-        * 4.2.0.4.63 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.timeSlots](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstimeslots)
-        * 4.2.0.4.64 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.formatDateTime](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsformatdatetime)
+      * 4.2.0.1 [RQ.SRS-010.DateTime64.ExtendedRange.ArrowFormat](#rqsrs-010datetime64extendedrangearrowformat)
+      * 4.2.0.2 [RQ.SRS-010.DateTime64.ExtendedRange.Start](#rqsrs-010datetime64extendedrangestart)
+      * 4.2.0.3 [RQ.SRS-010.DateTime64.ExtendedRange.End](#rqsrs-010datetime64extendedrangeend)
+      * 4.2.0.4 [Non-Existent Time](#non-existent-time)
+        * 4.2.0.4.1 [RQ.SRS-010.DateTime64.ExtendedRange.NonExistentTime.InvalidDate](#rqsrs-010datetime64extendedrangenonexistenttimeinvaliddate)
+        * 4.2.0.4.2 [RQ.SRS-010.DateTime64.ExtendedRange.NonExistentTime.InvalidTime](#rqsrs-010datetime64extendedrangenonexistenttimeinvalidtime)
+        * 4.2.0.4.3 [RQ.SRS-010.DateTime64.ExtendedRange.NonExistentTime.TimeZoneSwitch](#rqsrs-010datetime64extendedrangenonexistenttimetimezoneswitch)
+        * 4.2.0.4.4 [RQ.SRS-010.DateTime64.ExtendedRange.NonExistentTime.DaylightSavingTime](#rqsrs-010datetime64extendedrangenonexistenttimedaylightsavingtime)
+        * 4.2.0.4.5 [RQ.SRS-010.DateTime64.ExtendedRange.NonExistentTime.DaylightSavingTime.Disappeared](#rqsrs-010datetime64extendedrangenonexistenttimedaylightsavingtimedisappeared)
+        * 4.2.0.4.6 [RQ.SRS-010.DateTime64.ExtendedRange.NonExistentTime.LeapSeconds](#rqsrs-010datetime64extendedrangenonexistenttimeleapseconds)
+      * 4.2.0.5 [Dates And Times Functions](#dates-and-times-functions)
+        * 4.2.0.5.1 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toTimeZone](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstotimezone)
+        * 4.2.0.5.2 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toYear](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstoyear)
+        * 4.2.0.5.3 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toQuarter](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstoquarter)
+        * 4.2.0.5.4 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toMonth](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstomonth)
+        * 4.2.0.5.5 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toDayOfYear](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstodayofyear)
+        * 4.2.0.5.6 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toDayOfMonth](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstodayofmonth)
+        * 4.2.0.5.7 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toDayOfWeek](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstodayofweek)
+        * 4.2.0.5.8 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toHour](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstohour)
+        * 4.2.0.5.9 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toMinute](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstominute)
+        * 4.2.0.5.10 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toSecond](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstosecond)
+        * 4.2.0.5.11 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toUnixTimestamp](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstounixtimestamp)
+        * 4.2.0.5.12 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfYear](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartofyear)
+        * 4.2.0.5.13 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfISOYear](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartofisoyear)
+        * 4.2.0.5.14 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfQuarter](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartofquarter)
+        * 4.2.0.5.15 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfMonth](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartofmonth)
+        * 4.2.0.5.16 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toMonday](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstomonday)
+        * 4.2.0.5.17 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfWeek](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartofweek)
+        * 4.2.0.5.18 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfDay](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartofday)
+        * 4.2.0.5.19 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfHour](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartofhour)
+        * 4.2.0.5.20 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfMinute](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartofminute)
+        * 4.2.0.5.21 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfSecond](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartofsecond)
+        * 4.2.0.5.22 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfFiveMinute](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartoffiveminute)
+        * 4.2.0.5.23 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfTenMinutes](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartoftenminutes)
+        * 4.2.0.5.24 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfFifteenMinutes](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartoffifteenminutes)
+        * 4.2.0.5.25 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toStartOfInterval](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstostartofinterval)
+        * 4.2.0.5.26 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toTime](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstotime)
+        * 4.2.0.5.27 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toRelativeYearNum](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstorelativeyearnum)
+        * 4.2.0.5.28 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toRelativeQuarterNum](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstorelativequarternum)
+        * 4.2.0.5.29 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toRelativeMonthNum](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstorelativemonthnum)
+        * 4.2.0.5.30 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toRelativeWeekNum](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstorelativeweeknum)
+        * 4.2.0.5.31 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toRelativeDayNum](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstorelativedaynum)
+        * 4.2.0.5.32 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toRelativeHourNum](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstorelativehournum)
+        * 4.2.0.5.33 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toRelativeMinuteNum](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstorelativeminutenum)
+        * 4.2.0.5.34 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toRelativeSecondNum](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstorelativesecondnum)
+        * 4.2.0.5.35 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toISOYear](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstoisoyear)
+        * 4.2.0.5.36 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toISOWeek](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstoisoweek)
+        * 4.2.0.5.37 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toWeek](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstoweek)
+        * 4.2.0.5.38 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toYearWeek](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstoyearweek)
+        * 4.2.0.5.39 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.now](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsnow)
+        * 4.2.0.5.40 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.today](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstoday)
+        * 4.2.0.5.41 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.yesterday](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsyesterday)
+        * 4.2.0.5.42 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.timeSlot](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstimeslot)
+        * 4.2.0.5.43 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toYYYYMM](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstoyyyymm)
+        * 4.2.0.5.44 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toYYYYMMDD](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstoyyyymmdd)
+        * 4.2.0.5.45 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.toYYYYMMDDhhmmss](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstoyyyymmddhhmmss)
+        * 4.2.0.5.46 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.addYears](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsaddyears)
+        * 4.2.0.5.47 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.addMonths](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsaddmonths)
+        * 4.2.0.5.48 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.addWeeks](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsaddweeks)
+        * 4.2.0.5.49 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.addDays](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsadddays)
+        * 4.2.0.5.50 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.addHours](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsaddhours)
+        * 4.2.0.5.51 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.addMinutes](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsaddminutes)
+        * 4.2.0.5.52 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.addSeconds](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsaddseconds)
+        * 4.2.0.5.53 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.addQuarters](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsaddquarters)
+        * 4.2.0.5.54 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.subtractYears](#rqsrs-010datetime64extendedrangedatesandtimesfunctionssubtractyears)
+        * 4.2.0.5.55 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.subtractMonths](#rqsrs-010datetime64extendedrangedatesandtimesfunctionssubtractmonths)
+        * 4.2.0.5.56 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.subtractWeeks](#rqsrs-010datetime64extendedrangedatesandtimesfunctionssubtractweeks)
+        * 4.2.0.5.57 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.subtractDays](#rqsrs-010datetime64extendedrangedatesandtimesfunctionssubtractdays)
+        * 4.2.0.5.58 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.subtractHours](#rqsrs-010datetime64extendedrangedatesandtimesfunctionssubtracthours)
+        * 4.2.0.5.59 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.subtractMinutes](#rqsrs-010datetime64extendedrangedatesandtimesfunctionssubtractminutes)
+        * 4.2.0.5.60 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.subtractSeconds](#rqsrs-010datetime64extendedrangedatesandtimesfunctionssubtractseconds)
+        * 4.2.0.5.61 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.subtractQuarters](#rqsrs-010datetime64extendedrangedatesandtimesfunctionssubtractquarters)
+        * 4.2.0.5.62 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.dateDiff](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsdatediff)
+        * 4.2.0.5.63 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.timeSlots](#rqsrs-010datetime64extendedrangedatesandtimesfunctionstimeslots)
+        * 4.2.0.5.64 [RQ.SRS-010.DateTime64.ExtendedRange.DatesAndTimesFunctions.formatDateTime](#rqsrs-010datetime64extendedrangedatesandtimesfunctionsformatdatetime)
     * 4.2.1 [Type Conversion Functions](#type-conversion-functions)
-        * 4.2.1.4.1 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toInt(8|16|32|64|128|256)](#rqsrs-010datetime64extendedrangetypeconversionfunctionstoint8163264128256)
-        * 4.2.1.4.2 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toUInt(8|16|32|64|256)](#rqsrs-010datetime64extendedrangetypeconversionfunctionstouint8163264256)
-        * 4.2.1.4.3 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toFloat(32|64)](#rqsrs-010datetime64extendedrangetypeconversionfunctionstofloat3264)
-        * 4.2.1.4.4 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toDate](#rqsrs-010datetime64extendedrangetypeconversionfunctionstodate)
-        * 4.2.1.4.5 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toDateTime](#rqsrs-010datetime64extendedrangetypeconversionfunctionstodatetime)
-        * 4.2.1.4.6 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toDateTime64](#rqsrs-010datetime64extendedrangetypeconversionfunctionstodatetime64)
-        * 4.2.1.4.7 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toDateTime64.FromString.MissingTime](#rqsrs-010datetime64extendedrangetypeconversionfunctionstodatetime64fromstringmissingtime)
-        * 4.2.1.4.8 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toDecimal(32|64|128|256)](#rqsrs-010datetime64extendedrangetypeconversionfunctionstodecimal3264128256)
-        * 4.2.1.4.9 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toString](#rqsrs-010datetime64extendedrangetypeconversionfunctionstostring)
-        * 4.2.1.4.10 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.CAST(x,T)](#rqsrs-010datetime64extendedrangetypeconversionfunctionscastxt)
-        * 4.2.1.4.11 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toUnixTimestamp64Milli](#rqsrs-010datetime64extendedrangetypeconversionfunctionstounixtimestamp64milli)
-        * 4.2.1.4.12 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toUnixTimestamp64Micro](#rqsrs-010datetime64extendedrangetypeconversionfunctionstounixtimestamp64micro)
-        * 4.2.1.4.13 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toUnixTimestamp64Nano](#rqsrs-010datetime64extendedrangetypeconversionfunctionstounixtimestamp64nano)
-        * 4.2.1.4.14 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.fromUnixTimestamp64Milli](#rqsrs-010datetime64extendedrangetypeconversionfunctionsfromunixtimestamp64milli)
-        * 4.2.1.4.15 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.fromUnixTimestamp64Micro](#rqsrs-010datetime64extendedrangetypeconversionfunctionsfromunixtimestamp64micro)
-        * 4.2.1.4.16 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.fromUnixTimestamp64Nano](#rqsrs-010datetime64extendedrangetypeconversionfunctionsfromunixtimestamp64nano)
+        * 4.2.1.5.1 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toInt(8|16|32|64|128|256)](#rqsrs-010datetime64extendedrangetypeconversionfunctionstoint8163264128256)
+        * 4.2.1.5.2 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toUInt(8|16|32|64|256)](#rqsrs-010datetime64extendedrangetypeconversionfunctionstouint8163264256)
+        * 4.2.1.5.3 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toFloat(32|64)](#rqsrs-010datetime64extendedrangetypeconversionfunctionstofloat3264)
+        * 4.2.1.5.4 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toDate](#rqsrs-010datetime64extendedrangetypeconversionfunctionstodate)
+        * 4.2.1.5.5 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toDate32](#rqsrs-010datetime64extendedrangetypeconversionfunctionstodate32)
+        * 4.2.1.5.6 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toDateTime](#rqsrs-010datetime64extendedrangetypeconversionfunctionstodatetime)
+        * 4.2.1.5.7 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toDateTime64](#rqsrs-010datetime64extendedrangetypeconversionfunctionstodatetime64)
+        * 4.2.1.5.8 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toDateTime64.FromString.MissingTime](#rqsrs-010datetime64extendedrangetypeconversionfunctionstodatetime64fromstringmissingtime)
+        * 4.2.1.5.9 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toDecimal(32|64|128|256)](#rqsrs-010datetime64extendedrangetypeconversionfunctionstodecimal3264128256)
+        * 4.2.1.5.10 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toString](#rqsrs-010datetime64extendedrangetypeconversionfunctionstostring)
+        * 4.2.1.5.11 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.CAST(x,T)](#rqsrs-010datetime64extendedrangetypeconversionfunctionscastxt)
+        * 4.2.1.5.12 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toUnixTimestamp64Milli](#rqsrs-010datetime64extendedrangetypeconversionfunctionstounixtimestamp64milli)
+        * 4.2.1.5.13 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toUnixTimestamp64Micro](#rqsrs-010datetime64extendedrangetypeconversionfunctionstounixtimestamp64micro)
+        * 4.2.1.5.14 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toUnixTimestamp64Nano](#rqsrs-010datetime64extendedrangetypeconversionfunctionstounixtimestamp64nano)
+        * 4.2.1.5.15 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.fromUnixTimestamp64Milli](#rqsrs-010datetime64extendedrangetypeconversionfunctionsfromunixtimestamp64milli)
+        * 4.2.1.5.16 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.fromUnixTimestamp64Micro](#rqsrs-010datetime64extendedrangetypeconversionfunctionsfromunixtimestamp64micro)
+        * 4.2.1.5.17 [RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.fromUnixTimestamp64Nano](#rqsrs-010datetime64extendedrangetypeconversionfunctionsfromunixtimestamp64nano)
 * 5 [References](#references)
 
 ## Revision History
@@ -210,8 +231,19 @@ version: 1.0
 [9961200,73476000,325666800,354675600,370400400,386125200,388566010,401850000,417574811,496803600,528253200,624423614,636516015,671011200,717555600,752047218,859683600,922582800,1018173600,1035705600,1143334800,1162105223,1174784400,1194156000,1206838823,1224982823,1236495624,1319936400,1319936424,1425798025,1459040400,1509872400,2090451627,2140668000]
 ```
 
+##### RQ.SRS-010.DateTime64.ExtendedRange.Transform
+version: 1.0
+
+[ClickHouse] SHALL support `DateTime64` in [`transform`](https://clickhouse.com/docs/ru/sql-reference/functions/other-functions/#transform).
 
 ### Specific
+
+##### RQ.SRS-010.DateTime64.ExtendedRange.ArrowFormat
+version: 1.0
+
+[ClickHouse] SHALL support exporting of [DateTime64] data type to 
+[Arrow](https://clickhouse.com/docs/en/interfaces/formats/#data-format-arrow) format and importing 
+[DateTime64] from corresponding Arrow data types.
 
 ##### RQ.SRS-010.DateTime64.ExtendedRange.Start
 version: 1.0
@@ -705,6 +737,11 @@ version: 1.0
 to the [Date](https://clickhouse.com/docs/en/sql-reference/data-types/date/) type using the [toDate](https://clickhouse.com/docs/en/sql-reference/functions/type-conversion-functions/#todate) function.
 This function is ONLY supposed to work in NORMAL RANGE.
 
+###### RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toDate32
+version: 1.0
+
+[ClickHouse] SHALL support correct conversion of the [DateTime64] data type to the [Date32](https://clickhouse.com/docs/en/sql-reference/data-types/date32/) type using the [toDate32](https://clickhouse.com/docs/en/sql-reference/functions/type-conversion-functions/#todate32) function.
+
 ###### RQ.SRS-010.DateTime64.ExtendedRange.TypeConversionFunctions.toDateTime
 version: 1.0
 
@@ -788,8 +825,8 @@ using the [fromUnixTimestamp64Nano](https://clickhouse.com/docs/en/sql-reference
 * **DateTime64**: https://clickhouse.com/docs/en/sql-reference/data-types/datetime64/
 * **ISO 8601 format**: https://en.wikipedia.org/wiki/ISO_8601
 * **ClickHouse:** https://clickhouse.com
-* **GitHub Repository:** https://github.com/ClickHouse/ClickHouse/blob/master/tests/testflows/datetime64_extended_range/requirements/requirements.md
-* **Revision History:** https://github.com/ClickHouse/ClickHouse/commits/master/tests/testflows/datetime64_extended_range/requirements/requirements.md
+* **GitLab Repository:** https://gitlab.com/altinity-qa/documents/qa-srs010-clickhouse-datetime64-extended-range/-/blob/master/QA_SRS010_ClickHouse_DateTime64_Extended_Range.md
+* **Revision History:** https://gitlab.com/altinity-qa/documents/qa-srs010-clickhouse-datetime64-extended-range/-/commits/master/QA_SRS010_ClickHouse_DateTime64_Extended_Range.md
 * **Git:** https://git-scm.com/
 
 [SRS]: #srs
@@ -799,7 +836,7 @@ using the [fromUnixTimestamp64Nano](https://clickhouse.com/docs/en/sql-reference
 [DateTime64]: https://clickhouse.com/docs/en/sql-reference/data-types/datetime64/
 [ISO 8601 format]: https://en.wikipedia.org/wiki/ISO_8601
 [ClickHouse]: https://clickhouse.com
-[GitHub Repository]: https://github.com/ClickHouse/ClickHouse/blob/master/tests/testflows/datetime64_extended_range/requirements/requirements.md
-[Revision History]: https://github.com/ClickHouse/ClickHouse/commits/master/tests/testflows/datetime64_extended_range/requirements/requirements.md
+[GitLab Repository]: https://gitlab.com/altinity-qa/documents/qa-srs010-clickhouse-datetime64-extended-range/-/blob/master/QA_SRS010_ClickHouse_DateTime64_Extended_Range.md
+[Revision History]: https://gitlab.com/altinity-qa/documents/qa-srs010-clickhouse-datetime64-extended-range/-/commits/master/QA_SRS010_ClickHouse_DateTime64_Extended_Range.md
 [Git]: https://git-scm.com/
-[GitHub]: https://github.com
+[GitLab]: https://gitlab.com

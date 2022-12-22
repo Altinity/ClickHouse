@@ -1,10 +1,11 @@
-from testflows.core import *
-from kerberos.tests.common import *
-from kerberos.requirements.requirements import *
-
+import os
 import time
 import datetime
 import itertools
+
+from testflows.core import *
+from kerberos.tests.common import *
+from kerberos.requirements.requirements import *
 
 
 @TestScenario
@@ -14,10 +15,12 @@ def kerberos_not_enabled(self):
     but Kerberos itself is not enabled in config.xml.
     """
     ch_nodes = self.context.ch_nodes
-    config_path = f"kerberos/configs/{ch_nodes[0].name}/config.d/kerberos.xml"
+    config_path = os.path.join(
+        current_dir(), "..", f"configs/{ch_nodes[0].name}/config.d/kerberos.xml"
+    )
 
     def modify_file(root):
-        return xmltree.fromstring("<clickhouse></clickhouse>")
+        return xmltree.fromstring("<yandex></yandex>")
 
     check_wrong_config(
         node=ch_nodes[0],
@@ -33,7 +36,9 @@ def kerberos_not_enabled(self):
 def multiple_kerberos(self):
     """ClickHouse SHALL disable Kerberos authentication if more than one kerberos sections specified in config.xml."""
     ch_nodes = self.context.ch_nodes
-    config_path = f"kerberos/configs/{ch_nodes[0].name}/config.d/kerberos.xml"
+    config_path = os.path.join(
+        current_dir(), "..", f"configs/{ch_nodes[0].name}/config.d/kerberos.xml"
+    )
 
     def modify_file(root):
         second_section = "<kerberos><realm>EXAM.COM</realm></kerberos>"
@@ -58,7 +63,9 @@ def wrong_user_realm(self):
     """
 
     ch_nodes = self.context.ch_nodes
-    config_path = f"kerberos/configs/{ch_nodes[0].name}/users.d/kerberos-users.xml"
+    config_path = os.path.join(
+        current_dir(), "..", f"configs/{ch_nodes[0].name}/users.d/kerberos-users.xml"
+    )
 
     def modify_file(root):
         krb = root.find("users").find("kerberos_user")
@@ -81,7 +88,9 @@ def multiple_auth_methods(self):
     auth method is specified for user alongside with Kerberos.
     """
     ch_nodes = self.context.ch_nodes
-    config_path = f"kerberos/configs/{ch_nodes[0].name}/users.d/kerberos-users.xml"
+    config_path = os.path.join(
+        current_dir(), "..", f"configs/{ch_nodes[0].name}/users.d/kerberos-users.xml"
+    )
 
     def modify_file(root):
         krb = root.find("users").find("kerberos_user")
@@ -103,7 +112,9 @@ def multiple_auth_methods(self):
 def principal_and_realm_specified(self):
     """ClickHouse SHALL drop an exception if both realm and principal fields are specified in config.xml."""
     ch_nodes = self.context.ch_nodes
-    config_path = f"kerberos/configs/{ch_nodes[0].name}/config.d/kerberos.xml"
+    config_path = os.path.join(
+        current_dir(), "..", f"configs/{ch_nodes[0].name}/config.d/kerberos.xml"
+    )
 
     def modify_file(root):
         krb = root.find("kerberos")
@@ -125,7 +136,9 @@ def principal_and_realm_specified(self):
 def multiple_realm(self):
     """ClickHouse SHALL throw an exception and disable Kerberos if more than one realm is specified in config.xml."""
     ch_nodes = self.context.ch_nodes
-    config_path = f"kerberos/configs/{ch_nodes[0].name}/config.d/kerberos.xml"
+    config_path = os.path.join(
+        current_dir(), "..", f"configs/{ch_nodes[0].name}/config.d/kerberos.xml"
+    )
 
     def modify_file(root):
         krb = root.find("kerberos")
@@ -146,7 +159,9 @@ def multiple_realm(self):
 def multiple_principal(self):
     """ClickHouse SHALL throw an exception and disable Kerberos if more than one principal is specified in config.xml."""
     ch_nodes = self.context.ch_nodes
-    config_path = f"kerberos/configs/{ch_nodes[0].name}/config.d/kerberos.xml"
+    config_path = os.path.join(
+        current_dir(), "..", f"configs/{ch_nodes[0].name}/config.d/kerberos.xml"
+    )
 
     def modify_file(root):
         krb = root.find("kerberos")

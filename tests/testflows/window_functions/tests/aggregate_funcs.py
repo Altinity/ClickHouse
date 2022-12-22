@@ -1,3 +1,4 @@
+from tracemalloc import Snapshot
 from testflows.core import *
 from testflows.asserts import values, error, snapshot
 
@@ -79,11 +80,25 @@ from window_functions.tests.common import *
 )
 def aggregate_funcs_over_rows_frame(self, func):
     """Checking aggregate funcs over rows frame."""
+    snapshot_name = (
+        "/window functions"
+        + current()
+        .name.replace(f"{sep}non distributed{sep}", ":")
+        .replace(f"{sep}distributed{sep}", ":")
+        .split("/window functions", 1)[-1]
+    )
+
+    if (
+        func.startswith("studentTTest") or func.startswith("welchTTest")
+    ) and check_clickhouse_version(">=22")(self):
+        snapshot_name += "/version>=22"
+
     execute_query(
         f"""
         SELECT {func} OVER (ORDER BY salary, empno ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS func
           FROM empsalary
-        """
+        """,
+        snapshot_name=snapshot_name,
     )
 
 
@@ -351,6 +366,81 @@ def ungrouped_aggregate_over_empty_row_set(self):
         "SELECT SUM(COUNT(number)) OVER () AS sum FROM numbers(10) WHERE number=42",
         expected=expected,
     )
+
+
+@TestScenario
+def avgWeighted(self):
+    """Check special case of using `avgWeighted` function with Decimal and mixed types
+    when used over a window function.
+    """
+    with Example("decimal weight"):
+        expected = convert_output(
+            """
+          avg
+        -------
+           nan
+             1
+             2
+             3
+             4
+             5
+             6
+             7
+             8
+             9
+        """
+        )
+
+        execute_query(
+            "SELECT avgWeighted(a, toDecimal64(c, 9)) OVER (PARTITION BY c) AS avg FROM (SELECT number AS a, number AS c FROM numbers(10))",
+            expected=expected,
+        )
+
+    with Example("decimal value and weight"):
+        expected = convert_output(
+            """
+          avg
+        -------
+           nan
+             1
+             2
+             3
+             4
+             5
+             6
+             7
+             8
+             9
+        """
+        )
+
+        execute_query(
+            "SELECT avgWeighted(toDecimal64(a, 4), toDecimal64(c, 9)) OVER (PARTITION BY c) AS avg FROM (SELECT number AS a, number AS c FROM numbers(10))",
+            expected=expected,
+        )
+
+    with Example("float value and decimal weight from table"):
+        expected = convert_output(
+            """
+          avg
+        -------
+          5000
+          3900
+          4800
+          4800
+          3500
+          4200
+          6000
+          4500
+          5200
+          5200
+        """
+        )
+
+        execute_query(
+            "SELECT avgWeighted(toFloat64(salary) + 0.02, toDecimal64(empno, 9)) OVER (PARTITION BY empno) AS avg FROM (SELECT * FROM empsalary ORDER BY empno)",
+            expected=expected,
+        )
 
 
 @TestFeature

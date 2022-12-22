@@ -6,6 +6,7 @@ from testflows.asserts import error
 
 from map_type.requirements import *
 from map_type.tests.common import *
+from helpers.common import check_clickhouse_version
 
 
 @TestOutline
@@ -1241,19 +1242,18 @@ def invalid_key(self):
     """Check when key is not valid."""
     node = self.context.node
 
+    exitcode = 43 if check_clickhouse_version("<21.12")(self) else 0
+    message = (
+        "DB::Exception: Illegal types of arguments"
+        if check_clickhouse_version("<21.12")(self)
+        else ""
+    )
+
     with When("I try to use an integer key that is too large"):
-        node.query(
-            "SELECT map(1,2) AS m, m[256]",
-            exitcode=43,
-            message="DB::Exception: Illegal types of arguments",
-        )
+        node.query("SELECT map(1,2) AS m, m[256]", exitcode=exitcode, message=message)
 
     with When("I try to use an integer key that is negative when key is unsigned"):
-        node.query(
-            "SELECT map(1,2) AS m, m[-1]",
-            exitcode=43,
-            message="DB::Exception: Illegal types of arguments",
-        )
+        node.query("SELECT map(1,2) AS m, m[-1]", exitcode=exitcode, message=message)
 
     with When("I try to use a string key when key is an integer"):
         node.query(
@@ -1278,18 +1278,14 @@ def invalid_key(self):
 
     with When("I try to use wrong type conversion in key"):
         r = node.query(
-            "SELECT map(1,2) AS m, m[toInt8('1')]",
-            exitcode=43,
-            message="DB::Exception: Illegal types of arguments",
+            "SELECT map(1,2) AS m, m[toInt8('1')]", exitcode=exitcode, message=message
         )
 
     with When(
         "in array of maps I try to use an integer key that is negative when key is unsigned"
     ):
         node.query(
-            "SELECT [map(1,2)] AS m, m[1][-1]",
-            exitcode=43,
-            message="DB::Exception: Illegal types of arguments",
+            "SELECT [map(1,2)] AS m, m[1][-1]", exitcode=exitcode, message=message
         )
 
     with When("I try to use a NULL key when key is not nullable"):

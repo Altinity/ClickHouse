@@ -123,7 +123,6 @@ void RequiredSourceColumnsMatcher::visit(const ASTSelectQuery & select, const AS
             data.addColumnAliasIfAny(*node);
     }
 
-
     std::vector<ASTPtr *> out;
     for (const auto & node : select.children)
     {

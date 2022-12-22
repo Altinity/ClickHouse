@@ -41,7 +41,7 @@ def to_int_8_16_32_64_128_256(self, cast):
     timezones = timezones_range(stress)
 
     for year in years_range(stress):
-        with Given(f"I select datetimes in {year}"):
+        with Given("I select datetimes in a year"):
             datetimes = select_dates_in_year(year=year, stress=stress)
 
         for d in datetimes:
@@ -100,7 +100,7 @@ def to_uint_8_16_32_64_256(self, cast):
     timezones = timezones_range(stress)
 
     for year in years_range(stress):
-        with Given(f"I select datetimes in {year}"):
+        with Given("I select datetimes in a year"):
             datetimes = select_dates_in_year(year=year, stress=stress)
 
         for d in datetimes:
@@ -159,7 +159,7 @@ def to_float_32_64(self, cast):
     timezones = timezones_range(stress)
 
     for year in years_range(stress):
-        with Given(f"I select datetimes in {year}"):
+        with Given("I select datetimes in a year"):
             datetimes = select_dates_in_year(year=year, stress=stress)
 
         for d in datetimes:
@@ -195,7 +195,7 @@ def to_datetime64_from_string_missing_time(self):
     timezones = timezones_range(stress)
 
     for year in years_range(stress):
-        with Given(f"I select datetimes in {year}"):
+        with Given("I select datetimes in a year"):
             datetimes = select_dates_in_year(year=year, stress=stress)
 
         for dt in datetimes:
@@ -221,7 +221,7 @@ def to_datetime64(self):
     timezones = timezones_range(stress)
 
     for year in years_range(stress):
-        with Given(f"I select datetimes in {year}"):
+        with Given("I select datetimes in a year"):
             datetimes = select_dates_in_year(year=year, stress=stress)
 
         for dt in datetimes:
@@ -264,7 +264,7 @@ def to_date(self, cast):
     timezones = timezones_range(stress)
 
     for year in years_range(stress):
-        with Given(f"I select datetimes in {year}"):
+        with Given("I select datetimes in a year"):
             datetimes = select_dates_in_year(year=year, stress=stress)
 
         for dt in datetimes:
@@ -297,6 +297,60 @@ def to_date(self, cast):
         (
             False,
             Requirements(
+                RQ_SRS_010_DateTime64_ExtendedRange_TypeConversionFunctions_toDate32(
+                    "1.0"
+                )
+            ),
+        ),
+        (
+            True,
+            Requirements(
+                RQ_SRS_010_DateTime64_ExtendedRange_TypeConversionFunctions_CAST_x_T_(
+                    "1.0"
+                )
+            ),
+        ),
+    ],
+)
+def to_date32(self, cast):
+    """Check the toDate32() conversion with DateTime64."""
+    stress = self.context.stress
+    timezones = timezones_range(stress)
+
+    for year in years_range(stress):
+        with Given("I select datetimes in a year"):
+            datetimes = select_dates_in_year(year=year, stress=stress)
+
+        for dt in datetimes:
+            for tz in timezones:
+                with Step(f"{dt} {tz}"):
+                    expected = None  # by default - not checked, checking the exitcode
+                    with By("converting datetime to string"):
+                        dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+
+                    if in_normal_range(dt):
+                        with And("DateTime64 fits normal range, change its value"):
+                            expected = f"{dt.strftime('%Y-%m-%d')}"
+
+                    with Given(f"I make a query string for ClickHouse"):
+                        if cast:
+                            query = f"SELECT CAST(toDateTime64('{dt_str}', 0, '{tz}'), 'Date32')"
+                        else:
+                            query = (
+                                f"SELECT toDate32(toDateTime64('{dt_str}', 0, '{tz}'))"
+                            )
+
+                    with Then(f"I execute toDate32() query and check return/exitcode"):
+                        exec_query(request=query, expected=expected, exitcode=0)
+
+
+@TestOutline(Scenario)
+@Examples(
+    "cast",
+    [
+        (
+            False,
+            Requirements(
                 RQ_SRS_010_DateTime64_ExtendedRange_TypeConversionFunctions_toDateTime(
                     "1.0"
                 )
@@ -318,7 +372,7 @@ def to_datetime(self, cast):
     timezones = timezones_range(stress)
 
     for year in years_range(stress):
-        with Given(f"I select datetimes in {year}"):
+        with Given("I select datetimes in a year"):
             datetimes = select_dates_in_year(year=year, stress=stress)
 
         for dt in datetimes:
@@ -327,15 +381,13 @@ def to_datetime(self, cast):
                     dt_str = dt.strftime("%Y-%m-%d %H:%M:%S")
                 with And(f"making a query string for ClickHouse"):
                     if cast:
-                        query = f"SELECT CAST(toDateTime64('{dt_str}', 0, '{tz}'), 'DateTime')"
+                        query = f"SELECT CAST(toDateTime('{dt_str}', 0, '{tz}'), 'DateTime')"
                         with When("figure out expected result in python"):
                             dt_local = pytz.timezone(tz).localize(dt)
                             dt_transformed = dt_local.astimezone(tzlocal())
                             expected = f"{dt_transformed.strftime('%Y-%m-%d %H:%M:%S')}"
                     else:
-                        query = (
-                            f"SELECT toDateTime(toDateTime64('{dt_str}', 0, '{tz}'))"
-                        )
+                        query = f"SELECT toDateTime(toDateTime('{dt_str}', 0, '{tz}'))"
                         with When("figure out expected result in python"):
                             expected = f"{dt.strftime('%Y-%m-%d %H:%M:%S')}"
 
@@ -375,7 +427,7 @@ def to_string(self, cast):
     timezones = timezones_range(stress)
 
     for year in years_range(stress):
-        with Given(f"I select datetimes in {year}"):
+        with Given("I select datetimes in a year"):
             datetimes = select_dates_in_year(year=year, stress=stress)
 
         for dt in datetimes:
@@ -438,7 +490,7 @@ def to_decimal_32_64_128_256(self, cast):
     scales = {32: 9, 64: 18, 128: 38, 256: 76}
 
     for year in years_range(stress):
-        with Given(f"I select datetimes in {year}"):
+        with Given("I select datetimes in a year"):
             datetimes = select_dates_in_year(year=year, stress=stress)
 
         for d in datetimes:
@@ -474,7 +526,7 @@ def to_unix_timestamp64_milli_micro_nano(self, scale):
     func = {3: "Milli", 6: "Micro", 9: "Nano"}
 
     for year in years_range(stress):
-        with Given(f"I select datetimes in {year}"):
+        with Given("I select datetimes in a year"):
             datetimes = select_dates_in_year(
                 year=year, stress=stress, microseconds=True
             )
@@ -542,7 +594,7 @@ def from_unix_timestamp64_milli_micro_nano(self, scale):
     func = {3: "Milli", 6: "Micro", 9: "Nano"}
 
     for year in years_range(stress):
-        with Given(f"I select datetimes in {year}"):
+        with Given("I select datetimes in a year"):
             datetimes = select_dates_in_year(
                 year=year, stress=stress, microseconds=True
             )
@@ -566,6 +618,82 @@ def from_unix_timestamp64_milli_micro_nano(self, scale):
                         query = f"SELECT fromUnixTimestamp64{func[scale]}(CAST({ts}, 'Int64'), '{tz}')"
                     with Then(f"I execute fromUnixTimestamp64{func[scale]}() query"):
                         exec_query(request=query, expected=f"{d_str}")
+
+
+@TestScenario
+def force_index_by_date(self):
+    """Check that when force_index_by_date is enabled, ClickHouse throws an exception if there is a partition key in a table, and it is not used."""
+    node = self.context.node
+    table_name = f"table_{getuid()}"
+
+    try:
+        with Given("I have a table"):
+            node.query(
+                f"""
+                create table {table_name}(date_time DateTime64(3), x String) 
+                Engine=MergeTree partition by toDate(date_time) order by tuple();
+            """
+            )
+
+        with And("I insert some data"):
+            node.query(
+                f"insert into {table_name} select toDateTime64('2020-01-01 00:00:00.000',3)+number , '' from numbers(1);"
+            )
+
+        with When("I select from the table"):
+            output = node.query(
+                f"SELECT count() FROM {table_name} WHERE date_time >= toDateTime64('2020-01-01 00:00:00.000',3) SETTINGS force_index_by_date=1;"
+            ).output
+            assert output == "1", error()
+
+        with Then("I check SELECT throws an exception."):
+            node.query(
+                f"SELECT count() FROM {table_name} WHERE toDateTime64(date_time,3) >= toDateTime64('2020-01-10 00:00:00.000',3) SETTINGS force_index_by_date=1;",
+                exitcode=21,
+                message="DB::Exception: Neither MinMax index by columns (date_time) nor partition expr is used and setting 'force_index_by_date' is set. (INDEX_NOT_USED)",
+            )
+
+    finally:
+        with Finally(f"I drop the table {table_name}"):
+            node.query(f"DROP TABLE IF EXISTS {table_name}")
+
+
+@TestScenario
+def force_primary_key(self):
+    """Check that when force_primary_key is enabled, ClickHOuse throws an exception if there is primary key in a table, and it is not used."""
+    node = self.context.node
+    table_name = f"table_{getuid()}"
+
+    try:
+        with Given("I have a table"):
+            node.query(
+                f"""
+                create table {table_name}(date_time DateTime64(3), x String) 
+                Engine=MergeTree partition by toDate(date_time) primary key toDate(date_time);
+            """
+            )
+
+        with And("I insert some data"):
+            node.query(
+                f"insert into {table_name} select toDateTime64('2020-01-01 00:00:00.000',3)+number , '' from numbers(1);"
+            )
+
+        with When("I select from the table"):
+            output = node.query(
+                f"SELECT count() FROM {table_name} WHERE date_time >= toDateTime64('2020-01-01 00:00:00.000',3) SETTINGS force_primary_key=1;"
+            ).output
+            assert output == "1", error()
+
+        with Then("I check SELECT throws an exception."):
+            node.query(
+                f"SELECT count() FROM {table_name} WHERE toDateTime64(date_time,3) >= toDateTime64('2020-01-10 00:00:00.000',3) SETTINGS force_primary_key=1;",
+                exitcode=21,
+                message="Exception: Primary key (toDate(date_time)) is not used and setting 'force_primary_key' is set. (INDEX_NOT_USED)",
+            )
+
+    finally:
+        with Finally(f"I drop the table {table_name}"):
+            node.query(f"DROP TABLE IF EXISTS {table_name}")
 
 
 @TestScenario
@@ -604,11 +732,10 @@ def from_unix_timestamp64_nano(self):
 @TestFeature
 @Requirements(RQ_SRS_010_DateTime64_ExtendedRange_TypeConversionFunctions("1.0"))
 def type_conversion(self, node="clickhouse1"):
-    """Check the type conversion operations with DateTime64.
-    Cast can be set as Requirement thereby as the module
+    """Check the type conversion operations with DateTime64. Cast can be set as Requirement thereby as the module
     tests exactly what CAST does.
     """
     self.context.node = self.context.cluster.node(node)
 
     for scenario in loads(current_module(), Scenario):
-        Scenario(run=scenario)
+        Scenario(run=scenario, flags=TE)

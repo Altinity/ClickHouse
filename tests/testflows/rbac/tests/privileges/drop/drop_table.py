@@ -147,11 +147,29 @@ def privilege_check(grant_target_name, user_name, node=None):
             with Finally("I drop the table"):
                 node.query(f"DROP TABLE IF EXISTS {table_name}")
 
+    with Scenario("user with DROP privilege"):
+        table_name = f"table_{getuid()}"
+
+        try:
+            with Given("I have a table"):
+                node.query(f"CREATE TABLE {table_name} (x Int8) ENGINE=Memory")
+
+            with When("I grant DROP privilege"):
+                node.query(f"GRANT DROP ON *.* TO {grant_target_name}")
+
+            with Then("I drop the table"):
+                node.query(f"DROP TABLE {table_name}", settings=[("user", user_name)])
+
+        finally:
+            with Finally("I drop the table"):
+                node.query(f"DROP TABLE IF EXISTS {table_name}")
+
 
 @TestFeature
 @Requirements(
     RQ_SRS_006_RBAC_Privileges_DropTable("1.0"),
     RQ_SRS_006_RBAC_Privileges_All("1.0"),
+    RQ_SRS_006_RBAC_Privileges_Drop("1.0"),
     RQ_SRS_006_RBAC_Privileges_None("1.0"),
 )
 @Name("drop table")

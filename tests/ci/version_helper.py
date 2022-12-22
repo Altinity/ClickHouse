@@ -48,6 +48,7 @@ class ClickHouseVersion:
         revision: Union[int, str],
         git: Git,
         tweak: str = None,
+        flavour: str = None,
     ):
         self._major = int(major)
         self._minor = int(minor)
@@ -58,6 +59,7 @@ class ClickHouseVersion:
         if tweak is not None:
             self._tweak = int(tweak)
         self._describe = ""
+        self._flavour = flavour
 
     def update(self, part: str) -> "ClickHouseVersion":
         """If part is valid, returns a new version"""
@@ -107,9 +109,12 @@ class ClickHouseVersion:
 
     @property
     def string(self):
-        return ".".join(
+        version_as_string = ".".join(
             (str(self.major), str(self.minor), str(self.patch), str(self.tweak))
         )
+        if self._flavour:
+            version_as_string = f"{version_as_string}.{self._flavour}"
+        return version_as_string
 
     def as_dict(self) -> VERSIONS:
         return {
@@ -129,7 +134,10 @@ class ClickHouseVersion:
     def with_description(self, version_type):
         if version_type not in VersionType.VALID:
             raise ValueError(f"version type {version_type} not in {VersionType.VALID}")
-        self._describe = f"v{self.string}-{version_type}"
+        if version_type == self._flavour:
+            self._describe = f"v{self.string}"
+        else:
+            self._describe = f"v{self.string}-{version_type}"
 
     def __eq__(self, other) -> bool:
         if not isinstance(self, type(other)):
@@ -157,16 +165,16 @@ class ClickHouseVersion:
 class VersionType:
     LTS = "lts"
     PRESTABLE = "prestable"
-    STABLE = "stable"
+    STABLE = "altinitystable"
     TESTING = "testing"
     VALID = (TESTING, PRESTABLE, STABLE, LTS)
 
 
 def validate_version(version: str):
     parts = version.split(".")
-    if len(parts) != 4:
+    if len(parts) < 4:
         raise ValueError(f"{version} does not contain 4 parts")
-    for part in parts:
+    for part in parts[:4]:
         int(part)
 
 
@@ -205,13 +213,16 @@ def get_version_from_repo(
         versions["patch"],
         versions["revision"],
         git,
+        # Explicitly use tweak value from version file
+        tweak=versions.get("tweak", versions["revision"]),
+        flavour=versions["flavour"]
     )
 
 
 def get_version_from_string(version: str) -> ClickHouseVersion:
     validate_version(version)
     parts = version.split(".")
-    return ClickHouseVersion(parts[0], parts[1], parts[2], -1, git, parts[3])
+    return ClickHouseVersion(parts[0], parts[1], parts[2], -1, git, parts[3], parts[4] if len(parts) >= 4 else None)
 
 
 def get_version_from_tag(tag: str) -> ClickHouseVersion:
@@ -278,7 +289,7 @@ def update_contributors(
         cfd.write(content)
 
 
-def update_version_local(version, version_type="testing"):
+def update_version_local(version : ClickHouseVersion, version_type="testing"):
     update_contributors()
     version.with_description(version_type)
     update_cmake_version(version)

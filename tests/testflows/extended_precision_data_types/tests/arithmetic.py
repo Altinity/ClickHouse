@@ -37,6 +37,9 @@ def inline_check(self, arithmetic_func, expected_result, int_type, min, max, nod
     if node is None:
         node = self.context.node
 
+    if arithmetic_func == "divide":
+        skip("divide is not supported for int types")
+
     if arithmetic_func in ["negate", "abs"]:
 
         with When(f"I check {arithmetic_func} with {int_type}"):
@@ -91,6 +94,9 @@ def table_check(self, arithmetic_func, expected_result, int_type, min, max, node
         node = self.context.node
 
     table_name = f"table_{getuid()}"
+
+    if arithmetic_func == "divide":
+        skip("divide is not supported for int types")
 
     with Given(f"I have a table"):
         table(name=table_name, data_type=int_type)

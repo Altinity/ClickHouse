@@ -73,9 +73,9 @@ def privilege_check(grant_target_name, user_name, node=None):
                     f"CREATE DICTIONARY {dict_name}(x Int32, y Int32) PRIMARY KEY x LAYOUT(FLAT()) SOURCE(CLICKHOUSE()) LIFETIME(0)"
                 )
 
-            with When("I grant drop dictionary privilege"):
+            with When(f"I grant {current().context.privilege} privilege"):
                 node.query(
-                    f"GRANT DROP DICTIONARY ON {dict_name} TO {grant_target_name}"
+                    f"GRANT {current().context.privilege} ON *.* TO {grant_target_name}"
                 )
 
             with Then("I attempt to drop aa dictionary"):
@@ -96,14 +96,14 @@ def privilege_check(grant_target_name, user_name, node=None):
                     f"CREATE DICTIONARY {dict_name}(x Int32, y Int32) PRIMARY KEY x LAYOUT(FLAT()) SOURCE(CLICKHOUSE()) LIFETIME(0)"
                 )
 
-            with When("I grant the drop dictionary privilege"):
+            with When(f"I grant the {current().context.privilege} privilege"):
                 node.query(
-                    f"GRANT DROP DICTIONARY ON {dict_name} TO {grant_target_name}"
+                    f"GRANT {current().context.privilege} ON *.* TO {grant_target_name}"
                 )
 
-            with And("I revoke the drop dictionary privilege"):
+            with And(f"I revoke the {current().context.privilege} privilege"):
                 node.query(
-                    f"REVOKE DROP DICTIONARY ON {dict_name} FROM {grant_target_name}"
+                    f"REVOKE {current().context.privilege} ON *.* FROM {grant_target_name}"
                 )
 
             with Then("I attempt to drop a dictionary"):
@@ -118,31 +118,11 @@ def privilege_check(grant_target_name, user_name, node=None):
             with Finally("I drop the dictionary"):
                 node.query(f"DROP DICTIONARY IF EXISTS {dict_name}")
 
-    with Scenario("user with ALL privilege"):
-        dict_name = f"db_{getuid()}"
-
-        try:
-            with Given("I have a dictionary"):
-                node.query(
-                    f"CREATE DICTIONARY {dict_name}(x Int32, y Int32) PRIMARY KEY x LAYOUT(FLAT()) SOURCE(CLICKHOUSE()) LIFETIME(0)"
-                )
-
-            with When("I grant ALL privilege"):
-                node.query(f"GRANT ALL ON *.* TO {grant_target_name}")
-
-            with Then("I drop the dictionary"):
-                node.query(
-                    f"DROP DICTIONARY {dict_name}", settings=[("user", user_name)]
-                )
-
-        finally:
-            with Finally("I drop the dictionary"):
-                node.query(f"DROP DICTIONARY IF EXISTS {dict_name}")
-
 
 @TestFeature
 @Requirements(
     RQ_SRS_006_RBAC_Privileges_DropDictionary("1.0"),
+    RQ_SRS_006_RBAC_Privileges_Drop("1.0"),
     RQ_SRS_006_RBAC_Privileges_All("1.0"),
     RQ_SRS_006_RBAC_Privileges_None("1.0"),
 )
@@ -156,8 +136,10 @@ def feature(self, node="clickhouse1", stress=None, parallel=None):
     if stress is not None:
         self.context.stress = stress
 
-    with Suite(
-        test=privilege_granted_directly_or_via_role,
-        setup=instrument_clickhouse_server_log,
-    ):
-        privilege_granted_directly_or_via_role()
+    for current().context.privilege in ["ALL", "DROP", "DROP DICTIONARY"]:
+        with Suite(
+            f" {current().context.privilege} privilege",
+            test=privilege_granted_directly_or_via_role,
+            setup=instrument_clickhouse_server_log,
+        ):
+            privilege_granted_directly_or_via_role()
