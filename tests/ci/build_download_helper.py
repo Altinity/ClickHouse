@@ -112,6 +112,7 @@ def download_builds_filter(
     check_name, reports_path, result_path, filter_fn=lambda _: True
 ):
     build_name = get_build_name_for_check(check_name)
+    print("build name: %s and reports path: %s", build_name, reports_path)
     urls = get_build_urls(build_name, reports_path)
     print(urls)
 
