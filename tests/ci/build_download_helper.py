@@ -48,6 +48,7 @@ def get_build_name_for_check(check_name):
 def get_build_urls(build_name, reports_path):
     for root, _, files in os.walk(reports_path):
         for f in files:
+            logging.info("Found file: %s", f)
             if build_name in f:
                 logging.info("Found build report json %s", f)
                 with open(os.path.join(root, f), "r", encoding="utf-8") as file_handler:
