@@ -42,9 +42,6 @@ def main():
 
     for f in os.listdir(packages_path):
         full_path = os.path.join(packages_path, f)
-        subprocess.check_call(
-            f"dpkg -x {full_path} {packages_path} && rm {full_path}", shell=True
-        )
         print(f"aaa: {full_path}")
 
 if __name__ == "__main__":
