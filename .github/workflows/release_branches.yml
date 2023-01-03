@@ -1116,13 +1116,10 @@ jobs:
           sudo rm -fr "$GITHUB_WORKSPACE" && mkdir "$GITHUB_WORKSPACE"
       - name: Check out repository code
         uses: actions/checkout@v2
-<<<<<<< HEAD
       - name: Download json reports
         uses: actions/download-artifact@v2
         with:
           path: ${{ env.REPORTS_PATH }}
-=======
->>>>>>> e6f24eca112 (a)
       - name: Sign release
         env:
           GPG_BINARY_SIGNING_KEY: ${{ secrets.GPG_BINARY_SIGNING_KEY }}
