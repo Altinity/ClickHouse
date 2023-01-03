@@ -5,6 +5,7 @@ import logging
 from env_helper import GPG_BINARY_SIGNING_KEY, TEMP_PATH, REPO_COPY, REPORTS_PATH
 from github import Github
 import subprocess
+import hashlib
 from s3_helper import S3Helper
 from get_robot_token import get_best_robot_token
 from pr_info import PRInfo

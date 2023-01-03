@@ -347,5 +347,8 @@ CI_CONFIG = {
         "Performance Comparison (actions)": {
             "required_build": "performance",
         },
+        "Sign release (actions)": {
+            "required_build": "package_release"
+        }
     },
 }  # type: dict
