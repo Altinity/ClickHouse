@@ -485,6 +485,11 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE/tests/ci"
           python3 sign_release.py
+      - name: Upload signed hashes
+        uses: actions/upload-artifact@v2
+        with:
+          name: signed-hashes
+          path: ${{ runner.temp }}/*.json
       - name: Cleanup
         if: always()
         run: |
