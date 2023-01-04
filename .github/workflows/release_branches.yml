@@ -465,8 +465,8 @@ jobs:
     steps:
       - name: Set envs
         run: |
-          REPORTS_PATH=${{runner.temp}}/reports_dir
           cat >> "$GITHUB_ENV" << 'EOF'
+          REPORTS_PATH=${{runner.temp}}/reports_dir
           EOF
       - name: Clear repository
         run: |
@@ -481,6 +481,7 @@ jobs:
         env:
           GPG_BINARY_SIGNING_KEY: ${{ secrets.GPG_BINARY_SIGNING_KEY }}
           GPG_BINARY_SIGNING_PASSPHRASE: ${{ secrets.GPG_BINARY_SIGNING_PASSPHRASE }}
+          REPORTS_PATH: ${{ env.REPORTS_PATH }}
         run: |
           cd "$GITHUB_WORKSPACE/tests/ci"
           python3 sign_release.py
