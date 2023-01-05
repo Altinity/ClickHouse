@@ -489,7 +489,8 @@ jobs:
         uses: actions/upload-artifact@v2
         with:
           name: signed-hashes
-          path: ${{ runner.temp }}/*.json
+          path: '/home/ubuntu/actions-runner/_work/ClickHouse/ClickHouse/tests/ci/tmp/packages/*.gpg'
+#          path: ${{ runner.temp }}/*.gpg
       - name: Cleanup
         if: always()
         run: |

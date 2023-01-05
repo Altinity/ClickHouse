@@ -40,7 +40,7 @@ def sign_file(file_path):
     with open(priv_key_file_path, 'x') as f:
         f.write(GPG_BINARY_SIGNING_KEY)
 
-    os.system(f'echo {GPG_BINARY_SIGNING_PASSPHRASE} | gpg --bash --import {priv_key_file_path}')
+    os.system(f'echo {GPG_BINARY_SIGNING_PASSPHRASE} | gpg --batch --import {priv_key_file_path}')
     os.system(f'gpg --pinentry-mode=loopback --batch --yes --passphrase {GPG_BINARY_SIGNING_PASSPHRASE} --sign {file_path}')
     print(f"Signed {file_path}")
     os.remove(priv_key_file_path)
