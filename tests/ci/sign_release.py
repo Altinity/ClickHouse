@@ -4,15 +4,13 @@ import os
 import logging
 from env_helper import GPG_BINARY_SIGNING_KEY, GPG_BINARY_SIGNING_PASSPHRASE, TEMP_PATH, REPO_COPY, REPORTS_PATH
 from github import Github
-import subprocess
-import hashlib
 from s3_helper import S3Helper
 from get_robot_token import get_best_robot_token
 from pr_info import PRInfo
-from build_download_helper import download_builds_filter
+from build_download_helper import download_builds_filter, get_build_name_for_check
 from rerun_helper import RerunHelper
-from docker_pull_helper import get_images_with_versions
 import hashlib
+from version_helper import get_version_from_repo
 
 
 CHECK_NAME = "Sign release (actions)"
@@ -45,14 +43,29 @@ def sign_file(file_path):
     print(f"Signed {file_path}")
     os.remove(priv_key_file_path)
 
+    return f'{file_path}.gpg'
+
 def main():
     temp_path = TEMP_PATH
-    repo_path = REPO_COPY
     reports_path = REPORTS_PATH
+
+    gh = Github(get_best_robot_token())
+
+    build_name = get_build_name_for_check(CHECK_NAME)
+
+    if not os.path.exists(TEMP_PATH):
+        os.makedirs(TEMP_PATH)
 
     pr_info = PRInfo()
 
-    gh = Github(get_best_robot_token())
+    logging.info("Repo copy path %s", REPO_COPY)
+
+    s3_helper = S3Helper("https://s3.amazonaws.com")
+
+    version = get_version_from_repo()
+    version_str = f"{version.major}.{version.minor}"
+
+    s3_path_prefix = "/".join((version_str, pr_info.sha, build_name))
 
     rerun_helper = RerunHelper(gh, pr_info, CHECK_NAME)
     if rerun_helper.is_already_finished_by_status():
@@ -63,17 +76,15 @@ def main():
     if not os.path.exists(packages_path):
         os.makedirs(packages_path)
 
-    # def url_filter(url):
-    #     return url.endswith(".deb") and (
-    #         "clickhouse-common-static_" in url or "clickhouse-server_" in url
-    #     )
-
     download_builds_filter(CHECK_NAME, reports_path, packages_path)
 
     for f in os.listdir(packages_path):
         full_path = os.path.join(packages_path, f)
         hashed_file_path = hash_file(full_path)
-        sign_file(hashed_file_path)
+        signed_file_path = sign_file(hashed_file_path)
+        s3_helper.upload_build_file_to_s3(signed_file_path, s3_path_prefix)
+
+    sys.exit(0)
 
 if __name__ == "__main__":
     main()
