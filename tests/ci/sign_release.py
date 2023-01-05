@@ -13,7 +13,6 @@ from build_download_helper import download_builds_filter
 from rerun_helper import RerunHelper
 from docker_pull_helper import get_images_with_versions
 import hashlib
-import gnupg
 
 
 CHECK_NAME = "Sign release (actions)"

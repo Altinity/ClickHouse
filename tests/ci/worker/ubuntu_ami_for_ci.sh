@@ -67,7 +67,7 @@ systemctl restart docker
 sudo -u ubuntu docker buildx version
 sudo -u ubuntu docker buildx create --use --name default-builder
 
-pip install boto3 pygithub requests urllib3 unidiff dohq-artifactory gnupg
+pip install boto3 pygithub requests urllib3 unidiff dohq-artifactory
 
 mkdir -p $RUNNER_HOME && cd $RUNNER_HOME
 
