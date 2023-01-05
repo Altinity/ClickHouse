@@ -10,7 +10,6 @@ from pr_info import PRInfo
 from build_download_helper import download_builds_filter, get_build_name_for_check
 from rerun_helper import RerunHelper
 import hashlib
-from version_helper import get_version_from_repo
 
 
 CHECK_NAME = "Sign release (actions)"
@@ -49,8 +48,6 @@ def main():
     temp_path = TEMP_PATH
     reports_path = REPORTS_PATH
 
-    gh = Github(get_best_robot_token())
-
     build_name = get_build_name_for_check(CHECK_NAME)
 
     if not os.path.exists(TEMP_PATH):
@@ -62,15 +59,7 @@ def main():
 
     s3_helper = S3Helper("https://s3.amazonaws.com")
 
-    version = get_version_from_repo()
-    version_str = f"{version.major}.{version.minor}"
-
-    s3_path_prefix = "/".join((version_str, pr_info.sha, build_name))
-
-    rerun_helper = RerunHelper(gh, pr_info, CHECK_NAME)
-    if rerun_helper.is_already_finished_by_status():
-        logging.info("Check is already finished according to github status, exiting")
-        sys.exit(0)
+    s3_path_prefix = "/".join((pr_info.head_ref, pr_info.sha, build_name))
 
     packages_path = os.path.join(temp_path, "packages")
     if not os.path.exists(packages_path):
@@ -83,6 +72,7 @@ def main():
         hashed_file_path = hash_file(full_path)
         signed_file_path = sign_file(hashed_file_path)
         s3_helper.upload_build_file_to_s3(signed_file_path, s3_path_prefix)
+        print(f'Uploaded file {signed_file_path} to {s3_path_prefix}')
 
     sys.exit(0)
 
