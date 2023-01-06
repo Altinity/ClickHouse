@@ -59,7 +59,9 @@ def main():
 
     s3_helper = S3Helper("https://s3.amazonaws.com")
 
-    s3_path_prefix = "/".join((pr_info.head_ref, pr_info.sha, build_name))
+    s3_path_prefix = f"{pr_info.number}/{pr_info.sha}/" + CHECK_NAME.lower().replace(
+        " ", "_"
+    ).replace("(", "_").replace(")", "_").replace(",", "_")
 
     packages_path = os.path.join(temp_path, "packages")
     if not os.path.exists(packages_path):
@@ -71,8 +73,9 @@ def main():
         full_path = os.path.join(packages_path, f)
         hashed_file_path = hash_file(full_path)
         signed_file_path = sign_file(hashed_file_path)
-        s3_helper.upload_build_file_to_s3(signed_file_path, s3_path_prefix)
-        print(f'Uploaded file {signed_file_path} to {s3_path_prefix}')
+        s3_path = f'{s3_path_prefix}/{os.path.basename(signed_file_path)}'
+        s3_helper.upload_build_file_to_s3(signed_file_path, s3_path)
+        print(f'Uploaded file {signed_file_path} to {s3_path}')
 
     sys.exit(0)
 
