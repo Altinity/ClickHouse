@@ -466,6 +466,7 @@ jobs:
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/signed
           REPORTS_PATH=${{runner.temp}}/reports_dir
           EOF
       - name: Clear repository
@@ -489,8 +490,8 @@ jobs:
         uses: actions/upload-artifact@v2
         with:
           name: signed-hashes
-          path: '/home/ubuntu/actions-runner/_work/ClickHouse/ClickHouse/tests/ci/tmp/packages/*.gpg'
-#          path: ${{ runner.temp }}/*.gpg
+          path: $TEMP_PATH/*.gpg
+#         '/home/ubuntu/actions-runner/_work/ClickHouse/ClickHouse/tests/ci/tmp/packages/*.gpg'
       - name: Cleanup
         if: always()
         run: |

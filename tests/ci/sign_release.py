@@ -3,12 +3,9 @@ import sys
 import os
 import logging
 from env_helper import GPG_BINARY_SIGNING_KEY, GPG_BINARY_SIGNING_PASSPHRASE, TEMP_PATH, REPO_COPY, REPORTS_PATH
-from github import Github
 from s3_helper import S3Helper
-from get_robot_token import get_best_robot_token
 from pr_info import PRInfo
-from build_download_helper import download_builds_filter, get_build_name_for_check
-from rerun_helper import RerunHelper
+from build_download_helper import download_builds_filter
 import hashlib
 
 
@@ -37,18 +34,17 @@ def sign_file(file_path):
     with open(priv_key_file_path, 'x') as f:
         f.write(GPG_BINARY_SIGNING_KEY)
 
+    out_file_path = f'{file_path}.gpg'
+
     os.system(f'echo {GPG_BINARY_SIGNING_PASSPHRASE} | gpg --batch --import {priv_key_file_path}')
-    os.system(f'gpg --pinentry-mode=loopback --batch --yes --passphrase {GPG_BINARY_SIGNING_PASSPHRASE} --sign {file_path}')
+    os.system(f'gpg -o {out_file_path} --pinentry-mode=loopback --batch --yes --passphrase {GPG_BINARY_SIGNING_PASSPHRASE} --sign {file_path}')
     print(f"Signed {file_path}")
     os.remove(priv_key_file_path)
 
-    return f'{file_path}.gpg'
+    return out_file_path
 
 def main():
-    temp_path = TEMP_PATH
     reports_path = REPORTS_PATH
-
-    build_name = get_build_name_for_check(CHECK_NAME)
 
     if not os.path.exists(TEMP_PATH):
         os.makedirs(TEMP_PATH)
@@ -63,14 +59,10 @@ def main():
         " ", "_"
     ).replace("(", "_").replace(")", "_").replace(",", "_")
 
-    packages_path = os.path.join(temp_path, "packages")
-    if not os.path.exists(packages_path):
-        os.makedirs(packages_path)
+    download_builds_filter(CHECK_NAME, reports_path, TEMP_PATH)
 
-    download_builds_filter(CHECK_NAME, reports_path, packages_path)
-
-    for f in os.listdir(packages_path):
-        full_path = os.path.join(packages_path, f)
+    for f in os.listdir(TEMP_PATH):
+        full_path = os.path.join(TEMP_PATH, f)
         hashed_file_path = hash_file(full_path)
         signed_file_path = sign_file(hashed_file_path)
         s3_path = f'{s3_path_prefix}/{os.path.basename(signed_file_path)}'
