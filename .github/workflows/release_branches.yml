@@ -490,7 +490,7 @@ jobs:
         uses: actions/upload-artifact@v2
         with:
           name: signed-hashes
-          path: $TEMP_PATH/*.gpg
+          path: ${{TEMP_PATH}}/*.gpg
 #         '/home/ubuntu/actions-runner/_work/ClickHouse/ClickHouse/tests/ci/tmp/packages/*.gpg'
       - name: Cleanup
         if: always()
