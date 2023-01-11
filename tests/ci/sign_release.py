@@ -14,7 +14,7 @@ CHECK_NAME = "Sign release (actions)"
 def hash_file(file_path):
     BLOCK_SIZE = 65536 # The size of each read from the file
 
-    file_hash = hashlib.sha512() # Create the hash object, can use something other than `.sha256()` if you wish
+    file_hash = hashlib.sha256() # Create the hash object, can use something other than `.sha256()` if you wish
     with open(file_path, 'rb') as f: # Open the file to read it's bytes
         fb = f.read(BLOCK_SIZE) # Read from the file. Take in the amount declared above
         while len(fb) > 0: # While there is still data being read from the file
