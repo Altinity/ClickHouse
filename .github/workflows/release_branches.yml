@@ -491,7 +491,6 @@ jobs:
         with:
           name: signed-hashes
           path: ${{ env.TEMP_PATH }}/*.gpg
-#         '/home/ubuntu/actions-runner/_work/ClickHouse/ClickHouse/tests/ci/tmp/packages/*.gpg'
       - name: Cleanup
         if: always()
         run: |
