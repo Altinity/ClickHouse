@@ -1,9 +1,29 @@
 
+
 # docker build -t altinityinfra/binary-builder .
 ARG FROM_TAG=latest
 FROM altinityinfra/test-util:$FROM_TAG as cctools
 # The cctools are built always from the altinityinfra/test-util:latest and cached inline
 # Theoretically, it should improve rebuild speed significantly
+RUN apt update && apt install cmake --yes
+
+
+# Install Docker
+ENV DOCKER_CHANNEL stable
+RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+RUN add-apt-repository "deb https://download.docker.com/linux/ubuntu $(lsb_release -c -s) ${DOCKER_CHANNEL}"
+
+RUN apt-get update \
+    && env DEBIAN_FRONTEND=noninteractive apt-get install --yes \
+        docker-ce \
+    && rm -rf \
+        /var/lib/apt/lists/* \
+        /var/cache/debconf \
+        /tmp/* \
+    && apt-get clean
+
+RUN dockerd --version; docker --version
+
 ENV CC=clang-${LLVM_VERSION}
 ENV CXX=clang++-${LLVM_VERSION}
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -35,6 +55,22 @@ RUN git clone --depth 1 https://github.com/tpoechtrager/cctools-port.git \
     && make install -j$(nproc) \
     && cd ../.. \
     && rm -rf cctools-port
+
+# Install Docker
+ENV DOCKER_CHANNEL stable
+RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+RUN add-apt-repository "deb https://download.docker.com/linux/ubuntu $(lsb_release -c -s) ${DOCKER_CHANNEL}"
+
+RUN apt-get update \
+    && env DEBIAN_FRONTEND=noninteractive apt-get install --yes \
+        docker-ce \
+    && rm -rf \
+        /var/lib/apt/lists/* \
+        /var/cache/debconf \
+        /tmp/* \
+    && apt-get clean
+
+RUN dockerd --version; docker --version
 
 # !!!!!!!!!!!
 # END COMPILE
@@ -105,9 +141,9 @@ RUN curl -Lo /usr/bin/clang-tidy-cache \
     && chmod +x /usr/bin/clang-tidy-cache
 
 COPY --from=cctools /cctools /cctools
-
 RUN mkdir /workdir && chmod 777 /workdir
 WORKDIR /workdir
-
 COPY build.sh /
+COPY daemon.json /etc/docker/
+
 CMD ["bash", "-c", "/build.sh 2>&1"]
