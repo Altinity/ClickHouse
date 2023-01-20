@@ -21,7 +21,7 @@ def hash_file(file_path):
             file_hash.update(fb) # Update the hash
             fb = f.read(BLOCK_SIZE) # Read the next block from the file
 
-    hash_file_path = file_path + '.sha512'
+    hash_file_path = file_path + '.sha256'
     with open(hash_file_path, 'x') as f:
         digest = file_hash.hexdigest()
         f.write(digest)
@@ -71,20 +71,20 @@ def main():
         print(f'Uploaded file {signed_file_path} to {s3_path}')
 
     # Signed hashes are:
-    # clickhouse-client_22.3.15.2.altinitystable_amd64.deb.sha512.gpg              clickhouse-keeper_22.3.15.2.altinitystable_x86_64.apk.sha512.gpg
-    # clickhouse-client-22.3.15.2.altinitystable-amd64.tgz.sha512.gpg              clickhouse-keeper-22.3.15.2.altinitystable.x86_64.rpm.sha512.gpg
-    # clickhouse-client_22.3.15.2.altinitystable_x86_64.apk.sha512.gpg             clickhouse-keeper-dbg_22.3.15.2.altinitystable_amd64.deb.sha512.gpg
-    # clickhouse-client-22.3.15.2.altinitystable.x86_64.rpm.sha512.gpg             clickhouse-keeper-dbg-22.3.15.2.altinitystable-amd64.tgz.sha512.gpg
-    # clickhouse-common-static_22.3.15.2.altinitystable_amd64.deb.sha512.gpg       clickhouse-keeper-dbg_22.3.15.2.altinitystable_x86_64.apk.sha512.gpg
-    # clickhouse-common-static-22.3.15.2.altinitystable-amd64.tgz.sha512.gpg       clickhouse-keeper-dbg-22.3.15.2.altinitystable.x86_64.rpm.sha512.gpg
-    # clickhouse-common-static_22.3.15.2.altinitystable_x86_64.apk.sha512.gpg      clickhouse-keeper.sha512.gpg
-    # clickhouse-common-static-22.3.15.2.altinitystable.x86_64.rpm.sha512.gpg      clickhouse-library-bridge.sha512.gpg
-    # clickhouse-common-static-dbg_22.3.15.2.altinitystable_amd64.deb.sha512.gpg   clickhouse-odbc-bridge.sha512.gpg
-    # clickhouse-common-static-dbg-22.3.15.2.altinitystable-amd64.tgz.sha512.gpg   clickhouse-server_22.3.15.2.altinitystable_amd64.deb.sha512.gpg
-    # clickhouse-common-static-dbg_22.3.15.2.altinitystable_x86_64.apk.sha512.gpg  clickhouse-server-22.3.15.2.altinitystable-amd64.tgz.sha512.gpg
-    # clickhouse-common-static-dbg-22.3.15.2.altinitystable.x86_64.rpm.sha512.gpg  clickhouse-server_22.3.15.2.altinitystable_x86_64.apk.sha512.gpg
-    # clickhouse-keeper_22.3.15.2.altinitystable_amd64.deb.sha512.gpg              clickhouse-server-22.3.15.2.altinitystable.x86_64.rpm.sha512.gpg
-    # clickhouse-keeper-22.3.15.2.altinitystable-amd64.tgz.sha512.gpg              clickhouse.sha512.gpg
+    # clickhouse-client_22.3.15.2.altinitystable_amd64.deb.sha256.gpg              clickhouse-keeper_22.3.15.2.altinitystable_x86_64.apk.sha256.gpg
+    # clickhouse-client-22.3.15.2.altinitystable-amd64.tgz.sha256.gpg              clickhouse-keeper-22.3.15.2.altinitystable.x86_64.rpm.sha256.gpg
+    # clickhouse-client_22.3.15.2.altinitystable_x86_64.apk.sha256.gpg             clickhouse-keeper-dbg_22.3.15.2.altinitystable_amd64.deb.sha256.gpg
+    # clickhouse-client-22.3.15.2.altinitystable.x86_64.rpm.sha256.gpg             clickhouse-keeper-dbg-22.3.15.2.altinitystable-amd64.tgz.sha256.gpg
+    # clickhouse-common-static_22.3.15.2.altinitystable_amd64.deb.sha256.gpg       clickhouse-keeper-dbg_22.3.15.2.altinitystable_x86_64.apk.sha256.gpg
+    # clickhouse-common-static-22.3.15.2.altinitystable-amd64.tgz.sha256.gpg       clickhouse-keeper-dbg-22.3.15.2.altinitystable.x86_64.rpm.sha256.gpg
+    # clickhouse-common-static_22.3.15.2.altinitystable_x86_64.apk.sha256.gpg      clickhouse-keeper.sha256.gpg
+    # clickhouse-common-static-22.3.15.2.altinitystable.x86_64.rpm.sha256.gpg      clickhouse-library-bridge.sha256.gpg
+    # clickhouse-common-static-dbg_22.3.15.2.altinitystable_amd64.deb.sha256.gpg   clickhouse-odbc-bridge.sha256.gpg
+    # clickhouse-common-static-dbg-22.3.15.2.altinitystable-amd64.tgz.sha256.gpg   clickhouse-server_22.3.15.2.altinitystable_amd64.deb.sha256.gpg
+    # clickhouse-common-static-dbg_22.3.15.2.altinitystable_x86_64.apk.sha256.gpg  clickhouse-server-22.3.15.2.altinitystable-amd64.tgz.sha256.gpg
+    # clickhouse-common-static-dbg-22.3.15.2.altinitystable.x86_64.rpm.sha256.gpg  clickhouse-server_22.3.15.2.altinitystable_x86_64.apk.sha256.gpg
+    # clickhouse-keeper_22.3.15.2.altinitystable_amd64.deb.sha256.gpg              clickhouse-server-22.3.15.2.altinitystable.x86_64.rpm.sha256.gpg
+    # clickhouse-keeper-22.3.15.2.altinitystable-amd64.tgz.sha256.gpg              clickhouse.sha256.gpg
 
     sys.exit(0)
 
