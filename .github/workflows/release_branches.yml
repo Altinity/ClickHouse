@@ -154,9 +154,9 @@ jobs:
           cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
           set -xe
           # Trying to find some safe default sthat wouldn't nuke the system
-          # On our runners we have 32 Cores, 128 GiB RAM
-          # export CMAKE_FLAGS="-DPARALLEL_COMPILE_JOBS=30 -DPARALLEL_LINK_JOBS=10"
-          # export CMAKE_FLAGS="-DMAX_COMPILER_MEMORY=4000 -DMAX_LINKER_MEMORY=10000"
+          # On our runners we have 32 Cores, 100 GiB RAM
+          export CMAKE_FLAGS="-DPARALLEL_COMPILE_JOBS=20 -DPARALLEL_LINK_JOBS=10"
+          #export CMAKE_FLAGS="-DMAX_COMPILER_MEMORY=4000 -DMAX_LINKER_MEMORY=10000"
           export NINJA_FLAGS="-j16"
           cd "$REPO_COPY/tests/ci" && python3 build_check.py "$BUILD_NAME"
       - name: Pause if in debug mode
