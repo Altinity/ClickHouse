@@ -27,6 +27,11 @@ RUN apt-get update \
         /etc/apt/sources.list \
     && apt-get clean
 
+
+# Note (vnemkov): Install clang-14 and all related stuff in recomended by Clang
+# https://apt.llvm.org/:
+RUN bash -c "$(wget -O - https://apt.llvm.org/llvm.sh)" "script" ${LLVM_VERSION} all
+
 # initial packages
 RUN apt-get update \
     && apt-get install \
