@@ -924,7 +924,7 @@ public:
     /// section from config.xml.
     CompressionCodecPtr getCompressionCodecForPart(size_t part_size_compressed, const IMergeTreeDataPart::TTLInfos & ttl_infos, time_t current_time) const;
 
-    std::lock_guard<std::mutex> getQueryIdSetLock() const { return std::lock_guard<std::mutex>(query_id_set_mutex); }
+    std::lock_guard<std::mutex> getQueryIdSetLock() const TSA_NO_THREAD_SAFETY_ANALYSIS { return std::lock_guard<std::mutex>(query_id_set_mutex); }
 
     /// Record current query id where querying the table. Throw if there are already `max_queries` queries accessing the same table.
     /// Returns false if the `query_id` already exists in the running set, otherwise return true.

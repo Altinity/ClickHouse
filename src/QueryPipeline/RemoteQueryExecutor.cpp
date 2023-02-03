@@ -497,7 +497,7 @@ void RemoteQueryExecutor::finish(std::unique_ptr<ReadContext> * read_context)
     /// Send the request to abort the execution of the request, if not already sent.
     tryCancel("Cancelling query because enough data has been read", read_context);
 
-    if (context->getSettingsRef().drain_timeout != Poco::Timespan(-1000000))
+    if (context->getSettingsRef().drain_timeout.value != Poco::Timespan(-1000000))
     {
         auto connections_left = ConnectionCollector::enqueueConnectionCleanup(pool, connections);
         if (connections_left)

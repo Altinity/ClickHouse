@@ -67,7 +67,7 @@ public:
     bool ackMessages();
     void updateAckTracker(AckTracker record = AckTracker());
 
-    bool queueEmpty() { return received.empty(); }
+    bool hasPendingMessages() { return received.empty(); }
     void allowNext() { allowed = true; } // Allow to read next message.
 
     auto getChannelID() const { return current.track.channel_id; }
