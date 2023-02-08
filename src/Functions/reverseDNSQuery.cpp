@@ -8,6 +8,7 @@
 #include <Poco/Net/IPAddress.h>
 #include <Interpreters/Context.h>
 #include <Poco/Util/AbstractConfiguration.h>
+#include <Common/Documentation.h>
 
 namespace DB
 {
