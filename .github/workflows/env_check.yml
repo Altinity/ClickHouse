@@ -19,4 +19,5 @@ jobs:
         uses: ClickHouse/checkout@v1
         with:
           clear-repository: true
+      - run: chmod +x check-env-vars.py
       - run: ./check-env-vars.py
