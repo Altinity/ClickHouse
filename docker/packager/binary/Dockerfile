@@ -24,6 +24,30 @@ RUN apt-get update \
 
 RUN dockerd --version; docker --version
 
+# Install CMake 3.20+ for Rust compilation
+# Used https://askubuntu.com/a/1157132 as reference
+RUN apt purge cmake --yes
+RUN wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | gpg --dearmor - | tee /etc/apt/trusted.gpg.d/kitware.gpg >/dev/null
+RUN apt-add-repository 'deb https://apt.kitware.com/ubuntu/ focal main'
+RUN apt update && apt install cmake --yes
+
+
+# Install Docker
+ENV DOCKER_CHANNEL stable
+RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+RUN add-apt-repository "deb https://download.docker.com/linux/ubuntu $(lsb_release -c -s) ${DOCKER_CHANNEL}"
+
+RUN apt-get update \
+    && env DEBIAN_FRONTEND=noninteractive apt-get install --yes \
+        docker-ce \
+    && rm -rf \
+        /var/lib/apt/lists/* \
+        /var/cache/debconf \
+        /tmp/* \
+    && apt-get clean
+
+RUN dockerd --version; docker --version
+
 ENV CC=clang-${LLVM_VERSION}
 ENV CXX=clang++-${LLVM_VERSION}
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!

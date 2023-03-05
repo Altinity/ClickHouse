@@ -240,7 +240,9 @@ def parse_env_variables(
         )
         if is_release_build(build_type, package_type, sanitizer):
             cmake_flags.append("-DSPLIT_DEBUG_SYMBOLS=ON")
-            result.append("WITH_PERFORMANCE=1")
+            # NOTE(vnemkov): we don't do performace tests, and this causes some issues down the road, disabling it for now
+            # https://s3.amazonaws.com/altinity-build-artifacts/217/dc4053ae4a78bfff0f689f001dfb30a7fa67694d/package_release/build_log.log
+            # result.append("WITH_PERFORMANCE=1")
             if is_cross_arm:
                 cmake_flags.append("-DBUILD_STANDALONE_KEEPER=1")
             else:
