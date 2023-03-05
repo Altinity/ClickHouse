@@ -314,7 +314,12 @@ def main():
         official_flag = build_config["official"]
 
     official_flag = True
-    version._flavour = version_type = CLICKHOUSE_STABLE_VERSION_SUFFIX
+    # Do not override version flavour, so it must be set in one place only
+    if (len(CLICKHOUSE_STABLE_VERSION_SUFFIX)):
+        version._flavour = version_type = CLICKHOUSE_STABLE_VERSION_SUFFIX
+    else:
+        version_type = version._flavour
+
     # TODO (vnemkov): right now we'll use simplified version management:
     # only update git hash and explicitly set stable version suffix.
     # official_flag = pr_info.number == 0
