@@ -597,7 +597,7 @@ jobs:
       - name: Run example suite
         run: python3 
               -u example/regression.py
-              --clickhouse-binary-path $(python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV)
+              --clickhouse-binary-path $(python3 .github/get-deb-url.py --report-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV)
               --test-to-end
               --local
               --collect-service-logs 
