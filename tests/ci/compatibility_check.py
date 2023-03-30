@@ -24,8 +24,8 @@ from clickhouse_helper import (
 from stopwatch import Stopwatch
 from rerun_helper import RerunHelper
 
-IMAGE_UBUNTU = "clickhouse/test-old-ubuntu"
-IMAGE_CENTOS = "clickhouse/test-old-centos"
+IMAGE_UBUNTU = "altinityinfra/test-old-ubuntu"
+IMAGE_CENTOS = "altinityinfra/test-old-centos"
 MAX_GLIBC_VERSION = "2.4"
 DOWNLOAD_RETRIES_COUNT = 5
 CHECK_NAME = "Compatibility check"
@@ -198,7 +198,7 @@ if __name__ == "__main__":
         CHECK_NAME,
     )
 
-    ch_helper.insert_events_into(db="default", table="checks", events=prepared_events)
+    ch_helper.insert_events_into(db="gh-data", table="checks", events=prepared_events)
 
     if state == "error":
         sys.exit(1)

@@ -17,6 +17,7 @@ from env_helper import (
     S3_BUILDS_BUCKET,
     S3_DOWNLOAD,
     TEMP_PATH,
+    CLICKHOUSE_STABLE_VERSION_SUFFIX,
 )
 from s3_helper import S3Helper
 from pr_info import PRInfo
@@ -31,7 +32,7 @@ from ci_config import CI_CONFIG, BuildConfig
 from docker_pull_helper import get_image_with_version
 from tee_popen import TeePopen
 
-IMAGE_NAME = "clickhouse/binary-builder"
+IMAGE_NAME = "altinityinfra/binary-builder"
 BUILD_LOG_NAME = "build_log.log"
 
 
@@ -270,18 +271,22 @@ def main():
 
     logging.info("Got version from repo %s", version.string)
 
-    official_flag = pr_info.number == 0
     if "official" in build_config:
         official_flag = build_config["official"]
 
-    version_type = "testing"
-    if "release" in pr_info.labels or "release-lts" in pr_info.labels:
-        version_type = "stable"
-        official_flag = True
+    official_flag = True
+    version._flavour = version_type = CLICKHOUSE_STABLE_VERSION_SUFFIX
+    # TODO (vnemkov): right now we'll use simplified version management:
+    # only update git hash and explicitly set stable version suffix.
+    # official_flag = pr_info.number == 0
+    # version_type = "testing"
+    # if "release" in pr_info.labels or "release-lts" in pr_info.labels:
+    #     version_type = CLICKHOUSE_STABLE_VERSION_SUFFIX
+    #     official_flag = True
 
     update_version_local(version, version_type)
 
-    logging.info("Updated local files with version")
+    logging.info(f"Updated local files with version : {version.string} / {version.describe}")
 
     logging.info("Build short name %s", build_name)
 
