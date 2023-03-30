@@ -584,7 +584,6 @@ jobs:
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
-          TEMP_PATH=${{runner.temp}}/regression_tests_release
           REPORTS_PATH=${{runner.temp}}/reports_dir
           SUITE=example
           artifacts=public
@@ -598,7 +597,7 @@ jobs:
       - name: Run example suite
         run: python3 
               -u example/regression.py
-              --clickhouse-binary-path $(python3 .github/get-deb-url.py)
+              --clickhouse-binary-path $(python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV)
               --test-to-end
               --local
               --collect-service-logs 
