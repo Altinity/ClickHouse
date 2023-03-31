@@ -2050,7 +2050,6 @@ jobs:
       - IntegrationTestsRelease0
       - IntegrationTestsRelease1
       - CompatibilityCheck
-      - RegressionTests
       - aes_encryption
       - aggregate_functions
       - atomic_insert
