@@ -2036,8 +2036,21 @@ jobs:
             ./*/_instances/*/logs/*.log
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
-  RegressionTests:
+  FinishCheck:
     needs:
+      - DockerHubPush
+      - DockerServerImages
+      - BuilderReport
+      # - BuilderSpecialReport
+      - MarkReleaseReady
+      - FunctionalStatelessTestRelease
+      # - FunctionalStatelessTestAarch64
+      - FunctionalStatefulTestRelease
+      # - FunctionalStatefulTestAarch64
+      - IntegrationTestsRelease0
+      - IntegrationTestsRelease1
+      - CompatibilityCheck
+      - RegressionTests
       - aes_encryption
       - aggregate_functions
       - atomic_insert
@@ -2065,24 +2078,6 @@ jobs:
       - tiered_storage
       - tiered_storage_minio
       - window_functions
-    runs-on: ubuntu-latest
-    steps: 
-      - run: echo "Syncing regression tests"
-  FinishCheck:
-    needs:
-      - DockerHubPush
-      - DockerServerImages
-      - BuilderReport
-      # - BuilderSpecialReport
-      - MarkReleaseReady
-      - FunctionalStatelessTestRelease
-      # - FunctionalStatelessTestAarch64
-      - FunctionalStatefulTestRelease
-      # - FunctionalStatefulTestAarch64
-      - IntegrationTestsRelease0
-      - IntegrationTestsRelease1
-      - CompatibilityCheck
-      - RegressionTests
     runs-on: [self-hosted, style-checker]
     steps:
       - name: Check out repository code
