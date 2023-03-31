@@ -592,10 +592,14 @@ jobs:
         uses: actions/download-artifact@v3
         with:
           path: ${{ env.REPORTS_PATH }}
+      - name: Debug reports_path
+        run: ls ${{ env.REPORTS_PATH }}
+      - name: Debug reports_path/build_urls_package_release
+        run: ls ${{ env.REPORTS_PATH }}/build_urls_package_release
       - name: Setup
         run: .github/setup.sh
       - name: Get deb url
-        run: python3 .github/get-deb-url.py --report-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
+        run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run example suite
         run: python3 
               -u example/regression.py
