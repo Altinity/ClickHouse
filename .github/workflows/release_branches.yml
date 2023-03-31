@@ -627,6 +627,8 @@ jobs:
     needs:
       - example
     runs-on: ubuntu-latest
+    steps: 
+      - run: echo "Syncing regression tests"
   FinishCheck:
     needs:
       - DockerHubPush
