@@ -779,7 +779,7 @@ jobs:
       - uses: actions/upload-artifact@v3
         if: always()
         with:
-          name: benchmark-artifacts
+          name: ${{ env.SUITE }}-artifacts
           path: |
             ./report.html
             ./*.log.txt
@@ -877,9 +877,9 @@ jobs:
         run: python3 
               -u ${{ env.SUITE }}/benchmark.py
               --storage aws_s3
-              --aws-s3-bucket ${{ secrets.REGRESSION_AWS_BUCKET }}
-              --aws-s3-region ${{ secrets.REGRESSION_AWS_REGION }}
-              --aws-s3-key-id ${{ secrets.REGRESSION_AWS_KEY_ID }}
+              --aws-s3-bucket ${{ secrets.REGRESSION_AWS_S3_BUCKET }}
+              --aws-s3-region ${{ secrets.REGRESSION_AWS_S3_REGION }}
+              --aws-s3-key-id ${{ secrets.REGRESSION_AWS_S3_KEY_ID }}
               --aws-s3-access-key ${{ secrets.REGRESSION_AWS_S3_SECRET_ACCESS_KEY }}
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
@@ -1706,9 +1706,9 @@ jobs:
               --log raw.log
               --storage minio
               --storage aws_s3
-              --aws-s3-bucket ${{ secrets.REGRESSION_AWS_BUCKET }}
-              --aws-s3-region ${{ secrets.REGRESSION_AWS_REGION }}
-              --aws-s3-key-id ${{ secrets.REGRESSION_AWS_KEY_ID }}
+              --aws-s3-bucket ${{ secrets.REGRESSION_AWS_S3_BUCKET }}
+              --aws-s3-region ${{ secrets.REGRESSION_AWS_S3_REGION }}
+              --aws-s3-key-id ${{ secrets.REGRESSION_AWS_S3_KEY_ID }}
               --aws-s3-access-key ${{ secrets.REGRESSION_AWS_S3_SECRET_ACCESS_KEY }}
               --storage gcs
               --gcs-uri ${{ secrets.REGRESSION_GCS_URI }}
@@ -1988,9 +1988,9 @@ jobs:
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
               --log raw.log
               --storage aws_s3
-              --aws-s3-bucket ${{ secrets.REGRESSION_AWS_BUCKET }}
-              --aws-s3-region ${{ secrets.REGRESSION_AWS_REGION }}
-              --aws-s3-key-id ${{ secrets.REGRESSION_AWS_KEY_ID }}
+              --aws-s3-bucket ${{ secrets.REGRESSION_AWS_S3_BUCKET }}
+              --aws-s3-region ${{ secrets.REGRESSION_AWS_S3_REGION }}
+              --aws-s3-key-id ${{ secrets.REGRESSION_AWS_S3_KEY_ID }}
               --aws-s3-access-key ${{ secrets.REGRESSION_AWS_S3_SECRET_ACCESS_KEY }}
       - name: Create and upload logs
         if: always()
@@ -2272,8 +2272,8 @@ jobs:
               --log raw.log
               --with-s3amazon
               --aws-s3-access-key ${{ secrets.REGRESSION_AWS_S3_SECRET_ACCESS_KEY }}
-              --aws-s3-key-id ${{ secrets.AWS_KEY_ID }}
-              --aws-s3-uri https://s3.${{ secrets.REGRESSION_AWS_REGION}}.amazonaws.com/${{ secrets.REGRESSION_AWS_BUCKET }}/data/
+              --aws-s3-key-id ${{ secrets.AWS_S3_KEY_ID }}
+              --aws-s3-uri https://s3.${{ secrets.REGRESSION_AWS_S3_REGION}}.amazonaws.com/${{ secrets.REGRESSION_AWS_S3_BUCKET }}/data/
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
