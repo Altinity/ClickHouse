@@ -8,7 +8,6 @@
 #include <Storages/RabbitMQ/RabbitMQHandler.h>
 #include <boost/algorithm/string/split.hpp>
 #include <Common/logger_useful.h>
-#include "Poco/Timer.h"
 #include <amqpcpp.h>
 
 namespace DB
@@ -26,8 +25,7 @@ ReadBufferFromRabbitMQConsumer::ReadBufferFromRabbitMQConsumer(
         const String & channel_base_,
         Poco::Logger * log_,
         char row_delimiter_,
-        uint32_t queue_size_,
-        const std::atomic<bool> & stopped_)
+        uint32_t queue_size_)
         : ReadBuffer(nullptr, 0)
         , event_handler(event_handler_)
         , queues(queues_)
@@ -35,11 +33,15 @@ ReadBufferFromRabbitMQConsumer::ReadBufferFromRabbitMQConsumer(
         , channel_id_base(channel_id_base_)
         , log(log_)
         , row_delimiter(row_delimiter_)
-        , stopped(stopped_)
         , received(queue_size_)
 {
 }
 
+void ReadBufferFromRabbitMQConsumer::shutdown()
+{
+    stopped = true;
+    cv.notify_one();
+}
 
 ReadBufferFromRabbitMQConsumer::~ReadBufferFromRabbitMQConsumer()
 {
@@ -47,7 +49,7 @@ ReadBufferFromRabbitMQConsumer::~ReadBufferFromRabbitMQConsumer()
 }
 
 
-void ReadBufferFromRabbitMQConsumer::closeChannel()
+void ReadBufferFromRabbitMQConsumer::closeConnections()
 {
     if (consumer_channel)
         consumer_channel->close();
@@ -77,6 +79,8 @@ void ReadBufferFromRabbitMQConsumer::subscribe()
                         message.hasTimestamp() ? message.timestamp() : 0,
                         redelivered, AckTracker(delivery_tag, channel_id)}))
                     throw Exception(ErrorCodes::LOGICAL_ERROR, "Could not push to received queue");
+
+                cv.notify_one();
             }
         })
         .onError([&](const char * message)

@@ -3,6 +3,7 @@
 #include <Core/BackgroundSchedulePool.h>
 #include <Storages/IStorage.h>
 #include <Poco/Semaphore.h>
+#include <memory>
 #include <mutex>
 #include <atomic>
 #include <Storages/RabbitMQ/Buffer_fwd.h>
@@ -107,8 +108,10 @@ private:
 
     size_t num_created_consumers = 0;
     Poco::Semaphore semaphore;
+
     std::mutex buffers_mutex;
     std::vector<ConsumerBufferPtr> buffers; /// available buffers for RabbitMQ consumers
+    std::vector<std::weak_ptr<ReadBufferFromRabbitMQConsumer>> buffers_ref; /// available buffers for RabbitMQ consumers
 
     String unique_strbase; /// to make unique consumer channel id
 

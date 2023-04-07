@@ -707,16 +707,15 @@ void StorageRabbitMQ::read(
     Pipes pipes;
     pipes.reserve(num_created_consumers);
 
+    uint64_t max_execution_time_ms = rabbitmq_settings->rabbitmq_flush_interval_ms.changed
+        ? rabbitmq_settings->rabbitmq_flush_interval_ms
+        : static_cast<UInt64>(Poco::Timespan(getContext()->getSettingsRef().stream_flush_interval_ms).milliseconds());
+
     for (size_t i = 0; i < num_created_consumers; ++i)
     {
         auto rabbit_source = std::make_shared<RabbitMQSource>(
-            *this, storage_snapshot, modified_context, column_names, 1, rabbitmq_settings->rabbitmq_commit_on_select);
-
-        uint64_t max_execution_time_ms = rabbitmq_settings->rabbitmq_flush_interval_ms.changed
-                                          ? rabbitmq_settings->rabbitmq_flush_interval_ms
-                                          : (static_cast<UInt64>(getContext()->getSettingsRef().stream_flush_interval_ms) * 1000);
-
-        rabbit_source->setTimeLimit(max_execution_time_ms);
+            *this, storage_snapshot, modified_context, column_names, 1,
+            max_execution_time_ms, rabbitmq_settings->rabbitmq_commit_on_select);
 
         auto converting_dag = ActionsDAG::makeConvertingActions(
             rabbit_source->getPort().getHeader().getColumnsWithTypeAndName(),
@@ -784,7 +783,9 @@ void StorageRabbitMQ::startup()
         try
         {
             auto buffer = createReadBuffer();
+            buffers_ref.push_back(buffer);
             pushReadBuffer(std::move(buffer));
+
             ++num_created_consumers;
         }
         catch (...)
@@ -803,6 +804,11 @@ void StorageRabbitMQ::shutdown()
 {
     shutdown_called = true;
 
+    LOG_TRACE(log, "Deactivating background tasks");
+
+    for (auto & buffer : buffers_ref)
+        buffer.lock()->shutdown();
+
     /// In case it has not yet been able to setup connection;
     deactivateTask(connection_task, true, false);
 
@@ -811,16 +817,16 @@ void StorageRabbitMQ::shutdown()
     deactivateTask(streaming_task, true, false);
     deactivateTask(looping_task, true, true);
 
+    LOG_TRACE(log, "Cleaning up RabbitMQ after table usage");
+
     /// Just a paranoid try catch, it is not actually needed.
     try
     {
-        if (drop_table)
-        {
-            for (auto & buffer : buffers)
-                buffer->closeChannel();
+        for (auto & buffer : buffers_ref)
+            buffer.lock()->closeConnections();
 
+        if (drop_table)
             cleanupRabbitMQ();
-        }
 
         /// It is important to close connection here - before removing consumer buffers, because
         /// it will finish and clean callbacks, which might use those buffers data.
@@ -925,7 +931,7 @@ ConsumerBufferPtr StorageRabbitMQ::createReadBuffer()
 {
     return std::make_shared<ReadBufferFromRabbitMQConsumer>(
         connection->getHandler(), queues, ++consumer_id,
-        unique_strbase, log, row_delimiter, queue_size, shutdown_called);
+        unique_strbase, log, row_delimiter, queue_size);
 }
 
 
@@ -1074,16 +1080,14 @@ bool StorageRabbitMQ::streamToViews()
     sources.reserve(num_created_consumers);
     pipes.reserve(num_created_consumers);
 
+    uint64_t max_execution_time_ms = rabbitmq_settings->rabbitmq_flush_interval_ms.changed
+        ? rabbitmq_settings->rabbitmq_flush_interval_ms
+        : static_cast<UInt64>(Poco::Timespan(getContext()->getSettingsRef().stream_flush_interval_ms).milliseconds());
+
     for (size_t i = 0; i < num_created_consumers; ++i)
     {
         auto source = std::make_shared<RabbitMQSource>(
-            *this, storage_snapshot, rabbitmq_context, column_names, block_size, false);
-
-        uint64_t max_execution_time_ms = rabbitmq_settings->rabbitmq_flush_interval_ms.changed
-                                          ? rabbitmq_settings->rabbitmq_flush_interval_ms
-                                          : (static_cast<UInt64>(getContext()->getSettingsRef().stream_flush_interval_ms) * 1000);
-
-        source->setTimeLimit(max_execution_time_ms);
+            *this, storage_snapshot, rabbitmq_context, column_names, block_size, max_execution_time_ms, false);
 
         sources.emplace_back(source);
         pipes.emplace_back(source);
@@ -1127,7 +1131,7 @@ bool StorageRabbitMQ::streamToViews()
         /// Commit
         for (auto & source : sources)
         {
-            if (source->queueEmpty())
+            if (!source->hasPendingMessages())
                 ++queue_empty;
 
             if (source->needChannelUpdate())
