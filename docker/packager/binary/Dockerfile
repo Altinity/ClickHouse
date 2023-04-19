@@ -94,7 +94,6 @@ RUN curl https://raw.githubusercontent.com/matus-chochlik/ctcache/7fd516e91c1777
 RUN mkdir /workdir && chmod 777 /workdir
 WORKDIR /workdir
 
-        libclang-rt-15-dev \
 COPY build.sh /
 COPY daemon.json /etc/docker/
 
