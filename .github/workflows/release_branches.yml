@@ -572,8 +572,14 @@ jobs:
 #############################################################################################
 ##################################### REGRESSION TESTS ######################################
 #############################################################################################
+  regression_start:
+    needs: [FunctionalStatelessTestRelease, FunctionalStatefulTestRelease, IntegrationTestsRelease0, IntegrationTestsRelease1]
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+
   aes_encryption:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -600,12 +606,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output nice
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -627,7 +633,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   aggregate_functions:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -654,12 +660,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -681,7 +687,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   atomic_insert:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -708,12 +714,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -735,7 +741,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   base_58:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -762,12 +768,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -789,7 +795,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   benchmark_minio:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -817,13 +823,13 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/benchmark.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --storage minio
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -845,7 +851,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   benchmark_aws:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -873,7 +879,7 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/benchmark.py
               --storage aws_s3
               --aws-s3-bucket ${{ secrets.REGRESSION_AWS_S3_BUCKET }}
@@ -883,7 +889,7 @@ jobs:
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -903,9 +909,9 @@ jobs:
             ./*/_instances/*.log
             ./*/_instances/*/logs/*.log
             ./*/*/_instances/*/logs/*.log
-            ./*/*/_instances/*.log 
+            ./*/*/_instances/*.log
   benchmark_gcs:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -933,7 +939,7 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/benchmark.py
               --storage gcs
               --gcs-uri ${{ secrets.REGRESSION_GCS_URI }}
@@ -942,7 +948,7 @@ jobs:
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -964,7 +970,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   clickhouse_keeper:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -991,12 +997,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -1018,7 +1024,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   datetime64_extended_range:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -1045,12 +1051,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -1072,7 +1078,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   disk_level_encryption:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -1099,12 +1105,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -1126,7 +1132,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   dns:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -1153,12 +1159,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -1180,7 +1186,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   example:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -1207,12 +1213,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -1232,9 +1238,9 @@ jobs:
             ./*/_instances/*.log
             ./*/_instances/*/logs/*.log
             ./*/*/_instances/*/logs/*.log
-            ./*/*/_instances/*.log  
+            ./*/*/_instances/*.log
   extended_precision_data_types:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -1261,12 +1267,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -1288,7 +1294,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   kafka:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -1315,12 +1321,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -1342,7 +1348,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   kerberos:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -1369,12 +1375,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -1396,7 +1402,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   ldap_authentication:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -1423,12 +1429,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -1450,7 +1456,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   ldap_external_user_directory:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -1477,12 +1483,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -1504,7 +1510,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   ldap_role_mapping:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -1531,12 +1537,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -1558,7 +1564,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   lightweight_delete:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -1585,12 +1591,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -1612,7 +1618,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   map_type:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -1639,12 +1645,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -1666,7 +1672,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   parquet:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -1693,12 +1699,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -1730,7 +1736,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   part_moves_between_shards:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -1757,12 +1763,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -1784,7 +1790,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   rbac:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -1811,12 +1817,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -1838,7 +1844,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   selects:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -1865,12 +1871,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -1892,7 +1898,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   s3_minio:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -1920,12 +1926,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -1948,7 +1954,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   s3_aws:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -1976,12 +1982,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -2008,7 +2014,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   s3_gcs:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -2036,12 +2042,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -2067,7 +2073,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   ssl_server:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -2094,12 +2100,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -2121,7 +2127,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   tiered_storage:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -2148,12 +2154,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -2175,7 +2181,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   tiered_storage_minio:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -2203,13 +2209,13 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --with-minio
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -2231,7 +2237,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   tiered_storage_aws:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -2259,12 +2265,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
@@ -2290,7 +2296,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   tiered_storage_gcs:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -2318,17 +2324,17 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
               --log raw.log
-              --with-s3gcs 
+              --with-s3gcs
               --gcs-key-id ${{ secrets.REGRESSION_GCS_KEY_ID }}
               --gcs-key-secret ${{ secrets.REGRESSION_GCS_KEY_SECRET }}
               --gcs-uri ${{ secrets.REGRESSION_GCS_URI }}
@@ -2349,7 +2355,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
   window_functions:
-    needs: [BuilderDebRelease]
+    needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -2376,12 +2382,12 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
-        run: python3 
+        run: python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
               --test-to-end
               --local
-              --collect-service-logs 
+              --collect-service-logs
               --output classic
               --parallel 1
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
