@@ -153,12 +153,9 @@ jobs:
       - name: Build
         run: |
           sudo rm -fr "$TEMP_PATH"
-          mkdir -p "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH/build_check/package_release"
           cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
-          ls
-          pwd
-          tar cvzf build_source.src.tar.gz *
-          #cd "$REPO_COPY/tests/ci" && python3 build_check.py "$BUILD_NAME"
+          tar czf build_source.src.tar.gz * && mv build_source.src.tar.gz $TEMP_PATH/build_check/package_release/build_source.src.tar.gz
           cd "$REPO_COPY/tests/ci" && python3 build_check.py "$BUILD_NAME"
       - name: Upload build URLs to artifacts
         if: ${{ success() || failure() }}
