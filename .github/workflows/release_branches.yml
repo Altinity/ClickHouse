@@ -624,6 +624,8 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+        env:
+          artifact_s3_dir: build/v${{ env.version }}/$GITHUB_SHA
       - uses: actions/upload-artifact@v3
         if: always()
         with:
@@ -692,6 +694,8 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+        env:
+          artifact_s3_dir: build/v${{ env.version }}/$GITHUB_SHA
       - uses: actions/upload-artifact@v3
         if: always()
         with:
@@ -752,6 +756,8 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+        env:
+          artifact_s3_dir: build/v${{ env.version }}/$GITHUB_SHA
       - uses: actions/upload-artifact@v3
         if: always()
         with:
@@ -818,6 +824,8 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+        env:
+          artifact_s3_dir: build/v${{ env.version }}/$GITHUB_SHA
       - uses: actions/upload-artifact@v3
         if: always()
         with:
@@ -887,6 +895,8 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+        env:
+          artifact_s3_dir: build/v${{ env.version }}/$GITHUB_SHA
       - uses: actions/upload-artifact@v3
         if: always()
         with:
@@ -955,6 +965,8 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+        env:
+          artifact_s3_dir: build/v${{ env.version }}/$GITHUB_SHA
       - uses: actions/upload-artifact@v3
         if: always()
         with:
