@@ -573,11 +573,8 @@ jobs:
 ##################################### REGRESSION TESTS ######################################
 #############################################################################################
   regression_start:
-    needs: [BuilderDebRelease, FunctionalStatelessTestRelease, FunctionalStatefulTestRelease, IntegrationTestsRelease0, IntegrationTestsRelease1]
-    # Run AFTER any of tests, but only if `BuilderDebRelease` succeed.
-    # Since we can't reference jobs directly and get their status, 
-    # check if any of jobs succeeds.
-    if: ${{ always() && contains(needs.*.result, 'success') }}
+    ## Not depending on the tests above since they can fail at any given moment.
+    needs: [BuilderDebRelease]
     runs-on: ubuntu-latest
     steps:
       - run: true
