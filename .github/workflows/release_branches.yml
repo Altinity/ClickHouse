@@ -573,7 +573,8 @@ jobs:
 ##################################### REGRESSION TESTS ######################################
 #############################################################################################
   regression_start:
-    needs: [FunctionalStatelessTestRelease, FunctionalStatefulTestRelease, IntegrationTestsRelease0, IntegrationTestsRelease1]
+    ## Not depending on the tests above since they can fail at any given moment.
+    needs: [BuilderDebRelease]
     runs-on: ubuntu-latest
     steps:
       - run: true
