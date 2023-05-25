@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <pwd.h>
 #include <unistd.h>
+#include <Poco/Crypto/Crypto.h>
 #include <Poco/Version.h>
 #include <Poco/DirectoryIterator.h>
 #include <Poco/Net/HTTPServer.h>
@@ -482,6 +483,11 @@ void Server::initialize(Poco::Util::Application & self)
         Poco::Environment::osName(),
         Poco::Environment::osVersion(),
         Poco::Environment::osArchitecture());
+
+    if (FIPS_mode())
+    {
+        LOG_INFO(&logger(), "Starting in FIPS mode, KAT test result: {}", BORINGSSL_self_test());
+    }
 }
 
 std::string Server::getDefaultCorePath() const

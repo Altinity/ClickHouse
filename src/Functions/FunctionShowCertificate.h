@@ -61,7 +61,7 @@ public:
         if (input_rows_count)
         {
 #if USE_SSL
-            if (const X509 * cert = SSL_CTX_get0_certificate(Poco::Net::SSLManager::instance().defaultServerContext()->sslContext()))
+            if (X509 * cert = SSL_CTX_get0_certificate(Poco::Net::SSLManager::instance().defaultServerContext()->sslContext()))
             {
                 BIO * b = BIO_new(BIO_s_mem());
                 SCOPE_EXIT(
@@ -74,7 +74,7 @@ public:
 
                 {
                     char buf[1024] = {0};
-                    const ASN1_INTEGER * sn = X509_get0_serialNumber(cert);
+                    const ASN1_INTEGER * sn = X509_get_serialNumber(cert);
                     BIGNUM * bnsn = ASN1_INTEGER_to_BN(sn, nullptr);
                     SCOPE_EXIT(
                     {
