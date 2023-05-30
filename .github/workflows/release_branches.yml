@@ -331,7 +331,7 @@ jobs:
   #    - BuilderBinDarwin
   #    - BuilderBinDarwinAarch64
       - BuilderDebRelease
-     - BuilderDebAarch64
+      - BuilderDebAarch64
     runs-on: [self-hosted, style-checker]
     steps:
       - name: Check out repository code
