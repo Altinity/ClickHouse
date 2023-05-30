@@ -170,56 +170,56 @@ jobs:
           # shellcheck disable=SC2046
           docker rm -f $(docker ps -a -q) ||:
           sudo rm -fr "$TEMP_PATH" "$CACHES_PATH"
-  # BuilderDebAarch64:
-  #   needs: [DockerHubPush]
-  #   runs-on: [self-hosted, builder]
-  #   steps:
-  #     - name: Set envs
-  #       run: |
-  #         cat >> "$GITHUB_ENV" << 'EOF'
-  #         TEMP_PATH=${{runner.temp}}/build_check
-  #         IMAGES_PATH=${{runner.temp}}/images_path
-  #         REPO_COPY=${{runner.temp}}/build_check/ClickHouse
-  #         CACHES_PATH=${{runner.temp}}/../ccaches
-  #         BUILD_NAME=package_aarch64
-  #         EOF
-  #     - name: Download changed images
-  #       uses: actions/download-artifact@v2
-  #       with:
-  #         name: changed_images
-  #         path: ${{ runner.temp }}/images_path
-  #     - name: Check out repository code
-  #       uses: ClickHouse/checkout@v1
-  #       with:
-  #         fetch-depth: 0 # otherwise we will have no info about contributors
-  #     - name: Build
-  #       run: |
-  #         git -C "$GITHUB_WORKSPACE" submodule sync
-  #         git -C "$GITHUB_WORKSPACE" submodule update --depth=1 --recursive --init --jobs=10
-  #         sudo rm -fr "$TEMP_PATH"
-  #         mkdir -p "$TEMP_PATH"
-  #         cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
-  #         cd "$REPO_COPY/tests/ci" && python3 build_check.py "$BUILD_NAME"
-  #     - name: Upload build URLs to artifacts
-  #       uses: actions/upload-artifact@v2
-  #       with:
-  #         name: ${{ env.BUILD_URLS }}
-  #         path: ${{ runner.temp }}/build_check/${{ env.BUILD_URLS }}.json
-  #     - name: Cleanup
-  #       if: always()
-  #       run: |
-  #         # shellcheck disable=SC2046
-  #         docker kill $(docker ps -q) ||:
-  #         # shellcheck disable=SC2046
-  #         docker rm -f $(docker ps -a -q) ||:
-  #         sudo rm -fr "$TEMP_PATH" "$CACHES_PATH"
+  BuilderDebAarch64:
+    needs: [DockerHubPush]
+    runs-on: [self-hosted, builder]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/build_check
+          IMAGES_PATH=${{runner.temp}}/images_path
+          REPO_COPY=${{runner.temp}}/build_check/ClickHouse
+          CACHES_PATH=${{runner.temp}}/../ccaches
+          BUILD_NAME=package_aarch64
+          EOF
+      - name: Download changed images
+        uses: actions/download-artifact@v2
+        with:
+          name: changed_images
+          path: ${{ runner.temp }}/images_path
+      - name: Check out repository code
+        uses: ClickHouse/checkout@v1
+        with:
+          fetch-depth: 0 # otherwise we will have no info about contributors
+      - name: Build
+        run: |
+          git -C "$GITHUB_WORKSPACE" submodule sync
+          git -C "$GITHUB_WORKSPACE" submodule update --depth=1 --recursive --init --jobs=10
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci" && python3 build_check.py "$BUILD_NAME"
+      - name: Upload build URLs to artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: ${{ env.BUILD_URLS }}
+          path: ${{ runner.temp }}/build_check/${{ env.BUILD_URLS }}.json
+      - name: Cleanup
+        if: always()
+        run: |
+          # shellcheck disable=SC2046
+          docker kill $(docker ps -q) ||:
+          # shellcheck disable=SC2046
+          docker rm -f $(docker ps -a -q) ||:
+          sudo rm -fr "$TEMP_PATH" "$CACHES_PATH"
 ############################################################################################
 ##################################### Docker images  #######################################
 ############################################################################################
   DockerServerImages:
     needs:
       - BuilderDebRelease
-      # - BuilderDebAarch64
+      - BuilderDebAarch64
     runs-on: [self-hosted, style-checker]
     steps:
       - name: Check out repository code
@@ -248,7 +248,7 @@ jobs:
   BuilderReport:
     needs:
       - BuilderDebRelease
-      # - BuilderDebAarch64
+      - BuilderDebAarch64
     runs-on: [self-hosted, style-checker]
     if: ${{ success() || failure() }}
     steps:
@@ -331,7 +331,7 @@ jobs:
   #    - BuilderBinDarwin
   #    - BuilderBinDarwinAarch64
       - BuilderDebRelease
-  #    - BuilderDebAarch64
+     - BuilderDebAarch64
     runs-on: [self-hosted, style-checker]
     steps:
       - name: Check out repository code
@@ -911,7 +911,7 @@ jobs:
             ./*/_instances/*/logs/*.log
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
-  
+
   tiered_storage_s3:
     strategy:
       fail-fast: false
@@ -981,7 +981,7 @@ jobs:
             ./*/_instances/*/logs/*.log
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
-           
+
   FinishCheck:
     needs:
       - DockerHubPush
