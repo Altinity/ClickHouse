@@ -21,7 +21,7 @@ def hash_file(file_path):
             file_hash.update(fb) # Update the hash
             fb = f.read(BLOCK_SIZE) # Read the next block from the file
 
-    hash_file_path = file_path + '.sha512'
+    hash_file_path = file_path + '.sha256'
     with open(hash_file_path, 'x') as f:
         digest = file_hash.hexdigest()
         f.write(digest)
