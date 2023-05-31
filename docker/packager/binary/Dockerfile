@@ -42,7 +42,7 @@ RUN add-apt-repository ppa:ubuntu-toolchain-r/test --yes \
     && apt-get clean
 
 # A cross-linker for RISC-V 64 (we need it, because LLVM's LLD does not work):
-RUN apt-get install binutils-riscv64-linux-gnu
+RUN apt-get install --yes binutils-riscv64-linux-gnu
 
 # Architecture of the image when BuildKit/buildx is used
 ARG TARGETARCH
