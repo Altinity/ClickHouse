@@ -11,6 +11,8 @@ TEMP_PATH = os.getenv("TEMP_PATH", p.abspath(p.join(module_dir, "./tmp")))
 
 CACHES_PATH = os.getenv("CACHES_PATH", TEMP_PATH)
 CLOUDFLARE_TOKEN = os.getenv("CLOUDFLARE_TOKEN")
+GPG_BINARY_SIGNING_KEY = os.getenv("GPG_BINARY_SIGNING_KEY")
+GPG_BINARY_SIGNING_PASSPHRASE = os.getenv("GPG_BINARY_SIGNING_PASSPHRASE")
 GITHUB_EVENT_PATH = os.getenv("GITHUB_EVENT_PATH", "")
 GITHUB_JOB = os.getenv("GITHUB_JOB", "local")
 GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "Altinity/ClickHouse")
