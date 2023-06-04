@@ -82,10 +82,10 @@ jobs:
         with:
           name: changed_images_amd64
           path: ${{ runner.temp }}
-      # - name: Images check
-      #   run: |
-      #     cd "$GITHUB_WORKSPACE/tests/ci"
-      #     python3 docker_manifests_merge.py --suffix amd64 --suffix aarch64
+      - name: Images check
+        run: |
+          cd "$GITHUB_WORKSPACE/tests/ci"
+          python3 docker_manifests_merge.py --suffix amd64 --suffix aarch64
       - name: Upload images files to artifacts
         uses: actions/upload-artifact@v3
         with:
