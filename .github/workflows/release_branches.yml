@@ -51,7 +51,6 @@ jobs:
           clear-repository: true
       - name: Images check
         run: |
-          echo ${{env.REGRESSION_RESULTS_URL}}
           cd "$GITHUB_WORKSPACE/tests/ci"
           python3 docker_images_check.py --suffix amd64
       # TODO(vnemkov): remove this step if you uncomment DockerHubPushAarch64 and DockerHubPush below.
