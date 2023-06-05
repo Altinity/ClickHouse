@@ -2,12 +2,14 @@
 import sys
 import os
 import logging
-from env_helper import GPG_BINARY_SIGNING_KEY, GPG_BINARY_SIGNING_PASSPHRASE, TEMP_PATH, REPO_COPY, REPORTS_PATH
+from env_helper import TEMP_PATH, REPO_COPY, REPORTS_PATH
 from s3_helper import S3Helper
 from pr_info import PRInfo
 from build_download_helper import download_builds_filter
 import hashlib
 
+GPG_BINARY_SIGNING_KEY = os.getenv("GPG_BINARY_SIGNING_KEY")
+GPG_BINARY_SIGNING_PASSPHRASE = os.getenv("GPG_BINARY_SIGNING_PASSPHRASE")
 
 CHECK_NAME = "Sign release (actions)"
 
