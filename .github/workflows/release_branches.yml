@@ -15,15 +15,15 @@ on: # yamllint disable-line rule:truthy
       - reopened
       - opened
     branches:
-      # Anything/22.8 (e.g customizations/22.8)
-      - '**/22.8*'
+      # Anything/23.3 (e.g customizations/23.3)
+      - '**/23.3*'
   release:
     types:
       - published
       - prereleased
   push:
     branches:
-      - 'releases/22.8**'
+      - 'releases/23.3**'
 
 jobs:
   # DockerHubPushAarch64:
