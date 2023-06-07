@@ -1,9 +1,7 @@
 {
     "docker/packager/binary": {
         "name": "altinityinfra/binary-builder",
-        "dependent": [
-            "docker/test/codebrowser"
-        ]
+        "dependent": []
     },
     "docker/test/compatibility/centos": {
         "name": "altinityinfra/test-old-centos",
@@ -57,10 +55,6 @@
     },
     "docker/test/upgrade": {
         "name": "altinityinfra/upgrade-check",
-        "dependent": []
-    },
-    "docker/test/codebrowser": {
-        "name": "altinityinfra/codebrowser",
         "dependent": []
     },
     "docker/test/integration/runner": {
@@ -133,14 +127,6 @@
     "docker/test/integration/kerberized_hadoop": {
         "only_amd64": true,
         "name": "altinityinfra/kerberized-hadoop",
-        "dependent": []
-    },
-    "docker/test/sqlancer": {
-        "name": "altinityinfra/sqlancer-test",
-        "dependent": []
-    },
-    "docker/test/keeper-jepsen": {
-        "name": "altinityinfra/keeper-jepsen-test",
         "dependent": []
     },
     "docker/test/install/deb": {
