@@ -6,11 +6,13 @@ import json
 import os
 import sys
 import time
+from shutil import rmtree
 from typing import List, Tuple
 
 from ci_config import CI_CONFIG, BuildConfig
 from docker_pull_helper import get_image_with_version
 from env_helper import (
+    CACHES_PATH,
     GITHUB_JOB,
     IMAGES_PATH,
     REPO_COPY,
@@ -28,6 +30,10 @@ from version_helper import (
     get_version_from_repo,
     update_version_local,
 )
+from ccache_utils import get_ccache_if_not_exists, upload_ccache
+from ci_config import CI_CONFIG, BuildConfig
+from docker_pull_helper import get_image_with_version
+from tee_popen import TeePopen
 
 IMAGE_NAME = "altinityinfra/binary-builder"
 BUILD_LOG_NAME = "build_log.log"
@@ -53,6 +59,7 @@ def get_packager_cmd(
     output_path: str,
     build_version: str,
     image_version: str,
+    ccache_path: str,
     official: bool,
 ) -> str:
     package_type = build_config["package_type"]
@@ -71,7 +78,9 @@ def get_packager_cmd(
     if build_config["tidy"] == "enable":
         cmd += " --clang-tidy"
 
-    cmd += " --cache=sccache"
+    # NOTE(vnemkov): we are going to continue to use ccache for now
+    cmd += " --cache=ccache"
+    cmd += f" --ccache-dir={ccache_path}"
     cmd += " --s3-rw-access"
     cmd += f" --s3-bucket={S3_BUILDS_BUCKET}"
 
@@ -293,12 +302,31 @@ def main():
     if not os.path.exists(build_output_path):
         os.makedirs(build_output_path)
 
+    # NOTE(vnemkov): since we still want to use CCACHE over SCCACHE, unlike upstream, 
+    # So we need to create local directory for that, just as with 22.8
+    ccache_path = os.path.join(CACHES_PATH, build_name + "_ccache")
+
+    logging.info("Will try to fetch cache for our build")
+    try:
+        get_ccache_if_not_exists(
+            ccache_path, s3_helper, pr_info.number, TEMP_PATH, pr_info.release_pr
+        )
+    except Exception as e:
+        # In case there are issues with ccache, remove the path and do not fail a build
+        logging.info("Failed to get ccache, building without it. Error: %s", e)
+        rmtree(ccache_path, ignore_errors=True)
+
+    if not os.path.exists(ccache_path):
+        logging.info("cache was not fetched, will create empty dir")
+        os.makedirs(ccache_path)
+
     packager_cmd = get_packager_cmd(
         build_config,
         os.path.join(REPO_COPY, "docker/packager"),
         build_output_path,
         version.string,
         image_version,
+        ccache_path,
         official_flag,
     )
 
@@ -314,6 +342,7 @@ def main():
     subprocess.check_call(
         f"sudo chown -R ubuntu:ubuntu {build_output_path}", shell=True
     )
+    subprocess.check_call(f"sudo chown -R ubuntu:ubuntu {ccache_path}", shell=True)
     logging.info("Build finished with %s, log path %s", success, log_path)
     if not success:
         # We check if docker works, because if it's down, it's infrastructure
@@ -324,6 +353,10 @@ def main():
                 "The dockerd looks down, won't upload anything and generate report"
             )
             sys.exit(1)
+
+    # Upload the ccache first to have the least build time in case of problems
+    logging.info("Will upload cache")
+    upload_ccache(ccache_path, s3_helper, pr_info.number, TEMP_PATH)
 
     # FIXME performance
     performance_urls = []

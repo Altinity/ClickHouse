@@ -46,7 +46,7 @@ class ClickHouseVersion:
         revision: Union[int, str],
         git: Optional[Git],
         tweak: str = None,
-        flavour: str = None,
+        flavour: Optional[str] = None,
     ):
         self._major = int(major)
         self._minor = int(minor)
@@ -233,8 +233,17 @@ def get_version_from_string(
     version: str, git: Optional[Git] = None
 ) -> ClickHouseVersion:
     validate_version(version)
-    parts = version.split(".")
-    return ClickHouseVersion(parts[0], parts[1], parts[2], -1, git, parts[3], parts[4] if len(parts) >= 4 else None)
+    # dict for simple handling of missing parts with parts.get(index, default)
+    parts = dict(enumerate(version.split(".")))
+    return ClickHouseVersion(
+        parts[0],
+        parts[1],
+        parts[2],
+        -1,
+        git,
+        parts.get(3, None),
+        parts.get(4, None)
+    )
 
 
 def get_version_from_tag(tag: str) -> ClickHouseVersion:
