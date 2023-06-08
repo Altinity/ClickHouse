@@ -10,7 +10,7 @@ from typing import List, Optional
 
 SCRIPT_PATH = Path(__file__).absolute()
 IMAGE_TYPE = "binary"
-IMAGE_NAME = f"altinity/{IMAGE_TYPE}-builder"
+IMAGE_NAME = f"altinityinfra/{IMAGE_TYPE}-builder"
 
 
 class BuildException(Exception):

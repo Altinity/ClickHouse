@@ -989,7 +989,7 @@ jobs:
             ./*/_instances/*/logs/*.log
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
-  
+
   tiered_storage_s3:
     strategy:
       fail-fast: false
