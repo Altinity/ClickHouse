@@ -243,7 +243,7 @@ def get_version_from_repo(
         git,
         # Explicitly use tweak value from version file
         tweak=versions.get("tweak", versions["revision"]),
-        flavour=versions["flavour"]
+        flavour=versions.get("flavour", None)
     )
 
 

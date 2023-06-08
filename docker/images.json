@@ -62,10 +62,6 @@
         "name": "altinityinfra/integration-tests-runner",
         "dependent": []
     },
-    "docker/test/testflows/runner": {
-        "name": "altinityinfra/testflows-runner",
-        "dependent": []
-    },
     "docker/test/fasttest": {
         "name": "altinityinfra/fasttest",
         "dependent": []
