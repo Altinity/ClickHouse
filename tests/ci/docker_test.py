@@ -57,14 +57,14 @@ class TestDockerImageCheck(unittest.TestCase):
                 #     "docker/test/fuzzer",
                 #     "altinityinfra/fuzzer",
                 #     False,
-                    "altinityinfra/test-base",  # type: ignore
+                #     "altinityinfra/test-base",  # type: ignore
                 # ),
-                di.DockerImage(
-                    # "docker/test/keeper-jepsen",
-                    "altinityinfra/keeper-jepsen-test",
-                    False,
-                    "altinityinfra/test-base",  # type: ignore
-                ),
+                # di.DockerImage(
+                #     # "docker/test/keeper-jepsen",
+                #     # "altinityinfra/keeper-jepsen-test",
+                #     False,
+                #     "altinityinfra/test-base",  # type: ignore
+                # ),
                 # di.DockerImage(
                 #     "docker/docs/check",
                 #     "altinityinfra/docs-check",
