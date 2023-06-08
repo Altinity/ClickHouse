@@ -60,7 +60,7 @@ class TestDockerImageCheck(unittest.TestCase):
                     "altinityinfra/test-base",  # type: ignore
                 # ),
                 di.DockerImage(
-                    "docker/test/keeper-jepsen",
+                    # "docker/test/keeper-jepsen",
                     "altinityinfra/keeper-jepsen-test",
                     False,
                     "altinityinfra/test-base",  # type: ignore
