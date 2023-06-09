@@ -78,7 +78,7 @@ def get_packager_cmd(
 
     # NOTE(vnemkov): we are going to continue to use ccache for now
     cmd += " --cache=ccache"
-    cmd += f" --ccache_dir={ccache_path}"
+    cmd += f" --ccache-dir={ccache_path}"
     cmd += " --s3-rw-access"
     cmd += f" --s3-bucket={S3_BUILDS_BUCKET}"
 
