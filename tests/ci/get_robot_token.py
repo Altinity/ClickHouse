@@ -29,9 +29,10 @@ ROBOT_TOKEN = None  # type: Optional[Token]
 # having multiple robot tokens
 def get_best_robot_token(token_prefix_env_name="github_robot_token"):
     # Re-use already fetched token (same as in get_best_robot_token_original)
+    # except here we assume it is always a string (since we use only one token and don't do token rotation)
     global ROBOT_TOKEN
     if ROBOT_TOKEN is not None:
-        return ROBOT_TOKEN.value
+        return ROBOT_TOKEN
     ROBOT_TOKEN = get_parameter_from_ssm(token_prefix_env_name)
     return ROBOT_TOKEN
 
