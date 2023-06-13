@@ -29,7 +29,7 @@ from s3_helper import S3Helper
 from stopwatch import Stopwatch
 from upload_result_helper import upload_results
 
-IMAGE_NAME = "clickhouse/sqlancer-test"
+IMAGE_NAME = "altinityinfra/sqlancer-test"
 
 
 def get_pull_command(docker_image):
