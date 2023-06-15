@@ -360,6 +360,11 @@ void KeeperServer::launchRaftServer(const Poco::Util::AbstractConfiguration & co
             "SSL support for NuRaft is disabled because ClickHouse was built without SSL support.", ErrorCodes::SUPPORT_IS_DISABLED);
 #endif
     }
+    else if (FIPS_mode() && !asio_opts.enable_ssl_)
+    {
+        LOG_FATAL(log, "Can't start NON-SECURE keeper server in FIPS mode, please check the config.");
+        throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "Can't start NON-SECURE keeper server in FIPS mode, please check the config.");
+    }
 
     if (is_recovering)
         enterRecoveryMode(params);
