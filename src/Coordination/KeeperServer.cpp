@@ -63,7 +63,7 @@ SSL_CTX* getSslContext()
     // Boring SSL states that it is Ok to use context from different threads,
     // OpenSSL discourages that.
 #if !defined(OPENSSL_IS_BORINGSSL) || !defined(BORINGSSL_API_VERSION)
-    throw Exception(ErrorCode::LOGICAL_ERROR, "Unsafe to share SSL_CTX with non-BoringSSL builds");
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "Unsafe to share SSL_CTX with non-BoringSSL builds");
 #endif
 
     auto & ssl_manager = Poco::Net::SSLManager::instance();
@@ -89,6 +89,7 @@ void setSSLParams(nuraft::asio_service::options & asio_opts, [[maybe_unused]] Po
     // OpenSSL explicitly prohibts sharing SSL_CTX by multiple threads, but BoringSSL allows it
     // and states that SSL_CTX is thread-safe.
 #if defined(OPENSSL_IS_BORINGSSL) && defined(BORINGSSL_API_VERSION)
+    asio_opts.enable_ssl_ = true;
     asio_opts.ssl_context_provider_server_ = getSslContext<SSLContext::Server>;
     asio_opts.ssl_context_provider_client_ = getSslContext<SSLContext::Client>;
 #else
@@ -358,6 +359,10 @@ void KeeperServer::launchRaftServer(const Poco::Util::AbstractConfiguration & co
         throw Exception(
             "SSL support for NuRaft is disabled because ClickHouse was built without SSL support.", ErrorCodes::SUPPORT_IS_DISABLED);
 #endif
+    }
+    else if (FIPS_mode() && !asio_opts.enable_ssl_)
+    {
+        LOG_FATAL(log, "Can't start NON-SECURE keeper server in FIPS mode, please check the config.");
     }
 
     if (is_recovering)
