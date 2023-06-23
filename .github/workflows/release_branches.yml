@@ -6,6 +6,7 @@ env:
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  REGRESSION_RESULTS_URL: altinity-build-artifacts/${{github.event.number}}/$GITHUB_SHA
 
 
 on: # yamllint disable-line rule:truthy
@@ -182,8 +183,9 @@ jobs:
       - name: Build
         run: |
           sudo rm -fr "$TEMP_PATH"
-          mkdir -p "$TEMP_PATH"
-          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH/build_check/package_release"
+          cd .. && tar czf $TEMP_PATH/build_source.src.tar.gz ClickHouse/
+          cd $TEMP_PATH && tar xvzf $TEMP_PATH/build_source.src.tar.gz
           cd "$REPO_COPY/tests/ci" && python3 build_check.py "$BUILD_NAME"
       - name: Upload build URLs to artifacts
         if: ${{ success() || failure() }}
@@ -661,7 +663,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, datetime64_extended_range, disk_level_encryption, dns, example, extended_precision_datatypes, kafka, kerberos, lightweight_delete, map_type, rbac, selects, ssl_server, tiered_storage, window_functions]
+        SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, datetime64_extended_range, disk_level_encryption, dns, example, extended_precision_data_types, kafka, kerberos, lightweight_delete, map_type, part_moves_between_shards, rbac, selects, ssl_server, tiered_storage, window_functions]
     needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
