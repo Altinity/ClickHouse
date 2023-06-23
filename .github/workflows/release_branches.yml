@@ -348,6 +348,7 @@ jobs:
   #    - BuilderBinDarwin
   #    - BuilderBinDarwinAarch64
       - BuilderDebRelease
+      - SignRelease
   #    - BuilderDebAarch64
     runs-on: [self-hosted, style-checker]
     steps:
@@ -363,7 +364,7 @@ jobs:
 #################################### INSTALL PACKAGES ######################################
 ############################################################################################
   InstallPackagesTestRelease:
-    needs: [BuilderDebRelease]
+    needs: [SignRelease]
     runs-on: [self-hosted, style-checker]
     steps:
       - name: Set envs
@@ -428,11 +429,18 @@ jobs:
   #         docker ps --quiet | xargs --no-run-if-empty docker kill ||:
   #         docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
   #         sudo rm -fr "$TEMP_PATH"
+
+  tests_start:
+    ## Do-nothing stage to trigger tests, makes is easier to
+    needs: [InstallPackagesTestRelease]
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
 ##############################################################################################
 ########################### FUNCTIONAl STATELESS TESTS #######################################
 ##############################################################################################
   FunctionalStatelessTestRelease:
-    needs: [BuilderDebRelease]
+    needs: [tests_start]
     runs-on: [self-hosted, func-tester]
     steps:
       - name: Set envs
@@ -505,7 +513,7 @@ jobs:
 ############################ FUNCTIONAl STATEFUL TESTS #######################################
 ##############################################################################################
   FunctionalStatefulTestRelease:
-    needs: [BuilderDebRelease]
+    needs: [tests_start]
     runs-on: [self-hosted, func-tester]
     steps:
       - name: Set envs
@@ -578,7 +586,7 @@ jobs:
 ############################# INTEGRATION TESTS #############################################
 #############################################################################################
   IntegrationTestsRelease0:
-    needs: [BuilderDebRelease]
+    needs: [tests_start]
     runs-on: [self-hosted, stress-tester]
     steps:
       - name: Set envs
@@ -613,7 +621,7 @@ jobs:
           docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsRelease1:
-    needs: [BuilderDebRelease]
+    needs: [tests_start]
     runs-on: [self-hosted, stress-tester]
     steps:
       - name: Set envs
@@ -652,7 +660,7 @@ jobs:
 #############################################################################################
   regression_start:
     ## Not depending on the tests above since they can fail at any given moment.
-    needs: [BuilderDebRelease]
+    needs: [tests_start]
     runs-on: ubuntu-latest
     steps:
       - run: true

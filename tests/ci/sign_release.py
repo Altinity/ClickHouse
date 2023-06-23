@@ -55,7 +55,7 @@ def main():
 
     logging.info("Repo copy path %s", REPO_COPY)
 
-    s3_helper = S3Helper("https://s3.amazonaws.com")
+    s3_helper = S3Helper()
 
     s3_path_prefix = f"{pr_info.number}/{pr_info.sha}/" + CHECK_NAME.lower().replace(
         " ", "_"
