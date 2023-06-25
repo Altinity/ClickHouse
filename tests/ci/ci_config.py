@@ -159,15 +159,7 @@ CI_CONFIG = {
     },
     "builds_report_config": {
         "ClickHouse build check": [
-            "package_release",
-            "coverity",
-            "package_aarch64",
-            "package_asan",
-            "package_ubsan",
-            "package_tsan",
-            "package_msan",
-            "package_debug",
-            "binary_release",
+            "package_release"
         ],
         "ClickHouse special build check": [
             "binary_tidy",
@@ -376,6 +368,9 @@ CI_CONFIG = {
         "SQLancer (debug)": {
             "required_build": "package_debug",
         },
+        "Sign release (actions)": {
+            "required_build": "package_release"
+        }
     },
 }  # type: dict
 
