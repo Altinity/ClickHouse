@@ -36,6 +36,7 @@ jobs:
         run: |
           echo 1
           whoami
+          ls -a
           pip list
       - name: Upload images files to artifacts
         uses: actions/upload-artifact@v2
