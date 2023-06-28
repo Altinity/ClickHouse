@@ -6,7 +6,7 @@ env:
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  REGRESSION_RESULTS_URL: altinity-build-artifacts/${{github.event.number}}/$GITHUB_SHA
+  REGRESSION_RESULTS_URL: ${{github.event.number}}/${GITHUB_SHA}/testflows
 
 
 on: # yamllint disable-line rule:truthy
@@ -689,7 +689,7 @@ jobs:
           cat >> "$GITHUB_ENV" << 'EOF'
           REPORTS_PATH=${{runner.temp}}/reports_dir
           SUITE=${{ matrix.SUITE }}
-          artifacts=public
+          artifacts=builds
           EOF
       - name: Download json reports
         uses: actions/download-artifact@v3
@@ -751,7 +751,7 @@ jobs:
           REPORTS_PATH=${{runner.temp}}/reports_dir
           SUITE=ontime_benchmark
           STORAGE=/${{ matrix.STORAGE }}
-          artifacts=public
+          artifacts=builds
           EOF
       - name: Download json reports
         uses: actions/download-artifact@v3
@@ -821,7 +821,7 @@ jobs:
           cat >> "$GITHUB_ENV" << 'EOF'
           REPORTS_PATH=${{runner.temp}}/reports_dir
           SUITE=ldap/${{ matrix.SUITE }}
-          artifacts=public
+          artifacts=builds
           EOF
       - name: Download json reports
         uses: actions/download-artifact@v3
@@ -879,7 +879,7 @@ jobs:
           cat >> "$GITHUB_ENV" << 'EOF'
           REPORTS_PATH=${{runner.temp}}/reports_dir
           SUITE=parquet
-          artifacts=public
+          artifacts=builds
           EOF
       - name: Download json reports
         uses: actions/download-artifact@v3
@@ -952,7 +952,7 @@ jobs:
           REPORTS_PATH=${{runner.temp}}/reports_dir
           SUITE=s3
           STORAGE=/${{ matrix.STORAGE }}
-          artifacts=public
+          artifacts=builds
           EOF
       - name: Download json reports
         uses: actions/download-artifact@v3
@@ -1023,7 +1023,7 @@ jobs:
           REPORTS_PATH=${{runner.temp}}/reports_dir
           SUITE=tiered_storage
           STORAGE=/${{ matrix.STORAGE }}
-          artifacts=public
+          artifacts=builds
           EOF
       - name: Download json reports
         uses: actions/download-artifact@v3
