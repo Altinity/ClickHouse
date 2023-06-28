@@ -6,7 +6,7 @@ env:
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  REGRESSION_RESULTS_URL: ${{github.event.number}}/${GITHUB_SHA}/testflows
+  REGRESSION_RESULTS_URL: PRs/${{github.event.number}}/${GITHUB_SHA}/testflows
 
 
 on: # yamllint disable-line rule:truthy
