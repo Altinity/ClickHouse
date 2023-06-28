@@ -375,6 +375,18 @@ def main():
 
     print(f"::notice ::Log URL: {log_url}")
 
+    src_path = os.path.join(TEMP_PATH, "build_source.src.tar.gz")
+   
+    if os.path.exists(src_path):
+        src_url = s3_helper.upload_build_file_to_s3(
+            src_path, s3_path_prefix + "/clickhouse-" + version.string + ".src.tar.gz"
+        )
+        logging.info("Source tar %s", src_url)
+    else:
+        logging.info("Source tar doesn't exist")
+
+    print(f"::notice ::Source tar URL: {src_url}")
+    
     create_json_artifact(
         TEMP_PATH, build_name, log_url, build_urls, build_config, elapsed, success
     )
