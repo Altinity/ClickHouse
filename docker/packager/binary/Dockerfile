@@ -5,7 +5,6 @@ ARG FROM_TAG=latest
 FROM altinityinfra/test-util:$FROM_TAG as cctools
 # The cctools are built always from the altinityinfra/test-util:latest and cached inline
 # Theoretically, it should improve rebuild speed significantly
-RUN apt update && apt install cmake --yes
 
 ENV CC=clang-${LLVM_VERSION}
 ENV CXX=clang++-${LLVM_VERSION}
@@ -21,23 +20,24 @@ RUN git clone --depth 1 https://github.com/tpoechtrager/apple-libtapi.git \
     && cd .. \
     && rm -rf apple-libtapi
 
-# Build and install tools for cross-linking to Darwin (x86-64)
-RUN git clone --depth 1 https://github.com/tpoechtrager/cctools-port.git \
-    && cd cctools-port/cctools \
-    && ./configure --prefix=/cctools --with-libtapi=/cctools \
-        --target=x86_64-apple-darwin \
-    && make install -j$(nproc) \
-    && cd ../.. \
-    && rm -rf cctools-port
+# NOTE(vnemkov): Not required for arm64 only build, reenable for arm64 builds.
+# # Build and install tools for cross-linking to Darwin (x86-64)
+# RUN git clone --depth 1 https://github.com/tpoechtrager/cctools-port.git \
+#     && cd cctools-port/cctools \
+#     && ./configure --prefix=/cctools --with-libtapi=/cctools \
+#         --target=x86_64-apple-darwin \
+#     && make install -j$(nproc) \
+#     && cd ../.. \
+#     && rm -rf cctools-port
 
-# Build and install tools for cross-linking to Darwin (aarch64)
-RUN git clone --depth 1 https://github.com/tpoechtrager/cctools-port.git \
-    && cd cctools-port/cctools \
-    && ./configure --prefix=/cctools --with-libtapi=/cctools \
-        --target=aarch64-apple-darwin \
-    && make install -j$(nproc) \
-    && cd ../.. \
-    && rm -rf cctools-port
+# # Build and install tools for cross-linking to Darwin (aarch64)
+# RUN git clone --depth 1 https://github.com/tpoechtrager/cctools-port.git \
+#     && cd cctools-port/cctools \
+#     && ./configure --prefix=/cctools --with-libtapi=/cctools \
+#         --target=aarch64-apple-darwin \
+#     && make install -j$(nproc) \
+#     && cd ../.. \
+#     && rm -rf cctools-port
 
 # !!!!!!!!!!!
 # END COMPILE

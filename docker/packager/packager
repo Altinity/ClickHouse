@@ -216,7 +216,6 @@ def parse_env_variables(
         result.append("DEB_ARCH=amd64")
 
     if fips:
-        cmake_flags.append("-DLINKER_NAME=/usr/lib/llvm-14/bin/ld.lld")
         cmake_flags.append("-DFIPS_CLICKHOUSE=ON")
 
     cxx = cc.replace("gcc", "g++").replace("clang", "clang++")
