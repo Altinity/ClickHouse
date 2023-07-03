@@ -57,10 +57,9 @@ RUN apt update && apt install cmake --yes
 
 # Install Docker
 ENV DOCKER_CHANNEL stable
-RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
-RUN add-apt-repository "deb https://download.docker.com/linux/ubuntu $(lsb_release -c -s) ${DOCKER_CHANNEL}"
-
-RUN apt-get update \
+RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add - \
+    && add-apt-repository "deb https://download.docker.com/linux/ubuntu $(lsb_release -c -s) ${DOCKER_CHANNEL}" \
+    && apt-get update \
     && env DEBIAN_FRONTEND=noninteractive apt-get install --yes \
         docker-ce \
     && rm -rf \

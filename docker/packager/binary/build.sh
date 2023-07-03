@@ -6,7 +6,10 @@ set -e
 # and on hung you can simply press Ctrl-C and it will spawn a python pdb,
 # but on SIGINT dockerd will exit, so ignore it to preserve the daemon.
 trap '' INT
-dockerd --host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2375 --default-address-pool base=172.17.0.0/12,size=24 &
+# Binding to an IP address without --tlsverify is deprecated. Startup is intentionally being slowed
+# unless --tls=false or --tlsverify=false is set
+dockerd --host=unix:///var/run/docker.sock --tls=false --host=tcp://0.0.0.0:2375 --default-address-pool base=172.17.0.0/12,size=24 \
+    &> /ClickHouse/packager/dockerd.log &
 
 set +e
 reties=0
@@ -15,6 +18,7 @@ while true; do
     reties=$((reties+1))
     if [[ $reties -ge 100 ]]; then # 10 sec max
         echo "Can't start docker daemon, timeout exceeded." >&2
+        cat /ClickHouse/packager/dockerd.log >&2
         exit 1;
     fi
     sleep 0.1
