@@ -71,7 +71,7 @@ if [ -n "$MAKE_DEB" ]; then
     #     GOARCH="${DEB_ARCH}" CGO_ENABLED=0 make VERSION="$VERSION_STRING" build
     #     mv clickhouse-diagnostics ..
     #   )
-        echo "NOT building clickhouse-diagnostics
+        echo "NOT building clickhouse-diagnostics"
     else
       echo -e "#!/bin/sh\necho 'Not implemented for this type of package'" > /build/programs/clickhouse-diagnostics
       chmod +x /build/programs/clickhouse-diagnostics
