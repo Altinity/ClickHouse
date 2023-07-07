@@ -43,7 +43,7 @@ jobs:
   #         path: ${{ runner.temp }}/docker_images_check/changed_images_aarch64.json
   # Former DockerHubPushAmd64
   DockerHubPush:
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, style-checker, altinity-amd64]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
@@ -90,7 +90,7 @@ jobs:
   #         path: ${{ runner.temp }}/changed_images.json
   CompatibilityCheck:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, style-checker, altinity-amd64]
     steps:
       - name: Set envs
         run: |
@@ -155,7 +155,7 @@ jobs:
 #########################################################################################
   BuilderDebRelease:
     needs: [DockerHubPush]
-    runs-on: [self-hosted, builder]
+    runs-on: [self-hosted, builder, altinity-amd64]
     steps:
       - name: Set envs
         run: |
@@ -246,7 +246,7 @@ jobs:
     needs:
       - BuilderDebRelease
       # - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, style-checker, altinity-amd64]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
@@ -273,7 +273,7 @@ jobs:
     needs:
       - BuilderDebRelease
       # - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, style-checker, altinity-amd64]
     if: ${{ success() || failure() }}
     steps:
       - name: Set envs
@@ -367,7 +367,7 @@ jobs:
 ############################################################################################
   InstallPackagesTestRelease:
     needs: [SignRelease]
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, style-checker, altinity-amd64]
     steps:
       - name: Set envs
         run: |
@@ -443,7 +443,7 @@ jobs:
 ##############################################################################################
   FunctionalStatelessTestRelease:
     needs: [tests_start]
-    runs-on: [self-hosted, func-tester]
+    runs-on: [self-hosted, func-tester, altinity-amd64]
     steps:
       - name: Set envs
         run: |
@@ -516,7 +516,7 @@ jobs:
 ##############################################################################################
   FunctionalStatefulTestRelease:
     needs: [tests_start]
-    runs-on: [self-hosted, func-tester]
+    runs-on: [self-hosted, func-tester, altinity-amd64]
     steps:
       - name: Set envs
         run: |
@@ -589,7 +589,7 @@ jobs:
 #############################################################################################
   IntegrationTestsRelease0:
     needs: [tests_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, stress-tester, altinity-amd64]
     steps:
       - name: Set envs
         run: |
@@ -624,7 +624,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsRelease1:
     needs: [tests_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, stress-tester, altinity-amd64]
     steps:
       - name: Set envs
         run: |
@@ -673,7 +673,7 @@ jobs:
       matrix:
         SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, datetime64_extended_range, disk_level_encryption, dns, example, extended_precision_data_types, kafka, kerberos, lightweight_delete, map_type, part_moves_between_shards, rbac, selects, ssl_server, tiered_storage, window_functions]
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, regression-tester, altinity-amd64]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -735,7 +735,7 @@ jobs:
       matrix:
         STORAGE: [minio, aws_s3, gcs]
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, regression-tester, altinity-amd64]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -805,7 +805,7 @@ jobs:
       matrix:
         SUITE: [authentication, external_user_directory, role_mapping]
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, regression-tester, altinity-amd64]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -863,7 +863,7 @@ jobs:
 
   parquet:
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, regression-tester, altinity-amd64]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -935,7 +935,7 @@ jobs:
       matrix:
         STORAGE: [minio, aws_s3, gcs]
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, regression-tester, altinity-amd64]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -1006,7 +1006,7 @@ jobs:
       matrix:
         STORAGE: [minio, s3amazon, s3gcs]
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, regression-tester, altinity-amd64]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -1072,7 +1072,7 @@ jobs:
 
   SignRelease:
     needs: [BuilderDebRelease]
-    runs-on: [ self-hosted ]
+    runs-on: [self-hosted, altinity-amd64]
     steps:
       - name: Set envs
         run: |
@@ -1132,7 +1132,7 @@ jobs:
       - parquet
       - s3
       - tiered_storage_s3
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, style-checker, altinity-amd64]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
