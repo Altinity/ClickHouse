@@ -38,9 +38,15 @@ jobs:
           whoami
           ls -a
           pip list
-      - name: Upload images files to artifacts
-        uses: actions/upload-artifact@v2
-        with:
-          name: changed_images_aarch64
-          path: ${{ runner.temp }}/docker_images_check/changed_images_aarch64.json
+  DockerHubPushAmd64:
+    runs-on: [self-hosted, altinity-x86]
+    steps:
+      - name: Check out repository code
+        uses: ClickHouse/checkout@v1
+      - name: Check
+        run: |
+          echo 1
+          whoami
+          ls -a
+          pip list
 
