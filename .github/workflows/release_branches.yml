@@ -28,7 +28,7 @@ on: # yamllint disable-line rule:truthy
 
 jobs:
   DockerHubPushAarch64:
-    runs-on: [self-hosted, altinity-style-checker-aarch64, arm64]
+    runs-on: [self-hosted, altinity-arm64]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
