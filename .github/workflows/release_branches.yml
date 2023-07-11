@@ -186,9 +186,8 @@ jobs:
           mkdir -p "$TEMP_PATH/build_check/package_release"
           cd .. && tar czf $TEMP_PATH/build_source.src.tar.gz ClickHouse/
           cd $TEMP_PATH && tar xvzf $TEMP_PATH/build_source.src.tar.gz
-          cd "$REPO_COPY/tests/ci" && python3 build_check.py "$BUILD_NAME"
           ls -l $TEMP_PATH
-          ls -l $TEMP_PATH/package_release/performance.tar.zst
+          cd "$REPO_COPY/tests/ci" && python3 build_check.py "$BUILD_NAME"
       - name: Upload build URLs to artifacts
         if: ${{ success() || failure() }}
         uses: actions/upload-artifact@v3
