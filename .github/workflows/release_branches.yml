@@ -28,17 +28,18 @@ on: # yamllint disable-line rule:truthy
 
 jobs:
   DockerHubPushAarch64:
-    runs-on: [self-hosted, altinity-arm64]
+    runs-on: [self-hosted, altinity-aarch64]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
       - name: Check
         run: |
+          echo ${{ env.REGRESSION_RESULTS_URL }}
           whoami
           df -h
           df -h /
   DockerHubPushAmd64:
-    runs-on: [self-hosted, altinity-x86]
+    runs-on: [self-hosted, altinity-amd64]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
