@@ -34,10 +34,9 @@ jobs:
         uses: ClickHouse/checkout@v1
       - name: Check
         run: |
-          echo 1
           whoami
-          ls -a
-          pip list
+          df -h
+          df -h /
   DockerHubPushAmd64:
     runs-on: [self-hosted, altinity-x86]
     steps:
@@ -45,8 +44,7 @@ jobs:
         uses: ClickHouse/checkout@v1
       - name: Check
         run: |
-          echo 1
           whoami
-          ls -a
-          pip list
+          df -h
+          df -h /
 
