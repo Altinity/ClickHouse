@@ -9,7 +9,7 @@ dpkg -i package_folder/clickhouse-client_*.deb
 
 service clickhouse-server start && sleep 5
 
-cd /sqlancer/sqlancer-master
+cd /sqlancer/sqlancer-main
 
 export TIMEOUT=300
 export NUM_QUERIES=1000
