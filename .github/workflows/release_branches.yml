@@ -36,9 +36,7 @@ jobs:
         run: |
           echo ${{ env.REGRESSION_RESULTS_URL }}
           whoami
-          df -h
-          df -h /
-  DockerHubPushAmd64:
+  one:
     runs-on: [self-hosted, altinity-amd64]
     steps:
       - name: Check out repository code
@@ -46,6 +44,37 @@ jobs:
       - name: Check
         run: |
           whoami
-          df -h
-          df -h /
+  two:
+    runs-on: [self-hosted, altinity-amd64]
+    steps:
+      - name: Check out repository code
+        uses: ClickHouse/checkout@v1
+      - name: Check
+        run: |
+          whoami
+  three:
+    runs-on: [self-hosted, altinity-amd64]
+    steps:
+      - name: Check out repository code
+        uses: ClickHouse/checkout@v1
+      - name: Check
+        run: |
+          whoami
+  four:
+    runs-on: [self-hosted, altinity-amd64]
+    steps:
+      - name: Check out repository code
+        uses: ClickHouse/checkout@v1
+      - name: Check
+        run: |
+          whoami
+  five:
+    runs-on: [self-hosted, altinity-amd64]
+    steps:
+      - name: Check out repository code
+        uses: ClickHouse/checkout@v1
+      - name: Check
+        run: |
+          whoami
+
 
