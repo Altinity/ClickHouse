@@ -46,6 +46,7 @@ jobs:
   # Former DockerHubPushAmd64
   DockerHubPush:
     runs-on: [self-hosted, style-checker, altinity-amd64]
+    timeout-minutes: 180
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
@@ -93,6 +94,7 @@ jobs:
   CompatibilityCheck:
     needs: [BuilderDebRelease]
     runs-on: [self-hosted, style-checker, altinity-amd64]
+    timeout-minutes: 180
     steps:
       - name: Set envs
         run: |
@@ -158,6 +160,7 @@ jobs:
   BuilderDebRelease:
     needs: [DockerHubPush]
     runs-on: [self-hosted, builder, altinity-amd64]
+    timeout-minutes: 180
     steps:
       - name: Set envs
         run: |
@@ -250,6 +253,7 @@ jobs:
       - BuilderDebRelease
       # - BuilderDebAarch64
     runs-on: [self-hosted, style-checker, altinity-amd64]
+    timeout-minutes: 180
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
@@ -277,6 +281,7 @@ jobs:
       - BuilderDebRelease
       # - BuilderDebAarch64
     runs-on: [self-hosted, style-checker, altinity-amd64]
+    timeout-minutes: 180
     if: ${{ success() || failure() }}
     steps:
       - name: Set envs
@@ -356,6 +361,7 @@ jobs:
       - SignRelease
   #    - BuilderDebAarch64
     runs-on: [self-hosted, style-checker]
+    timeout-minutes: 180
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
@@ -371,6 +377,7 @@ jobs:
   InstallPackagesTestRelease:
     needs: [SignRelease]
     runs-on: [self-hosted, style-checker, altinity-amd64]
+    timeout-minutes: 180
     steps:
       - name: Set envs
         run: |
@@ -439,6 +446,7 @@ jobs:
     ## Do-nothing stage to trigger tests, makes is easier to
     needs: [InstallPackagesTestRelease]
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     steps:
       - run: true
 ##############################################################################################
@@ -447,6 +455,7 @@ jobs:
   FunctionalStatelessTestRelease:
     needs: [tests_start]
     runs-on: [self-hosted, func-tester, altinity-amd64]
+    timeout-minutes: 180
     steps:
       - name: Set envs
         run: |
@@ -520,6 +529,7 @@ jobs:
   FunctionalStatefulTestRelease:
     needs: [tests_start]
     runs-on: [self-hosted, func-tester, altinity-amd64]
+    timeout-minutes: 180
     steps:
       - name: Set envs
         run: |
@@ -593,6 +603,7 @@ jobs:
   IntegrationTestsRelease0:
     needs: [tests_start]
     runs-on: [self-hosted, stress-tester, altinity-amd64]
+    timeout-minutes: 180
     steps:
       - name: Set envs
         run: |
@@ -628,6 +639,7 @@ jobs:
   IntegrationTestsRelease1:
     needs: [tests_start]
     runs-on: [self-hosted, stress-tester, altinity-amd64]
+    timeout-minutes: 180
     steps:
       - name: Set envs
         run: |
@@ -667,6 +679,7 @@ jobs:
     ## Not depending on the tests above since they can fail at any given moment.
     needs: [tests_start]
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     steps:
       - run: true
 
@@ -677,6 +690,7 @@ jobs:
         SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, datetime64_extended_range, disk_level_encryption, dns, example, extended_precision_data_types, kafka, kerberos, lightweight_delete, map_type, part_moves_between_shards, rbac, selects, ssl_server, tiered_storage, window_functions]
     needs: [regression_start]
     runs-on: [self-hosted, regression-tester, altinity-amd64]
+    timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -739,6 +753,7 @@ jobs:
         STORAGE: [minio, aws_s3, gcs]
     needs: [regression_start]
     runs-on: [self-hosted, regression-tester, altinity-amd64]
+    timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -809,6 +824,7 @@ jobs:
         SUITE: [authentication, external_user_directory, role_mapping]
     needs: [regression_start]
     runs-on: [self-hosted, regression-tester, altinity-amd64]
+    timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -867,6 +883,7 @@ jobs:
   parquet:
     needs: [regression_start]
     runs-on: [self-hosted, regression-tester, altinity-amd64]
+    timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -939,6 +956,7 @@ jobs:
         STORAGE: [minio, aws_s3, gcs]
     needs: [regression_start]
     runs-on: [self-hosted, regression-tester, altinity-amd64]
+    timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -1010,6 +1028,7 @@ jobs:
         STORAGE: [minio, s3amazon, s3gcs]
     needs: [regression_start]
     runs-on: [self-hosted, regression-tester, altinity-amd64]
+    timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -1076,6 +1095,7 @@ jobs:
   SignRelease:
     needs: [BuilderDebRelease]
     runs-on: [self-hosted, altinity-amd64]
+    timeout-minutes: 180
     steps:
       - name: Set envs
         run: |
