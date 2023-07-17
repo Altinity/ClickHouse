@@ -5,6 +5,7 @@ import time
 import sys
 import os
 import shutil
+from env_helper import S3_BUILDS_BUCKET
 from pathlib import Path
 
 import requests  # type: ignore

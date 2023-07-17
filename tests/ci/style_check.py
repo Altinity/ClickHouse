@@ -165,7 +165,7 @@ if __name__ == "__main__":
     if not os.path.exists(temp_path):
         os.makedirs(temp_path)
 
-    docker_image = get_image_with_version(temp_path, "clickhouse/style-test")
+    docker_image = get_image_with_version(temp_path, "altinityinfra/style-test")
     s3_helper = S3Helper()
 
     cmd = (
@@ -202,7 +202,7 @@ if __name__ == "__main__":
         report_url,
         NAME,
     )
-    ch_helper.insert_events_into(db="default", table="checks", events=prepared_events)
+    ch_helper.insert_events_into(db="gh-data", table="checks", events=prepared_events)
 
     if state in ["error", "failure"]:
         sys.exit(1)

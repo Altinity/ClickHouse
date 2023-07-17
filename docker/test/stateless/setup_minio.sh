@@ -42,6 +42,7 @@ MINIO_ROOT_USER=${MINIO_ROOT_USER:-clickhouse}
 MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-clickhouse}
 
 ./minio --version
+
 ./minio server --address ":11111" ./minio_data &
 
 i=0
