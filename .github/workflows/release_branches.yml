@@ -141,7 +141,7 @@ jobs:
       timeout_minutes: 180
       runner_type: builder, on-demand, type-ccx53, image-x86-app-docker-ce
       additional_envs: |
-        CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
+        CLICKHOUSE_STABLE_VERSION_SUFFIX=altinityfips
 
   BuilderDebAarch64:
     needs: [DockerHubPush]
@@ -325,7 +325,7 @@ jobs:
     with:
       runner_type: regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce
       commit: 09db6160aac30e37169797b73fac77b4cbca41c6
-      arch: release 
+      arch: release
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'release' && github.sha }}
 
   RegressionTestsAarch64:

@@ -15,6 +15,19 @@ macro(clickhouse_split_debug_symbols)
        message(FATAL_ERROR "Destination directory for stripped binary must be provided")
    endif()
 
+   set(STRIP_EXTRA_ARGS "")
+   if (FIPS_CHLICKHOUSE)
+       # For FIPS tests (hash-break and to run properly, we need to keep some symbols
+       foreach(symbol_name IN ITEMS
+               BORINGSSL_bcm_rodata_start
+               BORINGSSL_bcm_rodata_end
+               BORINGSSL_bcm_text_start
+               BORINGSSL_bcm_text_end
+        )
+           set(STRIP_EXTRA_ARGS "${STRIP_EXTRA_ARGS} --keep-symbol=${symbol_name}")
+       endforeach()
+   endif()
+
    add_custom_command(TARGET ${STRIP_TARGET} POST_BUILD
        COMMAND mkdir -p "${STRIP_DESTINATION_DIR}/lib/debug/bin"
        COMMAND mkdir -p "${STRIP_DESTINATION_DIR}/bin"
@@ -24,7 +37,7 @@ macro(clickhouse_split_debug_symbols)
        COMMAND chmod 0644 "${STRIP_DESTINATION_DIR}/lib/debug/bin/${STRIP_TARGET}.debug"
        # Strips binary, sections '.note' & '.comment' are removed in line with Debian's stripping policy: www.debian.org/doc/debian-policy/ch-files.html, section '.clickhouse.hash' is needed for integrity check.
        # Also, after we disabled the export of symbols for dynamic linking, we still to keep a static symbol table for good stack traces.
-       COMMAND "${STRIP_PATH}" --strip-debug --remove-section=.comment --remove-section=.note "${STRIP_DESTINATION_DIR}/bin/${STRIP_TARGET}"
+       COMMAND "${STRIP_PATH}" --strip-debug --remove-section=.comment --remove-section=.note ${STRIP_EXTRA_ARGS} "${STRIP_DESTINATION_DIR}/bin/${STRIP_TARGET}"
        # Associate stripped binary with debug symbols:
        COMMAND "${OBJCOPY_PATH}" --add-gnu-debuglink "${STRIP_DESTINATION_DIR}/lib/debug/bin/${STRIP_TARGET}.debug" "${STRIP_DESTINATION_DIR}/bin/${STRIP_TARGET}"
        COMMENT "Stripping clickhouse binary" VERBATIM

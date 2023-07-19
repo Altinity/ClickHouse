@@ -13,6 +13,124 @@ if(NOT ENABLE_SSL)
   return()
 endif()
 
+if(FIPS_CLICKHOUSE)
+
+set(BORINGSSL_BUILD_DIR "${CMAKE_BINARY_DIR}/go1.19-boringssl-build")
+set(BORINGSSL_BINARIES_DIR "${BORINGSSL_BUILD_DIR}/output")
+
+message("Will build BoringSSL in FIPS mode according to go1.19 recipe...")
+# build BoringSSL in FIPS mode accoring to the Security Policy:
+# https://csrc.nist.gov/CSRC/media/projects/cryptographic-module-validation-program/documents/security-policies/140sp3678.pdf
+# We re-use golang-1.19 routine, for that we need only 3 files from golang repo, so no need to checkout a full repository:
+# - src/crypto/internal/boring/Dockerfile - build environment
+# - src/crypto/internal/boring/build.sh - build and test script
+# - src/crypto/internal/boring/goboringcrypto.h - required for producing golangs syso (whuch we do not need), but build will fail without it.
+# hashsums were calculated on 28 Dec 2022
+
+message("Downloading build files from go1.19 github...")
+file(DOWNLOAD
+    https://raw.githubusercontent.com/golang/go/go1.19/src/crypto/internal/boring/goboringcrypto.h
+    ${BORINGSSL_BUILD_DIR}/goboringcrypto.h
+    EXPECTED_HASH SHA256=2bea41082e0cc2bdfc6d5fccc64544cb52cc889e6e99330a6b423f04fef48a57
+    SHOW_PROGRESS
+)
+
+file(DOWNLOAD
+    https://raw.githubusercontent.com/golang/go/go1.19/src/crypto/internal/boring/Dockerfile
+    ${BORINGSSL_BUILD_DIR}/Dockerfile
+    EXPECTED_HASH SHA256=c7d3d13d028f542af5dd9f173ad7b7a29bc398f61bb5dd228e6da48b05ea5487
+    SHOW_PROGRESS
+)
+
+file(DOWNLOAD
+    https://raw.githubusercontent.com/golang/go/go1.19/src/crypto/internal/boring/build.sh
+    ${BORINGSSL_BUILD_DIR}/build.sh
+    EXPECTED_HASH SHA256=b4daa2ee2c1ce735c8720eb22d4ef21f9a7a03c737230bddf3582b0fed1b3728
+    SHOW_PROGRESS
+)
+
+# Build driver - the script that triggers the build and pulls out results from docker container
+file(WRITE ${BORINGSSL_BUILD_DIR}/build_boringssl_fips.sh
+"#!/bin/bash
+set -ex
+
+OUTPUT_DIR=$1
+shift
+
+docker build . -t boringssl-builder
+readonly id=$(docker create boringssl-builder)
+
+docker start -a $id #| tr -dc \\\\x0-\\\\x9
+
+mkdir -p $OUTPUT_DIR
+
+# Copy build artifacts
+docker cp $id:/boring/boringssl/build/ssl/libssl.a $OUTPUT_DIR
+docker cp $id:/boring/boringssl/build/crypto/libcrypto.a $OUTPUT_DIR
+docker cp $id:/boring/boringssl/build/decrepit/libdecrepit.a $OUTPUT_DIR
+docker cp $id:/boring/boringssl/include $OUTPUT_DIR
+
+docker rm $id"
+)
+
+# patch a single file in krb5 that relies on file missing from this version of BoringSSL
+SET(krb5_filb_to_patch ${PROJECT_SOURCE_DIR}/contrib/krb5/src/lib/crypto/openssl/enc_provider/aes.c)
+message("Patching ${krb5_filb_to_patch} to allow building against older version of BoringSSL")
+file(READ ${krb5_filb_to_patch} FILE_CONTENTS)
+string(REPLACE "#include <openssl/modes.h>" "//#include <openssl/modes.h>" FILE_CONTENTS "${FILE_CONTENTS}")
+file(WRITE ${krb5_filb_to_patch} "${FILE_CONTENTS}")
+
+message("Creating directory for BoringSSL binaries and includes in ${BORINGSSL_BINARIES_DIR}")
+execute_process(COMMAND ${CMAKE_COMMAND} -E make_directory "${BORINGSSL_BINARIES_DIR}/include")
+
+add_custom_target(build-boringssl
+#    COMMENT "Build BoringSSL in FIPS mode with docker (using go1.19 build suite)"
+    DEPENDS ${BORINGSSL_BINARIES_DIR}/libssl.a ${BORINGSSL_BINARIES_DIR}/libcrypto.a
+)
+
+add_custom_command(
+    OUTPUT
+        "${BORINGSSL_BUILD_DIR}/output/libssl.a"
+        "${BORINGSSL_BUILD_DIR}/output/libcrypto.a"
+        "${BORINGSSL_BUILD_DIR}/output/libdecrepit.a"
+    COMMENT "Building BoringSSL in FIPS mode using Docker"
+    COMMAND bash -c "chmod +x ${BORINGSSL_BUILD_DIR}/build_boringssl_fips.sh ${BORINGSSL_BUILD_DIR}/build.sh"
+    COMMAND bash -c "${BORINGSSL_BUILD_DIR}/build_boringssl_fips.sh ${BORINGSSL_BINARIES_DIR}"
+    WORKING_DIRECTORY ${BORINGSSL_BUILD_DIR}
+    USES_TERMINAL # To stream output
+    DEPENDS
+        ${BORINGSSL_BUILD_DIR}/build.sh
+        ${BORINGSSL_BUILD_DIR}/goboringcrypto.h
+        ${BORINGSSL_BUILD_DIR}/Dockerfile
+)
+
+add_library(_crypto UNKNOWN IMPORTED GLOBAL)
+add_dependencies(_crypto build-boringssl)
+set_target_properties(_crypto PROPERTIES
+    IMPORTED_LINK_INTERFACE_LANGUAGES "CXX"
+    IMPORTED_LOCATION "${BORINGSSL_BINARIES_DIR}/libcrypto.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${BORINGSSL_BINARIES_DIR}/include"
+)
+
+add_library(_decrepit UNKNOWN IMPORTED)
+add_dependencies(_decrepit build-boringssl)
+set_target_properties(_decrepit PROPERTIES
+    IMPORTED_LINK_INTERFACE_LANGUAGES "CXX"
+    IMPORTED_LOCATION "${BORINGSSL_BINARIES_DIR}/libdecrepit.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${BORINGSSL_BINARIES_DIR}/include"
+)
+
+add_library(_ssl UNKNOWN IMPORTED GLOBAL)
+add_dependencies(_ssl _crypto)
+set_target_properties(_ssl PROPERTIES
+    IMPORTED_LINK_INTERFACE_LANGUAGES "CXX"
+    IMPORTED_LOCATION "${BORINGSSL_BINARIES_DIR}/libssl.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${BORINGSSL_BINARIES_DIR}/include"
+    INTERFACE_LINK_LIBRARIES _decrepit
+)
+
+else() # FIPS_CLICKHOUSE
+
 # Copyright (c) 2019 The Chromium Authors. All rights reserved.
 # Use of this source code is governed by a BSD-style license that can be
 # found in the LICENSE file.
@@ -688,6 +806,8 @@ target_include_directories(_crypto SYSTEM PUBLIC "${BORINGSSL_SOURCE_DIR}/includ
 target_include_directories(_ssl SYSTEM PUBLIC "${BORINGSSL_SOURCE_DIR}/include")
 
 target_compile_options(_crypto PRIVATE -Wno-gnu-anonymous-struct)
+
+endif() # FIPS_CLICKHOUSE
 
 add_library(OpenSSL::Crypto ALIAS _crypto)
 add_library(OpenSSL::SSL ALIAS _ssl)

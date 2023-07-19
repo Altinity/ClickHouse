@@ -1,0 +1,8 @@
+{
+  "ipv6": true,
+  "fixed-cidr-v6": "fd00::/8",
+  "ip-forward": true,
+  "log-level": "debug",
+  "insecure-registries" : ["dockerhub-proxy.dockerhub-proxy-zone:5000"],
+  "registry-mirrors" : ["http://dockerhub-proxy.dockerhub-proxy-zone:5000"]
+}

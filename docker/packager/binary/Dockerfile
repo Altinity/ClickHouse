@@ -1,9 +1,11 @@
 
+
 # docker build -t altinityinfra/binary-builder .
 ARG FROM_TAG=latest
 FROM altinityinfra/test-util:$FROM_TAG as cctools
 # The cctools are built always from the altinityinfra/test-util:latest and cached inline
 # Theoretically, it should improve rebuild speed significantly
+
 ENV CC=clang-${LLVM_VERSION}
 ENV CXX=clang++-${LLVM_VERSION}
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -19,20 +21,24 @@ RUN git clone https://github.com/tpoechtrager/apple-libtapi.git \
     && cd .. \
     && rm -rf apple-libtapi
 
-# Build and install tools for cross-linking to Darwin (x86-64)
-# Build and install tools for cross-linking to Darwin (aarch64)
-RUN git clone https://github.com/tpoechtrager/cctools-port.git \
-    && cd cctools-port/cctools \
-    && git checkout 2a3e1c2a6ff54a30f898b70cfb9ba1692a55fad7 \
-    && ./configure --prefix=/cctools --with-libtapi=/cctools \
-        --target=x86_64-apple-darwin \
-    && make install -j$(nproc) \
-    && make clean \
-    && ./configure --prefix=/cctools --with-libtapi=/cctools \
-        --target=aarch64-apple-darwin \
-    && make install -j$(nproc) \
-    && cd ../.. \
-    && rm -rf cctools-port
+# NOTE(vnemkov): Not required for arm64 only build, reenable for arm64 builds.
+# # Build and install tools for cross-linking to Darwin (x86-64)
+# RUN git clone --depth 1 https://github.com/tpoechtrager/cctools-port.git \
+#     && cd cctools-port/cctools \
+#     && ./configure --prefix=/cctools --with-libtapi=/cctools \
+#         --target=x86_64-apple-darwin \
+#     && make install -j$(nproc) \
+#     && cd ../.. \
+#     && rm -rf cctools-port
+
+# # Build and install tools for cross-linking to Darwin (aarch64)
+# RUN git clone --depth 1 https://github.com/tpoechtrager/cctools-port.git \
+#     && cd cctools-port/cctools \
+#     && ./configure --prefix=/cctools --with-libtapi=/cctools \
+#         --target=aarch64-apple-darwin \
+#     && make install -j$(nproc) \
+#     && cd ../.. \
+#     && rm -rf cctools-port
 
 # !!!!!!!!!!!
 # END COMPILE
@@ -41,6 +47,30 @@ RUN git clone https://github.com/tpoechtrager/cctools-port.git \
 FROM altinityinfra/test-util:$FROM_TAG
 ENV CC=clang-${LLVM_VERSION}
 ENV CXX=clang++-${LLVM_VERSION}
+
+# Install CMake 3.20+ for Rust compilation
+# Used https://askubuntu.com/a/1157132 as reference
+RUN apt purge cmake --yes
+RUN wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | gpg --dearmor - | tee /etc/apt/trusted.gpg.d/kitware.gpg >/dev/null
+RUN apt-add-repository 'deb https://apt.kitware.com/ubuntu/ focal main'
+RUN apt update && apt install cmake --yes
+
+
+# Install Docker
+ENV DOCKER_CHANNEL stable
+RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add - \
+    && add-apt-repository "deb https://download.docker.com/linux/ubuntu $(lsb_release -c -s) ${DOCKER_CHANNEL}" \
+    && apt-get update \
+    && env DEBIAN_FRONTEND=noninteractive apt-get install --yes \
+        docker-ce \
+    && rm -rf \
+        /var/lib/apt/lists/* \
+        /var/cache/debconf \
+        /tmp/* \
+    && apt-get clean
+
+RUN dockerd --version; docker --version
+
 
 # Rust toolchain and libraries
 ENV RUSTUP_HOME=/rust/rustup
@@ -112,9 +142,9 @@ RUN curl -Lo /usr/bin/clang-tidy-cache \
     && chmod +x /usr/bin/clang-tidy-cache
 
 COPY --from=cctools /cctools /cctools
-
 RUN mkdir /workdir && chmod 777 /workdir
 WORKDIR /workdir
-
 COPY build.sh /
+COPY daemon.json /etc/docker/
+
 CMD ["bash", "-c", "/build.sh 2>&1"]

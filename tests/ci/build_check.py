@@ -70,7 +70,8 @@ def get_packager_cmd(
     cmake_flags = "-DENABLE_CLICKHOUSE_SELF_EXTRACTING=1"
     cmd = (
         f"cd {packager_path} && CMAKE_FLAGS='{cmake_flags}' ./packager "
-        f"--output-dir={output_path} --package-type={package_type} --compiler={comp}"
+        f"--output-dir={output_path} --package-type={package_type} --compiler={comp} "
+        "--fips --as-root"
     )
 
     if build_config.debug_build:
@@ -257,7 +258,6 @@ def main():
     logging.info("Got version from repo %s", version.string)
 
     official_flag = True
-    # version._flavour = version_type = CLICKHOUSE_STABLE_VERSION_SUFFIX
     # TODO (vnemkov): right now we'll use simplified version management:
     # only update git hash and explicitly set stable version suffix.
     # official_flag = pr_info.number == 0
