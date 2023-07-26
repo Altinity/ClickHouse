@@ -374,7 +374,7 @@ jobs:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
         with:
-          clear-repository: true
+          clear-repository: trueл
       - name: Functional test
         run: |
           sudo rm -fr "$TEMP_PATH"
