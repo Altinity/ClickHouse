@@ -671,7 +671,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, datetime64_extended_range, disk_level_encryption, dns, engines, example, extended_precision_data_types, kafka, kerberos, key_value, lightweight_delete, map_type, parquet, part_moves_between_shards, rbac, selects, session_timezone, ssl_server, tiered_storage, window_functions]
+        SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, datetime64_extended_range, disk_level_encryption, dns, engines, example, extended_precision_data_types, kafka, kerberos, key_value, lightweight_delete, data_types, parquet, part_moves_between_shards, rbac, selects, session_timezone, ssl_server, tiered_storage, window_functions]
     needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
