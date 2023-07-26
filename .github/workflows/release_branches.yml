@@ -1169,7 +1169,8 @@ jobs:
       - regression_common
       - benchmark
       - ldap
-      - parquet
+      - parquet_minio
+      - parquet_aws
       - s3
       - tiered_storage_s3
     runs-on: [self-hosted, style-checker]
