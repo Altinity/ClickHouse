@@ -6,6 +6,7 @@ env:
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  REGRESSION_RESULTS_URL: altinity-build-artifacts/${{github.event.number}}/$GITHUB_SHA
 
 
 on: # yamllint disable-line rule:truthy
@@ -153,8 +154,9 @@ jobs:
       - name: Build
         run: |
           sudo rm -fr "$TEMP_PATH"
-          mkdir -p "$TEMP_PATH"
-          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH/build_check/package_release"
+          cd .. && tar czf $TEMP_PATH/build_source.src.tar.gz ClickHouse/
+          cd $TEMP_PATH && tar xvzf $TEMP_PATH/build_source.src.tar.gz
           cd "$REPO_COPY/tests/ci" && python3 build_check.py "$BUILD_NAME"
       - name: Upload build URLs to artifacts
         if: ${{ success() || failure() }}
@@ -569,6 +571,460 @@ jobs:
           # shellcheck disable=SC2046
           docker rm -f $(docker ps -a -q) ||:
           sudo rm -fr "$TEMP_PATH"
+#############################################################################################
+##################################### REGRESSION TESTS ######################################
+#############################################################################################
+  regression_start:
+    ## Not depending on the tests above since they can fail at any given moment.
+    needs: [BuilderDebRelease]
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
+
+  regression_common:
+    strategy:
+      fail-fast: false
+      matrix:
+        SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, datetime64_extended_range, disk_level_encryption, dns, example, extended_precision_data_types, kafka, kerberos, lightweight_delete, map_type, part_moves_between_shards, rbac, selects, ssl_server, tiered_storage, window_functions]
+    needs: [regression_start]
+    runs-on: [self-hosted, stress-tester]
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
+    steps:
+      - name: Checkout regression repo
+        uses: actions/checkout@v3
+        with:
+          repository: Altinity/clickhouse-regression
+          ref: releases
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          SUITE=${{ matrix.SUITE }}
+          artifacts=public
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Setup
+        run: .github/setup.sh
+      - name: Get deb url
+        run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
+      - name: Run ${{ env.SUITE }} suite
+        run: python3
+              -u ${{ env.SUITE }}/regression.py
+              --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --test-to-end
+              --local
+              --collect-service-logs
+              --output classic
+              --parallel 1
+              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
+              --log raw.log
+      - name: Create and upload logs
+        if: always()
+        run: .github/create_and_upload_logs.sh 1
+        env:
+          artifact_s3_dir: build/v${{ env.version }}/$GITHUB_SHA
+      - uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: ${{ env.SUITE }}-artifacts
+          path: |
+            ./report.html
+            ./*.log.txt
+            ./*.log
+            ./*.html
+            ./*/_instances/*.log
+            ./*/_instances/*/logs/*.log
+            ./*/*/_instances/*/logs/*.log
+            ./*/*/_instances/*.log
+
+  benchmark:
+    strategy:
+      fail-fast: false
+      matrix:
+        STORAGE: [minio, aws_s3, gcs]
+    needs: [regression_start]
+    runs-on: [self-hosted, stress-tester]
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
+    steps:
+      - name: Checkout regression repo
+        uses: actions/checkout@v3
+        with:
+          repository: Altinity/clickhouse-regression
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          SUITE=ontime_benchmark
+          STORAGE=/${{ matrix.STORAGE }}
+          artifacts=public
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Setup
+        run: .github/setup.sh
+      - name: Get deb url
+        run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
+      - name: Run ${{ env.SUITE }} suite
+        run: python3
+              -u ${{ env.SUITE }}/benchmark.py
+              --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --storage ${{ matrix.STORAGE }}
+              --gcs-uri ${{ secrets.REGRESSION_GCS_URI }}
+              --gcs-key-id ${{ secrets.REGRESSION_GCS_KEY_ID }}
+              --gcs-key-secret ${{ secrets.REGRESSION_GCS_KEY_SECRET }}
+              --aws-s3-bucket ${{ secrets.REGRESSION_AWS_S3_BUCKET }}
+              --aws-s3-region ${{ secrets.REGRESSION_AWS_S3_REGION }}
+              --aws-s3-key-id ${{ secrets.REGRESSION_AWS_S3_KEY_ID }}
+              --aws-s3-access-key ${{ secrets.REGRESSION_AWS_S3_SECRET_ACCESS_KEY }}
+              --test-to-end
+              --local
+              --collect-service-logs
+              --output classic
+              --parallel 1
+              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
+              --log raw.log
+      - name: Create and upload logs
+        if: always()
+        run: .github/create_and_upload_logs.sh 1
+        env:
+          artifact_s3_dir: build/v${{ env.version }}/$GITHUB_SHA
+      - uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: ${{ env.SUITE }}-minio-artifacts
+          path: |
+            ./report.html
+            ./*.log.txt
+            ./*.log
+            ./*.html
+            ./*/_instances/*.log
+            ./*/_instances/*/logs/*.log
+            ./*/*/_instances/*/logs/*.log
+            ./*/*/_instances/*.log
+
+  ldap:
+    strategy:
+      fail-fast: false
+      matrix:
+        SUITE: [authentication, external_user_directory, role_mapping]
+    needs: [regression_start]
+    runs-on: [self-hosted, stress-tester]
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
+    steps:
+      - name: Checkout regression repo
+        uses: actions/checkout@v3
+        with:
+          repository: Altinity/clickhouse-regression
+          ref: releases
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          SUITE=ldap/${{ matrix.SUITE }}
+          artifacts=public
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Setup
+        run: .github/setup.sh
+      - name: Get deb url
+        run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
+      - name: Run ${{ env.SUITE }} suite
+        run: python3
+              -u ${{ env.SUITE }}/regression.py
+              --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --test-to-end
+              --local
+              --collect-service-logs
+              --output classic
+              --parallel 1
+              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
+              --log raw.log
+      - name: Create and upload logs
+        if: always()
+        run: .github/create_and_upload_logs.sh 1
+        env:
+          artifact_s3_dir: build/v${{ env.version }}/$GITHUB_SHA
+      - uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: ldap-authentication-artifacts
+          path: |
+            ./report.html
+            ./*.log.txt
+            ./*.log
+            ./*.html
+            ./*/_instances/*.log
+            ./*/_instances/*/logs/*.log
+            ./*/*/_instances/*/logs/*.log
+            ./*/*/_instances/*.log
+
+  parquet:
+    needs: [regression_start]
+    runs-on: [self-hosted, stress-tester]
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
+    steps:
+      - name: Checkout regression repo
+        uses: actions/checkout@v3
+        with:
+          repository: Altinity/clickhouse-regression
+          ref: releases
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          SUITE=parquet
+          artifacts=public
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Setup
+        run: .github/setup.sh
+      - name: Get deb url
+        run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
+      - name: Run ${{ env.SUITE }} suite
+        run: python3
+              -u ${{ env.SUITE }}/regression.py
+              --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --test-to-end
+              --local
+              --collect-service-logs
+              --output classic
+              --parallel 1
+              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
+              --log raw.log
+              --storage minio
+              --storage aws_s3
+              --aws-s3-bucket ${{ secrets.REGRESSION_AWS_S3_BUCKET }}
+              --aws-s3-region ${{ secrets.REGRESSION_AWS_S3_REGION }}
+              --aws-s3-key-id ${{ secrets.REGRESSION_AWS_S3_KEY_ID }}
+              --aws-s3-access-key ${{ secrets.REGRESSION_AWS_S3_SECRET_ACCESS_KEY }}
+              --storage gcs
+              --gcs-uri ${{ secrets.REGRESSION_GCS_URI }}
+              --gcs-key-id ${{ secrets.REGRESSION_GCS_KEY_ID }}
+              --gcs-key-secret ${{ secrets.REGRESSION_GCS_KEY_SECRET }}
+      - name: Create and upload logs
+        if: always()
+        run: .github/create_and_upload_logs.sh 1
+        env:
+          artifact_s3_dir: build/v${{ env.version }}/$GITHUB_SHA
+      - uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: ${{ env.SUITE }}-artifacts
+          path: |
+            ./report.html
+            ./*.log.txt
+            ./*.log
+            ./*.html
+            ./*/_instances/*.log
+            ./*/_instances/*/logs/*.log
+            ./*/*/_instances/*/logs/*.log
+            ./*/*/_instances/*.log
+
+  s3:
+    strategy:
+      fail-fast: false
+      matrix:
+        STORAGE: [minio, aws_s3, gcs]
+    needs: [regression_start]
+    runs-on: [self-hosted, stress-tester]
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
+    steps:
+      - name: Checkout regression repo
+        uses: actions/checkout@v3
+        with:
+          repository: Altinity/clickhouse-regression
+          ref: releases
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          SUITE=s3
+          STORAGE=/${{ matrix.STORAGE }}
+          artifacts=public
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Setup
+        run: .github/setup.sh
+      - name: Get deb url
+        run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
+      - name: Run ${{ env.SUITE }} suite
+        run: python3
+              -u ${{ env.SUITE }}/regression.py
+              --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --test-to-end
+              --local
+              --collect-service-logs
+              --output classic
+              --parallel 1
+              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
+              --log raw.log
+              --storage ${{ matrix.STORAGE }}
+              --gcs-uri ${{ secrets.REGRESSION_GCS_URI }}
+              --gcs-key-id ${{ secrets.REGRESSION_GCS_KEY_ID }}
+              --gcs-key-secret ${{ secrets.REGRESSION_GCS_KEY_SECRET }}
+              --aws-s3-bucket ${{ secrets.REGRESSION_AWS_S3_BUCKET }}
+              --aws-s3-region ${{ secrets.REGRESSION_AWS_S3_REGION }}
+              --aws-s3-key-id ${{ secrets.REGRESSION_AWS_S3_KEY_ID }}
+              --aws-s3-access-key ${{ secrets.REGRESSION_AWS_S3_SECRET_ACCESS_KEY }}
+      - name: Create and upload logs
+        if: always()
+        run: .github/create_and_upload_logs.sh 1
+        env:
+          artifact_s3_dir: build/v${{ env.version }}/$GITHUB_SHA
+      - uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: ${{ env.SUITE }}-${{ matrix.STORAGE }}-artifacts
+          path: |
+            ./report.html
+            ./*.log.txt
+            ./*.log
+            ./*.html
+            ./*/_instances/*.log
+            ./*/_instances/*/logs/*.log
+            ./*/*/_instances/*/logs/*.log
+            ./*/*/_instances/*.log
+  
+  tiered_storage_s3:
+    strategy:
+      fail-fast: false
+      matrix:
+        STORAGE: [minio, s3amazon, s3gcs]
+    needs: [regression_start]
+    runs-on: [self-hosted, stress-tester]
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
+    steps:
+      - name: Checkout regression repo
+        uses: actions/checkout@v3
+        with:
+          repository: Altinity/clickhouse-regression
+          ref: releases
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          SUITE=tiered_storage
+          STORAGE=/${{ matrix.STORAGE }}
+          artifacts=public
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Setup
+        run: .github/setup.sh
+      - name: Get deb url
+        run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
+      - name: Run ${{ env.SUITE }} suite
+        run: python3
+              -u ${{ env.SUITE }}/regression.py
+              --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --test-to-end
+              --local
+              --collect-service-logs
+              --output classic
+              --parallel 1
+              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
+              --log raw.log
+              --aws-s3-access-key ${{ secrets.REGRESSION_AWS_S3_SECRET_ACCESS_KEY }}
+              --aws-s3-key-id ${{ secrets.REGRESSION_AWS_S3_KEY_ID }}
+              --aws-s3-uri https://s3.${{ secrets.REGRESSION_AWS_S3_REGION}}.amazonaws.com/${{ secrets.REGRESSION_AWS_S3_BUCKET }}/data/
+              --gcs-key-id ${{ secrets.REGRESSION_GCS_KEY_ID }}
+              --gcs-key-secret ${{ secrets.REGRESSION_GCS_KEY_SECRET }}
+              --gcs-uri ${{ secrets.REGRESSION_GCS_URI }}
+              --with-${{ matrix.STORAGE }}
+      - name: Create and upload logs
+        if: always()
+        run: .github/create_and_upload_logs.sh 1
+        env:
+          artifact_s3_dir: build/v${{ env.version }}/$GITHUB_SHA
+      - uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: ${{ env.SUITE }}-${{ matrix.STORAGE }}-artifacts
+          path: |
+            ./report.html
+            ./*.log.txt
+            ./*.log
+            ./*.html
+            ./*/_instances/*.log
+            ./*/_instances/*/logs/*.log
+            ./*/*/_instances/*/logs/*.log
+            ./*/*/_instances/*.log
+
+  SignRelease:
+    needs: [BuilderDebRelease]
+    runs-on: [ self-hosted ]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/signed
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          EOF
+      - name: Clear repository
+        run: |
+          sudo rm -fr "$GITHUB_WORKSPACE" && mkdir "$GITHUB_WORKSPACE"
+      - name: Check out repository code
+        uses: actions/checkout@v2
+      - name: Download json reports
+        uses: actions/download-artifact@v2
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Sign release
+        env:
+          GPG_BINARY_SIGNING_KEY: ${{ secrets.GPG_BINARY_SIGNING_KEY }}
+          GPG_BINARY_SIGNING_PASSPHRASE: ${{ secrets.GPG_BINARY_SIGNING_PASSPHRASE }}
+          REPORTS_PATH: ${{ env.REPORTS_PATH }}
+        run: |
+          cd "$GITHUB_WORKSPACE/tests/ci"
+          python3 sign_release.py
+      - name: Upload signed hashes
+        uses: actions/upload-artifact@v2
+        with:
+          name: signed-hashes
+          path: ${{ env.TEMP_PATH }}/*.gpg
+      - name: Cleanup
+        if: always()
+        run: |
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+          sudo rm -fr "$TEMP_PATH"
+  ###########################################################################################
+  ################################ FINISH CHECK #############################################
+  ###########################################################################################
   FinishCheck:
     needs:
       - DockerHubPush
@@ -583,6 +1039,13 @@ jobs:
       - IntegrationTestsRelease0
       - IntegrationTestsRelease1
       - CompatibilityCheck
+      - SignRelease
+      - regression_common
+      - benchmark
+      - ldap
+      - parquet
+      - s3
+      - tiered_storage_s3
     runs-on: [self-hosted, style-checker]
     steps:
       - name: Check out repository code
