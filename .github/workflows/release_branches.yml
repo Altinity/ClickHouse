@@ -45,7 +45,7 @@ jobs:
   #         path: ${{ runner.temp }}/docker_images_check/changed_images_aarch64.json
   # Former DockerHubPushAmd64
   DockerHubPush:
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx41, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Check out repository code
@@ -93,7 +93,7 @@ jobs:
   #         path: ${{ runner.temp }}/changed_images.json
   CompatibilityCheck:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx41, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -159,7 +159,7 @@ jobs:
 #########################################################################################
   BuilderDebRelease:
     needs: [DockerHubPush]
-    runs-on: [self-hosted, builder, on-demand, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, builder, on-demand, type-cpx41, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -252,7 +252,7 @@ jobs:
     needs:
       - BuilderDebRelease
       # - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx41, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Check out repository code
@@ -280,7 +280,7 @@ jobs:
     needs:
       - BuilderDebRelease
       # - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx41, image-x86-app-docker-ce]
     timeout-minutes: 180
     if: ${{ success() || failure() }}
     steps:
@@ -376,7 +376,7 @@ jobs:
 ############################################################################################
   InstallPackagesTestRelease:
     needs: [SignRelease]
-    runs-on: [self-hosted, style-checker, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, style-checker, type-cpx41, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
