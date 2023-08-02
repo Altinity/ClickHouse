@@ -45,7 +45,7 @@ jobs:
   #         path: ${{ runner.temp }}/docker_images_check/changed_images_aarch64.json
   # Former DockerHubPushAmd64
   DockerHubPush:
-    runs-on: [self-hosted, style-checker, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx31, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Check out repository code
@@ -93,7 +93,7 @@ jobs:
   #         path: ${{ runner.temp }}/changed_images.json
   CompatibilityCheck:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, style-checker, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx31, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -159,7 +159,7 @@ jobs:
 #########################################################################################
   BuilderDebRelease:
     needs: [DockerHubPush]
-    runs-on: [self-hosted, builder, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, builder, on-demand, type-cpx31, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -252,7 +252,7 @@ jobs:
     needs:
       - BuilderDebRelease
       # - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx31, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Check out repository code
@@ -280,7 +280,7 @@ jobs:
     needs:
       - BuilderDebRelease
       # - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx31, image-x86-app-docker-ce]
     timeout-minutes: 180
     if: ${{ success() || failure() }}
     steps:
@@ -360,7 +360,7 @@ jobs:
       - BuilderDebRelease
       - SignRelease
   #    - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx31, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Check out repository code
@@ -454,7 +454,7 @@ jobs:
 ##############################################################################################
   FunctionalStatelessTestRelease:
     needs: [tests_start]
-    runs-on: [self-hosted, func-tester, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, func-tester, on-demand, type-cpx31, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -528,7 +528,7 @@ jobs:
 ##############################################################################################
   FunctionalStatefulTestRelease:
     needs: [tests_start]
-    runs-on: [self-hosted, func-tester, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, func-tester, on-demand, type-cpx31, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -602,7 +602,7 @@ jobs:
 #############################################################################################
   IntegrationTestsRelease0:
     needs: [tests_start]
-    runs-on: [self-hosted, stress-tester, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, stress-tester, on-demand, type-cpx31, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -638,7 +638,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsRelease1:
     needs: [tests_start]
-    runs-on: [self-hosted, stress-tester, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, stress-tester, on-demand, type-cpx31, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -689,7 +689,7 @@ jobs:
       matrix:
         SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, datetime64_extended_range, disk_level_encryption, dns, example, extended_precision_data_types, kafka, kerberos, lightweight_delete, map_type, part_moves_between_shards, rbac, selects, ssl_server, tiered_storage, window_functions]
     needs: [regression_start]
-    runs-on: [self-hosted, regression-tester, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, regression-tester, on-demand, type-cpx31, image-x86-app-docker-ce]
     timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -752,7 +752,7 @@ jobs:
       matrix:
         STORAGE: [minio, aws_s3, gcs]
     needs: [regression_start]
-    runs-on: [self-hosted, regression-tester, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, regression-tester, on-demand, type-cpx31, image-x86-app-docker-ce]
     timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -823,7 +823,7 @@ jobs:
       matrix:
         SUITE: [authentication, external_user_directory, role_mapping]
     needs: [regression_start]
-    runs-on: [self-hosted, regression-tester, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, regression-tester, on-demand, type-cpx31, image-x86-app-docker-ce]
     timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -882,7 +882,7 @@ jobs:
 
   parquet:
     needs: [regression_start]
-    runs-on: [self-hosted, regression-tester, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, regression-tester, on-demand, type-cpx31, image-x86-app-docker-ce]
     timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -955,7 +955,7 @@ jobs:
       matrix:
         STORAGE: [minio, aws_s3, gcs]
     needs: [regression_start]
-    runs-on: [self-hosted, regression-tester, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, regression-tester, on-demand, type-cpx31, image-x86-app-docker-ce]
     timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -1027,7 +1027,7 @@ jobs:
       matrix:
         STORAGE: [minio, s3amazon, s3gcs]
     needs: [regression_start]
-    runs-on: [self-hosted, regression-tester, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, regression-tester, on-demand, type-cpx31, image-x86-app-docker-ce]
     timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -1094,7 +1094,7 @@ jobs:
 
   SignRelease:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, on-demand, type-cpx31, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -1155,7 +1155,7 @@ jobs:
       - parquet
       - s3
       - tiered_storage_s3
-    runs-on: [self-hosted, style-checker, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx31, image-x86-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
