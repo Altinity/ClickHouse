@@ -197,7 +197,7 @@ WHERE
     AND pull_request_number = 0
 """
 
-        tests_data = clickhouse_helper.select_json_each_row("default", query)
+        tests_data = clickhouse_helper.select_json_each_row("gh-data", query)
         master_failed_tests = {row["test_name"] for row in tests_data}
         logging.info("Found flaky tests: %s", ", ".join(master_failed_tests))
 

@@ -335,6 +335,9 @@ CI_CONFIG = {
             "required_build": "package_aarch64",
             "test_grep_exclude_filter": "constant_column_search",
         },
+        "Sign release (actions)": {
+            "required_build": "package_release"
+        }
     },
 }  # type: dict
 
