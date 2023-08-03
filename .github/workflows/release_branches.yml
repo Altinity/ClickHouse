@@ -28,7 +28,7 @@ on: # yamllint disable-line rule:truthy
 
 jobs:
   DockerHubPushAarch64:
-    runs-on: [self-hosted, style-checker, on-demand, type-cax51, image-arm-app-docker-ce]
+    runs-on: [self-hosted, style-checker, on-demand, type-cax41, image-arm-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
@@ -178,7 +178,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH" "$CACHES_PATH"
   BuilderDebAarch64:
     needs: [DockerHubPush]
-    runs-on: [self-hosted, builder, on-demand, type-cax51, image-arm-app-docker-ce]
+    runs-on: [self-hosted, builder, on-demand, type-cax41, image-arm-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -394,7 +394,7 @@ jobs:
 
   FunctionalStatelessTestAarch64:
     needs: [BuilderDebAarch64]
-    runs-on: [self-hosted, func-tester, on-demand, type-cax51, image-arm-app-docker-ce]
+    runs-on: [self-hosted, func-tester, on-demand, type-cax41, image-arm-app-docker-ce]
     steps:
       - name: Set envs
         run: |
