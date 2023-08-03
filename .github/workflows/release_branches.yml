@@ -376,7 +376,7 @@ jobs:
 ############################################################################################
   InstallPackagesTestRelease:
     needs: [SignRelease]
-    runs-on: [self-hosted, style-checker, type-cpx41, image-x86-app-docker-ce]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx41, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
