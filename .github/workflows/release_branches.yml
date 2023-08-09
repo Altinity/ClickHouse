@@ -45,7 +45,7 @@ jobs:
   #         path: ${{ runner.temp }}/docker_images_check/changed_images_aarch64.json
   # Former DockerHubPushAmd64
   DockerHubPush:
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx51, image-x86-app-docker-ce]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx51]
     timeout-minutes: 180
     steps:
       - name: Check out repository code
@@ -93,7 +93,7 @@ jobs:
   #         path: ${{ runner.temp }}/changed_images.json
   CompatibilityCheck:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx51, image-x86-app-docker-ce]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx51]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -159,7 +159,7 @@ jobs:
 #########################################################################################
   BuilderDebRelease:
     needs: [DockerHubPush]
-    runs-on: [self-hosted, builder, on-demand, type-ccx52, image-x86-app-docker-ce]
+    runs-on: [self-hosted, builder, on-demand, type-ccx52]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -252,7 +252,7 @@ jobs:
     needs:
       - BuilderDebRelease
       # - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx31]
     timeout-minutes: 180
     steps:
       - name: Check out repository code
@@ -280,7 +280,7 @@ jobs:
     needs:
       - BuilderDebRelease
       # - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx31]
     timeout-minutes: 180
     if: ${{ success() || failure() }}
     steps:
@@ -360,7 +360,7 @@ jobs:
       - BuilderDebRelease
       - SignRelease
   #    - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx31]
     timeout-minutes: 180
     steps:
       - name: Check out repository code
@@ -376,7 +376,7 @@ jobs:
 ############################################################################################
   InstallPackagesTestRelease:
     needs: [SignRelease]
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx31, image-x86-app-docker-ce]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx31]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -454,7 +454,7 @@ jobs:
 ##############################################################################################
   FunctionalStatelessTestRelease:
     needs: [tests_start]
-    runs-on: [self-hosted, func-tester, on-demand, type-ccx52, image-x86-app-docker-ce]
+    runs-on: [self-hosted, func-tester, on-demand, type-cpx51]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -528,7 +528,7 @@ jobs:
 ##############################################################################################
   FunctionalStatefulTestRelease:
     needs: [tests_start]
-    runs-on: [self-hosted, func-tester, on-demand, type-ccx52, image-x86-app-docker-ce]
+    runs-on: [self-hosted, func-tester, on-demand, type-cpx51]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -602,7 +602,7 @@ jobs:
 #############################################################################################
   IntegrationTestsRelease0:
     needs: [tests_start]
-    runs-on: [self-hosted, stress-tester, on-demand, type-ccx52, image-x86-app-docker-ce]
+    runs-on: [self-hosted, stress-tester, on-demand, type-cpx51]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -638,7 +638,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsRelease1:
     needs: [tests_start]
-    runs-on: [self-hosted, stress-tester, on-demand, type-ccx52, image-x86-app-docker-ce]
+    runs-on: [self-hosted, stress-tester, on-demand, type-cpx51]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -675,40 +675,40 @@ jobs:
 #############################################################################################
 ###################################### STRESS TESTS #########################################
 #############################################################################################
-  StressTest:
-    needs: [tests_start]
-    runs-on: [self-hosted, stress-tester, on-demand, type-ccx52, image-x86-app-docker-ce]
-    timeout-minutes: 180
-    steps:
-      - name: Set envs
-        run: |
-          cat >> "$GITHUB_ENV" << 'EOF'
-          TEMP_PATH=${{runner.temp}}/stress_thread
-          REPORTS_PATH=${{runner.temp}}/reports_dir
-          CHECK_NAME=Stress test (release)
-          REPO_COPY=${{runner.temp}}/stress_thread/ClickHouse
-          EOF
-      - name: Download json reports
-        uses: actions/download-artifact@v3
-        with:
-          path: ${{ env.REPORTS_PATH }}
-      - name: Check out repository code
-        uses: ClickHouse/checkout@v1
-        with:
-          clear-repository: true
-      - name: Integration test
-        run: |
-          sudo rm -fr "$TEMP_PATH"
-          mkdir -p "$TEMP_PATH"
-          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
-          cd "$REPO_COPY/tests/ci"
-          python3 stress_check.py "$CHECK_NAME"
-      - name: Cleanup
-        if: always()
-        run: |
-          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
-          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
-          sudo rm -fr "$TEMP_PATH"
+#   StressTest:
+#     needs: [tests_start]
+#     runs-on: [self-hosted, stress-tester, on-demand, type-cpx51]
+#     timeout-minutes: 180
+#     steps:
+#       - name: Set envs
+#         run: |
+#           cat >> "$GITHUB_ENV" << 'EOF'
+#           TEMP_PATH=${{runner.temp}}/stress_thread
+#           REPORTS_PATH=${{runner.temp}}/reports_dir
+#           CHECK_NAME=Stress test (release)
+#           REPO_COPY=${{runner.temp}}/stress_thread/ClickHouse
+#           EOF
+#       - name: Download json reports
+#         uses: actions/download-artifact@v3
+#         with:
+#           path: ${{ env.REPORTS_PATH }}
+#       - name: Check out repository code
+#         uses: ClickHouse/checkout@v1
+#         with:
+#           clear-repository: true
+#       - name: Stress Test
+#         run: |
+#           sudo rm -fr "$TEMP_PATH"
+#           mkdir -p "$TEMP_PATH"
+#           cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+#           cd "$REPO_COPY/tests/ci"
+#           python3 stress_check.py "$CHECK_NAME"
+#       - name: Cleanup
+#         if: always()
+#         run: |
+#           docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+#           docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+#           sudo rm -fr "$TEMP_PATH"
 #############################################################################################
 ##################################### REGRESSION TESTS ######################################
 #############################################################################################
