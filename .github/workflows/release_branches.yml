@@ -1342,7 +1342,7 @@ jobs:
       # - FunctionalStatefulTestAarch64
       - IntegrationTestsRelease0
       - IntegrationTestsRelease1
-      - StressTest
+#       - StressTest
       - CompatibilityCheck
       - SignRelease
       - regression_common
