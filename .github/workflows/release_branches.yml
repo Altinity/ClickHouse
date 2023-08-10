@@ -252,7 +252,7 @@ jobs:
     needs:
       - BuilderDebRelease
       # - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx31]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx51]
     timeout-minutes: 180
     steps:
       - name: Check out repository code
@@ -376,7 +376,7 @@ jobs:
 ############################################################################################
   InstallPackagesTestRelease:
     needs: [SignRelease]
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx31]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx51]
     timeout-minutes: 180
     steps:
       - name: Set envs
