@@ -28,7 +28,7 @@ on: # yamllint disable-line rule:truthy
 
 jobs:
   DockerHubPushAarch64:
-    runs-on: [self-hosted, style-checker, on-demand, type-cax41]
+    runs-on: [self-hosted, style-checker, on-demand, type-cax41, image-arm-system-ubuntu-22.04]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
@@ -178,7 +178,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH" "$CACHES_PATH"
   BuilderDebAarch64:
     needs: [DockerHubPush]
-    runs-on: [self-hosted, builder, on-demand, type-cax41]
+    runs-on: [self-hosted, builder, on-demand, type-cax41, image-arm-system-ubuntu-22.04]
     steps:
       - name: Set envs
         run: |
@@ -394,7 +394,7 @@ jobs:
 
   FunctionalStatelessTestAarch64:
     needs: [BuilderDebAarch64]
-    runs-on: [self-hosted, func-tester, on-demand, type-cax41]
+    runs-on: [self-hosted, func-tester, on-demand, type-cax41, image-arm-system-ubuntu-22.04]
     steps:
       - name: Set envs
         run: |
@@ -510,7 +510,7 @@ jobs:
 #############################################################################################
   IntegrationTestsRelease0:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, stress-tester, on-demand, type-cpx51]
+    runs-on: [self-hosted, stress-tester, on-demand, type-ccx52]
     steps:
       - name: Set envs
         run: |
@@ -547,7 +547,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsRelease1:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, stress-tester, on-demand, type-cpx41]
+    runs-on: [self-hosted, stress-tester, on-demand, type-ccx52]
     steps:
       - name: Set envs
         run: |
