@@ -226,8 +226,9 @@ jobs:
       - name: Build
         run: |
           sudo rm -fr "$TEMP_PATH"
-          mkdir -p "$TEMP_PATH"
-          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH/build_check/package_release"
+          cd .. && tar czf $TEMP_PATH/build_source.src.tar.gz ClickHouse/
+          cd $TEMP_PATH && tar xvzf $TEMP_PATH/build_source.src.tar.gz
           cd "$REPO_COPY/tests/ci" && python3 build_check.py "$BUILD_NAME"
       - name: Upload build URLs to artifacts
         if: ${{ success() || failure() }}
@@ -268,8 +269,9 @@ jobs:
       - name: Build
         run: |
           sudo rm -fr "$TEMP_PATH"
-          mkdir -p "$TEMP_PATH"
-          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH/build_check/package_release"
+          cd .. && tar czf $TEMP_PATH/build_source.src.tar.gz ClickHouse/
+          cd $TEMP_PATH && tar xvzf $TEMP_PATH/build_source.src.tar.gz
           cd "$REPO_COPY/tests/ci" && python3 build_check.py "$BUILD_NAME"
       - name: Upload build URLs to artifacts
         if: ${{ success() || failure() }}
@@ -310,8 +312,9 @@ jobs:
       - name: Build
         run: |
           sudo rm -fr "$TEMP_PATH"
-          mkdir -p "$TEMP_PATH"
-          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH/build_check/package_release"
+          cd .. && tar czf $TEMP_PATH/build_source.src.tar.gz ClickHouse/
+          cd $TEMP_PATH && tar xvzf $TEMP_PATH/build_source.src.tar.gz
           cd "$REPO_COPY/tests/ci" && python3 build_check.py "$BUILD_NAME"
       - name: Upload build URLs to artifacts
         if: ${{ success() || failure() }}
@@ -352,8 +355,9 @@ jobs:
       - name: Build
         run: |
           sudo rm -fr "$TEMP_PATH"
-          mkdir -p "$TEMP_PATH"
-          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH/build_check/package_release"
+          cd .. && tar czf $TEMP_PATH/build_source.src.tar.gz ClickHouse/
+          cd $TEMP_PATH && tar xvzf $TEMP_PATH/build_source.src.tar.gz
           cd "$REPO_COPY/tests/ci" && python3 build_check.py "$BUILD_NAME"
       - name: Upload build URLs to artifacts
         if: ${{ success() || failure() }}
