@@ -217,6 +217,7 @@ def parse_env_variables(
     if package_type == "deb":
         # NOTE: This are the env for packages/build script
         result.append("MAKE_DEB=true")
+        cmake_flags.append("-DPARALLEL_LINK_JOBS=4")
         cmake_flags.append("-DENABLE_TESTS=0")
         cmake_flags.append("-DENABLE_UTILS=0")
         cmake_flags.append("-DCMAKE_EXPORT_NO_PACKAGE_REGISTRY=ON")
