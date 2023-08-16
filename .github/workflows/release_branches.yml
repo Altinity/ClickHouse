@@ -155,7 +155,7 @@ jobs:
 #########################################################################################
   BuilderDebRelease:
     needs: [DockerHubPush]
-    runs-on: [self-hosted, builder]
+    runs-on: [self-hosted, builder, on-demand, type-cpx51]
     steps:
       - name: Set envs
         run: |
