@@ -94,7 +94,7 @@ jobs:
           path: ${{ runner.temp }}/changed_images.json
   CompatibilityCheck:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx41]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx41, image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -130,7 +130,7 @@ jobs:
 #########################################################################################
   BuilderDebRelease:
     needs: [DockerHubPush]
-    runs-on: [self-hosted, builder, on-demand, type-cpx51]
+    runs-on: [self-hosted, builder, on-demand, type-cpx51, image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -178,7 +178,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH" "$CACHES_PATH"
   BuilderDebAarch64:
     needs: [DockerHubPush]
-    runs-on: [self-hosted, builder, on-demand, type-cax41, image-arm-system-ubuntu-22.04]
+    runs-on: [self-hosted, builder, on-demand, type-cax41, image-arm-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -229,7 +229,7 @@ jobs:
     needs:
       - BuilderDebRelease
       - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx41]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx41, image-x86-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
@@ -258,7 +258,7 @@ jobs:
     needs:
       - BuilderDebRelease
       - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx41]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx41, image-x86-app-docker-ce]
     if: ${{ success() || failure() }}
     steps:
       - name: Set envs
@@ -341,7 +341,7 @@ jobs:
   #    - BuilderBinDarwinAarch64
       - BuilderDebRelease
       - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx31]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx31, image-x86-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
@@ -356,7 +356,7 @@ jobs:
 ##############################################################################################
   FunctionalStatelessTestRelease:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, func-tester, on-demand, type-cpx51]
+    runs-on: [self-hosted, func-tester, on-demand, type-cpx51, image-x86-snapshot-docker_ipv6_x86]
     steps:
       - name: Set envs
         run: |
@@ -394,7 +394,7 @@ jobs:
 
   FunctionalStatelessTestAarch64:
     needs: [BuilderDebAarch64]
-    runs-on: [self-hosted, func-tester, on-demand, type-cax41, image-arm-system-ubuntu-22.04]
+    runs-on: [self-hosted, func-tester, on-demand, type-cax41, image-arm-snapshot-docker_ipv6_arm]
     steps:
       - name: Set envs
         run: |
@@ -435,7 +435,7 @@ jobs:
 ##############################################################################################
   FunctionalStatefulTestRelease:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, func-tester, on-demand, type-cpx51]
+    runs-on: [self-hosted, func-tester, on-demand, type-cpx51, ]
     steps:
       - name: Set envs
         run: |
