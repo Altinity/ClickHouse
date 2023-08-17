@@ -81,7 +81,7 @@ def get_packager_cmd(
 
     # NOTE(vnemkov): we are going to continue to use ccache for now
     cmd += " --cache=sccache"
-    # cmd += f" --ccache-dir={ccache_path}"
+    cmd += f" --ccache-dir={ccache_path}"
     cmd += " --s3-rw-access"
     cmd += f" --s3-bucket={S3_BUILDS_BUCKET}"
 
@@ -335,7 +335,7 @@ def main():
 
     # NOTE(vnemkov): since we still want to use CCACHE over SCCACHE, unlike upstream,
     # we need to create local directory for that, just as with 22.8
-    ccache_path = os.path.join(CACHES_PATH, build_name + "_ccache")
+     = os.path.join(CACHES_PATH, build_name + "_ccache")
 
     logging.info("Will try to fetch cache for our build")
     try:
