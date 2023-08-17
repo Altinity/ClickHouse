@@ -80,8 +80,8 @@ def get_packager_cmd(
         cmd += " --clang-tidy"
 
     # NOTE(vnemkov): we are going to continue to use ccache for now
-    cmd += " --cache=ccache"
-    cmd += f" --ccache-dir={ccache_path}"
+    cmd += " --cache=sccache"
+    # cmd += f" --ccache-dir={ccache_path}"
     cmd += " --s3-rw-access"
     cmd += f" --s3-bucket={S3_BUILDS_BUCKET}"
 
