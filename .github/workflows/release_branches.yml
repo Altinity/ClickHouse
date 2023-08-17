@@ -28,7 +28,7 @@ on: # yamllint disable-line rule:truthy
 
 jobs:
   DockerHubPushAarch64:
-    runs-on: [self-hosted, style-checker, on-demand, type-cax41, image-arm-app-docker-ce]
+    runs-on: [self-hosted, style-checker, image-builder, type-cax41, image-arm-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
@@ -45,7 +45,7 @@ jobs:
           path: ${{ runner.temp }}/docker_images_check/changed_images_aarch64.json
   # temporary DockerHubPush:
   DockerHubPushAmd64:
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx51, image-x86-app-docker-ce]
+    runs-on: [self-hosted, style-checker, image-builder, type-cpx51, image-x86-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
