@@ -166,6 +166,7 @@ jobs:
           CACHES_PATH=${{runner.temp}}/../ccaches
           BUILD_NAME=package_release
           CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
+          S3_BUILDS_BUCKET=altinity-build-artifacts
           EOF
       - name: Download changed images
         uses: actions/download-artifact@v3
@@ -212,6 +213,7 @@ jobs:
           CACHES_PATH=${{runner.temp}}/../ccaches
           BUILD_NAME=package_asan
           CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
+          S3_BUILDS_BUCKET=altinity-build-artifacts
           EOF
       - name: Download changed images
         uses: actions/download-artifact@v3
@@ -255,6 +257,7 @@ jobs:
           CACHES_PATH=${{runner.temp}}/../ccaches
           BUILD_NAME=package_ubsan
           CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
+          S3_BUILDS_BUCKET=altinity-build-artifacts
           EOF
       - name: Download changed images
         uses: actions/download-artifact@v3
@@ -298,6 +301,7 @@ jobs:
           CACHES_PATH=${{runner.temp}}/../ccaches
           BUILD_NAME=package_tsan
           CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
+          S3_BUILDS_BUCKET=altinity-build-artifacts
           EOF
       - name: Download changed images
         uses: actions/download-artifact@v3
@@ -341,6 +345,7 @@ jobs:
           CACHES_PATH=${{runner.temp}}/../ccaches
           BUILD_NAME=package_msan
           CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
+          S3_BUILDS_BUCKET=altinity-build-artifacts
           EOF
       - name: Download changed images
         uses: actions/download-artifact@v3
