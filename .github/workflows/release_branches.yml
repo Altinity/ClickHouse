@@ -6,7 +6,9 @@ env:
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  REGRESSION_RESULTS_URL: altinity-build-artifacts/${{github.event.number}}/$GITHUB_SHA
+  REGRESSION_RESULTS_URL: ${{github.event.number}}/${GITHUB_SHA}/testflows
+  REGRESSION_COMMON_COMMIT: 0bb6dd1f2814069ffae896a1164cf0610553b29b
+  REGRESSION_PARQUET_COMMIT: 63a15b5dfc55badefcf4b869296e3ec99ca08141
 
 
 on: # yamllint disable-line rule:truthy
@@ -585,7 +587,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, datetime64_extended_range, disk_level_encryption, dns, example, extended_precision_data_types, kafka, kerberos, lightweight_delete, map_type, part_moves_between_shards, rbac, selects, ssl_server, tiered_storage, window_functions]
+        SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, datetime64_extended_range, disk_level_encryption, dns, engines, example, extended_precision_data_types, kafka, kerberos, key_value, lightweight_delete, data_types, parquet, part_moves_between_shards, rbac, selects, session_timezone, ssl_server, tiered_storage, window_functions]
     needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
@@ -597,7 +599,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
-          ref: releases
+          ref: ${{ env.REGRESSION_COMMON_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -659,6 +661,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
+          ref: ${{ env.REGRESSION_COMMON_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -729,7 +732,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
-          ref: releases
+          ref: ${{ env.REGRESSION_COMMON_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -787,7 +790,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
-          ref: releases
+          ref: ${{ env.REGRESSION+PARQUET_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -859,7 +862,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
-          ref: releases
+          ref: ${{ env.REGRESSION_COMMON_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -930,7 +933,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
-          ref: releases
+          ref: ${{ env.REGRESSION_COMMON_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
