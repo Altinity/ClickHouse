@@ -7,6 +7,7 @@ env:
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   REGRESSION_RESULTS_URL: ${{github.event.number}}/${GITHUB_SHA}/testflows
+  REGRESSION_COMMON_COMMIT: 0bb6dd1f2814069ffae896a1164cf0610553b29b
 
 
 on: # yamllint disable-line rule:truthy
@@ -671,9 +672,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, datetime64_extended_range, disk_level_encryption, dns, engines, example, extended_precision_data_types, kafka, kerberos, key_value, lightweight_delete, data_types, parquet, part_moves_between_shards, rbac, selects, session_timezone, ssl_server, tiered_storage, window_functions]
+        SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, datetime64_extended_range, disk_level_encryption, dns, engines, example, extended_precision_data_types, kafka, kerberos, key_value, lightweight_delete, data_types, part_moves_between_shards, rbac, selects, session_timezone, ssl_server, tiered_storage, window_functions]
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, on-demand, type-cx41, image-x86-app-docker-ce]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -683,7 +684,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
-          ref: releases
+          refs: ${{ env.REGRESSION_COMMON_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -733,7 +734,7 @@ jobs:
       matrix:
         STORAGE: [minio, aws_s3, gcs]
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, on-demand, type-cx51, image-x86-app-docker-ce]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -743,6 +744,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
+          refs: ${{ env.REGRESSION_COMMON_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -795,9 +797,9 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
 
-  clickhouse_keeper_ssl_fips:
+  clickhouse_keeper_ssl:
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, on-demand, type-cx51, image-x86-app-docker-ce]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -807,6 +809,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
+          refs: ${{ env.REGRESSION_COMMON_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -858,7 +861,7 @@ jobs:
       matrix:
         SUITE: [authentication, external_user_directory, role_mapping]
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, on-demand, type-cx51, image-x86-app-docker-ce]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -868,7 +871,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
-          ref: releases
+          ref: ${{ env.REGRESSION_COMMON_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -912,9 +915,9 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
 
-  parquet_minio:
+  parquet:
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, on-demand, type-cx51, image-x86-app-docker-ce]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -924,12 +927,70 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
-          ref: releases
+          ref: ${{ env.REGRESSION_COMMON_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
           REPORTS_PATH=${{runner.temp}}/reports_dir
           SUITE=parquet
+          STORAGE=/no_s3
+          artifacts=builds
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Setup
+        run: .github/setup.sh
+      - name: Get deb url
+        run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
+      - name: Run ${{ env.SUITE }} suite
+        run: python3
+              -u ${{ env.SUITE }}/regression.py
+              --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --test-to-end
+              --local
+              --collect-service-logs
+              --output classic
+              --parallel 1
+              --attr project="${GITHUB_REPOSITORY}" project.id="${GITHUB_REPOSITORY_ID}" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="${GITHUB_ACTOR}" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="${GITHUB_RUN_ID}" job.url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" arch="$(uname -i)"
+              --log raw.log
+      - name: Create and upload logs
+        if: always()
+        run: .github/create_and_upload_logs.sh 1
+      - uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: ${{ env.SUITE }}-artifacts
+          path: |
+            ./report.html
+            ./*.log.txt
+            ./*.log
+            ./*.html
+            ./*/_instances/*.log
+            ./*/_instances/*/logs/*.log
+            ./*/*/_instances/*/logs/*.log
+            ./*/*/_instances/*.log
+
+  parquet_minio:
+    needs: [regression_start]
+    runs-on: [self-hosted, on-demand, type-cx51, image-x86-app-docker-ce]
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
+    steps:
+      - name: Checkout regression repo
+        uses: actions/checkout@v3
+        with:
+          repository: Altinity/clickhouse-regression
+          ref: ${{ env.REGRESSION_COMMON_COMMIT }}
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          SUITE=parquet
+          STORAGE=/minio
           artifacts=builds
           EOF
       - name: Download json reports
@@ -958,7 +1019,7 @@ jobs:
       - uses: actions/upload-artifact@v3
         if: always()
         with:
-          name: ${{ env.SUITE }}-artifacts
+          name: ${{ env.SUITE }}-minio-artifacts
           path: |
             ./report.html
             ./*.log.txt
@@ -971,7 +1032,7 @@ jobs:
 
   parquet_aws:
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, on-demand, type-cx51, image-x86-app-docker-ce]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -981,12 +1042,13 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
-          ref: releases
+          ref: ${{ env.REGRESSION_COMMON_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
           REPORTS_PATH=${{runner.temp}}/reports_dir
           SUITE=parquet
+          STORAGE=/aws_s3
           artifacts=builds
           EOF
       - name: Download json reports
@@ -1019,7 +1081,7 @@ jobs:
       - uses: actions/upload-artifact@v3
         if: always()
         with:
-          name: ${{ env.SUITE }}-artifacts
+          name: ${{ env.SUITE }}-aws_s3-artifacts
           path: |
             ./report.html
             ./*.log.txt
@@ -1036,7 +1098,7 @@ jobs:
       matrix:
         STORAGE: [minio, aws_s3, gcs]
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, on-demand, type-cx51, image-x86-app-docker-ce]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -1046,7 +1108,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
-          ref: releases
+          ref: ${{ env.REGRESSION_COMMON_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -1105,7 +1167,7 @@ jobs:
       matrix:
         STORAGE: [minio, s3amazon, s3gcs]
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, on-demand, type-cx51, image-x86-app-docker-ce]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -1115,7 +1177,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
-          ref: releases
+          ref: ${{ env.REGRESSION_COMMON_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
