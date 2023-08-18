@@ -1003,7 +1003,7 @@ jobs:
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
 
-  parquet_minio:
+  parquet:
     needs: [regression_start]
     runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
     timeout-minutes: 180
