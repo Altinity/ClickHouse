@@ -18,15 +18,15 @@ on: # yamllint disable-line rule:truthy
       - reopened
       - opened
     branches:
-      # Anything/22.8 (e.g customizations/22.8)
-      - '**/22.8*'
+      # Anything/23.3 (e.g customizations/23.3)
+      - '**/23.3*'
   release:
     types:
       - published
       - prereleased
   push:
     branches:
-      - 'releases/22.8**'
+      - 'releases/23.3**'
 
 jobs:
   # DockerHubPushAarch64:
@@ -109,20 +109,49 @@ jobs:
         uses: actions/download-artifact@v3
         with:
           path: ${{ env.REPORTS_PATH }}
-      - name: CompatibilityCheck
+      - name: CompatibilityCheckX86
         run: |
           sudo rm -fr "$TEMP_PATH"
           mkdir -p "$TEMP_PATH"
           cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
-          cd "$REPO_COPY/tests/ci" && python3 compatibility_check.py
+          cd "$REPO_COPY/tests/ci" && python3 compatibility_check.py --check-name "Compatibility check (amd64)" --check-glibc --check-distributions
       - name: Cleanup
         if: always()
         run: |
-          # shellcheck disable=SC2046
-          docker kill $(docker ps -q) ||:
-          # shellcheck disable=SC2046
-          docker rm -f $(docker ps -a -q) ||:
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
           sudo rm -fr "$TEMP_PATH"
+  # CompatibilityCheckAarch64:
+  #   needs: [BuilderDebAarch64]
+  #   runs-on: [self-hosted, style-checker]
+  #   steps:
+  #     - name: Set envs
+  #       run: |
+  #         cat >> "$GITHUB_ENV" << 'EOF'
+  #         TEMP_PATH=${{runner.temp}}/compatibility_check
+  #         REPO_COPY=${{runner.temp}}/compatibility_check/ClickHouse
+  #         REPORTS_PATH=${{runner.temp}}/reports_dir
+  #         EOF
+  #     - name: Check out repository code
+  #       uses: ClickHouse/checkout@v1
+  #       with:
+  #         clear-repository: true
+  #     - name: Download json reports
+  #       uses: actions/download-artifact@v3
+  #       with:
+  #         path: ${{ env.REPORTS_PATH }}
+  #     - name: CompatibilityCheckAarch64
+  #       run: |
+  #         sudo rm -fr "$TEMP_PATH"
+  #         mkdir -p "$TEMP_PATH"
+  #         cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+  #         cd "$REPO_COPY/tests/ci" && python3 compatibility_check.py --check-name "Compatibility check (aarch64)" --check-glibc
+  #     - name: Cleanup
+  #       if: always()
+  #       run: |
+  #         docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+  #         docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+  #         sudo rm -fr "$TEMP_PATH"
 #########################################################################################
 #################################### ORDINARY BUILDS ####################################
 #########################################################################################
@@ -169,10 +198,8 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          # shellcheck disable=SC2046
-          docker kill $(docker ps -q) ||:
-          # shellcheck disable=SC2046
-          docker rm -f $(docker ps -a -q) ||:
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
           sudo rm -fr "$TEMP_PATH" "$CACHES_PATH"
   # BuilderDebAarch64:
   #   needs: [DockerHubPush]
@@ -212,10 +239,7 @@ jobs:
   #     - name: Cleanup
   #       if: always()
   #       run: |
-  #         # shellcheck disable=SC2046
-  #         docker kill $(docker ps -q) ||:
-  #         # shellcheck disable=SC2046
-  #         docker rm -f $(docker ps -a -q) ||:
+  #        docker ps --quiet | xargs --no-run-if-empty docker kill ||:
   #         sudo rm -fr "$TEMP_PATH" "$CACHES_PATH"
 ############################################################################################
 ##################################### Docker images  #######################################
@@ -231,20 +255,18 @@ jobs:
         with:
           clear-repository: true
           fetch-depth: 0  # It MUST BE THE SAME for all dependencies and the job itself
-      - name: Check docker altinity/clickhouse-server building
+      - name: Check docker altinityinfra/clickhouse-server building
         run: |
           cd "$GITHUB_WORKSPACE/tests/ci"
           python3 docker_server.py --release-type head --no-push \
-            --image-repo altinity/clickhouse-server --image-path docker/server
+            --image-repo altinityinfra/clickhouse-server --image-path docker/server
           python3 docker_server.py --release-type head --no-push \
-            --image-repo altinity/clickhouse-keeper --image-path docker/keeper
+            --image-repo altinityinfra/clickhouse-keeper --image-path docker/keeper
       - name: Cleanup
         if: always()
         run: |
-          # shellcheck disable=SC2046
-          docker kill $(docker ps -q) ||:
-          # shellcheck disable=SC2046
-          docker rm -f $(docker ps -a -q) ||:
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
           sudo rm -fr "$TEMP_PATH"
 ############################################################################################
 ##################################### BUILD REPORTER #######################################
@@ -285,10 +307,8 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          # shellcheck disable=SC2046
-          docker kill $(docker ps -q) ||:
-          # shellcheck disable=SC2046
-          docker rm -f $(docker ps -a -q) ||:
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
           sudo rm -fr "$TEMP_PATH"
   # BuilderSpecialReport:
   #   needs:
@@ -325,16 +345,14 @@ jobs:
   #     - name: Cleanup
   #       if: always()
   #       run: |
-  #         # shellcheck disable=SC2046
-  #         docker kill $(docker ps -q) ||:
-  #         # shellcheck disable=SC2046
-  #         docker rm -f $(docker ps -a -q) ||:
+  #        docker ps --quiet | xargs --no-run-if-empty docker kill ||:
   #         sudo rm -fr "$TEMP_PATH"
   MarkReleaseReady:
     needs:
   #    - BuilderBinDarwin
   #    - BuilderBinDarwinAarch64
       - BuilderDebRelease
+      - SignRelease
   #    - BuilderDebAarch64
     runs-on: [self-hosted, style-checker]
     steps:
@@ -346,11 +364,87 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE/tests/ci"
           python3 mark_release_ready.py
+############################################################################################
+#################################### INSTALL PACKAGES ######################################
+############################################################################################
+  InstallPackagesTestRelease:
+    needs: [SignRelease]
+    runs-on: [self-hosted, style-checker]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/test_install
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=Install packages (amd64)
+          REPO_COPY=${{runner.temp}}/test_install/ClickHouse
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: ClickHouse/checkout@v1
+        with:
+          clear-repository: true
+      - name: Test packages installation
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 install_check.py "$CHECK_NAME"
+      - name: Cleanup
+        if: always()
+        run: |
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+          sudo rm -fr "$TEMP_PATH"
+  # InstallPackagesTestAarch64:
+  #   needs: [BuilderDebAarch64]
+  #   runs-on: [self-hosted, style-checker-aarch64]
+  #   steps:
+  #     - name: Set envs
+  #       run: |
+  #         cat >> "$GITHUB_ENV" << 'EOF'
+  #         TEMP_PATH=${{runner.temp}}/test_install
+  #         REPORTS_PATH=${{runner.temp}}/reports_dir
+  #         CHECK_NAME=Install packages (arm64)
+  #         REPO_COPY=${{runner.temp}}/test_install/ClickHouse
+  #         EOF
+  #     - name: Download json reports
+  #       uses: actions/download-artifact@v3
+  #       with:
+  #         path: ${{ env.REPORTS_PATH }}
+  #     - name: Check out repository code
+  #       uses: ClickHouse/checkout@v1
+  #       with:
+  #         clear-repository: true
+  #     - name: Test packages installation
+  #       run: |
+  #         sudo rm -fr "$TEMP_PATH"
+  #         mkdir -p "$TEMP_PATH"
+  #         cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+  #         cd "$REPO_COPY/tests/ci"
+  #         python3 install_check.py "$CHECK_NAME"
+  #     - name: Cleanup
+  #       if: always()
+  #       run: |
+  #         docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+  #         docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+  #         sudo rm -fr "$TEMP_PATH"
+
+  tests_start:
+    ## Do-nothing stage to trigger tests, makes is easier to
+    needs: [InstallPackagesTestRelease]
+    runs-on: ubuntu-latest
+    steps:
+      - run: true
 ##############################################################################################
 ########################### FUNCTIONAl STATELESS TESTS #######################################
 ##############################################################################################
   FunctionalStatelessTestRelease:
-    needs: [BuilderDebRelease]
+    needs: [tests_start]
     runs-on: [self-hosted, func-tester]
     steps:
       - name: Set envs
@@ -380,10 +474,8 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          # shellcheck disable=SC2046
-          docker kill $(docker ps -q) ||:
-          # shellcheck disable=SC2046
-          docker rm -f $(docker ps -a -q) ||:
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
           sudo rm -fr "$TEMP_PATH"
   # FunctionalStatelessTestAarch64:
   #   needs: [BuilderDebAarch64]
@@ -425,7 +517,7 @@ jobs:
 ############################ FUNCTIONAl STATEFUL TESTS #######################################
 ##############################################################################################
   FunctionalStatefulTestRelease:
-    needs: [BuilderDebRelease]
+    needs: [tests_start]
     runs-on: [self-hosted, func-tester]
     steps:
       - name: Set envs
@@ -455,10 +547,8 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          # shellcheck disable=SC2046
-          docker kill $(docker ps -q) ||:
-          # shellcheck disable=SC2046
-          docker rm -f $(docker ps -a -q) ||:
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
           sudo rm -fr "$TEMP_PATH"
   # FunctionalStatefulTestAarch64:
   #   needs: [BuilderDebAarch64]
@@ -500,7 +590,7 @@ jobs:
 ############################# INTEGRATION TESTS #############################################
 #############################################################################################
   IntegrationTestsRelease0:
-    needs: [BuilderDebRelease]
+    needs: [tests_start]
     runs-on: [self-hosted, stress-tester]
     steps:
       - name: Set envs
@@ -531,13 +621,11 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          # shellcheck disable=SC2046
-          docker kill $(docker ps -q) ||:
-          # shellcheck disable=SC2046
-          docker rm -f $(docker ps -a -q) ||:
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsRelease1:
-    needs: [BuilderDebRelease]
+    needs: [tests_start]
     runs-on: [self-hosted, stress-tester]
     steps:
       - name: Set envs
@@ -568,17 +656,15 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          # shellcheck disable=SC2046
-          docker kill $(docker ps -q) ||:
-          # shellcheck disable=SC2046
-          docker rm -f $(docker ps -a -q) ||:
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
           sudo rm -fr "$TEMP_PATH"
 #############################################################################################
 ##################################### REGRESSION TESTS ######################################
 #############################################################################################
   regression_start:
     ## Not depending on the tests above since they can fail at any given moment.
-    needs: [BuilderDebRelease]
+    needs: [tests_start]
     runs-on: ubuntu-latest
     steps:
       - run: true
@@ -587,7 +673,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, datetime64_extended_range, disk_level_encryption, dns, engines, example, extended_precision_data_types, kafka, kerberos, key_value, lightweight_delete, data_types, parquet, part_moves_between_shards, rbac, selects, session_timezone, ssl_server, tiered_storage, window_functions]
+        SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, datetime64_extended_range, disk_level_encryption, dns, engines, example, extended_precision_data_types, kafka, kerberos, key_value, lightweight_delete, data_types, part_moves_between_shards, rbac, selects, session_timezone, ssl_server, tiered_storage, window_functions]
     needs: [regression_start]
     runs-on: [self-hosted, stress-tester]
     env:
@@ -599,13 +685,13 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
-          ref: ${{ env.REGRESSION_COMMON_COMMIT }}
+          refs: ${{ env.REGRESSION_COMMON_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
           REPORTS_PATH=${{runner.temp}}/reports_dir
           SUITE=${{ matrix.SUITE }}
-          artifacts=public
+          artifacts=builds
           EOF
       - name: Download json reports
         uses: actions/download-artifact@v3
@@ -624,13 +710,11 @@ jobs:
               --collect-service-logs
               --output classic
               --parallel 1
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
+              --attr project="${GITHUB_REPOSITORY}" project.id="${GITHUB_REPOSITORY_ID}" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="${GITHUB_ACTOR}" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="${GITHUB_RUN_ID}" job.url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" arch="$(uname -i)"
               --log raw.log
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-        env:
-          artifact_s3_dir: build/v${{ env.version }}/$GITHUB_SHA
       - uses: actions/upload-artifact@v3
         if: always()
         with:
@@ -661,14 +745,14 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
-          ref: ${{ env.REGRESSION_COMMON_COMMIT }}
+          refs: ${{ env.REGRESSION_COMMON_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
           REPORTS_PATH=${{runner.temp}}/reports_dir
           SUITE=ontime_benchmark
           STORAGE=/${{ matrix.STORAGE }}
-          artifacts=public
+          artifacts=builds
           EOF
       - name: Download json reports
         uses: actions/download-artifact@v3
@@ -695,17 +779,73 @@ jobs:
               --collect-service-logs
               --output classic
               --parallel 1
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
+              --attr project="${GITHUB_REPOSITORY}" project.id="${GITHUB_REPOSITORY_ID}" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="${GITHUB_ACTOR}" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="${GITHUB_RUN_ID}" job.url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" arch="$(uname -i)"
               --log raw.log
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-        env:
-          artifact_s3_dir: build/v${{ env.version }}/$GITHUB_SHA
       - uses: actions/upload-artifact@v3
         if: always()
         with:
           name: ${{ env.SUITE }}-minio-artifacts
+          path: |
+            ./report.html
+            ./*.log.txt
+            ./*.log
+            ./*.html
+            ./*/_instances/*.log
+            ./*/_instances/*/logs/*.log
+            ./*/*/_instances/*/logs/*.log
+            ./*/*/_instances/*.log
+
+  clickhouse_keeper_ssl:
+    needs: [regression_start]
+    runs-on: [self-hosted, stress-tester]
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
+    steps:
+      - name: Checkout regression repo
+        uses: actions/checkout@v3
+        with:
+          repository: Altinity/clickhouse-regression
+          refs: ${{ env.REGRESSION_COMMON_COMMIT }}
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          SUITE=clickhouse_keeper_ssl_fips
+          STORAGE=/${{ matrix.STORAGE }}
+          artifacts=builds
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Setup
+        run: .github/setup.sh
+      - name: Get deb url
+        run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
+      - name: Run ${{ env.SUITE }} suite
+        run: python3
+              -u ${{ env.SUITE }}/regression.py
+              --ssl
+              --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --test-to-end
+              --local
+              --collect-service-logs
+              --output classic
+              --parallel 1
+              --attr project="${GITHUB_REPOSITORY}" project.id="${GITHUB_REPOSITORY_ID}" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="${GITHUB_ACTOR}" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="${GITHUB_RUN_ID}" job.url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" arch="$(uname -i)"
+              --log raw.log
+      - name: Create and upload logs
+        if: always()
+        run: .github/create_and_upload_logs.sh 1
+      - uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: ${{ env.SUITE }}-artifacts
           path: |
             ./report.html
             ./*.log.txt
@@ -738,7 +878,7 @@ jobs:
           cat >> "$GITHUB_ENV" << 'EOF'
           REPORTS_PATH=${{runner.temp}}/reports_dir
           SUITE=ldap/${{ matrix.SUITE }}
-          artifacts=public
+          artifacts=builds
           EOF
       - name: Download json reports
         uses: actions/download-artifact@v3
@@ -757,13 +897,11 @@ jobs:
               --collect-service-logs
               --output classic
               --parallel 1
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
+              --attr project="${GITHUB_REPOSITORY}" project.id="${GITHUB_REPOSITORY_ID}" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="${GITHUB_ACTOR}" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="${GITHUB_RUN_ID}" job.url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" arch="$(uname -i)"
               --log raw.log
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-        env:
-          artifact_s3_dir: build/v${{ env.version }}/$GITHUB_SHA
       - uses: actions/upload-artifact@v3
         if: always()
         with:
@@ -790,13 +928,14 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
-          ref: ${{ env.REGRESSION+PARQUET_COMMIT }}
+          ref: ${{ env.REGRESSION_PARQUET_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
           REPORTS_PATH=${{runner.temp}}/reports_dir
           SUITE=parquet
-          artifacts=public
+          STORAGE=/no_s3
+          artifacts=builds
           EOF
       - name: Download json reports
         uses: actions/download-artifact@v3
@@ -815,27 +954,135 @@ jobs:
               --collect-service-logs
               --output classic
               --parallel 1
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
+              --attr project="${GITHUB_REPOSITORY}" project.id="${GITHUB_REPOSITORY_ID}" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="${GITHUB_ACTOR}" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="${GITHUB_RUN_ID}" job.url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" arch="$(uname -i)"
+              --log raw.log
+      - name: Create and upload logs
+        if: always()
+        run: .github/create_and_upload_logs.sh 1
+      - uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: ${{ env.SUITE }}-artifacts
+          path: |
+            ./report.html
+            ./*.log.txt
+            ./*.log
+            ./*.html
+            ./*/_instances/*.log
+            ./*/_instances/*/logs/*.log
+            ./*/*/_instances/*/logs/*.log
+            ./*/*/_instances/*.log
+
+  parquet_minio:
+    needs: [regression_start]
+    runs-on: [self-hosted, stress-tester]
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
+    steps:
+      - name: Checkout regression repo
+        uses: actions/checkout@v3
+        with:
+          repository: Altinity/clickhouse-regression
+          ref: ${{ env.REGRESSION_PARQUET_COMMIT }}
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          SUITE=parquet
+          STORAGE=/minio
+          artifacts=builds
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Setup
+        run: .github/setup.sh
+      - name: Get deb url
+        run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
+      - name: Run ${{ env.SUITE }} suite
+        run: python3
+              -u ${{ env.SUITE }}/regression.py
+              --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --test-to-end
+              --local
+              --collect-service-logs
+              --output classic
+              --parallel 1
+              --attr project="${GITHUB_REPOSITORY}" project.id="${GITHUB_REPOSITORY_ID}" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="${GITHUB_ACTOR}" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="${GITHUB_RUN_ID}" job.url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" arch="$(uname -i)"
               --log raw.log
               --storage minio
+      - name: Create and upload logs
+        if: always()
+        run: .github/create_and_upload_logs.sh 1
+      - uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: ${{ env.SUITE }}-minio-artifacts
+          path: |
+            ./report.html
+            ./*.log.txt
+            ./*.log
+            ./*.html
+            ./*/_instances/*.log
+            ./*/_instances/*/logs/*.log
+            ./*/*/_instances/*/logs/*.log
+            ./*/*/_instances/*.log
+
+  parquet_aws:
+    needs: [regression_start]
+    runs-on: [self-hosted, stress-tester]
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
+    steps:
+      - name: Checkout regression repo
+        uses: actions/checkout@v3
+        with:
+          repository: Altinity/clickhouse-regression
+          ref: ${{ env.REGRESSION_PARQUET_COMMIT }}
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          SUITE=parquet
+          STORAGE=/aws_s3
+          artifacts=builds
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Setup
+        run: .github/setup.sh
+      - name: Get deb url
+        run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
+      - name: Run ${{ env.SUITE }} suite
+        run: python3
+              -u ${{ env.SUITE }}/regression.py
+              --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --test-to-end
+              --local
+              --collect-service-logs
+              --output classic
+              --parallel 1
+              --attr project="${GITHUB_REPOSITORY}" project.id="${GITHUB_REPOSITORY_ID}" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="${GITHUB_ACTOR}" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="${GITHUB_RUN_ID}" job.url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" arch="$(uname -i)"
+              --log raw.log
               --storage aws_s3
               --aws-s3-bucket ${{ secrets.REGRESSION_AWS_S3_BUCKET }}
               --aws-s3-region ${{ secrets.REGRESSION_AWS_S3_REGION }}
               --aws-s3-key-id ${{ secrets.REGRESSION_AWS_S3_KEY_ID }}
               --aws-s3-access-key ${{ secrets.REGRESSION_AWS_S3_SECRET_ACCESS_KEY }}
-              --storage gcs
-              --gcs-uri ${{ secrets.REGRESSION_GCS_URI }}
-              --gcs-key-id ${{ secrets.REGRESSION_GCS_KEY_ID }}
-              --gcs-key-secret ${{ secrets.REGRESSION_GCS_KEY_SECRET }}
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-        env:
-          artifact_s3_dir: build/v${{ env.version }}/$GITHUB_SHA
       - uses: actions/upload-artifact@v3
         if: always()
         with:
-          name: ${{ env.SUITE }}-artifacts
+          name: ${{ env.SUITE }}-aws_s3-artifacts
           path: |
             ./report.html
             ./*.log.txt
@@ -869,7 +1116,7 @@ jobs:
           REPORTS_PATH=${{runner.temp}}/reports_dir
           SUITE=s3
           STORAGE=/${{ matrix.STORAGE }}
-          artifacts=public
+          artifacts=builds
           EOF
       - name: Download json reports
         uses: actions/download-artifact@v3
@@ -888,7 +1135,7 @@ jobs:
               --collect-service-logs
               --output classic
               --parallel 1
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
+              --attr project="${GITHUB_REPOSITORY}" project.id="${GITHUB_REPOSITORY_ID}" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="${GITHUB_ACTOR}" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="${GITHUB_RUN_ID}" job.url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" arch="$(uname -i)"
               --log raw.log
               --storage ${{ matrix.STORAGE }}
               --gcs-uri ${{ secrets.REGRESSION_GCS_URI }}
@@ -901,8 +1148,6 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-        env:
-          artifact_s3_dir: build/v${{ env.version }}/$GITHUB_SHA
       - uses: actions/upload-artifact@v3
         if: always()
         with:
@@ -916,7 +1161,7 @@ jobs:
             ./*/_instances/*/logs/*.log
             ./*/*/_instances/*/logs/*.log
             ./*/*/_instances/*.log
-  
+
   tiered_storage_s3:
     strategy:
       fail-fast: false
@@ -940,7 +1185,7 @@ jobs:
           REPORTS_PATH=${{runner.temp}}/reports_dir
           SUITE=tiered_storage
           STORAGE=/${{ matrix.STORAGE }}
-          artifacts=public
+          artifacts=builds
           EOF
       - name: Download json reports
         uses: actions/download-artifact@v3
@@ -959,7 +1204,7 @@ jobs:
               --collect-service-logs
               --output classic
               --parallel 1
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="x86_64"
+              --attr project="${GITHUB_REPOSITORY}" project.id="${GITHUB_REPOSITORY_ID}" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="${GITHUB_ACTOR}" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="${GITHUB_RUN_ID}" job.url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" arch="$(uname -i)"
               --log raw.log
               --aws-s3-access-key ${{ secrets.REGRESSION_AWS_S3_SECRET_ACCESS_KEY }}
               --aws-s3-key-id ${{ secrets.REGRESSION_AWS_S3_KEY_ID }}
@@ -971,8 +1216,6 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-        env:
-          artifact_s3_dir: build/v${{ env.version }}/$GITHUB_SHA
       - uses: actions/upload-artifact@v3
         if: always()
         with:
@@ -1046,7 +1289,8 @@ jobs:
       - regression_common
       - benchmark
       - ldap
-      - parquet
+      - parquet_minio
+      - parquet_aws
       - s3
       - tiered_storage_s3
     runs-on: [self-hosted, style-checker]
