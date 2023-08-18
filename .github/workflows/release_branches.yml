@@ -1202,7 +1202,9 @@ jobs:
       - SignRelease
       - regression_common
       - benchmark
+      - clickhouse_keeper_ssl
       - ldap
+      - parquet
       - parquet_minio
       - parquet_aws
       - s3
