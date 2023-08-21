@@ -7,7 +7,7 @@ env:
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   REGRESSION_RESULTS_URL: ${{github.event.number}}/${GITHUB_SHA}/testflows
-  REGRESSION_COMMON_COMMIT: 0bb6dd1f2814069ffae896a1164cf0610553b29b
+  REGRESSION_COMMON_COMMIT: 1108c52f249af64885c255f39192ba3cc4c145ab
   REGRESSION_PARQUET_COMMIT: 63a15b5dfc55badefcf4b869296e3ec99ca08141
 
 
@@ -729,8 +729,8 @@ jobs:
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
           REPORTS_PATH=${{runner.temp}}/reports_dir
-          SUITE=clickhouse_keeper_ssl_fips
-          STORAGE=/${{ matrix.STORAGE }}
+          SUITE=clickhouse_keeper
+          STORAGE=/ssl
           artifacts=builds
           EOF
       - name: Download json reports
@@ -849,7 +849,7 @@ jobs:
           REPORTS_PATH=${{runner.temp}}/reports_dir
           SUITE=parquet
           STORAGE=/no_s3
-          artifacts=builds
+          artifacts=public
           EOF
       - name: Download json reports
         uses: actions/download-artifact@v3
@@ -876,7 +876,7 @@ jobs:
       - uses: actions/upload-artifact@v3
         if: always()
         with:
-          name: ${{ env.SUITE }}-artifacts
+          name: ${{ env.SUITE }}-${{ env.STORAGE }}-artifacts
           path: |
             ./report.html
             ./*.log.txt
@@ -906,7 +906,7 @@ jobs:
           REPORTS_PATH=${{runner.temp}}/reports_dir
           SUITE=parquet
           STORAGE=/minio
-          artifacts=builds
+          artifacts=public
           EOF
       - name: Download json reports
         uses: actions/download-artifact@v3
@@ -964,7 +964,7 @@ jobs:
           REPORTS_PATH=${{runner.temp}}/reports_dir
           SUITE=parquet
           STORAGE=/aws_s3
-          artifacts=builds
+          artifacts=public
           EOF
       - name: Download json reports
         uses: actions/download-artifact@v3
