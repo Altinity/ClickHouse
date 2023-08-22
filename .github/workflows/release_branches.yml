@@ -394,7 +394,7 @@ jobs:
 
   FunctionalStatelessTestAarch64:
     needs: [BuilderDebAarch64]
-    runs-on: [self-hosted, func-tester, on-demand, type-ccx41, in-fsn1, image-arm-snapshot-docker_ipv6_arm]
+    runs-on: [self-hosted, func-tester, on-demand, type-cax41, in-fsn1, image-arm-snapshot-docker_ipv6_arm]
     steps:
       - name: Set envs
         run: |
