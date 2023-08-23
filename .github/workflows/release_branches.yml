@@ -90,7 +90,7 @@ jobs:
   #         path: ${{ runner.temp }}/changed_images.json
   CompatibilityCheck:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, style-checker, on-demand]
     steps:
       - name: Set envs
         run: |
