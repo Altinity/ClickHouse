@@ -27,54 +27,37 @@ on: # yamllint disable-line rule:truthy
       - 'releases/23.3**'
 
 jobs:
-  DockerHubPushAarch64:
-    runs-on: [self-hosted, altinity-aarch64]
+  x86-app:
+    runs-on: [self-hosted, on-demand, type-cpx11, image-x86-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
       - name: Check
         run: |
-          echo ${{ env.REGRESSION_RESULTS_URL }}
-          whoami
-  one:
-    runs-on: [self-hosted, altinity-amd64]
+          free -h
+  arm-app:
+    runs-on: [self-hosted, on-demand, type-cax11, in-fsn1, image-arm-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
       - name: Check
         run: |
-          whoami
-  two:
-    runs-on: [self-hosted, altinity-amd64]
+          free -h
+  x86-snap:
+    runs-on: [self-hosted, image-x86-snapshot-docker_ipv6_x86, on-demand, type-cpx11]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
       - name: Check
         run: |
-          whoami
-  three:
-    runs-on: [self-hosted, altinity-amd64]
+          free -h
+  arm-snap:
+    runs-on: [self-hosted, on-demand, type-cax11, image-arm-snapshot-docker_ipv6_arm]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
       - name: Check
         run: |
-          whoami
-  four:
-    runs-on: [self-hosted, altinity-amd64]
-    steps:
-      - name: Check out repository code
-        uses: ClickHouse/checkout@v1
-      - name: Check
-        run: |
-          whoami
-  five:
-    runs-on: [self-hosted, altinity-amd64]
-    steps:
-      - name: Check out repository code
-        uses: ClickHouse/checkout@v1
-      - name: Check
-        run: |
-          whoami
+          free -h
 
 
