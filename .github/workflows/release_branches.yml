@@ -28,7 +28,7 @@ on: # yamllint disable-line rule:truthy
 
 jobs:
   x86-app:
-    runs-on: [self-hosted, on-demand, type-cpx11, image-x86-app-docker-ce]
+    runs-on: [self-hosted, on-demand, type-cpx21, image-x86-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
@@ -36,7 +36,7 @@ jobs:
         run: |
           free -h
   arm-app:
-    runs-on: [self-hosted, on-demand, type-cax11, in-fsn1, image-arm-app-docker-ce]
+    runs-on: [self-hosted, on-demand, type-cax21, in-fsn1, image-arm-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
@@ -44,7 +44,7 @@ jobs:
         run: |
           free -h
   x86-snap:
-    runs-on: [self-hosted, image-x86-snapshot-docker_ipv6_x86, on-demand, type-cpx11]
+    runs-on: [self-hosted, image-x86-snapshot-docker_ipv6_x86, on-demand, type-cpx21]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
@@ -52,7 +52,7 @@ jobs:
         run: |
           free -h
   arm-snap:
-    runs-on: [self-hosted, on-demand, type-cax11, image-arm-snapshot-docker_ipv6_arm]
+    runs-on: [self-hosted, on-demand, type-cax21, image-arm-snapshot-docker_ipv6_arm]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
