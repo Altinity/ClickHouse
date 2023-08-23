@@ -44,7 +44,7 @@ jobs:
         run: |
           free -h
   x86-snap:
-    runs-on: [self-hosted, image-x86-snapshot-docker_ipv6_x86, on-demand, type-cpx21]
+    runs-on: [self-hosted, image-x86-snapshot-docker_ipv6_x86, on-demand, type-cpx31]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
@@ -52,7 +52,7 @@ jobs:
         run: |
           free -h
   arm-snap:
-    runs-on: [self-hosted, on-demand, type-cax21, image-arm-snapshot-docker_ipv6_arm]
+    runs-on: [self-hosted, on-demand, type-cax31, image-arm-snapshot-docker_ipv6_arm]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
