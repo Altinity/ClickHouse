@@ -35,6 +35,17 @@ jobs:
       - name: Check
         run: |
           free -h
+      - name: Setup docker IPv6
+        run: |
+          sudo cat <<EOT > /etc/docker/daemon.json
+            {
+               "ipv6": true,
+               "fixed-cidr-v6": "2001:db8:1::/64",
+               "insecure-registries" : ["dockerhub-proxy.dockerhub-proxy-zone:5000"],
+               "registry-mirrors" : ["http://dockerhub-proxy.dockerhub-proxy-zone:5000"]
+            }
+          EOT
+          sudo systemctl restart docker
   arm-app:
     runs-on: [self-hosted, on-demand, type-cax21, in-fsn1, image-arm-app-docker-ce]
     steps:
@@ -43,6 +54,17 @@ jobs:
       - name: Check
         run: |
           free -h
+      - name: Setup docker IPv6
+        run: |
+          sudo cat <<EOT > /etc/docker/daemon.json
+            {
+               "ipv6": true,
+               "fixed-cidr-v6": "2001:db8:1::/64",
+               "insecure-registries" : ["dockerhub-proxy.dockerhub-proxy-zone:5000"],
+               "registry-mirrors" : ["http://dockerhub-proxy.dockerhub-proxy-zone:5000"]
+            }
+          EOT
+          sudo systemctl restart docker
   x86-snap:
     runs-on: [self-hosted, image-x86-snapshot-docker_ipv6_x86, on-demand, type-cpx51]
     steps:
