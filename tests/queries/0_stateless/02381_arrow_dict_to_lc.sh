@@ -25,14 +25,12 @@ CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # cat data.arrow | gzip | base64
 
-ls -l $CLICKHOUSE_LOCAL 1>&2
-
-# cat <<EOF | base64 --decode | gunzip | $CLICKHOUSE_LOCAL --query='SELECT * FROM table FORMAT TSVWithNamesAndTypes' --input-format=ArrowStream
-# H4sIAAAAAAAAA5VTsU7DQAz1pZc2giBaFFAGkBgYMjIyMOQD+gHdCqWpiBQlqErhZzowMvIB/Ft4
-# d+drrqGFYsny+fzO9rN1TdM0L4JoSEqOKKQ++RTgBBGSJEwEjLL6DOwn7B37IWIA9tX7a75TcgKd
-# VVUxLVdF8TgrMvgpsGuD9yL4Y2jivDmFFk/TvKzbVwFFUAk1PQpqZaJzkVB153xONS4Gvk8DsBni
-# veEmfFVTxW+cmsemplMv0NGAMV9ODUlmHkPdk8mvPM7vKXvp5Pag+ZyADaEDndP2iLTNh5onY0Oc
-# zORDnZU8qWO3HDcbaeegdhUDKTky5nvfmU+P9kvcsedOTHTyWJG6D7PbEb+pyiyr36qqfl5m2aJa
-# LRf5a8b83g/gl2z4nW32HJO7522e9zt4er/wTJzzLl62js1hZ2Z3aPGKTyxcPhfbfHpS9/2wp+/1
-# jr6DA/pO9tzbPtJOPO3EJ5249d1/JOnnXP7rHzpHi/UYI/+4v2LbmH9I36C0faSwBAAA
-# EOF
+cat <<EOF | base64 --decode | gunzip | $CLICKHOUSE_LOCAL --query='SELECT * FROM table FORMAT TSVWithNamesAndTypes' --input-format=ArrowStream
+H4sIAAAAAAAAA5VTsU7DQAz1pZc2giBaFFAGkBgYMjIyMOQD+gHdCqWpiBQlqErhZzowMvIB/Ft4
+d+drrqGFYsny+fzO9rN1TdM0L4JoSEqOKKQ++RTgBBGSJEwEjLL6DOwn7B37IWIA9tX7a75TcgKd
+VVUxLVdF8TgrMvgpsGuD9yL4Y2jivDmFFk/TvKzbVwFFUAk1PQpqZaJzkVB153xONS4Gvk8DsBni
+veEmfFVTxW+cmsemplMv0NGAMV9ODUlmHkPdk8mvPM7vKXvp5Pag+ZyADaEDndP2iLTNh5onY0Oc
+zORDnZU8qWO3HDcbaeegdhUDKTky5nvfmU+P9kvcsedOTHTyWJG6D7PbEb+pyiyr36qqfl5m2aJa
+LRf5a8b83g/gl2z4nW32HJO7522e9zt4er/wTJzzLl62js1hZ2Z3aPGKTyxcPhfbfHpS9/2wp+/1
+jr6DA/pO9tzbPtJOPO3EJ5249d1/JOnnXP7rHzpHi/UYI/+4v2LbmH9I36C0faSwBAAA
+EOF
