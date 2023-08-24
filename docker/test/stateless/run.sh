@@ -2,6 +2,8 @@
 
 # fail on errors, verbose and export all env variables
 set -e -x -a
+echo "memory check"
+free -h
 
 # Choose random timezone for this test run.
 TZ="$(grep -v '#' /usr/share/zoneinfo/zone.tab  | awk '{print $3}' | shuf | head -n1)"
@@ -109,7 +111,7 @@ function run_tests()
         # Too many tests fail for DatabaseReplicated in parallel. All other
         # configurations are OK.
         ADDITIONAL_OPTIONS+=('--jobs')
-        ADDITIONAL_OPTIONS+=('2')
+        ADDITIONAL_OPTIONS+=('1')
     fi
 
     if [[ -n "$RUN_BY_HASH_NUM" ]] && [[ -n "$RUN_BY_HASH_TOTAL" ]]; then
