@@ -159,7 +159,7 @@ jobs:
 #########################################################################################
   BuilderDebRelease:
     needs: [DockerHubPush]
-    runs-on: [self-hosted, builder, on-demand, type-ccx52]
+    runs-on: [self-hosted, builder, on-demand, type-ccx53]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -454,7 +454,7 @@ jobs:
 ##############################################################################################
   FunctionalStatelessTestRelease:
     needs: [tests_start]
-    runs-on: [self-hosted, func-tester, on-demand, type-ccx42]
+    runs-on: [self-hosted, func-tester, on-demand, type-ccx43]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -466,6 +466,18 @@ jobs:
           REPO_COPY=${{runner.temp}}/stateless_debug/ClickHouse
           KILL_TIMEOUT=10800
           EOF
+      - name: Configure docker IPv6
+        run: |
+          sudo touch /etc/docker/daemon.json
+          sudo chown ubuntu:ubuntu /etc/docker/daemon.json
+          sudo cat <<EOT > /etc/docker/daemon.json
+            {
+               "ipv6": true,
+               "fixed-cidr-v6": "2001:db8:1::/64"
+            }
+          EOT
+          sudo chown root:root /etc/docker/daemon.json
+          sudo systemctl restart docker
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
@@ -528,7 +540,7 @@ jobs:
 ##############################################################################################
   FunctionalStatefulTestRelease:
     needs: [tests_start]
-    runs-on: [self-hosted, func-tester, on-demand, type-ccx42]
+    runs-on: [self-hosted, func-tester, on-demand, type-ccx43]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -540,6 +552,18 @@ jobs:
           REPO_COPY=${{runner.temp}}/stateful_debug/ClickHouse
           KILL_TIMEOUT=3600
           EOF
+      - name: Configure docker IPv6
+        run: |
+          sudo touch /etc/docker/daemon.json
+          sudo chown ubuntu:ubuntu /etc/docker/daemon.json
+          sudo cat <<EOT > /etc/docker/daemon.json
+            {
+               "ipv6": true,
+               "fixed-cidr-v6": "2001:db8:1::/64"
+            }
+          EOT
+          sudo chown root:root /etc/docker/daemon.json
+          sudo systemctl restart docker
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
@@ -602,7 +626,7 @@ jobs:
 #############################################################################################
   IntegrationTestsRelease0:
     needs: [tests_start]
-    runs-on: [self-hosted, stress-tester, on-demand, type-ccx52]
+    runs-on: [self-hosted, stress-tester, on-demand, type-ccx43]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -615,6 +639,18 @@ jobs:
           RUN_BY_HASH_NUM=0
           RUN_BY_HASH_TOTAL=2
           EOF
+      - name: Configure docker IPv6
+        run: |
+          sudo touch /etc/docker/daemon.json
+          sudo chown ubuntu:ubuntu /etc/docker/daemon.json
+          sudo cat <<EOT > /etc/docker/daemon.json
+            {
+               "ipv6": true,
+               "fixed-cidr-v6": "2001:db8:1::/64"
+            }
+          EOT
+          sudo chown root:root /etc/docker/daemon.json
+          sudo systemctl restart docker
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
@@ -638,7 +674,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsRelease1:
     needs: [tests_start]
-    runs-on: [self-hosted, stress-tester, on-demand, type-ccx52]
+    runs-on: [self-hosted, stress-tester, on-demand, type-ccx43]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -651,6 +687,18 @@ jobs:
           RUN_BY_HASH_NUM=1
           RUN_BY_HASH_TOTAL=2
           EOF
+      - name: Configure docker IPv6
+        run: |
+          sudo touch /etc/docker/daemon.json
+          sudo chown ubuntu:ubuntu /etc/docker/daemon.json
+          sudo cat <<EOT > /etc/docker/daemon.json
+            {
+               "ipv6": true,
+               "fixed-cidr-v6": "2001:db8:1::/64"
+            }
+          EOT
+          sudo chown root:root /etc/docker/daemon.json
+          sudo systemctl restart docker
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
@@ -673,43 +721,6 @@ jobs:
           docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
           sudo rm -fr "$TEMP_PATH"
 #############################################################################################
-###################################### STRESS TESTS #########################################
-#############################################################################################
-#   StressTest:
-#     needs: [tests_start]
-#     runs-on: [self-hosted, stress-tester, on-demand, type-cpx51]
-#     timeout-minutes: 180
-#     steps:
-#       - name: Set envs
-#         run: |
-#           cat >> "$GITHUB_ENV" << 'EOF'
-#           TEMP_PATH=${{runner.temp}}/stress_thread
-#           REPORTS_PATH=${{runner.temp}}/reports_dir
-#           CHECK_NAME=Stress test (release)
-#           REPO_COPY=${{runner.temp}}/stress_thread/ClickHouse
-#           EOF
-#       - name: Download json reports
-#         uses: actions/download-artifact@v3
-#         with:
-#           path: ${{ env.REPORTS_PATH }}
-#       - name: Check out repository code
-#         uses: ClickHouse/checkout@v1
-#         with:
-#           clear-repository: true
-#       - name: Stress Test
-#         run: |
-#           sudo rm -fr "$TEMP_PATH"
-#           mkdir -p "$TEMP_PATH"
-#           cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
-#           cd "$REPO_COPY/tests/ci"
-#           python3 stress_check.py "$CHECK_NAME"
-#       - name: Cleanup
-#         if: always()
-#         run: |
-#           docker ps --quiet | xargs --no-run-if-empty docker kill ||:
-#           docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
-#           sudo rm -fr "$TEMP_PATH"
-#############################################################################################
 ##################################### REGRESSION TESTS ######################################
 #############################################################################################
   regression_start:
@@ -726,13 +737,19 @@ jobs:
       matrix:
         SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, datetime64_extended_range, disk_level_encryption, dns, engines, example, extended_precision_data_types, kafka, kerberos, key_value, lightweight_delete, data_types, part_moves_between_shards, rbac, selects, session_timezone, ssl_server, tiered_storage, window_functions]
     needs: [regression_start]
-    runs-on: [self-hosted, regression-tester, on-demand, type-cpx41]
+    runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
     timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
     steps:
+      - name: Install aws cli
+        run: |
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "/home/ubuntu/awscliv2.zip"
+          unzip /home/ubuntu/awscliv2.zip > /dev/null 2>&1
+          /home/ubuntu/aws/install
+          rm -rf /home/ubuntu/awscliv2.zip /home/ubuntu/aws 
       - name: Checkout regression repo
         uses: actions/checkout@v3
         with:
@@ -787,13 +804,19 @@ jobs:
       matrix:
         STORAGE: [minio, aws_s3, gcs]
     needs: [regression_start]
-    runs-on: [self-hosted, regression-tester, on-demand, type-cpx51]
+    runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
     timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
     steps:
+      - name: Install aws cli
+        run: |
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "/home/ubuntu/awscliv2.zip"
+          unzip /home/ubuntu/awscliv2.zip > /dev/null 2>&1
+          /home/ubuntu/aws/install
+          rm -rf /home/ubuntu/awscliv2.zip /home/ubuntu/aws 
       - name: Checkout regression repo
         uses: actions/checkout@v3
         with:
@@ -915,13 +938,19 @@ jobs:
       matrix:
         SUITE: [authentication, external_user_directory, role_mapping]
     needs: [regression_start]
-    runs-on: [self-hosted, regression-tester, on-demand, type-cpx51]
+    runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
     timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
     steps:
+      - name: Install aws cli
+        run: |
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "/home/ubuntu/awscliv2.zip"
+          unzip /home/ubuntu/awscliv2.zip > /dev/null 2>&1
+          /home/ubuntu/aws/install
+          rm -rf /home/ubuntu/awscliv2.zip /home/ubuntu/aws 
       - name: Checkout regression repo
         uses: actions/checkout@v3
         with:
@@ -972,13 +1001,19 @@ jobs:
 
   parquet:
     needs: [regression_start]
-    runs-on: [self-hosted, regression-tester, on-demand, type-cpx51]
+    runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
     timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
     steps:
+      - name: Install aws cli
+        run: |
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "/home/ubuntu/awscliv2.zip"
+          unzip /home/ubuntu/awscliv2.zip > /dev/null 2>&1
+          /home/ubuntu/aws/install
+          rm -rf /home/ubuntu/awscliv2.zip /home/ubuntu/aws 
       - name: Checkout regression repo
         uses: actions/checkout@v3
         with:
@@ -1154,13 +1189,19 @@ jobs:
       matrix:
         STORAGE: [minio, aws_s3, gcs]
     needs: [regression_start]
-    runs-on: [self-hosted, regression-tester, on-demand, type-cpx51]
+    runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
     timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
     steps:
+      - name: Install aws cli
+        run: |
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "/home/ubuntu/awscliv2.zip"
+          unzip /home/ubuntu/awscliv2.zip > /dev/null 2>&1
+          /home/ubuntu/aws/install
+          rm -rf /home/ubuntu/awscliv2.zip /home/ubuntu/aws 
       - name: Checkout regression repo
         uses: actions/checkout@v3
         with:
@@ -1224,13 +1265,19 @@ jobs:
       matrix:
         STORAGE: [minio, s3amazon, s3gcs]
     needs: [regression_start]
-    runs-on: [self-hosted, regression-tester, on-demand, type-cpx51]
+    runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
     timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
     steps:
+      - name: Install aws cli
+        run: |
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "/home/ubuntu/awscliv2.zip"
+          unzip /home/ubuntu/awscliv2.zip > /dev/null 2>&1
+          /home/ubuntu/aws/install
+          rm -rf /home/ubuntu/awscliv2.zip /home/ubuntu/aws 
       - name: Checkout regression repo
         uses: actions/checkout@v3
         with:
@@ -1289,7 +1336,7 @@ jobs:
 
   SignRelease:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, on-demand, type-cpx31]
+    runs-on: [self-hosted, on-demand, type-cpx31, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -1342,7 +1389,6 @@ jobs:
       # - FunctionalStatefulTestAarch64
       - IntegrationTestsRelease0
       - IntegrationTestsRelease1
-#       - StressTest
       - CompatibilityCheck
       - SignRelease
       - regression_common
@@ -1352,7 +1398,7 @@ jobs:
       - parquet_aws
       - s3
       - tiered_storage_s3
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx31]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx31, image-x86-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
