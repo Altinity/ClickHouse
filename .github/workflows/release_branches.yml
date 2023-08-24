@@ -45,7 +45,7 @@ jobs:
   #         path: ${{ runner.temp }}/docker_images_check/changed_images_aarch64.json
   # Former DockerHubPushAmd64
   DockerHubPush:
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx51]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx51, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Check out repository code
@@ -93,7 +93,7 @@ jobs:
   #         path: ${{ runner.temp }}/changed_images.json
   CompatibilityCheck:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx51]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx51, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -159,7 +159,7 @@ jobs:
 #########################################################################################
   BuilderDebRelease:
     needs: [DockerHubPush]
-    runs-on: [self-hosted, builder, on-demand, type-ccx53]
+    runs-on: [self-hosted, builder, on-demand, type-ccx53, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -252,7 +252,7 @@ jobs:
     needs:
       - BuilderDebRelease
       # - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx51]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx51, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Check out repository code
@@ -280,7 +280,7 @@ jobs:
     needs:
       - BuilderDebRelease
       # - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx31]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx31, image-x86-app-docker-ce]
     timeout-minutes: 180
     if: ${{ success() || failure() }}
     steps:
@@ -360,7 +360,7 @@ jobs:
       - BuilderDebRelease
       - SignRelease
   #    - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx31]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx31, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Check out repository code
@@ -376,7 +376,7 @@ jobs:
 ############################################################################################
   InstallPackagesTestRelease:
     needs: [SignRelease]
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx51]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx51, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -454,7 +454,7 @@ jobs:
 ##############################################################################################
   FunctionalStatelessTestRelease:
     needs: [tests_start]
-    runs-on: [self-hosted, func-tester, on-demand, type-ccx43]
+    runs-on: [self-hosted, func-tester, on-demand, type-ccx43, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -540,7 +540,7 @@ jobs:
 ##############################################################################################
   FunctionalStatefulTestRelease:
     needs: [tests_start]
-    runs-on: [self-hosted, func-tester, on-demand, type-ccx43]
+    runs-on: [self-hosted, func-tester, on-demand, type-ccx43, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -626,7 +626,7 @@ jobs:
 #############################################################################################
   IntegrationTestsRelease0:
     needs: [tests_start]
-    runs-on: [self-hosted, stress-tester, on-demand, type-ccx43]
+    runs-on: [self-hosted, stress-tester, on-demand, type-ccx43, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -674,7 +674,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsRelease1:
     needs: [tests_start]
-    runs-on: [self-hosted, stress-tester, on-demand, type-ccx43]
+    runs-on: [self-hosted, stress-tester, on-demand, type-ccx43, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
