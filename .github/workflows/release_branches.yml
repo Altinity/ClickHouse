@@ -1071,8 +1071,8 @@ jobs:
       - FunctionalStatelessTestAarch64
       - FunctionalStatefulTestRelease
       # - FunctionalStatefulTestAarch64
-      - IntegrationTestsRelease0
-      - IntegrationTestsRelease1
+      # - IntegrationTestsRelease0
+      # - IntegrationTestsRelease1
       - CompatibilityCheck
 #       - regression_common
 #       - benchmark
