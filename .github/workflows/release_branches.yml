@@ -746,10 +746,10 @@ jobs:
     steps:
       - name: Install aws cli
         run: |
-          curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "awscliv2.zip"
-          unzip awscliv2.zip > /dev/null 2>&1
-          ./aws/install
-          rm -rf awscliv2.zip
+          sudo curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "awscliv2.zip"
+          sudo unzip awscliv2.zip > /dev/null 2>&1
+          sudo ./aws/install
+          sudo rm -rf awscliv2.zip
       - name: Checkout regression repo
         uses: actions/checkout@v3
         with:
@@ -813,10 +813,10 @@ jobs:
     steps:
       - name: Install aws cli
         run: |
-          curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "awscliv2.zip"
-          unzip awscliv2.zip > /dev/null 2>&1
-          ./aws/install
-          rm -rf awscliv2.zip
+          sudo curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "awscliv2.zip"
+          sudo unzip awscliv2.zip > /dev/null 2>&1
+          sudo ./aws/install
+          sudo rm -rf awscliv2.zip
       - name: Checkout regression repo
         uses: actions/checkout@v3
         with:
@@ -947,10 +947,10 @@ jobs:
     steps:
       - name: Install aws cli
         run: |
-          curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "awscliv2.zip"
-          unzip awscliv2.zip > /dev/null 2>&1
-          ./aws/install
-          rm -rf awscliv2.zip
+          sudo curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "awscliv2.zip"
+          sudo unzip awscliv2.zip > /dev/null 2>&1
+          sudo ./aws/install
+          sudo rm -rf awscliv2.zip
       - name: Checkout regression repo
         uses: actions/checkout@v3
         with:
@@ -1010,10 +1010,10 @@ jobs:
     steps:
       - name: Install aws cli
         run: |
-          curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "awscliv2.zip"
-          unzip awscliv2.zip > /dev/null 2>&1
-          ./aws/install
-          rm -rf awscliv2.zip 
+          sudo curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "awscliv2.zip"
+          sudo unzip awscliv2.zip > /dev/null 2>&1
+          sudo ./aws/install
+          sudo rm -rf awscliv2.zip 
       - name: Checkout regression repo
         uses: actions/checkout@v3
         with:
@@ -1198,10 +1198,10 @@ jobs:
     steps:
       - name: Install aws cli
         run: |
-          curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "awscliv2.zip"
-          unzip awscliv2.zip > /dev/null 2>&1
-          ./aws/install
-          rm -rf awscliv2.zip
+          sudo curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "awscliv2.zip"
+          sudo unzip awscliv2.zip > /dev/null 2>&1
+          sudo ./aws/install
+          sudo rm -rf awscliv2.zip
       - name: Checkout regression repo
         uses: actions/checkout@v3
         with:
@@ -1274,10 +1274,10 @@ jobs:
     steps:
       - name: Install aws cli
         run: |
-          curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "awscliv2.zip"
-          unzip awscliv2.zip > /dev/null 2>&1
-          ./aws/install
-          rm -rf awscliv2.zip
+          sudo curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "awscliv2.zip"
+          sudo unzip awscliv2.zip > /dev/null 2>&1
+          sudo ./aws/install
+          sudo rm -rf awscliv2.zip
       - name: Checkout regression repo
         uses: actions/checkout@v3
         with:
