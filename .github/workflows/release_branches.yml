@@ -32,60 +32,15 @@ jobs:
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
-      - name: Check
+      - name: Change location
         run: |
-          free -h
-      - name: Setup docker IPv6
+          pwd
+          mkdir aaa
+          cd aaa
+          pwd
+      - name: Check location
         run: |
-          sudo touch /etc/docker/daemon.json
-          sudo chown ubuntu:ubuntu /etc/docker/daemon.json
-          sudo cat <<EOT > /etc/docker/daemon.json
-            {
-               "ipv6": true,
-               "fixed-cidr-v6": "2001:db8:1::/64",
-               "insecure-registries" : ["dockerhub-proxy.dockerhub-proxy-zone:5000"],
-               "registry-mirrors" : ["http://dockerhub-proxy.dockerhub-proxy-zone:5000"]
-            }
-          EOT
-          sudo chown root:root /etc/docker/daemon.json
-          sudo systemctl restart docker
-  arm-app:
-    runs-on: [self-hosted, on-demand, type-cax21, in-fsn1, image-arm-app-docker-ce]
-    steps:
-      - name: Check out repository code
-        uses: ClickHouse/checkout@v1
-      - name: Check
-        run: |
-          free -h
-      - name: Setup docker IPv6
-        run: |
-          sudo touch /etc/docker/daemon.json
-          sudo chown ubuntu:ubuntu /etc/docker/daemon.json
-          sudo cat <<EOT > /etc/docker/daemon.json
-            {
-               "ipv6": true,
-               "fixed-cidr-v6": "2001:db8:1::/64",
-               "insecure-registries" : ["dockerhub-proxy.dockerhub-proxy-zone:5000"],
-               "registry-mirrors" : ["http://dockerhub-proxy.dockerhub-proxy-zone:5000"]
-            }
-          EOT
-          sudo chown root:root /etc/docker/daemon.json
-          sudo systemctl restart docker
-  # x86-snap:
-  #   runs-on: [self-hosted, image-x86-snapshot-docker_ipv6_x86, on-demand, type-cpx51]
-  #   steps:
-  #     - name: Check out repository code
-  #       uses: ClickHouse/checkout@v1
-  #     - name: Check
-  #       run: |
-  #         free -h
-  # arm-snap:
-  #   runs-on: [self-hosted, on-demand, type-cax41, image-arm-snapshot-docker_ipv6_arm]
-  #   steps:
-  #     - name: Check out repository code
-  #       uses: ClickHouse/checkout@v1
-  #     - name: Check
-  #       run: |
-  #         free -h
+          pwd
+
 
 
