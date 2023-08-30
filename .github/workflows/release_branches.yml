@@ -1259,6 +1259,7 @@ jobs:
       - regression_common
       - benchmark
       - clickhouse_keeper_ssl
+      - key_value
       - ldap
       - parquet
       - parquet_minio
