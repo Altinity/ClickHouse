@@ -31,8 +31,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86, arm]
-    runs-on: [self-hosted, on-demand, type-cpx21, 'image-${{ matrix.arch }}-app-docker-ce']
+        include:
+          - os: arm
+            server: cax21
+          - os: x86
+            server: cx21
+    runs-on: [self-hosted, on-demand, 'type-${{ matrix.server }}', 'image-${{ matrix.os }}-app-docker-ce']
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
