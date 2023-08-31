@@ -626,7 +626,7 @@ jobs:
 #############################################################################################
   IntegrationTestsRelease0:
     needs: [tests_start]
-    runs-on: [self-hosted, stress-tester, builder, func-tester]
+    runs-on: [self-hosted, stress-tester, on-demand, type-ccx43, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -674,7 +674,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsRelease1:
     needs: [tests_start]
-    runs-on: [self-hosted, stress-tester, builder, func-tester]
+    runs-on: [self-hosted, stress-tester, on-demand, type-ccx43, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
