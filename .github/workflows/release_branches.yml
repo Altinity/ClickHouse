@@ -350,7 +350,7 @@ jobs:
 ##############################################################################################
   FunctionalStatelessTestRelease:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, altinity-aarch64, func-tester-aarch64]
+    runs-on: [self-hosted, func-tester, on-demand, type-cax41, image-arm-snapshot-docker_ipv6_arm]
     steps:
       - name: Set envs
         run: |
