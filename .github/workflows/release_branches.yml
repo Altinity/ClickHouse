@@ -28,19 +28,16 @@ on: # yamllint disable-line rule:truthy
 
 jobs:
   x86-app:
-    runs-on: [self-hosted, on-demand, type-cpx21, image-x86-app-docker-ce]
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86, arm]
+    runs-on: [self-hosted, on-demand, type-cpx21, 'image-${{ matrix.arch }}-app-docker-ce']
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
-      - name: Change location
-        run: |
-          pwd
-          mkdir aaa
-          cd aaa
-          pwd
-      - name: Check location
-        run: |
-          pwd
+      - name: Check arch
+        run: uname -i
 
 
 
