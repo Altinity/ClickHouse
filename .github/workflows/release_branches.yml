@@ -27,19 +27,17 @@ on: # yamllint disable-line rule:truthy
       - 'releases/23.3**'
 
 jobs:
-  x86-app:
+  app:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: arm
+          - arch: arm
             server: cax21
-          - os: x86
+          - arch: x86
             server: cx21
-    runs-on: [self-hosted, on-demand, 'type-${{ matrix.server }}', 'image-${{ matrix.os }}-app-docker-ce']
+    runs-on: ['self-harchted, on-demand, type-${{ matrix.server }}, image-${{ matrix.arch }}-app-docker-ce']
     steps:
-      - name: Check out repository code
-        uses: ClickHouse/checkout@v1
       - name: Check arch
         run: uname -i
 
