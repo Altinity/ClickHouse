@@ -93,7 +93,7 @@ jobs:
   #         path: ${{ runner.temp }}/changed_images.json
   CompatibilityCheck:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx51, image-x86-app-docker-ce]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx41, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -627,7 +627,7 @@ jobs:
   IntegrationTestsRelease0:
     needs: [tests_start]
     runs-on: [self-hosted, stress-tester, on-demand, type-ccx43, image-x86-app-docker-ce]
-    timeout-minutes: 180
+    timeout-minutes: 240
     steps:
       - name: Set envs
         run: |
@@ -675,7 +675,7 @@ jobs:
   IntegrationTestsRelease1:
     needs: [tests_start]
     runs-on: [self-hosted, stress-tester, on-demand, type-ccx43, image-x86-app-docker-ce]
-    timeout-minutes: 180
+    timeout-minutes: 240
     steps:
       - name: Set envs
         run: |
