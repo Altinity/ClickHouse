@@ -297,7 +297,7 @@ class ClickhouseIntegrationTestsRunner:
 
         cmd = (
             "cd {repo_path}/tests/integration && "
-            "timeout -s 9 1h ./runner {runner_opts} {image_cmd} --pre-pull --command '{command}' ".format(
+            "timeout -s 9 2h ./runner {runner_opts} {image_cmd} --pre-pull --command '{command}' ".format(
                 repo_path=repo_path,
                 runner_opts=self._get_runner_opts(),
                 image_cmd=image_cmd,
