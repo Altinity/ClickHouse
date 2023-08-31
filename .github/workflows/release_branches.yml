@@ -36,7 +36,7 @@ jobs:
             server: cax21
           - arch: x86
             server: cx21
-    runs-on: ['self-harchted, on-demand, type-${{ matrix.server }}, image-${{ matrix.arch }}-app-docker-ce']
+    runs-on: [self-hosted, on-demand, 'type-${{ matrix.server }}', 'image-${{ matrix.arch }}-app-docker-ce']
     steps:
       - name: Check arch
         run: uname -i
