@@ -350,7 +350,7 @@ jobs:
 ##############################################################################################
   FunctionalStatelessTestRelease:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, func-tester, on-demand, type-cax41, image-arm-snapshot-docker_ipv6_arm]
+    runs-on: [self-hosted, func-tester, on-demand, type-cpx51, image-x86-snapshot-docker_ipv6_x86]
     steps:
       - name: Set envs
         run: |
@@ -605,7 +605,7 @@ jobs:
 #############################################################################################
   RegressionStart:
     ## Not depending on the tests above since they can fail at any given moment.
-    needs: [BuilderDebRelease]
+    needs: [BuilderDebRelease, BuilderDebAarch64]
     runs-on: ubuntu-latest
     steps:
       - run: true
@@ -616,7 +616,7 @@ jobs:
       matrix:
         SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, datetime64_extended_range, disk_level_encryption, dns, example, extended_precision_data_types, kafka, kerberos, lightweight_delete, map_type, part_moves_between_shards, rbac, selects, ssl_server, tiered_storage, window_functions]
     needs: [RegressionStart]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
