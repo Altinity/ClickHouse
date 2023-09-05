@@ -48,9 +48,6 @@ jobs:
           fetch-depth: 0
           token: ${{ github.token }}
       - uses: ./.github/actions/checkout
-        with:
-          submodules: true
-          fetch-depth: 0
       - name: Check arch
         run: uname -i
       - name: sanity
