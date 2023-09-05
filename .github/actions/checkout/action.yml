@@ -37,5 +37,4 @@ runs:
         git config --file "$GITHUB_WORKSPACE/.gitmodules" --null --get-regexp path | \
             sed -z 's|.*\n||' | \
             xargs --max-procs=100 --null --no-run-if-empty --max-args=1 \
-                git -C "$GITHUB_WORKSPACE" submodule update \
-                --depth="${{ inputs.submodules-depth }}" --single-branch
+                $GITHUB_WORKSPACE/.github/retry.sh 60 5 "git -C \"$GITHUB_WORKSPACE\" submodule update --depth=\"${{ inputs.submodules-depth }}\" --single-branch"
