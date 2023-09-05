@@ -1,0 +1,41 @@
+name: Checkout
+description: 'Checkout the repository'
+inputs:
+  fetch-depth:
+    description: The value is passed as is to the upstream checkout action
+    required: true
+    default: 1
+  ref:
+    description: Defines branch or commit to checkout
+  submodules:
+    description: Defines if submodules should be fetched
+    required: true
+    default: false
+  submodules-depth:
+    description: The depth of submodules to checkout
+    required: true
+    default: 1
+runs:
+  using: "composite"
+  steps:
+    - name: Clear repository
+      shell: bash
+      run: |
+        sudo rm -fr "$GITHUB_WORKSPACE" && mkdir "$GITHUB_WORKSPACE"
+    - name: Check out repository code
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: ${{ inputs.fetch-depth }}
+        ref: ${{ inputs.ref }}
+        token: ${{ github.token }}
+    - name: Checkout submodules
+      if: ${{ fromJSON(inputs.submodules) }}
+      shell: bash
+      run: |
+        git -C "$GITHUB_WORKSPACE" submodule sync
+        git -C "$GITHUB_WORKSPACE" submodule init
+        git config --file "$GITHUB_WORKSPACE/.gitmodules" --null --get-regexp path | \
+            sed -z 's|.*\n||' | \
+            xargs --max-procs=100 --null --no-run-if-empty --max-args=1 \
+                git -C "$GITHUB_WORKSPACE" submodule update \
+                --depth="${{ inputs.submodules-depth }}" --single-branch
