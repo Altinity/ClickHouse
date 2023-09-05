@@ -454,7 +454,7 @@ jobs:
 ##############################################################################################
   FunctionalStatelessTestRelease:
     needs: [tests_start]
-    runs-on: [self-hosted, func-tester, on-demand, type-ccx43, image-x86-app-docker-ce]
+    runs-on: [self-hosted, func-tester, on-demand, type-ccx53, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -540,7 +540,7 @@ jobs:
 ##############################################################################################
   FunctionalStatefulTestRelease:
     needs: [tests_start]
-    runs-on: [self-hosted, func-tester, on-demand, type-ccx43, image-x86-app-docker-ce]
+    runs-on: [self-hosted, func-tester, on-demand, type-ccx53, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -627,7 +627,7 @@ jobs:
   IntegrationTestsRelease0:
     needs: [tests_start]
     runs-on: [self-hosted, stress-tester, on-demand, type-ccx53, image-x86-app-docker-ce]
-    timeout-minutes: 240
+    timeout-minutes: 300
     steps:
       - name: Set envs
         run: |
@@ -675,7 +675,7 @@ jobs:
   IntegrationTestsRelease1:
     needs: [tests_start]
     runs-on: [self-hosted, stress-tester, on-demand, type-ccx53, image-x86-app-docker-ce]
-    timeout-minutes: 240
+    timeout-minutes: 300
     steps:
       - name: Set envs
         run: |
