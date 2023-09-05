@@ -38,8 +38,14 @@ jobs:
             server: cx21
     runs-on: [self-hosted, on-demand, 'type-${{ matrix.server }}', 'image-${{ matrix.arch }}-app-docker-ce']
     steps:
+      - uses: ./.github/actions/checkout
+        with:
+          submodules: true
+          fetch-depth: 0
       - name: Check arch
         run: uname -i
+      - name: sanity
+        run: ls
 
 
 
