@@ -48,17 +48,10 @@ jobs:
           fetch-depth: 0
           token: ${{ github.token }}
       - uses: ./.github/actions/checkout
-      # - name: Checkout regression repo
-      #   uses: actions/checkout@v3
-      #   with:
-      #     repository: Altinity/clickhouse-regression
-      #     ref: ${{ env.REGRESSION_COMMON_COMMIT }}
-      # - name: script check
-      #   run: python3 .github/get-deb-url.py
+        with:
+          submodules: true
+          fetch-depth: 0
       - name: Check arch
         run: uname -i
       - name: sanity
         run: ls
-
-
-
