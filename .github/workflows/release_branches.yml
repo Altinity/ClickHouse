@@ -626,7 +626,6 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
-          ref: releases
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -688,7 +687,6 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
-          ref: releases
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -830,7 +828,6 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
-          ref: releases
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -888,7 +885,6 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
-          ref: releases
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -965,7 +961,6 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
-          ref: releases
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -1041,7 +1036,6 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
-          ref: releases
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
