@@ -47,7 +47,7 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ github.token }}
-      - uses: ./.github/actions/submodule-checkout
+      - uses: ./.github/actions/submodule_checkout
       # - name: Checkout regression repo
       #   uses: actions/checkout@v3
       #   with:
