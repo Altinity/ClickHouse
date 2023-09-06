@@ -38,16 +38,23 @@ jobs:
             server: cx41
     runs-on: [self-hosted, on-demand, 'type-${{ matrix.server }}', 'image-${{ matrix.arch }}-app-docker-ce']
     steps:
-      - name: Clear repository
-        shell: bash
-        run: |
-          sudo rm -fr "$GITHUB_WORKSPACE" && mkdir "$GITHUB_WORKSPACE"
-      - name: Check out repository code
+      # - name: Clear repository
+      #   shell: bash
+      #   run: |
+      #     sudo rm -fr "$GITHUB_WORKSPACE" && mkdir "$GITHUB_WORKSPACE"
+      # - name: Check out repository code
+      #   uses: actions/checkout@v3
+      #   with:
+      #     fetch-depth: 0
+      #     token: ${{ github.token }}
+      # - uses: ./.github/actions/checkout
+      - name: Checkout regression repo
         uses: actions/checkout@v3
         with:
-          fetch-depth: 0
-          token: ${{ github.token }}
-      - uses: ./.github/actions/checkout
+          repository: Altinity/clickhouse-regression
+          ref: ${{ env.REGRESSION_COMMON_COMMIT }}
+      - name: script check
+        run: python3 .github/get-deb-url.py
       - name: Check arch
         run: uname -i
       - name: sanity
