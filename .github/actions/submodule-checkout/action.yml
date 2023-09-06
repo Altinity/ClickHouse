@@ -9,7 +9,6 @@ runs:
   using: "composite"
   steps:
     - name: Checkout submodules
-      if: ${{ fromJSON(inputs.submodules) }}
       shell: bash
       run: |
         git -C "$GITHUB_WORKSPACE" submodule sync
