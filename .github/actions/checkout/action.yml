@@ -6,6 +6,7 @@ inputs:
     required: true
     default: 1
 runs:
+  using: "composite"
   steps:
     - name: Checkout submodules
       shell: bash
