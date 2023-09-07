@@ -31,6 +31,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        animal: [cat, dog, big_cat]
         include:
           - arch: arm
             server: cax41
@@ -38,20 +39,20 @@ jobs:
             server: cx41
     runs-on: [self-hosted, on-demand, 'type-${{ matrix.server }}', 'image-${{ matrix.arch }}-app-docker-ce']
     steps:
-      - name: Clear repository
-        shell: bash
-        run: |
-          sudo rm -fr "$GITHUB_WORKSPACE" && mkdir "$GITHUB_WORKSPACE"
-      - name: Check out repository code
-        uses: actions/checkout@v3
-        with:
-          fetch-depth: 0
-          token: ${{ github.token }}
-      - uses: ./.github/actions/checkout
-        with:
-          submodules: true
-          fetch-depth: 0
+      # - name: Clear repository
+      #   shell: bash
+      #   run: |
+      #     sudo rm -fr "$GITHUB_WORKSPACE" && mkdir "$GITHUB_WORKSPACE"
+      # - name: Check out repository code
+      #   uses: actions/checkout@v3
+      #   with:
+      #     fetch-depth: 0
+      #     token: ${{ github.token }}
+      # - uses: ./.github/actions/checkout
+      #   with:
+      #     submodules: true
+      #     fetch-depth: 0
       - name: Check arch
         run: uname -i
-      - name: sanity
-        run: ls
+      - name: Check animal
+        run: echo ${{ matrix.animal }}
