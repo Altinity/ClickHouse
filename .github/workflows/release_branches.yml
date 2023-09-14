@@ -684,7 +684,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
-          refs: ${{ env.REGRESSION_COMMON_COMMIT }}
+          ref: ${{ env.REGRESSION_COMMON_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -695,6 +695,7 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
+          name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
       - name: Setup
         run: .github/setup.sh
@@ -744,7 +745,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
-          refs: ${{ env.REGRESSION_COMMON_COMMIT }}
+          ref: ${{ env.REGRESSION_COMMON_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -756,6 +757,7 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
+          name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
       - name: Setup
         run: .github/setup.sh
@@ -809,7 +811,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
-          refs: ${{ env.REGRESSION_COMMON_COMMIT }}
+          ref: ${{ env.REGRESSION_COMMON_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -821,6 +823,7 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
+          name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
       - name: Setup
         run: .github/setup.sh
@@ -882,6 +885,7 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
+          name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
       - name: Setup
         run: .github/setup.sh
@@ -939,6 +943,7 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
+          name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
       - name: Setup
         run: .github/setup.sh
@@ -996,6 +1001,7 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
+          name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
       - name: Setup
         run: .github/setup.sh
@@ -1054,6 +1060,7 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
+          name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
       - name: Setup
         run: .github/setup.sh
@@ -1120,6 +1127,7 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
+          name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
       - name: Setup
         run: .github/setup.sh
@@ -1189,6 +1197,7 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
+          name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
       - name: Setup
         run: .github/setup.sh
