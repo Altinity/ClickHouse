@@ -9,7 +9,7 @@ Engine=MergeTree()
 ORDER BY key
 SETTINGS storage_policy='_storagePolicy', min_bytes_for_wide_part = 10485760;
 
-SYSTEM STOP MERGES;
+SYSTEM STOP MERGES test;
 SYSTEM DROP FILESYSTEM CACHE;
 
 SELECT count() FROM system.filesystem_cache;
