@@ -33,7 +33,7 @@ jobs:
   #   runs-on: [self-hosted, style-checker-aarch64]
   #   steps:
   #     - name: Check out repository code
-  #       uses: ClickHouse/checkout@v1
+  #       uses: Altinity/checkout@v1
   #     - name: Images check
   #       run: |
   #         cd "$GITHUB_WORKSPACE/tests/ci"
@@ -49,7 +49,7 @@ jobs:
     timeout-minutes: 180
     steps:
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@v1
         with:
           clear-repository: true
       - name: Images check
@@ -71,7 +71,7 @@ jobs:
   #   runs-on: [self-hosted, style-checker]
   #   steps:
   #     - name: Check out repository code
-  #       uses: ClickHouse/checkout@v1
+  #       uses: Altinity/checkout@v1
   #     - name: Download changed aarch64 images
   #       uses: actions/download-artifact@v2
   #       with:
@@ -104,7 +104,7 @@ jobs:
           REPORTS_PATH=${{runner.temp}}/reports_dir
           EOF
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@v1
         with:
           clear-repository: true
       - name: Download json reports
@@ -135,7 +135,7 @@ jobs:
   #         REPORTS_PATH=${{runner.temp}}/reports_dir
   #         EOF
   #     - name: Check out repository code
-  #       uses: ClickHouse/checkout@v1
+  #       uses: Altinity/checkout@v1
   #       with:
   #         clear-repository: true
   #     - name: Download json reports
@@ -179,15 +179,12 @@ jobs:
           path: ${{ env.IMAGES_PATH }}
       - name: Trust My Directory
         run: git config --global --add safe.directory * # https://stackoverflow.com/a/71940133
-      - name: Clear repository
-        shell: bash
-        run: |
-          sudo rm -fr "$GITHUB_WORKSPACE" && mkdir "$GITHUB_WORKSPACE"
       - name: Check out repository code
-        uses: actions/checkout@v3
+        uses: Altinity/checkout@v1
         with:
-          fetch-depth: 0
-          token: ${{ github.token }}
+          clear-repository: true
+          submodules: true
+          fetch-depth: 0 # otherwise we will have no info about contributors
       - name: Check out submodules
         uses: ./.github/actions/submodule-checkout
       - name: Build
@@ -229,7 +226,7 @@ jobs:
   #         name: changed_images
   #         path: ${{ runner.temp }}/images_path
   #     - name: Check out repository code
-  #       uses: ClickHouse/checkout@v1
+  #       uses: Altinity/checkout@v1
   #       with:
   #         fetch-depth: 0 # otherwise we will have no info about contributors
   #     - name: Build
@@ -261,7 +258,7 @@ jobs:
     timeout-minutes: 180
     steps:
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@v1
         with:
           clear-repository: true
           fetch-depth: 0  # It MUST BE THE SAME for all dependencies and the job itself
@@ -303,7 +300,7 @@ jobs:
         with:
           path: ${{ env.REPORTS_PATH }}
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@v1
         with:
           clear-repository: true
       - name: Report Builder
@@ -341,7 +338,7 @@ jobs:
   #       with:
   #         path: ${{ env.REPORTS_PATH }}
   #     - name: Check out repository code
-  #       uses: ClickHouse/checkout@v1
+  #       uses: Altinity/checkout@v1
   #       with:
   #         clear-repository: true
   #     - name: Report Builder
@@ -369,7 +366,7 @@ jobs:
     timeout-minutes: 180
     steps:
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@v1
         with:
           clear-repository: true
       - name: Mark Commit Release Ready
@@ -397,7 +394,7 @@ jobs:
         with:
           path: ${{ env.REPORTS_PATH }}
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@v1
         with:
           clear-repository: true
       - name: Test packages installation
@@ -430,7 +427,7 @@ jobs:
   #       with:
   #         path: ${{ env.REPORTS_PATH }}
   #     - name: Check out repository code
-  #       uses: ClickHouse/checkout@v1
+  #       uses: Altinity/checkout@v1
   #       with:
   #         clear-repository: true
   #     - name: Test packages installation
@@ -488,7 +485,7 @@ jobs:
         with:
           path: ${{ env.REPORTS_PATH }}
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@v1
         with:
           clear-repository: true
       - name: Functional test
@@ -522,7 +519,7 @@ jobs:
   #       with:
   #         path: ${{ env.REPORTS_PATH }}
   #     - name: Check out repository code
-  #       uses: ClickHouse/checkout@v1
+  #       uses: Altinity/checkout@v1
   #       with:
   #         clear-repository: true
   #     - name: Functional test
@@ -574,7 +571,7 @@ jobs:
         with:
           path: ${{ env.REPORTS_PATH }}
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@v1
         with:
           clear-repository: true
       - name: Functional test
@@ -608,7 +605,7 @@ jobs:
   #       with:
   #         path: ${{ env.REPORTS_PATH }}
   #     - name: Check out repository code
-  #       uses: ClickHouse/checkout@v1
+  #       uses: Altinity/checkout@v1
   #       with:
   #         clear-repository: true
   #     - name: Functional test
@@ -649,7 +646,7 @@ jobs:
         with:
           path: ${{ env.REPORTS_PATH }}
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@v1
         with:
           clear-repository: true
       - name: Integration test
@@ -685,7 +682,7 @@ jobs:
         with:
           path: ${{ env.REPORTS_PATH }}
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@v1
         with:
           clear-repository: true
       - name: Integration test
@@ -1388,7 +1385,7 @@ jobs:
     runs-on: [self-hosted, style-checker, on-demand, type-cpx31, image-x86-app-docker-ce]
     steps:
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@v1
         with:
           clear-repository: true
       - name: Finish label
