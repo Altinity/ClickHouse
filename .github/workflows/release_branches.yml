@@ -28,17 +28,18 @@ on: # yamllint disable-line rule:truthy
 
 jobs:
   app:
-    strategy:
-      fail-fast: false
-      matrix:
-        animal: [cat, dog, big_cat]
-        arch: [arm, x86]
-        include:
-          - arch: arm
-            server: cax41
-          - arch: x86
-            server: cx41
-    runs-on: [self-hosted, on-demand, 'type-${{ matrix.server }}', 'image-${{ matrix.arch }}-app-docker-ce']
+    # strategy:
+    #   fail-fast: false
+    #   matrix:
+    #     animal: [cat, dog, big_cat]
+    #     arch: [arm, x86]
+    #     include:
+    #       - arch: arm
+    #         server: cax41
+    #       - arch: x86
+    #         server: cx41
+    # runs-on: [self-hosted, on-demand, 'type-${{ matrix.server }}', 'image-${{ matrix.arch }}-app-docker-ce']
+    runs-on: [self-hosted, on-demand, 'type-cx41', 'image-x86-app-docker-ce']
     steps:
       # - name: Clear repository
       #   shell: bash
@@ -54,10 +55,10 @@ jobs:
       #     submodules: true
       #     fetch-depth: 0
       - name: Checkout
-        uses: Altinity/checkout@9000c966011f80946e257cc672c1cc8afe8d7e0d
+        uses: Altinity/checkout@80d804038438bd4e2a85514d5bcb3bfcb21f2511
         with:
           clear-repository: true
       - name: Check arch
         run: uname -i
-      - name: Check animal
-        run: echo ${{ matrix.animal }}
+      # - name: Check animal
+      #   run: echo ${{ matrix.animal }}
