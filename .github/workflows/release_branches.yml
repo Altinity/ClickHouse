@@ -53,6 +53,10 @@ jobs:
       #   with:
       #     submodules: true
       #     fetch-depth: 0
+      - name: Checkout
+        uses: Altinity/checkout@9000c966011f80946e257cc672c1cc8afe8d7e0d
+        with:
+          clear-repository: true
       - name: Check arch
         run: uname -i
       - name: Check animal
