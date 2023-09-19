@@ -638,7 +638,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, datetime64_extended_range, disk_level_encryption, dns, example, extended_precision_data_types, kafka, kerberos, lightweight_delete, map_type, part_moves_between_shards, rbac, selects, ssl_server, tiered_storage, window_functions]
+        SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, datetime64_extended_range, disk_level_encryption, dns, example, extended_precision_data_types, kafka, kerberos, lightweight_delete, data_types, part_moves_between_shards, rbac, selects, ssl_server, tiered_storage, window_functions]
     needs: [RegressionStart]
     runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
     env:
@@ -699,7 +699,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        SUITE: [aes_encryption, base_58, datetime64_extended_range, disk_level_encryption, example, extended_precision_data_types, kafka, lightweight_delete, data_types, part_moves_between_shards, rbac, selects, tiered_storage, windows_functions]
+        SUITE: [aes_encryption, base_58, datetime64_extended_range, disk_level_encryption, example, extended_precision_data_types, kafka, lightweight_delete, data_types, part_moves_between_shards, rbac, selects, tiered_storage, window_functions]
     needs: [RegressionStart]
     runs-on: [self-hosted, regression-tester, on-demand, type-cax41, image-arm-app-docker-ce]
     env:
