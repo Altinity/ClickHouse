@@ -699,7 +699,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        SUITE: [aes_encryption, base_58, datetime64_extended_range, disk_level_encryption, example, extended_precision_data_types, kafka, lightweight_delete, map_type, part_moves_between_shards, rbac, selects, tiered_storage]
+        SUITE: [aes_encryption, base_58, datetime64_extended_range, disk_level_encryption, example, extended_precision_data_types, kafka, lightweight_delete, data_types, part_moves_between_shards, rbac, selects, tiered_storage, windows_functions]
     needs: [RegressionStart]
     runs-on: [self-hosted, regression-tester, on-demand, type-cax41, image-arm-app-docker-ce]
     env:
@@ -1229,7 +1229,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        STORAGE: [minio, aws_s3, gcs]
+        STORAGE: [minio, s3amazon, s3gcs]
     needs: [RegressionStart]
     runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
     env:
@@ -1298,7 +1298,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        STORAGE: [minio, aws_s3, gcs]
+        STORAGE: [minio, s3amazon, s3gcs]
     needs: [RegressionStart]
     runs-on: [self-hosted, regression-tester, on-demand, type-cax41, image-arm-app-docker-ce]
     env:
