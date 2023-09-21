@@ -695,7 +695,6 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
-          name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
       - name: Setup
         run: .github/setup.sh
@@ -757,7 +756,6 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
-          name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
       - name: Setup
         run: .github/setup.sh
@@ -823,7 +821,6 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
-          name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
       - name: Setup
         run: .github/setup.sh
@@ -885,7 +882,6 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
-          name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
       - name: Setup
         run: .github/setup.sh
@@ -943,7 +939,6 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
-          name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
       - name: Setup
         run: .github/setup.sh
@@ -1001,7 +996,6 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
-          name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
       - name: Setup
         run: .github/setup.sh
@@ -1060,7 +1054,6 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
-          name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
       - name: Setup
         run: .github/setup.sh
@@ -1127,7 +1120,6 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
-          name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
       - name: Setup
         run: .github/setup.sh
@@ -1197,7 +1189,6 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
-          name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
       - name: Setup
         run: .github/setup.sh
