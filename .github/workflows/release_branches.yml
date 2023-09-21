@@ -6,6 +6,8 @@ env:
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
   REGRESSION_RESULTS_URL: altinity-build-artifacts/${{github.event.number}}/$GITHUB_SHA
 
 
@@ -31,7 +33,7 @@ jobs:
   #   runs-on: [self-hosted, style-checker-aarch64]
   #   steps:
   #     - name: Check out repository code
-  #       uses: ClickHouse/checkout@v1
+  #       uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
   #     - name: Images check
   #       run: |
   #         cd "$GITHUB_WORKSPACE/tests/ci"
@@ -43,10 +45,11 @@ jobs:
   #         path: ${{ runner.temp }}/docker_images_check/changed_images_aarch64.json
   # Former DockerHubPushAmd64
   DockerHubPush:
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx51, image-x86-app-docker-ce]
+    timeout-minutes: 180
     steps:
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
         with:
           clear-repository: true
       - name: Images check
@@ -68,7 +71,7 @@ jobs:
   #   runs-on: [self-hosted, style-checker]
   #   steps:
   #     - name: Check out repository code
-  #       uses: ClickHouse/checkout@v1
+  #       uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
   #     - name: Download changed aarch64 images
   #       uses: actions/download-artifact@v2
   #       with:
@@ -90,7 +93,8 @@ jobs:
   #         path: ${{ runner.temp }}/changed_images.json
   CompatibilityCheck:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx41, image-x86-app-docker-ce]
+    timeout-minutes: 180
     steps:
       - name: Set envs
         run: |
@@ -100,7 +104,7 @@ jobs:
           REPORTS_PATH=${{runner.temp}}/reports_dir
           EOF
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
         with:
           clear-repository: true
       - name: Download json reports
@@ -131,7 +135,7 @@ jobs:
   #         REPORTS_PATH=${{runner.temp}}/reports_dir
   #         EOF
   #     - name: Check out repository code
-  #       uses: ClickHouse/checkout@v1
+  #       uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
   #       with:
   #         clear-repository: true
   #     - name: Download json reports
@@ -155,7 +159,8 @@ jobs:
 #########################################################################################
   BuilderDebRelease:
     needs: [DockerHubPush]
-    runs-on: [self-hosted, builder]
+    runs-on: [self-hosted, builder, on-demand, type-ccx53, image-x86-app-docker-ce]
+    timeout-minutes: 180
     steps:
       - name: Set envs
         run: |
@@ -175,7 +180,7 @@ jobs:
       - name: Trust My Directory
         run: git config --global --add safe.directory * # https://stackoverflow.com/a/71940133
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
         with:
           clear-repository: true
           submodules: true
@@ -186,6 +191,7 @@ jobs:
           mkdir -p "$TEMP_PATH/build_check/package_release"
           cd .. && tar czf $TEMP_PATH/build_source.src.tar.gz ClickHouse/
           cd $TEMP_PATH && tar xvzf $TEMP_PATH/build_source.src.tar.gz
+          ls -l $TEMP_PATH
           cd "$REPO_COPY/tests/ci" && python3 build_check.py "$BUILD_NAME"
       - name: Upload build URLs to artifacts
         if: ${{ success() || failure() }}
@@ -218,7 +224,7 @@ jobs:
   #         name: changed_images
   #         path: ${{ runner.temp }}/images_path
   #     - name: Check out repository code
-  #       uses: ClickHouse/checkout@v1
+  #       uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
   #       with:
   #         fetch-depth: 0 # otherwise we will have no info about contributors
   #     - name: Build
@@ -246,10 +252,11 @@ jobs:
     needs:
       - BuilderDebRelease
       # - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx51, image-x86-app-docker-ce]
+    timeout-minutes: 180
     steps:
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
         with:
           clear-repository: true
           fetch-depth: 0  # It MUST BE THE SAME for all dependencies and the job itself
@@ -273,7 +280,8 @@ jobs:
     needs:
       - BuilderDebRelease
       # - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx31, image-x86-app-docker-ce]
+    timeout-minutes: 180
     if: ${{ success() || failure() }}
     steps:
       - name: Set envs
@@ -290,7 +298,7 @@ jobs:
         with:
           path: ${{ env.REPORTS_PATH }}
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
         with:
           clear-repository: true
       - name: Report Builder
@@ -328,7 +336,7 @@ jobs:
   #       with:
   #         path: ${{ env.REPORTS_PATH }}
   #     - name: Check out repository code
-  #       uses: ClickHouse/checkout@v1
+  #       uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
   #       with:
   #         clear-repository: true
   #     - name: Report Builder
@@ -352,10 +360,11 @@ jobs:
       - BuilderDebRelease
       - SignRelease
   #    - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx31, image-x86-app-docker-ce]
+    timeout-minutes: 180
     steps:
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
         with:
           clear-repository: true
       - name: Mark Commit Release Ready
@@ -367,8 +376,21 @@ jobs:
 ############################################################################################
   InstallPackagesTestRelease:
     needs: [SignRelease]
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx51, image-x86-app-docker-ce]
+    timeout-minutes: 180
     steps:
+      - name: Setup
+        run: |
+          sudo touch /etc/docker/daemon.json
+          sudo chown ubuntu:ubuntu /etc/docker/daemon.json
+          sudo cat <<EOT > /etc/docker/daemon.json
+            {
+               "ipv6": true,
+               "fixed-cidr-v6": "2001:3984:3989::/64"
+            }
+          EOT
+          sudo chown root:root /etc/docker/daemon.json
+          sudo systemctl restart docker
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -382,7 +404,7 @@ jobs:
         with:
           path: ${{ env.REPORTS_PATH }}
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
         with:
           clear-repository: true
       - name: Test packages installation
@@ -415,7 +437,7 @@ jobs:
   #       with:
   #         path: ${{ env.REPORTS_PATH }}
   #     - name: Check out repository code
-  #       uses: ClickHouse/checkout@v1
+  #       uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
   #       with:
   #         clear-repository: true
   #     - name: Test packages installation
@@ -436,6 +458,7 @@ jobs:
     ## Do-nothing stage to trigger tests, makes is easier to
     needs: [InstallPackagesTestRelease]
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     steps:
       - run: true
 ##############################################################################################
@@ -443,7 +466,8 @@ jobs:
 ##############################################################################################
   FunctionalStatelessTestRelease:
     needs: [tests_start]
-    runs-on: [self-hosted, func-tester]
+    runs-on: [self-hosted, func-tester, on-demand, type-ccx53, image-x86-app-docker-ce]
+    timeout-minutes: 180
     steps:
       - name: Set envs
         run: |
@@ -454,12 +478,24 @@ jobs:
           REPO_COPY=${{runner.temp}}/stateless_debug/ClickHouse
           KILL_TIMEOUT=10800
           EOF
+      - name: Configure docker IPv6
+        run: |
+          sudo touch /etc/docker/daemon.json
+          sudo chown ubuntu:ubuntu /etc/docker/daemon.json
+          sudo cat <<EOT > /etc/docker/daemon.json
+            {
+               "ipv6": true,
+               "fixed-cidr-v6": "2001:3984:3989::/64"
+            }
+          EOT
+          sudo chown root:root /etc/docker/daemon.json
+          sudo systemctl restart docker
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
           path: ${{ env.REPORTS_PATH }}
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
         with:
           clear-repository: true
       - name: Functional test
@@ -493,7 +529,7 @@ jobs:
   #       with:
   #         path: ${{ env.REPORTS_PATH }}
   #     - name: Check out repository code
-  #       uses: ClickHouse/checkout@v1
+  #       uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
   #       with:
   #         clear-repository: true
   #     - name: Functional test
@@ -516,8 +552,21 @@ jobs:
 ##############################################################################################
   FunctionalStatefulTestRelease:
     needs: [tests_start]
-    runs-on: [self-hosted, func-tester]
+    runs-on: [self-hosted, func-tester, on-demand, type-ccx53, image-x86-app-docker-ce]
+    timeout-minutes: 180
     steps:
+      - name: Setup
+        run: |
+          sudo touch /etc/docker/daemon.json
+          sudo chown ubuntu:ubuntu /etc/docker/daemon.json
+          sudo cat <<EOT > /etc/docker/daemon.json
+            {
+               "ipv6": true,
+               "fixed-cidr-v6": "2001:3984:3989::/64"
+            }
+          EOT
+          sudo chown root:root /etc/docker/daemon.json
+          sudo systemctl restart docker
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -527,12 +576,24 @@ jobs:
           REPO_COPY=${{runner.temp}}/stateful_debug/ClickHouse
           KILL_TIMEOUT=3600
           EOF
+      - name: Configure docker IPv6
+        run: |
+          sudo touch /etc/docker/daemon.json
+          sudo chown ubuntu:ubuntu /etc/docker/daemon.json
+          sudo cat <<EOT > /etc/docker/daemon.json
+            {
+               "ipv6": true,
+               "fixed-cidr-v6": "2001:3984:3989::/64"
+            }
+          EOT
+          sudo chown root:root /etc/docker/daemon.json
+          sudo systemctl restart docker
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
           path: ${{ env.REPORTS_PATH }}
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
         with:
           clear-repository: true
       - name: Functional test
@@ -566,7 +627,7 @@ jobs:
   #       with:
   #         path: ${{ env.REPORTS_PATH }}
   #     - name: Check out repository code
-  #       uses: ClickHouse/checkout@v1
+  #       uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
   #       with:
   #         clear-repository: true
   #     - name: Functional test
@@ -589,7 +650,8 @@ jobs:
 #############################################################################################
   IntegrationTestsRelease0:
     needs: [tests_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, func-tester, style-checker]
+    timeout-minutes: 300
     steps:
       - name: Set envs
         run: |
@@ -606,7 +668,7 @@ jobs:
         with:
           path: ${{ env.REPORTS_PATH }}
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
         with:
           clear-repository: true
       - name: Integration test
@@ -624,7 +686,8 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsRelease1:
     needs: [tests_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, func-tester, style-checker]
+    timeout-minutes: 300
     steps:
       - name: Set envs
         run: |
@@ -641,7 +704,7 @@ jobs:
         with:
           path: ${{ env.REPORTS_PATH }}
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
         with:
           clear-repository: true
       - name: Integration test
@@ -664,6 +727,7 @@ jobs:
     ## Not depending on the tests above since they can fail at any given moment.
     needs: [tests_start]
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     steps:
       - run: true
 
@@ -673,12 +737,20 @@ jobs:
       matrix:
         SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, datetime64_extended_range, disk_level_encryption, dns, example, extended_precision_data_types, kafka, kerberos, lightweight_delete, map_type, part_moves_between_shards, rbac, selects, ssl_server, tiered_storage, window_functions]
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
+    timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
     steps:
+      - name: Install aws cli
+        run: |
+          cd /home/ubuntu
+          sudo curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "awscliv2.zip"
+          sudo unzip awscliv2.zip > /dev/null 2>&1
+          sudo ./aws/install
+          sudo rm -rf /home/ubuntu/awscliv2.zip /home/ubuntu/aws
       - name: Checkout regression repo
         uses: actions/checkout@v3
         with:
@@ -735,12 +807,20 @@ jobs:
       matrix:
         STORAGE: [minio, aws_s3, gcs]
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
+    timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
     steps:
+      - name: Install aws cli
+        run: |
+          cd /home/ubuntu
+          sudo curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "awscliv2.zip"
+          sudo unzip awscliv2.zip > /dev/null 2>&1
+          sudo ./aws/install
+          sudo rm -rf /home/ubuntu/awscliv2.zip /home/ubuntu/aws
       - name: Checkout regression repo
         uses: actions/checkout@v3
         with:
@@ -805,12 +885,20 @@ jobs:
       matrix:
         SUITE: [authentication, external_user_directory, role_mapping]
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
+    timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
     steps:
+      - name: Install aws cli
+        run: |
+          cd /home/ubuntu
+          sudo curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "awscliv2.zip"
+          sudo unzip awscliv2.zip > /dev/null 2>&1
+          sudo ./aws/install
+          sudo rm -rf /home/ubuntu/awscliv2.zip /home/ubuntu/aws
       - name: Checkout regression repo
         uses: actions/checkout@v3
         with:
@@ -863,12 +951,20 @@ jobs:
 
   parquet:
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
+    timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
     steps:
+      - name: Install aws cli
+        run: |
+          cd /home/ubuntu
+          sudo curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "awscliv2.zip"
+          sudo unzip awscliv2.zip > /dev/null 2>&1
+          sudo ./aws/install
+          sudo rm -rf /home/ubuntu/awscliv2.zip /home/ubuntu/aws
       - name: Checkout regression repo
         uses: actions/checkout@v3
         with:
@@ -935,12 +1031,20 @@ jobs:
       matrix:
         STORAGE: [minio, aws_s3, gcs]
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
+    timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
     steps:
+      - name: Install aws cli
+        run: |
+          cd /home/ubuntu
+          sudo curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "awscliv2.zip"
+          sudo unzip awscliv2.zip > /dev/null 2>&1
+          sudo ./aws/install
+          sudo rm -rf /home/ubuntu/awscliv2.zip /home/ubuntu/aws
       - name: Checkout regression repo
         uses: actions/checkout@v3
         with:
@@ -1006,12 +1110,20 @@ jobs:
       matrix:
         STORAGE: [minio, s3amazon, s3gcs]
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
+    timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
     steps:
+      - name: Install aws cli
+        run: |
+          cd /home/ubuntu
+          sudo curl "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "awscliv2.zip"
+          sudo unzip awscliv2.zip > /dev/null 2>&1
+          sudo ./aws/install
+          sudo rm -rf /home/ubuntu/awscliv2.zip /home/ubuntu/aws
       - name: Checkout regression repo
         uses: actions/checkout@v3
         with:
@@ -1072,7 +1184,8 @@ jobs:
 
   SignRelease:
     needs: [BuilderDebRelease]
-    runs-on: [ self-hosted ]
+    runs-on: [self-hosted, on-demand, type-cpx31, image-x86-app-docker-ce]
+    timeout-minutes: 180
     steps:
       - name: Set envs
         run: |
@@ -1132,10 +1245,10 @@ jobs:
       - parquet
       - s3
       - tiered_storage_s3
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx31, image-x86-app-docker-ce]
     steps:
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
         with:
           clear-repository: true
       - name: Finish label
