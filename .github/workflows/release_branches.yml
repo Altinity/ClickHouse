@@ -7,6 +7,7 @@ env:
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   REGRESSION_RESULTS_URL: altinity-build-artifacts/${{github.event.number}}/$GITHUB_SHA
+  REGRESSION_ARM_COMMIT: e948952d4910b4bc9d95ddedc439903a0f795778
 
 
 on: # yamllint disable-line rule:truthy
@@ -699,7 +700,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        SUITE: [aes_encryption, base_58, datetime64_extended_range, disk_level_encryption, example, extended_precision_data_types, kafka, lightweight_delete, data_types, part_moves_between_shards, rbac, selects, tiered_storage, window_functions]
+        SUITE: [aes_encryption, atomic_insert, base_58, datetime64_extended_range, data_types, disk_level_encryption, dns, engines, example, extended_precision_data_types, kafka, key_value, lightweight_delete, part_moves_between_shards, rbac, selects, session_timezone, tiered_storage, window_functions]
     needs: [RegressionStart]
     runs-on: [self-hosted, regression-tester, on-demand, type-cax41, image-arm-app-docker-ce]
     env:
@@ -711,6 +712,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
+          ref: ${{ env.REGRESSION_ARM_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -842,6 +844,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
+          ref: ${{ env.REGRESSION_ARM_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -973,6 +976,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
+          ref: ${{ env.REGRESSION_ARM_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -1171,6 +1175,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
+          ref: ${{ env.REGRESSION_ARM_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -1310,6 +1315,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
+          ref: ${{ env.REGRESSION_ARM_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
