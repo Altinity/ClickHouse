@@ -10,7 +10,7 @@ RUN wget https://github.com/sqlancer/sqlancer/archive/master.zip -O /sqlancer.zi
 RUN mkdir /sqlancer && \
 	cd /sqlancer && \
 	unzip /sqlancer.zip
-RUN cd /sqlancer/sqlancer-master && mvn package -DskipTests
+RUN cd /sqlancer/sqlancer-main && mvn package -DskipTests
 
 COPY run.sh /
 COPY process_sqlancer_result.py /

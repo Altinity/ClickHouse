@@ -152,7 +152,7 @@ if [[ -n "$USE_DATABASE_REPLICATED" ]] && [[ "$USE_DATABASE_REPLICATED" -eq 1 ]]
     sudo clickhouse stop --pid-path /var/run/clickhouse-server2 ||:
 fi
 
-grep -Fa "Fatal" /var/log/clickhouse-server/clickhouse-server.log ||:
+rg -Fa "<Fatal>" /var/log/clickhouse-server/clickhouse-server.log ||:
 
 pigz < /var/log/clickhouse-server/clickhouse-server.log > /test_output/clickhouse-server.log.gz ||:
 # FIXME: remove once only github actions will be left
