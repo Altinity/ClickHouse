@@ -894,8 +894,7 @@ jobs:
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
           REPORTS_PATH=${{runner.temp}}/reports_dir
-          SUITE=clickhouse_keeper_ssl_fips
-          STORAGE=/${{ matrix.STORAGE }}
+          SUITE=clickhouse_keeper
           artifacts=builds
           EOF
       - name: Download json reports
@@ -924,7 +923,7 @@ jobs:
       - uses: actions/upload-artifact@v3
         if: always()
         with:
-          name: ${{ env.SUITE }}-artifacts
+          name: ${{ env.SUITE }}-ssl-artifacts
           path: |
             ./report.html
             ./*.log.txt
