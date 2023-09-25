@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import time
+from shutil import rmtree
 
 from ci_config import CI_CONFIG, BuildConfig
 from commit_status_helper import (
@@ -18,12 +19,14 @@ from commit_status_helper import (
 )
 from docker_pull_helper import get_image_with_version
 from env_helper import (
+    CACHES_PATH,
     GITHUB_JOB,
     IMAGES_PATH,
     REPO_COPY,
     S3_BUILDS_BUCKET,
     S3_DOWNLOAD,
     TEMP_PATH,
+    CLICKHOUSE_STABLE_VERSION_SUFFIX,
 )
 from get_robot_token import get_best_robot_token
 from git_helper import Git, git_runner
@@ -33,9 +36,11 @@ from s3_helper import S3Helper
 from tee_popen import TeePopen
 from version_helper import (
     ClickHouseVersion,
+    Git,
     get_version_from_repo,
     update_version_local,
 )
+from ccache_utils import get_ccache_if_not_exists, upload_ccache
 from clickhouse_helper import (
     ClickHouseHelper,
     prepare_tests_results_for_clickhouse,
@@ -43,7 +48,8 @@ from clickhouse_helper import (
 )
 from stopwatch import Stopwatch
 
-IMAGE_NAME = "clickhouse/binary-builder"
+
+IMAGE_NAME = "altinityinfra/binary-builder"
 BUILD_LOG_NAME = "build_log.log"
 
 
@@ -63,6 +69,7 @@ def get_packager_cmd(
     output_path: Path,
     build_version: str,
     image_version: str,
+    ccache_path: str,
     official: bool,
 ) -> str:
     package_type = build_config["package_type"]
@@ -80,7 +87,9 @@ def get_packager_cmd(
     if build_config["tidy"] == "enable":
         cmd += " --clang-tidy"
 
-    cmd += " --cache=sccache"
+    # NOTE(vnemkov): we are going to continue to use ccache for now
+    cmd += " --cache=ccache"
+    cmd += f" --ccache-dir={ccache_path}"
     cmd += " --s3-rw-access"
     cmd += f" --s3-bucket={S3_BUILDS_BUCKET}"
 
@@ -311,23 +320,45 @@ def main():
 
     logging.info("Got version from repo %s", version.string)
 
-    official_flag = pr_info.number == 0
     if "official" in build_config:
         official_flag = build_config["official"]
 
-    version_type = "testing"
-    if "release" in pr_info.labels or "release-lts" in pr_info.labels:
-        version_type = "stable"
-        official_flag = True
+    official_flag = True
+    version._flavour = version_type = CLICKHOUSE_STABLE_VERSION_SUFFIX
+    # TODO (vnemkov): right now we'll use simplified version management:
+    # only update git hash and explicitly set stable version suffix.
+    # official_flag = pr_info.number == 0
+    # version_type = "testing"
+    # if "release" in pr_info.labels or "release-lts" in pr_info.labels:
+    #     version_type = CLICKHOUSE_STABLE_VERSION_SUFFIX
+    #     official_flag = True
 
     update_version_local(version, version_type)
 
-    logging.info("Updated local files with version")
+    logging.info(f"Updated local files with version : {version.string} / {version.describe}")
 
     logging.info("Build short name %s", build_name)
 
     build_output_path = temp_path / build_name
     os.makedirs(build_output_path, exist_ok=True)
+
+    # NOTE(vnemkov): since we still want to use CCACHE over SCCACHE, unlike upstream,
+    # we need to create local directory for that, just as with 22.8
+    ccache_path = os.path.join(CACHES_PATH, build_name + "_ccache")
+
+    logging.info("Will try to fetch cache for our build")
+    try:
+        get_ccache_if_not_exists(
+            ccache_path, s3_helper, pr_info.number, TEMP_PATH, pr_info.release_pr
+        )
+    except Exception as e:
+        # In case there are issues with ccache, remove the path and do not fail a build
+        logging.info("Failed to get ccache, building without it. Error: %s", e)
+        rmtree(ccache_path, ignore_errors=True)
+
+    if not os.path.exists(ccache_path):
+        logging.info("cache was not fetched, will create empty dir")
+        os.makedirs(ccache_path)
 
     packager_cmd = get_packager_cmd(
         build_config,
@@ -335,6 +366,7 @@ def main():
         build_output_path,
         version.string,
         image_version,
+        ccache_path,
         official_flag,
     )
 
@@ -349,6 +381,7 @@ def main():
     subprocess.check_call(
         f"sudo chown -R ubuntu:ubuntu {build_output_path}", shell=True
     )
+    subprocess.check_call(f"sudo chown -R ubuntu:ubuntu {ccache_path}", shell=True)
     logging.info("Build finished with %s, log path %s", success, log_path)
     if not success:
         # We check if docker works, because if it's down, it's infrastructure
@@ -359,6 +392,10 @@ def main():
                 "The dockerd looks down, won't upload anything and generate report"
             )
             sys.exit(1)
+
+    # Upload the ccache first to have the least build time in case of problems
+    logging.info("Will upload cache")
+    upload_ccache(ccache_path, s3_helper, pr_info.number, TEMP_PATH)
 
     # FIXME performance
     performance_urls = []
@@ -396,83 +433,96 @@ def main():
 
     print(f"::notice ::Log URL: {log_url}")
 
+    //TODO(vnemkov): make use of Path instead of string concatenation
+    src_path = os.path.join(TEMP_PATH, "build_source.src.tar.gz")
+
+    if os.path.exists(src_path):
+        src_url = s3_helper.upload_build_file_to_s3(
+            src_path, s3_path_prefix + "/clickhouse-" + version.string + ".src.tar.gz"
+        )
+        logging.info("Source tar %s", src_url)
+    else:
+        logging.info("Source tar doesn't exist")
+
+    print(f"::notice ::Source tar URL: {src_url}")
+    
     create_json_artifact(
         TEMP_PATH, build_name, log_url, build_urls, build_config, elapsed, success
     )
 
     upload_master_static_binaries(pr_info, build_config, s3_helper, build_output_path)
 
-    # Upload profile data
-    ch_helper = ClickHouseHelper()
-
-    clickhouse_ci_logs_host = os.getenv("CLICKHOUSE_CI_LOGS_HOST", "")
-    if clickhouse_ci_logs_host:
-        instance_type = get_instance_type()
-        query = f"""INSERT INTO build_time_trace
-(
-    pull_request_number,
-    commit_sha,
-    check_start_time,
-    check_name,
-    instance_type,
-    file,
-    library,
-    time,
-    pid,
-    tid,
-    ph,
-    ts,
-    dur,
-    cat,
-    name,
-    detail,
-    count,
-    avgMs,
-    args_name
-)
-SELECT {pr_info.number}, '{pr_info.sha}', '{stopwatch.start_time_str}', '{build_name}', '{instance_type}', *
-FROM input('
-    file String,
-    library String,
-    time DateTime64(6),
-    pid UInt32,
-    tid UInt32,
-    ph String,
-    ts UInt64,
-    dur UInt64,
-    cat String,
-    name String,
-    detail String,
-    count UInt64,
-    avgMs UInt64,
-    args_name String')
-FORMAT JSONCompactEachRow"""
-
-        auth = {
-            "X-ClickHouse-User": "ci",
-            "X-ClickHouse-Key": os.getenv("CLICKHOUSE_CI_LOGS_PASSWORD", ""),
-        }
-        url = f"https://{clickhouse_ci_logs_host}/"
-        profiles_dir = temp_path / "profiles_source"
-        os.makedirs(profiles_dir, exist_ok=True)
-        logging.info("Processing profile JSON files from {GIT_REPO_ROOT}/build_docker")
-        git_runner(
-            "./utils/prepare-time-trace/prepare-time-trace.sh "
-            f"build_docker {profiles_dir.absolute()}"
-        )
-        profile_data_file = temp_path / "profile.json"
-        with open(profile_data_file, "wb") as profile_fd:
-            for profile_sourse in os.listdir(profiles_dir):
-                with open(profiles_dir / profile_sourse, "rb") as ps_fd:
-                    profile_fd.write(ps_fd.read())
-
-        logging.info(
-            "::notice ::Log Uploading profile data, path: %s, size: %s, query: %s",
-            profile_data_file,
-            profile_data_file.stat().st_size,
-            query,
-        )
-        ch_helper.insert_file(url, auth, query, profile_data_file)
+#    # Upload profile data
+#    ch_helper = ClickHouseHelper()
+#
+#    clickhouse_ci_logs_host = os.getenv("CLICKHOUSE_CI_LOGS_HOST", "")
+#    if clickhouse_ci_logs_host:
+#        instance_type = get_instance_type()
+#        query = f"""INSERT INTO build_time_trace
+#(
+#    pull_request_number,
+#    commit_sha,
+#    check_start_time,
+#    check_name,
+#    instance_type,
+#    file,
+#    library,
+#    time,
+#    pid,
+#    tid,
+#    ph,
+#    ts,
+#    dur,
+#    cat,
+#    name,
+#    detail,
+#    count,
+#    avgMs,
+#    args_name
+#)
+#SELECT {pr_info.number}, '{pr_info.sha}', '{stopwatch.start_time_str}', '{build_name}', '{instance_type}', *
+#FROM input('
+#    file String,
+#    library String,
+#    time DateTime64(6),
+#    pid UInt32,
+#    tid UInt32,
+#    ph String,
+#    ts UInt64,
+#    dur UInt64,
+#    cat String,
+#    name String,
+#    detail String,
+#    count UInt64,
+#    avgMs UInt64,
+#    args_name String')
+#FORMAT JSONCompactEachRow"""
+#
+#        auth = {
+#            "X-ClickHouse-User": "ci",
+#            "X-ClickHouse-Key": os.getenv("CLICKHOUSE_CI_LOGS_PASSWORD", ""),
+#        }
+#        url = f"https://{clickhouse_ci_logs_host}/"
+#        profiles_dir = temp_path / "profiles_source"
+#        os.makedirs(profiles_dir, exist_ok=True)
+#        logging.info("Processing profile JSON files from {GIT_REPO_ROOT}/build_docker")
+#        git_runner(
+#            "./utils/prepare-time-trace/prepare-time-trace.sh "
+#            f"build_docker {profiles_dir.absolute()}"
+#        )
+#        profile_data_file = temp_path / "profile.json"
+#        with open(profile_data_file, "wb") as profile_fd:
+#            for profile_sourse in os.listdir(profiles_dir):
+#                with open(profiles_dir / profile_sourse, "rb") as ps_fd:
+#                    profile_fd.write(ps_fd.read())
+#
+#        logging.info(
+#            "::notice ::Log Uploading profile data, path: %s, size: %s, query: %s",
+#            profile_data_file,
+#            profile_data_file.stat().st_size,
+#            query,
+#        )
+#        ch_helper.insert_file(url, auth, query, profile_data_file)
 
     # Upload statistics to CI database
     prepared_events = prepare_tests_results_for_clickhouse(
@@ -484,7 +534,7 @@ FORMAT JSONCompactEachRow"""
         log_url,
         f"Build ({build_name})",
     )
-    ch_helper.insert_events_into(db="default", table="checks", events=prepared_events)
+    ch_helper.insert_events_into(db="gh-data", table="checks", events=prepared_events)
 
     # Fail the build job if it didn't succeed
     if not success:

@@ -5,12 +5,12 @@ import time
 import sys
 import os
 import shutil
+from env_helper import S3_BUILDS_BUCKET
 from pathlib import Path
 
 import requests  # type: ignore
 
 from compress_files import decompress_fast, compress_fast
-from env_helper import S3_DOWNLOAD, S3_BUILDS_BUCKET
 from s3_helper import S3Helper
 
 DOWNLOAD_RETRIES_COUNT = 5
