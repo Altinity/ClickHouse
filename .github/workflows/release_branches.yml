@@ -173,7 +173,6 @@ jobs:
   BuilderDebAarch64:
     needs: [DockerHubPush]
     runs-on: [self-hosted, builder, on-demand, type-cax41, image-arm-app-docker-ce]
-    timeout-minutes: 180
     steps:
       - name: Set envs
         run: |
