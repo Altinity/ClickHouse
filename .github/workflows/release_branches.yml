@@ -892,7 +892,7 @@ jobs:
       - uses: actions/upload-artifact@v3
         if: always()
         with:
-          name: benchmark-${{ env.STORAGE }}-amd64-artifacts
+          name: benchmark-${{ matrix.STORAGE }}-amd64-artifacts
           path: |
             ./report.html
             ./*.log.txt
@@ -963,7 +963,7 @@ jobs:
       - uses: actions/upload-artifact@v3
         if: always()
         with:
-          name: benchmark-${{ env.STORAGE }}-aarch64-artifacts
+          name: benchmark-${{ matrix.STORAGE }}-aarch64-artifacts
           path: |
             ./report.html
             ./*.log.txt
@@ -1024,7 +1024,7 @@ jobs:
       - uses: actions/upload-artifact@v3
         if: always()
         with:
-          name: ldap-${{ env.SUITE }}-amd64-artifacts
+          name: ldap-${{ matrix.SUITE }}-amd64-artifacts
           path: |
             ./report.html
             ./*.log.txt
@@ -1086,7 +1086,7 @@ jobs:
       - uses: actions/upload-artifact@v3
         if: always()
         with:
-          name: ldap-${{ env.SUITE }}-aarch64-artifacts
+          name: ldap-${{ matrix.SUITE }}-aarch64-artifacts
           path: |
             ./report.html
             ./*.log.txt
