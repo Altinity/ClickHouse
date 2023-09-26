@@ -17,8 +17,26 @@ namespace ErrorCodes
 
 namespace
 {
-    std::shared_ptr<ProxyConfigurationResolver> getRemoteResolver(
-        const String & config_prefix, const Poco::Util::AbstractConfiguration & configuration)
+    using ConnectProtocolPolicy = ProxyConfigurationResolver::ConnectProtocolPolicy;
+
+    ConnectProtocolPolicy getConnectProtocolPolicy(
+        const Poco::Util::AbstractConfiguration & configuration
+    )
+    {
+        static constexpr auto use_connect_protocol_config_key = "proxy.use_connect_protocol";
+        if (configuration.has(use_connect_protocol_config_key))
+        {
+            return configuration.getBool(use_connect_protocol_config_key) ? ConnectProtocolPolicy::FORCE_ON
+                                                                          : ConnectProtocolPolicy::FORCE_OFF;
+        }
+
+        return ConnectProtocolPolicy::DEFAULT;
+    }
+
+    std::shared_ptr<ProxyConfigurationResolver> extractRemoteResolver(
+        ProxyConfiguration::Protocol request_protocol,
+        const String & config_prefix, const Poco::Util::AbstractConfiguration & configuration
+    )
     {
         auto resolver_prefix = config_prefix + ".resolver";
         auto endpoint = Poco::URI(configuration.getString(resolver_prefix + ".endpoint"));
@@ -31,7 +49,40 @@ namespace
         LOG_DEBUG(&Poco::Logger::get("ProxyConfigurationResolverProvider"), "Configured remote proxy resolver: {}, Scheme: {}, Port: {}",
                   endpoint.toString(), proxy_scheme, proxy_port);
 
-        return std::make_shared<RemoteProxyConfigurationResolver>(endpoint, proxy_scheme, proxy_port, cache_ttl);
+        auto server_configuration = RemoteProxyConfigurationResolver::RemoteServerConfiguration {
+            endpoint,
+            proxy_scheme,
+            proxy_port,
+            cache_ttl
+        };
+
+        return std::make_shared<RemoteProxyConfigurationResolver>(server_configuration, request_protocol, getConnectProtocolPolicy(configuration));
+    }
+
+    std::shared_ptr<ProxyConfigurationResolver> getRemoteResolver(
+        ProxyConfiguration::Protocol protocol, const String & config_prefix,
+        const Poco::Util::AbstractConfiguration & configuration)
+    {
+        std::vector<String> keys;
+        configuration.keys(config_prefix, keys);
+
+        std::vector<Poco::URI> uris;
+        for (const auto & key : keys)
+        {
+            if (startsWith(key, "resolver"))
+            {
+                auto prefix_with_key = config_prefix + "." + key;
+                auto proxy_scheme_config_string = prefix_with_key + ".proxy_scheme";
+                auto config_protocol = configuration.getString(proxy_scheme_config_string);
+
+                if (ProxyConfiguration::Protocol::ANY == protocol || config_protocol == ProxyConfiguration::protocolToString(protocol))
+                {
+                    return extractRemoteResolver(protocol, prefix_with_key, configuration);
+                }
+            }
+        }
+
+        return nullptr;
     }
 
     auto extractURIList(const String & config_prefix, const Poco::Util::AbstractConfiguration & configuration)
@@ -60,32 +111,46 @@ namespace
         return uris;
     }
 
-    std::shared_ptr<ProxyConfigurationResolver> getListResolver(
+    std::shared_ptr<ProxyConfigurationResolver> getListResolverNewSyntax(
+        ProxyConfiguration::Protocol request_protocol,
+        const String & config_prefix,
+        const Poco::Util::AbstractConfiguration & configuration
+    )
+    {
+        std::vector<Poco::URI> uris;
+
+        bool include_http_uris = ProxyConfiguration::Protocol::ANY == request_protocol || ProxyConfiguration::Protocol::HTTP == request_protocol;
+
+        if (include_http_uris && configuration.has(config_prefix + ".http"))
+        {
+            auto http_uris = extractURIList(config_prefix + ".http", configuration);
+            uris.insert(uris.end(), http_uris.begin(), http_uris.end());
+        }
+
+        bool include_https_uris = ProxyConfiguration::Protocol::ANY == request_protocol || ProxyConfiguration::Protocol::HTTPS == request_protocol;
+
+        if (include_https_uris && configuration.has(config_prefix + ".https"))
+        {
+            auto https_uris = extractURIList(config_prefix + ".https", configuration);
+            uris.insert(uris.end(), https_uris.begin(), https_uris.end());
+        }
+
+        return uris.empty() ? nullptr : std::make_shared<ProxyListConfigurationResolver>(uris, request_protocol, getConnectProtocolPolicy(configuration));
+    }
+
+    std::shared_ptr<ProxyConfigurationResolver> getListResolverOldSyntax(
         const String & config_prefix,
         const Poco::Util::AbstractConfiguration & configuration
     )
     {
         auto uris = extractURIList(config_prefix, configuration);
 
-        return uris.empty() ? nullptr : std::make_shared<ProxyListConfigurationResolver>(uris);
+        // TODO add comment and actually reason about this
+        return uris.empty() ? nullptr : std::make_shared<ProxyListConfigurationResolver>(uris, ProxyConfiguration::Protocol::ANY, ConnectProtocolPolicy::DEFAULT);
     }
 
-    bool hasRemoteResolver(const String & config_prefix, const Poco::Util::AbstractConfiguration & configuration)
-    {
-        return configuration.has(config_prefix + ".resolver");
-    }
-
-    bool hasListResolver(const String & config_prefix, const Poco::Util::AbstractConfiguration & configuration)
-    {
-        return configuration.has(config_prefix + ".uri");
-    }
-
-    /*
-     * New syntax requires protocol prefix "<http> or <https>"
-     * */
-    std::optional<std::string> getProtocolPrefix(
-        ProxyConfiguration::Protocol request_protocol,
-        const String & config_prefix,
+    std::shared_ptr<ProxyConfigurationResolver> getListResolver(
+        ProxyConfiguration::Protocol protocol, const String & config_prefix,
         const Poco::Util::AbstractConfiguration & configuration
     )
     {
@@ -119,14 +184,17 @@ namespace
     }
 }
 
-std::shared_ptr<ProxyConfigurationResolver> ProxyConfigurationResolverProvider::get(Protocol protocol, const Poco::Util::AbstractConfiguration & configuration)
+std::shared_ptr<ProxyConfigurationResolver> ProxyConfigurationResolverProvider::get(
+    Protocol request_protocol,
+    const Poco::Util::AbstractConfiguration & configuration
+)
 {
-    if (auto resolver = getFromSettings(protocol, "proxy", configuration))
+    if (auto resolver = getFromSettings(request_protocol, "", configuration))
     {
         return resolver;
     }
 
-    return std::make_shared<EnvironmentProxyConfigurationResolver>(protocol);
+    return std::make_shared<EnvironmentProxyConfigurationResolver>(request_protocol, getConnectProtocolPolicy(configuration));
 }
 
 template <bool is_new_syntax>
@@ -143,15 +211,15 @@ std::shared_ptr<ProxyConfigurationResolver> ProxyConfigurationResolverProvider::
         return nullptr;
     }
 
-    auto prefix = *prefix_opt;
+        if (auto remote_resolver = getRemoteResolver(request_protocol, proxy_prefix, configuration))
+        {
+            return remote_resolver;
+        }
 
-    if (hasRemoteResolver(prefix, configuration))
-    {
-        return getRemoteResolver(prefix, configuration);
-    }
-    else if (hasListResolver(prefix, configuration))
-    {
-        return getListResolver(prefix, configuration);
+        if (auto list_resolver = getListResolver(request_protocol, proxy_prefix, configuration))
+        {
+            return list_resolver;
+        }
     }
 
     return nullptr;

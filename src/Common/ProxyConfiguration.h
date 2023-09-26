@@ -48,6 +48,7 @@ struct ProxyConfiguration
     std::string host;
     Protocol protocol;
     uint16_t port;
+    bool use_connect_protocol;
 };
 
 }
