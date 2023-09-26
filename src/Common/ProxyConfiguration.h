@@ -11,7 +11,6 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
 }
 
-
 struct ProxyConfiguration
 {
     enum class Protocol
