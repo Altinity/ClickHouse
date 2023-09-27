@@ -433,7 +433,7 @@ def main():
 
     print(f"::notice ::Log URL: {log_url}")
 
-    //TODO(vnemkov): make use of Path instead of string concatenation
+    # TODO(vnemkov): make use of Path instead of string concatenation
     src_path = os.path.join(TEMP_PATH, "build_source.src.tar.gz")
 
     if os.path.exists(src_path):
@@ -445,15 +445,15 @@ def main():
         logging.info("Source tar doesn't exist")
 
     print(f"::notice ::Source tar URL: {src_url}")
-    
+
     create_json_artifact(
         TEMP_PATH, build_name, log_url, build_urls, build_config, elapsed, success
     )
 
     upload_master_static_binaries(pr_info, build_config, s3_helper, build_output_path)
 
-#    # Upload profile data
-#    ch_helper = ClickHouseHelper()
+    # Upload profile data
+    ch_helper = ClickHouseHelper()
 #
 #    clickhouse_ci_logs_host = os.getenv("CLICKHOUSE_CI_LOGS_HOST", "")
 #    if clickhouse_ci_logs_host:
