@@ -159,7 +159,8 @@ CI_CONFIG = {
     },
     "builds_report_config": {
         "ClickHouse build check": [
-            "package_release"
+            "package_release",
+            "package_aarch64"
         ],
         "ClickHouse special build check": [
             "binary_tidy",
