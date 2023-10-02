@@ -9,7 +9,7 @@ env:
   DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
   DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
   REGRESSION_RESULTS_URL: altinity-build-artifacts/${{github.event.number}}/$GITHUB_SHA
-  REGRESSION_ARM_COMMIT: e948952d4910b4bc9d95ddedc439903a0f795778
+  REGRESSION_ARM_COMMIT: a3d16d9859e2d963aea1f5ccb09370f9b1a21ec7
 
 
 on: # yamllint disable-line rule:truthy
@@ -715,7 +715,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, datetime64_extended_range, disk_level_encryption, dns, example, extended_precision_data_types, kafka, kerberos, lightweight_delete, data_types, part_moves_between_shards, rbac, selects, ssl_server, tiered_storage, window_functions]
+        SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, data_types, datetime64_extended_range, disk_level_encryption, dns, example, extended_precision_data_types, kafka, kerberos, key_value, lightweight_delete, part_moves_between_shards, rbac, selects, session_timezone, ssl_server, tiered_storage, window_functions]
     needs: [RegressionStart]
     runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
     timeout-minutes: 180
@@ -777,7 +777,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        SUITE: [aes_encryption, atomic_insert, base_58, datetime64_extended_range, data_types, disk_level_encryption, dns, engines, example, extended_precision_data_types, kafka, key_value, lightweight_delete, part_moves_between_shards, rbac, selects, session_timezone, tiered_storage, window_functions]
+        SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, data_types, datetime64_extended_range, disk_level_encryption, dns, engines, example, extended_precision_data_types, kafka, key_value, lightweight_delete, part_moves_between_shards, rbac, selects, session_timezone, ssl_server, tiered_storage, window_functions]
     needs: [RegressionStart]
     runs-on: [self-hosted, regression-tester, on-demand, type-cax41, image-arm-app-docker-ce]
     timeout-minutes: 180
