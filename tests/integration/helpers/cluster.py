@@ -1571,6 +1571,7 @@ class ClickHouseCluster:
         hostname=None,
         env_variables=None,
         image="altinityinfra/integration-test",
+        exclusive_env_variables=False,
         tag=None,
         stay_alive=False,
         ipv4_address=None,
@@ -1612,7 +1613,6 @@ class ClickHouseCluster:
             tag = self.docker_base_tag
         if not env_variables:
             env_variables = {}
-
         self.use_keeper = use_keeper
 
         # Code coverage files will be placed in database directory
@@ -1626,7 +1626,6 @@ class ClickHouseCluster:
             clickhouse_start_command += " --log-file=" + clickhouse_log_file
         if clickhouse_error_log_file:
             clickhouse_start_command += " --errorlog-file=" + clickhouse_error_log_file
-        logging.debug(f"clickhouse_start_command: {clickhouse_start_command}")
 
         instance = ClickHouseInstance(
             cluster=self,
@@ -1681,6 +1680,7 @@ class ClickHouseCluster:
             copy_common_configs=copy_common_configs,
             hostname=hostname,
             env_variables=env_variables,
+            exclusive_env_variables=exclusive_env_variables,
             image=image,
             tag=tag,
             stay_alive=stay_alive,
@@ -3259,6 +3259,7 @@ class ClickHouseInstance:
         hostname=None,
         env_variables=None,
         image="altinityinfra/integration-test",
+        exclusive_env_variables=False,
         tag="latest",
         stay_alive=False,
         ipv4_address=None,
@@ -3348,6 +3349,7 @@ class ClickHouseInstance:
         self.path = p.join(self.cluster.instances_dir, name)
         self.docker_compose_path = p.join(self.path, "docker-compose.yml")
         self.env_variables = env_variables or {}
+        self.exclusive_env_variables = exclusive_env_variables
         self.env_file = self.cluster.env_file
         if with_odbc_drivers:
             self.odbc_ini_path = self.path + "/odbc.ini:/etc/odbc.ini"
@@ -4464,7 +4466,10 @@ class ClickHouseInstance:
         if self.with_azurite:
             depends_on.append("azurite1")
 
-        self.cluster.env_variables.update(self.env_variables)
+        if self.exclusive_env_variables is True:
+            self.env_variables.update(self.cluster.env_variables)
+        else:
+            self.cluster.env_variables.update(self.env_variables)
 
         odbc_ini_path = ""
         if self.odbc_ini_path:
@@ -4536,6 +4541,11 @@ class ClickHouseInstance:
                 external_dirs_volumes += (
                     "- " + external_dir_abs_path + ":" + external_dir + "\n"
                 )
+
+        # 
+        if self.exclusive_env_variables:
+            self.env_file = p.abspath(p.join(self.path, ".env"))
+            _create_env_file(self.env_file, self.env_variables)
 
         with open(self.docker_compose_path, "w") as docker_compose:
             docker_compose.write(
