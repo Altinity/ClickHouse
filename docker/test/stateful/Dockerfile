@@ -1,7 +1,8 @@
 # rebuild in #47031
 # docker build -t clickhouse/stateful-test .
 ARG FROM_TAG=latest
-FROM clickhouse/stateless-test:$FROM_TAG
+# TODO consider replacing clickhouse with altinityinfra dockerhub account
+FROM altinityinfra/stateless-test:$FROM_TAG
 
 RUN apt-get update -y \
     && env DEBIAN_FRONTEND=noninteractive \
@@ -9,6 +10,8 @@ RUN apt-get update -y \
         python3-requests \
         nodejs \
         npm \
+        rpm2cpio \
+        cpio \
     && apt-get clean
 
 COPY s3downloader /s3downloader

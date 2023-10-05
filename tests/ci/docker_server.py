@@ -34,7 +34,11 @@ from version_helper import (
 )
 
 TEMP_PATH = p.join(RUNNER_TEMP, "docker_images_check")
-BUCKETS = {"amd64": "package_release", "arm64": "package_aarch64"}
+BUCKETS = {
+    "amd64": "package_release",
+    # NOTE(vnemkov): arm64 is temporary not supported
+    # "arm64": "package_aarch64"
+}
 git = Git(ignore_no_tags=True)
 
 
@@ -56,7 +60,7 @@ def parse_args() -> argparse.Namespace:
         "--version",
         type=version_arg,
         default=get_version_from_repo(git=git).string,
-        help="a version to build, automaticaly got from version_helper, accepts either "
+        help="a version to build, automatically got from version_helper, accepts either "
         "tag ('refs/tags/' is removed automatically) or a normal 22.2.2.2 format",
     )
     parser.add_argument(
@@ -77,7 +81,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--image-repo",
         type=str,
-        default="clickhouse/clickhouse-server",
+        default="altinityinfra/clickhouse-server",
         help="image name on docker hub",
     )
     parser.add_argument(
@@ -337,8 +341,8 @@ def main():
 
     if args.push:
         subprocess.check_output(  # pylint: disable=unexpected-keyword-arg
-            "docker login --username 'robotclickhouse' --password-stdin",
-            input=get_parameter_from_ssm("dockerhub_robot_password"),
+            "docker login --username 'altinityinfra' --password-stdin",
+            input=get_parameter_from_ssm("dockerhub-password"),
             encoding="utf-8",
             shell=True,
         )
@@ -385,7 +389,7 @@ def main():
         NAME,
     )
     ch_helper = ClickHouseHelper()
-    ch_helper.insert_events_into(db="default", table="checks", events=prepared_events)
+    ch_helper.insert_events_into(db="gh-data", table="checks", events=prepared_events)
     if status != "success":
         sys.exit(1)
 
