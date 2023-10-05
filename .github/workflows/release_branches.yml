@@ -28,37 +28,6 @@ on: # yamllint disable-line rule:truthy
 
 jobs:
   app:
-    # strategy:
-    #   fail-fast: false
-    #   matrix:
-    #     animal: [cat, dog, big_cat]
-    #     arch: [arm, x86]
-    #     include:
-    #       - arch: arm
-    #         server: cax41
-    #       - arch: x86
-    #         server: cx41
-    # runs-on: [self-hosted, on-demand, 'type-${{ matrix.server }}', 'image-${{ matrix.arch }}-app-docker-ce']
-    runs-on: [self-hosted, on-demand, 'type-cx41', 'image-x86-app-docker-ce']
-    steps:
-      # - name: Clear repository
-      #   shell: bash
-      #   run: |
-      #     sudo rm -fr "$GITHUB_WORKSPACE" && mkdir "$GITHUB_WORKSPACE"
-      # - name: Check out repository code
-      #   uses: actions/checkout@v3
-      #   with:
-      #     fetch-depth: 0
-      #     token: ${{ github.token }}
-      # - uses: ./.github/actions/checkout
-      #   with:
-      #     submodules: true
-      #     fetch-depth: 0
-      - name: Checkout
-        uses: Altinity/checkout@80d804038438bd4e2a85514d5bcb3bfcb21f2511
-        with:
-          clear-repository: true
-      - name: Check arch
-        run: uname -i
-      # - name: Check animal
-      #   run: echo ${{ matrix.animal }}
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx51, image-x86-app-docker-ce]]
+      - name: Docker info
+        run: docker info
