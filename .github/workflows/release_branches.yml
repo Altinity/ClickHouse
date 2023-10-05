@@ -28,6 +28,7 @@ on: # yamllint disable-line rule:truthy
 
 jobs:
   app:
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx51, image-x86-app-docker-ce]]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx51, image-x86-app-docker-ce]
+    steps:
       - name: Docker info
         run: docker info
