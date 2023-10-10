@@ -28,7 +28,15 @@ on: # yamllint disable-line rule:truthy
 
 jobs:
   app:
-    runs-on: [self-hosted, style-checker, on-demand, type-cpx51, image-x86-app-docker-ce]
+    runs-on: [self-hosted, style-checker, on-demand, type-cpx41, image-x86-app-docker-ce]
     steps:
-      - name: Docker info
-        run: docker info
+      - name: ${{github.event.number}}
+        run: echo ${{github.event.number}}
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          PR=${{github.event.number}}
+          EOF
+      - name: env
+        run: echo $PR
+      
