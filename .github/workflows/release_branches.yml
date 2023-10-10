@@ -35,8 +35,8 @@ jobs:
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
-          PR=${${{github.event.number}}:-0}
-          PR_FAIL=${${{github.event.fake_number}}:-0}
+          PR=${{github.event.number:-0}}
+          PR_FAIL=${{github.event.fake_number:-0}}
           EOF
       - name: env
         run: echo $PR
