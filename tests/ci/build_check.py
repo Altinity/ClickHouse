@@ -69,7 +69,7 @@ def get_packager_cmd(
     output_path: Path,
     build_version: str,
     image_version: str,
-    ccache_path: str,
+    sccache_directory: str,
     official: bool,
 ) -> str:
     package_type = build_config["package_type"]
@@ -88,8 +88,8 @@ def get_packager_cmd(
         cmd += " --clang-tidy"
 
     # NOTE(vnemkov): we are going to continue to use ccache for now
-    cmd += " --cache=ccache"
-    cmd += f" --ccache-dir={ccache_path}"
+    cmd += " --cache=sccache"
+    cmd += f" --s3-directory={sccache_directory}"
     cmd += " --s3-rw-access"
     cmd += f" --s3-bucket={S3_BUILDS_BUCKET}"
 
@@ -345,20 +345,22 @@ def main():
     # NOTE(vnemkov): since we still want to use CCACHE over SCCACHE, unlike upstream,
     # we need to create local directory for that, just as with 22.8
     ccache_path = os.path.join(CACHES_PATH, build_name + "_ccache")
+    sccache_directory = pr_info.number
 
-    logging.info("Will try to fetch cache for our build")
-    try:
-        get_ccache_if_not_exists(
-            ccache_path, s3_helper, pr_info.number, TEMP_PATH, pr_info.release_pr
-        )
-    except Exception as e:
-        # In case there are issues with ccache, remove the path and do not fail a build
-        logging.info("Failed to get ccache, building without it. Error: %s", e)
-        rmtree(ccache_path, ignore_errors=True)
+    # Remove for sccache
+    # logging.info("Will try to fetch cache for our build")
+    # try:
+    #     get_ccache_if_not_exists(
+    #         ccache_path, s3_helper, pr_info.number, TEMP_PATH, pr_info.release_pr
+    #     )
+    # except Exception as e:
+    #     # In case there are issues with ccache, remove the path and do not fail a build
+    #     logging.info("Failed to get ccache, building without it. Error: %s", e)
+    #     rmtree(ccache_path, ignore_errors=True)
 
-    if not os.path.exists(ccache_path):
-        logging.info("cache was not fetched, will create empty dir")
-        os.makedirs(ccache_path)
+    # if not os.path.exists(ccache_path):
+    #     logging.info("cache was not fetched, will create empty dir")
+    #     os.makedirs(ccache_path)
 
     packager_cmd = get_packager_cmd(
         build_config,
@@ -366,7 +368,7 @@ def main():
         build_output_path,
         version.string,
         image_version,
-        ccache_path,
+        sccache_directory,
         official_flag,
     )
 
@@ -394,8 +396,9 @@ def main():
             sys.exit(1)
 
     # Upload the ccache first to have the least build time in case of problems
-    logging.info("Will upload cache")
-    upload_ccache(ccache_path, s3_helper, pr_info.number, TEMP_PATH)
+    # Disabling ccache upload
+    # logging.info("Will upload cache")
+    # upload_ccache(ccache_path, s3_helper, pr_info.number, TEMP_PATH)
 
     # FIXME performance
     performance_urls = []
