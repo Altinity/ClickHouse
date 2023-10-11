@@ -126,7 +126,7 @@ jobs:
 #########################################################################################
   BuilderDebRelease:
     needs: [DockerHubPush]
-    runs-on: [self-hosted, builder, on-demand, type-cpx51, image-x86-app-docker-ce]
+    runs-on: [self-hosted, builder, on-demand, type-ccx53, image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -173,7 +173,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH" "$CACHES_PATH"
   BuilderDebAarch64:
     needs: [DockerHubPush]
-    runs-on: [self-hosted, builder, on-demand, type-cax41, image-arm-app-docker-ce]
+    runs-on: [self-hosted, builder, on-demand, type-ccx53, image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
