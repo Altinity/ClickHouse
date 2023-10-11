@@ -348,7 +348,7 @@ def main():
 
     # NOTE(vnemkov): since we still want to use CCACHE over SCCACHE, unlike upstream,
     # we need to create local directory for that, just as with 22.8
-    ccache_path = os.path.join(CACHES_PATH, build_name + "_ccache")
+    # ccache_path = os.path.join(CACHES_PATH, build_name + "_ccache")
     sccache_directory = "ccache"
 
     # Remove for sccache
