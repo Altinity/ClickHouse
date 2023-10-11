@@ -23,8 +23,10 @@ from env_helper import (
     GITHUB_JOB,
     IMAGES_PATH,
     REPO_COPY,
+    S3_ACCESS_KEY_ID,
     S3_BUILDS_BUCKET,
     S3_DOWNLOAD,
+    S3_SECRET_ACCESS_KEY,
     TEMP_PATH,
     CLICKHOUSE_STABLE_VERSION_SUFFIX,
 )
@@ -92,6 +94,8 @@ def get_packager_cmd(
     cmd += f" --s3-directory={sccache_directory}"
     cmd += " --s3-rw-access"
     cmd += f" --s3-bucket={S3_BUILDS_BUCKET}"
+    cmd += f" --s3-access-key-id={S3_ACCESS_KEY_ID}"
+    cmd += f" --s3-secret-access-key={S3_SECRET_ACCESS_KEY}"
 
     if "additional_pkgs" in build_config and build_config["additional_pkgs"]:
         cmd += " --additional-pkgs"
@@ -345,7 +349,7 @@ def main():
     # NOTE(vnemkov): since we still want to use CCACHE over SCCACHE, unlike upstream,
     # we need to create local directory for that, just as with 22.8
     ccache_path = os.path.join(CACHES_PATH, build_name + "_ccache")
-    sccache_directory = pr_info.number
+    sccache_directory = "ccache"
 
     # Remove for sccache
     # logging.info("Will try to fetch cache for our build")
