@@ -466,95 +466,6 @@ jobs:
           docker ps --quiet | xargs --no-run-if-empty docker kill ||:
           docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
           sudo rm -fr "$TEMP_PATH" "$CACHES_PATH"
-  BuilderBinDarwin:
-    needs: [DockerHubPush]
-    runs-on: [self-hosted, builder, on-demand, type-ccx53, image-x86-app-docker-ce]
-    steps:
-      - name: Set envs
-        run: |
-          cat >> "$GITHUB_ENV" << 'EOF'
-          TEMP_PATH=${{runner.temp}}/build_check
-          IMAGES_PATH=${{runner.temp}}/images_path
-          REPO_COPY=${{runner.temp}}/build_check/ClickHouse
-          CACHES_PATH=${{runner.temp}}/../ccaches
-          BUILD_NAME=binary_darwin
-          CLICKHOUSE_STABLE_VERSION_SUFFIX=altinityst
-          able
-          EOF
-      - name: Download changed images
-        uses: actions/download-artifact@v3
-        with:
-          name: changed_images
-          path: ${{ runner.temp }}/images_path
-      - name: Trust My Directory
-        run: git config --global --add safe.directory * # https://stackoverflow.com/a/71940133
-      - name: Check out repository code
-        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
-        with:
-          clear-repository: true
-          submodules: true
-          fetch-depth: 0 # otherwise we will have no info about contributors
-      - name: Build
-        run: |
-          sudo rm -fr "$TEMP_PATH"
-          mkdir -p "$TEMP_PATH"
-          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
-          cd "$REPO_COPY/tests/ci" && python3 build_check.py "$BUILD_NAME"
-      - name: Upload build URLs to artifacts
-        uses: actions/upload-artifact@v3
-        with:
-          name: ${{ env.BUILD_URLS }}
-          path: ${{ runner.temp }}/build_check/${{ env.BUILD_URLS }}.json
-      - name: Cleanup
-        if: always()
-        run: |
-          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
-          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
-          sudo rm -fr "$TEMP_PATH" "$CACHES_PATH"
-  BuilderBinDarwinAarch64:
-    needs: [DockerHubPush]
-    runs-on: [self-hosted, builder, on-demand, type-ccx53, image-x86-app-docker-ce]
-    steps:
-      - name: Set envs
-        run: |
-          cat >> "$GITHUB_ENV" << 'EOF'
-          TEMP_PATH=${{runner.temp}}/build_check
-          IMAGES_PATH=${{runner.temp}}/images_path
-          REPO_COPY=${{runner.temp}}/build_check/ClickHouse
-          CACHES_PATH=${{runner.temp}}/../ccaches
-          BUILD_NAME=binary_darwin_aarch64
-          CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
-          EOF
-      - name: Download changed images
-        uses: actions/download-artifact@v3
-        with:
-          name: changed_images
-          path: ${{ runner.temp }}/images_path
-      - name: Trust My Directory
-        run: git config --global --add safe.directory * # https://stackoverflow.com/a/71940133
-      - name: Check out repository code
-        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
-        with:
-          clear-repository: true
-          submodules: true
-          fetch-depth: 0 # otherwise we will have no info about contributors
-      - name: Build
-        run: |
-          sudo rm -fr "$TEMP_PATH"
-          mkdir -p "$TEMP_PATH"
-          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
-          cd "$REPO_COPY/tests/ci" && python3 build_check.py "$BUILD_NAME"
-      - name: Upload build URLs to artifacts
-        uses: actions/upload-artifact@v3
-        with:
-          name: ${{ env.BUILD_URLS }}
-          path: ${{ runner.temp }}/build_check/${{ env.BUILD_URLS }}.json
-      - name: Cleanup
-        if: always()
-        run: |
-          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
-          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
-          sudo rm -fr "$TEMP_PATH" "$CACHES_PATH"
 ############################################################################################
 ##################################### Docker images  #######################################
 ############################################################################################
@@ -631,50 +542,8 @@ jobs:
           docker ps --quiet | xargs --no-run-if-empty docker kill ||:
           docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
           sudo rm -fr "$TEMP_PATH"
-  BuilderSpecialReport:
-    needs:
-      - BuilderBinDarwin
-      - BuilderBinDarwinAarch64
-    runs-on: [self-hosted, build-report, on-demand, type-cpx31, image-x86-app-docker-ce]
-    timeout-minutes: 180
-    if: ${{ success() || failure() }}
-    steps:
-      - name: Set envs
-        run: |
-          cat >> "$GITHUB_ENV" << 'EOF'
-          CHECK_NAME=ClickHouse special build check
-          REPORTS_PATH=${{runner.temp}}/reports_dir
-          REPORTS_PATH=${{runner.temp}}/reports_dir
-          TEMP_PATH=${{runner.temp}}/report_check
-          NEEDS_DATA_PATH=${{runner.temp}}/needs.json
-          EOF
-      - name: Download json reports
-        uses: actions/download-artifact@v3
-        with:
-          path: ${{ env.REPORTS_PATH }}
-      - name: Check out repository code
-        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
-        with:
-          clear-repository: true
-      - name: Report Builder
-        run: |
-          sudo rm -fr "$TEMP_PATH"
-          mkdir -p "$TEMP_PATH"
-          cat > "$NEEDS_DATA_PATH" << 'EOF'
-          ${{ toJSON(needs) }}
-          EOF
-          cd "$GITHUB_WORKSPACE/tests/ci"
-          python3 build_report_check.py "$CHECK_NAME"
-      - name: Cleanup
-        if: always()
-        run: |
-          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
-          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
-          sudo rm -fr "$TEMP_PATH"
   MarkReleaseReady:
     needs:
-      - BuilderBinDarwin
-      - BuilderBinDarwinAarch64
       - BuilderDebRelease
       - BuilderDebAarch64
     runs-on: [self-hosted, build-report, on-demand, type-cpx31, image-x86-app-docker-ce]
@@ -1386,83 +1255,22 @@ jobs:
           docker ps --quiet | xargs --no-run-if-empty docker kill ||:
           docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
           sudo rm -fr "$TEMP_PATH"
-#############################################################################################
-############################# INTEGRATION TESTS #############################################
-#############################################################################################
-  IntegrationTestsRelease0:
-    needs: [BuilderDebRelease]
-    runs-on: [self-hosted, stress-tester, func-tester]
-    steps:
-      - name: Set envs
-        run: |
-          cat >> "$GITHUB_ENV" << 'EOF'
-          TEMP_PATH=${{runner.temp}}/integration_tests_release
-          REPORTS_PATH=${{runner.temp}}/reports_dir
-          CHECK_NAME=Integration tests (release)
-          REPO_COPY=${{runner.temp}}/integration_tests_release/ClickHouse
-          RUN_BY_HASH_NUM=0
-          RUN_BY_HASH_TOTAL=2
-          EOF
-      - name: Download json reports
-        uses: actions/download-artifact@v3
-        with:
-          path: ${{ env.REPORTS_PATH }}
-      - name: Check out repository code
-        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
-        with:
-          clear-repository: true
-      - name: Integration test
-        run: |
-          sudo rm -fr "$TEMP_PATH"
-          mkdir -p "$TEMP_PATH"
-          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
-          cd "$REPO_COPY/tests/ci"
-          python3 integration_test_check.py "$CHECK_NAME"
-      - name: Cleanup
-        if: always()
-        run: |
-          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
-          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
-          sudo rm -fr "$TEMP_PATH"
-  IntegrationTestsRelease1:
-    needs: [BuilderDebRelease]
-    runs-on: [self-hosted, stress-tester, func-tester]
-    steps:
-      - name: Set envs
-        run: |
-          cat >> "$GITHUB_ENV" << 'EOF'
-          TEMP_PATH=${{runner.temp}}/integration_tests_release
-          REPORTS_PATH=${{runner.temp}}/reports_dir
-          CHECK_NAME=Integration tests (release)
-          REPO_COPY=${{runner.temp}}/integration_tests_release/ClickHouse
-          RUN_BY_HASH_NUM=1
-          RUN_BY_HASH_TOTAL=2
-          EOF
-      - name: Download json reports
-        uses: actions/download-artifact@v3
-        with:
-          path: ${{ env.REPORTS_PATH }}
-      - name: Check out repository code
-        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
-        with:
-          clear-repository: true
-      - name: Integration test
-        run: |
-          sudo rm -fr "$TEMP_PATH"
-          mkdir -p "$TEMP_PATH"
-          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
-          cd "$REPO_COPY/tests/ci"
-          python3 integration_test_check.py "$CHECK_NAME"
-      - name: Cleanup
-        if: always()
-        run: |
-          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
-          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
-          sudo rm -fr "$TEMP_PATH"
   FunctionalStatefulTestAsan:
     needs: [BuilderDebAsan]
     runs-on: [self-hosted, func-tester, on-demand, type-cpx51, image-x86-snapshot-docker_ipv6_x86]
     steps:
+      - name: Setup
+        run: |
+          sudo touch /etc/docker/daemon.json
+          sudo chown ubuntu:ubuntu /etc/docker/daemon.json
+          sudo cat <<EOT > /etc/docker/daemon.json
+            {
+               "ipv6": true,
+               "fixed-cidr-v6": "2001:3984:3989::/64"
+            }
+          EOT
+          sudo chown root:root /etc/docker/daemon.json
+          sudo systemctl restart docker
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -1497,6 +1305,18 @@ jobs:
     needs: [BuilderDebTsan]
     runs-on: [self-hosted, func-tester, on-demand, type-cpx51, image-x86-snapshot-docker_ipv6_x86]
     steps:
+      - name: Setup
+        run: |
+          sudo touch /etc/docker/daemon.json
+          sudo chown ubuntu:ubuntu /etc/docker/daemon.json
+          sudo cat <<EOT > /etc/docker/daemon.json
+            {
+               "ipv6": true,
+               "fixed-cidr-v6": "2001:3984:3989::/64"
+            }
+          EOT
+          sudo chown root:root /etc/docker/daemon.json
+          sudo systemctl restart docker
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -1531,6 +1351,18 @@ jobs:
     needs: [BuilderDebMsan]
     runs-on: [self-hosted, func-tester, on-demand, type-cpx51, image-x86-snapshot-docker_ipv6_x86]
     steps:
+      - name: Setup
+        run: |
+          sudo touch /etc/docker/daemon.json
+          sudo chown ubuntu:ubuntu /etc/docker/daemon.json
+          sudo cat <<EOT > /etc/docker/daemon.json
+            {
+               "ipv6": true,
+               "fixed-cidr-v6": "2001:3984:3989::/64"
+            }
+          EOT
+          sudo chown root:root /etc/docker/daemon.json
+          sudo systemctl restart docker
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -1565,6 +1397,18 @@ jobs:
     needs: [BuilderDebUBsan]
     runs-on: [self-hosted, func-tester, on-demand, type-cpx51, image-x86-snapshot-docker_ipv6_x86]
     steps:
+      - name: Setup
+        run: |
+          sudo touch /etc/docker/daemon.json
+          sudo chown ubuntu:ubuntu /etc/docker/daemon.json
+          sudo cat <<EOT > /etc/docker/daemon.json
+            {
+               "ipv6": true,
+               "fixed-cidr-v6": "2001:3984:3989::/64"
+            }
+          EOT
+          sudo chown root:root /etc/docker/daemon.json
+          sudo systemctl restart docker
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -1599,6 +1443,18 @@ jobs:
     needs: [BuilderDebDebug]
     runs-on: [self-hosted, func-tester, on-demand, type-cpx51, image-x86-snapshot-docker_ipv6_x86]
     steps:
+      - name: Setup
+        run: |
+          sudo touch /etc/docker/daemon.json
+          sudo chown ubuntu:ubuntu /etc/docker/daemon.json
+          sudo cat <<EOT > /etc/docker/daemon.json
+            {
+               "ipv6": true,
+               "fixed-cidr-v6": "2001:3984:3989::/64"
+            }
+          EOT
+          sudo chown root:root /etc/docker/daemon.json
+          sudo systemctl restart docker
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
@@ -1623,6 +1479,324 @@ jobs:
           cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
           cd "$REPO_COPY/tests/ci"
           python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
+      - name: Cleanup
+        if: always()
+        run: |
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+          sudo rm -fr "$TEMP_PATH"
+#############################################################################################
+############################# INTEGRATION TESTS #############################################
+#############################################################################################
+  IntegrationTestsAsan0:
+    needs: [BuilderDebAsan]
+    runs-on: [self-hosted, func-tester , on-demand, type-cpx51, image-x86-app-docker-ce]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/integration_tests_asan
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=Integration tests (asan)
+          REPO_COPY=${{runner.temp}}/integration_tests_asan/ClickHouse
+          RUN_BY_HASH_NUM=0
+          RUN_BY_HASH_TOTAL=3
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
+        with:
+          clear-repository: true
+      - name: Integration test
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 integration_test_check.py "$CHECK_NAME"
+      - name: Cleanup
+        if: always()
+        run: |
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+          sudo rm -fr "$TEMP_PATH"
+  IntegrationTestsAsan1:
+    needs: [BuilderDebAsan]
+    runs-on: [self-hosted, func-tester , on-demand, type-cpx51, image-x86-app-docker-ce]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/integration_tests_asan
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=Integration tests (asan)
+          REPO_COPY=${{runner.temp}}/integration_tests_asan/ClickHouse
+          RUN_BY_HASH_NUM=1
+          RUN_BY_HASH_TOTAL=3
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
+        with:
+          clear-repository: true
+      - name: Integration test
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 integration_test_check.py "$CHECK_NAME"
+      - name: Cleanup
+        if: always()
+        run: |
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+          sudo rm -fr "$TEMP_PATH"
+  IntegrationTestsAsan2:
+    needs: [BuilderDebAsan]
+    runs-on: [self-hosted, func-tester , on-demand, type-cpx51, image-x86-app-docker-ce]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/integration_tests_asan
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=Integration tests (asan)
+          REPO_COPY=${{runner.temp}}/integration_tests_asan/ClickHouse
+          RUN_BY_HASH_NUM=2
+          RUN_BY_HASH_TOTAL=3
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
+        with:
+          clear-repository: true
+      - name: Integration test
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 integration_test_check.py "$CHECK_NAME"
+      - name: Cleanup
+        if: always()
+        run: |
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+          sudo rm -fr "$TEMP_PATH"
+  IntegrationTestsTsan0:
+    needs: [BuilderDebTsan]
+    runs-on: [self-hosted, func-tester , on-demand, type-cpx51, image-x86-app-docker-ce]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/integration_tests_tsan
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=Integration tests (tsan)
+          REPO_COPY=${{runner.temp}}/integration_tests_tsan/ClickHouse
+          RUN_BY_HASH_NUM=0
+          RUN_BY_HASH_TOTAL=4
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
+        with:
+          clear-repository: true
+      - name: Integration test
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 integration_test_check.py "$CHECK_NAME"
+      - name: Cleanup
+        if: always()
+        run: |
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+          sudo rm -fr "$TEMP_PATH"
+  IntegrationTestsTsan1:
+    needs: [BuilderDebTsan]
+    runs-on: [self-hosted, func-tester , on-demand, type-cpx51, image-x86-app-docker-ce]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/integration_tests_tsan
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=Integration tests (tsan)
+          REPO_COPY=${{runner.temp}}/integration_tests_tsan/ClickHouse
+          RUN_BY_HASH_NUM=1
+          RUN_BY_HASH_TOTAL=4
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
+        with:
+          clear-repository: true
+      - name: Integration test
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 integration_test_check.py "$CHECK_NAME"
+      - name: Cleanup
+        if: always()
+        run: |
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+          sudo rm -fr "$TEMP_PATH"
+  IntegrationTestsTsan2:
+    needs: [BuilderDebTsan]
+    runs-on: [self-hosted, func-tester , on-demand, type-cpx51, image-x86-app-docker-ce]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/integration_tests_tsan
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=Integration tests (tsan)
+          REPO_COPY=${{runner.temp}}/integration_tests_tsan/ClickHouse
+          RUN_BY_HASH_NUM=2
+          RUN_BY_HASH_TOTAL=4
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
+        with:
+          clear-repository: true
+      - name: Integration test
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 integration_test_check.py "$CHECK_NAME"
+      - name: Cleanup
+        if: always()
+        run: |
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+          sudo rm -fr "$TEMP_PATH"
+  IntegrationTestsTsan3:
+    needs: [BuilderDebTsan]
+    runs-on: [self-hosted, func-tester , on-demand, type-cpx51, image-x86-app-docker-ce]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/integration_tests_tsan
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=Integration tests (tsan)
+          REPO_COPY=${{runner.temp}}/integration_tests_tsan/ClickHouse
+          RUN_BY_HASH_NUM=3
+          RUN_BY_HASH_TOTAL=4
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
+        with:
+          clear-repository: true
+      - name: Integration test
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 integration_test_check.py "$CHECK_NAME"
+      - name: Cleanup
+        if: always()
+        run: |
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+          sudo rm -fr "$TEMP_PATH"
+  IntegrationTestsRelease0:
+    needs: [BuilderDebRelease]
+    runs-on: [self-hosted, func-tester , on-demand, type-cpx51, image-x86-app-docker-ce]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/integration_tests_release
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=Integration tests (release)
+          REPO_COPY=${{runner.temp}}/integration_tests_release/ClickHouse
+          RUN_BY_HASH_NUM=0
+          RUN_BY_HASH_TOTAL=2
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
+        with:
+          clear-repository: true
+      - name: Integration test
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 integration_test_check.py "$CHECK_NAME"
+      - name: Cleanup
+        if: always()
+        run: |
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+          sudo rm -fr "$TEMP_PATH"
+  IntegrationTestsRelease1:
+    needs: [BuilderDebRelease]
+    runs-on: [self-hosted, func-tester , on-demand, type-cpx51, image-x86-app-docker-ce]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/integration_tests_release
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=Integration tests (release)
+          REPO_COPY=${{runner.temp}}/integration_tests_release/ClickHouse
+          RUN_BY_HASH_NUM=1
+          RUN_BY_HASH_TOTAL=2
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
+        with:
+          clear-repository: true
+      - name: Integration test
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 integration_test_check.py "$CHECK_NAME"
       - name: Cleanup
         if: always()
         run: |
@@ -2719,7 +2893,6 @@ jobs:
       - DockerHubPush
       - DockerServerImages
       - BuilderReport
-      - BuilderSpecialReport
       - MarkReleaseReady
       - FunctionalStatelessTestDebug0
       - FunctionalStatelessTestDebug1
@@ -2747,8 +2920,15 @@ jobs:
       - StressTestTsan
       - StressTestMsan
       - StressTestUBsan
+      - IntegrationTestsAsan0
+      - IntegrationTestsAsan1
+      - IntegrationTestsAsan2
       - IntegrationTestsRelease0
       - IntegrationTestsRelease1
+      - IntegrationTestsTsan0
+      - IntegrationTestsTsan1
+      - IntegrationTestsTsan2
+      - IntegrationTestsTsan3
       - CompatibilityCheckX86
       - CompatibilityCheckAarch64
       - RegressionCommonAmd64
