@@ -1485,6 +1485,346 @@ jobs:
           docker ps --quiet | xargs --no-run-if-empty docker kill ||:
           docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
           sudo rm -fr "$TEMP_PATH"
+##############################################################################################
+######################################### STRESS TESTS #######################################
+##############################################################################################
+  StressTestAsan:
+    needs: [BuilderDebAsan]
+    runs-on: [self-hosted, stress-tester, on-demand, type-cpx51, image-x86-snapshot-docker_ipv6_x86]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/stress_thread
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=Stress test (asan)
+          REPO_COPY=${{runner.temp}}/stress_thread/ClickHouse
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
+        with:
+          clear-repository: true
+      - name: Stress test
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 stress_check.py "$CHECK_NAME"
+      - name: Cleanup
+        if: always()
+        run: |
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+          sudo rm -fr "$TEMP_PATH"
+  StressTestTsan:
+    needs: [BuilderDebTsan]
+    # func testers have 16 cores + 128 GB memory
+    # while stress testers have 36 cores + 72 memory
+    # It would be better to have something like 32 + 128,
+    # but such servers almost unavailable as spot instances.
+    runs-on: [self-hosted, func-tester, on-demand, type-cpx51, image-x86-snapshot-docker_ipv6_x86]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/stress_thread
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=Stress test (tsan)
+          REPO_COPY=${{runner.temp}}/stress_thread/ClickHouse
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
+        with:
+          clear-repository: true
+      - name: Stress test
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 stress_check.py "$CHECK_NAME"
+      - name: Cleanup
+        if: always()
+        run: |
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+          sudo rm -fr "$TEMP_PATH"
+  StressTestMsan:
+    needs: [BuilderDebMsan]
+    runs-on: [self-hosted, stress-tester, on-demand, type-cpx51, image-x86-snapshot-docker_ipv6_x86]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/stress_memory
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=Stress test (msan)
+          REPO_COPY=${{runner.temp}}/stress_memory/ClickHouse
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
+        with:
+          clear-repository: true
+      - name: Stress test
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 stress_check.py "$CHECK_NAME"
+      - name: Cleanup
+        if: always()
+        run: |
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+          sudo rm -fr "$TEMP_PATH"
+  StressTestUBsan:
+    needs: [BuilderDebUBsan]
+    runs-on: [self-hosted, stress-tester, on-demand, type-cpx51, image-x86-snapshot-docker_ipv6_x86]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/stress_undefined
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=Stress test (ubsan)
+          REPO_COPY=${{runner.temp}}/stress_undefined/ClickHouse
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
+        with:
+          clear-repository: true
+      - name: Stress test
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 stress_check.py "$CHECK_NAME"
+      - name: Cleanup
+        if: always()
+        run: |
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+          sudo rm -fr "$TEMP_PATH"
+  StressTestDebug:
+    needs: [BuilderDebDebug]
+    runs-on: [self-hosted, stress-tester, on-demand, type-cpx51, image-x86-snapshot-docker_ipv6_x86]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/stress_debug
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=Stress test (debug)
+          REPO_COPY=${{runner.temp}}/stress_debug/ClickHouse
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
+        with:
+          clear-repository: true
+      - name: Stress test
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 stress_check.py "$CHECK_NAME"
+      - name: Cleanup
+        if: always()
+        run: |
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+          sudo rm -fr "$TEMP_PATH"
+##############################################################################################
+##################################### AST FUZZERS ############################################
+##############################################################################################
+  ASTFuzzerTestAsan:
+    needs: [BuilderDebAsan]
+    runs-on: [self-hosted, fuzzer-unit-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/ast_fuzzer_asan
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=AST fuzzer (asan)
+          REPO_COPY=${{runner.temp}}/ast_fuzzer_asan/ClickHouse
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
+        with:
+          clear-repository: true
+      - name: Fuzzer
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 ast_fuzzer_check.py "$CHECK_NAME"
+      - name: Cleanup
+        if: always()
+        run: |
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+          sudo rm -fr "$TEMP_PATH"
+  ASTFuzzerTestTsan:
+    needs: [BuilderDebTsan]
+    runs-on: [self-hosted, fuzzer-unit-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/ast_fuzzer_tsan
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=AST fuzzer (tsan)
+          REPO_COPY=${{runner.temp}}/ast_fuzzer_tsan/ClickHouse
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
+        with:
+          clear-repository: true
+      - name: Fuzzer
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 ast_fuzzer_check.py "$CHECK_NAME"
+      - name: Cleanup
+        if: always()
+        run: |
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+          sudo rm -fr "$TEMP_PATH"
+  ASTFuzzerTestUBSan:
+    needs: [BuilderDebUBsan]
+    runs-on: [self-hosted, fuzzer-unit-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/ast_fuzzer_ubsan
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=AST fuzzer (ubsan)
+          REPO_COPY=${{runner.temp}}/ast_fuzzer_ubsan/ClickHouse
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
+        with:
+          clear-repository: true
+      - name: Fuzzer
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 ast_fuzzer_check.py "$CHECK_NAME"
+      - name: Cleanup
+        if: always()
+        run: |
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+          sudo rm -fr "$TEMP_PATH"
+  ASTFuzzerTestMSan:
+    needs: [BuilderDebMsan]
+    runs-on: [self-hosted, fuzzer-unit-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/ast_fuzzer_msan
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=AST fuzzer (msan)
+          REPO_COPY=${{runner.temp}}/ast_fuzzer_msan/ClickHouse
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
+        with:
+          clear-repository: true
+      - name: Fuzzer
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 ast_fuzzer_check.py "$CHECK_NAME"
+      - name: Cleanup
+        if: always()
+        run: |
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+          sudo rm -fr "$TEMP_PATH"
+  ASTFuzzerTestDebug:
+    needs: [BuilderDebDebug]
+    runs-on: [self-hosted, fuzzer-unit-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/ast_fuzzer_debug
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=AST fuzzer (debug)
+          REPO_COPY=${{runner.temp}}/ast_fuzzer_debug/ClickHouse
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
+        with:
+          clear-repository: true
+      - name: Fuzzer
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 ast_fuzzer_check.py "$CHECK_NAME"
+      - name: Cleanup
+        if: always()
+        run: |
+          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
+          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+          sudo rm -fr "$TEMP_PATH"
 #############################################################################################
 ############################# INTEGRATION TESTS #############################################
 #############################################################################################
@@ -1803,194 +2143,15 @@ jobs:
           docker ps --quiet | xargs --no-run-if-empty docker kill ||:
           docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
           sudo rm -fr "$TEMP_PATH"
-##############################################################################################
-######################################### STRESS TESTS #######################################
-##############################################################################################
-  StressTestAsan:
-    needs: [BuilderDebAsan]
-    runs-on: [self-hosted, stress-tester, on-demand, type-cpx51, image-x86-snapshot-docker_ipv6_x86]
-    steps:
-      - name: Set envs
-        run: |
-          cat >> "$GITHUB_ENV" << 'EOF'
-          TEMP_PATH=${{runner.temp}}/stress_thread
-          REPORTS_PATH=${{runner.temp}}/reports_dir
-          CHECK_NAME=Stress test (asan)
-          REPO_COPY=${{runner.temp}}/stress_thread/ClickHouse
-          EOF
-      - name: Download json reports
-        uses: actions/download-artifact@v3
-        with:
-          path: ${{ env.REPORTS_PATH }}
-      - name: Check out repository code
-        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
-        with:
-          clear-repository: true
-      - name: Stress test
-        run: |
-          sudo rm -fr "$TEMP_PATH"
-          mkdir -p "$TEMP_PATH"
-          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
-          cd "$REPO_COPY/tests/ci"
-          python3 stress_check.py "$CHECK_NAME"
-      - name: Cleanup
-        if: always()
-        run: |
-          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
-          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
-          sudo rm -fr "$TEMP_PATH"
-  StressTestTsan:
-    needs: [BuilderDebTsan]
-    # func testers have 16 cores + 128 GB memory
-    # while stress testers have 36 cores + 72 memory
-    # It would be better to have something like 32 + 128,
-    # but such servers almost unavailable as spot instances.
-    runs-on: [self-hosted, func-tester, on-demand, type-cpx51, image-x86-snapshot-docker_ipv6_x86]
-    steps:
-      - name: Set envs
-        run: |
-          cat >> "$GITHUB_ENV" << 'EOF'
-          TEMP_PATH=${{runner.temp}}/stress_thread
-          REPORTS_PATH=${{runner.temp}}/reports_dir
-          CHECK_NAME=Stress test (tsan)
-          REPO_COPY=${{runner.temp}}/stress_thread/ClickHouse
-          EOF
-      - name: Download json reports
-        uses: actions/download-artifact@v3
-        with:
-          path: ${{ env.REPORTS_PATH }}
-      - name: Check out repository code
-        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
-        with:
-          clear-repository: true
-      - name: Stress test
-        run: |
-          sudo rm -fr "$TEMP_PATH"
-          mkdir -p "$TEMP_PATH"
-          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
-          cd "$REPO_COPY/tests/ci"
-          python3 stress_check.py "$CHECK_NAME"
-      - name: Cleanup
-        if: always()
-        run: |
-          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
-          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
-          sudo rm -fr "$TEMP_PATH"
-  StressTestMsan:
-    needs: [BuilderDebMsan]
-    runs-on: [self-hosted, stress-tester, on-demand, type-cpx51, image-x86-snapshot-docker_ipv6_x86]
-    steps:
-      - name: Set envs
-        run: |
-          cat >> "$GITHUB_ENV" << 'EOF'
-          TEMP_PATH=${{runner.temp}}/stress_memory
-          REPORTS_PATH=${{runner.temp}}/reports_dir
-          CHECK_NAME=Stress test (msan)
-          REPO_COPY=${{runner.temp}}/stress_memory/ClickHouse
-          EOF
-      - name: Download json reports
-        uses: actions/download-artifact@v3
-        with:
-          path: ${{ env.REPORTS_PATH }}
-      - name: Check out repository code
-        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
-        with:
-          clear-repository: true
-      - name: Stress test
-        run: |
-          sudo rm -fr "$TEMP_PATH"
-          mkdir -p "$TEMP_PATH"
-          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
-          cd "$REPO_COPY/tests/ci"
-          python3 stress_check.py "$CHECK_NAME"
-      - name: Cleanup
-        if: always()
-        run: |
-          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
-          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
-          sudo rm -fr "$TEMP_PATH"
-  StressTestUBsan:
-    needs: [BuilderDebUBsan]
-    runs-on: [self-hosted, stress-tester, on-demand, type-cpx51, image-x86-snapshot-docker_ipv6_x86]
-    steps:
-      - name: Set envs
-        run: |
-          cat >> "$GITHUB_ENV" << 'EOF'
-          TEMP_PATH=${{runner.temp}}/stress_undefined
-          REPORTS_PATH=${{runner.temp}}/reports_dir
-          CHECK_NAME=Stress test (ubsan)
-          REPO_COPY=${{runner.temp}}/stress_undefined/ClickHouse
-          EOF
-      - name: Download json reports
-        uses: actions/download-artifact@v3
-        with:
-          path: ${{ env.REPORTS_PATH }}
-      - name: Check out repository code
-        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
-        with:
-          clear-repository: true
-      - name: Stress test
-        run: |
-          sudo rm -fr "$TEMP_PATH"
-          mkdir -p "$TEMP_PATH"
-          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
-          cd "$REPO_COPY/tests/ci"
-          python3 stress_check.py "$CHECK_NAME"
-      - name: Cleanup
-        if: always()
-        run: |
-          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
-          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
-          sudo rm -fr "$TEMP_PATH"
-  StressTestDebug:
-    needs: [BuilderDebDebug]
-    runs-on: [self-hosted, stress-tester, on-demand, type-cpx51, image-x86-snapshot-docker_ipv6_x86]
-    steps:
-      - name: Set envs
-        run: |
-          cat >> "$GITHUB_ENV" << 'EOF'
-          TEMP_PATH=${{runner.temp}}/stress_debug
-          REPORTS_PATH=${{runner.temp}}/reports_dir
-          CHECK_NAME=Stress test (debug)
-          REPO_COPY=${{runner.temp}}/stress_debug/ClickHouse
-          EOF
-      - name: Download json reports
-        uses: actions/download-artifact@v3
-        with:
-          path: ${{ env.REPORTS_PATH }}
-      - name: Check out repository code
-        uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
-        with:
-          clear-repository: true
-      - name: Stress test
-        run: |
-          sudo rm -fr "$TEMP_PATH"
-          mkdir -p "$TEMP_PATH"
-          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
-          cd "$REPO_COPY/tests/ci"
-          python3 stress_check.py "$CHECK_NAME"
-      - name: Cleanup
-        if: always()
-        run: |
-          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
-          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
-          sudo rm -fr "$TEMP_PATH"
 #############################################################################################
 ##################################### REGRESSION TESTS ######################################
 #############################################################################################
-  RegressionStart:
-    ## Not depending on the tests above since they can fail at any given moment.
-    needs: [BuilderDebRelease, BuilderDebAarch64]
-    runs-on: ubuntu-latest
-    steps:
-      - run: true
-
   RegressionCommonAmd64:
     strategy:
       fail-fast: false
       matrix:
         SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, data_types, datetime64_extended_range, disk_level_encryption, dns, example, extended_precision_data_types, kafka, kerberos, key_value, lightweight_delete, part_moves_between_shards, rbac, selects, session_timezone, ssl_server, tiered_storage, window_functions]
-    needs: [RegressionStart]
+    needs: [BuilderDebRelease]
     runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
     timeout-minutes: 180
     env:
@@ -2052,7 +2213,7 @@ jobs:
       fail-fast: false
       matrix:
         SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, data_types, datetime64_extended_range, disk_level_encryption, dns, engines, example, extended_precision_data_types, kafka, kerberos, key_value, lightweight_delete, part_moves_between_shards, rbac, selects, session_timezone, ssl_server, tiered_storage, window_functions]
-    needs: [RegressionStart]
+    needs: [BuilderDebAarch64]
     runs-on: [self-hosted, regression-tester, on-demand, type-cax41, image-arm-app-docker-ce]
     timeout-minutes: 180
     env:
@@ -2115,7 +2276,7 @@ jobs:
       fail-fast: false
       matrix:
         STORAGE: [minio, aws_s3, gcs]
-    needs: [RegressionStart]
+    needs: [BuilderDebRelease]
     runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
     timeout-minutes: 180
     env:
@@ -2186,7 +2347,7 @@ jobs:
       fail-fast: false
       matrix:
         STORAGE: [minio, aws_s3, gcs]
-    needs: [RegressionStart]
+    needs: [BuilderDebAarch64]
     runs-on: [self-hosted, regression-tester, on-demand, type-cax41, image-arm-app-docker-ce]
     timeout-minutes: 180
     env:
@@ -2254,7 +2415,7 @@ jobs:
             ./*/*/_instances/*.log
 
   RegressionClickHouseKeeperSSLAmd64:
-    needs: [RegressionStart]
+    needs: [BuilderDebRelease]
     runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -2312,7 +2473,7 @@ jobs:
             ./*/*/_instances/*.log
 
   RegressionClickHouseKeeperSSLAarch64:
-    needs: [RegressionStart]
+    needs: [BuilderDebAarch64]
     runs-on: [self-hosted, regression-tester, on-demand, type-cax41, image-arm-app-docker-ce]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
@@ -2374,7 +2535,7 @@ jobs:
       fail-fast: false
       matrix:
         SUITE: [authentication, external_user_directory, role_mapping]
-    needs: [RegressionStart]
+    needs: [BuilderDebRelease]
     runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
     timeout-minutes: 180
     env:
@@ -2436,7 +2597,7 @@ jobs:
       fail-fast: false
       matrix:
         SUITE: [authentication, external_user_directory, role_mapping]
-    needs: [RegressionStart]
+    needs: [BuilderDebAarch64]
     runs-on: [self-hosted, regression-tester, on-demand, type-cax41, image-arm-app-docker-ce]
     timeout-minutes: 180
     env:
@@ -2495,7 +2656,7 @@ jobs:
             ./*/*/_instances/*.log
 
   RegressionParquetAmd64:
-    needs: [RegressionStart]
+    needs: [BuilderDebRelease]
     runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
     timeout-minutes: 180
     env:
@@ -2507,12 +2668,14 @@ jobs:
         uses: actions/checkout@v3
         with:
           repository: Altinity/clickhouse-regression
+          ref: ${{ env.REGRESSION_COMMON_COMMIT }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
           REPORTS_PATH=${{runner.temp}}/reports_dir
           SUITE=parquet
-          artifacts=public
+          STORAGE=/no_s3
+          artifacts=builds
           EOF
       - name: Download json reports
         uses: actions/download-artifact@v3
@@ -2531,27 +2694,135 @@ jobs:
               --collect-service-logs
               --output classic
               --parallel 1
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
+              --attr project="${GITHUB_REPOSITORY}" project.id="${GITHUB_REPOSITORY_ID}" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="${GITHUB_ACTOR}" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="${GITHUB_RUN_ID}" job.url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" arch="$(uname -i)"
               --log raw.log
-              --storage minio
+      - name: Create and upload logs
+        if: always()
+        run: .github/create_and_upload_logs.sh 1
+      - uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: ${{ env.SUITE }}-amd64-artifacts
+          path: |
+            ./report.html
+            ./*.log.txt
+            ./*.log
+            ./*.html
+            ./*/_instances/*.log
+            ./*/_instances/*/logs/*.log
+            ./*/*/_instances/*/logs/*.log
+            ./*/*/_instances/*.log
+
+  RegressionParquetAWSAmd64:
+    needs: [BuilderDebRelease]
+    runs-on: [self-hosted, regression-tester, on-demand, type-cx51, image-x86-app-docker-ce]
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
+    steps:
+      - name: Checkout regression repo
+        uses: actions/checkout@v3
+        with:
+          repository: Altinity/clickhouse-regression
+          ref: ${{ env.REGRESSION_COMMON_COMMIT }}
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          SUITE=parquet
+          STORAGE=/aws_s3
+          artifacts=builds
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Setup
+        run: .github/setup.sh
+      - name: Get deb url
+        run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
+      - name: Run ${{ env.SUITE }} suite
+        run: python3
+              -u ${{ env.SUITE }}/regression.py
+              --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --test-to-end
+              --local
+              --collect-service-logs
+              --output classic
+              --parallel 1
+              --attr project="${GITHUB_REPOSITORY}" project.id="${GITHUB_REPOSITORY_ID}" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="${GITHUB_ACTOR}" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="${GITHUB_RUN_ID}" job.url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" arch="$(uname -i)"
+              --log raw.log
               --storage aws_s3
               --aws-s3-bucket ${{ secrets.REGRESSION_AWS_S3_BUCKET }}
               --aws-s3-region ${{ secrets.REGRESSION_AWS_S3_REGION }}
               --aws-s3-key-id ${{ secrets.REGRESSION_AWS_S3_KEY_ID }}
               --aws-s3-access-key ${{ secrets.REGRESSION_AWS_S3_SECRET_ACCESS_KEY }}
-              --storage gcs
-              --gcs-uri ${{ secrets.REGRESSION_GCS_URI }}
-              --gcs-key-id ${{ secrets.REGRESSION_GCS_KEY_ID }}
-              --gcs-key-secret ${{ secrets.REGRESSION_GCS_KEY_SECRET }}
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-        env:
-          artifact_s3_dir: build/v${{ env.version }}/$GITHUB_SHA
       - uses: actions/upload-artifact@v3
         if: always()
         with:
-          name: ${{ env.SUITE }}-amd64-artifacts
+          name: ${{ env.SUITE }}-aws-s3-artifacts
+          path: |
+            ./report.html
+            ./*.log.txt
+            ./*.log
+            ./*.html
+            ./*/_instances/*.log
+            ./*/_instances/*/logs/*.log
+            ./*/*/_instances/*/logs/*.log
+            ./*/*/_instances/*.log
+
+  RegressionParquetMinioAmd64:
+    needs: [BuilderDebRelease]
+    runs-on: [self-hosted, regression-tester, on-demand, type-cx51, image-x86-app-docker-ce]
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
+    steps:
+      - name: Checkout regression repo
+        uses: actions/checkout@v3
+        with:
+          repository: Altinity/clickhouse-regression
+          ref: ${{ env.REGRESSION_COMMON_COMMIT }}
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          SUITE=parquet
+          STORAGE=/minio
+          artifacts=builds
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Setup
+        run: .github/setup.sh
+      - name: Get deb url
+        run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
+      - name: Run ${{ env.SUITE }} suite
+        run: python3
+              -u ${{ env.SUITE }}/regression.py
+              --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --test-to-end
+              --local
+              --collect-service-logs
+              --output classic
+              --parallel 1
+              --attr project="${GITHUB_REPOSITORY}" project.id="${GITHUB_REPOSITORY_ID}" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="${GITHUB_ACTOR}" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="${GITHUB_RUN_ID}" job.url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" arch="$(uname -i)"
+              --log raw.log
+              --storage minio
+      - name: Create and upload logs
+        if: always()
+        run: .github/create_and_upload_logs.sh 1
+      - uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: ${{ env.SUITE }}-minio-amd64-artifacts
           path: |
             ./report.html
             ./*.log.txt
@@ -2567,7 +2838,7 @@ jobs:
       fail-fast: false
       matrix:
         STORAGE: [minio, aws_s3, gcs]
-    needs: [RegressionStart]
+    needs: [BuilderDebRelease]
     runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
     timeout-minutes: 180
     env:
@@ -2638,7 +2909,7 @@ jobs:
       fail-fast: false
       matrix:
         STORAGE: [minio, aws_s3, gcs]
-    needs: [RegressionStart]
+    needs: [BuilderDebAarch64]
     runs-on: [self-hosted, regression-tester, on-demand, type-cax41, image-arm-app-docker-ce]
     timeout-minutes: 180
     env:
@@ -2710,7 +2981,7 @@ jobs:
       fail-fast: false
       matrix:
         STORAGE: [minio, s3amazon, s3gcs]
-    needs: [RegressionStart]
+    needs: [BuilderDebRelease]
     runs-on: [self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce]
     timeout-minutes: 180
     env:
@@ -2780,7 +3051,7 @@ jobs:
       fail-fast: false
       matrix:
         STORAGE: [minio, s3amazon, s3gcs]
-    needs: [RegressionStart]
+    needs: [BuilderDebAarch64]
     runs-on: [self-hosted, regression-tester, on-demand, type-cax41, image-arm-app-docker-ce]
     timeout-minutes: 180
     env:
@@ -2920,6 +3191,11 @@ jobs:
       - StressTestTsan
       - StressTestMsan
       - StressTestUBsan
+      - ASTFuzzerTestDebug
+      - ASTFuzzerTestAsan
+      - ASTFuzzerTestTsan
+      - ASTFuzzerTestMSan
+      - ASTFuzzerTestUBSan
       - IntegrationTestsAsan0
       - IntegrationTestsAsan1
       - IntegrationTestsAsan2
@@ -2940,6 +3216,8 @@ jobs:
       - RegressionLDAPAmd64
       - RegressionLDAPAarch64
       - RegressionParquetAmd64
+      - RegressionParquetAWSAmd64
+      - RegressionParquetMinioAmd64
       - RegressionS3Amd64
       - RegressionS3Aarch64
       - RegressionTieredStorageS3Amd64
