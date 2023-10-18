@@ -26,7 +26,7 @@ previous_release_tag=$(dpkg --info package_folder/clickhouse-client*.deb | grep 
 echo $previous_release_tag
 
 echo "Clone previous release repository"
-git clone https://github.com/ClickHouse/ClickHouse.git --no-tags --progress --branch=$previous_release_tag --no-recurse-submodules --depth=1 previous_release_repository
+git clone https://github.com/Altinity/ClickHouse.git --no-tags --progress --branch=$previous_release_tag --no-recurse-submodules --depth=1 previous_release_repository
 
 echo "Download clickhouse-server from the previous release"
 mkdir previous_release_package_folder
