@@ -39,7 +39,7 @@ https://github.com/ClickHouse/ClickHouse/blob/23.3/.github/workflows/pull_reques
 | CompatibilityCheckX86 | yes | 
 | CompatibilityCheckAarch64 | yes | 
 | BuilderDebRelease | yes | 
-| BuilderBinRelease | no, we are focused on deb. | 
+| BuilderBinRelease | yes | 
 | BuilderDebAarch64 | yes | 
 | BuilderDebAsan | yes |
 | BuilderDebUBsan | yes | 
@@ -148,7 +148,7 @@ https://github.com/ClickHouse/ClickHouse/blob/23.3/.github/workflows/pull_reques
 | IntegrationTestsRelease3 | yes | 
 | IntegrationTestsFlakyCheck | yes | 
 | UnitTestsAsan | yes | 
-| UnitTestsReleaseClang | no, depends on BuilderBinRelease. | 
+| UnitTestsReleaseClang | yes | 
 | UnitTestsTsan | yes | 
 | UnitTestsMsan | yes | 
 | UnitTestsUBsan | yes | 
@@ -162,7 +162,7 @@ https://github.com/ClickHouse/ClickHouse/blob/23.3/.github/workflows/pull_reques
 | PerformanceComparisonAarch-3 | no, to be added. | 
 | SQLancerTestRelease | yes | 
 | SQLancerTestDebug | yes | 
-| Jepsen* | no, depends on BuilderBinRelease. | 
+| Jepsen | yes | 
 
 Jepsen job only runs if the pull request name containes `jepsen-test`
 
