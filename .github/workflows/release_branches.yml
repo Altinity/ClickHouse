@@ -2737,7 +2737,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatefulTestAarch64:
     needs: [BuilderDebAarch64]
-    runs-on: [altinity-self-hosted, on-demand, type-cax41, in-ash, image-arm-app-docker-ce]
+    runs-on: [altinity-self-hosted, on-demand, type-cax41, in-fns1, image-arm-app-docker-ce]
     steps:
       - name: Setup
         run: |
