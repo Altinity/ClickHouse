@@ -8,6 +8,7 @@
 #include <Poco/Net/HTTPResponse.h>
 #include <Poco/URI.h>
 #include <Common/PoolBase.h>
+#include <Common/ProxyConfiguration.h>
 #include <Poco/URIStreamFactory.h>
 
 #include <IO/ConnectionTimeouts.h>
@@ -72,11 +73,8 @@ void setResponseDefaultHeaders(HTTPServerResponse & response, size_t keep_alive_
 HTTPSessionPtr makeHTTPSession(
     const Poco::URI & uri,
     const ConnectionTimeouts & timeouts,
-    Poco::Net::HTTPClientSession::ProxyConfig proxy_config = {}
+    ProxyConfiguration proxy_config = {}
 );
-
-struct ProxyConfiguration;
-Poco::Net::HTTPClientSession::ProxyConfig proxyConfigurationToPocoProxyConfig(const ProxyConfiguration & proxy_configuration);
 
 /// As previous method creates session, but takes it from pool, without and with proxy uri.
 ///
@@ -95,7 +93,7 @@ PooledHTTPSessionPtr makePooledHTTPSession(
     const ConnectionTimeouts & timeouts,
     size_t per_endpoint_pool_size,
     bool wait_on_pool_size_limit = true,
-    Poco::Net::HTTPClientSession::ProxyConfig proxy_config = {});
+    ProxyConfiguration proxy_config = {});
 
 bool isRedirect(Poco::Net::HTTPResponse::HTTPStatus status);
 
