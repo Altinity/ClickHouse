@@ -19,7 +19,6 @@ from commit_status_helper import (
 )
 from docker_pull_helper import get_image_with_version
 from env_helper import (
-    CACHES_PATH,
     GITHUB_JOB,
     IMAGES_PATH,
     REPO_COPY,

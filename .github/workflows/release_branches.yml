@@ -123,7 +123,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FastTest:
     needs: DockerHubPush
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx31, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -276,6 +276,7 @@ jobs:
           REPO_COPY=${{runner.temp}}/build_check/ClickHouse
           CACHES_PATH=${{runner.temp}}/../ccaches
           BUILD_NAME=binary_release
+          CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
           EOF
       - name: Download changed images
         uses: actions/download-artifact@v3
@@ -2807,6 +2808,7 @@ jobs:
           clear-repository: true
       - name: Stress test
         run: |
+          .github/docker-ipv6-setup.sh
           sudo rm -fr "$TEMP_PATH"
           mkdir -p "$TEMP_PATH"
           cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
@@ -2824,6 +2826,7 @@ jobs:
     steps:
       - name: Set envs
         run: |
+          .github/docker-ipv6-setup.sh
           cat >> "$GITHUB_ENV" << 'EOF'
           TEMP_PATH=${{runner.temp}}/stress_thread
           REPORTS_PATH=${{runner.temp}}/reports_dir
@@ -2873,6 +2876,7 @@ jobs:
           clear-repository: true
       - name: Stress test
         run: |
+          .github/docker-ipv6-setup.sh
           sudo rm -fr "$TEMP_PATH"
           mkdir -p "$TEMP_PATH"
           cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
@@ -2890,6 +2894,7 @@ jobs:
     steps:
       - name: Set envs
         run: |
+          .github/docker-ipv6-setup.sh
           cat >> "$GITHUB_ENV" << 'EOF'
           TEMP_PATH=${{runner.temp}}/stress_undefined
           REPORTS_PATH=${{runner.temp}}/reports_dir
@@ -2923,6 +2928,7 @@ jobs:
     steps:
       - name: Set envs
         run: |
+          .github/docker-ipv6-setup.sh
           cat >> "$GITHUB_ENV" << 'EOF'
           TEMP_PATH=${{runner.temp}}/stress_debug
           REPORTS_PATH=${{runner.temp}}/reports_dir
