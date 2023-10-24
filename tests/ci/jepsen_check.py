@@ -175,9 +175,9 @@ if __name__ == "__main__":
         pr_info.labels,
     )
 
-    if pr_info.number != 0 and "jepsen-test" not in pr_info.labels:
-        logging.info("Not jepsen test label in labels list, skipping")
-        sys.exit(0)
+    # if pr_info.number != 0 and "jepsen-test" not in pr_info.labels:
+    #     logging.info("Not jepsen test label in labels list, skipping")
+    #     sys.exit(0)
 
     gh = Github(get_best_robot_token(), per_page=100)
     commit = get_commit(gh, pr_info.sha)

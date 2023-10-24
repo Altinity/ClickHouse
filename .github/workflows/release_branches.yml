@@ -31,7 +31,7 @@ on: # yamllint disable-line rule:truthy
 
 jobs:
   DockerHubPushAarch64:
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cax31, altinity-in-fsn1, altinity-image-arm-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cax41, altinity-in-fsn1, altinity-image-arm-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
@@ -47,7 +47,7 @@ jobs:
           name: changed_images_aarch64
           path: ${{ runner.temp }}/docker_images_check/changed_images_aarch64.json
   DockerHubPushAmd64:
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx31, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
@@ -64,7 +64,7 @@ jobs:
           path: ${{ runner.temp }}/docker_images_check/changed_images_amd64.json
   DockerHubPush:
     needs: [DockerHubPushAmd64, DockerHubPushAarch64]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx31, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
@@ -91,7 +91,7 @@ jobs:
           path: ${{ runner.temp }}/changed_images.json
   StyleCheck:
     needs: DockerHubPush
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx31, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
     # We need additional `&& ! cancelled()` to have the job being able to cancel
     if: ${{ success() || failure() || ( always() && ! cancelled() ) }}
     steps:
@@ -123,7 +123,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FastTest:
     needs: DockerHubPush
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -153,7 +153,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH" "$CACHES_PATH"
   CompatibilityCheckX86:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx31, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -185,7 +185,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   CompatibilityCheckAarch64:
     needs: [BuilderDebAarch64]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cax31, altinity-in-fsn1, altinity-image-arm-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cax41, altinity-in-fsn1, altinity-image-arm-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -577,7 +577,7 @@ jobs:
     needs:
       - BuilderDebRelease
       - BuilderDebAarch64
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx31, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Check out repository code
@@ -611,7 +611,7 @@ jobs:
       - BuilderDebRelease
       - BuilderDebTsan
       - BuilderDebUBsan
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx31, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
     timeout-minutes: 180
     if: ${{ success() || failure() }}
     steps:
@@ -651,7 +651,7 @@ jobs:
     needs:
       - BuilderDebRelease
       - BuilderDebAarch64
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx31, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Check out repository code
@@ -667,7 +667,7 @@ jobs:
 ############################################################################################
   InstallPackagesTestRelease:
     needs: [SignRelease]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx31, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -701,7 +701,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   InstallPackagesTestAarch64:
     needs: [BuilderDebAarch64]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cax31, altinity-in-fsn1, altinity-image-arm-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cax41, altinity-in-fsn1, altinity-image-arm-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -5237,7 +5237,7 @@ jobs:
       - SignRelease
       - SQLancerTestRelease
       - SQLancerTestDebug
-    runs-on: [self-hosted, finish-checker, altinity-on-demand, altinity-type-cpx31, altinity-in-fsn1, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, finish-checker, altinity-on-demand, altinity-type-cpx41, altinity-in-fsn1, altinity-image-x86-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@34c90ad008fe1469182f3637d3de4766aa10a5c7
