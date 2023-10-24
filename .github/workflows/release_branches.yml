@@ -2826,7 +2826,6 @@ jobs:
     steps:
       - name: Set envs
         run: |
-          .github/docker-ipv6-setup.sh
           cat >> "$GITHUB_ENV" << 'EOF'
           TEMP_PATH=${{runner.temp}}/stress_thread
           REPORTS_PATH=${{runner.temp}}/reports_dir
@@ -2843,6 +2842,7 @@ jobs:
           clear-repository: true
       - name: Stress test
         run: |
+          .github/docker-ipv6-setup.sh
           sudo rm -fr "$TEMP_PATH"
           mkdir -p "$TEMP_PATH"
           cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
@@ -2894,7 +2894,6 @@ jobs:
     steps:
       - name: Set envs
         run: |
-          .github/docker-ipv6-setup.sh
           cat >> "$GITHUB_ENV" << 'EOF'
           TEMP_PATH=${{runner.temp}}/stress_undefined
           REPORTS_PATH=${{runner.temp}}/reports_dir
@@ -2911,6 +2910,7 @@ jobs:
           clear-repository: true
       - name: Stress test
         run: |
+          .github/docker-ipv6-setup.sh
           sudo rm -fr "$TEMP_PATH"
           mkdir -p "$TEMP_PATH"
           cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
@@ -2928,7 +2928,6 @@ jobs:
     steps:
       - name: Set envs
         run: |
-          .github/docker-ipv6-setup.sh
           cat >> "$GITHUB_ENV" << 'EOF'
           TEMP_PATH=${{runner.temp}}/stress_debug
           REPORTS_PATH=${{runner.temp}}/reports_dir
@@ -2945,6 +2944,7 @@ jobs:
           clear-repository: true
       - name: Stress test
         run: |
+          .github/docker-ipv6-setup.sh
           sudo rm -fr "$TEMP_PATH"
           mkdir -p "$TEMP_PATH"
           cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
