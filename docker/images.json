@@ -130,5 +130,13 @@
     "docker/test/install/rpm": {
         "name": "altinityinfra/install-rpm-test",
         "dependent": []
+    },
+    "docker/test/sqlancer": {
+        "name": "altinityinfra/sqlancer-test",
+        "dependent": []
+    },
+    "docker/test/keeper-jepsen": {
+        "name": "altinityinfra/keeper-jepsen-test",
+        "dependent": []
     }
 }
