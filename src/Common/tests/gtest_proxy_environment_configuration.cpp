@@ -27,7 +27,7 @@ TEST(EnvironmentProxyConfigurationResolver, TestHTTP)
     ASSERT_EQ(configuration.host, http_proxy_server.getHost());
     ASSERT_EQ(configuration.port, http_proxy_server.getPort());
     ASSERT_EQ(configuration.protocol, ProxyConfiguration::protocolFromString(http_proxy_server.getScheme()));
-    ASSERT_EQ(configuration.use_connect_protocol, false);
+    ASSERT_EQ(configuration.use_tunneling, false);
 }
 
 TEST(EnvironmentProxyConfigurationResolver, TestHTTPConnectProtocolOn)
@@ -77,6 +77,33 @@ TEST(EnvironmentProxyConfigurationResolver, TestHTTPs)
     ASSERT_EQ(configuration.protocol, ProxyConfiguration::protocolFromString(https_proxy_server.getScheme()));
 }
 
+TEST(EnvironmentProxyConfigurationResolver, TestHTTPsNoEnv)
+{
+    EnvironmentProxyConfigurationResolver resolver(
+        ProxyConfiguration::Protocol::HTTPS, ProxyConfigurationResolver::ConnectProtocolPolicy::DEFAULT);
+
+    auto configuration = resolver.resolve();
+
+    ASSERT_EQ(configuration.host, "");
+    ASSERT_EQ(configuration.protocol, ProxyConfiguration::Protocol::HTTP);
+    ASSERT_EQ(configuration.port, 80u);
+}
+
+TEST(EnvironmentProxyConfigurationResolver, TestHTTPConnectProtocolOn)
+{
+    EnvironmentProxySetter setter(http_proxy_server, {});
+
+    EnvironmentProxyConfigurationResolver resolver(
+        ProxyConfiguration::Protocol::HTTP, ProxyConfigurationResolver::ConnectProtocolPolicy::FORCE_ON);
+
+    auto configuration = resolver.resolve();
+
+    ASSERT_EQ(configuration.host, http_proxy_server.getHost());
+    ASSERT_EQ(configuration.port, http_proxy_server.getPort());
+    ASSERT_EQ(configuration.protocol, ProxyConfiguration::protocolFromString(http_proxy_server.getScheme()));
+    ASSERT_EQ(configuration.use_tunneling, true);
+}
+
 TEST(EnvironmentProxyConfigurationResolver, TestHTTPsConnectProtocolOff)
 {
     // use http proxy for https, this would use connect protocol by default
@@ -92,7 +119,7 @@ TEST(EnvironmentProxyConfigurationResolver, TestHTTPsConnectProtocolOff)
     ASSERT_EQ(configuration.host, http_proxy_server.getHost());
     ASSERT_EQ(configuration.port, http_proxy_server.getPort());
     ASSERT_EQ(configuration.protocol, ProxyConfiguration::protocolFromString(http_proxy_server.getScheme()));
-    ASSERT_EQ(configuration.use_connect_protocol, false);
+    ASSERT_EQ(configuration.use_tunneling, false);
 }
 
 TEST(EnvironmentProxyConfigurationResolver, TestHTTPsNoEnv)
