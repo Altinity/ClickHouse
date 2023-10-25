@@ -737,7 +737,7 @@ jobs:
   ##############################################################################################
   FunctionalStatelessTestRelease:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -772,7 +772,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestReleaseDatabaseReplicated0:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -809,7 +809,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestReleaseDatabaseReplicated1:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -846,7 +846,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestReleaseDatabaseReplicated2:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -883,7 +883,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestReleaseDatabaseReplicated3:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -920,7 +920,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestReleaseWideParts:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -955,7 +955,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestReleaseS3_0:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -992,7 +992,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestReleaseS3_1:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1029,7 +1029,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestS3Debug0:
     needs: [BuilderDebDebug]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1066,7 +1066,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestS3Debug1:
     needs: [BuilderDebDebug]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1103,7 +1103,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestS3Debug2:
     needs: [BuilderDebDebug]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1140,7 +1140,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestS3Debug3:
     needs: [BuilderDebDebug]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1177,7 +1177,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestS3Debug4:
     needs: [BuilderDebDebug]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1214,7 +1214,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestS3Debug5:
     needs: [BuilderDebDebug]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1251,7 +1251,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestS3Tsan0:
     needs: [BuilderDebTsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1288,7 +1288,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestS3Tsan1:
     needs: [BuilderDebTsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1325,7 +1325,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestS3Tsan2:
     needs: [BuilderDebTsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1362,7 +1362,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestS3Tsan3:
     needs: [BuilderDebTsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1399,7 +1399,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestS3Tsan4:
     needs: [BuilderDebTsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1471,7 +1471,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestAsan0:
     needs: [BuilderDebAsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1508,7 +1508,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestAsan1:
     needs: [BuilderDebAsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1545,7 +1545,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestAsan2:
     needs: [BuilderDebAsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1582,7 +1582,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestAsan3:
     needs: [BuilderDebAsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1619,7 +1619,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestTsan0:
     needs: [BuilderDebTsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1656,7 +1656,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestTsan1:
     needs: [BuilderDebTsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1693,7 +1693,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestTsan2:
     needs: [BuilderDebTsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1730,7 +1730,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestTsan3:
     needs: [BuilderDebTsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1767,7 +1767,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestTsan4:
     needs: [BuilderDebTsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1804,7 +1804,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestUBsan0:
     needs: [BuilderDebUBsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1841,7 +1841,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestUBsan1:
     needs: [BuilderDebUBsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1878,7 +1878,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestMsan0:
     needs: [BuilderDebMsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1915,7 +1915,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestMsan1:
     needs: [BuilderDebMsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1952,7 +1952,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestMsan2:
     needs: [BuilderDebMsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -1989,7 +1989,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestMsan3:
     needs: [BuilderDebMsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -2026,7 +2026,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestMsan4:
     needs: [BuilderDebMsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -2063,7 +2063,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestMsan5:
     needs: [BuilderDebMsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -2100,7 +2100,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestDebug0:
     needs: [BuilderDebDebug]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -2137,7 +2137,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestDebug1:
     needs: [BuilderDebDebug]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -2174,7 +2174,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestDebug2:
     needs: [BuilderDebDebug]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -2211,7 +2211,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestDebug3:
     needs: [BuilderDebDebug]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -2248,7 +2248,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestDebug4:
     needs: [BuilderDebDebug]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -2285,7 +2285,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatelessTestFlakyCheck:
     needs: [BuilderDebAsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -2641,7 +2641,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatefulTestMsanParallelReplicas:
     needs: [BuilderDebMsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -2677,7 +2677,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatefulTestTsanParallelReplicas:
     needs: [BuilderDebTsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -2713,7 +2713,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatefulTestAsanParallelReplicas:
     needs: [BuilderDebAsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -2749,7 +2749,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   FunctionalStatefulTestReleaseParallelReplicas:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -3265,7 +3265,7 @@ jobs:
   #############################################################################################
   IntegrationTestsAsan0:
     needs: [BuilderDebAsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -3300,7 +3300,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsAsan1:
     needs: [BuilderDebAsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -3335,7 +3335,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsAsan2:
     needs: [BuilderDebAsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -3370,7 +3370,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsAsan3:
     needs: [BuilderDebAsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -3405,7 +3405,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsAsan4:
     needs: [BuilderDebAsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -3440,7 +3440,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsAsan5:
     needs: [BuilderDebAsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -3475,7 +3475,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsTsan0:
     needs: [BuilderDebTsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -3510,7 +3510,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsTsan1:
     needs: [BuilderDebTsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -3545,7 +3545,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsTsan2:
     needs: [BuilderDebTsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -3580,7 +3580,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsTsan3:
     needs: [BuilderDebTsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -3615,7 +3615,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsTsan4:
     needs: [BuilderDebTsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -3650,7 +3650,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsTsan5:
     needs: [BuilderDebTsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -3685,7 +3685,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsRelease0:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -3720,7 +3720,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsRelease1:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -3755,7 +3755,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsRelease2:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -3790,7 +3790,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsRelease3:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -3825,7 +3825,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsFlakyCheck:
     needs: [BuilderDebAsan]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
