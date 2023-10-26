@@ -1,9 +1,27 @@
 # 23.3 GitHub CI/CD Pipeline
 
+## Release Test Fails
+| Job | Test Name | Reason | Resolution | Report | Detail |  
+| --- | --------- | ------ | ---------- | ------ | ------ |   
+| FunctionalStatelessMsan3 | 00534_functions_bad_arguments5 | Timeout | Consistent fail | https://s3.amazonaws.com/altinity-build-artifacts/315/40a1d584f651d64851fd801cb147abb3de03378d/stateless_tests__msan__[4_6].html | |  
+| FunctionalStatelessMsan3 | 00534_functions_bad_arguments6 | Timeout | Consistent fail | https://s3.amazonaws.com/altinity-build-artifacts/315/40a1d584f651d64851fd801cb147abb3de03378d/stateless_tests__msan__[4_6].html | |  
+| FunctionalStatelessMsan3 | 00534_functions_bad_arguments9 | Timeout | Consistent fail | https://s3.amazonaws.com/altinity-build-artifacts/315/40a1d584f651d64851fd801cb147abb3de03378d/stateless_tests__msan__[4_6].html | |  
+| FunctionalStatelessMsan4 | 00534_functions_bad_arguments2 | Timeout | Consistent fail | https://s3.amazonaws.com/altinity-build-artifacts/315/40a1d584f651d64851fd801cb147abb3de03378d/stateless_tests__msan__[5_6].html | |  
+| FunctionalStatelessMsan4 | 00534_functions_bad_arguments7 | Timeout | Consistent fail | https://s3.amazonaws.com/altinity-build-artifacts/315/40a1d584f651d64851fd801cb147abb3de03378d/stateless_tests__msan__[5_6].html | |  
+| FunctionalStatelessS3Debug0 | 02479_mysql_connect_to_self | Fail to connect to MySQL server | Consistent fail | https://s3.amazonaws.com/altinity-build-artifacts/315/40a1d584f651d64851fd801cb147abb3de03378d/stateless_tests__debug__s3_storage__[1_6].html |  
+| FunctionalStatelessDebug1 | 02561_null_as_default_more_formats | Fail to write to fail | Flaky | https://s3.amazonaws.com/altinity-build-artifacts/315/40a1d584f651d64851fd801cb147abb3de03378d/stateless_tests__debug__[2_5].html | Passed on the previous run |  
+| FunctionalStatelessDebug1 | 02703_jit_external_aggregation | Timeout | Consistent fail | https://s3.amazonaws.com/altinity-build-artifacts/315/40a1d584f651d64851fd801cb147abb3de03378d/stateless_tests__debug__[2_5].html | |  
+| StressTestAsan | | | | https://s3.amazonaws.com/altinity-build-artifacts/315/40a1d584f651d64851fd801cb147abb3de03378d/stress_test__tsan_.html | |  
+| StressTestTsan | | | | https://s3.amazonaws.com/altinity-build-artifacts/315/40a1d584f651d64851fd801cb147abb3de03378d/stress_test__tsan_.html | |  
+| SQLancer (release) | ALL | settings used not supported on 23.3 | OK to fail | https://s3.amazonaws.com/altinity-build-artifacts/315/40a1d584f651d64851fd801cb147abb3de03378d/sqlancer__release_.html | |  
+| SQLancer (debug) | ALL | settings used not supported on 23.3 | OK to fail | https://s3.amazonaws.com/altinity-build-artifacts/315/40a1d584f651d64851fd801cb147abb3de03378d/sqlancer__debug_.html | |  
+
+
+## Comparison to ClickHouse
 Comparison between ClickHouse and Altinity CI/CD pipeline. Primary focus on the comparison is on testing and builds.  
 ClickHouse workflows from https://github.com/ClickHouse/ClickHouse/tree/ff5101070e4732977e72d810f0e0ca1042dd4d3a.  
 
-## Master only
+### Master only
 
 The following workflow files are included but they're only run on the master branch:
 - jepsen.yml
@@ -11,7 +29,7 @@ The following workflow files are included but they're only run on the master bra
 - master.yml
 - woboq.yml
 
-## Not included workflows
+### Not included workflows
 
 The following workflow files are not included in the comparison as they are minor, not used, or do not provide any new tests relative to other workflows:
 - backport_branches.yml
@@ -23,7 +41,7 @@ The following workflow files are not included in the comparison as they are mino
 - tags_stable.yml
 - docs_check.yml
 
-## pull_request.yml
+### pull_request.yml
 
 https://github.com/ClickHouse/ClickHouse/blob/23.3/.github/workflows/pull_request.yml
 
@@ -166,7 +184,7 @@ https://github.com/ClickHouse/ClickHouse/blob/23.3/.github/workflows/pull_reques
 
 Jepsen job only runs if the pull request name containes `jepsen-test`
 
-## release_branches.yml  
+### release_branches.yml  
 
 https://github.com/ClickHouse/ClickHouse/blob/23.3/.github/workflows/release_branches.yml
 

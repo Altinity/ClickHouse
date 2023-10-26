@@ -31,8 +31,8 @@ class Version:
 
 class ReleaseInfo:
     def __init__(self, release_tag: str):
-        self.version = Version(release_tag[1:].split("-")[0])
-        self.type = release_tag[1:].split("-")[1]
+        self.version = Version(release_tag[1:].split(".")[0])
+        self.type = release_tag[1:].split(".")[1]
 
     def __str__(self):
         return f"v{self.version}-{self.type}"
