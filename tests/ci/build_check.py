@@ -41,7 +41,6 @@ from version_helper import (
     get_version_from_repo,
     update_version_local,
 )
-from ccache_utils import get_ccache_if_not_exists, upload_ccache
 from clickhouse_helper import (
     ClickHouseHelper,
     prepare_tests_results_for_clickhouse,
@@ -88,7 +87,6 @@ def get_packager_cmd(
     if build_config["tidy"] == "enable":
         cmd += " --clang-tidy"
 
-    # NOTE(vnemkov): we are going to continue to use ccache for now
     cmd += " --cache=sccache"
     cmd += f" --s3-directory={sccache_directory}"
     cmd += " --s3-rw-access"
@@ -345,25 +343,7 @@ def main():
     build_output_path = temp_path / build_name
     os.makedirs(build_output_path, exist_ok=True)
 
-    # NOTE(vnemkov): since we still want to use CCACHE over SCCACHE, unlike upstream,
-    # we need to create local directory for that, just as with 22.8
-    # ccache_path = os.path.join(CACHES_PATH, build_name + "_ccache")
     sccache_directory = "ccache"
-
-    # Remove for sccache
-    # logging.info("Will try to fetch cache for our build")
-    # try:
-    #     get_ccache_if_not_exists(
-    #         ccache_path, s3_helper, pr_info.number, TEMP_PATH, pr_info.release_pr
-    #     )
-    # except Exception as e:
-    #     # In case there are issues with ccache, remove the path and do not fail a build
-    #     logging.info("Failed to get ccache, building without it. Error: %s", e)
-    #     rmtree(ccache_path, ignore_errors=True)
-
-    # if not os.path.exists(ccache_path):
-    #     logging.info("cache was not fetched, will create empty dir")
-    #     os.makedirs(ccache_path)
 
     packager_cmd = get_packager_cmd(
         build_config,
@@ -386,7 +366,6 @@ def main():
     subprocess.check_call(
         f"sudo chown -R ubuntu:ubuntu {build_output_path}", shell=True
     )
-    # subprocess.check_call(f"sudo chown -R ubuntu:ubuntu {ccache_path}", shell=True)
     logging.info("Build finished with %s, log path %s", success, log_path)
     if not success:
         # We check if docker works, because if it's down, it's infrastructure
@@ -397,11 +376,6 @@ def main():
                 "The dockerd looks down, won't upload anything and generate report"
             )
             sys.exit(1)
-
-    # Upload the ccache first to have the least build time in case of problems
-    # Disabling ccache upload
-    # logging.info("Will upload cache")
-    # upload_ccache(ccache_path, s3_helper, pr_info.number, TEMP_PATH)
 
     # FIXME performance
     performance_urls = []
