@@ -137,7 +137,7 @@ jobs:
           REPO_COPY=${{runner.temp}}/build_check/ClickHouse
           CACHES_PATH=${{runner.temp}}/../ccaches
           BUILD_NAME=package_release
-          CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
+          CLICKHOUSE_STABLE_VERSION_SUFFIX=altinityfips
           EOF
       - name: Download changed images
         uses: actions/download-artifact@v3
