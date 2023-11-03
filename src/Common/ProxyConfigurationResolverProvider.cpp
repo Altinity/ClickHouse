@@ -18,16 +18,15 @@ namespace ErrorCodes
 namespace
 {
     bool isTunnelingDisabledForHTTPSRequestsOverHTTPProxy(
-        const Poco::Util::AbstractConfiguration & configuration
-    )
+        const Poco::Util::AbstractConfiguration & configuration)
     {
         return configuration.getBool("proxy.disable_tunneling_for_https_requests_over_http_proxy", false);
     }
 
     std::shared_ptr<ProxyConfigurationResolver> extractRemoteResolver(
         ProxyConfiguration::Protocol request_protocol,
-        const String & config_prefix, const Poco::Util::AbstractConfiguration & configuration
-    )
+        const String & config_prefix,
+        const Poco::Util::AbstractConfiguration & configuration)
     {
         auto resolver_prefix = config_prefix + ".resolver";
         auto endpoint = Poco::URI(configuration.getString(resolver_prefix + ".endpoint"));
@@ -136,8 +135,7 @@ namespace
     std::shared_ptr<ProxyConfigurationResolver> getListResolverOldSyntax(
         ProxyConfiguration::Protocol request_protocol,
         const String & config_prefix,
-        const Poco::Util::AbstractConfiguration & configuration
-    )
+        const Poco::Util::AbstractConfiguration & configuration)
     {
         auto uris = extractURIList(config_prefix, configuration);
 
@@ -167,8 +165,7 @@ namespace
 
 std::shared_ptr<ProxyConfigurationResolver> ProxyConfigurationResolverProvider::get(
     Protocol request_protocol,
-    const Poco::Util::AbstractConfiguration & configuration
-)
+    const Poco::Util::AbstractConfiguration & configuration)
 {
     if (auto resolver = getFromSettings(request_protocol, "", configuration))
     {
