@@ -53,7 +53,7 @@ https://github.com/ClickHouse/ClickHouse/blob/23.3/.github/workflows/pull_reques
 | DockerHubPushAmd64 | yes | 
 | DockerHubPush | yes | 
 | StyleCheck | yes | 
-| FastTest | yes | 
+| FastTest | no, ClickHouse infrastructure tests. | 
 | CompatibilityCheckX86 | yes | 
 | CompatibilityCheckAarch64 | yes | 
 | BuilderDebRelease | yes | 
@@ -139,10 +139,10 @@ https://github.com/ClickHouse/ClickHouse/blob/23.3/.github/workflows/pull_reques
 | StressTestMsan | yes | 
 | StressTestUBsan | yes | 
 | StressTestDebug | yes | 
-| UpgradeCheckAsan | yes | 
-| UpgradeCheckTsan | yes | 
-| UpgradeCheckMsan | yes | 
-| UpgradeCheckDebug | yes | 
+| UpgradeCheckAsan | no, in development. | 
+| UpgradeCheckTsan | no, in development. | 
+| UpgradeCheckMsan | no, in development. | 
+| UpgradeCheckDebug | no, in development. | 
 | ASTFuzzerTestAsan | yes | 
 | ASTFuzzerTestTsan | yes | 
 | ASTFuzzerTestUBSan | yes | 
@@ -180,7 +180,7 @@ https://github.com/ClickHouse/ClickHouse/blob/23.3/.github/workflows/pull_reques
 | PerformanceComparisonAarch-3 | no, to be added. | 
 | SQLancerTestRelease | yes | 
 | SQLancerTestDebug | yes | 
-| Jepsen | yes | 
+| Jepsen | no, in development. | 
 
 Jepsen job only runs if the pull request name containes `jepsen-test`
 
