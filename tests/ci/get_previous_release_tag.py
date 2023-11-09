@@ -6,9 +6,9 @@ from typing import List, Optional, Tuple
 
 import requests  # type: ignore
 
-CLICKHOUSE_TAGS_URL = "https://api.github.com/repos/ClickHouse/ClickHouse/tags"
+CLICKHOUSE_TAGS_URL = "https://api.github.com/repos/Altinity/ClickHouse/tags"
 CLICKHOUSE_PACKAGE_URL = (
-    "https://github.com/ClickHouse/ClickHouse/releases/download/"
+    "https://github.com/Altinity/ClickHouse/releases/download/"
     "v{version}-{type}/clickhouse-common-static_{version}_amd64.deb"
 )
 VERSION_PATTERN = r"(v(?:\d+\.)?(?:\d+\.)?(?:\d+\.)?\d+-[a-zA-Z]*)"
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 class Version:
     def __init__(self, version: str):
-        self.version = version
+        self.version = '.'.join(version.split('.')[:-1])
 
     def __lt__(self, other: "Version") -> bool:
         return list(map(int, self.version.split("."))) < list(
@@ -31,8 +31,8 @@ class Version:
 
 class ReleaseInfo:
     def __init__(self, release_tag: str):
-        self.version = Version(release_tag[1:].split("-")[0])
-        self.type = release_tag[1:].split("-")[1]
+        self.version = Version(release_tag[1:].split(".")[0])
+        self.type = release_tag[1:].split(".")[1]
 
     def __str__(self):
         return f"v{self.version}-{self.type}"

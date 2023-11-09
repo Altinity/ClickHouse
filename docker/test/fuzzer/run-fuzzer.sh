@@ -21,7 +21,7 @@ BINARY_URL_TO_DOWNLOAD=${BINARY_URL_TO_DOWNLOAD:="https://clickhouse-builds.s3.a
 function git_clone_with_retry
 {
     for _ in 1 2 3 4; do
-        if git clone --depth 1 https://github.com/ClickHouse/ClickHouse.git -- "$1" 2>&1 | ts '%Y-%m-%d %H:%M:%S';then
+        if git clone --depth 1 https://github.com/Altinity/ClickHouse.git -- "$1" 2>&1 | ts '%Y-%m-%d %H:%M:%S';then
             return 0
         else
             sleep 0.5
@@ -404,7 +404,7 @@ p.links a { padding: 5px; margin: 3px; background: #FFF; line-height: 2; white-s
 <body>
 <div class="main">
 
-<h1>AST Fuzzer for PR <a href="https://github.com/ClickHouse/ClickHouse/pull/${PR_TO_TEST}">#${PR_TO_TEST}</a> @ ${SHA_TO_TEST}</h1>
+<h1>AST Fuzzer for PR <a href="https://github.com/Altinity/ClickHouse/pull/${PR_TO_TEST}">#${PR_TO_TEST}</a> @ ${SHA_TO_TEST}</h1>
 <p class="links">
   <a href="run.log">run.log</a>
   <a href="fuzzer.log">fuzzer.log</a>

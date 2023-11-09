@@ -1,9 +1,11 @@
 self-hosted-runner:
   labels:
-    - builder
-    - func-tester
-    - func-tester-aarch64
-    - fuzzer-unit-tester
-    - stress-tester
-    - style-checker
-    - style-checker-aarch64
+    - altinity-on-demand
+    - altinity-in-fsn1
+    - altinity-in-ash
+    - altinity-image-arm-app-docker-ce
+    - altinity-image-x86-app-docker-ce
+    - altinity-type-cax41
+    - altinity-type-cpx41
+    - altinity-type-cpx51
+    - altinity-type-ccx53

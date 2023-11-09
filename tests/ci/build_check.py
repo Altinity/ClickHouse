@@ -19,12 +19,13 @@ from commit_status_helper import (
 )
 from docker_pull_helper import get_image_with_version
 from env_helper import (
-    CACHES_PATH,
     GITHUB_JOB,
     IMAGES_PATH,
     REPO_COPY,
+    S3_ACCESS_KEY_ID,
     S3_BUILDS_BUCKET,
     S3_DOWNLOAD,
+    S3_SECRET_ACCESS_KEY,
     TEMP_PATH,
     CLICKHOUSE_STABLE_VERSION_SUFFIX,
 )
@@ -40,7 +41,6 @@ from version_helper import (
     get_version_from_repo,
     update_version_local,
 )
-from ccache_utils import get_ccache_if_not_exists, upload_ccache
 from clickhouse_helper import (
     ClickHouseHelper,
     prepare_tests_results_for_clickhouse,
@@ -69,7 +69,7 @@ def get_packager_cmd(
     output_path: Path,
     build_version: str,
     image_version: str,
-    ccache_path: str,
+    sccache_directory: str,
     official: bool,
 ) -> str:
     package_type = build_config["package_type"]
@@ -87,11 +87,12 @@ def get_packager_cmd(
     if build_config["tidy"] == "enable":
         cmd += " --clang-tidy"
 
-    # NOTE(vnemkov): we are going to continue to use ccache for now
-    cmd += " --cache=ccache"
-    cmd += f" --ccache-dir={ccache_path}"
+    cmd += " --cache=sccache"
+    cmd += f" --s3-directory={sccache_directory}"
     cmd += " --s3-rw-access"
     cmd += f" --s3-bucket={S3_BUILDS_BUCKET}"
+    cmd += f" --s3-access-key-id={S3_ACCESS_KEY_ID}"
+    cmd += f" --s3-secret-access-key={S3_SECRET_ACCESS_KEY}"
 
     if "additional_pkgs" in build_config and build_config["additional_pkgs"]:
         cmd += " --additional-pkgs"
@@ -342,23 +343,7 @@ def main():
     build_output_path = temp_path / build_name
     os.makedirs(build_output_path, exist_ok=True)
 
-    # NOTE(vnemkov): since we still want to use CCACHE over SCCACHE, unlike upstream,
-    # we need to create local directory for that, just as with 22.8
-    ccache_path = os.path.join(CACHES_PATH, build_name + "_ccache")
-
-    logging.info("Will try to fetch cache for our build")
-    try:
-        get_ccache_if_not_exists(
-            ccache_path, s3_helper, pr_info.number, TEMP_PATH, pr_info.release_pr
-        )
-    except Exception as e:
-        # In case there are issues with ccache, remove the path and do not fail a build
-        logging.info("Failed to get ccache, building without it. Error: %s", e)
-        rmtree(ccache_path, ignore_errors=True)
-
-    if not os.path.exists(ccache_path):
-        logging.info("cache was not fetched, will create empty dir")
-        os.makedirs(ccache_path)
+    sccache_directory = "ccache"
 
     packager_cmd = get_packager_cmd(
         build_config,
@@ -366,7 +351,7 @@ def main():
         build_output_path,
         version.string,
         image_version,
-        ccache_path,
+        sccache_directory,
         official_flag,
     )
 
@@ -381,7 +366,6 @@ def main():
     subprocess.check_call(
         f"sudo chown -R ubuntu:ubuntu {build_output_path}", shell=True
     )
-    subprocess.check_call(f"sudo chown -R ubuntu:ubuntu {ccache_path}", shell=True)
     logging.info("Build finished with %s, log path %s", success, log_path)
     if not success:
         # We check if docker works, because if it's down, it's infrastructure
@@ -392,10 +376,6 @@ def main():
                 "The dockerd looks down, won't upload anything and generate report"
             )
             sys.exit(1)
-
-    # Upload the ccache first to have the least build time in case of problems
-    logging.info("Will upload cache")
-    upload_ccache(ccache_path, s3_helper, pr_info.number, TEMP_PATH)
 
     # FIXME performance
     performance_urls = []
