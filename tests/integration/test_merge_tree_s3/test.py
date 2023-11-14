@@ -882,6 +882,10 @@ def test_s3_engine_heavy_write_check_mem(
 
     node.query("SYSTEM FLUSH LOGS")
 
+    query_thread_log_result = node.query(f"SELECT *, except('query') FROM system.query_thread_log WHERE query_id='{query_id}'")
+    logging.info(f'system.query_thread_log for {query_id}: \n{query_thread_log_result}')
+    # assert False
+
     memory_usage, wait_inflight = node.query(
         "SELECT memory_usage, ProfileEvents['WriteBufferFromS3WaitInflightLimitMicroseconds']"
         " FROM system.query_log"

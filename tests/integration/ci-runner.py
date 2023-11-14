@@ -16,7 +16,8 @@ import zlib  # for crc32
 
 
 MAX_RETRY = 1
-NUM_WORKERS = 5
+# NOTE (vnemkov): to make tests more stable and less dependant resource consumption by other tests executing in parallel.
+NUM_WORKERS = 3
 SLEEP_BETWEEN_RETRIES = 5
 PARALLEL_GROUP_SIZE = 100
 CLICKHOUSE_BINARY_PATH = "usr/bin/clickhouse"
