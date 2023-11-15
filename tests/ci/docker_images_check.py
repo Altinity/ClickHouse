@@ -220,13 +220,16 @@ def build_and_push_one_image(
     if child:
         from_tag_arg = f"--build-arg FROM_TAG={version_string} "
 
-    cache_from = (
-        f"--cache-from type=registry,ref={image.repo}:{version_string} "
-        f"--cache-from type=registry,ref={image.repo}:latest"
-    )
-    for tag in additional_cache:
-        assert tag
-        cache_from = f"{cache_from} --cache-from type=registry,ref={image.repo}:{tag}"
+    # NOTE (vnemkov): attemp to fix following CI/CD issue:
+    # ERROR: failed to configure registry cache importer: docker.io/altinityinfra/binary-builder:324-aarch64: not found
+    cache_from = ''
+    # cache_from = (
+    #     f"--cache-from type=registry,ref={image.repo}:{version_string} "
+    #     f"--cache-from type=registry,ref={image.repo}:latest"
+    # )
+    # for tag in additional_cache:
+    #     assert tag
+    #     cache_from = f"{cache_from} --cache-from type=registry,ref={image.repo}:{tag}"
 
     cmd = (
         "docker buildx build --builder default "
