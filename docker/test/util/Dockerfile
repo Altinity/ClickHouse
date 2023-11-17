@@ -59,6 +59,7 @@ RUN apt-get update \
         rename \
         software-properties-common \
         tzdata \
+        libdispatch \
         --yes --no-install-recommends \
     && apt-get clean
 
