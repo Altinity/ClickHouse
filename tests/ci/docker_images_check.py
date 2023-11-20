@@ -249,11 +249,11 @@ def build_and_push_one_image(
         "docker buildx build --builder default "
         f"--label build-url={GITHUB_RUN_URL} "
         f"{from_tag_arg}"
-        # A hack to invalidate cache, grep for it in docker/ dir
-        f"--build-arg CACHE_INVALIDATOR={GITHUB_RUN_URL} "
+        # # A hack to invalidate cache, grep for it in docker/ dir
+        # f"--build-arg CACHE_INVALIDATOR={GITHUB_RUN_URL} "
         f"--tag {image.repo}:{version_string} "
         f"{cache_from} "
-        f"--cache-to type=inline,mode=max "
+        f"--cache-to type=registry,ref={image.repo}:{version_string} "
             # FIXME: many tests utilize packages without specifying version, hence docker pulls :latest
             # this will fail multiple jobs are going to be executed on different machines and
             # push different images as latest.
