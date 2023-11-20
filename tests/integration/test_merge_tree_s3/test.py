@@ -882,9 +882,8 @@ def test_s3_engine_heavy_write_check_mem(
 
     node.query("SYSTEM FLUSH LOGS")
 
-    query_thread_log_result = node.query(f"SELECT *, except('query') FROM system.query_thread_log WHERE query_id='{query_id}'")
-    logging.info(f'system.query_thread_log for {query_id}: \n{query_thread_log_result}')
-    # assert False
+    query_thread_log_result = node.query(f"SELECT * EXCEPT('query') FROM system.query_thread_log WHERE query_id='{query_id}'")
+    logging.info(f'{node.name} : system.query_thread_log for {query_id}: \n{query_thread_log_result}')
 
     memory_usage, wait_inflight = node.query(
         "SELECT memory_usage, ProfileEvents['WriteBufferFromS3WaitInflightLimitMicroseconds']"
@@ -934,6 +933,9 @@ def test_s3_disk_heavy_write_check_mem(cluster, broken_s3, node_name):
 
     node.query("SYSTEM FLUSH LOGS")
 
+    query_thread_log_result = node.query(f"SELECT * except('query') FROM system.query_thread_log WHERE query_id='{query_id}'")
+    logging.info(f'{node.name} : system.query_thread_log for {query_id}: \n{query_thread_log_result}')
+
     result = node.query(
         "SELECT memory_usage"
         " FROM system.query_log"
@@ -947,14 +949,19 @@ def test_s3_disk_heavy_write_check_mem(cluster, broken_s3, node_name):
     check_no_objects_after_drop(cluster, node_name=node_name)
 
 
-def get_memory_usage(node, query_id):
-    node.query("SYSTEM FLUSH LOGS")
+def get_memory_usage(node, query_id, flush_logs=True):
+    if flush_logs:
+        node.query("SYSTEM FLUSH LOGS")
+
     memory_usage = node.query(
         "SELECT memory_usage"
         " FROM system.query_log"
         f" WHERE query_id='{query_id}'"
         "   AND type='QueryFinish'"
     )
+    query_thread_log_result = node.query(f"SELECT * EXCEPT('query') FROM system.query_thread_log WHERE query_id='{query_id}'")
+    logging.info(f'{node.name} : system.query_thread_log for {query_id}: \n{query_thread_log_result}')
+
     return int(memory_usage)
 
 
@@ -962,13 +969,8 @@ def get_memory_usages(node, query_ids):
     node.query("SYSTEM FLUSH LOGS")
     result = []
     for query_id in query_ids:
-        memory_usage = node.query(
-            "SELECT memory_usage"
-            " FROM system.query_log"
-            f" WHERE query_id='{query_id}'"
-            "   AND type='QueryFinish'"
-        )
-        result.append(int(memory_usage))
+        result.append(get_memory_usage(node, query_id, flush_logs=False))
+
     return result
 
 
