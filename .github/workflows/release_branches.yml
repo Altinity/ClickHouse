@@ -648,6 +648,9 @@ jobs:
           RUN_BY_HASH_NUM=0
           RUN_BY_HASH_TOTAL=2
           EOF
+      - name: Docker login
+        run: |
+          docker login -u $DOCKER_USERNAME -p $DOCKER_PASSWORD
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
