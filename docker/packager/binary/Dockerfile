@@ -45,6 +45,7 @@ ENV CXX=clang++-${LLVM_VERSION}
 # Rust toolchain and libraries
 ENV RUSTUP_HOME=/rust/rustup
 ENV CARGO_HOME=/rust/cargo
+ENV PATH="/rust/cargo/env:${PATH}"
 ENV PATH="/rust/cargo/bin:${PATH}"
 RUN curl https://sh.rustup.rs -sSf | bash -s -- -y && \
     chmod 777 -R /rust && \
