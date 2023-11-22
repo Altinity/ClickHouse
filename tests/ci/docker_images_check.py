@@ -220,7 +220,6 @@ def build_and_push_one_image(
     if child:
         from_tag_arg = f"--build-arg FROM_TAG={version_string} "
 
-    cache_from = ''
     cache_from = (
         f"--cache-from type=registry,ref={image.repo}:{version_string} "
         f"--cache-from type=registry,ref={image.repo}:latest"
