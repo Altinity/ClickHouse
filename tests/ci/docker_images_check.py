@@ -94,6 +94,8 @@ def get_changed_docker_images(
     # Rebuild all images
     # changed_images = [DockerImage(dockerfile_dir, image_description["name"], image_description.get("only_amd64", False)) for dockerfile_dir, image_description in images_dict.items()]
 
+    changed_images = []
+
     for dockerfile_dir, image_description in images_dict.items():
         for f in files_changed:
             if f.startswith(dockerfile_dir):
