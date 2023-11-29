@@ -86,6 +86,9 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE/tests/ci"
           python3 docker_manifests_merge.py --suffix amd64 --suffix aarch64
+      - name: Upload docker files
+        working-directory: /var/lib
+        run: tar czvf docker | aws s3 cp - s3://altinity-build-artifacts/${{ github.event.number }}/$GITHUB_SHA/docker.tar.gz
       - name: Upload images files to artifacts
         uses: actions/upload-artifact@v3
         with:
@@ -651,6 +654,13 @@ jobs:
       - name: Docker login
         run: |
           docker login -u $DOCKER_USERNAME -p $DOCKER_PASSWORD
+      - name: Docker download
+        working-directory: /var/lib
+        run: |
+          sudo systemctl stop docker
+          aws s3 cp s3://altinity-build-artifacts/${{ github.event.number }}/$GITHUB_SHA/docker.tar.gz docker.tar.gz
+          tar xvfz docker.tar.gz
+          sudo systemctl start docker
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
