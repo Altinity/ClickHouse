@@ -103,10 +103,11 @@ def get_changed_docker_images(
                 only_amd64 = image_description.get("only_amd64", False)
                 logging.info(
                     "Found changed file '%s' which affects "
-                    "docker image '%s' with path '%s'",
+                    "docker image '%s' with path '%s' DEBUG_SEARCHME: '%s'",
                     f,
                     name,
                     dockerfile_dir,
+                    only_amd64
                 )
                 changed_images.append(DockerImage(dockerfile_dir, name, only_amd64))
                 break
