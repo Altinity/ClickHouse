@@ -6,7 +6,6 @@ import platform
 import subprocess
 import time
 import sys
-import pause
 from pathlib import Path
 from typing import Any, List, Optional, Set, Tuple, Union
 
@@ -258,7 +257,7 @@ def build_and_push_one_image(
         f"--progress plain {image.full_path}"
     )
     logging.info("Docker command to run: %s", cmd)
-    pause(3600)
+    time.sleep(3600)
     with TeePopen(cmd, build_log) as proc:
         retcode = proc.wait()
 
