@@ -41,7 +41,7 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE/tests/ci"
           env > /tmp/my_env
-          sleep 3600
+          sleep 3300
           python3 docker_images_check.py --suffix aarch64
       - name: Upload images files to artifacts
         uses: actions/upload-artifact@v3
