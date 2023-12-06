@@ -73,7 +73,6 @@ RUN add-apt-repository ppa:ubuntu-toolchain-r/test --yes \
         python3-boto3 \
         yasm \
         zstd \
-        python3-pip \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists
 
@@ -117,6 +116,7 @@ COPY --from=cctools /cctools /cctools
 
 RUN mkdir /workdir && chmod 777 /workdir
 WORKDIR /workdir
+RUN echo 1
 
 COPY build.sh /
 CMD ["bash", "-c", "/build.sh 2>&1"]
