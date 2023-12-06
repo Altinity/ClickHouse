@@ -253,7 +253,7 @@ def build_and_push_one_image(
             # - do something crazy
             f"--tag {image.repo}:latest "
         # f"{push_arg}"
-        # f"--progress plain {image.full_path}"
+        f"--progress plain {image.full_path}"
     )
     logging.info("Docker command to run: %s", cmd)
     with TeePopen(cmd, build_log) as proc:
