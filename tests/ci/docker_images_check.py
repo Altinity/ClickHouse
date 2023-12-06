@@ -235,10 +235,10 @@ def build_and_push_one_image(
         f"--label build-url={GITHUB_RUN_URL} "
         f"{from_tag_arg}"
         # A hack to invalidate cache, grep for it in docker/ dir
-        f"--build-arg CACHE_INVALIDATOR={GITHUB_RUN_URL} "
+        # f"--build-arg CACHE_INVALIDATOR={GITHUB_RUN_URL} "
         f"--tag {image.repo}:{version_string} "
         # f"{cache_from} "
-        f"--cache-to type=inline,mode=max "
+        # f"--cache-to type=inline,mode=max "
             # FIXME: many tests utilize packages without specifying version, hence docker pulls :latest
             # this will fail multiple jobs are going to be executed on different machines and
             # push different images as latest.
@@ -252,8 +252,8 @@ def build_and_push_one_image(
             #   (^^^ CURRENT SOLUTION ^^^) But this is just a numbers game, it will blow up at some point.
             # - do something crazy
             f"--tag {image.repo}:latest "
-        f"{push_arg}"
-        f"--progress plain {image.full_path}"
+        # f"{push_arg}"
+        # f"--progress plain {image.full_path}"
     )
     logging.info("Docker command to run: %s", cmd)
     with TeePopen(cmd, build_log) as proc:
