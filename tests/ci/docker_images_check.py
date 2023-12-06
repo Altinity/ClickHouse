@@ -92,25 +92,25 @@ def get_changed_docker_images(
     )
 
     # Rebuild all images
-    # changed_images = [DockerImage(dockerfile_dir, image_description["name"], image_description.get("only_amd64", False)) for dockerfile_dir, image_description in images_dict.items()]
+    changed_images = [DockerImage(dockerfile_dir, image_description["name"], image_description.get("only_amd64", False)) for dockerfile_dir, image_description in images_dict.items()]
 
-    changed_images = []
+    # changed_images = []
 
-    for dockerfile_dir, image_description in images_dict.items():
-        for f in files_changed:
-            if f.startswith(dockerfile_dir):
-                name = image_description["name"]
-                only_amd64 = image_description.get("only_amd64", False)
-                logging.info(
-                    "Found changed file '%s' which affects "
-                    "docker image '%s' with path '%s' DEBUG_SEARCHME: '%s'",
-                    f,
-                    name,
-                    dockerfile_dir,
-                    only_amd64
-                )
-                changed_images.append(DockerImage(dockerfile_dir, name, only_amd64))
-                break
+    # for dockerfile_dir, image_description in images_dict.items():
+    #     for f in files_changed:
+    #         if f.startswith(dockerfile_dir):
+    #             name = image_description["name"]
+    #             only_amd64 = image_description.get("only_amd64", False)
+    #             logging.info(
+    #                 "Found changed file '%s' which affects "
+    #                 "docker image '%s' with path '%s' DEBUG_SEARCHME: '%s'",
+    #                 f,
+    #                 name,
+    #                 dockerfile_dir,
+    #                 only_amd64
+    #             )
+    #             changed_images.append(DockerImage(dockerfile_dir, name, only_amd64))
+    #             break
 
     # The order is important: dependents should go later than bases, so that
     # they are built with updated base versions.
@@ -219,7 +219,7 @@ def build_and_push_one_image(
     if push:
         push_arg = "--push "
 
-    from_tag_arg = ""
+    from_tag_arg = "--build-arg FROM_TAG={}"
     if child:
         from_tag_arg = f"--build-arg FROM_TAG={version_string} "
 
@@ -235,10 +235,10 @@ def build_and_push_one_image(
         f"--label build-url={GITHUB_RUN_URL} "
         f"{from_tag_arg}"
         # A hack to invalidate cache, grep for it in docker/ dir
-        # f"--build-arg CACHE_INVALIDATOR={GITHUB_RUN_URL} "
+        f"--build-arg CACHE_INVALIDATOR={GITHUB_RUN_URL} "
         f"--tag {image.repo}:{version_string} "
-        # f"{cache_from} "
-        # f"--cache-to type=inline,mode=max "
+        f"{cache_from} "
+        f"--cache-to type=inline,mode=max "
             # FIXME: many tests utilize packages without specifying version, hence docker pulls :latest
             # this will fail multiple jobs are going to be executed on different machines and
             # push different images as latest.
@@ -252,7 +252,7 @@ def build_and_push_one_image(
             #   (^^^ CURRENT SOLUTION ^^^) But this is just a numbers game, it will blow up at some point.
             # - do something crazy
             f"--tag {image.repo}:latest "
-        # f"{push_arg}"
+        f"{push_arg}"
         f"--progress plain {image.full_path}"
     )
     logging.info("Docker command to run: %s", cmd)
