@@ -225,7 +225,6 @@ def build_and_push_one_image(
 
     cache_from = (
         f"--cache-from type=registry,ref={image.repo}:{version_string} "
-        f"--cache-from type=registry,ref={image.repo}:latest"
     )
     for tag in additional_cache:
         assert tag
@@ -473,7 +472,7 @@ def main():
 
     gh = Github(get_best_robot_token(), per_page=100)
     commit = get_commit(gh, pr_info.sha)
-    post_commit_status(commit, status, url, description, NAME, pr_info)
+    # post_commit_status(commit, status, url, description, NAME, pr_info)
 
     prepared_events = prepare_tests_results_for_clickhouse(
         pr_info,
@@ -485,7 +484,7 @@ def main():
         NAME,
     )
     ch_helper = ClickHouseHelper()
-    ch_helper.insert_events_into(db="gh-data", table="checks", events=prepared_events)
+    # ch_helper.insert_events_into(db="gh-data", table="checks", events=prepared_events)
 
     if status == "failure":
         sys.exit(1)
