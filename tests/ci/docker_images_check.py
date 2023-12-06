@@ -237,7 +237,7 @@ def build_and_push_one_image(
         # A hack to invalidate cache, grep for it in docker/ dir
         f"--build-arg CACHE_INVALIDATOR={GITHUB_RUN_URL} "
         f"--tag {image.repo}:{version_string} "
-        f"{cache_from} "
+        # f"{cache_from} "
         f"--cache-to type=inline,mode=max "
             # FIXME: many tests utilize packages without specifying version, hence docker pulls :latest
             # this will fail multiple jobs are going to be executed on different machines and
