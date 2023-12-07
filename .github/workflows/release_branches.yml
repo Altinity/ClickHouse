@@ -96,7 +96,7 @@ jobs:
         working-directory: /var/lib
         run: |
           sudo tar czf docker.tar.gz docker 
-          aws s3 cp docker.tar.gz - s3://altinity-build-artifacts/${{ github.event.number }}/$GITHUB_SHA/docker.tar.gz
+          aws s3 cp docker.tar.gz s3://altinity-build-artifacts/${{ github.event.number }}/$GITHUB_SHA/docker.tar.gz
       - name: Upload images files to artifacts
         uses: actions/upload-artifact@v3
         with:
