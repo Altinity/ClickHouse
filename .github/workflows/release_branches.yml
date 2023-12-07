@@ -90,7 +90,7 @@ jobs:
       - name: Upload docker files
         working-directory: /var/lib
         run: |
-          tar czf docker.tar.gz docker 
+          sudo tar czf docker.tar.gz docker 
           aws s3 cp docker.tar.gz - s3://altinity-build-artifacts/${{ github.event.number }}/$GITHUB_SHA/docker.tar.gz
       - name: Upload images files to artifacts
         uses: actions/upload-artifact@v3
@@ -662,7 +662,7 @@ jobs:
         run: |
           sudo systemctl stop docker
           aws s3 cp s3://altinity-build-artifacts/${{ github.event.number }}/$GITHUB_SHA/docker.tar.gz docker.tar.gz
-          tar xfz docker.tar.gz
+          sudo tar xfz docker.tar.gz
           sudo systemctl start docker
       - name: Download json reports
         uses: actions/download-artifact@v3
