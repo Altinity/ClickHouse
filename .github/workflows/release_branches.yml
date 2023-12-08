@@ -662,11 +662,13 @@ jobs:
       - name: Docker login
         run: |
           docker login -u $DOCKER_USERNAME -p $DOCKER_PASSWORD
-      - name: Docker download
+      - name: Download docker 
+        run: aws s3 cp s3://altinity-build-artifacts/${{ github.event.number }}/$GITHUB_SHA/docker.tar.gz docker.tar.gz
+      - name: Install docker
         working-directory: /var/lib
         run: |
           sudo systemctl stop docker
-          sudo aws s3 cp s3://altinity-build-artifacts/${{ github.event.number }}/$GITHUB_SHA/docker.tar.gz docker.tar.gz
+          sudo mv $GITHUB_WORKSPACE/docker.tar.gz docker.tar.gz
           sudo tar xfz docker.tar.gz
           sudo systemctl start docker
       - name: Download json reports
