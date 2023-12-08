@@ -666,7 +666,7 @@ jobs:
         working-directory: /var/lib
         run: |
           sudo systemctl stop docker
-          aws s3 cp s3://altinity-build-artifacts/${{ github.event.number }}/$GITHUB_SHA/docker.tar.gz docker.tar.gz
+          sudo aws s3 cp s3://altinity-build-artifacts/${{ github.event.number }}/$GITHUB_SHA/docker.tar.gz docker.tar.gz
           sudo tar xfz docker.tar.gz
           sudo systemctl start docker
       - name: Download json reports
