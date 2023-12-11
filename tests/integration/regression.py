@@ -8,8 +8,12 @@ import testflows.settings
 from testflows.core import *
 from testflows.connect import Shell
 
+# FIXME: add collect tests
+# FIXME: run parallel_skip.json tests sequentially
 # FIXME: add pre-pull
 # FIXME: add docker image rebuild
+# FIXME: add test_times.json that contains approximate test times for each test
+#        to devide tests by approximate total test time instead of number of tests
 
 
 def argparser(parser):
