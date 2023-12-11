@@ -73,7 +73,7 @@ RUN python3 -m pip install --no-cache-dir \
     delta-spark==2.3.0 \
     dict2xml \
     dicttoxml \
-    docker \
+    docker==6.1.3 \
     docker-compose==1.29.2 \
     grpcio \
     grpcio-tools \
@@ -94,6 +94,7 @@ RUN python3 -m pip install --no-cache-dir \
     pytest-repeat \
     pytest-timeout \
     pytest-xdist \
+    pytest-reportlog==0.4.0 \
     pytz \
     pyyaml==5.3.1 \
     redis \

@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+from testflows.core import *
+
+import json
+import time
+import random
+import subprocess
+
+
+@TestScenario
+def build_image(self, path, name, dependent, tag="latest"):
+    """Build single image in specified path and with the specified name
+    and tag taking account any dependent images that must be build first.
+    """
+    with By(f"building {name}:{tag} at {path}"):
+        for d in dependent:
+            while d not in self.context.ready:
+                with By(f"waiting for {d} to be ready"):
+                    time.sleep(1)
+
+        command = f"cd ../{path}; docker build -t {name}:latest ."
+        proc = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            encoding="utf-8",
+            shell=True,
+        )
+
+        while proc.poll() is None:
+            if self.terminating:
+                break
+            message(f"{proc.stdout.readline()}", stream=name)
+
+        assert proc.returncode == 0, f"failed to build {name} at {path}"
+
+        self.context.ready.append(path)
+
+
+@TestFeature
+def build_images(self, tag="latest"):
+    """Build all images."""
+    self.context.ready = []
+
+    with Given("I load images.json definitions"):
+        with open("./images.json") as images_json:
+            images = json.load(images_json)
+
+    with And("I build a dictionary of image dependencies"):
+        dependents = {}
+
+        for path in images:
+            if path not in dependents:
+                dependents[path] = []
+            for _path, _image in images.items():
+                dependent = _image["dependent"]
+                if path in dependent:
+                    dependents[path].append(_path)
+
+    with Pool() as executor:
+        for path, image in images.items():
+            name = image["name"]
+            dependent = dependents[path]
+            Scenario(
+                name=f"build {name}:{tag}",
+                description=f"depends on {dependent}",
+                test=build_image,
+                executor=executor,
+                parallel=True,
+            )(path=path, name=name, dependent=dependent)
+
+        join()
+
+
+if main():
+    build_images()
