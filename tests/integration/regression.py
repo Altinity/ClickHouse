@@ -281,7 +281,7 @@ def regression(self, clickhouse_binary_path, run_in_parallel=None):
         for line in log.readlines():
             with By(
                 f"parsing json line: {lineno}"
-            ) if not testflows.settings.debug else NullStep():
+            ) if testflows.settings.debug else NullStep():
                 if testflows.settings.debug:
                     debug(line)
                 entry = json.loads(line)
@@ -313,7 +313,8 @@ def regression(self, clickhouse_binary_path, run_in_parallel=None):
         if runner.exitcode is not None:
             break
 
-    debug(f"runner exitcode: {runner.exitcode}")
+    if runner.exitcode != 0:
+        fail(f"runner exited with non-zero exitcode: {runner.exitcode}")
 
 
 if main():
