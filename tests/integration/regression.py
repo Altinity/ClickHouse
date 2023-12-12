@@ -11,8 +11,11 @@ import testflows.settings
 from testflows.core import *
 from testflows.connect import Shell
 
+# FIXME: add support similar to run by hash_total, hash_num (allows to partition tests between different runners)
+# FIXME: customize run_in_parallel per specific group? Some groups run with 10 some with 5 some with 3 etc.
 # FIXME: handler analyzer and analyzer broken tests
 # FIXME: handle runner timeout
+# FIXME: add support to provide fixed list of tests instead collecting them dynamically
 # FIXME: clear ip tables and restart docker between each interation of runner?
 # FIXME: add pre-pull
 # FIXME: add docker image rebuild
@@ -43,6 +46,23 @@ def argparser(parser):
         help="set runner parallelism, default: not set",
         default=10,
     )
+
+
+def readline(file):
+    """Read full line from a file taking into account
+    that if the file is updated concurrently the line
+    may not be complete yet."""
+    while True:
+        pos = file.tell()
+        line = file.readline()
+
+        if line:
+            if not line.endswith("\n"):
+                log.seek(pos)
+                time.sleep(1)
+                continue
+        break
+    return line
 
 
 @contextlib.contextmanager
@@ -346,101 +366,83 @@ def execute_group(self, group_id, tests, run_in_parallel):
             run_in_parallel=run_in_parallel,
         )
 
-    try:
-        while True:
-            pos = log.tell()
-            line = log.readline()
+    while True:
+        line = readline(log)
 
-            if line:
-                if not line.endswith("\n"):
-                    log.seek(pos)
-                    time.sleep(1)
-                    continue
+        if not line:
+            if runner.poll() is not None:
+                # runner has exited, try reading one final time
+                line = readline(log)
+                if not line:
+                    break
+            time.sleep(1)
+            continue
 
-                with catch(
-                    Exception, raising=ValueError(f"failed to parse line: {line}")
-                ):
-                    entry = json.loads(line)
+        with catch(Exception, raising=ValueError(f"failed to parse line: {line}")):
+            entry = json.loads(line)
 
-                if entry["$report_type"] == "TestReport":
-                    # skip setup and teardown entries unless they have non-passing outcome
-                    if entry["when"] != "call" and entry["outcome"] == "passed":
-                        continue
+        if entry["$report_type"] == "TestReport":
+            # skip setup and teardown entries unless they have non-passing outcome
+            if entry["when"] != "call" and entry["outcome"] == "passed":
+                continue
 
-                    # create scenario for each test call or non-passing setup or teardown outcome
-                    with Scenario(
-                        name=entry["nodeid"]
-                        + ((":" + entry["when"]) if entry["when"] != "call" else ""),
-                        description=f"location {':'.join([str(e) for e in entry['location']])}",
-                        attributes=Attributes(*entry["keywords"].items()),
-                        start_time=entry["start"],
-                        test_time=(entry["start"] - entry["stop"]),
-                        flags=TE,
-                    ):
-                        for section in entry["sections"]:
-                            # process captured log
-                            if section and section[0] == "Captured log call":
-                                message("Captured log call\n" + section[1])
+            # create scenario for each test call or non-passing setup or teardown outcome
+            with Scenario(
+                name=entry["nodeid"]
+                + ((":" + entry["when"]) if entry["when"] != "call" else ""),
+                description=f"Test location: {':'.join([str(e) for e in entry['location']])}",
+                attributes=Attributes(*entry["keywords"].items()),
+                start_time=entry["start"],
+                test_time=(entry["start"] - entry["stop"]),
+                flags=TE,
+            ):
+                for section in entry["sections"]:
+                    # process captured log
+                    if section and section[0] == "Captured log call":
+                        message("Captured log call\n" + section[1])
 
-                        # process trackback entries if any
-                        longrepr = entry.get("longrepr")
+                # process trackback entries if any
+                longrepr = entry.get("longrepr")
 
-                        reprcrash = (
-                            longrepr.get("reprcrash") if longrepr is not None else None
-                        )
-                        if reprcrash:
-                            reprcrash = f"{reprcrash['path']}:{reprcrash['lineno']} {reprcrash['message']}"
-                            message(reprcrash)
+                reprcrash = longrepr.get("reprcrash") if longrepr is not None else None
+                if reprcrash:
+                    reprcrash = f"{reprcrash['path']}:{reprcrash['lineno']} {reprcrash['message']}"
+                    message(reprcrash)
 
-                        reprtraceback = (
-                            longrepr.get("reprtraceback")
-                            if longrepr is not None
-                            else None
-                        )
-                        reprentries = (
-                            reprtraceback.get("reprentries", [])
-                            if reprtraceback is not None
+                reprtraceback = (
+                    longrepr.get("reprtraceback") if longrepr is not None else None
+                )
+                reprentries = (
+                    reprtraceback.get("reprentries", [])
+                    if reprtraceback is not None
+                    else []
+                )
+
+                for reprentry in reprentries:
+                    if reprentry["type"] == "ReprEntry":
+                        reprfuncargs = reprentry["data"].get("reprfuncargs")
+                        args = (
+                            reprfuncargs.get("args", [])
+                            if reprfuncargs is not None
                             else []
                         )
+                        for arg in args:
+                            message(" = ".join(arg))
+                        if reprentry["data"].get("lines"):
+                            message("\n".join(reprentry["data"]["lines"]))
+                        if reprentry["data"].get("reprfileloc"):
+                            fileloc = reprentry["data"]["reprfileloc"]
+                            message(
+                                f"{fileloc['path']}:{fileloc['lineno']} {fileloc['message']}"
+                            )
 
-                        for reprentry in reprentries:
-                            if reprentry["type"] == "ReprEntry":
-                                reprfuncargs = reprentry["data"].get("reprfuncargs")
-                                args = (
-                                    reprfuncargs.get("args", [])
-                                    if reprfuncargs is not None
-                                    else []
-                                )
-                                for arg in args:
-                                    message(" = ".join(arg))
-                                if reprentry["data"].get("lines"):
-                                    message("\n".join(reprentry["data"]["lines"]))
-                                if reprentry["data"].get("reprfileloc"):
-                                    fileloc = reprentry["data"]["reprfileloc"]
-                                    message(
-                                        f"{fileloc['path']}:{fileloc['lineno']} {fileloc['message']}"
-                                    )
+                if entry["outcome"].lower() == "passed":
+                    ok("success")
 
-                        if entry["outcome"].lower() == "passed":
-                            ok("success")
+                fail(f"{entry['outcome']}{(' ' + reprcrash) if reprcrash else ''}")
 
-                        fail(
-                            f"{entry['outcome']}{(' ' + reprcrash) if reprcrash else ''}"
-                        )
-
-            if runner.poll() is not None:
-                break
-
-            time.sleep(1)
-
-        if runner.returncode != 0:
-            fail(f"runner exited with non-zero exitcode: {runner.returncode}")
-
-    finally:
-        pass
-        # with Finally("dump runner stdout/stderr"):
-        #    for line in runner.stdout.readlines():
-        #        message(line, stream="runner")
+    if runner.returncode != 0:
+        fail(f"runner exited with non-zero exitcode: {runner.returncode}")
 
 
 @TestFeature
@@ -461,7 +463,7 @@ def execute_serial(self, group_size):
 
         note(f"serial group {i, i + group_size}")
 
-        Feature(name=f"{group_id}", test=execute_group)(
+        Feature(name=f"{group_id}", test=execute_group, flags=TE)(
             group_id=group_id, tests=group_tests, run_in_parallel=None
         )
 
@@ -483,7 +485,7 @@ def execute_parallel(self, group_size, run_in_parallel):
 
         note(f"parallel group {i, i + group_size}")
 
-        Feature(name=f"{group_id}", test=execute_group)(
+        Feature(name=f"{group_id}", test=execute_group, flags=TE)(
             group_id=group_id, tests=group_tests, run_in_parallel=run_in_parallel
         )
 
@@ -508,7 +510,6 @@ def regression(
 
     with And("collected all tests"):
         self.context.all_tests = get_all_tests()
-        # self.context.all_tests = ["test_concurrent_threads_soft_limit∕test.py::test_concurrent_threads_soft_limit_defined_1"]
 
     with And("collected all tests that must be run in serial"):
         self.context.parallel_skip_tests = get_all_parallel_skip_tests()
