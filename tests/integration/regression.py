@@ -322,7 +322,7 @@ def launch_runner(self, run_id, tests, run_in_parallel=None):
         + " --"
         + " -rfEps"
         + f" --run-id={run_id} --color=no --durations=0"
-        + f" --report-log={os.path.basename(log.name)} > runner.log 2>&1",
+        + f" --report-log={os.path.basename(log.name)} > runner_{run_id}.log 2>&1",
     )
 
     with And("launch runner"):
@@ -380,7 +380,7 @@ def execute_group(self, group_id, tests, run_in_parallel):
                         for section in entry["sections"]:
                             # process captured log
                             if section and section[0] == "Captured log call":
-                                message(section[1])
+                                message("Captured log call\n" + section[1])
 
                         # process trackback entries if any
                         longrepr = entry.get("longrepr")
