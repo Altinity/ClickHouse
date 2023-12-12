@@ -12,8 +12,8 @@ from testflows.core import *
 from testflows.connect import Shell
 
 # FIXME: handler analyzer and analyzer broken tests
+# FIXME: handle runner timeout
 # FIXME: clear ip tables and restart docker between each interation of runner?
-# FIXME: run parallel_skip.json tests sequentially
 # FIXME: add pre-pull
 # FIXME: add docker image rebuild
 # FIXME: add test_times.json that contains approximate test times for each test
@@ -335,40 +335,14 @@ def launch_runner(self, run_id, tests, run_in_parallel=None):
     yield proc, log
 
 
-@TestModule
-@ArgumentParser(argparser)
-def regression(self, clickhouse_binary_path, run_in_parallel=5):
-    """Run ClickHouse pytest integration tests."""
+@TestOutline
+def execute_group(self, group_id, tests, run_in_parallel):
+    """Execute a group of tests."""
 
-    with Given("I get clickhouse binaries"):
-        (
-            self.context.binary,
-            self.context.odbc_bridge_binary,
-            self.context.library_bridge_binary,
-        ) = clickhouse_binaries(path=clickhouse_binary_path)
-
-    with And("I collect all tests"):
-        self.context.all_tests = get_all_tests()
-
-    with And("I collect all parallel skip tests"):
-        self.context.parallel_skip_tests = get_all_parallel_skip_tests()
-
-    with And("I create parallel and non parallel tests list"):
-        self.context.non_parallel_tests = [
-            test
-            for test in self.context.parallel_skip_tests
-            if test in self.context.all_tests
-        ]
-        self.context.parallel_tests = [
-            test
-            for test in self.context.all_tests
-            if not (test in self.context.parallel_skip_tests)
-        ]
-
-    with And("I launch the runner"):
+    with Given("I launch the runner"):
         runner, log = launch_runner(
-            run_id=0,
-            tests=self.context.parallel_tests[:100],
+            run_id=group_id,
+            tests=tests,
             run_in_parallel=run_in_parallel,
         )
 
@@ -397,19 +371,62 @@ def regression(self, clickhouse_binary_path, run_in_parallel=5):
                     with Scenario(
                         name=entry["nodeid"]
                         + ((":" + entry["when"]) if entry["when"] != "call" else ""),
-                        description=f"location: {entry['location']}",
-                        # attributes=Attributes(entry["keywords"]), # FIXME
+                        description=f"location {':'.join([str(e) for e in entry['location']])}",
+                        attributes=Attributes(*entry["keywords"].items()),
                         start_time=entry["start"],
                         test_time=(entry["start"] - entry["stop"]),
+                        flags=TE,
                     ):
                         for section in entry["sections"]:
+                            # process captured log
                             if section and section[0] == "Captured log call":
                                 message(section[1])
+
+                        # process trackback entries if any
+                        longrepr = entry.get("longrepr")
+
+                        reprcrash = (
+                            longrepr.get("reprcrash") if longrepr is not None else None
+                        )
+                        if reprcrash:
+                            reprcrash = f"{reprcrash['path']}:{reprcrash['lineno']} {reprcrash['message']}"
+                            message(reprcrash)
+
+                        reprtraceback = (
+                            longrepr.get("reprtraceback")
+                            if longrepr is not None
+                            else None
+                        )
+                        reprentries = (
+                            reprtraceback.get("reprentries", [])
+                            if reprtraceback is not None
+                            else []
+                        )
+
+                        for reprentry in reprentries:
+                            if reprentry["type"] == "ReprEntry":
+                                reprfuncargs = reprentry["data"].get("reprfuncargs")
+                                args = (
+                                    reprfuncargs.get("args", [])
+                                    if reprfuncargs is not None
+                                    else []
+                                )
+                                for arg in args:
+                                    message(" = ".join(arg))
+                                if reprentry["data"].get("lines"):
+                                    message("\n".join(reprentry["data"]["lines"]))
+                                if reprentry["data"].get("reprfileloc"):
+                                    fileloc = reprentry["data"]["reprfileloc"]
+                                    message(
+                                        f"{fileloc['path']}:{fileloc['lineno']} {fileloc['message']}"
+                                    )
 
                         if entry["outcome"].lower() == "passed":
                             ok("success")
 
-                        fail(entry["outcome"])
+                        fail(
+                            f"{entry['outcome']}{(' ' + reprcrash) if reprcrash else ''}"
+                        )
 
             if runner.poll() is not None:
                 break
@@ -420,9 +437,91 @@ def regression(self, clickhouse_binary_path, run_in_parallel=5):
             fail(f"runner exited with non-zero exitcode: {runner.returncode}")
 
     finally:
-        with Finally("dump runner stdout/stderr"):
-            for line in runner.stdout.readlines():
-                message(line, stream="runner")
+        pass
+        # with Finally("dump runner stdout/stderr"):
+        #    for line in runner.stdout.readlines():
+        #        message(line, stream="runner")
+
+
+@TestFeature
+def execute_serial(self, group_size):
+    """Execute all tests that can't be run in parallel
+    and must be executed serially one by one."""
+
+    with Given("serial tests list"):
+        tests = [
+            test
+            for test in self.context.parallel_skip_tests
+            if test in self.context.all_tests
+        ]
+        note(f"total number of serial tests {len(tests)}")
+
+    for group_id, i in enumerate(range(0, len(tests), group_size)):
+        group_tests = tests[i : i + group_size]
+
+        note(f"serial group {i, i + group_size}")
+
+        Feature(name=f"{group_id}", test=execute_group)(
+            group_id=group_id, tests=group_tests, run_in_parallel=None
+        )
+
+
+@TestFeature
+def execute_parallel(self, group_size, run_in_parallel):
+    """Execute all tests that can be run in parallel."""
+
+    with Given("parallel tests list"):
+        tests = [
+            test
+            for test in self.context.all_tests
+            if not (test in self.context.parallel_skip_tests)
+        ]
+        note(f"total number of parallel tests {len(tests)}")
+
+    for group_id, i in enumerate(range(0, len(tests), group_size)):
+        group_tests = tests[i : i + group_size]
+
+        note(f"parallel group {i, i + group_size}")
+
+        Feature(name=f"{group_id}", test=execute_group)(
+            group_id=group_id, tests=group_tests, run_in_parallel=run_in_parallel
+        )
+
+
+@TestModule
+@ArgumentParser(argparser)
+def regression(
+    self,
+    clickhouse_binary_path,
+    run_in_parallel=5,
+    parallel_group_size=100,
+    serial_group_size=100,
+):
+    """Execute ClickHouse pytest integration tests."""
+
+    with Given("clickhouse binaries"):
+        (
+            self.context.binary,
+            self.context.odbc_bridge_binary,
+            self.context.library_bridge_binary,
+        ) = clickhouse_binaries(path=clickhouse_binary_path)
+
+    with And("collected all tests"):
+        self.context.all_tests = get_all_tests()
+        # self.context.all_tests = ["test_concurrent_threads_soft_limit∕test.py::test_concurrent_threads_soft_limit_defined_1"]
+
+    with And("collected all tests that must be run in serial"):
+        self.context.parallel_skip_tests = get_all_parallel_skip_tests()
+
+    with Feature(
+        "parallel", description="Execute all tests that can be run in parallel."
+    ):
+        execute_parallel(
+            group_size=parallel_group_size, run_in_parallel=run_in_parallel
+        )
+
+    with Feature("serial", description="Execute all tests that must be run in serial."):
+        execute_serial(group_size=serial_group_size)
 
 
 if main():
