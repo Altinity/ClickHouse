@@ -1,14 +1,18 @@
 import os
 import uuid
 import json
+import time
+import shlex
 import tempfile
-
+import contextlib
+import subprocess
 import testflows.settings
 
 from testflows.core import *
 from testflows.connect import Shell
 
-# FIXME: add collect tests
+# FIXME: handler analyzer and analyzer broken tests
+# FIXME: clear ip tables and restart docker between each interation of runner?
 # FIXME: run parallel_skip.json tests sequentially
 # FIXME: add pre-pull
 # FIXME: add docker image rebuild
@@ -37,8 +41,38 @@ def argparser(parser):
         type=int,
         dest="run_in_parallel",
         help="set runner parallelism, default: not set",
-        default=None,
+        default=10,
     )
+
+
+@contextlib.contextmanager
+def catch(exceptions, raising):
+    try:
+        yield
+    except exceptions as e:
+        raise raising from e
+
+
+@TestStep(Given)
+def sysprocess(self, command):
+    """Run system command"""
+
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        shell=True,
+    )
+    try:
+        yield proc
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+        while proc.poll() is None:
+            debug(f"waiting for {proc} to exit")
+            time.sleep(1)
 
 
 @TestStep
@@ -219,102 +253,176 @@ def shell(self):
         yield bash
 
 
+@TestStep
+def runner_opts(self):
+    """Return runner script options."""
+    return (
+        f" --binary {self.context.binary}"
+        + f" --odbc-bridge-binary {self.context.odbc_bridge_binary}"
+        + f" --library-bridge-binary {self.context.library_bridge_binary}"
+    )
+
+
 @TestStep(Given)
-def launch_runner(
-    self, binary, odbc_bridge_binary, library_bridge_binary, run_in_parallel=None
-):
+def get_all_tests(self):
+    """Collect a list of tests using pytest --setup-plan command."""
+
+    with tempfile.NamedTemporaryFile(
+        "r", dir=current_dir(), delete=(not testflows.settings.debug)
+    ) as out:
+        command = (
+            f"set -o pipefail && ./runner {runner_opts()} -- --setup-plan "
+            "| grep -F '::' | sed -r 's/ \(fixtures used:.*//g; s/^ *//g; s/ *$//g' "
+            f"| grep -v -F 'SKIPPED' | sort --unique > {os.path.basename(out.name)}"
+        )
+
+        with shell() as bash:
+            cmd = bash(command, timeout=100)
+            assert (
+                cmd.exitcode == 0
+            ), f"non-zero exitcode {cmd.exitcode} when trying to collect all tests"
+
+        tests = []
+        for line in out.readlines():
+            if not line.startswith("test_"):
+                continue
+            tests.append(line.strip())
+
+    assert tests, "no tests found"
+    return sorted(tests)
+
+
+@TestStep(Given)
+def get_all_parallel_skip_tests(self):
+    """Get all tests that can't be run in parallel defined in parallel_skip.json file."""
+    tests = []
+
+    with open(os.path.join(current_dir(), "parallel_skip.json"), "r") as fd:
+        for test in json.load(fd):
+            tests.append(test)
+
+    return sorted(tests)
+
+
+@TestStep(Given)
+def launch_runner(self, run_id, tests, run_in_parallel=None):
     report_timeout = 60
 
     with By("creating temporary report log file"):
         log = temporary_file(mode="r", suffix=".pytest.jsonl", dir=current_dir())
 
+    tests = " ".join([shlex.quote(test) for test in sorted(tests)])
+
     command = define(
         "command",
         "./runner"
-        + (f" -n {run_in_parallel}" if run_in_parallel is not None else "")
-        + f" --binary {binary}"
-        + f" --odbc-bridge-binary {odbc_bridge_binary}"
-        + f" --library-bridge-binary {library_bridge_binary}"
-        + " 'test_ssl_cert_authentication'"
+        + runner_opts()
+        + f" -t {tests}"
+        + (f" --parallel {run_in_parallel}" if run_in_parallel is not None else "")
         + " --"
-        + f" --report-log={os.path.basename(log.name)}",
+        + " -rfEps"
+        + f" --run-id={run_id} --color=no --durations=0"
+        + f" --report-log={os.path.basename(log.name)} > runner.log 2>&1",
     )
 
-    with And("execute runner"):
-        bash = shell()
+    with And("launch runner"):
+        proc = sysprocess(command=command)
 
-        with bash(command, asyncronous=True, name="runner") as runner:
-            runner.readlines()
+        if proc.poll() is not None:
+            if proc.returncode != 0:
+                fail(f"failed to start, exitcode: {proc.returncode}")
 
-            if runner.exitcode is not None:
-                if runner.exitcode != 0:
-                    fail(f"failed to start, exitcode: {runner.exitcode}")
-                report_timeout = 1
-
-            yield runner, log
-
-            runner.readlines()
+    yield proc, log
 
 
 @TestModule
 @ArgumentParser(argparser)
-def regression(self, clickhouse_binary_path, run_in_parallel=None):
+def regression(self, clickhouse_binary_path, run_in_parallel=5):
     """Run ClickHouse pytest integration tests."""
-    lineno = 0
 
-    with Given("clickhouse binary path"):
-        binary, odbc_bridge_binary, library_bridge_binary = clickhouse_binaries(
-            path=clickhouse_binary_path
-        )
+    with Given("I get clickhouse binaries"):
+        (
+            self.context.binary,
+            self.context.odbc_bridge_binary,
+            self.context.library_bridge_binary,
+        ) = clickhouse_binaries(path=clickhouse_binary_path)
 
-    with And("launch runner"):
+    with And("I collect all tests"):
+        self.context.all_tests = get_all_tests()
+
+    with And("I collect all parallel skip tests"):
+        self.context.parallel_skip_tests = get_all_parallel_skip_tests()
+
+    with And("I create parallel and non parallel tests list"):
+        self.context.non_parallel_tests = [
+            test
+            for test in self.context.parallel_skip_tests
+            if test in self.context.all_tests
+        ]
+        self.context.parallel_tests = [
+            test
+            for test in self.context.all_tests
+            if not (test in self.context.parallel_skip_tests)
+        ]
+
+    with And("I launch the runner"):
         runner, log = launch_runner(
-            binary=binary,
-            odbc_bridge_binary=odbc_bridge_binary,
-            library_bridge_binary=library_bridge_binary,
+            run_id=0,
+            tests=self.context.parallel_tests[:100],
             run_in_parallel=run_in_parallel,
         )
 
-    while True:
-        runner.readlines(timeout=1)
+    try:
+        while True:
+            pos = log.tell()
+            line = log.readline()
 
-        for line in log.readlines():
-            with By(
-                f"parsing json line: {lineno}"
-            ) if testflows.settings.debug else NullStep():
-                if testflows.settings.debug:
-                    debug(line)
-                entry = json.loads(line)
-                lineno += 1
-
-            if entry["$report_type"] == "TestReport":
-                # skip setup and teardown entries unless they have non-passing outcome
-                if entry["when"] != "call" and entry["outcome"] == "passed":
+            if line:
+                if not line.endswith("\n"):
+                    log.seek(pos)
+                    time.sleep(1)
                     continue
 
-                # create scenario for each test call or non-passing setup or teardown outcome
-                with Scenario(
-                    name=entry["nodeid"]
-                    + ((":" + entry["when"]) if entry["when"] != "call" else ""),
-                    description=f"location: {entry['location']}",
-                    attributes=Attributes(entry["keywords"]),
-                    start_time=entry["start"],
-                    test_time=(entry["start"] - entry["stop"]),
+                with catch(
+                    Exception, raising=ValueError(f"failed to parse line: {line}")
                 ):
-                    for section in entry["sections"]:
-                        if section and section[0] == "Captured log call":
-                            message(section[1])
+                    entry = json.loads(line)
 
-                    if entry["outcome"].lower() == "passed":
-                        ok("success")
+                if entry["$report_type"] == "TestReport":
+                    # skip setup and teardown entries unless they have non-passing outcome
+                    if entry["when"] != "call" and entry["outcome"] == "passed":
+                        continue
 
-                    fail(entry["outcome"])
+                    # create scenario for each test call or non-passing setup or teardown outcome
+                    with Scenario(
+                        name=entry["nodeid"]
+                        + ((":" + entry["when"]) if entry["when"] != "call" else ""),
+                        description=f"location: {entry['location']}",
+                        # attributes=Attributes(entry["keywords"]), # FIXME
+                        start_time=entry["start"],
+                        test_time=(entry["start"] - entry["stop"]),
+                    ):
+                        for section in entry["sections"]:
+                            if section and section[0] == "Captured log call":
+                                message(section[1])
 
-        if runner.exitcode is not None:
-            break
+                        if entry["outcome"].lower() == "passed":
+                            ok("success")
 
-    if runner.exitcode != 0:
-        fail(f"runner exited with non-zero exitcode: {runner.exitcode}")
+                        fail(entry["outcome"])
+
+            if runner.poll() is not None:
+                break
+
+            time.sleep(1)
+
+        if runner.returncode != 0:
+            fail(f"runner exited with non-zero exitcode: {runner.returncode}")
+
+    finally:
+        with Finally("dump runner stdout/stderr"):
+            for line in runner.stdout.readlines():
+                message(line, stream="runner")
 
 
 if main():
