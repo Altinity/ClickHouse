@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+import os
+
+from testflows.core import *
+
+
+def argparser(parser):
+    parser.add_argument(
+        "--image-tag",
+        help="tag to be used for all the images, default: latest",
+        default="latest",
+    )
+    parser.add_argument(
+        "--image-timeout",
+        help="timeout to build a single image or wait for one of its dependencies",
+    )
+
+
+@TestFeature
+@ArgumentParser(argparser)
+def build_images(self, image_tag, image_timeout=None):
+    """Test program to manually build all docker images."""
+    load(
+        load_module(
+            "regression",
+            path=os.path.join(
+                current_dir(), "..", "tests", "integration", "regression.py"
+            ),
+        ),
+        "build_images",
+    )(tag=image_tag, timeout=image_timeout)
+
+
+if main():
+    build_images()

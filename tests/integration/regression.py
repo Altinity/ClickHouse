@@ -11,6 +11,8 @@ import testflows.settings
 from testflows.core import *
 from testflows.connect import Shell
 
+# FIXME: add support for --network which should be "" by default (instead of host by default)
+#        in general we need to support all ./runner options
 # FIXME: add support similar to run by hash_total, hash_num (allows to partition tests between different runners)
 # FIXME: customize run_in_parallel per specific group? Some groups run with 10 some with 5 some with 3 etc.
 # FIXME: handler analyzer and analyzer broken tests
@@ -105,6 +107,69 @@ def getuid(self):
 def short_hash(s):
     """Return good enough short hash of a string."""
     return hashlib.sha1(s.encode("utf-8")).hexdigest()[:10]
+
+
+@TestScenario
+def build_image(self, path, name, dependent, tag="latest", timeout=None):
+    """Build single image in specified path and with the specified name
+    and tag taking account any dependent images that must be build first.
+    """
+    with By(f"waiting for dependent images to be ready"):
+        for d in dependent:
+            with By(f"waiting for {d} to be ready"):
+                while d not in self.context.ready:
+                    with timer(timeout, f"waiting for depended {d} image to be ready"):
+                        time.sleep(1)
+
+    command = f"cd ../{path}; docker build -t {name}:{tag} ."
+
+    with And("launching build command"):
+        proc = sysprocess(command=command)
+
+    while proc.poll() is None:
+        with timer(timeout, f"building image took too long"):
+            if self.terminating:
+                break
+            message(f"{proc.stdout.readline()}", stream=name)
+
+    assert proc.returncode == 0, f"failed to build {name} at {path}"
+
+    self.context.ready.append(path)
+
+
+@TestFeature
+def build_images(self, tag="latest", timeout=None):
+    """Build all images."""
+    self.context.ready = []
+
+    with Given("I load images.json definitions"):
+        with open("./images.json") as images_json:
+            images = json.load(images_json)
+
+    with And("I build a dictionary of image dependencies"):
+        dependents = {}
+
+        for path in images:
+            if path not in dependents:
+                dependents[path] = []
+            for _path, _image in images.items():
+                dependent = _image["dependent"]
+                if path in dependent:
+                    dependents[path].append(_path)
+
+    with Pool() as executor:
+        for path, image in images.items():
+            name = image["name"]
+            dependent = dependents[path]
+            Scenario(
+                name=f"build {name}:{tag}",
+                description=f"depends on {dependent}",
+                test=build_image,
+                executor=executor,
+                parallel=True,
+            )(path=path, name=name, dependent=dependent, tag=tag, timeout=timeout)
+
+        join()
 
 
 @TestStep
