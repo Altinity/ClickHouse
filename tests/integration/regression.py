@@ -20,7 +20,6 @@ from testflows.connect import Shell
 # FIXME: add support to provide fixed list of tests instead collecting them dynamically
 # FIXME: clear ip tables and restart docker between each interation of runner?
 # FIXME: add pre-pull
-# FIXME: add docker image rebuild
 # FIXME: add test_times.json that contains approximate test times for each test
 #        to devide tests by approximate total test time instead of number of tests
 
@@ -47,6 +46,34 @@ def argparser(parser):
         dest="run_in_parallel",
         help="set runner parallelism, default: not set",
         default=10,
+    )
+
+    parser.add_argument(
+        "--build-images",
+        dest="build_docker_images",
+        action="store_true",
+        help=(
+            "build all docker images inside the ClickHouse/docker folder including the ones used\n"
+            "by integration tests. Use --build-images-tag to specify custom tag, default: latest."
+        ),
+    )
+
+    parser.add_argument(
+        "--build-images-tag",
+        dest="build_docker_images_with_tag",
+        type=str,
+        metavar="tag",
+        help="tag to be used when building images, default: latest",
+        default="latest",
+    )
+
+    parser.add_argument(
+        "--build-images-timeout",
+        dest="build_docker_images_timeout",
+        type=float,
+        metavar="timeout",
+        help="timeout to build each image or wait for one of its dependencies, default: None",
+        default=None,
     )
 
 
@@ -121,7 +148,7 @@ def build_image(self, path, name, dependent, tag="latest", timeout=None):
                     with timer(timeout, f"waiting for depended {d} image to be ready"):
                         time.sleep(1)
 
-    command = f"cd ../{path}; docker build -t {name}:{tag} ."
+    command = f"cd {os.path.join(current_dir(), '..', '..', path)}; docker build -t {name}:{tag} ."
 
     with And("launching build command"):
         proc = sysprocess(command=command)
@@ -143,7 +170,9 @@ def build_images(self, tag="latest", timeout=None):
     self.context.ready = []
 
     with Given("I load images.json definitions"):
-        with open("./images.json") as images_json:
+        with open(
+            os.path.join(current_dir(), "..", "..", "docker", "images.json")
+        ) as images_json:
             images = json.load(images_json)
 
     with And("I build a dictionary of image dependencies"):
@@ -356,7 +385,7 @@ def get_all_tests(self):
         "r", dir=current_dir(), delete=(not testflows.settings.debug)
     ) as out:
         command = (
-            f"set -o pipefail && ./runner {runner_opts()} -- --setup-plan "
+            f"set -o pipefail && {os.path.join(current_dir(), 'runner')} {runner_opts()} -- --setup-plan "
             "| grep -F '::' | sed -r 's/ \(fixtures used:.*//g; s/^ *//g; s/ *$//g' "
             f"| grep -v -F 'SKIPPED' | sort --unique > {os.path.basename(out.name)}"
         )
@@ -400,7 +429,7 @@ def launch_runner(self, run_id, tests, run_in_parallel=None):
 
     command = define(
         "command",
-        "./runner"
+        f"{os.path.join(current_dir(), 'runner')}"
         + runner_opts()
         + f" -t {tests}"
         + (f" --parallel {run_in_parallel}" if run_in_parallel is not None else "")
@@ -563,6 +592,9 @@ def regression(
     run_in_parallel=5,
     parallel_group_size=100,
     serial_group_size=100,
+    build_docker_images=False,
+    build_docker_images_timeout=None,
+    build_docker_images_with_tag="latest",
 ):
     """Execute ClickHouse pytest integration tests."""
 
@@ -572,6 +604,12 @@ def regression(
             self.context.odbc_bridge_binary,
             self.context.library_bridge_binary,
         ) = clickhouse_binaries(path=clickhouse_binary_path)
+
+    if build_docker_images:
+        with Feature("build images"):
+            build_images(
+                tag=build_docker_images_with_tag, timeout=build_docker_images_timeout
+            )
 
     with And("collected all tests"):
         self.context.all_tests = get_all_tests()
