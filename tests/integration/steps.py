@@ -50,7 +50,7 @@ def short_hash(s):
 
 
 @TestStep(Given)
-def sysprocess(self, command):
+def sysprocess(self, command, stream=None):
     """Run system command."""
 
     proc = subprocess.Popen(
@@ -70,6 +70,10 @@ def sysprocess(self, command):
         while proc.poll() is None:
             debug(f"waiting for {proc} to exit")
             time.sleep(1)
+
+        with Finally(f"stdout: {command}"):
+            for line in proc.stdout.readlines():
+                message(line, stream=stream)
 
 
 @TestStep

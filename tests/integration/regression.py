@@ -52,6 +52,14 @@ def argparser(parser):
     )
 
     parser.add_argument(
+        "--retry-attempts",
+        type=int,
+        choices=range(0, 6),
+        help="number of times to retry failed tests, default: 2",
+        default=2,
+    )
+
+    parser.add_argument(
         "--max-failed-tests-to-retry",
         help="maximum number of failed tests to retry, default: 100",
         default=100,
@@ -133,7 +141,7 @@ def launch_runner(self, run_id, tests, in_parallel=None):
         + " --"
         + " -rfEps"
         + f" --run-id={run_id} --color=no --durations=0"
-        + f" --report-log={os.path.basename(log.name)} > runner_{run_id}.log 2>&1",
+        + f" --report-log={os.path.basename(log.name)}",
     )
 
     with And("launching command"):
@@ -280,7 +288,11 @@ def regression(
 ):
     """Execute ClickHouse pytest integration tests."""
 
-    retry_tests = []
+    retry_tests = None
+
+    if retry_attempts > 1:
+        # create a list to collect failed tests to be retried
+        retry_tests = []
 
     with Given("clickhouse binaries"):
         (
