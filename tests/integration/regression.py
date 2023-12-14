@@ -1,6 +1,5 @@
 """Integration tests high-level runner using TestFlows framework.
 """
-
 import os
 import json
 import time
@@ -12,8 +11,11 @@ from testflows.connect import Shell
 
 from steps import *
 
+# FIXME: only clickhouse/integration-test-runner:latest is used
+#        but inside the runner image, locally build images are not being used
 # FIXME: add support for --network which should be "" by default (instead of host by default)
-#        in general we need to support all ./runner options
+#        in general we need to support all ./runner options, --disable-net-host
+# FIXME: docker-compose-images-tags?
 # FIXME: handler analyzer and analyzer broken tests
 # FIXME: clear ip tables and restart docker between each interation of runner?
 # FIXME: add pre-pull
@@ -77,6 +79,38 @@ def argparser(parser):
         dest="in_parallel",
         help="number of tests to be executed in parallel, default: 10",
         default=10,
+    )
+
+    # runner options
+    parser.add_argument(
+        "--analyzer",
+        action="store_true",
+        default=False,
+        dest="analyzer",
+        help="run tests with analyzer enabled",
+    )
+
+    parser.add_argument(
+        "--tmpfs",
+        action="store_true",
+        default=False,
+        dest="tmpfs",
+        help="use tmpfs for /var/lib/docker that is used inside the runner",
+    )
+
+    parser.add_argument(
+        "--cleanup-containers",
+        action="store_true",
+        default=False,
+        dest="cleanup_containers",
+        help="remove all running containers on runner's test session start",
+    )
+
+    parser.add_argument(
+        "--dockerd-volume-dir",
+        action="store",
+        dest="dockerd_volume_dir",
+        help="bind volume to this dir to use for runner's dockerd files",
     )
 
     parser.add_argument(
@@ -162,7 +196,12 @@ def launch_runner(self, run_id, tests, in_parallel=None):
         f"{os.path.join(current_dir(), 'runner')}"
         + runner_opts()
         + f" -t {' '.join([shlex.quote(test) for test in sorted(tests)])}"
+        + f" --docker-image-version {self.context.docker_image_version}"
         + (f" --parallel {in_parallel}" if in_parallel is not None else "")
+        + (" --analyzer" if self.context.analyzer else "")
+        + (" --tmpfs" if self.context.tmpfs else "")
+        + (" --cleanup-containers" if self.context.cleanup_containers else "")
+        + (" --dockerd-volume-dir" if self.context.dockerd_volume_dir else "")
         + " --"
         + " -rfEps"
         + f" --run-id={run_id} --color=no --durations=0"
@@ -332,8 +371,19 @@ def regression(
     group_size=100,
     timeout=None,
     group_timeout=None,
+    analyzer=False,
+    tmpfs=False,
+    cleanup_containers=False,
+    dockerd_volume_dir=None,
 ):
     """Execute ClickHouse pytest integration tests."""
+    # propagate runner options
+    self.context.docker_image_version = images_tag
+    self.context.analyzer = analyzer
+    self.context.tmpfs = tmpfs
+    self.context.cleanup_containers = cleanup_containers
+    self.context.dockerd_volume_dir = dockerd_volume_dir
+
     retry_tests = None
     part_num, max_parts = part
 
