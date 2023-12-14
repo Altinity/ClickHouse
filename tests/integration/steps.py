@@ -3,6 +3,7 @@
 import os
 import time
 import uuid
+import zlib
 import tempfile
 import hashlib
 import subprocess
@@ -11,6 +12,17 @@ import testflows.settings
 from contextlib import contextmanager
 from testflows.core import *
 from testflows.connect import Shell
+from testflows._core.cli.arg.type import count
+
+
+def next_group_timeout(group_timeout, timeout):
+    """Return next group timeout."""
+    if timeout is not None:
+        if group_timeout is not None:
+            return int(max(min(group_timeout, timeout - current_time()), 0))
+        else:
+            return int(timeout - current_time())
+    return group_timeout
 
 
 def readline(file):
@@ -68,10 +80,10 @@ def sysprocess(self, command, stream=None):
             proc.kill()
 
         while proc.poll() is None:
-            debug(f"waiting for {proc} to exit")
+            debug(f"waiting for {proc.pid} to exit running {command}")
             time.sleep(1)
 
-        with Finally(f"stdout: {command}"):
+        with Finally(f"stdout for {command}"):
             for line in proc.stdout.readlines():
                 message(line, stream=stream)
 

@@ -14,9 +14,7 @@ from steps import *
 
 # FIXME: add support for --network which should be "" by default (instead of host by default)
 #        in general we need to support all ./runner options
-# FIXME: add support similar to run by hash_total, hash_num (allows to partition tests between different runners)
 # FIXME: handler analyzer and analyzer broken tests
-# FIXME: handle runner timeout
 # FIXME: clear ip tables and restart docker between each interation of runner?
 # FIXME: add pre-pull
 
@@ -33,6 +31,14 @@ def argparser(parser):
             "docker://<clickhouse/docker_image:tag>\n"
         ),
         default="/usr/bin/clickhouse",
+    )
+
+    parser.add_argument(
+        "--part",
+        type=count,
+        nargs=2,
+        help="run specific part of tests specified as '<part number> <total number of parts>', default: 0 1",
+        default=[0, 1],
     )
 
     parser.add_argument(
@@ -53,21 +59,21 @@ def argparser(parser):
 
     parser.add_argument(
         "--retry-attempts",
-        type=int,
-        choices=range(0, 6),
+        type=count,
         help="number of times to retry failed tests, default: 2",
         default=2,
     )
 
     parser.add_argument(
         "--max-failed-tests-to-retry",
+        type=count,
         help="maximum number of failed tests to retry, default: 100",
         default=100,
     )
 
     parser.add_argument(
         "--in-parallel",
-        type=int,
+        type=count,
         dest="in_parallel",
         help="number of tests to be executed in parallel, default: 10",
         default=10,
@@ -83,10 +89,29 @@ def argparser(parser):
     )
 
     parser.add_argument(
-        "--image-tag",
+        "--images-tag",
         type=str,
         help="tag to be used for all docker images or when building them, default: latest",
         default="latest",
+    )
+
+    parser.add_argument(
+        "--timeout",
+        type=count,
+        help="timeout in sec to wait for tests to complete, default: none",
+    )
+
+    parser.add_argument(
+        "--group-timeout",
+        type=count,
+        help="timeout in sec to wait for a group of tests to complete, default: none",
+    )
+
+    parser.add_argument(
+        "--group-size",
+        type=count,
+        help="size of test group, default: 100",
+        default=100,
     )
 
 
@@ -101,7 +126,7 @@ def runner_opts(self):
 
 
 @TestStep(Given)
-def all_tests(self, timeout=100):
+def all_tests(self, timeout=300):
     """Collect a list of all tests using pytest --setup-plan command."""
     tests = []
     command = (
@@ -155,7 +180,9 @@ def launch_runner(self, run_id, tests, in_parallel=None):
 
 
 @TestOutline(Feature)
-def execute_group(self, group_id, tests, in_parallel=None, retry_tests=None):
+def execute_group(
+    self, group_id, tests, in_parallel=None, retry_tests=None, timeout=None
+):
     """Execute a group of tests."""
     executed = 0
 
@@ -167,6 +194,11 @@ def execute_group(self, group_id, tests, in_parallel=None, retry_tests=None):
         )
 
     while True:
+        with timer(
+            timeout, f"timed out while running {len(tests)} tests in group {group_id}"
+        ):
+            pass
+
         line = readline(log)
 
         if not line:
@@ -256,10 +288,21 @@ def execute_group(self, group_id, tests, in_parallel=None, retry_tests=None):
 
 
 @TestFeature
-def execute(self, tests, group_size, in_parallel, retry_tests=None):
-    """Execute tests by groups."""
+def execute(
+    self,
+    tests,
+    group_size,
+    in_parallel,
+    retry_tests=None,
+    timeout=None,
+    group_timeout=None,
+):
+    """Execute tests in groups."""
 
     for group_id, i in enumerate(range(0, len(tests), group_size)):
+        with timer(timeout, f"timed out while executing {len(tests)} tests in groups"):
+            pass
+
         group_tests = tests[i : i + group_size]
 
         note(f"running group {i, i + group_size}")
@@ -269,6 +312,7 @@ def execute(self, tests, group_size, in_parallel, retry_tests=None):
             tests=group_tests,
             in_parallel=in_parallel,
             retry_tests=retry_tests,
+            timeout=next_group_timeout(group_timeout, timeout),
         )
 
 
@@ -278,17 +322,20 @@ def regression(
     self,
     binary,
     tests=None,
+    part=None,
     deselect=None,
     in_parallel=5,
-    group_size=100,
     build_images=False,
-    image_tag="latest",
+    images_tag="latest",
     max_failed_tests_to_retry=100,
     retry_attempts=2,
+    group_size=100,
+    timeout=None,
+    group_timeout=None,
 ):
     """Execute ClickHouse pytest integration tests."""
-
     retry_tests = None
+    part_num, max_parts = part
 
     if retry_attempts > 1:
         # create a list to collect failed tests to be retried
@@ -302,14 +349,25 @@ def regression(
         ) = clickhouse_binaries(path=binary)
 
     if not tests:
-        with And("collect all tests"):
-            tests = all_tests()
+        with And("automatically collect all tests"):
+            all_tests = all_tests()
+    all_tests = tests
 
     if deselect:
         with And(f"deselect {len(deselect)} tests"):
             tests = [test for test in tests if test not in deselect]
 
-    note(f"total number of tests to be executed {len(tests)}")
+    with And("select tests for the choose part"):
+        tests_per_part = max(int(len(all_tests) / max_parts), 1)
+        tests_offset = part_num * tests_per_part
+        tests = all_tests[tests_offset : tests_offset + tests_per_part]
+
+    note(
+        f"number of tests to be executed {len(tests)}/{len(all_tests)}, part {part_num}/{max_parts}"
+    )
+
+    if not tests:
+        fail("no tests")
 
     if build_images:
         with Feature("build images"):
@@ -317,13 +375,15 @@ def regression(
                 "buildimages",
                 path=os.path.join(current_dir(), "..", "..", "docker", "build"),
             ).build_images
-            build_images(tag=image_tag, timeout=300)
+            build_images(tag=images_tag, timeout=300)
 
     Feature("group", description="execute tests in groups", test=execute)(
         tests=tests,
         group_size=group_size,
         in_parallel=in_parallel,
         retry_tests=retry_tests,
+        timeout=timeout,
+        group_timeout=group_timeout,
     )
 
     for attempt in range(retry_attempts):
@@ -340,7 +400,10 @@ def regression(
                 tests = retry_tests
                 retry_tests = [] if attempt + 1 < retry_attempts else None
                 execute_group(
-                    group_id=f"retry-{attempt}", tests=tests, retry_tests=retry_tests
+                    group_id=f"retry-{attempt}",
+                    tests=tests,
+                    retry_tests=retry_tests,
+                    group_timeout=next_group_timeout(group_timeout, timeout),
                 )
 
 
