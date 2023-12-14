@@ -1,56 +1,72 @@
+"""Integration tests high-level runner using TestFlows framework.
+"""
+
 import os
-import uuid
 import json
 import time
 import shlex
-import tempfile
-import contextlib
-import subprocess
 import testflows.settings
 
 from testflows.core import *
 from testflows.connect import Shell
 
+from steps import *
+
 # FIXME: add support for --network which should be "" by default (instead of host by default)
 #        in general we need to support all ./runner options
 # FIXME: add support similar to run by hash_total, hash_num (allows to partition tests between different runners)
-# FIXME: customize run_in_parallel per specific group? Some groups run with 10 some with 5 some with 3 etc.
 # FIXME: handler analyzer and analyzer broken tests
 # FIXME: handle runner timeout
-# FIXME: add support to provide fixed list of tests instead collecting them dynamically
 # FIXME: clear ip tables and restart docker between each interation of runner?
 # FIXME: add pre-pull
-# FIXME: add test_times.json that contains approximate test times for each test
-#        to devide tests by approximate total test time instead of number of tests
 
 
 def argparser(parser):
     parser.add_argument(
-        "--clickhouse-binary-path",
+        "--binary",
         type=str,
-        dest="clickhouse_binary_path",
         help=(
-            "path to ClickHouse binary, default: $CLICKHOUSE_TESTS_SERVER_BIN_PATH or /usr/bin/clickhouse.\n"
-            "The path can be either:\n"
-            "  relative or absolute local file path"
-            "  http[s]://<url_to_binary_or_deb_package>"
-            "  docker://<clickhouse/docker_image:tag>"
+            "path to ClickHouse binary, default: /usr/bin/clickhouse.\n"
+            "The path can be either:"
+            "relative or absolute file path, "
+            "http[s]://<url_to_binary_or_deb_package>, or "
+            "docker://<clickhouse/docker_image:tag>\n"
         ),
-        metavar="path",
-        default=os.getenv("CLICKHOUSE_TESTS_SERVER_BIN_PATH", "/usr/bin/clickhouse"),
+        default="/usr/bin/clickhouse",
     )
 
     parser.add_argument(
-        "--run-in-parallel",
+        "--tests",
+        action="store",
+        nargs="+",
+        default=[],
+        help="list of tests to run, default: collect all tests automatically",
+    )
+
+    parser.add_argument(
+        "--deselect",
+        action="store",
+        nargs="+",
+        default=[],
+        help="list of tests to exclude from the tests list",
+    )
+
+    parser.add_argument(
+        "--max-failed-tests-to-retry",
+        help="maximum number of failed tests to retry, default: 100",
+        default=100,
+    )
+
+    parser.add_argument(
+        "--in-parallel",
         type=int,
-        dest="run_in_parallel",
-        help="set runner parallelism, default: not set",
+        dest="in_parallel",
+        help="number of tests to be executed in parallel, default: 10",
         default=10,
     )
 
     parser.add_argument(
         "--build-images",
-        dest="build_docker_images",
         action="store_true",
         help=(
             "build all docker images inside the ClickHouse/docker folder including the ones used\n"
@@ -59,312 +75,11 @@ def argparser(parser):
     )
 
     parser.add_argument(
-        "--build-images-tag",
-        dest="build_docker_images_with_tag",
+        "--image-tag",
         type=str,
-        metavar="tag",
-        help="tag to be used when building images, default: latest",
+        help="tag to be used for all docker images or when building them, default: latest",
         default="latest",
     )
-
-    parser.add_argument(
-        "--build-images-timeout",
-        dest="build_docker_images_timeout",
-        type=float,
-        metavar="timeout",
-        help="timeout to build each image or wait for one of its dependencies, default: None",
-        default=None,
-    )
-
-
-def readline(file):
-    """Read full line from a file taking into account
-    that if the file is updated concurrently the line
-    may not be complete yet."""
-    while True:
-        pos = file.tell()
-        line = file.readline()
-
-        if line:
-            if not line.endswith("\n"):
-                log.seek(pos)
-                time.sleep(1)
-                continue
-        break
-    return line
-
-
-@contextlib.contextmanager
-def catch(exceptions, raising):
-    try:
-        yield
-    except exceptions as e:
-        raise raising from e
-
-
-@TestStep(Given)
-def sysprocess(self, command):
-    """Run system command"""
-
-    proc = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        encoding="utf-8",
-        shell=True,
-    )
-    try:
-        yield proc
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-
-        while proc.poll() is None:
-            debug(f"waiting for {proc} to exit")
-            time.sleep(1)
-
-
-@TestStep
-def getuid(self):
-    """Return unique id."""
-    return str(uuid.uuid1()).replace("-", "_")
-
-
-@TestStep
-def short_hash(s):
-    """Return good enough short hash of a string."""
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:10]
-
-
-@TestScenario
-def build_image(self, path, name, dependent, tag="latest", timeout=None):
-    """Build single image in specified path and with the specified name
-    and tag taking account any dependent images that must be build first.
-    """
-    with By(f"waiting for dependent images to be ready"):
-        for d in dependent:
-            with By(f"waiting for {d} to be ready"):
-                while d not in self.context.ready:
-                    with timer(timeout, f"waiting for depended {d} image to be ready"):
-                        time.sleep(1)
-
-    command = f"cd {os.path.join(current_dir(), '..', '..', path)}; docker build -t {name}:{tag} ."
-
-    with And("launching build command"):
-        proc = sysprocess(command=command)
-
-    while proc.poll() is None:
-        with timer(timeout, f"building image took too long"):
-            if self.terminating:
-                break
-            message(f"{proc.stdout.readline()}", stream=name)
-
-    assert proc.returncode == 0, f"failed to build {name} at {path}"
-
-    self.context.ready.append(path)
-
-
-@TestFeature
-def build_images(self, tag="latest", timeout=None):
-    """Build all images."""
-    self.context.ready = []
-
-    with Given("I load images.json definitions"):
-        with open(
-            os.path.join(current_dir(), "..", "..", "docker", "images.json")
-        ) as images_json:
-            images = json.load(images_json)
-
-    with And("I build a dictionary of image dependencies"):
-        dependents = {}
-
-        for path in images:
-            if path not in dependents:
-                dependents[path] = []
-            for _path, _image in images.items():
-                dependent = _image["dependent"]
-                if path in dependent:
-                    dependents[path].append(_path)
-
-    with Pool() as executor:
-        for path, image in images.items():
-            name = image["name"]
-            dependent = dependents[path]
-            Scenario(
-                name=f"build {name}:{tag}",
-                description=f"depends on {dependent}",
-                test=build_image,
-                executor=executor,
-                parallel=True,
-            )(path=path, name=name, dependent=dependent, tag=tag, timeout=timeout)
-
-        join()
-
-
-@TestStep
-def get_clickhouse_binary_from_docker_container(
-    self,
-    docker_image,
-    container_binary="/usr/bin/clickhouse",
-    container_odbc_bridge_binary="/usr/bin/clickhouse-odbc-bridge",
-    container_library_bridge_binary="/usr/bin/clickhouse-library-bridge",
-    host_binary=None,
-    host_odbc_bridge_binary=None,
-    host_library_bridge_binary=None,
-):
-    """Get clickhouse binaries from some ClickHouse docker container."""
-    docker_image = docker_image.split("docker://", 1)[-1]
-    docker_container_name = str(uuid.uuid1())
-
-    if host_binary is None:
-        host_binary = os.path.join(
-            tempfile.gettempdir(),
-            f"{docker_image.rsplit('/', 1)[-1].replace(':', '_')}",
-        )
-
-    if host_odbc_bridge_binary is None:
-        host_odbc_bridge_binary = host_binary + "_odbc_bridge"
-
-    if host_library_bridge_binary is None:
-        host_library_bridge_binary = host_binary + "_library_bridge"
-
-    with Given(
-        "I get ClickHouse server binary from docker container",
-        description=f"{docker_image}",
-    ):
-        with Shell() as bash:
-            bash.timeout = 300
-            bash(
-                f'set -o pipefail && docker run -d --name "{docker_container_name}" {docker_image} | tee'
-            )
-            bash(
-                f'docker cp "{docker_container_name}:{container_binary}" "{host_binary}"'
-            )
-            bash(
-                f'docker cp "{docker_container_name}:{container_odbc_bridge_binary}" "{host_odbc_bridge_binary}"'
-            )
-            bash(
-                f'docker cp "{docker_container_name}:{container_library_bridge_binary}" "{host_library_bridge_binary}"'
-            )
-            bash(f'docker stop "{docker_container_name}"')
-
-    with And("debug"):
-        with Shell() as bash:
-            bash(f"ls -la {host_binary}", timeout=300)
-            bash(f"ls -la {host_odbc_bridge_binary}", timeout=300)
-            bash(f"ls -la {host_library_bridge_binary}", timeout=300)
-
-    return host_binary, host_odbc_bridge_binary, host_library_bridge_binary
-
-
-@TestStep(Given)
-def download_clickhouse_binary(self, path):
-    """I download ClickHouse server binary using wget"""
-    filename = f"{short_hash(path)}-{path.rsplit('/', 1)[-1]}"
-
-    if not os.path.exists(f"./{filename}"):
-        with Shell() as bash:
-            bash.timeout = 300
-            try:
-                cmd = bash(f'wget --progress dot "{path}" -O {filename}')
-                assert cmd.exitcode == 0
-            except BaseException:
-                if os.path.exists(filename):
-                    os.remove(filename)
-                raise
-
-    return f"./{filename}"
-
-
-@TestStep(Given)
-def get_clickhouse_binary_from_deb(self, path):
-    """Get clickhouse binary from deb package."""
-
-    deb_binary_dir = path.rsplit(".deb", 1)[0]
-    os.makedirs(deb_binary_dir, exist_ok=True)
-
-    with Shell() as bash:
-        bash.timeout = 300
-        if not os.path.exists(f"{deb_binary_dir}/clickhouse") or not os.path.exists(
-            f"{deb_binary_dir}/clickhouse-odbc-bridge"
-        ):
-            bash(f'ar x "{clickhouse_binary_path}" --output "{deb_binary_dir}"')
-            bash(
-                f'tar -vxzf "{deb_binary_dir}/data.tar.gz" ./usr/bin/clickhouse -O > "{deb_binary_dir}/clickhouse"'
-            )
-            bash(f'chmod +x "{deb_binary_dir}/clickhouse"')
-            bash(
-                f'tar -vxzf "{deb_binary_dir}/data.tar.gz" ./usr/bin/clickhouse-odbc-bridge -O > "{deb_binary_dir}/clickhouse-odbc-bridge"'
-            )
-            bash(f'chmod +x "{deb_binary_dir}/clickhouse-odbc-bridge"')
-            bash(
-                f'tar -vxzf "{deb_binary_dir}/data.tar.gz" ./usr/bin/clickhouse-library-bridge -O > "{deb_binary_dir}/clickhouse-library-bridge"'
-            )
-            bash(f'chmod +x "{deb_binary_dir}/clickhouse-library-bridge"')
-
-    return (
-        f"./{deb_binary_dir}/clickhouse",
-        f"{deb_binary_dir}/clickhouse-odbc-bridge",
-        f"{deb_binary_dir}/clickhouse-library-bridge",
-    )
-
-
-@TestStep(Given)
-def clickhouse_binaries(self, path, odbc_bridge_path=None, library_bridge_path=None):
-    """Extract clickhouse, clickhouse-odbc-bridge, clickhouse-library-bridge
-    binaries from --clickhouse_binary_path."""
-
-    if path.startswith(("http://", "https://")):
-        path = download_clickhouse_binary(clickhouse_binary_path=path)
-
-    elif path.startswith("docker://"):
-        (
-            path,
-            odbc_bridge_path,
-            library_bridge_path,
-        ) = get_clickhouse_binary_from_docker_container(docker_image=path)
-
-    if path.endswith(".deb"):
-        path, odbc_bridge_path, library_bridge_path = get_clickhouse_binary_from_deb(
-            path=path
-        )
-
-    if odbc_bridge_path is None:
-        odbc_bridge_path = path + "-odbc-bridge"
-
-    if library_bridge_path is None:
-        library_bridge_path = path + "-library-bridge"
-
-    path = os.path.abspath(path)
-    odbc_bridge_path = os.path.abspath(odbc_bridge_path)
-    library_bridge_path = os.path.abspath(library_bridge_path)
-
-    with Shell() as bash:
-        bash(f"chmod +x {path}", timeout=300)
-        bash(f"chmod +x {odbc_bridge_path}", timeout=300)
-        bash(f"chmod +x {library_bridge_path}", timeout=300)
-
-    return path, odbc_bridge_path, library_bridge_path
-
-
-@TestStep(Given)
-def temporary_file(self, mode, dir=None, prefix=None, suffix=None):
-    """Create temporary named file."""
-    with tempfile.NamedTemporaryFile(
-        mode,
-        dir=dir,
-        prefix=prefix,
-        suffix=suffix,
-        delete=(not testflows.settings.debug),
-    ) as log:
-        yield log
-
-
-@TestStep(Given)
-def shell(self):
-    """Create iteractive system bash shell."""
-    with Shell() as bash:
-        yield bash
 
 
 @TestStep
@@ -378,26 +93,22 @@ def runner_opts(self):
 
 
 @TestStep(Given)
-def get_all_tests(self):
-    """Collect a list of tests using pytest --setup-plan command."""
+def all_tests(self, timeout=100):
+    """Collect a list of all tests using pytest --setup-plan command."""
+    tests = []
+    command = (
+        f"set -o pipefail && {os.path.join(current_dir(), 'runner')} {runner_opts()} -- --setup-plan "
+        "| grep -F '::' | sed -r 's/ \(fixtures used:.*//g; s/^ *//g; s/ *$//g' "
+        f"| grep -v -F 'SKIPPED' | sort --unique"
+    )
 
-    with tempfile.NamedTemporaryFile(
-        "r", dir=current_dir(), delete=(not testflows.settings.debug)
-    ) as out:
-        command = (
-            f"set -o pipefail && {os.path.join(current_dir(), 'runner')} {runner_opts()} -- --setup-plan "
-            "| grep -F '::' | sed -r 's/ \(fixtures used:.*//g; s/^ *//g; s/ *$//g' "
-            f"| grep -v -F 'SKIPPED' | sort --unique > {os.path.basename(out.name)}"
-        )
+    with Shell() as bash:
+        cmd = bash(command, timeout=timeout)
+        assert (
+            cmd.exitcode == 0
+        ), f"non-zero exitcode {cmd.exitcode} when trying to collect all tests"
 
-        with shell() as bash:
-            cmd = bash(command, timeout=100)
-            assert (
-                cmd.exitcode == 0
-            ), f"non-zero exitcode {cmd.exitcode} when trying to collect all tests"
-
-        tests = []
-        for line in out.readlines():
+        for line in cmd.output.splitlines():
             if not line.startswith("test_"):
                 continue
             tests.append(line.strip())
@@ -407,39 +118,25 @@ def get_all_tests(self):
 
 
 @TestStep(Given)
-def get_all_parallel_skip_tests(self):
-    """Get all tests that can't be run in parallel defined in parallel_skip.json file."""
-    tests = []
+def launch_runner(self, run_id, tests, in_parallel=None):
+    """Launch integration tests runner script."""
 
-    with open(os.path.join(current_dir(), "parallel_skip.json"), "r") as fd:
-        for test in json.load(fd):
-            tests.append(test)
-
-    return sorted(tests)
-
-
-@TestStep(Given)
-def launch_runner(self, run_id, tests, run_in_parallel=None):
-    report_timeout = 60
-
-    with By("creating temporary report log file"):
+    with By("creating temporary file for the report"):
         log = temporary_file(mode="r", suffix=".pytest.jsonl", dir=current_dir())
-
-    tests = " ".join([shlex.quote(test) for test in sorted(tests)])
 
     command = define(
         "command",
         f"{os.path.join(current_dir(), 'runner')}"
         + runner_opts()
-        + f" -t {tests}"
-        + (f" --parallel {run_in_parallel}" if run_in_parallel is not None else "")
+        + f" -t {' '.join([shlex.quote(test) for test in sorted(tests)])}"
+        + (f" --parallel {in_parallel}" if in_parallel is not None else "")
         + " --"
         + " -rfEps"
         + f" --run-id={run_id} --color=no --durations=0"
         + f" --report-log={os.path.basename(log.name)} > runner_{run_id}.log 2>&1",
     )
 
-    with And("launch runner"):
+    with And("launching command"):
         proc = sysprocess(command=command)
 
         if proc.poll() is not None:
@@ -449,15 +146,16 @@ def launch_runner(self, run_id, tests, run_in_parallel=None):
     yield proc, log
 
 
-@TestOutline
-def execute_group(self, group_id, tests, run_in_parallel):
+@TestOutline(Feature)
+def execute_group(self, group_id, tests, in_parallel=None, retry_tests=None):
     """Execute a group of tests."""
+    executed = 0
 
-    with Given("I launch the runner"):
+    with Given(f"launch runner for {group_id}"):
         runner, log = launch_runner(
             run_id=group_id,
             tests=tests,
-            run_in_parallel=run_in_parallel,
+            in_parallel=in_parallel,
         )
 
     while True:
@@ -490,6 +188,7 @@ def execute_group(self, group_id, tests, run_in_parallel):
                 test_time=(entry["start"] - entry["stop"]),
                 flags=TE,
             ):
+                executed += 1
                 for section in entry["sections"]:
                     # process captured log
                     if section and section[0] == "Captured log call":
@@ -533,54 +232,35 @@ def execute_group(self, group_id, tests, run_in_parallel):
                 if entry["outcome"].lower() == "passed":
                     ok("success")
 
-                fail(f"{entry['outcome']}{(' ' + reprcrash) if reprcrash else ''}")
+                fail_message = (
+                    f"{entry['outcome']}{(' ' + reprcrash) if reprcrash else ''}"
+                )
 
-    if runner.returncode != 0:
-        fail(f"runner exited with non-zero exitcode: {runner.returncode}")
+                if retry_tests is not None:
+                    retry_tests.append(entry["nodeid"])
+                    xfail(fail_message, reason="will be retried")
+                else:
+                    fail(fail_message)
+
+    assert executed == len(
+        tests
+    ), f"failed to execute all tests: executed {executed} out of {len(tests)}"
 
 
 @TestFeature
-def execute_serial(self, group_size):
-    """Execute all tests that can't be run in parallel
-    and must be executed serially one by one."""
-
-    with Given("serial tests list"):
-        tests = [
-            test
-            for test in self.context.parallel_skip_tests
-            if test in self.context.all_tests
-        ]
-        note(f"total number of serial tests {len(tests)}")
+def execute(self, tests, group_size, in_parallel, retry_tests=None):
+    """Execute tests by groups."""
 
     for group_id, i in enumerate(range(0, len(tests), group_size)):
         group_tests = tests[i : i + group_size]
 
-        note(f"serial group {i, i + group_size}")
+        note(f"running group {i, i + group_size}")
 
         Feature(name=f"{group_id}", test=execute_group, flags=TE)(
-            group_id=group_id, tests=group_tests, run_in_parallel=None
-        )
-
-
-@TestFeature
-def execute_parallel(self, group_size, run_in_parallel):
-    """Execute all tests that can be run in parallel."""
-
-    with Given("parallel tests list"):
-        tests = [
-            test
-            for test in self.context.all_tests
-            if not (test in self.context.parallel_skip_tests)
-        ]
-        note(f"total number of parallel tests {len(tests)}")
-
-    for group_id, i in enumerate(range(0, len(tests), group_size)):
-        group_tests = tests[i : i + group_size]
-
-        note(f"parallel group {i, i + group_size}")
-
-        Feature(name=f"{group_id}", test=execute_group, flags=TE)(
-            group_id=group_id, tests=group_tests, run_in_parallel=run_in_parallel
+            group_id=group_id,
+            tests=group_tests,
+            in_parallel=in_parallel,
+            retry_tests=retry_tests,
         )
 
 
@@ -588,44 +268,68 @@ def execute_parallel(self, group_size, run_in_parallel):
 @ArgumentParser(argparser)
 def regression(
     self,
-    clickhouse_binary_path,
-    run_in_parallel=5,
-    parallel_group_size=100,
-    serial_group_size=100,
-    build_docker_images=False,
-    build_docker_images_timeout=None,
-    build_docker_images_with_tag="latest",
+    binary,
+    tests=None,
+    deselect=None,
+    in_parallel=5,
+    group_size=100,
+    build_images=False,
+    image_tag="latest",
+    max_failed_tests_to_retry=100,
+    retry_attempts=2,
 ):
     """Execute ClickHouse pytest integration tests."""
+
+    retry_tests = []
 
     with Given("clickhouse binaries"):
         (
             self.context.binary,
             self.context.odbc_bridge_binary,
             self.context.library_bridge_binary,
-        ) = clickhouse_binaries(path=clickhouse_binary_path)
+        ) = clickhouse_binaries(path=binary)
 
-    if build_docker_images:
+    if not tests:
+        with And("collect all tests"):
+            tests = all_tests()
+
+    if deselect:
+        with And(f"deselect {len(deselect)} tests"):
+            tests = [test for test in tests if test not in deselect]
+
+    note(f"total number of tests to be executed {len(tests)}")
+
+    if build_images:
         with Feature("build images"):
-            build_images(
-                tag=build_docker_images_with_tag, timeout=build_docker_images_timeout
-            )
+            build_images = load_module(
+                "buildimages",
+                path=os.path.join(current_dir(), "..", "..", "docker", "build"),
+            ).build_images
+            build_images(tag=image_tag, timeout=300)
 
-    with And("collected all tests"):
-        self.context.all_tests = get_all_tests()
+    Feature("group", description="execute tests in groups", test=execute)(
+        tests=tests,
+        group_size=group_size,
+        in_parallel=in_parallel,
+        retry_tests=retry_tests,
+    )
 
-    with And("collected all tests that must be run in serial"):
-        self.context.parallel_skip_tests = get_all_parallel_skip_tests()
+    for attempt in range(retry_attempts):
+        if retry_tests:
+            with Feature(
+                f"retry #{attempt}",
+                description="Retry failed tests by running them without any parallelism.",
+                flags=TE,
+            ):
+                if len(retry_tests) > max_failed_tests_to_retry:
+                    debug(retry_tests)
+                    fail(f"too many tests to retry: {len(retry_tests)}")
 
-    with Feature(
-        "parallel", description="Execute all tests that can be run in parallel."
-    ):
-        execute_parallel(
-            group_size=parallel_group_size, run_in_parallel=run_in_parallel
-        )
-
-    with Feature("serial", description="Execute all tests that must be run in serial."):
-        execute_serial(group_size=serial_group_size)
+                tests = retry_tests
+                retry_tests = [] if attempt + 1 < retry_attempts else None
+                execute_group(
+                    group_id=f"retry-{attempt}", tests=tests, retry_tests=retry_tests
+                )
 
 
 if main():
