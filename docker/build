@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os
+import os, json, time, subprocess
 
 from testflows.core import *
 
@@ -16,20 +16,100 @@ def argparser(parser):
     )
 
 
+@TestStep(Given)
+def sysprocess(self, command):
+    """Run system command"""
+
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        shell=True,
+    )
+    try:
+        yield proc
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+        while proc.poll() is None:
+            debug(f"waiting for {proc} to exit")
+            time.sleep(1)
+
+
+@TestScenario
+def build_image(self, path, name, dependent, tag="latest", timeout=None):
+    """Build single image in specified path and with the specified name
+    and tag taking account any dependent images that must be build first.
+    """
+    with By(f"waiting for dependent images to be ready"):
+        for d in dependent:
+            with By(f"waiting for {d} to be ready"):
+                while d not in self.context.ready:
+                    with timer(timeout, f"waiting for depended {d} image to be ready"):
+                        time.sleep(1)
+
+    command = (
+        f"cd {os.path.join(current_dir(), '..', path)}; docker build -t {name}:{tag} ."
+    )
+
+    with And("launching build command"):
+        proc = sysprocess(command=command)
+
+    while proc.poll() is None:
+        with timer(timeout, f"building image took too long"):
+            if self.terminating:
+                break
+            message(f"{proc.stdout.readline()}", stream=name)
+
+    assert proc.returncode == 0, f"failed to build {name} at {path}"
+
+    self.context.ready.append(path)
+
+
+@TestFeature
+def build_images(self, tag="latest", timeout=None):
+    """Build all images."""
+    self.context.ready = []
+
+    with Given("I load images.json definitions"):
+        with open(os.path.join(current_dir(), "images.json")) as images_json:
+            images = json.load(images_json)
+
+    with And("I build a dictionary of image dependencies"):
+        dependents = {}
+
+        for path in images:
+            if path not in dependents:
+                dependents[path] = []
+            for _path, _image in images.items():
+                dependent = _image["dependent"]
+                if path in dependent:
+                    dependents[path].append(_path)
+
+    with Pool() as executor:
+        for path, image in images.items():
+            name = image["name"]
+            dependent = dependents[path]
+            Scenario(
+                name=f"build {name}:{tag}",
+                description=f"depends on {dependent}",
+                test=build_image,
+                executor=executor,
+                parallel=True,
+            )(path=path, name=name, dependent=dependent, tag=tag, timeout=timeout)
+
+        join()
+
+
 @TestFeature
 @ArgumentParser(argparser)
-def build_images(self, image_tag, image_timeout=None):
+def build(self, image_tag, image_timeout=None):
     """Test program to manually build all docker images."""
-    load(
-        load_module(
-            "regression",
-            path=os.path.join(
-                current_dir(), "..", "tests", "integration", "regression.py"
-            ),
-        ),
-        "build_images",
-    )(tag=image_tag, timeout=image_timeout)
+
+    build_images(tag=image_tag, timeout=image_timeout)
 
 
 if main():
-    build_images()
+    build()
