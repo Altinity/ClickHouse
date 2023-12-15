@@ -6,5 +6,5 @@
 # Note: needs root privilege because Docker mounts
 # these folders into containers.
 #
-find . -type d -name _instances | sudo xargs rm -rf
+find . -type d -name _instances* | sudo xargs rm -rf
 
