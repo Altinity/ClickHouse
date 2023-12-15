@@ -36,6 +36,15 @@ def argparser(parser):
     )
 
     parser.add_argument(
+        "--slice",
+        type=int,
+        dest="tests_slice",
+        nargs=2,
+        help="run specific slice of tests specified as '<start> <end>', default: 0 -1",
+        default=[0, -1],
+    )
+
+    parser.add_argument(
         "--part",
         type=count,
         nargs=2,
@@ -160,7 +169,7 @@ def runner_opts(self):
 
 
 @TestStep(Given)
-def all_tests(self, timeout=300):
+def collect_tests(self, timeout=300):
     """Collect a list of all tests using pytest --setup-plan command."""
     tests = []
     command = (
@@ -361,7 +370,9 @@ def regression(
     self,
     binary,
     tests=None,
+    tests_slice=None,
     part=None,
+    subset=None,
     deselect=None,
     in_parallel=5,
     build_images=False,
@@ -400,12 +411,16 @@ def regression(
 
     if not tests:
         with And("automatically collect all tests"):
-            all_tests = all_tests()
-    all_tests = tests
+            all_tests = collect_tests()
+    else:
+        all_tests = tests
 
     if deselect:
         with And(f"deselect {len(deselect)} tests"):
-            tests = [test for test in tests if test not in deselect]
+            all_tests = [test for test in all_tests if test not in deselect]
+
+    with And("select slice of tests"):
+        all_tests = all_tests[slice(*tests_slice)]
 
     with And("select tests for the choose part"):
         tests_per_part = max(int(len(all_tests) / max_parts), 1)
@@ -453,7 +468,7 @@ def regression(
                     group_id=f"retry-{attempt}",
                     tests=tests,
                     retry_tests=retry_tests,
-                    group_timeout=next_group_timeout(group_timeout, timeout),
+                    timeout=next_group_timeout(group_timeout, timeout),
                 )
 
 

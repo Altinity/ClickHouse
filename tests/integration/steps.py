@@ -62,16 +62,34 @@ def short_hash(s):
 
 
 @TestStep(Given)
+def temporary_file(self, mode, dir=None, prefix=None, suffix=None):
+    """Create temporary named file."""
+    with tempfile.NamedTemporaryFile(
+        mode,
+        dir=dir,
+        prefix=prefix,
+        suffix=suffix,
+        delete=(not testflows.settings.debug),
+    ) as log:
+        yield log
+
+
+@TestStep(Given)
 def sysprocess(self, command, stream=None):
     """Run system command."""
 
+    log = temporary_file(
+        mode="r+", dir=current_dir(), prefix="sysprocess-", suffix=".log"
+    )
+
     proc = subprocess.Popen(
         command,
-        stdout=subprocess.PIPE,
+        stdout=log,
         stderr=subprocess.STDOUT,
         encoding="utf-8",
         shell=True,
     )
+    proc.stdout = log
     try:
         yield proc
 
@@ -84,7 +102,10 @@ def sysprocess(self, command, stream=None):
             time.sleep(1)
 
         with Finally(f"stdout for {command}"):
+            proc.stdout.flush()
             for line in proc.stdout.readlines():
+                if not line:
+                    break
                 message(line, stream=stream)
 
 
@@ -232,16 +253,3 @@ def clickhouse_binaries(self, path, odbc_bridge_path=None, library_bridge_path=N
         bash(f"chmod +x {library_bridge_path}", timeout=300)
 
     return path, odbc_bridge_path, library_bridge_path
-
-
-@TestStep(Given)
-def temporary_file(self, mode, dir=None, prefix=None, suffix=None):
-    """Create temporary named file."""
-    with tempfile.NamedTemporaryFile(
-        mode,
-        dir=dir,
-        prefix=prefix,
-        suffix=suffix,
-        delete=(not testflows.settings.debug),
-    ) as log:
-        yield log
