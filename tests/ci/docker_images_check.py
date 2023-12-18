@@ -369,7 +369,7 @@ def parse_args() -> argparse.Namespace:
         "--no-reports",
         action="store_false",
         dest="reports",
-        default=argparse.SUPPRESS,
+        default=False,
         help="don't push reports to S3 and github",
     )
     parser.add_argument("--push", default=True, help=argparse.SUPPRESS)
@@ -377,7 +377,7 @@ def parse_args() -> argparse.Namespace:
         "--no-push-images",
         action="store_false",
         dest="push",
-        default=argparse.SUPPRESS,
+        default=False,
         help="don't push images to docker hub",
     )
 
