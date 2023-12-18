@@ -9,45 +9,45 @@ ARG odbc_driver_url="https://github.com/ClickHouse/clickhouse-odbc/releases/down
 RUN apt-get update -y \
     && env DEBIAN_FRONTEND=noninteractive \
         apt-get install --yes --no-install-recommends \
-            awscli=1.22.34-1 \
-            brotli=1.0.9-2build6 \
-            lz4=1.9.3-2build2 \
-            expect=5.45.4-2build1 \
-            golang=2:1.18~0ubuntu2 \
-            lsof=4.93.2+dfsg-1.1build2 \
-            mysql-client=8.0* \
-            ncdu=1.15.1-1 \
-            netcat-openbsd=1.218-4ubuntu1 \
-            nodejs=12.22.9~dfsg-1ubuntu3.2 \
-            npm=8.5.1~ds-1 \
-            odbcinst=2.3.9-5 \
-            openjdk-11-jre-headless=11.0.21+9-0ubuntu1~22.04 \
-            openssl=3.0.2-0ubuntu1.12 \
-            postgresql-client=14+238 \
-            protobuf-compiler=3.12.4-1ubuntu7.22.04.1 \
-            python3=3.10.6-1~22.04 \
-            python3-lxml=4.8.0-1build1 \
-            python3-pip=22.0.2+dfsg-1ubuntu0.4 \
-            python3-requests=2.25.1+dfsg-2ubuntu0.1 \
-            python3-termcolor=1.1.0-3 \
-            qemu-user-static=1:6.2+dfsg-2ubuntu6.15 \
-            sqlite3=3.37.2-2ubuntu0.1 \
-            sudo=1.9.9-1ubuntu2.4 \
-            tree=2.0.2-1 \
-            unixodbc=2.3.9-5 \
-            wget=1.21.2-2ubuntu1 \
-            rustc=1.70.0+dfsg0ubuntu1~bpo2-0ubuntu0.22.04.2 \
-            cargo=1.70.0+dfsg0ubuntu1~bpo2-0ubuntu0.22.04.2 \
-            zstd=1.4.8+dfsg-3build1 \
-            file=1:5.41-3ubuntu0.1 \
-            pv=1.6.6-1build2 \
-            zip=3.0-12build2 \
-            p7zip-full=16.02+dfsg-8 \
-            rpm2cpio=4.17.0+dfsg1-4build1 \
-            cpio=2.13+dfsg-7 \
+            awscli='1.22.*' \
+            brotli='1.0.*' \
+            lz4='1.9.*' \
+            expect='5.45.*' \
+            golang='2:1.18*' \
+            lsof='4.93.*' \
+            mysql-client='8.0*' \
+            ncdu='1.15.*' \
+            netcat-openbsd='1.218*' \
+            nodejs='12.22.*' \
+            npm='8.5.*' \
+            odbcinst='2.3.*' \
+            openjdk-11-jre-headless='11.0.*' \
+            openssl='3.0.*' \
+            postgresql-client='14+*' \
+            protobuf-compiler='3.12.*' \
+            python3='3.10.*' \
+            python3-lxml='4.8.*' \
+            python3-pip='22.0.*' \
+            python3-requests='2.25.*' \
+            python3-termcolor='1.1.*' \
+            qemu-user-static='1:6.2+*' \
+            sqlite3='3.37.*' \
+            sudo='1.9.*' \
+            tree='2.0.*' \
+            unixodbc='2.3.*' \
+            wget='1.21.*' \
+            rustc='1.70.*' \
+            cargo='1.70.*' \
+            zstd='1.4.*' \
+            file='1:5.41-*' \
+            pv='1.6.*' \
+            zip='3.0*' \
+            p7zip-full='16.02*' \
+            rpm2cpio='4.17.*' \
+            cpio='2.13+*' \
     && apt-get clean
 
-RUN pip3 install numpy==1.26.2 scipy==1.11.4 pandas==2.1.3 Jinja2==3.1.2
+RUN pip3 install numpy=='1.26.*' scipy=='1.11.*' pandas=='2.1.*' Jinja2=='3.1.*'
 
 RUN mkdir -p /tmp/clickhouse-odbc-tmp \
    && wget -nv -O - ${odbc_driver_url} | tar --strip-components=1 -xz -C /tmp/clickhouse-odbc-tmp \

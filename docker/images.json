@@ -71,38 +71,47 @@
         "dependent": []
     },
     "docker/test/integration/s3_proxy": {
+        "only_amd64": true,
         "name": "altinityinfra/s3-proxy",
         "dependent": []
     },
     "docker/test/integration/resolver": {
+        "only_amd64": true,
         "name": "altinityinfra/python-bottle",
         "dependent": []
     },
     "docker/test/integration/helper_container": {
+        "only_amd64": true,
         "name": "altinityinfra/integration-helper",
         "dependent": []
     },
     "docker/test/integration/mysql_golang_client": {
+        "only_amd64": true,
         "name": "altinityinfra/mysql-golang-client",
         "dependent": []
     },
     "docker/test/integration/dotnet_client": {
+        "only_amd64": true,
         "name": "altinityinfra/dotnet-client",
         "dependent": []
     },
     "docker/test/integration/mysql_java_client": {
+        "only_amd64": true,
         "name": "altinityinfra/mysql-java-client",
         "dependent": []
     },
     "docker/test/integration/mysql_js_client": {
+        "only_amd64": true,
         "name": "altinityinfra/mysql-js-client",
         "dependent": []
     },
     "docker/test/integration/mysql_php_client": {
+        "only_amd64": true,
         "name": "altinityinfra/mysql-php-client",
         "dependent": []
     },
     "docker/test/integration/postgresql_java_client": {
+        "only_amd64": true,
         "name": "altinityinfra/postgresql-java-client",
         "dependent": []
     },
@@ -144,6 +153,7 @@
         "dependent": []
     },
     "docker/test/integration/nginx_dav": {
+        "only_amd64": true,
         "name": "altinityinfra/nginx-dav",
         "dependent": []
     }

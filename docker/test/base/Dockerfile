@@ -5,12 +5,12 @@ FROM altinityinfra/test-util:$FROM_TAG
 
 RUN apt-get update \
     && apt-get install \
-        lcov=1.15-1 \
+        lcov='1.15*' \
         netbase=6.3 \
-        perl=5.34.0-3ubuntu1.3 \
-        pv=1.6.6-1build2 \
-        ripgrep=13.0.0-2ubuntu0.1 \
-        zstd=1.4.8+dfsg-3build1 \
+        perl='5.34.*' \
+        pv='1.6.*' \
+        ripgrep='13.0.*' \
+        zstd='1.4.*' \
         locales='2.35*' \
         --yes --no-install-recommends
 
