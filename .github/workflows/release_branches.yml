@@ -319,7 +319,7 @@ jobs:
 #############################################################################################
   RegressionTestsRelease:
     needs: [BuilderDebRelease]
-    uses: ./.github/workflows/regression/release_tests.yml
+    uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
       runner_type: self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce
