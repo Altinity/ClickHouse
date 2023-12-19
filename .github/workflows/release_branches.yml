@@ -311,7 +311,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Integration tests (release)
-      runner_type: stress-tester, func-tester
+      runner_type: self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
       batches: 6
       run_command: |
         cd "$REPO_COPY/tests/ci"
