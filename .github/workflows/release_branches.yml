@@ -326,14 +326,14 @@ jobs:
       commit: f3c160dcbda1d8715a6c6a3a3b0ab557dc24e3ab
       arch: release
 
-  # RegressionTestsAarch64:
-  #   needs: [BuilderDebAarch64]
-  #   uses: ./.github/workflows/regression.yml
-  #   secrets: inherit
-  #   with:
-  #     runner_type: self-hosted, regression-tester, on-demand, type-cax41, image-arm-app-docker-ce
-  #     commit: a20e7fc63582990a7ddfc8a13e45fae7a1a7e9e2
-  #     arch: aarch64
+  RegressionTestsAarch64:
+    needs: [BuilderDebAarch64]
+    uses: ./.github/workflows/regression.yml
+    secrets: inherit
+    with:
+      runner_type: self-hosted, regression-tester, on-demand, type-cax41, image-arm-app-docker-ce
+      commit: a20e7fc63582990a7ddfc8a13e45fae7a1a7e9e2
+      arch: aarch64
 
   SignRelease:
     needs: [BuilderDebRelease]

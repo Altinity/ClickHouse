@@ -159,10 +159,6 @@ jobs:
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_report_package_${{ inputs.arch }}
-      - name: debug
-        run: ls ${{ env.REPORTS_PATH }}
-      - name: Extract json report
-        run: unzip ${{ env.REPORTS_PATH }}/build_report_package_${{ inputs.arch }}
       - name: Setup
         run: .github/setup.sh
       - name: Get deb url
