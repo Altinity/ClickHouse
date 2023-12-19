@@ -328,7 +328,7 @@ jobs:
 
   # RegressionTestsAarch64:
   #   needs: [BuilderDebAarch64]
-  #   uses: ./.github/workflows/regression/aarch64_tests.yml
+  #   uses: ./.github/workflows/regression.yml
   #   secrets: inherit
   #   with:
   #     runner_type: self-hosted, regression-tester, on-demand, type-cax41, image-arm-app-docker-ce
