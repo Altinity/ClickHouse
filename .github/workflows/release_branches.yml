@@ -332,7 +332,7 @@ jobs:
     secrets: inherit
     with:
       runner_type: self-hosted, regression-tester, on-demand, type-cax41, image-arm-app-docker-ce
-      commit: a20e7fc63582990a7ddfc8a13e45fae7a1a7e9e2
+      commit: f3c160dcbda1d8715a6c6a3a3b0ab557dc24e3ab
       arch: aarch64
 
   SignRelease:

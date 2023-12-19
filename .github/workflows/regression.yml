@@ -84,9 +84,9 @@ name: Regression test workflow - Release
 env:
   # Force the stdout and stderr streams to be unbuffered
   PYTHONUNBUFFERED: 1
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-  AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
   DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
   DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
   artifacts: builds
@@ -138,10 +138,6 @@ jobs:
     needs: [runner_labels_setup]
     runs-on: ${{ fromJson(needs.runner_labels_setup.outputs.runner_labels) }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
     steps:
       - name: Checkout regression repo
         uses: actions/checkout@v3
@@ -188,10 +184,6 @@ jobs:
     needs: [runner_labels_setup]
     runs-on: ${{ fromJson(needs.runner_labels_setup.outputs.runner_labels) }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
     steps:
       - name: Checkout regression repo
         uses: actions/checkout@v3
@@ -210,10 +202,6 @@ jobs:
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_report_package_${{ inputs.arch }}
-      - name: debug
-        run: ls ${{ env.REPORTS_PATH }}
-      - name: Extract json report
-        run: unzip ${{ env.REPORTS_PATH }}/build_report_package_${{ inputs.arch }}
       - name: Setup
         run: .github/setup.sh
       - name: Get deb url
@@ -247,10 +235,6 @@ jobs:
     needs: [runner_labels_setup]
     runs-on: ${{ fromJson(needs.runner_labels_setup.outputs.runner_labels) }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
     steps:
       - name: Checkout regression repo
         uses: actions/checkout@v3
@@ -269,10 +253,6 @@ jobs:
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_report_package_${{ inputs.arch }}
-      - name: debug
-        run: ls ${{ env.REPORTS_PATH }}
-      - name: Extract json report
-        run: unzip ${{ env.REPORTS_PATH }}/build_report_package_${{ inputs.arch }}
       - name: Setup
         run: .github/setup.sh
       - name: Get deb url
@@ -301,10 +281,6 @@ jobs:
     needs: [runner_labels_setup]
     runs-on: ${{ fromJson(needs.runner_labels_setup.outputs.runner_labels) }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
     steps:
       - name: Checkout regression repo
         uses: actions/checkout@v3
@@ -322,10 +298,6 @@ jobs:
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_report_package_${{ inputs.arch }}
-      - name: debug
-        run: ls ${{ env.REPORTS_PATH }}
-      - name: Extract json report
-        run: unzip ${{ env.REPORTS_PATH }}/build_report_package_${{ inputs.arch }}
       - name: Setup
         run: .github/setup.sh
       - name: Get deb url
@@ -351,10 +323,6 @@ jobs:
     needs: [runner_labels_setup]
     runs-on: ${{ fromJson(needs.runner_labels_setup.outputs.runner_labels) }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
     steps:
       - name: Checkout regression repo
         uses: actions/checkout@v3
@@ -372,10 +340,6 @@ jobs:
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_report_package_${{ inputs.arch }}
-      - name: debug
-        run: ls ${{ env.REPORTS_PATH }}
-      - name: Extract json report
-        run: unzip ${{ env.REPORTS_PATH }}/build_report_package_${{ inputs.arch }}
       - name: Setup
         run: .github/setup.sh
       - name: Get deb url
@@ -405,10 +369,6 @@ jobs:
     needs: [runner_labels_setup]
     runs-on: ${{ fromJson(needs.runner_labels_setup.outputs.runner_labels) }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
     steps:
       - name: Checkout regression repo
         uses: actions/checkout@v3
@@ -427,10 +387,6 @@ jobs:
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_report_package_${{ inputs.arch }}
-      - name: debug
-        run: ls ${{ env.REPORTS_PATH }}
-      - name: Extract json report
-        run: unzip ${{ env.REPORTS_PATH }}/build_report_package_${{ inputs.arch }}
       - name: Setup
         run: .github/setup.sh
       - name: Get deb url
@@ -465,10 +421,6 @@ jobs:
     needs: [runner_labels_setup]
     runs-on: ${{ fromJson(needs.runner_labels_setup.outputs.runner_labels) }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
     steps:
       - name: Checkout regression repo
         uses: actions/checkout@v3
@@ -487,10 +439,6 @@ jobs:
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_report_package_${{ inputs.arch }}
-      - name: debug
-        run: ls ${{ env.REPORTS_PATH }}
-      - name: Extract json report
-        run: unzip ${{ env.REPORTS_PATH }}/build_report_package_${{ inputs.arch }}
       - name: Setup
         run: .github/setup.sh
       - name: Get deb url
@@ -528,10 +476,6 @@ jobs:
     needs: [runner_labels_setup]
     runs-on: ${{ fromJson(needs.runner_labels_setup.outputs.runner_labels) }}
     timeout-minutes: ${{ inputs.timeout_minutes }}
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
     steps:
       - name: Checkout regression repo
         uses: actions/checkout@v3
@@ -549,10 +493,6 @@ jobs:
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_report_package_${{ inputs.arch }}
-      - name: debug
-        run: ls ${{ env.REPORTS_PATH }}
-      - name: Extract json report
-        run: unzip ${{ env.REPORTS_PATH }}/build_report_package_${{ inputs.arch }}
       - name: Setup
         run: .github/setup.sh
       - name: Get deb url
