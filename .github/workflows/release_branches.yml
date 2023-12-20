@@ -322,7 +322,7 @@ jobs:
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
-      runner_type: self-hosted, regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce
+      runner_type: regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce
       commit: f3c160dcbda1d8715a6c6a3a3b0ab557dc24e3ab
       arch: release
 
@@ -331,7 +331,7 @@ jobs:
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
-      runner_type: self-hosted, regression-tester, on-demand, type-cax41, image-arm-app-docker-ce
+      runner_type: regression-tester, on-demand, type-cax41, image-arm-app-docker-ce
       commit: f3c160dcbda1d8715a6c6a3a3b0ab557dc24e3ab
       arch: aarch64
 
