@@ -106,6 +106,7 @@ env:
     ./*/_instances/*/logs/*.log
     ./*/*/_instances/*/logs/*.log
     ./*/*/_instances/*.log
+  build_sha: ${{ github.sha }}
   pr_number: ${{ github.event.number }}
   event_name: ${{ github.event_name }}
 
