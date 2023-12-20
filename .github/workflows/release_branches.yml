@@ -393,7 +393,7 @@ jobs:
       - IntegrationTestsRelease
       - CompatibilityCheck
       - RegressionTestsRelease
-      # - RegressionTestsAarch64
+      - RegressionTestsAarch64
       - SignRelease
     runs-on: [self-hosted, style-checker, on-demand, type-cpx31, image-x86-app-docker-ce]
     steps:
