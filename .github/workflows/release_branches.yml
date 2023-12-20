@@ -175,9 +175,10 @@ jobs:
       - name: Check docker altinityinfra/clickhouse-server building
         run: |
           cd "$GITHUB_WORKSPACE/tests/ci"
-          python3 docker_server.py --release-type head --no-push \
+          docker buildx create --use
+          python3 docker_server.py --release-type head \
             --image-repo altinityinfra/clickhouse-server --image-path docker/server
-          python3 docker_server.py --release-type head --no-push \
+          python3 docker_server.py --release-type head \
             --image-repo altinityinfra/clickhouse-keeper --image-path docker/keeper
       - name: Cleanup
         if: always()
