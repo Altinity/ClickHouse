@@ -18,6 +18,10 @@ name: Regression test workflow - Release
         description: Maximum number of minutes to let workflow run before GitHub cancels it.
         default: 180
         type: number
+      build_sha:
+        description: commit sha of the workflow run for artifact upload. 
+        required: true
+        type: string
       checkout_depth:
         description: the value of the git shallow checkout
         required: false
@@ -106,7 +110,7 @@ env:
     ./*/_instances/*/logs/*.log
     ./*/*/_instances/*/logs/*.log
     ./*/*/_instances/*.log
-  build_sha: ${{ github.sha }}
+  build_sha: ${{ inputs.build_sha }}
   pr_number: ${{ github.event.number }}
   event_name: ${{ github.event_name }}
 

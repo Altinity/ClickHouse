@@ -325,7 +325,8 @@ jobs:
     with:
       runner_type: regression-tester, on-demand, type-cpx51, image-x86-app-docker-ce
       commit: 09db6160aac30e37169797b73fac77b4cbca41c6
-      arch: release
+      arch: release 
+      build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'release' && github.sha }}
 
   RegressionTestsAarch64:
     needs: [BuilderDebAarch64]
@@ -335,6 +336,7 @@ jobs:
       runner_type: regression-tester, on-demand, type-cax41, image-arm-app-docker-ce
       commit: 09db6160aac30e37169797b73fac77b4cbca41c6
       arch: aarch64
+      build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'release' && github.sha }}
 
   SignRelease:
     needs: [BuilderDebRelease]
