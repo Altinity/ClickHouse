@@ -172,9 +172,10 @@ jobs:
       - name: Check docker altinityinfra/clickhouse-server building
         run: |
           cd "$GITHUB_WORKSPACE/tests/ci"
-          python3 docker_server.py --release-type head --no-push \
+          docker buildx create --use
+          python3 docker_server.py --release-type head \
             --image-repo altinityinfra/clickhouse-server --image-path docker/server
-          python3 docker_server.py --release-type head --no-push \
+          python3 docker_server.py --release-type head \
             --image-repo altinityinfra/clickhouse-keeper --image-path docker/keeper
       - name: Cleanup
         if: always()
@@ -308,7 +309,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Integration tests (release)
-      runner_type: stress-tester, func-tester
+      runner_type: self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
       batches: 6
       run_command: |
         cd "$REPO_COPY/tests/ci"
