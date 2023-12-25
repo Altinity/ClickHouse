@@ -1262,6 +1262,14 @@ bool KeyCondition::tryPrepareSetIndex(
     if (!future_set)
         return false;
 
+    const auto set_types = future_set->getTypes();
+    size_t set_types_size = set_types.size();
+    size_t indexes_mapping_size = indexes_mapping.size();
+
+    /// When doing strict matches, we have to check all elements in set.
+    if (strict && indexes_mapping_size < set_types_size)
+        return false;
+
     auto prepared_set = future_set->buildOrderedSetInplace(right_arg.getTreeContext().getQueryContext());
     if (!prepared_set)
         return false;
