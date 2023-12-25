@@ -491,7 +491,7 @@ FORMAT JSONCompactEachRow"""
         log_url,
         f"Build ({build_name})",
     )
-    ch_helper.insert_events_into(db="default", table="checks", events=prepared_events)
+    ch_helper.insert_events_into(db="gh-data", table="checks", events=prepared_events)
 
     # Fail the build job if it didn't succeed
     if build_status != SUCCESS:

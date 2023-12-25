@@ -372,7 +372,7 @@ def main():
         args.check_name,
     )
 
-    ch_helper.insert_events_into(db="default", table="checks", events=prepared_events)
+    ch_helper.insert_events_into(db="gh-data", table="checks", events=prepared_events)
 
     if state == FAILURE:
         sys.exit(1)
