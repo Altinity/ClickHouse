@@ -32,7 +32,7 @@ from tee_popen import TeePopen
 from upload_result_helper import upload_results
 
 
-IMAGE_NAME = "clickhouse/unit-test"
+IMAGE_NAME = "altinityinfra/unit-test"
 
 
 def get_test_name(line):
@@ -183,7 +183,7 @@ def main():
         check_name,
     )
 
-    ch_helper.insert_events_into(db="default", table="checks", events=prepared_events)
+    ch_helper.insert_events_into(db="gh-data", table="checks", events=prepared_events)
 
     if state == "failure":
         sys.exit(1)

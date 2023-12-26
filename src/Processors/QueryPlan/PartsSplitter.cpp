@@ -14,6 +14,7 @@
 #include <Processors/Transforms/FilterSortedStreamByRange.h>
 #include <Storages/MergeTree/RangesInDataPart.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
+#include <Common/FieldVisitorsAccurateComparison.h>
 
 using namespace DB;
 
@@ -78,7 +79,25 @@ std::pair<std::vector<Values>, std::vector<RangesInDataParts>> split(RangesInDat
             RangeEnd,
         };
 
-        [[ maybe_unused ]] bool operator<(const PartsRangesIterator & other) const { return std::tie(value, event) > std::tie(other.value, other.event); }
+        [[maybe_unused]] bool operator<(const PartsRangesIterator & other) const
+        {
+            // Accurate comparison of `value > other.value`
+            for (size_t i = 0; i < value.size(); ++i)
+            {
+                if (applyVisitor(FieldVisitorAccurateLess(), value[i], other.value[i]))
+                    return false;
+
+                if (!applyVisitor(FieldVisitorAccurateEquals(), value[i], other.value[i]))
+                    return true;
+            }
+
+            /// Within the same part we should process events in order of mark numbers,
+            /// because they already ordered by value and range ends have greater mark numbers than the beginnings.
+            /// Otherwise we could get invalid ranges with the right bound that is less than the left bound.
+            const auto ev_mark = event == EventType::RangeStart ? range.begin : range.end;
+            const auto other_ev_mark = other.event == EventType::RangeStart ? other.range.begin : other.range.end;
+            return ev_mark > other_ev_mark;
+        }
 
         Values value;
         MarkRangeWithPartIdx range;

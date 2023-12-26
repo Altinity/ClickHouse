@@ -6,6 +6,7 @@ cluster = ClickHouseCluster(__file__)
 
 node_old = cluster.add_instance(
     "node1",
+    # NOTE(vnemkov): do not change to altinityinfra/clickhouse-server
     image="clickhouse/clickhouse-server",
     tag="22.8",
     stay_alive=True,

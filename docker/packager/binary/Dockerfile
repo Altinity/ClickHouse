@@ -1,7 +1,8 @@
-# docker build -t clickhouse/binary-builder .
+
+# docker build -t altinityinfra/binary-builder .
 ARG FROM_TAG=latest
-FROM clickhouse/test-util:latest AS cctools
-# The cctools are built always from the clickhouse/test-util:latest and cached inline
+FROM altinityinfra/test-util:$FROM_TAG as cctools
+# The cctools are built always from the altinityinfra/test-util:latest and cached inline
 # Theoretically, it should improve rebuild speed significantly
 ENV CC=clang-${LLVM_VERSION}
 ENV CXX=clang++-${LLVM_VERSION}
@@ -37,7 +38,7 @@ RUN git clone https://github.com/tpoechtrager/cctools-port.git \
 # END COMPILE
 # !!!!!!!!!!!
 
-FROM clickhouse/test-util:$FROM_TAG
+FROM altinityinfra/test-util:$FROM_TAG
 ENV CC=clang-${LLVM_VERSION}
 ENV CXX=clang++-${LLVM_VERSION}
 
@@ -58,8 +59,7 @@ RUN curl https://sh.rustup.rs -sSf | bash -s -- -y && \
 
 # NOTE: Seems like gcc-11 is too new for ubuntu20 repository
 # A cross-linker for RISC-V 64 (we need it, because LLVM's LLD does not work):
-RUN add-apt-repository ppa:ubuntu-toolchain-r/test --yes \
-    && apt-get update \
+RUN apt-get update \
     && apt-get install --yes \
         binutils-riscv64-linux-gnu \
         build-essential \

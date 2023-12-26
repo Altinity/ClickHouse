@@ -1,10 +1,6 @@
 ### For the pure soul wishes to move it to another place
 # https://github.com/orgs/community/discussions/9050
 
-env:
-  # Force the stdout and stderr streams to be unbuffered
-  PYTHONUNBUFFERED: 1
-
 name: Build ClickHouse
 'on':
   workflow_call:
@@ -14,38 +10,104 @@ name: Build ClickHouse
         required: true
         type: string
       checkout_depth:
-        description: the value of the git shallow checkout
+        description: the value of the git shallow checkout.
         required: false
         type: number
         default: 1
       runner_type:
-        description: the label of runner to use
+        description: the label of runner to use, can be a simple string or a comma-separated list.
         default: builder
         type: string
+      timeout_minutes:
+        description: Maximum number of minutes to let workflow run before GitHub cancels it.
+        default: 120
+        type: number
       additional_envs:
-        description: additional ENV variables to setup the job
+        description: additional ENV variables to setup the job.
         type: string
+    secrets:
+      AWS_SECRET_ACCESS_KEY:
+        description: the access key to the aws param store.
+        required: true
+      AWS_ACCESS_KEY_ID:
+        description: the access key id to the aws param store.
+        required: true
+      AWS_DEFAULT_REGION:
+        description: the region of the aws param store.
+        required: true
+      DOCKER_USERNAME:
+        description: username of the docker user.
+        required: true
+      DOCKER_PASSWORD:
+        description: password to the docker user.
+        required: true
+
+env:
+  # Force the stdout and stderr streams to be unbuffered
+  PYTHONUNBUFFERED: 1
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
 
 jobs:
+  runner_labels_setup:
+    name: Compute proper runner labels for the rest of the jobs
+    runs-on: ubuntu-latest
+    outputs:
+      runner_labels: ${{ steps.setVariables.outputs.runner_labels }}
+    steps:
+      - id: setVariables
+        name: Prepare runner_labels variables for the later steps
+        run: |
+
+          # Prepend self-hosted
+          input="self-hosted, ${input}"
+
+          # Remove all whitespace
+          input="$(echo ${input} | tr -d [:space:])"
+          # Make something like a JSON array from comma-separated list
+          input="['${input}']"
+          input="${input//\,/\'\, \'}"
+
+          echo "runner_labels=$input" >> ${GITHUB_OUTPUT}
+        env:
+          input: ${{ inputs.runner_type }}
+
   Build:
     name: Build-${{inputs.build_name}}
+    needs: runner_labels_setup
+    runs-on: ${{ fromJson(needs.runner_labels_setup.outputs.runner_labels) }}
+
     env:
       GITHUB_JOB_OVERRIDDEN: Build-${{inputs.build_name}}
-    runs-on: [self-hosted, '${{inputs.runner_type}}']
+    timeout-minutes: ${{inputs.timeout_minutes}}
     steps:
+      - name: Debug input runer tag names
+        run: |
+          cat <<JSON
+          inputs: ${{toJson(inputs)   }}
+          JSON
+
+      - name: Trust My Directory
+        run: git config --global --add safe.directory * # https://stackoverflow.com/a/71940133
+
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
           clear-repository: true
           submodules: true
           fetch-depth: ${{inputs.checkout_depth}}
           filter: tree:0
+
       - name: Set build envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
           ${{inputs.additional_envs}}
           EOF
           python3 "$GITHUB_WORKSPACE"/tests/ci/ci_config.py --build-name "${{inputs.build_name}}" >> "$GITHUB_ENV"
+
       - name: Apply sparse checkout for contrib # in order to check that it doesn't break build
         # This step is done in GITHUB_WORKSPACE,
         # because it's broken in REPO_COPY for some reason
@@ -56,24 +118,35 @@ jobs:
           "$GITHUB_WORKSPACE/contrib/update-submodules.sh" && echo 'OK'
           du -hs "$GITHUB_WORKSPACE/contrib" ||:
           find "$GITHUB_WORKSPACE/contrib" -type f | wc -l ||:
+
       - name: Common setup
         uses: ./.github/actions/common_setup
         with:
           job_type: build_check
+
+      - name: Common docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+
       - name: Download changed images
         uses: actions/download-artifact@v3
         with:
           name: changed_images
           path: ${{ env.IMAGES_PATH }}
+
       - name: Build
         run: |
           cd "$REPO_COPY/tests/ci" && python3 build_check.py "$BUILD_NAME"
+
       - name: Upload build URLs to artifacts
         if: ${{ success() || failure() }}
         uses: actions/upload-artifact@v3
         with:
           name: ${{ env.BUILD_URLS }}
           path: ${{ env.TEMP_PATH }}/${{ env.BUILD_URLS }}.json
+
       - name: Clean
         if: always()
         uses: ./.github/actions/clean

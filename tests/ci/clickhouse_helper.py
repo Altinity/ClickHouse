@@ -170,19 +170,19 @@ class ClickHouseHelper:
 
 # Obtain the machine type from IMDS:
 def get_instance_type():
-    url = "http://169.254.169.254/latest/meta-data/instance-type"
-    for i in range(5):
-        try:
-            response = requests.get(url, timeout=1)
-            if response.status_code == 200:
-                return response.text
-        except Exception as e:
-            error = (
-                f"Received exception while sending data to {url} on {i} attempt: {e}"
-            )
-            logging.warning(error)
-            continue
-    return ""
+    # url = "http://169.254.169.254/latest/meta-data/instance-type"
+    # for i in range(5):
+    #     try:
+    #         response = requests.get(url, timeout=1)
+    #         if response.status_code == 200:
+    #             return response.text
+    #     except Exception as e:
+    #         error = (
+    #             f"Received exception while sending data to {url} on {i} attempt: {e}"
+    #         )
+    #         logging.warning(error)
+    #         continue
+    return "Altinity runner"
 
 
 def prepare_tests_results_for_clickhouse(
@@ -194,7 +194,7 @@ def prepare_tests_results_for_clickhouse(
     report_url: str,
     check_name: str,
 ) -> List[dict]:
-    pull_request_url = "https://github.com/ClickHouse/ClickHouse/commits/master"
+    pull_request_url = "https://github.com/Altinity/ClickHouse/commits/master"
     base_ref = "master"
     head_ref = "master"
     base_repo = pr_info.repo_full_name

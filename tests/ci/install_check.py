@@ -36,8 +36,8 @@ from tee_popen import TeePopen
 from upload_result_helper import upload_results
 
 
-RPM_IMAGE = "clickhouse/install-rpm-test"
-DEB_IMAGE = "clickhouse/install-deb-test"
+RPM_IMAGE = "altinityinfra/install-rpm-test"
+DEB_IMAGE = "altinityinfra/install-deb-test"
 TEMP_PATH = Path(TEMP)
 LOGS_PATH = TEMP_PATH / "tests_logs"
 
@@ -372,7 +372,7 @@ def main():
         args.check_name,
     )
 
-    ch_helper.insert_events_into(db="default", table="checks", events=prepared_events)
+    ch_helper.insert_events_into(db="gh-data", table="checks", events=prepared_events)
 
     if state == FAILURE:
         sys.exit(1)

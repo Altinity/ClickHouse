@@ -8,35 +8,35 @@ RUN sed -i "s|http://archive.ubuntu.com|$apt_archive|g" /etc/apt/sources.list
 
 RUN apt-get update \
     && env DEBIAN_FRONTEND=noninteractive apt-get install --yes \
-    adduser \
-    ca-certificates \
-    bash \
-    btrfs-progs \
-    e2fsprogs \
-    iptables \
-    xfsprogs \
-    tar \
-    pigz \
-    wget \
-    git \
-    iproute2 \
-    cgroupfs-mount \
-    python3-pip \
-    tzdata \
-    libicu-dev \
-    bsdutils \
-    curl \
-    python3-pika \
+    adduser='3.118*' \
+    ca-certificates='20230311ubuntu0.22.04.*' \
+    bash='5.1*' \
+    btrfs-progs='5.16.*' \
+    e2fsprogs='1.46.*' \
+    iptables='1.8.*' \
+    xfsprogs='5.13.*' \
+    tar='1.34*' \
+    pigz='2.6*' \
+    wget='1.21.*' \
+    git='1:2.34*' \
+    iproute2='5.15.*' \
+    cgroupfs-mount='1.4*' \
+    python3-pip='22.0.*' \
+    tzdata='2023c-0ubuntu0.22.04*' \
+    libicu-dev='70.1*' \
+    bsdutils='1:2.37.*' \
+    curl='7.81.*' \
+    python3-pika='1.2.*' \
     liblua5.1-dev \
-    luajit \
-    libssl-dev \
-    libcurl4-openssl-dev \
-    gdb \
-    default-jdk \
-    software-properties-common \
-    libkrb5-dev \
-    krb5-user \
-    g++ \
+    luajit='2.1.*' \
+    libssl-dev='3.0.*' \
+    libcurl4-openssl-dev='7.81.*' \
+    gdb='12.1*' \
+    default-jdk='2:1.11*' \
+    software-properties-common='0.99.*' \
+    libkrb5-dev='1.19.*' \
+    krb5-user='1.19.*' \
+    g++='4:11.*' \
     && rm -rf \
         /var/lib/apt/lists/* \
         /var/cache/debconf \
@@ -63,46 +63,46 @@ RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add - \
 
 
 RUN python3 -m pip install --no-cache-dir \
-    PyMySQL \
-    aerospike==11.1.0 \
-    asyncio \
-    avro==1.10.2 \
-    azure-storage-blob \
-    cassandra-driver \
-    confluent-kafka==1.9.2 \
-    delta-spark==2.3.0 \
-    dict2xml \
-    dicttoxml \
-    docker \
-    docker-compose==1.29.2 \
-    grpcio \
-    grpcio-tools \
-    kafka-python \
-    kazoo \
-    lz4 \
-    meilisearch==0.18.3 \
-    minio \
-    nats-py \
-    protobuf \
-    psycopg2-binary==2.9.6 \
-    pyhdfs \
-    pymongo==3.11.0 \
-    pyspark==3.3.2 \
-    pytest \
-    pytest-order==1.0.0 \
-    pytest-random \
-    pytest-repeat \
-    pytest-timeout \
-    pytest-xdist \
-    pytz \
-    pyyaml==5.3.1 \
-    redis \
+    PyMySQL=='1.1.*' \
+    aerospike=='11.1.*' \
+    asyncio=='3.4.*'\
+    avro=='1.10.*' \
+    azure-storage-blob=='12.19.*'\
+    cassandra-driver=='3.28.*'\
+    confluent-kafka=='1.9.*' \
+    delta-spark=='2.3.*' \
+    dict2xml=='1.7.*' \
+    dicttoxml=='1.7.*' \
+    docker=='6.1.*' \
+    docker-compose=='1.29.*' \
+    grpcio=='1.59.*' \
+    grpcio-tools=='1.59.*' \
+    kafka-python=='2.0.*' \
+    kazoo=='2.9.*' \
+    lz4=='4.3.*' \
+    meilisearch=='0.18.*' \
+    minio=='7.2.*' \
+    nats-py=='2.6.*' \
+    protobuf=='4.25.*' \
+    psycopg2-binary=='2.9.*' \
+    pyhdfs=='0.3.*' \
+    pymongo=='3.11.*' \
+    pyspark=='3.3.*' \
+    pytest=='7.4.*' \
+    pytest-order=='1.0.*' \
+    pytest-random==0.2 \
+    pytest-repeat=='0.9.*' \
+    pytest-timeout=='2.2.*' \
+    pytest-xdist=='3.5.*' \
+    pytz=='2023.3.*' \
+    pyyaml=='5.3.*' \
+    redis=='5.0.*' \
     requests-kerberos \
     tzlocal==2.1 \
-    retry \
-    bs4 \
-    lxml \
-    urllib3
+    retry=='0.9.*' \
+    bs4=='0.0.*' \
+    lxml=='4.9.*' \
+    urllib3=='2.1.*'
 # bs4, lxml are for cloud tests, do not delete
 
 # Hudi supports only spark 3.3.*, not 3.4

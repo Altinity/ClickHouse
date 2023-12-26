@@ -30,7 +30,7 @@ from upload_result_helper import upload_results
 
 
 NO_CHANGES_MSG = "Nothing to run"
-IMAGE_NAME = "clickhouse/sqllogic-test"
+IMAGE_NAME = "altinityinfra/sqllogic-test"
 
 
 def get_run_command(

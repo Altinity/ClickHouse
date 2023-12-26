@@ -4,13 +4,13 @@ import logging
 import os
 import shutil
 from hashlib import md5
+from env_helper import S3_BUILDS_BUCKET, S3_DOWNLOAD
 from pathlib import Path
 
 import requests  # type: ignore
 
 from build_download_helper import download_build_with_progress, DownloadException
 from compress_files import decompress_fast, compress_fast
-from env_helper import S3_DOWNLOAD, S3_BUILDS_BUCKET
 from git_helper import git_runner
 from s3_helper import S3Helper
 

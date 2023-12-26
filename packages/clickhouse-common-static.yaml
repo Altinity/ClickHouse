@@ -11,8 +11,8 @@ description: |
 arch: "${DEB_ARCH}" # amd64, arm64
 platform: "linux"
 version: "${CLICKHOUSE_VERSION_STRING}"
-vendor: "ClickHouse Inc."
-homepage: "https://clickhouse.com"
+vendor: "Altinity Inc."
+homepage: "https://altinity.com/"
 license: "Apache"
 section: "database"
 priority: "optional"
@@ -34,8 +34,9 @@ suggests:
 contents:
 - src: root/usr/bin/clickhouse
   dst: /usr/bin/clickhouse
-- src: root/usr/bin/clickhouse-diagnostics
-  dst: /usr/bin/clickhouse-diagnostics
+# Excluded due to CVEs in go runtime that popup constantly
+# - src: root/usr/bin/clickhouse-diagnostics
+#   dst: /usr/bin/clickhouse-diagnostics
 - src: root/usr/bin/clickhouse-extract-from-config
   dst: /usr/bin/clickhouse-extract-from-config
 - src: root/usr/bin/clickhouse-library-bridge

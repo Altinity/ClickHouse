@@ -25,8 +25,8 @@ from s3_helper import S3Helper
 from stopwatch import Stopwatch
 from upload_result_helper import upload_results
 
-IMAGE_UBUNTU = "clickhouse/test-old-ubuntu"
-IMAGE_CENTOS = "clickhouse/test-old-centos"
+IMAGE_UBUNTU = "altinityinfra/test-old-ubuntu"
+IMAGE_CENTOS = "altinityinfra/test-old-centos"
 DOWNLOAD_RETRIES_COUNT = 5
 
 
@@ -251,7 +251,7 @@ def main():
         args.check_name,
     )
 
-    ch_helper.insert_events_into(db="default", table="checks", events=prepared_events)
+    ch_helper.insert_events_into(db="gh-data", table="checks", events=prepared_events)
 
     if state == "failure":
         sys.exit(1)

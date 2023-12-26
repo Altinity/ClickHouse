@@ -163,7 +163,7 @@ def main():
         code = int(state != "success")
         sys.exit(code)
 
-    docker_image = get_image_with_version(reports_path, "clickhouse/style-test")
+    docker_image = get_image_with_version(reports_path, "altinityinfra/style-test")
     s3_helper = S3Helper()
 
     cmd = (
@@ -199,7 +199,7 @@ def main():
         report_url,
         NAME,
     )
-    ch_helper.insert_events_into(db="default", table="checks", events=prepared_events)
+    ch_helper.insert_events_into(db="gh-data", table="checks", events=prepared_events)
 
     if state in ["error", "failure"]:
         sys.exit(1)

@@ -38,67 +38,67 @@ class TestDockerImageCheck(unittest.TestCase):
         self.maxDiff = None
         expected = sorted(
             [
-                di.DockerImage("docker/test/base", "clickhouse/test-base", False),
-                di.DockerImage("docker/docs/builder", "clickhouse/docs-builder", True),
+                di.DockerImage("docker/test/base", "altinityinfra/test-base", False),
+                di.DockerImage("docker/docs/builder", "altinityinfra/docs-builder", True),
                 di.DockerImage(
                     "docker/test/sqltest",
-                    "clickhouse/sqltest",
+                    "altinityinfra/sqltest",
                     False,
-                    "clickhouse/test-base",  # type: ignore
+                    "altinityinfra/test-base",  # type: ignore
                 ),
                 di.DockerImage(
                     "docker/test/stateless",
-                    "clickhouse/stateless-test",
+                    "altinityinfra/stateless-test",
                     False,
-                    "clickhouse/test-base",  # type: ignore
+                    "altinityinfra/test-base",  # type: ignore
                 ),
                 di.DockerImage(
                     "docker/test/integration/base",
-                    "clickhouse/integration-test",
+                    "altinityinfra/integration-test",
                     False,
-                    "clickhouse/test-base",  # type: ignore
+                    "altinityinfra/test-base",  # type: ignore
                 ),
-                di.DockerImage(
-                    "docker/test/fuzzer",
-                    "clickhouse/fuzzer",
-                    False,
-                    "clickhouse/test-base",  # type: ignore
-                ),
-                di.DockerImage(
-                    "docker/test/keeper-jepsen",
-                    "clickhouse/keeper-jepsen-test",
-                    False,
-                    "clickhouse/test-base",  # type: ignore
-                ),
-                di.DockerImage(
-                    "docker/docs/check",
-                    "clickhouse/docs-check",
-                    False,
-                    "clickhouse/docs-builder",  # type: ignore
-                ),
-                di.DockerImage(
-                    "docker/docs/release",
-                    "clickhouse/docs-release",
-                    False,
-                    "clickhouse/docs-builder",  # type: ignore
-                ),
+                # di.DockerImage(
+                #     "docker/test/fuzzer",
+                #     "altinityinfra/fuzzer",
+                #     False,
+                #     "altinityinfra/test-base",  # type: ignore
+                # ),
+                # di.DockerImage(
+                #     # "docker/test/keeper-jepsen",
+                #     # "altinityinfra/keeper-jepsen-test",
+                #     False,
+                #     "altinityinfra/test-base",  # type: ignore
+                # ),
+                # di.DockerImage(
+                #     "docker/docs/check",
+                #     "altinityinfra/docs-check",
+                #     False,
+                #    "altinityinfra/docs-builder",  # type: ignore
+                # ),
+                # di.DockerImage(
+                #     "docker/docs/release",
+                #     "altinityinfra/docs-release",
+                #     False,
+                #    "altinityinfra/docs-builder",  # type: ignore
+                # ),
                 di.DockerImage(
                     "docker/test/stateful",
-                    "clickhouse/stateful-test",
+                    "altinityinfra/stateful-test",
                     False,
-                    "clickhouse/stateless-test",  # type: ignore
+                    "altinityinfra/stateless-test",  # type: ignore
                 ),
                 di.DockerImage(
                     "docker/test/unit",
-                    "clickhouse/unit-test",
+                    "altinityinfra/unit-test",
                     False,
-                    "clickhouse/stateless-test",  # type: ignore
+                    "altinityinfra/stateless-test",  # type: ignore
                 ),
                 di.DockerImage(
                     "docker/test/stress",
-                    "clickhouse/stress-test",
+                    "altinityinfra/stress-test",
                     False,
-                    "clickhouse/stateful-test",  # type: ignore
+                    "altinityinfra/stateful-test",  # type: ignore
                 ),
             ]
         )

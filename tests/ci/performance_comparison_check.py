@@ -31,7 +31,7 @@ from tee_popen import TeePopen
 from clickhouse_helper import get_instance_type
 from stopwatch import Stopwatch
 
-IMAGE_NAME = "clickhouse/performance-comparison"
+IMAGE_NAME = "altinityinfra/performance-comparison"
 
 
 def get_run_command(
