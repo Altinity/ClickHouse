@@ -171,7 +171,6 @@ bool optimizeUseNormalProjections(Stack & stack, QueryPlan::Nodes & nodes)
             reader,
             required_columns,
             parts_with_ranges,
-            metadata,
             query_info,
             context,
             max_added_blocks,

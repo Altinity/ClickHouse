@@ -1168,7 +1168,6 @@ MergeTreeDataSelectAnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
         std::move(alter_conversions),
         prewhere_info,
         filter_nodes,
-        storage_snapshot->metadata,
         metadata_for_reading,
         query_info,
         context,
@@ -1354,7 +1353,6 @@ MergeTreeDataSelectAnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
     std::vector<AlterConversionsPtr> alter_conversions,
     const PrewhereInfoPtr & prewhere_info,
     const ActionDAGNodes & added_filter_nodes,
-    const StorageMetadataPtr & metadata_snapshot_base,
     const StorageMetadataPtr & metadata_snapshot,
     const SelectQueryInfo & query_info,
     ContextPtr context,
@@ -1375,7 +1373,6 @@ MergeTreeDataSelectAnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
         return selectRangesToReadImpl(
             std::move(parts),
             std::move(alter_conversions),
-            metadata_snapshot_base,
             metadata_snapshot,
             updated_query_info_with_filter_dag,
             context,
@@ -1391,7 +1388,6 @@ MergeTreeDataSelectAnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
     return selectRangesToReadImpl(
         std::move(parts),
         std::move(alter_conversions),
-        metadata_snapshot_base,
         metadata_snapshot,
         query_info,
         context,
@@ -1407,7 +1403,6 @@ MergeTreeDataSelectAnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
 MergeTreeDataSelectAnalysisResultPtr ReadFromMergeTree::selectRangesToReadImpl(
     MergeTreeData::DataPartsVector parts,
     std::vector<AlterConversionsPtr> alter_conversions,
-    const StorageMetadataPtr & metadata_snapshot_base,
     const StorageMetadataPtr & metadata_snapshot,
     const SelectQueryInfo & query_info,
     ContextPtr context,
@@ -1468,7 +1463,7 @@ MergeTreeDataSelectAnalysisResultPtr ReadFromMergeTree::selectRangesToReadImpl(
             parts,
             alter_conversions,
             part_values,
-            metadata_snapshot_base,
+            metadata_snapshot,
             data,
             context,
             max_block_numbers_to_read.get(),
