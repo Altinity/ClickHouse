@@ -298,9 +298,7 @@ CI_CONFIG = CiConfig(
         "SQLancer (release)": TestConfig("package_release"),
         "SQLancer (debug)": TestConfig("package_debug"),
         "Sqllogic test (release)": TestConfig("package_release"),
-        "Sign release (actions)": {
-            "required_build": "package_release"
-        }
+        "Sign release (actions)": TestConfig("package_release"),
     },
 )
 CI_CONFIG.validate()
