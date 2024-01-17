@@ -5,6 +5,7 @@ import json
 import time
 import subprocess
 import logging
+import traceback
 
 from pathlib import Path
 from typing import List, Optional, Union
@@ -52,11 +53,28 @@ def get_images_with_versions(
     for image_name in required_images:
         docker_image = DockerImage(image_name, version)
         if image_name in images:
-            docker_image.version = images[image_name]
+            image_version = images[image_name]
+            # NOTE(vnemkov): For some reason we can get version as list of versions,
+            # in this case choose one that has commit hash and hence is the longest string.
+            # E.g. from ['latest-amd64', '0-amd64', '0-473d8f560fc78c6cdaabb960a537ca5ab49f795f-amd64']
+            # choose '0-473d8f560fc78c6cdaabb960a537ca5ab49f795f-amd64' since it 100% points to proper commit.
+            if isinstance(image_version, list):
+                max_len = 0
+                max_len_version = ''
+                for version_variant in image_version:
+                    if len(version_variant) > max_len:
+                        max_len = len(version_variant)
+                        max_len_version = version_variant
+                logging.debug(f"selected version {max_len_version} from {image_version}")
+                image_version = max_len_version
+
+            docker_image.version = image_version
+
         docker_images.append(docker_image)
 
     latest_error = Exception("predefined to avoid access before created")
     if pull:
+        latest_error = None
         for docker_image in docker_images:
             for i in range(10):
                 try:
@@ -70,7 +88,8 @@ def get_images_with_versions(
                 except Exception as ex:
                     latest_error = ex
                     time.sleep(i * 3)
-                    logging.info("Got execption pulling docker %s", ex)
+                    logging.info("Got exception pulling docker %s", ex)
+                    latest_error = traceback.format_exc()
             else:
                 raise Exception(
                     "Cannot pull dockerhub for image docker pull "

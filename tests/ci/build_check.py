@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import time
+from shutil import rmtree
 
 from ci_config import CI_CONFIG, BuildConfig
 from docker_pull_helper import get_image_with_version
@@ -14,9 +15,12 @@ from env_helper import (
     GITHUB_JOB_API_URL,
     IMAGES_PATH,
     REPO_COPY,
+    S3_ACCESS_KEY_ID,
     S3_BUILDS_BUCKET,
     S3_DOWNLOAD,
+    S3_SECRET_ACCESS_KEY,
     TEMP_PATH,
+    CLICKHOUSE_STABLE_VERSION_SUFFIX,
 )
 from git_helper import Git, git_runner
 from pr_info import PRInfo
@@ -25,6 +29,7 @@ from s3_helper import S3Helper
 from tee_popen import TeePopen
 from version_helper import (
     ClickHouseVersion,
+    Git,
     get_version_from_repo,
     update_version_local,
 )
@@ -35,7 +40,8 @@ from clickhouse_helper import (
 )
 from stopwatch import Stopwatch
 
-IMAGE_NAME = "clickhouse/binary-builder"
+
+IMAGE_NAME = "altinityinfra/binary-builder"
 BUILD_LOG_NAME = "build_log.log"
 
 
@@ -55,6 +61,7 @@ def get_packager_cmd(
     output_path: Path,
     build_version: str,
     image_version: str,
+    sccache_directory: str,
     official: bool,
 ) -> str:
     package_type = build_config.package_type
@@ -73,8 +80,11 @@ def get_packager_cmd(
         cmd += " --clang-tidy"
 
     cmd += " --cache=sccache"
+    cmd += f" --s3-directory={sccache_directory}"
     cmd += " --s3-rw-access"
     cmd += f" --s3-bucket={S3_BUILDS_BUCKET}"
+    cmd += f" --s3-access-key-id={S3_ACCESS_KEY_ID}"
+    cmd += f" --s3-secret-access-key={S3_SECRET_ACCESS_KEY}"
 
     if build_config.additional_pkgs:
         cmd += " --additional-pkgs"
@@ -245,21 +255,27 @@ def main():
 
     logging.info("Got version from repo %s", version.string)
 
-    official_flag = pr_info.number == 0
 
-    version_type = "testing"
-    if "release" in pr_info.labels or "release-lts" in pr_info.labels:
-        version_type = "stable"
-        official_flag = True
+    official_flag = True
+    version._flavour = version_type = CLICKHOUSE_STABLE_VERSION_SUFFIX
+    # TODO (vnemkov): right now we'll use simplified version management:
+    # only update git hash and explicitly set stable version suffix.
+    # official_flag = pr_info.number == 0
+    # version_type = "testing"
+    # if "release" in pr_info.labels or "release-lts" in pr_info.labels:
+    #     version_type = CLICKHOUSE_STABLE_VERSION_SUFFIX
+    #     official_flag = True
 
     update_version_local(version, version_type)
 
-    logging.info("Updated local files with version")
+    logging.info(f"Updated local files with version : {version.string} / {version.describe}")
 
     logging.info("Build short name %s", build_name)
 
     build_output_path = temp_path / build_name
     build_output_path.mkdir(parents=True, exist_ok=True)
+
+    sccache_directory = "ccache"
 
     packager_cmd = get_packager_cmd(
         build_config,
@@ -267,6 +283,7 @@ def main():
         build_output_path,
         version.string,
         image_version,
+        sccache_directory,
         official_flag,
     )
 
@@ -321,13 +338,15 @@ def main():
 
     print("::notice ::Build URLs: {}".format("\n".join(build_urls)))
 
-    if log_path.exists():
+    if os.path.exists(log_path):
         log_url = s3_helper.upload_build_file_to_s3(
-            log_path, s3_path_prefix + "/" + log_path.name
+            log_path, s3_path_prefix + "/" + os.path.basename(log_path)
         )
         logging.info("Log url %s", log_url)
+        print(f"::notice ::Log URL: {log_url}")
     else:
         logging.info("Build log doesn't exist")
+        print("Build log doesn't exist")
 
     print(f"::notice ::Log URL: {log_url}")
 
@@ -345,83 +364,84 @@ def main():
         "Build result file %s is written, content:\n %s",
         result_json_path,
         result_json_path.read_text(encoding="utf-8"),
+
     )
 
     upload_master_static_binaries(pr_info, build_config, s3_helper, build_output_path)
 
     # Upload profile data
     ch_helper = ClickHouseHelper()
-
-    clickhouse_ci_logs_host = os.getenv("CLICKHOUSE_CI_LOGS_HOST", "")
-    if clickhouse_ci_logs_host:
-        instance_type = get_instance_type()
-        query = f"""INSERT INTO build_time_trace
-(
-    pull_request_number,
-    commit_sha,
-    check_start_time,
-    check_name,
-    instance_type,
-    file,
-    library,
-    time,
-    pid,
-    tid,
-    ph,
-    ts,
-    dur,
-    cat,
-    name,
-    detail,
-    count,
-    avgMs,
-    args_name
-)
-SELECT {pr_info.number}, '{pr_info.sha}', '{stopwatch.start_time_str}', '{build_name}', '{instance_type}', *
-FROM input('
-    file String,
-    library String,
-    time DateTime64(6),
-    pid UInt32,
-    tid UInt32,
-    ph String,
-    ts UInt64,
-    dur UInt64,
-    cat String,
-    name String,
-    detail String,
-    count UInt64,
-    avgMs UInt64,
-    args_name String')
-FORMAT JSONCompactEachRow"""
-
-        auth = {
-            "X-ClickHouse-User": "ci",
-            "X-ClickHouse-Key": os.getenv("CLICKHOUSE_CI_LOGS_PASSWORD", ""),
-        }
-        url = f"https://{clickhouse_ci_logs_host}/"
-        profiles_dir = temp_path / "profiles_source"
-        profiles_dir.mkdir(parents=True, exist_ok=True)
-        logging.info(
-            "Processing profile JSON files from %s", repo_path / "build_docker"
-        )
-        git_runner(
-            "./utils/prepare-time-trace/prepare-time-trace.sh "
-            f"build_docker {profiles_dir.absolute()}"
-        )
-        profile_data_file = temp_path / "profile.json"
-        with open(profile_data_file, "wb") as profile_fd:
-            for profile_sourse in profiles_dir.iterdir():
-                with open(profiles_dir / profile_sourse, "rb") as ps_fd:
-                    profile_fd.write(ps_fd.read())
-
-        logging.info(
-            "::notice ::Log Uploading profile data, path: %s, size: %s, query: %s",
-            profile_data_file,
-            profile_data_file.stat().st_size,
-            query,
-        )
-        ch_helper.insert_file(url, auth, query, profile_data_file)
+#
+#    clickhouse_ci_logs_host = os.getenv("CLICKHOUSE_CI_LOGS_HOST", "")
+#    if clickhouse_ci_logs_host:
+#        instance_type = get_instance_type()
+#        query = f"""INSERT INTO build_time_trace
+#(
+#    pull_request_number,
+#    commit_sha,
+#    check_start_time,
+#    check_name,
+#    instance_type,
+#    file,
+#    library,
+#    time,
+#    pid,
+#    tid,
+#    ph,
+#    ts,
+#    dur,
+#    cat,
+#    name,
+#    detail,
+#    count,
+#    avgMs,
+#    args_name
+#)
+#SELECT {pr_info.number}, '{pr_info.sha}', '{stopwatch.start_time_str}', '{build_name}', '{instance_type}', *
+#FROM input('
+#    file String,
+#    library String,
+#    time DateTime64(6),
+#    pid UInt32,
+#    tid UInt32,
+#    ph String,
+#    ts UInt64,
+#    dur UInt64,
+#    cat String,
+#    name String,
+#    detail String,
+#    count UInt64,
+#    avgMs UInt64,
+#    args_name String')
+#FORMAT JSONCompactEachRow"""
+#
+#        auth = {
+#            "X-ClickHouse-User": "ci",
+#            "X-ClickHouse-Key": os.getenv("CLICKHOUSE_CI_LOGS_PASSWORD", ""),
+#        }
+#        url = f"https://{clickhouse_ci_logs_host}/"
+#        profiles_dir = temp_path / "profiles_source"
+#        profiles_dir.mkdir(parents=True, exist_ok=True)
+#        logging.info(
+#            "Processing profile JSON files from %s", repo_path / "build_docker"
+#        )
+#            f"build_docker {profiles_dir.absolute()}"
+#        )
+#        profile_data_file = temp_path / "profile.json"
+#        with open(profile_data_file, "wb") as profile_fd:
+#            for profile_sourse in os.listdir(profiles_dir):
+#                with open(profiles_dir / profile_sourse, "rb") as ps_fd:
+#            for profile_sourse in profiles_dir.iterdir():
+#                with open(profiles_dir / profile_sourse, "rb") as ps_fd:
+#                    profile_fd.write(ps_fd.read())
+#
+#        logging.info(
+#            "::notice ::Log Uploading profile data, path: %s, size: %s, query: %s",
+#            profile_data_file,
+#            profile_data_file.stat().st_size,
+#            query,
+#        )
+#        ch_helper.insert_file(url, auth, query, profile_data_file)
 
     # Upload statistics to CI database
     prepared_events = prepare_tests_results_for_clickhouse(
@@ -433,7 +453,7 @@ FORMAT JSONCompactEachRow"""
         log_url,
         f"Build ({build_name})",
     )
-    ch_helper.insert_events_into(db="default", table="checks", events=prepared_events)
+    ch_helper.insert_events_into(db="gh-data", table="checks", events=prepared_events)
 
     # Fail the build job if it didn't succeed
     if build_status != SUCCESS:

@@ -28,7 +28,7 @@ from stopwatch import Stopwatch
 from tee_popen import TeePopen
 from upload_result_helper import upload_results
 
-IMAGE_NAME = "clickhouse/fuzzer"
+IMAGE_NAME = "altinityinfra/fuzzer"
 
 
 def get_run_command(
@@ -191,7 +191,7 @@ def main():
         check_name,
     )
 
-    ch_helper.insert_events_into(db="default", table="checks", events=prepared_events)
+    ch_helper.insert_events_into(db="gh-data", table="checks", events=prepared_events)
 
     logging.info("Result: '%s', '%s', '%s'", status, description, report_url)
     print(f"::notice ::Report url: {report_url}")
