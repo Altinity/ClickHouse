@@ -439,7 +439,7 @@ def main():
     for image in changed_images:
         # If we are in backport PR, then pr_info.release_pr is defined
         # We use it as tag to reduce rebuilding time
-        subprocess.run("sudo docker restart", shell=True)
+        subprocess.run("sudo systemctl restart docker", shell=True)
         test_results += process_image_with_parents(
             image, image_versions, additional_cache, args.push
         )
