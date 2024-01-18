@@ -59,8 +59,7 @@ RUN curl https://sh.rustup.rs -sSf | bash -s -- -y && \
 
 # NOTE: Seems like gcc-11 is too new for ubuntu20 repository
 # A cross-linker for RISC-V 64 (we need it, because LLVM's LLD does not work):
-RUN add-apt-repository ppa:ubuntu-toolchain-r/test --yes \
-    && apt-get update \
+RUN apt-get update \
     && apt-get install --yes \
         binutils-riscv64-linux-gnu \
         build-essential \
