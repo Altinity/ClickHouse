@@ -445,8 +445,7 @@ def main():
             result = process_image_with_parents(
                 image, image_versions, additional_cache, args.push
             )
-            print(result, "SEARCHME")
-            if result.status == "OK":
+            if result[0].status == "OK":
                 break
         test_results += result
         result_images[image.repo] = result_version
