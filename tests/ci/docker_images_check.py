@@ -439,16 +439,9 @@ def main():
     for image in changed_images:
         # If we are in backport PR, then pr_info.release_pr is defined
         # We use it as tag to reduce rebuilding time
-        retry = 0
-        while retry < 3:
-            retry += 1
-            result = process_image_with_parents(
+        test_results += result = process_image_with_parents(
                 image, image_versions, additional_cache, args.push
             )
-            print(result, type(result), "DEBUG")
-            if result[0].status == "OK":
-                break
-        test_results += result
         result_images[image.repo] = result_version
 
     if changed_images:
