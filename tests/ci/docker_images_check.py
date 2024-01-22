@@ -439,9 +439,19 @@ def main():
     for image in changed_images:
         # If we are in backport PR, then pr_info.release_pr is defined
         # We use it as tag to reduce rebuilding time
-        test_results += process_image_with_parents(
-            image, image_versions, additional_cache, args.push
-        )
+        retry = 0
+        while retry < 3:
+            retry += 1
+            result = process_image_with_parents(
+                image, image_versions, additional_cache, args.push
+            )
+            if result == []:
+                break
+            if result[0].status == "OK":
+                break
+            logging.info("Image build fail, sleep 30 seconds, then restart...")
+            time.sleep(30)
+        test_results += result
         result_images[image.repo] = result_version
 
     if changed_images:
