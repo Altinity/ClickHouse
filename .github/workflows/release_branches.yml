@@ -29,18 +29,18 @@ on: # yamllint disable-line rule:truthy
 
 jobs:
   DockerHubPushAarch64:
-    runs-on: [self-hosted, style-checker, on-demand, type-ccx53, in-hel1, image-x86-app-docker-ce]
+    runs-on: [self-hosted, style-checker, on-demand, type-ccx53, in-ash, image-x86-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
           clear-repository: true
 
-      - name: Common docker setup
-        uses: ./.github/actions/docker_setup
-        with:
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+      # - name: Common docker setup
+      #   uses: ./.github/actions/docker_setup
+      #   with:
+      #     DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      #     DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Images check
         run: |
@@ -53,18 +53,18 @@ jobs:
           path: ${{ runner.temp }}/docker_images_check/changed_images_aarch64.json
 
   DockerHubPushAmd64:
-    runs-on: [self-hosted, style-checker, on-demand, type-ccx53, in-hel1, image-x86-app-docker-ce]
+    runs-on: [self-hosted, style-checker, on-demand, type-ccx53, in-ash, image-x86-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
           clear-repository: true
 
-      - name: Common docker setup
-        uses: ./.github/actions/docker_setup
-        with:
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+      # - name: Common docker setup
+      #   uses: ./.github/actions/docker_setup
+      #   with:
+      #     DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      #     DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Images check
         run: |
