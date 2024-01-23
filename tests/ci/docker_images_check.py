@@ -449,8 +449,9 @@ def main():
                 break
             if result[0].status == "OK":
                 break
-            logging.info("Image build fail, sleep 30 seconds, then restart...")
-            time.sleep(30)
+            logging.info("Image build fail, sleep 15 seconds, then restart...")
+            subprocess.run("sudo systemctl docker restart", shell=True)
+            time.sleep(15)
         test_results += result
         result_images[image.repo] = result_version
 
