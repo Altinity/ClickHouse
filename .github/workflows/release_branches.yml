@@ -36,12 +36,6 @@ jobs:
         with:
           clear-repository: true
 
-      # - name: Common docker setup
-      #   uses: ./.github/actions/docker_setup
-      #   with:
-      #     DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-      #     DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-
       - name: Images check
         run: |
           cd "$GITHUB_WORKSPACE/tests/ci"
@@ -59,12 +53,6 @@ jobs:
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
           clear-repository: true
-
-      # - name: Common docker setup
-      #   uses: ./.github/actions/docker_setup
-      #   with:
-      #     DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-      #     DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Images check
         run: |
@@ -139,7 +127,7 @@ jobs:
       build_name: package_release
       checkout_depth: 0
       timeout_minutes: 180
-      runner_type: builder, on-demand, type-ccx53, image-x86-app-docker-ce
+      runner_type: builder, on-demand, type-ccx53, in-ash, image-x86-app-docker-ce
       additional_envs: |
         CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
 
@@ -150,8 +138,10 @@ jobs:
     with:
       build_name: package_aarch64
       checkout_depth: 0
-      runner_type: builder, on-demand, type-ccx53, image-x86-app-docker-ce
-
+      timeout_minutes: 180
+      runner_type: builder, on-demand, type-ccx53, in-ash, image-x86-app-docker-ce
+      additional_envs: |
+        CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
 
 ############################################################################################
 ##################################### Docker images  #######################################
