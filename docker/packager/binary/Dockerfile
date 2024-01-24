@@ -1,4 +1,3 @@
-
 # docker build -t altinityinfra/binary-builder .
 ARG FROM_TAG=latest
 FROM altinityinfra/test-util:$FROM_TAG as cctools
@@ -59,7 +58,8 @@ RUN curl https://sh.rustup.rs -sSf | bash -s -- -y && \
 
 # NOTE: Seems like gcc-11 is too new for ubuntu20 repository
 # A cross-linker for RISC-V 64 (we need it, because LLVM's LLD does not work):
-RUN apt-get update \
+RUN add-apt-repository ppa:ubuntu-toolchain-r/test --yes \
+    && apt-get update \
     && apt-get install --yes \
         binutils-riscv64-linux-gnu \
         build-essential \
