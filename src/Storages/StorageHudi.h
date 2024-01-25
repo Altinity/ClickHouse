@@ -26,7 +26,7 @@ public:
 private:
     Configuration configuration;
     ContextPtr context;
-    Poco::Logger * log;
+    LoggerPtr log;
 };
 
 struct StorageHudiName

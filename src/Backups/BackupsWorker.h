@@ -140,7 +140,7 @@ private:
     std::atomic<size_t> num_active_backups = 0;
     std::atomic<size_t> num_active_restores = 0;
     mutable std::mutex infos_mutex;
-    Poco::Logger * log;
+    LoggerPtr log;
     const bool allow_concurrent_backups;
     const bool allow_concurrent_restores;
 };

@@ -83,7 +83,7 @@ BackupEntriesCollector::BackupEntriesCollector(
     , context(context_)
     , on_cluster_first_sync_timeout(context->getConfigRef().getUInt64("backups.on_cluster_first_sync_timeout", 180000))
     , consistent_metadata_snapshot_timeout(context->getConfigRef().getUInt64("backups.consistent_metadata_snapshot_timeout", 600000))
-    , log(&Poco::Logger::get("BackupEntriesCollector"))
+    , log(getLogger("BackupEntriesCollector"))
 {
 }
 

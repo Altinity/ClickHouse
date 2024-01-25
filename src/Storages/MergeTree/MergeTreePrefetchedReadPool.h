@@ -74,7 +74,7 @@ private:
 
     static std::string dumpTasks(const ThreadsTasks & tasks);
 
-    Poco::Logger * log;
+    LoggerPtr log;
 
     Block header;
     MarkCache * mark_cache;

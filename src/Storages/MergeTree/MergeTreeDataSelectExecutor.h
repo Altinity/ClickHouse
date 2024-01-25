@@ -71,11 +71,11 @@ public:
         const StorageMetadataPtr & metadata_snapshot,
         const KeyCondition & key_condition,
         const Settings & settings,
-        Poco::Logger * log);
+        LoggerPtr log);
 
 private:
     const MergeTreeData & data;
-    Poco::Logger * log;
+    LoggerPtr log;
 
     /// Get the approximate value (bottom estimate - only by full marks) of the number of rows falling under the index.
     static size_t getApproximateTotalRowsToRead(
@@ -83,7 +83,7 @@ private:
         const StorageMetadataPtr & metadata_snapshot,
         const KeyCondition & key_condition,
         const Settings & settings,
-        Poco::Logger * log);
+        LoggerPtr log);
 
     static MarkRanges filterMarksUsingIndex(
         MergeTreeIndexPtr index_helper,
@@ -96,7 +96,7 @@ private:
         size_t & granules_dropped,
         MarkCache * mark_cache,
         UncompressedCache * uncompressed_cache,
-        Poco::Logger * log);
+        LoggerPtr log);
 
     static MarkRanges filterMarksUsingMergedIndex(
         MergeTreeIndices indices,
@@ -109,7 +109,7 @@ private:
         size_t & granules_dropped,
         MarkCache * mark_cache,
         UncompressedCache * uncompressed_cache,
-        Poco::Logger * log);
+        LoggerPtr log);
 
     struct PartFilterCounters
     {
@@ -143,7 +143,7 @@ private:
         const PartitionIdToMaxBlock * max_block_numbers_to_read,
         ContextPtr query_context,
         PartFilterCounters & counters,
-        Poco::Logger * log);
+        LoggerPtr log);
 
 public:
     /// For given number rows and bytes, get the number of marks to read.
@@ -180,7 +180,7 @@ public:
         const SelectQueryInfo & query_info,
         const ContextPtr & context,
         const PartitionIdToMaxBlock * max_block_numbers_to_read,
-        Poco::Logger * log,
+        LoggerPtr log,
         ReadFromMergeTree::IndexStats & index_stats);
 
     /// Filter parts using primary key and secondary indexes.
@@ -193,7 +193,7 @@ public:
         const ContextPtr & context,
         const KeyCondition & key_condition,
         const MergeTreeReaderSettings & reader_settings,
-        Poco::Logger * log,
+        LoggerPtr log,
         size_t num_streams,
         ReadFromMergeTree::IndexStats & index_stats,
         bool use_skip_indexes);
@@ -210,7 +210,7 @@ public:
         const StorageMetadataPtr & metadata_snapshot,
         ContextPtr context,
         bool sample_factor_column_queried,
-        Poco::Logger * log);
+        LoggerPtr log);
 
     /// Check query limits: max_partitions_to_read, max_concurrent_queries.
     /// Also, return QueryIdHolder. If not null, we should keep it until query finishes.

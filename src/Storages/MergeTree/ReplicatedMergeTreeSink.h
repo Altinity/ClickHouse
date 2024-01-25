@@ -124,7 +124,7 @@ private:
     bool last_block_is_duplicate = false;
 
     using Logger = Poco::Logger;
-    Poco::Logger * log;
+    LoggerPtr log;
 
     ContextPtr context;
     StorageSnapshotPtr storage_snapshot;

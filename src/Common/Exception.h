@@ -211,6 +211,7 @@ using Exceptions = std::vector<std::exception_ptr>;
   */
 void tryLogCurrentException(const char * log_name, const std::string & start_of_message = "");
 void tryLogCurrentException(Poco::Logger * logger, const std::string & start_of_message = "");
+void tryLogCurrentException(LoggerPtr logger, const std::string & start_of_message = "");
 
 
 /** Prints current exception in canonical format.
@@ -256,6 +257,7 @@ struct ExecutionStatus
 
 void tryLogException(std::exception_ptr e, const char * log_name, const std::string & start_of_message = "");
 void tryLogException(std::exception_ptr e, Poco::Logger * logger, const std::string & start_of_message = "");
+void tryLogException(std::exception_ptr e, LoggerPtr logger, const std::string & start_of_message = "");
 
 std::string getExceptionMessage(const Exception & e, bool with_stacktrace, bool check_embedded_stacktrace = false);
 PreformattedMessage getExceptionMessageAndPattern(const Exception & e, bool with_stacktrace, bool check_embedded_stacktrace = false);

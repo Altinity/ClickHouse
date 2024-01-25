@@ -22,7 +22,7 @@ public:
     ConnectionEstablisher(IConnectionPool * pool_,
                           const ConnectionTimeouts * timeouts_,
                           const Settings * settings_,
-                          Poco::Logger * log,
+                          LoggerPtr log,
                           const QualifiedTableName * table_to_check = nullptr);
 
     /// Establish connection and save it in result, write possible exception message in fail_message.
@@ -37,7 +37,7 @@ private:
     IConnectionPool * pool;
     const ConnectionTimeouts * timeouts;
     const Settings * settings;
-    Poco::Logger * log;
+    LoggerPtr log;
     const QualifiedTableName * table_to_check;
 
     bool is_finished;
@@ -61,7 +61,7 @@ public:
     ConnectionEstablisherAsync(IConnectionPool * pool_,
                           const ConnectionTimeouts * timeouts_,
                           const Settings * settings_,
-                          Poco::Logger * log_,
+                          LoggerPtr log_,
                           const QualifiedTableName * table_to_check = nullptr);
 
     /// Resume establishing connection. If the process was not finished,

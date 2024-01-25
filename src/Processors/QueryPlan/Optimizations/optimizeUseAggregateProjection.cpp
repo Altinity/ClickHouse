@@ -135,7 +135,7 @@ std::optional<AggregateFunctionMatches> matchAggregateFunctions(
         if (it == projection_aggregate_functions.end())
         {
             // LOG_TRACE(
-            //     &Poco::Logger::get("optimizeUseProjections"),
+            //     getLogger("optimizeUseProjections"),
             //     "Cannot match agg func {} by name {}",
             //     aggregate.column_name, aggregate.function->getName());
 
@@ -163,7 +163,7 @@ std::optional<AggregateFunctionMatches> matchAggregateFunctions(
             /// not match.
             if (!candidate.function->getStateType()->equals(*aggregate.function->getStateType()))
             {
-                // LOG_TRACE(&Poco::Logger::get("optimizeUseProjections"), "Cannot match agg func {} vs {} by state {} vs {}",
+                // LOG_TRACE(getLogger("optimizeUseProjections"), "Cannot match agg func {} vs {} by state {} vs {}",
                 //     aggregate.column_name, candidate.column_name,
                 //     candidate.function->getStateType()->getName(), aggregate.function->getStateType()->getName());
                 continue;
@@ -212,7 +212,7 @@ std::optional<AggregateFunctionMatches> matchAggregateFunctions(
                 if (mt == matches.end())
                 {
                     // LOG_TRACE(
-                    //     &Poco::Logger::get("optimizeUseProjections"),
+                    //     getLogger("optimizeUseProjections"),
                     //     "Cannot match agg func {} vs {} : can't match arg {} vs {} : no node in map",
                     //     aggregate.column_name, candidate.column_name, query_name, proj_name);
 
@@ -223,7 +223,7 @@ std::optional<AggregateFunctionMatches> matchAggregateFunctions(
                 if (node_match.node != proj_node || node_match.monotonicity)
                 {
                     // LOG_TRACE(
-                    //     &Poco::Logger::get("optimizeUseProjections"),
+                    //     getLogger("optimizeUseProjections"),
                     //     "Cannot match agg func {} vs {} : can't match arg {} vs {} : no match or monotonicity",
                     //     aggregate.column_name, candidate.column_name, query_name, proj_name);
 
@@ -303,7 +303,7 @@ ActionsDAGPtr analyzeAggregateProjection(
 
     // for (const auto & [node, match] : matches)
     // {
-    //     LOG_TRACE(&Poco::Logger::get("optimizeUseProjections"), "Match {} {} -> {} {} (with monotonicity : {})",
+    //     LOG_TRACE(getLogger("optimizeUseProjections"), "Match {} {} -> {} {} (with monotonicity : {})",
     //         static_cast<const void *>(node), node->result_name,
     //         static_cast<const void *>(match.node), (match.node ? match.node->result_name : ""), match.monotonicity != std::nullopt);
     // }
@@ -397,7 +397,7 @@ ActionsDAGPtr analyzeAggregateProjection(
             /// Not a match and there is no matched child.
             if (frame.node->type == ActionsDAG::ActionType::INPUT)
             {
-                // LOG_TRACE(&Poco::Logger::get("optimizeUseProjections"), "Cannot find match for {}", frame.node->result_name);
+                // LOG_TRACE(getLogger("optimizeUseProjections"), "Cannot find match for {}", frame.node->result_name);
                 return {};
             }
 
@@ -407,7 +407,7 @@ ActionsDAGPtr analyzeAggregateProjection(
         }
     }
 
-    // LOG_TRACE(&Poco::Logger::get("optimizeUseProjections"), "Folding actions by projection");
+    // LOG_TRACE(getLogger("optimizeUseProjections"), "Folding actions by projection");
 
     auto proj_dag = query.dag->foldActionsByProjection(new_inputs, query_key_nodes);
     appendAggregateFunctions(*proj_dag, aggregates, *matched_aggregates);
@@ -470,7 +470,7 @@ AggregateProjectionCandidates getAggregateProjectionCandidates(
     if (!can_use_minmax_projection && agg_projections.empty())
         return candidates;
 
-    // LOG_TRACE(&Poco::Logger::get("optimizeUseProjections"), "Has agg projection");
+    // LOG_TRACE(getLogger("optimizeUseProjections"), "Has agg projection");
 
     QueryDAG dag;
     if (!dag.build(*node.children.front()))
@@ -478,23 +478,23 @@ AggregateProjectionCandidates getAggregateProjectionCandidates(
 
     auto query_index = buildDAGIndex(*dag.dag);
 
-    // LOG_TRACE(&Poco::Logger::get("optimizeUseProjections"), "Query DAG: {}", dag.dag->dumpDAG());
+    // LOG_TRACE(getLogger("optimizeUseProjections"), "Query DAG: {}", dag.dag->dumpDAG());
 
     candidates.has_filter = dag.filter_node;
 
     if (can_use_minmax_projection)
     {
         const auto * projection = &*(metadata->minmax_count_projection);
-        // LOG_TRACE(&Poco::Logger::get("optimizeUseProjections"), "Try projection {}", projection->name);
+        // LOG_TRACE(getLogger("optimizeUseProjections"), "Try projection {}", projection->name);
         auto info = getAggregatingProjectionInfo(*projection, context, metadata, key_virtual_columns);
-        // LOG_TRACE(&Poco::Logger::get("optimizeUseProjections"), "Projection DAG {}", info.before_aggregation->dumpDAG());
+        // LOG_TRACE(getLogger("optimizeUseProjections"), "Projection DAG {}", info.before_aggregation->dumpDAG());
         if (auto proj_dag = analyzeAggregateProjection(info, dag, query_index, keys, aggregates))
         {
-            // LOG_TRACE(&Poco::Logger::get("optimizeUseProjections"), "Projection analyzed DAG {}", proj_dag->dumpDAG());
+            // LOG_TRACE(getLogger("optimizeUseProjections"), "Projection analyzed DAG {}", proj_dag->dumpDAG());
             AggregateProjectionCandidate candidate{.info = std::move(info), .dag = std::move(proj_dag)};
             MergeTreeData::DataPartsVector minmax_projection_normal_parts;
 
-            // LOG_TRACE(&Poco::Logger::get("optimizeUseProjections"), "Projection sample block {}", sample_block.dumpStructure());
+            // LOG_TRACE(getLogger("optimizeUseProjections"), "Projection sample block {}", sample_block.dumpStructure());
             auto block = reading.getMergeTreeData().getMinMaxCountProjectionBlock(
                 metadata,
                 candidate.dag->getRequiredColumnsNames(),
@@ -505,7 +505,7 @@ AggregateProjectionCandidates getAggregateProjectionCandidates(
                 max_added_blocks.get(),
                 context);
 
-            // LOG_TRACE(&Poco::Logger::get("optimizeUseProjections"), "Projection sample block 2 {}", block.dumpStructure());
+            // LOG_TRACE(getLogger("optimizeUseProjections"), "Projection sample block 2 {}", block.dumpStructure());
 
             if (block)
             {
@@ -524,12 +524,12 @@ AggregateProjectionCandidates getAggregateProjectionCandidates(
         candidates.real.reserve(agg_projections.size());
         for (const auto * projection : agg_projections)
         {
-            // LOG_TRACE(&Poco::Logger::get("optimizeUseProjections"), "Try projection {}", projection->name);
+            // LOG_TRACE(getLogger("optimizeUseProjections"), "Try projection {}", projection->name);
             auto info = getAggregatingProjectionInfo(*projection, context, metadata, key_virtual_columns);
-            // LOG_TRACE(&Poco::Logger::get("optimizeUseProjections"), "Projection DAG {}", info.before_aggregation->dumpDAG());
+            // LOG_TRACE(getLogger("optimizeUseProjections"), "Projection DAG {}", info.before_aggregation->dumpDAG());
             if (auto proj_dag = analyzeAggregateProjection(info, dag, query_index, keys, aggregates))
             {
-                // LOG_TRACE(&Poco::Logger::get("optimizeUseProjections"), "Projection analyzed DAG {}", proj_dag->dumpDAG());
+                // LOG_TRACE(getLogger("optimizeUseProjections"), "Projection analyzed DAG {}", proj_dag->dumpDAG());
                 AggregateProjectionCandidate candidate{.info = std::move(info), .dag = std::move(proj_dag)};
                 candidate.projection = projection;
                 candidates.real.emplace_back(std::move(candidate));
@@ -622,7 +622,7 @@ bool optimizeUseAggregateProjections(QueryPlan::Node & node, QueryPlan::Nodes & 
     /// Add reading from projection step.
     if (candidates.minmax_projection)
     {
-        // LOG_TRACE(&Poco::Logger::get("optimizeUseProjections"), "Minmax proj block {}",
+        // LOG_TRACE(getLogger("optimizeUseProjections"), "Minmax proj block {}",
         //           candidates.minmax_projection->block.dumpStructure());
 
         Pipe pipe(std::make_shared<SourceFromSingleChunk>(std::move(candidates.minmax_projection->block)));
@@ -666,7 +666,7 @@ bool optimizeUseAggregateProjections(QueryPlan::Node & node, QueryPlan::Nodes & 
             reading->setAnalyzedResult(std::move(best_candidate->merge_tree_ordinary_select_result_ptr));
     }
 
-    // LOG_TRACE(&Poco::Logger::get("optimizeUseProjections"), "Projection reading header {}",
+    // LOG_TRACE(getLogger("optimizeUseProjections"), "Projection reading header {}",
     //           projection_reading->getOutputStream().header.dumpStructure());
 
     projection_reading->setStepDescription(best_candidate->projection->name);

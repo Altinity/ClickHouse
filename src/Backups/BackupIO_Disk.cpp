@@ -14,7 +14,7 @@ namespace ErrorCodes
 }
 
 BackupReaderDisk::BackupReaderDisk(const DiskPtr & disk_, const String & path_)
-    : disk(disk_), path(path_), log(&Poco::Logger::get("BackupReaderDisk"))
+    : disk(disk_), path(path_), log(getLogger("BackupReaderDisk"))
 {
 }
 

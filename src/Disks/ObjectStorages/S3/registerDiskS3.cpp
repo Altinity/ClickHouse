@@ -143,7 +143,7 @@ void registerDiskS3(DiskFactory & factory, bool global_skip_access_check)
             if (s3_capabilities.support_batch_delete && !CheckAccess::checkBatchRemove(*s3_storage, uri.key))
             {
                 LOG_WARNING(
-                    &Poco::Logger::get("registerDiskS3"),
+                    getLogger("registerDiskS3"),
                     "Storage for disk {} does not support batch delete operations, "
                     "so `s3_capabilities.support_batch_delete` was automatically turned off during the access check. "
                     "To remove this message set `s3_capabilities.support_batch_delete` for the disk to `false`.",

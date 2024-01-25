@@ -76,7 +76,7 @@ private:
     ContextMutablePtr context;
     std::chrono::milliseconds on_cluster_first_sync_timeout;
     std::chrono::milliseconds create_table_timeout;
-    Poco::Logger * log;
+    LoggerPtr log;
 
     Strings all_hosts;
     DDLRenamingMap renaming_map;

@@ -211,7 +211,7 @@ private:
 
     const size_t max_redirects;
 
-    Poco::Logger * log;
+    LoggerPtr log;
 };
 
 class ClientFactory

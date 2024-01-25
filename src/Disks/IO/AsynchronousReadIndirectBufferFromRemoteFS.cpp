@@ -59,9 +59,9 @@ AsynchronousReadIndirectBufferFromRemoteFS::AsynchronousReadIndirectBufferFromRe
                ? CurrentThread::getQueryId() : "")
     , current_reader_id(getRandomASCIIString(8))
 #ifndef NDEBUG
-    , log(&Poco::Logger::get("AsynchronousBufferFromRemoteFS"))
+    , log(getLogger("AsynchronousBufferFromRemoteFS"))
 #else
-    , log(&Poco::Logger::get("AsyncBuffer(" + impl->getFileName() + ")"))
+    , log(getLogger("AsyncBuffer(" + impl->getFileName() + ")"))
 #endif
 {
     ProfileEvents::increment(ProfileEvents::RemoteFSBuffers);

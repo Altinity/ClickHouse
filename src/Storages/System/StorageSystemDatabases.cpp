@@ -50,7 +50,7 @@ static String getEngineFull(const DatabasePtr & database)
             return {};
 
         guard.reset();
-        LOG_TRACE(&Poco::Logger::get("StorageSystemDatabases"), "Failed to lock database {} ({}), will retry", name, database->getUUID());
+        LOG_TRACE(getLogger("StorageSystemDatabases"), "Failed to lock database {} ({}), will retry", name, database->getUUID());
     }
 
     ASTPtr ast = database->getCreateDatabaseQuery();

@@ -178,7 +178,7 @@ QueryCache::Writer::Writer(Cache & cache_, const Key & key_,
     if (auto entry = cache.getWithKey(key); entry.has_value() && !IsStale()(entry->key))
     {
         skip_insert = true; /// Key already contained in cache and did not expire yet --> don't replace it
-        LOG_TRACE(&Poco::Logger::get("QueryCache"), "Skipped insert (non-stale entry found), query: {}", key.queryStringFromAst());
+        LOG_TRACE(getLogger("QueryCache"), "Skipped insert (non-stale entry found), query: {}", key.queryStringFromAst());
     }
 }
 
@@ -200,7 +200,7 @@ void QueryCache::Writer::buffer(Chunk && partial_query_result)
     {
         chunks.clear(); /// eagerly free some space
         skip_insert = true;
-        LOG_TRACE(&Poco::Logger::get("QueryCache"), "Skipped insert (query result too big), new_entry_size_in_bytes: {} ({}), new_entry_size_in_rows: {} ({}), query: {}", new_entry_size_in_bytes, max_entry_size_in_bytes, new_entry_size_in_rows, max_entry_size_in_rows, key.queryStringFromAst());
+        LOG_TRACE(getLogger("QueryCache"), "Skipped insert (query result too big), new_entry_size_in_bytes: {} ({}), new_entry_size_in_rows: {} ({}), query: {}", new_entry_size_in_bytes, max_entry_size_in_bytes, new_entry_size_in_rows, max_entry_size_in_rows, key.queryStringFromAst());
     }
 }
 
@@ -213,14 +213,14 @@ void QueryCache::Writer::finalizeWrite()
 
     if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - query_start_time) < min_query_runtime)
     {
-        LOG_TRACE(&Poco::Logger::get("QueryCache"), "Skipped insert (query not expensive enough), query: {}", key.queryStringFromAst());
+        LOG_TRACE(getLogger("QueryCache"), "Skipped insert (query not expensive enough), query: {}", key.queryStringFromAst());
         return;
     }
 
     if (auto entry = cache.getWithKey(key); entry.has_value() && !IsStale()(entry->key))
     {
         /// same check as in ctor because a parallel Writer could have inserted the current key in the meantime
-        LOG_TRACE(&Poco::Logger::get("QueryCache"), "Skipped insert (non-stale entry found), query: {}", key.queryStringFromAst());
+        LOG_TRACE(getLogger("QueryCache"), "Skipped insert (non-stale entry found), query: {}", key.queryStringFromAst());
         return;
     }
 
@@ -233,24 +233,24 @@ QueryCache::Reader::Reader(Cache & cache_, const Key & key, const std::lock_guar
 
     if (!entry.has_value())
     {
-        LOG_TRACE(&Poco::Logger::get("QueryCache"), "No entry found for query {}", key.queryStringFromAst());
+        LOG_TRACE(getLogger("QueryCache"), "No entry found for query {}", key.queryStringFromAst());
         return;
     }
 
     if (entry->key.username.has_value() && entry->key.username != key.username)
     {
-        LOG_TRACE(&Poco::Logger::get("QueryCache"), "Inaccessible entry found for query {}", key.queryStringFromAst());
+        LOG_TRACE(getLogger("QueryCache"), "Inaccessible entry found for query {}", key.queryStringFromAst());
         return;
     }
 
     if (IsStale()(entry->key))
     {
-        LOG_TRACE(&Poco::Logger::get("QueryCache"), "Stale entry found for query {}", key.queryStringFromAst());
+        LOG_TRACE(getLogger("QueryCache"), "Stale entry found for query {}", key.queryStringFromAst());
         return;
     }
 
     pipe = Pipe(std::make_shared<SourceFromChunks>(entry->key.header, entry->mapped));
-    LOG_TRACE(&Poco::Logger::get("QueryCache"), "Entry found for query {}", key.queryStringFromAst());
+    LOG_TRACE(getLogger("QueryCache"), "Entry found for query {}", key.queryStringFromAst());
 }
 
 bool QueryCache::Reader::hasCacheEntryForKey() const

@@ -49,9 +49,9 @@ CachedOnDiskReadBufferFromFile::CachedOnDiskReadBufferFromFile(
     std::optional<size_t> read_until_position_)
     : ReadBufferFromFileBase(settings_.remote_fs_buffer_size, nullptr, 0, file_size_)
 #ifndef NDEBUG
-    , log(&Poco::Logger::get("CachedOnDiskReadBufferFromFile(" + source_file_path_ + ")"))
+    , log(getLogger("CachedOnDiskReadBufferFromFile(" + source_file_path_ + ")"))
 #else
-    , log(&Poco::Logger::get("CachedOnDiskReadBufferFromFile"))
+    , log(getLogger("CachedOnDiskReadBufferFromFile"))
 #endif
     , cache_key(cache_key_)
     , source_file_path(source_file_path_)
