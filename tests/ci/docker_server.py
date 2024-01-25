@@ -338,6 +338,7 @@ def main():
         args.bucket_prefix = (
             f"{S3_DOWNLOAD}/{S3_BUILDS_BUCKET}/{release_or_pr}/{pr_info.sha}"
         )
+        tags.append(f"{pr_info.number}-{pr_info.sha}")
 
     if args.push:
         subprocess.check_output(  # pylint: disable=unexpected-keyword-arg
