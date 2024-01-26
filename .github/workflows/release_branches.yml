@@ -104,7 +104,7 @@ jobs:
           name: changed_images
           path: ${{ runner.temp }}/changed_images.json
 
-  CompatibilityCheck:
+  CompatibilityCheckX86:
     needs: [BuilderDebRelease]
     uses: ./.github/workflows/reusable_test.yml
     secrets: inherit
@@ -621,7 +621,7 @@ jobs:
     secrets: inherit
     with:
       runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-app-docker-ce
-      commit: 09db6160aac30e37169797b73fac77b4cbca41c6
+      commit: e9c0ff0fe77b41e7876d0113593d25c9e650e050
       arch: release 
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'release' && github.sha }}
 
@@ -631,7 +631,7 @@ jobs:
     secrets: inherit
     with:
       runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-app-docker-ce
-      commit: 09db6160aac30e37169797b73fac77b4cbca41c6
+      commit: e9c0ff0fe77b41e7876d0113593d25c9e650e050
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'release' && github.sha }}
 
@@ -683,7 +683,6 @@ jobs:
       - DockerHubPush
       - DockerServerImages
       - BuilderReport
-      - BuilderSpecialReport
       - MarkReleaseReady
       - FunctionalStatelessTestDebug
       - FunctionalStatelessTestRelease
