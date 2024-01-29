@@ -31,7 +31,6 @@ TEST(Logger, TestLog)
         LOG_TEST(log, "Hello World");
 
         EXPECT_EQ(oss.str(), "Hello World\n");
-        Poco::Logger::destroy("TestLogger");
     }
 
     {   /// Test logs invisible for other levels
@@ -44,8 +43,6 @@ TEST(Logger, TestLog)
             LOG_TEST(log, "Hello World");
 
             EXPECT_EQ(oss.str(), "");
-
-            Poco::Logger::destroy(std::string{level} + "_Logger");
         }
     }
 

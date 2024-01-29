@@ -9,6 +9,7 @@
 #include <Common/LoggingFormatStringHelpers.h>
 
 #include <Common/Logger.h>
+#include <Common/AtomicLogger.h>
 
 namespace Poco { class Logger; }
 
@@ -18,7 +19,8 @@ namespace Poco { class Logger; }
 
 namespace
 {
-    [[maybe_unused]] const ::Poco::Logger * getLoggerHelper(const LoggerPtr & logger) { return logger.get(); }
+    [[maybe_unused]] LoggerPtr getLoggerHelper(const LoggerPtr & logger) { return logger; }
+    [[maybe_unused]] LoggerPtr getLoggerHelper(const AtomicLogger & logger) { return logger.load(); }
     [[maybe_unused]] const ::Poco::Logger * getLoggerHelper(const ::Poco::Logger * logger) { return logger; }
     [[maybe_unused]] std::unique_ptr<LogToStrImpl> getLoggerHelper(std::unique_ptr<LogToStrImpl> && logger) { return logger; }
     [[maybe_unused]] std::unique_ptr<LogFrequencyLimiterIml> getLoggerHelper(std::unique_ptr<LogFrequencyLimiterIml> && logger) { return logger; }

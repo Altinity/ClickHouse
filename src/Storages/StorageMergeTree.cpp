@@ -612,8 +612,9 @@ std::optional<MergeTreeMutationStatus> StorageMergeTree::getIncompleteMutationsS
 
     const auto & mutation_entry = current_mutation_it->second;
 
-    auto txn = tryGetTransactionForMutation(mutation_entry, log);
+    auto txn = tryGetTransactionForMutation(mutation_entry, log.load());
     assert(txn || mutation_entry.tid.isPrehistoric());
+
     auto data_parts = getVisibleDataPartsVector(txn);
     for (const auto & data_part : data_parts)
     {
@@ -729,7 +730,7 @@ CancellationCode StorageMergeTree::killMutation(const String & mutation_id)
     if (!to_kill)
         return CancellationCode::NotFound;
 
-    if (auto txn = tryGetTransactionForMutation(*to_kill, log))
+    if (auto txn = tryGetTransactionForMutation(*to_kill, log.load()))
     {
         LOG_TRACE(log, "Cancelling transaction {} which had started mutation {}", to_kill->tid, mutation_id);
         TransactionLog::instance().rollbackTransaction(txn);
@@ -1087,7 +1088,7 @@ MergeMutateSelectedEntryPtr StorageMergeTree::selectPartsToMutate(
         }
 
         TransactionID first_mutation_tid = mutations_begin_it->second.tid;
-        MergeTreeTransactionPtr txn = tryGetTransactionForMutation(mutations_begin_it->second, log);
+        MergeTreeTransactionPtr txn = tryGetTransactionForMutation(mutations_begin_it->second, log.load());
         assert(txn || first_mutation_tid.isPrehistoric());
 
         if (txn)
