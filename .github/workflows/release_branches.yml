@@ -333,7 +333,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (aarch64)
-      runner_type: altintiy-on-demand, altinity-type-cax41, altinity-image-arm-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-app-docker-ce
       additional_envs: |
         KILL_TIMEOUT=10800
       run_command: |
@@ -432,7 +432,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (aarch64)
-      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-app-docker-ce
       additional_envs: |
         KILL_TIMEOUT=3600
       run_command: |
