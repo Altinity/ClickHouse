@@ -13,8 +13,8 @@ import time
 import zlib  # for crc32
 
 
-MAX_RETRY = 1
-NUM_WORKERS = 5
+MAX_RETRY = 3
+NUM_WORKERS = 10
 SLEEP_BETWEEN_RETRIES = 5
 PARALLEL_GROUP_SIZE = 100
 CLICKHOUSE_BINARY_PATH = "usr/bin/clickhouse"
@@ -628,7 +628,7 @@ class ClickhouseIntegrationTestsRunner:
 
             test_cmd = " ".join([test for test in sorted(test_names)])
             parallel_cmd = (
-                " --parallel {} ".format(num_workers) if num_workers > 0 else ""
+                " --parallel {} ".format(num_workers) if (num_workers > 0 or i > 0) else ""
             )
             # -r -- show extra test summary:
             # -f -- (f)ailed
