@@ -9,7 +9,7 @@ echo '{
     "log-level": "debug",
     "storage-driver": "overlay2",
     "insecure-registries" : ["65.108.242.32:5000"],
-    "registry-mirrors" : ["65.108.242.32:5000"]
+    "registry-mirrors" : ["http://65.108.242.32:5000"]
 }' | dd of=/etc/docker/daemon.json 2>/dev/null
 
 # In case of test hung it is convenient to use pytest --pdb to debug it,
