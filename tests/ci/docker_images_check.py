@@ -109,6 +109,7 @@ def get_changed_docker_images(
     # The order is important: dependents should go later than bases, so that
     # they are built with updated base versions.
     index = 0
+    changed_images = []
     while index < len(changed_images):
         image = changed_images[index]
         for dependent in images_dict[image.path]["dependent"]:
