@@ -90,24 +90,21 @@ def get_changed_docker_images(
         pr_info.sha,
         str(files_changed),
     )
-
-    # Rebuild all images
-    changed_images = [DockerImage(dockerfile_dir, image_description["name"], image_description.get("only_amd64", False)) for dockerfile_dir, image_description in images_dict.items()]
-
-    # for dockerfile_dir, image_description in images_dict.items():
-    #     for f in files_changed:
-    #         if f.startswith(dockerfile_dir):
-    #             name = image_description["name"]
-    #             only_amd64 = image_description.get("only_amd64", False)
-    #             logging.info(
-    #                 "Found changed file '%s' which affects "
-    #                 "docker image '%s' with path '%s'",
-    #                 f,
-    #                 name,
-    #                 dockerfile_dir,
-    #             )
-    #             changed_images.append(DockerImage(dockerfile_dir, name, only_amd64))
-    #             break
+    
+    for dockerfile_dir, image_description in images_dict.items():
+        for f in files_changed:
+            if f.startswith(dockerfile_dir):
+                name = image_description["name"]
+                only_amd64 = image_description.get("only_amd64", False)
+                logging.info(
+                    "Found changed file '%s' which affects "
+                    "docker image '%s' with path '%s'",
+                    f,
+                    name,
+                    dockerfile_dir,
+                )
+                changed_images.append(DockerImage(dockerfile_dir, name, only_amd64))
+                break
 
     # The order is important: dependents should go later than bases, so that
     # they are built with updated base versions.
