@@ -36,8 +36,7 @@ from version_helper import (
 TEMP_PATH = p.join(RUNNER_TEMP, "docker_images_check")
 BUCKETS = {
     "amd64": "package_release",
-    # NOTE(vnemkov): arm64 is temporary not supported
-    # "arm64": "package_aarch64"
+    "arm64": "package_aarch64"
 }
 git = Git(ignore_no_tags=True)
 
@@ -338,6 +337,7 @@ def main():
         args.bucket_prefix = (
             f"{S3_DOWNLOAD}/{S3_BUILDS_BUCKET}/{release_or_pr}/{pr_info.sha}"
         )
+        tags.append(f"{pr_info.number}-{pr_info.sha}")
 
     if args.push:
         subprocess.check_output(  # pylint: disable=unexpected-keyword-arg
