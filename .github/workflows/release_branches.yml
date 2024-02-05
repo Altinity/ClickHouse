@@ -573,6 +573,7 @@ jobs:
       test_name: Integration tests (asan)
       runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
       batches: 4
+      timeout_minutes: 180
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 integration_test_check.py "$CHECK_NAME"
@@ -585,6 +586,7 @@ jobs:
       test_name: Integration tests (asan, analyzer)
       runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
       batches: 6
+      timeout_minutes: 180
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 integration_test_check.py "$CHECK_NAME"
@@ -597,6 +599,7 @@ jobs:
       test_name: Integration tests (tsan)
       runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
       batches: 6
+      timeout_minutes: 180
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 integration_test_check.py "$CHECK_NAME"
