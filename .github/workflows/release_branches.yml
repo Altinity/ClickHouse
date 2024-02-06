@@ -295,7 +295,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Install packages (amd64)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86--docker-ce
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 install_check.py "$CHECK_NAME"
@@ -320,7 +320,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (release)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
       additional_envs: |
         KILL_TIMEOUT=10800
       run_command: |
@@ -333,7 +333,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (aarch64)
-      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-snapshot-docker_ipv6_arm
       additional_envs: |
         KILL_TIMEOUT=10800
       run_command: |
@@ -346,7 +346,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (asan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
       additional_envs: |
         KILL_TIMEOUT=10800
       batches: 4
@@ -360,7 +360,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (tsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
       additional_envs: |
         KILL_TIMEOUT=10800
       batches: 4
@@ -374,7 +374,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (ubsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
       additional_envs: |
         KILL_TIMEOUT=10800
       batches: 4
@@ -388,7 +388,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (msan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
       additional_envs: |
         KILL_TIMEOUT=10800
       batches: 4
@@ -402,7 +402,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (debug)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
       additional_envs: |
         KILL_TIMEOUT=10800
       batches: 4
@@ -419,7 +419,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (release)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
       additional_envs: |
         KILL_TIMEOUT=3600
       run_command: |
@@ -432,7 +432,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (aarch64)
-      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-snapshot-docker_ipv6_arm
       additional_envs: |
         KILL_TIMEOUT=3600
       run_command: |
@@ -445,7 +445,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (asan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
       additional_envs: |
         KILL_TIMEOUT=3600
       run_command: |
@@ -458,7 +458,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (tsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
       additional_envs: |
         KILL_TIMEOUT=3600
       run_command: |
@@ -471,7 +471,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (msan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
       additional_envs: |
         KILL_TIMEOUT=3600
       run_command: |
@@ -484,7 +484,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (ubsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
       additional_envs: |
         KILL_TIMEOUT=3600
       run_command: |
@@ -497,7 +497,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (debug)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
       additional_envs: |
         KILL_TIMEOUT=3600
       run_command: |
@@ -513,7 +513,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stress test (asan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 stress_check.py "$CHECK_NAME"
@@ -524,7 +524,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stress test (tsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 stress_check.py "$CHECK_NAME"
@@ -535,7 +535,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stress test (msan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 stress_check.py "$CHECK_NAME"
@@ -546,7 +546,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stress test (ubsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 stress_check.py "$CHECK_NAME"
@@ -557,7 +557,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stress test (debug)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 stress_check.py "$CHECK_NAME"
