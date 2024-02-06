@@ -427,7 +427,6 @@ class ClickHouseCluster:
         self.with_net_trics = False
         self.with_redis = False
         self.with_cassandra = False
-        self.with_ldap = False
         self.with_jdbc_bridge = False
         self.with_nginx = False
         self.with_hive = False
@@ -509,12 +508,6 @@ class ClickHouseCluster:
         self.cassandra_port = 9042
         self.cassandra_ip = None
         self.cassandra_id = self.get_instance_docker_id(self.cassandra_host)
-
-        # available when with_ldap == True
-        self.ldap_host = "openldap"
-        self.ldap_container = None
-        self.ldap_port = 1389
-        self.ldap_id = self.get_instance_docker_id(self.ldap_host)
 
         # available when with_rabbitmq == True
         self.rabbitmq_host = "rabbitmq1"
@@ -1355,23 +1348,6 @@ class ClickHouseCluster:
         ]
         return self.base_cassandra_cmd
 
-    def setup_ldap_cmd(self, instance, env_variables, docker_compose_yml_dir):
-        self.with_ldap = True
-        env_variables["LDAP_EXTERNAL_PORT"] = str(self.ldap_port)
-        self.base_cmd.extend(
-            ["--file", p.join(docker_compose_yml_dir, "docker_compose_ldap.yml")]
-        )
-        self.base_ldap_cmd = [
-            "docker-compose",
-            "--env-file",
-            instance.env_file,
-            "--project-name",
-            self.project_name,
-            "--file",
-            p.join(docker_compose_yml_dir, "docker_compose_ldap.yml"),
-        ]
-        return self.base_ldap_cmd
-
     def setup_jdbc_bridge_cmd(self, instance, env_variables, docker_compose_yml_dir):
         self.with_jdbc_bridge = True
         env_variables["JDBC_DRIVER_LOGS"] = self.jdbc_driver_logs_dir
@@ -1457,7 +1433,6 @@ class ClickHouseCluster:
         with_minio=False,
         with_azurite=False,
         with_cassandra=False,
-        with_ldap=False,
         with_jdbc_bridge=False,
         with_hive=False,
         with_coredns=False,
@@ -1547,12 +1522,6 @@ class ClickHouseCluster:
             with_jdbc_bridge=with_jdbc_bridge,
             with_hive=with_hive,
             with_coredns=with_coredns,
-<<<<<<< HEAD
-=======
-            with_cassandra=with_cassandra,
-            with_ldap=with_ldap,
-            allow_analyzer=allow_analyzer,
->>>>>>> b38d4b5b0fb (Merge pull request #55119 from jmaicher/fix/54318/deadlock-ldap-role-update)
             server_bin_path=self.server_bin_path,
             odbc_bridge_bin_path=self.odbc_bridge_bin_path,
             library_bridge_bin_path=self.library_bridge_bin_path,
@@ -1778,11 +1747,6 @@ class ClickHouseCluster:
                 self.setup_cassandra_cmd(
                     instance, env_variables, docker_compose_yml_dir
                 )
-            )
-
-        if with_ldap and not self.with_ldap:
-            cmds.append(
-                self.setup_ldap_cmd(instance, env_variables, docker_compose_yml_dir)
             )
 
         if with_jdbc_bridge and not self.with_jdbc_bridge:
@@ -2485,29 +2449,6 @@ class ClickHouseCluster:
 
         raise Exception("Can't wait Cassandra to start")
 
-    def wait_ldap_to_start(self, timeout=180):
-        self.ldap_container = self.get_docker_handle(self.ldap_id)
-        start = time.time()
-        while time.time() - start < timeout:
-            try:
-                logging.info(f"Check LDAP Online {self.ldap_host} {self.ldap_port}")
-                self.exec_in_container(
-                    self.ldap_id,
-                    [
-                        "bash",
-                        "-c",
-                        f"/opt/bitnami/openldap/bin/ldapsearch -x -H ldap://{self.ldap_host}:{self.ldap_port} -D cn=admin,dc=example,dc=org -w clickhouse -b dc=example,dc=org",
-                    ],
-                    user="root",
-                )
-                logging.info("LDAP Online")
-                return
-            except Exception as ex:
-                logging.warning("Can't connect to LDAP: %s", str(ex))
-                time.sleep(1)
-
-        raise Exception("Can't wait LDAP to start")
-
     def start(self):
         pytest_xdist_logging_to_separate_files.setup()
         logging.info("Running tests in {}".format(self.base_path))
@@ -2836,12 +2777,6 @@ class ClickHouseCluster:
                 self.up_called = True
                 self.wait_cassandra_to_start()
 
-            if self.with_ldap and self.base_ldap_cmd:
-                ldap_start_cmd = self.base_ldap_cmd + common_opts
-                subprocess_check_call(ldap_start_cmd)
-                self.up_called = True
-                self.wait_ldap_to_start()
-
             if self.with_jdbc_bridge and self.base_jdbc_bridge_cmd:
                 os.makedirs(self.jdbc_driver_logs_dir)
                 os.chmod(self.jdbc_driver_logs_dir, stat.S_IRWXU | stat.S_IRWXO)
@@ -3130,11 +3065,6 @@ class ClickHouseInstance:
         with_hive,
         with_coredns,
         with_cassandra,
-<<<<<<< HEAD
-=======
-        with_ldap,
-        allow_analyzer,
->>>>>>> b38d4b5b0fb (Merge pull request #55119 from jmaicher/fix/54318/deadlock-ldap-role-update)
         server_bin_path,
         odbc_bridge_bin_path,
         library_bridge_bin_path,
@@ -3217,7 +3147,6 @@ class ClickHouseInstance:
         self.with_minio = with_minio
         self.with_azurite = with_azurite
         self.with_cassandra = with_cassandra
-        self.with_ldap = with_ldap
         self.with_jdbc_bridge = with_jdbc_bridge
         self.with_hive = with_hive
         self.with_coredns = with_coredns
