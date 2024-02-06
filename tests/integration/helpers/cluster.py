@@ -1547,12 +1547,7 @@ class ClickHouseCluster:
             with_jdbc_bridge=with_jdbc_bridge,
             with_hive=with_hive,
             with_coredns=with_coredns,
-<<<<<<< HEAD
-=======
-            with_cassandra=with_cassandra,
             with_ldap=with_ldap,
-            allow_analyzer=allow_analyzer,
->>>>>>> b38d4b5b0fb (Merge pull request #55119 from jmaicher/fix/54318/deadlock-ldap-role-update)
             server_bin_path=self.server_bin_path,
             odbc_bridge_bin_path=self.odbc_bridge_bin_path,
             library_bridge_bin_path=self.library_bridge_bin_path,
@@ -3130,11 +3125,7 @@ class ClickHouseInstance:
         with_hive,
         with_coredns,
         with_cassandra,
-<<<<<<< HEAD
-=======
         with_ldap,
-        allow_analyzer,
->>>>>>> b38d4b5b0fb (Merge pull request #55119 from jmaicher/fix/54318/deadlock-ldap-role-update)
         server_bin_path,
         odbc_bridge_bin_path,
         library_bridge_bin_path,
