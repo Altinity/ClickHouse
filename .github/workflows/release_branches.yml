@@ -188,7 +188,7 @@ jobs:
       test_name: ClickHouse build check
       runner_type: style-checker, on-demand, type-cpx31, image-x86-app-docker-ce
       timeout_minutes: 180
-      download_artifacts_pattern: build_report_*.json
+      download_artifacts_pattern: build_report_*
       additional_envs: |
         NEEDS_DATA<<NDENV
         ${{ toJSON(needs) }}
@@ -311,7 +311,7 @@ jobs:
 ##################################### REGRESSION TESTS ######################################
 #############################################################################################
   RegressionTestsRelease:
-    needs: [BuilderDebRelease]
+    needs: [BuilderReport]
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
@@ -321,7 +321,7 @@ jobs:
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'release' && github.sha }}
 
   RegressionTestsAarch64:
-    needs: [BuilderDebAarch64]
+    needs: [BuilderReport]
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
