@@ -38,10 +38,6 @@ name: Testing workflow
       additional_envs:
         description: additional ENV variables to setup the job
         type: string
-      download_artifacts_pattern:
-        description: A glob pattern to the artifacts that should be downloaded. (see https://github.com/actions/download-artifact `pattern`)
-        type: string
-        required: false
     secrets:
       secret_envs:
         description: if given, it's passed to the environments
@@ -159,9 +155,8 @@ jobs:
           job_type: test
 
       - name: Download json reports
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v3
         with:
-          pattern: ${{ inputs.download_artifacts_pattern }}
           path: ${{ env.REPORTS_PATH }}
 
       - name: Docker setup

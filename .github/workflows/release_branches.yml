@@ -188,7 +188,6 @@ jobs:
       test_name: ClickHouse build check
       runner_type: style-checker, on-demand, type-cpx31, image-x86-app-docker-ce
       timeout_minutes: 180
-      download_artifacts_pattern: build_report_*
       additional_envs: |
         NEEDS_DATA<<NDENV
         ${{ toJSON(needs) }}
