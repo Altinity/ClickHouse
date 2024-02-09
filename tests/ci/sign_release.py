@@ -70,7 +70,7 @@ def main():
         hashed_file_path = hash_file(full_path)
         signed_file_path = sign_file(hashed_file_path)
         s3_path = s3_path_prefix / os.path.basename(signed_file_path)
-        s3_helper.upload_build_file_to_s3(Path(signed_file_path), s3_path)
+        s3_helper.upload_build_file_to_s3(Path(signed_file_path), str(s3_path))
         print(f'Uploaded file {signed_file_path} to {s3_path}')
 
     # Signed hashes are:
