@@ -257,7 +257,7 @@ jobs:
     secrets: inherit
     with:
       test_name: ClickHouse build check
-      runner_type: altinity-on-demand, altinity-type-cpx31, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx41, altinity-image-x86-app-docker-ce
       timeout_minutes: 180
       additional_envs: |
         NEEDS_DATA<<NDENV
@@ -274,7 +274,7 @@ jobs:
       - BuilderDebRelease
       - BuilderDebAarch64
       - SignRelease
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx31, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Check out repository code
