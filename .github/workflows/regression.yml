@@ -16,7 +16,7 @@ name: Regression test workflow - Release
         type: string
       timeout_minutes:
         description: Maximum number of minutes to let workflow run before GitHub cancels it.
-        default: 180
+        default: 210
         type: number
       build_sha:
         description: commit sha of the workflow run for artifact upload. 
