@@ -1,4 +1,5 @@
 import logging
+import time
 import pytest
 from helpers.cluster import ClickHouseCluster
 from helpers.test_tools import TSV
@@ -87,6 +88,7 @@ def test_role_mapping(ldap_cluster):
     # Check that non-existing role in ClickHouse is ignored during role update
     # See https://github.com/ClickHouse/ClickHouse/issues/54318
     add_ldap_group(ldap_cluster, group_cn="clickhouse-role_4", member_cn="johndoe")
+    time.sleep(1) # allow LDAP server to update the roles, internal CH caches to settle, etc.
 
     assert instance.query(
         "select role_name from system.current_roles ORDER BY role_name",
