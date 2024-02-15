@@ -354,7 +354,7 @@ def main():
    
     if os.path.exists(src_path):
         src_url = s3_helper.upload_build_file_to_s3(
-            src_path, s3_path_prefix + "/clickhouse-" + version.string + ".src.tar.gz"
+            Path(src_path), s3_path_prefix + "/clickhouse-" + version.string + ".src.tar.gz"
         )
         logging.info("Source tar %s", src_url)
     else:
