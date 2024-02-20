@@ -88,7 +88,12 @@ def test_role_mapping(ldap_cluster):
     # Check that non-existing role in ClickHouse is ignored during role update
     # See https://github.com/ClickHouse/ClickHouse/issues/54318
     add_ldap_group(ldap_cluster, group_cn="clickhouse-role_4", member_cn="johndoe")
-    time.sleep(1) # allow LDAP server to update the roles, internal CH caches to settle, etc.
+
+    # Default AccessControl is cached for 600 seconds inside clickhouse,
+    # so we'll wait until previous entry (with old access rights) expires
+    # to see effect of assigning a new role in system.current_roles.
+    # TODO(vnemkov): this issue is already fixed in upstream/master, but for now we are not going to backport it.
+    time.sleep(60*10 + 10)
 
     assert instance.query(
         "select role_name from system.current_roles ORDER BY role_name",
