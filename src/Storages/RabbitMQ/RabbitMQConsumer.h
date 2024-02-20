@@ -31,7 +31,7 @@ public:
             std::vector<String> & queues_,
             size_t channel_id_base_,
             const String & channel_base_,
-            Poco::Logger * log_,
+            LoggerPtr log_,
             uint32_t queue_size_);
 
     struct AckTracker
@@ -95,7 +95,7 @@ private:
     std::vector<String> queues;
     const String channel_base;
     const size_t channel_id_base;
-    Poco::Logger * log;
+    LoggerPtr log;
     std::atomic<bool> stopped;
 
     String channel_id;

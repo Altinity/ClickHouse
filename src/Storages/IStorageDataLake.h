@@ -39,7 +39,7 @@ public:
         std::optional<FormatSettings> format_settings_)
         : Storage(
             getAdjustedConfiguration(
-                context_, Storage::updateConfiguration(context_, configuration_), &Poco::Logger::get("Storage" + String(name))),
+                context_, Storage::updateConfiguration(context_, configuration_), getLogger("Storage" + String(name))),
             table_id_,
             columns_,
             constraints_,
@@ -57,13 +57,13 @@ public:
     {
         Storage::updateConfiguration(ctx, configuration);
 
-        auto new_configuration = getAdjustedConfiguration(ctx, configuration, &Poco::Logger::get("Storage" + String(name)));
+        auto new_configuration = getAdjustedConfiguration(ctx, configuration, getLogger("Storage" + String(name)));
 
         return Storage::getTableStructureFromData(new_configuration, format_settings, ctx, /*object_infos*/ nullptr);
     }
 
     static Configuration
-    getAdjustedConfiguration(const ContextPtr & context, const Configuration & configuration, Poco::Logger * log)
+    getAdjustedConfiguration(const ContextPtr & context, const Configuration & configuration, LoggerPtr log)
     {
         MetadataParser parser{configuration, context};
 

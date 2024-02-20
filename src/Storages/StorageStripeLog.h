@@ -108,7 +108,7 @@ private:
 
     mutable std::shared_timed_mutex rwlock;
 
-    Poco::Logger * log;
+    LoggerPtr log;
 };
 
 }

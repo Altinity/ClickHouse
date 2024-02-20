@@ -52,7 +52,7 @@ std::string DataPartStorageOnDiskBase::getRelativePath() const
     return fs::path(root_path) / part_dir / "";
 }
 
-std::optional<String> DataPartStorageOnDiskBase::getRelativePathForPrefix(Poco::Logger * log, const String & prefix, bool detached, bool broken) const
+std::optional<String> DataPartStorageOnDiskBase::getRelativePathForPrefix(LoggerPtr log, const String & prefix, bool detached, bool broken) const
 {
     assert(!broken || detached);
     String res;
@@ -420,7 +420,7 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::clonePart(
     const std::string & to,
     const std::string & dir_path,
     const DiskPtr & disk,
-    Poco::Logger * log) const
+    LoggerPtr log) const
 {
     String path_to_clone = fs::path(to) / dir_path / "";
 
@@ -441,7 +441,7 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::clonePart(
 void DataPartStorageOnDiskBase::rename(
     std::string new_root_path,
     std::string new_part_dir,
-    Poco::Logger * log,
+    LoggerPtr log,
     bool remove_new_dir_if_exists,
     bool fsync_part_dir)
 {
@@ -498,7 +498,7 @@ void DataPartStorageOnDiskBase::remove(
     const MergeTreeDataPartChecksums & checksums,
     std::list<ProjectionChecksums> projections,
     bool is_temp,
-    Poco::Logger * log)
+    LoggerPtr log)
 {
     /// NOTE We rename part to delete_tmp_<relative_path> instead of delete_tmp_<name> to avoid race condition
     /// when we try to remove two parts with the same name, but different relative paths,
@@ -649,7 +649,7 @@ void DataPartStorageOnDiskBase::clearDirectory(
     const CanRemoveDescription & can_remove_description,
     const MergeTreeDataPartChecksums & checksums,
     bool is_temp,
-    Poco::Logger * log)
+    LoggerPtr log)
 {
     auto disk = volume->getDisk();
     auto [can_remove_shared_data, names_not_to_remove] = can_remove_description;

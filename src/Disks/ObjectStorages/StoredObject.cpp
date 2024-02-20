@@ -53,7 +53,7 @@ StoredObject StoredObject::create(
         catch (...)
         {
             LOG_DEBUG(
-               &Poco::Logger::get("StoredObject"),
+               getLogger("StoredObject"),
                 "Object does not exist while getting cache path hint (object path: {})",
                 path);
 

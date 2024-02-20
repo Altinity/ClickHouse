@@ -31,6 +31,6 @@ void createMergeTreeSequentialSource(
     bool apply_deleted_mask,
     ActionsDAGPtr filter,
     ContextPtr context,
-    Poco::Logger * log);
+    LoggerPtr log);
 
 }

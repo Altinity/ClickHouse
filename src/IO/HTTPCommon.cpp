@@ -132,7 +132,7 @@ namespace
                 bool proxy_https_,
                 size_t max_pool_size_,
                 bool resolve_host_ = true)
-            : Base(static_cast<unsigned>(max_pool_size_), &Poco::Logger::get("HTTPSessionPool"))
+            : Base(static_cast<unsigned>(max_pool_size_), getLogger("HTTPSessionPool"))
             , host(host_)
             , port(port_)
             , https(https_)
@@ -253,7 +253,7 @@ namespace
                 auto msg = Poco::AnyCast<std::string>(session_data);
                 if (!msg.empty())
                 {
-                    LOG_TRACE((&Poco::Logger::get("HTTPCommon")), "Failed communicating with {} with error '{}' will try to reconnect session", host, msg);
+                    LOG_TRACE((getLogger("HTTPCommon")), "Failed communicating with {} with error '{}' will try to reconnect session", host, msg);
 
                     if (resolve_host)
                     {

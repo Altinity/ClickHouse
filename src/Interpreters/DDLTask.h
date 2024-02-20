@@ -139,9 +139,9 @@ struct DDLTask : public DDLTaskBase
 {
     DDLTask(const String & name, const String & path) : DDLTaskBase(name, path) {}
 
-    bool findCurrentHostID(ContextPtr global_context, Poco::Logger * log);
+    bool findCurrentHostID(ContextPtr global_context, LoggerPtr log);
 
-    void setClusterInfo(ContextPtr context, Poco::Logger * log);
+    void setClusterInfo(ContextPtr context, LoggerPtr log);
 
     String getShardID() const override;
 

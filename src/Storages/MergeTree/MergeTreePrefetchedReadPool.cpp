@@ -41,7 +41,7 @@ MergeTreePrefetchedReadPool::MergeTreePrefetchedReadPool(
     bool is_remote_read_,
     const MergeTreeSettings & storage_settings_)
     : WithContext(context_)
-    , log(&Poco::Logger::get("MergeTreePrefetchedReadPool(" + (parts_.empty() ? "" : parts_.front().data_part->storage.getStorageID().getNameForLogs()) + ")"))
+    , log(getLogger("MergeTreePrefetchedReadPool(" + (parts_.empty() ? "" : parts_.front().data_part->storage.getStorageID().getNameForLogs()) + ")"))
     , header(storage_snapshot_->getSampleBlockForColumns(column_names_))
     , mark_cache(context_->getGlobalContext()->getMarkCache().get())
     , uncompressed_cache(use_uncompressed_cache_ ? context_->getGlobalContext()->getUncompressedCache().get() : nullptr)

@@ -151,7 +151,7 @@ void optimizePrewhere(Stack & stack, QueryPlan::Nodes & nodes)
         storage_metadata,
         queried_columns,
         storage.supportedPrewhereColumns(),
-        &Poco::Logger::get("QueryPlanOptimizePrewhere")};
+        getLogger("QueryPlanOptimizePrewhere")};
 
     auto optimize_result = where_optimizer.optimize(filter_step->getExpression(),
         filter_step->getFilterColumnName(),

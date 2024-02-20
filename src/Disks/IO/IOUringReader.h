@@ -64,7 +64,7 @@ private:
         return promise.get_future();
     }
 
-    const Poco::Logger * log;
+    const LoggerPtr log;
 
 public:
     IOUringReader(uint32_t entries_);

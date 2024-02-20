@@ -30,7 +30,7 @@ FileSegmentRangeWriter::FileSegmentRangeWriter(
     const String & source_path_)
     : cache(cache_)
     , key(key_)
-    , log(&Poco::Logger::get("FileSegmentRangeWriter"))
+    , log(getLogger("FileSegmentRangeWriter"))
     , cache_log(cache_log_)
     , query_id(query_id_)
     , source_path(source_path_)
@@ -199,7 +199,7 @@ CachedOnDiskWriteBufferFromFile::CachedOnDiskWriteBufferFromFile(
     const String & query_id_,
     const WriteSettings & settings_)
     : WriteBufferFromFileDecorator(std::move(impl_))
-    , log(&Poco::Logger::get("CachedOnDiskWriteBufferFromFile"))
+    , log(getLogger("CachedOnDiskWriteBufferFromFile"))
     , cache(cache_)
     , source_path(source_path_)
     , key(key_)

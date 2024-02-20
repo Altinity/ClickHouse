@@ -92,7 +92,7 @@ T execute(nanodbc::ConnectionHolderPtr connection_holder, std::function<T(nanodb
     catch (const nanodbc::database_error & e)
     {
         LOG_ERROR(
-            &Poco::Logger::get("ODBCConnection"),
+            getLogger("ODBCConnection"),
             "ODBC query failed with error: {}, state: {}, native code: {}",
             e.what(), e.state(), e.native());
 

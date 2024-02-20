@@ -126,7 +126,7 @@ private:
 
     ThreadFromGlobalPool main_thread;
 
-    Poco::Logger * log;
+    LoggerPtr log;
 };
 
 }

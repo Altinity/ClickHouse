@@ -145,7 +145,7 @@ private:
     const size_t bypass_cache_threashold;
 
     mutable std::mutex mutex;
-    Poco::Logger * log;
+    LoggerPtr log;
 
     bool is_initialized = false;
     std::exception_ptr initialization_exception;

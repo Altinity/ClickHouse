@@ -258,7 +258,7 @@ private:
     ThreadFromGlobalPool send_thread;
     ThreadFromGlobalPool receive_thread;
 
-    Poco::Logger * log;
+    LoggerPtr log;
 
     void connect(
         const Nodes & node,

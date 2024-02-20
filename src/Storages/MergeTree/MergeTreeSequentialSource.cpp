@@ -61,7 +61,7 @@ private:
     /// Should read using direct IO
     bool read_with_direct_io;
 
-    Poco::Logger * log = &Poco::Logger::get("MergeTreeSequentialSource");
+    LoggerPtr log = getLogger("MergeTreeSequentialSource");
 
     std::optional<MarkRanges> mark_ranges;
 
@@ -276,7 +276,7 @@ public:
         bool apply_deleted_mask_,
         ActionsDAGPtr filter_,
         ContextPtr context_,
-        Poco::Logger * log_)
+        LoggerPtr log_)
         : ISourceStep(DataStream{.header = storage_snapshot_->getSampleBlockForColumns(columns_to_read_)})
         , storage(storage_)
         , storage_snapshot(storage_snapshot_)
@@ -328,7 +328,7 @@ private:
     bool apply_deleted_mask;
     ActionsDAGPtr filter;
     ContextPtr context;
-    Poco::Logger * log;
+    LoggerPtr log;
 };
 
 void createMergeTreeSequentialSource(
@@ -340,7 +340,7 @@ void createMergeTreeSequentialSource(
     bool apply_deleted_mask,
     ActionsDAGPtr filter,
     ContextPtr context,
-    Poco::Logger * log)
+    LoggerPtr log)
 {
     auto reading = std::make_unique<ReadFromPart>(
         storage, storage_snapshot, std::move(data_part), std::move(columns_to_read), apply_deleted_mask, filter, std::move(context), log);
