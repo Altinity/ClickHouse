@@ -95,7 +95,7 @@ public:
     static const char * getDefaultOrderBy() { return "(event_date, event_time)"; }
 
 protected:
-    Poco::Logger * log;
+    LoggerPtr log;
 
     // Queue is bounded. But its size is quite large to not block in all normal cases.
     std::vector<LogElement> queue;

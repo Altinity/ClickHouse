@@ -109,7 +109,7 @@ public:
     /// Once all task will be done by some replica, it can steal tasks
     std::vector<PartRefs> reading_state;
 
-    Poco::Logger * log = &Poco::Logger::get("DefaultCoordinator");
+    LoggerPtr log = getLogger("DefaultCoordinator");
 
     std::atomic<bool> state_initialized{false};
 
@@ -342,7 +342,7 @@ public:
 
     Parts all_parts_to_read;
 
-    Poco::Logger * log = &Poco::Logger::get(fmt::format("{}{}", magic_enum::enum_name(mode), "Coordinator"));
+    LoggerPtr log = getLogger(fmt::format("{}{}", magic_enum::enum_name(mode), "Coordinator"));
 };
 
 

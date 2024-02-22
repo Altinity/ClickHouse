@@ -132,7 +132,7 @@ namespace detail
         bool http_skip_not_found_url;
 
         ReadSettings settings;
-        Poco::Logger * log;
+        LoggerPtr log;
 
         bool withPartialContent(const Range & range) const
         {
@@ -320,7 +320,7 @@ namespace detail
             , read_range(read_range_)
             , http_skip_not_found_url(http_skip_not_found_url_)
             , settings {settings_}
-            , log(&Poco::Logger::get("ReadWriteBufferFromHTTP"))
+            , log(getLogger("ReadWriteBufferFromHTTP"))
         {
             if (settings.http_max_tries <= 0 || settings.http_retry_initial_backoff_ms <= 0
                 || settings.http_retry_initial_backoff_ms >= settings.http_retry_max_backoff_ms)

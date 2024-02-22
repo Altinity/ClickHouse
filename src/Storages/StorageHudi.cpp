@@ -23,7 +23,7 @@ namespace ErrorCodes
 
 template <typename Configuration, typename MetadataReadHelper>
 HudiMetadataParser<Configuration, MetadataReadHelper>::HudiMetadataParser(const Configuration & configuration_, ContextPtr context_)
-    : configuration(configuration_), context(context_), log(&Poco::Logger::get("StorageHudi"))
+    : configuration(configuration_), context(context_), log(getLogger("StorageHudi"))
 {
 }
 

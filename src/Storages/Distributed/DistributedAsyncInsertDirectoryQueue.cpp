@@ -53,7 +53,7 @@ namespace
 {
 
 template <typename PoolFactory>
-ConnectionPoolPtrs createPoolsForAddresses(const std::string & name, PoolFactory && factory, const Cluster::ShardsInfo & shards_info, Poco::Logger * log)
+ConnectionPoolPtrs createPoolsForAddresses(const std::string & name, PoolFactory && factory, const Cluster::ShardsInfo & shards_info, LoggerPtr log)
 {
     ConnectionPoolPtrs pools;
 
@@ -136,7 +136,7 @@ DistributedAsyncInsertDirectoryQueue::DistributedAsyncInsertDirectoryQueue(
     , default_sleep_time(storage.getDistributedSettingsRef().monitor_sleep_time_ms.totalMilliseconds())
     , sleep_time(default_sleep_time)
     , max_sleep_time(storage.getDistributedSettingsRef().monitor_max_sleep_time_ms.totalMilliseconds())
-    , log(&Poco::Logger::get(getLoggerName()))
+    , log(getLogger(getLoggerName()))
     , monitor_blocker(monitor_blocker_)
     , metric_pending_files(CurrentMetrics::DistributedFilesToInsert, 0)
     , metric_broken_files(CurrentMetrics::BrokenDistributedFilesToInsert, 0)

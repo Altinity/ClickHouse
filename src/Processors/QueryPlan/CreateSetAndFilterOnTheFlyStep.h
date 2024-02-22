@@ -52,7 +52,7 @@ private:
 
     JoinTableSide position;
 
-    Poco::Logger * log = &Poco::Logger::get("CreateSetAndFilterOnTheFlyStep");
+    LoggerPtr log = getLogger("CreateSetAndFilterOnTheFlyStep");
 };
 
 }

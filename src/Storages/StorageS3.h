@@ -220,7 +220,7 @@ private:
     std::shared_ptr<IIterator> file_iterator;
     size_t download_thread_num = 1;
 
-    Poco::Logger * log = &Poco::Logger::get("StorageS3Source");
+    LoggerPtr log = getLogger("StorageS3Source");
 
     ThreadPool create_reader_pool;
     ThreadPoolCallbackRunner<ReaderHolder> create_reader_scheduler;

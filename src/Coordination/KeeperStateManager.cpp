@@ -216,7 +216,7 @@ KeeperStateManager::KeeperStateManager(
     , secure(false)
     , log_store(nuraft::cs_new<KeeperLogStore>(logs_path, LogFileSettings{.force_sync =false, .compress_logs = false, .rotate_interval = 5000}))
     , server_state_path(state_file_path)
-    , logger(&Poco::Logger::get("KeeperStateManager"))
+    , logger(getLogger("KeeperStateManager"))
 {
     auto peer_config = nuraft::cs_new<nuraft::srv_config>(my_server_id, host + ":" + std::to_string(port));
     configuration_wrapper.cluster_config = nuraft::cs_new<nuraft::cluster_config>();
@@ -247,7 +247,7 @@ KeeperStateManager::KeeperStateManager(
             .overallocate_size = coordination_settings->log_file_overallocate_size
           }))
     , server_state_path(state_file_path)
-    , logger(&Poco::Logger::get("KeeperStateManager"))
+    , logger(getLogger("KeeperStateManager"))
 {
 }
 
@@ -448,7 +448,7 @@ ConfigUpdateActions KeeperStateManager::getConfigurationDiff(const Poco::Util::A
             if (old_endpoint != server_config->get_endpoint())
             {
                 LOG_WARNING(
-                    &Poco::Logger::get("RaftConfiguration"),
+                    getLogger("RaftConfiguration"),
                     "Config will be ignored because a server with ID {} is already present in the cluster on a different endpoint ({}). "
                     "The endpoint of the current servers should not be changed. For servers on a new endpoint, please use a new ID.",
                     new_id,

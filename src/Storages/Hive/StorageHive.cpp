@@ -399,7 +399,7 @@ private:
     bool generate_chunk_from_metadata{false};
     UInt64 current_file_remained_rows = 0;
 
-    Poco::Logger * log = &Poco::Logger::get("StorageHive");
+    LoggerPtr log = getLogger("StorageHive");
 };
 
 

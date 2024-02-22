@@ -34,7 +34,7 @@ StorageMeiliSearch::StorageMeiliSearch(
     const ColumnsDescription & columns_,
     const ConstraintsDescription & constraints_,
     const String & comment)
-    : IStorage(table_id), config{config_}, log(&Poco::Logger::get("StorageMeiliSearch (" + table_id.table_name + ")"))
+    : IStorage(table_id), config{config_}, log(getLogger("StorageMeiliSearch (" + table_id.table_name + ")"))
 {
     StorageInMemoryMetadata storage_metadata;
     storage_metadata.setColumns(columns_);

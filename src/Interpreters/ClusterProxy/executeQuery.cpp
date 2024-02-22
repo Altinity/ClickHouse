@@ -35,7 +35,7 @@ namespace ErrorCodes
 namespace ClusterProxy
 {
 
-ContextMutablePtr updateSettingsForCluster(const Cluster & cluster, ContextPtr context, const Settings & settings, const StorageID & main_table, const SelectQueryInfo * query_info, Poco::Logger * log)
+ContextMutablePtr updateSettingsForCluster(const Cluster & cluster, ContextPtr context, const Settings & settings, const StorageID & main_table, const SelectQueryInfo * query_info, LoggerPtr log)
 {
     Settings new_settings = settings;
     new_settings.queue_max_wait_ms = Cluster::saturate(new_settings.queue_max_wait_ms, settings.max_execution_time);
@@ -155,7 +155,7 @@ void executeQuery(
     QueryProcessingStage::Enum processed_stage,
     const StorageID & main_table,
     const ASTPtr & table_func_ptr,
-    SelectStreamFactory & stream_factory, Poco::Logger * log,
+    SelectStreamFactory & stream_factory, LoggerPtr log,
     const ASTPtr & query_ast, ContextPtr context, const SelectQueryInfo & query_info,
     const ExpressionActionsPtr & sharding_key_expr,
     const std::string & sharding_key_column_name,
@@ -325,7 +325,7 @@ void executeQueryWithParallelReplicas(
         getThrottler(new_context),
         std::move(scalars),
         std::move(external_tables),
-        &Poco::Logger::get("ReadFromParallelRemoteReplicasStep"),
+        getLogger("ReadFromParallelRemoteReplicasStep"),
         query_info.storage_limits,
         parallel_group_id);
 

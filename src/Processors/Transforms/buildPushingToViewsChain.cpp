@@ -261,7 +261,7 @@ Chain buildPushingToViewsChain(
         if (view == nullptr)
         {
             LOG_WARNING(
-                &Poco::Logger::get("PushingToViews"), "Trying to access table {} but it doesn't exist", view_id.getFullTableName());
+                getLogger("PushingToViews"), "Trying to access table {} but it doesn't exist", view_id.getFullTableName());
             continue;
         }
 
@@ -310,7 +310,7 @@ Chain buildPushingToViewsChain(
                 // In case the materialized view is dropped/detached at this point, we register a warning and ignore it
                 assert(materialized_view->is_dropped || materialized_view->is_detached);
                 LOG_WARNING(
-                    &Poco::Logger::get("PushingToViews"), "Trying to access table {} but it doesn't exist", view_id.getFullTableName());
+                    getLogger("PushingToViews"), "Trying to access table {} but it doesn't exist", view_id.getFullTableName());
                 continue;
             }
 
@@ -796,14 +796,14 @@ void FinalizingViewsTransform::work()
 
             /// Exception will be ignored, it is saved here for the system.query_views_log
             if (materialized_views_ignore_errors)
-                tryLogException(view.exception, &Poco::Logger::get("PushingToViews"), "Cannot push to the storage, ignoring the error");
+                tryLogException(view.exception, getLogger("PushingToViews"), "Cannot push to the storage, ignoring the error");
         }
         else
         {
             view.runtime_stats->setStatus(QueryViewsLogElement::ViewStatus::QUERY_FINISH);
 
             LOG_TRACE(
-                &Poco::Logger::get("PushingToViews"),
+                getLogger("PushingToViews"),
                 "Pushing ({}) from {} to {} took {} ms.",
                 views_data->max_threads <= 1 ? "sequentially" : ("parallel " + std::to_string(views_data->max_threads)),
                 views_data->source_storage_id.getNameForLogs(),

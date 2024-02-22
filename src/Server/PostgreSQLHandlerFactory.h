@@ -14,7 +14,7 @@ class PostgreSQLHandlerFactory : public TCPServerConnectionFactory
 {
 private:
     IServer & server;
-    Poco::Logger * log;
+    LoggerPtr log;
 
 #if USE_SSL
     bool ssl_enabled = true;

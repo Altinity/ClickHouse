@@ -27,7 +27,7 @@ class KafkaConsumer
 public:
     KafkaConsumer(
         ConsumerPtr consumer_,
-        Poco::Logger * log_,
+        LoggerPtr log_,
         size_t max_batch_size,
         size_t poll_timeout_,
         bool intermediate_commit_,
@@ -85,7 +85,7 @@ private:
     };
 
     ConsumerPtr consumer;
-    Poco::Logger * log;
+    LoggerPtr log;
     const size_t batch_size = 1;
     const size_t poll_timeout = 0;
     size_t offsets_stored = 0;

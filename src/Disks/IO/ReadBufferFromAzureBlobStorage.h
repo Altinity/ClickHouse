@@ -65,7 +65,7 @@ private:
     char * data_ptr;
     size_t data_capacity;
 
-    Poco::Logger * log = &Poco::Logger::get("ReadBufferFromAzureBlobStorage");
+    LoggerPtr log = getLogger("ReadBufferFromAzureBlobStorage");
 };
 
 }

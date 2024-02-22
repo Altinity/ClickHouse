@@ -25,7 +25,7 @@ private:
 
 public:
     LoggerWrapper(const std::string & name, LogsLevel level_)
-        : log(&Poco::Logger::get(name))
+        : log(getLogger(name))
         , level(level_)
     {
         log->setLevel(static_cast<int>(LEVELS.at(level)));
@@ -56,7 +56,7 @@ public:
     }
 
 private:
-    Poco::Logger * log;
+    LoggerPtr log;
     std::atomic<LogsLevel> level;
 };
 

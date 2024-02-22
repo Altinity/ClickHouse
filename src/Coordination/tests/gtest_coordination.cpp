@@ -67,7 +67,7 @@ class CoordinationTest : public ::testing::TestWithParam<CompressionParam>
 {
 protected:
     DB::KeeperContextPtr keeper_context = std::make_shared<DB::KeeperContext>();
-    Poco::Logger * log{&Poco::Logger::get("CoordinationTest")};
+    LoggerPtr log{getLogger("CoordinationTest")};
 };
 
 TEST_P(CoordinationTest, BuildTest)
@@ -1429,7 +1429,7 @@ void testLogAndStateMachine(Coordination::CoordinationSettingsPtr settings, uint
             nuraft::async_result<bool>::handler_type when_done = [&snapshot_created] (bool & ret, nuraft::ptr<std::exception> &/*exception*/)
             {
                 snapshot_created = ret;
-                LOG_INFO(&Poco::Logger::get("CoordinationTest"), "Snapshot finished");
+                LOG_INFO(getLogger("CoordinationTest"), "Snapshot finished");
             };
 
             state_machine->create_snapshot(s, when_done);

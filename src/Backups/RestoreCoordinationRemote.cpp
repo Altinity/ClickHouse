@@ -29,7 +29,7 @@ RestoreCoordinationRemote::RestoreCoordinationRemote(
     createRootNodes();
 
     stage_sync.emplace(
-        zookeeper_path + "/stage", [this] { return getZooKeeper(); }, &Poco::Logger::get("RestoreCoordination"));
+        zookeeper_path + "/stage", [this] { return getZooKeeper(); }, getLogger("RestoreCoordination"));
 }
 
 RestoreCoordinationRemote::~RestoreCoordinationRemote()

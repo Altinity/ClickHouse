@@ -164,7 +164,7 @@ namespace
 BackupsWorker::BackupsWorker(size_t num_backup_threads, size_t num_restore_threads, bool allow_concurrent_backups_, bool allow_concurrent_restores_)
     : backups_thread_pool(CurrentMetrics::BackupsThreads, CurrentMetrics::BackupsThreadsActive, num_backup_threads, /* max_free_threads = */ 0, num_backup_threads)
     , restores_thread_pool(CurrentMetrics::RestoreThreads, CurrentMetrics::RestoreThreadsActive, num_restore_threads, /* max_free_threads = */ 0, num_restore_threads)
-    , log(&Poco::Logger::get("BackupsWorker"))
+    , log(getLogger("BackupsWorker"))
     , allow_concurrent_backups(allow_concurrent_backups_)
     , allow_concurrent_restores(allow_concurrent_restores_)
 {

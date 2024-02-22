@@ -29,7 +29,7 @@ bool IDisk::isDirectoryEmpty(const String & path) const
 
 void IDisk::copyFile(const String & from_file_path, IDisk & to_disk, const String & to_file_path, const WriteSettings & settings) /// NOLINT
 {
-    LOG_DEBUG(&Poco::Logger::get("IDisk"), "Copying from {} (path: {}) {} to {} (path: {}) {}.",
+    LOG_DEBUG(getLogger("IDisk"), "Copying from {} (path: {}) {} to {} (path: {}) {}.",
               getName(), getPath(), from_file_path, to_disk.getName(), to_disk.getPath(), to_file_path);
 
     auto in = readFile(from_file_path);
@@ -144,7 +144,7 @@ void IDisk::startup(ContextPtr context, bool skip_access_check)
     {
         if (isReadOnly())
         {
-            LOG_DEBUG(&Poco::Logger::get("IDisk"),
+            LOG_DEBUG(getLogger("IDisk"),
                 "Skip access check for disk {} (read-only disk).",
                 getName());
         }

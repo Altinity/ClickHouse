@@ -157,7 +157,7 @@ private:
 
     std::vector<ThreadTask> threads_tasks;
     std::set<size_t> remaining_thread_tasks;
-    Poco::Logger * log = &Poco::Logger::get("MergeTreeReadPool");
+    LoggerPtr log = getLogger("MergeTreeReadPool");
 
 };
 
@@ -212,7 +212,7 @@ private:
     RangesInDataPartsDescription buffered_ranges;
     size_t threads;
     bool no_more_tasks_available{false};
-    Poco::Logger * log = &Poco::Logger::get("MergeTreeReadPoolParallelReplicas");
+    LoggerPtr log = getLogger("MergeTreeReadPoolParallelReplicas");
 
     std::mutex mutex;
 
