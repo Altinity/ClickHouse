@@ -625,7 +625,7 @@ jobs:
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-ccx53, altinity-image-x86-app-docker-ce
       commit: 724eeb2b02ef83ee4046fd5d6e0637e84741a9b3
       arch: release 
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'release' && github.sha }}
