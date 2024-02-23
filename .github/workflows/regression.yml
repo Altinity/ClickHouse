@@ -187,7 +187,7 @@ jobs:
       matrix:
         STORAGE: [minio, aws_s3, gcs]
     needs: [runner_labels_setup]
-    runs-on: ${{ fromJson(needs.runner_labels_setup.outputs.runner_labels) }}
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-app-docker-ce]
     timeout-minutes: ${{ inputs.timeout_minutes }}
     steps:
       - name: Checkout regression repo
