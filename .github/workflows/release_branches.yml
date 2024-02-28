@@ -625,8 +625,8 @@ jobs:
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-app-docker-ce
-      commit: 33092279b2001199aeca8ee64a757d9be31d16c9
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-app-docker-ce, altinity-setup-regression
+      commit: 254dbb4a60149624819b637c0100d2d071d3bda5
       arch: release 
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'release' && github.sha }}
 
@@ -635,8 +635,8 @@ jobs:
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
-      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-app-docker-ce
-      commit: 33092279b2001199aeca8ee64a757d9be31d16c9
+      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-app-docker-ce, altinity-setup-regression
+      commit: 254dbb4a60149624819b637c0100d2d071d3bda5
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'release' && github.sha }}
 
