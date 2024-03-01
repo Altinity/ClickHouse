@@ -12,5 +12,5 @@ SET(VERSION_TWEAK 33)
 SET(VERSION_FLAVOUR altinitystable)
 
 SET(VERSION_DESCRIBE v23.3.19.33.altinitystable)
-SET(VERSION_STRING 23.3.19.133.altinitystable)
+SET(VERSION_STRING 23.3.19.33.altinitystable)
 # end of autochange
