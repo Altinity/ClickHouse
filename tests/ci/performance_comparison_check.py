@@ -30,7 +30,7 @@ from pr_info import PRInfo
 from s3_helper import S3Helper
 from tee_popen import TeePopen
 
-IMAGE_NAME = "clickhouse/performance-comparison"
+IMAGE_NAME = "altinityinfra/performance-comparison"
 
 
 def get_run_command(

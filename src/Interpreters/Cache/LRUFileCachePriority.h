@@ -33,7 +33,7 @@ public:
 
 private:
     LRUQueue queue;
-    Poco::Logger * log = &Poco::Logger::get("LRUFileCachePriority");
+    LoggerPtr log = getLogger("LRUFileCachePriority");
 };
 
 class LRUFileCachePriority::LRUFileCacheIterator : public IFileCachePriority::IIterator

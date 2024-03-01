@@ -1,11 +1,13 @@
 #pragma once
 
-#include <Core/SettingsEnums.h>
 #include <Interpreters/Context_fwd.h>
+#include <Core/SettingsEnums.h>
 #include <IO/Progress.h>
 #include <Common/MemoryTracker.h>
 #include <Common/ProfileEvents.h>
 #include <Common/Stopwatch.h>
+#include <Common/Logger.h>
+
 #include <base/StringRef.h>
 
 #include <boost/noncopyable.hpp>
@@ -213,7 +215,7 @@ private:
     using Deleter = std::function<void()>;
     Deleter deleter;
 
-    Poco::Logger * log = nullptr;
+    LoggerPtr log = nullptr;
 
 public:
     ThreadStatus();

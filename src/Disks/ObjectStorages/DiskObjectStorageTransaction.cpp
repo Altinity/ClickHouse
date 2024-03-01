@@ -290,7 +290,7 @@ struct RemoveRecursiveObjectStorageOperation final : public IDiskObjectStorageOp
                     || e.code() == ErrorCodes::CANNOT_PARSE_INPUT_ASSERTION_FAILED)
                 {
                     LOG_DEBUG(
-                        &Poco::Logger::get("RemoveRecursiveObjectStorageOperation"),
+                        getLogger("RemoveRecursiveObjectStorageOperation"),
                         "Can't read metadata because of an exception. Just remove it from the filesystem. Path: {}, exception: {}",
                         metadata_storage.getPath() + path_to_remove,
                         e.message());
@@ -802,7 +802,7 @@ void DiskObjectStorageTransaction::commit()
         catch (...)
         {
             tryLogCurrentException(
-                &Poco::Logger::get("DiskObjectStorageTransaction"),
+                getLogger("DiskObjectStorageTransaction"),
                 fmt::format("An error occurred while executing transaction's operation #{} ({})", i, operations_to_execute[i]->getInfoForLog()));
 
             for (int64_t j = i; j >= 0; --j)
@@ -814,7 +814,7 @@ void DiskObjectStorageTransaction::commit()
                 catch (...)
                 {
                     tryLogCurrentException(
-                        &Poco::Logger::get("DiskObjectStorageTransaction"),
+                        getLogger("DiskObjectStorageTransaction"),
                         fmt::format("An error occurred while undoing transaction's operation #{}", i));
 
                     throw;

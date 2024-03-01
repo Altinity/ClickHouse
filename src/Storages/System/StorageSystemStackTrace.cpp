@@ -221,7 +221,7 @@ namespace
 
 StorageSystemStackTrace::StorageSystemStackTrace(const StorageID & table_id_)
     : IStorage(table_id_)
-    , log(&Poco::Logger::get("StorageSystemStackTrace"))
+    , log(getLogger("StorageSystemStackTrace"))
 {
     StorageInMemoryMetadata storage_metadata;
     storage_metadata.setColumns(ColumnsDescription({

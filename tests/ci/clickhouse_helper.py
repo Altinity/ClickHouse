@@ -192,7 +192,7 @@ def prepare_tests_results_for_clickhouse(
     report_url: str,
     check_name: str,
 ) -> List[dict]:
-    pull_request_url = "https://github.com/ClickHouse/ClickHouse/commits/master"
+    pull_request_url = "https://github.com/Altinity/ClickHouse/commits/master"
     base_ref = "master"
     head_ref = "master"
     base_repo = pr_info.repo_full_name
@@ -256,7 +256,7 @@ WHERE
     AND pull_request_number = 0
 """
 
-        tests_data = clickhouse_helper.select_json_each_row("default", query)
+        tests_data = clickhouse_helper.select_json_each_row("gh-data", query)
         master_failed_tests = {row["test_name"] for row in tests_data}
         logging.info("Found flaky tests: %s", ", ".join(master_failed_tests))
 

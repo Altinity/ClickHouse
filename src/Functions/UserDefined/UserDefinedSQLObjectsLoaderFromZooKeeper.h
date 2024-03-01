@@ -75,7 +75,7 @@ private:
     using UserDefinedSQLObjectTypeAndName = std::pair<UserDefinedSQLObjectType, String>;
     std::shared_ptr<ConcurrentBoundedQueue<UserDefinedSQLObjectTypeAndName>> watch_queue;
 
-    Poco::Logger * log;
+    LoggerPtr log;
 };
 
 }

@@ -28,7 +28,7 @@ func createClickHouseContainer(t *testing.T, ctx context.Context) (testcontainer
 
 	// for now, we test against a hardcoded database-server version but we should make this a property
 	req := testcontainers.ContainerRequest{
-		Image:        fmt.Sprintf("clickhouse/clickhouse-server:%s", test.GetClickHouseTestVersion()),
+		Image:        fmt.Sprintf("altinityinfra/clickhouse-server:%s", test.GetClickHouseTestVersion()),
 		ExposedPorts: []string{"9000/tcp"},
 		WaitingFor:   wait.ForLog("Ready for connections"),
 		Mounts: testcontainers.ContainerMounts{
@@ -107,7 +107,7 @@ func TestReadTable(t *testing.T) {
 				require.Nil(t, err)
 				require.True(t, ok)
 				require.Equal(t, "default", values[0])
-				require.Equal(t, "/var/lib/clickhouse/", values[1])
+				require.Equal(t, "/var/lib/altinityinfra/", values[1])
 				require.Greater(t, values[2], uint64(0))
 				require.Greater(t, values[3], uint64(0))
 				require.Greater(t, values[4], uint64(0))
@@ -134,10 +134,10 @@ func TestReadTable(t *testing.T) {
 		frame, err := clickhouseClient.ReadTable("system", "databases", []string{}, data.OrderBy{}, 10)
 		require.Nil(t, err)
 		require.ElementsMatch(t, frame.Columns(), [6]string{"name", "engine", "data_path", "metadata_path", "uuid", "comment"})
-		expectedRows := [4][3]string{{"INFORMATION_SCHEMA", "Memory", "/var/lib/clickhouse/"},
-			{"default", "Atomic", "/var/lib/clickhouse/store/"},
-			{"information_schema", "Memory", "/var/lib/clickhouse/"},
-			{"system", "Atomic", "/var/lib/clickhouse/store/"}}
+		expectedRows := [4][3]string{{"INFORMATION_SCHEMA", "Memory", "/var/lib/altinityinfra/"},
+			{"default", "Atomic", "/var/lib/altinityinfra/store/"},
+			{"information_schema", "Memory", "/var/lib/altinityinfra/"},
+			{"system", "Atomic", "/var/lib/altinityinfra/store/"}}
 		i := 0
 		for {
 			values, ok, err := frame.Next()
@@ -181,7 +181,7 @@ func TestReadTable(t *testing.T) {
 		frame, err := clickhouseClient.ReadTable("system", "databases", []string{}, data.OrderBy{}, 1)
 		require.Nil(t, err)
 		require.ElementsMatch(t, frame.Columns(), [6]string{"name", "engine", "data_path", "metadata_path", "uuid", "comment"})
-		expectedRows := [1][3]string{{"INFORMATION_SCHEMA", "Memory", "/var/lib/clickhouse/"}}
+		expectedRows := [1][3]string{{"INFORMATION_SCHEMA", "Memory", "/var/lib/altinityinfra/"}}
 		i := 0
 		for {
 			values, ok, err := frame.Next()
@@ -216,10 +216,10 @@ func TestReadTable(t *testing.T) {
 		require.Nil(t, err)
 		require.ElementsMatch(t, frame.Columns(), [6]string{"name", "engine", "data_path", "metadata_path", "uuid", "comment"})
 		expectedRows := [4][3]string{
-			{"default", "Atomic", "/var/lib/clickhouse/store/"},
-			{"system", "Atomic", "/var/lib/clickhouse/store/"},
-			{"INFORMATION_SCHEMA", "Memory", "/var/lib/clickhouse/"},
-			{"information_schema", "Memory", "/var/lib/clickhouse/"},
+			{"default", "Atomic", "/var/lib/altinityinfra/store/"},
+			{"system", "Atomic", "/var/lib/altinityinfra/store/"},
+			{"INFORMATION_SCHEMA", "Memory", "/var/lib/altinityinfra/"},
+			{"information_schema", "Memory", "/var/lib/altinityinfra/"},
 		}
 		i := 0
 		for {
@@ -256,7 +256,7 @@ func TestExecuteStatement(t *testing.T) {
 		require.Nil(t, err)
 		require.ElementsMatch(t, frame.Columns(), [2]string{"path", "count"})
 		expectedRows := [1][2]interface{}{
-			{"/var/lib/clickhouse/", uint64(1)},
+			{"/var/lib/altinityinfra/", uint64(1)},
 		}
 		i := 0
 		for {

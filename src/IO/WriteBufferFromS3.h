@@ -112,7 +112,7 @@ private:
     std::mutex bg_tasks_mutex;
     std::condition_variable bg_tasks_condvar;
 
-    Poco::Logger * log = &Poco::Logger::get("WriteBufferFromS3");
+    LoggerPtr log = getLogger("WriteBufferFromS3");
 
     WriteSettings write_settings;
 };

@@ -39,7 +39,7 @@ public:
 
 protected:
     mutable std::mutex mutex;
-    Poco::Logger * log;
+    LoggerPtr log;
 };
 
 }

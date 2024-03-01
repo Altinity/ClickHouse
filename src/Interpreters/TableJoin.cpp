@@ -453,12 +453,12 @@ TableJoin::createConvertingActions(
                 for (const auto & col : dag->getResultColumns())
                     output_cols.push_back(col.name + ": " + col.type->getName());
 
-                LOG_DEBUG(&Poco::Logger::get("TableJoin"), "{} JOIN converting actions: [{}] -> [{}]",
+                LOG_DEBUG(getLogger("TableJoin"), "{} JOIN converting actions: [{}] -> [{}]",
                     side, fmt::join(input_cols, ", "), fmt::join(output_cols, ", "));
             }
             else
             {
-                LOG_DEBUG(&Poco::Logger::get("TableJoin"), "{} JOIN converting actions: empty", side);
+                LOG_DEBUG(getLogger("TableJoin"), "{} JOIN converting actions: empty", side);
                 return;
             }
         };
@@ -547,7 +547,7 @@ void TableJoin::inferJoinKeyCommonType(const LeftNamesAndTypes & left, const Rig
     if (!left_type_map.empty() || !right_type_map.empty())
     {
         LOG_TRACE(
-            &Poco::Logger::get("TableJoin"),
+            getLogger("TableJoin"),
             "Infer supertype for joined columns. Left: [{}], Right: [{}]",
             formatTypeMap(left_type_map, left_types),
             formatTypeMap(right_type_map, right_types));
@@ -703,7 +703,7 @@ static void addJoinConditionWithAnd(ASTPtr & current_cond, const ASTPtr & new_co
 void TableJoin::addJoinCondition(const ASTPtr & ast, bool is_left)
 {
     auto & cond_ast = is_left ? clauses.back().on_filter_condition_left : clauses.back().on_filter_condition_right;
-    LOG_TRACE(&Poco::Logger::get("TableJoin"), "Adding join condition for {} table: {} -> {}",
+    LOG_TRACE(getLogger("TableJoin"), "Adding join condition for {} table: {} -> {}",
               (is_left ? "left" : "right"), ast ? queryToString(ast) : "NULL", cond_ast ? queryToString(cond_ast) : "NULL");
     addJoinConditionWithAnd(cond_ast, ast);
 }

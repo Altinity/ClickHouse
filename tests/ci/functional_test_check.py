@@ -66,9 +66,9 @@ def get_additional_envs(
 
 def get_image_name(check_name: str) -> str:
     if "stateless" in check_name.lower():
-        return "clickhouse/stateless-test"
+        return "altinityinfra/stateless-test"
     if "stateful" in check_name.lower():
-        return "clickhouse/stateful-test"
+        return "altinityinfra/stateful-test"
     else:
         raise Exception(f"Cannot deduce image name based on check name {check_name}")
 
@@ -110,6 +110,7 @@ def get_run_command(
     return (
         f"docker run --volume={builds_path}:/package_folder "
         f"--volume={repo_path}/tests:/usr/share/clickhouse-test "
+        f"--dns=8.8.8.8 "
         f"--volume={result_path}:/test_output "
         f"--volume={server_log_path}:/var/log/clickhouse-server "
         f"--cap-add=SYS_PTRACE {env_str} {additional_options_str} {image}"
@@ -259,10 +260,12 @@ def main():
         run_by_hash_total = 0
         check_name_with_group = check_name
 
-    rerun_helper = RerunHelper(commit, check_name_with_group)
-    if rerun_helper.is_already_finished_by_status():
-        logging.info("Check is already finished according to github status, exiting")
-        sys.exit(0)
+    # Always re-run, even if it finished in previous run.
+    # gh = Github(get_best_robot_token())
+    # rerun_helper = RerunHelper(gh, pr_info, check_name_with_group)
+    # if rerun_helper.is_already_finished_by_status():
+    #     logging.info("Check is already finished according to github status, exiting")
+    #     sys.exit(0)
 
     tests_to_run = []
     if run_changed_tests:
@@ -397,7 +400,7 @@ def main():
         report_url,
         check_name_with_group,
     )
-    ch_helper.insert_events_into(db="default", table="checks", events=prepared_events)
+    ch_helper.insert_events_into(db="gh-data", table="checks", events=prepared_events)
 
     if state != "success":
         # Parallel replicas are always green for now

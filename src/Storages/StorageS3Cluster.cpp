@@ -49,7 +49,7 @@ StorageS3Cluster::StorageS3Cluster(
     ContextPtr context_,
     bool structure_argument_was_provided_)
     : IStorageCluster(table_id_)
-    , log(&Poco::Logger::get("StorageS3Cluster (" + table_id_.table_name + ")"))
+    , log(getLogger("StorageS3Cluster (" + table_id_.table_name + ")"))
     , s3_configuration{configuration_}
     , cluster_name(configuration_.cluster_name)
     , format_name(configuration_.format)

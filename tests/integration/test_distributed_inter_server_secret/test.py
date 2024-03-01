@@ -29,6 +29,7 @@ n2 = make_instance("n2", "configs/remote_servers_n2.xml")
 backward = make_instance(
     "backward",
     "configs/remote_servers_backward.xml",
+    # NOTE(vnemkov): do not change to altinityinfra/clickhouse-server
     image="clickhouse/clickhouse-server",
     # version without DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET_V2
     tag="23.2.3",

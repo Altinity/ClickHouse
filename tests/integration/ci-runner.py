@@ -13,8 +13,8 @@ import time
 import zlib  # for crc32
 
 
-MAX_RETRY = 1
-NUM_WORKERS = 5
+MAX_RETRY = 3
+NUM_WORKERS = 10
 SLEEP_BETWEEN_RETRIES = 5
 PARALLEL_GROUP_SIZE = 100
 CLICKHOUSE_BINARY_PATH = "usr/bin/clickhouse"
@@ -279,17 +279,17 @@ class ClickhouseIntegrationTestsRunner:
     @staticmethod
     def get_images_names():
         return [
-            "clickhouse/dotnet-client",
-            "clickhouse/integration-helper",
-            "clickhouse/integration-test",
-            "clickhouse/integration-tests-runner",
-            "clickhouse/kerberized-hadoop",
-            "clickhouse/kerberos-kdc",
-            "clickhouse/mysql-golang-client",
-            "clickhouse/mysql-java-client",
-            "clickhouse/mysql-js-client",
-            "clickhouse/mysql-php-client",
-            "clickhouse/postgresql-java-client",
+            "altinityinfra/dotnet-client",
+            "altinityinfra/integration-helper",
+            "altinityinfra/integration-test",
+            "altinityinfra/integration-tests-runner",
+            "altinityinfra/kerberized-hadoop",
+            "altinityinfra/kerberos-kdc",
+            "altinityinfra/mysql-golang-client",
+            "altinityinfra/mysql-java-client",
+            "altinityinfra/mysql-js-client",
+            "altinityinfra/mysql-php-client",
+            "altinityinfra/postgresql-java-client",
         ]
 
     def _pre_pull_images(self, repo_path):
@@ -297,7 +297,7 @@ class ClickhouseIntegrationTestsRunner:
 
         cmd = (
             "cd {repo_path}/tests/integration && "
-            "timeout -s 9 1h ./runner {runner_opts} {image_cmd} --pre-pull --command '{command}' ".format(
+            "timeout -s 9 2h ./runner {runner_opts} {image_cmd} --pre-pull --command '{command}' ".format(
                 repo_path=repo_path,
                 runner_opts=self._get_runner_opts(),
                 image_cmd=image_cmd,
@@ -520,7 +520,7 @@ class ClickhouseIntegrationTestsRunner:
             "--docker-image-version",
         ):
             for img in self.get_images_names():
-                if img == "clickhouse/integration-tests-runner":
+                if img == "altinityinfra/integration-tests-runner":
                     runner_version = self.get_image_version(img)
                     logging.info(
                         "Can run with custom docker image version %s", runner_version
@@ -628,7 +628,7 @@ class ClickhouseIntegrationTestsRunner:
 
             test_cmd = " ".join([test for test in sorted(test_names)])
             parallel_cmd = (
-                " --parallel {} ".format(num_workers) if num_workers > 0 else ""
+                " --parallel {} ".format(num_workers) if (num_workers > 0 or i > 0) else ""
             )
             # -r -- show extra test summary:
             # -f -- (f)ailed

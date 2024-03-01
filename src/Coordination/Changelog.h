@@ -87,7 +87,7 @@ class Changelog
 public:
     Changelog(
         const std::string & changelogs_dir_,
-        Poco::Logger * log_,
+        LoggerPtr log_,
         LogFileSettings log_file_settings);
 
     Changelog(Changelog &&) = delete;
@@ -171,7 +171,7 @@ private:
     const std::filesystem::path changelogs_dir;
     const std::filesystem::path changelogs_detached_dir;
     const uint64_t rotate_interval;
-    Poco::Logger * log;
+    LoggerPtr log;
 
     std::mutex writer_mutex;
     /// Current writer for changelog file

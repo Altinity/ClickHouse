@@ -78,7 +78,7 @@ AsyncBlockIDsCache::AsyncBlockIDsCache(StorageReplicatedMergeTree & storage_)
     update_min_interval(storage.getSettings()->async_block_ids_cache_min_update_interval_ms),
     path(storage.zookeeper_path + "/async_blocks"),
     log_name(storage.getStorageID().getFullTableName() + " (AsyncBlockIDsCache)"),
-    log(&Poco::Logger::get(log_name))
+    log(getLogger(log_name))
 {
     task = storage.getContext()->getSchedulePool().createTask(log_name, [this]{ update(); });
 }

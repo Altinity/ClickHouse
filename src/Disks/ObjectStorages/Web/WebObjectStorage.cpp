@@ -58,7 +58,7 @@ void WebObjectStorage::initialize(const String & uri_path) const
         FileData file_data{};
 
         String dir_name = fs::path(uri_path.substr(url.size())) / "";
-        LOG_TRACE(&Poco::Logger::get("DiskWeb"), "Adding directory: {}", dir_name);
+        LOG_TRACE(getLogger("DiskWeb"), "Adding directory: {}", dir_name);
 
         while (!metadata_buf.eof())
         {
@@ -83,7 +83,7 @@ void WebObjectStorage::initialize(const String & uri_path) const
 
             file_path = file_path.substr(url.size());
             files.emplace(std::make_pair(file_path, file_data));
-            LOG_TRACE(&Poco::Logger::get("DiskWeb"), "Adding file: {}, size: {}", file_path, file_data.size);
+            LOG_TRACE(getLogger("DiskWeb"), "Adding file: {}, size: {}", file_path, file_data.size);
         }
 
         files.emplace(std::make_pair(dir_name, FileData({ .type = FileType::Directory })));
@@ -113,7 +113,7 @@ WebObjectStorage::WebObjectStorage(
     ContextPtr context_)
     : WithContext(context_->getGlobalContext())
     , url(url_)
-    , log(&Poco::Logger::get("WebObjectStorage"))
+    , log(getLogger("WebObjectStorage"))
 {
 }
 
@@ -121,7 +121,7 @@ bool WebObjectStorage::exists(const StoredObject & object) const
 {
     const auto & path = object.absolute_path;
 
-    LOG_TRACE(&Poco::Logger::get("DiskWeb"), "Checking existence of path: {}", path);
+    LOG_TRACE(getLogger("DiskWeb"), "Checking existence of path: {}", path);
 
     if (files.find(path) != files.end())
         return true;
@@ -140,7 +140,7 @@ bool WebObjectStorage::exists(const StoredObject & object) const
             if (can_throw)
                 throw Exception(ErrorCodes::NETWORK_ERROR, "Cannot load disk metadata. Error: {}", message);
 
-            LOG_TRACE(&Poco::Logger::get("DiskWeb"), "Cannot load disk metadata. Error: {}", message);
+            LOG_TRACE(getLogger("DiskWeb"), "Cannot load disk metadata. Error: {}", message);
             return false;
         }
     }

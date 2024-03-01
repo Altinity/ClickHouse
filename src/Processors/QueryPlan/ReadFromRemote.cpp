@@ -104,7 +104,7 @@ ReadFromRemote::ReadFromRemote(
     ThrottlerPtr throttler_,
     Scalars scalars_,
     Tables external_tables_,
-    Poco::Logger * log_,
+    LoggerPtr log_,
     UInt32 shard_count_,
     std::shared_ptr<const StorageLimitsList> storage_limits_)
     : ISourceStep(DataStream{.header = std::move(header_)})
@@ -168,7 +168,7 @@ void ReadFromRemote::addLazyPipe(Pipes & pipes, const ClusterProxy::SelectStream
         catch (const Exception & ex)
         {
             if (ex.code() == ErrorCodes::ALL_CONNECTION_TRIES_FAILED)
-                LOG_WARNING(&Poco::Logger::get("ClusterProxy::SelectStreamFactory"),
+                LOG_WARNING(getLogger("ClusterProxy::SelectStreamFactory"),
                     "Connections to remote replicas of local shard {} failed, will use stale local replica", shard.shard_info.shard_num);
             else
                 throw;
@@ -280,7 +280,7 @@ ReadFromParallelRemoteReplicasStep::ReadFromParallelRemoteReplicasStep(
     ThrottlerPtr throttler_,
     Scalars scalars_,
     Tables external_tables_,
-    Poco::Logger * log_,
+    LoggerPtr log_,
     std::shared_ptr<const StorageLimitsList> storage_limits_,
     UUID uuid_)
     : ISourceStep(DataStream{.header = std::move(header_)})
@@ -326,7 +326,7 @@ void ReadFromParallelRemoteReplicasStep::initializePipeline(QueryPipelineBuilder
     size_t all_replicas_count = current_settings.max_parallel_replicas;
     if (all_replicas_count > shard_info.all_addresses.size())
     {
-        LOG_INFO(&Poco::Logger::get("ReadFromParallelRemoteReplicasStep"),
+        LOG_INFO(getLogger("ReadFromParallelRemoteReplicasStep"),
             "The number of replicas requested ({}) is bigger than the real number available in the cluster ({}). "\
             "Will use the latter number to execute the query.", current_settings.max_parallel_replicas, shard_info.all_addresses.size());
         all_replicas_count = shard_info.all_addresses.size();

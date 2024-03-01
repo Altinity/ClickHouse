@@ -115,7 +115,7 @@ BackupImpl::BackupImpl(
     , version(CURRENT_BACKUP_VERSION)
     , base_backup_info(base_backup_info_)
     , deduplicate_files(deduplicate_files_)
-    , log(&Poco::Logger::get("BackupImpl"))
+    , log(getLogger("BackupImpl"))
 {
     open(context_);
 }

@@ -25,7 +25,7 @@ public:
     UInt64 calculateTotalSizeOnDisk() const override;
 
     /// Returns path to place detached part in or nullopt if we don't need to detach part (if it already exists and has the same content)
-    std::optional<String> getRelativePathForPrefix(Poco::Logger * log, const String & prefix, bool detached, bool broken) const override;
+    std::optional<String> getRelativePathForPrefix(LoggerPtr log, const String & prefix, bool detached, bool broken) const override;
 
     /// Returns true if detached part already exists and has the same content (compares checksums.txt and the list of files)
     bool looksLikeBrokenDetachedPartHasTheSameContent(const String & detached_part_path, std::optional<String> & original_checksums_content,
@@ -68,12 +68,12 @@ public:
         const std::string & to,
         const std::string & dir_path,
         const DiskPtr & disk,
-        Poco::Logger * log) const override;
+        LoggerPtr log) const override;
 
     void rename(
         std::string new_root_path,
         std::string new_part_dir,
-        Poco::Logger * log,
+        LoggerPtr log,
         bool remove_new_dir_if_exists,
         bool fsync_part_dir) override;
 
@@ -82,7 +82,7 @@ public:
         const MergeTreeDataPartChecksums & checksums,
         std::list<ProjectionChecksums> projections,
         bool is_temp,
-        Poco::Logger * log) override;
+        LoggerPtr log) override;
 
     void changeRootPath(const std::string & from_root, const std::string & to_root) override;
     void createDirectories() override;
@@ -122,7 +122,7 @@ private:
         const CanRemoveDescription & can_remove_description,
         const MergeTreeDataPartChecksums & checksums,
         bool is_temp,
-        Poco::Logger * log);
+        LoggerPtr log);
 
     /// For names of expected data part files returns the actual names
     /// of files in filesystem to which data of these files is written.

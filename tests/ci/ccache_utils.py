@@ -3,11 +3,11 @@
 import logging
 import os
 import shutil
+from env_helper import S3_BUILDS_BUCKET, S3_DOWNLOAD
 from pathlib import Path
 
 from build_download_helper import download_build_with_progress
 from compress_files import decompress_fast, compress_fast
-from env_helper import S3_DOWNLOAD, S3_BUILDS_BUCKET
 from s3_helper import S3Helper
 
 DOWNLOAD_RETRIES_COUNT = 5

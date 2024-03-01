@@ -1,7 +1,7 @@
-# docker build -t clickhouse/binary-builder .
+# docker build -t altinityinfra/binary-builder .
 ARG FROM_TAG=latest
-FROM clickhouse/test-util:48280 AS cctools
-# The cctools are built always from the clickhouse/test-util:latest and cached inline
+FROM altinityinfra/test-util:$FROM_TAG as cctools
+# The cctools are built always from the altinityinfra/test-util:latest and cached inline
 # Theoretically, it should improve rebuild speed significantly
 ENV CC=clang-${LLVM_VERSION}
 ENV CXX=clang++-${LLVM_VERSION}
@@ -37,7 +37,7 @@ RUN git clone https://github.com/tpoechtrager/cctools-port.git \
 # END COMPILE
 # !!!!!!!!!!!
 
-FROM clickhouse/test-util:$FROM_TAG
+FROM altinityinfra/test-util:$FROM_TAG
 ENV CC=clang-${LLVM_VERSION}
 ENV CXX=clang++-${LLVM_VERSION}
 

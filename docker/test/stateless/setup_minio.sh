@@ -72,6 +72,7 @@ download_minio() {
 start_minio() {
   mkdir -p ./minio_data
   ./minio --version
+
   ./minio server --address ":11111" ./minio_data &
   wait_for_it
   lsof -i :11111

@@ -196,7 +196,7 @@ HashedDictionary<dictionary_key_type, sparse, sharded>::HashedDictionary(
     const HashedDictionaryConfiguration & configuration_,
     BlockPtr update_field_loaded_block_)
     : IDictionary(dict_id_)
-    , log(&Poco::Logger::get("HashedDictionary"))
+    , log(getLogger("HashedDictionary"))
     , dict_struct(dict_struct_)
     , source_ptr(std::move(source_ptr_))
     , configuration(configuration_)
@@ -1161,7 +1161,7 @@ void registerDictionaryHashed(DictionaryFactory & factory)
         const std::string dictionary_layout_prefix = ".layout." + dictionary_layout_name;
         const bool preallocate = config.getBool(config_prefix + dictionary_layout_prefix + ".preallocate", false);
         if (preallocate)
-            LOG_WARNING(&Poco::Logger::get("HashedDictionary"), "'prellocate' attribute is obsolete, consider looking at 'shards'");
+            LOG_WARNING(getLogger("HashedDictionary"), "'prellocate' attribute is obsolete, consider looking at 'shards'");
 
         Int64 shards = config.getInt(config_prefix + dictionary_layout_prefix + ".shards", 1);
         if (shards <= 0 || shards > 128)
