@@ -81,7 +81,7 @@ SSL_CTX* getSslContext()
     return raw_ssl_ctx;
 }
 
-void setSSLParams(nuraft::asio_service::options & asio_opts, [[maybe_unused]] Poco::Logger * log)
+void setSSLParams(nuraft::asio_service::options & asio_opts, [[maybe_unused]] LoggerPtr log)
 {
     // In order to maintain uniformity with CH on how SSL is used by Keeper,
     // we need to use same SSL_CTX configuration as rest of ClickHouse does.
@@ -95,7 +95,7 @@ void setSSLParams(nuraft::asio_service::options & asio_opts, [[maybe_unused]] Po
     asio_opts.ssl_context_provider_server_ = getSslContext<SSLContext::Server>;
     asio_opts.ssl_context_provider_client_ = getSslContext<SSLContext::Client>;
 #else
-    LOG_WARNING(log, "Not all openSSL cofiguration options from config are applied, some SSL-related functionalty may work incorrectly.");
+    LOG_WARNING(log, "Not all openSSL configuration options from config are applied, some SSL-related functionality may work incorrectly.");
 
     const Poco::Util::LayeredConfiguration & config = Poco::Util::Application::instance().config();
     String certificate_file_property = "openSSL.server.certificateFile";
