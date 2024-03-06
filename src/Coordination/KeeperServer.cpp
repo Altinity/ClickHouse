@@ -27,6 +27,15 @@
 #include <Common/Stopwatch.h>
 #include <Common/getMultipleKeysFromConfig.h>
 
+#if USE_SSL
+#include <Poco/Net/SSLManager.h>
+#include <Poco/Net/Context.h>
+
+#include <openssl/ssl.h>
+#include <openssl/crypto.h>
+#endif
+#include <Common/logger_useful.h>
+
 namespace DB
 {
 
@@ -43,8 +52,51 @@ namespace
 {
 
 #if USE_SSL
-void setSSLParams(nuraft::asio_service::options & asio_opts)
+
+enum class SSLContext
 {
+    Server,
+    Client
+};
+
+template <SSLContext contextType>
+SSL_CTX* getSslContext()
+{
+    // Boring SSL states that it is Ok to use context from different threads,
+    // OpenSSL discourages that.
+#if !defined(OPENSSL_IS_BORINGSSL) || !defined(BORINGSSL_API_VERSION)
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "Unsafe to share SSL_CTX with non-BoringSSL builds");
+#endif
+
+    auto & ssl_manager = Poco::Net::SSLManager::instance();
+    const auto & ssl_ctx = contextType == SSLContext::Server ? ssl_manager.defaultServerContext() : ssl_manager.defaultClientContext();
+
+    auto raw_ssl_ctx = ssl_ctx->sslContext();
+    assert(raw_ssl_ctx);
+
+    // asio will SSL_CTX_free context in desctructor,
+    // so we need to make sure that that wouldn't actually destroy a context.
+    SSL_CTX_up_ref(raw_ssl_ctx);
+
+    return raw_ssl_ctx;
+}
+
+void setSSLParams(nuraft::asio_service::options & asio_opts, [[maybe_unused]] Poco::Logger * log)
+{
+    // In order to maintain uniformity with CH on how SSL is used by Keeper,
+    // we need to use same SSL_CTX configuration as rest of ClickHouse does.
+    // Since copying configuration from one SSL_CTX to another is hard, we are using same
+    // SSL_CTX as rest of CH does (via Poco).
+    //
+    // OpenSSL explicitly prohibts sharing SSL_CTX by multiple threads, but BoringSSL allows it
+    // and states that SSL_CTX is thread-safe.
+#if defined(OPENSSL_IS_BORINGSSL) && defined(BORINGSSL_API_VERSION)
+    asio_opts.enable_ssl_ = true;
+    asio_opts.ssl_context_provider_server_ = getSslContext<SSLContext::Server>;
+    asio_opts.ssl_context_provider_client_ = getSslContext<SSLContext::Client>;
+#else
+    LOG_WARNING(log, "Not all openSSL cofiguration options from config are applied, some SSL-related functionalty may work incorrectly.");
+
     const Poco::Util::LayeredConfiguration & config = Poco::Util::Application::instance().config();
     String certificate_file_property = "openSSL.server.certificateFile";
     String private_key_file_property = "openSSL.server.privateKeyFile";
@@ -68,6 +120,7 @@ void setSSLParams(nuraft::asio_service::options & asio_opts)
 
     if (config.getString("openSSL.server.verificationMode", "none") == "none")
         asio_opts.skip_verification_ = true;
+#endif
 }
 #endif
 
@@ -119,6 +172,13 @@ KeeperServer::KeeperServer(
 {
     if (coordination_settings->quorum_reads)
         LOG_WARNING(log, "Quorum reads enabled, Keeper will work slower.");
+
+#if USE_SSL
+    if (FIPS_mode())
+    {
+        LOG_INFO(log, "Starting in FIPS mode, KAT test result: {}", BORINGSSL_self_test());
+    }
+#endif
 
     keeper_context->digest_enabled = config.getBool("keeper_server.digest_enabled", false);
     keeper_context->ignore_system_path_on_startup = config.getBool("keeper_server.ignore_system_path_on_startup", false);
@@ -315,10 +375,14 @@ void KeeperServer::launchRaftServer(const Poco::Util::AbstractConfiguration & co
     if (state_manager->isSecure())
     {
 #if USE_SSL
-        setSSLParams(asio_opts);
+        setSSLParams(asio_opts, log);
 #else
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "SSL support for NuRaft is disabled because ClickHouse was built without SSL support.");
 #endif
+    }
+    else if (FIPS_mode() && !asio_opts.enable_ssl_)
+    {
+        LOG_FATAL(log, "Can't start NON-SECURE keeper server in FIPS mode, please check the config.");
     }
 
     if (is_recovering)

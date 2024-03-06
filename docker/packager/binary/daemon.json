@@ -1,0 +1,8 @@
+{
+  "ipv6": true,
+  "fixed-cidr-v6": "fd00::/8",
+  "ip-forward": true,
+  "log-level": "debug",
+  "insecure-registries" : ["65.108.242.32:5000"],
+  "registry-mirrors" : ["http://65.108.242.32:5000"]
+}

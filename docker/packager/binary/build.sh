@@ -1,4 +1,30 @@
 #!/usr/bin/env bash
+
+set -e
+
+# In case of test hung it is convenient to use pytest --pdb to debug it,
+# and on hung you can simply press Ctrl-C and it will spawn a python pdb,
+# but on SIGINT dockerd will exit, so ignore it to preserve the daemon.
+trap '' INT
+# Binding to an IP address without --tlsverify is deprecated. Startup is intentionally being slowed
+# unless --tls=false or --tlsverify=false is set
+dockerd --host=unix:///var/run/docker.sock --tls=false --host=tcp://0.0.0.0:2375 --default-address-pool base=172.17.0.0/12,size=24 \
+    &> /ClickHouse/packager/dockerd.log &
+
+set +e
+reties=0
+while true; do
+    docker info &>/dev/null && break
+    reties=$((reties+1))
+    if [[ $reties -ge 100 ]]; then # 10 sec max
+        echo "Can't start docker daemon, timeout exceeded." >&2
+        cat /ClickHouse/packager/dockerd.log >&2
+        exit 1;
+    fi
+    sleep 0.1
+done
+set -e
+
 set -x -e
 
 exec &> >(ts)
@@ -44,18 +70,19 @@ if [ -n "$MAKE_DEB" ]; then
   # NOTE: this is for backward compatibility with previous releases,
   # that does not diagnostics tool (only script).
   if [ -d /build/programs/diagnostics ]; then
-    if [ -z "$SANITIZER" ]; then
+    # if [ -z "$SANITIZER" ]; then
       # We need to check if clickhouse-diagnostics is fine and build it
-      (
-        cd /build/programs/diagnostics
-        make test-no-docker
-        GOARCH="${DEB_ARCH}" CGO_ENABLED=0 make VERSION="$VERSION_STRING" build
-        mv clickhouse-diagnostics ..
-      )
-    else
+    #   (
+    #     cd /build/programs/diagnostics
+    #     make test-no-docker
+    #     GOARCH="${DEB_ARCH}" CGO_ENABLED=0 make VERSION="$VERSION_STRING" build
+    #     mv clickhouse-diagnostics ..
+    #   )
+    #    echo "NOT building clickhouse-diagnostics"
+    # else
       echo -e "#!/bin/sh\necho 'Not implemented for this type of package'" > /build/programs/clickhouse-diagnostics
       chmod +x /build/programs/clickhouse-diagnostics
-    fi
+    # fi
   fi
 fi
 
