@@ -102,8 +102,10 @@ def run_docker_image_with_env(
     if ccache_dir is None:
         ccache_mount = ""
 
+    # Added v /var/run/docker.sock:/var/run/docker.sock, required for docker-in-docker to build BoringSSL in FIPS mode.
     cmd = (
-        f"docker run --network=host --user={user} --rm {ccache_mount}"
+        f"docker run --network=host --user={user} --rm {ccache_mount} "
+        f" -v /var/run/docker.sock:/var/run/docker.sock "
         f" --volume={output_dir}:/output --volume={ch_root}:/build {env_part} "
         f"{interactive} {image_name}"
     )
@@ -135,6 +137,7 @@ def parse_env_variables(
     with_profiler: bool,
     with_coverage: bool,
     with_binaries: str,
+    fips,
 ) -> List[str]:
     DARWIN_SUFFIX = "-darwin"
     DARWIN_ARM_SUFFIX = "-darwin-aarch64"
@@ -219,6 +222,9 @@ def parse_env_variables(
         cc = compiler
         result.append("DEB_ARCH=amd64")
 
+    if fips:
+        cmake_flags.append("-DFIPS_CLICKHOUSE=ON")
+
     cxx = cc.replace("gcc", "g++").replace("clang", "clang++")
 
     if package_type == "deb":
@@ -240,7 +246,9 @@ def parse_env_variables(
         )
         if is_release_build(build_type, package_type, sanitizer):
             cmake_flags.append("-DSPLIT_DEBUG_SYMBOLS=ON")
-            result.append("WITH_PERFORMANCE=1")
+            # NOTE(vnemkov): we don't do performace tests, and this causes some issues down the road, disabling it for now
+            # https://s3.amazonaws.com/altinity-build-artifacts/217/dc4053ae4a78bfff0f689f001dfb30a7fa67694d/package_release/build_log.log
+            # result.append("WITH_PERFORMANCE=1")
             if is_cross_arm:
                 cmake_flags.append("-DBUILD_STANDALONE_KEEPER=1")
             else:
@@ -444,6 +452,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--as-root", action="store_true", help="if the container should run as root"
     )
+    parser.add_argument(
+        "--fips", action="store_true", help="enbale FIPS build", default=False
+    )
 
     args = parser.parse_args()
 
@@ -502,6 +513,7 @@ def main() -> None:
         args.with_profiler,
         args.with_coverage,
         args.with_binaries,
+        args.fips,
     )
 
     pre_build(args.clickhouse_repo_path, env_prepared)
