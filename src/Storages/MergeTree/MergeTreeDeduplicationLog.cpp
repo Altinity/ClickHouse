@@ -9,8 +9,15 @@
 #include <Disks/WriteMode.h>
 #include <Disks/IDisk.h>
 
+#include <Common/Exception.h>
+
 namespace DB
 {
+
+namespace ErrorCodes
+{
+    extern const int ABORTED;
+}
 
 namespace
 {
@@ -227,7 +234,12 @@ std::pair<MergeTreePartInfo, bool> MergeTreeDeduplicationLog::addPart(const std:
         return std::make_pair(info, false);
     }
 
-    assert(current_writer != nullptr);
+    if (stopped)
+    {
+        throw Exception(ErrorCodes::ABORTED, "Storage has been shutdown when we add this part.");
+    }
+
+    chassert(current_writer != nullptr);
 
     /// Create new record
     MergeTreeDeduplicationLogRecord record;
@@ -257,7 +269,12 @@ void MergeTreeDeduplicationLog::dropPart(const MergeTreePartInfo & drop_part_inf
     if (deduplication_window == 0)
         return;
 
-    assert(current_writer != nullptr);
+    if (stopped)
+    {
+        throw Exception(ErrorCodes::ABORTED, "Storage has been shutdown when we drop this part.");
+    }
+
+    chassert(current_writer != nullptr);
 
     for (auto itr = deduplication_map.begin(); itr != deduplication_map.end(); /* no increment here, we erasing from map */)
     {

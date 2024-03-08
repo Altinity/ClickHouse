@@ -113,7 +113,7 @@ static void logQuery(const String & query, ContextPtr context, bool internal, Qu
 {
     if (internal)
     {
-        LOG_DEBUG(&Poco::Logger::get("executeQuery"), "(internal) {} (stage: {})", toOneLineQuery(query), QueryProcessingStage::toString(stage));
+        LOG_DEBUG(getLogger("executeQuery"), "(internal) {} (stage: {})", toOneLineQuery(query), QueryProcessingStage::toString(stage));
     }
     else
     {
@@ -136,7 +136,7 @@ static void logQuery(const String & query, ContextPtr context, bool internal, Qu
         if (auto txn = context->getCurrentTransaction())
             transaction_info = fmt::format(" (TID: {}, TIDH: {})", txn->tid, txn->tid.getHash());
 
-        LOG_DEBUG(&Poco::Logger::get("executeQuery"), "(from {}{}{}){}{} {} (stage: {})",
+        LOG_DEBUG(getLogger("executeQuery"), "(from {}{}{}){}{} {} (stage: {})",
             client_info.current_address.toString(),
             (current_user != "default" ? ", user: " + current_user : ""),
             (!initial_query_id.empty() && current_query_id != initial_query_id ? ", initial_query_id: " + initial_query_id : std::string()),
@@ -147,7 +147,7 @@ static void logQuery(const String & query, ContextPtr context, bool internal, Qu
 
         if (client_info.client_trace_context.trace_id != UUID())
         {
-            LOG_TRACE(&Poco::Logger::get("executeQuery"),
+            LOG_TRACE(getLogger("executeQuery"),
                 "OpenTelemetry traceparent '{}'",
                 client_info.client_trace_context.composeTraceparentHeader());
         }
@@ -202,9 +202,9 @@ static void logException(ContextPtr context, QueryLogElement & elem, bool log_er
             elem.stack_trace);
 
     if (log_error)
-        LOG_ERROR(&Poco::Logger::get("executeQuery"), message);
+        LOG_ERROR(getLogger("executeQuery"), message);
     else
-        LOG_INFO(&Poco::Logger::get("executeQuery"), message);
+        LOG_INFO(getLogger("executeQuery"), message);
 }
 
 static void onExceptionBeforeStart(
@@ -566,7 +566,7 @@ static std::tuple<ASTPtr, BlockIO> executeQueryImpl(
 
         bool async_insert = false;
         auto * queue = context->getAsynchronousInsertQueue();
-        auto * logger = &Poco::Logger::get("executeQuery");
+        auto logger = getLogger("executeQuery");
 
         if (insert_query && settings.async_insert)
         {
@@ -969,7 +969,7 @@ static std::tuple<ASTPtr, BlockIO> executeQueryImpl(
                         double elapsed_seconds = static_cast<double>(info.elapsed_microseconds) / 1000000.0;
                         double rows_per_second = static_cast<double>(elem.read_rows) / elapsed_seconds;
                         LOG_DEBUG(
-                            &Poco::Logger::get("executeQuery"),
+                            getLogger("executeQuery"),
                             "Read {} rows, {} in {} sec., {} rows/sec., {}/sec.",
                             elem.read_rows,
                             ReadableSize(elem.read_bytes),

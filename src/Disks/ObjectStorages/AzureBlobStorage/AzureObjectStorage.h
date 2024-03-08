@@ -132,7 +132,7 @@ private:
     MultiVersion<Azure::Storage::Blobs::BlobContainerClient> client;
     MultiVersion<AzureObjectStorageSettings> settings;
 
-    Poco::Logger * log;
+    LoggerPtr log;
 
     DataSourceDescription data_source_description;
 };

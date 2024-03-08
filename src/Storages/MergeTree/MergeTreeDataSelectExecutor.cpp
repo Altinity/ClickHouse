@@ -72,7 +72,7 @@ namespace ErrorCodes
 
 
 MergeTreeDataSelectExecutor::MergeTreeDataSelectExecutor(const MergeTreeData & data_)
-    : data(data_), log(&Poco::Logger::get(data.getLogName() + " (SelectExecutor)"))
+    : data(data_), log(getLogger(data.getLogName() + " (SelectExecutor)"))
 {
 }
 
@@ -81,7 +81,7 @@ size_t MergeTreeDataSelectExecutor::getApproximateTotalRowsToRead(
     const StorageMetadataPtr & metadata_snapshot,
     const KeyCondition & key_condition,
     const Settings & settings,
-    Poco::Logger * log)
+    LoggerPtr log)
 {
     size_t rows_count = 0;
 
@@ -489,7 +489,7 @@ MergeTreeDataSelectSamplingData MergeTreeDataSelectExecutor::getSampling(
     const StorageMetadataPtr & metadata_snapshot,
     ContextPtr context,
     bool sample_factor_column_queried,
-    Poco::Logger * log)
+    LoggerPtr log)
 {
     const Settings & settings = context->getSettingsRef();
     /// Sampling.
@@ -800,7 +800,7 @@ void MergeTreeDataSelectExecutor::filterPartsByPartition(
     const SelectQueryInfo & query_info,
     const ContextPtr & context,
     const PartitionIdToMaxBlock * max_block_numbers_to_read,
-    Poco::Logger * log,
+    LoggerPtr log,
     ReadFromMergeTree::IndexStats & index_stats)
 {
     const Settings & settings = context->getSettingsRef();
@@ -891,7 +891,7 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
     const ContextPtr & context,
     const KeyCondition & key_condition,
     const MergeTreeReaderSettings & reader_settings,
-    Poco::Logger * log,
+    LoggerPtr log,
     size_t num_streams,
     ReadFromMergeTree::IndexStats & index_stats,
     bool use_skip_indexes)
@@ -1408,7 +1408,7 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
     const StorageMetadataPtr & metadata_snapshot,
     const KeyCondition & key_condition,
     const Settings & settings,
-    Poco::Logger * log)
+    LoggerPtr log)
 {
     MarkRanges res;
 
@@ -1613,7 +1613,7 @@ MarkRanges MergeTreeDataSelectExecutor::filterMarksUsingIndex(
     size_t & granules_dropped,
     MarkCache * mark_cache,
     UncompressedCache * uncompressed_cache,
-    Poco::Logger * log)
+    LoggerPtr log)
 {
     if (!index_helper->getDeserializedFormat(part->getDataPartStorage(), index_helper->getFileName()))
     {
@@ -1742,7 +1742,7 @@ MarkRanges MergeTreeDataSelectExecutor::filterMarksUsingMergedIndex(
     size_t & granules_dropped,
     MarkCache * mark_cache,
     UncompressedCache * uncompressed_cache,
-    Poco::Logger * log)
+    LoggerPtr log)
 {
     for (const auto & index_helper : indices)
     {
@@ -1895,7 +1895,7 @@ void MergeTreeDataSelectExecutor::selectPartsToReadWithUUIDFilter(
     const PartitionIdToMaxBlock * max_block_numbers_to_read,
     ContextPtr query_context,
     PartFilterCounters & counters,
-    Poco::Logger * log)
+    LoggerPtr log)
 {
     /// process_parts prepare parts that have to be read for the query,
     /// returns false if duplicated parts' UUID have been met

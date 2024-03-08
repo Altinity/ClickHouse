@@ -100,7 +100,7 @@ private:
 
     mutable std::mutex write_mutex;
 
-    Poco::Logger * log;
+    LoggerPtr log;
 };
 
 }

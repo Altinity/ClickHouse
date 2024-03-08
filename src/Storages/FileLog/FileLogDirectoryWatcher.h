@@ -66,7 +66,7 @@ private:
     /// accessed in thread created by dw.
     Events events;
 
-    Poco::Logger * log;
+    LoggerPtr log;
 
     std::mutex mutex;
 

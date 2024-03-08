@@ -28,7 +28,7 @@ MergeTreeWhereOptimizer::MergeTreeWhereOptimizer(
     const StorageMetadataPtr & metadata_snapshot,
     const Names & queried_columns_,
     const std::optional<NameSet> & supported_columns_,
-    Poco::Logger * log_)
+    LoggerPtr log_)
     : table_columns{collections::map<std::unordered_set>(
         metadata_snapshot->getColumns().getAllPhysical(), [](const NameAndTypePair & col) { return col.name; })}
     , queried_columns{queried_columns_}

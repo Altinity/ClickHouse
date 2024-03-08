@@ -45,7 +45,7 @@ namespace
     }
 
 
-    AccessEntityPtr tryReadEntityFile(const String & file_path, Poco::Logger & log)
+    AccessEntityPtr tryReadEntityFile(const String & file_path, LoggerPtr log)
     {
         try
         {
@@ -53,7 +53,7 @@ namespace
         }
         catch (...)
         {
-            tryLogCurrentException(&log);
+            tryLogCurrentException(log);
             return nullptr;
         }
     }
@@ -376,7 +376,7 @@ void DiskAccessStorage::reloadAllAndRebuildLists()
             continue;
 
         const auto access_entity_file_path = getEntityFilePath(directory_path, id);
-        auto entity = tryReadEntityFile(access_entity_file_path, *getLogger());
+        auto entity = tryReadEntityFile(access_entity_file_path, getLogger());
         if (!entity)
             continue;
 

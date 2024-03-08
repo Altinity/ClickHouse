@@ -115,13 +115,13 @@ std::shared_ptr<TSystemLog> createSystemLog(
 {
     if (!config.has(config_prefix))
     {
-        LOG_DEBUG(&Poco::Logger::get("SystemLog"),
+        LOG_DEBUG(getLogger("SystemLog"),
                 "Not creating {}.{} since corresponding section '{}' is missing from config",
                 default_database_name, default_table_name, config_prefix);
 
         return {};
     }
-    LOG_DEBUG(&Poco::Logger::get("SystemLog"),
+    LOG_DEBUG(getLogger("SystemLog"),
               "Creating {}.{} from {}", default_database_name, default_table_name, config_prefix);
 
     String database = config.getString(config_prefix + ".database", default_database_name);
@@ -130,7 +130,7 @@ std::shared_ptr<TSystemLog> createSystemLog(
     if (database != default_database_name)
     {
         /// System tables must be loaded before other tables, but loading order is undefined for all databases except `system`
-        LOG_ERROR(&Poco::Logger::get("SystemLog"), "Custom database name for a system table specified in config."
+        LOG_ERROR(getLogger("SystemLog"), "Custom database name for a system table specified in config."
             " Table `{}` will be created in `system` database instead of `{}`", table, database);
         database = default_database_name;
     }
@@ -310,7 +310,7 @@ SystemLog<LogElement>::SystemLog(
     , flush_interval_milliseconds(flush_interval_milliseconds_)
 {
     assert(database_name_ == DatabaseCatalog::SYSTEM_DATABASE);
-    log = &Poco::Logger::get("SystemLog (" + database_name_ + "." + table_name_ + ")");
+    log = getLogger("SystemLog (" + database_name_ + "." + table_name_ + ")");
 }
 
 template <typename LogElement>

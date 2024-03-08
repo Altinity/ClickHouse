@@ -13,6 +13,10 @@ namespace ErrorCodes
     extern const int SYNTAX_ERROR;
 }
 
+Macros::Macros(const Poco::Util::AbstractConfiguration & config, const String & key, LoggerPtr log)
+    : Macros(config, key, log.get())
+{}
+
 Macros::Macros(const Poco::Util::AbstractConfiguration & config, const String & root_key, Poco::Logger * log)
 {
     Poco::Util::AbstractConfiguration::Keys keys;

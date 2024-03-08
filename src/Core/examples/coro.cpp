@@ -176,7 +176,7 @@ int main()
     Poco::Logger::root().setChannel(app_channel);
     Poco::Logger::root().setLevel("trace");
 
-    LOG_INFO(&Poco::Logger::get(""), "Starting");
+    LOG_INFO(getLogger(""), "Starting");
 
     try
     {

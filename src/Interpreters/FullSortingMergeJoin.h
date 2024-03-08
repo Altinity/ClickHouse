@@ -24,7 +24,7 @@ public:
         : table_join(table_join_)
         , right_sample_block(right_sample_block_)
     {
-        LOG_TRACE(&Poco::Logger::get("FullSortingMergeJoin"), "Will use full sorting merge join");
+        LOG_TRACE(getLogger("FullSortingMergeJoin"), "Will use full sorting merge join");
     }
 
     const TableJoin & getTableJoin() const override { return *table_join; }

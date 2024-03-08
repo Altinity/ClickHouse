@@ -15,7 +15,7 @@ namespace ErrorCodes
 struct ZooKeeperRetriesInfo
 {
     ZooKeeperRetriesInfo() = default;
-    ZooKeeperRetriesInfo(std::string name_, Poco::Logger * logger_, UInt64 max_retries_, UInt64 initial_backoff_ms_, UInt64 max_backoff_ms_)
+    ZooKeeperRetriesInfo(std::string name_, LoggerPtr logger_, UInt64 max_retries_, UInt64 initial_backoff_ms_, UInt64 max_backoff_ms_)
         : name(std::move(name_))
         , logger(logger_)
         , max_retries(max_retries_)
@@ -25,7 +25,7 @@ struct ZooKeeperRetriesInfo
     }
 
     std::string name;
-    Poco::Logger * logger = nullptr;
+    LoggerPtr logger = nullptr;
     UInt64 max_retries = 0;
     UInt64 curr_backoff_ms = 0;
     UInt64 max_backoff_ms = 0;

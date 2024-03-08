@@ -45,7 +45,7 @@ struct ReplicatedMergeTreeSinkImpl<async_insert>::DelayedChunk
 {
     struct Partition
     {
-        Poco::Logger * log;
+        LoggerPtr log;
         MergeTreeDataWriter::TemporaryPart temp_part;
         UInt64 elapsed_ns;
         BlockIDsType block_id;
@@ -57,7 +57,7 @@ struct ReplicatedMergeTreeSinkImpl<async_insert>::DelayedChunk
         ProfileEvents::Counters part_counters;
 
         Partition() = default;
-        Partition(Poco::Logger * log_,
+        Partition(LoggerPtr log_,
                   MergeTreeDataWriter::TemporaryPart && temp_part_,
                   UInt64 elapsed_ns_,
                   BlockIDsType && block_id_,
@@ -207,7 +207,7 @@ std::vector<Int64> testSelfDeduplicate(std::vector<Int64> data, std::vector<size
     BlockWithPartition block1(std::move(block), Row(), std::move(offsets));
     ProfileEvents::Counters profile_counters;
     ReplicatedMergeTreeSinkImpl<true>::DelayedChunk::Partition part(
-        &Poco::Logger::get("testSelfDeduplicate"), MergeTreeDataWriter::TemporaryPart(), 0, std::move(hashes), std::move(block1), std::nullopt, std::move(profile_counters));
+        getLogger("testSelfDeduplicate"), MergeTreeDataWriter::TemporaryPart(), 0, std::move(hashes), std::move(block1), std::nullopt, std::move(profile_counters));
 
     part.filterSelfDuplicate();
 
@@ -280,7 +280,7 @@ ReplicatedMergeTreeSinkImpl<async_insert>::ReplicatedMergeTreeSinkImpl(
     , is_attach(is_attach_)
     , quorum_parallel(quorum_parallel_)
     , deduplicate(deduplicate_)
-    , log(&Poco::Logger::get(storage.getLogName() + " (Replicated OutputStream)"))
+    , log(getLogger(storage.getLogName() + " (Replicated OutputStream)"))
     , context(context_)
     , storage_snapshot(storage.getStorageSnapshotWithoutParts(metadata_snapshot))
 {

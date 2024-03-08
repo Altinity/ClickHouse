@@ -167,14 +167,14 @@ BackupCoordinationRemote::BackupCoordinationRemote(
 {
     zookeeper_retries_info = ZooKeeperRetriesInfo(
         "BackupCoordinationRemote",
-        &Poco::Logger::get("BackupCoordinationRemote"),
+        getLogger("BackupCoordinationRemote"),
         keeper_settings.keeper_max_retries,
         keeper_settings.keeper_retry_initial_backoff_ms,
         keeper_settings.keeper_retry_max_backoff_ms);
 
     createRootNodes();
     stage_sync.emplace(
-        zookeeper_path + "/stage", [this] { return getZooKeeper(); }, &Poco::Logger::get("BackupCoordination"));
+        zookeeper_path + "/stage", [this] { return getZooKeeper(); }, getLogger("BackupCoordination"));
 }
 
 BackupCoordinationRemote::~BackupCoordinationRemote()

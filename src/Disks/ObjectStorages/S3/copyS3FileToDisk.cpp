@@ -36,7 +36,7 @@ void copyS3FileToDisk(
     auto destination_data_source_description = destination_disk->getDataSourceDescription();
     if (destination_data_source_description != DataSourceDescription{DataSourceType::S3, s3_client->getInitialEndpoint(), false, false})
     {
-        LOG_TRACE(&Poco::Logger::get("copyS3FileToDisk"), "Copying {} to disk {} through buffers", src_key, destination_disk->getName());
+        LOG_TRACE(getLogger("copyS3FileToDisk"), "Copying {} to disk {} through buffers", src_key, destination_disk->getName());
         ReadBufferFromS3 read_buffer{s3_client, src_bucket, src_key, {}, request_settings, read_settings};
         if (*src_offset)
             read_buffer.seek(*src_offset, SEEK_SET);
@@ -46,7 +46,7 @@ void copyS3FileToDisk(
         return;
     }
 
-    LOG_TRACE(&Poco::Logger::get("copyS3FileToDisk"), "Copying {} to disk {} using native copy", src_key, destination_disk->getName());
+    LOG_TRACE(getLogger("copyS3FileToDisk"), "Copying {} to disk {} using native copy", src_key, destination_disk->getName());
 
     String dest_bucket = destination_disk->getObjectStorage()->getObjectsNamespace();
 

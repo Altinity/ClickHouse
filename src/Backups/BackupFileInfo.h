@@ -62,7 +62,7 @@ struct BackupFileInfo
 using BackupFileInfos = std::vector<BackupFileInfo>;
 
 /// Builds a BackupFileInfo for a specified backup entry.
-BackupFileInfo buildFileInfoForBackupEntry(const String & file_name, const BackupEntryPtr & backup_entry, const BackupPtr & base_backup, Poco::Logger * log);
+BackupFileInfo buildFileInfoForBackupEntry(const String & file_name, const BackupEntryPtr & backup_entry, const BackupPtr & base_backup, LoggerPtr log);
 
 /// Builds a vector of BackupFileInfos for specified backup entries.
 BackupFileInfos buildFileInfosForBackupEntries(const BackupEntries & backup_entries, const BackupPtr & base_backup, ThreadPool & thread_pool);

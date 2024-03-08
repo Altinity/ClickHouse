@@ -32,7 +32,7 @@ public:
         ThrottlerPtr throttler_,
         Scalars scalars_,
         Tables external_tables_,
-        Poco::Logger * log_,
+        LoggerPtr log_,
         UInt32 shard_count_,
         std::shared_ptr<const StorageLimitsList> storage_limits_);
 
@@ -53,7 +53,7 @@ private:
     Scalars scalars;
     Tables external_tables;
     std::shared_ptr<const StorageLimitsList> storage_limits;
-    Poco::Logger * log;
+    LoggerPtr log;
 
     UInt32 shard_count;
     void addLazyPipe(Pipes & pipes, const ClusterProxy::SelectStreamFactory::Shard & shard);
@@ -76,7 +76,7 @@ public:
         ThrottlerPtr throttler_,
         Scalars scalars_,
         Tables external_tables_,
-        Poco::Logger * log_,
+        LoggerPtr log_,
         std::shared_ptr<const StorageLimitsList> storage_limits_,
         UUID uuid);
 
@@ -103,7 +103,7 @@ private:
     Tables external_tables;
 
     std::shared_ptr<const StorageLimitsList> storage_limits;
-    Poco::Logger * log;
+    LoggerPtr log;
     UUID uuid;
 };
 

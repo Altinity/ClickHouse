@@ -256,7 +256,7 @@ void PocoHTTPClient::makeRequestInternal(
     Aws::Utils::RateLimits::RateLimiterInterface *,
     Aws::Utils::RateLimits::RateLimiterInterface *) const
 {
-    Poco::Logger * log = &Poco::Logger::get("AWSClient");
+    LoggerPtr log = getLogger("AWSClient");
 
     auto uri = request.GetUri().GetURIString();
     if (enable_s3_requests_logging)

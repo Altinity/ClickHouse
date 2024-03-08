@@ -92,7 +92,7 @@ private:
 
     static bool canStartFromCache(size_t current_offset, const FileSegment & file_segment);
 
-    Poco::Logger * log;
+    LoggerPtr log;
     FileCache::Key cache_key;
     String source_file_path;
 

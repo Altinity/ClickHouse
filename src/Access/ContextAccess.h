@@ -218,7 +218,7 @@ private:
     const AccessControl * access_control = nullptr;
     const Params params;
     bool is_full_access = false;
-    mutable Poco::Logger * trace_log = nullptr;
+    mutable LoggerPtr trace_log = nullptr;
     mutable UserPtr user;
     mutable String user_name;
     mutable bool user_was_dropped = false;

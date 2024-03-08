@@ -12,7 +12,7 @@ namespace fs = std::filesystem;
 
 namespace DB
 {
-BackupReaderFile::BackupReaderFile(const String & path_) : path(path_), log(&Poco::Logger::get("BackupReaderFile"))
+BackupReaderFile::BackupReaderFile(const String & path_) : path(path_), log(getLogger("BackupReaderFile"))
 {
 }
 

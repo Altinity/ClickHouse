@@ -187,7 +187,7 @@ protected:
     size_t min_marks_to_read = 0;
 
 private:
-    Poco::Logger * log = &Poco::Logger::get("MergeTreeBaseSelectProcessor");
+    LoggerPtr log = getLogger("MergeTreeBaseSelectProcessor");
 
     std::atomic<bool> is_cancelled{false};
 

@@ -6,7 +6,7 @@ namespace DB
 
 KeeperLogStore::KeeperLogStore(
     const std::string & changelogs_path, LogFileSettings log_file_settings)
-    : log(&Poco::Logger::get("KeeperLogStore"))
+    : log(getLogger("KeeperLogStore"))
     , changelog(changelogs_path, log, log_file_settings)
 {
     if (log_file_settings.force_sync)

@@ -130,7 +130,7 @@ private:
         return (static_cast<Int64>(upper_half) << 32) + lower_half;
     }
 
-    Poco::Logger * log;
+    LoggerPtr log;
     ContextPtr context;
     const std::string replication_slot_name, publication_name;
 

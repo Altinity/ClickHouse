@@ -31,7 +31,7 @@ private:
     std::shared_ptr<S3::Client> client;
     ReadSettings read_settings;
     S3Settings::RequestSettings request_settings;
-    Poco::Logger * log;
+    LoggerPtr log;
 };
 
 
@@ -78,7 +78,7 @@ private:
     std::shared_ptr<S3::Client> client;
     ReadSettings read_settings;
     S3Settings::RequestSettings request_settings;
-    Poco::Logger * log;
+    LoggerPtr log;
     std::optional<bool> supports_batch_delete;
 };
 

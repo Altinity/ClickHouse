@@ -360,7 +360,7 @@ namespace
                                 catch (const Poco::Exception & e)
                                 {
                                     LOG_TRACE(
-                                        &Poco::Logger::get("StorageURLSource"),
+                                        getLogger("StorageURLSource"),
                                         "HTTP HEAD request to `{}` failed at try {}/{}. "
                                         "Error: {}.",
                                         request_uri.toString(),
@@ -379,16 +379,16 @@ namespace
                                 || (res.has("Content-Range") && res.get("Content-Range").starts_with("bytes"));
 
                             if (supports_ranges)
-                                LOG_TRACE(&Poco::Logger::get("StorageURLSource"), "HTTP Range is supported");
+                                LOG_TRACE(getLogger("StorageURLSource"), "HTTP Range is supported");
                             else
-                                LOG_TRACE(&Poco::Logger::get("StorageURLSource"), "HTTP Range is not supported");
+                                LOG_TRACE(getLogger("StorageURLSource"), "HTTP Range is not supported");
 
 
                             if (supports_ranges && res.getStatus() == Poco::Net::HTTPResponse::HTTP_PARTIAL_CONTENT
                                 && res.hasContentLength())
                             {
                                 LOG_TRACE(
-                                    &Poco::Logger::get("StorageURLSource"),
+                                    getLogger("StorageURLSource"),
                                     "Using ParallelReadBuffer with {} workers with chunks of {} bytes",
                                     download_threads,
                                     settings.max_download_buffer_size);
@@ -422,14 +422,14 @@ namespace
                         catch (const Poco::Exception & e)
                         {
                             LOG_TRACE(
-                                &Poco::Logger::get("StorageURLSource"),
+                                getLogger("StorageURLSource"),
                                 "Failed to setup ParallelReadBuffer because of an exception:\n{}.\nFalling back to the single-threaded "
                                 "buffer",
                                 e.displayText());
                         }
                     }
 
-                    LOG_TRACE(&Poco::Logger::get("StorageURLSource"), "Using single-threaded read buffer");
+                    LOG_TRACE(getLogger("StorageURLSource"), "Using single-threaded read buffer");
 
                     return wrapReadBufferWithCompressionMethod(
                         std::make_unique<ReadWriteBufferFromHTTP>(
@@ -1008,7 +1008,7 @@ StorageURLWithFailover::StorageURLWithFailover(
     {
         Poco::URI poco_uri(uri_option);
         context_->getRemoteHostFilter().checkURL(poco_uri);
-        LOG_DEBUG(&Poco::Logger::get("StorageURLDistributed"), "Adding URL option: {}", uri_option);
+        LOG_DEBUG(getLogger("StorageURLDistributed"), "Adding URL option: {}", uri_option);
         uri_options.emplace_back(uri_option);
     }
 }

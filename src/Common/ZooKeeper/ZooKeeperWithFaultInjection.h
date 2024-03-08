@@ -46,7 +46,7 @@ class ZooKeeperWithFaultInjection
     zk::Ptr keeper_prev;
     std::unique_ptr<RandomFaultInjection> fault_policy;
     std::string name;
-    Poco::Logger * logger = nullptr;
+    LoggerPtr logger = nullptr;
     UInt64 calls_total = 0;
     UInt64 calls_without_fault_injection = 0;
     const UInt64 seed = 0;
@@ -58,7 +58,7 @@ class ZooKeeperWithFaultInjection
         double fault_injection_probability,
         UInt64 fault_injection_seed,
         std::string name_,
-        Poco::Logger * logger_)
+        LoggerPtr logger_)
         : keeper(keeper_), name(std::move(name_)), logger(logger_), seed(fault_injection_seed)
     {
         fault_policy = std::make_unique<RandomFaultInjection>(fault_injection_probability, fault_injection_seed);
@@ -76,7 +76,7 @@ public:
     using Ptr = std::shared_ptr<ZooKeeperWithFaultInjection>;
 
     static ZooKeeperWithFaultInjection::Ptr createInstance(
-        double fault_injection_probability, UInt64 fault_injection_seed, const zk::Ptr & zookeeper, std::string name, Poco::Logger * logger)
+        double fault_injection_probability, UInt64 fault_injection_seed, const zk::Ptr & zookeeper, std::string name, LoggerPtr logger)
     {
         /// validate all parameters here, constructor just accept everything
 

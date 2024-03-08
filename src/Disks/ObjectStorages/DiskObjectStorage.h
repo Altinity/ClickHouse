@@ -218,7 +218,7 @@ private:
     DiskTransactionPtr createObjectStorageTransaction();
 
     const String object_storage_root_path;
-    Poco::Logger * log;
+    LoggerPtr log;
 
     MetadataStoragePtr metadata_storage;
     ObjectStoragePtr object_storage;

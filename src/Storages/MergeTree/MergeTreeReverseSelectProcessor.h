@@ -37,7 +37,7 @@ private:
     /// Used for parallel replicas
     bool no_more_tasks{false};
 
-    Poco::Logger * log = &Poco::Logger::get("MergeTreeReverseSelectProcessor");
+    LoggerPtr log = getLogger("MergeTreeReverseSelectProcessor");
 };
 
 }

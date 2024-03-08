@@ -26,7 +26,7 @@ ProxyResolverConfiguration::ProxyResolverConfiguration(const Poco::URI & endpoin
 
 ClientConfigurationPerRequest ProxyResolverConfiguration::getConfiguration(const Aws::Http::HttpRequest &)
 {
-    LOG_DEBUG(&Poco::Logger::get("AWSClient"), "Obtain proxy using resolver: {}", endpoint.toString());
+    LOG_DEBUG(getLogger("AWSClient"), "Obtain proxy using resolver: {}", endpoint.toString());
 
     std::lock_guard lock(cache_mutex);
 
@@ -34,7 +34,7 @@ ClientConfigurationPerRequest ProxyResolverConfiguration::getConfiguration(const
 
     if (cache_ttl.count() && cache_valid && now <= cache_timestamp + cache_ttl && now >= cache_timestamp)
     {
-        LOG_DEBUG(&Poco::Logger::get("AWSClient"), "Use cached proxy: {}://{}:{}", Aws::Http::SchemeMapper::ToString(cached_config.proxy_scheme), cached_config.proxy_host, cached_config.proxy_port);
+        LOG_DEBUG(getLogger("AWSClient"), "Use cached proxy: {}://{}:{}", Aws::Http::SchemeMapper::ToString(cached_config.proxy_scheme), cached_config.proxy_host, cached_config.proxy_port);
         return cached_config;
     }
 
@@ -84,7 +84,7 @@ ClientConfigurationPerRequest ProxyResolverConfiguration::getConfiguration(const
         /// Read proxy host as string from response body.
         Poco::StreamCopier::copyToString(response_body_stream, proxy_host);
 
-        LOG_DEBUG(&Poco::Logger::get("AWSClient"), "Use proxy: {}://{}:{}", proxy_scheme, proxy_host, proxy_port);
+        LOG_DEBUG(getLogger("AWSClient"), "Use proxy: {}://{}:{}", proxy_scheme, proxy_host, proxy_port);
 
         cached_config.proxy_scheme = Aws::Http::SchemeMapper::FromString(proxy_scheme.c_str());
         cached_config.proxy_host = proxy_host;

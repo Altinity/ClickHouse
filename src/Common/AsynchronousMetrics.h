@@ -83,7 +83,7 @@ protected:
     bool first_run = true;
     TimePoint previous_update_time;
 
-    Poco::Logger * log;
+    LoggerPtr log;
 private:
     virtual void updateImpl(AsynchronousMetricValues & new_values, TimePoint update_time, TimePoint current_time) = 0;
     virtual void logImpl(AsynchronousMetricValues &) {}

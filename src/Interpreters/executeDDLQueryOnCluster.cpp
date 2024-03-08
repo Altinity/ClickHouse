@@ -212,7 +212,7 @@ private:
     String node_path;
     ContextPtr context;
     Stopwatch watch;
-    Poco::Logger * log;
+    LoggerPtr log;
 
     NameSet waiting_hosts;  /// hosts from task host list
     NameSet finished_hosts; /// finished hosts from host list
@@ -296,7 +296,7 @@ DDLQueryStatusSource::DDLQueryStatusSource(
     , node_path(zk_node_path)
     , context(context_)
     , watch(CLOCK_MONOTONIC_COARSE)
-    , log(&Poco::Logger::get("DDLQueryStatusSource"))
+    , log(getLogger("DDLQueryStatusSource"))
 {
     auto output_mode = context->getSettingsRef().distributed_ddl_output_mode;
     throw_on_timeout = output_mode == DistributedDDLOutputMode::THROW || output_mode == DistributedDDLOutputMode::NONE;

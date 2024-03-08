@@ -251,7 +251,7 @@ StorageKeeperMap::StorageKeeperMap(
     , primary_key(primary_key_)
     , zookeeper_name(zkutil::extractZooKeeperName(root_path_))
     , keys_limit(keys_limit_)
-    , log(&Poco::Logger::get(fmt::format("StorageKeeperMap ({})", table_id.getNameForLogs())))
+    , log(getLogger(fmt::format("StorageKeeperMap ({})", table_id.getNameForLogs())))
 {
     std::string path_prefix = context_->getConfigRef().getString("keeper_map_path_prefix", "");
     if (path_prefix.empty())

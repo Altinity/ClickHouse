@@ -46,7 +46,7 @@ namespace
         if (!response.sent())
             *response.send() << message << std::endl;
 
-        LOG_WARNING(&Poco::Logger::get("LibraryBridge"), fmt::runtime(message));
+        LOG_WARNING(getLogger("LibraryBridge"), fmt::runtime(message));
     }
 
     std::shared_ptr<Block> parseColumns(String && column_string)
@@ -91,7 +91,7 @@ static void writeData(Block data, OutputFormatPtr format)
 ExternalDictionaryLibraryBridgeRequestHandler::ExternalDictionaryLibraryBridgeRequestHandler(size_t keep_alive_timeout_, ContextPtr context_)
     : WithContext(context_)
     , keep_alive_timeout(keep_alive_timeout_)
-    , log(&Poco::Logger::get("ExternalDictionaryLibraryBridgeRequestHandler"))
+    , log(getLogger("ExternalDictionaryLibraryBridgeRequestHandler"))
 {
 }
 
@@ -379,7 +379,7 @@ void ExternalDictionaryLibraryBridgeRequestHandler::handleRequest(HTTPServerRequ
 ExternalDictionaryLibraryBridgeExistsHandler::ExternalDictionaryLibraryBridgeExistsHandler(size_t keep_alive_timeout_, ContextPtr context_)
     : WithContext(context_)
     , keep_alive_timeout(keep_alive_timeout_)
-    , log(&Poco::Logger::get("ExternalDictionaryLibraryBridgeExistsHandler"))
+    , log(getLogger("ExternalDictionaryLibraryBridgeExistsHandler"))
 {
 }
 
@@ -418,7 +418,7 @@ CatBoostLibraryBridgeRequestHandler::CatBoostLibraryBridgeRequestHandler(
     size_t keep_alive_timeout_, ContextPtr context_)
     : WithContext(context_)
     , keep_alive_timeout(keep_alive_timeout_)
-    , log(&Poco::Logger::get("CatBoostLibraryBridgeRequestHandler"))
+    , log(getLogger("CatBoostLibraryBridgeRequestHandler"))
 {
 }
 
@@ -616,7 +616,7 @@ void CatBoostLibraryBridgeRequestHandler::handleRequest(HTTPServerRequest & requ
 CatBoostLibraryBridgeExistsHandler::CatBoostLibraryBridgeExistsHandler(size_t keep_alive_timeout_, ContextPtr context_)
     : WithContext(context_)
     , keep_alive_timeout(keep_alive_timeout_)
-    , log(&Poco::Logger::get("CatBoostLibraryBridgeExistsHandler"))
+    , log(getLogger("CatBoostLibraryBridgeExistsHandler"))
 {
 }
 

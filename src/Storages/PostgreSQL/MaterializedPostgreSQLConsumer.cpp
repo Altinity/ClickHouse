@@ -34,7 +34,7 @@ MaterializedPostgreSQLConsumer::MaterializedPostgreSQLConsumer(
     bool schema_as_a_part_of_table_name_,
     StorageInfos storages_info_,
     const String & name_for_logger)
-    : log(&Poco::Logger::get("PostgreSQLReplicaConsumer(" + name_for_logger + ")"))
+    : log(getLogger("PostgreSQLReplicaConsumer(" + name_for_logger + ")"))
     , context(context_)
     , replication_slot_name(replication_slot_name_)
     , publication_name(publication_name_)
@@ -59,7 +59,7 @@ MaterializedPostgreSQLConsumer::StorageData::StorageData(const StorageInfo & sto
     : storage(storage_info.storage), buffer(storage_info.storage->getInMemoryMetadataPtr(), storage_info.attributes)
 {
     auto table_id = storage_info.storage->getStorageID();
-    LOG_TRACE(&Poco::Logger::get("StorageMaterializedPostgreSQL"),
+    LOG_TRACE(getLogger("StorageMaterializedPostgreSQL"),
               "New buffer for table {}, number of attributes: {}, number if columns: {}, structure: {}",
               table_id.getNameForLogs(), buffer.attributes.size(), buffer.getColumnsNum(), buffer.description.sample_block.dumpStructure());
 }

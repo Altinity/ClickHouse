@@ -93,7 +93,7 @@ private:
 
     std::optional<size_t> read_until_position;
 
-    Poco::Logger * log;
+    LoggerPtr log;
 
     struct LastPrefetchInfo
     {

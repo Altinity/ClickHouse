@@ -167,7 +167,7 @@ private:
     hs_database_t* origin_db;
     #endif
 
-    Poco::Logger * logger;
+    LoggerPtr logger;
 };
 
 }

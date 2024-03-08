@@ -129,7 +129,7 @@ private:
     int last_used_index = -1;
     bool fallback_to_stale_replicas;
     Epoll epoll;
-    Poco::Logger * log;
+    LoggerPtr log;
     std::string fail_messages;
 
     /// The maximum number of attempts to connect to replicas.

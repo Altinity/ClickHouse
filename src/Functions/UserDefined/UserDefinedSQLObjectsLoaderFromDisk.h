@@ -39,7 +39,7 @@ private:
 
     ContextPtr global_context;
     String dir_path;
-    Poco::Logger * log;
+    LoggerPtr log;
     std::atomic<bool> objects_loaded = false;
 };
 

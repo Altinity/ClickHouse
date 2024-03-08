@@ -10,7 +10,7 @@ namespace DB
 class BackupCoordinationStageSync
 {
 public:
-    BackupCoordinationStageSync(const String & zookeeper_path_, zkutil::GetZooKeeper get_zookeeper_, Poco::Logger * log_);
+    BackupCoordinationStageSync(const String & zookeeper_path_, zkutil::GetZooKeeper get_zookeeper_, LoggerPtr log_);
 
     /// Sets the stage of the current host and signal other hosts if there were other hosts waiting for that.
     void set(const String & current_host, const String & new_stage, const String & message);
@@ -33,7 +33,7 @@ private:
 
     String zookeeper_path;
     zkutil::GetZooKeeper get_zookeeper;
-    Poco::Logger * log;
+    LoggerPtr log;
 };
 
 }

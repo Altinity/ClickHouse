@@ -144,7 +144,7 @@ private:
 
     bool writing_finalized = false;
     bool deduplicate_files = true;
-    const Poco::Logger * log;
+    const LoggerPtr log;
 };
 
 }

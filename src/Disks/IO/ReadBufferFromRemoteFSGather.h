@@ -76,7 +76,7 @@ private:
 
     String query_id;
 
-    Poco::Logger * log;
+    LoggerPtr log;
 
     SeekableReadBufferPtr current_buf;
 

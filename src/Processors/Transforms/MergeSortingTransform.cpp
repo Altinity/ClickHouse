@@ -29,7 +29,7 @@ namespace DB
 class BufferingToFileTransform : public IAccumulatingTransform
 {
 public:
-    BufferingToFileTransform(const Block & header, TemporaryFileStream & tmp_stream_, Poco::Logger * log_)
+    BufferingToFileTransform(const Block & header, TemporaryFileStream & tmp_stream_, LoggerPtr log_)
         : IAccumulatingTransform(header, header)
         , tmp_stream(tmp_stream_)
         , log(log_)
@@ -72,7 +72,7 @@ public:
 private:
     TemporaryFileStream & tmp_stream;
 
-    Poco::Logger * log;
+    LoggerPtr log;
 };
 
 MergeSortingTransform::MergeSortingTransform(

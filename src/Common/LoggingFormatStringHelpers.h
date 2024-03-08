@@ -7,6 +7,8 @@
 #include <Poco/Logger.h>
 #include <Poco/Message.h>
 
+#include <Common/Logger.h>
+
 struct PreformattedMessage;
 consteval void formatStringCheckArgsNumImpl(std::string_view str, size_t nargs);
 template <typename T> constexpr std::string_view tryGetStaticFormatString(T && x);
@@ -173,10 +175,10 @@ class LogFrequencyLimiterIml
     static time_t last_cleanup;
     static std::mutex mutex;
 
-    Poco::Logger * logger;
+    LoggerPtr logger;
     time_t min_interval_s;
 public:
-    LogFrequencyLimiterIml(Poco::Logger * logger_, time_t min_interval_s_) : logger(logger_), min_interval_s(min_interval_s_) {}
+    LogFrequencyLimiterIml(LoggerPtr logger_, time_t min_interval_s_) : logger(logger_), min_interval_s(min_interval_s_) {}
 
     LogFrequencyLimiterIml & operator -> () { return *this; }
     bool is(Poco::Message::Priority priority) { return logger->is(priority); }
@@ -188,18 +190,18 @@ public:
     /// Clears messages that were logged last time more than too_old_threshold_s seconds ago
     static void cleanup(time_t too_old_threshold_s = 600);
 
-    Poco::Logger * getLogger() { return logger; }
+    LoggerPtr getLogger() { return logger; }
 };
 
 /// This wrapper is useful to save formatted message into a String before sending it to a logger
 class LogToStrImpl
 {
     String & out_str;
-    Poco::Logger * logger;
+    LoggerPtr logger;
     std::unique_ptr<LogFrequencyLimiterIml> maybe_nested;
     bool propagate_to_actual_log = true;
 public:
-    LogToStrImpl(String & out_str_, Poco::Logger * logger_) : out_str(out_str_), logger(logger_) {}
+    LogToStrImpl(String & out_str_, LoggerPtr logger_) : out_str(out_str_), logger(logger_) {}
     LogToStrImpl(String & out_str_, std::unique_ptr<LogFrequencyLimiterIml> && maybe_nested_)
         : out_str(out_str_), logger(maybe_nested_->getLogger()), maybe_nested(std::move(maybe_nested_)) {}
     LogToStrImpl & operator -> () { return *this; }

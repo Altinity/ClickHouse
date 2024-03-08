@@ -31,7 +31,7 @@ DeflateQplJobHWPool::DeflateQplJobHWPool()
     : random_engine(std::random_device()())
     , distribution(0, MAX_HW_JOB_NUMBER - 1)
 {
-    Poco::Logger * log = &Poco::Logger::get("DeflateQplJobHWPool");
+    LoggerPtr log = getLogger("DeflateQplJobHWPool");
     UInt32 job_size = 0;
     const char * qpl_version = qpl_get_library_version();
 
@@ -117,7 +117,7 @@ void DeflateQplJobHWPool::unLockJob(UInt32 index)
 
 //HardwareCodecDeflateQpl
 HardwareCodecDeflateQpl::HardwareCodecDeflateQpl()
-    :log(&Poco::Logger::get("HardwareCodecDeflateQpl"))
+    :log(getLogger("HardwareCodecDeflateQpl"))
 {
 }
 

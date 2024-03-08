@@ -54,7 +54,7 @@ std::shared_ptr<S3::ProxyResolverConfiguration> getProxyResolverConfiguration(
     auto proxy_port = proxy_resolver_config.getUInt(prefix + ".proxy_port");
     auto cache_ttl = proxy_resolver_config.getUInt(prefix + ".proxy_cache_time", 10);
 
-    LOG_DEBUG(&Poco::Logger::get("DiskS3"), "Configured proxy resolver: {}, Scheme: {}, Port: {}",
+    LOG_DEBUG(getLogger("DiskS3"), "Configured proxy resolver: {}, Scheme: {}, Port: {}",
         endpoint.toString(), proxy_scheme, proxy_port);
 
     return std::make_shared<S3::ProxyResolverConfiguration>(endpoint, proxy_scheme, proxy_port, cache_ttl);
@@ -79,7 +79,7 @@ std::shared_ptr<S3::ProxyListConfiguration> getProxyListConfiguration(
 
             proxies.push_back(proxy_uri);
 
-            LOG_DEBUG(&Poco::Logger::get("DiskS3"), "Configured proxy: {}", proxy_uri.toString());
+            LOG_DEBUG(getLogger("DiskS3"), "Configured proxy: {}", proxy_uri.toString());
         }
 
     if (!proxies.empty())

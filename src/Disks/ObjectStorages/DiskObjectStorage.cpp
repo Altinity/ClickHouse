@@ -121,7 +121,7 @@ DiskObjectStorage::DiskObjectStorage(
     uint64_t thread_pool_size_)
     : IDisk(name_, getAsyncExecutor(log_name, thread_pool_size_))
     , object_storage_root_path(object_storage_root_path_)
-    , log (&Poco::Logger::get("DiskObjectStorage(" + log_name + ")"))
+    , log (getLogger("DiskObjectStorage(" + log_name + ")"))
     , metadata_storage(std::move(metadata_storage_))
     , object_storage(std::move(object_storage_))
     , send_metadata(send_metadata_)

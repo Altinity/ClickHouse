@@ -39,7 +39,7 @@ public:
         const StorageMetadataPtr & metadata_snapshot,
         const Names & queried_columns_,
         const std::optional<NameSet> & supported_columns_,
-        Poco::Logger * log_);
+        LoggerPtr log_);
 
     void optimize(SelectQueryInfo & select_query_info, const ContextPtr & context) const;
 
@@ -141,7 +141,7 @@ private:
     const Names queried_columns;
     const std::optional<NameSet> supported_columns;
     const NameSet sorting_key_names;
-    Poco::Logger * log;
+    LoggerPtr log;
     std::unordered_map<std::string, UInt64> column_sizes;
     UInt64 total_size_of_queried_columns = 0;
 };

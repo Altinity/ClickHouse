@@ -33,7 +33,7 @@ public:
 private:
     MeiliSearchConfiguration config;
 
-    Poco::Logger * log;
+    LoggerPtr log;
 };
 
 }

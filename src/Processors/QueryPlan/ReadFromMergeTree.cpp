@@ -181,7 +181,7 @@ ReadFromMergeTree::ReadFromMergeTree(
     size_t num_streams_,
     bool sample_factor_column_queried_,
     std::shared_ptr<PartitionIdToMaxBlock> max_block_numbers_to_read_,
-    Poco::Logger * log_,
+    LoggerPtr log_,
     MergeTreeDataSelectAnalysisResultPtr analyzed_result_ptr_,
     bool enable_parallel_reading)
     : SourceStepWithFilter(DataStream{.header = IMergeTreeSelectAlgorithm::transformHeader(
@@ -426,7 +426,7 @@ Pipe ReadFromMergeTree::readFromPool(
             false);
     }
 
-    auto * logger = &Poco::Logger::get(data.getLogName() + " (SelectExecutor)");
+    auto logger = getLogger(data.getLogName() + " (SelectExecutor)");
     LOG_DEBUG(logger, "Reading approx. {} rows with {} streams", total_rows, max_streams);
 
     for (size_t i = 0; i < max_streams; ++i)
@@ -1158,7 +1158,7 @@ MergeTreeDataSelectAnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
     const MergeTreeData & data,
     const Names & real_column_names,
     bool sample_factor_column_queried,
-    Poco::Logger * log)
+    LoggerPtr log)
 {
     const auto & settings = context->getSettingsRef();
     if (settings.allow_experimental_analyzer || settings.query_plan_optimize_primary_key)
@@ -1236,7 +1236,7 @@ MergeTreeDataSelectAnalysisResultPtr ReadFromMergeTree::selectRangesToReadImpl(
     const MergeTreeData & data,
     const Names & real_column_names,
     bool sample_factor_column_queried,
-    Poco::Logger * log)
+    LoggerPtr log)
 {
     AnalysisResult result;
     const auto & settings = context->getSettingsRef();

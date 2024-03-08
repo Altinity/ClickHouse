@@ -24,7 +24,7 @@ namespace ErrorCodes
 }
 
 LocalObjectStorage::LocalObjectStorage()
-    : log(&Poco::Logger::get("LocalObjectStorage"))
+    : log(getLogger("LocalObjectStorage"))
 {
     data_source_description.type = DataSourceType::Local;
     if (auto block_device_id = tryGetBlockDeviceId("/"); block_device_id.has_value())

@@ -350,7 +350,7 @@ DatabasePtr DatabaseFactory::getImpl(const ASTCreateQuery & create, const String
                 else
                 {
                     use_table_cache = safeGetLiteralValue<UInt8>(engine_args[4], engine_name);
-                    LOG_WARNING(&Poco::Logger::get("DatabaseFactory"), "A deprecated syntax of PostgreSQL database engine is used");
+                    LOG_WARNING(getLogger("DatabaseFactory"), "A deprecated syntax of PostgreSQL database engine is used");
                     is_deprecated_syntax = true;
                 }
             }

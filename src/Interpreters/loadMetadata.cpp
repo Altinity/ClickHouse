@@ -160,7 +160,7 @@ static void checkIncompleteOrdinaryToAtomicConversion(ContextPtr context, const 
 
 void loadMetadata(ContextMutablePtr context, const String & default_database_name)
 {
-    Poco::Logger * log = &Poco::Logger::get("loadMetadata");
+    LoggerPtr log = getLogger("loadMetadata");
 
     String path = context->getPath() + "metadata";
 
@@ -267,7 +267,7 @@ static void loadSystemDatabaseImpl(ContextMutablePtr context, const String & dat
     }
 }
 
-static void convertOrdinaryDatabaseToAtomic(Poco::Logger * log, ContextMutablePtr context, const DatabasePtr & database,
+static void convertOrdinaryDatabaseToAtomic(LoggerPtr log, ContextMutablePtr context, const DatabasePtr & database,
                                             const String & name, const String tmp_name)
 {
     /// It's kind of C++ script that creates temporary database with Atomic engine,
@@ -346,7 +346,7 @@ static void convertOrdinaryDatabaseToAtomic(Poco::Logger * log, ContextMutablePt
 /// Can be called only during server startup when there are no queries from users.
 static void maybeConvertOrdinaryDatabaseToAtomic(ContextMutablePtr context, const String & database_name, bool tables_started)
 {
-    Poco::Logger * log = &Poco::Logger::get("loadMetadata");
+    LoggerPtr log = getLogger("loadMetadata");
 
     auto database = DatabaseCatalog::instance().getDatabase(database_name);
     if (!database)
@@ -456,14 +456,14 @@ void convertDatabasesEnginesIfNeed(ContextMutablePtr context)
     if (!fs::exists(convert_flag_path))
         return;
 
-    LOG_INFO(&Poco::Logger::get("loadMetadata"), "Found convert_ordinary_to_atomic file in flags directory, "
+    LOG_INFO(getLogger("loadMetadata"), "Found convert_ordinary_to_atomic file in flags directory, "
                                                  "will try to convert all Ordinary databases to Atomic");
 
     for (const auto & [name, _] : DatabaseCatalog::instance().getDatabases())
         if (name != DatabaseCatalog::SYSTEM_DATABASE)
             maybeConvertOrdinaryDatabaseToAtomic(context, name, /* tables_started */ true);
 
-    LOG_INFO(&Poco::Logger::get("loadMetadata"), "Conversion finished, removing convert_ordinary_to_atomic flag");
+    LOG_INFO(getLogger("loadMetadata"), "Conversion finished, removing convert_ordinary_to_atomic flag");
     fs::remove(convert_flag_path);
 }
 

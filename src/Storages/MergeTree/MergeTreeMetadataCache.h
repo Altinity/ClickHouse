@@ -3,6 +3,7 @@
 #include "config.h"
 
 #if USE_ROCKSDB
+#include <Common/Logger.h>
 #include <base/types.h>
 #include <Core/Types.h>
 #include <Poco/Logger.h>
@@ -36,7 +37,7 @@ public:
     void shutdown();
 private:
     std::unique_ptr<rocksdb::DB> rocksdb;
-    Poco::Logger * log = &Poco::Logger::get("MergeTreeMetadataCache");
+    LoggerPtr log = getLogger("MergeTreeMetadataCache");
 };
 
 using MergeTreeMetadataCachePtr = std::shared_ptr<MergeTreeMetadataCache>;

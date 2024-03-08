@@ -46,7 +46,7 @@ private:
     BackgroundSchedulePool::TaskHolder task;
 
     const String log_name;
-    Poco::Logger * log;
+    LoggerPtr log;
 };
 
 using AsyncBlockIDsCachePtr = std::shared_ptr<AsyncBlockIDsCache>;

@@ -86,7 +86,7 @@ public:
     bool isRemote() const override { return false; }
 
 private:
-    Poco::Logger * log;
+    LoggerPtr log;
     DataSourceDescription data_source_description;
 };
 

@@ -27,7 +27,7 @@ ReadBufferFromRemoteFSGather::ReadBufferFromRemoteFSGather(
     , blobs_to_read(blobs_to_read_)
     , settings(settings_)
     , query_id(CurrentThread::isInitialized() && CurrentThread::get().getQueryContext() != nullptr ? CurrentThread::getQueryId() : "")
-    , log(&Poco::Logger::get("ReadBufferFromRemoteFSGather"))
+    , log(getLogger("ReadBufferFromRemoteFSGather"))
     , enable_cache_log(!query_id.empty() && settings.enable_filesystem_cache_log)
 {
     if (blobs_to_read.empty())

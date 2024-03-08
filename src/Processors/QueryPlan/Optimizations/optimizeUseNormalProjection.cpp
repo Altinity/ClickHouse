@@ -112,7 +112,7 @@ bool optimizeUseNormalProjections(Stack & stack, QueryPlan::Nodes & nodes)
         if (query.dag)
         {
             query.dag->removeUnusedActions();
-            // LOG_TRACE(&Poco::Logger::get("optimizeUseProjections"), "Query DAG: {}", query.dag->dumpDAG());
+            // LOG_TRACE(getLogger("optimizeUseProjections"), "Query DAG: {}", query.dag->dumpDAG());
         }
     }
 
@@ -128,7 +128,7 @@ bool optimizeUseNormalProjections(Stack & stack, QueryPlan::Nodes & nodes)
     auto ordinary_reading_select_result = reading->selectRangesToRead(parts);
     size_t ordinary_reading_marks = ordinary_reading_select_result->marks();
 
-    // LOG_TRACE(&Poco::Logger::get("optimizeUseProjections"),
+    // LOG_TRACE(getLogger("optimizeUseProjections"),
     //           "Marks for ordinary reading {}", ordinary_reading_marks);
 
     std::shared_ptr<PartitionIdToMaxBlock> max_added_blocks = getMaxAddedBlocks(reading);
@@ -152,7 +152,7 @@ bool optimizeUseNormalProjections(Stack & stack, QueryPlan::Nodes & nodes)
         if (!analyzed)
             continue;
 
-        // LOG_TRACE(&Poco::Logger::get("optimizeUseProjections"),
+        // LOG_TRACE(getLogger("optimizeUseProjections"),
         //           "Marks for projection {} {}", projection->name ,candidate.sum_marks);
 
         if (candidate.sum_marks >= ordinary_reading_marks)
@@ -173,7 +173,7 @@ bool optimizeUseNormalProjections(Stack & stack, QueryPlan::Nodes & nodes)
         storage_snapshot->storage, storage_snapshot->metadata, storage_snapshot->object_columns); //, storage_snapshot->data);
     proj_snapshot->addProjection(best_candidate->projection);
 
-    // LOG_TRACE(&Poco::Logger::get("optimizeUseProjections"), "Proj snapshot {}",
+    // LOG_TRACE(getLogger("optimizeUseProjections"), "Proj snapshot {}",
     //           proj_snapshot->getColumns(GetColumnsOptions::Kind::All).toString());
 
     auto query_info_copy = query_info;
@@ -201,7 +201,7 @@ bool optimizeUseNormalProjections(Stack & stack, QueryPlan::Nodes & nodes)
     if (has_ordinary_parts)
         reading->setAnalyzedResult(std::move(best_candidate->merge_tree_ordinary_select_result_ptr));
 
-    // LOG_TRACE(&Poco::Logger::get("optimizeUseProjections"), "Projection reading header {}",
+    // LOG_TRACE(getLogger("optimizeUseProjections"), "Projection reading header {}",
     //           projection_reading->getOutputStream().header.dumpStructure());
 
     projection_reading->setStepDescription(best_candidate->projection->name);

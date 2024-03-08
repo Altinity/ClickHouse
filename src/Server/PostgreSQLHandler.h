@@ -39,7 +39,7 @@ public:
     void run() final;
 
 private:
-    Poco::Logger * log = &Poco::Logger::get("PostgreSQLHandler");
+    LoggerPtr log = getLogger("PostgreSQLHandler");
 
     IServer & server;
     TCPServer & tcp_server;

@@ -62,7 +62,7 @@ private:
         data_source_description.is_cached = false;
         data_source_description.is_encrypted = false;
 
-        log = &Poco::Logger::get(logger_name);
+        log = getLogger(logger_name);
     }
 
 public:
@@ -175,7 +175,7 @@ private:
 
     const String version_id;
 
-    Poco::Logger * log;
+    LoggerPtr log;
     DataSourceDescription data_source_description;
 };
 

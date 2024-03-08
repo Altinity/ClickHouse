@@ -21,7 +21,7 @@ public:
 
 private:
     std::filesystem::path path;
-    Poco::Logger * log;
+    LoggerPtr log;
 };
 
 class BackupWriterFile : public IBackupWriter

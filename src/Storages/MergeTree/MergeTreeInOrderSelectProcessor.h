@@ -26,7 +26,7 @@ private:
     bool getNewTaskImpl() override;
     void finalizeNewTask() override {}
 
-    Poco::Logger * log = &Poco::Logger::get("MergeTreeInOrderSelectProcessor");
+    LoggerPtr log = getLogger("MergeTreeInOrderSelectProcessor");
 };
 
 }

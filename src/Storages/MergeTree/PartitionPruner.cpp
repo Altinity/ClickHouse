@@ -54,7 +54,7 @@ bool PartitionPruner::canBePruned(const IMergeTreeDataPart & part)
         {
             WriteBufferFromOwnString buf;
             part.partition.serializeText(part.storage, buf, FormatSettings{});
-            LOG_TRACE(&Poco::Logger::get("PartitionPruner"), "Partition {} gets pruned", buf.str());
+            LOG_TRACE(getLogger("PartitionPruner"), "Partition {} gets pruned", buf.str());
         }
     }
 

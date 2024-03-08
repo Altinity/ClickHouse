@@ -197,7 +197,7 @@ private:
 
     const DictionaryLifetime dict_lifetime;
 
-    Poco::Logger * log;
+    LoggerPtr log;
 
     const bool allow_read_expired_keys;
 

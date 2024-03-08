@@ -87,7 +87,7 @@ namespace ErrorCodes
 
 template <typename ProfilerImpl>
 QueryProfilerBase<ProfilerImpl>::QueryProfilerBase(UInt64 thread_id, int clock_type, UInt32 period, int pause_signal_)
-    : log(&Poco::Logger::get("QueryProfiler"))
+    : log(getLogger("QueryProfiler"))
     , pause_signal(pause_signal_)
 {
 #if defined(SANITIZER)
