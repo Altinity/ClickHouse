@@ -3,6 +3,7 @@ ARG FROM_TAG=latest
 FROM altinityinfra/test-util:$FROM_TAG as cctools
 # The cctools are built always from the altinityinfra/test-util:latest and cached inline
 # Theoretically, it should improve rebuild speed significantly
+
 ENV CC=clang-${LLVM_VERSION}
 ENV CXX=clang++-${LLVM_VERSION}
 # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -40,6 +41,22 @@ RUN git clone https://github.com/tpoechtrager/cctools-port.git \
 FROM altinityinfra/test-util:$FROM_TAG
 ENV CC=clang-${LLVM_VERSION}
 ENV CXX=clang++-${LLVM_VERSION}
+
+# Install Docker, required for docker-in-docker build of BoringSSL in FIPS mode.
+ENV DOCKER_CHANNEL stable
+RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add - \
+    && add-apt-repository "deb https://download.docker.com/linux/ubuntu $(lsb_release -c -s) ${DOCKER_CHANNEL}" \
+    && apt-get update \
+    && env DEBIAN_FRONTEND=noninteractive apt-get install --yes \
+        docker-ce \
+    && rm -rf \
+        /var/lib/apt/lists/* \
+        /var/cache/debconf \
+        /tmp/* \
+    && apt-get clean
+
+RUN dockerd --version; docker --version
+
 
 # Rust toolchain and libraries
 ENV RUSTUP_HOME=/rust/rustup
@@ -104,9 +121,9 @@ RUN curl -Lo /usr/bin/clang-tidy-cache \
     && chmod +x /usr/bin/clang-tidy-cache
 
 COPY --from=cctools /cctools /cctools
-
 RUN mkdir /workdir && chmod 777 /workdir
 WORKDIR /workdir
-
 COPY build.sh /
+COPY daemon.json /etc/docker/
+
 CMD ["bash", "-c", "/build.sh 2>&1"]

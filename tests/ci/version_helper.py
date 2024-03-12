@@ -31,6 +31,7 @@ SET(VERSION_PATCH {patch})
 SET(VERSION_GITHASH {githash})
 SET(VERSION_DESCRIBE {describe})
 SET(VERSION_STRING {string})
+SET(VERSION_FLAVOUR {flavour})
 # end of autochange
 """
 
@@ -151,6 +152,7 @@ class ClickHouseVersion:
             "githash": self.githash,
             "describe": self.describe,
             "string": self.string,
+            "flavour": self._flavour
         }
 
     def as_tuple(self) -> Tuple[int, int, int, int]:
@@ -193,11 +195,12 @@ class VersionType:
     PRESTABLE = "prestable"
     STABLE = "altinitystable"
     TESTING = "testing"
-    VALID = (TESTING, PRESTABLE, STABLE, LTS)
+    FIPS = "altinityfips"
+    VALID = (TESTING, PRESTABLE, STABLE, LTS, FIPS)
 
 
 def validate_version(version: str) -> None:
-    # NOTE(vnemkov): minor but imporant fixes, so versions with 'flavour' are threated as valid (e.g. 22.8.8.4.altinitystable)
+    # NOTE(vnemkov): minor but important fixes, so versions with 'flavour' are threated as valid (e.g. 22.8.8.4.altinitystable)
     parts = version.split(".")
     if len(parts) < 4:
         raise ValueError(f"{version} does not contain 4 parts")

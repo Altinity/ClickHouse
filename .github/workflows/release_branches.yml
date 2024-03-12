@@ -140,7 +140,7 @@ jobs:
       timeout_minutes: 180
       runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-app-docker-ce
       additional_envs: |
-        CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
+        CLICKHOUSE_STABLE_VERSION_SUFFIX=altinityfips
 
   BuilderDebAarch64:
     needs: [DockerHubPush]
@@ -152,7 +152,7 @@ jobs:
       timeout_minutes: 180
       runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-app-docker-ce
       additional_envs: |
-        CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
+        CLICKHOUSE_STABLE_VERSION_SUFFIX=altinityfips
 
   BuilderDebAsan:
     needs: [DockerHubPush]
@@ -177,7 +177,7 @@ jobs:
       runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-app-docker-ce
       additional_envs: |
         CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
-        
+
   BuilderDebTsan:
     needs: [DockerHubPush]
     uses: ./.github/workflows/reusable_build.yml
@@ -353,7 +353,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
-        
+
   FunctionalStatelessTestTsan:
     needs: [BuilderDebTsan]
     uses: ./.github/workflows/reusable_test.yml
@@ -367,7 +367,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
-        
+
   FunctionalStatelessTestUBsan:
     needs: [BuilderDebUBsan]
     uses: ./.github/workflows/reusable_test.yml
@@ -381,7 +381,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
-        
+
   FunctionalStatelessTestMsan:
     needs: [BuilderDebMsan]
     uses: ./.github/workflows/reusable_test.yml
@@ -395,7 +395,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
-        
+
   FunctionalStatelessTestDebug:
     needs: [BuilderDebDebug]
     uses: ./.github/workflows/reusable_test.yml
@@ -451,7 +451,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
-        
+
   FunctionalStatefulTestTsan:
     needs: [BuilderDebTsan]
     uses: ./.github/workflows/reusable_test.yml
@@ -464,7 +464,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
-        
+
   FunctionalStatefulTestMsan:
     needs: [BuilderDebMsan]
     uses: ./.github/workflows/reusable_test.yml
@@ -477,7 +477,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
-        
+
   FunctionalStatefulTestUBsan:
     needs: [BuilderDebUBsan]
     uses: ./.github/workflows/reusable_test.yml
@@ -490,7 +490,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
-        
+
   FunctionalStatefulTestDebug:
     needs: [BuilderDebDebug]
     uses: ./.github/workflows/reusable_test.yml
@@ -503,7 +503,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
-        
+
 ##############################################################################################
 ######################################### STRESS TESTS #######################################
 ##############################################################################################
@@ -517,7 +517,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 stress_check.py "$CHECK_NAME"
-        
+
   StressTestTsan:
     needs: [BuilderDebTsan]
     uses: ./.github/workflows/reusable_test.yml
@@ -528,7 +528,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 stress_check.py "$CHECK_NAME"
-        
+
   StressTestMsan:
     needs: [BuilderDebMsan]
     uses: ./.github/workflows/reusable_test.yml
@@ -539,7 +539,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 stress_check.py "$CHECK_NAME"
-        
+
   StressTestUBsan:
     needs: [BuilderDebUBsan]
     uses: ./.github/workflows/reusable_test.yml
@@ -550,7 +550,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 stress_check.py "$CHECK_NAME"
-        
+
   StressTestDebug:
     needs: [BuilderDebDebug]
     uses: ./.github/workflows/reusable_test.yml
@@ -577,7 +577,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 integration_test_check.py "$CHECK_NAME"
-        
+
   IntegrationTestsAnalyzerAsan:
     needs: [BuilderDebAsan]
     uses: ./.github/workflows/reusable_test.yml
@@ -590,7 +590,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 integration_test_check.py "$CHECK_NAME"
-        
+
   IntegrationTestsTsan:
     needs: [BuilderDebTsan]
     uses: ./.github/workflows/reusable_test.yml
@@ -627,7 +627,7 @@ jobs:
     with:
       runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-app-docker-ce, altinity-setup-regression
       commit: 6da94b78dc53cb8965ab56c04a89ebf54ed04cbc
-      arch: release 
+      arch: release
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'release' && github.sha }}
 
   RegressionTestsAarch64:

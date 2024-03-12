@@ -70,6 +70,7 @@ def get_packager_cmd(
     cmd = (
         f"cd {packager_path} && CMAKE_FLAGS='{cmake_flags}' ./packager "
         f"--output-dir={output_path} --package-type={package_type} --compiler={comp}"
+        f" --fips --as-root"
     )
 
     if build_config.debug_build:
@@ -257,7 +258,12 @@ def main():
 
 
     official_flag = True
-    version._flavour = version_type = CLICKHOUSE_STABLE_VERSION_SUFFIX
+    # Do not override version flavour, so it must be set in one place only
+    if (len(CLICKHOUSE_STABLE_VERSION_SUFFIX)):
+        version._flavour = version_type = CLICKHOUSE_STABLE_VERSION_SUFFIX
+    else:
+        version_type = version._flavour
+
     # TODO (vnemkov): right now we'll use simplified version management:
     # only update git hash and explicitly set stable version suffix.
     # official_flag = pr_info.number == 0
@@ -350,8 +356,10 @@ def main():
 
     print(f"::notice ::Log URL: {log_url}")
 
-    src_path = os.path.join(TEMP_PATH, "build_source.src.tar.gz")
-   
+    src_path = temp_path / "build_source.src.tar.gz"
+    s3_path = s3_path_prefix + "/clickhouse-" + version.string + ".src.tar.gz"
+    logging.info("s3_path %s", s3_path)
+
     if os.path.exists(src_path):
         src_url = s3_helper.upload_build_file_to_s3(
             Path(src_path), s3_path_prefix + "/clickhouse-" + version.string + ".src.tar.gz"
@@ -361,7 +369,7 @@ def main():
         logging.info("Source tar doesn't exist")
 
     print(f"::notice ::Source tar URL: {src_url}")
-    
+
     build_result = BuildResult(
         build_name,
         log_url,
