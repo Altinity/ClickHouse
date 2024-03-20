@@ -222,7 +222,8 @@ def build_and_push_one_image(
 
     cache_from = (
         f"--cache-from type=registry,ref={image.repo}:{version_string} "
-        f"--cache-from type=registry,ref={image.repo}:latest"
+        f"--cache-from type=registry,ref={image.repo}:latest "
+        f"--cache-from type=local"
     )
     for tag in additional_cache:
         assert tag
@@ -237,6 +238,7 @@ def build_and_push_one_image(
         f"--tag {image.repo}:{version_string} "
         f"{cache_from} "
         f"--cache-to type=inline,mode=max "
+        f"--cache-to type=local,mode=max "
             # FIXME: many tests utilize packages without specifying version, hence docker pulls :latest
             # this will fail multiple jobs are going to be executed on different machines and
             # push different images as latest.
