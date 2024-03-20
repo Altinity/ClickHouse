@@ -456,6 +456,7 @@ def main():
             time.sleep(15)
         test_results += result
         result_images[image.repo] = result_version
+        logging.info(f"Stopwatch after {str(image)} {str(stopwatch)}")
 
     logging.info(f"Stopwatch after image rebuild {str(stopwatch)}")
     
