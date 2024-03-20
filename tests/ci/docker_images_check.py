@@ -436,6 +436,8 @@ def main():
         logging.info("Use %s as additional cache tag", pr_info.merged_pr)
         additional_cache.append(str(pr_info.merged_pr))
 
+    logging.info(f"Stopwatch before image rebuild {str(stopwatch)}")
+    
     for image in changed_images:
         # If we are in backport PR, then pr_info.release_pr is defined
         # We use it as tag to reduce rebuilding time
@@ -455,11 +457,15 @@ def main():
         test_results += result
         result_images[image.repo] = result_version
 
+    logging.info(f"Stopwatch after image rebuild {str(stopwatch)}")
+    
     if changed_images:
         description = "Updated " + ",".join([im.repo for im in changed_images])
     else:
         description = "Nothing to update"
 
+    logging.info(f"Stopwatch after image save {str(stopwatch)}")
+    
     description = format_description(description)
 
     with open(changed_json, "w", encoding="utf-8") as images_file:
