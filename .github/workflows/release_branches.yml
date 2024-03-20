@@ -58,14 +58,17 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE/tests/ci"
           python3 docker_images_check.py --suffix amd64
+
+      - name: Images check Rerun - local cache
+        run: |
+          cd "$GITHUB_WORKSPACE/tests/ci"
+          python3 docker_images_check.py --suffix amd64
+        
       - name: Upload images files to artifacts
         uses: actions/upload-artifact@v3
         with:
           name: changed_images_amd64
           path: ${{ runner.temp }}/docker_images_check/changed_images_amd64.json
-
-      - name: Sleep
-        run: sleep 3600
 
 #   DockerHubPush:
 #     needs: [DockerHubPushAmd64, DockerHubPushAarch64]
