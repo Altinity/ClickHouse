@@ -53,6 +53,8 @@ jobs:
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
           clear-repository: true
+          
+      - run: buildx create --use 
 
       - name: Images check
         run: |
