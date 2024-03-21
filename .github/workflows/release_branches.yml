@@ -54,6 +54,8 @@ jobs:
         with:
           clear-repository: true
 
+      - run: docker buildx create --use
+
       - name: Images check
         run: |
           cd "$GITHUB_WORKSPACE/tests/ci"
