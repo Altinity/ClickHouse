@@ -237,7 +237,6 @@ def build_and_push_one_image(
         f"--build-arg CACHE_INVALIDATOR={GITHUB_RUN_URL} "
         f"--tag {image.repo}:{version_string} "
         f"{cache_from} "
-        f"--cache-to type=inline,mode=max "
         f"--cache-to type=local,mode=max "
             # FIXME: many tests utilize packages without specifying version, hence docker pulls :latest
             # this will fail multiple jobs are going to be executed on different machines and
