@@ -34,6 +34,9 @@ jobs:
   DockerHubPushAarch64:
     runs-on: [self-hosted, style-checker, on-demand, type-cax41, in-fsn1, image-arm-app-docker-ce]
     steps:
+      - name: sanity
+        run: wget https://api.nuget.org/v3/index.json
+    
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
