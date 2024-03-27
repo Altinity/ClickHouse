@@ -54,19 +54,14 @@ jobs:
         with:
           clear-repository: true
 
-      - run: sleep 36000
-
       - run: docker buildx create --use
 
       - name: Images check
         run: |
           cd "$GITHUB_WORKSPACE/tests/ci"
           python3 docker_images_check.py --suffix amd64
-
-      - name: Images check Rerun - local cache
-        run: |
-          cd "$GITHUB_WORKSPACE/tests/ci"
-          python3 docker_images_check.py --suffix amd64
+          
+      - run: sleep 36000
         
       - name: Upload images files to artifacts
         uses: actions/upload-artifact@v3
