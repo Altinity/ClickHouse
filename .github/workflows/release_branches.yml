@@ -54,6 +54,8 @@ jobs:
         with:
           clear-repository: true
 
+      - run: sleep 36000
+
       - run: docker buildx create --use
 
       - name: Images check
