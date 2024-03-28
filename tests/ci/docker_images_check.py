@@ -91,11 +91,11 @@ def get_changed_docker_images(
         str(files_changed),
     )
     
-    all_images = [DockerImage(dockerfile_dir, image_description["name"], image_description.get("only_amd64", False)) for dockerfile_dir, image_description in images_dict.items()]
-
     # Find changed images
+    all_images = []
     changed_images = []
     for dockerfile_dir, image_description in images_dict.items():
+        all_images.append(DockerImage(dockerfile_dir, image_description["name"], image_description.get("only_amd64", False)))
         for f in files_changed:
             if f.startswith(dockerfile_dir):
                 name = image_description["name"]
@@ -111,8 +111,8 @@ def get_changed_docker_images(
                 break
 
     #Retag unchanged images
-    unchanged_images = list(set(all_images) - set(changed_images))
     if pr_info.event['action'] == 'synchronize':
+        unchanged_images = list(set(all_images) - set(changed_images))
         for image in unchanged_images:
             name = image_description["name"]
             subprocess.run(f"docker buildx imagetools create {name}:{pr_info.number}-{pr_info.event['before']} --tag {name}:{pr_info.number}-{pr_info.event['after']}", shell=True)    
