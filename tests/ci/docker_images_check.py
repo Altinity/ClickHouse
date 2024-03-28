@@ -116,7 +116,7 @@ def get_changed_docker_images(
         for image in unchanged_images:
             name = image_description["name"]
             # Check that the previous commit image exists
-            if subprocess.run(f"docker manifest inspect {name}:{pr_info.number}-{pr_info.event['before']}"):
+            if subprocess.run(f"docker manifest inspect {name}:{pr_info.number}-{pr_info.event['before']}", shell=True):
                 subprocess.run(f"docker buildx imagetools create {name}:{pr_info.number}-{pr_info.event['before']} --tag {name}:{pr_info.number}-{pr_info.event['after']}", shell=True)
             # Rebuild image if the previous image does not exist
             else:
