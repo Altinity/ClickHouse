@@ -251,7 +251,7 @@ def main():
     # e.g. `binary_darwin_aarch64/clickhouse` for `binary_darwin`
     check_for_success_run(s3_helper, f"{s3_path_prefix}/", build_name, version)
 
-    docker_image = get_image_with_version(IMAGES_PATH, IMAGE_NAME)
+    docker_image = get_image_with_version(IMAGES_PATH, IMAGE_NAME, version=f"{pr_info.number}-{pr_info.sha}")
     image_version = docker_image.version
 
     logging.info("Got version from repo %s", version.string)
