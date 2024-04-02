@@ -1,7 +1,7 @@
 List of Altinity contributions to ClickHouse server to date:
 
 ## 2024   
-          * Fix incorrect CI error message	[62139](https://github.com/ClickHouse/ClickHouse/pull/62139)	by @arthurpassos
+	  * Fix incorrect CI error message	[62139](https://github.com/ClickHouse/ClickHouse/pull/62139)	by @arthurpassos
 	  * Crash in Engine Merge if Row Policy does not have expression	[61971](https://github.com/ClickHouse/ClickHouse/pull/61971)	by @ilejn
 	  * Update storing-data.md	[62094](https://github.com/ClickHouse/ClickHouse/pull/62094)	by @filimonov
 	  * Reset part level upon attach from disk on MergeTree	[61536](https://github.com/ClickHouse/ClickHouse/pull/61536)	by @arthurpassos
