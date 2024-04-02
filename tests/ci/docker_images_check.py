@@ -436,7 +436,6 @@ def main():
     images_dict = get_images_dict(Path(REPO_COPY), IMAGES_FILE_PATH)
 
     pr_info = PRInfo()
-    print(pr_info.event)
     if args.all:
         pr_info.changed_files = set(images_dict.keys())
     elif args.image_path:
