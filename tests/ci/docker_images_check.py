@@ -109,22 +109,21 @@ def get_changed_docker_images(
                 )
                 changed_images.append(DockerImage(dockerfile_dir, name, only_amd64))
                 break
-
-    # Retag unchanged images
-    if pr_info.event['action'] == 'synchronize':
-        unchanged_images = list(set(all_images) - set(changed_images))
-        for image in unchanged_images:
-            name = image_description["name"]
-            # Check that the previous commit image exists
-            if subprocess.run(f"docker manifest inspect {name}:{pr_info.number}-{pr_info.event['before']}", shell=True).returncode == 0:
-                subprocess.run(f"docker buildx imagetools create {name}:{pr_info.number}-{pr_info.event['before']} --tag {name}:{pr_info.number}-{pr_info.event['after']}", shell=True)
-            # Rebuild image if the previous image does not exist
-            else:
-                changed_images.append(image)
     
     # Rebuild all on opened PR
-    elif pr_info.event['action'] == 'opened':
+    if pr_info.event['action'] == 'opened':
         changed_images = all_images
+
+    # Check that image for the PR exists
+    elif pr_info.event['action'] == 'synchronize':
+        unchanged_images = [
+            image for image in all_image_names if image not in changed_images
+        ]
+        logging.info(f"Unchanged images: {unchanged_images}")  
+        for image in unchanged_images:
+            name = image_description["name"]
+            if subprocess.run(f"docker manifest inspect {name}:{pr_info.number}-latest", shell=True).returncode != 0:
+                changed_images.append(image)
     
     # The order is important: dependents should go later than bases, so that
     # they are built with updated base versions.
