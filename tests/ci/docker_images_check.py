@@ -117,7 +117,7 @@ def get_changed_docker_images(
     # Check that image for the PR exists
     elif pr_info.event['action'] == 'synchronize':
         unchanged_images = [
-            image for image in all_image_names if image not in changed_images
+            image for image in all_images if image not in changed_images
         ]
         logging.info(f"Unchanged images: {unchanged_images}")  
         for image in unchanged_images:
