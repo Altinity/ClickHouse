@@ -622,4 +622,3 @@ List of pull requests contributed by Altinity develoeprs to ClickHouse server. I
 
 ## 2018
   * Added support of int-based types: Int\UInt(8,16,32), Date, DateTime f…	[3123](https://github.com/ClickHouse/ClickHouse/pull/3123)	by @Enmk
-☁
