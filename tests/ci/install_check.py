@@ -290,7 +290,7 @@ def main():
             sys.exit(0)
 
     docker_images = {
-        name: get_image_with_version(REPORTS_PATH, name, args.download)
+        name: get_image_with_version(REPORTS_PATH, name, args.download, pr_info.number)
         for name in (RPM_IMAGE, DEB_IMAGE)
     }
     prepare_test_scripts()
