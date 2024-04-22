@@ -12,12 +12,13 @@ from ci_config import CI_CONFIG, BuildConfig
 from ccache_utils import CargoCache
 from docker_pull_helper import get_image_with_version
 from env_helper import (
-    CACHES_PATH,
     GITHUB_JOB_API_URL,
     IMAGES_PATH,
     REPO_COPY,
+    S3_ACCESS_KEY_ID,
     S3_BUILDS_BUCKET,
     S3_DOWNLOAD,
+    S3_SECRET_ACCESS_KEY,
     TEMP_PATH,
     CLICKHOUSE_STABLE_VERSION_SUFFIX,
 )
@@ -38,8 +39,6 @@ from clickhouse_helper import (
     get_instance_type,
 )
 from stopwatch import Stopwatch
-from ccache_utils import get_ccache_if_not_exists, upload_ccache
-
 
 IMAGE_NAME = "altinityinfra/binary-builder"
 BUILD_LOG_NAME = "build_log.log"
@@ -62,7 +61,6 @@ def get_packager_cmd(
     cargo_cache_dir: Path,
     build_version: str,
     image_version: str,
-    ccache_path: str,
     official: bool,
 ) -> str:
     package_type = build_config.package_type
@@ -80,12 +78,12 @@ def get_packager_cmd(
     if build_config.tidy:
         cmd += " --clang-tidy"
 
-    # NOTE(vnemkov): we are going to continue to use ccache for now
-    cmd += " --cache=ccache"
-    cmd += f" --ccache-dir={ccache_path}"
+    cmd += " --cache=sccache"
     cmd += " --s3-rw-access"
     cmd += f" --s3-bucket={S3_BUILDS_BUCKET}"
     cmd += f" --cargo-cache-dir={cargo_cache_dir}"
+    cmd += f" --s3-access-key-id={S3_ACCESS_KEY_ID}"
+    cmd += f" --s3-secret-access-key={S3_SECRET_ACCESS_KEY}"
 
     if build_config.additional_pkgs:
         cmd += " --additional-pkgs"
@@ -278,24 +276,6 @@ def main():
     )
     cargo_cache.download()
 
-    # NOTE(vnemkov): since we still want to use CCACHE over SCCACHE, unlike upstream,
-    # we need to create local directory for that, just as with 22.8
-    ccache_path = Path(CACHES_PATH, build_name + "_ccache")
-
-    logging.info("Will try to fetch cache for our build")
-    try:
-        get_ccache_if_not_exists(
-            ccache_path, s3_helper, pr_info.number, temp_path, pr_info.release_pr
-        )
-    except Exception as e:
-        # In case there are issues with ccache, remove the path and do not fail a build
-        logging.info("Failed to get ccache, building without it. Error: %s", e)
-        rmtree(ccache_path, ignore_errors=True)
-
-    if not ccache_path.exists():
-        logging.info("cache was not fetched, will create empty dir")
-        ccache_path.mkdir(parents=True)
-
     packager_cmd = get_packager_cmd(
         build_config,
         repo_path / "docker" / "packager",
@@ -303,7 +283,6 @@ def main():
         cargo_cache.directory,
         version.string,
         image_version,
-        ccache_path,
         official_flag,
     )
 
@@ -320,7 +299,6 @@ def main():
     subprocess.check_call(
         f"sudo chown -R ubuntu:ubuntu {build_output_path}", shell=True
     )
-    subprocess.check_call(f"sudo chown -R ubuntu:ubuntu {ccache_path}", shell=True)
     logging.info("Build finished as %s, log path %s", build_status, log_path)
     if build_status == SUCCESS:
         cargo_cache.upload()
@@ -333,10 +311,6 @@ def main():
                 "The dockerd looks down, won't upload anything and generate report"
             )
             sys.exit(1)
-
-    # Upload the ccache first to have the least build time in case of problems
-    logging.info("Will upload cache")
-    upload_ccache(ccache_path, s3_helper, pr_info.number, temp_path)
 
     # FIXME performance
     performance_urls = []
@@ -491,7 +465,7 @@ FORMAT JSONCompactEachRow"""
         log_url,
         f"Build ({build_name})",
     )
-    ch_helper.insert_events_into(db="default", table="checks", events=prepared_events)
+    ch_helper.insert_events_into(db="gh-data", table="checks", events=prepared_events)
 
     # Fail the build job if it didn't succeed
     if build_status != SUCCESS:

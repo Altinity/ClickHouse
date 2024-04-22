@@ -7,6 +7,7 @@ from s3_helper import S3Helper
 from pr_info import PRInfo
 from build_download_helper import download_builds_filter
 import hashlib
+from pathlib import Path
 
 GPG_BINARY_SIGNING_KEY = os.getenv("GPG_BINARY_SIGNING_KEY")
 GPG_BINARY_SIGNING_PASSPHRASE = os.getenv("GPG_BINARY_SIGNING_PASSPHRASE")
@@ -57,9 +58,9 @@ def main():
 
     s3_helper = S3Helper()
 
-    s3_path_prefix = f"{pr_info.number}/{pr_info.sha}/" + CHECK_NAME.lower().replace(
+    s3_path_prefix = Path(f"{pr_info.number}/{pr_info.sha}/" + CHECK_NAME.lower().replace(
         " ", "_"
-    ).replace("(", "_").replace(")", "_").replace(",", "_")
+    ).replace("(", "_").replace(")", "_").replace(",", "_"))
 
     # downloads `package_release` artifacts generated
     download_builds_filter(CHECK_NAME, reports_path, TEMP_PATH)
@@ -68,8 +69,8 @@ def main():
         full_path = os.path.join(TEMP_PATH, f)
         hashed_file_path = hash_file(full_path)
         signed_file_path = sign_file(hashed_file_path)
-        s3_path = f'{s3_path_prefix}/{os.path.basename(signed_file_path)}'
-        s3_helper.upload_build_file_to_s3(signed_file_path, s3_path)
+        s3_path = s3_path_prefix / os.path.basename(signed_file_path)
+        s3_helper.upload_build_file_to_s3(Path(signed_file_path), str(s3_path))
         print(f'Uploaded file {signed_file_path} to {s3_path}')
 
     # Signed hashes are:
