@@ -674,13 +674,11 @@ class ClickhouseIntegrationTestsRunner:
             info_path = os.path.join(repo_path, "tests/integration", info_basename)
 
             test_cmd = " ".join([shlex.quote(test) for test in sorted(test_names)])
+
             parallel_cmd = (
-                " --parallel {} ".format(num_workers) if (num_workers > 0 or i > 0) else ""
+                # Make second and later re-runs non-parallel
+                " --parallel {} ".format(num_workers) if (i != 0) else ""
             )
-            # For each re-run reduce number of workers,
-            # to improve chances of tests passing.
-            if num_workers and num_workers > 0:
-                num_workers = max(1, num_workers // 2)
 
             # -r -- show extra test summary:
             # -f -- (f)ailed
