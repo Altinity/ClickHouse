@@ -3010,33 +3010,31 @@ class ClickHouseCluster:
 
     def collect_logs(self):
         """
-        Get logs of recently exited containers from this project
+        Get logs of recently exited containers from this project, this grabs more data
+        than `docker-compose log`, providing better insigts about container's run.
+
+        This is something similar to:
+
         for i in $(docker ps --filter="status=exited" --filter="status=restarting"  --format "{{.ID}}") ;
         do
-            echo '==================================================================================';
-            docker ps -a --filter "id=$i" --format '{{.Names}} ' | tail -n1;
-            echo '==================================================================================';
-            docker logs $i;
-            echo; echo;
+            docker logs $i > container_$i.log;
         done
         """
-        logging.debug("!!! Starting collecting logs")
         # docker ps -a --filter='label=com.docker.compose.project=X' --format "{{.ID}}\t{{.Names}}"
         field_separator_re = re.compile('\s+')
         out = subprocess.check_output(
                 [
                     'docker', 'ps',
                     '-a',
-                    # '--filter=', f'label=com.docker.compose.project={self.project_name}',
+                    '--filter', f'label=com.docker.compose.project={self.project_name}',
                     '--format={{.ID}}\\t{{.Names}}'
                 ],encoding='utf-8', universal_newlines=True
             )
-        logging.debug("Project containers output: %s", out)
         project_containers = [
             field_separator_re.split(x) for x in out.splitlines()
         ]
 
-        logging.debug("Project containers: %d", len(project_containers))
+        logging.debug("Found %d project containers", len(project_containers))
 
         for container_id, container_name in project_containers:
             log_file_name = p.join(self.instances_dir, '' + container_name + '.docker_container.log')
@@ -3060,7 +3058,7 @@ class ClickHouseCluster:
                     stdout=output,
                     stderr=subprocess.STDOUT)
 
-                logging.debug("Container %s log collection into %s, ret code: %d", container_name, log_file_name, ret_code)
+            logging.debug("Container %s log collection ret code: %d", container_name, ret_code)
 
 
     def shutdown(self, kill=True, ignore_fatal=True):
