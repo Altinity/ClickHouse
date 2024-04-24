@@ -10,6 +10,7 @@ cluster = ClickHouseCluster(__file__)
 node1 = cluster.add_instance(
     "node1",
     main_configs=["configs/logs_config.xml"],
+    user_configs=["configs/user_overrides.xml"],
     with_zookeeper=True,
     macros={"shard": 0, "replica": 1},
 )
@@ -17,6 +18,7 @@ node1 = cluster.add_instance(
 node2 = cluster.add_instance(
     "node2",
     main_configs=["configs/logs_config.xml"],
+    user_configs=["configs/user_overrides.xml"],
     with_zookeeper=True,
     macros={"shard": 0, "replica": 2},
 )
@@ -183,15 +185,20 @@ def test_mutation_simple(started_cluster, replicated):
             starting_block, starting_block, starting_block + 1
         )
 
-        # ALTER will sleep for 3s * 3 (rows) = 9s
+        # ALTER will sleep for 9s
         def alter():
             node1.query(
-                f"ALTER TABLE {name} UPDATE a = 42 WHERE sleep(9) = 0",
+                f"ALTER TABLE {name} UPDATE a = 42 WHERE ignore(sleep(9)) == 0",
                 settings=settings,
             )
 
         t = threading.Thread(target=alter)
         t.start()
+
+        node1.query(
+                f"SYSTEM START MERGES {name}",
+                settings=settings,
+            )
 
         # Wait for the mutation to actually start
         assert_eq_with_retry(
