@@ -2977,11 +2977,8 @@ class ClickHouseCluster:
                 )
 
             clickhouse_start_cmd = self.base_cmd + ["up", "-d", "--no-recreate"]
-            logging.debug(
-                (
-                    "Trying to create ClickHouse instance by command %s",
-                    " ".join(map(str, clickhouse_start_cmd)),
-                )
+            logging.debug("Trying to create ClickHouse instance by command %s",
+                " ".join(map(str, clickhouse_start_cmd))
             )
             self.up_called = True
             run_and_check(clickhouse_start_cmd)
@@ -3011,9 +3008,70 @@ class ClickHouseCluster:
             self.shutdown()
             raise
 
+    def collect_logs(self):
+        """
+        Get logs of recently exited containers from this project, this grabs more data
+        than `docker-compose log`, providing better insigts about container's run.
+
+        This is something similar to:
+
+        for i in $(docker ps --filter="status=exited" --filter="status=restarting"  --format "{{.ID}}") ;
+        do
+            docker logs $i > container_$i.log;
+        done
+        """
+        # docker ps -a --filter='label=com.docker.compose.project=X' --format "{{.ID}}\t{{.Names}}"
+        field_separator_re = re.compile('\s+')
+        out = subprocess.check_output(
+                [
+                    'docker', 'ps',
+                    '-a',
+                    '--filter', f'label=com.docker.compose.project={self.project_name}',
+                    '--format={{.ID}}\\t{{.Names}}'
+                ],encoding='utf-8', universal_newlines=True
+            )
+        project_containers = [
+            field_separator_re.split(x) for x in out.splitlines()
+        ]
+
+        logging.debug("Found %d project containers", len(project_containers))
+
+        for container_id, container_name in project_containers:
+            log_file_name = p.join(self.instances_dir, '' + container_name + '.docker_container.log')
+            logging.debug("Collecting docker container %s logs into %s", container_name, log_file_name)
+
+            with open(log_file_name, 'wt') as output:
+
+                output.write("docker inspect:\n")
+                output.flush()
+
+                subprocess.call(
+                    ['docker', 'inspect', container_id],
+                    stdout=output,
+                    stderr=subprocess.STDOUT)
+
+                output.write("docker logs:\n")
+                output.flush()
+
+                ret_code = subprocess.call(
+                    ['docker', 'logs', container_id],
+                    stdout=output,
+                    stderr=subprocess.STDOUT)
+
+            logging.debug("Container %s log collection ret code: %d", container_name, ret_code)
+
+
     def shutdown(self, kill=True, ignore_fatal=True):
         sanitizer_assert_instance = None
         fatal_log = None
+
+        try:
+            if self.up_called:
+                self.collect_logs()
+        except Exception as e:
+            logging.debug(
+                "Failed collecting containers logs during shutdown. %s:\n%s", repr(e), traceback.format_exc()
+            )
 
         if self.up_called:
             with open(self.docker_logs_path, "w+") as f:
@@ -3690,7 +3748,7 @@ class ClickHouseInstance:
         r = requester.request(method, url, data=data, auth=auth, timeout=timeout)
         # Force encoding to UTF-8
         r.encoding = "UTF-8"
-        
+
         if r.ok:
             return (r.content if content else r.text, None)
 
