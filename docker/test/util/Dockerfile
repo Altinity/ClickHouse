@@ -107,4 +107,5 @@ RUN arch=${TARGETARCH:-amd64} \
   && mv "/tmp/sccache-$SCCACHE_VERSION-$rarch-unknown-linux-musl/sccache" /usr/bin \
   && rm "/tmp/sccache-$SCCACHE_VERSION-$rarch-unknown-linux-musl" -r
 
+
 COPY process_functional_tests_result.py /
