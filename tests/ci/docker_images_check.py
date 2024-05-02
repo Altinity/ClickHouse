@@ -90,7 +90,7 @@ def get_changed_docker_images(
         pr_info.sha,
         str(files_changed),
     )
-    
+
     # Find changed images
     all_images = []
     changed_images = []
@@ -109,9 +109,9 @@ def get_changed_docker_images(
                 )
                 changed_images.append(DockerImage(dockerfile_dir, name, only_amd64))
                 break
-    
-    # Rebuild all on opened PR
-    if pr_info.event['action'] == 'opened':
+
+    # Rebuild all on opened PR or during release
+    if pr_info.event['action'] in ['opened', 'reopened', 'published', 'prereleased']:
         changed_images = all_images
 
     # Check that image for the PR exists
@@ -119,11 +119,11 @@ def get_changed_docker_images(
         unchanged_images = [
             image for image in all_images if image not in changed_images
         ]
-        logging.info(f"Unchanged images: {unchanged_images}")  
+        logging.info(f"Unchanged images: {unchanged_images}")
         for image in unchanged_images:
             if subprocess.run(f"docker manifest inspect {image.repo}:{pr_info.number}", shell=True).returncode != 0:
                 changed_images.append(image)
-    
+
     # The order is important: dependents should go later than bases, so that
     # they are built with updated base versions.
     index = 0

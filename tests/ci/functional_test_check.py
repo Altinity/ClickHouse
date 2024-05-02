@@ -303,7 +303,13 @@ def main():
             sys.exit(0)
 
     image_name = get_image_name(check_name)
-    docker_image = get_image_with_version(reports_path, image_name, version=pr_info.number)
+
+    if pr_info.event['action'] in ['published', 'prereleased']:
+        docker_version = pr_info.number + "-" + pr_info.sha
+    else:
+        docker_version = pr_info.number
+
+    docker_image = get_image_with_version(reports_path, image_name, version=docker_version)
 
     packages_path = temp_path / "packages"
     packages_path.mkdir(parents=True, exist_ok=True)

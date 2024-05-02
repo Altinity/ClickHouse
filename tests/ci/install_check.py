@@ -289,8 +289,13 @@ def main():
             )
             sys.exit(0)
 
+    if pr_info.event['action'] in ['published', 'prereleased']:
+        docker_version = pr_info.number + "-" + pr_info.sha
+    else:
+        docker_version = pr_info.number
+
     docker_images = {
-        name: get_image_with_version(REPORTS_PATH, name, args.download, pr_info.number)
+        name: get_image_with_version(REPORTS_PATH, name, args.download, docker_version)
         for name in (RPM_IMAGE, DEB_IMAGE)
     }
     prepare_test_scripts()

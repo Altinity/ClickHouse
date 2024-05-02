@@ -219,7 +219,12 @@ def main():
     #     logging.info("Check is already finished according to github status, exiting")
     #     sys.exit(0)
 
-    images = get_images_with_versions(reports_path, IMAGES, version=pr_info.number)
+    if pr_info.event['action'] in ['published', 'prereleased']:
+        docker_version = pr_info.number + "-" + pr_info.sha
+    else:
+        docker_version = pr_info.number
+
+    images = get_images_with_versions(reports_path, IMAGES, version=docker_version)
     result_path = temp_path / "output_dir"
     result_path.mkdir(parents=True, exist_ok=True)
 
