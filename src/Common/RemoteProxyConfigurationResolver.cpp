@@ -42,11 +42,11 @@ std::string RemoteProxyHostFetcherImpl::fetch(const Poco::URI & endpoint, const 
 RemoteProxyConfigurationResolver::RemoteProxyConfigurationResolver(
     const RemoteServerConfiguration & remote_server_configuration_,
     Protocol request_protocol_,
-    std::shared_ptr<RemoteProxyHostFetcher> fetcher_,
-    bool disable_tunneling_for_https_requests_over_http_proxy_
+    bool disable_tunneling_for_https_requests_over_http_proxy_,
+    const std::string & no_proxy_hosts_
 )
 : ProxyConfigurationResolver(request_protocol_, disable_tunneling_for_https_requests_over_http_proxy_),
-    remote_server_configuration(remote_server_configuration_), fetcher(fetcher_)
+    remote_server_configuration(remote_server_configuration_), no_proxy_hosts(no_proxy_hosts_)
 {
 }
 
@@ -98,7 +98,39 @@ ProxyConfiguration RemoteProxyConfigurationResolver::resolve()
     cache_timestamp = std::chrono::system_clock::now();
     cache_valid = true;
 
-    return cached_config;
+        Poco::Net::HTTPResponse response;
+        auto & response_body_stream = session->receiveResponse(response);
+
+        if (response.getStatus() != Poco::Net::HTTPResponse::HTTP_OK)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Proxy resolver returned not OK status: {}", response.getReason());
+
+        String proxy_host;
+        /// Read proxy host as string from response body.
+        Poco::StreamCopier::copyToString(response_body_stream, proxy_host);
+
+        LOG_DEBUG(logger, "Use proxy: {}://{}:{}", proxy_protocol, proxy_host, proxy_port);
+
+        bool use_tunneling_for_https_requests_over_http_proxy = useTunneling(
+            request_protocol,
+            cached_config.protocol,
+            disable_tunneling_for_https_requests_over_http_proxy);
+
+        cached_config.protocol = ProxyConfiguration::protocolFromString(proxy_protocol);
+        cached_config.host = proxy_host;
+        cached_config.port = proxy_port;
+        cached_config.tunneling = use_tunneling_for_https_requests_over_http_proxy;
+        cached_config.original_request_protocol = request_protocol;
+        cached_config.no_proxy_hosts = no_proxy_hosts;
+        cache_timestamp = std::chrono::system_clock::now();
+        cache_valid = true;
+
+        return cached_config;
+    }
+    catch (...)
+    {
+        tryLogCurrentException("RemoteProxyConfigurationResolver", "Failed to obtain proxy");
+        return {};
+    }
 }
 
 void RemoteProxyConfigurationResolver::errorReport(const ProxyConfiguration & config)

@@ -41,8 +41,8 @@ public:
     RemoteProxyConfigurationResolver(
         const RemoteServerConfiguration & remote_server_configuration_,
         Protocol request_protocol_,
-        std::shared_ptr<RemoteProxyHostFetcher> fetcher_,
-        bool disable_tunneling_for_https_requests_over_http_proxy_ = false);
+        bool disable_tunneling_for_https_requests_over_http_proxy_ = true,
+        const std::string & no_proxy_hosts_ = "");
 
     ProxyConfiguration resolve() override;
 
@@ -50,7 +50,7 @@ public:
 
 private:
     RemoteServerConfiguration remote_server_configuration;
-    std::shared_ptr<RemoteProxyHostFetcher> fetcher;
+    std::string no_proxy_hosts;
 
     std::mutex cache_mutex;
     bool cache_valid = false;
