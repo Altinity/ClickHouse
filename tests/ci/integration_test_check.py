@@ -220,9 +220,9 @@ def main():
     #     sys.exit(0)
 
     if pr_info.event['action'] in ['published', 'prereleased']:
-        docker_version = pr_info.number + "-" + pr_info.sha
+        docker_version = str(pr_info.number) + "-" + str(pr_info.sha)
     else:
-        docker_version = pr_info.number
+        docker_version = str(pr_info.number)
 
     images = get_images_with_versions(reports_path, IMAGES, version=docker_version)
     result_path = temp_path / "output_dir"

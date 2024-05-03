@@ -125,9 +125,9 @@ def run_stress_test(docker_image_name: str) -> None:
         sys.exit(0)
 
     if pr_info.event['action'] in ['published', 'prereleased']:
-        docker_version = pr_info.number + "-" + pr_info.sha
+        docker_version = str(pr_info.number) + "-" + str(pr_info.sha)
     else:
-        docker_version = pr_info.number
+        docker_version = str(pr_info.number)
 
     docker_image = get_image_with_version(reports_path, docker_image_name, version=docker_version)
 

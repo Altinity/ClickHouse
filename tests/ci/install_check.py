@@ -290,9 +290,9 @@ def main():
             sys.exit(0)
 
     if pr_info.event['action'] in ['published', 'prereleased']:
-        docker_version = pr_info.number + "-" + pr_info.sha
+        docker_version = str(pr_info.number) + "-" + str(pr_info.sha)
     else:
-        docker_version = pr_info.number
+        docker_version = str(pr_info.number)
 
     docker_images = {
         name: get_image_with_version(REPORTS_PATH, name, args.download, docker_version)

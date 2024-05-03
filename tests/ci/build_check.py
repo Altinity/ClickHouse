@@ -250,9 +250,9 @@ def main():
     check_for_success_run(s3_helper, f"{s3_path_prefix}/", build_name, version)
 
     if pr_info.event['action'] in ['published', 'prereleased']:
-        docker_version = pr_info.number + "-" + pr_info.sha
+        docker_version = str(pr_info.number) + "-" + str(pr_info.sha)
     else:
-        docker_version = pr_info.number
+        docker_version = str(pr_info.number)
 
     docker_image = get_image_with_version(IMAGES_PATH, IMAGE_NAME, version=docker_version)
     image_version = docker_image.version
