@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 # Because at early release stages there could be no Altinity tag set on commit, only upstream one.
 RELEASE_BRANCH_REGEXP = r"\A\d+[.]\d+\Z"
 TAG_REGEXP = (
-    r"\Av\d{2}[.][1-9]\d*[.][1-9]\d*[.][1-9]\d*[-\.](testing|prestable|stable|lts|altinitystable)\Z"
+    r"\Av\d{2}[.][1-9]\d*[.][1-9]\d*[.][1-9]\d*[-\.](testing|prestable|stable|lts|altinitystable|altinityfips)\Z"
 )
 SHA_REGEXP = re.compile(r"\A([0-9]|[a-f]){40}\Z")
 
