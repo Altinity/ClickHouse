@@ -148,6 +148,7 @@ TEST_F(ProxyConfigurationResolverProviderTests, RemoteResolverIsBasedOnProtocolC
     ConfigurationPtr config = Poco::AutoPtr(new Poco::Util::MapConfiguration());
 
     config->setString("proxy", "");
+    config->setString("proxy.no_proxy", no_proxy_hosts);
     config->setString("proxy.https", "");
     config->setString("proxy.https.resolver", "");
     config->setString("proxy.https.resolver.endpoint", "http://resolver:8080/hostname");
@@ -168,7 +169,7 @@ TEST_F(ProxyConfigurationResolverProviderTests, RemoteResolverIsBasedOnProtocolC
     ASSERT_EQ(http_proxy_configuration.host, http_env_proxy_server.getHost());
     ASSERT_EQ(http_proxy_configuration.port, http_env_proxy_server.getPort());
     ASSERT_EQ(http_proxy_configuration.protocol, DB::ProxyConfiguration::protocolFromString(http_env_proxy_server.getScheme()));
-    ASSERT_EQ(http_proxy_configuration.no_proxy_hosts, no_proxy_hosts);
+    ASSERT_EQ(http_proxy_configuration.no_proxy_hosts, "");
 }
 
 TEST_F(ProxyConfigurationResolverProviderTests, RemoteResolverIsBasedOnProtocolConfigurationHTTPS)
@@ -243,5 +244,3 @@ TEST_F(ProxyConfigurationResolverProviderTests, TunnelingForHTTPSRequestsOverHTT
     test_tunneling<true, false>(context);
     test_tunneling<true, true>(context);
 }
-
-// remote resolver is tricky to be tested in unit tests
