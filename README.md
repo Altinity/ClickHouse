@@ -63,4 +63,6 @@ Altinity maintains multiple open-source projects to support the ClickHouse commu
 * [The ClickHouse Backup utility](https://altinity.com/blog/introduction-to-clickhouse-backups-and-clickhouse-backup), and
 * [The ClickHouse Sink Connector](https://altinity.com/blog/running-analytics-on-clickhouse-against-your-mysql-data).  
 
+<hr/>
+
 *©2024 Altinity Inc. All rights reserved. Altinity®, Altinity.Cloud®, and Altinity Stable Builds® are registered trademarks of Altinity, Inc. ClickHouse® is a registered trademark of ClickHouse, Inc.*
