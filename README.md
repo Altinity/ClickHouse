@@ -3,7 +3,7 @@
 [![Website](https://img.shields.io/website?up_message=AVAILABLE&down_message=DOWN&url=https://docs.altinity.com/altinitystablebuilds&style=for-the-badge)](https://docs.altinity.com/altinitystablebuilds/)
 [![Apache 2.0 License](https://img.shields.io/badge/license-Apache%202.0-blueviolet?style=for-the-badge)](https://www.apache.org/licenses/LICENSE-2.0)
 
-<img alt="Altinity company logo" src="https://raw.githubusercontent.com/Altinity/altinity.github.io/88ecfdf78f1681eb47c5d24f0cde55d5b1b7074a/static/images/altinitycloud/logo_horizontal_blue_black.png?token=GHSAT0AAAAAACFTX25OTABR2A4WVFU7Y4XYZRY4AQA"/>
+<img alt="Altinity company logo" src="https://raw.githubusercontent.com/Altinity/altinity.github.io/main/static/images/altinitycloud/logo_horizontal_blue_black.png?token=GHSAT0AAAAAACFTX25PQZ2Q5P3SKPFB6TBMZRY53ZA"/>
 
 [//]: # (<picture align=center>)
 
