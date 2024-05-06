@@ -16,7 +16,8 @@
 ## Useful Links
 
 * [Altinity home page](https://altinity.com/) - Your starting point for all things Altinity
-* [Documentation](https://docs.altinity.com/altinitystablebuilds/) - Complete details of current releases and their lifecycles
+* [Documentation](https://docs.altinity.com/altinitystablebuilds/) - A list of current releases and their lifecycles
+* [Release notes](https://docs.altinity.com/releasenotes/altinity-stable-release-notes/) - Complete details on the changes and fixes in each release
 * [Builds page](https://builds.altinity.cloud/) - Download and installation instructions
 * [Dockerhub page](https://hub.docker.com/r/altinity/clickhouse-server) - Home of the Altinity Stable Build container images
 * [Product page](https://altinity.com/altinity-stable/) - Customer testimonials and additional information
