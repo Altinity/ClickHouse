@@ -42,8 +42,8 @@ std::string RemoteProxyHostFetcherImpl::fetch(const Poco::URI & endpoint, const 
 RemoteProxyConfigurationResolver::RemoteProxyConfigurationResolver(
     const RemoteServerConfiguration & remote_server_configuration_,
     Protocol request_protocol_,
-    bool disable_tunneling_for_https_requests_over_http_proxy_,
-    const std::string & no_proxy_hosts_
+    const std::string & no_proxy_hosts_,
+    bool disable_tunneling_for_https_requests_over_http_proxy_
 )
 : ProxyConfigurationResolver(request_protocol_, disable_tunneling_for_https_requests_over_http_proxy_),
     remote_server_configuration(remote_server_configuration_), no_proxy_hosts(no_proxy_hosts_)

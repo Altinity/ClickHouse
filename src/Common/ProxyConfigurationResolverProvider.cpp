@@ -56,8 +56,8 @@ namespace
         return std::make_shared<RemoteProxyConfigurationResolver>(
             server_configuration,
             request_protocol,
-            isTunnelingDisabledForHTTPSRequestsOverHTTPProxy(configuration),
-            getNoProxyHosts(configuration));
+            getNoProxyHosts(configuration),
+            isTunnelingDisabledForHTTPSRequestsOverHTTPProxy(configuration));
     }
 
     template <bool match_protocol>
@@ -152,8 +152,8 @@ namespace
             : std::make_shared<ProxyListConfigurationResolver>(
                   uris,
                   request_protocol,
-                  isTunnelingDisabledForHTTPSRequestsOverHTTPProxy(configuration),
-                  getNoProxyHosts(configuration));
+                  getNoProxyHosts(configuration),
+                  isTunnelingDisabledForHTTPSRequestsOverHTTPProxy(configuration));
     }
 
     std::shared_ptr<ProxyConfigurationResolver> getListResolver(
