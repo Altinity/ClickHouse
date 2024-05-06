@@ -1,57 +1,66 @@
 <div align=center>
 
-[![Website](https://img.shields.io/website?up_message=AVAILABLE&down_message=DOWN&url=https%3A%2F%2Fclickhouse.com&style=for-the-badge)](https://clickhouse.com)
+[![Website](https://img.shields.io/website?up_message=AVAILABLE&down_message=DOWN&url=https://docs.altinity.com/altinitystablebuilds&style=for-the-badge)](https://docs.altinity.com/altinitystablebuilds/)
 [![Apache 2.0 License](https://img.shields.io/badge/license-Apache%202.0-blueviolet?style=for-the-badge)](https://www.apache.org/licenses/LICENSE-2.0)
 
-<picture align=center>
-    <source media="(prefers-color-scheme: dark)" srcset="https://github.com/ClickHouse/clickhouse-docs/assets/9611008/4ef9c104-2d3f-4646-b186-507358d2fe28">
-    <source media="(prefers-color-scheme: light)" srcset="https://github.com/ClickHouse/clickhouse-docs/assets/9611008/b001dc7b-5a45-4dcd-9275-e03beb7f9177">
-    <img alt="The ClickHouse company logo." src="https://github.com/ClickHouse/clickhouse-docs/assets/9611008/b001dc7b-5a45-4dcd-9275-e03beb7f9177">
-</picture>
+<img alt="Altinity company logo" src="https://raw.githubusercontent.com/Altinity/altinity.github.io/88ecfdf78f1681eb47c5d24f0cde55d5b1b7074a/static/images/altinitycloud/logo_horizontal_blue_black.png?token=GHSAT0AAAAAACFTX25OTABR2A4WVFU7Y4XYZRY4AQA"/>
 
-<h4>ClickHouse® is an open-source column-oriented database management system that allows generating analytical data reports in real-time.</h4>
+[//]: # (<picture align=center>)
+
+[//]: # (    <source media="&#40;prefers-color-scheme: dark&#41;" srcset="https://github.com/ClickHouse/clickhouse-docs/assets/9611008/4ef9c104-2d3f-4646-b186-507358d2fe28">)
+
+[//]: # (    <source media="&#40;prefers-color-scheme: light&#41;" srcset="https://github.com/ClickHouse/clickhouse-docs/assets/9611008/b001dc7b-5a45-4dcd-9275-e03beb7f9177">)
+
+[//]: # (    <img alt="The ClickHouse company logo." src="https://github.com/ClickHouse/clickhouse-docs/assets/9611008/b001dc7b-5a45-4dcd-9275-e03beb7f9177">)
+
+[//]: # (</picture>)
+
+<h1>Altinity Stable Builds®</h1>
 
 </div>
 
-## How To Install (Linux, macOS, FreeBSD)
-```
-curl https://clickhouse.com/ | sh
-```
+**Altinity Stable Builds®** are releases of ClickHouse® supported by Altinity for three years. They undergo rigorous testing to verify they are secure and ready for production use. They're also 100% open source and 100% compatible with ClickHouse community builds. FIPS-compatible versions are available as well. 
 
-## Useful Links
+## Altinity Stable Builds - Useful Links
 
-* [Official website](https://clickhouse.com/) has a quick high-level overview of ClickHouse on the main page.
-* [ClickHouse Cloud](https://clickhouse.cloud) ClickHouse as a service, built by the creators and maintainers.
-* [Tutorial](https://clickhouse.com/docs/en/getting_started/tutorial/) shows how to set up and query a small ClickHouse cluster.
-* [Documentation](https://clickhouse.com/docs/en/) provides more in-depth information.
-* [YouTube channel](https://www.youtube.com/c/ClickHouseDB) has a lot of content about ClickHouse in video format.
-* [Slack](https://clickhouse.com/slack) and [Telegram](https://telegram.me/clickhouse_en) allow chatting with ClickHouse users in real-time.
-* [Blog](https://clickhouse.com/blog/) contains various ClickHouse-related articles, as well as announcements and reports about events.
-* [Code Browser (github.dev)](https://github.dev/ClickHouse/ClickHouse) with syntax highlighting, powered by github.dev.
-* [Contacts](https://clickhouse.com/company/contact) can help to get your questions answered if there are any.
+* [Documentation](https://docs.altinity.com/altinitystablebuilds/) - Complete details of current releases and their lifecycles
+* [Builds page](https://builds.altinity.cloud/) - Download and installation instructions
+* [Dockerhub page](https://hub.docker.com/r/altinity/clickhouse-server) - Home of the Altinity Stable Build container images
+* [Product page](https://altinity.com/altinity-stable/) - Customer testimonials and additional information 
+* [Knowledge base](https://kb.altinity.com/) - Insight, knowledge, and advice from the Altinity Engineering and Support teams
 
-## Monthly Release & Community Call
+## Altinity Links
 
-Every month we get together with the community (users, contributors, customers, those interested in learning more about ClickHouse) to discuss what is coming in the latest release. If you are interested in sharing what you've built on ClickHouse, let us know.
+* [Altinity.Cloud](https://altinity.com/managed-clickhouse/) - Learn about Altinity solutions for running ClickHouse as a service, in your AWS, GCP, or Azure cloud account, or in your Kubernetes environment
+* [Altinity support for ClickHouse](https://altinity.com/clickhouse-support/) - The best ClickHouse support in the industry, delivered by the most knowledgeable ClickHouse team in the industry
+* [Altinity administrator training for ClickHouse](https://altinity.com/clickhouse-training/) - Understand how ClickHouse works, not just how to use it
+* [Altinity home page](https://altinity.com/) - Your starting point for all things Altinity
+* [Altinity support](https://altinity.com/support/) - Contact us!
+* [Altinity blog](https://altinity.com/blog/) - The latest news on Altinity's ClickHouse-related projects, release notes, tutorials, and more 
+* [Altinity YouTube channel](https://www.youtube.com/@AltinityB) - ClickHouse tutorials, webinars, conference presentations, and other useful things
+* [Slack](https://altinitydbworkspace.slack.com/join/shared_invite/zt-1togw9b4g-N0ZOXQyEyPCBh_7IEHUjdw#/shared-invite/email) - The Altinity Slack channel
 
-* [v24.3 Community Call](https://clickhouse.com/company/events/v24-3-community-release-call) - Mar 26
-* [v24.4 Community Call](https://clickhouse.com/company/events/v24-4-community-release-call) - Apr 30
+## Recent Webinars
 
-## Upcoming Events
+### [ClickHouse Performance Master Class – Tools and Techniques to Speed up any ClickHouse App](https://altinity.com/webinarspage/clickhouse-performance-master-class-tools-and-techniques-to-speed-up-any-clickhouse-app)
 
-Keep an eye out for upcoming meetups and events around the world. Somewhere else you want us to be? Please feel free to reach out to tyler `<at>` clickhouse `<dot>` com. You can also peruse [ClickHouse Events](https://clickhouse.com/company/news-events) for a list of all upcoming trainings, meetups, speaking engagements, etc.
+(23 April 2024) - ClickHouse gives impressive performance out of the box. In this webinar, Altinity's Mikhail Filimonov, Senior Software Engineer, and Alexander Zaitsev, Co-Founder and CTO, show you how to make it amazing. We start by providing a framework for performance that includes basic drivers like I/O and compute, as well as ClickHouse structures like compression and indexes. We’ll also discuss tools to evaluate performance including ClickHouse system tables and `EXPLAIN`. We’ll then demonstrate how to evaluate and improve performance for common query use cases ranging from MergeTree data on block storage to Parquet files in data lakes. Join our webinar to become a master at diagnosing query bottlenecks and curing them quickly.
 
-* [ClickHouse Meetup in Dubai](https://www.meetup.com/clickhouse-dubai-meetup-group/events/299629189/) - May 28
+### [Deep Dive on ClickHouse Sharding and Replication](https://altinity.com/webinarspage/deep-dive-on-clickhouse-sharding-and-replication)
 
+(26 March 2024) - ClickHouse works out of the box on a single machine, but it gets complicated in a cluster. ClickHouse provides two scaling-out dimensions, sharding and replication, and understanding when and how those should be applied is vital for production and high-load applications. In this webinar, Alexander Zaitsev, Altinity Co-Founder and CTO, focuses on ClickHouse cluster setup and configuration, cluster operation in public clouds, executing distributed queries, hedged requests, and more.
 
-## Recent Recordings
-* **Recent Meetup Videos**: [Meetup Playlist](https://www.youtube.com/playlist?list=PL0Z2YDlm0b3iNDUzpY1S3L_iV4nARda_U) Whenever possible recordings of the ClickHouse Community Meetups are edited and presented as individual talks. Current featuring "Modern SQL in 2023", "Fast, Concurrent, and Consistent Asynchronous INSERTS in ClickHouse", and "Full-Text Indices: Design and Experiments"
-* **Recording available**: [**v24.2 Release Call**](https://www.youtube.com/watch?v=iN2y-TK8f3A) All the features of 24.2, one convenient video! Watch it now!
-  
- ## Interested in joining ClickHouse and making it your full-time job? 
-  
-We are a globally diverse and distributed team, united behind a common goal of creating industry-leading, real-time analytics. Here, you will have an opportunity to solve some of the most cutting-edge technical challenges and have direct ownership of your work and vision. If you are a contributor by nature, a thinker and a doer - we’ll definitely click!
-  
-Check out our **current openings** here: https://clickhouse.com/company/careers 
-  
-Can't find what you are looking for, but want to let us know you are interested in joining ClickHouse? Email careers@clickhouse.com! 
+### [Eureka! 8 developer tricks for running ClickHouse on Kubernetes](https://altinity.com/webinarspage/eureka-8-developer-tricks-for-running-clickhouse-on-kubernetes)
+
+(27 February 2024) - In this webinar, Robert Hodges, Altinity Co-Founder and CEO, shows 8 practices to help ClickHouse developers build faster and more cost-efficient analytics on Kubernetes. We’ll start with using the Altinity operator, work our way through various techniques to scale up or shut off compute, and end with advice on zero-downtime upgrade. Along the way, we’ll review key Kubernetes features like node autoscaling.
+
+## Open Source
+
+Altinity maintains multiple open-source projects to support the ClickHouse community, including:
+
+* [The Altinity Kubernetes Operator for ClickHouse](https://altinity.com/kubernetes-operator/)
+* [The Altinity Grafana plugin for ClickHouse](https://altinity.com/blog/altinity-grafana-plugin-for-clickhouse-ready-for-grafana-10)
+* [The ClickHouse Backup utility](https://altinity.com/blog/introduction-to-clickhouse-backups-and-clickhouse-backup), and
+* [The ClickHouse Sink Connector](https://altinity.com/blog/running-analytics-on-clickhouse-against-your-mysql-data).  
+
+*©2024 Altinity Inc. All rights reserved. Altinity®, Altinity.Cloud®, and Altinity Stable Builds® are registered trademarks of Altinity, Inc. ClickHouse® is a registered trademark of ClickHouse, Inc.*
