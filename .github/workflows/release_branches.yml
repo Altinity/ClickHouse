@@ -44,7 +44,7 @@ jobs:
     runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
           clear-repository: true
       - name: Images check
@@ -89,22 +89,44 @@ jobs:
 
   CompatibilityCheck:
     needs: [BuilderDebRelease]
-    uses: ./.github/workflows/reusable_test.yml
-    secrets: inherit
-    with:
-      test_name: Compatibility check X86
-      runner_type: altinity-on-demand, altinity-type-cpx41, altinity-image-x86-app-docker-ce
-      timeout_minutes: 180
-      run_command: |
-        cd "$REPO_COPY/tests/ci"
-        python3 compatibility_check.py --check-name "Compatibility check (amd64)" --check-glibc --check-distributions
+    runs-on: [altinity-on-demand, altinity-type-cpx41, altinity-image-x86-app-docker-ce]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/compatibility_check
+          REPO_COPY=${{runner.temp}}/compatibility_check/ClickHouse
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          EOF
+      - name: Check out repository code
+        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
+        with:
+          clear-repository: true
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: CompatibilityCheck
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci" && python3 compatibility_check.py
+      - name: Cleanup
+        if: always()
+        run: |
+          # shellcheck disable=SC2046
+          docker kill $(docker ps -q) ||:
+          # shellcheck disable=SC2046
+          docker rm -f $(docker ps -a -q) ||:
+          sudo rm -fr "$TEMP_PATH"
 
 #########################################################################################
 #################################### ORDINARY BUILDS ####################################
 #########################################################################################
   BuilderDebRelease:
     needs: [DockerHubPush]
-    runs-on: [altinity-on-demand, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [altinity-on-demand, altinity-setup-builder, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -124,7 +146,7 @@ jobs:
       - name: Trust My Directory
         run: git config --global --add safe.directory * # https://stackoverflow.com/a/71940133
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
           clear-repository: true
           submodules: true
@@ -202,14 +224,12 @@ jobs:
       - BuilderDebRelease
       # - BuilderDebAarch64
     runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-app-docker-ce]
-    timeout-minutes: 180
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
           clear-repository: true
           fetch-depth: 0  # It MUST BE THE SAME for all dependencies and the job itself
-          filter: tree:0
       - name: Check docker altinity/clickhouse-server building
         run: |
           cd "$GITHUB_WORKSPACE/tests/ci"
@@ -220,31 +240,55 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          docker ps --quiet | xargs --no-run-if-empty docker kill ||:
-          docker ps --all --quiet | xargs --no-run-if-empty docker rm -f ||:
+          # shellcheck disable=SC2046
+          docker kill $(docker ps -q) ||:
+          # shellcheck disable=SC2046
+          docker rm -f $(docker ps -a -q) ||:
           sudo rm -fr "$TEMP_PATH"
-          
 ############################################################################################
 ##################################### BUILD REPORTER #######################################
 ############################################################################################
   BuilderReport:
-    if: ${{ success() || failure() }}
     needs:
       - BuilderDebRelease
       # - BuilderDebAarch64
-    uses: ./.github/workflows/reusable_test.yml
-    secrets: inherit
-    with:
-      test_name: ClickHouse build check
-      runner_type: altinity-on-demand, altinity-type-cpx41, altinity-image-x86-app-docker-ce
-      timeout_minutes: 180
-      additional_envs: |
-        NEEDS_DATA<<NDENV
-        ${{ toJSON(needs) }}
-        NDENV
-      run_command: |
-        cd "$GITHUB_WORKSPACE/tests/ci"
-        python3 build_report_check.py "$CHECK_NAME"
+    runs-on: [altinity-on-demand, altinity-type-cpx41, altinity-image-x86-app-docker-ce]
+    if: ${{ success() || failure() }}
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          CHECK_NAME=ClickHouse build check
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          TEMP_PATH=${{runner.temp}}/report_check
+          NEEDS_DATA_PATH=${{runner.temp}}/needs.json
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: ClickHouse/checkout@v1
+        with:
+          clear-repository: true
+      - name: Report Builder
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cat > "$NEEDS_DATA_PATH" << 'EOF'
+          ${{ toJSON(needs) }}
+          EOF
+          cd "$GITHUB_WORKSPACE/tests/ci"
+          python3 build_report_check.py "$CHECK_NAME"
+      - name: Cleanup
+        if: always()
+        run: |
+          # shellcheck disable=SC2046
+          docker kill $(docker ps -q) ||:
+          # shellcheck disable=SC2046
+          docker rm -f $(docker ps -a -q) ||:
+          sudo rm -fr "$TEMP_PATH"
         
   # BuilderSpecialReport:
   #   needs:
@@ -292,10 +336,10 @@ jobs:
   #    - BuilderBinDarwinAarch64
       - BuilderDebRelease
   #    - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker]
+    runs-on: [altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86]
     steps:
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
           clear-repository: true
       - name: Mark Commit Release Ready
@@ -307,16 +351,40 @@ jobs:
 ##############################################################################################
   FunctionalStatelessTestRelease:
     needs: [BuilderDebRelease]
-    uses: ./.github/workflows/reusable_test.yml
-    secrets: inherit
-    with:
-      test_name: Stateless tests (release)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
-      additional_envs: |
-        KILL_TIMEOUT=10800
-      run_command: |
-        cd "$REPO_COPY/tests/ci"
-        python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
+    runs-on: [altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/stateless_debug
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=Stateless tests (release)
+          REPO_COPY=${{runner.temp}}/stateless_debug/ClickHouse
+          KILL_TIMEOUT=10800
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
+        with:
+          clear-repository: true
+      - name: Functional test
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
+      - name: Cleanup
+        if: always()
+        run: |
+          # shellcheck disable=SC2046
+          docker kill $(docker ps -q) ||:
+          # shellcheck disable=SC2046
+          docker rm -f $(docker ps -a -q) ||:
+          sudo rm -fr "$TEMP_PATH"
         
   # FunctionalStatelessTestAarch64:
   #   needs: [BuilderDebAarch64]
@@ -359,16 +427,40 @@ jobs:
 ##############################################################################################
   FunctionalStatefulTestRelease:
     needs: [BuilderDebRelease]
-    uses: ./.github/workflows/reusable_test.yml
-    secrets: inherit
-    with:
-      test_name: Stateful tests (release)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
-      additional_envs: |
-        KILL_TIMEOUT=3600
-      run_command: |
-        cd "$REPO_COPY/tests/ci"
-        python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
+    runs-on: [altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/stateful_debug
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=Stateful tests (release)
+          REPO_COPY=${{runner.temp}}/stateful_debug/ClickHouse
+          KILL_TIMEOUT=3600
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
+        with:
+          clear-repository: true
+      - name: Functional test
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
+      - name: Cleanup
+        if: always()
+        run: |
+          # shellcheck disable=SC2046
+          docker kill $(docker ps -q) ||:
+          # shellcheck disable=SC2046
+          docker rm -f $(docker ps -a -q) ||:
+          sudo rm -fr "$TEMP_PATH"
 
   # FunctionalStatefulTestAarch64:
   #   needs: [BuilderDebAarch64]
@@ -409,19 +501,80 @@ jobs:
 #############################################################################################
 ############################# INTEGRATION TESTS #############################################
 #############################################################################################
-  IntegrationTestsRelease:
+  IntegrationTestsRelease0:
     needs: [BuilderDebRelease]
-    uses: ./.github/workflows/reusable_test.yml
-    secrets: inherit
-    with:
-      test_name: Integration tests (release)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
-      batches: 6
-      timeout_minutes: 180
-      run_command: |
-        cd "$REPO_COPY/tests/ci"
-        python3 integration_test_check.py "$CHECK_NAME"
-        
+    runs-on: [altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/integration_tests_release
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=Integration tests (release)
+          REPO_COPY=${{runner.temp}}/integration_tests_release/ClickHouse
+          RUN_BY_HASH_NUM=0
+          RUN_BY_HASH_TOTAL=2
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
+        with:
+          clear-repository: true
+      - name: Integration test
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 integration_test_check.py "$CHECK_NAME"
+      - name: Cleanup
+        if: always()
+        run: |
+          # shellcheck disable=SC2046
+          docker kill $(docker ps -q) ||:
+          # shellcheck disable=SC2046
+          docker rm -f $(docker ps -a -q) ||:
+          sudo rm -fr "$TEMP_PATH"
+  IntegrationTestsRelease1:
+    needs: [BuilderDebRelease]
+    runs-on: [altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86]
+    steps:
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          TEMP_PATH=${{runner.temp}}/integration_tests_release
+          REPORTS_PATH=${{runner.temp}}/reports_dir
+          CHECK_NAME=Integration tests (release)
+          REPO_COPY=${{runner.temp}}/integration_tests_release/ClickHouse
+          RUN_BY_HASH_NUM=1
+          RUN_BY_HASH_TOTAL=2
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v3
+        with:
+          path: ${{ env.REPORTS_PATH }}
+      - name: Check out repository code
+        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
+        with:
+          clear-repository: true
+      - name: Integration test
+        run: |
+          sudo rm -fr "$TEMP_PATH"
+          mkdir -p "$TEMP_PATH"
+          cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
+          cd "$REPO_COPY/tests/ci"
+          python3 integration_test_check.py "$CHECK_NAME"
+      - name: Cleanup
+        if: always()
+        run: |
+          # shellcheck disable=SC2046
+          docker kill $(docker ps -q) ||:
+          # shellcheck disable=SC2046
+          docker rm -f $(docker ps -a -q) ||:
+          sudo rm -fr "$TEMP_PATH"
 #############################################################################################
 ##################################### REGRESSION TESTS ######################################
 #############################################################################################
@@ -482,13 +635,17 @@ jobs:
       - DockerHubPush
       - DockerServerImages
       - BuilderReport
+      # - BuilderSpecialReport
       - MarkReleaseReady
       - FunctionalStatelessTestRelease
+      # - FunctionalStatelessTestAarch64
       - FunctionalStatefulTestRelease
-      - IntegrationTestsRelease
+      # - FunctionalStatefulTestAarch64
+      - IntegrationTestsRelease0
+      - IntegrationTestsRelease1
       - CompatibilityCheck
-      - RegressionTestsRelease
       - SignRelease
+      - RegressionTestsRelease
     runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx31, altinity-image-x86-app-docker-ce]
     steps:
       - name: Check out repository code
