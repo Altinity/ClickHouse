@@ -1,30 +1,29 @@
 ---
-name: Unexpected behaviour
-about: Some feature is working in non-obvious way
+name: Unexpected behavior
+about: Report a feature that's behaving in an unexpected way
 title: ''
-labels: unexpected behaviour
+labels: 'unexpected behavior'
 assignees: ''
 
 ---
 
-(you don't have to strictly follow this form)
+## Describe the unexpected behavior
+A clear, concise description of what's happening.
 
-**Describe the unexpected behaviour**
-A clear and concise description of what works not as it is supposed to.
+## How to reproduce the behavior
 
-**How to reproduce**
-* Which ClickHouse server version to use
-* Which interface to use, if matters
+* Which Altinity Stable Build version to use
+* Which interface to use, if it matters
 * Non-default settings, if any
 * `CREATE TABLE` statements for all tables involved
-* Sample data for all these tables, use [clickhouse-obfuscator](https://github.com/ClickHouse/ClickHouse/blob/master/programs/obfuscator/Obfuscator.cpp#L42-L80) if necessary
-* Queries to run that lead to unexpected result
+* Sample data for all of those tables (use [clickhouse-obfuscator](https://github.com/ClickHouse/ClickHouse/blob/master/programs/obfuscator/Obfuscator.cpp#L42-L80) if necessary)
+* Queries to run that lead to the unexpected result
 
-**Expected behavior**
-A clear and concise description of what you expected to happen.
+## Expected behavior
+A clear, concise description of what should have happened.
 
-**Error message and/or stacktrace**
-If applicable, add screenshots to help explain your problem.
+## Logs, error messages, stacktraces, screenshots...
+Add any details that might explain the issue.
 
-**Additional context**
-Add any other context about the problem here.
+## Additional context
+Add any other context about the issue here.
