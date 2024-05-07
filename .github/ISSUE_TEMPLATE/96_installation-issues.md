@@ -1,31 +1,24 @@
 ---
 name: Installation issue
-about: Issue with ClickHouse installation from https://clickhouse.com/docs/en/install/
+about: Report an issue with installing an Altinity Stable Build
 title: ''
-labels: comp-install
+labels: install
 assignees: ''
 
 ---
 
-**I have tried the following solutions**: https://clickhouse.com/docs/en/faq/troubleshooting/#troubleshooting-installation-errors
+*After following the instructions at https://docs.altinity.com/altinitystablebuilds/stablequickstartguide/, I can't get the Altinity Stable Build up and running.* 
 
-**Installation type**
+## Installation type
+Deb package, RPM package, or Docker image
 
-Packages, docker, single binary, curl?
+## Altinity Stable Build version
+The version that isn't installing correctly
 
-**Source of the ClickHouse**
+## What's going wrong
+A clear, concise description of the problem with the installation
 
-A link to the source. Or the command you've tried
-
-**Expected result**
-
-What you expected
-
-**The actual result**
-
-What you get
-
-**How to reproduce**
+## How to reproduce
 
 * For Linux-based operating systems: provide a script for clear docker container from the official image
 * For anything else: steps to reproduce on as much as possible clear system
