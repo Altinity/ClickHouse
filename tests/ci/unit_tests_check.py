@@ -26,7 +26,7 @@ from rerun_helper import RerunHelper
 from tee_popen import TeePopen
 
 
-IMAGE_NAME = "clickhouse/unit-test"
+IMAGE_NAME = "altinityinfra/unit-test"
 
 
 def get_test_name(line):
@@ -177,7 +177,7 @@ if __name__ == "__main__":
         check_name,
     )
 
-    ch_helper.insert_events_into(db="default", table="checks", events=prepared_events)
+    ch_helper.insert_events_into(db="gh-data", table="checks", events=prepared_events)
 
     if state == "error":
         sys.exit(1)

@@ -231,7 +231,7 @@ class _NetworkManager:
 
     def _ensure_container(self):
         if self._container is None or self._container_expire_time <= time.time():
-            image_name = "clickhouse/integration-helper:" + os.getenv(
+            image_name = "altinityinfra/integration-helper:" + os.getenv(
                 "DOCKER_HELPER_TAG", "latest"
             )
             for i in range(5):
@@ -308,7 +308,7 @@ class _NetworkManager:
         return output
 
 
-# Approximately mesure network I/O speed for interface
+# Approximately measure network I/O speed for interface
 class NetThroughput(object):
     def __init__(self, node):
         self.node = node

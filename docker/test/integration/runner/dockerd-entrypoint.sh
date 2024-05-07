@@ -27,6 +27,7 @@ while true; do
     reties=$((reties+1))
     if [[ $reties -ge 100 ]]; then # 10 sec max
         echo "Can't start docker daemon, timeout exceeded." >&2
+        cat /ClickHouse/tests/integration/dockerd.log >&2
         exit 1;
     fi
     sleep 0.1

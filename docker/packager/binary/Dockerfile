@@ -1,7 +1,7 @@
 # rebuild in #33610
 # docker build -t clickhouse/binary-builder .
 ARG FROM_TAG=latest
-FROM clickhouse/test-util:$FROM_TAG
+FROM altinityinfra/test-util:$FROM_TAG
 
 ENV CC=clang-${LLVM_VERSION}
 ENV CXX=clang++-${LLVM_VERSION}
@@ -55,7 +55,7 @@ RUN arch=${TARGETARCH:-amd64} \
   && dpkg -i /tmp/nfpm.deb \
   && rm /tmp/nfpm.deb
 
-ARG GO_VERSION=1.18.3
+ARG GO_VERSION=1.19.8
 # We need go for clickhouse-diagnostics
 RUN arch=${TARGETARCH:-amd64} \
   && curl -Lo /tmp/go.tgz "https://go.dev/dl/go${GO_VERSION}.linux-${arch}.tar.gz" \

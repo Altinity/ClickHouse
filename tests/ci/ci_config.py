@@ -180,15 +180,7 @@ CI_CONFIG = {
     },
     "builds_report_config": {
         "ClickHouse build check": [
-            "package_release",
-            "coverity",
-            "package_aarch64",
-            "package_asan",
-            "package_ubsan",
-            "package_tsan",
-            "package_msan",
-            "package_debug",
-            "binary_release",
+            "package_release"
         ],
         "ClickHouse special build check": [
             "binary_tidy",
@@ -343,6 +335,9 @@ CI_CONFIG = {
             "required_build": "package_aarch64",
             "test_grep_exclude_filter": "constant_column_search",
         },
+        "Sign release (actions)": {
+            "required_build": "package_release"
+        }
     },
 }  # type: dict
 
