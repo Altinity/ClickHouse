@@ -1,27 +1,26 @@
 ---
 name: Backward compatibility issue
-about: Report the case when the behaviour of a new version can break existing use cases
+about: Describe a use case that used to work, but doesn't anymore
 title: ''
-labels: backward compatibility
+labels: 'backward compatibility'
 assignees: ''
 
 ---
 
-(you don't have to strictly follow this form)
+## Describe the issue
+A clear, concise description of what doesn't work anymore.
 
-**Describe the issue**
-A clear and concise description of what works not as it is supposed to.
+## How to reproduce the behavior
 
-**How to reproduce**
-* Which ClickHouse server versions are incompatible
+* The Altinity Stable Build version you're using now and the one you were using before
 * Which interface to use, if matters
 * Non-default settings, if any
 * `CREATE TABLE` statements for all tables involved
 * Sample data for all these tables, use [clickhouse-obfuscator](https://github.com/ClickHouse/ClickHouse/blob/master/programs/obfuscator/Obfuscator.cpp#L42-L80) if necessary
 * Queries to run that lead to unexpected result
 
-**Error message and/or stacktrace**
-If applicable, add screenshots to help explain your problem.
+## Logs, error messages, stacktraces, screenshots...
+Add any details that might explain the issue. Details from this use case as it ran under the previous version can be particularly helpful here. 
 
-**Additional context**
-Add any other context about the problem here.
+## Additional context
+Add any other context about the issue here.
