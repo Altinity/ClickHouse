@@ -1,53 +1,43 @@
 ---
 name: Bug report
-about: Wrong behavior (visible to users) in the official ClickHouse release.
+about: Report something broken in an Altinity Stable Build 
 title: ''
 labels: 'potential bug'
 assignees: ''
 
 ---
 
-> Please make sure that the version you're using is still supported (you can find the list [here](https://github.com/ClickHouse/ClickHouse/blob/master/SECURITY.md#scope-and-supported-versions)).
+*I checked [the Altinity Stable Builds lifecycle table](https://docs.altinity.com/altinitystablebuilds/#altinity-stable-builds-life-cycle-table), and the Altinity Stable Build version I'm using is still supported.*
 
-> You have to provide the following information whenever possible.
-
-**Describe what's wrong**
-
-> A clear and concise description of what works not as it is supposed to.
+## Describe what's wrong
+A clear, concise description of what isn't working. 
 
 > A link to reproducer in [https://fiddle.clickhouse.com/](https://fiddle.clickhouse.com/).
 
-**Does it reproduce on the most recent release?**
+## Enable crash reporting
 
-[The list of releases](https://github.com/ClickHouse/ClickHouse/blob/master/utils/list-versions/version_date.tsv)
-
-**Enable crash reporting**
-
-> Change "enabled" to true in "send_crash_reports" section in `config.xml`:
+> Set `send_crash_reports\enabled` to `true` in `config.xml`:
 ```
 <send_crash_reports>
         <!-- Changing <enabled> to true allows sending crash reports to -->
         <!-- the ClickHouse core developers team via Sentry https://sentry.io -->
-        <enabled>false</enabled>
+        <enabled>true</enabled>
 ```
 
-**How to reproduce**
+## How to reproduce the behavior
 
-* Which ClickHouse server version to use
+* Which Altinity Stable Build version to use 
 * Which interface to use, if it matters
 * Non-default settings, if any
 * `CREATE TABLE` statements for all tables involved
 * Sample data for all these tables, use [clickhouse-obfuscator](https://github.com/ClickHouse/ClickHouse/blob/master/programs/obfuscator/Obfuscator.cpp#L42-L80) if necessary
 * Queries to run that lead to an unexpected result
 
-**Expected behavior**
+## Expected behavior
+A clear, concise description of what you expected to happen.
 
-> A clear and concise description of what you expected to happen.
+## Logs, error messages, stacktraces, screenshots...
+Add any details that might explain the issue.
 
-**Error message and/or stacktrace**
-
-> If applicable, add screenshots to help explain your problem.
-
-**Additional context**
-
-> Add any other context about the problem here.
+## Additional context
+Add any other context about the issue here.
