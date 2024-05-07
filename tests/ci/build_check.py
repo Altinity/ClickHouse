@@ -341,10 +341,6 @@ def main():
             )
             sys.exit(1)
 
-    # Upload the ccache first to have the least build time in case of problems
-    logging.info("Will upload cache")
-    upload_ccache(ccache_path, s3_helper, pr_info.number, TEMP_PATH)
-
     # FIXME performance
     performance_urls = []
     performance_path = os.path.join(build_output_path, "performance.tgz")
