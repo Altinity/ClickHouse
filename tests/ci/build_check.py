@@ -83,7 +83,7 @@ def get_packager_cmd(
     cmd += " --cache=sccache"
     cmd += " --s3-rw-access"
     cmd += f" --s3-bucket={S3_BUILDS_BUCKET}"
-    cmd += f" --cargo-cache-dir={ccache_path}"
+    cmd += f" --s3-directory={ccache_path}"
     cmd += f" --s3-access-key-id={S3_ACCESS_KEY_ID}"
     cmd += f" --s3-secret-access-key={S3_SECRET_ACCESS_KEY}"
 
@@ -382,7 +382,7 @@ def main():
     print(f"::notice ::Log URL: {log_url}")
 
     src_path = os.path.join(TEMP_PATH, "build_source.src.tar.gz")
-   
+
     if os.path.exists(src_path):
         src_url = s3_helper.upload_build_file_to_s3(
             src_path, s3_path_prefix + "/clickhouse-" + version.string + ".src.tar.gz"
@@ -392,7 +392,7 @@ def main():
         logging.info("Source tar doesn't exist")
 
     print(f"::notice ::Source tar URL: {src_url}")
-    
+
     create_json_artifact(
         TEMP_PATH, build_name, log_url, build_urls, build_config, elapsed, success
     )
