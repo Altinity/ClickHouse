@@ -124,12 +124,7 @@ def run_stress_test(docker_image_name: str) -> None:
         logging.info("Check is already finished according to github status, exiting")
         sys.exit(0)
 
-    if pr_info.event['action'] in ['published', 'prereleased']:
-        docker_version = str(pr_info.number) + "-" + str(pr_info.sha)
-    else:
-        docker_version = str(pr_info.number)
-
-    docker_image = get_image_with_version(reports_path, docker_image_name, version=docker_version)
+    docker_image = get_image_with_version(reports_path, docker_image_name, version=pr_info.docker_image_tag)
 
     packages_path = temp_path / "packages"
     packages_path.mkdir(parents=True, exist_ok=True)
