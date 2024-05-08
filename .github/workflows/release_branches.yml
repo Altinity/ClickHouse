@@ -256,7 +256,6 @@ jobs:
       - BuilderDebRelease
       # - BuilderDebAarch64
     runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86]
-    if: ${{ success() || failure() }}
     steps:
       - name: Set envs
         run: |
