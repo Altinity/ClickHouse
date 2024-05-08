@@ -289,7 +289,6 @@ jobs:
           # shellcheck disable=SC2046
           docker rm -f $(docker ps -a -q) ||:
           sudo rm -fr "$TEMP_PATH"
-        
   # BuilderSpecialReport:
   #   needs:
   #     # - BuilderBinDarwin
@@ -385,7 +384,6 @@ jobs:
           # shellcheck disable=SC2046
           docker rm -f $(docker ps -a -q) ||:
           sudo rm -fr "$TEMP_PATH"
-        
   # FunctionalStatelessTestAarch64:
   #   needs: [BuilderDebAarch64]
   #   runs-on: [self-hosted, func-tester-aarch64]
@@ -461,7 +459,6 @@ jobs:
           # shellcheck disable=SC2046
           docker rm -f $(docker ps -a -q) ||:
           sudo rm -fr "$TEMP_PATH"
-
   # FunctionalStatefulTestAarch64:
   #   needs: [BuilderDebAarch64]
   #   runs-on: [self-hosted, func-tester-aarch64]
@@ -523,11 +520,6 @@ jobs:
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
           clear-repository: true
-      - name: Docker setup
-        uses: ./.github/actions/docker_setup
-        with:
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
       - name: Integration test
         run: |
           sudo rm -fr "$TEMP_PATH"
@@ -565,11 +557,6 @@ jobs:
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
           clear-repository: true
-      - name: Docker setup
-        uses: ./.github/actions/docker_setup
-        with:
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
       - name: Integration test
         run: |
           sudo rm -fr "$TEMP_PATH"

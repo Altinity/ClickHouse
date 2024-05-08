@@ -61,7 +61,7 @@ def get_packager_cmd(
     output_path: str,
     build_version: str,
     image_version: str,
-    ccache_path: str,
+    sccache_directory: str,
     official: bool,
 ) -> str:
     package_type = build_config["package_type"]
@@ -83,7 +83,7 @@ def get_packager_cmd(
     cmd += " --cache=sccache"
     cmd += " --s3-rw-access"
     cmd += f" --s3-bucket={S3_BUILDS_BUCKET}"
-    cmd += f" --s3-directory={ccache_path}"
+    cmd += f" --s3-directory={sccache_directory}"
     cmd += f" --s3-access-key-id={S3_ACCESS_KEY_ID}"
     cmd += f" --s3-secret-access-key={S3_SECRET_ACCESS_KEY}"
 
@@ -305,7 +305,7 @@ def main():
     if not os.path.exists(build_output_path):
         os.makedirs(build_output_path)
 
-    ccache_path = "ccache"
+    sccache_directory = "ccache"
 
     packager_cmd = get_packager_cmd(
         build_config,
@@ -313,7 +313,7 @@ def main():
         build_output_path,
         version.string,
         image_version,
-        ccache_path,
+        sccache_directory,
         official_flag,
     )
 
