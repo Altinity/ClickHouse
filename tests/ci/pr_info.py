@@ -115,6 +115,7 @@ class PRInfo:
 
         if "pull_request" in github_event:  # pull request and other similar events
             self.number = github_event["pull_request"]["number"]  # type: int
+            self.docker_image_tag = str(self.number) # type: str
             if pr_event_from_api:
                 try:
                     response = get_gh_api(
@@ -191,6 +192,7 @@ class PRInfo:
             if pull_request is None or pull_request["state"] == "closed":
                 # it's merged PR to master
                 self.number = 0
+                self.docker_image_tag = str(self.number) + "-" + str(self.sha)
                 self.labels = set()
                 self.pr_html_url = f"{repo_prefix}/commits/{ref}"
                 self.base_ref = ref
@@ -202,6 +204,7 @@ class PRInfo:
                 )
             else:
                 self.number = pull_request["number"]
+                self.docker_image_tag = str(self.number)
                 self.labels = {label["name"] for label in pull_request["labels"]}
 
                 self.base_ref = pull_request["base"]["ref"]
@@ -248,6 +251,7 @@ class PRInfo:
                 "GITHUB_SHA", "0000000000000000000000000000000000000000"
             )
             self.number = 0
+            self.docker_image_tag = str(self.number) + "-" + str(self.sha)
             self.labels = set()
             repo_prefix = f"{GITHUB_SERVER_URL}/{GITHUB_REPOSITORY}"
             self.task_url = GITHUB_RUN_URL
