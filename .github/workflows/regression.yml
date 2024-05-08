@@ -202,7 +202,7 @@ jobs:
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
           REPORTS_PATH=${{ runner.temp }}/reports_dir
-          SUITE=alter/${{ matrix.ONLY }} partition
+          SUITE=alter-${{ matrix.ONLY }}_partition
           EOF
       - name: Download json reports
         uses: actions/download-artifact@v3
