@@ -1,6 +1,9 @@
 List of pull requests contributed by Altinity develoeprs to ClickHouse server. It does not include documentation changes.
 
 ## 2024   
+  * Improve S3 glob performance	[62120](https://github.com/ClickHouse/ClickHouse/pull/62120)	by @zvonand
+  * Build kererberized_hadoop image by downloading commons-daemon via https	[62886](https://github.com/ClickHouse/ClickHouse/pull/62886)	by @ilejn
+  * Do not allow table to be attached if there already is an active replica path	[61876](https://github.com/ClickHouse/ClickHouse/pull/61876)	by @arthurpassos
   * Add support for S3 access through aws private link interface [#62208](https://github.com/ClickHouse/ClickHouse/pull/62208) by @arthurpassos
   * Fix incorrect CI error message	[62139](https://github.com/ClickHouse/ClickHouse/pull/62139)	by @arthurpassos
   * Crash in Engine Merge if Row Policy does not have expression	[61971](https://github.com/ClickHouse/ClickHouse/pull/61971)	by @ilejn
