@@ -86,7 +86,6 @@ jobs:
   #       with:
   #         name: changed_images
   #         path: ${{ runner.temp }}/changed_images.json
-
   CompatibilityCheck:
     needs: [BuilderDebRelease]
     runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-image-x86-app-docker-ce]
@@ -120,7 +119,6 @@ jobs:
           # shellcheck disable=SC2046
           docker rm -f $(docker ps -a -q) ||:
           sudo rm -fr "$TEMP_PATH"
-
 #########################################################################################
 #################################### ORDINARY BUILDS ####################################
 #########################################################################################
@@ -172,7 +170,6 @@ jobs:
           # shellcheck disable=SC2046
           docker rm -f $(docker ps -a -q) ||:
           sudo rm -fr "$TEMP_PATH" "$CACHES_PATH"
-  
   # BuilderDebAarch64:
   #   needs: [DockerHubPush]
   #   runs-on: [self-hosted, builder]
