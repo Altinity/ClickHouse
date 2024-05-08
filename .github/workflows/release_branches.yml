@@ -89,7 +89,7 @@ jobs:
 
   CompatibilityCheck:
     needs: [BuilderDebRelease]
-    runs-on: [altinity-on-demand, altinity-type-cpx41, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -126,7 +126,7 @@ jobs:
 #########################################################################################
   BuilderDebRelease:
     needs: [DockerHubPush]
-    runs-on: [altinity-on-demand, altinity-setup-builder, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-setup-builder, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -252,7 +252,7 @@ jobs:
     needs:
       - BuilderDebRelease
       # - BuilderDebAarch64
-    runs-on: [altinity-on-demand, altinity-type-cpx41, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-image-x86-app-docker-ce]
     if: ${{ success() || failure() }}
     steps:
       - name: Set envs
@@ -336,7 +336,7 @@ jobs:
   #    - BuilderBinDarwinAarch64
       - BuilderDebRelease
   #    - BuilderDebAarch64
-    runs-on: [altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
@@ -351,7 +351,7 @@ jobs:
 ##############################################################################################
   FunctionalStatelessTestRelease:
     needs: [BuilderDebRelease]
-    runs-on: [altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86]
     steps:
       - name: Set envs
         run: |
@@ -370,11 +370,6 @@ jobs:
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
           clear-repository: true
-      - name: Docker setup
-        uses: ./.github/actions/docker_setup
-        with:
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
       - name: Functional test
         run: |
           sudo rm -fr "$TEMP_PATH"
@@ -432,7 +427,7 @@ jobs:
 ##############################################################################################
   FunctionalStatefulTestRelease:
     needs: [BuilderDebRelease]
-    runs-on: [altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86]
     steps:
       - name: Set envs
         run: |
@@ -451,11 +446,6 @@ jobs:
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
           clear-repository: true
-      - name: Docker setup
-        uses: ./.github/actions/docker_setup
-        with:
-          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
       - name: Functional test
         run: |
           sudo rm -fr "$TEMP_PATH"
@@ -513,7 +503,7 @@ jobs:
 #############################################################################################
   IntegrationTestsRelease0:
     needs: [BuilderDebRelease]
-    runs-on: [altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86]
     steps:
       - name: Set envs
         run: |
@@ -555,7 +545,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsRelease1:
     needs: [BuilderDebRelease]
-    runs-on: [altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86]
     steps:
       - name: Set envs
         run: |
