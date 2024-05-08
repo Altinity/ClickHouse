@@ -370,6 +370,11 @@ jobs:
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
           clear-repository: true
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
       - name: Functional test
         run: |
           sudo rm -fr "$TEMP_PATH"
@@ -446,6 +451,11 @@ jobs:
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
           clear-repository: true
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
       - name: Functional test
         run: |
           sudo rm -fr "$TEMP_PATH"
@@ -523,6 +533,11 @@ jobs:
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
           clear-repository: true
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
       - name: Integration test
         run: |
           sudo rm -fr "$TEMP_PATH"
@@ -560,6 +575,11 @@ jobs:
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
           clear-repository: true
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
       - name: Integration test
         run: |
           sudo rm -fr "$TEMP_PATH"
