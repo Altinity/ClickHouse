@@ -3,7 +3,7 @@ import time
 
 
 def has_any_proxy_related_logs(
-cluster, proxy_instance, protocol, bucket, http_methods={"POST", "PUT", "GET"}
+    cluster, proxy_instance, protocol, bucket, http_methods={"POST", "PUT", "GET"}
 ):
     for i in range(10):
         # Check with retry that all possible interactions with Minio are present
@@ -89,11 +89,12 @@ def simple_test(cluster, proxies, protocol, bucket):
 
 
 def simple_test_assert_no_proxy(cluster, proxies, protocol, bucket):
-   minio_endpoint = build_s3_endpoint(protocol, bucket)
-   node = cluster.instances[f"{bucket}"]
+    minio_endpoint = build_s3_endpoint(protocol, bucket)
+    node = cluster.instances[bucket]
+    perform_simple_queries(node, minio_endpoint)
 
-   perform_simple_queries(node, minio_endpoint)
-
-   for proxy in proxies:
-       no_proxy_logs = not has_any_proxy_related_logs(cluster, proxy, protocol, bucket)
-       assert no_proxy_logs, f"Found proxy logs in {proxy} and it should not have found it"
+    for proxy in proxies:
+        no_proxy_logs = not has_any_proxy_related_logs(cluster, proxy, protocol, bucket)
+        assert (
+            no_proxy_logs
+        ), f"Found proxy logs in {proxy} and it should not have found it"
