@@ -347,7 +347,7 @@ jobs:
 ##############################################################################################
   FunctionalStatelessTestRelease:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -422,7 +422,7 @@ jobs:
 ##############################################################################################
   FunctionalStatefulTestRelease:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -497,7 +497,7 @@ jobs:
 #############################################################################################
   IntegrationTestsRelease0:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
@@ -534,7 +534,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsRelease1:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Set envs
         run: |
