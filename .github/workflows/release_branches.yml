@@ -503,10 +503,6 @@ jobs:
     needs: [BuilderDebRelease]
     runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
-      - name: debug
-        run: |
-          pip list
-          pip install docker==6.1.3
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
