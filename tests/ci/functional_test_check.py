@@ -266,7 +266,7 @@ if __name__ == "__main__":
             sys.exit(0)
 
     image_name = get_image_name(check_name)
-    docker_image = get_image_with_version(reports_path, image_name, version=pr_info.docker_image_tag)
+    docker_image = get_image_with_version(reports_path, image_name, version=pr_info.docker_image_tag + "-amd64")
 
     repo_tests_path = os.path.join(repo_path, "tests")
 

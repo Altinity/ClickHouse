@@ -275,7 +275,7 @@ def main():
     # put them as github actions artifact (result)
     check_for_success_run(s3_helper, s3_path_prefix, build_name, build_config)
 
-    docker_image = get_image_with_version(IMAGES_PATH, IMAGE_NAME, version=pr_info.docker_image_tag)
+    docker_image = get_image_with_version(IMAGES_PATH, IMAGE_NAME, version=pr_info.docker_image_tag + "-amd64")
     image_version = docker_image.version
 
     logging.info("Got version from repo %s", version.string)
