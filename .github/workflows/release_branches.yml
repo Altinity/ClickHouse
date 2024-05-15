@@ -499,6 +499,8 @@ jobs:
     needs: [BuilderDebRelease]
     runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
+      - name: debug
+        run: docker info
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
