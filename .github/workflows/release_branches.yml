@@ -104,6 +104,7 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
+          name: changed_images
           path: ${{ env.REPORTS_PATH }}
       - name: CompatibilityCheck
         run: |
@@ -264,6 +265,7 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
+          name: changed_images
           path: ${{ env.REPORTS_PATH }}
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
@@ -361,6 +363,7 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
+          name: changed_images
           path: ${{ env.REPORTS_PATH }}
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
@@ -436,6 +439,7 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
+          name: changed_images
           path: ${{ env.REPORTS_PATH }}
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
@@ -516,6 +520,7 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
+          name: changed_images
           path: ${{ env.REPORTS_PATH }}
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
@@ -553,6 +558,7 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
+          name: changed_images
           path: ${{ env.REPORTS_PATH }}
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
@@ -605,6 +611,7 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v2
         with:
+          name: changed_images
           path: ${{ env.REPORTS_PATH }}
       - name: Sign release
         env:
