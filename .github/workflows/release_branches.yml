@@ -518,6 +518,11 @@ jobs:
         with:
           name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
@@ -556,6 +561,11 @@ jobs:
         with:
           name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
