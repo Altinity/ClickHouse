@@ -155,7 +155,7 @@ jobs:
           job_type: test
 
       - name: Download json reports
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: ${{ env.REPORTS_PATH }}
 
