@@ -507,12 +507,18 @@ jobs:
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
           TEMP_PATH=${{runner.temp}}/integration_tests_release
+          IMAGES_PATH=${{runner.temp}}/images_path
           REPORTS_PATH=${{runner.temp}}/reports_dir
           CHECK_NAME=Integration tests (release)
           REPO_COPY=${{runner.temp}}/integration_tests_release/ClickHouse
           RUN_BY_HASH_NUM=0
           RUN_BY_HASH_TOTAL=2
           EOF
+      - name: Download changed images
+        uses: actions/download-artifact@v3
+        with:
+          name: changed_images
+          path: ${{ env.IMAGES_PATH }}
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
@@ -550,12 +556,18 @@ jobs:
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
           TEMP_PATH=${{runner.temp}}/integration_tests_release
+          IMAGES_PATH=${{runner.temp}}/images_path
           REPORTS_PATH=${{runner.temp}}/reports_dir
           CHECK_NAME=Integration tests (release)
           REPO_COPY=${{runner.temp}}/integration_tests_release/ClickHouse
           RUN_BY_HASH_NUM=1
           RUN_BY_HASH_TOTAL=2
           EOF
+      - name: Download changed images
+        uses: actions/download-artifact@v3
+        with:
+          name: changed_images
+          path: ${{ env.IMAGES_PATH }}
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
@@ -595,7 +607,7 @@ jobs:
     with:
       runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-app-docker-ce, altinity-setup-regression
       commit: 6da94b78dc53cb8965ab56c04a89ebf54ed04cbc
-      arch: release 
+      arch: release
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
   SignRelease:

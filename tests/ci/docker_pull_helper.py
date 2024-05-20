@@ -44,6 +44,7 @@ def get_images_with_versions(
             logging.info("Got images %s", images)
     else:
         images = {}
+        logging.info("Images file doesn't exist")
 
     docker_images = []
     for image_name in required_image:
