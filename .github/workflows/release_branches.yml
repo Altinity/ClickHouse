@@ -43,7 +43,7 @@ jobs:
           cd "$GITHUB_WORKSPACE/tests/ci"
           python3 docker_images_check.py --suffix aarch64
       - name: Upload images files to artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: changed_images_aarch64
           path: ${{ runner.temp }}/docker_images_check/changed_images_aarch64.json
@@ -61,7 +61,7 @@ jobs:
           cd "$GITHUB_WORKSPACE/tests/ci"
           python3 docker_images_check.py --suffix amd64
       - name: Upload images files to artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: changed_images_amd64
           path: ${{ runner.temp }}/docker_images_check/changed_images_amd64.json
@@ -84,13 +84,13 @@ jobs:
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Download changed aarch64 images
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: changed_images_aarch64
           path: ${{ runner.temp }}
 
       - name: Download changed amd64 images
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: changed_images_amd64
           path: ${{ runner.temp }}
@@ -101,7 +101,7 @@ jobs:
           python3 docker_manifests_merge.py --suffix amd64 --suffix aarch64
 
       - name: Upload images files to artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: changed_images
           path: ${{ runner.temp }}/changed_images.json
@@ -657,9 +657,9 @@ jobs:
         run: |
           sudo rm -fr "$GITHUB_WORKSPACE" && mkdir "$GITHUB_WORKSPACE"
       - name: Check out repository code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
       - name: Download json reports
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v4
         with:
           path: ${{ env.REPORTS_PATH }}
       - name: Sign release
@@ -671,7 +671,7 @@ jobs:
           cd "$GITHUB_WORKSPACE/tests/ci"
           python3 sign_release.py
       - name: Upload signed hashes
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: signed-hashes
           path: ${{ env.TEMP_PATH }}/*.gpg
