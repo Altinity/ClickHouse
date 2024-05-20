@@ -507,7 +507,6 @@ jobs:
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
           TEMP_PATH=${{runner.temp}}/integration_tests_release
-          IMAGES_PATH=${{runner.temp}}/images_path
           REPORTS_PATH=${{runner.temp}}/reports_dir
           CHECK_NAME=Integration tests (release)
           REPO_COPY=${{runner.temp}}/integration_tests_release/ClickHouse
@@ -518,7 +517,7 @@ jobs:
         uses: actions/download-artifact@v3
         with:
           name: changed_images
-          path: ${{ env.IMAGES_PATH }}
+          path: ${{ env.REPORTS_PATH }}
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
@@ -556,7 +555,6 @@ jobs:
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
           TEMP_PATH=${{runner.temp}}/integration_tests_release
-          IMAGES_PATH=${{runner.temp}}/images_path
           REPORTS_PATH=${{runner.temp}}/reports_dir
           CHECK_NAME=Integration tests (release)
           REPO_COPY=${{runner.temp}}/integration_tests_release/ClickHouse
@@ -567,7 +565,7 @@ jobs:
         uses: actions/download-artifact@v3
         with:
           name: changed_images
-          path: ${{ env.IMAGES_PATH }}
+          path: ${{ env.REPORTS_PATH }}
       - name: Download json reports
         uses: actions/download-artifact@v3
         with:
