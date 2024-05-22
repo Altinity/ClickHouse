@@ -51,12 +51,6 @@ name: Testing workflow
       AWS_DEFAULT_REGION:
         description: the region of the aws param store.
         required: true
-      DOCKER_USERNAME:
-        description: username of the docker user.
-        required: true
-      DOCKER_PASSWORD:
-        description: password to the docker user.
-        required: true
 
 env:
   # Force the stdout and stderr streams to be unbuffered
@@ -65,8 +59,6 @@ env:
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
-  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
 
 jobs:
   runner_labels_setup:
@@ -157,6 +149,7 @@ jobs:
       - name: Download json reports
         uses: actions/download-artifact@v4
         with:
+          pattern: build_report_package_*
           path: ${{ env.REPORTS_PATH }}
 
       - name: Docker setup
