@@ -334,7 +334,7 @@ jobs:
   #    - BuilderBinDarwinAarch64
       - BuilderDebRelease
   #    - BuilderDebAarch64
-    runs-on: [self-hosted, altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-in-ash, altinity-image-arm-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-image-arm-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6

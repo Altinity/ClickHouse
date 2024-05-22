@@ -180,7 +180,7 @@ jobs:
    strategy:
      fail-fast: false
      matrix:
-      ONLY: [replace, attach, move]    
+      ONLY: [replace, attach, move]
    needs: [runner_labels_setup]
    runs-on: ${{ fromJson(needs.runner_labels_setup.outputs.runner_labels) }}
    timeout-minutes: ${{ inputs.timeout_minutes }}
@@ -194,7 +194,8 @@ jobs:
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
           REPORTS_PATH=${{ runner.temp }}/reports_dir
-          SUITE=alter-${{ matrix.ONLY }}_partition
+          SUITE=alter
+          STORAGE=/${{ matrix.ONLY }}_partition
           EOF
       - name: Download json reports
         uses: actions/download-artifact@v4
@@ -221,7 +222,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ${{ env.SUITE }}-${{ inputs.arch }}-artifacts
+          name: ${{ env.SUITE }}-${{ env.ONLY }}_partition-${{ inputs.arch }}-artifacts
           path: ${{ env.artifact_paths}}
 
   Benchmark:
