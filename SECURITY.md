@@ -10,7 +10,6 @@ Altinity follows the [ClickHouse security policy](https://github.com/ClickHouse/
 
 The following versions of Altinity Stable Builds are currently being supported with security updates:
 
-
 | Altinity Stable Build release | Last update | Supported? |
 |-------------------------------|-------------|:----------:|
 | <span style="font-size: large; font-weight: bold;">23.8</span>.11.29.altinitystable | 2024-04-30 | ✅ |
@@ -32,7 +31,11 @@ The following versions of Altinity Stable Builds are currently being supported w
 
 ## Reporting a Vulnerability
 
-We're extremely grateful for security researchers and users that report vulnerabilities to the ClickHouse Open Source Community in general and Altinity in particular. All reports are thoroughly investigated by developers. Here's how to decide whether to report a potential vulnerability to ClickHouse.com or Altinity:
+We're extremely grateful for security researchers and users that report vulnerabilities to the ClickHouse Open Source Community in general and Altinity in particular. All reports are thoroughly investigated by developers.
+
+**NOTE: When sending a vulnerability report to ClickHouse.com, report this as an issue with base ClickHouse itself**. Understandably, any report that cites an Altinity Stable Build (or any third party build, for that matter) as the source of the issue is highly unlikely to be accepted by ClickHouse.com. 
+
+Here's how to decide whether to report a potential vulnerability to ClickHouse.com or Altinity:
 
 * **If you're NOT SURE where the problem lies,** send the details of the potential vulnerability to [security@clickhouse.com](mailto:security@clickhouse.com).
 
@@ -61,3 +64,6 @@ Each report sent to Altinity is acknowledged and analyzed within five working da
 
 If the vulnerability is verified as a threat and it applies only to code maintained by Altinity, a public disclosure date will be negotiated by Altinity and the bug submitter. We prefer to fully disclose the vulnerability as soon as possible once a user mitigation is available. It is reasonable to delay disclosure when the vulnerability, fix, or mitigation is not yet fully understood, the solution is not well-tested, or for vendor coordination. The timeframe for disclosure is from immediate (especially if it's already publicly known) to 90 days. For a vulnerability with a straightforward mitigation, we expect the report date to disclosure date to be on the order of 7 days.
 
+<hr>
+
+*©2024 Altinity Inc. All rights reserved. Altinity®, Altinity.Cloud®, and Altinity Stable Builds® are registered trademarks of Altinity, Inc. ClickHouse® is a registered trademark of ClickHouse, Inc.*
