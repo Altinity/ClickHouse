@@ -26,6 +26,8 @@ on: # yamllint disable-line rule:truthy
   push:
     branches:
       - 'releases/23.8**'
+  schedule:
+    - cron: "0 0 * * 6"
 
 jobs:
   DockerHubPushAarch64:
@@ -45,7 +47,7 @@ jobs:
           RUNNER_SSH_COMMAND: "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@$(hostname -I | cut -d ' ' -f 1)"
           
       - name: Upload images files to artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: changed_images_aarch64
           path: ${{ runner.temp }}/docker_images_check/changed_images_aarch64.json
@@ -67,7 +69,7 @@ jobs:
           RUNNER_SSH_COMMAND: "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@$(hostname -I | cut -d ' ' -f 1)"
 
       - name: Upload images files to artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: changed_images_amd64
           path: ${{ runner.temp }}/docker_images_check/changed_images_amd64.json
@@ -90,13 +92,13 @@ jobs:
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Download changed aarch64 images
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: changed_images_aarch64
           path: ${{ runner.temp }}
 
       - name: Download changed amd64 images
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: changed_images_amd64
           path: ${{ runner.temp }}
@@ -107,7 +109,7 @@ jobs:
           python3 docker_manifests_merge.py --suffix amd64 --suffix aarch64
 
       - name: Upload images files to artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: changed_images
           path: ${{ runner.temp }}/changed_images.json
@@ -118,7 +120,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Compatibility check X86
-      runner_type: altinity-on-demand, altinity-type-cpx41, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-app-docker-ce
       timeout_minutes: 180
       run_command: |
         cd "$REPO_COPY/tests/ci"
@@ -131,6 +133,7 @@ jobs:
     with:
       test_name: Compatibility check Aarch64
       runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-app-docker-ce
+      timeout_minutes: 180
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 compatibility_check.py --check-name "Compatibility check (aarch64)" --check-glibc
@@ -185,7 +188,7 @@ jobs:
       runner_type: altinity-on-demand, altinity-setup-builder, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-app-docker-ce
       additional_envs: |
         CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
-        
+
   BuilderDebTsan:
     needs: [DockerHubPush]
     uses: ./.github/workflows/reusable_build.yml
@@ -265,7 +268,7 @@ jobs:
     secrets: inherit
     with:
       test_name: ClickHouse build check
-      runner_type: altinity-on-demand, altinity-type-cpx41, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-image-x86-app-docker-ce
       timeout_minutes: 180
       additional_envs: |
         NEEDS_DATA<<NDENV
@@ -282,7 +285,7 @@ jobs:
       - BuilderDebRelease
       - BuilderDebAarch64
       - SignRelease
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Check out repository code
@@ -389,7 +392,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
-        
+
   FunctionalStatelessTestMsan:
     needs: [BuilderDebMsan]
     uses: ./.github/workflows/reusable_test.yml
@@ -403,7 +406,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
-        
+
   FunctionalStatelessTestDebug:
     needs: [BuilderDebDebug]
     uses: ./.github/workflows/reusable_test.yml
@@ -459,7 +462,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
-        
+
   FunctionalStatefulTestTsan:
     needs: [BuilderDebTsan]
     uses: ./.github/workflows/reusable_test.yml
@@ -472,7 +475,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
-        
+
   FunctionalStatefulTestMsan:
     needs: [BuilderDebMsan]
     uses: ./.github/workflows/reusable_test.yml
@@ -485,7 +488,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
-        
+
   FunctionalStatefulTestUBsan:
     needs: [BuilderDebUBsan]
     uses: ./.github/workflows/reusable_test.yml
@@ -498,7 +501,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
-        
+
   FunctionalStatefulTestDebug:
     needs: [BuilderDebDebug]
     uses: ./.github/workflows/reusable_test.yml
@@ -511,7 +514,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
-        
+
 ##############################################################################################
 ######################################### STRESS TESTS #######################################
 ##############################################################################################
@@ -526,7 +529,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 stress_check.py "$CHECK_NAME"
-        
+
   StressTestTsan:
     needs: [BuilderDebTsan]
     uses: ./.github/workflows/reusable_test.yml
@@ -538,7 +541,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 stress_check.py "$CHECK_NAME"
-        
+
   StressTestMsan:
     needs: [BuilderDebMsan]
     uses: ./.github/workflows/reusable_test.yml
@@ -549,7 +552,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 stress_check.py "$CHECK_NAME"
-        
+
   StressTestUBsan:
     needs: [BuilderDebUBsan]
     uses: ./.github/workflows/reusable_test.yml
@@ -561,7 +564,7 @@ jobs:
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 stress_check.py "$CHECK_NAME"
-        
+
   StressTestDebug:
     needs: [BuilderDebDebug]
     uses: ./.github/workflows/reusable_test.yml
@@ -640,7 +643,7 @@ jobs:
       runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-app-docker-ce, altinity-setup-regression
       commit: 17a81c07fc1f41fbee651e0ef0ca4b44e537e5b1
       arch: release 
-      build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'release' && github.sha }}
+      build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
   RegressionTestsAarch64:
     needs: [BuilderReport]
@@ -650,11 +653,11 @@ jobs:
       runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-app-docker-ce, altinity-setup-regression
       commit: 17a81c07fc1f41fbee651e0ef0ca4b44e537e5b1
       arch: aarch64
-      build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'release' && github.sha }}
+      build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
   SignRelease:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-in-ash, altinity-image-x86-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -667,10 +670,11 @@ jobs:
         run: |
           sudo rm -fr "$GITHUB_WORKSPACE" && mkdir "$GITHUB_WORKSPACE"
       - name: Check out repository code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
       - name: Download json reports
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v4
         with:
+          pattern: build_report_package_*
           path: ${{ env.REPORTS_PATH }}
       - name: Sign release
         env:
@@ -681,7 +685,7 @@ jobs:
           cd "$GITHUB_WORKSPACE/tests/ci"
           python3 sign_release.py
       - name: Upload signed hashes
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: signed-hashes
           path: ${{ env.TEMP_PATH }}/*.gpg
@@ -728,7 +732,7 @@ jobs:
       - RegressionTestsRelease
       - RegressionTestsAarch64
       - SignRelease
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx31, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-image-x86-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
