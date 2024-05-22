@@ -109,7 +109,7 @@ def main():
         logging.info("Check is already finished according to github status, exiting")
         sys.exit(0)
 
-    docker_image = get_image_with_version(reports_path, "altinityinfra/fasttest")
+    docker_image = get_image_with_version(reports_path, "altinityinfra/fasttest", version=pr_info.docker_image_tag)
 
     s3_helper = S3Helper()
 

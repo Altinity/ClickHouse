@@ -273,7 +273,7 @@ def main():
             sys.exit(0)
 
     docker_images = {
-        name: get_image_with_version(REPORTS_PATH, name)
+        name: get_image_with_version(REPORTS_PATH, name, version=pr_info.docker_image_tag)
         for name in (RPM_IMAGE, DEB_IMAGE)
     }
     prepare_test_scripts()
@@ -354,7 +354,7 @@ def main():
         args.check_name,
     )
 
-    ch_helper.insert_events_into(db="default", table="checks", events=prepared_events)
+    ch_helper.insert_events_into(db="gh-data", table="checks", events=prepared_events)
 
     if state == FAILURE:
         sys.exit(1)

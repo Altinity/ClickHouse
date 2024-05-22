@@ -181,6 +181,52 @@ jobs:
           name: ${{ env.SUITE }}-${{ inputs.arch }}-artifacts
           path: ${{ env.artifact_paths}}
 
+  Alter:
+   strategy:
+     fail-fast: false
+     matrix:
+      ONLY: [replace, attach, move]
+   needs: [runner_labels_setup]
+   runs-on: ${{ fromJson(needs.runner_labels_setup.outputs.runner_labels) }}
+   timeout-minutes: ${{ inputs.timeout_minutes }}
+   steps:
+      - name: Checkout regression repo
+        uses: actions/checkout@v4
+        with:
+          repository: Altinity/clickhouse-regression
+          ref: ${{ inputs.commit }}
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          REPORTS_PATH=${{ runner.temp }}/reports_dir
+          SUITE=alter
+          STORAGE=/${{ matrix.ONLY }}_partition
+          EOF
+      - name: Download json reports
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ env.REPORTS_PATH }}
+          name: build_report_package_${{ inputs.arch }}
+      - name: Setup
+        run: .github/setup.sh
+      - name: Get deb url
+        run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
+      - name: Run ${{ env.SUITE }} suite
+        run: python3
+              -u alter/regression.py
+              --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --only "/alter/${{ matrix.ONLY }} partition/*"
+              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
+              ${{ env.args }}
+      - name: Create and upload logs
+        if: always()
+        run: .github/create_and_upload_logs.sh 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ env.SUITE }}-${{ env.ONLY }}_partition-${{ inputs.arch }}-artifacts
+          path: ${{ env.artifact_paths}}
+
   Benchmark:
     strategy:
       fail-fast: false

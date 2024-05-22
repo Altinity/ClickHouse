@@ -68,7 +68,7 @@ jobs:
 
   DockerHubPush:
     needs: [DockerHubPushAmd64, DockerHubPushAarch64]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
@@ -260,7 +260,7 @@ jobs:
     secrets: inherit
     with:
       test_name: ClickHouse build check
-      runner_type: altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-image-arm-app-docker-ce
       timeout_minutes: 180
       additional_envs: |
         NEEDS_DATA<<NDENV
@@ -277,7 +277,7 @@ jobs:
       - BuilderDebRelease
       - BuilderDebAarch64
       - SignRelease
-    runs-on: [self-hosted, altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-image-arm-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Check out repository code
@@ -628,7 +628,7 @@ jobs:
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-app-docker-ce, altinity-setup-regression
+      runner_type: altinity-on-demand, altinity-setup-regression, altinity-type-cpx51, altinity-image-x86-app-docker-ce
       commit: 6da94b78dc53cb8965ab56c04a89ebf54ed04cbc
       arch: release 
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
@@ -638,14 +638,14 @@ jobs:
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
-      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-app-docker-ce, altinity-setup-regression
+      runner_type: altinity-on-demand, altinity-setup-regression, altinity-type-cax41, altinity-image-arm-app-docker-ce
       commit: 6da94b78dc53cb8965ab56c04a89ebf54ed04cbc
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
   SignRelease:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-image-arm-app-docker-ce]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -720,7 +720,7 @@ jobs:
       - RegressionTestsRelease
       - RegressionTestsAarch64
       - SignRelease
-    runs-on: [self-hosted, altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-image-arm-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
