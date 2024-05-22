@@ -39,7 +39,9 @@ But as with any piece of software, bad things may happen. If something *does* go
 4. If you can reproduce the bug, try to isolate it. For example, remove pieces of a failing query one by one, creating the simplest scenario where the error still occurs. Creating [a minimal reproducible example](https://stackoverflow.com/help/minimal-reproducible-example) is a huge step towards a solution.
 5. Once you have that minimal reproducible example, see if it fails on the newest version of ClickHouse (not just the latest bugfix release of the version you’re using).
    * If you’re an Altinity support customer, [contact Altinity support](https://docs.altinity.com/support).
-   * If you’re not an Altinity customer, you can create a GitHub issue in the [Altinity/ClickHouse](https://github.com/Altinity/ClickHouse/issues/new/choose) repo.
+   * If you’re not an Altinity customer, you can create a GitHub issue in the [Altinity/ClickHouse repo](https://github.com/Altinity/ClickHouse/issues/new/choose).
+
+**NOTE**: We strongly recommend that you send bug reports to Altinity, either through [Altinity support](https://docs.altinity.com/support) or via an issue in the [Altinity/ClickHouse repo](https://github.com/Altinity/ClickHouse/issues/new/choose). However, if you *do* decide to submit a bug report to ClickHouse.com, **report this as an issue with base ClickHouse itself**. Understandably, any report that cites an Altinity Stable Build (or any third party build, for that matter) as the source of the bug is highly unlikely to be accepted by ClickHouse.com.
 
 ## Altinity Links
 
