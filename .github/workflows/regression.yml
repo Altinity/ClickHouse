@@ -147,7 +147,7 @@ jobs:
     timeout-minutes: ${{ inputs.timeout_minutes }}
     steps:
       - name: Checkout regression repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: Altinity/clickhouse-regression
           ref: ${{ inputs.commit }}
@@ -158,7 +158,7 @@ jobs:
           SUITE=${{ matrix.SUITE }}
           EOF
       - name: Download json reports
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_urls_package_${{ inputs.arch }}
@@ -178,12 +178,12 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: ${{ env.SUITE }}-${{ inputs.arch }}-artifacts
           path: ${{ env.artifact_paths}}
-          
+
   Alter:
    strategy:
      fail-fast: false
@@ -194,7 +194,7 @@ jobs:
    timeout-minutes: ${{ inputs.timeout_minutes }}
    steps:
       - name: Checkout regression repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: Altinity/clickhouse-regression
           ref: ${{ inputs.commit }}
@@ -205,7 +205,7 @@ jobs:
           SUITE=alter-${{ matrix.ONLY }}_partition
           EOF
       - name: Download json reports
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_urls_package_${{ inputs.arch }}
@@ -226,7 +226,7 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: ${{ env.SUITE }}-${{ inputs.arch }}-artifacts
@@ -242,7 +242,7 @@ jobs:
     timeout-minutes: ${{ inputs.timeout_minutes }}
     steps:
       - name: Checkout regression repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: Altinity/clickhouse-regression
           ref: ${{ inputs.commit }}
@@ -254,7 +254,7 @@ jobs:
           STORAGE=/${{ matrix.STORAGE }}
           EOF
       - name: Download json reports
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_urls_package_${{ inputs.arch }}
@@ -282,7 +282,7 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: benchmark-${{ matrix.STORAGE }}-${{ inputs.arch }}-artifacts
@@ -294,7 +294,7 @@ jobs:
     timeout-minutes: ${{ inputs.timeout_minutes }}
     steps:
       - name: Checkout regression repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: Altinity/clickhouse-regression
           ref: ${{ inputs.commit }}
@@ -306,7 +306,7 @@ jobs:
           STORAGE=/ssl
           EOF
       - name: Download json reports
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_urls_package_${{ inputs.arch }}
@@ -327,7 +327,7 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: ${{ env.SUITE }}-${{ inputs.arch }}-ssl-artifacts
@@ -343,7 +343,7 @@ jobs:
     timeout-minutes: ${{ inputs.timeout_minutes }}
     steps:
       - name: Checkout regression repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: Altinity/clickhouse-regression
           ref: ${{ inputs.commit }}
@@ -354,7 +354,7 @@ jobs:
           SUITE=ldap/${{ matrix.SUITE }}
           EOF
       - name: Download json reports
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_urls_package_${{ inputs.arch }}
@@ -374,7 +374,7 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: ldap-${{ matrix.SUITE }}-${{ inputs.arch }}-artifacts
@@ -386,7 +386,7 @@ jobs:
     timeout-minutes: ${{ inputs.timeout_minutes }}
     steps:
       - name: Checkout regression repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: Altinity/clickhouse-regression
           ref: ${{ inputs.commit }}
@@ -397,7 +397,7 @@ jobs:
           SUITE=parquet
           EOF
       - name: Download json reports
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_urls_package_${{ inputs.arch }}
@@ -417,7 +417,7 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: ${{ env.SUITE }}-${{ inputs.arch }}-artifacts
@@ -433,7 +433,7 @@ jobs:
     timeout-minutes: ${{ inputs.timeout_minutes }}
     steps:
       - name: Checkout regression repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: Altinity/clickhouse-regression
           ref: ${{ inputs.commit }}
@@ -445,7 +445,7 @@ jobs:
           STORAGE=${{ matrix.STORAGE}}
           EOF
       - name: Download json reports
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_urls_package_${{ inputs.arch }}
@@ -470,7 +470,7 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: ${{ env.SUITE }}-${{ env.STORAGE }}-${{ inputs.arch }}-artifacts
@@ -486,7 +486,7 @@ jobs:
     timeout-minutes: ${{ inputs.timeout_minutes }}
     steps:
       - name: Checkout regression repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: Altinity/clickhouse-regression
           ref: ${{ inputs.commit }}
@@ -498,7 +498,7 @@ jobs:
           STORAGE=/${{ matrix.STORAGE }}
           EOF
       - name: Download json reports
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_urls_package_${{ inputs.arch }}
@@ -526,7 +526,7 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: ${{ env.SUITE }}-${{ matrix.STORAGE }}-${{ inputs.arch }}-artifacts
@@ -542,7 +542,7 @@ jobs:
     timeout-minutes: ${{ inputs.timeout_minutes }}
     steps:
       - name: Checkout regression repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           repository: Altinity/clickhouse-regression
       - name: Set envs
@@ -553,7 +553,7 @@ jobs:
           STORAGE=/${{ matrix.STORAGE }}
           EOF
       - name: Download json reports
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_urls_package_${{ inputs.arch }}
@@ -580,7 +580,7 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: ${{ env.SUITE }}-${{ matrix.STORAGE }}-${{ inputs.arch }}-artifacts

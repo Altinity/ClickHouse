@@ -57,7 +57,7 @@ jobs:
         run: |
           mv ${{ runner.temp }}/docker_images_check/changed_images_amd64.json ${{ runner.temp }}/docker_images_check/changed_images.json
       - name: Upload images files to artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: changed_images
           path: ${{ runner.temp }}/docker_images_check/changed_images.json
@@ -102,7 +102,7 @@ jobs:
         with:
           clear-repository: true
       - name: Download json reports
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
@@ -138,7 +138,7 @@ jobs:
           CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
           EOF
       - name: Download changed images
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: changed_images
           path: ${{ env.IMAGES_PATH }}
@@ -159,7 +159,7 @@ jobs:
           cd "$REPO_COPY/tests/ci" && python3 build_check.py "$BUILD_NAME"
       - name: Upload build URLs to artifacts
         if: ${{ success() || failure() }}
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BUILD_URLS }}
           path: ${{ env.TEMP_PATH }}/${{ env.BUILD_URLS }}.json
@@ -250,7 +250,7 @@ jobs:
     needs:
       - BuilderDebRelease
       # - BuilderDebAarch64
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-image-x86-app-docker-ce]
     if: ${{ success() || failure() }}
     steps:
       - name: Set envs
@@ -263,12 +263,12 @@ jobs:
           NEEDS_DATA_PATH=${{runner.temp}}/needs.json
           EOF
       - name: Download json reports
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
       - name: Check out repository code
-        uses: ClickHouse/checkout@v1
+        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
           clear-repository: true
       - name: Report Builder
@@ -334,7 +334,7 @@ jobs:
   #    - BuilderBinDarwinAarch64
       - BuilderDebRelease
   #    - BuilderDebAarch64
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-in-ash, altinity-image-x86-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
@@ -361,7 +361,7 @@ jobs:
           KILL_TIMEOUT=10800
           EOF
       - name: Download json reports
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
@@ -437,7 +437,7 @@ jobs:
           KILL_TIMEOUT=3600
           EOF
       - name: Download json reports
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
@@ -514,12 +514,12 @@ jobs:
           RUN_BY_HASH_TOTAL=2
           EOF
       - name: Download changed images
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: changed_images
           path: ${{ env.REPORTS_PATH }}
       - name: Download json reports
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
@@ -562,12 +562,12 @@ jobs:
           RUN_BY_HASH_TOTAL=2
           EOF
       - name: Download changed images
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: changed_images
           path: ${{ env.REPORTS_PATH }}
       - name: Download json reports
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
@@ -623,9 +623,9 @@ jobs:
         run: |
           sudo rm -fr "$GITHUB_WORKSPACE" && mkdir "$GITHUB_WORKSPACE"
       - name: Check out repository code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
       - name: Download json reports
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v4
         with:
           name: build_urls_package_release
           path: ${{ env.REPORTS_PATH }}
@@ -638,7 +638,7 @@ jobs:
           cd "$GITHUB_WORKSPACE/tests/ci"
           python3 sign_release.py
       - name: Upload signed hashes
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: signed-hashes
           path: ${{ env.TEMP_PATH }}/*.gpg
@@ -667,7 +667,7 @@ jobs:
       - CompatibilityCheck
       - SignRelease
       - RegressionTestsRelease
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx31, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-image-x86-app-docker-ce]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
