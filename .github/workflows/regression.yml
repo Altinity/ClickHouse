@@ -57,12 +57,6 @@ name: Regression test workflow - Release
       AWS_REPORT_REGION:
         description: aws s3 region used for regression test reports.
         required: true
-      DOCKER_USERNAME:
-        description: username of the docker user.
-        required: true
-      DOCKER_PASSWORD:
-        description: password to the docker user.
-        required: true
       REGRESSION_AWS_S3_BUCKET:
         description: aws s3 bucket used for regression tests.
         required: true
@@ -91,8 +85,6 @@ env:
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
   AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
-  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
   args: --test-to-end
     --no-colors
     --local
