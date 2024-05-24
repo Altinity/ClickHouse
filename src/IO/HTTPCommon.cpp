@@ -364,8 +364,7 @@ void setResponseDefaultHeaders(HTTPServerResponse & response, size_t keep_alive_
 HTTPSessionPtr makeHTTPSession(
     const Poco::URI & uri,
     const ConnectionTimeouts & timeouts,
-    ProxyConfiguration proxy_configuration
-)
+    const ProxyConfiguration & proxy_configuration)
 {
     const std::string & host = uri.getHost();
     UInt16 port = uri.getPort();

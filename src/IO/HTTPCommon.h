@@ -73,7 +73,7 @@ void setResponseDefaultHeaders(HTTPServerResponse & response, size_t keep_alive_
 HTTPSessionPtr makeHTTPSession(
     const Poco::URI & uri,
     const ConnectionTimeouts & timeouts,
-    ProxyConfiguration proxy_config = {}
+    const ProxyConfiguration & proxy_config = {}
 );
 
 /// As previous method creates session, but takes it from pool, without and with proxy uri.
