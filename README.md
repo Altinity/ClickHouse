@@ -13,39 +13,42 @@
 
 </div>
 
-**Altinity Stable Builds** are releases of ClickHouse® supported by Altinity for three years. They undergo rigorous testing to verify they are secure and ready for production use. They're also 100% open source and 100% compatible with ClickHouse upstream builds. FIPS-compatible versions are available as well.
+**Altinity Stable Builds** are releases of ClickHouse® that undergo rigorous testing to verify they are secure and ready for production use. Among other things, they are: 
+
+* Supported for three years
+* Validated against client libraries and visualization tools
+* Tested for cloud use, including Kubernetes
+* 100% open source and 100% compatible with ClickHouse upstream builds
+* Available in FIPS-compatible versions
 
 **We encourage you to use Altinity Stable Builds whether you're an Altinity Support customer or not.**
 
-## Useful Links
+## Acknowledgement
 
-* [Altinity home page](https://altinity.com/) - Your starting point for all things Altinity
-* [Documentation](https://docs.altinity.com/altinitystablebuilds/) - A list of current releases and their lifecycles
-* [Release notes](https://docs.altinity.com/releasenotes/altinity-stable-release-notes/) - Complete details on the changes and fixes in each release
-* [Builds page](https://builds.altinity.cloud/) - Download and installation instructions
-* [Dockerhub page](https://hub.docker.com/r/altinity/clickhouse-server) - Home of the Altinity Stable Build container images
-* [Product page](https://altinity.com/altinity-stable/) - Customer testimonials and additional information
-* [Knowledge base](https://kb.altinity.com/) - Insight, knowledge, and advice from the Altinity Engineering and Support teams
+We at Altinity, Inc. are thoroughly grateful to the worldwide ClickHouse community, including the core committers who make ClickHouse the world's best analytics database. 
 
 ## What should I do if I find a bug in an Altinity Stable Build?
 
-ClickHouse’s thousands of core features are all well-tested and stable. To maintain that stability, Altinity Stable Builds are built with a CI system that runs tens of thousands of tests against every commit.
+ClickHouse’s thousands of core features are all well-tested and stable. To maintain that stability, Altinity Stable Builds are built with a CI system that runs tens of thousands of tests against every commit. But of course, things can always go wrong. If that happens, let us know! **We stand behind our work.**
 
-But as with any piece of software, bad things may happen. If something *does* go wrong:
+### If you're an Altinity customer:
 
-1. First of all, if you’re an Altinity customer, you can [contact Altinity support](https://docs.altinity.com/support/) to file an issue. (If you’d like to go through the troubleshooting tips outlined here before you reach out to us, that’s fine, but not necessary.)
-2. If you’re not an Altinity Support customer, try to upgrade to the latest bugfix release. If you’re using v23.8.8 but you know that v23.8.11.29 exists, start by upgrading to the bugfix. Upgrades to the latest maintenance releases are smooth and safe.
-3. Look for similar issues in the [Altinity/ClickHouse](https://github.com/Altinity/ClickHouse/issues) or [ClickHouse/ClickHouse](https://github.com/ClickHouse/ClickHouse/issues) repos; it's possible the problem has been logged and a fix is on the way.
-4. If you can reproduce the bug, try to isolate it. For example, remove pieces of a failing query one by one, creating the simplest scenario where the error still occurs. Creating [a minimal reproducible example](https://stackoverflow.com/help/minimal-reproducible-example) is a huge step towards a solution.
-5. Once you have that minimal reproducible example, see if it fails on the newest version of ClickHouse (not just the latest bugfix release of the version you’re using).
-   * If you’re an Altinity support customer, [contact Altinity support](https://docs.altinity.com/support).
-   * If you’re not an Altinity customer, you can create a GitHub issue in the [Altinity/ClickHouse repo](https://github.com/Altinity/ClickHouse/issues/new/choose).
+1. [Contact Altinity support](https://docs.altinity.com/support/) to file an issue.
 
-**NOTE**: We strongly recommend that you send bug reports to Altinity, either through [Altinity support](https://docs.altinity.com/support) or via an issue in the [Altinity/ClickHouse repo](https://github.com/Altinity/ClickHouse/issues/new/choose). However, if you *do* decide to submit a bug report to ClickHouse.com, **report this as an issue with base ClickHouse itself**. Understandably, any report that cites an Altinity Stable Build (or any third party build, for that matter) as the source of the bug is highly unlikely to be accepted by ClickHouse.com.
+### If you're not an Altinity customer:
 
-## Altinity Links
+1. Try to upgrade to the latest bugfix release. If you’re using v23.8.8 but you know that v23.8.11.29 exists, start by upgrading to the bugfix. Upgrades to the latest maintenance releases are smooth and safe.
+2. Look for similar issues in the [Altinity/ClickHouse](https://github.com/Altinity/ClickHouse/issues) or [ClickHouse/ClickHouse](https://github.com/ClickHouse/ClickHouse/issues) repos; it's possible the problem has been logged and a fix is on the way.
+3. If you can reproduce the bug, try to isolate it. For example, remove pieces of a failing query one by one, creating the simplest scenario where the error still occurs. Creating [a minimal reproducible example](https://stackoverflow.com/help/minimal-reproducible-example) is a huge step towards a solution.
+4. [File an issue](https://github.com/Altinity/ClickHouse/issues/new/choose) in the Altinity/ClickHouse repo.
 
-* [Altinity.Cloud](https://altinity.com/managed-clickhouse/) - Learn about Altinity solutions for running ClickHouse as a service, in your AWS, GCP, or Azure cloud account, or in your Kubernetes environment
+## Useful Links
+
+* [Release notes](https://docs.altinity.com/releasenotes/altinity-stable-release-notes/) - Complete details on the changes and fixes in each Altinity Stable Build release
+* [Builds page](https://builds.altinity.cloud/) - Download and installation instructions for Altinity Stable Builds
+* [Dockerhub page](https://hub.docker.com/r/altinity/clickhouse-server) - Home of the Altinity Stable Build container images
+* [Knowledge base](https://kb.altinity.com/) - Insight, knowledge, and advice from the Altinity Engineering and Support teams
+* [Documentation](https://docs.altinity.com/altinitystablebuilds/) - A list of current releases and their lifecycles
 * [Altinity support for ClickHouse](https://altinity.com/clickhouse-support/) - The best ClickHouse support in the industry, delivered by the most knowledgeable ClickHouse team in the industry
 * [Altinity administrator training for ClickHouse](https://altinity.com/clickhouse-training/) - Understand how ClickHouse works, not just how to use it
 * [Altinity blog](https://altinity.com/blog/) - The latest news on Altinity's ClickHouse-related projects, release notes, tutorials, and more
