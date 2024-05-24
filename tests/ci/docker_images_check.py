@@ -476,6 +476,7 @@ def main():
     description = format_description(description)
 
     with open(changed_json, "w", encoding="utf-8") as images_file:
+        logging.info(f"Updating {changed_json} with:\n{json.dumps(result_images)}")
         json.dump(result_images, images_file)
 
     s3_helper = S3Helper()
