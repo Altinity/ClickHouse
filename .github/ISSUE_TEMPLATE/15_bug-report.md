@@ -24,6 +24,8 @@ Choose one of the following items, then delete the others:
 
 **Installation issue** - something doesn't install they way it should
 
+**Usability issue** - something works, but it could be a lot easier
+
 ## Describe the situation
 A clear, concise description of what's happening. 
 
