@@ -7,22 +7,25 @@ assignees: ''
 
 ---
 
-*I checked [the Altinity Stable Builds lifecycle table](https://docs.altinity.com/altinitystablebuilds/#altinity-stable-builds-life-cycle-table), and the Altinity Stable Build version I'm using is still supported.*
+✅  *I checked [the Altinity Stable Builds lifecycle table](https://docs.altinity.com/altinitystablebuilds/#altinity-stable-builds-life-cycle-table), and the Altinity Stable Build version I'm using is still supported.*
 
-## Describe what's wrong
-A clear, concise description of what isn't working. 
+## Type of problem
+Choose one of the following items, then delete the others: 
 
-> A link to reproducer in [https://fiddle.clickhouse.com/](https://fiddle.clickhouse.com/).
+**Bug report** - something's broken
 
-## Enable crash reporting
+**Incomplete implementation** - something's not quite right
 
-> Set `send_crash_reports\enabled` to `true` in `config.xml`:
-```
-<send_crash_reports>
-        <!-- Changing <enabled> to true allows sending crash reports to -->
-        <!-- the ClickHouse core developers team via Sentry https://sentry.io -->
-        <enabled>true</enabled>
-```
+**Performance issue** - something works, just not as quickly as it should
+
+**Backwards compatibility issue** - something used to work, but now it doesn't
+
+**Unexpected behavior** - something surprising happened, but it wasn't the good kind of surprise
+
+**Installation issue** - something doesn't install they way it should
+
+## Describe the situation
+A clear, concise description of what's happening. 
 
 ## How to reproduce the behavior
 
