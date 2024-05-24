@@ -26,6 +26,8 @@ Choose one of the following items, then delete the others:
 
 **Usability issue** - something works, but it could be a lot easier
 
+**Documentation issue** - something in the docs is wrong, incomplete, or confusing
+
 ## Describe the situation
 A clear, concise description of what's happening. 
 
