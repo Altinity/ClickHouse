@@ -22,7 +22,7 @@ Choose one of the following items, then delete the others:
 
 **Unexpected behavior** - something surprising happened, but it wasn't the good kind of surprise
 
-**Installation issue** - something doesn't install they way it should
+**Installation issue** - something doesn't install the way it should
 
 **Usability issue** - something works, but it could be a lot easier
 
@@ -37,7 +37,7 @@ A clear, concise description of what's happening.
 * Which interface to use, if it matters
 * Non-default settings, if any
 * `CREATE TABLE` statements for all tables involved
-* Sample data for all these tables, use [clickhouse-obfuscator](https://github.com/ClickHouse/ClickHouse/blob/master/programs/obfuscator/Obfuscator.cpp#L42-L80) if necessary
+* Sample data for all these tables, use the [clickhouse-obfuscator](https://github.com/ClickHouse/ClickHouse/blob/31fd4f5eb41d5ec26724fc645c11fe4d62eae07f/programs/obfuscator/README.md) if necessary
 * Queries to run that lead to an unexpected result
 
 ## Expected behavior
