@@ -29,7 +29,7 @@ Choose one of the following items, then delete the others:
 **Documentation issue** - something in the docs is wrong, incomplete, or confusing
 
 ## Describe the situation
-A clear, concise description of what's happening. 
+A clear, concise description of what's happening. Can you reproduce it in a ClickHouse Official build of the same version?
 
 ## How to reproduce the behavior
 
