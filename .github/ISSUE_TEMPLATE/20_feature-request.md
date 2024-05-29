@@ -1,26 +1,20 @@
 ---
 name: Feature request
-about: Suggest an idea for ClickHouse
+about: Suggest a new ClickHouse feature
 title: ''
 labels: feature
 assignees: ''
 
 ---
 
-> (you don't have to strictly follow this form)
+## Describe the new feature
+A clear, concise description of the feature you'd like to see.
 
-**Use case**
+## Use case
+What is a situation where this feature would be useful? How common is that situation? 
 
-> A clear and concise description of what is the intended usage scenario is.
+## Alternative solutions
+Are there other ways to solve the problem this new feature addresses? Are any of them possible now? If so, how would the solution you're proposing be better? 
 
-**Describe the solution you'd like**
-
-> A clear and concise description of what you want to happen.
-
-**Describe alternatives you've considered**
-
-> A clear and concise description of any alternative solutions or features you've considered.
-
-**Additional context**
-
-> Add any other context or screenshots about the feature request here.
+## Additional context
+Add any other context about your proposed feature here.
