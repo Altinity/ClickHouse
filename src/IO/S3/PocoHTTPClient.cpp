@@ -265,18 +265,31 @@ void PocoHTTPClient::makeRequestInternal(
     Aws::Utils::RateLimits::RateLimiterInterface * readLimiter,
     Aws::Utils::RateLimits::RateLimiterInterface * writeLimiter) const
 {
-    /// Most sessions in pool are already connected and it is not possible to set proxy host/port to a connected session.
-    const auto request_configuration = per_request_configuration();
-    if (http_connection_pool_size && request_configuration.host.empty())
-        makeRequestInternalImpl<true>(request, request_configuration, response, readLimiter, writeLimiter);
-    else
-        makeRequestInternalImpl<false>(request, request_configuration, response, readLimiter, writeLimiter);
+    makeRequestInternalImpl(request, response, readLimiter, writeLimiter);
+}
+
+String getMethod(const Aws::Http::HttpRequest & request)
+{
+    switch (request.GetMethod())
+    {
+        case Aws::Http::HttpMethod::HTTP_GET:
+            return Poco::Net::HTTPRequest::HTTP_GET;
+        case Aws::Http::HttpMethod::HTTP_POST:
+            return Poco::Net::HTTPRequest::HTTP_POST;
+        case Aws::Http::HttpMethod::HTTP_DELETE:
+            return Poco::Net::HTTPRequest::HTTP_DELETE;
+        case Aws::Http::HttpMethod::HTTP_PUT:
+            return Poco::Net::HTTPRequest::HTTP_PUT;
+        case Aws::Http::HttpMethod::HTTP_HEAD:
+            return Poco::Net::HTTPRequest::HTTP_HEAD;
+        case Aws::Http::HttpMethod::HTTP_PATCH:
+            return Poco::Net::HTTPRequest::HTTP_PATCH;
+    }
 }
 
 template <bool pooled>
 void PocoHTTPClient::makeRequestInternalImpl(
     Aws::Http::HttpRequest & request,
-    const DB::ProxyConfiguration & proxy_configuration,
     std::shared_ptr<PocoHTTPResponse> & response,
     Aws::Utils::RateLimits::RateLimiterInterface *,
     Aws::Utils::RateLimits::RateLimiterInterface *) const
@@ -326,6 +339,7 @@ void PocoHTTPClient::makeRequestInternalImpl(
 
     try
     {
+        const auto proxy_configuration = per_request_configuration();
         for (unsigned int attempt = 0; attempt <= s3_max_redirects; ++attempt)
         {
             Poco::URI target_uri(uri);
