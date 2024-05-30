@@ -586,7 +586,7 @@ Client::doRequestWithRetryNetworkErrors(const RequestType & request, RequestFn r
                 /// Requests that expose the response stream as an answer are not retried with that code. E.g. GetObject.
                 return request_fn_(request_);
             }
-            catch (Poco::Net::NetException &)
+            catch (Poco::Net::ConnectionResetException &)
             {
 
                 if constexpr (IsReadMethod)
