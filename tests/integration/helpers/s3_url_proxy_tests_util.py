@@ -98,6 +98,7 @@ def simple_test_assert_no_proxy(cluster, proxies, protocol, bucket):
     # not checking for POST because it is in a different format
     check_proxy_logs(cluster, proxies, "http", policy, ["PUT", "GET"])
 
+
 def simple_test_assert_no_proxy(cluster, proxies, protocol, bucket):
     minio_endpoint = build_s3_endpoint(protocol, bucket)
     node = cluster.instances[bucket]
