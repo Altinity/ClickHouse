@@ -31,7 +31,7 @@ on: # yamllint disable-line rule:truthy
 
 jobs:
   DockerHubPushAarch64:
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cax41, altinity-in-hel1, altinity-image-arm-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cax41, altinity-in-hel1, altinity-image-arm-system-ubuntu-22.04]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
@@ -49,7 +49,7 @@ jobs:
           path: ${{ runner.temp }}/docker_images_check/changed_images_aarch64.json
 
   DockerHubPushAmd64:
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
@@ -68,7 +68,7 @@ jobs:
 
   DockerHubPush:
     needs: [DockerHubPushAmd64, DockerHubPushAarch64]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-image-x86-system-ubuntu-22.04]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
@@ -112,7 +112,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Compatibility check X86
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx41, altinity-image-x86-system-ubuntu-22.04
       timeout_minutes: 180
       run_command: |
         cd "$REPO_COPY/tests/ci"
@@ -124,7 +124,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Compatibility check Aarch64
-      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-system-ubuntu-22.04
       timeout_minutes: 180
       run_command: |
         cd "$REPO_COPY/tests/ci"
@@ -141,7 +141,7 @@ jobs:
       build_name: package_release
       checkout_depth: 0
       timeout_minutes: 180
-      runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04, altinity-setup-builder
       additional_envs: |
         CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
 
@@ -153,7 +153,7 @@ jobs:
       build_name: package_aarch64
       checkout_depth: 0
       timeout_minutes: 180
-      runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04, altinity-setup-builder
       additional_envs: |
         CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
 
@@ -165,7 +165,7 @@ jobs:
       build_name: package_asan
       checkout_depth: 0
       timeout_minutes: 180
-      runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04, altinity-setup-builder
       additional_envs: |
         CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
 
@@ -177,7 +177,7 @@ jobs:
       build_name: package_ubsan
       checkout_depth: 0
       timeout_minutes: 180
-      runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04, altinity-setup-builder
       additional_envs: |
         CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
         
@@ -189,7 +189,7 @@ jobs:
       build_name: package_tsan
       checkout_depth: 0
       timeout_minutes: 180
-      runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04, altinity-setup-builder
       additional_envs: |
         CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
 
@@ -201,7 +201,7 @@ jobs:
       build_name: package_msan
       checkout_depth: 0
       timeout_minutes: 180
-      runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04, altinity-setup-builder
       additional_envs: |
         CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
 
@@ -213,7 +213,7 @@ jobs:
       build_name: package_debug
       checkout_depth: 0
       timeout_minutes: 180
-      runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04, altinity-setup-builder
       additional_envs: |
         CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
 
@@ -224,7 +224,7 @@ jobs:
     needs:
       - BuilderDebRelease
       - BuilderDebAarch64
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04]
     timeout-minutes: 180
     steps:
       - name: Check out repository code
@@ -260,7 +260,7 @@ jobs:
     secrets: inherit
     with:
       test_name: ClickHouse build check
-      runner_type: altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-image-arm-app-docker-ce
+      runner_type: altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-image-arm-system-ubuntu-22.04
       timeout_minutes: 180
       additional_envs: |
         NEEDS_DATA<<NDENV
@@ -277,7 +277,7 @@ jobs:
       - BuilderDebRelease
       - BuilderDebAarch64
       - SignRelease
-    runs-on: [self-hosted, altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-image-arm-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-image-arm-system-ubuntu-22.04]
     timeout-minutes: 180
     steps:
       - name: Check out repository code
@@ -298,7 +298,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Install packages (amd64)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 install_check.py "$CHECK_NAME"
@@ -309,7 +309,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Install packages (arm64)
-      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-system-ubuntu-22.04
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 install_check.py "$CHECK_NAME"
@@ -323,7 +323,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (release)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
       additional_envs: |
         KILL_TIMEOUT=10800
       run_command: |
@@ -336,7 +336,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (aarch64)
-      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-snapshot-docker_ipv6_arm
+      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-system-ubuntu-22.04
       additional_envs: |
         KILL_TIMEOUT=10800
       run_command: |
@@ -349,7 +349,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (asan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
       additional_envs: |
         KILL_TIMEOUT=10800
       batches: 4
@@ -363,7 +363,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (tsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
       additional_envs: |
         KILL_TIMEOUT=10800
       batches: 4
@@ -377,7 +377,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (ubsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
       additional_envs: |
         KILL_TIMEOUT=10800
       batches: 4
@@ -391,7 +391,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (msan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
       additional_envs: |
         KILL_TIMEOUT=10800
       batches: 4
@@ -405,7 +405,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (debug)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
       additional_envs: |
         KILL_TIMEOUT=10800
       batches: 4
@@ -422,7 +422,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (release)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
       additional_envs: |
         KILL_TIMEOUT=3600
       run_command: |
@@ -435,7 +435,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (aarch64)
-      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-snapshot-docker_ipv6_arm
+      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-system-ubuntu-22.04
       additional_envs: |
         KILL_TIMEOUT=3600
       run_command: |
@@ -448,65 +448,65 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (asan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
       additional_envs: |
         KILL_TIMEOUT=3600
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
-        
+
   FunctionalStatefulTestTsan:
     needs: [BuilderDebTsan]
     uses: ./.github/workflows/reusable_test.yml
     secrets: inherit
     with:
       test_name: Stateful tests (tsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
       additional_envs: |
         KILL_TIMEOUT=3600
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
-        
+
   FunctionalStatefulTestMsan:
     needs: [BuilderDebMsan]
     uses: ./.github/workflows/reusable_test.yml
     secrets: inherit
     with:
       test_name: Stateful tests (msan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
       additional_envs: |
         KILL_TIMEOUT=3600
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
-        
+
   FunctionalStatefulTestUBsan:
     needs: [BuilderDebUBsan]
     uses: ./.github/workflows/reusable_test.yml
     secrets: inherit
     with:
       test_name: Stateful tests (ubsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
       additional_envs: |
         KILL_TIMEOUT=3600
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
-        
+
   FunctionalStatefulTestDebug:
     needs: [BuilderDebDebug]
     uses: ./.github/workflows/reusable_test.yml
     secrets: inherit
     with:
       test_name: Stateful tests (debug)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
       additional_envs: |
         KILL_TIMEOUT=3600
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 functional_test_check.py "$CHECK_NAME" "$KILL_TIMEOUT"
-        
+
 ##############################################################################################
 ######################################### STRESS TESTS #######################################
 ##############################################################################################
@@ -516,51 +516,51 @@ jobs:
     secrets: inherit
     with:
       test_name: Stress test (asan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 stress_check.py "$CHECK_NAME"
-        
+
   StressTestTsan:
     needs: [BuilderDebTsan]
     uses: ./.github/workflows/reusable_test.yml
     secrets: inherit
     with:
       test_name: Stress test (tsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 stress_check.py "$CHECK_NAME"
-        
+
   StressTestMsan:
     needs: [BuilderDebMsan]
     uses: ./.github/workflows/reusable_test.yml
     secrets: inherit
     with:
       test_name: Stress test (msan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 stress_check.py "$CHECK_NAME"
-        
+
   StressTestUBsan:
     needs: [BuilderDebUBsan]
     uses: ./.github/workflows/reusable_test.yml
     secrets: inherit
     with:
       test_name: Stress test (ubsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 stress_check.py "$CHECK_NAME"
-        
+
   StressTestDebug:
     needs: [BuilderDebDebug]
     uses: ./.github/workflows/reusable_test.yml
     secrets: inherit
     with:
       test_name: Stress test (debug)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 stress_check.py "$CHECK_NAME"
@@ -574,7 +574,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Integration tests (asan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
       batches: 4
       timeout_minutes: 180
       run_command: |
@@ -587,7 +587,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Integration tests (asan, analyzer)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
       batches: 6
       timeout_minutes: 180
       run_command: |
@@ -600,7 +600,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Integration tests (tsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
       batches: 6
       timeout_minutes: 180
       run_command: |
@@ -613,7 +613,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Integration tests (release)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
       batches: 6
       timeout_minutes: 180
       run_command: |
@@ -628,7 +628,7 @@ jobs:
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
-      runner_type: altinity-on-demand, altinity-setup-regression, altinity-type-cpx51, altinity-image-x86-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04, altinity-setup-regression
       commit: 6da94b78dc53cb8965ab56c04a89ebf54ed04cbc
       arch: release 
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
@@ -638,14 +638,14 @@ jobs:
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
-      runner_type: altinity-on-demand, altinity-setup-regression, altinity-type-cax41, altinity-image-arm-app-docker-ce
+      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-system-ubuntu-22.04, altinity-setup-regression
       commit: 6da94b78dc53cb8965ab56c04a89ebf54ed04cbc
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
   SignRelease:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-image-arm-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -720,7 +720,7 @@ jobs:
       - RegressionTestsRelease
       - RegressionTestsAarch64
       - SignRelease
-    runs-on: [self-hosted, altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-image-arm-app-docker-ce]
+    runs-on: [self-hosted, altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-image-arm-system-ubuntu-22.04]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6

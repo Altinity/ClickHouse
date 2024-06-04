@@ -8,33 +8,33 @@ RUN sed -i "s|http://archive.ubuntu.com|$apt_archive|g" /etc/apt/sources.list
 
 RUN apt-get update \
     && env DEBIAN_FRONTEND=noninteractive apt-get install --yes \
-    adduser \
+    adduser='3.*' \
     ca-certificates \
-    bash \
-    btrfs-progs \
-    e2fsprogs \
-    iptables \
-    xfsprogs \
+    bash='5.*' \
+    btrfs-progs='5.4.*' \
+    e2fsprogs='1.45.*' \
+    iptables='1.8.*' \
+    xfsprogs='5.3.*' \
     tar \
-    pigz \
+    pigz='2.4*' \
     wget \
     git \
-    iproute2 \
+    iproute2='5.5.*' \
     cgroupfs-mount \
     python3-pip \
     tzdata \
-    libicu-dev \
-    bsdutils \
+    libicu-dev='66.*' \
+    bsdutils='1:2.34*' \
     curl \
-    python3-pika \
+    python3-pika='0.11.*' \
     liblua5.1-dev \
-    luajit \
-    libssl-dev \
-    libcurl4-openssl-dev \
+    luajit='2.1.*' \
+    libssl-dev='1.1.*' \
+    libcurl4-openssl-dev='7.68.*' \
     gdb \
     software-properties-common \
-    libkrb5-dev \
-    krb5-user \
+    libkrb5-dev='1.17*' \
+    krb5-user='1.17*' \
     g++ \
     && rm -rf \
         /var/lib/apt/lists/* \
@@ -61,39 +61,38 @@ RUN dockerd --version; docker --version
 
 RUN python3 -m pip install --no-cache-dir \
     PyMySQL \
-    aerospike==4.0.0 \
-    avro==1.10.2 \
-    asyncio \
-    cassandra-driver \
-    confluent-kafka==1.5.0 \
-    dict2xml \
-    dicttoxml \
-    docker==6.1.3 \
-    docker-compose==1.29.2 \
-    grpcio \
-    grpcio-tools \
-    kafka-python \
-    kazoo \
-    lz4 \
-    minio \
-    nats-py \
-    protobuf \
-    psycopg2-binary==2.8.6 \
-    pymongo==3.11.0 \
-    pytest \
-    pytest-order==1.0.0 \
-    pytest-timeout \
-    pytest-random \
-    pytest-xdist \
-    pytest-repeat \
+    aerospike~=4.0 \
+    avro~=1.10 \
+    asyncio~=3.4 \
+    cassandra-driver~=3.28 \
+    confluent-kafka~=1.5 \
+    dict2xml~=1.7 \
+    dicttoxml~=1.7 \
+    docker~=6.1 \
+    docker-compose~=1.29 \
+    grpcio~=1.56 \
+    grpcio-tools~=1.56 \
+    kafka-python~=2.0 \
+    kazoo~=2.9 \
+    lz4~=4.3 \
+    minio~=7.1 \
+    nats-py~=2.3 \
+    protobuf~=4.24 \
+    psycopg2-binary~=2.8 \
+    pymongo~=3.11 \
+    pytest~=7.4 \
+    pytest-order~=1.0 \
+    pytest-timeout~=2.1 \
+    pytest-xdist~=3.3 \
+    pytest-repeat~=0.9 \
     pytz \
-    redis \
-    tzlocal==2.1 \
-    urllib3 \
-    requests-kerberos \
-    pyhdfs \
-    azure-storage-blob \
-    meilisearch==0.18.3 
+    redis~=4.6 \
+    tzlocal~=2.1 \
+    urllib3~=1.25 \
+    requests-kerberos~=0.14 \
+    pyhdfs~=0.3 \
+    azure-storage-blob~=12.17 \
+    meilisearch~=0.18
 
 COPY modprobe.sh /usr/local/bin/modprobe
 COPY dockerd-entrypoint.sh /usr/local/bin/
