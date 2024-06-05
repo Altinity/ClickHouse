@@ -89,6 +89,7 @@ RUN python3 -m pip install --no-cache-dir \
     redis~=4.6 \
     tzlocal~=2.1 \
     urllib3~=1.25 \
+    requests~=2.31.0 \
     requests-kerberos~=0.14 \
     pyhdfs~=0.3 \
     azure-storage-blob~=12.17 \
