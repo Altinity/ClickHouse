@@ -78,7 +78,7 @@ def main():
         logging.info("Check is already finished according to github status, exiting")
         sys.exit(0)
 
-    docker_image = get_image_with_version(reports_path, IMAGE_NAME)
+    docker_image = get_image_with_version(reports_path, IMAGE_NAME, version=pr_info.docker_image_tag)
 
     build_name = get_build_name_for_check(check_name)
     urls = read_build_urls(build_name, reports_path)

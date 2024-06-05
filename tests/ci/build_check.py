@@ -250,7 +250,7 @@ def main():
     # e.g. `binary_darwin_aarch64/clickhouse` for `binary_darwin`
     check_for_success_run(s3_helper, f"{s3_path_prefix}/", build_name, version)
 
-    docker_image = get_image_with_version(IMAGES_PATH, IMAGE_NAME)
+    docker_image = get_image_with_version(IMAGES_PATH, IMAGE_NAME, version=pr_info.docker_image_tag)
     image_version = docker_image.version
 
     logging.info("Got version from repo %s", version.string)
@@ -351,7 +351,7 @@ def main():
     print(f"::notice ::Log URL: {log_url}")
 
     src_path = os.path.join(TEMP_PATH, "build_source.src.tar.gz")
-   
+
     if os.path.exists(src_path):
         src_url = s3_helper.upload_build_file_to_s3(
             Path(src_path), s3_path_prefix + "/clickhouse-" + version.string + ".src.tar.gz"
@@ -361,7 +361,7 @@ def main():
         logging.info("Source tar doesn't exist")
 
     print(f"::notice ::Source tar URL: {src_url}")
-    
+
     build_result = BuildResult(
         build_name,
         log_url,

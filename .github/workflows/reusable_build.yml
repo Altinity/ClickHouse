@@ -131,7 +131,7 @@ jobs:
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Download changed images
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: changed_images
           path: ${{ env.IMAGES_PATH }}
@@ -141,14 +141,14 @@ jobs:
           mkdir -p "$TEMP_PATH/build_check/package_release"
           cd .. && tar czf $TEMP_PATH/build_source.src.tar.gz ClickHouse/
           cd $TEMP_PATH && tar xvzf $TEMP_PATH/build_source.src.tar.gz
-          
+
       - name: Build
         run: |
           cd "$REPO_COPY/tests/ci" && python3 build_check.py "$BUILD_NAME"
 
       - name: Upload build URLs to artifacts
         if: ${{ success() || failure() }}
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BUILD_URLS }}
           path: ${{ env.TEMP_PATH }}/${{ env.BUILD_URLS }}.json

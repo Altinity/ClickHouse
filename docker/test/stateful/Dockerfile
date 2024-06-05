@@ -7,7 +7,7 @@ FROM altinityinfra/stateless-test:$FROM_TAG
 RUN apt-get update -y \
     && env DEBIAN_FRONTEND=noninteractive \
         apt-get install --yes --no-install-recommends \
-        python3-requests \
+        python3-requests=2.22.* \
         nodejs \
         npm \
         rpm2cpio \
@@ -19,7 +19,7 @@ COPY s3downloader /s3downloader
 ENV S3_URL="https://clickhouse-datasets.s3.amazonaws.com"
 ENV DATASETS="hits visits"
 
-RUN npm install -g azurite
+# RUN npm install -g azurite
 RUN npm install tslib
 
 COPY run.sh /

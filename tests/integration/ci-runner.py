@@ -628,7 +628,8 @@ class ClickhouseIntegrationTestsRunner:
 
             test_cmd = " ".join([test for test in sorted(test_names)])
             parallel_cmd = (
-                " --parallel {} ".format(num_workers) if (num_workers > 0 or i > 0) else ""
+                ## NOTE(vnemkov) Second and consecutive runs non-parallel to improve stability
+                " --parallel {} ".format(num_workers) if (num_workers > 0 and i == 0) else ""
             )
             # -r -- show extra test summary:
             # -f -- (f)ailed

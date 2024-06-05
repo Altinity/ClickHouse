@@ -81,7 +81,7 @@ def main():
     elif args.force:
         logging.info("Check the docs because of force flag")
 
-    docker_image = get_image_with_version(reports_path, "altinityinfra/docs-builder")
+    docker_image = get_image_with_version(reports_path, "altinityinfra/docs-builder", version=pr_info.docker_image_tag)
 
     test_output = temp_path / "docs_check_log"
     test_output.mkdir(parents=True, exist_ok=True)
