@@ -1,6 +1,7 @@
 #include <Common/ProxyConfigurationResolverProvider.h>
 
 #include <Common/EnvironmentProxyConfigurationResolver.h>
+#include <Common/proxyConfigurationToPocoProxyConfig.h>
 #include <Common/Exception.h>
 #include <Common/ProxyListConfigurationResolver.h>
 #include <Common/RemoteProxyConfigurationResolver.h>
@@ -56,7 +57,8 @@ namespace
         return std::make_shared<RemoteProxyConfigurationResolver>(
             server_configuration,
             request_protocol,
-            getNoProxyHosts(configuration),
+            buildPocoNonProxyHosts(getNoProxyHosts(configuration)),
+            std::make_shared<RemoteProxyHostFetcherImpl>(),
             isTunnelingDisabledForHTTPSRequestsOverHTTPProxy(configuration));
     }
 
@@ -152,7 +154,7 @@ namespace
             : std::make_shared<ProxyListConfigurationResolver>(
                   uris,
                   request_protocol,
-                  getNoProxyHosts(configuration),
+                  buildPocoNonProxyHosts(getNoProxyHosts(configuration)),
                   isTunnelingDisabledForHTTPSRequestsOverHTTPProxy(configuration));
     }
 
