@@ -27,7 +27,7 @@ on: # yamllint disable-line rule:truthy
 
 jobs:
   RunConfig:
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cax41, altinity-in-hel1, altinity-image-arm-system-ubuntu-22.04]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cax41, altinity-in-hel1, altinity-snapshot-nixos-runner]
     outputs:
       data: ${{ steps.runconfig.outputs.CI_DATA }}
     steps:
