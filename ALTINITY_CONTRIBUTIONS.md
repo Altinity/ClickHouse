@@ -1,6 +1,9 @@
 List of pull requests contributed by Altinity develoeprs to ClickHouse server. It does not include documentation changes.
 
-## 2024   
+## 2024
+  * Add _time virtual column to file alike storages	[64947](https://github.com/ClickHouse/ClickHouse/pull/64947)	by @ilejn
+  * Several minor fixes to proxy support in ClickHouse	[63427](https://github.com/ClickHouse/ClickHouse/pull/63427)	by @arthurpassos
+  * Remove unused CaresPTRResolver::cancel_requests method	[63754](https://github.com/ClickHouse/ClickHouse/pull/63754)	by @arthurpassos
   * Improve S3 glob performance	[62120](https://github.com/ClickHouse/ClickHouse/pull/62120)	by @zvonand
   * Build kererberized_hadoop image by downloading commons-daemon via https	[62886](https://github.com/ClickHouse/ClickHouse/pull/62886)	by @ilejn
   * Do not allow table to be attached if there already is an active replica path	[61876](https://github.com/ClickHouse/ClickHouse/pull/61876)	by @arthurpassos
