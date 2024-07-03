@@ -368,6 +368,7 @@ def main():
     image = DockerImageData(image_path, image_repo, False)
     args.release_type = auto_release_type(args.version, args.release_type)
     tags = gen_tags(args.version, args.release_type)
+    tags.append(f'{pr_info.number}-{args.version}')
     repo_urls = {}
     direct_urls: Dict[str, List[str]] = {}
     release_or_pr, _ = get_release_or_pr(pr_info, args.version)
