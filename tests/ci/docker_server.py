@@ -75,13 +75,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--image-path",
         type=str,
-        default="docker/server",
+        default="",
         help="a path to docker context directory",
     )
     parser.add_argument(
         "--image-repo",
         type=str,
-        default="altinityinfra/clickhouse-server",
+        default="",
         help="image name on docker hub",
     )
     parser.add_argument(
