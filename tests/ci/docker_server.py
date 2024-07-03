@@ -60,7 +60,7 @@ def parse_args() -> argparse.Namespace:
         "--version",
         type=version_arg,
         default=get_version_from_repo(git=git).string,
-        help="a version to build, automaticaly got from version_helper, accepts either "
+        help="a version to build, automatically got from version_helper, accepts either "
         "tag ('refs/tags/' is removed automatically) or a normal 22.2.2.2 format",
     )
     parser.add_argument(
@@ -75,13 +75,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--image-path",
         type=str,
-        default="",
+        default="docker/server",
         help="a path to docker context directory",
     )
     parser.add_argument(
         "--image-repo",
         type=str,
-        default="",
+        default="altinityinfra/clickhouse-server",
         help="image name on docker hub",
     )
     parser.add_argument(
@@ -249,7 +249,7 @@ def build_and_push_image(
     init_args = ["docker", "buildx", "build"]
     if push:
         init_args.append("--push")
-        init_args.append("--output=type=image,push-by-digest=true")
+        init_args.append("--output=type=image")
         init_args.append(f"--tag={image.repo}")
     else:
         init_args.append("--output=type=docker")
