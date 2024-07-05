@@ -4666,6 +4666,11 @@ class ClickHouseInstance:
                     "- " + external_dir_abs_path + ":" + external_dir + "\n"
                 )
 
+        print('!!!! Configs:\n', subprocess.check_output(
+            [f"for f in {self.base_config_dir}/**.*xml ; do echo; echo $f; cat $f; done"],
+            stderr=subprocess.STDOUT, shell=True))
+
+
         # The current implementation of `self.env_variables` is not exclusive. Meaning the variables
         # are shared with all nodes within the same cluster, even if it is specified for a single node.
         # In order not to break the existing tests, the `self.instance_env_variables` option was added as a workaround.
