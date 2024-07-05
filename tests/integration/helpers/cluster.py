@@ -3054,7 +3054,7 @@ class ClickHouseCluster:
                                 "USERS",
                                 "ACCESS",
                                 ):
-                            query = "SHOW {q}"
+                            query = f"SHOW {q}"
                             try:
                                 logging.debug(f"{query}: {instance.query(query)}")
                             except Exception as e:
