@@ -3031,11 +3031,49 @@ class ClickHouseCluster:
             self.shutdown()
             raise
 
+    def __debug_cluster(self):
+        logging.debug("!!! __debug_cluster")
+        try:
+            # report = request.node.stash[phase_report_key]
+            # if report["setup"].failed:
+            #     print("setting up a test failed or skipped", request.node.nodeid)
+            # elif ("call" not in report) or report["call"].failed:
+            #     print("executing test failed or skipped", request.node.nodeid)
+            self.print_all_docker_pieces()
+            if True:
+                for instance_no, (instance_name, instance) in enumerate(self.instances.items()):
+                    logging.debug(f"Dumping instance #{instance_no} : {instance_name} upon cluster termination")
+
+                    try:
+                        logging.debug(f"instance is " + "UP" if instance.is_up else "DOWN")
+                        if not instance.is_up:
+                            continue
+
+                        for q in (
+                                "SETTINGS",
+                                "USERS",
+                                "ACCESS",
+                                ):
+                            query = "SHOW {q}"
+                            try:
+                                logging.debug(f"{query}: {instance.query(query)}")
+                            except Exception as e:
+                                logging.error(F"Failed to execute query \"{query}\" on #{instance_no} : {instance_name}, error: {e}")
+
+                    except Exception as e:
+                        logging.error(f"Failed to dump instance #{instance_no} {instance_name} info, error: {e}")
+
+        except Exception as e:
+            logging.error(f"__debug_cluster error: {e}")
+
+
     def shutdown(self, kill=True, ignore_fatal=True):
         sanitizer_assert_instance = None
         fatal_log = None
 
         if self.up_called:
+            self.__debug_cluster()
+
             with open(self.docker_logs_path, "w+") as f:
                 try:
                     subprocess.check_call(  # STYLE_CHECK_ALLOW_SUBPROCESS_CHECK_CALL
