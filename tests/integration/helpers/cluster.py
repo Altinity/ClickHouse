@@ -3050,7 +3050,7 @@ class ClickHouseCluster:
                             continue
 
                         for q in (
-                                "SETTINGS",
+                                "SETTINGS LIKE '%'",
                                 "USERS",
                                 "ACCESS",
                                 ):
@@ -4668,7 +4668,7 @@ class ClickHouseInstance:
 
         print('!!!! Configs:\n', subprocess.check_output(
             [f"for f in {self.base_config_dir}/**.*xml ; do echo; echo $f; cat $f; done"],
-            stderr=subprocess.STDOUT, shell=True))
+            stderr=subprocess.STDOUT, shell=True).decode())
 
 
         # The current implementation of `self.env_variables` is not exclusive. Meaning the variables
