@@ -3037,14 +3037,14 @@ class ClickHouseCluster:
         if not instance.is_up:
             return
 
-        for q in (
-                "SETTINGS LIKE '%'",
-                "USERS",
-                "ACCESS",
+        for query in (
+                "SELECT version()",
+                "SHOW SETTINGS LIKE '%'",
+                "SHOW USERS",
+                "SHOW ACCESS",
                 ):
-            query = f"SHOW {q}"
             try:
-                logging.debug(f"{query}: {instance.query(query)}")
+                logging.debug(f"{query}:\n{instance.query(query)}")
             except Exception as e:
                 logging.error(F"Failed to execute query \"{query}\", error: {e}")
 
