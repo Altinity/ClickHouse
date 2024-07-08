@@ -3031,8 +3031,26 @@ class ClickHouseCluster:
             self.shutdown()
             raise
 
-    def __debug_cluster(self):
-        logging.debug("!!! __debug_cluster")
+
+    def debug_ch_instance(self, instance):
+        logging.debug(f"instance is " + "UP" if instance.is_up else "DOWN")
+        if not instance.is_up:
+            return
+
+        for q in (
+                "SETTINGS LIKE '%'",
+                "USERS",
+                "ACCESS",
+                ):
+            query = f"SHOW {q}"
+            try:
+                logging.debug(f"{query}: {instance.query(query)}")
+            except Exception as e:
+                logging.error(F"Failed to execute query \"{query}\", error: {e}")
+
+
+    def debug_cluster(self):
+        logging.debug("!!! debug_cluster")
         try:
             # report = request.node.stash[phase_report_key]
             # if report["setup"].failed:
@@ -3043,23 +3061,8 @@ class ClickHouseCluster:
             if True:
                 for instance_no, (instance_name, instance) in enumerate(self.instances.items()):
                     logging.debug(f"Dumping instance #{instance_no} : {instance_name} upon cluster termination")
-
                     try:
-                        logging.debug(f"instance is " + "UP" if instance.is_up else "DOWN")
-                        if not instance.is_up:
-                            continue
-
-                        for q in (
-                                "SETTINGS LIKE '%'",
-                                "USERS",
-                                "ACCESS",
-                                ):
-                            query = f"SHOW {q}"
-                            try:
-                                logging.debug(f"{query}: {instance.query(query)}")
-                            except Exception as e:
-                                logging.error(F"Failed to execute query \"{query}\" on #{instance_no} : {instance_name}, error: {e}")
-
+                        self.debug_ch_instance(instance)
                     except Exception as e:
                         logging.error(f"Failed to dump instance #{instance_no} {instance_name} info, error: {e}")
 
@@ -3072,7 +3075,7 @@ class ClickHouseCluster:
         fatal_log = None
 
         if self.up_called:
-            self.__debug_cluster()
+            self.debug_cluster()
 
             with open(self.docker_logs_path, "w+") as f:
                 try:
@@ -4665,10 +4668,6 @@ class ClickHouseInstance:
                 external_dirs_volumes += (
                     "- " + external_dir_abs_path + ":" + external_dir + "\n"
                 )
-
-        print('!!!! Configs:\n', subprocess.check_output(
-            [f"for f in {self.base_config_dir}/**.*xml ; do echo; echo $f; cat $f; done"],
-            stderr=subprocess.STDOUT, shell=True).decode())
 
 
         # The current implementation of `self.env_variables` is not exclusive. Meaning the variables

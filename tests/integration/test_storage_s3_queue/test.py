@@ -1406,6 +1406,7 @@ def test_upgrade(started_cluster):
     files_path = f"{table_name}_data"
     files_to_generate = 10
 
+    started_cluster.debug_ch_instance(node)
     create_table(
         started_cluster,
         node,
