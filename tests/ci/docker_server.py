@@ -60,7 +60,7 @@ def parse_args() -> argparse.Namespace:
         "--version",
         type=version_arg,
         default=get_version_from_repo(git=git).string,
-        help="a version to build, automaticaly got from version_helper, accepts either "
+        help="a version to build, automatically got from version_helper, accepts either "
         "tag ('refs/tags/' is removed automatically) or a normal 22.2.2.2 format",
     )
     parser.add_argument(
@@ -249,7 +249,7 @@ def build_and_push_image(
     init_args = ["docker", "buildx", "build"]
     if push:
         init_args.append("--push")
-        init_args.append("--output=type=image,push-by-digest=true")
+        init_args.append("--output=type=image")
         init_args.append(f"--tag={image.repo}")
     else:
         init_args.append("--output=type=docker")
@@ -368,6 +368,7 @@ def main():
     image = DockerImageData(image_path, image_repo, False)
     args.release_type = auto_release_type(args.version, args.release_type)
     tags = gen_tags(args.version, args.release_type)
+    tags.append(f'{pr_info.number}-{args.version}')
     repo_urls = {}
     direct_urls: Dict[str, List[str]] = {}
     release_or_pr, _ = get_release_or_pr(pr_info, args.version)
