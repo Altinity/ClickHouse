@@ -1,6 +1,8 @@
 #include <Disks/ObjectStorages/Local/LocalObjectStorage.h>
 
+#include <exception>
 #include <filesystem>
+#include <stdexcept>
 #include <Disks/IO/AsynchronousBoundedReadBuffer.h>
 #include <Disks/IO/ReadBufferFromRemoteFSGather.h>
 #include <Disks/IO/createReadBufferFromFileBase.h>
