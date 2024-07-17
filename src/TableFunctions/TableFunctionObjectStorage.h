@@ -66,6 +66,17 @@ struct LocalDefinition
     static constexpr auto max_number_of_arguments = 4;
 };
 
+struct LocalDefinition
+{
+    static constexpr auto name = "local";
+    static constexpr auto storage_type_name = "Local";
+    static constexpr auto signature = " - path\n"
+                                      " - path, format\n"
+                                      " - path, format, structure\n"
+                                      " - path, format, structure, compression_method\n";
+    static constexpr auto max_number_of_arguments = 4;
+};
+
 template <typename Definition, typename Configuration>
 class TableFunctionObjectStorage : public ITableFunction
 {

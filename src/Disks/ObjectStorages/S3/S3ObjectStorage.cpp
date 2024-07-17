@@ -204,6 +204,18 @@ std::unique_ptr<ReadBufferFromFileBase> S3ObjectStorage::readObjects( /// NOLINT
     {
         case RemoteFSReadMethod::read:
         {
+            auto impl2 = std::make_unique<ReadBufferFromRemoteFSGather>(
+                std::move(read_buffer_creator),
+                objects,
+                "s3:" + uri.bucket + "/",
+                disk_read_settings,
+                global_context->getFilesystemCacheLog(),
+                /* use_external_buffer */ true);
+            std::string answer(1000, ' ');
+            size_t read_bytes = impl2->read(answer.data(), 1000);
+            LOG_DEBUG(
+                &Poco::Logger::get("ReadBufferFromRemoteFSGather"), "Read bytes: {}, string: {}", read_bytes, answer.substr(0, read_bytes));
+
             return std::make_unique<ReadBufferFromRemoteFSGather>(
                 std::move(read_buffer_creator),
                 objects,
@@ -221,6 +233,20 @@ std::unique_ptr<ReadBufferFromFileBase> S3ObjectStorage::readObjects( /// NOLINT
                 disk_read_settings,
                 global_context->getFilesystemCacheLog(),
                 /* use_external_buffer */true);
+
+            auto impl2 = std::make_unique<ReadBufferFromRemoteFSGather>(
+                std::move(read_buffer_creator),
+                objects,
+                "s3:" + uri.bucket + "/",
+                disk_read_settings,
+                global_context->getFilesystemCacheLog(),
+                /* use_external_buffer */ true);
+
+            std::string answer(1000, ' ');
+            size_t read_bytes = impl2->read(answer.data(), 1000);
+            LOG_DEBUG(
+                &Poco::Logger::get("ReadBufferFromRemoteFSGather"), "Read bytes: {}, string: {}", read_bytes, answer.substr(0, read_bytes));
+
 
             auto & reader = global_context->getThreadPoolReader(FilesystemReaderType::ASYNCHRONOUS_REMOTE_FS_READER);
             return std::make_unique<AsynchronousBoundedReadBuffer>(
