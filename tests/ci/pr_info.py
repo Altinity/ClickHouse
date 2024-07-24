@@ -40,7 +40,6 @@ DIFF_IN_DOCUMENTATION_EXT = [
     ".json",
 ]
 RETRY_SLEEP = 0
-VERSION = get_version_from_repo(git=Git(True))
 
 def get_pr_for_commit(sha, ref):
     if not ref:
@@ -102,6 +101,7 @@ class PRInfo:
         # release_pr and merged_pr are used for docker images additional cache
         self.release_pr = 0
         self.merged_pr = 0
+        self.version = get_version_from_repo(git=Git(True))
         ref = github_event.get("ref", "refs/heads/master")
         if ref and ref.startswith("refs/heads/"):
             ref = ref[11:]
@@ -254,7 +254,7 @@ class PRInfo:
             self.sha = os.getenv(
                 "GITHUB_SHA", "0000000000000000000000000000000000000000"
             )
-            self.number = f"{VERSION.major}.{VERSION.minor}.{VERSION.patch}"
+            self.number = f"{self.version.major}.{self.version.minor}.{self.version.patch}"
             self.docker_image_tag = str(self.number) + "-" + str(self.sha)
             self.labels = set()
             repo_prefix = f"{GITHUB_SERVER_URL}/{GITHUB_REPOSITORY}"
