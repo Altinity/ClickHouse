@@ -30,6 +30,7 @@ RUN apt-get update \
         python3-pip \
         libcurl4-openssl-dev \
         libssl-dev \
+        iptables='1.8.*' \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/debconf /tmp/*
 

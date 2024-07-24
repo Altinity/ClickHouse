@@ -33,7 +33,7 @@ def get_images_with_versions(
                 break
 
     if not images_path:
-        logging.info("Images file not found")
+        logging.info(f"Images file not found in {reports_path}")
     else:
         logging.info("Images file path %s", images_path)
 
@@ -44,6 +44,7 @@ def get_images_with_versions(
             logging.info("Got images %s", images)
     else:
         images = {}
+        logging.info("Images file doesn't exist")
 
     docker_images = []
     for image_name in required_image:

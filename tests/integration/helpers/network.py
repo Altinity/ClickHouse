@@ -278,7 +278,7 @@ class _NetworkManager:
                 detach=True,
                 network_mode="host",
             )
-            logging.debug("[network] Created new container %s", self._container.id)
+            logging.debug("[network] Created new container %s from %s", self._container.id, image_name)
             self._container_expire_time = time.time() + self.container_expire_timeout
 
         return self._container
@@ -298,7 +298,7 @@ class _NetworkManager:
         exit_code = self._docker_client.api.exec_inspect(handle)["ExitCode"]
 
         logging.debug(
-            "[network] %s: %s (%s): %s", container.id, cmd, exit_code, output.strip()
+            "[network] %s (%s): %s (%s): %s", container.id, container.image, cmd, exit_code, output.strip()
         )
 
         if exit_code != 0:
