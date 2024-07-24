@@ -13,6 +13,10 @@ from env_helper import (
     GITHUB_RUN_URL,
     GITHUB_EVENT_PATH,
 )
+from version_helper import (
+    Git,
+    get_version_from_repo,
+)
 
 FORCE_TESTS_LABEL = "force tests"
 SKIP_MERGEABLE_CHECK_LABEL = "skip mergeable check"
@@ -97,6 +101,7 @@ class PRInfo:
         # release_pr and merged_pr are used for docker images additional cache
         self.release_pr = 0
         self.merged_pr = 0
+        self.version = get_version_from_repo(git=Git(True))
         ref = github_event.get("ref", "refs/heads/master")
         if ref and ref.startswith("refs/heads/"):
             ref = ref[11:]
@@ -236,8 +241,10 @@ class PRInfo:
         else:
             print("event.json does not match pull_request or push:")
             print(json.dumps(github_event, sort_keys=True, indent=4))
-            self.sha = os.getenv("GITHUB_SHA")
-            self.number = 0
+            self.sha = os.getenv(
+                "GITHUB_SHA", "0000000000000000000000000000000000000000"
+            )
+            self.number = f"{self.version.major}.{self.version.minor}.{self.version.patch}"
             self.docker_image_tag = str(self.number) + "-" + str(self.sha)
             self.labels = {}
             repo_prefix = f"{GITHUB_SERVER_URL}/{GITHUB_REPOSITORY}"
