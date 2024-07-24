@@ -121,7 +121,7 @@ def main():
         .replace("/", "_")
     )
 
-    docker_image = get_image_with_version(reports_path, IMAGE_NAME)
+    docker_image = get_image_with_version(reports_path, IMAGE_NAME, version=pr_info.docker_image_tag)
 
     result_path = temp_path / "result"
     result_path.mkdir(parents=True, exist_ok=True)

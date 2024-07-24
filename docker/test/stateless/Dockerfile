@@ -9,43 +9,41 @@ ARG odbc_driver_url="https://github.com/ClickHouse/clickhouse-odbc/releases/down
 RUN apt-get update -y \
     && env DEBIAN_FRONTEND=noninteractive \
         apt-get install --yes --no-install-recommends \
-            awscli \
-            brotli \
-            lz4 \
+            awscli=1.18.* \
+            brotli=1.0.* \
             expect \
-            golang \
+            golang=2:1.13* \
             lsof \
             mysql-client=8.0* \
-            ncdu \
+            ncdu=1.14.* \
             netcat-openbsd \
-            nodejs \
-            npm \
+            nodejs=10.19.* \
+            npm=6.14.* \
             openjdk-11-jre-headless \
-            openssl \
+            openssl=1.1.1* \
             postgresql-client \
-            protobuf-compiler \
+            protobuf-compiler=3.6.* \
             python3 \
-            python3-lxml \
-            python3-pip \
-            python3-requests \
+            python3-lxml=4.5.* \
+            python3-pip=20.0.* \
+            python3-requests=2.22.* \
             python3-termcolor \
-            qemu-user-static \
+            qemu-user-static='1:4.2*' \
             sqlite3 \
             sudo \
             telnet \
             tree \
             unixodbc \
             wget \
-            rustc \
-            cargo \
             zstd \
             file \
             pv \
-            rpm2cpio \
-            cpio \
+            rpm2cpio=4.14.* \
+            cpio=2.13* \
     && apt-get clean
 
-RUN pip3 install numpy scipy pandas Jinja2
+
+RUN pip3 install numpy~=1.24 scipy~=1.10 pandas~=2.0 Jinja2~=3.1
 
 RUN mkdir -p /tmp/clickhouse-odbc-tmp \
    && wget -nv -O - ${odbc_driver_url} | tar --strip-components=1 -xz -C /tmp/clickhouse-odbc-tmp \
@@ -81,8 +79,7 @@ ENV MINIO_ROOT_USER="clickhouse"
 ENV MINIO_ROOT_PASSWORD="clickhouse"
 ENV EXPORT_S3_STORAGE_POLICIES=1
 
-RUN npm install -g azurite
-RUN npm install tslib
+RUN npm install -g azurite@3.25.1
 
 COPY run.sh /
 COPY setup_minio.sh /

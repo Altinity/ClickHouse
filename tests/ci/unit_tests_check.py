@@ -130,7 +130,7 @@ def main():
         logging.info("Check is already finished according to github status, exiting")
         sys.exit(0)
 
-    docker_image = get_image_with_version(REPORTS_PATH, IMAGE_NAME)
+    docker_image = get_image_with_version(REPORTS_PATH, IMAGE_NAME, version=pr_info.docker_image_tag)
 
     download_unit_tests(check_name, REPORTS_PATH, TEMP_PATH)
 

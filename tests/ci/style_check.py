@@ -164,7 +164,7 @@ def main():
         code = int(state != "success")
         sys.exit(code)
 
-    docker_image = get_image_with_version(reports_path, "altinityinfra/style-test")
+    docker_image = get_image_with_version(reports_path, "altinityinfra/style-test", version=pr_info.docker_image_tag)
     s3_helper = S3Helper()
 
     cmd = (
