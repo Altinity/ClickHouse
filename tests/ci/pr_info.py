@@ -13,6 +13,10 @@ from env_helper import (
     GITHUB_RUN_URL,
     GITHUB_EVENT_PATH,
 )
+from version_helper import (
+    Git,
+    get_version_from_repo,
+)
 
 FORCE_TESTS_LABEL = "force tests"
 SKIP_MERGEABLE_CHECK_LABEL = "skip mergeable check"
@@ -98,6 +102,7 @@ class PRInfo:
         # release_pr and merged_pr are used for docker images additional cache
         self.release_pr = 0
         self.merged_pr = 0
+        self.version = get_version_from_repo(git=Git(True))
         ref = github_event.get("ref", "refs/heads/master")
         if ref and ref.startswith("refs/heads/"):
             ref = ref[11:]
@@ -115,6 +120,7 @@ class PRInfo:
 
         if "pull_request" in github_event:  # pull request and other similar events
             self.number = github_event["pull_request"]["number"]  # type: int
+            self.docker_image_tag = str(self.number) # type: str
             if pr_event_from_api:
                 try:
                     response = get_gh_api(
@@ -191,6 +197,7 @@ class PRInfo:
             if pull_request is None or pull_request["state"] == "closed":
                 # it's merged PR to master
                 self.number = 0
+                self.docker_image_tag = str(self.number) + "-" + str(self.sha)
                 self.labels = set()
                 self.pr_html_url = f"{repo_prefix}/commits/{ref}"
                 self.base_ref = ref
@@ -202,6 +209,7 @@ class PRInfo:
                 )
             else:
                 self.number = pull_request["number"]
+                self.docker_image_tag = str(self.number)
                 self.labels = {label["name"] for label in pull_request["labels"]}
 
                 self.base_ref = pull_request["base"]["ref"]
@@ -247,7 +255,8 @@ class PRInfo:
             self.sha = os.getenv(
                 "GITHUB_SHA", "0000000000000000000000000000000000000000"
             )
-            self.number = 0
+            self.number = f"{self.version.major}.{self.version.minor}.{self.version.patch}"
+            self.docker_image_tag = str(self.number) + "-" + str(self.sha)
             self.labels = set()
             repo_prefix = f"{GITHUB_SERVER_URL}/{GITHUB_REPOSITORY}"
             self.task_url = GITHUB_RUN_URL

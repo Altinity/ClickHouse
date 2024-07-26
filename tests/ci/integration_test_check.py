@@ -219,7 +219,7 @@ def main():
     #     logging.info("Check is already finished according to github status, exiting")
     #     sys.exit(0)
 
-    images = get_images_with_versions(reports_path, IMAGES)
+    images = get_images_with_versions(reports_path, IMAGES, version=pr_info.docker_image_tag)
     result_path = temp_path / "output_dir"
     result_path.mkdir(parents=True, exist_ok=True)
 

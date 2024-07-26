@@ -35,12 +35,6 @@ name: Build ClickHouse
       AWS_DEFAULT_REGION:
         description: the region of the aws param store.
         required: true
-      DOCKER_USERNAME:
-        description: username of the docker user.
-        required: true
-      DOCKER_PASSWORD:
-        description: password to the docker user.
-        required: true
 
 env:
   # Force the stdout and stderr streams to be unbuffered
@@ -48,8 +42,6 @@ env:
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
-  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
 
 jobs:
   runner_labels_setup:
@@ -131,24 +123,24 @@ jobs:
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Download changed images
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: changed_images
           path: ${{ env.IMAGES_PATH }}
-          
+
       - name: Create source tar
         run: |
           mkdir -p "$TEMP_PATH/build_check/package_release"
           cd .. && tar czf $TEMP_PATH/build_source.src.tar.gz ClickHouse/
           cd $TEMP_PATH && tar xvzf $TEMP_PATH/build_source.src.tar.gz
-          
+
       - name: Build
         run: |
           cd "$REPO_COPY/tests/ci" && python3 build_check.py "$BUILD_NAME"
 
       - name: Upload build URLs to artifacts
         if: ${{ success() || failure() }}
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ env.BUILD_URLS }}
           path: ${{ env.TEMP_PATH }}/${{ env.BUILD_URLS }}.json

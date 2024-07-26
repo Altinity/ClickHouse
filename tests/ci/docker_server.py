@@ -245,7 +245,7 @@ def build_and_push_image(
     init_args = ["docker", "buildx", "build"]
     if push:
         init_args.append("--push")
-        init_args.append("--output=type=image,push-by-digest=true")
+        init_args.append("--output=type=image")
         init_args.append(f"--tag={image.repo}")
     else:
         init_args.append("--output=type=docker")
@@ -338,6 +338,7 @@ def main():
         args.bucket_prefix = (
             f"{S3_DOWNLOAD}/{S3_BUILDS_BUCKET}/{release_or_pr}/{pr_info.sha}"
         )
+        tags.append(f"{pr_info.number}-{args.version}")
 
     if args.push:
         subprocess.check_output(  # pylint: disable=unexpected-keyword-arg
