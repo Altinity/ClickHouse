@@ -36,6 +36,7 @@ def started_cluster():
 def test_replicated_db_and_ttl(started_cluster):
     node1 = cluster.instances["node1"]
     node1.query("DROP DATABASE default")
+    started_cluster.debug_ch_instance(node1)
     node1.query("CREATE DATABASE default ENGINE Replicated('/replicated')")
 
     node1.query(

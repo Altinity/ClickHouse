@@ -105,7 +105,7 @@ def started_cluster():
             "old_instance",
             with_zookeeper=True,
             image="altinity/clickhouse-server",
-            tag="23.8.11.29.altinitystable", #TODO: (mtkachenko) verify this substitution is ok. Originally 23.12
+            tag="23.12", #TODO: (mtkachenko) verify this substitution is ok. Originally 23.12
             stay_alive=True,
             with_installed_binary=True,
             use_old_analyzer=True,
@@ -1406,6 +1406,7 @@ def test_upgrade(started_cluster):
     files_path = f"{table_name}_data"
     files_to_generate = 10
 
+    started_cluster.debug_ch_instance(node)
     create_table(
         started_cluster,
         node,
