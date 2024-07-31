@@ -151,9 +151,10 @@ void StorageAzureConfiguration::fromAST(ASTs & engine_args, ContextPtr context, 
     {
         throw Exception(
             ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
-            "Storage AzureBlobStorage requires 3 to {} arguments. All supported signatures:\n{}",
-            getMaxNumberOfArguments(with_structure),
-            getSignatures(with_structure));
+            "Storage AzureBlobStorage requires 3 to {} arguments: "
+            "AzureBlobStorage(connection_string|storage_account_url, container_name, blobpath, "
+            "[account_name, account_key, format, compression, structure)])",
+            (with_structure ? 8 : 7));
     }
 
     for (auto & engine_arg : engine_args)
