@@ -4,6 +4,24 @@ FROM altinityinfra/fasttest:$FROM_TAG
 ENV CC=clang-${LLVM_VERSION}
 ENV CXX=clang++-${LLVM_VERSION}
 
+# Install Docker, required for docker-in-docker build of BoringSSL in FIPS mode.
+ENV DOCKER_CHANNEL stable
+RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add - \
+    && add-apt-repository "deb https://download.docker.com/linux/ubuntu $(lsb_release -c -s) ${DOCKER_CHANNEL}" \
+    && apt-get update \
+    && env DEBIAN_FRONTEND=noninteractive apt-get install --yes \
+        docker-ce \
+    && rm -rf \
+        /var/lib/apt/lists/* \
+        /var/cache/debconf \
+        /tmp/* \
+    && apt-get clean
+
+RUN dockerd --version; docker --version
+
+
+RUN apt update && apt install cmake --yes
+
 # If the cctools is updated, then first build it in the CI, then update here in a different commit
 # NOTE: a9e509c9bbc0 created from commit 1bc0e6ee583d49a472fd01f0e9960a11bf240c6c
 COPY --from=altinityinfra/cctools:a9e509c9bbc0 /cctools /cctools
@@ -61,16 +79,16 @@ RUN arch=${TARGETARCH:-amd64} \
     && dpkg -i /tmp/nfpm.deb \
     && rm /tmp/nfpm.deb
 
-ARG GO_VERSION=1.19.10
-# We needed go for clickhouse-diagnostics (it is not used anymore)
-RUN arch=${TARGETARCH:-amd64} \
-    && curl -Lo /tmp/go.tgz "https://go.dev/dl/go${GO_VERSION}.linux-${arch}.tar.gz" \
-    && tar -xzf /tmp/go.tgz -C /usr/local/ \
-    && rm /tmp/go.tgz
+# ARG GO_VERSION=1.19.10
+# # We needed go for clickhouse-diagnostics (it is not used anymore)
+# RUN arch=${TARGETARCH:-amd64} \
+#     && curl -Lo /tmp/go.tgz "https://go.dev/dl/go${GO_VERSION}.linux-${arch}.tar.gz" \
+#     && tar -xzf /tmp/go.tgz -C /usr/local/ \
+#     && rm /tmp/go.tgz
 
-ENV PATH="$PATH:/usr/local/go/bin"
-ENV GOPATH=/workdir/go
-ENV GOCACHE=/workdir/
+# ENV PATH="$PATH:/usr/local/go/bin"
+# ENV GOPATH=/workdir/go
+# ENV GOCACHE=/workdir/
 
 ARG CLANG_TIDY_SHA1=c191254ea00d47ade11d7170ef82fe038c213774
 RUN curl -Lo /usr/bin/clang-tidy-cache \
@@ -81,4 +99,6 @@ RUN mkdir /workdir && chmod 777 /workdir
 WORKDIR /workdir
 
 COPY build.sh /
+COPY daemon.json /etc/docker/
+
 CMD ["bash", "-c", "/build.sh 2>&1"]

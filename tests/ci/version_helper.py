@@ -31,6 +31,7 @@ SET(VERSION_PATCH {patch})
 SET(VERSION_GITHASH {githash})
 SET(VERSION_DESCRIBE {describe})
 SET(VERSION_STRING {string})
+SET(VERSION_FLAVOUR {flavour})
 # end of autochange
 """
 
@@ -163,6 +164,7 @@ class ClickHouseVersion:
             "githash": self.githash,
             "describe": self.describe,
             "string": self.string,
+            "flavour": self._flavour,
         }
 
     def as_tuple(self) -> Tuple[int, int, int, int]:
@@ -237,8 +239,9 @@ class VersionType:
     NEW = "new"
     PRESTABLE = "prestable"
     STABLE = "altinitystable"
+    FIPS = "altinityfips"
     TESTING = "testing"
-    VALID = (NEW, TESTING, PRESTABLE, STABLE, LTS,
+    VALID = (NEW, TESTING, PRESTABLE, STABLE, LTS, FIPS
              "stable" # NOTE (vnemkov): we don't use that directly, but it is used in unit-tests
             )
 
