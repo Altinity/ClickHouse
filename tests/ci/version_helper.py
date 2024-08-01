@@ -241,7 +241,7 @@ class VersionType:
     STABLE = "altinitystable"
     FIPS = "altinityfips"
     TESTING = "testing"
-    VALID = (NEW, TESTING, PRESTABLE, STABLE, LTS, FIPS
+    VALID = (NEW, TESTING, PRESTABLE, STABLE, LTS, FIPS,
              "stable" # NOTE (vnemkov): we don't use that directly, but it is used in unit-tests
             )
 
