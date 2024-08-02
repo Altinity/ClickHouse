@@ -57,16 +57,16 @@ class TestGit(unittest.TestCase):
         self.git.commits_since_new = 0
 
     def test_tags(self):
-        self.git.new_tag = "v21.12.333.22222-altinitystable"
-        self.git.latest_tag = "v21.12.333.22222-altinitystable"
+        self.git.new_tag = "v21.12.333.22222.altinitystable"
+        self.git.latest_tag = "v21.12.333.22222.altinitystable"
         for tag_attr in ("new_tag", "latest_tag"):
-            self.assertEqual(getattr(self.git, tag_attr), "v21.12.333.22222-altinitystable")
+            self.assertEqual(getattr(self.git, tag_attr), "v21.12.333.22222.altinitystable")
             setattr(self.git, tag_attr, "")
             self.assertEqual(getattr(self.git, tag_attr), "")
             for tag in (
-                "v21.12.333-altinitystable",
+                "v21.12.333.altinitystable",
                 "v21.12.333-prestable",
-                "21.12.333.22222-altinitystable",
+                "21.12.333.22222.altinitystable",
                 "v21.12.333.22222-production",
             ):
                 with self.assertRaises(Exception):
