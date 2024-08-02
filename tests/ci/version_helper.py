@@ -329,7 +329,7 @@ def get_version_from_string(
 
 def get_version_from_tag(tag: str) -> ClickHouseVersion:
     Git.check_tag(tag)
-    tag, description = tag[1:].split("-", 1)
+    tag, description = tag[1:].rsplit(".", 1)
     version = get_version_from_string(tag)
     version.with_description(description)
     return version
