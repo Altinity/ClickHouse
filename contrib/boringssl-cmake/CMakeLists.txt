@@ -83,6 +83,20 @@ SET(krb5_filb_to_patch ${PROJECT_SOURCE_DIR}/contrib/krb5/src/lib/crypto/openssl
 message("Patching ${krb5_filb_to_patch} to allow building against older version of BoringSSL")
 file(READ ${krb5_filb_to_patch} FILE_CONTENTS)
 string(REPLACE "#include <openssl/modes.h>" "//#include <openssl/modes.h>" FILE_CONTENTS "${FILE_CONTENTS}")
+
+# This function is originally declared in file that can't be extracted from BoringSSL:
+# crypto/fipsmodule/modes/internal.h
+# The function itself is present in binary, so just forward-declare it.
+string(REPLACE
+  "static size_t CRYPTO_cts128_encrypt(const unsigned char *in, unsigned char *out,"
+
+  "
+void CRYPTO_cbc128_decrypt(const uint8_t *in, uint8_t *out, size_t len,
+                           const AES_KEY *key, uint8_t ivec[16],
+                           block128_f block);
+static size_t CRYPTO_cts128_encrypt(const unsigned char *in, unsigned char *out,"
+  FILE_CONTENTS "${FILE_CONTENTS}")
+
 file(WRITE ${krb5_filb_to_patch} "${FILE_CONTENTS}")
 
 message("Creating directory for BoringSSL binaries and includes in ${BORINGSSL_BINARIES_DIR}")
