@@ -49,7 +49,9 @@ foreach(file_to_download IN LISTS FILES_TO_DOWNLOAD)
         SHOW_PROGRESS
     )
     file(CHMOD ${BORINGSSL_BUILD_DIR}/${file_name}
-      FILE_PERMISSIONS WORLD_READ WORLD_WRITE WORLD_EXECUTE)
+      FILE_PERMISSIONS
+        OWNER_EXECUTE OWNER_WRITE OWNER_READ
+        WORLD_READ WORLD_WRITE WORLD_EXECUTE)
 endforeach()
 
 # Build driver - the script that triggers the build and pulls out results from docker container
