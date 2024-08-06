@@ -21,7 +21,7 @@ set(BORINGSSL_BINARIES_DIR "${BORINGSSL_BUILD_DIR}/output")
 message("Will build BoringSSL in FIPS mode according to go1.22 recipe...")
 # build BoringSSL in FIPS mode accoring to the Security Policy:
 # https://csrc.nist.gov/CSRC/media/projects/cryptographic-module-validation-program/documents/security-policies/140sp4407.pdf
-# 853ca1ea1168dff08011e5d42d94609cc0ca2e27
+# 853ca1ea1168dff08011e5d42d94609cc0ca2e27 (https://boringssl.googlesource.com/boringssl/+/refs/tags/fips-20210429)
 # We re-use golang-1.22 routine, for that we need only couple of files from golang repo, so no need to checkout a full repository:
 # - src/crypto/internal/boring/Dockerfile - build environment
 # - src/crypto/internal/boring/buidl.sh, build-boring.sh, build-goboring.sh - build and test scripts
@@ -78,26 +78,18 @@ docker cp $id:/boring/boringssl/include $OUTPUT_DIR
 docker rm $id"
 )
 
-# patch a single file in krb5 that relies on file missing from this version of BoringSSL
-SET(krb5_filb_to_patch ${PROJECT_SOURCE_DIR}/contrib/krb5/src/lib/crypto/openssl/enc_provider/aes.c)
-message("Patching ${krb5_filb_to_patch} to allow building against older version of BoringSSL")
-file(READ ${krb5_filb_to_patch} FILE_CONTENTS)
-string(REPLACE "#include <openssl/modes.h>" "//#include <openssl/modes.h>" FILE_CONTENTS "${FILE_CONTENTS}")
-
-# This function is originally declared in file that can't be extracted from BoringSSL:
-# crypto/fipsmodule/modes/internal.h
-# The function itself is present in binary, so just forward-declare it.
-string(REPLACE
-  "static size_t CRYPTO_cts128_encrypt(const unsigned char *in, unsigned char *out,"
-
-  "
-void CRYPTO_cbc128_decrypt(const uint8_t *in, uint8_t *out, size_t len,
-                           const AES_KEY *key, uint8_t ivec[16],
-                           block128_f block);
-static size_t CRYPTO_cts128_encrypt(const unsigned char *in, unsigned char *out,"
-  FILE_CONTENTS "${FILE_CONTENTS}")
-
-file(WRITE ${krb5_filb_to_patch} "${FILE_CONTENTS}")
+# patch submodules (which are not in Altinity's fork) to accommodate for differences between BoringSSL versions.
+# First we rollback any changes into the submodules, to allow clean patching
+# (in case of multiple rebuilds on dev machine)
+# Then the patch is applied (on clean submodules).
+execute_process(
+  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+  COMMAND bash -c "git submodule foreach git reset --hard HEAD && git submodule foreach git restore ."
+)
+execute_process(
+  WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+  COMMAND bash -c "patch --directory=./ --strip=1 -i ./contrib/boringssl-cmake/fips_submodues_24.3.patch"
+)
 
 message("Creating directory for BoringSSL binaries and includes in ${BORINGSSL_BINARIES_DIR}")
 execute_process(COMMAND ${CMAKE_COMMAND} -E make_directory "${BORINGSSL_BINARIES_DIR}/include")
