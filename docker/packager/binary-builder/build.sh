@@ -1,6 +1,24 @@
 #!/usr/bin/env bash
 set -x -e
 
+setsid dockerd --host=unix:///var/run/docker.sock --tls=false --host=tcp://0.0.0.0:2375 --default-address-pool base=172.17.0.0/12,size=24 \
+  &>/ClickHouse/packager/dockerd.log &
+
+set +e
+reties=0
+while true; do
+    docker info &>/dev/null && break
+    reties=$((reties+1))
+    if [[ $reties -ge 100 ]]; then # 10 sec max
+        echo "Can't start docker daemon, timeout exceeded." >&2
+        cat /ClickHouse/packager/dockerd.log >&2
+        exit 1;
+    fi
+    sleep 0.1
+done
+set -e
+
+
 exec &> >(ts)
 
 ccache_status () {

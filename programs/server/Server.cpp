@@ -428,6 +428,11 @@ void Server::initialize(Poco::Util::Application & self)
         Poco::Environment::osName(),
         Poco::Environment::osVersion(),
         Poco::Environment::osArchitecture());
+
+    if (FIPS_mode())
+    {
+        LOG_INFO(&logger(), "Starting in FIPS mode, KAT test result: {}", BORINGSSL_self_test());
+    }
 }
 
 std::string Server::getDefaultCorePath() const

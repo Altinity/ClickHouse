@@ -31,6 +31,7 @@ SET(VERSION_PATCH {patch})
 SET(VERSION_GITHASH {githash})
 SET(VERSION_DESCRIBE {describe})
 SET(VERSION_STRING {string})
+SET(VERSION_FLAVOUR {flavour})
 # end of autochange
 """
 
@@ -163,6 +164,7 @@ class ClickHouseVersion:
             "githash": self.githash,
             "describe": self.describe,
             "string": self.string,
+            "flavour": self._flavour,
         }
 
     def as_tuple(self) -> Tuple[int, int, int, int]:
@@ -237,14 +239,15 @@ class VersionType:
     NEW = "new"
     PRESTABLE = "prestable"
     STABLE = "altinitystable"
+    FIPS = "altinityfips"
     TESTING = "testing"
-    VALID = (NEW, TESTING, PRESTABLE, STABLE, LTS,
+    VALID = (NEW, TESTING, PRESTABLE, STABLE, LTS, FIPS,
              "stable" # NOTE (vnemkov): we don't use that directly, but it is used in unit-tests
             )
 
 
 def validate_version(version: str) -> None:
-    # NOTE(vnemkov): minor but imporant fixes, so versions with 'flavour' are threated as valid (e.g. 22.8.8.4.altinitystable)
+    # NOTE(vnemkov): minor but important fixes, so versions with 'flavour' are threated as valid (e.g. 22.8.8.4.altinitystable)
     parts = version.split(".")
     if len(parts) < 4:
         raise ValueError(f"{version} does not contain 4 parts")
@@ -326,7 +329,13 @@ def get_version_from_string(
 
 def get_version_from_tag(tag: str) -> ClickHouseVersion:
     Git.check_tag(tag)
-    tag, description = tag[1:].split("-", 1)
+    if '-' in tag:
+        # upstream-style tags v24.6.1.1-testing
+        tag, description = tag[1:].split("-", -1)
+    else:
+        # altinity-style tags: v24.3.5.46.altinitystable
+        tag, description = tag[1:].rsplit(".", 1)
+
     version = get_version_from_string(tag)
     version.with_description(description)
     return version
