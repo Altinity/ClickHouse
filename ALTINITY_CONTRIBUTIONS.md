@@ -1,6 +1,16 @@
 List of pull requests contributed by Altinity develoeprs to ClickHouse server. It does not include documentation changes.
 
 ## 2024
+  * Even better healthcheck for ldap	[67667](https://github.com/ClickHouse/ClickHouse/pull/67667)	by @zvonand
+  * Fix serialization of parameterized view parameters	[67654](https://github.com/ClickHouse/ClickHouse/pull/67654)	by @shiyer7474
+  * Skip parallel for `test_storage_kerberized_kafka`	[67349](https://github.com/ClickHouse/ClickHouse/pull/67349)	by @zvonand
+  * [CI fest] Try to fix `test_broken_projections/test.py::test_broken_ignored_replicated`	[66915](https://github.com/ClickHouse/ClickHouse/pull/66915)	by @zvonand
+  * Fix detection of number of CPUs in containers	[66237](https://github.com/ClickHouse/ClickHouse/pull/66237)	by @filimonov
+  * Remove host regexp concurrent integration test	[66233](https://github.com/ClickHouse/ClickHouse/pull/66233)	by @arthurpassos
+  * Minor: replaced expression with LEGACY_MAX_LEVEL	[61268](https://github.com/ClickHouse/ClickHouse/pull/61268)	by @Enmk
+  * Build failure if ENABLE_AWS_S3 is OFF fixed	[66335](https://github.com/ClickHouse/ClickHouse/pull/66335)	by @ilejn
+  * Try to make `test_ldap_external_user_directory` less flaky	[65794](https://github.com/ClickHouse/ClickHouse/pull/65794)	by @zvonand
+  * Add `no_proxy` support	[63314](https://github.com/ClickHouse/ClickHouse/pull/63314)	by @arthurpassos
   * Add _time virtual column to file alike storages	[64947](https://github.com/ClickHouse/ClickHouse/pull/64947)	by @ilejn
   * Several minor fixes to proxy support in ClickHouse	[63427](https://github.com/ClickHouse/ClickHouse/pull/63427)	by @arthurpassos
   * Remove unused CaresPTRResolver::cancel_requests method	[63754](https://github.com/ClickHouse/ClickHouse/pull/63754)	by @arthurpassos
