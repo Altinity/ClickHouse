@@ -1,17 +1,17 @@
 # rebuild in #33610
-# docker build -t clickhouse/test-base .
+# docker build -t altinityinfra/test-base .
 ARG FROM_TAG=latest
-FROM clickhouse/test-util:$FROM_TAG
+FROM altinityinfra/test-util:$FROM_TAG
 
 RUN apt-get update \
     && apt-get install \
-        lcov \
-        netbase \
-        perl \
-        pv \
-        ripgrep \
-        zstd \
-        locales \
+        lcov='1.15*' \
+        netbase='6.3*' \
+        perl='5.34.*' \
+        pv='1.6.*' \
+        ripgrep='13.0.*' \
+        zstd='1.4.*' \
+        locales='2.35*' \
         --yes --no-install-recommends
 
 # Sanitizer options for services (clickhouse-server)

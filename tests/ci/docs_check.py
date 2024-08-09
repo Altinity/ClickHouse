@@ -84,7 +84,7 @@ def main():
     elif args.force:
         logging.info("Check the docs because of force flag")
 
-    docker_image = get_image_with_version(reports_path, "clickhouse/docs-builder")
+    docker_image = get_image_with_version(reports_path, "altinityinfra/docs-builder")
 
     test_output = temp_path / "docs_check_log"
     test_output.mkdir(parents=True, exist_ok=True)
@@ -150,7 +150,7 @@ def main():
         NAME,
     )
 
-    ch_helper.insert_events_into(db="default", table="checks", events=prepared_events)
+    ch_helper.insert_events_into(db="gh-data", table="checks", events=prepared_events)
     if status == "failure":
         sys.exit(1)
 

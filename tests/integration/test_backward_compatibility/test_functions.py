@@ -12,6 +12,7 @@ cluster = ClickHouseCluster(__file__)
 upstream = cluster.add_instance("upstream", allow_analyzer=False)
 backward = cluster.add_instance(
     "backward",
+    # NOTE(vnemkov): don't change that to altinitystable/clickhouse-server
     image="clickhouse/clickhouse-server",
     # Note that a bug changed the string representation of several aggregations in 22.9 and 22.10 and some minor
     # releases of 22.8, 22.7 and 22.3

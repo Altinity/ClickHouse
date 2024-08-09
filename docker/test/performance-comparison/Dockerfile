@@ -1,7 +1,7 @@
 # docker build -t clickhouse/performance-comparison .
 
 ARG FROM_TAG=latest
-FROM clickhouse/test-base:$FROM_TAG
+FROM altinityinfra/test-base:$FROM_TAG
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
@@ -33,7 +33,7 @@ RUN apt-get update \
             cargo \
             ripgrep \
             zstd \
-    && pip3 --no-cache-dir install 'clickhouse-driver==0.2.1' scipy \
+    && pip3 --no-cache-dir install 'clickhouse-driver~=0.2.1' scipy \
     && apt-get purge --yes python3-dev g++ \
     && apt-get autoremove --yes \
     && apt-get clean \

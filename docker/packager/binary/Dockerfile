@@ -1,6 +1,44 @@
-# docker build -t clickhouse/binary-builder .
+
+# docker build -t altinityinfra/binary-builder .
 ARG FROM_TAG=latest
-FROM clickhouse/test-util:$FROM_TAG
+FROM altinityinfra/test-util:$FROM_TAG as cctools
+# The cctools are built always from the altinityinfra/test-util:latest and cached inline
+# Theoretically, it should improve rebuild speed significantly
+ENV CC=clang-${LLVM_VERSION}
+ENV CXX=clang++-${LLVM_VERSION}
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# DO NOT PUT ANYTHING BEFORE THE NEXT TWO `RUN` DIRECTIVES
+# THE MOST HEAVY OPERATION MUST BE THE FIRST IN THE CACHE
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# libtapi is required to support .tbh format from recent MacOS SDKs
+RUN git clone https://github.com/tpoechtrager/apple-libtapi.git \
+    && cd apple-libtapi \
+    && git checkout 15dfc2a8c9a2a89d06ff227560a69f5265b692f9 \
+    && INSTALLPREFIX=/cctools ./build.sh \
+    && ./install.sh \
+    && cd .. \
+    && rm -rf apple-libtapi
+
+# Build and install tools for cross-linking to Darwin (x86-64)
+# Build and install tools for cross-linking to Darwin (aarch64)
+RUN git clone https://github.com/tpoechtrager/cctools-port.git \
+    && cd cctools-port/cctools \
+    && git checkout 2a3e1c2a6ff54a30f898b70cfb9ba1692a55fad7 \
+    && ./configure --prefix=/cctools --with-libtapi=/cctools \
+        --target=x86_64-apple-darwin \
+    && make install -j$(nproc) \
+    && make clean \
+    && ./configure --prefix=/cctools --with-libtapi=/cctools \
+        --target=aarch64-apple-darwin \
+    && make install -j$(nproc) \
+    && cd ../.. \
+    && rm -rf cctools-port
+
+# !!!!!!!!!!!
+# END COMPILE
+# !!!!!!!!!!!
+
+FROM altinityinfra/test-util:$FROM_TAG
 ENV CC=clang-${LLVM_VERSION}
 ENV CXX=clang++-${LLVM_VERSION}
 
@@ -25,8 +63,7 @@ RUN curl https://sh.rustup.rs -sSf | bash -s -- -y && \
 
 # NOTE: Seems like gcc-11 is too new for ubuntu20 repository
 # A cross-linker for RISC-V 64 (we need it, because LLVM's LLD does not work):
-RUN add-apt-repository ppa:ubuntu-toolchain-r/test --yes \
-    && apt-get update \
+RUN apt-get update \
     && apt-get install --yes \
         binutils-riscv64-linux-gnu \
         build-essential \

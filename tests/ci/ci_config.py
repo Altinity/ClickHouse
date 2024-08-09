@@ -229,6 +229,7 @@ CI_CONFIG = CiConfig(
             "package_ubsan",
             "package_tsan",
             "package_msan",
+            "package_tsan",
             "package_debug",
             "binary_release",
         ],
@@ -315,10 +316,10 @@ CI_CONFIG = CiConfig(
         "SQLancer (debug)": TestConfig("package_debug"),
         "Sqllogic test (release)": TestConfig("package_release"),
         "SQLTest": TestConfig("package_release"),
+        "Sign release (actions)": TestConfig("package_release"),
     },
 )
 CI_CONFIG.validate()
-
 
 # checks required by Mergeable Check
 REQUIRED_CHECKS = [

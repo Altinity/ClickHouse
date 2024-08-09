@@ -28,7 +28,7 @@ from report import TestResult
 from s3_helper import S3Helper
 from stopwatch import Stopwatch
 
-IMAGE_NAME = "clickhouse/sqltest"
+IMAGE_NAME = "altinityinfra/sqltest"
 
 
 def get_run_command(pr_number, sha, download_url, workspace_path, image):

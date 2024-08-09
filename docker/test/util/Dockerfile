@@ -10,15 +10,15 @@ ENV DEBIAN_FRONTEND=noninteractive LLVM_VERSION=16
 
 RUN apt-get update \
     && apt-get install \
-        apt-transport-https \
-        apt-utils \
-        ca-certificates \
-        curl \
-        dnsutils \
-        gnupg \
-        iputils-ping \
-        lsb-release \
-        wget \
+        apt-transport-https='2.4.*' \
+        apt-utils='2.4.*' \
+        ca-certificates='20230311ubuntu0.22.04.*' \
+        curl='7.81.*' \
+        dnsutils='1:9.18.*' \
+        gnupg='2.2.*' \
+        iputils-ping=3:20211215-1 \
+        lsb-release='11.1.*' \
+        wget='1.21.*' \
         --yes --no-install-recommends --verbose-versions \
     && export LLVM_PUBKEY_HASH="bda960a8da687a275a2078d43c111d66b1c6a893a3275271beedf266c1ff4a0cdecb429c7a5cccf9f486ea7aa43fd27f" \
     && wget -nv -O /tmp/llvm-snapshot.gpg.key https://apt.llvm.org/llvm-snapshot.gpg.key \
@@ -38,26 +38,26 @@ RUN curl -s https://apt.kitware.com/keys/kitware-archive-latest.asc | \
 # initial packages
 RUN apt-get update \
     && apt-get install \
-        bash \
-        bsdmainutils \
-        build-essential \
+        bash='5.1*' \
+        bsdmainutils='12.1.*' \
+        build-essential='12.9*' \
         clang-${LLVM_VERSION} \
         clang-tidy-${LLVM_VERSION} \
-        cmake \
-        gdb \
-        git \
-        gperf \
+        cmake='3.*' \
+        gdb='12.1*' \
+        git='1:2.34.*' \
+        gperf='3.1*' \
         libclang-rt-${LLVM_VERSION}-dev \
         lld-${LLVM_VERSION} \
         llvm-${LLVM_VERSION} \
         llvm-${LLVM_VERSION}-dev \
         libclang-${LLVM_VERSION}-dev \
-        moreutils \
-        nasm \
-        ninja-build \
-        pigz \
-        rename \
-        software-properties-common \
+        moreutils='0.66*' \
+        nasm='2.15.*' \
+        ninja-build='1.10.*' \
+        pigz='2.6*' \
+        rename='1.30*' \
+        software-properties-common='0.99.*' \
         tzdata \
         --yes --no-install-recommends \
     && apt-get clean

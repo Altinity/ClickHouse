@@ -29,7 +29,7 @@ from stopwatch import Stopwatch
 from tee_popen import TeePopen
 from upload_result_helper import upload_results
 
-IMAGE_NAME = "clickhouse/sqlancer-test"
+IMAGE_NAME = "altinityinfra/sqlancer-test"
 
 
 def get_run_command(download_url: str, workspace_path: Path, image: DockerImage) -> str:

@@ -190,11 +190,11 @@ def run_stress_test(docker_image_name: str) -> None:
         report_url,
         check_name,
     )
-    ch_helper.insert_events_into(db="default", table="checks", events=prepared_events)
+    ch_helper.insert_events_into(db="gh-data", table="checks", events=prepared_events)
 
     if state == "failure":
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    run_stress_test("clickhouse/stress-test")
+    run_stress_test("altinityinfra/stress-test")

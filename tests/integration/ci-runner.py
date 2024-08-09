@@ -15,8 +15,8 @@ import shlex
 import zlib  # for crc32
 
 
-MAX_RETRY = 1
-NUM_WORKERS = 5
+MAX_RETRY = 3
+NUM_WORKERS = 10
 SLEEP_BETWEEN_RETRIES = 5
 PARALLEL_GROUP_SIZE = 100
 CLICKHOUSE_BINARY_PATH = "usr/bin/clickhouse"
@@ -255,6 +255,7 @@ class ClickhouseIntegrationTestsRunner:
         )
         # if use_tmpfs is not set we assume it to be true, otherwise check
         self.use_tmpfs = "use_tmpfs" not in self.params or self.params["use_tmpfs"]
+        self.dockerd_volume_dir = self.params.get("dockerd_volume_dir", None)
         self.disable_net_host = (
             "disable_net_host" in self.params and self.params["disable_net_host"]
         )
@@ -303,18 +304,18 @@ class ClickhouseIntegrationTestsRunner:
     @staticmethod
     def get_images_names():
         return [
-            "clickhouse/dotnet-client",
-            "clickhouse/integration-helper",
-            "clickhouse/integration-test",
-            "clickhouse/integration-tests-runner",
-            "clickhouse/kerberized-hadoop",
-            "clickhouse/kerberos-kdc",
-            "clickhouse/mysql-golang-client",
-            "clickhouse/mysql-java-client",
-            "clickhouse/mysql-js-client",
-            "clickhouse/mysql-php-client",
-            "clickhouse/nginx-dav",
-            "clickhouse/postgresql-java-client",
+            "altinityinfra/dotnet-client",
+            "altinityinfra/integration-helper",
+            "altinityinfra/integration-test",
+            "altinityinfra/integration-tests-runner",
+            "altinityinfra/kerberized-hadoop",
+            "altinityinfra/kerberos-kdc",
+            "altinityinfra/mysql-golang-client",
+            "altinityinfra/mysql-java-client",
+            "altinityinfra/mysql-js-client",
+            "altinityinfra/mysql-php-client",
+            "altinityinfra/nginx-dav",
+            "altinityinfra/postgresql-java-client",
         ]
 
     def _pre_pull_images(self, repo_path):
@@ -322,7 +323,7 @@ class ClickhouseIntegrationTestsRunner:
 
         cmd = (
             "cd {repo_path}/tests/integration && "
-            "timeout --signal=KILL 1h ./runner {runner_opts} {image_cmd} --pre-pull --command '{command}' ".format(
+            "timeout --signal=KILL 2h ./runner {runner_opts} {image_cmd} --pre-pull --command '{command}' ".format(
                 repo_path=repo_path,
                 runner_opts=self._get_runner_opts(),
                 image_cmd=image_cmd,
@@ -419,8 +420,11 @@ class ClickhouseIntegrationTestsRunner:
 
     def _get_runner_opts(self):
         result = []
-        if self.use_tmpfs:
+        if self.dockerd_volume_dir:
+            result.append(f"--dockerd-volume-dir={self.dockerd_volume_dir}")
+        elif self.use_tmpfs:
             result.append("--tmpfs")
+
         if self.disable_net_host:
             result.append("--disable-net-host")
         if self.use_analyzer:
@@ -546,7 +550,7 @@ class ClickhouseIntegrationTestsRunner:
             "--docker-image-version",
         ):
             for img in self.get_images_names():
-                if img == "clickhouse/integration-tests-runner":
+                if img == "altinityinfra/integration-tests-runner":
                     runner_version = self.get_image_version(img)
                     logging.info(
                         "Can run with custom docker image version %s", runner_version
@@ -671,8 +675,13 @@ class ClickhouseIntegrationTestsRunner:
 
             test_cmd = " ".join([shlex.quote(test) for test in sorted(test_names)])
             parallel_cmd = (
-                " --parallel {} ".format(num_workers) if num_workers > 0 else ""
+                " --parallel {} ".format(num_workers) if (num_workers > 0 or i > 0) else ""
             )
+            # For each re-run reduce number of workers,
+            # to improve chances of tests passing.
+            if num_workers and num_workers > 0:
+                num_workers = max(1, num_workers // 2)
+
             # -r -- show extra test summary:
             # -f -- (f)ailed
             # -E -- (E)rror
@@ -877,6 +886,10 @@ class ClickhouseIntegrationTestsRunner:
 
         logging.info("Pulling images")
         runner._pre_pull_images(repo_path)
+        if self.dockerd_volume_dir:
+            logging.info("Cached pre-pulled docker images into %s:\n%s",
+                self.dockerd_volume_dir,
+                subprocess.check_output(f"du -hs {shlex.quote(self.dockerd_volume_dir)}", shell=True))
 
         logging.info(
             "Dump iptables before run %s",

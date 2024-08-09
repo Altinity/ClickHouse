@@ -1,39 +1,39 @@
 # rebuild in #33610
 # docker build -t clickhouse/integration-test .
 ARG FROM_TAG=latest
-FROM clickhouse/test-base:$FROM_TAG
+FROM altinityinfra/test-base:$FROM_TAG
 
 SHELL ["/bin/bash", "-c"]
 
 RUN apt-get update \
     && env DEBIAN_FRONTEND=noninteractive apt-get -y install \
-        bsdutils \
-        curl \
-        default-jre \
-        g++ \
-        gdb \
-        iproute2 \
-        krb5-user \
-        libicu-dev \
-        libsqlite3-dev \
-        libsqliteodbc \
-        lsof \
-        lz4 \
-        odbc-postgresql \
-        odbcinst \
-        python3 \
-        rpm2cpio \
-        sqlite3 \
-        tar \
+        bsdutils='1:2.37.*' \
+        curl='7.81.*' \
+        default-jre='2:1.11-*' \
+        g++='4:11.2.*' \
+        gdb='12.1-*' \
+        iproute2='5.15.*' \
+        krb5-user='1.19.*' \
+        libicu-dev='70.1-*' \
+        libsqlite3-dev='3.37.*' \
+        libsqliteodbc='0.999*' \
+        lsof='4.93.*' \
+        lz4='1.9.*' \
+        odbc-postgresql='1:13.02.*' \
+        odbcinst='2.3.*' \
+        python3='3.10.*' \
+        rpm2cpio='4.17.*' \
+        sqlite3='3.37.*' \
+        tar='1.34*' \
         tzdata \
-        unixodbc \
-        python3-pip \
-        libcurl4-openssl-dev \
-        libssl-dev \
+        unixodbc='2.3.*' \
+        python3-pip='22.0.*' \
+        libcurl4-openssl-dev='7.81.*' \
+        libssl-dev='3.0.*' \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/debconf /tmp/*
 
-RUN pip3 install pycurl
+RUN pip3 install pycurl~=7.45.2
 
 # Architecture of the image when BuildKit/buildx is used
 ARG TARGETARCH
