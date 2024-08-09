@@ -1,0 +1,53 @@
+Submodule contrib/azure contains modified content
+diff --git a/contrib/azure/sdk/identity/azure-identity/src/client_certificate_credential.cpp b/contrib/azure/sdk/identity/azure-identity/src/client_certificate_credential.cpp
+index 9ecbbd2d..8b826bee 100644
+--- a/contrib/azure/sdk/identity/azure-identity/src/client_certificate_credential.cpp
++++ b/contrib/azure/sdk/identity/azure-identity/src/client_certificate_credential.cpp
+@@ -38,6 +38,8 @@ template <typename T> std::vector<uint8_t> ToUInt8Vector(T const& in)
+ }
+ } // namespace
+ 
++# define BIO_seek(b,ofs) (int)BIO_ctrl(b,BIO_C_FILE_SEEK,ofs,NULL)
++
+ ClientCertificateCredential::ClientCertificateCredential(
+     std::string const& tenantId,
+     std::string const& clientId,
+Submodule contrib/krb5 contains modified content
+diff --git a/contrib/krb5/src/lib/crypto/openssl/enc_provider/aes.c b/contrib/krb5/src/lib/crypto/openssl/enc_provider/aes.c
+index faac53bd7..9351766b0 100644
+--- a/contrib/krb5/src/lib/crypto/openssl/enc_provider/aes.c
++++ b/contrib/krb5/src/lib/crypto/openssl/enc_provider/aes.c
+@@ -33,7 +33,7 @@
+ #include <openssl/core_names.h>
+ #else
+ #include <openssl/aes.h>
+-#include <openssl/modes.h>
++// #include <openssl/modes.h>
+ #endif
+ 
+ /* proto's */
+@@ -192,6 +192,10 @@ typedef void (*block128_f)(const uint8_t in[16], uint8_t out[16],
+ typedef void (*cbc128_f)(const uint8_t *in, uint8_t *out, size_t len,
+                          const AES_KEY *key, uint8_t ivec[16], int enc);
+ 
++void CRYPTO_cbc128_decrypt(const uint8_t *in, uint8_t *out, size_t len,
++                           const AES_KEY *key, uint8_t ivec[16],
++                           block128_f block);
++
+ static size_t CRYPTO_cts128_encrypt(const unsigned char *in, unsigned char *out,
+                              size_t len, const void *key,
+                              unsigned char ivec[16], cbc128_f cbc)
+Submodule contrib/libssh contains modified content
+diff --git a/contrib/libssh/src/libcrypto.c b/contrib/libssh/src/libcrypto.c
+index 45f45a9e..fb0b668b 100644
+--- a/contrib/libssh/src/libcrypto.c
++++ b/contrib/libssh/src/libcrypto.c
+@@ -67,7 +67,7 @@
+ #endif
+ 
+ #ifdef HAVE_OPENSSL_CRYPTO_CTR128_ENCRYPT
+-#include <openssl/modes.h>
++//#include <openssl/modes.h>
+ #endif
+ 
+ #include "libssh/crypto.h"
