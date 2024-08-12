@@ -37,7 +37,7 @@ import helpers.client
 from helpers.cluster import ClickHouseCluster
 from helpers.network import PartitionManager
 
-from helpers.cloud_tools import (
+from tests.integration.helpers.s3_tools import (
     prepare_s3_bucket,
     upload_directory,
     get_file_contents,

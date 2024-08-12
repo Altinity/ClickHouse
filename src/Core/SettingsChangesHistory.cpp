@@ -93,6 +93,7 @@ static std::initializer_list<std::pair<ClickHouseVersion, SettingsChangesHistory
             {"type_json_skip_duplicated_paths", false, false, "Allow to skip duplicated paths during JSON parsing"},
             {"allow_experimental_vector_similarity_index", false, false, "Added new setting to allow experimental vector similarity indexes"},
             {"input_format_try_infer_datetimes_only_datetime64", true, false, "Allow to infer DateTime instead of DateTime64 in data formats"}
+            {"merge_tree_min_bytes_per_task_for_remote_reading", 4194304, 2097152, "Value is unified with `filesystem_prefetch_min_bytes_for_single_read_task`"},
         }
     },
     {"24.7",
@@ -104,6 +105,8 @@ static std::initializer_list<std::pair<ClickHouseVersion, SettingsChangesHistory
             {"input_format_native_decode_types_in_binary_format", false, false, "Added new setting to allow to read type names in binary format in Native output format"},
             {"read_in_order_use_buffering", false, true, "Use buffering before merging while reading in order of primary key"},
             {"enable_named_columns_in_function_tuple", false, false, "Generate named tuples in function tuple() when all names are unique and can be treated as unquoted identifiers."},
+            {"enable_named_columns_in_function_tuple", false, true, "Generate named tuples in function tuple() when all names are unique and can be treated as unquoted identifiers."},
+            {"input_format_json_case_insensitive_column_matching", false, false, "Ignore case when matching JSON keys with CH columns."},
             {"optimize_trivial_insert_select", true, false, "The optimization does not make sense in many cases."},
             {"dictionary_validate_primary_key_type", false, false, "Validate primary key type for dictionaries. By default id type for simple layouts will be implicitly converted to UInt64."},
             {"collect_hash_table_stats_during_joins", false, true, "New setting."},
@@ -167,7 +170,6 @@ static std::initializer_list<std::pair<ClickHouseVersion, SettingsChangesHistory
             {"cast_string_to_dynamic_use_inference", false, false, "Add setting to allow converting String to Dynamic through parsing"},
             {"allow_experimental_dynamic_type", false, false, "Add new experimental Dynamic type"},
             {"azure_max_blocks_in_multipart_upload", 50000, 50000, "Maximum number of blocks in multipart upload for Azure."},
-            {"allow_archive_path_syntax", false, true, "Added new setting to allow disabling archive path syntax."},
         }
     },
     {"24.4",
