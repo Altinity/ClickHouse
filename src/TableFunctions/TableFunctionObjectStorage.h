@@ -1,11 +1,11 @@
 #pragma once
 
-#include "config.h"
-#include <TableFunctions/ITableFunction.h>
-#include <Formats/FormatFactory.h>
 #include <Disks/ObjectStorages/IObjectStorage_fwd.h>
-#include <Storages/VirtualColumnUtils.h>
+#include <Formats/FormatFactory.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
+#include <Storages/VirtualColumnUtils.h>
+#include <TableFunctions/ITableFunction.h>
+#include "config.h"
 
 namespace DB
 {
@@ -14,6 +14,7 @@ class Context;
 class StorageS3Configuration;
 class StorageAzureConfiguration;
 class StorageHDFSConfiguration;
+class StorageLocalConfiguration;
 struct S3StorageSettings;
 struct AzureStorageSettings;
 struct HDFSStorageSettings;
@@ -52,6 +53,17 @@ struct HDFSDefinition
 {
     static constexpr auto name = "hdfs";
     static constexpr auto storage_type_name = "HDFS";
+};
+
+struct LocalDefinition
+{
+    static constexpr auto name = "local";
+    static constexpr auto storage_type_name = "Local";
+    static constexpr auto signature = " - path\n"
+                                      " - path, format\n"
+                                      " - path, format, structure\n"
+                                      " - path, format, structure, compression_method\n";
+    static constexpr auto max_number_of_arguments = 4;
 };
 
 struct LocalDefinition
@@ -139,4 +151,6 @@ using TableFunctionAzureBlob = TableFunctionObjectStorage<AzureDefinition, Stora
 #if USE_HDFS
 using TableFunctionHDFS = TableFunctionObjectStorage<HDFSDefinition, StorageHDFSConfiguration>;
 #endif
+
+using TableFunctionLocal = TableFunctionObjectStorage<LocalDefinition, StorageLocalConfiguration>;
 }
