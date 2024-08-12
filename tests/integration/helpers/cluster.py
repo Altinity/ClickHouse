@@ -2205,7 +2205,6 @@ class ClickHouseCluster:
             data = fdata.read()
             encodedBytes = base64.b64encode(data)
             encodedStr = str(encodedBytes, "utf-8")
-            
             self.exec_in_container(
                 container_id,
                 [
