@@ -54,6 +54,14 @@ foreach(file_to_download IN LISTS FILES_TO_DOWNLOAD)
         WORLD_READ WORLD_WRITE WORLD_EXECUTE)
 endforeach()
 
+if (ARCH_AMD64)
+  set(CH_BORINGSSL_GOARCH "amd64")
+elseif(ARCH_AARCH64)
+  set(CH_BORINGSSL_GOARCH "arm64")
+else()
+  message(FATAL_ERROR "Unsupported architecture for building BoringSSL in FIPS mode")
+endif()
+
 # Build driver - the script that triggers the build and pulls out results from docker container
 file(WRITE ${BORINGSSL_BUILD_DIR}/build_boringssl_fips.sh
 "#!/bin/bash
@@ -62,7 +70,7 @@ set -ex
 OUTPUT_DIR=$1
 shift
 
-docker build . -t boringssl-builder --build-arg='GOARCH=amd64' --build-arg='GoV=1.22.5'
+docker build . -t boringssl-builder --build-arg='GOARCH=${CH_BORINGSSL_GOARCH}'
 readonly id=$(docker create boringssl-builder)
 
 docker start -a $id #| tr -dc \\\\x0-\\\\x9
