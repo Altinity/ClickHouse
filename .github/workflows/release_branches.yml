@@ -1,4 +1,5 @@
 # yamllint disable rule:comments-indentation
+# Trigger workflow
 name: ReleaseBranchCI
 
 env:
