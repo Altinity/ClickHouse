@@ -119,7 +119,7 @@ if __name__ == "__main__":
         logging.info("Check is already finished according to github status, exiting")
         sys.exit(0)
 
-    docker_image = get_image_with_version(reports_path, "altinityinfra/stress-test")
+    docker_image = get_image_with_version(reports_path, "altinityinfra/stress-test", version=pr_info.docker_image_tag)
 
     packages_path = os.path.join(temp_path, "packages")
     if not os.path.exists(packages_path):

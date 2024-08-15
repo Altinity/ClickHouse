@@ -19,7 +19,8 @@ COPY s3downloader /s3downloader
 ENV S3_URL="https://clickhouse-datasets.s3.amazonaws.com"
 ENV DATASETS="hits visits"
 
-RUN npm install -g azurite
+# The following is already done in clickhouse/stateless-test
+# RUN npm install -g azurite
 
 COPY run.sh /
 CMD ["/bin/bash", "/run.sh"]
