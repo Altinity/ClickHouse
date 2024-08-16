@@ -35,7 +35,10 @@ from version_helper import (
 
 git = Git(ignore_no_tags=True)
 
-ARCH = ("amd64", "arm64")
+ARCH = (
+    "amd64",
+#    "arm64",
+)
 
 
 class DelOS(argparse.Action):
@@ -372,7 +375,7 @@ def main():
     direct_urls: Dict[str, List[str]] = {}
     release_or_pr, _ = get_release_or_pr(pr_info, args.version)
 
-    for arch, build_name in zip(ARCH, ("package_release", "package_aarch64")):
+    for arch, build_name in zip(ARCH, ("package_release",)):
         if not args.bucket_prefix:
             repo_urls[
                 arch
