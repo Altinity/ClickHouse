@@ -628,6 +628,7 @@ class CiCache:
         )
         if file_prefix:
             path += "_" + file_prefix
+        logging.info(f"Downloading build reports with prefix '{path}'")
         reports_files = self.s3.download_files(
             bucket=S3_BUILDS_BUCKET,
             s3_path=path,
