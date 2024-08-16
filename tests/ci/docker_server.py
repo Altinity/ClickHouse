@@ -375,7 +375,7 @@ def main():
     direct_urls: Dict[str, List[str]] = {}
     release_or_pr, _ = get_release_or_pr(pr_info, args.version)
 
-    for arch, build_name in zip(ARCH, ("package_release")):
+    for arch, build_name in zip(ARCH, ("package_release",)):
         if not args.bucket_prefix:
             repo_urls[
                 arch
