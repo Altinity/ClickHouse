@@ -669,6 +669,10 @@ BlockIO InterpreterSystemQuery::execute()
             for (const auto & task : getRefreshTasks())
                 task->run();
             break;
+        case Type::WAIT_VIEW:
+            for (const auto & task : getRefreshTasks())
+                task->wait();
+            break;
         case Type::CANCEL_VIEW:
             for (const auto & task : getRefreshTasks())
                 task->cancel();
@@ -1412,6 +1416,7 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
             break;
         }
         case Type::REFRESH_VIEW:
+        case Type::WAIT_VIEW:
         case Type::START_VIEW:
         case Type::START_VIEWS:
         case Type::STOP_VIEW:
