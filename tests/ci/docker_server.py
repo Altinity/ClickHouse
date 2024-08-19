@@ -365,8 +365,10 @@ def main():
     del args.image_repo
     del args.push
 
-    if pr_info.is_master():
-        push = True
+    # if pr_info.is_master():
+    #     push = True
+    # NOTE(vnemkov): always push (since we are pushing to a intermediary repo) for testing
+    push = True
 
     image = DockerImageData(image_path, image_repo, False)
     args.release_type = auto_release_type(args.version, args.release_type)
