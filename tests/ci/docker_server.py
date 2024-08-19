@@ -371,6 +371,11 @@ def main():
     image = DockerImageData(image_path, image_repo, False)
     args.release_type = auto_release_type(args.version, args.release_type)
     tags = gen_tags(args.version, args.release_type)
+
+    # NOTE(vnemkov): publish docker images created by PRs, so there is a way to test them
+    if pr_info.is_pr():
+        tags.append(f'PR-{pr_info.number}-{pr_info.sha}')
+
     repo_urls = {}
     direct_urls: Dict[str, List[str]] = {}
     release_or_pr, _ = get_release_or_pr(pr_info, args.version)
