@@ -186,6 +186,7 @@ jobs:
               python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --clickhouse-version ${{ env.version }}
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
               ${{ env.args }} || EXITCODE=$?;
               .github/add_link_to_logs.sh;
@@ -237,6 +238,7 @@ jobs:
               python3
               -u alter/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --clickhouse-version ${{ env.version }}
               --only "/alter/${{ matrix.ONLY }} partition/*"
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
               ${{ env.args }} || EXITCODE=$?;
@@ -289,6 +291,7 @@ jobs:
               python3
               -u ${{ env.SUITE }}/benchmark.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --clickhouse-version ${{ env.version }}
               --storage ${{ matrix.STORAGE }}
               --gcs-uri ${{ secrets.REGRESSION_GCS_URI }}
               --gcs-key-id ${{ secrets.REGRESSION_GCS_KEY_ID }}
@@ -345,6 +348,7 @@ jobs:
               -u ${{ env.SUITE }}/regression.py
               --ssl
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --clickhouse-version ${{ env.version }}
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
               ${{ env.args }} || EXITCODE=$?;
               .github/add_link_to_logs.sh;
@@ -395,6 +399,7 @@ jobs:
               python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --clickhouse-version ${{ env.version }}
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
               ${{ env.args }} || EXITCODE=$?;
               .github/add_link_to_logs.sh;
@@ -441,6 +446,7 @@ jobs:
               python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --clickhouse-version ${{ env.version }}
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
               ${{ env.args }} || EXITCODE=$?;
               .github/add_link_to_logs.sh;
@@ -492,6 +498,7 @@ jobs:
               python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --clickhouse-version ${{ env.version }}
               --storage ${{ matrix.STORAGE }}
               --aws-s3-bucket ${{ secrets.REGRESSION_AWS_S3_BUCKET }}
               --aws-s3-region ${{ secrets.REGRESSION_AWS_S3_REGION }}
@@ -548,6 +555,7 @@ jobs:
               python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --clickhouse-version ${{ env.version }}
               --storage ${{ matrix.STORAGE }}
               --gcs-uri ${{ secrets.REGRESSION_GCS_URI }}
               --gcs-key-id ${{ secrets.REGRESSION_GCS_KEY_ID }}
@@ -606,6 +614,7 @@ jobs:
               python3
               -u ${{ env.SUITE }}/regression.py
               --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --clickhouse-version ${{ env.version }}
               --aws-s3-access-key ${{ secrets.REGRESSION_AWS_S3_SECRET_ACCESS_KEY }}
               --aws-s3-key-id ${{ secrets.REGRESSION_AWS_S3_KEY_ID }}
               --aws-s3-uri https://s3.${{ secrets.REGRESSION_AWS_S3_REGION}}.amazonaws.com/${{ secrets.REGRESSION_AWS_S3_BUCKET }}/data/
