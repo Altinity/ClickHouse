@@ -84,7 +84,16 @@ name: Regression test workflow - Release
       REGRESSION_GCS_URI:
         description: gcs uri used for regression tests.
         required: true
-
+      DATABASE_HOST_VAR:
+        description: database host name to upload regression test results to clickhouse.
+        required: true
+      DATABASE_USER_VAR:
+        description: database user name to upload regression test results to clickhouse.
+        required: true
+      DATABASE_PASSWORD_VAR:
+        description: database password to upload regression test results to clickhouse.
+        required: true
+        
 env:
   # Force the stdout and stderr streams to be unbuffered
   PYTHONUNBUFFERED: 1
@@ -93,6 +102,9 @@ env:
   AWS_DEFAULT_REGION: ${{ secrets.AWS_REPORT_REGION }}
   DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
   DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+  CHECKS_DATABASE_HOST: ${{ secrets.CHECKS_DATABASE_HOST }}
+  CHECKS_DATABASE_USER: ${{ secrets.CHECKS_DATABASE_USER }}
+  CHECKS_DATABASE_PASSWORD: ${{ secrets.CHECKS_DATABASE_PASSWORD }}
   args: --test-to-end
     --no-colors
     --local
