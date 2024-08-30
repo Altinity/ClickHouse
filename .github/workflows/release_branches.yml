@@ -521,7 +521,7 @@ jobs:
     secrets: inherit
     with:
       runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-app-docker-ce, altinity-setup-regression
-      commit: c5e1513a2214ee33696c29717935e0a94989ac2a
+      commit: 0c78d66f01dd08f324c57ae2efec5cd6bd7d19e3
       arch: release
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
   # RegressionTestsAarch64:
