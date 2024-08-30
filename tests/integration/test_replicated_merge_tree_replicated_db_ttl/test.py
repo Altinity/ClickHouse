@@ -30,9 +30,6 @@ def started_cluster():
 
         yield cluster
     finally:
-        for node_name, node in cluster.instances.items():
-            if node.is_up:
-                logging.debug("%s : %s", node_name, str(node.query("SELECT * FROM system.settings")))
         cluster.shutdown()
 
 
