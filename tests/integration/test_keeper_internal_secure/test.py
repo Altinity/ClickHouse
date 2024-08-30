@@ -61,6 +61,7 @@ def get_fake_zk(nodename, timeout=30.0):
     return _fake_zk_instance
 
 
+@pytest.mark.skip(reason="Doesn't work in FIPS mode due to configuration issues")
 def test_secure_raft_works(started_cluster):
     try:
         node1_zk = get_fake_zk("node1")

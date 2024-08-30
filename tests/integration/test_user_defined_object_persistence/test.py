@@ -48,3 +48,4 @@ def test_persistence():
         or "Function with name 'MySum2' does not exists. In scope SELECT MySum2(1, 2)"
         in error_message
     )
+
