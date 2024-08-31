@@ -628,6 +628,7 @@ class CiCache:
         )
         if file_prefix:
             path += "_" + file_prefix
+        logging.info(f"Downloading build reports with prefix '{path}'")
         reports_files = self.s3.download_files(
             bucket=S3_BUILDS_BUCKET,
             s3_path=path,
@@ -1165,7 +1166,7 @@ def _pre_action(s3, indata, pr_info):
     ci_cache = CiCache(s3, indata["jobs_data"]["digests"])
 
     # for release/master branches reports must be from the same branches
-    report_prefix = normalize_string(pr_info.head_ref) if pr_info.number == 0 else ""
+    report_prefix = normalize_string(pr_info.head_ref) if pr_info.number == 0 else str(pr_info.number)
     print(
         f"Use report prefix [{report_prefix}], pr_num [{pr_info.number}], head_ref [{pr_info.head_ref}]"
     )

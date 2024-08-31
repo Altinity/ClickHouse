@@ -109,6 +109,8 @@ def started_cluster():
             stay_alive=True,
             with_installed_binary=True,
             use_old_analyzer=True,
+            # needed to set allow_experimental_s3queue to 1
+            user_configs=["configs/users_23.8.xml"],
         )
 
         logging.info("Starting cluster...")

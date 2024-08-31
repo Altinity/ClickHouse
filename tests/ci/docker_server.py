@@ -35,7 +35,10 @@ from version_helper import (
 
 git = Git(ignore_no_tags=True)
 
-ARCH = ("amd64", "arm64")
+ARCH = (
+    "amd64",
+#    "arm64",
+)
 
 
 class DelOS(argparse.Action):
@@ -249,7 +252,9 @@ def build_and_push_image(
     init_args = ["docker", "buildx", "build"]
     if push:
         init_args.append("--push")
-        init_args.append("--output=type=image,push-by-digest=true")
+        # NOTE(vnemkov): since for FIPS we don't build arm64 images and don't merge that against amd64 images,
+        # we don't need to do `push-by-digest`.
+        init_args.append("--output=type=image")
         init_args.append(f"--tag={image.repo}")
     else:
         init_args.append("--output=type=docker")
@@ -362,17 +367,24 @@ def main():
     del args.image_repo
     del args.push
 
-    if pr_info.is_master():
-        push = True
+    # if pr_info.is_master():
+    #     push = True
+    # NOTE(vnemkov): always push (since we are pushing to a intermediary repo) for testing
+    push = True
 
     image = DockerImageData(image_path, image_repo, False)
     args.release_type = auto_release_type(args.version, args.release_type)
     tags = gen_tags(args.version, args.release_type)
+
+    # NOTE(vnemkov): publish docker images created by PRs, so there is a way to test them
+    if pr_info.is_pr():
+        tags.append(f'PR-{pr_info.number}-{pr_info.sha}')
+
     repo_urls = {}
     direct_urls: Dict[str, List[str]] = {}
     release_or_pr, _ = get_release_or_pr(pr_info, args.version)
 
-    for arch, build_name in zip(ARCH, ("package_release", "package_aarch64")):
+    for arch, build_name in zip(ARCH, ("package_release",)):
         if not args.bucket_prefix:
             repo_urls[
                 arch
