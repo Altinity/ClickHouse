@@ -1,6 +1,9 @@
 List of pull requests contributed by Altinity develoeprs to ClickHouse server. It does not include documentation changes.
 
 ## 2024
+  * Fix small value DateTime64 constant folding in nested subquery for remote	[68323](https://github.com/ClickHouse/ClickHouse/pull/68323)	by @shiyer7474
+  * Building aarch64 builds with '-no-pie' to allow better introspection	[67916](https://github.com/ClickHouse/ClickHouse/pull/67916)	by @filimonov
+  * Add `**` to `hdfs` docs, add test for `**` in `hdfs`	[67064](https://github.com/ClickHouse/ClickHouse/pull/67064)	by @zvonand
   * Even better healthcheck for ldap	[67667](https://github.com/ClickHouse/ClickHouse/pull/67667)	by @zvonand
   * Fix serialization of parameterized view parameters	[67654](https://github.com/ClickHouse/ClickHouse/pull/67654)	by @shiyer7474
   * Skip parallel for `test_storage_kerberized_kafka`	[67349](https://github.com/ClickHouse/ClickHouse/pull/67349)	by @zvonand
