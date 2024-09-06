@@ -7,6 +7,8 @@
 #include <Common/StringUtils/StringUtils.h>
 #include <Common/logger_useful.h>
 
+#include <Interpreters/Context.h>
+
 namespace DB
 {
 

@@ -229,6 +229,7 @@ bool AsynchronousBoundedReadBuffer::nextImpl()
     /// In case of multiple files for the same file in clickhouse (i.e. log family)
     /// file_offset_of_buffer_end will not match getImplementationBufferOffset()
     /// so we use [impl->getImplementationBufferOffset(), impl->getFileSize()]
+    chassert(file_offset_of_buffer_end >= impl->getFileOffsetOfBufferEnd());
     chassert(file_offset_of_buffer_end <= impl->getFileSize());
 
     if (read_until_position && (file_offset_of_buffer_end > *read_until_position))
@@ -316,8 +317,7 @@ off_t AsynchronousBoundedReadBuffer::seek(off_t offset, int whence)
 
     if (read_until_position && new_pos > *read_until_position)
     {
-        if (!impl->seekIsCheap())
-            ProfileEvents::increment(ProfileEvents::RemoteFSSeeksWithReset);
+        ProfileEvents::increment(ProfileEvents::RemoteFSSeeksWithReset);
         file_offset_of_buffer_end = new_pos = *read_until_position; /// read_until_position is a non-included boundary.
         impl->seek(file_offset_of_buffer_end, SEEK_SET);
         return new_pos;
@@ -335,8 +335,7 @@ off_t AsynchronousBoundedReadBuffer::seek(off_t offset, int whence)
     }
     else
     {
-        if (!impl->seekIsCheap())
-            ProfileEvents::increment(ProfileEvents::RemoteFSSeeksWithReset);
+        ProfileEvents::increment(ProfileEvents::RemoteFSSeeksWithReset);
         file_offset_of_buffer_end = new_pos;
         impl->seek(file_offset_of_buffer_end, SEEK_SET);
     }
