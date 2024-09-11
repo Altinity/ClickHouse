@@ -1,8 +1,8 @@
 name: Scheduled Altinity Stable Builds
-run-name: Scheduled Altinity Stable Builds
+
 on:
   schedule:
-    - cron: "0 0 * * 6" # Saturday midnight
+    - cron: "0 0 * * 4" # Change to "0 0 * * 6" (Saturday midnight) once tested
 
 jobs:
   v24_3_5_47_altinitystable:
@@ -11,4 +11,3 @@ jobs:
   v24_3_5_48_altinityfips:
     uses: Altinity/ClickHouse/.github/workflows/release_workflow.yml@24.3-fips-scheduled-run
     secrets: inherit
-    
