@@ -12,5 +12,5 @@ jobs:
           - 24.3-scheduled-run
           - 24.3-fips-scheduled-run
     name: ${{ matrix.branch }}
-    uses: Altinity/ClickHouse/.github/workflows/release_workflow.yml@${{matrix.branch}}
+    uses: Altinity/ClickHouse/.github/workflows/release_branches.yml@${{matrix.branch}}
     secrets: inherit
