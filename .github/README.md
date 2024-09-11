@@ -1,4 +1,4 @@
-## Scheduled Buildds Runs
+## Scheduled Build Run Results
 
 Results for **the latest** release_workflow scheduled runs.
 
