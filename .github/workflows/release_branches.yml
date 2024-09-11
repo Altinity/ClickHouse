@@ -24,6 +24,7 @@ on: # yamllint disable-line rule:truthy
   push:
     branches:
       - 'releases/24.3**'
+  workflow_call:
 
 jobs:
   RunConfig:
