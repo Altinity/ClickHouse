@@ -1285,10 +1285,9 @@ def _configure_docker_jobs(docker_digest_or_latest: bool) -> Dict:
     # FIXME: we need login as docker manifest inspect goes directly to one of the *.docker.com hosts instead of "registry-mirrors" : ["http://dockerhub-proxy.dockerhub-proxy-zone:5000"]
     #   find if it's possible to use the setting of /etc/docker/daemon.json (https://github.com/docker/cli/issues/4484#issuecomment-1688095463)
     docker_images_helper.docker_login()
-    missing_multi_dict = check_missing_images_on_dockerhub(imagename_digest_dict)
-    print(imagename_digest_dict) #debug
+    # missing_multi_dict = check_missing_images_on_dockerhub(imagename_digest_dict) #REMOVEME: force clickhouse to build integration
+    missing_multi_dict = {'altinityinfra/integration-test' : imagename_digest_dict['altinityinfra/integration-test'], 'altinityinfra/integration-tests-runner':imagename_digest_dict['altinityinfra/integration-tests-runner'], 'altinityinfra/integration-helper':imagename_digest_dict['altinityinfra/integration-helper']}
     missing_multi = list(missing_multi_dict)
-    print(missing_multi_dict) #debug
     missing_amd64 = []
     missing_aarch64 = []
     if not docker_digest_or_latest:
@@ -1308,7 +1307,6 @@ def _configure_docker_jobs(docker_digest_or_latest: bool) -> Dict:
                 "aarch64",
             )
         )
-        print(missing_aarch64) #debug
     else:
         if missing_multi:
             assert False, f"Missing images [{missing_multi}], cannot proceed"
