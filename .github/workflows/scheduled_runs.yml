@@ -12,14 +12,10 @@ on:
     paths:
       - '**/scheduled_runs.yml'
 
-
 jobs:
-  release_workflows:
-    strategy:
-      matrix:
-        branch: 
-          - 24.3-scheduled-run
-          - 24.3-fips-scheduled-run
-    name: ${{ matrix.branch }}
-    uses: Altinity/ClickHouse/.github/workflows/release_branches.yml@${{matrix.branch}}
+  v24_3_5_47_altinitystable:
+    uses: Altinity/ClickHouse/.github/workflows/release_workflow.yml@24.3-scheduled-run
+    secrets: inherit
+  v24_3_5_48_altinityfips:
+    uses: Altinity/ClickHouse/.github/workflows/release_workflow.yml@24.3-fips-scheduled-run
     secrets: inherit
