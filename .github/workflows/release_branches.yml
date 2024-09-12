@@ -18,6 +18,13 @@ on: # yamllint disable-line rule:truthy
     branches:
       - 'releases/24.3**'
   workflow_call:
+    secrets:
+      AWS_SECRET_ACCESS_KEY:
+        description: the access key to the aws param store.
+        required: true
+      AWS_ACCESS_KEY_ID:
+        description: the access key id to the aws param store.
+        required: true
 
 env:
   # Force the stdout and stderr streams to be unbuffered
