@@ -3,6 +3,15 @@ name: Scheduled Altinity Stable Builds
 on:
   schedule:
     - cron: "0 0 * * 4" # Change to "0 0 * * 6" (Saturday midnight) once tested
+  # Make sure that any changes to this file is actually tested with PRs
+  pull_request:
+    types:
+      - synchronize
+      - reopened
+      - opened
+    paths:
+      - '**/scheduled_runs.yml'
+
 
 jobs:
   release_workflows:
