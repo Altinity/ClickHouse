@@ -1,6 +1,11 @@
 List of pull requests contributed by Altinity develoeprs to ClickHouse server. It does not include documentation changes.
 
 ## 2024
+  * Multi auth methods	[65277](https://github.com/ClickHouse/ClickHouse/pull/65277)	by @arthurpassos
+  * Do not use docker pause for Kerberos KDC container in integration tests	[69136](https://github.com/ClickHouse/ClickHouse/pull/69136)	by @ilejn
+  * Fix test_role & test_keeper_s3_snapshot integration tests	[69013](https://github.com/ClickHouse/ClickHouse/pull/69013)	by @shiyer7474
+  * Thread pool metrics	[68674](https://github.com/ClickHouse/ClickHouse/pull/68674)	by @filimonov
+  * Fix subnet in docker_compose_net.yml	[69121](https://github.com/ClickHouse/ClickHouse/pull/69121)	by @ilejn
   * Fix small value DateTime64 constant folding in nested subquery for remote	[68323](https://github.com/ClickHouse/ClickHouse/pull/68323)	by @shiyer7474
   * Building aarch64 builds with '-no-pie' to allow better introspection	[67916](https://github.com/ClickHouse/ClickHouse/pull/67916)	by @filimonov
   * Add `**` to `hdfs` docs, add test for `**` in `hdfs`	[67064](https://github.com/ClickHouse/ClickHouse/pull/67064)	by @zvonand
