@@ -38,19 +38,11 @@ jobs:
           clear-repository: true # to ensure correct digests
           fetch-depth: 0 # to get version
           filter: tree:0
-      # - name: Labels check
-      #   run: |
-      #     cd "$GITHUB_WORKSPACE/tests/ci"
-      #     python3 run_check.py
       - name: Python unit tests
         run: |
           cd "$GITHUB_WORKSPACE/tests/ci"
           echo "Testing the main ci directory"
           python3 -m unittest discover -s . -p 'test_*.py'
-          for dir in *_lambda/; do
-            echo "Testing $dir"
-            python3 -m unittest discover -s "$dir" -p 'test_*.py'
-          done
       - name: PrepareRunConfig
         id: runconfig
         run: |
@@ -158,28 +150,6 @@ jobs:
     with:
       build_name: package_debug
       data: ${{ needs.RunConfig.outputs.data }}
-  BuilderBinDarwin:
-    needs: [RunConfig, BuildDockers]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_build.yml
-    secrets: inherit
-    with:
-      build_name: binary_darwin
-      checkout_depth: 0
-      data: ${{ needs.RunConfig.outputs.data }}
-      # always rebuild on release branches to be able to publish from any commit
-      force: true
-  BuilderBinDarwinAarch64:
-    needs: [RunConfig, BuildDockers]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_build.yml
-    secrets: inherit
-    with:
-      build_name: binary_darwin_aarch64
-      checkout_depth: 0
-      data: ${{ needs.RunConfig.outputs.data }}
-      # always rebuild on release branches to be able to publish from any commit
-      force: true
 ############################################################################################
 ##################################### Docker images  #######################################
 ############################################################################################
@@ -222,24 +192,9 @@ jobs:
       test_name: ClickHouse build check
       runner_type: altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-in-hel1, altinity-image-arm-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
-  BuilderSpecialReport:
-    # run report check for failed builds to indicate the CI error
-    if: ${{ !cancelled() }}
-    needs:
-      - RunConfig
-      - BuilderBinDarwin
-      - BuilderBinDarwinAarch64
-    uses: ./.github/workflows/reusable_test.yml
-    secrets: inherit
-    with:
-      test_name: ClickHouse special build check
-      runner_type: altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-in-hel1, altinity-image-arm-system-ubuntu-22.04
-      data: ${{ needs.RunConfig.outputs.data }}
   MarkReleaseReady:
     if: ${{ !failure() && !cancelled() }}
     needs:
-      - BuilderBinDarwin
-      - BuilderBinDarwinAarch64
       - BuilderDebRelease
       - BuilderDebAarch64
     runs-on: [self-hosted, altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-in-hel1, altinity-image-arm-system-ubuntu-22.04]
@@ -557,7 +512,6 @@ jobs:
       - DockerServerImage
       - DockerKeeperImage
       - BuilderReport
-      - BuilderSpecialReport
       - MarkReleaseReady
       - FunctionalStatelessTestDebug
       - FunctionalStatelessTestRelease
