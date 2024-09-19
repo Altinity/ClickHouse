@@ -1874,7 +1874,8 @@ def main() -> int:
             if not args.skip_jobs
             else {}
         )
-        
+
+        print(pr_info.event) #DEBUG
         if pr_info.event != "workflow_dispatch":
             # Avoid calling pr_info.has_changes_in_documentation_only() during workflow_dispatch event
             if not args.skip_jobs and pr_info.has_changes_in_documentation_only():
