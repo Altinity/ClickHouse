@@ -127,6 +127,9 @@ def get_release_or_pr(pr_info: PRInfo, version: ClickHouseVersion) -> Tuple[str,
     # It should be fixed in performance-comparison image eventually
     # For performance tests we always set PRs prefix
     performance_pr = "PRs/0"
+    if pr_info.event_type == "dispatch":
+        # for dispatch maintenance run we use major version and time
+        return f"maintenance/{version.major}.{version.minor}/{time.strftime('%Y-%m-%d-%H:%M:%S', time.gmtime())}", performance_pr
     if "release" in pr_info.labels or "release-lts" in pr_info.labels:
         # for release pull requests we use branch names prefixes, not pr numbers
         return pr_info.head_ref, performance_pr
