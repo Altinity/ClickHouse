@@ -3,6 +3,7 @@
 #include <Core/Settings.h>
 
 #include <Common/scope_guard_safe.h>
+#include <Core/ParallelReplicasMode.h>
 
 #include <Columns/ColumnAggregateFunction.h>
 
@@ -290,14 +291,21 @@ bool applyTrivialCountIfPossible(
     if (!num_rows)
         return false;
 
-    if (settings.max_parallel_replicas > 1)
+    if (settings.allow_experimental_parallel_reading_from_replicas > 0 && settings.max_parallel_replicas > 1)
     {
-        if (!settings.parallel_replicas_custom_key.value.empty() || settings.allow_experimental_parallel_reading_from_replicas == 0)
+        /// Imagine the situation when we have a query with parallel replicas and
+        /// this code executed on the remote server.
+        /// If we will apply trivial count optimization, then each remote server will do the same
+        /// and we will have N times more rows as the result on the initiator.
+        /// TODO: This condition seems unneeded when we will make the parallel replicas with custom key
+        /// to work on top of MergeTree instead of Distributed.
+        if (settings.parallel_replicas_mode == ParallelReplicasMode::CUSTOM_KEY_RANGE ||
+            settings.parallel_replicas_mode == ParallelReplicasMode::CUSTOM_KEY_SAMPLING ||
+            settings.parallel_replicas_mode == ParallelReplicasMode::SAMPLING_KEY)
             return false;
 
         /// The query could use trivial count if it didn't use parallel replicas, so let's disable it
         query_context->setSetting("allow_experimental_parallel_reading_from_replicas", Field(0));
-        query_context->setSetting("max_parallel_replicas", UInt64{1});
         LOG_TRACE(getLogger("Planner"), "Disabling parallel replicas to be able to use a trivial count optimization");
 
     }
@@ -504,7 +512,7 @@ std::optional<FilterDAGInfo> buildCustomKeyFilterIfNeeded(const StoragePtr & sto
         settings.parallel_replicas_count,
         settings.parallel_replica_offset,
         std::move(custom_key_ast),
-        {settings.parallel_replicas_custom_key_filter_type,
+        {settings.parallel_replicas_mode,
          settings.parallel_replicas_custom_key_range_lower,
          settings.parallel_replicas_custom_key_range_upper},
         storage->getInMemoryMetadataPtr()->columns,
