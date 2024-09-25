@@ -597,7 +597,7 @@ InterpreterSelectQuery::InterpreterSelectQuery(
                     settings.parallel_replicas_count,
                     settings.parallel_replica_offset,
                     std::move(custom_key_ast),
-                    {settings.parallel_replicas_custom_key_filter_type,
+                    {settings.parallel_replicas_mode,
                      settings.parallel_replicas_custom_key_range_lower,
                      settings.parallel_replicas_custom_key_range_upper},
                     storage->getInMemoryMetadataPtr()->columns,
@@ -2314,12 +2314,12 @@ void InterpreterSelectQuery::addPrewhereAliasActions()
 }
 
 /// Based on the query analysis, check if using a trivial count (storage or partition metadata) is possible
-std::optional<UInt64> InterpreterSelectQuery::getTrivialCount(UInt64 max_parallel_replicas)
+std::optional<UInt64> InterpreterSelectQuery::getTrivialCount(UInt64 allow_experimental_parallel_reading_from_replicas)
 {
     const Settings & settings = context->getSettingsRef();
     bool optimize_trivial_count =
         syntax_analyzer_result->optimize_trivial_count
-        && (max_parallel_replicas <= 1)
+        && (allow_experimental_parallel_reading_from_replicas <= 1)
         && !settings.allow_experimental_query_deduplication
         && !settings.empty_result_for_aggregation_by_empty_set
         && storage
@@ -2403,7 +2403,7 @@ void InterpreterSelectQuery::executeFetchColumns(QueryProcessingStage::Enum proc
     std::optional<UInt64> num_rows;
 
     /// Optimization for trivial query like SELECT count() FROM table.
-    if (processing_stage == QueryProcessingStage::FetchColumns && (num_rows = getTrivialCount(settings.max_parallel_replicas)))
+    if (processing_stage == QueryProcessingStage::FetchColumns && (num_rows = getTrivialCount(settings.allow_experimental_parallel_reading_from_replicas)))
     {
         const auto & desc = query_analyzer->aggregates()[0];
         const auto & func = desc.function;
