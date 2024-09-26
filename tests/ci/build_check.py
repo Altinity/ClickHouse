@@ -130,7 +130,7 @@ def get_release_or_pr(pr_info: PRInfo, version: ClickHouseVersion) -> Tuple[str,
     performance_pr = "PRs/0"
     if pr_info.event_type == "dispatch":
         # for dispatch maintenance run we use major version and time
-        return f"maintenance/{pr_info.ref}/{GITHUB_RUN_ID}", performance_pr
+        return f"maintenance/{pr_info.base_ref}/{GITHUB_RUN_ID}", performance_pr
     if "release" in pr_info.labels or "release-lts" in pr_info.labels:
         # for release pull requests we use branch names prefixes, not pr numbers
         return pr_info.head_ref, performance_pr
