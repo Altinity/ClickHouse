@@ -13,7 +13,13 @@ on:
       - '**/scheduled_runs.yml'
 
 jobs:
-  v24_3_5_47_altinitystable:
+  LaunchWorkflows:
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: 
+          - 24.3-scheduled-run
+    name: Scheduled run for ${{ matrix.branch }}
     runs-on: ubuntu-latest
     steps:
      - name: Run 24.3 workflow
@@ -24,8 +30,4 @@ jobs:
           -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
           -H "X-GitHub-Api-Version: 2022-11-28" \
           https://api.github.com/repos/Altinity/ClickHouse/actions/workflows/release_branches.yml/dispatches \
-          -d '{"ref":"24.3-scheduled-run"}'
-  
-  # v24_3_5_48_altinityfips:
-  #   uses: Altinity/ClickHouse/.github/workflows/release_branches.yml@24.3-fips-scheduled-run
-  #   secrets: inherit
+          -d '{"ref":"${{ matrix.branch }}"}'
