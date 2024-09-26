@@ -19,7 +19,7 @@ jobs:
       matrix:
         branch: 
           - 24.3-scheduled-run
-    name: Scheduled run for ${{ matrix.branch }}
+    name: ${{ matrix.branch }}
     runs-on: ubuntu-latest
     steps:
      - name: Run 24.3 workflow
