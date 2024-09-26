@@ -932,7 +932,7 @@ class ClickhouseIntegrationTestsRunner:
             for fail_status in ("ERROR", "FAILED"):
                 for failed_test in group_counters[fail_status]:
                     if failed_test in known_broken_tests.keys():
-                        fail_message = known_broken_tests[failed_test]
+                        fail_message = known_broken_tests["message"][failed_test]
                         mark_as_broken = False
                         for log_path in log_paths:
                             if log_path.endswith(".log"):
