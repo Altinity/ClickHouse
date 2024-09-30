@@ -1875,8 +1875,10 @@ def main() -> int:
             else {}
         )
 
-        if not args.skip_jobs and pr_info.has_changes_in_documentation_only():
-            _update_config_for_docs_only(jobs_data)
+        if pr_info.event_type != "dispatch":
+            # Avoid calling pr_info.has_changes_in_documentation_only() during workflow_dispatch event
+            if not args.skip_jobs and pr_info.has_changes_in_documentation_only():
+                _update_config_for_docs_only(jobs_data)
 
         if not args.skip_jobs:
             ci_cache = CiCache(s3, jobs_data["digests"])
