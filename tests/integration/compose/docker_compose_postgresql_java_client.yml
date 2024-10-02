@@ -1,4 +1,3 @@
-version: '2.2'
 services:
   java:
     image: altinityinfra/postgresql-java-client:${DOCKER_POSTGRESQL_JAVA_CLIENT_TAG:-latest}
