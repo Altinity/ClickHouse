@@ -74,7 +74,7 @@ using StepStack = std::vector<IQueryPlanStep*>;
 static QueryPlan::Node * findReadingStep(QueryPlan::Node & node, StepStack & backward_path)
 {
     IQueryPlanStep * step = node.step.get();
-    if (auto * reading = checkSupportedReadingStep(step))
+    if (auto * /*reading*/ _ = checkSupportedReadingStep(step))
     {
         backward_path.push_back(node.step.get());
         return &node;
