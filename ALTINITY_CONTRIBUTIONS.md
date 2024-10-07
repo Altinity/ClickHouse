@@ -1,6 +1,15 @@
 List of pull requests contributed by Altinity develoeprs to ClickHouse server. It does not include documentation changes.
 
 ## 2024
+  * Thread pool: move thread creation out of lock	[68694](https://github.com/ClickHouse/ClickHouse/pull/68694)	by @filimonov
+  * fix Kafka test	[70352](https://github.com/ClickHouse/ClickHouse/pull/70352)	by @filimonov
+  * Maybe fix RabbitMQ	[70336](https://github.com/ClickHouse/ClickHouse/pull/70336)	by @filimonov
+  * Add getSettingOrDefault() function	[69917](https://github.com/ClickHouse/ClickHouse/pull/69917)	by @shiyer7474
+  * Fix REPLACE PARTITION waiting for mutations/merges on unrelated partitions 	[59138](https://github.com/ClickHouse/ClickHouse/pull/59138)	by @Enmk
+  * Implement missing decimal cases for `zeroField` function by casting 0 to proper types	[69978](https://github.com/ClickHouse/ClickHouse/pull/69978)	by @arthurpassos
+  * alpine docker images - use ubuntu 22.04 as glibc donor	[69033](https://github.com/ClickHouse/ClickHouse/pull/69033)	by @filimonov
+  * Read only necessary columns & respect `ttl_only_drop_parts` on `materialize ttl`	[65488](https://github.com/ClickHouse/ClickHouse/pull/65488)	by @zvonand
+  * Some fixes for LDAP	[68355](https://github.com/ClickHouse/ClickHouse/pull/68355)	by @zvonand
   * Multi auth methods	[65277](https://github.com/ClickHouse/ClickHouse/pull/65277)	by @arthurpassos
   * Do not use docker pause for Kerberos KDC container in integration tests	[69136](https://github.com/ClickHouse/ClickHouse/pull/69136)	by @ilejn
   * Fix test_role & test_keeper_s3_snapshot integration tests	[69013](https://github.com/ClickHouse/ClickHouse/pull/69013)	by @shiyer7474
