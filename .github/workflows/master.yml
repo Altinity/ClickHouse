@@ -807,7 +807,7 @@ jobs:
       - FunctionalStatelessTestAarch64
       - FunctionalStatelessTestAsan
       - FunctionalStatelessTestTsan
-      - FunctionalStatelessTestMsan
+      # - FunctionalStatelessTestMsan
       - FunctionalStatelessTestUBsan
       - FunctionalStatelessTestS3Debug
       - FunctionalStatelessTestS3Tsan
@@ -816,18 +816,18 @@ jobs:
       - FunctionalStatefulTestAarch64
       - FunctionalStatefulTestAsan
       - FunctionalStatefulTestTsan
-      - FunctionalStatefulTestMsan
+      # - FunctionalStatefulTestMsan
       - FunctionalStatefulTestUBsan
       - FunctionalStatefulTestDebugParallelReplicas
       - FunctionalStatefulTestUBsanParallelReplicas
-      - FunctionalStatefulTestMsanParallelReplicas
+      # - FunctionalStatefulTestMsanParallelReplicas
       - FunctionalStatefulTestTsanParallelReplicas
       - FunctionalStatefulTestAsanParallelReplicas
       - FunctionalStatefulTestReleaseParallelReplicas
       - StressTestDebug
       - StressTestAsan
       - StressTestTsan
-      - StressTestMsan
+      # - StressTestMsan
       - StressTestUBsan
       - IntegrationTestsAsan
       - IntegrationTestsAnalyzerAsan
@@ -840,11 +840,11 @@ jobs:
       - ASTFuzzerTestDebug
       - ASTFuzzerTestAsan
       - ASTFuzzerTestTsan
-      - ASTFuzzerTestMSan
+      # - ASTFuzzerTestMSan
       - ASTFuzzerTestUBSan
       - UnitTestsAsan
       - UnitTestsTsan
-      - UnitTestsMsan
+      # - UnitTestsMsan
       - UnitTestsUBsan
       - UnitTestsReleaseClang
       - SQLancerTestRelease

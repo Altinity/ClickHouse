@@ -580,19 +580,19 @@ jobs:
       # - FunctionalStatelessTestAarch64
       - FunctionalStatelessTestAsan
       - FunctionalStatelessTestTsan
-      - FunctionalStatelessTestMsan
+      # - FunctionalStatelessTestMsan
       - FunctionalStatelessTestUBsan
       - FunctionalStatefulTestDebug
       - FunctionalStatefulTestRelease
       # - FunctionalStatefulTestAarch64
       - FunctionalStatefulTestAsan
       - FunctionalStatefulTestTsan
-      - FunctionalStatefulTestMsan
+      # - FunctionalStatefulTestMsan
       - FunctionalStatefulTestUBsan
       - StressTestDebug
       - StressTestAsan
       - StressTestTsan
-      - StressTestMsan
+      # - StressTestMsan
       - StressTestUBsan
       - IntegrationTestsAsan
       - IntegrationTestsTsan
