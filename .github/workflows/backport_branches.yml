@@ -115,22 +115,22 @@ jobs:
     with:
       build_name: package_debug
       data: ${{ needs.RunConfig.outputs.data }}
-  BuilderBinDarwin:
-    needs: [RunConfig, BuildDockers]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_build.yml
-    with:
-      build_name: binary_darwin
-      data: ${{ needs.RunConfig.outputs.data }}
-      checkout_depth: 0
-  BuilderBinDarwinAarch64:
-    needs: [RunConfig, BuildDockers]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_build.yml
-    with:
-      build_name: binary_darwin_aarch64
-      data: ${{ needs.RunConfig.outputs.data }}
-      checkout_depth: 0
+  # BuilderBinDarwin:
+  #   needs: [RunConfig, BuildDockers]
+  #   if: ${{ !failure() && !cancelled() }}
+  #   uses: ./.github/workflows/reusable_build.yml
+  #   with:
+  #     build_name: binary_darwin
+  #     data: ${{ needs.RunConfig.outputs.data }}
+  #     checkout_depth: 0
+  # BuilderBinDarwinAarch64:
+  #   needs: [RunConfig, BuildDockers]
+  #   if: ${{ !failure() && !cancelled() }}
+  #   uses: ./.github/workflows/reusable_build.yml
+  #   with:
+  #     build_name: binary_darwin_aarch64
+  #     data: ${{ needs.RunConfig.outputs.data }}
+  #     checkout_depth: 0
 ############################################################################################
 ##################################### Docker images  #######################################
 ############################################################################################
@@ -173,8 +173,8 @@ jobs:
     if: ${{ !cancelled() }}
     needs:
       - RunConfig
-      - BuilderBinDarwin
-      - BuilderBinDarwinAarch64
+      # - BuilderBinDarwin
+      # - BuilderBinDarwinAarch64
     uses: ./.github/workflows/reusable_test.yml
     with:
       test_name: ClickHouse special build check
