@@ -1168,7 +1168,6 @@ MergeTreeDataSelectAnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
         std::move(alter_conversions),
         prewhere_info,
         filter_nodes,
-        storage_snapshot->metadata,
         metadata_for_reading,
         query_info,
         context,
@@ -1354,7 +1353,6 @@ MergeTreeDataSelectAnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
     std::vector<AlterConversionsPtr> alter_conversions,
     const PrewhereInfoPtr & prewhere_info,
     const ActionDAGNodes & added_filter_nodes,
-    const StorageMetadataPtr & metadata_snapshot_base,
     const StorageMetadataPtr & metadata_snapshot,
     const SelectQueryInfo & query_info,
     ContextPtr context,
@@ -1375,7 +1373,6 @@ MergeTreeDataSelectAnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
         return selectRangesToReadImpl(
             std::move(parts),
             std::move(alter_conversions),
-            metadata_snapshot_base,
             metadata_snapshot,
             updated_query_info_with_filter_dag,
             context,
@@ -1391,7 +1388,6 @@ MergeTreeDataSelectAnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
     return selectRangesToReadImpl(
         std::move(parts),
         std::move(alter_conversions),
-        metadata_snapshot_base,
         metadata_snapshot,
         query_info,
         context,
@@ -1407,7 +1403,6 @@ MergeTreeDataSelectAnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
 MergeTreeDataSelectAnalysisResultPtr ReadFromMergeTree::selectRangesToReadImpl(
     MergeTreeData::DataPartsVector parts,
     std::vector<AlterConversionsPtr> alter_conversions,
-    const StorageMetadataPtr & metadata_snapshot_base,
     const StorageMetadataPtr & metadata_snapshot,
     const SelectQueryInfo & query_info,
     ContextPtr context,
@@ -1468,7 +1463,7 @@ MergeTreeDataSelectAnalysisResultPtr ReadFromMergeTree::selectRangesToReadImpl(
             parts,
             alter_conversions,
             part_values,
-            metadata_snapshot_base,
+            metadata_snapshot,
             data,
             context,
             max_block_numbers_to_read.get(),
@@ -2157,10 +2152,23 @@ size_t MergeTreeDataSelectAnalysisResult::marks() const
     if (std::holds_alternative<std::exception_ptr>(result))
         std::rethrow_exception(std::get<std::exception_ptr>(result));
 
-    const auto & index_stats = std::get<ReadFromMergeTree::AnalysisResult>(result).index_stats;
-    if (index_stats.empty())
-        return 0;
-    return index_stats.back().num_granules_after;
+    return std::get<ReadFromMergeTree::AnalysisResult>(result).selected_marks;
+}
+
+UInt64 MergeTreeDataSelectAnalysisResult::rows() const
+{
+    if (std::holds_alternative<std::exception_ptr>(result))
+        std::rethrow_exception(std::get<std::exception_ptr>(result));
+
+    return std::get<ReadFromMergeTree::AnalysisResult>(result).selected_rows;
+}
+
+const RangesInDataParts & MergeTreeDataSelectAnalysisResult::partsWithRanges() const
+{
+    if (std::holds_alternative<std::exception_ptr>(result))
+        std::rethrow_exception(std::get<std::exception_ptr>(result));
+
+    return std::get<ReadFromMergeTree::AnalysisResult>(result).parts_with_ranges;
 }
 
 }

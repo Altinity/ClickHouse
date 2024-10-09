@@ -178,7 +178,6 @@ public:
         std::vector<AlterConversionsPtr> alter_conversions,
         const PrewhereInfoPtr & prewhere_info,
         const ActionDAGNodes & added_filter_nodes,
-        const StorageMetadataPtr & metadata_snapshot_base,
         const StorageMetadataPtr & metadata_snapshot,
         const SelectQueryInfo & query_info,
         ContextPtr context,
@@ -214,13 +213,9 @@ public:
     bool hasAnalyzedResult() const { return analyzed_result_ptr != nullptr; }
     void setAnalyzedResult(MergeTreeDataSelectAnalysisResultPtr analyzed_result_ptr_) { analyzed_result_ptr = std::move(analyzed_result_ptr_); }
 
-    void resetParts(MergeTreeData::DataPartsVector parts)
-    {
-        prepared_parts = std::move(parts);
-        alter_conversions_for_parts = {};
-    }
-
     const MergeTreeData::DataPartsVector & getParts() const { return prepared_parts; }
+    const std::vector<AlterConversionsPtr> & getAlterConvertionsForParts() const { return alter_conversions_for_parts; }
+
     const MergeTreeData & getMergeTreeData() const { return data; }
     size_t getMaxBlockSize() const { return max_block_size; }
     size_t getNumStreams() const { return requested_num_streams; }
@@ -232,7 +227,6 @@ private:
     static MergeTreeDataSelectAnalysisResultPtr selectRangesToReadImpl(
         MergeTreeData::DataPartsVector parts,
         std::vector<AlterConversionsPtr> alter_conversions,
-        const StorageMetadataPtr & metadata_snapshot_base,
         const StorageMetadataPtr & metadata_snapshot,
         const SelectQueryInfo & query_info,
         ContextPtr context,
@@ -330,6 +324,8 @@ struct MergeTreeDataSelectAnalysisResult
 
     bool error() const;
     size_t marks() const;
+    UInt64 rows() const;
+    const RangesInDataParts & partsWithRanges() const;
 };
 
 }
