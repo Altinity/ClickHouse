@@ -26,6 +26,7 @@
 #include <Storages/MergeTree/RangesInDataPart.h>
 #include <Compression/CompressedReadBuffer.h>
 #include <Core/QueryProcessingStage.h>
+#include <DataTypes/DataTypeCustomSimpleAggregateFunction.h>
 #include <DataTypes/DataTypeEnum.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeTuple.h>
@@ -189,6 +190,7 @@ namespace ErrorCodes
     extern const int CANNOT_SCHEDULE_TASK;
     extern const int LIMIT_EXCEEDED;
     extern const int CANNOT_FORGET_PARTITION;
+    extern const int DATA_TYPE_CANNOT_BE_USED_IN_KEY;
 }
 
 static void checkSuspiciousIndices(const ASTFunction * index_function)
@@ -5099,6 +5101,25 @@ void MergeTreeData::movePartitionToVolume(const ASTPtr & partition, const String
     }
 }
 
+void MergeTreeData::movePartitionToTable(const PartitionCommand & command, ContextPtr query_context)
+{
+    String dest_database = query_context->resolveDatabase(command.to_database);
+    auto dest_storage = DatabaseCatalog::instance().getTable({dest_database, command.to_table}, query_context);
+
+    /// The target table and the source table are the same.
+    if (dest_storage->getStorageID() == this->getStorageID())
+        return;
+
+    auto * dest_storage_merge_tree = dynamic_cast<MergeTreeData *>(dest_storage.get());
+    if (!dest_storage_merge_tree)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "Cannot move partition from table {} to table {} with storage {}",
+            getStorageID().getNameForLogs(), dest_storage->getStorageID().getNameForLogs(), dest_storage->getName());
+
+    dest_storage_merge_tree->waitForOutdatedPartsToBeLoaded();
+    movePartitionToTable(dest_storage, command.partition, query_context);
+}
+
 void MergeTreeData::movePartitionToShard(const ASTPtr & /*partition*/, bool /*move_part*/, const String & /*to*/, ContextPtr /*query_context*/)
 {
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "MOVE PARTITION TO SHARD is not supported by storage {}", getName());
@@ -5175,20 +5196,8 @@ Pipe MergeTreeData::alterPartition(
                         break;
 
                     case PartitionCommand::MoveDestinationType::TABLE:
-                    {
-                        String dest_database = query_context->resolveDatabase(command.to_database);
-                        auto dest_storage = DatabaseCatalog::instance().getTable({dest_database, command.to_table}, query_context);
-
-                        auto * dest_storage_merge_tree = dynamic_cast<MergeTreeData *>(dest_storage.get());
-                        if (!dest_storage_merge_tree)
-                            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-                                "Cannot move partition from table {} to table {} with storage {}",
-                                getStorageID().getNameForLogs(), dest_storage->getStorageID().getNameForLogs(), dest_storage->getName());
-
-                        dest_storage_merge_tree->waitForOutdatedPartsToBeLoaded();
-                        movePartitionToTable(dest_storage, command.partition, query_context);
-                    }
-                    break;
+                        movePartitionToTable(command, query_context);
+                        break;
 
                     case PartitionCommand::MoveDestinationType::SHARD:
                     {
@@ -8425,4 +8434,15 @@ bool MergeTreeData::initializeDiskOnConfigChange(const std::set<String> & new_ad
     }
     return true;
 }
+
+void MergeTreeData::verifySortingKey(const KeyDescription & sorting_key)
+{
+    /// Aggregate functions already forbidden, but SimpleAggregateFunction are not
+    for (const auto & data_type : sorting_key.data_types)
+    {
+        if (dynamic_cast<const DataTypeCustomSimpleAggregateFunction *>(data_type->getCustomName()))
+            throw Exception(ErrorCodes::DATA_TYPE_CANNOT_BE_USED_IN_KEY, "Column with type {} is not allowed in key expression", data_type->getCustomName()->getName());
+    }
+}
+
 }

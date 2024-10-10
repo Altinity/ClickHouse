@@ -1,7 +1,7 @@
 # The Dockerfile.ubuntu exists for the tests/ci/docker_server.py script
 # If the image is built from Dockerfile.alpine, then the `-alpine` suffix is added automatically,
 # so the only purpose of Dockerfile.ubuntu is to push `latest`, `head` and so on w/o suffixes
-FROM ubuntu:20.04 AS glibc-donor
+FROM ubuntu:22.04 AS glibc-donor
 ARG TARGETARCH
 
 RUN arch=${TARGETARCH:-amd64} \
@@ -12,7 +12,10 @@ RUN arch=${TARGETARCH:-amd64} \
     && ln -s "${rarch}-linux-gnu" /lib/linux-gnu
 
 
-FROM alpine
+# All versions starting from 3.17, there is a critical CVE-2024-5535
+# https://security.alpinelinux.org/vuln/CVE-2024-5535
+# on 17th of July 2024, alpine:3.16.9 had only 1 medium
+FROM alpine:3.16.9
 
 ENV LANG=en_US.UTF-8 \
     LANGUAGE=en_US:en \
