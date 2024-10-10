@@ -221,7 +221,7 @@ jobs:
     secrets: inherit
     with:
       test_name: ClickHouse build check
-      runner_type:  altinity-on-demand, altinity-type-cax11, altinity-in-hel1, altinity-image-arm-snapshot-22.04-arm, altinity-startup-snapshot, altinity-setup-none04
+      runner_type:  altinity-on-demand, altinity-type-cax11, altinity-in-hel1, altinity-image-arm-snapshot-22.04-arm, altinity-startup-snapshot, altinity-setup-none
       data: ${{ needs.RunConfig.outputs.data }}
   MarkReleaseReady:
     if: ${{ !failure() && !cancelled() }}
