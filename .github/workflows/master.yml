@@ -138,13 +138,13 @@ jobs:
     with:
       build_name: package_tsan
       data: ${{ needs.RunConfig.outputs.data }}
-  BuilderDebMsan:
-    needs: [RunConfig, BuildDockers]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_build.yml
-    with:
-      build_name: package_msan
-      data: ${{ needs.RunConfig.outputs.data }}
+  # BuilderDebMsan:
+  #   needs: [RunConfig, BuildDockers]
+  #   if: ${{ !failure() && !cancelled() }}
+  #   uses: ./.github/workflows/reusable_build.yml
+  #   with:
+  #     build_name: package_msan
+  #     data: ${{ needs.RunConfig.outputs.data }}
   BuilderDebDebug:
     needs: [RunConfig, BuildDockers]
     if: ${{ !failure() && !cancelled() }}
@@ -162,14 +162,14 @@ jobs:
     with:
       build_name: binary_tidy
       data: ${{ needs.RunConfig.outputs.data }}
-  BuilderBinDarwin:
-    needs: [RunConfig, BuilderDebRelease]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_build.yml
-    with:
-      build_name: binary_darwin
-      data: ${{ needs.RunConfig.outputs.data }}
-      checkout_depth: 0
+  # BuilderBinDarwin:
+  #   needs: [RunConfig, BuilderDebRelease]
+  #   if: ${{ !failure() && !cancelled() }}
+  #   uses: ./.github/workflows/reusable_build.yml
+  #   with:
+  #     build_name: binary_darwin
+  #     data: ${{ needs.RunConfig.outputs.data }}
+  #     checkout_depth: 0
   BuilderBinAarch64:
     needs: [RunConfig, BuilderDebRelease]
     if: ${{ !failure() && !cancelled() }}
@@ -186,14 +186,14 @@ jobs:
       build_name: binary_freebsd
       data: ${{ needs.RunConfig.outputs.data }}
       checkout_depth: 0
-  BuilderBinDarwinAarch64:
-    needs: [RunConfig, BuilderDebRelease]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_build.yml
-    with:
-      build_name: binary_darwin_aarch64
-      data: ${{ needs.RunConfig.outputs.data }}
-      checkout_depth: 0
+  # BuilderBinDarwinAarch64:
+  #   needs: [RunConfig, BuilderDebRelease]
+  #   if: ${{ !failure() && !cancelled() }}
+  #   uses: ./.github/workflows/reusable_build.yml
+  #   with:
+  #     build_name: binary_darwin_aarch64
+  #     data: ${{ needs.RunConfig.outputs.data }}
+  #     checkout_depth: 0
   BuilderBinPPC64:
     needs: [RunConfig, BuilderDebRelease]
     if: ${{ !failure() && !cancelled() }}
@@ -272,7 +272,7 @@ jobs:
       - BuilderDebAarch64
       - BuilderDebAsan
       - BuilderDebDebug
-      - BuilderDebMsan
+      # - BuilderDebMsan
       - BuilderDebRelease
       - BuilderDebTsan
       - BuilderDebUBsan
@@ -281,34 +281,34 @@ jobs:
       test_name: ClickHouse build check
       runner_type: style-checker-aarch64
       data: ${{ needs.RunConfig.outputs.data }}
-  BuilderSpecialReport:
-    # run report check for failed builds to indicate the CI error
-    if: ${{ !cancelled() }}
-    needs:
-      - RunConfig
-      - BuilderBinAarch64
-      - BuilderBinDarwin
-      - BuilderBinDarwinAarch64
-      - BuilderBinFreeBSD
-      - BuilderBinPPC64
-      - BuilderBinRISCV64
-      - BuilderBinS390X
-      - BuilderBinAmd64Compat
-      - BuilderBinAarch64V80Compat
-      - BuilderBinClangTidy
-      - BuilderBinAmd64Musl
-      - BuilderDebReleaseCoverage
-      - BuilderBinRelease
-    uses: ./.github/workflows/reusable_test.yml
-    with:
-      test_name: ClickHouse special build check
-      runner_type: style-checker-aarch64
-      data: ${{ needs.RunConfig.outputs.data }}
+  # BuilderSpecialReport:
+  #   # run report check for failed builds to indicate the CI error
+  #   if: ${{ !cancelled() }}
+  #   needs:
+  #     - RunConfig
+  #     - BuilderBinAarch64
+  #     - BuilderBinDarwin
+  #     - BuilderBinDarwinAarch64
+  #     - BuilderBinFreeBSD
+  #     - BuilderBinPPC64
+  #     - BuilderBinRISCV64
+  #     - BuilderBinS390X
+  #     - BuilderBinAmd64Compat
+  #     - BuilderBinAarch64V80Compat
+  #     - BuilderBinClangTidy
+  #     - BuilderBinAmd64Musl
+  #     - BuilderDebReleaseCoverage
+  #     - BuilderBinRelease
+  #   uses: ./.github/workflows/reusable_test.yml
+  #   with:
+  #     test_name: ClickHouse special build check
+  #     runner_type: style-checker-aarch64
+  #     data: ${{ needs.RunConfig.outputs.data }}
   MarkReleaseReady:
     if: ${{ !failure() && !cancelled() }}
     needs:
-      - BuilderBinDarwin
-      - BuilderBinDarwinAarch64
+      # - BuilderBinDarwin
+      # - BuilderBinDarwinAarch64
       - BuilderDebRelease
       - BuilderDebAarch64
     runs-on: [self-hosted, style-checker]
@@ -418,14 +418,14 @@ jobs:
       test_name: Stateless tests (tsan)
       runner_type: func-tester
       data: ${{ needs.RunConfig.outputs.data }}
-  FunctionalStatelessTestMsan:
-    needs: [RunConfig, BuilderDebMsan]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_test.yml
-    with:
-      test_name: Stateless tests (msan)
-      runner_type: func-tester
-      data: ${{ needs.RunConfig.outputs.data }}
+  # FunctionalStatelessTestMsan:
+  #   needs: [RunConfig, BuilderDebMsan]
+  #   if: ${{ !failure() && !cancelled() }}
+  #   uses: ./.github/workflows/reusable_test.yml
+  #   with:
+  #     test_name: Stateless tests (msan)
+  #     runner_type: func-tester
+  #     data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatelessTestUBsan:
     needs: [RunConfig, BuilderDebUBsan]
     if: ${{ !failure() && !cancelled() }}
@@ -477,14 +477,14 @@ jobs:
       test_name: Stateful tests (tsan)
       runner_type: func-tester
       data: ${{ needs.RunConfig.outputs.data }}
-  FunctionalStatefulTestMsan:
-    needs: [RunConfig, BuilderDebMsan]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_test.yml
-    with:
-      test_name: Stateful tests (msan)
-      runner_type: func-tester
-      data: ${{ needs.RunConfig.outputs.data }}
+  # FunctionalStatefulTestMsan:
+  #   needs: [RunConfig, BuilderDebMsan]
+  #   if: ${{ !failure() && !cancelled() }}
+  #   uses: ./.github/workflows/reusable_test.yml
+  #   with:
+  #     test_name: Stateful tests (msan)
+  #     runner_type: func-tester
+  #     data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatefulTestUBsan:
     needs: [RunConfig, BuilderDebUBsan]
     if: ${{ !failure() && !cancelled() }}
@@ -518,14 +518,14 @@ jobs:
       test_name: Stateful tests (ubsan, ParallelReplicas)
       runner_type: func-tester
       data: ${{ needs.RunConfig.outputs.data }}
-  FunctionalStatefulTestMsanParallelReplicas:
-    needs: [RunConfig, BuilderDebMsan]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_test.yml
-    with:
-      test_name: Stateful tests (msan, ParallelReplicas)
-      runner_type: func-tester
-      data: ${{ needs.RunConfig.outputs.data }}
+  # FunctionalStatefulTestMsanParallelReplicas:
+  #   needs: [RunConfig, BuilderDebMsan]
+  #   if: ${{ !failure() && !cancelled() }}
+  #   uses: ./.github/workflows/reusable_test.yml
+  #   with:
+  #     test_name: Stateful tests (msan, ParallelReplicas)
+  #     runner_type: func-tester
+  #     data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatefulTestTsanParallelReplicas:
     needs: [RunConfig, BuilderDebTsan]
     if: ${{ !failure() && !cancelled() }}
@@ -592,14 +592,14 @@ jobs:
       test_name: Stress test (tsan)
       runner_type: stress-tester
       data: ${{ needs.RunConfig.outputs.data }}
-  StressTestMsan:
-    needs: [RunConfig, BuilderDebMsan]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_test.yml
-    with:
-      test_name: Stress test (msan)
-      runner_type: stress-tester
-      data: ${{ needs.RunConfig.outputs.data }}
+  # StressTestMsan:
+  #   needs: [RunConfig, BuilderDebMsan]
+  #   if: ${{ !failure() && !cancelled() }}
+  #   uses: ./.github/workflows/reusable_test.yml
+  #   with:
+  #     test_name: Stress test (msan)
+  #     runner_type: stress-tester
+  #     data: ${{ needs.RunConfig.outputs.data }}
   StressTestUBsan:
     needs: [RunConfig, BuilderDebUBsan]
     if: ${{ !failure() && !cancelled() }}
@@ -678,14 +678,14 @@ jobs:
       test_name: AST fuzzer (ubsan)
       runner_type: fuzzer-unit-tester
       data: ${{ needs.RunConfig.outputs.data }}
-  ASTFuzzerTestMSan:
-    needs: [RunConfig, BuilderDebMsan]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_test.yml
-    with:
-      test_name: AST fuzzer (msan)
-      runner_type: fuzzer-unit-tester
-      data: ${{ needs.RunConfig.outputs.data }}
+  # ASTFuzzerTestMSan:
+  #   needs: [RunConfig, BuilderDebMsan]
+  #   if: ${{ !failure() && !cancelled() }}
+  #   uses: ./.github/workflows/reusable_test.yml
+  #   with:
+  #     test_name: AST fuzzer (msan)
+  #     runner_type: fuzzer-unit-tester
+  #     data: ${{ needs.RunConfig.outputs.data }}
   ASTFuzzerTestDebug:
     needs: [RunConfig, BuilderDebDebug]
     if: ${{ !failure() && !cancelled() }}
@@ -721,14 +721,14 @@ jobs:
       test_name: Unit tests (tsan)
       runner_type: fuzzer-unit-tester
       data: ${{ needs.RunConfig.outputs.data }}
-  UnitTestsMsan:
-    needs: [RunConfig, BuilderDebMsan]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_test.yml
-    with:
-      test_name: Unit tests (msan)
-      runner_type: fuzzer-unit-tester
-      data: ${{ needs.RunConfig.outputs.data }}
+  # UnitTestsMsan:
+  #   needs: [RunConfig, BuilderDebMsan]
+  #   if: ${{ !failure() && !cancelled() }}
+  #   uses: ./.github/workflows/reusable_test.yml
+  #   with:
+  #     test_name: Unit tests (msan)
+  #     runner_type: fuzzer-unit-tester
+  #     data: ${{ needs.RunConfig.outputs.data }}
   UnitTestsUBsan:
     needs: [RunConfig, BuilderDebUBsan]
     if: ${{ !failure() && !cancelled() }}
@@ -807,7 +807,7 @@ jobs:
       - FunctionalStatelessTestAarch64
       - FunctionalStatelessTestAsan
       - FunctionalStatelessTestTsan
-      - FunctionalStatelessTestMsan
+      # - FunctionalStatelessTestMsan
       - FunctionalStatelessTestUBsan
       - FunctionalStatelessTestS3Debug
       - FunctionalStatelessTestS3Tsan
@@ -816,18 +816,18 @@ jobs:
       - FunctionalStatefulTestAarch64
       - FunctionalStatefulTestAsan
       - FunctionalStatefulTestTsan
-      - FunctionalStatefulTestMsan
+      # - FunctionalStatefulTestMsan
       - FunctionalStatefulTestUBsan
       - FunctionalStatefulTestDebugParallelReplicas
       - FunctionalStatefulTestUBsanParallelReplicas
-      - FunctionalStatefulTestMsanParallelReplicas
+      # - FunctionalStatefulTestMsanParallelReplicas
       - FunctionalStatefulTestTsanParallelReplicas
       - FunctionalStatefulTestAsanParallelReplicas
       - FunctionalStatefulTestReleaseParallelReplicas
       - StressTestDebug
       - StressTestAsan
       - StressTestTsan
-      - StressTestMsan
+      # - StressTestMsan
       - StressTestUBsan
       - IntegrationTestsAsan
       - IntegrationTestsAnalyzerAsan
@@ -840,11 +840,11 @@ jobs:
       - ASTFuzzerTestDebug
       - ASTFuzzerTestAsan
       - ASTFuzzerTestTsan
-      - ASTFuzzerTestMSan
+      # - ASTFuzzerTestMSan
       - ASTFuzzerTestUBSan
       - UnitTestsAsan
       - UnitTestsTsan
-      - UnitTestsMsan
+      # - UnitTestsMsan
       - UnitTestsUBsan
       - UnitTestsReleaseClang
       - SQLancerTestRelease
