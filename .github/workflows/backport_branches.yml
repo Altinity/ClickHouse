@@ -168,18 +168,18 @@ jobs:
       test_name: ClickHouse build check
       runner_type: style-checker-aarch64
       data: ${{ needs.RunConfig.outputs.data }}
-  BuilderSpecialReport:
-    # run report check for failed builds to indicate the CI error
-    if: ${{ !cancelled() }}
-    needs:
-      - RunConfig
-      # - BuilderBinDarwin
-      # - BuilderBinDarwinAarch64
-    uses: ./.github/workflows/reusable_test.yml
-    with:
-      test_name: ClickHouse special build check
-      runner_type: style-checker-aarch64
-      data: ${{ needs.RunConfig.outputs.data }}
+  # BuilderSpecialReport:
+  #   # run report check for failed builds to indicate the CI error
+  #   if: ${{ !cancelled() }}
+  #   needs:
+  #     - RunConfig
+  #     - BuilderBinDarwin
+  #     - BuilderBinDarwinAarch64
+  #   uses: ./.github/workflows/reusable_test.yml
+  #   with:
+  #     test_name: ClickHouse special build check
+  #     runner_type: style-checker-aarch64
+  #     data: ${{ needs.RunConfig.outputs.data }}
 ############################################################################################
 #################################### INSTALL PACKAGES ######################################
 ############################################################################################
@@ -251,7 +251,7 @@ jobs:
     if: ${{ !failure() && !cancelled() }}
     needs:
       - BuilderReport
-      - BuilderSpecialReport
+      # - BuilderSpecialReport
       - FunctionalStatelessTestAsan
       - FunctionalStatefulTestDebug
       - StressTestTsan

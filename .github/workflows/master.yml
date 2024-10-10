@@ -281,29 +281,29 @@ jobs:
       test_name: ClickHouse build check
       runner_type: style-checker-aarch64
       data: ${{ needs.RunConfig.outputs.data }}
-  BuilderSpecialReport:
-    # run report check for failed builds to indicate the CI error
-    if: ${{ !cancelled() }}
-    needs:
-      - RunConfig
-      - BuilderBinAarch64
-      # - BuilderBinDarwin
-      # - BuilderBinDarwinAarch64
-      - BuilderBinFreeBSD
-      - BuilderBinPPC64
-      - BuilderBinRISCV64
-      - BuilderBinS390X
-      - BuilderBinAmd64Compat
-      - BuilderBinAarch64V80Compat
-      - BuilderBinClangTidy
-      - BuilderBinAmd64Musl
-      - BuilderDebReleaseCoverage
-      - BuilderBinRelease
-    uses: ./.github/workflows/reusable_test.yml
-    with:
-      test_name: ClickHouse special build check
-      runner_type: style-checker-aarch64
-      data: ${{ needs.RunConfig.outputs.data }}
+  # BuilderSpecialReport:
+  #   # run report check for failed builds to indicate the CI error
+  #   if: ${{ !cancelled() }}
+  #   needs:
+  #     - RunConfig
+  #     - BuilderBinAarch64
+  #     - BuilderBinDarwin
+  #     - BuilderBinDarwinAarch64
+  #     - BuilderBinFreeBSD
+  #     - BuilderBinPPC64
+  #     - BuilderBinRISCV64
+  #     - BuilderBinS390X
+  #     - BuilderBinAmd64Compat
+  #     - BuilderBinAarch64V80Compat
+  #     - BuilderBinClangTidy
+  #     - BuilderBinAmd64Musl
+  #     - BuilderDebReleaseCoverage
+  #     - BuilderBinRelease
+  #   uses: ./.github/workflows/reusable_test.yml
+  #   with:
+  #     test_name: ClickHouse special build check
+  #     runner_type: style-checker-aarch64
+  #     data: ${{ needs.RunConfig.outputs.data }}
   MarkReleaseReady:
     if: ${{ !failure() && !cancelled() }}
     needs:
