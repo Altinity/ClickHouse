@@ -1,7 +1,6 @@
 #include <Core/SettingsEnums.h>
 #include <magic_enum.hpp>
 #include <Access/Common/SQLSecurityDefs.h>
-
 #include <boost/range/adaptor/map.hpp>
 
 
@@ -249,4 +248,10 @@ IMPLEMENT_SETTING_ENUM(
     GroupArrayActionWhenLimitReached,
     ErrorCodes::BAD_ARGUMENTS,
     {{"throw", GroupArrayActionWhenLimitReached::THROW}, {"discard", GroupArrayActionWhenLimitReached::DISCARD}})
+
+IMPLEMENT_SETTING_ENUM(
+    MergeSelectorAlgorithm,
+    ErrorCodes::BAD_ARGUMENTS,
+    {{"Simple", MergeSelectorAlgorithm::SIMPLE}})
+
 }
