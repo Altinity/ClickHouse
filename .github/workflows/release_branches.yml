@@ -512,6 +512,15 @@ jobs:
       test_name: Integration tests (release)
       runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
+  IntegrationTestsAarch64:
+    needs: [RunConfig, BuilderDebAarch64]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/reusable_test.yml
+    secrets: inherit
+    with:
+      test_name: Integration tests (aarch64)
+      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-system-ubuntu-22.04
+      data: ${{ needs.RunConfig.outputs.data }}
 #############################################################################################
 ##################################### REGRESSION TESTS ######################################
 #############################################################################################
@@ -583,6 +592,7 @@ jobs:
       - IntegrationTestsAsan
       - IntegrationTestsTsan
       - IntegrationTestsRelease
+      - IntegrationTestsAarch64
       - CompatibilityCheckX86
       - CompatibilityCheckAarch64
       - RegressionTestsRelease
