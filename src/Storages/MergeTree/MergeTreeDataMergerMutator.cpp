@@ -514,16 +514,26 @@ SelectPartsDecision MergeTreeDataMergerMutator::selectPartsToMergeFromRanges(
     {
         auto merge_selector_algorithm = data_settings->merge_selector_algorithm;
         std::any merge_settings;
-        if (merge_selector_algorithm == MergeSelectorAlgorithm::SIMPLE)
+        if (merge_selector_algorithm == MergeSelectorAlgorithm::SIMPLE
+            || merge_selector_algorithm == MergeSelectorAlgorithm::STOCHASTIC_SIMPLE)
         {
             SimpleMergeSelector::Settings simple_merge_settings;
             /// Override value from table settings
+            simple_merge_settings.window_size = data_settings->merge_selector_window_size;
             simple_merge_settings.max_parts_to_merge_at_once = data_settings->max_parts_to_merge_at_once;
             if (!data_settings->min_age_to_force_merge_on_partition_only)
                 simple_merge_settings.min_age_to_force_merge = data_settings->min_age_to_force_merge_seconds;
 
             if (aggressive)
                 simple_merge_settings.base = 1;
+
+            if (merge_selector_algorithm == MergeSelectorAlgorithm::STOCHASTIC_SIMPLE)
+            {
+                simple_merge_settings.parts_to_throw_insert = data_settings->parts_to_throw_insert;
+                simple_merge_settings.blurry_base_scale_factor = data_settings->merge_selector_blurry_base_scale_factor;
+                simple_merge_settings.use_blurry_base = simple_merge_settings.blurry_base_scale_factor != 0;
+                simple_merge_settings.enable_stochastic_sliding = true;
+            }
 
             merge_settings = simple_merge_settings;
         }
