@@ -100,6 +100,7 @@ env:
     --output classic
     --parallel 1
     --log raw.log
+    --with-analyzer
   artifacts: builds
   artifact_paths: |
     ./report.html
@@ -570,6 +571,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Altinity/clickhouse-regression
+          ref: ${{ inputs.commit }}
       - name: Set envs
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
