@@ -9,7 +9,7 @@ RUN sed -i "s|http://archive.ubuntu.com|$apt_archive|g" /etc/apt/sources.list
 RUN apt-get update \
     && env DEBIAN_FRONTEND=noninteractive apt-get install --yes \
     adduser='3.11*' \
-    ca-certificates='2023*' \
+    ca-certificates \
     bash='5.1-*' \
     btrfs-progs='5.16.*' \
     e2fsprogs='1.46.*' \
@@ -96,7 +96,7 @@ RUN python3 -m pip install --no-cache-dir \
     pytest-repeat~=0.9.3 \
     pytest-timeout~=2.2.0 \
     pytest-xdist~=3.5.0 \
-    pytz~=2023.3.post1 \
+    pytz \
     pyyaml~=5.3.1 \
     redis~=5.0.1 \
     requests==2.31.0 \

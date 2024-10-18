@@ -12,7 +12,7 @@ RUN apt-get update \
     && apt-get install \
         apt-transport-https='2.4.*' \
         apt-utils='2.4.*' \
-        ca-certificates='20230311ubuntu0.22.04.*' \
+        ca-certificates \
         curl='7.81.*' \
         dnsutils='1:9.18.*' \
         gnupg='2.2.*' \
