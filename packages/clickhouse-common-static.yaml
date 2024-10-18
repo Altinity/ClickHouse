@@ -16,7 +16,7 @@ homepage: "https://altinity.com/"
 license: "Apache"
 section: "database"
 priority: "optional"
-maintainer: "ClickHouse Dev Team <packages+linux@clickhouse.com>"
+maintainer: "Altinity Dev Team https://github.com/Altinity/ClickHouse"
 deb:
   fields:
     Source: clickhouse

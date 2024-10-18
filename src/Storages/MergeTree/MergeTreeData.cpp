@@ -6536,7 +6536,6 @@ static void selectBestProjection(
         projection_parts,
         candidate.prewhere_info,
         candidate.required_columns,
-        storage_snapshot->metadata,
         candidate.desc->metadata,
         query_info,
         added_filter_nodes,
@@ -6560,7 +6559,6 @@ static void selectBestProjection(
             normal_parts,
             query_info.prewhere_info,
             required_columns,
-            storage_snapshot->metadata,
             storage_snapshot->metadata,
             query_info, // TODO syntax_analysis_result set in index
             added_filter_nodes,
@@ -6596,7 +6594,7 @@ Block MergeTreeData::getMinMaxCountProjectionBlock(
     bool has_filter,
     const SelectQueryInfo & query_info,
     const DataPartsVector & parts,
-    DataPartsVector & normal_parts,
+    DataPartsVector * normal_parts,
     const PartitionIdToMaxBlock * max_block_numbers_to_read,
     ContextPtr query_context) const
 {
@@ -6721,10 +6719,22 @@ Block MergeTreeData::getMinMaxCountProjectionBlock(
                 continue;
         }
 
+        /// It's extremely rare that some parts have final marks while others don't. To make it
+        /// straightforward, disable minmax_count projection when `max(pk)' encounters any part with
+        /// no final mark.
         if (need_primary_key_max_column && !part->index_granularity.hasFinalMark())
         {
-            normal_parts.push_back(part);
-            continue;
+            if (normal_parts)
+            {
+                // 23.8 behaviour
+                normal_parts->push_back(part);
+                continue;
+            }
+            else
+            {
+                // 23.12 behaviour
+                return {};
+            }
         }
 
         real_parts.push_back(part);
@@ -7161,7 +7171,7 @@ std::optional<ProjectionCandidate> MergeTreeData::getQueryProcessingStageWithAgg
             !query_info.filter_asts.empty() || analysis_result.prewhere_info || analysis_result.before_where,
             query_info,
             parts,
-            normal_parts,
+            &normal_parts,
             max_added_blocks.get(),
             query_context);
 
@@ -7201,7 +7211,6 @@ std::optional<ProjectionCandidate> MergeTreeData::getQueryProcessingStageWithAgg
                 query_info.prewhere_info,
                 analysis_result.required_columns,
                 metadata_snapshot,
-                metadata_snapshot,
                 query_info,
                 added_filter_nodes,
                 query_context,
@@ -7233,7 +7242,6 @@ std::optional<ProjectionCandidate> MergeTreeData::getQueryProcessingStageWithAgg
             parts,
             query_info.prewhere_info,
             analysis_result.required_columns,
-            metadata_snapshot,
             metadata_snapshot,
             query_info,
             added_filter_nodes,
@@ -7373,7 +7381,6 @@ bool MergeTreeData::canUseParallelReplicasBasedOnPKAnalysis(
         parts,
         query_info.prewhere_info,
         storage_snapshot->getMetadataForQuery()->getColumns().getAll().getNames(),
-        storage_snapshot->metadata,
         storage_snapshot->metadata,
         query_info,
         /*added_filter_nodes*/ActionDAGNodes{},
