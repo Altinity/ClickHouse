@@ -2101,7 +2101,7 @@ def main() -> int:
                     job_report.check_name or _get_ext_check_name(args.job_name),
                 )
 
-            print(f"Job report url: [{check_url}]")
+            print(f"Job report url: [ {check_url} ]")
             prepared_events = prepare_tests_results_for_clickhouse(
                 pr_info,
                 job_report.test_results,
