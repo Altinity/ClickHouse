@@ -30,7 +30,7 @@ on: # yamllint disable-line rule:truthy
 
 jobs:
   DockerHubPushAarch64:
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cax41, altinity-in-hel1, altinity-image-arm-system-ubuntu-22.04]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cax41, altinity-in-hel1, altinity-image-arm-snapshot-22.04-arm, altinity-startup-snapshot, altinity-setup-none]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
@@ -52,7 +52,7 @@ jobs:
           path: ${{ runner.temp }}/docker_images_check/changed_images_aarch64.json
 
   DockerHubPushAmd64:
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
@@ -75,7 +75,7 @@ jobs:
 
   DockerHubPush:
     needs: [DockerHubPushAmd64, DockerHubPushAarch64]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
@@ -119,7 +119,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Compatibility check X86
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       timeout_minutes: 180
       run_command: |
         cd "$REPO_COPY/tests/ci"
@@ -131,7 +131,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Compatibility check Aarch64
-      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-snapshot-22.04-arm, altinity-startup-snapshot, altinity-setup-none
       timeout_minutes: 180
       run_command: |
         cd "$REPO_COPY/tests/ci"
@@ -148,7 +148,7 @@ jobs:
       build_name: package_release
       checkout_depth: 0
       timeout_minutes: 180
-      runner_type: altinity-setup-builder, altinity-type-ccx53, altinity-on-demand, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-hil, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       additional_envs: |
         CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
 
@@ -160,7 +160,7 @@ jobs:
       build_name: package_aarch64
       checkout_depth: 0
       timeout_minutes: 180
-      runner_type: altinity-setup-builder, altinity-type-ccx53, altinity-on-demand, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-hil, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       additional_envs: |
         CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
 
@@ -172,7 +172,7 @@ jobs:
       build_name: package_asan
       checkout_depth: 0
       timeout_minutes: 180
-      runner_type: altinity-on-demand, altinity-setup-builder, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-hil, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       additional_envs: |
         CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
 
@@ -184,7 +184,7 @@ jobs:
       build_name: package_ubsan
       checkout_depth: 0
       timeout_minutes: 180
-      runner_type: altinity-on-demand, altinity-setup-builder, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-hil, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       additional_envs: |
         CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
 
@@ -196,7 +196,7 @@ jobs:
       build_name: package_tsan
       checkout_depth: 0
       timeout_minutes: 180
-      runner_type: altinity-on-demand, altinity-setup-builder, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-hil, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       additional_envs: |
         CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
 
@@ -208,7 +208,7 @@ jobs:
       build_name: package_msan
       checkout_depth: 0
       timeout_minutes: 180
-      runner_type: altinity-on-demand, altinity-setup-builder, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-hil, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       additional_envs: |
         CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
 
@@ -220,7 +220,7 @@ jobs:
       build_name: package_debug
       checkout_depth: 0
       timeout_minutes: 180
-      runner_type: altinity-on-demand, altinity-setup-builder, altinity-type-ccx53, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-ccx53, altinity-in-hil, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       additional_envs: |
         CLICKHOUSE_STABLE_VERSION_SUFFIX=altinitystable
 
@@ -231,7 +231,7 @@ jobs:
     needs:
       - BuilderDebRelease
       - BuilderDebAarch64
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     timeout-minutes: 180
     steps:
       - name: Check out repository code
@@ -267,7 +267,7 @@ jobs:
     secrets: inherit
     with:
       test_name: ClickHouse build check
-      runner_type: altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-in-hel1, altinity-image-arm-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cax11, altinity-in-hel1, altinity-image-arm-snapshot-22.04-arm, altinity-startup-snapshot, altinity-setup-none
       timeout_minutes: 180
       additional_envs: |
         NEEDS_DATA<<NDENV
@@ -279,12 +279,10 @@ jobs:
 
   MarkReleaseReady:
     needs:
-  #    - BuilderBinDarwin
-  #    - BuilderBinDarwinAarch64
       - BuilderDebRelease
       - BuilderDebAarch64
       - SignRelease
-    runs-on: [self-hosted, altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-in-hel1, altinity-image-arm-system-ubuntu-22.04]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cax11, altinity-in-hel1, altinity-image-arm-snapshot-22.04-arm, altinity-startup-snapshot, altinity-setup-none]
     timeout-minutes: 180
     steps:
       - name: Check out repository code
@@ -305,7 +303,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Install packages (amd64)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 install_check.py "$CHECK_NAME"
@@ -316,7 +314,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Install packages (arm64)
-      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-snapshot-22.04-arm, altinity-startup-snapshot, altinity-setup-none
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 install_check.py "$CHECK_NAME"
@@ -330,7 +328,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (release)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       additional_envs: |
         KILL_TIMEOUT=10800
       run_command: |
@@ -343,7 +341,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (aarch64)
-      runner_type: altinity-on-demand, altinity-type-cax41, altinity-in-hel1, altinity-image-arm-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cax41, altinity-in-hel1, altinity-image-arm-snapshot-22.04-arm, altinity-startup-snapshot, altinity-setup-none
       additional_envs: |
         KILL_TIMEOUT=10800
       run_command: |
@@ -356,7 +354,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (asan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash,  altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       additional_envs: |
         KILL_TIMEOUT=10800
       batches: 4
@@ -370,7 +368,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (tsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash,  altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       additional_envs: |
         KILL_TIMEOUT=10800
       batches: 4
@@ -384,7 +382,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (ubsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash,  altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       additional_envs: |
         KILL_TIMEOUT=10800
       batches: 4
@@ -398,7 +396,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (msan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash,  altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       additional_envs: |
         KILL_TIMEOUT=10800
       batches: 4
@@ -412,7 +410,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (debug)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash,  altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       additional_envs: |
         KILL_TIMEOUT=10800
       batches: 4
@@ -429,7 +427,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (release)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       additional_envs: |
         KILL_TIMEOUT=3600
       run_command: |
@@ -442,7 +440,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (aarch64)
-      runner_type: altinity-on-demand, altinity-type-cax41, altinity-in-hel1, altinity-image-arm-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cax41, altinity-in-hel1, altinity-image-arm-snapshot-22.04-arm, altinity-startup-snapshot, altinity-setup-none
       additional_envs: |
         KILL_TIMEOUT=3600
       run_command: |
@@ -455,7 +453,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (asan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash,  altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       additional_envs: |
         KILL_TIMEOUT=3600
       run_command: |
@@ -468,7 +466,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (tsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash,  altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       additional_envs: |
         KILL_TIMEOUT=3600
       run_command: |
@@ -481,7 +479,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (msan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash,  altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       additional_envs: |
         KILL_TIMEOUT=3600
       run_command: |
@@ -494,7 +492,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (ubsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash,  altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       additional_envs: |
         KILL_TIMEOUT=3600
       run_command: |
@@ -507,7 +505,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (debug)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash,  altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       additional_envs: |
         KILL_TIMEOUT=3600
       run_command: |
@@ -523,7 +521,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stress test (asan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash,  altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       timeout_minutes: 180
       run_command: |
         cd "$REPO_COPY/tests/ci"
@@ -535,7 +533,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stress test (tsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash,  altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       timeout_minutes: 180
       run_command: |
         cd "$REPO_COPY/tests/ci"
@@ -547,7 +545,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stress test (msan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash,  altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       run_command: |
         cd "$REPO_COPY/tests/ci"
         python3 stress_check.py "$CHECK_NAME"
@@ -558,7 +556,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stress test (ubsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash,  altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       timeout_minutes: 180
       run_command: |
         cd "$REPO_COPY/tests/ci"
@@ -570,7 +568,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stress test (debug)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-docker_ipv6_x86
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash,  altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       timeout_minutes: 180
       run_command: |
         cd "$REPO_COPY/tests/ci"
@@ -585,7 +583,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Integration tests (asan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       batches: 4
       timeout_minutes: 180
       run_command: |
@@ -598,7 +596,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Integration tests (asan, analyzer)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       batches: 6
       timeout_minutes: 180
       run_command: |
@@ -611,7 +609,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Integration tests (tsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       batches: 6
       timeout_minutes: 180
       run_command: |
@@ -624,7 +622,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Integration tests (release)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       batches: 6
       timeout_minutes: 180
       run_command: |
@@ -640,7 +638,7 @@ jobs:
     secrets: inherit
     with:
       runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-app-docker-ce, altinity-setup-regression
-      commit: 66fff15e3afa278543a6b6ffab9be576e054a921
+      commit: 91b2de501b77cd90ae9345abb7b56e5fa8c1a921
       arch: release 
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
@@ -650,13 +648,13 @@ jobs:
     secrets: inherit
     with:
       runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-app-docker-ce, altinity-setup-regression
-      commit: 66fff15e3afa278543a6b6ffab9be576e054a921
+      commit: 91b2de501b77cd90ae9345abb7b56e5fa8c1a921
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
   SignRelease:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-image-arm-system-ubuntu-22.04]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cax11, altinity-image-arm-snapshot-22.04-arm, altinity-startup-snapshot, altinity-setup-none]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -697,7 +695,7 @@ jobs:
 
   SignAarch64:
     needs: [BuilderDebAarch64]
-    runs-on: [self-hosted, altinity-on-demand, altinity-setup-reporter, altinity-type-cax11, altinity-image-arm-system-ubuntu-22.04]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cax11, altinity-image-arm-snapshot-22.04-arm, altinity-startup-snapshot, altinity-setup-none]
     timeout-minutes: 180
     steps:
       - name: Set envs
@@ -773,7 +771,7 @@ jobs:
       - RegressionTestsAarch64
       - SignRelease
       - SignAarch64
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
