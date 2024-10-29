@@ -1,6 +1,9 @@
 #include <Access/Credentials.h>
 #include <Access/Common/SSLCertificateSubjects.h>
 #include <Common/Exception.h>
+#include <Common/logger_useful.h>
+
+#include <jwt-cpp/jwt.h>
 
 namespace DB
 {
@@ -8,6 +11,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
+    extern const int AUTHENTICATION_FAILED;
 }
 
 Credentials::Credentials(const String & user_name_)
@@ -97,4 +101,26 @@ const String & BasicCredentials::getPassword() const
     return password;
 }
 
+namespace
+{
+String extractSubjectFromToken(const String & token)
+{
+    try
+    {
+        auto decoded_jwt = jwt::decode(token);
+        return decoded_jwt.get_subject();
+    }
+    catch (...)
+    {
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to validate jwt");
+    }
+}
+}
+
+JWTCredentials::JWTCredentials(const String & token_)
+        : Credentials(extractSubjectFromToken(token_))
+        , token(token_)
+    {
+        is_ready = !user_name.empty();
+    }
 }
