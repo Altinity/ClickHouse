@@ -244,6 +244,8 @@ DockerHub
 DoubleDelta
 Doxygen
 Durre
+ECDSA
+EdDSA
 ECMA
 Ecto
 EdgeAngle
@@ -343,6 +345,7 @@ Heredoc
 HexAreaKm
 HexAreaM
 HexRing
+HMSC
 Holistics
 Homebrew
 Homebrew's
@@ -434,6 +437,8 @@ Jitter
 Joda
 JumpConsistentHash
 Jupyter
+jwks
+JWKS
 KDevelop
 KafkaAssignedPartitions
 KafkaBackgroundReads
@@ -2698,6 +2703,7 @@ userspace
 userver
 utils
 uuid
+validators
 varPop
 varPopStable
 varSamp
@@ -2712,6 +2718,8 @@ vectorized
 vectorscan
 verificationDepth
 verificationMode
+verifier
+verifiers
 versionedcollapsingmergetree
 vhost
 virtualized

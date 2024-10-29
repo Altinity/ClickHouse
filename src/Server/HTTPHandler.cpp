@@ -125,6 +125,8 @@ namespace ErrorCodes
 
 namespace
 {
+const String BEARER_PREFIX = "bearer ";
+
 bool tryAddHTTPOptionHeadersFromConfig(HTTPServerResponse & response, const Poco::Util::LayeredConfiguration & config)
 {
     if (config.has("http_options_response"))
@@ -364,6 +366,8 @@ bool HTTPHandler::authenticateUser(
     bool has_http_credentials = request.hasCredentials();
     bool has_credentials_in_query_params = params.has("user") || params.has("password") || params.has("quota_key");
 
+    std::string jwt_token = request.get("X-ClickHouse-JWT-Token", request.get("Authorization", (params.has("token") ? BEARER_PREFIX + params.get("token") : "")));
+
     std::string spnego_challenge;
     std::string certificate_common_name;
 
@@ -424,7 +428,7 @@ bool HTTPHandler::authenticateUser(
             if (spnego_challenge.empty())
                 throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Invalid authentication: SPNEGO challenge is empty");
         }
-        else
+        else if (Poco::icompare(scheme, "Bearer") < 0)
         {
             throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Invalid authentication: '{}' HTTP Authorization scheme is not supported", scheme);
         }
@@ -474,6 +478,10 @@ bool HTTPHandler::authenticateUser(
             response.send();
             return false;
         }
+    }
+    else if (!jwt_token.empty() && Poco::toLower(jwt_token).starts_with(BEARER_PREFIX))
+    {
+        request_credentials = std::make_unique<JWTCredentials>(jwt_token.substr(BEARER_PREFIX.length()));
     }
     else // I.e., now using user name and password strings ("Basic").
     {

@@ -68,6 +68,7 @@ namespace
             bool expect_common_names = false;
             bool expect_public_ssh_key = false;
             bool expect_http_auth_server = false;
+            bool expect_claims = false;
 
             if (ParserKeyword{Keyword::WITH}.ignore(pos, expected))
             {
@@ -89,6 +90,8 @@ namespace
                             expect_http_auth_server = true;
                         else if (check_type != AuthenticationType::NO_PASSWORD)
                             expect_password = true;
+                        else if (check_type != AuthenticationType::JWT)
+                            expect_claims = true;
 
                         break;
                     }
@@ -125,6 +128,7 @@ namespace
             ASTPtr common_names;
             ASTPtr public_ssh_keys;
             ASTPtr http_auth_scheme;
+            ASTPtr jwt_claims;
 
             if (expect_password || expect_hash)
             {
@@ -182,6 +186,14 @@ namespace
                         return false;
                 }
             }
+            else if (expect_claims)
+            {
+                if (ParserKeyword{Keyword::CLAIMS}.ignore(pos, expected))
+                {
+                    if (!ParserStringAndSubstitution{}.parse(pos, jwt_claims, expected))
+                        return false;
+                }
+            }
 
             auth_data = std::make_shared<ASTAuthenticationData>();
 
@@ -203,6 +215,9 @@ namespace
 
             if (http_auth_scheme)
                 auth_data->children.push_back(std::move(http_auth_scheme));
+
+            if (jwt_claims)
+                auth_data->children.push_back(std::move(jwt_claims));
 
             return true;
         });

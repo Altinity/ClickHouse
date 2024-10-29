@@ -369,3 +369,6 @@
 [submodule "contrib/idna"]
 	path = contrib/idna
 	url = https://github.com/ada-url/idna.git
+[submodule "contrib/jwt-cpp"]
+	path = contrib/jwt-cpp
+	url = https://github.com/Thalhammer/jwt-cpp.git
