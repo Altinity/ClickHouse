@@ -9,6 +9,7 @@
 #include <Common/Exception.h>
 #include <Common/quoteString.h>
 #include <Common/callOnce.h>
+#include "Access/Common/AuthenticationType.h"
 #include <IO/WriteHelpers.h>
 #include <Interpreters/Context.h>
 #include <Poco/UUIDGenerator.h>
