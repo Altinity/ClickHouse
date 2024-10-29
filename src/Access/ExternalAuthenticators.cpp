@@ -2,14 +2,21 @@
 #include <Access/LDAPClient.h>
 #include <Access/SettingsAuthResponseParser.h>
 #include <Access/resolveSetting.h>
+#include "Common/Logger.h"
+#include "Common/logger_useful.h"
 #include <Common/Exception.h>
 #include <Common/SettingsChanges.h>
 #include <Common/SipHash.h>
 #include <Common/quoteString.h>
+#include "Access/AccessControl.h"
+#include "Access/Credentials.h"
+#include "Access/JWTValidator.h"
 
 #include <boost/algorithm/string/case_conv.hpp>
 #include <Poco/Util/AbstractConfiguration.h>
 
+#include <map>
+#include <memory>
 #include <optional>
 #include <utility>
 
@@ -253,7 +260,6 @@ HTTPAuthClientParams parseHTTPAuthParams(const Poco::Util::AbstractConfiguration
 
     return http_auth_params;
 }
-
 }
 
 void parseLDAPRoleSearchParams(LDAPClient::RoleSearchParams & params, const Poco::Util::AbstractConfiguration & config, const String & prefix)
@@ -271,6 +277,13 @@ void ExternalAuthenticators::resetImpl()
     ldap_client_params_blueprint.clear();
     ldap_caches.clear();
     kerberos_params.reset();
+    jwt_validators.clear();
+}
+
+bool ExternalAuthenticators::isJWTAllowed() const
+{
+    std::lock_guard lock(mutex);
+    return !jwt_validators.empty();
 }
 
 void ExternalAuthenticators::reset()
@@ -290,8 +303,10 @@ void ExternalAuthenticators::setConfiguration(const Poco::Util::AbstractConfigur
     std::size_t ldap_servers_key_count = 0;
     std::size_t kerberos_keys_count = 0;
     std::size_t http_auth_server_keys_count = 0;
+    std::size_t jwt_validators_count = 0;
 
     const String http_auth_servers_config = "http_authentication_servers";
+    const String jwt_validators_config = "jwt_validators";
 
     for (auto key : all_keys)
     {
@@ -304,6 +319,7 @@ void ExternalAuthenticators::setConfiguration(const Poco::Util::AbstractConfigur
         ldap_servers_key_count += (key == "ldap_servers");
         kerberos_keys_count += (key == "kerberos");
         http_auth_server_keys_count += (key == http_auth_servers_config);
+        jwt_validators_count += (key == jwt_validators_config);
     }
 
     if (ldap_servers_key_count > 1)
@@ -314,6 +330,9 @@ void ExternalAuthenticators::setConfiguration(const Poco::Util::AbstractConfigur
 
     if (http_auth_server_keys_count > 1)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Multiple http_authentication_servers sections are not allowed");
+
+    if (jwt_validators_count > 1)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Multiple jwt_validators sections are not allowed");
 
     Poco::Util::AbstractConfiguration::Keys http_auth_server_names;
     config.keys(http_auth_servers_config, http_auth_server_names);
@@ -368,6 +387,26 @@ void ExternalAuthenticators::setConfiguration(const Poco::Util::AbstractConfigur
     catch (...)
     {
         tryLogCurrentException(log, "Could not parse Kerberos section");
+    }
+
+    Poco::Util::AbstractConfiguration::Keys jwt_validators_keys;
+    config.keys(jwt_validators_config, jwt_validators_keys);
+    jwt_validators.clear();
+    String jwt_validator_settings_key;
+    if (config.has(jwt_validators_config + ".settings_key"))
+        jwt_validator_settings_key = config.getString(jwt_validators_config + ".settings_key");
+    for (const auto & jwt_validator : jwt_validators_keys)
+    {
+        if (jwt_validator == "settings_key") continue;
+        String prefix = fmt::format("{}.{}", jwt_validators_config, jwt_validator);
+        try
+        {
+            jwt_validators[jwt_validator] = IJWTValidator::parseJWTValidator(config, prefix, jwt_validator, jwt_validator_settings_key);
+        }
+        catch (...)
+        {
+            tryLogCurrentException(log, "Could not parse JWT validator" + backQuote(jwt_validator));
+        }
     }
 }
 
@@ -537,7 +576,7 @@ GSSAcceptorContext::Params ExternalAuthenticators::getKerberosParams() const
     return kerberos_params.value();
 }
 
-HTTPAuthClientParams ExternalAuthenticators::getHTTPAuthenticationParams(const String& server) const
+HTTPAuthClientParams ExternalAuthenticators::getHTTPAuthenticationParams(const String & server) const
 {
     std::lock_guard lock{mutex};
 
@@ -545,6 +584,28 @@ HTTPAuthClientParams ExternalAuthenticators::getHTTPAuthenticationParams(const S
     if (it == http_auth_servers.end())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "HTTP server '{}' is not configured", server);
     return it->second;
+}
+
+bool ExternalAuthenticators::checkJWTCredentials(const String & claims, const JWTCredentials & credentials, SettingsChanges & settings) const
+{
+    std::lock_guard lock{mutex};
+
+    const auto token = String(credentials.getToken());
+    const auto & user_name = credentials.getUserName();
+
+    if (jwt_validators.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "JWT authentication is not configured");
+
+    for (const auto & it : jwt_validators)
+    {
+        if (it.second->validate(claims, token, settings))
+        {
+            LOG_DEBUG(getLogger("JWTAuth"), "Authenticated with JWT for {} by {}", user_name, it.first);
+            return true;
+        }
+        LOG_TRACE(getLogger("JWTAuth"), "Failed authentication with JWT for {} by {}", user_name, it.first);
+    }
+    return false;
 }
 
 bool ExternalAuthenticators::checkHTTPBasicCredentials(

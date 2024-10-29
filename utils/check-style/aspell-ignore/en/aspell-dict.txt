@@ -278,6 +278,8 @@ DoubleDelta
 Doxygen
 Dresseler
 Durre
+ECDSA
+EdDSA
 ECMA
 ETag
 EachRow
@@ -507,6 +509,8 @@ JoinAlgorithm
 JoinStrictness
 JumpConsistentHash
 Jupyter
+jwks
+JWKS
 KDevelop
 KafkaAssignedPartitions
 KafkaBackgroundReads
@@ -3134,6 +3138,7 @@ uuid
 uuids
 uuidv
 vCPU
+validators
 varPop
 varPopStable
 varSamp
@@ -3151,6 +3156,8 @@ vectorscan
 vendoring
 verificationDepth
 verificationMode
+verifier
+verifiers
 versionedcollapsingmergetree
 vhost
 virtualized

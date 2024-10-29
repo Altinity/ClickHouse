@@ -89,7 +89,6 @@ add_contrib (avro-cmake avro) # requires: snappy
 add_contrib (openldap-cmake openldap)
 add_contrib (msgpack-c-cmake msgpack-c)
 add_contrib (libarchive-cmake libarchive)
-
 add_contrib (corrosion-cmake corrosion)
 
 if (ENABLE_FUZZING)
