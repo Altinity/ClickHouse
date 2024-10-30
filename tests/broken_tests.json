@@ -1,0 +1,16 @@
+{
+    "test_replicated_merge_tree_replicated_db_ttl/test.py::test_replicated_db_and_ttl": {
+        "message": "DB::Exception: Replicated is an experimental database engine.",
+        "reason": "Will not work without allow_experimental_database_replicated=1"
+    },
+    "test_storage_s3_queue/test.py::test_upgrade": {
+        "message": "DB::Exception: S3Queue is experimental.",
+        "reason": "Will not work without allow_experimental_s3queue=1"
+    },
+    "02920_alter_column_of_projections": {
+        "reason": "requires different settings"
+    },
+    "02888_system_tables_with_inaccsessible_table_function": {
+        "reason": "todo investigate"
+    }
+}
