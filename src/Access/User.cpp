@@ -33,6 +33,8 @@ void User::setName(const String & name_)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "User name '{}' is reserved", name_);
     if (startsWith(name_, EncodedUserInfo::SSH_KEY_AUTHENTICAION_MARKER))
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "User name '{}' is reserved", name_);
+    if (name_.starts_with(EncodedUserInfo::JWT_AUTHENTICAION_MARKER))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "User name '{}' is reserved", name_);
     name = name_;
 }
 

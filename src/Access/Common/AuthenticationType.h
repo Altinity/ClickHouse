@@ -41,6 +41,9 @@ enum class AuthenticationType
     /// Authentication through HTTP protocol
     HTTP,
 
+    /// JSON Web Token
+    JWT,
+
     MAX,
 };
 

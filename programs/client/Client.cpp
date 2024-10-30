@@ -63,6 +63,7 @@ namespace ErrorCodes
     extern const int NETWORK_ERROR;
     extern const int AUTHENTICATION_FAILED;
     extern const int NO_ELEMENTS_IN_CONFIG;
+    extern const int USER_EXPIRED;
 }
 
 
@@ -73,6 +74,12 @@ void Client::processError(const String & query) const
         fmt::print(stderr, "Received exception from server (version {}):\n{}\n",
                 server_version,
                 getExceptionMessage(*server_exception, print_stack_trace, true));
+
+        if (server_exception->code() == ErrorCodes::USER_EXPIRED)
+        {
+            server_exception->rethrow();
+        }
+
         if (is_interactive)
         {
             fmt::print(stderr, "\n");
@@ -936,6 +943,7 @@ void Client::addOptions(OptionsDescription & options_description)
         ("ssh-key-file", po::value<std::string>(), "File containing ssh private key needed for authentication. If not set does password authentication.")
         ("ssh-key-passphrase", po::value<std::string>(), "Passphrase for imported ssh key.")
         ("quota_key", po::value<std::string>(), "A string to differentiate quotas when the user have keyed quotas configured on server")
+        ("jwt", po::value<std::string>(), "Use JWT for authentication")
 
         ("max_client_network_bandwidth", po::value<int>(), "the maximum speed of data exchange over the network for the client in bytes per second.")
         ("compression", po::value<bool>(), "enable or disable compression (enabled by default for remote communication and disabled for localhost communication).")
@@ -1093,6 +1101,12 @@ void Client::processOptions(const OptionsDescription & options_description,
         config().setBool("no-warnings", true);
     if (options.count("fake-drop"))
         fake_drop = true;
+    if (options.count("jwt"))
+    {
+        if (!options["user"].defaulted())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "User and JWT flags can't be specified together");
+        config().setString("jwt", options["jwt"].as<std::string>());
+    }
     if (options.count("accept-invalid-certificate"))
     {
         config().setString("openSSL.client.invalidCertificateHandler.name", "AcceptCertificateHandler");
