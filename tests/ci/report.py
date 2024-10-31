@@ -23,7 +23,7 @@ from typing import (
 from build_download_helper import get_gh_api
 from ci_config import CI_CONFIG, BuildConfig
 from ci_utils import normalize_string
-from env_helper import REPORT_PATH, TEMP_PATH, ROOT_DIR
+from env_helper import REPORT_PATH, TEMP_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -325,19 +325,6 @@ class JobReport:
 
 def read_test_results(results_path: Path, with_raw_logs: bool = True) -> TestResults:
     results = []  # type: TestResults
-
-    broken_tests_config_path = f"{ROOT_DIR}/tests/broken_tests.json"
-    if (
-        os.path.isfile(broken_tests_config_path)
-        and os.path.getsize(broken_tests_config_path) > 0
-    ):
-        with open(broken_tests_config_path, "r", encoding="utf-8") as broken_tests_file:
-            broken_tests = json.load(
-                broken_tests_file
-            )  # type: Dict[str, Dict[str, str]]
-    else:
-        broken_tests = {}
-
     with open(results_path, "r", encoding="utf-8") as descriptor:
         reader = csv.reader(descriptor, delimiter="\t")
         for line in reader:
@@ -363,18 +350,6 @@ def read_test_results(results_path: Path, with_raw_logs: bool = True) -> TestRes
                     )
                 else:
                     result.set_log_files(line[3])
-
-            if name in broken_tests.keys() and status == "FAIL":
-                fail_message = broken_tests[name].get("message", "")
-                if result.log_files and fail_message:
-                    for log_path in result.log_files:
-                        if log_path.endswith(".log"):
-                            with open(log_path) as log_file:
-                                if fail_message in log_file.read():
-                                    result.status = "XFAIL"
-                                    break
-                else:
-                    result.status = "XFAIL"
 
             results.append(result)
 
