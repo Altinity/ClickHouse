@@ -1,11 +1,11 @@
 {
-    "test_replicated_merge_tree_replicated_db_ttl/test.py::test_replicated_db_and_ttl": {
-        "message": "DB::Exception: Replicated is an experimental database engine.",
-        "reason": "Will not work without allow_experimental_database_replicated=1"
+    "test_postgresql_replica_database_engine_2/test.py::test_quoting_publication": {
+        "message": "DB::Exception: Syntax error:",
+        "reason": "syntax error"
     },
-    "test_storage_s3_queue/test.py::test_upgrade": {
-        "message": "DB::Exception: S3Queue is experimental.",
-        "reason": "Will not work without allow_experimental_s3queue=1"
+    "test_distributed_inter_server_secret/test.py::test_secure_cluster_distributed_over_distributed_different_users": {
+        "message": "DB::NetException: Connection reset by peer, while reading from socket",
+        "reason": "network issue"
     },
     "02920_alter_column_of_projections": {
         "reason": "requires different settings"
