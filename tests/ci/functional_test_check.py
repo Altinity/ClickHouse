@@ -96,6 +96,7 @@ def get_run_command(
         f"--volume={repo_path}/tests/analyzer_tech_debt.txt:/analyzer_tech_debt.txt "
         if "analyzer" not in check_name
         else ""
+        f"--volume={repo_path}/tests/broken_tests.json:/broken_tests.json "
     )
 
     return (
