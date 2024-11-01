@@ -28,6 +28,7 @@
 #include <Common/FieldVisitorsAccurateComparison.h>
 #include <Processors/Formats/Impl/Parquet/ParquetRecordReader.h>
 #include <Processors/Formats/Impl/Parquet/ParquetBloomFilterCondition.h>
+#include <Processors/Formats/Impl/Parquet/ParquetFilterCondition.h>
 #include <Interpreters/convertFieldToType.h>
 
 namespace CurrentMetrics
@@ -581,25 +582,54 @@ void ParquetBlockInputFormat::initializeIfNeeded()
         if (skip_row_groups.contains(row_group))
             continue;
 
-        if (parquet_bloom_filter_condition)
+        if (key_condition)
         {
-            const auto column_index_to_bf = buildColumnIndexToBF(*bf_reader, row_group, index_mapping, filtering_columns);
-
-            if (!parquet_bloom_filter_condition->mayBeTrueOnRowGroup(column_index_to_bf))
+            if (format_settings.parquet.filter_push_down && format_settings.parquet.bloom_filter_push_down)
             {
-                continue;
+                auto parquet_rpn = abcdefgh(key_condition->getRPN(),
+                                            index_mapping,
+                                            metadata->RowGroup(row_group));
+                auto hyperrectangle = getHyperrectangleForRowGroup(*metadata, row_group, getPort().getHeader(), format_settings);
+
+                const auto column_index_to_bf = buildColumnIndexToBF(*bf_reader, row_group, index_mapping, filtering_columns);
+
+                bool maybe_exists = ParquetFilterCondition::check(
+                    parquet_rpn,
+                    hyperrectangle,
+                    key_condition->key_space_filling_curves,
+                    getPort().getHeader().getDataTypes(),
+                    column_index_to_bf,
+                    key_condition->isSinglePoint()).can_be_true;
+
+                if (!maybe_exists)
+                {
+                    continue;
+                }
+            }
+            else if (format_settings.parquet.filter_push_down)
+            {
+                if (!key_condition
+                         ->checkInHyperrectangle(
+                             getHyperrectangleForRowGroup(*metadata, row_group, getPort().getHeader(), format_settings),
+                             getPort().getHeader().getDataTypes())
+                         .can_be_true)
+                {
+                    continue;
+                }
+            }
+            else if (format_settings.parquet.bloom_filter_push_down)
+            {
+                const auto column_index_to_bf = buildColumnIndexToBF(*bf_reader, row_group, index_mapping, filtering_columns);
+
+                if (!parquet_bloom_filter_condition->mayBeTrueOnRowGroup(column_index_to_bf))
+                {
+                    continue;
+                }
             }
         }
 
-        if (format_settings.parquet.filter_push_down && key_condition
-            && !key_condition
-                    ->checkInHyperrectangle(
-                        getHyperrectangleForRowGroup(*metadata, row_group, getPort().getHeader(), format_settings),
-                        getPort().getHeader().getDataTypes())
-                    .can_be_true)
-            continue;
-
-        if (row_group_batches.empty() || row_group_batches.back().total_bytes_compressed >= min_bytes_for_seek)
+        // When single-threaded parsing, can prefetch row groups, so need to put all row groups in the same row_group_batch
+        if (row_group_batches.empty() || (!prefetch_group && row_group_batches.back().total_bytes_compressed >= min_bytes_for_seek))
             row_group_batches.emplace_back();
 
         row_group_batches.back().row_groups_idxs.push_back(row_group);

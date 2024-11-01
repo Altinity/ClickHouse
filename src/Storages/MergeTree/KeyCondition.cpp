@@ -2888,6 +2888,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
                 if (!new_range)
                 {
                     rpn_stack.emplace_back(true, true);
+                    // aqui eu pergunto pro bloom filter
                     continue;
                 }
                 transformed_range = *new_range;
@@ -2896,6 +2897,8 @@ BoolMask KeyCondition::checkInHyperrectangle(
 
             bool intersects = element.range.intersectsRange(*key_range);
             bool contains = element.range.containsRange(*key_range);
+
+            // aqui eu pergunto pro bloom filter
 
             rpn_stack.emplace_back(intersects, !contains);
             if (element.function == RPNElement::FUNCTION_NOT_IN_RANGE)
@@ -3030,6 +3033,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
             if (!element.set_index)
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Set for IN is not created yet");
 
+            // aqui eu pergunto pro bloom filter
             rpn_stack.emplace_back(element.set_index->checkInRange(hyperrectangle, data_types, single_point));
             if (element.function == RPNElement::FUNCTION_NOT_IN_SET)
                 rpn_stack.back() = !rpn_stack.back();
