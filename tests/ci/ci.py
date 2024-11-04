@@ -770,7 +770,8 @@ class CiOptions:
         res = CiOptions()
         pr_info = PRInfo()
         if (
-            not pr_info.is_pr() and not debug_message
+            (not pr_info.is_pr() and not debug_message)
+            or pr_info.body is None
         ):  # if commit_message is provided it's test/debug scenario - do not return
             # CI options can be configured in PRs only
             return res
@@ -2111,7 +2112,7 @@ def main() -> int:
                 job_report.check_name or _get_ext_check_name(args.job_name),
             )
             ch_helper.insert_events_into(
-                db="default", table="checks", events=prepared_events
+                db="gh-data", table="checks", events=prepared_events
             )
         else:
             # no job report

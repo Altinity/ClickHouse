@@ -1,5 +1,6 @@
 -- Tags: no-fasttest, no-parallel
 
+set input_format_parquet_filter_push_down=true;
 set output_format_parquet_row_group_size = 100;
 
 set input_format_null_as_default = 1;

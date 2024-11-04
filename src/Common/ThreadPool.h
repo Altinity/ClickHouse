@@ -10,8 +10,10 @@
 #include <optional>
 #include <atomic>
 #include <stack>
+#include <random>
 
 #include <boost/heap/priority_queue.hpp>
+#include <pcg_random.hpp>
 
 #include <Poco/Event.h>
 #include <Common/ThreadStatus.h>
@@ -129,7 +131,7 @@ private:
     bool threads_remove_themselves = true;
     const bool shutdown_on_exception = true;
 
-    boost::heap::priority_queue<JobWithPriority> jobs;
+    boost::heap::priority_queue<JobWithPriority,boost::heap::stable<true>> jobs;
     std::list<Thread> threads;
     std::exception_ptr first_exception;
     std::stack<OnDestroyCallback> on_destroy_callbacks;
@@ -324,3 +326,21 @@ using ThreadFromGlobalPool = ThreadFromGlobalPoolImpl<true>;
 /// To make sure the tracing context is correctly propagated, we explicitly disable context propagation(including initialization and de-initialization) at underlying worker level.
 ///
 using ThreadPool = ThreadPoolImpl<ThreadFromGlobalPoolNoTracingContextPropagation>;
+
+/// Enables fault injections globally for all thread pools
+class CannotAllocateThreadFaultInjector
+{
+    std::atomic_bool enabled = false;
+    std::mutex mutex;
+    pcg64_fast rndgen;
+    std::optional<std::bernoulli_distribution> random;
+
+    static thread_local bool block_fault_injections;
+
+    static CannotAllocateThreadFaultInjector & instance();
+public:
+    static void setFaultProbability(double probability);
+    static bool injectFault();
+
+    static scope_guard blockFaultInjections();
+};
