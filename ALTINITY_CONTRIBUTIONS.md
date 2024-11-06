@@ -1,6 +1,12 @@
 List of pull requests contributed by Altinity develoeprs to ClickHouse server. It does not include documentation changes.
 
 ## 2024
+  * Boolean support for parquet native reader	[71055](https://github.com/ClickHouse/ClickHouse/pull/71055)	by @arthurpassos
+  * Allow each authentication method to have its own expiration date, remove from user entity.	[70090](https://github.com/ClickHouse/ClickHouse/pull/70090)	by @arthurpassos
+  * make numactl respect EPERM error, when get_mempolicy is is restricted by seccomp	[70900](https://github.com/ClickHouse/ClickHouse/pull/70900)	by @filimonov
+  * add timeouts for retry loops in test_storage_rabbitmq	[70510](https://github.com/ClickHouse/ClickHouse/pull/70510)	by @filimonov
+  * Support for Parquet page V2 on native reader	[70807](https://github.com/ClickHouse/ClickHouse/pull/70807)	by @arthurpassos
+  * Add parquet bloom filters support	[62966](https://github.com/ClickHouse/ClickHouse/pull/62966)	by @arthurpassos
   * Thread pool: move thread creation out of lock	[68694](https://github.com/ClickHouse/ClickHouse/pull/68694)	by @filimonov
   * fix Kafka test	[70352](https://github.com/ClickHouse/ClickHouse/pull/70352)	by @filimonov
   * Maybe fix RabbitMQ	[70336](https://github.com/ClickHouse/ClickHouse/pull/70336)	by @filimonov
