@@ -20,7 +20,7 @@ jobs:
         branch: 
           #- 24.3-scheduled-run
           #- 24.3.fips-schduled-runs
-          - 23.8.16-scheduled-runs 
+          - releases/23.8.16 
     name: ${{ matrix.branch }}
     runs-on: ubuntu-latest
     steps:
