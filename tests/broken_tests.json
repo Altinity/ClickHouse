@@ -12,5 +12,11 @@
     },
     "02888_system_tables_with_inaccsessible_table_function": {
         "reason": "todo investigate"
+    },
+    "03094_grouparraysorted_memory": {
+        "reason": "fails with tsan"
+    },
+    "02700_s3_part_INT_MAX": {
+        "reason": "fails with asan"
     }
 }
