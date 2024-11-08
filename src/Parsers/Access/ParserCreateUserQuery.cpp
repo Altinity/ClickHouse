@@ -88,10 +88,10 @@ namespace
                             expect_public_ssh_key = true;
                         else if (check_type == AuthenticationType::HTTP)
                             expect_http_auth_server = true;
+                        else if (check_type == AuthenticationType::JWT)
+                            expect_claims = true;
                         else if (check_type != AuthenticationType::NO_PASSWORD)
                             expect_password = true;
-                        else if (check_type != AuthenticationType::JWT)
-                            expect_claims = true;
 
                         break;
                     }
