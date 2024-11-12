@@ -16,7 +16,7 @@ namespace DB
 
 class SettingsChanges;
 
-struct JWTValidator
+struct JWTValidatorParams
 {
     String settings_key;
 };
@@ -24,20 +24,17 @@ struct JWTValidator
 class IJWTValidator
 {
 public:
-    explicit IJWTValidator(const String & name_)
-        : name(name_)
-    {}
-    void init(const JWTValidator & _params);
+    explicit IJWTValidator(const String & name_, const JWTValidatorParams & params_) : params(params_), name(name_) {}
     bool verify(const String & claims, const String & token, SettingsChanges & settings) const;
     virtual ~IJWTValidator() = default;
 protected:
-    virtual bool verifyImpl(const jwt::decoded_jwt<jwt::traits::kazuho_picojson> & token) const = 0;
-    JWTValidator params;
+    virtual void verifyImpl(const jwt::decoded_jwt<jwt::traits::kazuho_picojson> & token) const = 0;
+    JWTValidatorParams params;
     const String name;
 };
 
 struct SimpleJWTValidatorParams :
-    public JWTValidator
+    public JWTValidatorParams
 {
     String algo;
     String static_key;
@@ -52,12 +49,12 @@ struct SimpleJWTValidatorParams :
 class SimpleJWTValidator : public IJWTValidator
 {
 public:
-    explicit SimpleJWTValidator(const String & _name);
-    void init(const SimpleJWTValidatorParams & _params);
+    explicit SimpleJWTValidator(const String & name_, const SimpleJWTValidatorParams & params_);
 private:
-    bool verifyImpl(const jwt::decoded_jwt<jwt::traits::kazuho_picojson> & token) const override;
+    void verifyImpl(const jwt::decoded_jwt<jwt::traits::kazuho_picojson> & token) const override;
     jwt::verifier<jwt::default_clock, jwt::traits::kazuho_picojson> verifier;
 };
+
 
 class IJWKSProvider
 {
@@ -69,9 +66,10 @@ public:
 class JWKSValidator : public IJWTValidator
 {
 public:
-    explicit JWKSValidator(const String & _name, std::shared_ptr<IJWKSProvider> _provider);
+    explicit JWKSValidator(const String & name_, std::shared_ptr<IJWKSProvider> provider_, const JWTValidatorParams & params_)
+        : IJWTValidator(name_, params_), provider(provider_) {}
 private:
-    bool verifyImpl(const jwt::decoded_jwt<jwt::traits::kazuho_picojson> & token) const override;
+    void verifyImpl(const jwt::decoded_jwt<jwt::traits::kazuho_picojson> & token) const override;
 
     std::shared_ptr<IJWKSProvider> provider;
 };

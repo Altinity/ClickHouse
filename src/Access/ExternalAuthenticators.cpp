@@ -275,7 +275,7 @@ std::unique_ptr<DB::IJWTValidator> makeJWTValidator(
     {
         SimpleJWTValidatorParams params = {};
         params.settings_key = settings_key;
-        params.algo = config.getString(prefix + ".algo");
+        params.algo = Poco::toLower(config.getString(prefix + ".algo"));
         params.static_key = config.getString(prefix + ".static_key", "");
         params.static_key_in_base64 = config.getBool(prefix + ".static_key_in_base64", false);
         params.public_key = config.getString(prefix + ".public_key", "");
@@ -283,9 +283,7 @@ std::unique_ptr<DB::IJWTValidator> makeJWTValidator(
         params.public_key_password = config.getString(prefix + ".public_key_password", "");
         params.private_key_password = config.getString(prefix + ".private_key_password", "");
         params.validate();
-        auto result = std::make_unique<SimpleJWTValidator>(name);
-        result->init(params);
-        return result;
+        return std::make_unique<SimpleJWTValidator>(name, params);
     }
 
     std::shared_ptr<IJWKSProvider> provider;
@@ -321,10 +319,8 @@ std::unique_ptr<DB::IJWTValidator> makeJWTValidator(
     }
     else
         throw DB::Exception(ErrorCodes::BAD_ARGUMENTS, "unsupported configuration");
-    auto result = std::make_unique<JWKSValidator>(name, provider);
-    JWTValidator params = {.settings_key = settings_key};
-    result->init(params);
-    return result;
+
+    return std::make_unique<JWKSValidator>(name, provider, JWTValidatorParams{.settings_key = settings_key});
 }
 
 }

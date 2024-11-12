@@ -168,20 +168,20 @@ bool check_claims(const String & claims, const picojson::value::object & payload
     return check_claims(json.get<picojson::value::object>(), payload, "");
 }
 
-std::map<String, Field> stringify_params(const picojson::value & params, const String & path);
+std::map<String, Field> stringifyparams_(const picojson::value & params, const String & path);
 
-std::map<String, Field> stringify_params(const picojson::value::array & params, const String & path)
+std::map<String, Field> stringifyparams_(const picojson::value::array & params, const String & path)
 {
     std::map<String, Field> result;
     for (size_t i = 0; i < params.size(); ++i)
     {
-        const auto tmp_result = stringify_params(params.at(i), path + "[" + std::to_string(i) + "]");
+        const auto tmp_result = stringifyparams_(params.at(i), path + "[" + std::to_string(i) + "]");
         result.insert(tmp_result.begin(), tmp_result.end());
     }
     return result;
 }
 
-std::map<String, Field> stringify_params(const picojson::value::object & params, const String & path)
+std::map<String, Field> stringifyparams_(const picojson::value::object & params, const String & path)
 {
     auto add_path = String(path);
     if (!add_path.empty())
@@ -189,19 +189,19 @@ std::map<String, Field> stringify_params(const picojson::value::object & params,
     std::map<String, Field> result;
     for (const auto & it : params)
     {
-        const auto tmp_result = stringify_params(it.second, add_path + it.first);
+        const auto tmp_result = stringifyparams_(it.second, add_path + it.first);
         result.insert(tmp_result.begin(), tmp_result.end());
     }
     return result;
 }
 
-std::map<String, Field> stringify_params(const picojson::value & params, const String & path)
+std::map<String, Field> stringifyparams_(const picojson::value & params, const String & path)
 {
     std::map<String, Field> result;
     if (params.is<picojson::array>())
-        return stringify_params(params.get<picojson::array>(), path);
+        return stringifyparams_(params.get<picojson::array>(), path);
     if (params.is<picojson::object>())
-        return stringify_params(params.get<picojson::object>(), path);
+        return stringifyparams_(params.get<picojson::object>(), path);
     if (params.is<bool>())
     {
         result[path] = Field(params.get<bool>());
@@ -228,42 +228,34 @@ std::map<String, Field> stringify_params(const picojson::value & params, const S
 }
 }
 
-void IJWTValidator::init(const JWTValidator & _params)
-{
-    params = _params;
-}
-
 bool IJWTValidator::verify(const String & claims, const String & token, SettingsChanges & settings) const
 {
     try
     {
         auto decoded_jwt = jwt::decode(token);
-        if (!verifyImpl(decoded_jwt))
-            return false;
+
+        verifyImpl(decoded_jwt);
+
         if (!check_claims(claims, decoded_jwt.get_payload_json()))
             return false;
         if (params.settings_key.empty())
             return true;
         const auto & payload_obj = decoded_jwt.get_payload_json();
         const auto & payload_settings = payload_obj.at(params.settings_key);
-        const auto string_settings = stringify_params(payload_settings, "");
+        const auto string_settings = stringifyparams_(payload_settings, "");
         for (const auto & it : string_settings)
             settings.insertSetting(it.first, it.second);
         return true;
     }
     catch (const std::exception & ex)
     {
-        LOG_TRACE(getLogger("JWTAuthentication"), "{}: Failed to validate JWT: {}",name, ex.what());
+        LOG_TRACE(getLogger("JWTAuthentication"), "{}: Failed to validate JWT: {}", name, ex.what());
         return false;
     }
 }
 
 void SimpleJWTValidatorParams::validate() const
 {
-    auto lower_algo = Poco::toLower(algo);
-    if (lower_algo == "none")
-        return;
-
     if (algo == "ps256"   ||
         algo == "ps384"   ||
         algo == "ps512"   ||
@@ -277,64 +269,57 @@ void SimpleJWTValidatorParams::validate() const
         algo == "es384"   ||
         algo == "es512"   )
     {
-        if (!public_key.empty())
-            return;
-        throw Exception(ErrorCodes::JWT_ERROR, "`public_key` parameter required for {}", algo);
+        if (public_key.empty())
+            throw Exception(ErrorCodes::JWT_ERROR, "`public_key` parameter required for {}", algo);
     }
-
-    if (algo == "hs256"   ||
-        algo == "hs384"   ||
-        algo == "hs512"   )
+    else if (algo == "hs256" ||
+             algo == "hs384" ||
+             algo == "hs512" )
     {
-        if (!static_key.empty())
-            return;
-        throw DB::Exception(ErrorCodes::JWT_ERROR, "`static_key` parameter required for {}", algo);
+        if (static_key.empty())
+            throw DB::Exception(ErrorCodes::JWT_ERROR, "`static_key` parameter required for {}", algo);
     }
-
-    throw DB::Exception(ErrorCodes::JWT_ERROR, "Unknown algorithm {}", algo);
+    else if (algo != "none")
+        throw DB::Exception(ErrorCodes::JWT_ERROR, "Unknown algorithm {}", algo);
 }
 
-SimpleJWTValidator::SimpleJWTValidator(const String & _name)
-    : IJWTValidator(_name)
-    , verifier(jwt::verify())
-{}
 
-void SimpleJWTValidator::init(const SimpleJWTValidatorParams & _params)
+SimpleJWTValidator::SimpleJWTValidator(const String & name_, const SimpleJWTValidatorParams & params_)
+    : IJWTValidator(name_, params_), verifier(jwt::verify())
 {
-    auto algo = Poco::toLower(_params.algo);
+    auto algo = params_.algo;
 
-    IJWTValidator::init(_params);
     verifier = jwt::verify();
     if (algo == "none")
         verifier = verifier.allow_algorithm(jwt::algorithm::none());
     else if (algo == "ps256")
-        verifier = verifier.allow_algorithm(jwt::algorithm::ps256(_params.public_key, _params.private_key, _params.private_key_password, _params.private_key_password));
+        verifier = verifier.allow_algorithm(jwt::algorithm::ps256(params_.public_key, params_.private_key, params_.private_key_password, params_.private_key_password));
     else if (algo == "ps384")
-        verifier = verifier.allow_algorithm(jwt::algorithm::ps384(_params.public_key, _params.private_key, _params.private_key_password, _params.private_key_password));
+        verifier = verifier.allow_algorithm(jwt::algorithm::ps384(params_.public_key, params_.private_key, params_.private_key_password, params_.private_key_password));
     else if (algo == "ps512")
-        verifier = verifier.allow_algorithm(jwt::algorithm::ps512(_params.public_key, _params.private_key, _params.private_key_password, _params.private_key_password));
+        verifier = verifier.allow_algorithm(jwt::algorithm::ps512(params_.public_key, params_.private_key, params_.private_key_password, params_.private_key_password));
     else if (algo == "ed25519")
-        verifier = verifier.allow_algorithm(jwt::algorithm::ed25519(_params.public_key, _params.private_key, _params.private_key_password, _params.private_key_password));
+        verifier = verifier.allow_algorithm(jwt::algorithm::ed25519(params_.public_key, params_.private_key, params_.private_key_password, params_.private_key_password));
     else if (algo == "ed448")
-        verifier = verifier.allow_algorithm(jwt::algorithm::ed448(_params.public_key, _params.private_key, _params.private_key_password, _params.private_key_password));
+        verifier = verifier.allow_algorithm(jwt::algorithm::ed448(params_.public_key, params_.private_key, params_.private_key_password, params_.private_key_password));
     else if (algo == "rs256")
-        verifier = verifier.allow_algorithm(jwt::algorithm::rs256(_params.public_key, _params.private_key, _params.private_key_password, _params.private_key_password));
+        verifier = verifier.allow_algorithm(jwt::algorithm::rs256(params_.public_key, params_.private_key, params_.private_key_password, params_.private_key_password));
     else if (algo == "rs384")
-        verifier = verifier.allow_algorithm(jwt::algorithm::rs384(_params.public_key, _params.private_key, _params.private_key_password, _params.private_key_password));
+        verifier = verifier.allow_algorithm(jwt::algorithm::rs384(params_.public_key, params_.private_key, params_.private_key_password, params_.private_key_password));
     else if (algo == "rs512")
-        verifier = verifier.allow_algorithm(jwt::algorithm::rs512(_params.public_key, _params.private_key, _params.private_key_password, _params.private_key_password));
+        verifier = verifier.allow_algorithm(jwt::algorithm::rs512(params_.public_key, params_.private_key, params_.private_key_password, params_.private_key_password));
     else if (algo == "es256")
-        verifier = verifier.allow_algorithm(jwt::algorithm::es256(_params.public_key, _params.private_key, _params.private_key_password, _params.private_key_password));
+        verifier = verifier.allow_algorithm(jwt::algorithm::es256(params_.public_key, params_.private_key, params_.private_key_password, params_.private_key_password));
     else if (algo == "es256k")
-        verifier = verifier.allow_algorithm(jwt::algorithm::es256k(_params.public_key, _params.private_key, _params.private_key_password, _params.private_key_password));
+        verifier = verifier.allow_algorithm(jwt::algorithm::es256k(params_.public_key, params_.private_key, params_.private_key_password, params_.private_key_password));
     else if (algo == "es384")
-        verifier = verifier.allow_algorithm(jwt::algorithm::es384(_params.public_key, _params.private_key, _params.private_key_password, _params.private_key_password));
+        verifier = verifier.allow_algorithm(jwt::algorithm::es384(params_.public_key, params_.private_key, params_.private_key_password, params_.private_key_password));
     else if (algo == "es512")
-        verifier = verifier.allow_algorithm(jwt::algorithm::es512(_params.public_key, _params.private_key, _params.private_key_password, _params.private_key_password));
+        verifier = verifier.allow_algorithm(jwt::algorithm::es512(params_.public_key, params_.private_key, params_.private_key_password, params_.private_key_password));
     else if (algo.starts_with("hs"))
     {
-        auto key = _params.static_key;
-        if (_params.static_key_in_base64)
+        auto key = params_.static_key;
+        if (params_.static_key_in_base64)
             key = base64Decode(key);
         if (algo == "hs256")
             verifier = verifier.allow_algorithm(jwt::algorithm::hs256(key));
@@ -343,24 +328,18 @@ void SimpleJWTValidator::init(const SimpleJWTValidatorParams & _params)
         else if (algo == "hs512")
             verifier = verifier.allow_algorithm(jwt::algorithm::hs512(key));
         else
-            throw Exception(ErrorCodes::JWT_ERROR, "Unknown algorithm {}", _params.algo);
+            throw Exception(ErrorCodes::JWT_ERROR, "Unknown algorithm {}", params_.algo);
     }
     else
-        throw Exception(ErrorCodes::JWT_ERROR, "Unknown algorithm {}", _params.algo);
+        throw Exception(ErrorCodes::JWT_ERROR, "Unknown algorithm {}", params_.algo);
 }
 
-bool SimpleJWTValidator::verifyImpl(const jwt::decoded_jwt<jwt::traits::kazuho_picojson> & token) const
+void SimpleJWTValidator::verifyImpl(const jwt::decoded_jwt<jwt::traits::kazuho_picojson> & token) const
 {
     verifier.verify(token);
-    return true;
 }
 
-JWKSValidator::JWKSValidator(const String & _name, std::shared_ptr<IJWKSProvider> _provider)
-    : IJWTValidator(_name)
-    , provider(_provider)
-{}
-
-bool JWKSValidator::verifyImpl(const jwt::decoded_jwt<jwt::traits::kazuho_picojson> & token) const
+void JWKSValidator::verifyImpl(const jwt::decoded_jwt<jwt::traits::kazuho_picojson> & token) const
 {
     auto jwk = provider->getJWKS().get_jwk(token.get_key_id());
     auto subject = token.get_subject();
@@ -404,9 +383,8 @@ bool JWKSValidator::verifyImpl(const jwt::decoded_jwt<jwt::traits::kazuho_picojs
         verifier = verifier.allow_algorithm(jwt::algorithm::rs512(public_key, "", "", ""));
     else
         throw Exception(ErrorCodes::JWT_ERROR, "Unknown algorithm {}", algo);
-    verifier = verifier.leeway(60UL); // value in seconds, add some to compensate timeout
+    verifier = verifier.leeway(60UL);
     verifier.verify(token);
-    return true;
 }
 
 JWKSClient::JWKSClient(const JWKSAuthClientParams & params_)
@@ -422,7 +400,7 @@ jwt::jwks<jwt::traits::kazuho_picojson> JWKSClient::getJWKS()
     {
         std::shared_lock lock(m_update_mutex);
         auto now = std::chrono::high_resolution_clock::now();
-        auto diff =  std::chrono::duration<double, std::milli>(now - m_last_request_send).count();
+        auto diff = std::chrono::duration<double, std::milli>(now - m_last_request_send).count();
         if (diff < m_refresh_ms)
         {
             jwt::jwks<jwt::traits::kazuho_picojson> result(m_jwks);
