@@ -2,7 +2,7 @@
     <jwt_validators>
 
         <single_key_validator>
-            <algo>hs256</algo>
+            <algo>HS256</algo>
             <static_key>my_secret</static_key>
             <static_key_in_base64>false</static_key_in_base64>
         </single_key_validator>

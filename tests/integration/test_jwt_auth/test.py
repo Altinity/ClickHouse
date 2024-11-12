@@ -9,7 +9,7 @@ SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 cluster = ClickHouseCluster(__file__)
 instance = cluster.add_instance(
     "instance",
-    main_configs=["configs/verify_static_key.xml"],
+    main_configs=["configs/validators.xml"],
     user_configs=["configs/users.xml"],
     with_minio=True,
     # We actually don't need minio, but we need to run dummy resolver
