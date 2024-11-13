@@ -28,6 +28,8 @@ SET(VERSION_REVISION {revision})
 SET(VERSION_MAJOR {major})
 SET(VERSION_MINOR {minor})
 SET(VERSION_PATCH {patch})
+SET(VERSION_TWEAK {tweak})
+SET(VERSION_FLAVOUR {flavour})
 SET(VERSION_GITHASH {githash})
 SET(VERSION_DESCRIBE {describe})
 SET(VERSION_STRING {string})
@@ -177,10 +179,11 @@ class ClickHouseVersion:
             "major": self.major,
             "minor": self.minor,
             "patch": self.patch,
-            "tweak": self.tweak,
             "githash": self.githash,
             "describe": self.describe,
             "string": self.string,
+            "tweak": self._tweak or "",
+            "flavour": self._flavour or "",
         }
 
     def as_tuple(self) -> Tuple[int, int, int, int]:
