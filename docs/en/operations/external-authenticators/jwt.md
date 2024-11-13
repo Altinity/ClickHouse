@@ -46,8 +46,8 @@ To enable JWT validators, add `jwt_validators` section in `config.xml`. This sec
 
 - `algo` - Algorithm for validate signature. Supported:
 
-  | HMSC  | RSA   | ECDSA  | PSS   | EdDSA   |
-  | ----- | ----- | ------ | ----- | ------- |
+  | HMAC  | RSA   | ECDSA  | PSS   | EdDSA   |
+  |-------| ----- | ------ | ----- | ------- |
   | HS256 | RS256 | ES256  | PS256 | Ed25519 |
   | HS384 | RS384 | ES384  | PS384 | Ed448   |
   | HS512 | RS512 | ES512  | PS512 |         |
