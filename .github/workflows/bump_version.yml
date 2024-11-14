@@ -1,6 +1,5 @@
 name: bump version
-permissions:
-  contents: write
+permissions: write-all
 # Upstream uses last portion of the version as a unique part to differentiate builds
 # created from different commits. Last part (or VERSION_TWEAK) is basically a number
 # of commits since the last tag (computed automatically by git).
