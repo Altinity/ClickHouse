@@ -11,6 +11,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
+    extern const int JWT_ERROR;
 }
 
 Credentials::Credentials(const String & user_name_)
@@ -111,7 +112,7 @@ String extractSubjectFromToken(const String & token)
     }
     catch (...)
     {
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "Failed to validate jwt");
+        throw Exception(ErrorCodes::JWT_ERROR, "Failed to validate jwt");
     }
 }
 }
