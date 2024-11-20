@@ -14,7 +14,7 @@
         "reason": "todo investigate"
     },
     "03094_grouparraysorted_memory": {
-        "reason": "fails with tsan"
+        "reason": "flaky"
     },
     "02700_s3_part_INT_MAX": {
         "reason": "fails with asan"
