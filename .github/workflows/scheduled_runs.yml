@@ -18,9 +18,9 @@ jobs:
       fail-fast: false
       matrix:
         branch: 
-          #- 24.3-scheduled-run
+          - 24.3.5-snapshot_runners
           #- 24.3.fips-schduled-runs
-          - releases/23.8.16 
+          - 23.8.16_scheduled_run_fix 
     name: ${{ matrix.branch }}
     runs-on: ubuntu-latest
     steps:
