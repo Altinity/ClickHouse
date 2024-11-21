@@ -256,7 +256,7 @@ class PRInfo:
                 "GITHUB_SHA", "0000000000000000000000000000000000000000"
             )
             self.number = 1
-            self.docker_image_tag = f"{self.version.major}.{self.version.minor}.{self.version.patch}-" + str(self.sha)
+            self.docker_image_tag = f"{self.number}-{str(self.sha)}"
             self.labels = set()
             repo_prefix = f"{GITHUB_SERVER_URL}/{GITHUB_REPOSITORY}"
             self.task_url = GITHUB_RUN_URL
