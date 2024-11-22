@@ -256,7 +256,7 @@ class VersionType:
     NEW = "new"
     PRESTABLE = "prestable"
     STABLE = "altinitystable"
-    TESTING = "testing"
+    TESTING = "altinityedge"
     VALID = (NEW, TESTING, PRESTABLE, STABLE, LTS,
              "stable" # NOTE (vnemkov): we don't use that directly, but it is used in unit-tests
             )
