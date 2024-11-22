@@ -104,7 +104,9 @@ class CIBuddy:
         return json_string
 
     def post(self, message: str, channels: List[str]) -> None:
-        print(f"Posting slack message, dry_run [{self.dry_run}]")
+        print(f"Would've posted slack message, dry_run [{self.dry_run}], message:", message)
+        # NOTE(vnemkov): it was easier to disable it here than in dozen places CIBuddy where is used.
+        return
         if self.dry_run:
             urls = [self.channels[Channels.DRY_RUN]]
         else:
