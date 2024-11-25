@@ -139,6 +139,16 @@ Chunk Squashing::squash(std::vector<Chunk> && input_chunks, Chunk::ChunkInfoColl
     {
         auto columns = input_chunks[i].detachColumns();
         for (size_t j = 0; j != num_columns; ++j)
+        {
+            /// IColumn::structureEquals is not implemented for deprecated object type, ignore it and always convert to non-sparse.
+            bool has_object_deprecated = columns[j]->getDataType() == TypeIndex::ObjectDeprecated ||
+                mutable_columns[j]->getDataType() == TypeIndex::ObjectDeprecated;
+            auto has_object_deprecated_lambda = [&has_object_deprecated](const auto & subcolumn)
+            {
+                has_object_deprecated = has_object_deprecated || subcolumn.getDataType() == TypeIndex::ObjectDeprecated;
+            };
+            columns[j]->forEachSubcolumnRecursively(has_object_deprecated_lambda);
+            mutable_columns[j]->forEachSubcolumnRecursively(has_object_deprecated_lambda);
             source_columns_list[j].emplace_back(std::move(columns[j]));
     }
 
