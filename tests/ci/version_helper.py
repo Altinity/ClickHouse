@@ -260,7 +260,7 @@ class VersionType:
     VALID = (NEW, TESTING, PRESTABLE, STABLE, LTS,
              # NOTE (vnemkov): we don't use those directly, but it is used in unit-tests
              "stable",
-             "altinityedge"
+             "testing"
             )
 
 
