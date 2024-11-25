@@ -258,7 +258,9 @@ class VersionType:
     STABLE = "altinitystable"
     TESTING = "altinityedge"
     VALID = (NEW, TESTING, PRESTABLE, STABLE, LTS,
-             "stable" # NOTE (vnemkov): we don't use that directly, but it is used in unit-tests
+             # NOTE (vnemkov): we don't use those directly, but it is used in unit-tests
+             "stable",
+             "testing"
             )
 
 
