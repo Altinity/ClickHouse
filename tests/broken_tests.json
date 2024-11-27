@@ -1,0 +1,22 @@
+{
+    "test_postgresql_replica_database_engine_2/test.py::test_quoting_publication": {
+        "message": "DB::Exception: Syntax error:",
+        "reason": "syntax error"
+    },
+    "test_distributed_inter_server_secret/test.py::test_secure_cluster_distributed_over_distributed_different_users": {
+        "message": "DB::NetException: Connection reset by peer, while reading from socket",
+        "reason": "network issue"
+    },
+    "02920_alter_column_of_projections": {
+        "reason": "requires different settings"
+    },
+    "02888_system_tables_with_inaccsessible_table_function": {
+        "reason": "todo investigate"
+    },
+    "03094_grouparraysorted_memory": {
+        "reason": "flaky"
+    },
+    "02700_s3_part_INT_MAX": {
+        "reason": "fails with asan"
+    }
+}
