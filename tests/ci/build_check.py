@@ -176,6 +176,7 @@ def main():
     #  (last part of version, like 'altinitystable') is obtained from tag.
     # If there is no tag, then version is considered to be 'testing'
     version_type = version._flavour = VersionType.TESTING
+    official_flag = True
 
     if pr_info.event_type == EventType.PUSH \
         and pr_info.ref.startswith('/ref/tags/'):
