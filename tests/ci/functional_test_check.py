@@ -52,8 +52,9 @@ def get_additional_envs(
     check_name: str, run_by_hash_num: int, run_by_hash_total: int
 ) -> List[str]:
     result = []
-    azure_connection_string = get_parameter_from_ssm("azure_connection_string")
-    result.append(f"AZURE_CONNECTION_STRING='{azure_connection_string}'")
+    # TODO(vnemkov): put proper connection string into SSM and re-enable this one
+    # azure_connection_string = get_parameter_from_ssm("azure_connection_string")
+    # result.append(f"AZURE_CONNECTION_STRING='{azure_connection_string}'")
     if "DatabaseReplicated" in check_name:
         result.append("USE_DATABASE_REPLICATED=1")
     if "DatabaseOrdinary" in check_name:
