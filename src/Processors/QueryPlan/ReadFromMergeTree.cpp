@@ -348,7 +348,7 @@ Pipe ReadFromMergeTree::readFromPoolParallelReplicas(
     {
         .all_callback = all_ranges_callback.value(),
         .callback = read_task_callback.value(),
-        .number_of_current_replica = number_of_current_replica.value_or(client_info.number_of_current_replica),
+        .number_of_current_replica = client_info.number_of_current_replica,
         .total_nodes_count = context->getClusterForParallelReplicas()->getShardsInfo().at(0).getAllNodeCount(),
     };
 
@@ -520,7 +520,7 @@ Pipe ReadFromMergeTree::readInOrder(
         {
             .all_callback = all_ranges_callback.value(),
             .callback = read_task_callback.value(),
-            .number_of_current_replica = number_of_current_replica.value_or(client_info.number_of_current_replica),
+            .number_of_current_replica = client_info.number_of_current_replica,
             .total_nodes_count = context->getClusterForParallelReplicas()->getShardsInfo().at(0).getAllNodeCount(),
         };
 
