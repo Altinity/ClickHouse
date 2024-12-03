@@ -62,6 +62,29 @@ ldapadd -H ldap://{host}:{port} -D "{admin_bind_dn}" -x -w {admin_password}
     assert code == 0
 
 
+def delete_ldap_group(ldap_cluster, group_cn):
+    code, (stdout, stderr) = ldap_cluster.ldap_container.exec_run(
+        [
+            "sh",
+            "-c",
+            """ldapdelete -r 'cn={group_cn},dc=example,dc=org' \
+-H ldap://{host}:{port} -D "{admin_bind_dn}" -x -w {admin_password}
+            """.format(
+                host=ldap_cluster.ldap_host,
+                port=ldap_cluster.ldap_port,
+                admin_bind_dn=LDAP_ADMIN_BIND_DN,
+                admin_password=LDAP_ADMIN_PASSWORD,
+                group_cn=group_cn,
+            ),
+        ],
+        demux=True,
+    )
+    logging.debug(
+        f"test_ldap_external_user_directory code:{code} stdout:{stdout}, stderr:{stderr}"
+    )
+    assert code == 0
+
+
 def test_authentication_pass():
     assert instance1.query(
         "SELECT currentUser()", user="janedoe", password="qwerty"
