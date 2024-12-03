@@ -3,6 +3,8 @@
 
 #if USE_PARQUET
 
+#include <Core/Settings.h>
+#include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 #include <Common/ThreadPool.h>
 #include <Formats/FormatFactory.h>
@@ -32,6 +34,12 @@ namespace CurrentMetrics
     extern const Metric ParquetDecoderThreads;
     extern const Metric ParquetDecoderThreadsActive;
     extern const Metric ParquetDecoderThreadsScheduled;
+}
+
+namespace ProfileEvents
+{
+    extern const Event ParquetMetaDataCacheHits;
+    extern const Event ParquetMetaDataCacheMisses;
 }
 
 namespace DB
@@ -426,6 +434,22 @@ static std::vector<Range> getHyperrectangleForRowGroup(const parquet::FileMetaDa
     return hyperrectangle;
 }
 
+std::mutex ParquetFileMetaDataCache::mutex;
+
+ParquetFileMetaDataCache::ParquetFileMetaDataCache(UInt64 max_cache_entries)
+    : CacheBase(max_cache_entries) {}
+
+ParquetFileMetaDataCache *  ParquetFileMetaDataCache::instance(UInt64 max_cache_entries)
+{
+    static ParquetFileMetaDataCache * instance = nullptr;
+    if (!instance)
+    {
+        std::lock_guard lock(mutex);
+        instance = new ParquetFileMetaDataCache(max_cache_entries);
+    }
+    return instance;
+}
+
 ParquetBlockInputFormat::ParquetBlockInputFormat(
     ReadBuffer & buf,
     const Block & header_,
@@ -450,6 +474,28 @@ ParquetBlockInputFormat::~ParquetBlockInputFormat()
         pool->wait();
 }
 
+std::shared_ptr<parquet::FileMetaData> ParquetBlockInputFormat::getFileMetaData()
+{
+    if (!use_metadata_cache || !metadata_cache_key.length())
+    {
+        ProfileEvents::increment(ProfileEvents::ParquetMetaDataCacheMisses);
+        return parquet::ReadMetaData(arrow_file);
+    }
+
+    auto [parquet_file_metadata, loaded] = ParquetFileMetaDataCache::instance(metadata_cache_max_entries)->getOrSet(
+        metadata_cache_key,
+        [this]()
+        {
+            return parquet::ReadMetaData(arrow_file);
+        }
+    );
+    if (loaded)
+        ProfileEvents::increment(ProfileEvents::ParquetMetaDataCacheMisses);
+    else
+        ProfileEvents::increment(ProfileEvents::ParquetMetaDataCacheHits);
+    return parquet_file_metadata;
+}
+
 void ParquetBlockInputFormat::initializeIfNeeded()
 {
     if (std::exchange(is_initialized, true))
@@ -463,7 +509,7 @@ void ParquetBlockInputFormat::initializeIfNeeded()
     if (is_stopped)
         return;
 
-    metadata = parquet::ReadMetaData(arrow_file);
+    metadata = getFileMetaData();
 
     std::shared_ptr<arrow::Schema> schema;
     THROW_ARROW_NOT_OK(parquet::arrow::FromParquetSchema(metadata->schema(), &schema));
@@ -842,6 +888,14 @@ const BlockMissingValues & ParquetBlockInputFormat::getMissingValues() const
 {
     return previous_block_missing_values;
 }
+
+void ParquetBlockInputFormat::setStorageRelatedUniqueKey(const Settings & settings, const String & key_)
+{
+    metadata_cache_key = key_;
+    use_metadata_cache = settings.parquet_use_metadata_cache;
+    metadata_cache_max_entries = settings.parquet_metadata_cache_max_entries;
+}
+
 
 ParquetSchemaReader::ParquetSchemaReader(ReadBuffer & in_, const FormatSettings & format_settings_)
     : ISchemaReader(in_), format_settings(format_settings_)
