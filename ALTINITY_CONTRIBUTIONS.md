@@ -1,6 +1,10 @@
 List of pull requests contributed by Altinity develoeprs to ClickHouse server. It does not include documentation changes.
 
 ## 2024
+  * Respect `prefer_locahost_replica` in `parallel_distributed_insert_select`	[72190](https://github.com/ClickHouse/ClickHouse/pull/72190)	by @filimonov
+  * Auxiliary autodiscovery	[71911](https://github.com/ClickHouse/ClickHouse/pull/71911)	by @ianton-ru
+  * Passing external user roles from query originator to other nodes	[70332](https://github.com/ClickHouse/ClickHouse/pull/70332)	by @zvonand
+  * Fix flaky test_drop_complex_columns	[71504](https://github.com/ClickHouse/ClickHouse/pull/71504)	by @ilejn
   * Boolean support for parquet native reader	[71055](https://github.com/ClickHouse/ClickHouse/pull/71055)	by @arthurpassos
   * Allow each authentication method to have its own expiration date, remove from user entity.	[70090](https://github.com/ClickHouse/ClickHouse/pull/70090)	by @arthurpassos
   * make numactl respect EPERM error, when get_mempolicy is is restricted by seccomp	[70900](https://github.com/ClickHouse/ClickHouse/pull/70900)	by @filimonov
