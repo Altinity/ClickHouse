@@ -22,8 +22,7 @@ source /utils.lib
 # install test configs
 /usr/share/clickhouse-test/config/install.sh
 
-azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --silent --inMemoryPersistence &
-
+azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --debug /azurite_log &
 ./setup_minio.sh stateful
 ./mc admin trace clickminio > /test_output/minio.log &
 MC_ADMIN_PID=$!
