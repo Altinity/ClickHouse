@@ -72,11 +72,11 @@ def drop_replication_slot(conn, slot_name="user_slot"):
 
 def create_postgres_schema(cursor, schema_name):
     drop_postgres_schema(cursor, schema_name)
-    cursor.execute(f"CREATE SCHEMA {schema_name}")
+    cursor.execute(f"CREATE SCHEMA `{schema_name}`")
 
 
 def drop_postgres_schema(cursor, schema_name):
-    cursor.execute(f"DROP SCHEMA IF EXISTS {schema_name} CASCADE")
+    cursor.execute(f"DROP SCHEMA IF EXISTS `{schema_name}` CASCADE")
 
 
 def create_postgres_table(
@@ -245,9 +245,9 @@ class PostgresManager:
     ):
         postgres_database = self.database_or_default(postgres_database)
         self.created_materialized_postgres_db_list.add(materialized_database)
-        self.instance.query(f"DROP DATABASE IF EXISTS {materialized_database}")
+        self.instance.query(f"DROP DATABASE IF EXISTS `{materialized_database}`")
 
-        create_query = f"CREATE DATABASE {materialized_database} ENGINE = MaterializedPostgreSQL('{ip}:{port}', '{postgres_database}', '{user}', '{password}')"
+        create_query = f"CREATE DATABASE `{materialized_database}` ENGINE = MaterializedPostgreSQL('{ip}:{port}', '{postgres_database}', '{user}', '{password}')"
         if len(settings) > 0:
             create_query += " SETTINGS "
             for i in range(len(settings)):
@@ -259,7 +259,7 @@ class PostgresManager:
         assert materialized_database in self.instance.query("SHOW DATABASES")
 
     def drop_materialized_db(self, materialized_database="test_database"):
-        self.instance.query(f"DROP DATABASE IF EXISTS {materialized_database} SYNC")
+        self.instance.query(f"DROP DATABASE IF EXISTS `{materialized_database}` SYNC")
         if materialized_database in self.created_materialized_postgres_db_list:
             self.created_materialized_postgres_db_list.remove(materialized_database)
 
@@ -306,7 +306,7 @@ class PostgresManager:
             if numbers > 0:
                 db = self.database_or_default(database_name)
                 self.instance.query(
-                    f"INSERT INTO `{db}`.{table_name} SELECT number, number from numbers({numbers})"
+                    f"INSERT INTO `{db}`.`{table_name}` SELECT number, number from numbers({numbers})"
                 )
 
 
@@ -342,11 +342,11 @@ def assert_nested_table_is_created(
         table = schema_name + "." + table_name
 
     print(f"Checking table {table} exists in {materialized_database}")
-    database_tables = instance.query(f"SHOW TABLES FROM {materialized_database}")
+    database_tables = instance.query(f"SHOW TABLES FROM `{materialized_database}`")
 
     while table not in database_tables:
         time.sleep(0.2)
-        database_tables = instance.query(f"SHOW TABLES FROM {materialized_database}")
+        database_tables = instance.query(f"SHOW TABLES FROM `{materialized_database}`")
 
     assert table in database_tables
 
@@ -384,7 +384,7 @@ def check_tables_are_synchronized(
         table_path = f"{materialized_database}.`{schema_name}.{table_name}`"
 
     print(f"Checking table is synchronized: {table_path}")
-    result_query = f"select * from {table_path} order by {order_by};"
+    result_query = f"select * from `{table_path}` order by {order_by};"
 
     expected = instance.query(
         f"select * from `{postgres_database}`.`{table_name}` order by {order_by};"
