@@ -165,7 +165,7 @@ def run_stress_test(docker_image_name: str) -> None:
         pr_info, stopwatch.start_time_str, check_name
     )
 
-    additional_envs = get_additional_envs()
+    additional_envs = get_additional_envs(check_name)
 
     run_command = get_run_command(
         packages_path,
