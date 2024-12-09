@@ -806,6 +806,8 @@ The server successfully detected this situation and will download merged part fr
     M(GWPAsanAllocateSuccess, "Number of successful allocations done by GWPAsan") \
     M(GWPAsanAllocateFailed, "Number of failed allocations done by GWPAsan (i.e. filled pool)") \
     M(GWPAsanFree, "Number of free operations done by GWPAsan") \
+    M(ParquetMetaDataCacheHits, "Number of times the read from filesystem cache hit the cache.") \
+    M(ParquetMetaDataCacheMisses, "Number of times the read from filesystem cache miss the cache.") \
 
 
 #ifdef APPLY_FOR_EXTERNAL_EVENTS
