@@ -293,9 +293,12 @@ private:
     std::exception_ptr background_exception = nullptr;
     std::atomic<int> is_stopped{0};
     bool is_initialized = false;
-    String metadata_cache_key;
-    bool use_metadata_cache = false;
-    UInt64 metadata_cache_max_entries{0};
+    struct Cache
+    {
+        String key;
+        bool use_cache = false;
+        UInt64 max_entries{0};
+    } metadata_cache;
 };
 
 class ParquetSchemaReader : public ISchemaReader
@@ -322,7 +325,6 @@ public:
 
 private:
     ParquetFileMetaDataCache(UInt64 max_cache_entries);
-    static std::mutex mutex;
 };
 
 }
