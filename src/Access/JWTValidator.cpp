@@ -229,13 +229,13 @@ std::map<String, Field> stringifyparams_(const picojson::value & params, const S
 }
 }
 
-bool IJWTValidator::verify(const String & claims, const String & token, SettingsChanges & settings) const
+bool IJWTValidator::validate(const String & claims, const String & token, SettingsChanges & settings) const
 {
     try
     {
         auto decoded_jwt = jwt::decode(token);
 
-        verifyImpl(decoded_jwt);
+        validateImpl(decoded_jwt);
 
         if (!check_claims(claims, decoded_jwt.get_payload_json()))
             return false;
@@ -290,7 +290,6 @@ SimpleJWTValidator::SimpleJWTValidator(const String & name_, const SimpleJWTVali
 {
     auto algo = params_.algo;
 
-    verifier = jwt::verify();
     if (algo == "none")
         verifier = verifier.allow_algorithm(jwt::algorithm::none());
     else if (algo == "ps256")
@@ -335,12 +334,12 @@ SimpleJWTValidator::SimpleJWTValidator(const String & name_, const SimpleJWTVali
         throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: unknown algorithm {}", params_.algo);
 }
 
-void SimpleJWTValidator::verifyImpl(const jwt::decoded_jwt<jwt::traits::kazuho_picojson> & token) const
+void SimpleJWTValidator::validateImpl(const jwt::decoded_jwt<jwt::traits::kazuho_picojson> & token) const
 {
     verifier.verify(token);
 }
 
-void JWKSValidator::verifyImpl(const jwt::decoded_jwt<jwt::traits::kazuho_picojson> & token) const
+void JWKSValidator::validateImpl(const jwt::decoded_jwt<jwt::traits::kazuho_picojson> & token) const
 {
     auto jwk = provider->getJWKS().get_jwk(token.get_key_id());
     auto subject = token.get_subject();
@@ -376,7 +375,7 @@ void JWKSValidator::verifyImpl(const jwt::decoded_jwt<jwt::traits::kazuho_picojs
         public_key = jwt::helper::create_public_key_from_rsa_components(modulus, exponent);
     }
 
-    if (jwk.has_algorithm() && (jwk.get_algorithm() != algo))
+    if (jwk.has_algorithm() && (Poco::toLower(jwk.get_algorithm()) != algo))
         throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT validation error: `alg` in JWK does not match the algo used in JWT");
 
     if (algo == "rs256")

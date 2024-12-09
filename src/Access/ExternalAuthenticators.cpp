@@ -598,7 +598,7 @@ bool ExternalAuthenticators::checkJWTCredentials(const String & claims, const JW
 
     for (const auto & it : jwt_validators)
     {
-        if (it.second->verify(claims, token, settings))
+        if (it.second->validate(claims, token, settings))
         {
             LOG_DEBUG(getLogger("JWTAuth"), "Authenticated with JWT for {} by {}", user_name, it.first);
             return true;
