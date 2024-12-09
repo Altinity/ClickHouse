@@ -689,6 +689,11 @@ bool AccessControl::isNoPasswordAllowed() const
     return allow_no_password;
 }
 
+bool AccessControl::isJWTEnabled() const
+{
+    return external_authenticators->isJWTAllowed();
+}
+
 void AccessControl::setPlaintextPasswordAllowed(bool allow_plaintext_password_)
 {
     allow_plaintext_password = allow_plaintext_password_;
