@@ -14,5 +14,4 @@ SET(VERSION_FLAVOUR altinitystable)
 SET(VERSION_DESCRIBE v24.8.8.18.altinitystable)
 SET(VERSION_STRING 24.8.8.18.altinitystable)
 
->>>>>>> altinity/customizations/24.8.7
 # end of autochange
