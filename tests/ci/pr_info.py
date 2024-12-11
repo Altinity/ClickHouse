@@ -80,8 +80,12 @@ def get_pr_for_commit(sha, ref):
             ref,
             sha,
         )
-        first_pr = our_prs[0]
-        return first_pr
+        if len(our_prs) != 0:
+            first_pr = our_prs[0]
+            return first_pr
+        else:
+            return None
+
     except Exception as ex:
         logging.error(
             "Cannot fetch PR info from commit ref %s, sha %s, exception: %s",
