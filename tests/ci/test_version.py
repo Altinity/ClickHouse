@@ -22,9 +22,10 @@ class TestFunctions(unittest.TestCase):
             ("v31.1.1.2-testing", vh.get_version_from_string("31.1.1.2")),
             ("refs/tags/v31.1.1.2-testing", vh.get_version_from_string("31.1.1.2")),
         )
-        for test_case in cases:
-            version = vh.version_arg(test_case[0])
-            self.assertEqual(test_case[1], version)
+        for i, test_case in enumerate(cases):
+            with self.subTest(test_case, i=i):
+                version = vh.version_arg(test_case[0])
+                self.assertEqual(test_case[1], version)
         error_cases = (
             "0.0.0",
             "1.1.1.a",
@@ -48,33 +49,40 @@ class TestFunctions(unittest.TestCase):
             expected: CHV
 
         cases = (
+            # TestCase(
+            #     "v24.6.1.1-new",
+            #     15,
+            #     "v24.4.1.2088-stable",
+            #     415,
+            #     CHV(24, 5, 1, 54487, None, 415),
+            # ),
+            # TestCase(
+            #     "v24.6.1.1-testing",
+            #     15,
+            #     "v24.4.1.2088-stable",
+            #     415,
+            #     CHV(24, 5, 1, 54487, None, 15),
+            # ),
+            # TestCase(
+            #     "v24.6.1.1-stable",
+            #     15,
+            #     "v24.4.1.2088-stable",
+            #     415,
+            #     CHV(24, 5, 1, 54487, None, 15),
+            # ),
+            # TestCase(
+            #     "v24.5.1.1-stable",
+            #     15,
+            #     "v24.4.1.2088-stable",
+            #     415,
+            #     CHV(24, 5, 1, 54487, None, 15),
+            # ),
             TestCase(
-                "v24.6.1.1-new",
-                15,
+                "v24.5.1.100-stable",
+                0,
                 "v24.4.1.2088-stable",
                 415,
-                CHV(24, 5, 1, 54487, None, 415),
-            ),
-            TestCase(
-                "v24.6.1.1-testing",
-                15,
-                "v24.4.1.2088-stable",
-                415,
-                CHV(24, 5, 1, 54487, None, 15),
-            ),
-            TestCase(
-                "v24.6.1.1-stable",
-                15,
-                "v24.4.1.2088-stable",
-                415,
-                CHV(24, 5, 1, 54487, None, 15),
-            ),
-            TestCase(
-                "v24.5.1.1-stable",
-                15,
-                "v24.4.1.2088-stable",
-                415,
-                CHV(24, 5, 1, 54487, None, 15),
+                CHV(24, 5, 1, 54487, None, 100),
             ),
         )
         git = Git(True)

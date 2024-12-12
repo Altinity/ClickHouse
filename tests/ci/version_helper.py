@@ -309,7 +309,7 @@ def get_version_from_repo(
         if not (version_from_tag.major == cmake_version.major \
             and version_from_tag.minor == cmake_version.minor \
             and version_from_tag.patch == cmake_version.patch):
-            raise RuntimeError("Version generated from tag ({version_from_tag}) should have same major, minor, and patch values as version generated from cmake ({cmake_version})")
+            raise RuntimeError(f"Version generated from tag ({version_from_tag}) should have same major, minor, and patch values as version generated from cmake ({cmake_version})")
 
         # Don't need to reset version completely, mostly because revision part is not set in tag, but must be preserved
         cmake_version._flavour = version_from_tag._flavour
