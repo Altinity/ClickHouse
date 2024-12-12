@@ -436,9 +436,6 @@ void ReadFromParallelRemoteReplicasStep::initializePipeline(QueryPipelineBuilder
         shuffled_pool = shard.pool->getShuffledPools(current_settings, priority_func);
     }
 
-    coordinator
-        = std::make_shared<ParallelReplicasReadingCoordinator>(max_replicas_to_use, current_settings.parallel_replicas_mark_segment_size);
-
     for (size_t i=0; i < max_replicas_to_use; ++i)
     {
         IConnections::ReplicaInfo replica_info

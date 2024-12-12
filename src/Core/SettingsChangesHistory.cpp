@@ -63,6 +63,7 @@ static std::initializer_list<std::pair<ClickHouseVersion, SettingsChangesHistory
     },
     {"24.11",
         {
+            {"push_external_roles_in_interserver_queries", false, true, "New setting."},
         }
     },
     {"24.10",
@@ -71,6 +72,7 @@ static std::initializer_list<std::pair<ClickHouseVersion, SettingsChangesHistory
     },
     {"24.9",
         {
+            {"parallel_replicas_mark_segment_size", 128, 0, "Value for this setting now determined automatically"},
         }
     },
     {"24.8",
