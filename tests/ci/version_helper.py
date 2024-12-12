@@ -300,17 +300,21 @@ def get_version_from_repo(
         tweak=versions.get("tweak", versions["revision"]),
         flavour=versions.get("flavour", None)
     )
-    # Since 24.5 we have tags like v24.6.1.1-new, and we must check if the release
-    # branch already has it's own commit. It's necessary for a proper tweak version
-    if git is not None and git.latest_tag:
+
+    # if this commit is tagged, use tag's version instead of something stored in cmake
+    if git is not None and git.latest_tag and git.commits_since_latest == 0:
         version_from_tag = get_version_from_tag(git.latest_tag)
-        if (
-            version_from_tag.description == VersionType.NEW
-            and cmake_version < version_from_tag
-        ):
-            # We are in a new release branch without existing release.
-            # We should change the tweak version to a `tweak_to_new`
-            cmake_version.tweak = git.tweak_to_new
+        # Tag has a priority over the version written in CMake.
+        # Version must match (except tweak, flavour, description, etc.) to avoid accidental mess.
+        if not (version_from_tag.major == cmake_version.major \
+            and version_from_tag.minor == cmake_version.minor \
+            and version_from_tag.patch == cmake_version.patch):
+            raise RuntimeError(f"Version generated from tag ({version_from_tag}) should have same major, minor, and patch values as version generated from cmake ({cmake_version})")
+
+        # Don't need to reset version completely, mostly because revision part is not set in tag, but must be preserved
+        cmake_version._flavour = version_from_tag._flavour
+        cmake_version.tweak = version_from_tag.tweak
+
     return cmake_version
 
 
@@ -333,9 +337,16 @@ def get_version_from_string(
 
 def get_version_from_tag(tag: str) -> ClickHouseVersion:
     Git.check_tag(tag)
-    tag, description = tag[1:].split("-", 1)
-    version = get_version_from_string(tag)
-    version.with_description(description)
+    tag = tag[1:] # strip initial 'v'
+    if '-' in tag:
+        # Upstream tags with dash
+        tag, description = tag.split("-", 1)
+        version = get_version_from_string(tag)
+        version.with_description(description)
+    else:
+        # Altinity's tags, with dots as separators between parts (handled properly down the road)
+        version = get_version_from_string(tag)
+
     return version
 
 
