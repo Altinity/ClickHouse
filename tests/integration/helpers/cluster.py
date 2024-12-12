@@ -569,6 +569,7 @@ class ClickHouseCluster:
         self.minio_docker_id = self.get_instance_docker_id(self.minio_host)
 
         self.spark_session = None
+        self.with_iceberg_catalog = False
 
         self.with_azurite = False
         self._azurite_port = 0
@@ -1528,6 +1529,26 @@ class ClickHouseCluster:
         ]
         return self.base_minio_cmd
 
+    def setup_iceberg_catalog_cmd(
+        self, instance, env_variables, docker_compose_yml_dir
+    ):
+        self.base_cmd.extend(
+            [
+                "--file",
+                p.join(
+                    docker_compose_yml_dir, "docker_compose_iceberg_rest_catalog.yml"
+                ),
+            ]
+        )
+        self.base_iceberg_catalog_cmd = self.compose_cmd(
+            "--env-file",
+            instance.env_file,
+            "--file",
+            p.join(docker_compose_yml_dir, "docker_compose_iceberg_rest_catalog.yml"),
+        )
+        return self.base_iceberg_catalog_cmd
+        # return self.base_minio_cmd
+
     def setup_azurite_cmd(self, instance, env_variables, docker_compose_yml_dir):
         self.with_azurite = True
         env_variables["AZURITE_PORT"] = str(self.azurite_port)
@@ -1716,6 +1737,7 @@ class ClickHouseCluster:
         with_hive=False,
         with_coredns=False,
         with_prometheus=False,
+        with_iceberg_catalog=False,
         handle_prometheus_remote_write=False,
         handle_prometheus_remote_read=False,
         use_old_analyzer=None,
@@ -1817,6 +1839,7 @@ class ClickHouseCluster:
             with_coredns=with_coredns,
             with_cassandra=with_cassandra,
             with_ldap=with_ldap,
+            with_iceberg_catalog=with_iceberg_catalog,
             use_old_analyzer=use_old_analyzer,
             server_bin_path=self.server_bin_path,
             odbc_bridge_bin_path=self.odbc_bridge_bin_path,
@@ -2017,6 +2040,13 @@ class ClickHouseCluster:
         if with_minio and not self.with_minio:
             cmds.append(
                 self.setup_minio_cmd(instance, env_variables, docker_compose_yml_dir)
+            )
+
+        if with_iceberg_catalog and not self.with_iceberg_catalog:
+            cmds.append(
+                self.setup_iceberg_catalog_cmd(
+                    instance, env_variables, docker_compose_yml_dir
+                )
             )
 
         if with_azurite and not self.with_azurite:
@@ -3407,6 +3437,7 @@ class ClickHouseInstance:
         with_coredns,
         with_cassandra,
         with_ldap,
+        with_iceberg_catalog,
         use_old_analyzer,
         server_bin_path,
         odbc_bridge_bin_path,

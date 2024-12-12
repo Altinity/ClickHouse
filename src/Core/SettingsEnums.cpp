@@ -257,4 +257,8 @@ IMPLEMENT_SETTING_ENUM(
     {{"user_display", IdentifierQuotingRule::UserDisplay},
      {"when_necessary", IdentifierQuotingRule::WhenNecessary},
      {"always", IdentifierQuotingRule::Always}})
+
+IMPLEMENT_SETTING_ENUM(DatabaseIcebergCatalogType, ErrorCodes::BAD_ARGUMENTS,
+                       {{"rest", DatabaseIcebergCatalogType::REST}})
+
 }

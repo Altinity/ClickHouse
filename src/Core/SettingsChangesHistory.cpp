@@ -59,6 +59,18 @@ static std::initializer_list<std::pair<ClickHouseVersion, SettingsChangesHistory
 {
     {"24.12",
         {
+            {"allow_experimental_database_iceberg", false, false, "New setting."},
+            {"query_plan_join_swap_table", "false", "auto", "New setting. Right table was always chosen before."},
+            {"max_size_to_preallocate_for_aggregation", 100'000'000, 1'000'000'000'000, "Enable optimisation for bigger tables."},
+            {"max_size_to_preallocate_for_joins", 100'000'000, 1'000'000'000'000, "Enable optimisation for bigger tables."},
+            {"max_bytes_ratio_before_external_group_by", 0., 0., "New setting."},
+            {"optimize_extract_common_expressions", false, false, "Introduce setting to optimize WHERE, PREWHERE, ON, HAVING and QUALIFY expressions by extracting common expressions out from disjunction of conjunctions."},
+            {"object_storage_remove_recursive_file_limit", 0, 1000, "Added new setting to limit number of files stored in memory while removing from object storage. Zero value means unlimited."},
+            {"max_bytes_ratio_before_external_sort", 0., 0., "New setting."},
+            {"use_async_executor_for_materialized_views", false, false, "New setting."},
+            {"composed_data_type_output_format_mode", "default", "default", "New setting"},
+            {"http_response_headers", "", "", "New setting."},
+            {"parallel_replicas_index_analysis_only_on_coordinator", true, true, "Index analysis done only on replica-coordinator and skipped on other replicas. Effective only with enabled parallel_replicas_local_plan"}, // enabling it was moved to 24.10
         }
     },
     {"24.11",

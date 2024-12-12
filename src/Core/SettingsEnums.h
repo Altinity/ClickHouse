@@ -360,4 +360,11 @@ enum class GroupArrayActionWhenLimitReached : uint8_t
 };
 DECLARE_SETTING_ENUM(GroupArrayActionWhenLimitReached)
 
+enum class DatabaseIcebergCatalogType : uint8_t
+{
+    REST,
+};
+
+DECLARE_SETTING_ENUM(DatabaseIcebergCatalogType)
+
 }
