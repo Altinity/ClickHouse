@@ -75,6 +75,7 @@ static std::initializer_list<std::pair<ClickHouseVersion, SettingsChangesHistory
     },
     {"24.8",
         {
+	    {"input_format_parquet_bloom_filter_push_down", false, true, "When reading Parquet files, skip whole row groups based on the WHERE/PREWHERE expressions and bloom filter in the Parquet metadata."},
             {"enable_named_columns_in_function_tuple", false, false, "Retroactively disabled by default due to critical bugs."},
             {"rows_before_aggregation", false, false, "Provide exact value for rows_before_aggregation statistic, represents the number of rows read before aggregation"},
             {"restore_replace_external_table_functions_to_null", false, false, "New setting."},
