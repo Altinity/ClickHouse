@@ -320,7 +320,7 @@ private:
 class ParquetFileMetaDataCache : public CacheBase<String, parquet::FileMetaData>
 {
 public:
-    static ParquetFileMetaDataCache *  instance(UInt64 max_cache_entries);
+    static ParquetFileMetaDataCache&  instance(UInt64 max_cache_entries);
     void clear() {}
 
 private:

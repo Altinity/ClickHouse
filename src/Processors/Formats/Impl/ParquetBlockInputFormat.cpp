@@ -437,13 +437,9 @@ static std::vector<Range> getHyperrectangleForRowGroup(const parquet::FileMetaDa
 ParquetFileMetaDataCache::ParquetFileMetaDataCache(UInt64 max_cache_entries)
     : CacheBase(max_cache_entries) {}
 
-ParquetFileMetaDataCache *  ParquetFileMetaDataCache::instance(UInt64 max_cache_entries)
+ParquetFileMetaDataCache& ParquetFileMetaDataCache::instance(UInt64 max_cache_entries)
 {
-    static ParquetFileMetaDataCache * instance = nullptr;
-    static std::once_flag once;
-    std::call_once(once, [&] {
-        instance = new ParquetFileMetaDataCache(max_cache_entries);
-    });
+    static ParquetFileMetaDataCache instance(max_cache_entries);
     return instance;
 }
 
@@ -473,19 +469,25 @@ ParquetBlockInputFormat::~ParquetBlockInputFormat()
 
 std::shared_ptr<parquet::FileMetaData> ParquetBlockInputFormat::getFileMetaData()
 {
-    if (!metadata_cache.use_cache || !metadata_cache.key.length())
+    if (!metadata_cache.use_cache)
+    {
+        return parquet::ReadMetaData(arrow_file);
+    }
+
+    if (!metadata_cache.key.length())
     {
         ProfileEvents::increment(ProfileEvents::ParquetMetaDataCacheMisses);
         return parquet::ReadMetaData(arrow_file);
     }
 
-    auto [parquet_file_metadata, loaded] = ParquetFileMetaDataCache::instance(metadata_cache.max_entries)->getOrSet(
+    auto [parquet_file_metadata, loaded] = ParquetFileMetaDataCache::instance(metadata_cache.max_entries).getOrSet(
         metadata_cache.key,
         [this]()
         {
             return parquet::ReadMetaData(arrow_file);
         }
     );
+
     if (loaded)
         ProfileEvents::increment(ProfileEvents::ParquetMetaDataCacheMisses);
     else
