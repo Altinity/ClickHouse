@@ -251,6 +251,7 @@ class ClickHouseVersion:
 
 ClickHouseVersions = List[ClickHouseVersion]
 
+
 def validate_version(version: str) -> None:
     # NOTE(vnemkov): minor but important fixes, so versions with 'flavour' are threated as valid (e.g. 22.8.8.4.altinitystable)
     parts = version.split(".")

@@ -10,10 +10,10 @@ SET(VERSION_GITHASH e28553d4f2ba78643f9ef47b698954a2c54e6bcc)
 
 #1000 for altinitystable candidates
 #2000 for altinityedge candidates
-SET(VERSION_TWEAK 181000)
-SET(VERSION_FLAVOUR altinitystable)
+SET(VERSION_TWEAK 182000)
+SET(VERSION_FLAVOUR altinityedge)
 
-SET(VERSION_DESCRIBE v24.8.8.181000.altinitystable)
-SET(VERSION_STRING 24.8.8.181000.altinitystable)
+SET(VERSION_DESCRIBE v24.8.8.182000.altinityedge)
+SET(VERSION_STRING 24.8.8.182000)
 
 # end of autochange
