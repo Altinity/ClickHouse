@@ -190,7 +190,7 @@ jobs:
       - name: Builds report
         run: |
           cd "$GITHUB_WORKSPACE/tests/ci"
-          python3 ./build_report_check.py --reports package_release package_aarch64 package_asan package_msan package_ubsan package_tsan package_debug binary_darwin binary_darwin_aarch64
+          python3 ./build_report_check.py --reports package_release package_aarch64 package_asan package_msan package_ubsan package_tsan package_debug
       - name: Set status
         # NOTE(vnemkov): generate and upload the report even if previous step failed
         if: success() || failure()
@@ -547,7 +547,7 @@ jobs:
       - RegressionTestsRelease
       - RegressionTestsAarch64
       - SignRelease
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cax11, altinity-image-arm-system-ubuntu-22.04]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cax11, altinity-image-arm-snapshot-22.04-arm, altinity-startup-snapshot, altinity-setup-none]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6

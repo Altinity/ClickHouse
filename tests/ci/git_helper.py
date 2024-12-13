@@ -11,6 +11,20 @@ from typing import Any, List, Literal, Optional
 
 logger = logging.getLogger(__name__)
 
+class VersionType:
+    LTS = "lts"
+    NEW = "new"
+    PRESTABLE = "altinityedge"
+    STABLE = "altinitystable"
+    TESTING = "altinitytest"
+
+    VALID = (NEW, TESTING, PRESTABLE, STABLE, LTS,
+            # NOTE (vnemkov): we don't use those directly, but it is used in unit-tests
+             "stable",
+             "prestable",
+             "testing",
+            )
+
 # ^ and $ match subline in `multiple\nlines`
 # \A and \Z match only start and end of the whole string
 # NOTE (vnemkov): support both upstream tag style: v22.x.y.z-lts and Altinity tag style: v22.x.y.z.altinitystable
@@ -19,7 +33,7 @@ RELEASE_BRANCH_REGEXP = r"\A\d+[.]\d+\Z"
 TAG_REGEXP = (
     r"\Av\d{2}"  # First two digits of major part
     r"([.][1-9]\d*){3}"  # minor.patch.tweak parts
-    r"-(new|testing|prestable|stable|lts|altinitystable|altinityedge)\Z"  # suffix with a version type
+    fr"[.-]({'|'.join(VersionType.VALID)})\Z"  # suffix with a version type
 )
 SHA_REGEXP = re.compile(r"\A([0-9]|[a-f]){40}\Z")
 
