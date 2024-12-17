@@ -26,6 +26,7 @@
 #include <Processors/Formats/Impl/AvroRowInputFormat.h>
 #include <Storages/ObjectStorage/DataLakes/IcebergMetadata.h>
 #include <Storages/ObjectStorage/DataLakes/Common.h>
+#include <Storages/ObjectStorage/StorageObjectStorageSource.h>
 
 #include <Poco/JSON/Array.h>
 #include <Poco/JSON/Object.h>
@@ -384,12 +385,9 @@ IcebergMetadata::create(ObjectStoragePtr object_storage, ConfigurationObserverPt
 
     const auto [metadata_version, metadata_file_path] = getMetadataFileAndVersion(object_storage, *configuration_ptr);
 
-    auto log = getLogger("IcebergMetadata");
-    LOG_DEBUG(log, "Parse metadata {}", metadata_file_path);
-
-    StorageObjectStorageSource::ObjectInfo object_info(metadata_file_path);
-    auto buf = StorageObjectStorageSource::createReadBuffer(object_info, object_storage, local_context, log);
-
+    LOG_DEBUG(getLogger("IcebergMetadata"), "Parse metadata {}", metadata_file_path);
+    auto read_settings = local_context->getReadSettings();
+    auto buf = object_storage->readObject(StoredObject(metadata_file_path), read_settings);
     String json_str;
     readJSONObjectPossiblyInvalid(json_str, *buf);
 
