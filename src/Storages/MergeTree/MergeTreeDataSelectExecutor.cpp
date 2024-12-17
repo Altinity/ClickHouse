@@ -271,9 +271,9 @@ MergeTreeDataSelectSamplingData MergeTreeDataSelectExecutor::getSampling(
         */
 
     const bool can_use_sampling_key_parallel_replicas =
-        settings[Setting::allow_experimental_parallel_reading_from_replicas] > 0
-        && settings[Setting::max_parallel_replicas] > 1
-        && settings[Setting::parallel_replicas_mode] == ParallelReplicasMode::SAMPLING_KEY;
+        settings.allow_experimental_parallel_reading_from_replicas > 0
+        && settings.max_parallel_replicas > 1
+        && settings.parallel_replicas_mode == ParallelReplicasMode::SAMPLING_KEY;
 
     /// Parallel replicas has been requested but there is no way to sample data.
     /// Select all data from first replica and no data from other replicas.
