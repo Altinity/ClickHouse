@@ -360,7 +360,7 @@ void Session::authenticate(const Credentials & credentials_, const Poco::Net::So
         LOG_DEBUG(log, "{} Authenticated with global context as user {}",
                 toString(auth_id), toString(*user_id));
 
-        if (!external_roles_.empty() && global_context->getSettingsRef()[Setting::push_external_roles_in_interserver_queries])
+        if (!external_roles_.empty() && global_context->getSettingsRef().push_external_roles_in_interserver_queries)
         {
             external_roles = global_context->getAccessControl().find<Role>(external_roles_);
 
