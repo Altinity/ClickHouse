@@ -467,18 +467,24 @@ ParquetBlockInputFormat::~ParquetBlockInputFormat()
         pool->wait();
 }
 
+std::shared_ptr<parquet::FileMetaData> ParquetBlockInputFormat::readMetadataFromFile()
+{
+    createArrowFileIfNotCreated();
+    return parquet::ReadMetaData(arrow_file);
+}
+
 std::shared_ptr<parquet::FileMetaData> ParquetBlockInputFormat::getFileMetaData()
 {
     if (!metadata_cache.use_cache || !metadata_cache.key.length())
     {
-        return parquet::ReadMetaData(arrow_file);
+        return readMetadataFromFile();
     }
 
     auto [parquet_file_metadata, loaded] = ParquetFileMetaDataCache::instance(metadata_cache.max_entries)->getOrSet(
         metadata_cache.key,
-        [this]()
+        [&]()
         {
-            return parquet::ReadMetaData(arrow_file);
+            return readMetadataFromFile();
         }
     );
     if (loaded)
@@ -488,15 +494,23 @@ std::shared_ptr<parquet::FileMetaData> ParquetBlockInputFormat::getFileMetaData(
     return parquet_file_metadata;
 }
 
-void ParquetBlockInputFormat::initializeIfNeeded()
+void ParquetBlockInputFormat::createArrowFileIfNotCreated()
 {
-    if (std::exchange(is_initialized, true))
+    if (arrow_file)
+    {
         return;
+    }
 
     // Create arrow file adapter.
     // TODO: Make the adapter do prefetching on IO threads, based on the full set of ranges that
     //       we'll need to read (which we know in advance). Use max_download_threads for that.
     arrow_file = asArrowFile(*in, format_settings, is_stopped, "Parquet", PARQUET_MAGIC_BYTES, /* avoid_buffering */ true);
+}
+
+void ParquetBlockInputFormat::initializeIfNeeded()
+{
+    if (std::exchange(is_initialized, true))
+        return;
 
     if (is_stopped)
         return;
@@ -532,6 +546,8 @@ void ParquetBlockInputFormat::initializeIfNeeded()
         return std::min(std::max(preferred_num_rows, MIN_ROW_NUM), static_cast<size_t>(format_settings.parquet.max_block_size));
     };
 
+    bool has_row_groups_to_read = false;
+
     for (int row_group = 0; row_group < num_row_groups; ++row_group)
     {
         if (skip_row_groups.contains(row_group))
@@ -553,6 +569,12 @@ void ParquetBlockInputFormat::initializeIfNeeded()
         row_group_batches.back().total_bytes_compressed += metadata->RowGroup(row_group)->total_compressed_size();
         auto rows = adaptive_chunk_size(row_group);
         row_group_batches.back().adaptive_chunk_size = rows ? rows : format_settings.parquet.max_block_size;
+        has_row_groups_to_read = true;
+    }
+
+    if (has_row_groups_to_read)
+    {
+        createArrowFileIfNotCreated();
     }
 }
 
@@ -884,8 +906,8 @@ const BlockMissingValues & ParquetBlockInputFormat::getMissingValues() const
 void ParquetBlockInputFormat::setStorageRelatedUniqueKey(const Settings & settings, const String & key_)
 {
     metadata_cache.key = key_;
-    metadata_cache.use_cache = settings.parquet_use_metadata_cache;
-    metadata_cache.max_entries = settings.parquet_metadata_cache_max_entries;
+    metadata_cache.use_cache = settings.input_format_parquet_use_metadata_cache;
+    metadata_cache.max_entries = settings.input_format_parquet_metadata_cache_max_entries;
 }
 
 

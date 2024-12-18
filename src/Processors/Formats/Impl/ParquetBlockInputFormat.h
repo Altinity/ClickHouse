@@ -86,6 +86,9 @@ private:
 
     void threadFunction(size_t row_group_batch_idx);
 
+    void createArrowFileIfNotCreated();
+    std::shared_ptr<parquet::FileMetaData> readMetadataFromFile();
+
     std::shared_ptr<parquet::FileMetaData> getFileMetaData();
 
     // Data layout in the file:
