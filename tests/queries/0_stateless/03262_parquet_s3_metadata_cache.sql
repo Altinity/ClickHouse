@@ -10,11 +10,11 @@ INSERT INTO t_parquet_03262 SELECT number FROM numbers(10) SETTINGS s3_truncate_
 
 SELECT COUNT(*)
 FROM s3(s3_conn, filename = 'test_03262_*', format = Parquet)
-SETTINGS parquet_use_metadata_cache=1;
+SETTINGS input_format_parquet_use_metadata_cache=1;
 
 SELECT COUNT(*)
 FROM s3(s3_conn, filename = 'test_03262_*', format = Parquet)
-SETTINGS parquet_use_metadata_cache=1,custom_x='test03262';
+SETTINGS input_format_parquet_use_metadata_cache=1,custom_x='test03262';
 
 SYSTEM FLUSH LOGS;
 
