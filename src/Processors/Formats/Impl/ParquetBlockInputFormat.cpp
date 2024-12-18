@@ -439,12 +439,8 @@ ParquetFileMetaDataCache::ParquetFileMetaDataCache(UInt64 max_cache_entries)
 
 ParquetFileMetaDataCache *  ParquetFileMetaDataCache::instance(UInt64 max_cache_entries)
 {
-    static ParquetFileMetaDataCache * instance = nullptr;
-    static std::once_flag once;
-    std::call_once(once, [&] {
-        instance = new ParquetFileMetaDataCache(max_cache_entries);
-    });
-    return instance;
+    static ParquetFileMetaDataCache instance(max_cache_entries);
+    return &instance;
 }
 
 ParquetBlockInputFormat::ParquetBlockInputFormat(
@@ -475,7 +471,6 @@ std::shared_ptr<parquet::FileMetaData> ParquetBlockInputFormat::getFileMetaData(
 {
     if (!metadata_cache.use_cache || !metadata_cache.key.length())
     {
-        ProfileEvents::increment(ProfileEvents::ParquetMetaDataCacheMisses);
         return parquet::ReadMetaData(arrow_file);
     }
 
