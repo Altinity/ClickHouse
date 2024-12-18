@@ -14,13 +14,13 @@ SETTINGS input_format_parquet_use_metadata_cache=1;
 
 SELECT COUNT(*)
 FROM s3(s3_conn, filename = 'test_03262_*', format = Parquet)
-SETTINGS input_format_parquet_use_metadata_cache=1,custom_x='test03262';
+SETTINGS input_format_parquet_use_metadata_cache=1, log_comment='test_03262_parquet_metadata_cache';
 
 SYSTEM FLUSH LOGS;
 
 SELECT ProfileEvents['ParquetMetaDataCacheHits']
 FROM system.query_log
-where query like '%test03262%'
+where log_comment = 'test_03262_parquet_metadata_cache'
 AND type = 'QueryFinish'
 ORDER BY event_time desc
 LIMIT 1;
