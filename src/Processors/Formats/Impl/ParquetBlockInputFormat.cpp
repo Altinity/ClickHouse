@@ -475,7 +475,10 @@ std::shared_ptr<parquet::FileMetaData> ParquetBlockInputFormat::readMetadataFrom
 
 std::shared_ptr<parquet::FileMetaData> ParquetBlockInputFormat::getFileMetaData()
 {
-    if (!metadata_cache.use_cache || !metadata_cache.key.length())
+    // in-memory cache is not implemented for local file operations, only for remote files
+    // there is a chance the user sets `input_format_parquet_use_metadata_cache=1` for a local file operation
+    // and the cache_key won't be set. Therefore, we also need to check for metadata_cache.key
+    if (!metadata_cache.use_cache || metadata_cache.key.empty())
     {
         return readMetadataFromFile();
     }
