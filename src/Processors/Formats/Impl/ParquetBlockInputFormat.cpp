@@ -3,6 +3,9 @@
 
 #if USE_PARQUET
 
+#include <Core/Settings.h>
+#include <Core/ServerSettings.h>
+#include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 #include <Common/ThreadPool.h>
 #include <Formats/FormatFactory.h>
@@ -32,6 +35,12 @@ namespace CurrentMetrics
     extern const Metric ParquetDecoderThreads;
     extern const Metric ParquetDecoderThreadsActive;
     extern const Metric ParquetDecoderThreadsScheduled;
+}
+
+namespace ProfileEvents
+{
+    extern const Event ParquetMetaDataCacheHits;
+    extern const Event ParquetMetaDataCacheMisses;
 }
 
 namespace DB
@@ -426,6 +435,15 @@ static std::vector<Range> getHyperrectangleForRowGroup(const parquet::FileMetaDa
     return hyperrectangle;
 }
 
+ParquetFileMetaDataCache::ParquetFileMetaDataCache(UInt64 max_cache_entries)
+    : CacheBase(max_cache_entries) {}
+
+ParquetFileMetaDataCache *  ParquetFileMetaDataCache::instance(UInt64 max_cache_entries)
+{
+    static ParquetFileMetaDataCache instance(max_cache_entries);
+    return &instance;
+}
+
 ParquetBlockInputFormat::ParquetBlockInputFormat(
     ReadBuffer & buf,
     const Block & header_,
@@ -450,20 +468,58 @@ ParquetBlockInputFormat::~ParquetBlockInputFormat()
         pool->wait();
 }
 
-void ParquetBlockInputFormat::initializeIfNeeded()
+std::shared_ptr<parquet::FileMetaData> ParquetBlockInputFormat::readMetadataFromFile()
 {
-    if (std::exchange(is_initialized, true))
+    createArrowFileIfNotCreated();
+    return parquet::ReadMetaData(arrow_file);
+}
+
+std::shared_ptr<parquet::FileMetaData> ParquetBlockInputFormat::getFileMetaData()
+{
+    // in-memory cache is not implemented for local file operations, only for remote files
+    // there is a chance the user sets `input_format_parquet_use_metadata_cache=1` for a local file operation
+    // and the cache_key won't be set. Therefore, we also need to check for metadata_cache.key
+    if (!metadata_cache.use_cache || metadata_cache.key.empty())
+    {
+        return readMetadataFromFile();
+    }
+
+    auto [parquet_file_metadata, loaded] = ParquetFileMetaDataCache::instance(metadata_cache.max_entries)->getOrSet(
+        metadata_cache.key,
+        [&]()
+        {
+            return readMetadataFromFile();
+        }
+    );
+    if (loaded)
+        ProfileEvents::increment(ProfileEvents::ParquetMetaDataCacheMisses);
+    else
+        ProfileEvents::increment(ProfileEvents::ParquetMetaDataCacheHits);
+    return parquet_file_metadata;
+}
+
+void ParquetBlockInputFormat::createArrowFileIfNotCreated()
+{
+    if (arrow_file)
+    {
         return;
+    }
 
     // Create arrow file adapter.
     // TODO: Make the adapter do prefetching on IO threads, based on the full set of ranges that
     //       we'll need to read (which we know in advance). Use max_download_threads for that.
     arrow_file = asArrowFile(*in, format_settings, is_stopped, "Parquet", PARQUET_MAGIC_BYTES, /* avoid_buffering */ true);
+}
+
+void ParquetBlockInputFormat::initializeIfNeeded()
+{
+    if (std::exchange(is_initialized, true))
+        return;
 
     if (is_stopped)
         return;
 
-    metadata = parquet::ReadMetaData(arrow_file);
+    metadata = getFileMetaData();
 
     std::shared_ptr<arrow::Schema> schema;
     THROW_ARROW_NOT_OK(parquet::arrow::FromParquetSchema(metadata->schema(), &schema));
@@ -494,6 +550,8 @@ void ParquetBlockInputFormat::initializeIfNeeded()
         return std::min(std::max(preferred_num_rows, MIN_ROW_NUM), static_cast<size_t>(format_settings.parquet.max_block_size));
     };
 
+    bool has_row_groups_to_read = false;
+
     for (int row_group = 0; row_group < num_row_groups; ++row_group)
     {
         if (skip_row_groups.contains(row_group))
@@ -515,6 +573,12 @@ void ParquetBlockInputFormat::initializeIfNeeded()
         row_group_batches.back().total_bytes_compressed += metadata->RowGroup(row_group)->total_compressed_size();
         auto rows = adaptive_chunk_size(row_group);
         row_group_batches.back().adaptive_chunk_size = rows ? rows : format_settings.parquet.max_block_size;
+        has_row_groups_to_read = true;
+    }
+
+    if (has_row_groups_to_read)
+    {
+        createArrowFileIfNotCreated();
     }
 }
 
@@ -842,6 +906,14 @@ const BlockMissingValues & ParquetBlockInputFormat::getMissingValues() const
 {
     return previous_block_missing_values;
 }
+
+void ParquetBlockInputFormat::setStorageRelatedUniqueKey(const ServerSettings & server_settings, const Settings & settings, const String & key_)
+{
+    metadata_cache.key = key_;
+    metadata_cache.use_cache = settings.input_format_parquet_use_metadata_cache;
+    metadata_cache.max_entries = server_settings.input_format_parquet_metadata_cache_max_entries;
+}
+
 
 ParquetSchemaReader::ParquetSchemaReader(ReadBuffer & in_, const FormatSettings & format_settings_)
     : ISchemaReader(in_), format_settings(format_settings_)
