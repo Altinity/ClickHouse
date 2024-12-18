@@ -66,7 +66,7 @@ public:
 
     size_t getApproxBytesReadForChunk() const override { return previous_approx_bytes_read_for_chunk; }
 
-    void setStorageRelatedUniqueKey(const Settings & settings, const String & key_) override;
+    void setStorageRelatedUniqueKey(const ServerSettings & server_settings, const Settings & settings, const String & key_) override;
 
 private:
     Chunk read() override;

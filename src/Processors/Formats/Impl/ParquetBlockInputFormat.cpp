@@ -4,6 +4,7 @@
 #if USE_PARQUET
 
 #include <Core/Settings.h>
+#include <Core/ServerSettings.h>
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 #include <Common/ThreadPool.h>
@@ -906,11 +907,11 @@ const BlockMissingValues & ParquetBlockInputFormat::getMissingValues() const
     return previous_block_missing_values;
 }
 
-void ParquetBlockInputFormat::setStorageRelatedUniqueKey(const Settings & settings, const String & key_)
+void ParquetBlockInputFormat::setStorageRelatedUniqueKey(const ServerSettings & server_settings, const Settings & settings, const String & key_)
 {
     metadata_cache.key = key_;
     metadata_cache.use_cache = settings.input_format_parquet_use_metadata_cache;
-    metadata_cache.max_entries = settings.input_format_parquet_metadata_cache_max_entries;
+    metadata_cache.max_entries = server_settings.input_format_parquet_metadata_cache_max_entries;
 }
 
 
