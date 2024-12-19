@@ -1497,6 +1497,10 @@ void TCPHandler::receiveHello()
     if (is_ssh_based_auth)
         user.erase(0, std::string_view(EncodedUserInfo::SSH_KEY_AUTHENTICAION_MARKER).size());
 
+    is_jwt_based_auth = user.starts_with(EncodedUserInfo::JWT_AUTHENTICAION_MARKER);
+    if (is_jwt_based_auth)
+        user.erase(0, std::string_view(EncodedUserInfo::JWT_AUTHENTICAION_MARKER).size());
+
     session = makeSession();
     const auto & client_info = session->getClientInfo();
 
@@ -1572,6 +1576,13 @@ void TCPHandler::receiveHello()
         return;
     }
 #endif
+
+    if (is_jwt_based_auth)
+    {
+        auto cred = JWTCredentials(password);
+        session->authenticate(cred, getClientAddress(client_info));
+        return;
+    }
 
     session->authenticate(user, password, getClientAddress(client_info));
 }
