@@ -199,6 +199,7 @@ ClickHouse will look for a JWT token in (by priority):
 
 ### Passing session settings {#passing-session-settings}
 
-If `settings_key` exists in the `jwt_validators` section or exists in the verifier section and the payload contains a sub-object of that `settings_key`, ClickHouse will attempt to parse its key:value pairs as string values ​​and set them as session settings for the currently authenticated user. If parsing fails, the JWT payload will be ignored.
+If `settings_key` is defined in the `jwt_validators` section or defined under validator section, then it is possible to pass session settings in JWT.  
+If JWT payload contains a claim `settings_key`, ClickHouse will attempt to parse its key:value pairs as string values ​​and set them as session settings for the currently authenticated user. If parsing fails, settings will be ignored.
 
-The `settings_key` in the verifier section takes precedence over the `settings_key` from the `jwt_validators` section. If `settings_key` in the verifier section does not exist, the `settings_key` from the `jwt_validators` section will be used.
+The `settings_key` in the validator section takes precedence over the `settings_key` from the `jwt_validators` section. If `settings_key` in the validator section does not exist, the `settings_key` from the `jwt_validators` section will be used.
