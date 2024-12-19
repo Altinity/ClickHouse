@@ -110,7 +110,7 @@ bool Authentication::areCredentialsValid(
                 throw Authentication::Require<BasicCredentials>("ClickHouse Basic Authentication");
 
             case AuthenticationType::JWT:
-                throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "JWT is available only in ClickHouse Cloud");
+                throw Authentication::Require<JWTCredentials>("JWT Authentication");
 
             case AuthenticationType::KERBEROS:
                 return external_authenticators.checkKerberosCredentials(auth_data.getKerberosRealm(), *gss_acceptor_context);
@@ -154,7 +154,7 @@ bool Authentication::areCredentialsValid(
                 throw Authentication::Require<BasicCredentials>("ClickHouse X.509 Authentication");
 
             case AuthenticationType::JWT:
-                throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "JWT is available only in ClickHouse Cloud");
+                throw Authentication::Require<JWTCredentials>("JWT Authentication");
 
             case AuthenticationType::SSH_KEY:
 #if USE_SSH
@@ -201,7 +201,7 @@ bool Authentication::areCredentialsValid(
 #endif
 
             case AuthenticationType::JWT:
-                throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "JWT is available only in ClickHouse Cloud");
+                throw Authentication::Require<JWTCredentials>("JWT Authentication");
 
             case AuthenticationType::BCRYPT_PASSWORD:
                 return checkPasswordBcrypt(basic_credentials->getPassword(), auth_data.getPasswordHashBinary());
@@ -233,7 +233,7 @@ bool Authentication::areCredentialsValid(
                 throw Authentication::Require<BasicCredentials>("ClickHouse Basic Authentication");
 
             case AuthenticationType::JWT:
-                throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "JWT is available only in ClickHouse Cloud");
+                throw Authentication::Require<JWTCredentials>("JWT Authentication");
 
             case AuthenticationType::KERBEROS:
                 throw Authentication::Require<GSSAcceptorContext>(auth_data.getKerberosRealm());
@@ -276,7 +276,7 @@ bool Authentication::areCredentialsValid(
                 throw Authentication::Require<BasicCredentials>("ClickHouse Basic Authentication");
 
             case AuthenticationType::JWT:
-                throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "JWT is available only in ClickHouse Cloud");
+                throw Authentication::Require<JWTCredentials>("JWT Authentication");
 
             case AuthenticationType::KERBEROS:
                 throw Authentication::Require<GSSAcceptorContext>(auth_data.getKerberosRealm());
@@ -294,7 +294,8 @@ bool Authentication::areCredentialsValid(
 
     if (const auto * jwt_credentials = typeid_cast<const JWTCredentials *>(&credentials))
     {
-        return external_authenticators.checkJWTCredentials(auth_data.getJWTClaims(), *jwt_credentials, settings);
+        return auth_data.getType() == AuthenticationType::JWT
+            && external_authenticators.checkJWTCredentials(auth_data.getJWTClaims(), *jwt_credentials, settings);
     }
 
     if ([[maybe_unused]] const auto * always_allow_credentials = typeid_cast<const AlwaysAllowCredentials *>(&credentials))
