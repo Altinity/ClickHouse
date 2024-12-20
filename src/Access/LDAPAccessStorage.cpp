@@ -26,7 +26,6 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
 }
 
-
 LDAPAccessStorage::LDAPAccessStorage(const String & storage_name_, AccessControl & access_control_, const Poco::Util::AbstractConfiguration & config, const String & prefix)
     : IAccessStorage(storage_name_), access_control(access_control_), memory_storage(storage_name_, access_control.getChangesNotifier(), false)
 {
@@ -191,8 +190,8 @@ void LDAPAccessStorage::applyRoleChangeNoLock(bool grant, const UUID & role_id, 
     }
     else
     {
-        granted_role_names.erase(role_id);
         granted_role_ids.erase(role_name);
+        granted_role_names.erase(role_id);
     }
 }
 
@@ -319,6 +318,10 @@ void LDAPAccessStorage::updateAssignedRolesNoLock(const UUID & id, const String 
 std::set<String> LDAPAccessStorage::mapExternalRolesNoLock(const LDAPClient::SearchResultsList & external_roles) const
 {
     std::set<String> role_names;
+
+    // If this node can't access LDAP server (or has not privileges to fetch roles) and gets empty list of external roles
+    if (external_roles.empty())
+        return role_names;
 
     if (external_roles.size() != role_search_params.size())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unable to map external roles");

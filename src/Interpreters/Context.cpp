@@ -1370,7 +1370,7 @@ ConfigurationPtr Context::getUsersConfig()
     return shared->users_config;
 }
 
-void Context::setUser(const UUID & user_id_)
+void Context::setUser(const UUID & user_id_, const std::vector<UUID> & external_roles_)
 {
     /// Prepare lists of user's profiles, constraints, settings, roles.
     /// NOTE: AccessControl::read<User>() and other AccessControl's functions may require some IO work,
@@ -1385,7 +1385,6 @@ void Context::setUser(const UUID & user_id_)
     const auto & database = user->default_database;
 
     /// Apply user's profiles, constraints, settings, roles.
-
     std::lock_guard lock(mutex);
 
     setUserIDWithLock(user_id_, lock);
@@ -1395,6 +1394,7 @@ void Context::setUser(const UUID & user_id_)
     setCurrentProfilesWithLock(*enabled_profiles, /* check_constraints= */ false, lock);
 
     setCurrentRolesWithLock(default_roles, lock);
+    setExternalRolesWithLock(external_roles_, lock);
 
     /// It's optional to specify the DEFAULT DATABASE in the user's definition.
     if (!database.empty())
@@ -1436,6 +1436,18 @@ void Context::setCurrentRolesWithLock(const std::vector<UUID> & new_current_role
     else
         current_roles = std::make_shared<std::vector<UUID>>(new_current_roles);
     need_recalculate_access = true;
+}
+
+void Context::setExternalRolesWithLock(const std::vector<UUID> & new_external_roles, const std::lock_guard<ContextSharedMutex> &)
+{
+    if (!new_external_roles.empty())
+    {
+        if (current_roles)
+            current_roles->insert(current_roles->end(), new_external_roles.begin(), new_external_roles.end());
+        else
+            current_roles = std::make_shared<std::vector<UUID>>(new_external_roles);
+        need_recalculate_access = true;
+    }
 }
 
 void Context::setCurrentRolesImpl(const std::vector<UUID> & new_current_roles, bool throw_if_not_granted, bool skip_if_not_granted, const std::shared_ptr<const User> & user)
@@ -1551,7 +1563,8 @@ std::shared_ptr<const ContextAccessWrapper> Context::getAccess() const
         /// If setUserID() was never called then this must be the global context with the full access.
         bool full_access = !user_id;
 
-        return ContextAccessParams{user_id, full_access, /* use_default_roles= */ false, current_roles, *settings, current_database, client_info};
+        return ContextAccessParams{
+            user_id, full_access, /* use_default_roles= */ false, current_roles, external_roles, *settings, current_database, client_info};
     };
 
     /// Check if the current access rights are still valid, otherwise get parameters for recalculating access rights.
@@ -5603,24 +5616,13 @@ std::shared_ptr<AsyncReadCounters> Context::getAsyncReadCounters() const
     return async_read_counters;
 }
 
-Context::ParallelReplicasMode Context::getParallelReplicasMode() const
-{
-    const auto & settings_ref = getSettingsRef();
-
-    using enum Context::ParallelReplicasMode;
-    if (!settings_ref.parallel_replicas_custom_key.value.empty())
-        return CUSTOM_KEY;
-
-    if (settings_ref.allow_experimental_parallel_reading_from_replicas > 0)
-        return READ_TASKS;
-
-    return SAMPLE_KEY;
-}
-
 bool Context::canUseTaskBasedParallelReplicas() const
 {
     const auto & settings_ref = getSettingsRef();
-    return getParallelReplicasMode() == ParallelReplicasMode::READ_TASKS && settings_ref.max_parallel_replicas > 1;
+
+    return settings_ref.allow_experimental_parallel_reading_from_replicas > 0
+        && settings_ref.parallel_replicas_mode == ParallelReplicasMode::READ_TASKS
+        && settings_ref.max_parallel_replicas > 1;
 }
 
 bool Context::canUseParallelReplicasOnInitiator() const
@@ -5635,7 +5637,15 @@ bool Context::canUseParallelReplicasOnFollower() const
 
 bool Context::canUseParallelReplicasCustomKey() const
 {
-    return settings->max_parallel_replicas > 1 && getParallelReplicasMode() == Context::ParallelReplicasMode::CUSTOM_KEY;
+    const auto & settings_ref = getSettingsRef();
+
+    const bool has_enough_servers = settings_ref.max_parallel_replicas > 1;
+    const bool parallel_replicas_enabled = settings_ref.allow_experimental_parallel_reading_from_replicas > 0;
+    const bool is_parallel_replicas_with_custom_key =
+        settings_ref.parallel_replicas_mode == ParallelReplicasMode::CUSTOM_KEY_SAMPLING ||
+        settings_ref.parallel_replicas_mode == ParallelReplicasMode::CUSTOM_KEY_RANGE;
+
+    return has_enough_servers && parallel_replicas_enabled && is_parallel_replicas_with_custom_key;
 }
 
 bool Context::canUseParallelReplicasCustomKeyForCluster(const Cluster & cluster) const
@@ -5645,8 +5655,23 @@ bool Context::canUseParallelReplicasCustomKeyForCluster(const Cluster & cluster)
 
 bool Context::canUseOffsetParallelReplicas() const
 {
-    return offset_parallel_replicas_enabled && settings->max_parallel_replicas > 1
-        && getParallelReplicasMode() != Context::ParallelReplicasMode::READ_TASKS;
+    const auto & settings_ref = getSettingsRef();
+
+    /**
+     * Offset parallel replicas algorithm is not only the one which relies on native SAMPLING KEY,
+     * but also those which rely on customer-provided "custom" key.
+     * We combine them together into one group for convenience.
+     */
+    const bool has_enough_servers = settings_ref.max_parallel_replicas > 1;
+    const bool parallel_replicas_enabled = settings_ref.allow_experimental_parallel_reading_from_replicas > 0;
+    const bool is_parallel_replicas_with_custom_key_or_native_sampling_key =
+        settings_ref.parallel_replicas_mode == ParallelReplicasMode::SAMPLING_KEY ||
+        settings_ref.parallel_replicas_mode == ParallelReplicasMode::CUSTOM_KEY_SAMPLING ||
+        settings_ref.parallel_replicas_mode == ParallelReplicasMode::CUSTOM_KEY_RANGE;
+    return offset_parallel_replicas_enabled &&
+           has_enough_servers &&
+           parallel_replicas_enabled &&
+           is_parallel_replicas_with_custom_key_or_native_sampling_key;
 }
 
 void Context::disableOffsetParallelReplicas()
