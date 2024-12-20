@@ -112,7 +112,7 @@ String extractSubjectFromToken(const String & token)
     }
     catch (...)
     {
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to validate jwt");
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to validate jwt: cannot extract `sub` claim");
     }
 }
 }
