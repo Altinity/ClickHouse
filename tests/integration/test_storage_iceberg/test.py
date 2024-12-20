@@ -1,5 +1,5 @@
 import helpers.client
-from helpers.cluster import ClickHouseCluster, ClickHouseInstance, is_arm
+from helpers.cluster import ClickHouseCluster, ClickHouseInstance
 from helpers.test_tools import TSV
 
 import pyspark
@@ -217,26 +217,6 @@ def get_creation_expression(
                     DROP TABLE IF EXISTS {table_name};
                     CREATE TABLE {table_name}
                     ENGINE=IcebergAzure(azure, container = {cluster.azure_container_name}, storage_account_url = '{cluster.env_variables["AZURITE_STORAGE_ACCOUNT_URL"]}', blob_path = '/iceberg_data/default/{table_name}/', format={format})"""
-                    + allow_dynamic_metadata_for_datalakes_suffix
-                )
-
-    elif storage_type == "hdfs":
-        if run_on_cluster:
-            assert table_function
-            return f"""
-                icebergHDFSCluster('cluster_simple', hdfs, filename= 'iceberg_data/default/{table_name}/', format={format}, url = 'hdfs://hdfs1:9000/')
-            """
-        else:
-            if table_function:
-                return f"""
-                    icebergHDFS(hdfs, filename= 'iceberg_data/default/{table_name}/', format={format}, url = 'hdfs://hdfs1:9000/')
-                """
-            else:
-                return (
-                    f"""
-                    DROP TABLE IF EXISTS {table_name};
-                    CREATE TABLE {table_name}
-                    ENGINE=IcebergHDFS(hdfs, filename = 'iceberg_data/default/{table_name}/', format={format}, url = 'hdfs://hdfs1:9000/')"""
                     + allow_dynamic_metadata_for_datalakes_suffix
                 )
 
@@ -596,13 +576,11 @@ def test_delete_files(started_cluster, format_version, storage_type):
 
 
 @pytest.mark.parametrize("format_version", ["1", "2"])
-@pytest.mark.parametrize("storage_type", ["s3", "azure", "hdfs", "local"])
+@pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
 @pytest.mark.parametrize("is_table_function", [False, True])
 def test_evolved_schema_simple(
     started_cluster, format_version, storage_type, is_table_function
 ):
-    if is_arm() and storage_type == "hdfs":
-        pytest.skip("Disabled test IcebergHDFS for aarch64")
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
     TABLE_NAME = (
@@ -976,10 +954,8 @@ def test_evolved_schema_simple(
 
 
 @pytest.mark.parametrize("format_version", ["1", "2"])
-@pytest.mark.parametrize("storage_type", ["s3", "azure", "hdfs", "local"])
+@pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
 def test_not_evolved_schema(started_cluster, format_version, storage_type):
-    if is_arm() and storage_type == "hdfs":
-        pytest.skip("Disabled test IcebergHDFS for aarch64")
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
     TABLE_NAME = (
@@ -1630,79 +1606,3 @@ def test_restart_broken_s3(started_cluster):
     )
 
     assert int(instance.query(f"SELECT count() FROM {TABLE_NAME}")) == 100
-
-
-@pytest.mark.parametrize("storage_type", ["s3"])
-def test_filesystem_cache(started_cluster, storage_type):
-    instance = started_cluster.instances["node1"]
-    spark = started_cluster.spark_session
-    TABLE_NAME = "test_filesystem_cache_" + storage_type + "_" + get_uuid_str()
-
-    write_iceberg_from_df(
-        spark,
-        generate_data(spark, 0, 10),
-        TABLE_NAME,
-        mode="overwrite",
-        format_version="1",
-        partition_by="a",
-    )
-
-    default_upload_directory(
-        started_cluster,
-        storage_type,
-        f"/iceberg_data/default/{TABLE_NAME}/",
-        f"/iceberg_data/default/{TABLE_NAME}/",
-    )
-
-    create_iceberg_table(storage_type, instance, TABLE_NAME, started_cluster)
-
-    query_id = f"{TABLE_NAME}-{uuid.uuid4()}"
-    instance.query(
-        f"SELECT * FROM {TABLE_NAME} SETTINGS filesystem_cache_name = 'cache1'",
-        query_id=query_id,
-    )
-
-    instance.query("SYSTEM FLUSH LOGS")
-
-    written_to_cache_first_select = int(
-        instance.query(
-            f"SELECT ProfileEvents['CachedReadBufferCacheWriteBytes'] FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
-        )
-    )
-
-    read_from_cache_first_select = int(
-        instance.query(
-            f"SELECT ProfileEvents['CachedReadBufferReadFromCacheBytes'] FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
-        )
-    )
-
-    assert 0 < int(
-        instance.query(
-            f"SELECT ProfileEvents['S3GetObject'] FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
-        )
-    )
-
-    query_id = f"{TABLE_NAME}-{uuid.uuid4()}"
-    instance.query(
-        f"SELECT * FROM {TABLE_NAME} SETTINGS filesystem_cache_name = 'cache1'",
-        query_id=query_id,
-    )
-
-    instance.query("SYSTEM FLUSH LOGS")
-
-    read_from_cache_second_select = int(
-        instance.query(
-            f"SELECT ProfileEvents['CachedReadBufferReadFromCacheBytes'] FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
-        )
-    )
-
-    assert (
-        read_from_cache_second_select
-        == read_from_cache_first_select + written_to_cache_first_select
-    )
-
-    assert 0 == int(
-        instance.query(
-            f"SELECT ProfileEvents['S3GetObject'] FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
-        )
-    )

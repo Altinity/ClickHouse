@@ -44,7 +44,7 @@ createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObject
     std::optional<FormatSettings> format_settings;
     if (args.storage_def->settings)
     {
-        FormatFactorySettings user_format_settings;
+        StorageObjectStorageSettings user_format_settings;
 
         // Apply changed settings from global context, but ignore the
         // unknown ones, because we only have the format settings here.
