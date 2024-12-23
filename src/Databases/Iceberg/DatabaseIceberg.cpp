@@ -353,7 +353,7 @@ void registerDatabaseIceberg(DatabaseFactory & factory)
             database_settings,
             database_engine_define->clone());
     };
-    factory.registerDatabase("Iceberg", create_fn/*, { .supports_arguments = true, .supports_settings = true }*/);
+    factory.registerDatabase("Iceberg", create_fn, { .supports_arguments = true, .supports_settings = true });
 }
 
 }
