@@ -350,11 +350,21 @@ DECLARE_SETTING_ENUM_WITH_RENAME(DateTimeOverflowBehavior, FormatSettings::DateT
 
 DECLARE_SETTING_ENUM(SQLSecurityType)
 
+DECLARE_SETTING_ENUM(IdentifierQuotingRule)
+DECLARE_SETTING_ENUM(IdentifierQuotingStyle)
+
 enum class GroupArrayActionWhenLimitReached : uint8_t
 {
     THROW,
     DISCARD
 };
 DECLARE_SETTING_ENUM(GroupArrayActionWhenLimitReached)
+
+enum class DatabaseIcebergCatalogType : uint8_t
+{
+    REST,
+};
+
+DECLARE_SETTING_ENUM(DatabaseIcebergCatalogType)
 
 }

@@ -59,6 +59,18 @@ static std::initializer_list<std::pair<ClickHouseVersion, SettingsChangesHistory
 {
     {"24.12",
         {
+            {"allow_experimental_database_iceberg", false, false, "New setting."},
+            {"query_plan_join_swap_table", "false", "auto", "New setting. Right table was always chosen before."},
+            {"max_size_to_preallocate_for_aggregation", 100'000'000, 1'000'000'000'000, "Enable optimisation for bigger tables."},
+            {"max_size_to_preallocate_for_joins", 100'000'000, 1'000'000'000'000, "Enable optimisation for bigger tables."},
+            {"max_bytes_ratio_before_external_group_by", 0., 0., "New setting."},
+            {"optimize_extract_common_expressions", false, false, "Introduce setting to optimize WHERE, PREWHERE, ON, HAVING and QUALIFY expressions by extracting common expressions out from disjunction of conjunctions."},
+            {"object_storage_remove_recursive_file_limit", 0, 1000, "Added new setting to limit number of files stored in memory while removing from object storage. Zero value means unlimited."},
+            {"max_bytes_ratio_before_external_sort", 0., 0., "New setting."},
+            {"use_async_executor_for_materialized_views", false, false, "New setting."},
+            {"composed_data_type_output_format_mode", "default", "default", "New setting"},
+            {"http_response_headers", "", "", "New setting."},
+            {"parallel_replicas_index_analysis_only_on_coordinator", true, true, "Index analysis done only on replica-coordinator and skipped on other replicas. Effective only with enabled parallel_replicas_local_plan"}, // enabling it was moved to 24.10
         }
     },
     {"24.11",
@@ -67,10 +79,29 @@ static std::initializer_list<std::pair<ClickHouseVersion, SettingsChangesHistory
     },
     {"24.10",
         {
+            {"mongodb_throw_on_unsupported_query", false, true, "New setting."},
+            {"enable_parallel_replicas", false, false, "Parallel replicas with read tasks became the Beta tier feature."},
+            {"parallel_replicas_mode", "read_tasks", "read_tasks", "This setting was introduced as a part of making parallel replicas feature Beta"},
+            {"show_create_query_identifier_quoting_rule", "when_necessary", "when_necessary", "New setting."},
+            {"show_create_query_identifier_quoting_style", "Backticks", "Backticks", "New setting."},
         }
     },
     {"24.9",
         {
+            {"output_format_orc_dictionary_key_size_threshold", 0.0, 0.0, "For a string column in ORC output format, if the number of distinct values is greater than this fraction of the total number of non-null rows, turn off dictionary encoding. Otherwise dictionary encoding is enabled"},
+            {"input_format_json_empty_as_default", false, false, "Added new setting to allow to treat empty fields in JSON input as default values."},
+            {"input_format_try_infer_variants", false, false, "Try to infer Variant type in text formats when there is more than one possible type for column/array elements"},
+            {"join_output_by_rowlist_perkey_rows_threshold", 0, 5, "The lower limit of per-key average rows in the right table to determine whether to output by row list in hash join."},
+            {"create_if_not_exists", false, false, "New setting."},
+            {"allow_materialized_view_with_bad_select", true, true, "Support (but not enable yet) stricter validation in CREATE MATERIALIZED VIEW"},
+            {"parallel_replicas_mark_segment_size", 128, 0, "Value for this setting now determined automatically"},
+            {"database_replicated_allow_replicated_engine_arguments", 1, 0, "Don't allow explicit arguments by default"},
+            {"database_replicated_allow_explicit_uuid", 0, 0, "Added a new setting to disallow explicitly specifying table UUID"},
+            {"parallel_replicas_local_plan", false, false, "Use local plan for local replica in a query with parallel replicas"},
+            {"join_to_sort_minimum_perkey_rows", 0, 40, "The lower limit of per-key average rows in the right table to determine whether to rerange the right table by key in left or inner join. This setting ensures that the optimization is not applied for sparse table keys"},
+            {"join_to_sort_maximum_table_rows", 0, 10000, "The maximum number of rows in the right table to determine whether to rerange the right table by key in left or inner join"},
+            {"allow_experimental_join_right_table_sorting", false, false, "If it is set to true, and the conditions of `join_to_sort_minimum_perkey_rows` and `join_to_sort_maximum_table_rows` are met, rerange the right table by key to improve the performance in left or inner hash join"},
+            {"mongodb_throw_on_unsupported_query", false, true, "New setting."},
         }
     },
     {"24.8",
@@ -92,7 +123,8 @@ static std::initializer_list<std::pair<ClickHouseVersion, SettingsChangesHistory
             {"use_json_alias_for_old_object_type", true, false, "Use JSON type alias to create new JSON type"},
             {"type_json_skip_duplicated_paths", false, false, "Allow to skip duplicated paths during JSON parsing"},
             {"allow_experimental_vector_similarity_index", false, false, "Added new setting to allow experimental vector similarity indexes"},
-            {"input_format_try_infer_datetimes_only_datetime64", true, false, "Allow to infer DateTime instead of DateTime64 in data formats"}
+            {"input_format_try_infer_datetimes_only_datetime64", true, false, "Allow to infer DateTime instead of DateTime64 in data formats"},
+            {"local_create_new_file_on_insert", false, false, "Enabled creating a new file on each insert in local object storage engine tables"}
         }
     },
     {"24.7",
@@ -104,6 +136,7 @@ static std::initializer_list<std::pair<ClickHouseVersion, SettingsChangesHistory
             {"input_format_native_decode_types_in_binary_format", false, false, "Added new setting to allow to read type names in binary format in Native output format"},
             {"read_in_order_use_buffering", false, true, "Use buffering before merging while reading in order of primary key"},
             {"enable_named_columns_in_function_tuple", false, false, "Generate named tuples in function tuple() when all names are unique and can be treated as unquoted identifiers."},
+            {"enable_named_columns_in_function_tuple", false, true, "Generate named tuples in function tuple() when all names are unique and can be treated as unquoted identifiers."},
             {"optimize_trivial_insert_select", true, false, "The optimization does not make sense in many cases."},
             {"dictionary_validate_primary_key_type", false, false, "Validate primary key type for dictionaries. By default id type for simple layouts will be implicitly converted to UInt64."},
             {"collect_hash_table_stats_during_joins", false, true, "New setting."},

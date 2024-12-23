@@ -18,6 +18,7 @@
 #include <Common/KnownObjectNames.h>
 #include <Common/tryGetFileNameByFileDescriptor.h>
 #include <Core/Settings.h>
+#include <Storages/ObjectStorage/StorageObjectStorageSettings.h>
 
 #include <boost/algorithm/string/case_conv.hpp>
 
@@ -304,6 +305,8 @@ FormatSettings getFormatSettings(const ContextPtr & context, const Settings & se
 template FormatSettings getFormatSettings<FormatFactorySettings>(const ContextPtr & context, const FormatFactorySettings & settings);
 
 template FormatSettings getFormatSettings<Settings>(const ContextPtr & context, const Settings & settings);
+
+template FormatSettings getFormatSettings<StorageObjectStorageSettings>(const ContextPtr & context, const StorageObjectStorageSettings & settings);
 
 
 InputFormatPtr FormatFactory::getInput(

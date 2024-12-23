@@ -1,5 +1,3 @@
-version: '2.3'
-
 services:
   kerberoskdc:
     image: altinityinfra/kerberos-kdc:${DOCKER_KERBEROS_KDC_TAG:-latest}

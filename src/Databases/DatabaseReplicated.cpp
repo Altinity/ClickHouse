@@ -1175,6 +1175,7 @@ void DatabaseReplicated::recoverLostReplica(const ZooKeeperPtr & current_zookeep
         query_context->setSetting("enable_zstd_qat_codec", 1);
         query_context->setSetting("allow_create_index_without_type", 1);
         query_context->setSetting("allow_experimental_s3queue", 1);
+        query_context->setSetting("allow_experimental_database_iceberg", 1);
 
         auto txn = std::make_shared<ZooKeeperMetadataTransaction>(current_zookeeper, zookeeper_path, false, "");
         query_context->initZooKeeperMetadataTransaction(txn);
@@ -1980,6 +1981,6 @@ void registerDatabaseReplicated(DatabaseFactory & factory)
             replica_name,
             std::move(database_replicated_settings), args.context);
     };
-    factory.registerDatabase("Replicated", create_fn);
+    factory.registerDatabase("Replicated", create_fn, {.supports_arguments = true, .supports_settings = true});
 }
 }

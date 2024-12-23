@@ -1,4 +1,3 @@
-version: '2.3'
 services:
   bridge1:
     # NOTE(vnemkov): not produced by CI/CD, so must not be replaced with altinityinfra/jdbc-bridge
