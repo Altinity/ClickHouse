@@ -2319,7 +2319,7 @@ std::optional<UInt64> InterpreterSelectQuery::getTrivialCount(UInt64 allow_exper
     const Settings & settings = context->getSettingsRef();
     bool optimize_trivial_count =
         syntax_analyzer_result->optimize_trivial_count
-        && (allow_experimental_parallel_reading_from_replicas <= 1)
+        && (allow_experimental_parallel_reading_from_replicas == 0)
         && !settings.allow_experimental_query_deduplication
         && !settings.empty_result_for_aggregation_by_empty_set
         && storage
