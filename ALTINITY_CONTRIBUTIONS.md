@@ -1,6 +1,10 @@
 List of pull requests contributed by Altinity develoeprs to ClickHouse server. It does not include documentation changes.
 
 ## 2024
+  * [Experiment] what if reorder compare of columns in Merge	[63780](https://github.com/ClickHouse/ClickHouse/pull/63780)	by @UnamedRus
+  * Fix if condition in #63151	[73504](https://github.com/ClickHouse/ClickHouse/pull/73504)	by @zvonand
+  * Make 01086_window_view_cleanup more stable	[72232](https://github.com/ClickHouse/ClickHouse/pull/72232)	by @ilejn
+  * Fix #72756 (exception in RemoteQueryExecutor when user does not exist locally)	[72759](https://github.com/ClickHouse/ClickHouse/pull/72759)	by @zvonand
   * Respect `prefer_locahost_replica` in `parallel_distributed_insert_select`	[72190](https://github.com/ClickHouse/ClickHouse/pull/72190)	by @filimonov
   * Auxiliary autodiscovery	[71911](https://github.com/ClickHouse/ClickHouse/pull/71911)	by @ianton-ru
   * Passing external user roles from query originator to other nodes	[70332](https://github.com/ClickHouse/ClickHouse/pull/70332)	by @zvonand
