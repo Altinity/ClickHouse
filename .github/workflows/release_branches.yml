@@ -470,6 +470,63 @@ jobs:
       test_name: Integration tests (release)
       runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       data: ${{ needs.RunConfig.outputs.data }}
+  IntegrationTestAarch64:
+    needs: [RunConfig, BuilderDebRelease]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/reusable_test.yml
+    secrets: inherit
+    with:
+      test_name: Integration tests (aarch64)
+      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-snapshot-22.04-arm, altinity-startup-snapshot, altinity-setup-none
+      data: ${{ needs.RunConfig.outputs.data }}
+#############################################################################################
+####################################### AST FUZZERS #########################################
+#############################################################################################
+  ASTFuzzerAsan:
+    needs: [RunConfig, BuilderDebAsan]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/reusable_test.yml
+    secrets: inherit
+    with:
+      test_name: AST fuzzer (asan)
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
+      data: ${{ needs.RunConfig.outputs.data }}
+  ASTFuzzerTsan:
+    needs: [RunConfig, BuilderDebTsan]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/reusable_test.yml
+    secrets: inherit
+    with:
+      test_name: AST fuzzer (tsan)
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
+      data: ${{ needs.RunConfig.outputs.data }}
+  ASTFuzzerMsan:
+    needs: [RunConfig, BuilderDebMsan]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/reusable_test.yml
+    secrets: inherit
+    with:
+      test_name: AST fuzzer (msan)
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
+      data: ${{ needs.RunConfig.outputs.data }}
+  ASTFuzzerUBsan:
+    needs: [RunConfig, BuilderDebUBsan]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/reusable_test.yml
+    secrets: inherit
+    with:
+      test_name: AST fuzzer (ubsan)
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
+      data: ${{ needs.RunConfig.outputs.data }}
+  ASTFuzzerDebug:
+    needs: [RunConfig, BuilderDebDebug]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/reusable_test.yml
+    secrets: inherit
+    with:
+      test_name: AST fuzzer (debug)
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
+      data: ${{ needs.RunConfig.outputs.data }}
 #############################################################################################
 ##################################### REGRESSION TESTS ######################################
 #############################################################################################
