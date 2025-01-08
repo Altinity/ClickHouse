@@ -375,8 +375,10 @@ void JWKSValidator::validateImpl(const jwt::decoded_jwt<jwt::traits::kazuho_pico
         public_key = jwt::helper::create_public_key_from_rsa_components(modulus, exponent);
     }
 
-    if (jwk.has_algorithm() && (Poco::toLower(jwk.get_algorithm()) != algo))
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT validation error: `alg` in JWK does not match the algo used in JWT");
+    if (!jwk.has_algorithm())
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT validation error: missing `alg` in JWK");
+    else if (Poco::toLower(jwk.get_algorithm()) != algo)
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT validation error: `alg` in JWK does not match the algorithm used in JWT");
 
     if (algo == "rs256")
         verifier = verifier.allow_algorithm(jwt::algorithm::rs256(public_key, "", "", ""));
