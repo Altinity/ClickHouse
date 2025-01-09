@@ -800,7 +800,7 @@ void KeyCondition::getAllSpaceFillingCurves()
 KeyCondition::KeyCondition(
     const ActionsDAG * filter_dag,
     ContextPtr context,
-    const Names & key_column_names,
+    const Names & key_column_names_,
     const ExpressionActionsPtr & key_expr_,
     bool single_point_)
     : key_expr(key_expr_)
@@ -808,7 +808,7 @@ KeyCondition::KeyCondition(
     , single_point(single_point_)
 {
     size_t key_index = 0;
-    for (const auto & name : key_column_names)
+    for (const auto & name : key_column_names_)
     {
         if (!key_columns.contains(name))
         {
