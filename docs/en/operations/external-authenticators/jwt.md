@@ -190,18 +190,12 @@ curl 'http://localhost:8080/?' \
  -H 'Content type: text/plain;charset=UTF-8' \
  --data-raw 'SELECT current_user()'
 ```
-
-By default, ClickHouse will look for a JWT token in `Authorization` header (in this case, token shall be prefixed by "Bearer").
-The header name can be changed with `jwt_header_name` setting in `config.xml`:
-```xml
-<clickhouse>
-    <!- ... -->
-    <jwt_header_name>X-Id-Token</jwt_header_name>
-</clickhouse>
-```
-In case of a custom header, token does not necessarily have to be prefixed,
-If JWT is not present there, `token` request parameter will be used as JWT source. In this case, the "Bearer" prefix should not exist.
-
+:::note
+ClickHouse will look for a JWT token in (by priority):
+1. `X-ClickHouse-JWT-Token` header.
+2. `Authorization` header.
+3. `token` request parameter. In this case, the "Bearer" prefix should not exist.
+:::
 
 ### Passing session settings {#passing-session-settings}
 

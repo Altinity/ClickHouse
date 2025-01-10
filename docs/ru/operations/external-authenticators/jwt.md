@@ -198,18 +198,12 @@ curl 'http://localhost:8080/?' \
  -H 'Content type: text/plain;charset=UTF-8' \
  --data-raw 'SELECT current_user()'
 ```
-
-По умолчанию, ClickHouse ищет токен в заголовке `Authorization` (в этом заголовке токен должен иметь префикс "Bearer").
-Параметром `jwt_header_name` в `config.xml` можно задать инойь заголовок, в котором будет передан JWT:
-```xml
-<clickhouse>
-    <!- ... -->
-    <jwt_header_name>X-Id-Token</jwt_header_name>
-</clickhouse>
-```
-В этом случае, токен может как иметь, так и не иметь префикс "Bearer".
-Если токен отсутствует в заголовке, то он будет взят из параметра запроса `token` (при наличии). В этом случае, префикса "Bearer" быть не должно.
-
+:::note
+ClickHouse ищет токен в следующих местах (по порядку):
+1. Заголовок `X-ClickHouse-JWT-Token`.
+2. Стандартный заголовок `Authorization`.
+3. Параметр `token`. В этом случае параметр не должен содержать префикс `Bearer`.
+:::
 
 ### Передача параметров сессии {#passing-session-settings}
 

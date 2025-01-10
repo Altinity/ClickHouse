@@ -75,13 +75,7 @@ bool authenticateUserByHTTP(
     bool has_http_credentials = request.hasCredentials();
     bool has_credentials_in_query_params = params.has("user") || params.has("password");
 
-    /// By default, CH will look for JWT token in Authorization header. This can be overridden in config.xml.
-    std::string jwt_header_name = global_context->getConfigRef().getString("jwt_header_name", "Authorization");
-    std::string jwt_token = request.get(jwt_header_name, (params.has("token") ? BEARER_PREFIX + params.get("token") : ""));
-
-    if (has_auth_headers && !jwt_token.empty())
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED,
-                        "Invalid authentication: JWT and authentication headers containing user or password cannot be present at the same time");
+    std::string jwt_token = request.get("X-ClickHouse-JWT-Token", request.get("Authorization", (params.has("token") ? BEARER_PREFIX + params.get("token") : "")));
 
     std::string spnego_challenge;
     SSLCertificateSubjects certificate_subjects;
@@ -145,10 +139,8 @@ bool authenticateUserByHTTP(
             if (spnego_challenge.empty())
                 throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Invalid authentication: SPNEGO challenge is empty");
         }
-        else if (!(Poco::toLower(scheme).starts_with(BEARER_PREFIX)) && jwt_token.empty())
+        else if (Poco::icompare(scheme, "Bearer") < 0)
         {
-            /// Only Bearer type is supported (JWT)
-            /// If there is something in this header, but CH is configured to look for JWT in other header and no JWT found there -- throw exception.
             throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Invalid authentication: '{}' HTTP Authorization scheme is not supported", scheme);
         }
     }
@@ -199,14 +191,9 @@ bool authenticateUserByHTTP(
             return false;
         }
     }
-    else if (!jwt_token.empty())
+    else if (!jwt_token.empty() && Poco::toLower(jwt_token).starts_with(BEARER_PREFIX))
     {
-        /// In case JWT is passed in Authorization header, It will have BEARER prefix
-        /// In other headers, it might have no prefix
-        if (Poco::toLower(jwt_token).starts_with(BEARER_PREFIX))
-            current_credentials = std::make_unique<JWTCredentials>(jwt_token.substr(BEARER_PREFIX.length()));
-        else
-            current_credentials = std::make_unique<JWTCredentials>(jwt_token);
+        current_credentials = std::make_unique<JWTCredentials>(jwt_token.substr(BEARER_PREFIX.length()));
     }
     else // I.e., now using user name and password strings ("Basic").
     {
