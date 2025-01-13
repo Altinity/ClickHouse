@@ -62,6 +62,13 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
+enum class ExecuteTTLType : uint8_t
+{
+    NONE = 0,
+    NORMAL = 1,
+    RECALCULATE= 2,
+};
+
 namespace MutationHelpers
 {
 
