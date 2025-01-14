@@ -471,7 +471,7 @@ jobs:
       runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
       data: ${{ needs.RunConfig.outputs.data }}
   IntegrationTestAarch64:
-    needs: [RunConfig, BuilderDebRelease]
+    needs: [RunConfig, BuilderDebAarch64]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/reusable_test.yml
     secrets: inherit
