@@ -7,6 +7,8 @@
 #include <vector>
 #include <Access/AccessControl.h>
 #include <Access/Credentials.h>
+#include <Access/ExternalAuthenticators.h>
+#include <Common/VersionNumber.h>
 #include <Compression/CompressedReadBuffer.h>
 #include <Compression/CompressedWriteBuffer.h>
 #include <Compression/CompressionFactory.h>
@@ -1779,8 +1781,15 @@ void TCPHandler::receiveHello()
 
     if (is_jwt_based_auth)
     {
-        auto cred = JWTCredentials(password);
-        session->authenticate(cred, getClientAddress(client_info));
+        auto credentials = TokenCredentials(password);
+
+        if (!credentials.isJWT())
+        {
+            /// In case the token is an access token, we need to resolve it to get user name.
+            /// This is why (for now) the check is made twice: here and later in authentication.
+            server.context()->getAccessControl().getExternalAuthenticators().checkAccessTokenCredentials(credentials);
+        }
+        session->authenticate(credentials, getClientAddress(client_info));
         return;
     }
 

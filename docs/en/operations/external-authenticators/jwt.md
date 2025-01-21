@@ -25,7 +25,7 @@ To use JWT authentication, JWT validators must be configured in ClickHouse confi
 
 ## Enabling JWT validators in ClickHouse {#enabling-jwt-validators-in-clickhouse}
 
-To enable JWT validators, add `jwt_validators` section in `config.xml`. This section may contain several JWT verifiers, minimum is 1.
+To enable JWT validators, add `token_validators` section in `config.xml`. This section may contain several JWT verifiers, minimum is 1.
 
 ### Verifying JWT signature using static key {$verifying-jwt-signature-using-static-key}
 
@@ -122,6 +122,27 @@ Retry parameters (optional):
 - `retry_initial_backoff_ms` - The backoff initial interval on retry. Default: 50.
 - `retry_max_backoff_ms` - The maximum backoff interval. Default: 1000.
 
+### Verifying access tokens {$verifying-access-tokens}
+
+Access tokens that are not JWT (and thus no data can be extracted from the token directly) need to be resolved by external providers.
+
+**Example**
+```xml
+<clickhouse>
+    <!- ... -->
+    <access_token_processors>
+        <my_access_token_processor>
+          <provider>google</provider>
+        </my_access_token_processor>
+    </access_token_processors>
+</clickhouse>
+```
+
+#### Parameters:
+
+- `provider` - name of provider that will be used for token processing. Mandatory parameter. Possible options: `google`.
+
+
 ### Enabling JWT authentication in `users.xml` {#enabling-jwt-auth-in-users-xml}
 
 In order to enable JWT authentication for the user, specify `jwt` section instead of `password` or other similar sections in the user definition.
@@ -199,7 +220,7 @@ ClickHouse will look for a JWT token in (by priority):
 
 ### Passing session settings {#passing-session-settings}
 
-If `settings_key` is defined in the `jwt_validators` section or defined under validator section, then it is possible to pass session settings in JWT.  
+If `settings_key` is defined in the `token_validators` section or defined under validator section, then it is possible to pass session settings in JWT.  
 If JWT payload contains a claim `settings_key`, ClickHouse will attempt to parse its key:value pairs as string values ​​and set them as session settings for the currently authenticated user. If parsing fails, settings will be ignored.
 
-The `settings_key` in the validator section takes precedence over the `settings_key` from the `jwt_validators` section. If `settings_key` in the validator section does not exist, the `settings_key` from the `jwt_validators` section will be used.
+The `settings_key` in the validator section takes precedence over the `settings_key` from the `token_validators` section. If `settings_key` in the validator section does not exist, the `settings_key` from the `token_validators` section will be used.

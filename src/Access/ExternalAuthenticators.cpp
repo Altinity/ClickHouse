@@ -10,7 +10,7 @@
 #include <Common/quoteString.h>
 #include "Access/AccessControl.h"
 #include "Access/Credentials.h"
-#include "Access/JWTValidator.h"
+#include <Access/JWTValidator.h>
 
 #include <boost/algorithm/string/case_conv.hpp>
 #include <Poco/Util/AbstractConfiguration.h>
@@ -292,6 +292,55 @@ void ExternalAuthenticators::reset()
     resetImpl();
 }
 
+void parseJWTValidators(std::unordered_map<String, std::unique_ptr<IJWTValidator>> & jwt_validators,
+                        const Poco::Util::AbstractConfiguration & config,
+                        const String & jwt_validators_config,
+                        LoggerPtr log)
+{
+    Poco::Util::AbstractConfiguration::Keys jwt_validators_keys;
+    config.keys(jwt_validators_config, jwt_validators_keys);
+    jwt_validators.clear();
+    String token_validator_settings_key;
+    if (config.has(jwt_validators_config + ".settings_key"))
+        token_validator_settings_key = config.getString(jwt_validators_config + ".settings_key");
+    for (const auto & jwt_validator : jwt_validators_keys)
+    {
+        if (jwt_validator == "settings_key") continue;
+        String prefix = fmt::format("{}.{}", jwt_validators_config, jwt_validator);
+        try
+        {
+            jwt_validators[jwt_validator] = IJWTValidator::parseJWTValidator(config, prefix, jwt_validator, token_validator_settings_key);
+        }
+        catch (...)
+        {
+            tryLogCurrentException(log, "Could not parse JWT validator" + backQuote(jwt_validator));
+        }
+    }
+}
+
+void parseAccessTokenProcessors(std::unordered_map<String, std::unique_ptr<IAccessTokenProcessor>> & access_token_processors,
+                        const Poco::Util::AbstractConfiguration & config,
+                        const String & access_token_processors_config,
+                        LoggerPtr log)
+{
+    Poco::Util::AbstractConfiguration::Keys access_token_processors_keys;
+    config.keys(access_token_processors_config, access_token_processors_keys);
+    access_token_processors.clear();
+
+    for (const auto & processor : access_token_processors_keys)
+    {
+        String prefix = fmt::format("{}.{}", access_token_processors_config, processor);
+        try
+        {
+            access_token_processors[processor] = IAccessTokenProcessor::parseTokenProcessor(config, prefix, processor);
+        }
+        catch (...)
+        {
+            tryLogCurrentException(log, "Could not parse access token processor" + backQuote(processor));
+        }
+    }
+}
+
 void ExternalAuthenticators::setConfiguration(const Poco::Util::AbstractConfiguration & config, LoggerPtr log)
 {
     std::lock_guard lock(mutex);
@@ -304,9 +353,11 @@ void ExternalAuthenticators::setConfiguration(const Poco::Util::AbstractConfigur
     std::size_t kerberos_keys_count = 0;
     std::size_t http_auth_server_keys_count = 0;
     std::size_t jwt_validators_count = 0;
+    std::size_t access_token_processors_count = 0;
 
     const String http_auth_servers_config = "http_authentication_servers";
     const String jwt_validators_config = "jwt_validators";
+    const String access_token_processors_config = "access_token_processors";
 
     for (auto key : all_keys)
     {
@@ -320,6 +371,7 @@ void ExternalAuthenticators::setConfiguration(const Poco::Util::AbstractConfigur
         kerberos_keys_count += (key == "kerberos");
         http_auth_server_keys_count += (key == http_auth_servers_config);
         jwt_validators_count += (key == jwt_validators_config);
+        access_token_processors_count += (key == access_token_processors_config);
     }
 
     if (ldap_servers_key_count > 1)
@@ -332,7 +384,10 @@ void ExternalAuthenticators::setConfiguration(const Poco::Util::AbstractConfigur
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Multiple http_authentication_servers sections are not allowed");
 
     if (jwt_validators_count > 1)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Multiple jwt_validators sections are not allowed");
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Multiple {} sections are not allowed", jwt_validators_config);
+
+    if (access_token_processors_count > 1)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Multiple {} sections are not allowed", access_token_processors_config);
 
     Poco::Util::AbstractConfiguration::Keys http_auth_server_names;
     config.keys(http_auth_servers_config, http_auth_server_names);
@@ -389,25 +444,8 @@ void ExternalAuthenticators::setConfiguration(const Poco::Util::AbstractConfigur
         tryLogCurrentException(log, "Could not parse Kerberos section");
     }
 
-    Poco::Util::AbstractConfiguration::Keys jwt_validators_keys;
-    config.keys(jwt_validators_config, jwt_validators_keys);
-    jwt_validators.clear();
-    String jwt_validator_settings_key;
-    if (config.has(jwt_validators_config + ".settings_key"))
-        jwt_validator_settings_key = config.getString(jwt_validators_config + ".settings_key");
-    for (const auto & jwt_validator : jwt_validators_keys)
-    {
-        if (jwt_validator == "settings_key") continue;
-        String prefix = fmt::format("{}.{}", jwt_validators_config, jwt_validator);
-        try
-        {
-            jwt_validators[jwt_validator] = IJWTValidator::parseJWTValidator(config, prefix, jwt_validator, jwt_validator_settings_key);
-        }
-        catch (...)
-        {
-            tryLogCurrentException(log, "Could not parse JWT validator" + backQuote(jwt_validator));
-        }
-    }
+    parseJWTValidators(jwt_validators, config, jwt_validators_config, log);
+    parseAccessTokenProcessors(access_token_processors, config, access_token_processors_config, log);
 }
 
 static UInt128 computeParamsHash(const LDAPClient::Params & params, const LDAPClient::RoleSearchParamsList * role_search_params)
@@ -586,7 +624,7 @@ HTTPAuthClientParams ExternalAuthenticators::getHTTPAuthenticationParams(const S
     return it->second;
 }
 
-bool ExternalAuthenticators::checkJWTCredentials(const String & claims, const JWTCredentials & credentials, SettingsChanges & settings) const
+bool ExternalAuthenticators::checkJWTCredentials(const String & claims, const TokenCredentials & credentials, SettingsChanges & settings) const
 {
     std::lock_guard lock{mutex};
 
@@ -600,10 +638,29 @@ bool ExternalAuthenticators::checkJWTCredentials(const String & claims, const JW
     {
         if (it.second->validate(claims, token, settings))
         {
-            LOG_DEBUG(getLogger("JWTAuth"), "Authenticated with JWT for {} by {}", user_name, it.first);
+            LOG_DEBUG(getLogger("JWTAuthentication"), "Authenticated with JWT for {} by {}", user_name, it.first);
             return true;
         }
-        LOG_TRACE(getLogger("JWTAuth"), "Failed authentication with JWT for {} by {}", user_name, it.first);
+        LOG_TRACE(getLogger("JWTAuthentication"), "Failed authentication with JWT for {} by {}", user_name, it.first);
+    }
+    return false;
+}
+
+bool ExternalAuthenticators::checkAccessTokenCredentials(const TokenCredentials & credentials) const
+{
+    std::lock_guard lock{mutex};
+
+    if (access_token_processors.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Access token authentication is not configured");
+
+    for (const auto & it : access_token_processors)
+    {
+        if (it.second->resolveAndValidate(credentials))
+        {
+            LOG_DEBUG(getLogger("AccessTokenAuthentication"), "Authenticated user {} with access token by {}", credentials.getUserName(), it.first);
+            return true;
+        }
+        LOG_TRACE(getLogger("AccessTokenAuthentication"), "Failed authentication with access token by {}", it.first);
     }
     return false;
 }

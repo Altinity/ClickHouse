@@ -125,21 +125,43 @@ private:
 };
 #endif
 
-
-class JWTCredentials: public Credentials
+class TokenCredentials : public Credentials
 {
 public:
-    explicit JWTCredentials(const String & token_);
+    explicit TokenCredentials(const String & token_);
+
     const String & getToken() const
     {
-        if (!isReady())
+        if (token.empty())
         {
             throwNotReady();
         }
         return token;
     }
+    void setUserName(const String & user_name_)
+    {
+        user_name = user_name_;
+        if (!user_name.empty())
+        {
+            is_ready = true;
+        }
+    }
+    bool isJWT() const
+    {
+        return is_jwt;
+    }
+    std::set<String> getGroups() const
+    {
+        return groups;
+    }
+    void setGroups(const std::set<String> & groups_)
+    {
+        groups = groups_;
+    }
 private:
     String token;
+    bool is_jwt = false;
+    std::set<String> groups;
 };
 
 }

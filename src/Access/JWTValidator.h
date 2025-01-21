@@ -12,13 +12,14 @@
 #include "Access/HTTPAuthClient.h"
 
 #include <Poco/Util/AbstractConfiguration.h>
+#include <Common/logger_useful.h>
 
 namespace DB
 {
 
 class SettingsChanges;
 
-struct JWTValidatorParams
+struct TokenValidatorParams
 {
     String settings_key;
 };
@@ -26,8 +27,8 @@ struct JWTValidatorParams
 class IJWTValidator
 {
 public:
-    explicit IJWTValidator(const String & name_, const JWTValidatorParams & params_) : params(params_), name(name_) {}
-    bool validate(const String & claims, const String & token, SettingsChanges & settings) const;
+    explicit IJWTValidator(const String & name_, const TokenValidatorParams & params_) : params(params_), name(name_) {}
+    virtual bool validate(const String & claims, const String & token, SettingsChanges & settings) const;
     virtual ~IJWTValidator() = default;
 
     static std::unique_ptr<DB::IJWTValidator> parseJWTValidator(
@@ -38,12 +39,12 @@ public:
 
 protected:
     virtual void validateImpl(const jwt::decoded_jwt<jwt::traits::kazuho_picojson> & token) const = 0;
-    JWTValidatorParams params;
+    TokenValidatorParams params;
     const String name;
 };
 
 struct SimpleJWTValidatorParams :
-    public JWTValidatorParams
+    public TokenValidatorParams
 {
     String algo;
     String static_key;
@@ -64,6 +65,22 @@ private:
     jwt::verifier<jwt::default_clock, jwt::traits::kazuho_picojson> verifier;
 };
 
+class AccessTokenValidator : public IJWTValidator
+{
+public:
+    explicit AccessTokenValidator(const String & name_) : IJWTValidator(name_, {}) {}
+
+    bool validate(const String &, const String &, SettingsChanges &) const override
+    {
+        return true;
+    }
+private:
+    void validateImpl(const jwt::decoded_jwt<jwt::traits::kazuho_picojson> &) const override
+    {
+        LOG_TRACE(getLogger("JWTAuthentication"), "Temporary allow all access tokens");
+    }
+};
+
 
 class IJWKSProvider
 {
@@ -75,7 +92,7 @@ public:
 class JWKSValidator : public IJWTValidator
 {
 public:
-    explicit JWKSValidator(const String & name_, std::shared_ptr<IJWKSProvider> provider_, const JWTValidatorParams & params_)
+    explicit JWKSValidator(const String & name_, std::shared_ptr<IJWKSProvider> provider_, const TokenValidatorParams & params_)
         : IJWTValidator(name_, params_), provider(provider_) {}
 private:
     void validateImpl(const jwt::decoded_jwt<jwt::traits::kazuho_picojson> & token) const override;
