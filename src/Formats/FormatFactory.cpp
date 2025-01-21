@@ -171,6 +171,7 @@ FormatSettings getFormatSettings(const ContextPtr & context, const Settings & se
     format_settings.parquet.max_block_size = settings.input_format_parquet_max_block_size;
     format_settings.parquet.prefer_block_bytes = settings.input_format_parquet_prefer_block_bytes;
     format_settings.parquet.output_compression_method = settings.output_format_parquet_compression_method;
+    format_settings.parquet.output_compression_level = context->getSettingsRef().output_format_compression_level;
     format_settings.parquet.output_compliant_nested_types = settings.output_format_parquet_compliant_nested_types;
     format_settings.parquet.use_custom_encoder = settings.output_format_parquet_use_custom_encoder;
     format_settings.parquet.parallel_encoding = settings.output_format_parquet_parallel_encoding;
