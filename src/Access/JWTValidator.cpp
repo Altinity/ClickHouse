@@ -3,9 +3,7 @@
 #include <exception>
 #include <fstream>
 #include <map>
-#include <utility>
 
-#include <absl/strings/match.h>
 #include <jwt-cpp/jwt.h>
 #include <jwt-cpp/traits/kazuho-picojson/traits.h>
 #include <picojson/picojson.h>
@@ -505,6 +503,11 @@ std::unique_ptr<DB::IJWTValidator> IJWTValidator::parseJWTValidator(
         params.validate();
         return std::make_unique<SimpleJWTValidator>(name, params);
     }
+    else if (config.hasProperty(prefix + ".token_resolve_url"))
+    {
+        /// This is an access token and we need to resolve it at the token issuer.
+        return std::make_unique<AccessTokenValidator>(name);
+    }
 
     std::shared_ptr<IJWKSProvider> provider;
     if (config.hasProperty(prefix + ".uri"))
@@ -535,7 +538,7 @@ std::unique_ptr<DB::IJWTValidator> IJWTValidator::parseJWTValidator(
     else
         throw DB::Exception(ErrorCodes::BAD_ARGUMENTS, "unsupported configuration");
 
-    return std::make_unique<JWKSValidator>(name, provider, JWTValidatorParams{.settings_key = settings_key});
+    return std::make_unique<JWKSValidator>(name, provider, TokenValidatorParams{.settings_key = settings_key});
 }
 
 }

@@ -1,5 +1,4 @@
 #include <Access/Credentials.h>
-#include <Access/Common/SSLCertificateSubjects.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 
@@ -103,24 +102,32 @@ const String & BasicCredentials::getPassword() const
 
 namespace
 {
-String extractSubjectFromToken(const String & token)
+String extractUsernameFromToken(const String & token)
 {
     try
     {
+        /// Attempt to handle token as JWT.
         auto decoded_jwt = jwt::decode(token);
         return decoded_jwt.get_subject();
     }
     catch (...)
     {
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to validate jwt: cannot extract `sub` claim");
+        /// Token is not JWT, try to handle it as access token
+        return "";
     }
 }
 }
 
-JWTCredentials::JWTCredentials(const String & token_)
-        : Credentials(extractSubjectFromToken(token_))
+TokenCredentials::TokenCredentials(const String & token_)
+        : Credentials(extractUsernameFromToken(token_))
         , token(token_)
     {
-        is_ready = !user_name.empty();
+        // If username is empty, then the token is probably not JWT;
+        // we will try treating this token as an access token.
+        if (!user_name.empty())
+        {
+            is_ready = true;
+            is_jwt = true;
+        }
     }
 }

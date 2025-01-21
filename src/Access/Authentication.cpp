@@ -235,7 +235,7 @@ bool Authentication::areCredentialsValid(
     const ExternalAuthenticators & external_authenticators,
     SettingsChanges & settings)
 {
-    if (!credentials.isReady())
+    if (!typeid_cast<const TokenCredentials *>(&credentials) && !credentials.isReady())
         return false;
 
     if (const auto * gss_acceptor_context = typeid_cast<const GSSAcceptorContext *>(&credentials))
@@ -270,10 +270,20 @@ bool Authentication::areCredentialsValid(
     }
 #endif
 
-    if (const auto * jwt_credentials = typeid_cast<const JWTCredentials *>(&credentials))
+    if (const auto * token_credentials = typeid_cast<const TokenCredentials *>(&credentials))
     {
-        return authentication_method.getType() == AuthenticationType::JWT
-            && external_authenticators.checkJWTCredentials(authentication_method.getJWTClaims(), *jwt_credentials, settings);
+        if (authentication_method.getType() != AuthenticationType::JWT)
+            return false;
+
+        if (token_credentials->isJWT())
+        {
+            /// The token was parsed as JWT, no further action needed.
+            return external_authenticators.checkJWTCredentials(authentication_method.getJWTClaims(), *token_credentials, settings);
+        }
+        else
+        {
+            return external_authenticators.checkAccessTokenCredentials(*token_credentials);
+        }
     }
 
     if ([[maybe_unused]] const auto * always_allow_credentials = typeid_cast<const AlwaysAllowCredentials *>(&credentials))

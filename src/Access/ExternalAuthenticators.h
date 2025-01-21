@@ -5,6 +5,7 @@
 #include <Access/HTTPAuthClient.h>
 #include <Access/JWTValidator.h>
 #include <Access/LDAPClient.h>
+#include <Access/AccessTokenProcessor.h>
 #include <base/defines.h>
 #include <base/extended_types.h>
 #include <base/types.h>
@@ -46,7 +47,8 @@ public:
         const LDAPClient::RoleSearchParamsList * role_search_params = nullptr, LDAPClient::SearchResultsList * role_search_results = nullptr) const;
     bool checkKerberosCredentials(const String & realm, const GSSAcceptorContext & credentials) const;
     bool checkHTTPBasicCredentials(const String & server, const BasicCredentials & credentials, SettingsChanges & settings) const;
-    bool checkJWTCredentials(const String & claims, const JWTCredentials & credentials, SettingsChanges & settings) const;
+    bool checkJWTCredentials(const String & claims, const TokenCredentials & credentials, SettingsChanges & settings) const;
+    bool checkAccessTokenCredentials(const TokenCredentials & credentials) const;
 
     GSSAcceptorContext::Params getKerberosParams() const;
 
@@ -72,6 +74,7 @@ private:
     std::optional<GSSAcceptorContext::Params> kerberos_params TSA_GUARDED_BY(mutex) ;
     std::unordered_map<String, HTTPAuthClientParams> http_auth_servers TSA_GUARDED_BY(mutex) ;
     std::unordered_map<String, std::unique_ptr<IJWTValidator>> jwt_validators TSA_GUARDED_BY(mutex) ;
+    std::unordered_map<String, std::unique_ptr<IAccessTokenProcessor>> access_token_processors TSA_GUARDED_BY(mutex) ;
 
     void resetImpl() TSA_REQUIRES(mutex);
 };
