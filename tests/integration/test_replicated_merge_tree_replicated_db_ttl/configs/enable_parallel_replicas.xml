@@ -2,7 +2,7 @@
     <profiles>
         <default>
             <enable_analyzer>1</enable_analyzer>
-            <allow_experimental_parallel_reading_from_replicas>1</allow_experimental_parallel_reading_from_replicas>
+            <enable_parallel_replicas>1</enable_parallel_replicas>
             <allow_experimental_database_replicated>1</allow_experimental_database_replicated>
             <cluster_for_parallel_replicas>default</cluster_for_parallel_replicas>
             <max_parallel_replicas>100</max_parallel_replicas>
