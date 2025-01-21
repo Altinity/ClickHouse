@@ -4696,6 +4696,9 @@ class ClickHouseInstance:
         if self.with_kerberized_hdfs:
             depends_on.append("kerberizedhdfs1")
 
+        if self.with_ldap:
+            depends_on.append("openldap")
+
         if self.with_rabbitmq:
             depends_on.append("rabbitmq1")
 
