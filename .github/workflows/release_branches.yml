@@ -58,7 +58,7 @@ jobs:
       - name: Upload images files to artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: changed_images
+          name: changed_images_amd64
           path: ${{ runner.temp }}/docker_images_check/changed_images_amd64.json
   DockerHubPush:
     needs: [DockerHubPushAmd64, DockerHubPushAarch64]
