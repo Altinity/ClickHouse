@@ -479,6 +479,11 @@ AccessRightsElements InterpreterAlterQuery::getRequiredAccessForCommand(const AS
             }
             break;
         }
+        case ASTAlterCommand::EXPORT_PART:
+        {
+            required_access.emplace_back(AccessType::ALTER_MOVE_PARTITION, database, table);
+            break;
+        }
         case ASTAlterCommand::REPLACE_PARTITION:
         {
             required_access.emplace_back(AccessType::SELECT, command.from_database, command.from_table);

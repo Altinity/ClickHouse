@@ -82,6 +82,7 @@ bool ParserAlterCommand::parseImpl(Pos & pos, ASTPtr & node, Expected & expected
     ParserKeyword s_forget_partition(Keyword::FORGET_PARTITION);
     ParserKeyword s_move_partition(Keyword::MOVE_PARTITION);
     ParserKeyword s_move_part(Keyword::MOVE_PART);
+    ParserKeyword s_export_part(Keyword::EXPORT_PART);
     ParserKeyword s_drop_detached_partition(Keyword::DROP_DETACHED_PARTITION);
     ParserKeyword s_drop_detached_part(Keyword::DROP_DETACHED_PART);
     ParserKeyword s_fetch_partition(Keyword::FETCH_PARTITION);
@@ -553,6 +554,31 @@ bool ParserAlterCommand::parseImpl(Pos & pos, ASTPtr & node, Expected & expected
 
                     command->move_destination_name = ast_space_name->as<ASTLiteral &>().value.safeGet<const String &>();
                 }
+            }
+            else if (s_export_part.ignore(pos, expected))
+            {
+                if (!parser_string_and_substituion.parse(pos, command_partition, expected))
+                    return false;
+
+                command->type = ASTAlterCommand::EXPORT_PART;
+                command->part = true;
+
+//                if (s_to_disk.ignore(pos, expected))
+//                    command->move_destination_type = DataDestinationType::DISK;
+//                else if (s_to_volume.ignore(pos, expected))
+//                    command->move_destination_type = DataDestinationType::VOLUME;
+//                else if (s_to_shard.ignore(pos, expected))
+//                {
+//                    command->move_destination_type = DataDestinationType::SHARD;
+//                }
+//                else
+//                    return false;
+//
+//                ASTPtr ast_space_name;
+//                if (!parser_string_literal.parse(pos, ast_space_name, expected))
+//                    return false;
+//
+//                command->move_destination_name = ast_space_name->as<ASTLiteral &>().value.safeGet<const String &>();
             }
             else if (s_add_constraint.ignore(pos, expected))
             {

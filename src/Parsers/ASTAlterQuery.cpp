@@ -343,6 +343,12 @@ void ASTAlterCommand::formatImpl(WriteBuffer & ostr, const FormatSettings & sett
             ostr << quoteString(move_destination_name);
         }
     }
+    else if (type == ASTAlterCommand::EXPORT_PART)
+    {
+        ostr << (settings.hilite ? hilite_keyword : "") << "EXPORT " << (part ? "PART " : "PARTITION ")
+             << (settings.hilite ? hilite_none : "");
+        partition->formatImpl(ostr, settings, state, frame);
+    }
     else if (type == ASTAlterCommand::REPLACE_PARTITION)
     {
         ostr << (settings.hilite ? hilite_keyword : "") << (replace ? "REPLACE" : "ATTACH") << " PARTITION "

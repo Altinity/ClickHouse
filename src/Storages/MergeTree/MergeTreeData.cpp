@@ -85,6 +85,7 @@
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <Storages/MergeTree/MergeTreeIndexGranularityAdaptive.h>
+#include <Storages/MergeTree/exportMTPartToParquet.h>
 
 #include <boost/range/algorithm_ext/erase.hpp>
 #include <boost/algorithm/string/join.hpp>
@@ -5593,6 +5594,21 @@ Pipe MergeTreeData::alterPartition(
                 }
             }
             break;
+
+            case PartitionCommand::EXPORT_PART:
+            {
+                if (command.part)
+                {
+                    auto part_name = command.partition->as<ASTLiteral &>().value.safeGet<String>();
+                    auto data_part = getPartIfExists(part_name, {DataPartStates::value_type::Active});
+
+                    if (!data_part)
+                        throw Exception(ErrorCodes::NO_SUCH_DATA_PART, "No part {} in committed state", part_name);
+
+                    exportMTPartToParquet(*this, data_part, query_context);
+                }
+                break;
+            }
 
             case PartitionCommand::DROP_DETACHED_PARTITION:
                 dropDetached(command.partition, command.part, query_context);

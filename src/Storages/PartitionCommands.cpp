@@ -51,6 +51,14 @@ std::optional<PartitionCommand> PartitionCommand::parse(const ASTAlterCommand * 
         res.part = command_ast->part;
         return res;
     }
+    if (command_ast->type == ASTAlterCommand::EXPORT_PART)
+    {
+        PartitionCommand res;
+        res.type = EXPORT_PART;
+        res.partition = command_ast->partition->clone();
+        res.part = command_ast->part;
+        return res;
+    }
     if (command_ast->type == ASTAlterCommand::MOVE_PARTITION)
     {
         PartitionCommand res;
