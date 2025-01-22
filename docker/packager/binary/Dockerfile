@@ -9,6 +9,7 @@ ENV CXX=clang++-${LLVM_VERSION}
 # libtapi is required to support .tbh format from recent MacOS SDKs
 RUN git clone --depth 1 https://github.com/tpoechtrager/apple-libtapi.git \
     && cd apple-libtapi \
+    && git checkout 15dfc2a8c9a2a89d06ff227560a69f5265b692f9 \
     && INSTALLPREFIX=/cctools ./build.sh \
     && ./install.sh \
     && cd .. \
@@ -17,6 +18,7 @@ RUN git clone --depth 1 https://github.com/tpoechtrager/apple-libtapi.git \
 # Build and install tools for cross-linking to Darwin (x86-64)
 RUN git clone --depth 1 https://github.com/tpoechtrager/cctools-port.git \
     && cd cctools-port/cctools \
+    && git checkout 2a3e1c2a6ff54a30f898b70cfb9ba1692a55fad7 \
     && ./configure --prefix=/cctools --with-libtapi=/cctools \
         --target=x86_64-apple-darwin \
     && make install -j$(nproc) \
@@ -26,6 +28,7 @@ RUN git clone --depth 1 https://github.com/tpoechtrager/cctools-port.git \
 # Build and install tools for cross-linking to Darwin (aarch64)
 RUN git clone --depth 1 https://github.com/tpoechtrager/cctools-port.git \
     && cd cctools-port/cctools \
+    && git checkout 2a3e1c2a6ff54a30f898b70cfb9ba1692a55fad7 \
     && ./configure --prefix=/cctools --with-libtapi=/cctools \
         --target=aarch64-apple-darwin \
     && make install -j$(nproc) \
