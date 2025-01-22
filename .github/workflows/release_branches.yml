@@ -31,7 +31,7 @@ on: # yamllint disable-line rule:truthy
 
 jobs:
   # DockerHubPushAarch64:
-  #   runs-on: [self-hosted, style-checker-aarch64]
+  #   runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none-aarch64]
   #   steps:
   #     - name: Check out repository code
   #       uses: ClickHouse/checkout@v1
@@ -46,7 +46,7 @@ jobs:
   #         path: ${{ runner.temp }}/docker_images_check/changed_images_aarch64.json
   # Former DockerHubPushAmd64
   DockerHubPush:
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
@@ -68,7 +68,7 @@ jobs:
           path: ${{ runner.temp }}/docker_images_check/changed_images.json
   # DockerHubPush:
   #   needs: [DockerHubPushAmd64, DockerHubPushAarch64]
-  #   runs-on: [self-hosted, style-checker]
+  #   runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
   #   steps:
   #     - name: Check out repository code
   #       uses: ClickHouse/checkout@v1
@@ -93,7 +93,7 @@ jobs:
   #         path: ${{ runner.temp }}/changed_images.json
   CompatibilityCheck:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     steps:
       - name: Set envs
         run: |
@@ -129,7 +129,7 @@ jobs:
 #########################################################################################
   BuilderDebRelease:
     needs: [DockerHubPush]
-    runs-on: [self-hosted, builder]
+    runs-on: [self-hosted, altinity-type-ccx53, altinity-on-demand, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     steps:
       - name: Set envs
         run: |
@@ -225,7 +225,7 @@ jobs:
     needs:
       - BuilderDebRelease
       # - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
@@ -254,7 +254,7 @@ jobs:
     needs:
       - BuilderDebRelease
       # - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     if: ${{ success() || failure() }}
     steps:
       - name: Set envs
@@ -295,7 +295,7 @@ jobs:
   #   needs:
   #     # - BuilderBinDarwin
   #     - BuilderBinDarwinAarch64
-  #   runs-on: [self-hosted, style-checker]
+  #   runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
   #   if: ${{ success() || failure() }}
   #   steps:
   #     - name: Set envs
@@ -337,7 +337,7 @@ jobs:
   #    - BuilderBinDarwinAarch64
       - BuilderDebRelease
   #    - BuilderDebAarch64
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
@@ -352,7 +352,7 @@ jobs:
 ##############################################################################################
   FunctionalStatelessTestRelease:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, func-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash,altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     steps:
       - name: Set envs
         run: |
@@ -427,7 +427,7 @@ jobs:
 ##############################################################################################
   FunctionalStatefulTestRelease:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, func-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-in-ash,altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     steps:
       - name: Set envs
         run: |
@@ -502,7 +502,7 @@ jobs:
 #############################################################################################
   IntegrationTestsRelease0:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     steps:
       - name: Set envs
         run: |
@@ -539,7 +539,7 @@ jobs:
           sudo rm -fr "$TEMP_PATH"
   IntegrationTestsRelease1:
     needs: [BuilderDebRelease]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     steps:
       - name: Set envs
         run: |
@@ -590,7 +590,7 @@ jobs:
       matrix:
         SUITE: [aes_encryption, aggregate_functions, atomic_insert, base_58, clickhouse_keeper, datetime64_extended_range, disk_level_encryption, dns, engines, example, extended_precision_data_types, kafka, kerberos, lightweight_delete, data_types, part_moves_between_shards, rbac, selects, session_timezone, ssl_server, tiered_storage, window_functions]
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -650,7 +650,7 @@ jobs:
       matrix:
         STORAGE: [minio, aws_s3, gcs]
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -715,7 +715,7 @@ jobs:
 
   clickhouse_keeper_ssl:
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -772,7 +772,7 @@ jobs:
             ./*/*/_instances/*.log
   key_value:
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -832,7 +832,7 @@ jobs:
       matrix:
         SUITE: [authentication, external_user_directory, role_mapping]
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -888,7 +888,7 @@ jobs:
 
   parquet:
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -945,7 +945,7 @@ jobs:
 
   parquet_minio:
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -1003,7 +1003,7 @@ jobs:
 
   parquet_aws:
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -1069,7 +1069,7 @@ jobs:
       matrix:
         STORAGE: [minio, aws_s3, gcs]
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -1138,7 +1138,7 @@ jobs:
       matrix:
         STORAGE: [minio, s3amazon, s3gcs]
     needs: [regression_start]
-    runs-on: [self-hosted, stress-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
@@ -1266,7 +1266,7 @@ jobs:
       - parquet_aws
       - s3
       - tiered_storage_s3
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
     steps:
       - name: Check out repository code
         uses: ClickHouse/checkout@v1
