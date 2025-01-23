@@ -229,6 +229,7 @@ jobs:
           fetch-depth: 0  # It MUST BE THE SAME for all dependencies and the job itself
       - name: Check docker altinity/clickhouse-server building
         run: |
+          docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_PASSWORD }}
           cd "$GITHUB_WORKSPACE/tests/ci"
           python3 docker_server.py --release-type head \
             --image-repo altinity/clickhouse-server --image-path docker/server
