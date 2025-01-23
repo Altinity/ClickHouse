@@ -175,7 +175,8 @@ class VersionType:
     PRESTABLE = "prestable"
     STABLE = "altinitystable"
     TESTING = "testing"
-    VALID = (TESTING, PRESTABLE, STABLE, LTS)
+    HOTFIX = "altinityhotfix"
+    VALID = (TESTING, PRESTABLE, STABLE, LTS, HOTFIX)
 
 
 def validate_version(version: str):
