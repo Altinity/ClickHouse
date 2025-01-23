@@ -230,9 +230,9 @@ jobs:
       - name: Check docker altinity/clickhouse-server building
         run: |
           cd "$GITHUB_WORKSPACE/tests/ci"
-          python3 docker_server.py --release-type head --no-push \
+          python3 docker_server.py --release-type head push \
             --image-repo altinity/clickhouse-server --image-path docker/server
-          python3 docker_server.py --release-type head --no-push \
+          python3 docker_server.py --release-type head push \
             --image-repo altinity/clickhouse-keeper --image-path docker/keeper
       - name: Cleanup
         if: always()
