@@ -210,6 +210,7 @@ def gen_tags(version: ClickHouseVersion, release_type: str) -> List[str]:
             tags.append(".".join(parts[: i + 1]))
     elif release_type == "head":
         tags.append(release_type)
+        tags.append(version.string)
     else:
         raise ValueError(f"{release_type} is not valid release part")
     return tags
