@@ -4,7 +4,8 @@ services:
   kerberizedhdfs1:
     cap_add:
       - DAC_READ_SEARCH
-    image: altinityinfra/kerberized-hadoop:${DOCKER_KERBERIZED_HADOOP_TAG:-latest}
+    # image: altinityinfra/kerberized-hadoop:${DOCKER_KERBERIZED_HADOOP_TAG:-latest}
+    image: altinityinfra/kerberized-hadoop:0-7fb126d648460c159657a337b2f0cc24fbbce2ee-amd64
     hostname: kerberizedhdfs1
     restart: always
     volumes:

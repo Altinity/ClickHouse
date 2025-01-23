@@ -44,7 +44,6 @@ IMAGES = [
     "altinityinfra/postgresql-java-client",
     "altinityinfra/integration-test",
     "altinityinfra/kerberos-kdc",
-    "altinityinfra/kerberized-hadoop",
     "altinityinfra/integration-helper",
     "altinityinfra/dotnet-client",
 ]
