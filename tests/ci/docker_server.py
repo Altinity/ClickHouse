@@ -242,7 +242,7 @@ def build_and_push_image(
     init_args = ["docker", "buildx", "build"]
     if push:
         init_args.append("--push")
-        init_args.append("--output=type=image,push-by-digest=true")
+        init_args.append("--output=type=image")
         init_args.append(f"--tag={image.repo}")
     else:
         init_args.append("--output=type=docker")

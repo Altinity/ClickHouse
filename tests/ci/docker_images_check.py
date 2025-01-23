@@ -141,7 +141,7 @@ def get_changed_docker_images(
             ]
             logging.info(f"Unchanged images: {unchanged_images}")
             for image in unchanged_images:
-                if subprocess.run(f"docker manifest inspect {image.repo}:{pr_info.number}", shell=True).returncode != 0:
+                if subprocess.run(f"docker manifest inspect {image.repo}:{pr_info.number}-amd64", shell=True).returncode != 0:
                     changed_images.append(image)
 
     # The order is important: dependents should go later than bases, so that
