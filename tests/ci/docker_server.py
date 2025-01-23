@@ -31,7 +31,7 @@ from version_helper import (
 )
 
 TEMP_PATH = p.join(RUNNER_TEMP, "docker_images_check")
-BUCKETS = {"amd64": "package_release", "arm64": "package_aarch64"}
+BUCKETS = {"amd64": "package_release"}
 git = Git(ignore_no_tags=True)
 
 
@@ -210,6 +210,7 @@ def gen_tags(version: ClickHouseVersion, release_type: str) -> List[str]:
             tags.append(".".join(parts[: i + 1]))
     elif release_type == "head":
         tags.append(release_type)
+        tags.append(version.string)
     else:
         raise ValueError(f"{release_type} is not valid release part")
     return tags
@@ -242,7 +243,7 @@ def build_and_push_image(
     init_args = ["docker", "buildx", "build"]
     if push:
         init_args.append("--push")
-        init_args.append("--output=type=image,push-by-digest=true")
+        init_args.append("--output=type=image")
         init_args.append(f"--tag={image.repo}")
     else:
         init_args.append("--output=type=docker")
