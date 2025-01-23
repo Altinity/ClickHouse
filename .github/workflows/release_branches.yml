@@ -391,7 +391,7 @@ jobs:
           KILL_TIMEOUT=10800
           EOF
       - name: Download json reports
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: ${{ env.REPORTS_PATH }}
       - name: Check out repository code
@@ -481,7 +481,7 @@ jobs:
           KILL_TIMEOUT=3600
           EOF
       - name: Download json reports
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: ${{ env.REPORTS_PATH }}
       - name: Check out repository code
