@@ -389,22 +389,25 @@ def main():
             log_path, s3_path_prefix + "/" + os.path.basename(log_path)
         )
         logging.info("Log url %s", log_url)
+        print(f"::notice ::Log URL: {log_url}")
     else:
         logging.info("Build log doesn't exist")
+        print("Build log doesn't exist")
 
-    print(f"::notice ::Log URL: {log_url}")
 
     src_path = os.path.join(TEMP_PATH, "build_source.src.tar.gz")
+    s3_path = s3_path_prefix + "/clickhouse-" + version.string + ".src.tar.gz"
+    logging.info("s3_path %s", s3_path)
    
     if os.path.exists(src_path):
         src_url = s3_helper.upload_build_file_to_s3(
-            src_path, s3_path_prefix + "/clickhouse-" + version.string + ".src.tar.gz"
+            src_path, s3_path
         )
         logging.info("Source tar %s", src_url)
+        print(f"::notice ::Source tar URL: {src_url}")
     else:
         logging.info("Source tar doesn't exist")
-
-    print(f"::notice ::Source tar URL: {src_url}")
+        print("Source tar doesn't exist")
     
     create_json_artifact(
         TEMP_PATH, build_name, log_url, build_urls, build_config, elapsed, success
