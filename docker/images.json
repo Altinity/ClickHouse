@@ -16,7 +16,6 @@
         "dependent": []
     },
     "docker/test/integration/base": {
-        "only_amd64": true,
         "name": "altinityinfra/integration-test",
         "dependent": []
     },
@@ -65,7 +64,6 @@
         "dependent": []
     },
     "docker/test/integration/runner": {
-        "only_amd64": true,
         "name": "altinityinfra/integration-tests-runner",
         "dependent": []
     },
@@ -88,7 +86,6 @@
         "dependent": []
     },
     "docker/test/integration/helper_container": {
-        "only_amd64": true,
         "name": "altinityinfra/integration-helper",
         "dependent": []
     },
