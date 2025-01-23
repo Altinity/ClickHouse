@@ -35,7 +35,7 @@ jobs:
   #         cd "$GITHUB_WORKSPACE/tests/ci"
   #         python3 docker_images_check.py --suffix aarch64
   #     - name: Upload images files to artifacts
-  #       uses: actions/upload-artifact@v2
+  #       uses: actions/download-artifact@v4
   #       with:
   #         name: changed_images_aarch64
   #         path: ${{ runner.temp }}/docker_images_check/changed_images_aarch64.json
@@ -82,7 +82,7 @@ jobs:
   #         cd "$GITHUB_WORKSPACE/tests/ci"
   #         python3 docker_manifests_merge.py --suffix amd64 --suffix aarch64
   #     - name: Upload images files to artifacts
-  #       uses: actions/upload-artifact@v2
+  #       uses: actions/download-artifact@v4
   #       with:
   #         name: changed_images
   #         path: ${{ runner.temp }}/changed_images.json
@@ -201,7 +201,7 @@ jobs:
   #         cp -r "$GITHUB_WORKSPACE" "$TEMP_PATH"
   #         cd "$REPO_COPY/tests/ci" && python3 build_check.py "$BUILD_NAME"
   #     - name: Upload build URLs to artifacts
-  #       uses: actions/upload-artifact@v2
+  #       uses: actions/download-artifact@v4
   #       with:
   #         name: ${{ env.BUILD_URLS }}
   #         path: ${{ runner.temp }}/build_check/${{ env.BUILD_URLS }}.json
@@ -230,9 +230,9 @@ jobs:
       - name: Check docker altinity/clickhouse-server building
         run: |
           cd "$GITHUB_WORKSPACE/tests/ci"
-          python3 docker_server.py --release-type head --push \
+          python3 docker_server.py --release-type head \
             --image-repo altinity/clickhouse-server --image-path docker/server
-          python3 docker_server.py --release-type head --push \
+          python3 docker_server.py --release-type head \
             --image-repo altinity/clickhouse-keeper --image-path docker/keeper
       - name: Cleanup
         if: always()
@@ -672,7 +672,7 @@ jobs:
           cd "$GITHUB_WORKSPACE/tests/ci"
           python3 sign_release.py
       - name: Upload signed hashes
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: signed-hashes
           path: ${{ env.TEMP_PATH }}/*.gpg
