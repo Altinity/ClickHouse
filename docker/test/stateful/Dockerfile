@@ -1,6 +1,6 @@
 # rebuild in #33610
 # docker build -t clickhouse/stateful-test .
-ARG FROM_TAG=latest
+ARG FROM_TAG=600-b244a6215ac30752985da8e19dece92e1cf7d059-amd64
 # TODO consider replacing clickhouse with altinityinfra dockerhub account
 FROM altinityinfra/stateless-test:$FROM_TAG
 
