@@ -48,7 +48,8 @@ def get_images_with_versions(
     docker_images = []
     for image_name in required_image:
         docker_image = DockerImage(image_name, version)
-        if image_name in images:
+
+        if "altinityinfra" not in image_name and image_name in images:
             image_version = images[image_name]
             # NOTE(vnemkov): For some reason we can get version as list of versions,
             # in this case choose one that has commit hash and hence is the longest string.

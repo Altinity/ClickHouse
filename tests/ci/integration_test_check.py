@@ -189,7 +189,7 @@ if __name__ == "__main__":
     #     sys.exit(0)
 
     images = get_images_with_versions(
-        reports_path, IMAGES, "0-7fb126d648460c159657a337b2f0cc24fbbce2ee-amd64"
+        reports_path, IMAGES, "291-84104d56b3efd1f1153e56e924b397ff9f0cdb27-amd64"
     )
     images_with_versions = {i.name: i.version for i in images}
     result_path = os.path.join(temp_path, "output_dir")
