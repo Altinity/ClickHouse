@@ -1,25 +1,28 @@
-# rebuild in #33610
+# rebuild in #47031
 # docker build -t clickhouse/stateful-test .
-ARG FROM_TAG=600-b244a6215ac30752985da8e19dece92e1cf7d059-amd64
+ARG FROM_TAG=latest
 # TODO consider replacing clickhouse with altinityinfra dockerhub account
 FROM altinityinfra/stateless-test:$FROM_TAG
 
-RUN apt-get update -y \
-    && env DEBIAN_FRONTEND=noninteractive \
-        apt-get install --yes --no-install-recommends \
-        python3-requests \
-        nodejs \
-        npm \
-        rpm2cpio \
-        cpio \
-    && apt-get clean
+# The following is already done in clickhouse/stateless-test
+# RUN apt-get update -y \
+#     && env DEBIAN_FRONTEND=noninteractive \
+#         apt-get install --yes --no-install-recommends \
+#         python3-requests \
+#         nodejs \
+#         npm \
+#         rpm2cpio \
+#         cpio \
+#     && apt-get clean
 
 COPY s3downloader /s3downloader
 
 ENV S3_URL="https://clickhouse-datasets.s3.amazonaws.com"
 ENV DATASETS="hits visits"
 
-RUN npm install -g azurite
+# The following is already done in clickhouse/stateless-test
+# RUN npm install -g azurite
+# RUN npm install tslib
 
 COPY run.sh /
 CMD ["/bin/bash", "/run.sh"]
