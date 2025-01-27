@@ -191,7 +191,14 @@ if __name__ == "__main__":
     images = get_images_with_versions(
         reports_path, IMAGES, "291-84104d56b3efd1f1153e56e924b397ff9f0cdb27-amd64"
     )
-    images_with_versions = {i.name: i.version for i in images}
+    images_with_versions = {
+        i.name: (
+            "291-84104d56b3efd1f1153e56e924b397ff9f0cdb27-amd64"
+            if "altinityinfra" in i.name
+            else i.version
+        )
+        for i in images
+    }
     result_path = os.path.join(temp_path, "output_dir")
     if not os.path.exists(result_path):
         os.makedirs(result_path)
