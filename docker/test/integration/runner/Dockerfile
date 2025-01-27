@@ -1,5 +1,5 @@
 # docker build -t clickhouse/integration-tests-runner .
-FROM ubuntu:20.04
+FROM ubuntu:22.04
 
 # ARG for quick switch to a given ubuntu mirror
 ARG apt_archive="http://archive.ubuntu.com"
@@ -8,34 +8,35 @@ RUN sed -i "s|http://archive.ubuntu.com|$apt_archive|g" /etc/apt/sources.list
 
 RUN apt-get update \
     && env DEBIAN_FRONTEND=noninteractive apt-get install --yes \
-    adduser \
+    adduser='3.11*' \
     ca-certificates \
-    bash \
-    btrfs-progs \
-    e2fsprogs \
-    iptables \
-    xfsprogs \
-    tar \
-    pigz \
-    wget \
-    git \
-    iproute2 \
-    cgroupfs-mount \
-    python3-pip \
+    bash='5.1-*' \
+    btrfs-progs='5.16.*' \
+    e2fsprogs='1.46.*' \
+    iptables='1.8.*' \
+    xfsprogs='5.13.*' \
+    tar='1.34*' \
+    pigz='2.6*' \
+    wget='1.21.*' \
+    git='1:2.34.*' \
+    iproute2='5.15.*' \
+    cgroupfs-mount=1.4 \
+    python3-pip='22.0.*' \
     tzdata \
-    libicu-dev \
-    bsdutils \
-    curl \
-    python3-pika \
+    libicu-dev='70.1*' \
+    bsdutils='1:2.37.*' \
+    curl='7.81.*' \
+    python3-pika='1.2.*' \
     liblua5.1-dev \
-    luajit \
-    libssl-dev \
-    libcurl4-openssl-dev \
-    gdb \
-    software-properties-common \
-    libkrb5-dev \
-    krb5-user \
-    g++ \
+    luajit='2.1.*' \
+    libssl-dev='3.0.*' \
+    libcurl4-openssl-dev='7.81.*' \
+    gdb='12.1-*' \
+    default-jdk='2:1.11-*' \
+    software-properties-common='0.99.*' \
+    libkrb5-dev='1.19.*' \
+    krb5-user='1.19.*' \
+    g++='4:11.2.*' \
     && rm -rf \
         /var/lib/apt/lists/* \
         /var/cache/debconf \
@@ -46,65 +47,99 @@ ENV TZ=Etc/UTC
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 ENV DOCKER_CHANNEL stable
+# Unpin the docker version after the release 24.0.3 is released
+# https://github.com/moby/moby/issues/45770#issuecomment-1618255130
 RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add - \
     && add-apt-repository "deb https://download.docker.com/linux/ubuntu $(lsb_release -c -s) ${DOCKER_CHANNEL}" \
     && apt-get update \
     && env DEBIAN_FRONTEND=noninteractive apt-get install --yes \
-        docker-ce \
+        docker-ce='5:23.*' \
     && rm -rf \
         /var/lib/apt/lists/* \
         /var/cache/debconf \
         /tmp/* \
-    && apt-get clean
+    && apt-get clean \
+    && dockerd --version; docker --version
 
-RUN dockerd --version; docker --version
 
+# kazoo 2.10.0 is broken
+# https://s3.amazonaws.com/clickhouse-test-reports/59337/524625a1d2f4cc608a3f1059e3df2c30f353a649/integration_tests__asan__analyzer__[5_6].html
 RUN python3 -m pip install --no-cache-dir \
-    PyMySQL \
-    aerospike==4.0.0 \
-    avro==1.10.2 \
-    asyncio \
-    cassandra-driver \
-    confluent-kafka==1.5.0 \
-    dict2xml \
-    dicttoxml \
-    docker \
-    docker-compose==1.29.2 \
-    grpcio \
-    grpcio-tools \
-    kafka-python \
-    kazoo \
-    lz4 \
-    minio \
-    nats-py \
-    protobuf \
-    psycopg2-binary==2.8.6 \
-    pymongo==3.11.0 \
-    pytest \
-    pytest-order==1.0.0 \
-    pytest-timeout \
-    pytest-xdist \
-    pytest-repeat \
+    PyMySQL~=1.1.0 \
+    aerospike~=11.1.0 \
+    asyncio~=3.4.3\
+    avro~=1.10.2 \
+    azure-storage-blob~=12.19.0\
+    cassandra-driver~=3.28.0\
+    confluent-kafka~=1.9.2 \
+    delta-spark~=2.3.0 \
+    dict2xml~=1.7.3 \
+    dicttoxml~=1.7.16 \
+    docker~=6.1.3 \
+    docker-compose~=1.29.2 \
+    grpcio~=1.59.3 \
+    grpcio-tools~=1.59.3 \
+    kafka-python~=2.0.2 \
+    kazoo~=2.9.0 \
+    lz4~=4.3.2 \
+    meilisearch~=0.18.3 \
+    minio~=7.2.0 \
+    nats-py~=2.6.0 \
+    protobuf~=4.25.1 \
+    psycopg2-binary~=2.9.6 \
+    pyhdfs~=0.3.1 \
+    pymongo~=3.11.0 \
+    pyspark~=3.3.2 \
+    pytest~=7.4.3 \
+    pytest-order~=1.0.0 \
+    pytest-random~=0.2 \
+    pytest-repeat~=0.9.3 \
+    pytest-timeout~=2.2.0 \
+    pytest-xdist~=3.5.0 \
     pytz \
-    redis \
-    tzlocal==2.1 \
-    urllib3 \
+    pyyaml~=5.3.1 \
+    redis~=5.0.1 \
+    requests==2.31.0 \
     requests-kerberos \
-    pyhdfs \
-    azure-storage-blob \
-    meilisearch==0.18.3 
+    requests~=2.31.0 \
+    tzlocal~=2.1 \
+    retry~=0.9.2 \
+    bs4~=0.0.1 \
+    lxml~=4.9.3 \
+    urllib3~=2.1.0
+# bs4, lxml are for cloud tests, do not delete
+
+# Hudi supports only spark 3.3.*, not 3.4
+RUN curl -fsSL -O https://archive.apache.org/dist/spark/spark-3.3.2/spark-3.3.2-bin-hadoop3.tgz \
+    && tar xzvf spark-3.3.2-bin-hadoop3.tgz -C / \
+    && rm spark-3.3.2-bin-hadoop3.tgz
+
+# download spark and packages
+# if you change packages, don't forget to update them in tests/integration/helpers/cluster.py
+RUN packages="org.apache.hudi:hudi-spark3.3-bundle_2.12:0.13.0,\
+io.delta:delta-core_2.12:2.3.0,\
+org.apache.iceberg:iceberg-spark-runtime-3.3_2.12:1.1.0" \
+    && /spark-3.3.2-bin-hadoop3/bin/spark-shell --packages "$packages" > /dev/null \
+    && find /root/.ivy2/ -name '*.jar' -exec ln -sf {} /spark-3.3.2-bin-hadoop3/jars/ \;
+
+RUN set -x \
+  && addgroup --system dockremap \
+  && adduser --system dockremap \
+  && adduser dockremap dockremap \
+  && echo 'dockremap:165536:65536' >> /etc/subuid \
+  && echo 'dockremap:165536:65536' >> /etc/subgid
 
 COPY modprobe.sh /usr/local/bin/modprobe
 COPY dockerd-entrypoint.sh /usr/local/bin/
 COPY compose/ /compose/
 COPY misc/ /misc/
 
-RUN set -x \
-  && addgroup --system dockremap \
-    && adduser --system dockremap \
-  && adduser dockremap dockremap \
-  && echo 'dockremap:165536:65536' >> /etc/subuid \
-    && echo 'dockremap:165536:65536' >> /etc/subgid
+
+# Same options as in test/base/Dockerfile
+# (in case you need to override them in tests)
+ENV TSAN_OPTIONS='halt_on_error=1 abort_on_error=1 history_size=7 memory_limit_mb=46080 second_deadlock_stack=1'
+ENV UBSAN_OPTIONS='print_stacktrace=1'
+ENV MSAN_OPTIONS='abort_on_error=1 poison_in_dtor=1'
 
 EXPOSE 2375
 ENTRYPOINT ["dockerd-entrypoint.sh"]
