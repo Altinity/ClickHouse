@@ -193,6 +193,8 @@ def main():
 
     logging.info("Build short name %s", build_name)
 
+    assert False, "DEBUG ONLY: We don't go past this point debugging stuff"
+
     build_output_path = temp_path / build_name
     build_output_path.mkdir(parents=True, exist_ok=True)
 
