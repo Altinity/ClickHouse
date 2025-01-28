@@ -76,15 +76,16 @@ def get_pr_for_commit(sha, ref):
                 return pr
             our_prs.append(pr)
         logging.warning(
-            "Cannot find PR with required ref %s, sha %s - returning first one",
+            "Cannot find PR with required ref %s, sha %s",
             ref,
             sha,
         )
-        if len(our_prs) != 0:
-            first_pr = our_prs[0]
-            return first_pr
-        else:
-            return None
+        # NOTE(vnemkov): IMO returning possibly unrelated PR it breaks CI/CD down the road
+        # if len(our_prs) != 0:
+        #     first_pr = our_prs[0]
+        #     return first_pr
+        # else:
+        return None
 
     except Exception as ex:
         logging.error(
@@ -247,7 +248,7 @@ class PRInfo:
             self.commit_html_url = f"{repo_prefix}/commit/{self.sha}"
 
             if pull_request is None or pull_request["state"] == "closed":
-                # it's merged PR to master
+                # it's merged PR to master, or there is no PR (build against specific commit or tag)
                 self.number = 0
                 if pull_request:
                     self.merged_pr = pull_request["number"]
@@ -483,6 +484,10 @@ class PRInfo:
                 break
         assert last_synced_upstream_commit
         return last_synced_upstream_commit
+
+    def __str__(self):
+        import pprint
+        return pprint.pformat(vars(self))
 
 
 class FakePRInfo:
