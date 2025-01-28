@@ -485,6 +485,10 @@ class PRInfo:
         assert last_synced_upstream_commit
         return last_synced_upstream_commit
 
+    def __str__(self):
+        import pprint
+        return pprint.pformat(vars(self))
+
 
 class FakePRInfo:
     def __init__(self):
