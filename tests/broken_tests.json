@@ -1,5 +1,47 @@
 {
     "Server died": {
         "reason": "Occurs with ubsan"
+    },
+    "02700_s3_part_INT_MAX": {
+        "reason": "Fails on asan"
+    },
+    "02815_no_throw_in_simple_queries": {
+        "reason": "Fails on asan,msan,tsan,debug,Aarch64"
+    },
+    "03206_no_exceptions_clickhouse_local": {
+        "reason": "Fails on asan,msan,tsan,debug,Aarch64"
+    },
+    "00763_long_lock_buffer_alter_destination_table": {
+        "reason": "Error, server died on ubsan"
+    },
+    "00825_protobuf_format_squares": {
+        "reason": "Error, server died on ubsan"
+    },
+    "01034_move_partition_from_table_zookeeper": {
+        "reason": "Error, server died on ubsan"
+    },
+    "01326_build_id": {
+        "reason": "Error, server died on ubsan"
+    },
+    "01475_read_subcolumns_3": {
+        "reason": "Error, server died on ubsan"
+    },
+    "01508_query_obfuscator": {
+        "reason": "Error, server died on ubsan"
+    },
+    "02118_deserialize_whole_text": {
+        "reason": "Error, server died on ubsan"
+    },
+    "02918_multif_for_nullable": {
+        "reason": "Error, server died on ubsan"
+    },
+    "03023_remove_unused_column_distinct": {
+        "reason": "Error, server died on ubsan"
+    },
+    "03215_parallel_replicas_crash_after_refactoring": {
+        "reason": "Error, server died on ubsan"
+    },
+    "03222_pr_asan_index_granularity": {
+        "reason": "Error, server died on ubsan"
     }
 }
