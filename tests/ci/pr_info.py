@@ -258,9 +258,13 @@ class PRInfo:
                 self.base_name = self.repo_full_name
                 self.head_ref = ref
                 self.head_name = self.repo_full_name
-                self.diff_urls.append(
-                    self.compare_url(github_event["before"], self.sha)
-                )
+                before_sha = github_event["before"]
+                # in case of just a tag on exsiting commit, "before_sha" is 0000000000000000000000000000000000000000
+                # Hence it is a special case and basically nothing changed, there is no need to compose a diff url
+                if not all(x == '0' for x in before_sha):
+                    self.diff_urls.append(
+                        self.compare_url(before_sha, self.sha)
+                    )
             else:
                 self.number = pull_request["number"]
                 self.labels = {label["name"] for label in pull_request["labels"]}
