@@ -1,7 +1,4 @@
 {
-    "Server died": {
-        "reason": "Occurs with ubsan"
-    },
     "02700_s3_part_INT_MAX": {
         "reason": "Fails on asan"
     },
