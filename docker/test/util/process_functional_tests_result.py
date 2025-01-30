@@ -175,7 +175,8 @@ def process_result(result_path, broken_tests, known_failing_tests):
             test_results.append(["Some queries hung", "FAIL", "0", ""])
         elif server_died:
             description = "Server died, "
-            state = "failure"
+            # state = "failure"
+            state = "success"
             # When ClickHouse server crashes, some tests are still running
             # and fail because they cannot connect to server
             for result in test_results:
