@@ -112,6 +112,8 @@ def get_run_command(
 
     if flaky_check:
         envs.append("-e NUM_TRIES=50")
+    else:
+        envs.append("-e NUM_TRIES=3")
 
     envs += [f"-e {e}" for e in additional_envs]
 
