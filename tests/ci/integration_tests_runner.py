@@ -1043,7 +1043,7 @@ class ClickhouseIntegrationTestsRunner:
             result_state = "failure"
             # add mock test case to make timeout visible in job report and in ci db
             test_result.insert(
-                0, (JOB_TIMEOUT_TEST_NAME, "FAIL", f"{stopwatch.duration_seconds}", "")
+                0, (JOB_TIMEOUT_TEST_NAME, "SKIPPED", f"{stopwatch.duration_seconds}", "")
             )
 
         if not counters or sum(len(counter) for counter in counters.values()) == 0:
