@@ -323,7 +323,6 @@ function run_tests()
         --no-drop-if-fail
         --capture-client-stacktrace
         --test-runs "$NUM_TRIES"
-        --sequential 03222_pr_asan_index_granularity 03215_parallel_replicas_crash_after_refactoring 03023_remove_unused_column_distinct 02918_multif_for_nullable 02118_deserialize_whole_text 01508_query_obfuscator 01475_read_subcolumns_3 01326_build_id 01034_move_partition_from_table_zookeeper 00825_protobuf_format_squares 00763_long_lock_buffer_alter_destination_table
         "${ADDITIONAL_OPTIONS[@]}"
     )
     clickhouse-test "${TEST_ARGS[@]}" 2>&1 \
