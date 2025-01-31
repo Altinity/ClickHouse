@@ -1040,11 +1040,10 @@ class ClickhouseIntegrationTestsRunner:
                 "Job killed by external timeout signal - setting status to failure!"
             )
             status_text = "Job timeout expired, " + status_text
-            # result_state = "failure"
-            result_state = "success"
+            result_state = "failure"
             # add mock test case to make timeout visible in job report and in ci db
             test_result.insert(
-                0, (JOB_TIMEOUT_TEST_NAME, "SKIPPED", f"{stopwatch.duration_seconds}", "")
+                0, (JOB_TIMEOUT_TEST_NAME, "FAIL", f"{stopwatch.duration_seconds}", "")
             )
 
         if not counters or sum(len(counter) for counter in counters.values()) == 0:

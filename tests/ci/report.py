@@ -279,7 +279,7 @@ class TestResult:
 
     @staticmethod
     def create_check_timeout_expired(duration: Optional[float] = None) -> "TestResult":
-        return TestResult(JOB_TIMEOUT_TEST_NAME, "SKIPPED", time=duration)
+        return TestResult(JOB_TIMEOUT_TEST_NAME, "FAIL", time=duration)
 
 
 TestResults = List[TestResult]
