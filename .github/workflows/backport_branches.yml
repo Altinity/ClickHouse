@@ -450,13 +450,13 @@ jobs:
         with:
           clear-repository: true
           fetch-depth: 0  # It MUST BE THE SAME for all dependencies and the job itself
-      - name: Check docker clickhouse/clickhouse-server building
+      - name: Check docker altinity/clickhouse-server building
         run: |
           cd "$GITHUB_WORKSPACE/tests/ci"
           python3 docker_server.py --release-type head --no-push \
-            --image-repo clickhouse/clickhouse-server --image-path docker/server
+            --image-repo altinity/clickhouse-server --image-path docker/server
           python3 docker_server.py --release-type head --no-push \
-            --image-repo clickhouse/clickhouse-keeper --image-path docker/keeper
+            --image-repo altinity/clickhouse-keeper --image-path docker/keeper
       - name: Cleanup
         if: always()
         run: |

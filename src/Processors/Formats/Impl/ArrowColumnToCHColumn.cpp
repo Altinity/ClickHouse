@@ -69,7 +69,6 @@ namespace ErrorCodes
     extern const int DUPLICATE_COLUMN;
     extern const int THERE_IS_NO_COLUMN;
     extern const int UNKNOWN_EXCEPTION;
-    extern const int INCORRECT_NUMBER_OF_COLUMNS;
     extern const int INCORRECT_DATA;
 }
 
@@ -90,7 +89,7 @@ static ColumnWithTypeAndName readColumnWithNumericData(std::shared_ptr<arrow::Ch
 
         /// buffers[0] is a null bitmap and buffers[1] are actual values
         std::shared_ptr<arrow::Buffer> buffer = chunk->data()->buffers[1];
-        const auto * raw_data = reinterpret_cast<const NumericType *>(buffer->data());
+        const auto * raw_data = reinterpret_cast<const NumericType *>(buffer->data()) + chunk->offset();
         column_data.insert_assume_reserved(raw_data, raw_data + chunk->length());
     }
     return {std::move(internal_column), std::move(internal_type), column_name};
@@ -347,7 +346,7 @@ static ColumnWithTypeAndName readColumnWithIndexesDataImpl(std::shared_ptr<arrow
 
         /// buffers[0] is a null bitmap and buffers[1] are actual values
         std::shared_ptr<arrow::Buffer> buffer = chunk->data()->buffers[1];
-        const auto * data = reinterpret_cast<const NumericType *>(buffer->data());
+        const auto * data = reinterpret_cast<const NumericType *>(buffer->data()) + chunk->offset();
 
         /// Check that indexes are correct (protection against corrupted files)
         for (int64_t i = 0; i != chunk->length(); ++i)
@@ -767,7 +766,7 @@ ArrowColumnToCHColumn::ArrowColumnToCHColumn(
 {
 }
 
-void ArrowColumnToCHColumn::arrowTableToCHChunk(Chunk & res, std::shared_ptr<arrow::Table> & table)
+void ArrowColumnToCHColumn::arrowTableToCHChunk(Chunk & res, std::shared_ptr<arrow::Table> & table, size_t num_rows)
 {
     NameToColumnPtr name_to_column_ptr;
     for (auto column_name : table->ColumnNames())
@@ -781,16 +780,12 @@ void ArrowColumnToCHColumn::arrowTableToCHChunk(Chunk & res, std::shared_ptr<arr
         name_to_column_ptr[std::move(column_name)] = arrow_column;
     }
 
-    arrowColumnsToCHChunk(res, name_to_column_ptr);
+    arrowColumnsToCHChunk(res, name_to_column_ptr, num_rows);
 }
 
-void ArrowColumnToCHColumn::arrowColumnsToCHChunk(Chunk & res, NameToColumnPtr & name_to_column_ptr)
+void ArrowColumnToCHColumn::arrowColumnsToCHChunk(Chunk & res, NameToColumnPtr & name_to_column_ptr, size_t num_rows)
 {
-    if (unlikely(name_to_column_ptr.empty()))
-        throw Exception(ErrorCodes::INCORRECT_NUMBER_OF_COLUMNS, "Columns is empty");
-
     Columns columns_list;
-    UInt64 num_rows = name_to_column_ptr.begin()->second->length();
     columns_list.reserve(header.columns());
     std::unordered_map<String, std::pair<BlockPtr, std::shared_ptr<NestedColumnExtractHelper>>> nested_tables;
     bool skipped = false;

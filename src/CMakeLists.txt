@@ -602,6 +602,7 @@ if (ENABLE_TESTS)
         dbms
         clickhouse_common_config
         clickhouse_common_zookeeper
+        ch_contrib::parquet
         string_utils)
 
     if (TARGET ch_contrib::simdjson)
