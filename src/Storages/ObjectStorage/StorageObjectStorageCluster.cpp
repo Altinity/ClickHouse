@@ -61,6 +61,7 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         cluster_name_, table_id_, getLogger(fmt::format("{}({})", configuration_->getEngineName(), table_id_.table_name)))
     , configuration{configuration_}
     , object_storage(object_storage_)
+    , cluster_name_in_settings(false)
 {
     ColumnsDescription columns{columns_};
     std::string sample_path;
@@ -128,7 +129,7 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
         }
     }
 
-    if (!endsWith(table_function->name, "Cluster"))
+    if (cluster_name_in_settings || !endsWith(table_function->name, "Cluster"))
         configuration->addStructureAndFormatToArgsIfNeeded(args, structure, configuration->format, context, /*with_structure=*/true);
     else
     {
