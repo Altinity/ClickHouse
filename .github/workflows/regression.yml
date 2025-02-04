@@ -193,9 +193,9 @@ jobs:
             github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              sha: ${{ github.event.pull_request.head.sha || github.sha }},
+              sha: "${{ github.event.pull_request.head.sha || github.sha }}",
               state: "success",
-              context: "regression-${{ matrix.SUITE }}",
+              context: "Regression-${{ matrix.SUITE }}",
               description: "Job for ${{ matrix.SUITE }} completed with status ${{ steps.run_suite.outcome }}",
               target_url: process.env.SUITE_REPORT_INDEX_URL
             });
