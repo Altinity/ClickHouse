@@ -174,6 +174,7 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
+        id: run_suite
         run: EXITCODE=0;
               python3
               -u ${{ env.SUITE }}/regression.py
@@ -182,6 +183,20 @@ jobs:
               ${{ env.args }} || EXITCODE=$?;
               .github/add_link_to_logs.sh;
               exit $EXITCODE
+      - name: Set Commit Status
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: "success",
+              context: "regression-${{ matrix.SUITE }}",
+              description: "Job for ${{ matrix.SUITE }} completed with status ${{ steps.run_suite.outcome }}",
+              target_url: "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            });
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
