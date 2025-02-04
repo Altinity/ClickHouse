@@ -184,21 +184,12 @@ jobs:
               .github/add_link_to_logs.sh;
               exit $EXITCODE
       - name: Set Commit Status
-        uses: actions/github-script@v7
+        if: always()
+        run: python3 .github/set_regression_status.py
         env:
-            SUITE_REPORT_INDEX_URL: ${{ env.SUITE_REPORT_INDEX_URL }}
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: "${{ github.event.pull_request.head.sha || github.sha }}",
-              state: "success",
-              context: "Regression-${{ matrix.SUITE }}",
-              description: "Job for ${{ matrix.SUITE }} completed with status ${{ steps.run_suite.outcome }}",
-              target_url: process.env.SUITE_REPORT_INDEX_URL
-            });
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
+          SUITE_NAME: "Regression ${{ matrix.SUITE }}"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
@@ -242,6 +233,7 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
+        id: run_suite
         run:  EXITCODE=0;
               python3
               -u alter/regression.py
@@ -251,6 +243,13 @@ jobs:
               ${{ env.args }} || EXITCODE=$?;
               .github/add_link_to_logs.sh;
               exit $EXITCODE
+      - name: Set Commit Status
+        if: always()
+        run: python3 .github/set_regression_status.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
+          SUITE_NAME: "Regression Alter ${{ matrix.ONLY }} partition"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
@@ -294,6 +293,7 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
+        id: run_suite
         run:  EXITCODE=0;
               python3
               -u ${{ env.SUITE }}/benchmark.py
@@ -310,6 +310,13 @@ jobs:
               ${{ env.args }} || EXITCODE=$?;
               .github/add_link_to_logs.sh;
               exit $EXITCODE
+      - name: Set Commit Status
+        if: always()
+        run: python3 .github/set_regression_status.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
+          SUITE_NAME: "Regression Benchmark ${{ matrix.STORAGE }}"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
@@ -349,6 +356,7 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
+        id: run_suite
         run:  EXITCODE=0;
               python3
               -u ${{ env.SUITE }}/regression.py
@@ -358,6 +366,13 @@ jobs:
               ${{ env.args }} || EXITCODE=$?;
               .github/add_link_to_logs.sh;
               exit $EXITCODE
+      - name: Set Commit Status
+        if: always()
+        run: python3 .github/set_regression_status.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
+          SUITE_NAME: "Regression Clickhouse Keeper SSL"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
@@ -400,6 +415,7 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
+        id: run_suite
         run:  EXITCODE=0;
               python3
               -u ${{ env.SUITE }}/regression.py
@@ -408,6 +424,13 @@ jobs:
               ${{ env.args }} || EXITCODE=$?;
               .github/add_link_to_logs.sh;
               exit $EXITCODE
+      - name: Set Commit Status
+        if: always()
+        run: python3 .github/set_regression_status.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
+          SUITE_NAME: "Regression LDAP ${{ matrix.SUITE }}"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
@@ -446,6 +469,7 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
+        id: run_suite
         run:  EXITCODE=0;
               python3
               -u ${{ env.SUITE }}/regression.py
@@ -454,6 +478,13 @@ jobs:
               ${{ env.args }} || EXITCODE=$?;
               .github/add_link_to_logs.sh;
               exit $EXITCODE
+      - name: Set Commit Status
+        if: always()
+        run: python3 .github/set_regression_status.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
+          SUITE_NAME: "Regression Parquet"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
@@ -497,6 +528,7 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
+        id: run_suite
         run:  EXITCODE=0;
               python3
               -u ${{ env.SUITE }}/regression.py
@@ -510,6 +542,13 @@ jobs:
               ${{ env.args }} || EXITCODE=$?;
               .github/add_link_to_logs.sh;
               exit $EXITCODE
+      - name: Set Commit Status
+        if: always()
+        run: python3 .github/set_regression_status.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
+          SUITE_NAME: "Regression Parquet ${{ matrix.STORAGE }}"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
@@ -553,6 +592,7 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
+        id: run_suite
         run:  EXITCODE=0;
               python3
               -u ${{ env.SUITE }}/regression.py
@@ -572,6 +612,13 @@ jobs:
               ${{ env.args }} || EXITCODE=$?;
               .github/add_link_to_logs.sh;
               exit $EXITCODE
+      - name: Set Commit Status
+        if: always()
+        run: python3 .github/set_regression_status.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
+          SUITE_NAME: "Regression S3 ${{ matrix.STORAGE }}"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
@@ -615,6 +662,7 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
+        id: run_suite
         run:  EXITCODE=0;
               python3
               -u ${{ env.SUITE }}/regression.py
@@ -630,6 +678,13 @@ jobs:
               ${{ env.args }} || EXITCODE=$?;
               .github/add_link_to_logs.sh;
               exit $EXITCODE
+      - name: Set Commit Status
+        if: always()
+        run: python3 .github/set_regression_status.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
+          SUITE_NAME: "Regression Tiered Storage ${{ matrix.STORAGE }}"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
