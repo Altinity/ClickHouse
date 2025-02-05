@@ -7,13 +7,11 @@
 #include <jwt-cpp/jwt.h>
 #include <jwt-cpp/traits/kazuho-picojson/traits.h>
 #include <picojson/picojson.h>
-#include "Poco/StreamCopier.h"
 #include <Poco/String.h>
 
-#include "Common/Base64.h"
-#include "Common/Exception.h"
-#include "Common/logger_useful.h"
-#include <Common/SettingsChanges.h>
+#include <Common/Base64.h>
+#include <Common/Exception.h>
+#include <Common/logger_useful.h>
 
 namespace DB
 {
@@ -167,67 +165,9 @@ bool check_claims(const String & claims, const picojson::value::object & payload
     return check_claims(json.get<picojson::value::object>(), payload, "");
 }
 
-std::map<String, Field> stringifyparams_(const picojson::value & params, const String & path);
-
-std::map<String, Field> stringifyparams_(const picojson::value::array & params, const String & path)
-{
-    std::map<String, Field> result;
-    for (size_t i = 0; i < params.size(); ++i)
-    {
-        const auto tmp_result = stringifyparams_(params.at(i), path + "[" + std::to_string(i) + "]");
-        result.insert(tmp_result.begin(), tmp_result.end());
-    }
-    return result;
 }
 
-std::map<String, Field> stringifyparams_(const picojson::value::object & params, const String & path)
-{
-    auto add_path = String(path);
-    if (!add_path.empty())
-        add_path = add_path + ".";
-    std::map<String, Field> result;
-    for (const auto & it : params)
-    {
-        const auto tmp_result = stringifyparams_(it.second, add_path + it.first);
-        result.insert(tmp_result.begin(), tmp_result.end());
-    }
-    return result;
-}
-
-std::map<String, Field> stringifyparams_(const picojson::value & params, const String & path)
-{
-    std::map<String, Field> result;
-    if (params.is<picojson::array>())
-        return stringifyparams_(params.get<picojson::array>(), path);
-    if (params.is<picojson::object>())
-        return stringifyparams_(params.get<picojson::object>(), path);
-    if (params.is<bool>())
-    {
-        result[path] = Field(params.get<bool>());
-        return result;
-    }
-    if (params.is<std::string>())
-    {
-        result[path] = Field(params.get<std::string>());
-        return result;
-    }
-    if (params.is<double>())
-    {
-        result[path] = Field(params.get<double>());
-        return result;
-    }
-    #ifdef PICOJSON_USE_INT64
-    if (params.is<int64_t>())
-    {
-        result[path] = Field(params.get<int64_t>());
-        return result;
-    }
-    #endif
-    return result;
-}
-}
-
-bool IJWTValidator::validate(const String & claims, const String & token, SettingsChanges & settings) const
+bool IJWTValidator::validate(const String & claims, const String & token) const
 {
     try
     {
@@ -237,13 +177,9 @@ bool IJWTValidator::validate(const String & claims, const String & token, Settin
 
         if (!check_claims(claims, decoded_jwt.get_payload_json()))
             return false;
-        if (params.settings_key.empty())
-            return true;
-        const auto & payload_obj = decoded_jwt.get_payload_json();
-        const auto & payload_settings = payload_obj.at(params.settings_key);
-        const auto string_settings = stringifyparams_(payload_settings, "");
-        for (const auto & it : string_settings)
-            settings.insertSetting(it.first, it.second);
+
+        LOG_TRACE(getLogger("JWTAuthentication"), "{}: claims checked", name);
+
         return true;
     }
     catch (const std::exception & ex)
@@ -284,7 +220,7 @@ void SimpleJWTValidatorParams::validate() const
 
 
 SimpleJWTValidator::SimpleJWTValidator(const String & name_, const SimpleJWTValidatorParams & params_)
-    : IJWTValidator(name_, params_), verifier(jwt::verify())
+    : IJWTValidator(name_), verifier(jwt::verify())
 {
     auto algo = params_.algo;
 
@@ -391,108 +327,15 @@ void JWKSValidator::validateImpl(const jwt::decoded_jwt<jwt::traits::kazuho_pico
     verifier.verify(token);
 }
 
-JWKSClient::JWKSClient(const JWKSAuthClientParams & params_)
-    : HTTPAuthClient<JWKSResponseParser>(params_)
-    , m_refresh_ms(params_.refresh_ms)
-{
-}
-
-JWKSClient::~JWKSClient() = default;
-
-jwt::jwks<jwt::traits::kazuho_picojson> JWKSClient::getJWKS()
-{
-    {
-        std::shared_lock lock(m_update_mutex);
-        auto now = std::chrono::high_resolution_clock::now();
-        auto diff = std::chrono::duration<double, std::milli>(now - m_last_request_send).count();
-        if (diff < m_refresh_ms)
-        {
-            jwt::jwks<jwt::traits::kazuho_picojson> result(m_jwks);
-            return result;
-        }
-    }
-    std::unique_lock lock(m_update_mutex);
-    auto now = std::chrono::high_resolution_clock::now();
-    auto diff =  std::chrono::duration<double, std::milli>(now - m_last_request_send).count();
-    if (diff < m_refresh_ms)
-    {
-        jwt::jwks<jwt::traits::kazuho_picojson> result(m_jwks);
-        return result;
-    }
-    Poco::Net::HTTPRequest request{Poco::Net::HTTPRequest::HTTP_GET, this->getURI().getPathAndQuery()};
-    auto result = authenticateRequest(request);
-    m_jwks = std::move(result.keys);
-    if (result.is_ok)
-    {
-        m_last_request_send = std::chrono::high_resolution_clock::now();
-    }
-    jwt::jwks<jwt::traits::kazuho_picojson> results(m_jwks);
-    return results;
-}
-
-JWKSResponseParser::Result
-JWKSResponseParser::parse(const Poco::Net::HTTPResponse & response, std::istream * body_stream) const
-{
-    Result result;
-
-    if (response.getStatus() != Poco::Net::HTTPResponse::HTTPStatus::HTTP_OK)
-        return result;
-    result.is_ok = true;
-
-    if (!body_stream)
-        return result;
-
-    try
-    {
-        String response_data;
-        Poco::StreamCopier::copyToString(*body_stream, response_data);
-        auto keys = jwt::parse_jwks(response_data);
-        result.keys = std::move(keys);
-    }
-    catch (...)
-    {
-        LOG_INFO(getLogger("JWKSAuthentication"), "Failed to parse jwks from authentication response. Skip it.");
-    }
-    return result;
-}
-
-StaticJWKSParams::StaticJWKSParams(const std::string & static_jwks_, const std::string & static_jwks_file_)
-{
-    if (static_jwks_.empty() && static_jwks_file_.empty())
-        throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "JWT validator misconfigured: `static_jwks` or `static_jwks_file` keys must be present in static JWKS validator configuration");
-    if (!static_jwks_.empty() && !static_jwks_file_.empty())
-        throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "JWT validator misconfigured: `static_jwks` and `static_jwks_file` keys cannot both be present in static JWKS validator configuration");
-
-    static_jwks = static_jwks_;
-    static_jwks_file = static_jwks_file_;
-}
-
-StaticJWKS::StaticJWKS(const StaticJWKSParams & params)
-{
-    String content = String(params.static_jwks);
-    if (!params.static_jwks_file.empty())
-    {
-        std::ifstream ifs(params.static_jwks_file);
-        content = String((std::istreambuf_iterator<char>(ifs)), (std::istreambuf_iterator<char>()));
-    }
-    auto keys = jwt::parse_jwks(content);
-    jwks = std::move(keys);
-}
 
 std::unique_ptr<DB::IJWTValidator> IJWTValidator::parseJWTValidator(
     const Poco::Util::AbstractConfiguration & config,
     const String & prefix,
-    const String & name,
-    const String & global_settings_key)
+    const String & name)
 {
-    auto settings_key = String(global_settings_key);
-    if (config.hasProperty(prefix + ".settings_key"))
-        settings_key = config.getString(prefix + ".settings_key");
-
     if (config.hasProperty(prefix + ".algo"))
     {
         SimpleJWTValidatorParams params = {};
-        params.settings_key = settings_key;
         params.algo = Poco::toLower(config.getString(prefix + ".algo"));
         params.static_key = config.getString(prefix + ".static_key", "");
         params.static_key_in_base64 = config.getBool(prefix + ".static_key_in_base64", false);
@@ -503,29 +346,11 @@ std::unique_ptr<DB::IJWTValidator> IJWTValidator::parseJWTValidator(
         params.validate();
         return std::make_unique<SimpleJWTValidator>(name, params);
     }
-    else if (config.hasProperty(prefix + ".token_resolve_url"))
-    {
-        /// This is an access token and we need to resolve it at the token issuer.
-        return std::make_unique<AccessTokenValidator>(name);
-    }
 
     std::shared_ptr<IJWKSProvider> provider;
     if (config.hasProperty(prefix + ".uri"))
     {
-        JWKSAuthClientParams params;
-
-        params.uri = config.getString(prefix + ".uri");
-
-        params.timeouts = ConnectionTimeouts()
-                              .withConnectionTimeout(Poco::Timespan(config.getInt(prefix + ".connection_timeout_ms", 1000) * 1000))
-                              .withReceiveTimeout(Poco::Timespan(config.getInt(prefix + ".receive_timeout_ms", 1000) * 1000))
-                              .withSendTimeout(Poco::Timespan(config.getInt(prefix + ".send_timeout_ms", 1000) * 1000));
-
-        params.max_tries = config.getInt(prefix + ".max_tries", 3);
-        params.retry_initial_backoff_ms = config.getInt(prefix + ".retry_initial_backoff_ms", 50);
-        params.retry_max_backoff_ms = config.getInt(prefix + ".retry_max_backoff_ms", 1000);
-        params.refresh_ms = config.getInt(prefix + ".refresh_ms", 300000);
-        provider = std::make_shared<JWKSClient>(params);
+        provider = std::make_shared<JWKSClient>(config.getString(prefix + ".uri"), config.getInt(prefix + ".refresh_ms", 300000));
     }
     else if (config.hasProperty(prefix + ".static_jwks") || config.hasProperty(prefix + ".static_jwks_file"))
     {
@@ -536,9 +361,9 @@ std::unique_ptr<DB::IJWTValidator> IJWTValidator::parseJWTValidator(
         provider = std::make_shared<StaticJWKS>(params);
     }
     else
-        throw DB::Exception(ErrorCodes::BAD_ARGUMENTS, "unsupported configuration");
+        throw DB::Exception(ErrorCodes::BAD_ARGUMENTS, "Either JWKS or JWKS URI must be specified in configuration");
 
-    return std::make_unique<JWKSValidator>(name, provider, TokenValidatorParams{.settings_key = settings_key});
+    return std::make_unique<JWKSValidator>(name, provider);
 }
 
 }

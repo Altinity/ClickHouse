@@ -300,16 +300,13 @@ void parseJWTValidators(std::unordered_map<String, std::unique_ptr<IJWTValidator
     Poco::Util::AbstractConfiguration::Keys jwt_validators_keys;
     config.keys(jwt_validators_config, jwt_validators_keys);
     jwt_validators.clear();
-    String token_validator_settings_key;
-    if (config.has(jwt_validators_config + ".settings_key"))
-        token_validator_settings_key = config.getString(jwt_validators_config + ".settings_key");
     for (const auto & jwt_validator : jwt_validators_keys)
     {
         if (jwt_validator == "settings_key") continue;
         String prefix = fmt::format("{}.{}", jwt_validators_config, jwt_validator);
         try
         {
-            jwt_validators[jwt_validator] = IJWTValidator::parseJWTValidator(config, prefix, jwt_validator, token_validator_settings_key);
+            jwt_validators[jwt_validator] = IJWTValidator::parseJWTValidator(config, prefix, jwt_validator);
         }
         catch (...)
         {
@@ -624,7 +621,7 @@ HTTPAuthClientParams ExternalAuthenticators::getHTTPAuthenticationParams(const S
     return it->second;
 }
 
-bool ExternalAuthenticators::checkJWTCredentials(const String & claims, const TokenCredentials & credentials, SettingsChanges & settings) const
+bool ExternalAuthenticators::checkJWTCredentials(const String & claims, const TokenCredentials & credentials) const
 {
     std::lock_guard lock{mutex};
 
@@ -636,7 +633,7 @@ bool ExternalAuthenticators::checkJWTCredentials(const String & claims, const To
 
     for (const auto & it : jwt_validators)
     {
-        if (it.second->validate(claims, token, settings))
+        if (it.second->validate(claims, token))
         {
             LOG_DEBUG(getLogger("JWTAuthentication"), "Authenticated with JWT for {} by {}", user_name, it.first);
             return true;
@@ -662,6 +659,25 @@ bool ExternalAuthenticators::checkAccessTokenCredentials(const TokenCredentials 
         }
         LOG_TRACE(getLogger("AccessTokenAuthentication"), "Failed authentication with access token by {}", it.first);
     }
+    return false;
+}
+
+bool ExternalAuthenticators::checkAccessTokenCredentialsByExactProcessor(const TokenCredentials & credentials, const String & name) const
+{
+    std::lock_guard lock{mutex};
+
+    if (access_token_processors.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Access token authentication is not configured");
+
+    for (const auto & it : access_token_processors)
+    {
+        if (name == it.second->getName() && it.second->resolveAndValidate(credentials))
+        {
+            LOG_DEBUG(getLogger("AccessTokenAuthentication"), "Authenticated user {} with access token by {}", credentials.getUserName(), it.first);
+            return true;
+        }
+    }
+    LOG_TRACE(getLogger("AccessTokenAuthentication"), "Failed authentication with access token: no processor with name {}", name);
     return false;
 }
 

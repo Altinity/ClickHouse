@@ -255,7 +255,7 @@ bool Authentication::areCredentialsValid(
         if (token_credentials->isJWT())
         {
             /// The token was parsed as JWT, no further action needed.
-            return external_authenticators.checkJWTCredentials(authentication_method.getJWTClaims(), *token_credentials, settings);
+            return external_authenticators.checkJWTCredentials(authentication_method.getJWTClaims(), *token_credentials);
         }
         else
         {
