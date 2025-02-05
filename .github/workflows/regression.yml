@@ -185,7 +185,7 @@ jobs:
               exit $EXITCODE
       - name: Set Commit Status
         if: always()
-        run: python3 .github/set_regression_status.py
+        run: python3 .github/set_builds_status.py
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           JOB_OUTCOME: ${{ steps.run_suite.outcome }}
@@ -245,7 +245,7 @@ jobs:
               exit $EXITCODE
       - name: Set Commit Status
         if: always()
-        run: python3 .github/set_regression_status.py
+        run: python3 .github/set_builds_status.py
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           JOB_OUTCOME: ${{ steps.run_suite.outcome }}
@@ -312,7 +312,7 @@ jobs:
               exit $EXITCODE
       - name: Set Commit Status
         if: always()
-        run: python3 .github/set_regression_status.py
+        run: python3 .github/set_builds_status.py
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           JOB_OUTCOME: ${{ steps.run_suite.outcome }}
@@ -368,7 +368,7 @@ jobs:
               exit $EXITCODE
       - name: Set Commit Status
         if: always()
-        run: python3 .github/set_regression_status.py
+        run: python3 .github/set_builds_status.py
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           JOB_OUTCOME: ${{ steps.run_suite.outcome }}
@@ -426,7 +426,7 @@ jobs:
               exit $EXITCODE
       - name: Set Commit Status
         if: always()
-        run: python3 .github/set_regression_status.py
+        run: python3 .github/set_builds_status.py
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           JOB_OUTCOME: ${{ steps.run_suite.outcome }}
@@ -480,7 +480,7 @@ jobs:
               exit $EXITCODE
       - name: Set Commit Status
         if: always()
-        run: python3 .github/set_regression_status.py
+        run: python3 .github/set_builds_status.py
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           JOB_OUTCOME: ${{ steps.run_suite.outcome }}
@@ -544,7 +544,7 @@ jobs:
               exit $EXITCODE
       - name: Set Commit Status
         if: always()
-        run: python3 .github/set_regression_status.py
+        run: python3 .github/set_builds_status.py
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           JOB_OUTCOME: ${{ steps.run_suite.outcome }}
@@ -614,7 +614,7 @@ jobs:
               exit $EXITCODE
       - name: Set Commit Status
         if: always()
-        run: python3 .github/set_regression_status.py
+        run: python3 .github/set_builds_status.py
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           JOB_OUTCOME: ${{ steps.run_suite.outcome }}
@@ -680,7 +680,7 @@ jobs:
               exit $EXITCODE
       - name: Set Commit Status
         if: always()
-        run: python3 .github/set_regression_status.py
+        run: python3 .github/set_builds_status.py
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           JOB_OUTCOME: ${{ steps.run_suite.outcome }}
