@@ -1,5 +1,6 @@
 #include <Access/AccessTokenProcessor.h>
 #include <picojson/picojson.h>
+#include <jwt-cpp/jwt.h>
 
 
 namespace DB
@@ -43,6 +44,8 @@ namespace
 const Poco::URI GoogleAccessTokenProcessor::token_info_uri = Poco::URI("https://www.googleapis.com/oauth2/v3/tokeninfo");
 const Poco::URI GoogleAccessTokenProcessor::user_info_uri = Poco::URI("https://www.googleapis.com/oauth2/v3/userinfo");
 
+const Poco::URI AzureAccessTokenProcessor::user_info_uri = Poco::URI("https://graph.microsoft.com/v1.0/me");
+
 
 std::unique_ptr<IAccessTokenProcessor> IAccessTokenProcessor::parseTokenProcessor(
     const Poco::Util::AbstractConfiguration & config,
@@ -53,18 +56,64 @@ std::unique_ptr<IAccessTokenProcessor> IAccessTokenProcessor::parseTokenProcesso
     {
         String provider = Poco::toLower(config.getString(prefix + ".provider"));
 
-        if (provider == "google") {
-            String email_regex_str = config.hasProperty(prefix + ".email_filter") ? config.getString(
-                    prefix + ".email_filter") : "";
+        String email_regex_str = config.hasProperty(prefix + ".email_filter") ? config.getString(
+                prefix + ".email_filter") : "";
 
+        if (provider == "google")
+        {
             return std::make_unique<GoogleAccessTokenProcessor>(name, email_regex_str);
         }
+        else if (provider == "azure")
+        {
+            if (!config.hasProperty(prefix + ".client_id"))
+                throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
+                                "Could not parse access token processor {}: client_id must be specified", name);
+
+            if (!config.hasProperty(prefix + ".tenant_id"))
+                throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
+                                "Could not parse access token processor {}: tenant_id must be specified", name);
+
+            String client_id_str = config.getString(prefix + ".client_id");
+            String tenant_id_str = config.getString(prefix + ".tenant_id");
+            String client_secret_str  = config.hasProperty(prefix + ".client_secret") ? config.getString(prefix + ".client_secret") : "";
+
+            return std::make_unique<AzureAccessTokenProcessor>(name, email_regex_str, client_id_str, tenant_id_str, client_secret_str);
+        }
+        else
+            throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
+                            "Could not parse access token processor {}: unknown provider {}", name, provider);
     }
 
     throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
         "Could not parse access token processor {}: provider name must be specified", name);
 }
 
+
+bool GoogleAccessTokenProcessor::resolveAndValidate(const TokenCredentials & credentials)
+{
+    const String & token = credentials.getToken();
+
+    String user_name = tryGetUserName(token);
+    if (user_name.empty())
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to authenticate with access token");
+
+    auto user_info = getUserInfo(token);
+
+    if (email_regex.ok())
+    {
+        if (!user_info.contains("email"))
+            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to authenticate user {}: e-mail address not found in user data.", user_name);
+        /// Additionally validate user email to match regex from config.
+        if (!RE2::FullMatch(user_info["email"], email_regex))
+            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to authenticate user {}: e-mail address is not permitted.", user_name);
+    }
+    /// Credentials are passed as const everywhere up the flow, so we have to comply,
+    /// in this case const_cast looks acceptable.
+    const_cast<TokenCredentials &>(credentials).setUserName(user_name);
+    const_cast<TokenCredentials &>(credentials).setGroups({});
+
+    return true;
+}
 
 String GoogleAccessTokenProcessor::tryGetUserName(const String & token) const
 {
@@ -125,6 +174,41 @@ std::unordered_map<String, String> GoogleAccessTokenProcessor::getUserInfo(const
     {
         throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to get user info by access token: {}", e.what());
     }
+}
+
+bool AzureAccessTokenProcessor::resolveAndValidate(const TokenCredentials & credentials)
+{
+    /// Token is a JWT in this case, all we need is to decode it and verify against JWKS (similar to JWTValidator.h)
+    String user_name = credentials.getUserName();
+    if (user_name.empty())
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to authenticate with access token: cannot extract username");
+
+    const String & token = credentials.getToken();
+
+    try
+    {
+        token_validator->validate("", token);
+    }
+    catch (...)
+    {
+        return false;
+    }
+
+    const auto decoded_token = jwt::decode(token);
+
+    if (email_regex.ok())
+    {
+        if (!decoded_token.has_payload_claim("email"))
+            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to authenticate user {}: e-mail address not found in user data.", user_name);
+        /// Additionally validate user email to match regex from config.
+        if (!RE2::FullMatch(decoded_token.get_payload_claim("email").as_string(), email_regex))
+            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to authenticate user {}: e-mail address is not permitted.", user_name);
+    }
+    /// Credentials are passed as const everywhere up the flow, so we have to comply,
+    /// in this case const_cast looks acceptable.
+    const_cast<TokenCredentials &>(credentials).setGroups({});
+
+    return true;
 }
 
 }

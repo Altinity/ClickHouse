@@ -35,6 +35,8 @@ void TokenAccessStorage::setConfiguration()
     if (provider_name.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "'processor' must be specified for Token user directory");
 
+//    getTokenProcessorByName
+
     const bool has_roles = config.has(prefix_str + "roles");
 
     std::set<String> common_roles_cfg;
@@ -175,11 +177,32 @@ String TokenAccessStorage::getStorageParamsJSON() const
 
     params_json.set("processor", provider_name);
 
+    Poco::JSON::Array common_role_names_json;
+    for (const auto & role : common_role_names)
+    {
+        common_role_names_json.add(role);
+    }
+    params_json.set("roles", common_role_names_json);
+
     std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
     oss.exceptions(std::ios::failbit);
     Poco::JSON::Stringifier::stringify(params_json, oss);
 
     return oss.str();
+}
+
+bool TokenAccessStorage::areTokenCredentialsValidNoLock(const User & user, const Credentials & credentials, const ExternalAuthenticators & external_authenticators) const
+{
+    if (!credentials.isReady())
+        return false;
+
+    if (credentials.getUserName() != user.getName())
+        return false;
+
+    if (const auto * token_credentials = dynamic_cast<const TokenCredentials *>(&credentials))
+        return external_authenticators.checkAccessTokenCredentials(*token_credentials);
+
+    return false;
 }
 
 std::optional<UUID> TokenAccessStorage::findImpl(AccessEntityType type, const String & name) const
@@ -342,7 +365,18 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
     if (!isAddressAllowed(*user, address))
         throwAddressNotAllowed(address);
 
-    std::set<String> external_roles = typeid_cast<const TokenCredentials &>(credentials).getGroups();
+    const auto & token_credentials = typeid_cast<const TokenCredentials &>(credentials);
+
+    if (!external_authenticators.checkAccessTokenCredentialsByExactProcessor(token_credentials, provider_name))
+    {
+        // Even though token itself may be valid (especially in case of a jwt token), authentication has just failed.
+        if (throw_if_user_not_exists)
+            throwNotFound(AccessEntityType::USER, credentials.getUserName());
+        else
+            return {};
+    }
+
+    std::set<String> external_roles = token_credentials.getGroups();
 
     if (new_user)
     {

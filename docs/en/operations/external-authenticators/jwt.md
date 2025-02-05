@@ -217,10 +217,3 @@ ClickHouse will look for a JWT token in (by priority):
 2. `Authorization` header.
 3. `token` request parameter. In this case, the "Bearer" prefix should not exist.
 :::
-
-### Passing session settings {#passing-session-settings}
-
-If `settings_key` is defined in the `token_validators` section or defined under validator section, then it is possible to pass session settings in JWT.  
-If JWT payload contains a claim `settings_key`, ClickHouse will attempt to parse its key:value pairs as string values ​​and set them as session settings for the currently authenticated user. If parsing fails, settings will be ignored.
-
-The `settings_key` in the validator section takes precedence over the `settings_key` from the `token_validators` section. If `settings_key` in the validator section does not exist, the `settings_key` from the `token_validators` section will be used.

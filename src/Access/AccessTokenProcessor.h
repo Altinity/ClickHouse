@@ -7,6 +7,7 @@
 
 #include <Access/Credentials.h>
 #include <Common/Exception.h>
+#include <Access/JWTValidator.h>
 #include <Common/re2.h>
 #include <Common/logger_useful.h>
 
@@ -34,6 +35,12 @@ public:
                 throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "Invalid regex in definition of access token processor {}", name);
         }
     }
+
+    String getName()
+    {
+        return name;
+    }
+
     virtual ~IAccessTokenProcessor() = default;
 
     virtual bool resolveAndValidate(const TokenCredentials & credentials) = 0;
@@ -51,12 +58,6 @@ public:
 protected:
     const String name;
     re2::RE2 email_regex;
-
-    static String user_info_uri_str;
-
-    virtual String tryGetUserName(const String & token) const = 0;
-    virtual std::unordered_map<String, String> getUserInfo(const String & token) const = 0;
-
 };
 
 
@@ -65,39 +66,47 @@ class GoogleAccessTokenProcessor : public IAccessTokenProcessor
 public:
     GoogleAccessTokenProcessor(const String & name_, const String & email_regex_str) : IAccessTokenProcessor(name_, email_regex_str) {}
 
-    bool resolveAndValidate(const TokenCredentials & credentials) override
-    {
-        const String & token = credentials.getToken();
+    bool resolveAndValidate(const TokenCredentials & credentials) override;
 
-        String user_name = tryGetUserName(token);
-        if (user_name.empty())
-            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to authenticate with access token");
-
-        auto user_info = getUserInfo(token);
-
-        if (email_regex.ok())
-        {
-            if (!user_info.contains("email"))
-                throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to authenticate user {}: e-mail address not found in user data.", user_name);
-            /// Additionally validate user email to match regex from config.
-            if (!RE2::FullMatch(user_info["email"], email_regex))
-                throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to authenticate user {}: e-mail address is not permitted.", user_name);
-        }
-        /// Credentials are passed as const everywhere up the flow, so we have to comply,
-        /// in this case const_cast looks acceptable.
-        const_cast<TokenCredentials &>(credentials).setUserName(user_name);
-        const_cast<TokenCredentials &>(credentials).setGroups({});
-
-        return true;
-    }
-protected:
+private:
     static const Poco::URI token_info_uri;
     static const Poco::URI user_info_uri;
 
+    String tryGetUserName(const String & token) const;
 
-    String tryGetUserName(const String & token) const override;
+    std::unordered_map<String, String> getUserInfo(const String & token) const;
+};
 
-    std::unordered_map<String, String> getUserInfo(const String & token) const override;
+
+class AzureAccessTokenProcessor : public IAccessTokenProcessor
+{
+public:
+    AzureAccessTokenProcessor(const String & name_,
+                              const String & email_regex_str,
+                              const String & client_id_,
+                              const String & tenant_id_,
+                              const String & client_secret_,
+                              const size_t jwks_refresh_interval = 300000)
+                              : IAccessTokenProcessor(name_, email_regex_str),
+                                client_id(client_id_),
+                                tenant_id(tenant_id_),
+                                client_secret(client_secret_),
+                                jwks_uri_str("https://login.microsoftonline.com/" + tenant_id + "/discovery/v2.0/keys")
+    {
+        token_validator = std::make_unique<JWKSValidator>(name + "_jwks_validator", std::make_unique<JWKSClient>(jwks_uri_str, jwks_refresh_interval));
+    }
+
+    bool resolveAndValidate(const TokenCredentials & credentials) override;
+private:
+    static const Poco::URI user_info_uri;
+
+    const String client_id;
+    const String tenant_id;
+    const String client_secret;
+
+    const String jwks_uri_str;
+
+    std::unique_ptr<JWKSValidator> token_validator;
 };
 
 }

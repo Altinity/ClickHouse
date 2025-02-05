@@ -60,6 +60,8 @@ private: // IAccessStorage implementations.
     void setConfiguration();
     void processRoleChange(const UUID & id, const AccessEntityPtr & entity);
 
+    bool areTokenCredentialsValidNoLock(const User & user, const Credentials & credentials, const ExternalAuthenticators & external_authenticators) const;
+
     std::optional<UUID> findImpl(AccessEntityType type, const String & name) const override;
     std::vector<UUID> findAllImpl(AccessEntityType type) const override;
     AccessEntityPtr readImpl(const UUID & id, bool throw_if_not_exists) const override;
