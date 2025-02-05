@@ -189,7 +189,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           JOB_OUTCOME: ${{ steps.run_suite.outcome }}
-          SUITE_NAME: "Regression ${{ matrix.SUITE }}"
+          SUITE_NAME: "Regression ${{ inputs.arch }} ${{ matrix.SUITE }}"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
@@ -249,7 +249,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           JOB_OUTCOME: ${{ steps.run_suite.outcome }}
-          SUITE_NAME: "Regression Alter ${{ matrix.ONLY }} partition"
+          SUITE_NAME: "Regression ${{ inputs.arch }} Alter ${{ matrix.ONLY }} partition"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
@@ -316,7 +316,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           JOB_OUTCOME: ${{ steps.run_suite.outcome }}
-          SUITE_NAME: "Regression Benchmark ${{ matrix.STORAGE }}"
+          SUITE_NAME: "Regression ${{ inputs.arch }} Benchmark ${{ matrix.STORAGE }}"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
@@ -372,7 +372,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           JOB_OUTCOME: ${{ steps.run_suite.outcome }}
-          SUITE_NAME: "Regression Clickhouse Keeper SSL"
+          SUITE_NAME: "Regression ${{ inputs.arch }} Clickhouse Keeper SSL"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
@@ -430,7 +430,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           JOB_OUTCOME: ${{ steps.run_suite.outcome }}
-          SUITE_NAME: "Regression LDAP ${{ matrix.SUITE }}"
+          SUITE_NAME: "Regression ${{ inputs.arch }} LDAP ${{ matrix.SUITE }}"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
@@ -484,7 +484,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           JOB_OUTCOME: ${{ steps.run_suite.outcome }}
-          SUITE_NAME: "Regression Parquet"
+          SUITE_NAME: "Regression ${{ inputs.arch }} Parquet"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
@@ -548,7 +548,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           JOB_OUTCOME: ${{ steps.run_suite.outcome }}
-          SUITE_NAME: "Regression Parquet ${{ matrix.STORAGE }}"
+          SUITE_NAME: "Regression ${{ inputs.arch }} Parquet ${{ matrix.STORAGE }}"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
@@ -618,7 +618,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           JOB_OUTCOME: ${{ steps.run_suite.outcome }}
-          SUITE_NAME: "Regression S3 ${{ matrix.STORAGE }}"
+          SUITE_NAME: "Regression ${{ inputs.arch }} S3 ${{ matrix.STORAGE }}"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
@@ -684,7 +684,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           JOB_OUTCOME: ${{ steps.run_suite.outcome }}
-          SUITE_NAME: "Regression Tiered Storage ${{ matrix.STORAGE }}"
+          SUITE_NAME: "Regression ${{ inputs.arch }} Tiered Storage ${{ matrix.STORAGE }}"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
