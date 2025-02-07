@@ -626,3 +626,16 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           python3 ./tests/ci/ci_buddy.py --check-wf-status
+      - name: Create and upload combined report
+        if: ${{ !cancelled() }}
+        env:
+          build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          pr_number: ${{ github.event.number }}
+        run: |
+          python3 -m venv venv
+          source venv/bin/activate
+          pip install clickhouse-driver==0.2.8
+
+          python3 ./github/create_combined_report.py \
+            --actions-job-url ${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }} \
+            --ci-running-report-url https://s3.amazonaws.com/altinity-build-artifacts/${{ env.pr_number }}/${{ env.build_sha }}/ci_running.html
