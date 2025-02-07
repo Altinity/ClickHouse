@@ -22,7 +22,7 @@ class IJWTValidator
 {
 public:
     explicit IJWTValidator(const String & name_) : name(name_) {}
-    virtual bool validate(const String & claims, const String & token) const;
+    virtual bool validate(const String & claims, const String & token, String & username);
     virtual ~IJWTValidator() = default;
 
     static std::unique_ptr<DB::IJWTValidator> parseJWTValidator(

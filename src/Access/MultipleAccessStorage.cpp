@@ -455,7 +455,6 @@ MultipleAccessStorage::authenticateImpl(const Credentials & credentials, const P
                                         allow_no_password, allow_plaintext_password);
         if (auth_result)
         {
-            std::cerr << "\n\nAuth result in: \n\n" << storage->getStorageName();
             std::lock_guard lock{mutex};
             ids_cache.set(auth_result->user_id, storage);
             return auth_result;

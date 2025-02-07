@@ -100,34 +100,7 @@ const String & BasicCredentials::getPassword() const
     return password;
 }
 
-namespace
-{
-String extractUsernameFromToken(const String & token)
-{
-    try
-    {
-        /// Attempt to handle token as JWT.
-        auto decoded_jwt = jwt::decode(token);
-        return decoded_jwt.get_subject();
-    }
-    catch (...)
-    {
-        /// Token is not JWT, try to handle it as access token
-        return "";
-    }
-}
-}
+/// Unless the token is validated, we will not use any data from it, including username.
+TokenCredentials::TokenCredentials(const String & token_) : Credentials(""), token(token_) {}
 
-TokenCredentials::TokenCredentials(const String & token_)
-        : Credentials(extractUsernameFromToken(token_))
-        , token(token_)
-    {
-        // If username is empty, then the token is probably not JWT;
-        // we will try treating this token as an access token.
-        if (!user_name.empty())
-        {
-            is_ready = true;
-            is_jwt = true;
-        }
-    }
 }

@@ -213,18 +213,13 @@ bool authenticateUserByHTTP(
     }
     else if (!jwt_token.empty() && Poco::toLower(jwt_token).starts_with(BEARER_PREFIX))
     {
-        current_credentials = std::make_unique<TokenCredentials>(jwt_token.substr(BEARER_PREFIX.length()));
+        const auto token_credentials = TokenCredentials(jwt_token.substr(BEARER_PREFIX.length()));
+        const auto & external_authenticators = global_context->getAccessControl().getExternalAuthenticators();
 
-        if (!static_cast<const TokenCredentials &>(*current_credentials).isJWT())
-        {
-            /// In case the token is an access token, we need to resolve it to get user name.
-            /// This is why (for now) the check is made twice: here and later in authentication.
-            global_context->getAccessControl().getExternalAuthenticators().checkAccessTokenCredentials(
-                    static_cast<const TokenCredentials &>(*current_credentials));
-        }
-        if (!current_credentials->isReady())
-            throw Exception(ErrorCodes::AUTHENTICATION_FAILED,
-                            "Failed to authenticate with access token: token invalid or none of `access_token_processors` was able to resolve it.");
+        if (!external_authenticators.resolveJWTCredentials(token_credentials, false))
+            external_authenticators.checkAccessTokenCredentials(token_credentials);
+
+        current_credentials = std::make_unique<TokenCredentials>(token_credentials);
     }
     else // I.e., now using user name and password strings ("Basic").
     {

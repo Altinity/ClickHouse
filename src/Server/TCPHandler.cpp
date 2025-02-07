@@ -1802,12 +1802,11 @@ void TCPHandler::receiveHello()
     {
         auto credentials = TokenCredentials(password);
 
-        if (!credentials.isJWT())
-        {
-            /// In case the token is an access token, we need to resolve it to get user name.
-            /// This is why (for now) the check is made twice: here and later in authentication.
-            server.context()->getAccessControl().getExternalAuthenticators().checkAccessTokenCredentials(credentials);
-        }
+        const auto & external_authenticators = server.context()->getAccessControl().getExternalAuthenticators();
+
+        if (!external_authenticators.resolveJWTCredentials(credentials, false))
+            external_authenticators.checkAccessTokenCredentials(credentials);
+
         session->authenticate(credentials, getClientAddress(client_info));
         return;
     }

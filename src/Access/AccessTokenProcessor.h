@@ -69,10 +69,8 @@ public:
     bool resolveAndValidate(const TokenCredentials & credentials) override;
 
 private:
-    static const Poco::URI token_info_uri;
+    [[maybe_unused]] static const Poco::URI token_info_uri;
     static const Poco::URI user_info_uri;
-
-    String tryGetUserName(const String & token) const;
 
     std::unordered_map<String, String> getUserInfo(const String & token) const;
 };
@@ -85,16 +83,12 @@ public:
                               const String & email_regex_str,
                               const String & client_id_,
                               const String & tenant_id_,
-                              const String & client_secret_,
-                              const size_t jwks_refresh_interval = 300000)
+                              const String & client_secret_)
                               : IAccessTokenProcessor(name_, email_regex_str),
                                 client_id(client_id_),
                                 tenant_id(tenant_id_),
                                 client_secret(client_secret_),
-                                jwks_uri_str("https://login.microsoftonline.com/" + tenant_id + "/discovery/v2.0/keys")
-    {
-        token_validator = std::make_unique<JWKSValidator>(name + "_jwks_validator", std::make_unique<JWKSClient>(jwks_uri_str, jwks_refresh_interval));
-    }
+                                jwks_uri_str("https://login.microsoftonline.com/" + tenant_id + "/discovery/v2.0/keys") {}
 
     bool resolveAndValidate(const TokenCredentials & credentials) override;
 private:
@@ -106,7 +100,7 @@ private:
 
     const String jwks_uri_str;
 
-    std::unique_ptr<JWKSValidator> token_validator;
+    String validateTokenAndGetUsername(const String & token) const;
 };
 
 }
