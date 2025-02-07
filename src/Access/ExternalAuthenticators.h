@@ -47,7 +47,9 @@ public:
         const LDAPClient::RoleSearchParamsList * role_search_params = nullptr, LDAPClient::SearchResultsList * role_search_results = nullptr) const;
     bool checkKerberosCredentials(const String & realm, const GSSAcceptorContext & credentials) const;
     bool checkHTTPBasicCredentials(const String & server, const BasicCredentials & credentials, SettingsChanges & settings) const;
-    bool checkJWTCredentials(const String & claims, const TokenCredentials & credentials) const;
+
+    bool resolveJWTCredentials(const TokenCredentials & credentials, bool throw_not_configured) const;
+    bool checkJWTClaims(const String & claims, const TokenCredentials & credentials) const;
 
     bool checkAccessTokenCredentials(const TokenCredentials & credentials) const;
     bool checkAccessTokenCredentialsByExactProcessor(const TokenCredentials & credentials, const String & name) const;

@@ -252,15 +252,10 @@ bool Authentication::areCredentialsValid(
         if (authentication_method.getType() != AuthenticationType::JWT)
             return false;
 
-        if (token_credentials->isJWT())
-        {
-            /// The token was parsed as JWT, no further action needed.
-            return external_authenticators.checkJWTCredentials(authentication_method.getJWTClaims(), *token_credentials);
-        }
-        else
-        {
-            return external_authenticators.checkAccessTokenCredentials(*token_credentials);
-        }
+        if (external_authenticators.checkJWTClaims(authentication_method.getJWTClaims(), *token_credentials))
+            return true;
+
+        return external_authenticators.checkAccessTokenCredentials(*token_credentials);
     }
 
     if ([[maybe_unused]] const auto * always_allow_credentials = typeid_cast<const AlwaysAllowCredentials *>(&credentials))

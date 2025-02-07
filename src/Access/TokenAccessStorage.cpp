@@ -35,8 +35,6 @@ void TokenAccessStorage::setConfiguration()
     if (provider_name.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "'processor' must be specified for Token user directory");
 
-//    getTokenProcessorByName
-
     const bool has_roles = config.has(prefix_str + "roles");
 
     std::set<String> common_roles_cfg;
@@ -352,6 +350,17 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
     auto id = memory_storage.find<User>(credentials.getUserName());
     UserPtr user = id ? memory_storage.read<User>(*id) : nullptr;
 
+    const auto & token_credentials = typeid_cast<const TokenCredentials &>(credentials);
+
+    if (!external_authenticators.checkAccessTokenCredentialsByExactProcessor(token_credentials, provider_name))
+    {
+        // Even though token itself may be valid (especially in case of a jwt token), authentication has just failed.
+        if (throw_if_user_not_exists)
+            throwNotFound(AccessEntityType::USER, credentials.getUserName());
+        else
+            return {};
+    }
+
     std::shared_ptr<User> new_user;
     if (!user)
     {
@@ -364,17 +373,6 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
 
     if (!isAddressAllowed(*user, address))
         throwAddressNotAllowed(address);
-
-    const auto & token_credentials = typeid_cast<const TokenCredentials &>(credentials);
-
-    if (!external_authenticators.checkAccessTokenCredentialsByExactProcessor(token_credentials, provider_name))
-    {
-        // Even though token itself may be valid (especially in case of a jwt token), authentication has just failed.
-        if (throw_if_user_not_exists)
-            throwNotFound(AccessEntityType::USER, credentials.getUserName());
-        else
-            return {};
-    }
 
     std::set<String> external_roles = token_credentials.getGroups();
 

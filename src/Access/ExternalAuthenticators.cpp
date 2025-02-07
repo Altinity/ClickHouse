@@ -621,24 +621,53 @@ HTTPAuthClientParams ExternalAuthenticators::getHTTPAuthenticationParams(const S
     return it->second;
 }
 
-bool ExternalAuthenticators::checkJWTCredentials(const String & claims, const TokenCredentials & credentials) const
+/// TODO: remove redundancy
+bool ExternalAuthenticators::resolveJWTCredentials(const TokenCredentials & credentials, bool throw_not_configured = true) const
 {
     std::lock_guard lock{mutex};
 
     const auto token = String(credentials.getToken());
-    const auto & user_name = credentials.getUserName();
+
+    if (jwt_validators.empty() && throw_not_configured)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "JWT authentication is not configured");
+
+    for (const auto & it : jwt_validators)
+    {
+        String username;
+        if (it.second->validate("", token, username))
+        {
+            /// Credentials are passed as const everywhere up the flow, so we have to comply,
+            /// in this case const_cast looks acceptable.
+            const_cast<TokenCredentials &>(credentials).setUserName(username);
+            LOG_TRACE(getLogger("JWTAuthentication"), "Extracted username {} from JWT by {}", username, it.first);
+            return true;
+        }
+        LOG_TRACE(getLogger("JWTAuthentication"), "Failed authentication with JWT by {}", it.first);
+    }
+    return false;
+}
+
+bool ExternalAuthenticators::checkJWTClaims(const String & claims, const TokenCredentials & credentials) const
+{
+    std::lock_guard lock{mutex};
+
+    const auto token = String(credentials.getToken());
 
     if (jwt_validators.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "JWT authentication is not configured");
 
     for (const auto & it : jwt_validators)
     {
-        if (it.second->validate(claims, token))
+        String username;
+        if (it.second->validate(claims, token, username))
         {
-            LOG_DEBUG(getLogger("JWTAuthentication"), "Authenticated with JWT for {} by {}", user_name, it.first);
+            /// Credentials are passed as const everywhere up the flow, so we have to comply,
+            /// in this case const_cast looks acceptable.
+            const_cast<TokenCredentials &>(credentials).setUserName(username);
+            LOG_DEBUG(getLogger("JWTAuthentication"), "Authenticated with JWT for {} by {}", username, it.first);
             return true;
         }
-        LOG_TRACE(getLogger("JWTAuthentication"), "Failed authentication with JWT for {} by {}", user_name, it.first);
+        LOG_TRACE(getLogger("JWTAuthentication"), "Failed authentication with JWT by {}", it.first);
     }
     return false;
 }
@@ -671,10 +700,17 @@ bool ExternalAuthenticators::checkAccessTokenCredentialsByExactProcessor(const T
 
     for (const auto & it : access_token_processors)
     {
-        if (name == it.second->getName() && it.second->resolveAndValidate(credentials))
+        if (name == it.second->getName())
         {
-            LOG_DEBUG(getLogger("AccessTokenAuthentication"), "Authenticated user {} with access token by {}", credentials.getUserName(), it.first);
-            return true;
+            if (it.second->resolveAndValidate(credentials)) {
+                LOG_DEBUG(getLogger("AccessTokenAuthentication"), "Authenticated user {} with access token by {}",
+                          credentials.getUserName(), it.first);
+                return true;
+            } else
+            {
+                LOG_TRACE(getLogger("AccessTokenAuthentication"), "Failed authentication with access token by processor {}", name);
+                return false;
+            }
         }
     }
     LOG_TRACE(getLogger("AccessTokenAuthentication"), "Failed authentication with access token: no processor with name {}", name);

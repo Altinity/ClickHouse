@@ -167,7 +167,7 @@ bool check_claims(const String & claims, const picojson::value::object & payload
 
 }
 
-bool IJWTValidator::validate(const String & claims, const String & token) const
+bool IJWTValidator::validate(const String & claims, const String & token, String & username)
 {
     try
     {
@@ -178,7 +178,7 @@ bool IJWTValidator::validate(const String & claims, const String & token) const
         if (!check_claims(claims, decoded_jwt.get_payload_json()))
             return false;
 
-        LOG_TRACE(getLogger("JWTAuthentication"), "{}: claims checked", name);
+        username = decoded_jwt.get_subject();
 
         return true;
     }
@@ -309,9 +309,7 @@ void JWKSValidator::validateImpl(const jwt::decoded_jwt<jwt::traits::kazuho_pico
         public_key = jwt::helper::create_public_key_from_rsa_components(modulus, exponent);
     }
 
-    if (!jwk.has_algorithm())
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT validation error: missing `alg` in JWK");
-    else if (Poco::toLower(jwk.get_algorithm()) != algo)
+    if (jwk.has_algorithm() && Poco::toLower(jwk.get_algorithm()) != algo)
         throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT validation error: `alg` in JWK does not match the algorithm used in JWT");
 
     if (algo == "rs256")

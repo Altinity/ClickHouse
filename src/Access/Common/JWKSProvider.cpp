@@ -1,11 +1,8 @@
 #include <Access/Common/JWKSProvider.h>
 
 #include <Common/Exception.h>
-#include <Common/logger_useful.h>
 #include <Poco/StreamCopier.h>
 #include <fstream>
-
-#include <Common/logger_useful.h>
 
 
 namespace DB

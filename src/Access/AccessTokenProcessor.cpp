@@ -1,4 +1,5 @@
 #include <Access/AccessTokenProcessor.h>
+#include <Common/logger_useful.h>
 #include <picojson/picojson.h>
 #include <jwt-cpp/jwt.h>
 
@@ -38,13 +39,49 @@ namespace
 
         return value.get<std::string>();
     }
+
+    picojson::object getObjectFromURI(const Poco::URI & uri, const String & token = "")
+    {
+        Poco::Net::HTTPResponse response;
+        std::ostringstream responseString;
+
+        Poco::Net::HTTPRequest request{Poco::Net::HTTPRequest::HTTP_GET, uri.getPathAndQuery()};
+        if (!token.empty())
+            request.add("Authorization", "Bearer " + token);
+
+        if (uri.getScheme() == "https") {
+            Poco::Net::HTTPSClientSession session(uri.getHost(), uri.getPort());
+            session.sendRequest(request);
+            Poco::StreamCopier::copyStream(session.receiveResponse(response), responseString);
+        }
+        else
+        {
+            Poco::Net::HTTPClientSession session(uri.getHost(), uri.getPort());
+            session.sendRequest(request);
+            Poco::StreamCopier::copyStream(session.receiveResponse(response), responseString);
+        }
+
+        if (response.getStatus() != Poco::Net::HTTPResponse::HTTP_OK)
+            throw Exception(ErrorCodes::AUTHENTICATION_FAILED,
+                            "Failed to get user info by access token, code: {}, reason: {}", response.getStatus(),
+                            response.getReason());
+
+        try
+        {
+            return parseJSON(responseString.str());
+        }
+        catch (const std::runtime_error & e)
+        {
+            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to parse server response: {}", e.what());
+        }
+    }
 }
 
 
-const Poco::URI GoogleAccessTokenProcessor::token_info_uri = Poco::URI("https://www.googleapis.com/oauth2/v3/tokeninfo");
+[[maybe_unused]] const Poco::URI GoogleAccessTokenProcessor::token_info_uri = Poco::URI("https://www.googleapis.com/oauth2/v3/tokeninfo");
 const Poco::URI GoogleAccessTokenProcessor::user_info_uri = Poco::URI("https://www.googleapis.com/oauth2/v3/userinfo");
 
-const Poco::URI AzureAccessTokenProcessor::user_info_uri = Poco::URI("https://graph.microsoft.com/v1.0/me");
+const Poco::URI AzureAccessTokenProcessor::user_info_uri = Poco::URI("https://graph.microsoft.com/oidc/userinfo");
 
 
 std::unique_ptr<IAccessTokenProcessor> IAccessTokenProcessor::parseTokenProcessor(
@@ -93,19 +130,24 @@ bool GoogleAccessTokenProcessor::resolveAndValidate(const TokenCredentials & cre
 {
     const String & token = credentials.getToken();
 
-    String user_name = tryGetUserName(token);
-    if (user_name.empty())
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to authenticate with access token");
-
     auto user_info = getUserInfo(token);
+    String user_name = user_info["sub"];
 
     if (email_regex.ok())
     {
         if (!user_info.contains("email"))
-            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to authenticate user {}: e-mail address not found in user data.", user_name);
+        {
+            LOG_TRACE(getLogger("AccessTokenProcessor"), "{}: Failed to validate {} by e-mail", name, user_name);
+            return false;
+        }
+
         /// Additionally validate user email to match regex from config.
         if (!RE2::FullMatch(user_info["email"], email_regex))
-            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to authenticate user {}: e-mail address is not permitted.", user_name);
+        {
+            LOG_TRACE(getLogger("AccessTokenProcessor"), "{}: Failed to authenticate user {}: e-mail address is not permitted.", name, user_name);
+            return false;
+        }
+
     }
     /// Credentials are passed as const everywhere up the flow, so we have to comply,
     /// in this case const_cast looks acceptable.
@@ -115,100 +157,61 @@ bool GoogleAccessTokenProcessor::resolveAndValidate(const TokenCredentials & cre
     return true;
 }
 
-String GoogleAccessTokenProcessor::tryGetUserName(const String & token) const
-{
-    Poco::Net::HTTPSClientSession session(token_info_uri.getHost(), token_info_uri.getPort());
-
-    Poco::Net::HTTPRequest request{Poco::Net::HTTPRequest::HTTP_GET, token_info_uri.getPathAndQuery()};
-    request.add("Authorization", "Bearer " + token);
-    session.sendRequest(request);
-
-    Poco::Net::HTTPResponse response;
-    std::istream & responseStream = session.receiveResponse(response);
-
-    if (response.getStatus() != Poco::Net::HTTPResponse::HTTP_OK)
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to resolve access token, code: {}, reason: {}", response.getStatus(), response.getReason());
-
-    std::ostringstream responseString;
-    Poco::StreamCopier::copyStream(responseStream, responseString);
-
-    try
-    {
-        picojson::object parsed_json = parseJSON(responseString.str());
-        String username = getValueByKey(parsed_json, "sub");
-        return username;
-    }
-    catch (const std::runtime_error &)
-    {
-        return "";
-    }
-}
-
 std::unordered_map<String, String> GoogleAccessTokenProcessor::getUserInfo(const String & token) const
 {
-    std::unordered_map<String, String> user_info;
-
-    Poco::Net::HTTPSClientSession session(user_info_uri.getHost(), user_info_uri.getPort());
-
-    Poco::Net::HTTPRequest request{Poco::Net::HTTPRequest::HTTP_GET, user_info_uri.getPathAndQuery()};
-    request.add("Authorization", "Bearer " + token);
-    session.sendRequest(request);
-
-    Poco::Net::HTTPResponse response;
-    std::istream & responseStream = session.receiveResponse(response);
-
-    if (response.getStatus() != Poco::Net::HTTPResponse::HTTP_OK)
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to get user info by access token, code: {}, reason: {}", response.getStatus(), response.getReason());
-
-    std::ostringstream responseString;
-    Poco::StreamCopier::copyStream(responseStream, responseString);
+    std::unordered_map<String, String> user_info_map;
+    picojson::object user_info_json = getObjectFromURI(user_info_uri, token);
 
     try
     {
-        picojson::object parsed_json = parseJSON(responseString.str());
-        user_info["email"] = getValueByKey(parsed_json, "email");
-        user_info["sub"] = getValueByKey(parsed_json, "sub");
-        return user_info;
+        user_info_map["email"] = getValueByKey(user_info_json, "email");
+        user_info_map["sub"] = getValueByKey(user_info_json, "sub");
+        return user_info_map;
     }
-    catch (const std::runtime_error & e)
+    catch (std::runtime_error & e)
     {
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to get user info by access token: {}", e.what());
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "{}: Failed to get user info with token: {}", name, e.what());
     }
 }
+
 
 bool AzureAccessTokenProcessor::resolveAndValidate(const TokenCredentials & credentials)
 {
-    /// Token is a JWT in this case, all we need is to decode it and verify against JWKS (similar to JWTValidator.h)
-    String user_name = credentials.getUserName();
-    if (user_name.empty())
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to authenticate with access token: cannot extract username");
+    /// Token is a JWT in this case, but we cannot directly verify it against Azure AD JWKS. We will not trust any data in this token.
+    /// e.g. see here: https://stackoverflow.com/questions/60778634/failing-signature-validation-of-jwt-tokens-from-azure-ad
+    /// Let Azure validate it: only valid tokens will be accepted.
+    /// Use GET https://graph.microsoft.com/oidc/userinfo to verify token and get sub at the same time
 
     const String & token = credentials.getToken();
 
     try
     {
-        token_validator->validate("", token);
+        String username = validateTokenAndGetUsername(token);
+        if (!username.empty())
+        {
+            /// Credentials are passed as const everywhere up the flow, so we have to comply,
+            /// in this case const_cast looks acceptable.
+            const_cast<TokenCredentials &>(credentials).setUserName(username);
+        }
+        else
+            LOG_TRACE(getLogger("AccessTokenProcessor"), "{}: Failed to get username with token", name);
+
     }
     catch (...)
     {
         return false;
     }
 
-    const auto decoded_token = jwt::decode(token);
-
-    if (email_regex.ok())
-    {
-        if (!decoded_token.has_payload_claim("email"))
-            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to authenticate user {}: e-mail address not found in user data.", user_name);
-        /// Additionally validate user email to match regex from config.
-        if (!RE2::FullMatch(decoded_token.get_payload_claim("email").as_string(), email_regex))
-            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to authenticate user {}: e-mail address is not permitted.", user_name);
-    }
-    /// Credentials are passed as const everywhere up the flow, so we have to comply,
-    /// in this case const_cast looks acceptable.
+    /// TODO: do not store it in credentials.
     const_cast<TokenCredentials &>(credentials).setGroups({});
 
     return true;
+}
+
+String AzureAccessTokenProcessor::validateTokenAndGetUsername(const String & token) const
+{
+    picojson::object user_info_json = getObjectFromURI(user_info_uri, token);
+    return getValueByKey(user_info_json, "sub");
 }
 
 }
