@@ -632,8 +632,6 @@ jobs:
           build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           pr_number: ${{ github.event.number }}
         run: |
-          python3 -m venv venv
-          source venv/bin/activate
           pip install clickhouse-driver==0.2.8
 
           python3 ./github/create_combined_report.py \
