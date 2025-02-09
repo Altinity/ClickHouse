@@ -629,6 +629,9 @@ jobs:
       - name: Create and upload combined report
         if: ${{ !cancelled() }}
         env:
+          CHECKS_DATABASE_HOST: ${{ secrets.CHECKS_DATABASE_HOST }}
+          CHECKS_DATABASE_USER: ${{ secrets.CHECKS_DATABASE_USER }}
+          CHECKS_DATABASE_PASSWORD: ${{ secrets.CHECKS_DATABASE_PASSWORD }}
           build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           pr_number: ${{ github.event.number }}
         run: |
