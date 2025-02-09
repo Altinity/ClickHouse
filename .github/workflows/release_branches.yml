@@ -632,7 +632,7 @@ jobs:
           build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           pr_number: ${{ github.event.number }}
         run: |
-          pip install clickhouse-driver==0.2.8
+          pip install clickhouse-driver==0.2.8 numpy==1.26.4 pandas==2.2.0
 
           python3 .github/create_combined_ci_report.py \
             --actions-job-url ${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }} \
