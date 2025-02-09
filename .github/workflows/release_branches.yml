@@ -634,6 +634,6 @@ jobs:
         run: |
           pip install clickhouse-driver==0.2.8
 
-          python3 .github/create_combined_report.py \
+          python3 .github/create_combined_ci_report.py \
             --actions-job-url ${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }} \
             --ci-running-report-url https://s3.amazonaws.com/altinity-build-artifacts/${{ env.pr_number }}/${{ env.build_sha }}/ci_running.html
