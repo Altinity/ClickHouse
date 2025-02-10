@@ -76,7 +76,7 @@ def format_results_as_html_table(results) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Create a combined CI report.")
     parser.add_argument(
-        "--actions-job-url", required=True, help="URL of the actions job"
+        "--actions-run-url", required=True, help="URL of the actions run"
     )
     parser.add_argument(
         "--pr-number", required=True, help="Pull request number for the S3 path"
@@ -120,13 +120,13 @@ def main():
 
     combined_report = f"""{ci_running_report.split("</body>")[0]}
 <h2>Checks Fails</h2>
-{format_results_as_html_table(get_checks_fails(db_client, args.actions_job_url))}
+{format_results_as_html_table(get_checks_fails(db_client, args.actions_run_url))}
 
 <h2>Checks Errors</h2>
-{format_results_as_html_table(get_checks_errors(db_client, args.actions_job_url))}
+{format_results_as_html_table(get_checks_errors(db_client, args.actions_run_url))}
 
 <h2>Regression Fails</h2>
-{format_results_as_html_table(get_regression_fails(db_client, args.actions_job_url))}
+{format_results_as_html_table(get_regression_fails(db_client, args.actions_run_url))}
 
 </body>
 </html>
