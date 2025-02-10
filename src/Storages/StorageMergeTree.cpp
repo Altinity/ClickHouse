@@ -39,6 +39,8 @@
 #include <Common/ProfileEventsScope.h>
 #include <Common/escapeForFileName.h>
 #include <IO/SharedThreadPools.h>
+#include <Parsers/ASTInsertQuery.h>
+#include <Storages/MergeTree/exportMTPartToStorage.h>
 
 
 namespace DB
@@ -2444,6 +2446,42 @@ void StorageMergeTree::movePartitionToTable(const StoragePtr & dest_table, const
     {
         PartLog::addNewParts(getContext(), PartLog::createPartLogEntries(dst_parts, watch.elapsed()), ExecutionStatus::fromCurrentException("", true));
         throw;
+    }
+}
+
+/*
+ * For now, this function is meant to be used when exporting to different formats (i.e, the case where data needs to be re-encoded / serialized)
+ * For the cases where this is not necessary, there are way more optimal ways of doing that, such as hard links implemented by `movePartitionToTable`
+ * */
+void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, ContextPtr query_context)
+{
+    String dest_database = query_context->resolveDatabase(command.to_database);
+    auto dest_storage = DatabaseCatalog::instance().getTable({dest_database, command.to_table}, query_context);
+
+    /// The target table and the source table are the same.
+    if (dest_storage->getStorageID() == this->getStorageID())
+        return;
+
+    bool async_insert = areAsynchronousInsertsEnabled();
+
+    auto query = std::make_shared<ASTInsertQuery>();
+
+    String partition_id = getPartitionIDFromQuery(command.partition, getContext());
+    auto src_parts = getVisibleDataPartsVectorInPartition(getContext(), partition_id);
+
+    if (src_parts.empty())
+    {
+        return;
+    }
+
+    auto lock1 = lockForShare(query_context->getCurrentQueryId(), query_context->getSettingsRef()[Setting::lock_acquire_timeout]);
+    auto lock2 = dest_storage->lockForShare(query_context->getCurrentQueryId(), query_context->getSettingsRef()[Setting::lock_acquire_timeout]);
+    auto merges_blocker = stopMergesAndWait();
+
+    for (const auto & data_part : src_parts)
+    {
+        auto sink = dest_storage->write(query, getInMemoryMetadataPtr(), getContext(), async_insert);
+        exportMTPartToStorage(*this, data_part, sink, query_context);
     }
 }
 

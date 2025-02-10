@@ -856,6 +856,8 @@ public:
     /// Moves partition to specified Table
     void movePartitionToTable(const PartitionCommand & command, ContextPtr query_context);
 
+    virtual void exportPartitionToTable(const PartitionCommand &, ContextPtr) { throw Exception(ErrorCodes::NOT_IMPLEMENTED, "export not implemented");}
+
     /// Checks that Partition could be dropped right now
     /// Otherwise - throws an exception with detailed information.
     /// We do not use mutex because it is not very important that the size could change during the operation.

@@ -117,7 +117,7 @@ StorageObjectStorage::QuerySettings StorageS3Configuration::getQuerySettings(con
     const auto & settings = context->getSettingsRef();
     return StorageObjectStorage::QuerySettings{
         .truncate_on_insert = settings[Setting::s3_truncate_on_insert],
-        .create_new_file_on_insert = settings[Setting::s3_create_new_file_on_insert],
+        . create_new_file_on_insert = settings[Setting::s3_create_new_file_on_insert],
         .schema_inference_use_cache = settings[Setting::schema_inference_use_cache_for_s3],
         .schema_inference_mode = settings[Setting::schema_inference_mode],
         .skip_empty_files = settings[Setting::s3_skip_empty_files],

@@ -1,22 +1,22 @@
-#include <Storages/MergeTree/exportMTPartToParquet.h>
-#include <Processors/QueryPlan/QueryPlan.h>
-#include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
-#include <Storages/MergeTree/MergeTreeSequentialSource.h>
-#include <Processors/Formats/Impl/ParquetBlockOutputFormat.h>
-#include <QueryPipeline/QueryPipelineBuilder.h>
+#include <Processors/Executors/CompletedPipelineExecutor.h>
 #include <Processors/Executors/PullingPipelineExecutor.h>
-#include <Processors/Executors/PushingPipelineExecutor.h>
-#include <Formats/FormatFactory.h>
+#include <Processors/Formats/Impl/ParquetBlockOutputFormat.h>
+#include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
+#include <Processors/QueryPlan/QueryPlan.h>
+#include <Processors/Sinks/EmptySink.h>
+#include <QueryPipeline/QueryPipelineBuilder.h>
+#include <Storages/MergeTree/MergeTreeSequentialSource.h>
+#include <Storages/MergeTree/exportMTPartToStorage.h>
 
 
 namespace DB
 {
 
-void exportMTPartToParquet(const MergeTreeData & data, const MergeTreeData::DataPartPtr & data_part, ContextPtr context)
+void exportMTPartToStorage(const MergeTreeData & source_data, const MergeTreeData::DataPartPtr & data_part, SinkToStoragePtr dst_storage_sink, ContextPtr context)
 {
-    auto metadata_snapshot = data.getInMemoryMetadataPtr();
+    auto metadata_snapshot = source_data.getInMemoryMetadataPtr();
     Names columns_to_read = metadata_snapshot->getColumns().getNamesOfPhysical();
-    StorageSnapshotPtr storage_snapshot = data.getStorageSnapshot(metadata_snapshot, context);
+    StorageSnapshotPtr storage_snapshot = source_data.getStorageSnapshot(metadata_snapshot, context);
 
     MergeTreeData::IMutationsSnapshot::Params params
     {
@@ -24,7 +24,7 @@ void exportMTPartToParquet(const MergeTreeData & data, const MergeTreeData::Data
         .min_part_metadata_version = data_part->getMetadataVersion(),
     };
 
-    auto mutations_snapshot = data.getMutationsSnapshot(params);
+    auto mutations_snapshot = source_data.getMutationsSnapshot(params);
 
     auto alter_conversions = MergeTreeData::getAlterConversionsForPart(
         data_part,
@@ -44,7 +44,7 @@ void exportMTPartToParquet(const MergeTreeData & data, const MergeTreeData::Data
     createReadFromPartStep(
         read_type,
         plan,
-        data,
+        source_data,
         storage_snapshot,
         data_part,
         alter_conversions,
@@ -62,23 +62,11 @@ void exportMTPartToParquet(const MergeTreeData & data, const MergeTreeData::Data
     auto builder = plan.buildQueryPipeline(optimization_settings, pipeline_settings);
 
     QueryPipeline pipeline = QueryPipelineBuilder::getPipeline(std::move(*builder));
-    auto header_block = pipeline.getHeader();
 
-    auto out_file_name = data_part->name + ".parquet";
+    pipeline.complete(std::move(dst_storage_sink));
 
-    auto out_file = std::make_shared<WriteBufferFromFile>(out_file_name);
-    auto parquet_output = FormatFactory::instance().getOutputFormat("Parquet", *out_file, header_block, context);
-    PullingPipelineExecutor executor(pipeline);
-
-    Block block;
-    while (executor.pull(block))
-    {
-        parquet_output->write(block);
-    }
-
-    parquet_output->finalize();
-
-    out_file->finalize();
+    CompletedPipelineExecutor executor(pipeline);
+    executor.execute();
 }
 
 }

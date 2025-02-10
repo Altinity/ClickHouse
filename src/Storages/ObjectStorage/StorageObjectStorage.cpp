@@ -366,6 +366,7 @@ SinkToStoragePtr StorageObjectStorage::write(
                         configuration->getPath());
     }
 
+    // todo arthur continue from here
     if (configuration->withGlobsIgnorePartitionWildcard())
     {
         throw Exception(ErrorCodes::DATABASE_ACCESS_DENIED,
