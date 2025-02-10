@@ -37,11 +37,20 @@ def get_checks_errors(client: Client, job_url: str):
 
 
 def get_regression_fails(client: Client, job_url: str):
-    columns = "architecture, result, test_name, report_url as results_link"
-    query = f"""SELECT {columns} FROM `gh-data`.clickhouse_regression_results 
-                WHERE job_url='{job_url}' 
-                AND result IN ('Fail', 'Error')
-                """
+    # If you rename the alias for report_url, also update the formatters in format_results_as_html_table
+    query = f"""SELECT arch, status, test_name, results_link
+            FROM (
+               SELECT
+                    architecture as arch,
+                    test_name,
+                    argMax(result, start_time) AS status,
+                    job_url,
+                    report_url as results_link
+               FROM `gh-data`.clickhouse_regression_results
+               GROUP BY architecture, test_name, job_url, report_url) 
+            WHERE job_url='{job_url}'
+            AND result IN ('Fail', 'Error')
+            """
     return client.query_dataframe(query)
 
 
