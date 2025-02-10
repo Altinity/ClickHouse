@@ -637,6 +637,6 @@ jobs:
         run: |
           pip install clickhouse-driver==0.2.8 numpy==1.26.4 pandas==2.2.0
 
-          python3 .github/create_combined_ci_report.py \
-            --actions-job-url ${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }} \
-            --ci-running-report-url https://s3.amazonaws.com/altinity-build-artifacts/${{ env.pr_number }}/${{ env.build_sha }}/ci_running.html
+          python3 .github/create_combined_ci_report.py --pr-number ${{ env.pr_number }} --commit_sha ${{ env.build_sha }} \
+          --actions-job-url ${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }} | tee report_link.txt
+          echo "Combined CI Report: [View Report]($(cat report_link.txt))" >> $GITHUB_STEP_SUMMARY
