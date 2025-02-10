@@ -130,7 +130,9 @@ def main():
 
 </body>
 </html>
-"""
+""".replace(
+        "ClickHouse CI running for", "Combined CI Report for"
+    )
 
     report_path = Path("combined_report.html")
     report_path.write_text(combined_report, encoding="utf-8")
