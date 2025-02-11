@@ -2,6 +2,7 @@
 import argparse
 import os
 from pathlib import Path
+from itertools import combinations
 
 import requests
 from clickhouse_driver import Client
@@ -46,6 +47,23 @@ def get_checks_errors(client: Client, job_url: str):
     return client.query_dataframe(query)
 
 
+def drop_prefix_rows(df, column_to_clean):
+    """
+    Drop rows from the dataframe if:
+    - the row matches another row completely except for the specified column
+    - the specified column of that row is a prefix of the same column in another row
+    """
+    to_drop = set()
+    reference_columns = [col for col in df.columns if col != column_to_clean]
+    for (i, row_1), (j, row_2) in combinations(df.iterrows(), 2):
+        if all(row_1[col] == row_2[col] for col in reference_columns):
+            if row_2[column_to_clean].startswith(row_1[column_to_clean]):
+                to_drop.add(i)
+            elif row_1[column_to_clean].startswith(row_2[column_to_clean]):
+                to_drop.add(j)
+    return df.drop(to_drop)
+
+
 def get_regression_fails(client: Client, job_url: str):
     """
     Get regression tests that did not succeed for the given job URL.
@@ -66,7 +84,9 @@ def get_regression_fails(client: Client, job_url: str):
             WHERE job_url='{job_url}'
             AND status IN ('Fail', 'Error')
             """
-    return client.query_dataframe(query)
+    df = client.query_dataframe(query)
+    df = drop_prefix_rows(df, "test_name")
+    return df
 
 
 def url_to_html_link(url: str) -> str:
