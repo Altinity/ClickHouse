@@ -47,9 +47,10 @@ def get_regression_fails(client: Client, job_url: str):
                     job_url,
                     report_url as results_link
                FROM `gh-data`.clickhouse_regression_results
-               GROUP BY architecture, test_name, job_url, report_url) 
+               GROUP BY architecture, test_name, job_url, report_url
+            )
             WHERE job_url='{job_url}'
-            AND result IN ('Fail', 'Error')
+            AND status IN ('Fail', 'Error')
             """
     return client.query_dataframe(query)
 
