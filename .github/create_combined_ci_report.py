@@ -100,6 +100,7 @@ def format_results_as_html_table(results) -> str:
         .replace("</tbody>\n", "")
         .replace("<thead>\n", "")
         .replace("</thead>\n", "")
+        .replace('<table border="1"', '<table style="min-width: min(900px, 98vw);"')
     )
     return html
 
