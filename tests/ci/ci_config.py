@@ -414,6 +414,7 @@ class CI:
             required_builds=[BuildNames.PACKAGE_AARCH64],
             num_batches=6,
             runner_type=Runners.FUNC_TESTER_ARM,
+            timeout=9000,  # the job timed out with default value (7200)
         ),
         JobNames.INTEGRATION_TEST: CommonJobConfigs.INTEGRATION_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_RELEASE],
