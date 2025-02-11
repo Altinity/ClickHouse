@@ -15,6 +15,10 @@ S3_BUCKET = "altinity-build-artifacts"
 
 
 def get_checks_fails(client: Client, job_url: str):
+    """
+    Get tests that did not succeed for the given job URL.
+    Exclude checks that have status 'error' as they are counted in get_checks_errors.
+    """
     columns = (
         "check_name, check_status, test_name, test_status, report_url as results_link"
     )
@@ -28,6 +32,9 @@ def get_checks_fails(client: Client, job_url: str):
 
 
 def get_checks_errors(client: Client, job_url: str):
+    """
+    Get checks that have status 'error' for the given job URL.
+    """
     columns = (
         "check_name, check_status, test_name, test_status, report_url as results_link"
     )
@@ -40,6 +47,9 @@ def get_checks_errors(client: Client, job_url: str):
 
 
 def get_regression_fails(client: Client, job_url: str):
+    """
+    Get regression tests that did not succeed for the given job URL.
+    """
     # If you rename the alias for report_url, also update the formatters in format_results_as_html_table
     query = f"""SELECT arch, status, test_name, results_link
             FROM (
