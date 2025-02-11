@@ -23,6 +23,7 @@ on: # yamllint disable-line rule:truthy
   push:
     branches:
       - 'releases/22.8**'
+  workflow_dispatch:
 
 jobs:
   DockerHubPushAarch64:
