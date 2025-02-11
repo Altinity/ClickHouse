@@ -60,39 +60,48 @@ RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add - \
 RUN dockerd --version; docker --version
 
 RUN python3 -m pip install --no-cache-dir \
-    PyMySQL \
-    aerospike==4.0.0 \
-    avro==1.10.2 \
-    asyncio \
-    cassandra-driver \
-    confluent-kafka==1.5.0 \
-    dict2xml \
-    dicttoxml \
-    docker \
-    docker-compose==1.29.2 \
-    grpcio \
-    grpcio-tools \
-    kafka-python \
-    kazoo \
-    lz4 \
-    minio \
-    nats-py \
-    protobuf \
-    psycopg2-binary==2.8.6 \
-    pymongo==3.11.0 \
-    pytest \
-    pytest-order==1.0.0 \
-    pytest-timeout \
-    pytest-xdist \
-    pytest-repeat \
+    PyMySQL~=1.1.0 \
+    aerospike~=11.1.0 \
+    asyncio~=3.4.3\
+    avro~=1.10.2 \
+    azure-storage-blob~=12.19.0\
+    cassandra-driver~=3.28.0\
+    confluent-kafka~=1.9.2 \
+    delta-spark~=2.3.0 \
+    dict2xml~=1.7.3 \
+    dicttoxml~=1.7.16 \
+    docker~=6.1.3 \
+    docker-compose~=1.29.2 \
+    grpcio~=1.59.3 \
+    grpcio-tools~=1.59.3 \
+    kafka-python~=2.0.2 \
+    kazoo~=2.9.0 \
+    lz4~=4.3.2 \
+    meilisearch~=0.18.3 \
+    minio~=7.2.0 \
+    nats-py~=2.6.0 \
+    protobuf~=4.25.1 \
+    psycopg2-binary~=2.9.6 \
+    pyhdfs~=0.3.1 \
+    pymongo~=3.11.0 \
+    pyspark~=3.3.2 \
+    pytest~=7.4.3 \
+    pytest-order~=1.0.0 \
+    pytest-random~=0.2 \
+    pytest-repeat~=0.9.3 \
+    pytest-timeout~=2.2.0 \
+    pytest-xdist~=3.5.0 \
     pytz \
-    redis \
-    tzlocal==2.1 \
-    urllib3 \
+    pyyaml~=5.3.1 \
+    redis~=5.0.1 \
+    requests==2.31.0 \
     requests-kerberos \
-    pyhdfs \
-    azure-storage-blob \
-    meilisearch==0.18.3 
+    requests~=2.31.0 \
+    tzlocal~=2.1 \
+    retry~=0.9.2 \
+    bs4~=0.0.1 \
+    lxml~=4.9.3 \
+    urllib3~=2.1.0
 
 COPY modprobe.sh /usr/local/bin/modprobe
 COPY dockerd-entrypoint.sh /usr/local/bin/
