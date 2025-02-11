@@ -20,7 +20,9 @@ def get_checks_fails(client: Client, job_url: str):
     )
     query = f"""SELECT {columns} FROM `gh-data`.checks 
                 WHERE task_url='{job_url}' 
-                AND test_status in ('FAIL', 'ERROR') 
+                AND test_status in ('FAIL', 'ERROR')
+                AND check_status!='error'
+                ORDER BY check_name, test_name
                 """
     return client.query_dataframe(query)
 
@@ -32,6 +34,7 @@ def get_checks_errors(client: Client, job_url: str):
     query = f"""SELECT {columns} FROM `gh-data`.checks 
                 WHERE task_url='{job_url}' 
                 AND check_status=='error'
+                ORDER BY check_name, test_name
                 """
     return client.query_dataframe(query)
 
@@ -47,7 +50,8 @@ def get_regression_fails(client: Client, job_url: str):
                     job_url,
                     report_url as results_link
                FROM `gh-data`.clickhouse_regression_results
-               GROUP BY architecture, test_name, job_url, report_url
+               GROUP BY architecture, test_name, job_url, report_url, start_time
+               ORDER BY start_time DESC, length(test_name) DESC
             )
             WHERE job_url='{job_url}'
             AND status IN ('Fail', 'Error')
@@ -119,21 +123,40 @@ def main():
         )
         exit(1)
 
-    combined_report = f"""{ci_running_report.split("</body>")[0]}
-<h2>Checks Fails</h2>
-{format_results_as_html_table(get_checks_fails(db_client, args.actions_run_url))}
+    fail_results = {
+        "checks_fails": get_checks_fails(db_client, args.actions_run_url),
+        "checks_errors": get_checks_errors(db_client, args.actions_run_url),
+        "regression_fails": get_regression_fails(db_client, args.actions_run_url),
+    }
 
-<h2>Checks Errors</h2>
-{format_results_as_html_table(get_checks_errors(db_client, args.actions_run_url))}
+    combined_report = ci_running_report.replace(
+        "ClickHouse CI running for", "Combined CI Report for"
+    ).replace(
+        "</h1>",
+        f"""</h1>
+<h2>Table of Contents</h2>
+<ul>
+    <li><a href="#ci-jobs-status">CI Jobs Status</a></li>
+    <li><a href="#checks-fails">Checks Fails</a> ({len(fail_results['checks_fails'])})</li>
+    <li><a href="#checks-errors">Checks Errors</a> ({len(fail_results['checks_errors'])})</li>
+    <li><a href="#regression-fails">Regression Fails</a> ({len(fail_results['regression_fails'])})</li>
+</ul>
+<h2 id="ci-jobs-status">CI Jobs Status</h2>
+""",
+    )
+    combined_report = f"""{combined_report.split("</body>")[0]}
+<h2 id="checks-fails">Checks Fails</h2>
+{format_results_as_html_table(fail_results['checks_fails'])}
 
-<h2>Regression Fails</h2>
-{format_results_as_html_table(get_regression_fails(db_client, args.actions_run_url))}
+<h2 id="checks-errors">Checks Errors</h2>
+{format_results_as_html_table(fail_results['checks_errors'])}
+
+<h2 id="regression-fails">Regression Fails</h2>
+{format_results_as_html_table(fail_results['regression_fails'])}
 
 </body>
 </html>
-""".replace(
-        "ClickHouse CI running for", "Combined CI Report for"
-    )
+"""
 
     report_path = Path("combined_report.html")
     report_path.write_text(combined_report, encoding="utf-8")
