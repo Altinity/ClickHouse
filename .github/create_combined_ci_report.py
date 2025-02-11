@@ -82,8 +82,14 @@ def format_results_as_html_table(results) -> str:
     if results.empty:
         return ""
     results.columns = [col.replace("_", " ").title() for col in results.columns]
-    html = results.to_html(
-        index=False, formatters={"Results Link": url_to_html_link}, escape=False
+    html = (
+        results.to_html(
+            index=False, formatters={"Results Link": url_to_html_link}, escape=False
+        )  # tbody/thead tags interfere with the table sorting script
+        .replace("<tbody>\n", "")
+        .replace("</tbody>\n", "")
+        .replace("<thead>\n", "")
+        .replace("</thead>\n", "")
     )
     return html
 
@@ -126,7 +132,7 @@ def main():
 
     response = requests.get(ci_running_report_url)
     if response.status_code == 200:
-        ci_running_report = response.text
+        ci_running_report: str = response.text
     else:
         print(
             f"Failed to download CI running report. Status code: {response.status_code}, Response: {response.text}"
@@ -139,11 +145,11 @@ def main():
         "regression_fails": get_regression_fails(db_client, args.actions_run_url),
     }
 
-    combined_report = ci_running_report.replace(
-        "ClickHouse CI running for", "Combined CI Report for"
-    ).replace(
-        "</h1>",
-        f"""</h1>
+    combined_report = (
+        ci_running_report.replace("ClickHouse CI running for", "Combined CI Report for")
+        .replace(
+            "</h1>",
+            f"""</h1>
 <h2>Table of Contents</h2>
 <ul>
     <li><a href="#ci-jobs-status">CI Jobs Status</a></li>
@@ -153,8 +159,11 @@ def main():
 </ul>
 <h2 id="ci-jobs-status">CI Jobs Status</h2>
 """,
-    )
-    combined_report = f"""{combined_report.split("</body>")[0]}
+        )
+        .replace(
+            "</table>",
+            f"""</table>
+
 <h2 id="checks-fails">Checks Fails</h2>
 {format_results_as_html_table(fail_results['checks_fails'])}
 
@@ -163,11 +172,9 @@ def main():
 
 <h2 id="regression-fails">Regression Fails</h2>
 {format_results_as_html_table(fail_results['regression_fails'])}
-
-</body>
-</html>
-"""
-
+""",
+        )
+    )
     report_path = Path("combined_report.html")
     report_path.write_text(combined_report, encoding="utf-8")
 
