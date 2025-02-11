@@ -78,13 +78,23 @@ def url_to_html_link(url: str) -> str:
     return f'<a href="{url}">{text}</a>'
 
 
+def format_test_name_for_linewrap(text: str) -> str:
+    """Tweak the test name to improve line wrapping."""
+    return text.replace(".py::", "/")
+
+
 def format_results_as_html_table(results) -> str:
     if results.empty:
         return ""
     results.columns = [col.replace("_", " ").title() for col in results.columns]
     html = (
         results.to_html(
-            index=False, formatters={"Results Link": url_to_html_link}, escape=False
+            index=False,
+            formatters={
+                "Results Link": url_to_html_link,
+                "Test Name": format_test_name_for_linewrap,
+            },
+            escape=False,
         )  # tbody/thead tags interfere with the table sorting script
         .replace("<tbody>\n", "")
         .replace("</tbody>\n", "")
@@ -148,17 +158,17 @@ def main():
     combined_report = (
         ci_running_report.replace("ClickHouse CI running for", "Combined CI Report for")
         .replace(
-            "</h1>",
-            f"""</h1>
-<h2>Table of Contents</h2>
+            "<table>",
+            f"""<h2>Table of Contents</h2>
 <ul>
     <li><a href="#ci-jobs-status">CI Jobs Status</a></li>
     <li><a href="#checks-fails">Checks Fails</a> ({len(fail_results['checks_fails'])})</li>
     <li><a href="#checks-errors">Checks Errors</a> ({len(fail_results['checks_errors'])})</li>
     <li><a href="#regression-fails">Regression Fails</a> ({len(fail_results['regression_fails'])})</li>
 </ul>
+
 <h2 id="ci-jobs-status">CI Jobs Status</h2>
-""",
+<table>""",
         )
         .replace(
             "</table>",
