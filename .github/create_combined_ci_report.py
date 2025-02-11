@@ -20,7 +20,7 @@ def get_checks_fails(client: Client, job_url: str):
     Exclude checks that have status 'error' as they are counted in get_checks_errors.
     """
     columns = (
-        "check_name, check_status, test_name, test_status, report_url as results_link"
+        "check_status, check_name, test_status, test_name, report_url as results_link"
     )
     query = f"""SELECT {columns} FROM `gh-data`.checks 
                 WHERE task_url='{job_url}' 
@@ -36,7 +36,7 @@ def get_checks_errors(client: Client, job_url: str):
     Get checks that have status 'error' for the given job URL.
     """
     columns = (
-        "check_name, check_status, test_name, test_status, report_url as results_link"
+        "check_status, check_name, test_status, test_name, report_url as results_link"
     )
     query = f"""SELECT {columns} FROM `gh-data`.checks 
                 WHERE task_url='{job_url}' 
