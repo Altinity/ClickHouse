@@ -24,8 +24,8 @@ def get_checks_fails(client: Client, job_url: str):
     columns = (
         "check_status, check_name, test_status, test_name, report_url as results_link"
     )
-    query = f"""SELECT {columns} FROM `gh-data`.checks 
-                WHERE task_url='{job_url}' 
+    query = f"""SELECT {columns} FROM `gh-data`.checks
+                WHERE task_url='{job_url}'
                 AND test_status IN ('FAIL', 'ERROR')
                 AND check_status!='error'
                 ORDER BY check_name, test_name
@@ -69,8 +69,8 @@ def get_checks_errors(client: Client, job_url: str):
     columns = (
         "check_status, check_name, test_status, test_name, report_url as results_link"
     )
-    query = f"""SELECT {columns} FROM `gh-data`.checks 
-                WHERE task_url='{job_url}' 
+    query = f"""SELECT {columns} FROM `gh-data`.checks
+                WHERE task_url='{job_url}'
                 AND check_status=='error'
                 ORDER BY check_name, test_name
                 """
