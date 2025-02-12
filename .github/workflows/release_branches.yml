@@ -23,6 +23,7 @@ on: # yamllint disable-line rule:truthy
   push:
     branches:
       - 'releases/22.8**'
+  workflow_dispatch:
 
 jobs:
   DockerHubPushAarch64:
@@ -362,6 +363,21 @@ jobs:
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
           clear-repository: true
+      - name: Docker IPv6 configuration
+        shell: bash
+        run: |
+          # make sure docker uses proper IPv6 config
+          sudo touch /etc/docker/daemon.json
+          sudo chown ubuntu:ubuntu /etc/docker/daemon.json
+          sudo cat <<EOT > /etc/docker/daemon.json
+          {
+            "ipv6": true,
+            "fixed-cidr-v6": "2001:3984:3989::/64"
+          }
+          EOT
+          sudo chown root:root /etc/docker/daemon.json
+          sudo systemctl restart docker
+          sudo systemctl status docker
       - name: Functional test
         run: |
           sudo rm -fr "$TEMP_PATH"
@@ -452,6 +468,21 @@ jobs:
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
           clear-repository: true
+      - name: Docker IPv6 configuration
+        shell: bash
+        run: |
+          # make sure docker uses proper IPv6 config
+          sudo touch /etc/docker/daemon.json
+          sudo chown ubuntu:ubuntu /etc/docker/daemon.json
+          sudo cat <<EOT > /etc/docker/daemon.json
+          {
+            "ipv6": true,
+            "fixed-cidr-v6": "2001:3984:3989::/64"
+          }
+          EOT
+          sudo chown root:root /etc/docker/daemon.json
+          sudo systemctl restart docker
+          sudo systemctl status docker
       - name: Functional test
         run: |
           sudo rm -fr "$TEMP_PATH"
@@ -635,7 +666,7 @@ jobs:
     secrets: inherit
     with:
       runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-app-docker-ce, altinity-setup-regression
-      commit: 217a4fde343586d50229ff5e24295a02412d1d98
+      commit: faf60032c142d34829aa5bb93da43075cd1b6832
       arch: release
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout_minutes: 300  
@@ -646,8 +677,8 @@ jobs:
     secrets: inherit
     with:
       runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-app-docker-ce, altinity-setup-regression
-      commit: 217a4fde343586d50229ff5e24295a02412d1d98
-      arch: release
+      commit: faf60032c142d34829aa5bb93da43075cd1b6832
+      arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout_minutes: 300
 
