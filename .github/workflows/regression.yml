@@ -186,6 +186,10 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+      - name: Upload logs to regression results database
+        if: always()
+        timeout-minutes: 20
+        run: .github/upload_results_to_database.sh 1
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -239,6 +243,10 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+      - name: Upload logs to regression results database
+        if: always()
+        timeout-minutes: 20
+        run: .github/upload_results_to_database.sh 1
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -300,6 +308,10 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+      - name: Upload logs to regression results database
+        if: always()
+        timeout-minutes: 20
+        run: .github/upload_results_to_database.sh 1
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -350,6 +362,10 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+      - name: Upload logs to regression results database
+        if: always()
+        timeout-minutes: 20
+        run: .github/upload_results_to_database.sh 1
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -402,6 +418,10 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+      - name: Upload logs to regression results database
+        if: always()
+        timeout-minutes: 20
+        run: .github/upload_results_to_database.sh 1
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -450,6 +470,10 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+      - name: Upload logs to regression results database
+        if: always()
+        timeout-minutes: 20
+        run: .github/upload_results_to_database.sh 1
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -509,6 +533,10 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+      - name: Upload logs to regression results database
+        if: always()
+        timeout-minutes: 20
+        run: .github/upload_results_to_database.sh 1
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -570,6 +598,10 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+      - name: Upload logs to regression results database
+        if: always()
+        timeout-minutes: 20
+        run: .github/upload_results_to_database.sh 1
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -630,6 +662,10 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+      - name: Upload logs to regression results database
+        if: always()
+        timeout-minutes: 20
+        run: .github/upload_results_to_database.sh 1
       - uses: actions/upload-artifact@v4
         if: always()
         with:
