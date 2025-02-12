@@ -94,7 +94,6 @@ RUN python3 -m pip install --no-cache-dir \
     pytz \
     pyyaml~=5.3.1 \
     redis~=5.0.1 \
-    requests==2.31.0 \
     requests-kerberos \
     requests~=2.31.0 \
     tzlocal~=2.1 \
