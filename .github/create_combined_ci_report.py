@@ -139,6 +139,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-upload", action="store_true", help="Do not upload the report"
     )
+    parser.add_argument(
+        "--mark-preview", action="store_true", help="Mark the report as a preview"
+    )
     return parser.parse_args()
 
 
@@ -181,6 +184,7 @@ def main():
         .replace(
             "<table>",
             f"""<h2>Table of Contents</h2>
+{'<p style="font-weight: bold;color: #F00;">This is a preview. FinishCheck has not completed.</p>' if args.mark_preview else ""}
 <ul>
     <li><a href="#ci-jobs-status">CI Jobs Status</a></li>
     <li><a href="#checks-fails">Checks Fails</a> ({len(fail_results['checks_fails'])})</li>
