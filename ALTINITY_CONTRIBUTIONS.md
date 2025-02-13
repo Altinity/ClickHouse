@@ -1,6 +1,34 @@
 List of pull requests contributed by Altinity develoeprs to ClickHouse server. It does not include documentation changes.
 
 ## 2024
+  * [Experiment] what if reorder compare of columns in Merge	[63780](https://github.com/ClickHouse/ClickHouse/pull/63780)	by @UnamedRus
+  * Fix if condition in #63151	[73504](https://github.com/ClickHouse/ClickHouse/pull/73504)	by @zvonand
+  * Make 01086_window_view_cleanup more stable	[72232](https://github.com/ClickHouse/ClickHouse/pull/72232)	by @ilejn
+  * Fix #72756 (exception in RemoteQueryExecutor when user does not exist locally)	[72759](https://github.com/ClickHouse/ClickHouse/pull/72759)	by @zvonand
+  * Respect `prefer_locahost_replica` in `parallel_distributed_insert_select`	[72190](https://github.com/ClickHouse/ClickHouse/pull/72190)	by @filimonov
+  * Auxiliary autodiscovery	[71911](https://github.com/ClickHouse/ClickHouse/pull/71911)	by @ianton-ru
+  * Passing external user roles from query originator to other nodes	[70332](https://github.com/ClickHouse/ClickHouse/pull/70332)	by @zvonand
+  * Fix flaky test_drop_complex_columns	[71504](https://github.com/ClickHouse/ClickHouse/pull/71504)	by @ilejn
+  * Boolean support for parquet native reader	[71055](https://github.com/ClickHouse/ClickHouse/pull/71055)	by @arthurpassos
+  * Allow each authentication method to have its own expiration date, remove from user entity.	[70090](https://github.com/ClickHouse/ClickHouse/pull/70090)	by @arthurpassos
+  * make numactl respect EPERM error, when get_mempolicy is is restricted by seccomp	[70900](https://github.com/ClickHouse/ClickHouse/pull/70900)	by @filimonov
+  * add timeouts for retry loops in test_storage_rabbitmq	[70510](https://github.com/ClickHouse/ClickHouse/pull/70510)	by @filimonov
+  * Support for Parquet page V2 on native reader	[70807](https://github.com/ClickHouse/ClickHouse/pull/70807)	by @arthurpassos
+  * Add parquet bloom filters support	[62966](https://github.com/ClickHouse/ClickHouse/pull/62966)	by @arthurpassos
+  * Thread pool: move thread creation out of lock	[68694](https://github.com/ClickHouse/ClickHouse/pull/68694)	by @filimonov
+  * fix Kafka test	[70352](https://github.com/ClickHouse/ClickHouse/pull/70352)	by @filimonov
+  * Maybe fix RabbitMQ	[70336](https://github.com/ClickHouse/ClickHouse/pull/70336)	by @filimonov
+  * Add getSettingOrDefault() function	[69917](https://github.com/ClickHouse/ClickHouse/pull/69917)	by @shiyer7474
+  * Fix REPLACE PARTITION waiting for mutations/merges on unrelated partitions 	[59138](https://github.com/ClickHouse/ClickHouse/pull/59138)	by @Enmk
+  * Implement missing decimal cases for `zeroField` function by casting 0 to proper types	[69978](https://github.com/ClickHouse/ClickHouse/pull/69978)	by @arthurpassos
+  * alpine docker images - use ubuntu 22.04 as glibc donor	[69033](https://github.com/ClickHouse/ClickHouse/pull/69033)	by @filimonov
+  * Read only necessary columns & respect `ttl_only_drop_parts` on `materialize ttl`	[65488](https://github.com/ClickHouse/ClickHouse/pull/65488)	by @zvonand
+  * Some fixes for LDAP	[68355](https://github.com/ClickHouse/ClickHouse/pull/68355)	by @zvonand
+  * Multi auth methods	[65277](https://github.com/ClickHouse/ClickHouse/pull/65277)	by @arthurpassos
+  * Do not use docker pause for Kerberos KDC container in integration tests	[69136](https://github.com/ClickHouse/ClickHouse/pull/69136)	by @ilejn
+  * Fix test_role & test_keeper_s3_snapshot integration tests	[69013](https://github.com/ClickHouse/ClickHouse/pull/69013)	by @shiyer7474
+  * Thread pool metrics	[68674](https://github.com/ClickHouse/ClickHouse/pull/68674)	by @filimonov
+  * Fix subnet in docker_compose_net.yml	[69121](https://github.com/ClickHouse/ClickHouse/pull/69121)	by @ilejn
   * Fix small value DateTime64 constant folding in nested subquery for remote	[68323](https://github.com/ClickHouse/ClickHouse/pull/68323)	by @shiyer7474
   * Building aarch64 builds with '-no-pie' to allow better introspection	[67916](https://github.com/ClickHouse/ClickHouse/pull/67916)	by @filimonov
   * Add `**` to `hdfs` docs, add test for `**` in `hdfs`	[67064](https://github.com/ClickHouse/ClickHouse/pull/67064)	by @zvonand
