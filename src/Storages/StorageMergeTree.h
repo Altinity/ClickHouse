@@ -245,6 +245,7 @@ private:
 
     void replacePartitionFrom(const StoragePtr & source_table, const ASTPtr & partition, bool replace, ContextPtr context) override;
     void movePartitionToTable(const StoragePtr & dest_table, const ASTPtr & partition, ContextPtr context) override;
+    void exportPartitionToTable(const PartitionCommand & command, ContextPtr query_context) override;
     bool partIsAssignedToBackgroundOperation(const DataPartPtr & part) const override;
     /// Update mutation entries after part mutation execution. May reset old
     /// errors if mutation was successful. Otherwise update last_failed* fields
