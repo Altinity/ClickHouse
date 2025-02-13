@@ -88,6 +88,11 @@ jobs:
         uses: ./.github/actions/common_setup
         with:
           job_type: build_check
+      - name: Create source tar
+        run: |          
+          mkdir -p "$TEMP_PATH/build_check/package_release"
+          cd .. && tar czf $TEMP_PATH/build_source.src.tar.gz ClickHouse/
+          cd $TEMP_PATH && tar xvzf $TEMP_PATH/build_source.src.tar.gz
       - name: Pre
         run: |
           python3 "$GITHUB_WORKSPACE/tests/ci/ci.py" --infile ${{ toJson(inputs.data) }} --pre --job-name '${{inputs.build_name}}'
