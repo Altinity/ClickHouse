@@ -247,6 +247,11 @@ public:
 
     virtual void update(ObjectStoragePtr object_storage, ContextPtr local_context);
 
+    /// Create arguments for table function with path and access parameters
+    virtual ASTPtr createArgsWithAccessData() const
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method createArgsWithAccessData is not supported by storage {}", getEngineName());
+    }
 
 protected:
     virtual void fromNamedCollection(const NamedCollection & collection, ContextPtr context) = 0;
