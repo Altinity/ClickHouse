@@ -140,6 +140,7 @@ class Git:
         self.description = "shallow-checkout"
         self.commits_since_tag = 0
         self.commits_since_latest = 0
+        self.commits_since_new = 0
         self.update()
 
     def update(self):
@@ -166,6 +167,17 @@ class Git:
         self.commits_since_latest = self.commits_since_tag = int(
             self.run(f"git rev-list {self.latest_tag}..HEAD --count")
         )
+        if self.latest_tag.endswith("-new"):
+            # We won't change the behaviour of the the "latest_tag"
+            # So here we set "new_tag" to the previous tag in the graph, that will allow
+            # getting alternative "tweak"
+            self.new_tag = self.run(
+                f"git describe --tags --abbrev=0 --exclude='{self.latest_tag}'",
+                stderr=stderr,
+            )
+            self.commits_since_new = int(
+                self.run(f"git rev-list {self.new_tag}..HEAD --count")
+            )
 
     @staticmethod
     def check_tag(value: str) -> None:
