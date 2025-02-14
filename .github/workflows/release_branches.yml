@@ -738,6 +738,7 @@ jobs:
   ################################ FINISH CHECK #############################################
   ###########################################################################################
   FinishCheck:
+    if: ${{ !cancelled() }}
     needs:
       - DockerHubPush
       - DockerServerImages
@@ -778,6 +779,7 @@ jobs:
         with:
           clear-repository: true
       - name: Finish label
+        if: ${{ !failure() }}
         run: |
           cd "$GITHUB_WORKSPACE/tests/ci"
           python3 finish_check.py
