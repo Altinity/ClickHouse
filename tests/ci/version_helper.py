@@ -303,9 +303,16 @@ def get_version_from_string(
 
 def get_version_from_tag(tag: str) -> ClickHouseVersion:
     Git.check_tag(tag)
-    tag, description = tag[1:].split("-", 1)
-    version = get_version_from_string(tag)
-    version.with_description(description)
+    tag = tag[1:] # strip initial 'v'
+    if '-' in tag:
+        # Upstream tags with dash
+        tag, description = tag.split("-", 1)
+        version = get_version_from_string(tag)
+        version.with_description(description)
+    else:
+        # Altinity's tags, with dots as separators between parts (handled properly down the road)
+        version = get_version_from_string(tag)
+
     return version
 
 
