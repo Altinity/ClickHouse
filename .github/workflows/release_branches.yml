@@ -579,7 +579,7 @@ jobs:
         run: |
           pip install clickhouse-driver==0.2.8 numpy==1.26.4 pandas==2.2.0
 
-          REPORT_LINK=$(python3 .github/create_combined_ci_report.py --pr-number $PR_NUMBER --commit-sha $COMMIT_SHA --actions-run-url $ACTIONS_RUN_URL)
+          REPORT_LINK=$(python3 .github/create_combined_ci_report.py --pr-number $PR_NUMBER --commit-sha $COMMIT_SHA --actions-run-url $ACTIONS_RUN_URL --known-fails tests/broken_tests.json)
 
           IS_VALID_URL=$(echo $REPORT_LINK | grep -E '^https?://')
           if [[ -n $IS_VALID_URL ]]; then
