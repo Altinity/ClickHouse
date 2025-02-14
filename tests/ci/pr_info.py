@@ -112,9 +112,20 @@ class PRInfo:
         self.release_pr = 0
         self.merged_pr = 0
         self.version = get_version_from_repo(git=Git(True))
+
+        self.event_type = EventType.UNKNOWN
         ref = github_event.get("ref", "refs/heads/master")
         if ref and ref.startswith("refs/heads/"):
             ref = ref[11:]
+        self.ref : str = ref # e.g. "refs/pull/509/merge" or "refs/tags/v24.3.12.76.altinitystable"
+
+        # Default values
+        self.base_ref = github_event.get("base_ref","")  # type: str
+        self.base_name = ""  # type: str
+        self.head_ref = ""  # type: str
+        self.head_name = ""  # type: str
+        self.number = 0  # type: int
+
 
         # workflow completed event, used for PRs only
         if "action" in github_event and github_event["action"] == "completed":
@@ -128,6 +139,7 @@ class PRInfo:
                 github_event["pull_request"] = prs_for_sha[0]
 
         if "pull_request" in github_event:  # pull request and other similar events
+            self.event_type = EventType.PULL_REQUEST
             self.number = github_event["pull_request"]["number"]  # type: int
             self.docker_image_tag = str(self.number) # type: str
             if pr_event_from_api:
@@ -161,15 +173,11 @@ class PRInfo:
             # master or backport/xx.x/xxxxx - where the PR will be merged
             self.base_ref = github_event["pull_request"]["base"]["ref"]  # type: str
             # ClickHouse/ClickHouse
-            self.base_name = github_event["pull_request"]["base"]["repo"][
-                "full_name"
-            ]  # type: str
+            self.base_name = github_event["pull_request"]["base"]["repo"]["full_name"]
             # any_branch-name - the name of working branch name
             self.head_ref = github_event["pull_request"]["head"]["ref"]  # type: str
             # UserName/ClickHouse or ClickHouse/ClickHouse
-            self.head_name = github_event["pull_request"]["head"]["repo"][
-                "full_name"
-            ]  # type: str
+            self.head_name = github_event["pull_request"]["head"]["repo"]["full_name"]  # type: str
             self.body = github_event["pull_request"]["body"]
             self.labels = {
                 label["name"] for label in github_event["pull_request"]["labels"]
@@ -189,6 +197,7 @@ class PRInfo:
             self.diff_urls.append(self.compare_pr_url(github_event["pull_request"]))
 
         elif "commits" in github_event:
+            self.event_type = EventType.PUSH
             # `head_commit` always comes with `commits`
             commit_message = github_event["head_commit"]["message"]  # type: str
             if commit_message.startswith("Merge pull request #"):
