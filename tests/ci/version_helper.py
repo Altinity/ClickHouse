@@ -114,6 +114,10 @@ class ClickHouseVersion:
     def tweak(self) -> int:
         return self._tweak
 
+    @tweak.setter
+    def tweak(self, tweak: int) -> None:
+        self._tweak = tweak
+
     @property
     def revision(self) -> int:
         return self._revision
