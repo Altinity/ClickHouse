@@ -8,11 +8,31 @@ from typing import Any, List, Optional
 
 logger = logging.getLogger(__name__)
 
+class VersionType:
+    LTS = "lts"
+    NEW = "new"
+    PRESTABLE = "altinityedge"
+    STABLE = "altinitystable"
+    TESTING = "altinitytest"
+    ANTALYA = "altinityantalya"
+
+    VALID = (NEW, TESTING, PRESTABLE, STABLE, LTS, ANTALYA,
+            # NOTE (vnemkov): we don't use those directly, but it is used in unit-tests
+            "stable",
+            "prestable",
+            "testing",
+    )
+
 # ^ and $ match subline in `multiple\nlines`
 # \A and \Z match only start and end of the whole string
 # NOTE (vnemkov): support both upstream tag style: v22.x.y.z-lts and Altinity tag style: v22.x.y.z.altinitystable
 # Because at early release stages there could be no Altinity tag set on commit, only upstream one.
 RELEASE_BRANCH_REGEXP = r"\A\d+[.]\d+\Z"
+TAG_REGEXP = (
+    r"\Av\d{2}"  # First two digits of major part
+    r"([.][1-9]\d*){3}"  # minor.patch.tweak parts
+    fr"[.-]({'|'.join(VersionType.VALID)})\Z"  # suffix with a version type
+)
 TAG_REGEXP = (
     r"\Av\d{2}[.][1-9]\d*[.][1-9]\d*[.][1-9]\d*[-\.](testing|prestable|stable|lts|altinitystable)\Z"
 )

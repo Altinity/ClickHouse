@@ -42,6 +42,15 @@ DIFF_IN_DOCUMENTATION_EXT = [
 RETRY_SLEEP = 0
 
 
+class EventType:
+    UNKNOWN = "unknown"
+    PUSH = "commits"
+    PULL_REQUEST = "pull_request"
+    SCHEDULE = "schedule"
+    DISPATCH = "dispatch"
+    MERGE_QUEUE = "merge_group"
+
+
 def get_pr_for_commit(sha, ref):
     if not ref:
         return None
@@ -65,9 +74,9 @@ def get_pr_for_commit(sha, ref):
             if pr["head"]["ref"] in ref:
                 return pr
             our_prs.append(pr)
-        print("Cannot find PR with required ref", ref, "returning first one")
-        first_pr = our_prs[0]
-        return first_pr
+        logging.warning("Cannot find PR with required ref %s", ref)
+        # first_pr = our_prs[0]
+        return None
     except Exception as ex:
         print("Cannot fetch PR info from commit", ex)
     return None
@@ -194,8 +203,9 @@ class PRInfo:
             self.task_url = GITHUB_RUN_URL
             self.commit_html_url = f"{repo_prefix}/commit/{self.sha}"
             self.repo_full_name = GITHUB_REPOSITORY
+
             if pull_request is None or pull_request["state"] == "closed":
-                # it's merged PR to master
+                # it's merged PR to master, or there is no PR (build against specific commit or tag)
                 self.number = 0
                 self.docker_image_tag = str(self.number) + "-" + str(self.sha)
                 self.labels = set()
@@ -204,9 +214,14 @@ class PRInfo:
                 self.base_name = self.repo_full_name
                 self.head_ref = ref
                 self.head_name = self.repo_full_name
-                self.diff_urls.append(
-                    self.compare_url(github_event["before"], self.sha)
-                )
+
+                before_sha = github_event["before"]
+                # in case of just a tag on existing commit, "before_sha" is 0000000000000000000000000000000000000000
+                # Hence it is a special case and basically nothing changed, there is no need to compose a diff url
+                if not all(x == '0' for x in before_sha):
+                    self.diff_urls.append(
+                        self.compare_url(before_sha, self.sha)
+                    )
             else:
                 self.number = pull_request["number"]
                 self.docker_image_tag = str(self.number)
