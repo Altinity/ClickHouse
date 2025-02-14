@@ -33,9 +33,7 @@ TAG_REGEXP = (
     r"([.][1-9]\d*){3}"  # minor.patch.tweak parts
     fr"[.-]({'|'.join(VersionType.VALID)})\Z"  # suffix with a version type
 )
-TAG_REGEXP = (
-    r"\Av\d{2}[.][1-9]\d*[.][1-9]\d*[.][1-9]\d*[-\.](testing|prestable|stable|lts|altinitystable)\Z"
-)
+
 SHA_REGEXP = re.compile(r"\A([0-9]|[a-f]){40}\Z")
 
 CWD = p.dirname(p.realpath(__file__))
@@ -141,6 +139,7 @@ class Git:
         self.sha_short = ""
         self.description = "shallow-checkout"
         self.commits_since_tag = 0
+        self.commits_since_latest = 0
         self.update()
 
     def update(self):
@@ -164,7 +163,7 @@ class Git:
         self.latest_tag = self.run("git describe --tags --abbrev=0", stderr=stderr)
         # Format should be: {latest_tag}-{commits_since_tag}-g{sha_short}
         self.description = self.run("git describe --tags --long")
-        self.commits_since_tag = int(
+        self.commits_since_latest = self.commits_since_tag = int(
             self.run(f"git rev-list {self.latest_tag}..HEAD --count")
         )
 
