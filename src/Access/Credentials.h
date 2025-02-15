@@ -154,9 +154,18 @@ public:
     {
         groups = groups_;
     }
+    std::optional<std::chrono::system_clock::time_point> getExpiresAt() const
+    {
+        return expires_at;
+    }
+    void setExpiresAt(std::chrono::system_clock::time_point expires_at_)
+    {
+        expires_at = expires_at_;
+    }
 private:
     String token;
     std::set<String> groups;
+    std::optional<std::chrono::system_clock::time_point> expires_at;
 };
 
 }

@@ -621,7 +621,6 @@ HTTPAuthClientParams ExternalAuthenticators::getHTTPAuthenticationParams(const S
     return it->second;
 }
 
-/// TODO: remove redundancy
 bool ExternalAuthenticators::resolveJWTCredentials(const TokenCredentials & credentials, bool throw_not_configured = true) const
 {
     std::lock_guard lock{mutex};
@@ -679,10 +678,48 @@ bool ExternalAuthenticators::checkAccessTokenCredentials(const TokenCredentials 
     if (access_token_processors.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Access token authentication is not configured");
 
+    /// lookup token in local cache if not expired.
+    auto cached_entry_iter = access_token_cache.find(credentials.getToken());
+    if (cached_entry_iter != access_token_cache.end())
+    {
+        if (cached_entry_iter->second.expires_at <= std::chrono::system_clock::now())
+        {
+            LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} expired, removing", cached_entry_iter->second.user_name);
+            access_token_cache.erase(cached_entry_iter);
+        }
+        else
+        {
+            const auto & user_data = cached_entry_iter->second;
+            const_cast<TokenCredentials &>(credentials).setUserName(user_data.user_name);
+            const_cast<TokenCredentials &>(credentials).setGroups(user_data.external_roles);
+            LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} found, using it to authenticate", cached_entry_iter->second.user_name);
+            return true;
+        }
+    }
+
     for (const auto & it : access_token_processors)
     {
         if (it.second->resolveAndValidate(credentials))
         {
+            AccessTokenCacheEntry cache_entry;
+            cache_entry.user_name = credentials.getUserName();
+            cache_entry.external_roles = credentials.getGroups();
+
+            auto default_expiration_ts = std::chrono::system_clock::now()
+                                         + std::chrono::minutes(it.second->getCacheInvalidationInterval());
+
+            if (credentials.getExpiresAt().has_value())
+            {
+                if (credentials.getExpiresAt().value() < default_expiration_ts)
+                    cache_entry.expires_at = credentials.getExpiresAt().value();
+            }
+            else
+            {
+                cache_entry.expires_at = default_expiration_ts;
+            }
+            LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} added", cached_entry_iter->second.user_name);
+
+            access_token_cache[credentials.getToken()] = cache_entry;
             LOG_DEBUG(getLogger("AccessTokenAuthentication"), "Authenticated user {} with access token by {}", credentials.getUserName(), it.first);
             return true;
         }
