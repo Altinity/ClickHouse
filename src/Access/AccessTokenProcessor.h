@@ -84,22 +84,13 @@ public:
     AzureAccessTokenProcessor(const String & name_,
                               const UInt64 cache_invalidation_interval_,
                               const String & email_regex_str,
-                              const String & client_id_,
-                              const String & tenant_id_,
-                              const String & client_secret_)
+                              const String & tenant_id_)
                               : IAccessTokenProcessor(name_, cache_invalidation_interval_, email_regex_str),
-                                client_id(client_id_),
-                                tenant_id(tenant_id_),
-                                client_secret(client_secret_),
-                                jwks_uri_str("https://login.microsoftonline.com/" + tenant_id + "/discovery/v2.0/keys") {}
+                                jwks_uri_str("https://login.microsoftonline.com/" + tenant_id_ + "/discovery/v2.0/keys") {}
 
     bool resolveAndValidate(const TokenCredentials & credentials) override;
 private:
     static const Poco::URI user_info_uri;
-
-    const String client_id;
-    const String tenant_id;
-    const String client_secret;
 
     const String jwks_uri_str;
 
