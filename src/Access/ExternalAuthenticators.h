@@ -68,13 +68,23 @@ private:
         LDAPClient::SearchResultsList last_successful_role_search_results;
     };
 
+    struct AccessTokenCacheEntry
+    {
+        std::chrono::system_clock::time_point expires_at;
+        String user_name;
+        std::set<String> external_roles;
+    };
+
     using LDAPCache = std::unordered_map<String, LDAPCacheEntry>; // user name   -> cache entry
     using LDAPCaches = std::map<String, LDAPCache>;               // server name -> cache
     using LDAPParams = std::map<String, LDAPClient::Params>;      // server name -> params
 
+    using AccessTokenCache = std::unordered_map<String, AccessTokenCacheEntry>; // Access token -> cache entry
+
     mutable std::mutex mutex;
     LDAPParams ldap_client_params_blueprint TSA_GUARDED_BY(mutex) ;
     mutable LDAPCaches ldap_caches TSA_GUARDED_BY(mutex) ;
+    mutable AccessTokenCache access_token_cache TSA_GUARDED_BY(mutex) ;
     std::optional<GSSAcceptorContext::Params> kerberos_params TSA_GUARDED_BY(mutex) ;
     std::unordered_map<String, HTTPAuthClientParams> http_auth_servers TSA_GUARDED_BY(mutex) ;
     std::unordered_map<String, std::unique_ptr<IJWTValidator>> jwt_validators TSA_GUARDED_BY(mutex) ;

@@ -26,7 +26,12 @@ class GoogleAccessTokenProcessor;
 class IAccessTokenProcessor
 {
 public:
-    IAccessTokenProcessor(const String & name_, const String & email_regex_str) : name(name_), email_regex(email_regex_str)
+    IAccessTokenProcessor(const String & name_,
+                          const UInt64 cache_invalidation_interval_,
+                          const String & email_regex_str)
+                          : name(name_),
+                            cache_invalidation_interval(cache_invalidation_interval_),
+                            email_regex(email_regex_str)
     {
         if (!email_regex_str.empty())
         {
@@ -36,19 +41,12 @@ public:
         }
     }
 
-    String getName()
-    {
-        return name;
-    }
-
     virtual ~IAccessTokenProcessor() = default;
 
-    virtual bool resolveAndValidate(const TokenCredentials & credentials) = 0;
+    String getName() { return name; }
+    UInt64 getCacheInvalidationInterval() { return cache_invalidation_interval; }
 
-    virtual std::set<String> getGroups([[maybe_unused]] const TokenCredentials & credentials)
-    {
-        return {};
-    }
+    virtual bool resolveAndValidate(const TokenCredentials & credentials) = 0;
 
     static std::unique_ptr<DB::IAccessTokenProcessor> parseTokenProcessor(
         const Poco::Util::AbstractConfiguration & config,
@@ -57,6 +55,7 @@ public:
 
 protected:
     const String name;
+    const UInt64 cache_invalidation_interval;
     re2::RE2 email_regex;
 };
 
@@ -64,7 +63,10 @@ protected:
 class GoogleAccessTokenProcessor : public IAccessTokenProcessor
 {
 public:
-    GoogleAccessTokenProcessor(const String & name_, const String & email_regex_str) : IAccessTokenProcessor(name_, email_regex_str) {}
+    GoogleAccessTokenProcessor(const String & name_,
+                               const UInt64 cache_invalidation_interval_,
+                               const String & email_regex_str)
+                               : IAccessTokenProcessor(name_, cache_invalidation_interval_, email_regex_str) {}
 
     bool resolveAndValidate(const TokenCredentials & credentials) override;
 
@@ -80,11 +82,12 @@ class AzureAccessTokenProcessor : public IAccessTokenProcessor
 {
 public:
     AzureAccessTokenProcessor(const String & name_,
+                              const UInt64 cache_invalidation_interval_,
                               const String & email_regex_str,
                               const String & client_id_,
                               const String & tenant_id_,
                               const String & client_secret_)
-                              : IAccessTokenProcessor(name_, email_regex_str),
+                              : IAccessTokenProcessor(name_, cache_invalidation_interval_, email_regex_str),
                                 client_id(client_id_),
                                 tenant_id(tenant_id_),
                                 client_secret(client_secret_),

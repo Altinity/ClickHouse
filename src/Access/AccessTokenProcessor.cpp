@@ -9,7 +9,7 @@ namespace DB
 
 namespace
 {
-    /// The JSON reply from provider has only a few key-value pairs, so no need for SimdJSON/RapidJSON.
+    /// The JSON reply from provider has only a few key-value pairs, so no need for any advanced parsing.
     /// Reduce complexity by using picojson.
     picojson::object parseJSON(const String & json_string) {
         picojson::value jsonValue;
@@ -26,18 +26,20 @@ namespace
         return jsonValue.get<picojson::object>();
     }
 
-    std::string getValueByKey(const picojson::object & jsonObject, const std::string & key) {
+    template<typename ValueType = std::string>
+    ValueType getValueByKey(const picojson::object & jsonObject, const std::string & key) {
         auto it = jsonObject.find(key); // Find the key in the object
-        if (it == jsonObject.end()) {
+        if (it == jsonObject.end())
+        {
             throw std::runtime_error("Key not found: " + key);
         }
 
-        const picojson::value &value = it->second;
-        if (!value.is<std::string>()) {
-            throw std::runtime_error("Value for key '" + key + "' is not a string");
+        const picojson::value & value = it->second;
+        if (!value.is<ValueType>()) {
+            throw std::runtime_error("Value for key '" + key + "' has incorrect type.");
         }
 
-        return value.get<std::string>();
+        return value.get<ValueType>();
     }
 
     picojson::object getObjectFromURI(const Poco::URI & uri, const String & token = "")
@@ -96,9 +98,12 @@ std::unique_ptr<IAccessTokenProcessor> IAccessTokenProcessor::parseTokenProcesso
         String email_regex_str = config.hasProperty(prefix + ".email_filter") ? config.getString(
                 prefix + ".email_filter") : "";
 
+        UInt64 cache_lifetime = config.hasProperty(prefix + ".cache_lifetime") ? config.getUInt64(
+                prefix + ".cache_lifetime") : 3600;
+
         if (provider == "google")
         {
-            return std::make_unique<GoogleAccessTokenProcessor>(name, email_regex_str);
+            return std::make_unique<GoogleAccessTokenProcessor>(name, cache_lifetime, email_regex_str);
         }
         else if (provider == "azure")
         {
@@ -114,7 +119,7 @@ std::unique_ptr<IAccessTokenProcessor> IAccessTokenProcessor::parseTokenProcesso
             String tenant_id_str = config.getString(prefix + ".tenant_id");
             String client_secret_str  = config.hasProperty(prefix + ".client_secret") ? config.getString(prefix + ".client_secret") : "";
 
-            return std::make_unique<AzureAccessTokenProcessor>(name, email_regex_str, client_id_str, tenant_id_str, client_secret_str);
+            return std::make_unique<AzureAccessTokenProcessor>(name, cache_lifetime, email_regex_str, client_id_str, tenant_id_str, client_secret_str);
         }
         else
             throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
@@ -132,10 +137,11 @@ bool GoogleAccessTokenProcessor::resolveAndValidate(const TokenCredentials & cre
 
     auto user_info = getUserInfo(token);
     String user_name = user_info["sub"];
+    bool has_email = user_info.contains("email");
 
     if (email_regex.ok())
     {
-        if (!user_info.contains("email"))
+        if (!has_email)
         {
             LOG_TRACE(getLogger("AccessTokenProcessor"), "{}: Failed to validate {} by e-mail", name, user_name);
             return false;
@@ -149,10 +155,54 @@ bool GoogleAccessTokenProcessor::resolveAndValidate(const TokenCredentials & cre
         }
 
     }
+
     /// Credentials are passed as const everywhere up the flow, so we have to comply,
     /// in this case const_cast looks acceptable.
     const_cast<TokenCredentials &>(credentials).setUserName(user_name);
-    const_cast<TokenCredentials &>(credentials).setGroups({});
+
+    auto token_info = getObjectFromURI(Poco::URI(token_info_uri), token);
+    if (token_info.contains("exp"))
+        const_cast<TokenCredentials &>(credentials).setExpiresAt(std::chrono::system_clock::from_time_t((getValueByKey<time_t>(token_info, "exp"))));
+
+    /// Groups info can only be retrieved if user email is known.
+    /// If no email found in user info, we skip this step and there are no external groups for the user.
+    if (has_email)
+    {
+        std::set<String> external_groups_names;
+        const Poco::URI get_groups_uri = Poco::URI("https://cloudidentity.googleapis.com/v1/groups/-/memberships:searchDirectGroups?query=member_key_id==" + user_info["email"] + "'");
+
+        try
+        {
+            auto groups_response = getObjectFromURI(get_groups_uri, token);
+
+            if (!groups_response.contains("memberships")) {
+                LOG_TRACE(getLogger("AccessTokenProcessor"),
+                          "{}: Failed to get Google groups: invalid content in response from server", name);
+                return true;
+            }
+
+            picojson::array groups_array = groups_response["memberships"].get<picojson::array>();
+
+            /// TODO: check for invalid JSON, LOG something meaningful
+            for (const auto & group: groups_array)
+            {
+                auto group_data = group.get<picojson::object>();
+                String group_name = getValueByKey(group_data["groupKey"].get<picojson::object>(), "id");
+                external_groups_names.insert(group_name);
+                LOG_TRACE(getLogger("AccessTokenProcessor"),
+                          "{}: User {}: new external group {}", name, user_name, group_name);
+            }
+
+            const_cast<TokenCredentials &>(credentials).setGroups(external_groups_names);
+        }
+        catch (const Exception & e)
+        {
+            /// Could not get groups info. Log it and skip it.
+            LOG_TRACE(getLogger("AccessTokenProcessor"),
+                      "{}: Failed to get Google groups, no external roles will be mapped. reason: {}", name, e.what());
+            return true;
+        }
+    }
 
     return true;
 }
@@ -177,8 +227,9 @@ std::unordered_map<String, String> GoogleAccessTokenProcessor::getUserInfo(const
 
 bool AzureAccessTokenProcessor::resolveAndValidate(const TokenCredentials & credentials)
 {
-    /// Token is a JWT in this case, but we cannot directly verify it against Azure AD JWKS. We will not trust any data in this token.
-    /// e.g. see here: https://stackoverflow.com/questions/60778634/failing-signature-validation-of-jwt-tokens-from-azure-ad
+    /// Token is a JWT in this case, but we cannot directly verify it against Azure AD JWKS.
+    /// We will not trust user data in this token except for 'exp' value to determine caching duration.
+    /// Explanation here: https://stackoverflow.com/questions/60778634/failing-signature-validation-of-jwt-tokens-from-azure-ad
     /// Let Azure validate it: only valid tokens will be accepted.
     /// Use GET https://graph.microsoft.com/oidc/userinfo to verify token and get sub at the same time
 
@@ -202,8 +253,49 @@ bool AzureAccessTokenProcessor::resolveAndValidate(const TokenCredentials & cred
         return false;
     }
 
-    /// TODO: do not store it in credentials.
-    const_cast<TokenCredentials &>(credentials).setGroups({});
+    try
+    {
+        const_cast<TokenCredentials &>(credentials).setExpiresAt(jwt::decode(token).get_expires_at());
+    }
+    catch (...) {
+        LOG_TRACE(getLogger("AccessTokenProcessor"),
+                  "{}: No expiration data found in a valid token, will use default cache lifetime", name);
+    }
+
+    std::set<String> external_groups_names;
+    const Poco::URI get_groups_uri = Poco::URI("https://graph.microsoft.com/v1.0/me/memberOf");
+
+    try
+    {
+        auto groups_response = getObjectFromURI(get_groups_uri, token);
+
+        if (!groups_response.contains("value")) {
+            LOG_TRACE(getLogger("AccessTokenProcessor"),
+                      "{}: Failed to get Azure groups: invalid content in response from server", name);
+            return true;
+        }
+
+        picojson::array groups_array = groups_response["value"].get<picojson::array>();
+
+        /// TODO: check for invalid JSON
+        for (const auto & group: groups_array)
+        {
+            auto group_data = group.get<picojson::object>();
+            String group_name = getValueByKey(group_data, "id");
+            external_groups_names.insert(group_name);
+            LOG_TRACE(getLogger("AccessTokenProcessor"),
+                      "{}: User {}: new external group {}", name, credentials.getUserName(), group_name);
+        }
+    }
+    catch (const Exception & e)
+    {
+        /// Could not get groups info. Log it and skip it.
+        LOG_TRACE(getLogger("AccessTokenProcessor"),
+                  "{}: Failed to get Azure groups, no external roles will be mapped. reason: {}", name, e.what());
+        return true;
+    }
+
+    const_cast<TokenCredentials &>(credentials).setGroups(external_groups_names);
 
     return true;
 }

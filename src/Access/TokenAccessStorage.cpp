@@ -252,7 +252,7 @@ void TokenAccessStorage::assignRolesNoLock(User & user, const std::set<String> &
         }
         else
         {
-            LOG_WARNING(getLogger(), "Unable to grant {} role '{}' to user '{}': role not found", (common ? "common" : "mapped"), role_name, user_name);
+            LOG_TRACE(getLogger(), "Did not grant {} role '{}' to user '{}': role not found", (common ? "common" : "mapped"), role_name, user_name);
         }
     };
 
