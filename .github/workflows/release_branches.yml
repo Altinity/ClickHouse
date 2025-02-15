@@ -25,7 +25,7 @@ on: # yamllint disable-line rule:truthy
       - prereleased
   push:
     branches:
-      - 'releases/23.8**'
+      - '**/23.8**'
     tags:
       - '*'
   workflow_dispatch:
