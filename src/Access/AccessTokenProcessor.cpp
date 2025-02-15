@@ -115,11 +115,9 @@ std::unique_ptr<IAccessTokenProcessor> IAccessTokenProcessor::parseTokenProcesso
                 throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
                                 "Could not parse access token processor {}: tenant_id must be specified", name);
 
-            String client_id_str = config.getString(prefix + ".client_id");
             String tenant_id_str = config.getString(prefix + ".tenant_id");
-            String client_secret_str  = config.hasProperty(prefix + ".client_secret") ? config.getString(prefix + ".client_secret") : "";
 
-            return std::make_unique<AzureAccessTokenProcessor>(name, cache_lifetime, email_regex_str, client_id_str, tenant_id_str, client_secret_str);
+            return std::make_unique<AzureAccessTokenProcessor>(name, cache_lifetime, email_regex_str, tenant_id_str);
         }
         else
             throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,

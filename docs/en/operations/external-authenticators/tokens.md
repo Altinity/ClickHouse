@@ -24,6 +24,7 @@ To define an access token processor, add `access_token_processors` section to `c
         <gogoogle>
             <provider>Google</provider>
             <email_filter>^[A-Za-z0-9._%+-]+@example\.com$</email_filter>
+            <cache_lifetime>600</cache_lifetime>
         </gogoogle>
         <azuure>
             <provider>azure</provider>
@@ -41,9 +42,15 @@ Different providers have different sets of parameters.
 **Parameters**
 
 - `provider` -- name of identity provider. Mandatory, case-insensitive. Supported options: "Google", "Azure".
+- `cache_lifetime` --  maximum lifetime of cached token (in seconds). Optional, default: 3600.
 - `email_filter` -- Regex for validation of user emails. Optional parameter, only for Google IdP.
 - `client_id` -- Azure AD (Entra ID) client ID. Optional parameter, only for Azure IdP.
 - `tenant_id` -- Azure AD (Entra ID) tenant ID. Optional parameter, only for Azure IdP.
+
+### Tokens cache
+To reduce number of requests to IdP, tokens are cached internally for no longer then `cache_lifetime` seconds.
+If token expires sooner than `cache_lifetime`, then cache entry for this token will only be valid while token is valid.
+If token lifetime is longer than `cache_lifetime`, cache entry for this token will be valid for `cache_lifetime`. 
 
 ## IdP as External Authenticator {#idp-external-authenticator}
 
