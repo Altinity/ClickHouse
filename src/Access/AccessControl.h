@@ -88,6 +88,8 @@ public:
     /// Adds LDAPAccessStorage which allows querying remote LDAP server for user info.
     void addLDAPStorage(const String & storage_name_, const Poco::Util::AbstractConfiguration & config_, const String & prefix_);
 
+    void addTokenStorage(const String & storage_name_, const Poco::Util::AbstractConfiguration & config_, const String & prefix_);
+
     void addReplicatedStorage(const String & storage_name,
                               const String & zookeeper_path,
                               const zkutil::GetZooKeeper & get_zookeeper_function,
@@ -149,6 +151,8 @@ public:
     /// Allows users without password (by default it's allowed).
     void setNoPasswordAllowed(bool allow_no_password_);
     bool isNoPasswordAllowed() const;
+
+    bool isJWTEnabled() const;
 
     /// Allows users with plaintext password (by default it's allowed).
     void setPlaintextPasswordAllowed(bool allow_plaintext_password_);

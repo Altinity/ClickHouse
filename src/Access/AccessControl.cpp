@@ -5,6 +5,7 @@
 #include <Access/UsersConfigAccessStorage.h>
 #include <Access/DiskAccessStorage.h>
 #include <Access/LDAPAccessStorage.h>
+#include <Access/TokenAccessStorage.h>
 #include <Access/ContextAccess.h>
 #include <Access/EnabledSettings.h>
 #include <Access/EnabledRolesInfo.h>
@@ -417,6 +418,12 @@ void AccessControl::addLDAPStorage(const String & storage_name_, const Poco::Uti
     LOG_DEBUG(getLogger(), "Added {} access storage '{}', LDAP server name: {}", String(new_storage->getStorageType()), new_storage->getStorageName(), new_storage->getLDAPServerName());
 }
 
+void AccessControl::addTokenStorage(const String & storage_name_, const Poco::Util::AbstractConfiguration & config_, const String & prefix_)
+{
+    auto new_storage = std::make_shared<TokenAccessStorage>(storage_name_, *this, config_, prefix_);
+    addStorage(new_storage);
+    LOG_DEBUG(getLogger(), "Added {} access storage '{}'", String(new_storage->getStorageType()), new_storage->getStorageName());
+}
 
 void AccessControl::addStoragesFromUserDirectoriesConfig(
     const Poco::Util::AbstractConfiguration & config,
@@ -442,6 +449,8 @@ void AccessControl::addStoragesFromUserDirectoriesConfig(
             type = DiskAccessStorage::STORAGE_TYPE;
         else if (type == "ldap")
             type = LDAPAccessStorage::STORAGE_TYPE;
+        else if (type == "token")
+            type = TokenAccessStorage::STORAGE_TYPE;
 
         String name = config.getString(prefix + ".name", type);
 
@@ -474,6 +483,10 @@ void AccessControl::addStoragesFromUserDirectoriesConfig(
             String zookeeper_path = config.getString(prefix + ".zookeeper_path");
             bool allow_backup = config.getBool(prefix + ".allow_backup", true);
             addReplicatedStorage(name, zookeeper_path, get_zookeeper_function, allow_backup);
+        }
+        else if (type == TokenAccessStorage::STORAGE_TYPE)
+        {
+            addTokenStorage(name, config, prefix);
         }
         else
             throw Exception(ErrorCodes::UNKNOWN_ELEMENT_IN_CONFIG, "Unknown storage type '{}' at {} in config", type, prefix);
@@ -690,6 +703,11 @@ void AccessControl::setNoPasswordAllowed(bool allow_no_password_)
 bool AccessControl::isNoPasswordAllowed() const
 {
     return allow_no_password;
+}
+
+bool AccessControl::isJWTEnabled() const
+{
+    return external_authenticators->isJWTAllowed();
 }
 
 void AccessControl::setPlaintextPasswordAllowed(bool allow_plaintext_password_)
