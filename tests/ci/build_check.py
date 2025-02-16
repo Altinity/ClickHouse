@@ -262,6 +262,13 @@ def main():
         version._flavour = version_type
         logging.info("Using version from tag: %s => %s", tag_name, version)
 
+    # NOTE(vnemkov): make sure that version is set correctly for the generated binaries
+    update_version_local(version, version_type)
+
+    logging.info(f"Updated local files with version : {version.string} / {version.describe}")
+
+    logging.info("Build short name %s", build_name)
+
     release_or_pr, performance_pr = get_release_or_pr(pr_info, version)
 
     s3_path_prefix = "/".join((release_or_pr, pr_info.sha, build_name))
@@ -278,23 +285,6 @@ def main():
 
     docker_image = get_image_with_version(IMAGES_PATH, IMAGE_NAME, version=pr_info.docker_image_tag)
     image_version = docker_image.version
-
-    logging.info("Got version from repo %s", version.string)
-
-    official_flag = True
-    # version._flavour = version_type = CLICKHOUSE_STABLE_VERSION_SUFFIX
-    # TODO (vnemkov): right now we'll use simplified version management:
-    # only update git hash and explicitly set stable version suffix.
-    # official_flag = pr_info.number == 0
-    # version_type = "testing"
-    # if "release" in pr_info.labels or "release-lts" in pr_info.labels:
-    #     version_type = CLICKHOUSE_STABLE_VERSION_SUFFIX
-    #     official_flag = True
-    # update_version_local(version, version_type)
-
-    logging.info(f"Updated local files with version : {version.string} / {version.describe}")
-
-    logging.info("Build short name %s", build_name)
 
     build_output_path = temp_path / build_name
     build_output_path.mkdir(parents=True, exist_ok=True)
