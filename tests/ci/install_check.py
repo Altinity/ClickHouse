@@ -94,7 +94,7 @@ chmod a+rw -R /tests_logs
 exit 1
 """
     check_stacktrace = r"""#!/bin/bash
-output=$(clickhouse-local --stacktrace --query="SELECT throwIf(1,'throw')" 2>&1 >/dev/null || true)
+output=$(clickhouse local --stacktrace --query="SELECT throwIf(1,'throw')" 2>&1 >/dev/null || true)
 echo "$output" | grep 'FunctionThrowIf::executeImpl'
 """
     (TEMP_PATH / "server_test.sh").write_text(server_test, encoding="utf-8")
@@ -117,7 +117,7 @@ bash -ex /packages/initd_test.sh""",
 apt-get install /packages/clickhouse-keeper*deb
 bash -ex /packages/keeper_test.sh""",
         "Install clickhouse binary in deb": r"bash -ex /packages/binary_test.sh",
-        "Check clickhouse stacktrace": r"bash -ex /packages/check_stacktrace.sh",
+        "Check clickhouse stacktrace in deb": r"bash -ex /packages/check_stacktrace.sh",
     }
     return test_install(image, tests)
 
@@ -134,7 +134,7 @@ bash -ex /packages/server_test.sh""",
 yum localinstall --disablerepo=* -y /packages/clickhouse-keeper*rpm
 bash -ex /packages/keeper_test.sh""",
         "Install clickhouse binary in rpm": r"bash -ex /packages/binary_test.sh",
-        "Check clickhouse stacktrace": r"bash -ex /packages/check_stacktrace.sh",
+        "Check clickhouse stacktrace in rpm": r"bash -ex /packages/check_stacktrace.sh",
     }
     return test_install(image, tests)
 
@@ -162,7 +162,7 @@ for pkg in /packages/clickhouse-keeper*tgz; do
     "/$package/install/doinst.sh" $CONFIGURE
 done
 bash -ex /packages/keeper_test.sh""",
-        "Check clickhouse stacktrace": r"bash -ex /packages/check_stacktrace.sh",
+        f"Check clickhouse stacktrace with tgz in {image}": r"bash -ex /packages/check_stacktrace.sh",
     }
     return test_install(image, tests)
 
