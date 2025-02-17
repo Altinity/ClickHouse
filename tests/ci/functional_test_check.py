@@ -116,6 +116,9 @@ def get_run_command(
         if "analyzer" in check_name
         else ""
     )
+    volume_with_broken_test += (
+        f"--volume={repo_path}/tests/broken_tests.json:/broken_tests.json "
+    )
 
     return (
         f"docker run --volume={builds_path}:/package_folder "
