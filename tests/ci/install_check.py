@@ -158,7 +158,7 @@ for pkg in /packages/clickhouse-keeper*tgz; do
     "/$package/install/doinst.sh" $CONFIGURE
 done
 bash -ex /packages/keeper_test.sh""",
-        "Check clickhouse stacktrace in tgz": r"bash -ex /packages/check_stacktrace.sh",
+        f"Check clickhouse stacktrace with tgz in {image}": r"bash -ex /packages/check_stacktrace.sh",
     }
     return test_install(image, tests)
 
