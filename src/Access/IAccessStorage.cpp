@@ -536,7 +536,7 @@ std::optional<AuthResult> IAccessStorage::authenticateImpl(
     bool allow_no_password,
     bool allow_plaintext_password) const
 {
-    if (!typeid_cast<const TokenCredentials &>(credentials).isReady())
+    if (typeid_cast<const TokenCredentials *>(&credentials) && !typeid_cast<const TokenCredentials *>(&credentials)->isReady())
         throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Could not resolve username from token");
 
     if (auto id = find<User>(credentials.getUserName()))
