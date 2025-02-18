@@ -154,7 +154,7 @@ def process_result(result_path, broken_tests, known_failing_tests):
             success_finish,
             retries,
             test_results,
-        ) = process_test_log(result_path, broken_tests)
+        ) = process_test_log(result_path, broken_tests, known_failing_tests)
         is_flacky_check = 1 < int(os.environ.get("NUM_TRIES", 1))
         logging.info("Is flaky check: %s", is_flacky_check)
         # If no tests were run (success == 0) it indicates an error (e.g. server did not start or crashed immediately)
