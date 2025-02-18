@@ -717,7 +717,7 @@ bool ExternalAuthenticators::checkAccessTokenCredentials(const TokenCredentials 
             {
                 cache_entry.expires_at = default_expiration_ts;
             }
-            LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} added", cached_entry_iter->second.user_name);
+            LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} added", cache_entry.user_name);
 
             access_token_cache[credentials.getToken()] = cache_entry;
             LOG_DEBUG(getLogger("AccessTokenAuthentication"), "Authenticated user {} with access token by {}", credentials.getUserName(), it.first);
