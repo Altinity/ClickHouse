@@ -86,7 +86,7 @@ jobs:
     secrets: inherit
     with:
       build_name: package_release
-      checkout_depth: 0
+      checkout_depth: 1
       data: ${{ needs.RunConfig.outputs.data }}
       # always rebuild on release branches to be able to publish from any commit
       force: true
