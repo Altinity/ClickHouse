@@ -173,17 +173,22 @@ bool GoogleAccessTokenProcessor::resolveAndValidate(const TokenCredentials & cre
         {
             auto groups_response = getObjectFromURI(get_groups_uri, token);
 
-            if (!groups_response.contains("memberships")) {
+            if (!groups_response.contains("memberships") || !groups_response["memberships"].is<picojson::array>())
+            {
                 LOG_TRACE(getLogger("AccessTokenProcessor"),
                           "{}: Failed to get Google groups: invalid content in response from server", name);
                 return true;
             }
 
-            picojson::array groups_array = groups_response["memberships"].get<picojson::array>();
-
-            /// TODO: check for invalid JSON, LOG something meaningful
-            for (const auto & group: groups_array)
+            for (const auto & group: groups_response["memberships"].get<picojson::array>())
             {
+                if (!group.is<picojson::object>())
+                {
+                    LOG_TRACE(getLogger("AccessTokenProcessor"),
+                              "{}: Failed to get Google groups: invalid content in response from server", name);
+                    continue;
+                }
+
                 auto group_data = group.get<picojson::object>();
                 String group_name = getValueByKey(group_data["groupKey"].get<picojson::object>(), "id");
                 external_groups_names.insert(group_name);
@@ -267,7 +272,8 @@ bool AzureAccessTokenProcessor::resolveAndValidate(const TokenCredentials & cred
     {
         auto groups_response = getObjectFromURI(get_groups_uri, token);
 
-        if (!groups_response.contains("value")) {
+        if (!groups_response.contains("value") || !groups_response["value"].is<picojson::array>())
+        {
             LOG_TRACE(getLogger("AccessTokenProcessor"),
                       "{}: Failed to get Azure groups: invalid content in response from server", name);
             return true;
@@ -275,14 +281,20 @@ bool AzureAccessTokenProcessor::resolveAndValidate(const TokenCredentials & cred
 
         picojson::array groups_array = groups_response["value"].get<picojson::array>();
 
-        /// TODO: check for invalid JSON
         for (const auto & group: groups_array)
         {
+            /// Got some invalid response. Ignore this, log this.
+            if (!group.is<picojson::object >())
+            {
+                LOG_TRACE(getLogger("AccessTokenProcessor"),
+                          "{}: Failed to get Azure groups: invalid content in response from server", name);
+                continue;
+            }
+
             auto group_data = group.get<picojson::object>();
             String group_name = getValueByKey(group_data, "id");
             external_groups_names.insert(group_name);
-            LOG_TRACE(getLogger("AccessTokenProcessor"),
-                      "{}: User {}: new external group {}", name, credentials.getUserName(), group_name);
+            LOG_TRACE(getLogger("AccessTokenProcessor"), "{}: User {}: new external group {}", name, credentials.getUserName(), group_name);
         }
     }
     catch (const Exception & e)
