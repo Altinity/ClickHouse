@@ -106,8 +106,11 @@ void ASTAuthenticationData::formatImpl(WriteBuffer & ostr, const FormatSettings 
             }
             case AuthenticationType::JWT:
             {
-                prefix = "CLAIMS";
-                parameter = true;
+                if (!children.empty())
+                {
+                    prefix = "CLAIMS";
+                    parameter = true;
+                }
                 break;
             }
             case AuthenticationType::LDAP:

@@ -1,6 +1,7 @@
 #include <Server/HTTP/authenticateUserByHTTP.h>
 
 #include <Access/Authentication.h>
+#include <Access/AccessControl.h>
 #include <Access/Common/SSLCertificateSubjects.h>
 #include <Access/Credentials.h>
 #include <Access/ExternalAuthenticators.h>
@@ -19,7 +20,7 @@
 #include <Poco/Net/X509Certificate.h>
 #endif
 
-
+const String BEARER_PREFIX = "bearer ";
 namespace DB
 {
 
@@ -79,6 +80,8 @@ bool authenticateUserByHTTP(
     /// (both methods are insecure).
     bool has_http_credentials = request.hasCredentials();
     bool has_credentials_in_query_params = params.has("user") || params.has("password");
+
+    std::string jwt_token = request.get("X-ClickHouse-JWT-Token", request.get("Authorization", (params.has("token") ? BEARER_PREFIX + params.get("token") : "")));
 
     std::string spnego_challenge;
     SSLCertificateSubjects certificate_subjects;
@@ -152,7 +155,7 @@ bool authenticateUserByHTTP(
             if (spnego_challenge.empty())
                 throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Invalid authentication: SPNEGO challenge is empty");
         }
-        else
+        else if (Poco::icompare(scheme, "Bearer") < 0)
         {
             throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Invalid authentication: '{}' HTTP Authorization scheme is not supported", scheme);
         }
@@ -207,6 +210,16 @@ bool authenticateUserByHTTP(
     else if (has_config_credentials)
     {
         current_credentials = std::make_unique<BasicCredentials>(*config_credentials);
+    }
+    else if (!jwt_token.empty() && Poco::toLower(jwt_token).starts_with(BEARER_PREFIX))
+    {
+        const auto token_credentials = TokenCredentials(jwt_token.substr(BEARER_PREFIX.length()));
+        const auto & external_authenticators = global_context->getAccessControl().getExternalAuthenticators();
+
+        if (!external_authenticators.resolveJWTCredentials(token_credentials, false))
+            external_authenticators.checkAccessTokenCredentials(token_credentials);
+
+        current_credentials = std::make_unique<TokenCredentials>(token_credentials);
     }
     else // I.e., now using user name and password strings ("Basic").
     {

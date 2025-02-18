@@ -1,6 +1,8 @@
 #include <Access/Credentials.h>
-#include <Access/Common/SSLCertificateSubjects.h>
 #include <Common/Exception.h>
+#include <Common/logger_useful.h>
+
+#include <jwt-cpp/jwt.h>
 
 namespace DB
 {
@@ -8,6 +10,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
+    extern const int AUTHENTICATION_FAILED;
 }
 
 Credentials::Credentials(const String & user_name_)
@@ -96,5 +99,8 @@ const String & BasicCredentials::getPassword() const
         throwNotReady();
     return password;
 }
+
+/// Unless the token is validated, we will not use any data from it, including username.
+TokenCredentials::TokenCredentials(const String & token_) : Credentials(""), token(token_), expires_at(std::chrono::system_clock::now() + std::chrono::hours(1)) {}
 
 }
