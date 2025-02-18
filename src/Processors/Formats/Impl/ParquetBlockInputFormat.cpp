@@ -829,7 +829,7 @@ void ParquetBlockInputFormat::initializeIfNeeded()
     }
 }
 
-void ParquetBlockInputFormat::setStorageRelatedUniqueKey( const Settings & settings, const String & key_)
+void ParquetBlockInputFormat::setStorageRelatedUniqueKey(const Settings & settings, const String & key_)
 {
     metadata_cache.key = key_;
     metadata_cache.use_cache = settings[Setting::input_format_parquet_use_metadata_cache];

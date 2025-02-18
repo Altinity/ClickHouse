@@ -4,7 +4,13 @@
 
 #if USE_PARQUET
 
-#include <parquet/metadata.h>
+namespace parquet
+{
+
+class FileMetaData;
+
+}
+
 #include <Common/CacheBase.h>
 
 namespace DB

@@ -25,10 +25,6 @@ if (TARGET ch_contrib::azure_sdk)
     list(APPEND CLICKHOUSE_SERVER_LINK PRIVATE ch_contrib::azure_sdk)
 endif()
 
-if (TARGET ch_contrib::parquet)
-    list(APPEND CLICKHOUSE_SERVER_LINK PRIVATE ch_contrib::parquet)
-endif ()
-
 clickhouse_program_add(server)
 
 install(FILES config.xml users.xml DESTINATION "${CLICKHOUSE_ETC_DIR}/clickhouse-server" COMPONENT clickhouse)
