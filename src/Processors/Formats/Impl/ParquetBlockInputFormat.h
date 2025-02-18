@@ -2,7 +2,6 @@
 #include "config.h"
 #if USE_PARQUET
 
-#include <Common/CacheBase.h>
 #include <Processors/Formats/IInputFormat.h>
 #include <Processors/Formats/ISchemaReader.h>
 #include <Formats/FormatSettings.h>
@@ -73,7 +72,7 @@ public:
 
     size_t getApproxBytesReadForChunk() const override { return previous_approx_bytes_read_for_chunk; }
 
-    void setStorageRelatedUniqueKey(const ServerSettings & server_settings, const Settings & settings, const String & key_) override;
+    void setStorageRelatedUniqueKey(const Settings & settings, const String & key_) override;
 
 private:
     Chunk read() override;
@@ -350,8 +349,9 @@ private:
     {
         String key;
         bool use_cache = false;
-        UInt64 max_size_bytes{0};
-    } metadata_cache;
+    };
+
+    Cache metadata_cache;
 };
 
 class ParquetSchemaReader : public ISchemaReader
@@ -368,16 +368,6 @@ private:
     const FormatSettings format_settings;
     std::shared_ptr<arrow::io::RandomAccessFile> arrow_file;
     std::shared_ptr<parquet::FileMetaData> metadata;
-};
-
-class ParquetFileMetaDataCache : public CacheBase<String, parquet::FileMetaData>
-{
-public:
-    static ParquetFileMetaDataCache *  instance(UInt64 max_size_bytes);
-    void clear() {}
-
-private:
-    ParquetFileMetaDataCache(UInt64 max_size_bytes);
 };
 
 }
