@@ -90,7 +90,7 @@ chmod a+rw -R /tests_logs
 exit 1
 """
     check_stacktrace = r"""#!/bin/bash
-output=$(clickhouse local --stacktrace --query="SELECT throwIf(1,'throw')" 2>&1 >/dev/null || true)
+output=$(clickhouse-client --stacktrace --query="SELECT throwIf(1,'throw')" 2>&1 >/dev/null || true)
 echo "$output" | grep 'FunctionThrowIf::executeImpl'
 """
     (TEMP_PATH / "server_test.sh").write_text(server_test, encoding="utf-8")
