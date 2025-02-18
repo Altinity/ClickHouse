@@ -31,7 +31,10 @@ test_env='TEST_THE_DEFAULT_PARAMETER=15'
 echo "$test_env" >> /etc/default/clickhouse
 systemctl restart clickhouse-server
 clickhouse-client -q 'SELECT version()'
-grep "$test_env" /proc/$(cat /var/run/clickhouse-server/clickhouse-server.pid)/environ"""
+grep "$test_env" /proc/$(cat /var/run/clickhouse-server/clickhouse-server.pid)/environ
+echo "Check Stacktrace"
+output=$(clickhouse-local --stacktrace --query="SELECT throwIf(1,'throw')" 2>&1 >/dev/null || true)
+echo "$output" | grep 'FunctionThrowIf::executeImpl'"""
     initd_test = r"""#!/bin/bash
 set -e
 trap "bash -ex /packages/preserve_logs.sh" ERR
@@ -89,16 +92,12 @@ cp /var/log/clickhouse-keeper/clickhouse-keeper.* /tests_logs/ || :
 chmod a+rw -R /tests_logs
 exit 1
 """
-    check_stacktrace = r"""#!/bin/bash
-output=$(clickhouse-client --stacktrace --query="SELECT throwIf(1,'throw')" 2>&1 >/dev/null || true)
-echo "$output" | grep 'FunctionThrowIf::executeImpl'
-"""
+
     (TEMP_PATH / "server_test.sh").write_text(server_test, encoding="utf-8")
     (TEMP_PATH / "initd_test.sh").write_text(initd_test, encoding="utf-8")
     (TEMP_PATH / "keeper_test.sh").write_text(keeper_test, encoding="utf-8")
     (TEMP_PATH / "binary_test.sh").write_text(binary_test, encoding="utf-8")
     (TEMP_PATH / "preserve_logs.sh").write_text(preserve_logs, encoding="utf-8")
-    (TEMP_PATH / "check_stacktrace.sh").write_text(check_stacktrace, encoding="utf-8")
 
 
 def test_install_deb(image: DockerImage) -> TestResults:
@@ -113,7 +112,6 @@ bash -ex /packages/initd_test.sh""",
 apt-get install /packages/clickhouse-keeper*deb
 bash -ex /packages/keeper_test.sh""",
         "Install clickhouse binary in deb": r"bash -ex /packages/binary_test.sh",
-        "Check clickhouse stacktrace in deb": r"bash -ex /packages/check_stacktrace.sh",
     }
     return test_install(image, tests)
 
@@ -130,7 +128,6 @@ bash -ex /packages/server_test.sh""",
 yum localinstall --disablerepo=* -y /packages/clickhouse-keeper*rpm
 bash -ex /packages/keeper_test.sh""",
         "Install clickhouse binary in rpm": r"bash -ex /packages/binary_test.sh",
-        "Check clickhouse stacktrace in rpm": r"bash -ex /packages/check_stacktrace.sh",
     }
     return test_install(image, tests)
 
@@ -158,7 +155,6 @@ for pkg in /packages/clickhouse-keeper*tgz; do
     "/$package/install/doinst.sh" $CONFIGURE
 done
 bash -ex /packages/keeper_test.sh""",
-        f"Check clickhouse stacktrace with tgz in {image}": r"bash -ex /packages/check_stacktrace.sh",
     }
     return test_install(image, tests)
 
