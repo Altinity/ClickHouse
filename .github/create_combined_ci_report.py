@@ -37,6 +37,7 @@ def get_checks_known_fails(client: Client, job_url: str, known_fails: dict):
     """
     Get tests that are known to fail for the given job URL.
     """
+    assert len(known_fails) > 0, "cannot query the database with empty known fails"
     columns = (
         "check_status, check_name, test_status, test_name, report_url as results_link"
     )
@@ -44,7 +45,7 @@ def get_checks_known_fails(client: Client, job_url: str, known_fails: dict):
                 WHERE task_url='{job_url}'
                 AND test_status='BROKEN'
                 AND test_name IN ({','.join(f"'{test}'" for test in known_fails.keys())})
-                ORDER BY check_name, test_name
+                ORDER BY test_name, check_name
                 """
 
     df = client.query_dataframe(query)
@@ -102,16 +103,17 @@ def get_regression_fails(client: Client, job_url: str):
     Get regression tests that did not succeed for the given job URL.
     """
     # If you rename the alias for report_url, also update the formatters in format_results_as_html_table
-    query = f"""SELECT arch, status, test_name, results_link
+    query = f"""SELECT arch, job_name, status, test_name, results_link
             FROM (
                SELECT
                     architecture as arch,
                     test_name,
                     argMax(result, start_time) AS status,
                     job_url,
+                    job_name,
                     report_url as results_link
                FROM `gh-data`.clickhouse_regression_results
-               GROUP BY architecture, test_name, job_url, report_url, start_time
+               GROUP BY architecture, test_name, job_url, job_name, report_url, start_time
                ORDER BY start_time DESC, length(test_name) DESC
             )
             WHERE job_url='{job_url}'
@@ -119,6 +121,7 @@ def get_regression_fails(client: Client, job_url: str):
             """
     df = client.query_dataframe(query)
     df = drop_prefix_rows(df, "test_name")
+    df["job_name"] = df["job_name"].str.title()
     return df
 
 
@@ -237,10 +240,10 @@ def main():
 {'<p style="font-weight: bold;color: #F00;">This is a preview. FinishCheck has not completed.</p>' if args.mark_preview else ""}
 <ul>
     <li><a href="#ci-jobs-status">CI Jobs Status</a></li>
-    <li><a href="#checks-fails">Checks Fails</a> ({len(fail_results['checks_fails'])})</li>
-    <li><a href="#checks-known-fails">Checks Known Fails</a> ({len(fail_results['checks_known_fails'])})</li>
     <li><a href="#checks-errors">Checks Errors</a> ({len(fail_results['checks_errors'])})</li>
-    <li><a href="#regression-fails">Regression Fails</a> ({len(fail_results['regression_fails'])})</li>
+    <li><a href="#regression-fails">Regression New Fails</a> ({len(fail_results['regression_fails'])})</li>
+    <li><a href="#checks-fails">Checks New Fails</a> ({len(fail_results['checks_fails'])})</li>
+    <li><a href="#checks-known-fails">Checks Known Fails</a> ({len(fail_results['checks_known_fails'])})</li>
 </ul>
 
 <h2 id="ci-jobs-status">CI Jobs Status</h2>
@@ -251,17 +254,17 @@ def main():
             "</table>",
             f"""</table>
 
-<h2 id="checks-fails">Checks Fails</h2>
+<h2 id="checks-errors">Checks Errors</h2>
+{format_results_as_html_table(fail_results['checks_errors'])}
+
+<h2 id="regression-fails">Regression New Fails</h2>
+{format_results_as_html_table(fail_results['regression_fails'])}
+
+<h2 id="checks-fails">Checks New Fails</h2>
 {format_results_as_html_table(fail_results['checks_fails'])}
 
 <h2 id="checks-known-fails">Checks Known Fails</h2>
 {format_results_as_html_table(fail_results['checks_known_fails'])}
-
-<h2 id="checks-errors">Checks Errors</h2>
-{format_results_as_html_table(fail_results['checks_errors'])}
-
-<h2 id="regression-fails">Regression Fails</h2>
-{format_results_as_html_table(fail_results['regression_fails'])}
 """,
             1,
         )
