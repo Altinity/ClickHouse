@@ -4,6 +4,7 @@ import os
 import logging
 import argparse
 import csv
+import json
 
 OK_SIGN = "[ OK "
 FAIL_SIGN = "[ FAIL "
@@ -20,7 +21,7 @@ SUCCESS_FINISH_SIGNS = ["All tests have finished", "No tests were run"]
 RETRIES_SIGN = "Some tests were restarted"
 
 
-def process_test_log(log_path, broken_tests):
+def process_test_log(log_path, broken_tests, known_failing_tests):
     total = 0
     skipped = 0
     unknown = 0
@@ -71,7 +72,7 @@ def process_test_log(log_path, broken_tests):
                         failed += 1
                         test_results.append((test_name, "Timeout", test_time, []))
                 elif FAIL_SIGN in line:
-                    if test_name in broken_tests:
+                    if test_name in broken_tests or test_name in known_failing_tests:
                         success += 1
                         test_results.append((test_name, "BROKEN", test_time, []))
                     else:
@@ -135,7 +136,7 @@ def process_test_log(log_path, broken_tests):
     )
 
 
-def process_result(result_path, broken_tests):
+def process_result(result_path, broken_tests, known_failing_tests):
     test_results = []
     state = "success"
     description = ""
@@ -160,7 +161,7 @@ def process_result(result_path, broken_tests):
             success_finish,
             retries,
             test_results,
-        ) = process_test_log(result_path, broken_tests)
+        ) = process_test_log(result_path, broken_tests, known_failing_tests)
         is_flaky_check = 1 < int(os.environ.get("NUM_TRIES", 1))
         logging.info("Is flaky check: %s", is_flaky_check)
         # If no tests were run (success == 0) it indicates an error (e.g. server did not start or crashed immediately)
@@ -222,6 +223,7 @@ if __name__ == "__main__":
     parser.add_argument("--out-results-file", default="/test_output/test_results.tsv")
     parser.add_argument("--out-status-file", default="/test_output/check_status.tsv")
     parser.add_argument("--broken-tests", default="/analyzer_tech_debt.txt")
+    parser.add_argument("--broken-tests-json", default="/broken_tests.json")
     args = parser.parse_args()
 
     broken_tests = list()
@@ -229,9 +231,20 @@ if __name__ == "__main__":
         logging.info(f"File {args.broken_tests} with broken tests found")
         with open(args.broken_tests) as f:
             broken_tests = f.read().splitlines()
+
+    known_failing_tests = list()
+    if os.path.exists(args.broken_tests_json):
+        logging.info(f"File {args.broken_tests_json} with broken tests found")
+
+        with open(args.broken_tests_json) as f:
+            known_failing_tests = list(json.load(f).keys())
+
+    if broken_tests:
         logging.info(f"Broken tests in the list: {len(broken_tests)}")
 
-    state, description, test_results = process_result(args.in_results_dir, broken_tests)
+    state, description, test_results = process_result(
+        args.in_results_dir, broken_tests, known_failing_tests
+    )
     logging.info("Result parsed")
     status = (state, description)
 

@@ -76,12 +76,17 @@ def get_pr_for_commit(sha, ref):
                 return pr
             our_prs.append(pr)
         logging.warning(
-            "Cannot find PR with required ref %s, sha %s - returning first one",
+            "Cannot find PR with required ref %s, sha %s",
             ref,
             sha,
         )
-        first_pr = our_prs[0]
-        return first_pr
+        # NOTE(vnemkov): IMO returning possibly unrelated PR it breaks CI/CD down the road
+        # if len(our_prs) != 0:
+        #     first_pr = our_prs[0]
+        #     return first_pr
+        # else:
+        return None
+
     except Exception as ex:
         logging.error(
             "Cannot fetch PR info from commit ref %s, sha %s, exception: %s",
@@ -132,8 +137,9 @@ class PRInfo:
         ref = github_event.get("ref", "refs/heads/master")
         if ref and ref.startswith("refs/heads/"):
             ref = ref[11:]
+        self.ref = ref # type: str e.g. "refs/pull/509/merge" or "refs/tags/v24.3.12.76.altinitystable"
         # Default values
-        self.base_ref = ""  # type: str
+        self.base_ref = github_event.get("base_ref","")  # type: str
         self.base_name = ""  # type: str
         self.head_ref = ""  # type: str
         self.head_name = ""  # type: str
@@ -237,7 +243,7 @@ class PRInfo:
             pull_request = get_pr_for_commit(self.sha, github_event["ref"])
 
             if pull_request is None or pull_request["state"] == "closed":
-                # it's merged PR to master
+                # it's merged PR to master, or there is no PR (build against specific commit or tag)
                 self.number = 0
                 if pull_request:
                     self.merged_pr = pull_request["number"]
@@ -487,6 +493,10 @@ class PRInfo:
                 break
         assert last_synced_upstream_commit
         return last_synced_upstream_commit
+
+    def __str__(self):
+        import pprint
+        return pprint.pformat(vars(self))
 
 
 class FakePRInfo:

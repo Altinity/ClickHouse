@@ -1,4 +1,4 @@
-# docker build -t clickhouse/test-util .
+# docker build -t altinityinfra/test-util .
 FROM ubuntu:22.04
 
 # ARG for quick switch to a given ubuntu mirror
@@ -34,9 +34,8 @@ RUN apt-get update \
 
 # Install cmake 3.20+ for Rust support
 # Used https://askubuntu.com/a/1157132 as reference
-RUN curl -s https://apt.kitware.com/keys/kitware-archive-latest.asc | \
-        gpg --dearmor - > /etc/apt/trusted.gpg.d/kitware.gpg && \
-    echo "deb https://apt.kitware.com/ubuntu/ $(lsb_release -cs) main" >> /etc/apt/sources.list
+RUN curl -s https://apt.kitware.com/keys/kitware-archive-latest.asc | gpg --dearmor - > /etc/apt/trusted.gpg.d/kitware.gpg && \
+    echo "deb [signed-by=/etc/apt/trusted.gpg.d/kitware.gpg] https://apt.kitware.com/ubuntu/ $(lsb_release -cs) main" >> /etc/apt/sources.list.d/kitware.list
 
 # initial packages
 RUN apt-get update \
