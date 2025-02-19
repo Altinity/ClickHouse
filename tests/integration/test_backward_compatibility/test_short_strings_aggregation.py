@@ -7,16 +7,18 @@ cluster = ClickHouseCluster(__file__)
 node1 = cluster.add_instance(
     "node1",
     with_zookeeper=False,
-    image="clickhouse/clickhouse-server",
-    tag="24.1" if is_arm() else CLICKHOUSE_CI_MIN_TESTED_VERSION,
+    # NOTE(vnemkov): here and below upstream uses clickhouse/clickhouse-server:24.1,
+    # the first Altinity Stable release after that was 24.3.5.47.altinitystable
+    image="altinity/clickhouse-server",
+    tag="24.3.5.47.altinitystable" if is_arm() else CLICKHOUSE_CI_MIN_TESTED_VERSION,
     stay_alive=True,
     with_installed_binary=True,
 )
 node2 = cluster.add_instance(
     "node2",
     with_zookeeper=False,
-    image="clickhouse/clickhouse-server",
-    tag="24.1" if is_arm() else CLICKHOUSE_CI_MIN_TESTED_VERSION,
+    image="altinity/clickhouse-server",
+    tag="24.3.5.47.altinitystable" if is_arm() else CLICKHOUSE_CI_MIN_TESTED_VERSION,
     stay_alive=True,
     with_installed_binary=True,
 )

@@ -63,6 +63,7 @@ static std::initializer_list<std::pair<ClickHouseVersion, SettingsChangesHistory
     },
     {"24.11",
         {
+            {"push_external_roles_in_interserver_queries", false, true, "New setting."}
         }
     },
     {"24.10",
@@ -71,10 +72,15 @@ static std::initializer_list<std::pair<ClickHouseVersion, SettingsChangesHistory
     },
     {"24.9",
         {
+            {"enable_parallel_replicas", false, false, "Parallel replicas with read tasks became the Beta tier feature."},
+            {"parallel_replicas_mode", "read_tasks", "read_tasks", "This setting was introduced as a part of making parallel replicas feature Beta"},
+            {"parallel_replicas_mark_segment_size", 128, 0, "Value for this setting now determined automatically"},
+            {"parallel_replicas_local_plan", false, false, "Use local plan for local replica in a query with parallel replicas"}
         }
     },
     {"24.8",
         {
+	    {"input_format_parquet_bloom_filter_push_down", false, true, "When reading Parquet files, skip whole row groups based on the WHERE/PREWHERE expressions and bloom filter in the Parquet metadata."},
             {"enable_named_columns_in_function_tuple", false, false, "Retroactively disabled by default due to critical bugs."},
             {"rows_before_aggregation", false, false, "Provide exact value for rows_before_aggregation statistic, represents the number of rows read before aggregation"},
             {"restore_replace_external_table_functions_to_null", false, false, "New setting."},
