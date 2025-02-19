@@ -3,6 +3,7 @@ import argparse
 import os
 from pathlib import Path
 from itertools import combinations
+import json
 
 import requests
 from clickhouse_driver import Client
@@ -25,11 +26,41 @@ def get_checks_fails(client: Client, job_url: str):
     )
     query = f"""SELECT {columns} FROM `gh-data`.checks
                 WHERE task_url='{job_url}'
-                AND test_status in ('FAIL', 'ERROR')
+                AND test_status IN ('FAIL', 'ERROR')
                 AND check_status!='error'
                 ORDER BY check_name, test_name
                 """
     return client.query_dataframe(query)
+
+
+def get_checks_known_fails(client: Client, job_url: str, known_fails: dict):
+    """
+    Get tests that are known to fail for the given job URL.
+    """
+    assert len(known_fails) > 0, "cannot query the database with empty known fails"
+    columns = (
+        "check_status, check_name, test_status, test_name, report_url as results_link"
+    )
+    query = f"""SELECT {columns} FROM `gh-data`.checks
+                WHERE task_url='{job_url}'
+                AND test_status='BROKEN'
+                AND test_name IN ({','.join(f"'{test}'" for test in known_fails.keys())})
+                ORDER BY test_name, check_name
+                """
+
+    df = client.query_dataframe(query)
+
+    df.insert(
+        len(df.columns) - 1,
+        "reason",
+        df["test_name"]
+        .cat.remove_unused_categories()
+        .apply(
+            lambda test_name: known_fails[test_name].get("reason", "No reason given")
+        ),
+    )
+
+    return df
 
 
 def get_checks_errors(client: Client, job_url: str):
@@ -69,16 +100,18 @@ def get_regression_fails(client: Client, job_url: str):
     Get regression tests that did not succeed for the given job URL.
     """
     # If you rename the alias for report_url, also update the formatters in format_results_as_html_table
-    query = f"""SELECT arch, status, test_name, results_link
+    # Nested SELECT handles test reruns
+    query = f"""SELECT arch, job_name, status, test_name, results_link
             FROM (
                SELECT
                     architecture as arch,
                     test_name,
                     argMax(result, start_time) AS status,
                     job_url,
+                    job_name,
                     report_url as results_link
                FROM `gh-data`.clickhouse_regression_results
-               GROUP BY architecture, test_name, job_url, report_url, start_time
+               GROUP BY architecture, test_name, job_url, job_name, report_url, start_time
                ORDER BY start_time DESC, length(test_name) DESC
             )
             WHERE job_url='{job_url}'
@@ -86,6 +119,7 @@ def get_regression_fails(client: Client, job_url: str):
             """
     df = client.query_dataframe(query)
     df = drop_prefix_rows(df, "test_name")
+    df["job_name"] = df["job_name"].str.title()
     return df
 
 
@@ -104,8 +138,8 @@ def format_test_name_for_linewrap(text: str) -> str:
 
 
 def format_results_as_html_table(results) -> str:
-    if results.empty:
-        return ""
+    if len(results) == 0:
+        return "<p>Nothing to report</p>"
     results.columns = [col.replace("_", " ").title() for col in results.columns]
     html = (
         results.to_html(
@@ -138,6 +172,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--no-upload", action="store_true", help="Do not upload the report"
+    )
+    parser.add_argument(
+        "--known-fails", type=str, help="Path to the file with known fails"
     )
     parser.add_argument(
         "--mark-preview", action="store_true", help="Mark the report as a preview"
@@ -175,9 +212,23 @@ def main():
 
     fail_results = {
         "checks_fails": get_checks_fails(db_client, args.actions_run_url),
+        "checks_known_fails": [],
         "checks_errors": get_checks_errors(db_client, args.actions_run_url),
         "regression_fails": get_regression_fails(db_client, args.actions_run_url),
     }
+
+    if args.known_fails:
+        if not os.path.exists(args.known_fails):
+            print(f"Known fails file {args.known_fails} not found.")
+            exit(1)
+
+        with open(args.known_fails) as f:
+            known_fails = json.load(f)
+
+        if known_fails:
+            fail_results["checks_known_fails"] = get_checks_known_fails(
+                db_client, args.actions_run_url, known_fails
+            )
 
     combined_report = (
         ci_running_report.replace("ClickHouse CI running for", "Combined CI Report for")
@@ -187,27 +238,33 @@ def main():
 {'<p style="font-weight: bold;color: #F00;">This is a preview. FinishCheck has not completed.</p>' if args.mark_preview else ""}
 <ul>
     <li><a href="#ci-jobs-status">CI Jobs Status</a></li>
-    <li><a href="#checks-fails">Checks Fails</a> ({len(fail_results['checks_fails'])})</li>
     <li><a href="#checks-errors">Checks Errors</a> ({len(fail_results['checks_errors'])})</li>
-    <li><a href="#regression-fails">Regression Fails</a> ({len(fail_results['regression_fails'])})</li>
+    <li><a href="#checks-fails">Checks New Fails</a> ({len(fail_results['checks_fails'])})</li>
+    <li><a href="#regression-fails">Regression New Fails</a> ({len(fail_results['regression_fails'])})</li>
+    <li><a href="#checks-known-fails">Checks Known Fails</a> ({len(fail_results['checks_known_fails'])})</li>
 </ul>
 
 <h2 id="ci-jobs-status">CI Jobs Status</h2>
 <table>""",
+            1,
         )
         .replace(
             "</table>",
             f"""</table>
 
-<h2 id="checks-fails">Checks Fails</h2>
-{format_results_as_html_table(fail_results['checks_fails'])}
-
 <h2 id="checks-errors">Checks Errors</h2>
 {format_results_as_html_table(fail_results['checks_errors'])}
 
-<h2 id="regression-fails">Regression Fails</h2>
+<h2 id="checks-fails">Checks New Fails</h2>
+{format_results_as_html_table(fail_results['checks_fails'])}
+
+<h2 id="regression-fails">Regression New Fails</h2>
 {format_results_as_html_table(fail_results['regression_fails'])}
+
+<h2 id="checks-known-fails">Checks Known Fails</h2>
+{format_results_as_html_table(fail_results['checks_known_fails'])}
 """,
+            1,
         )
     )
     report_path = Path("combined_report.html")

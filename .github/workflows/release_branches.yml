@@ -479,7 +479,7 @@ jobs:
     secrets: inherit
     with:
       runner_type: altinity-on-demand, altinity-type-cx52, altinity-image-x86-app-docker-ce, altinity-setup-regression
-      commit: a5b768e5aa5d634f17c5b0c960c1e79580058347
+      commit: 53d73ed32155a8a17ee0d0cdb15aee96c98010a2
       arch: release
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout_minutes: 300
@@ -490,7 +490,7 @@ jobs:
     secrets: inherit
     with:
       runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-app-docker-ce, altinity-setup-regression
-      commit: a5b768e5aa5d634f17c5b0c960c1e79580058347
+      commit: 53d73ed32155a8a17ee0d0cdb15aee96c98010a2
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout_minutes: 300
@@ -579,7 +579,7 @@ jobs:
         run: |
           pip install clickhouse-driver==0.2.8 numpy==1.26.4 pandas==2.2.0
 
-          REPORT_LINK=$(python3 .github/create_combined_ci_report.py --pr-number $PR_NUMBER --commit-sha $COMMIT_SHA --actions-run-url $ACTIONS_RUN_URL)
+          REPORT_LINK=$(python3 .github/create_combined_ci_report.py --pr-number $PR_NUMBER --commit-sha $COMMIT_SHA --actions-run-url $ACTIONS_RUN_URL --known-fails tests/broken_tests.json)
 
           IS_VALID_URL=$(echo $REPORT_LINK | grep -E '^https?://')
           if [[ -n $IS_VALID_URL ]]; then
