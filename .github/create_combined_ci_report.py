@@ -103,6 +103,7 @@ def get_regression_fails(client: Client, job_url: str):
     Get regression tests that did not succeed for the given job URL.
     """
     # If you rename the alias for report_url, also update the formatters in format_results_as_html_table
+    # Nested SELECT handles test reruns
     query = f"""SELECT arch, job_name, status, test_name, results_link
             FROM (
                SELECT
@@ -241,8 +242,8 @@ def main():
 <ul>
     <li><a href="#ci-jobs-status">CI Jobs Status</a></li>
     <li><a href="#checks-errors">Checks Errors</a> ({len(fail_results['checks_errors'])})</li>
-    <li><a href="#regression-fails">Regression New Fails</a> ({len(fail_results['regression_fails'])})</li>
     <li><a href="#checks-fails">Checks New Fails</a> ({len(fail_results['checks_fails'])})</li>
+    <li><a href="#regression-fails">Regression New Fails</a> ({len(fail_results['regression_fails'])})</li>
     <li><a href="#checks-known-fails">Checks Known Fails</a> ({len(fail_results['checks_known_fails'])})</li>
 </ul>
 
@@ -257,11 +258,11 @@ def main():
 <h2 id="checks-errors">Checks Errors</h2>
 {format_results_as_html_table(fail_results['checks_errors'])}
 
-<h2 id="regression-fails">Regression New Fails</h2>
-{format_results_as_html_table(fail_results['regression_fails'])}
-
 <h2 id="checks-fails">Checks New Fails</h2>
 {format_results_as_html_table(fail_results['checks_fails'])}
+
+<h2 id="regression-fails">Regression New Fails</h2>
+{format_results_as_html_table(fail_results['regression_fails'])}
 
 <h2 id="checks-known-fails">Checks Known Fails</h2>
 {format_results_as_html_table(fail_results['checks_known_fails'])}
