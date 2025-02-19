@@ -24,12 +24,13 @@ from env_helper import (
     CLICKHOUSE_STABLE_VERSION_SUFFIX,
 )
 from git_helper import Git, git_runner
-from pr_info import PRInfo
+from pr_info import PRInfo, EventType
 from report import BuildResult, FAILURE, StatusType, SUCCESS
 from s3_helper import S3Helper
 from tee_popen import TeePopen
 from version_helper import (
     ClickHouseVersion,
+    VersionType,
     get_version_from_repo,
     update_version_local,
 )
@@ -239,6 +240,35 @@ def main():
     s3_helper = S3Helper()
 
     version = get_version_from_repo(git=Git(True))
+    logging.info("Got version from repo %s", version.string)
+
+    # official_flag = pr_info.number == 0
+
+    # version_type = "testing"
+    # if is_release_pr(pr_info):
+    #     version_type = "stable"
+    #     official_flag = True
+
+    # NOTE(vnemkov): For Altinity Stable builds, version flavor
+    #  (last part of version, like 'altinitystable') is obtained from tag.
+    # If there is no tag, then version is considered to be 'testing'
+    version_type = version._flavour = VersionType.TESTING
+    official_flag = True
+
+    if pr_info.event_type == EventType.PUSH \
+            and pr_info.ref.startswith('refs/tags/'):
+        tag_name = pr_info.ref.removeprefix('refs/tags/')
+        version_type = tag_name.split('.')[-1]
+        version._flavour = version_type
+        logging.info("Using version from tag: %s => %s", tag_name, version)
+
+    # NOTE(vnemkov): make sure that version is set correctly for the generated binaries
+    update_version_local(version, version_type)
+
+    logging.info(f"Updated local files with version : {version.string} / {version.describe}")
+
+    logging.info("Build short name %s", build_name)
+
     release_or_pr, performance_pr = get_release_or_pr(pr_info, version)
 
     s3_path_prefix = "/".join((release_or_pr, pr_info.sha, build_name))
@@ -255,23 +285,6 @@ def main():
 
     docker_image = get_image_with_version(IMAGES_PATH, IMAGE_NAME, version=pr_info.docker_image_tag)
     image_version = docker_image.version
-
-    logging.info("Got version from repo %s", version.string)
-
-    official_flag = True
-    # version._flavour = version_type = CLICKHOUSE_STABLE_VERSION_SUFFIX
-    # TODO (vnemkov): right now we'll use simplified version management:
-    # only update git hash and explicitly set stable version suffix.
-    # official_flag = pr_info.number == 0
-    # version_type = "testing"
-    # if "release" in pr_info.labels or "release-lts" in pr_info.labels:
-    #     version_type = CLICKHOUSE_STABLE_VERSION_SUFFIX
-    #     official_flag = True
-    # update_version_local(version, version_type)
-
-    logging.info(f"Updated local files with version : {version.string} / {version.describe}")
-
-    logging.info("Build short name %s", build_name)
 
     build_output_path = temp_path / build_name
     build_output_path.mkdir(parents=True, exist_ok=True)
