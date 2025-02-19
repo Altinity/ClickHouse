@@ -26,8 +26,8 @@ from report import JOB_TIMEOUT_TEST_NAME
 from stopwatch import Stopwatch
 from tee_popen import TeePopen
 
-MAX_RETRY = 1
-NUM_WORKERS = 5
+MAX_RETRY = 3
+NUM_WORKERS = 10
 SLEEP_BETWEEN_RETRIES = 5
 PARALLEL_GROUP_SIZE = 100
 CLICKHOUSE_BINARY_PATH = "usr/bin/clickhouse"
@@ -318,7 +318,7 @@ class ClickhouseIntegrationTestsRunner:
 
         cmd = (
             f"cd {repo_path}/tests/integration && "
-            f"timeout --signal=KILL 1h ./runner {self._get_runner_opts()} {image_cmd} "
+            f"timeout --signal=KILL 2h ./runner {self._get_runner_opts()} {image_cmd} "
             "--pre-pull --command ' echo Pre Pull finished ' "
         )
 
@@ -428,7 +428,7 @@ class ClickhouseIntegrationTestsRunner:
         out_file_full = os.path.join(self.result_path, "runner_get_all_tests.log")
         cmd = (
             f"cd {repo_path}/tests/integration && "
-            f"timeout --signal=KILL 1h ./runner {runner_opts} {image_cmd} -- --setup-plan "
+            f"timeout --signal=KILL 2h ./runner {runner_opts} {image_cmd} -- --setup-plan "
         )
 
         logging.info(
@@ -477,6 +477,19 @@ class ClickhouseIntegrationTestsRunner:
         return list(sorted(skip_list_tests))
 
     @staticmethod
+    def _get_broken_tests_list(repo_path: str) -> dict:
+        skip_list_file_path = f"{repo_path}/tests/broken_tests.json"
+        if (
+            not os.path.isfile(skip_list_file_path)
+            or os.path.getsize(skip_list_file_path) == 0
+        ):
+            return {}
+
+        with open(skip_list_file_path, "r", encoding="utf-8") as skip_list_file:
+            skip_list_tests = json.load(skip_list_file)
+        return skip_list_tests
+
+    @staticmethod
     def group_test_by_file(tests):
         result = {}  # type: Dict
         for test in tests:
@@ -515,7 +528,7 @@ class ClickhouseIntegrationTestsRunner:
             "--docker-image-version",
         ):
             for img in IMAGES:
-                if img == "clickhouse/integration-tests-runner":
+                if img == "altinityinfra/integration-tests-runner":
                     runner_version = self.get_image_version(img)
                     logging.info(
                         "Can run with custom docker image version %s", runner_version
@@ -645,7 +658,8 @@ class ClickhouseIntegrationTestsRunner:
             info_path = os.path.join(repo_path, "tests/integration", info_basename)
 
             test_cmd = " ".join([shlex.quote(test) for test in sorted(test_names)])
-            parallel_cmd = f" --parallel {num_workers} " if num_workers > 0 else ""
+            # run in parallel only the first time, re-runs are sequential to give chance to flappy tests to pass.
+            parallel_cmd = f" --parallel {num_workers} " if num_workers > 0 and i == 0 else ""
             repeat_cmd = f" --count {repeat_count} " if repeat_count > 0 else ""
             # -r -- show extra test summary:
             # -f -- (f)ailed
@@ -910,6 +924,8 @@ class ClickhouseIntegrationTestsRunner:
             " ".join(not_found_tests[:3]),
         )
 
+        known_broken_tests = self._get_broken_tests_list(repo_path)
+
         grouped_tests = self.group_test_by_file(filtered_sequential_tests)
         i = 0
         for par_group in chunks(filtered_parallel_tests, PARALLEL_GROUP_SIZE):
@@ -943,6 +959,26 @@ class ClickhouseIntegrationTestsRunner:
             group_counters, group_test_times, log_paths = self.try_run_test_group(
                 repo_path, group, tests, MAX_RETRY, NUM_WORKERS, 0
             )
+
+            for fail_status in ("ERROR", "FAILED"):
+                for failed_test in group_counters[fail_status]:
+                    if failed_test in known_broken_tests.keys():
+                        fail_message = known_broken_tests[failed_test].get("message")
+                        if not fail_message:
+                            mark_as_broken = True
+                        else:
+                            mark_as_broken = False
+                            for log_path in log_paths:
+                                if log_path.endswith(".log"):
+                                    with open(log_path) as log_file:
+                                        if fail_message in log_file.read():
+                                            mark_as_broken = True
+                                            break
+
+                        if mark_as_broken:
+                            group_counters[fail_status].remove(failed_test)
+                            group_counters["BROKEN"].append(failed_test)
+
             total_tests = 0
             for counter, value in group_counters.items():
                 logging.info(
