@@ -170,14 +170,26 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
+        id: run_suite
         run: python3
               -u ${{ env.SUITE }}/regression.py
-              --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
+              --clickhouse-binary-path ${{ env.clickhouse_path }}
+              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name=$GITHUB_JOB job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
               ${{ env.args }}
+      - name: Set Commit Status
+        if: always()
+        run: python3 .github/set_builds_status.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
+          SUITE_NAME: "Regression ${{ inputs.arch }} ${{ matrix.SUITE }}"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+      - name: Upload logs to regression results database
+        if: always()
+        timeout-minutes: 20
+        run: .github/upload_results_to_database.sh 1
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -214,15 +226,27 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
+        id: run_suite
         run: python3
               -u alter/regression.py
-              --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --clickhouse-binary-path ${{ env.clickhouse_path }}
               --only "/alter/${{ matrix.ONLY }} partition/*"
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
+              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name=$GITHUB_JOB job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
               ${{ env.args }}
+      - name: Set Commit Status
+        if: always()
+        run: python3 .github/set_builds_status.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
+          SUITE_NAME: "Regression ${{ inputs.arch }} Alter ${{ matrix.ONLY }} partition"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+      - name: Upload logs to regression results database
+        if: always()
+        timeout-minutes: 20
+        run: .github/upload_results_to_database.sh 1
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -260,9 +284,10 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
+        id: run_suite
         run: python3
               -u ${{ env.SUITE }}/benchmark.py
-              --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --clickhouse-binary-path ${{ env.clickhouse_path }}
               --storage ${{ matrix.STORAGE }}
               --gcs-uri ${{ secrets.REGRESSION_GCS_URI }}
               --gcs-key-id ${{ secrets.REGRESSION_GCS_KEY_ID }}
@@ -271,11 +296,22 @@ jobs:
               --aws-s3-region ${{ secrets.REGRESSION_AWS_S3_REGION }}
               --aws-s3-key-id ${{ secrets.REGRESSION_AWS_S3_KEY_ID }}
               --aws-s3-access-key ${{ secrets.REGRESSION_AWS_S3_SECRET_ACCESS_KEY }}
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
+              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name=$GITHUB_JOB job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
               ${{ env.args }}
+      - name: Set Commit Status
+        if: always()
+        run: python3 .github/set_builds_status.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
+          SUITE_NAME: "Regression ${{ inputs.arch }} Benchmark ${{ matrix.STORAGE }}"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+      - name: Upload logs to regression results database
+        if: always()
+        timeout-minutes: 20
+        run: .github/upload_results_to_database.sh 1
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -309,15 +345,27 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
+        id: run_suite
         run: python3
               -u ${{ env.SUITE }}/regression.py
               --ssl
-              --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
+              --clickhouse-binary-path ${{ env.clickhouse_path }}
+              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name=$GITHUB_JOB job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
               ${{ env.args }}
+      - name: Set Commit Status
+        if: always()
+        run: python3 .github/set_builds_status.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
+          SUITE_NAME: "Regression ${{ inputs.arch }} Clickhouse Keeper SSL"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+      - name: Upload logs to regression results database
+        if: always()
+        timeout-minutes: 20
+        run: .github/upload_results_to_database.sh 1
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -354,14 +402,26 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
+        id: run_suite
         run: python3
               -u ${{ env.SUITE }}/regression.py
-              --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
+              --clickhouse-binary-path ${{ env.clickhouse_path }}
+              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name=$GITHUB_JOB job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
               ${{ env.args }}
+      - name: Set Commit Status
+        if: always()
+        run: python3 .github/set_builds_status.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
+          SUITE_NAME: "Regression ${{ inputs.arch }} LDAP ${{ matrix.SUITE }}"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+      - name: Upload logs to regression results database
+        if: always()
+        timeout-minutes: 20
+        run: .github/upload_results_to_database.sh 1
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -394,14 +454,26 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
+        id: run_suite
         run: python3
               -u ${{ env.SUITE }}/regression.py
-              --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
+              --clickhouse-binary-path ${{ env.clickhouse_path }}
+              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name=$GITHUB_JOB job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
               ${{ env.args }}
+      - name: Set Commit Status
+        if: always()
+        run: python3 .github/set_builds_status.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
+          SUITE_NAME: "Regression ${{ inputs.arch }} Parquet"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+      - name: Upload logs to regression results database
+        if: always()
+        timeout-minutes: 20
+        run: .github/upload_results_to_database.sh 1
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -439,20 +511,32 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
+        id: run_suite
         run: python3
               -u ${{ env.SUITE }}/regression.py
-              --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --clickhouse-binary-path ${{ env.clickhouse_path }}
               --only "/parquet/${{ matrix.STORAGE }}/*"
               --storage ${{ matrix.STORAGE }}
               --aws-s3-bucket ${{ secrets.REGRESSION_AWS_S3_BUCKET }}
               --aws-s3-region ${{ secrets.REGRESSION_AWS_S3_REGION }}
               --aws-s3-key-id ${{ secrets.REGRESSION_AWS_S3_KEY_ID }}
               --aws-s3-access-key ${{ secrets.REGRESSION_AWS_S3_SECRET_ACCESS_KEY }}
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
+              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name=$GITHUB_JOB job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
               ${{ env.args }}
+      - name: Set Commit Status
+        if: always()
+        run: python3 .github/set_builds_status.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
+          SUITE_NAME: "Regression ${{ inputs.arch }} Parquet ${{ matrix.STORAGE }}"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+      - name: Upload logs to regression results database
+        if: always()
+        timeout-minutes: 20
+        run: .github/upload_results_to_database.sh 1
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -490,9 +574,10 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
+        id: run_suite
         run: python3
               -u ${{ env.SUITE }}/regression.py
-              --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --clickhouse-binary-path ${{ env.clickhouse_path }}
               --storage ${{ matrix.STORAGE }}
               --gcs-uri ${{ secrets.REGRESSION_GCS_URI }}
               --gcs-key-id ${{ secrets.REGRESSION_GCS_KEY_ID }}
@@ -501,11 +586,22 @@ jobs:
               --aws-s3-region ${{ secrets.REGRESSION_AWS_S3_REGION }}
               --aws-s3-key-id ${{ secrets.REGRESSION_AWS_S3_KEY_ID }}
               --aws-s3-access-key ${{ secrets.REGRESSION_AWS_S3_SECRET_ACCESS_KEY }}
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
+              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name=$GITHUB_JOB job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
               ${{ env.args }}
+      - name: Set Commit Status
+        if: always()
+        run: python3 .github/set_builds_status.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
+          SUITE_NAME: "Regression ${{ inputs.arch }} S3 ${{ matrix.STORAGE }}"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+      - name: Upload logs to regression results database
+        if: always()
+        timeout-minutes: 20
+        run: .github/upload_results_to_database.sh 1
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -543,9 +639,10 @@ jobs:
       - name: Get deb url
         run: python3 .github/get-deb-url.py --reports-path ${{ env.REPORTS_PATH }} --github-env $GITHUB_ENV
       - name: Run ${{ env.SUITE }} suite
+        id: run_suite
         run: python3
               -u ${{ env.SUITE }}/regression.py
-              --clickhouse-binary-path ${{ env.clickhouse_binary_path }}
+              --clickhouse-binary-path ${{ env.clickhouse_path }}
               --aws-s3-access-key ${{ secrets.REGRESSION_AWS_S3_SECRET_ACCESS_KEY }}
               --aws-s3-key-id ${{ secrets.REGRESSION_AWS_S3_KEY_ID }}
               --aws-s3-uri https://s3.${{ secrets.REGRESSION_AWS_S3_REGION}}.amazonaws.com/${{ secrets.REGRESSION_AWS_S3_BUCKET }}/data/
@@ -553,11 +650,22 @@ jobs:
               --gcs-key-secret ${{ secrets.REGRESSION_GCS_KEY_SECRET }}
               --gcs-uri ${{ secrets.REGRESSION_GCS_URI }}
               --with-${{ matrix.STORAGE }}
-              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_binary_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.id="$GITHUB_RUN_ID" job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
+              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name=$GITHUB_JOB job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
               ${{ env.args }}
+      - name: Set Commit Status
+        if: always()
+        run: python3 .github/set_builds_status.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
+          SUITE_NAME: "Regression ${{ inputs.arch }} Tiered Storage ${{ matrix.STORAGE }}"
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
+      - name: Upload logs to regression results database
+        if: always()
+        timeout-minutes: 20
+        run: .github/upload_results_to_database.sh 1
       - uses: actions/upload-artifact@v4
         if: always()
         with:
