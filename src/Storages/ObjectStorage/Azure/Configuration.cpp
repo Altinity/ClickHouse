@@ -132,8 +132,6 @@ void StorageAzureConfiguration::fromNamedCollection(const NamedCollection & coll
 
     String connection_url;
     String container_name;
-    std::optional<String> account_name;
-    std::optional<String> account_key;
 
     if (collection.has("connection_string"))
         connection_url = collection.get<String>("connection_string");
@@ -173,13 +171,9 @@ void StorageAzureConfiguration::fromAST(ASTs & engine_args, ContextPtr context, 
 
     std::unordered_map<std::string_view, size_t> engine_args_to_idx;
 
-
     String connection_url = checkAndGetLiteralArgument<String>(engine_args[0], "connection_string/storage_account_url");
     String container_name = checkAndGetLiteralArgument<String>(engine_args[1], "container");
     blob_path = checkAndGetLiteralArgument<String>(engine_args[2], "blobpath");
-
-    std::optional<String> account_name;
-    std::optional<String> account_key;
 
     auto is_format_arg = [] (const std::string & s) -> bool
     {
@@ -442,6 +436,22 @@ void StorageAzureConfiguration::addStructureAndFormatToArgsIfNeeded(
                 args[7] = structure_literal;
         }
     }
+}
+
+ASTPtr StorageAzureConfiguration::createArgsWithAccessData() const
+{
+    auto arguments = std::make_shared<ASTExpressionList>();
+
+    arguments->children.push_back(std::make_shared<ASTLiteral>(connection_params.endpoint.storage_account_url));
+    arguments->children.push_back(std::make_shared<ASTIdentifier>(connection_params.endpoint.container_name));
+    arguments->children.push_back(std::make_shared<ASTLiteral>(blob_path));
+    if (account_name && account_key)
+    {
+        arguments->children.push_back(std::make_shared<ASTLiteral>(*account_name));
+        arguments->children.push_back(std::make_shared<ASTLiteral>(*account_key));
+    }
+
+    return arguments;
 }
 
 }

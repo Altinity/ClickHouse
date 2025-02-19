@@ -36,6 +36,11 @@ namespace Setting
     extern const SettingsBool skip_unavailable_shards;
 }
 
+namespace ErrorCodes
+{
+    extern const int NOT_IMPLEMENTED;
+}
+
 IStorageCluster::IStorageCluster(
     const String & cluster_name_,
     const StorageID & table_id_,
@@ -73,13 +78,21 @@ void IStorageCluster::read(
     SelectQueryInfo & query_info,
     ContextPtr context,
     QueryProcessingStage::Enum processed_stage,
-    size_t /*max_block_size*/,
-    size_t /*num_streams*/)
+    size_t max_block_size,
+    size_t num_streams)
 {
+    auto cluster_name_ = getClusterName(context);
+
+    if (cluster_name_.empty())
+    {
+        readFallBackToPure(query_plan, column_names, storage_snapshot, query_info, context, processed_stage, max_block_size, num_streams);
+        return;
+    }
+
     storage_snapshot->check(column_names);
 
     updateBeforeRead(context);
-    auto cluster = getCluster(context);
+    auto cluster = getClusterImpl(context, cluster_name_);
 
     /// Calculate the header. This is significant, because some columns could be thrown away in some cases like query with count(*)
 
@@ -124,6 +137,20 @@ void IStorageCluster::read(
         log);
 
     query_plan.addStep(std::move(reading));
+}
+
+SinkToStoragePtr IStorageCluster::write(
+    const ASTPtr & query,
+    const StorageMetadataPtr & metadata_snapshot,
+    ContextPtr context,
+    bool async_insert)
+{
+    auto cluster_name_ = getClusterName(context);
+
+    if (cluster_name_.empty())
+        return writeFallBackToPure(query, metadata_snapshot, context, async_insert);
+
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method write is not supported by storage {}", getName());
 }
 
 void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
@@ -196,9 +223,9 @@ ContextPtr ReadFromCluster::updateSettings(const Settings & settings)
     return new_context;
 }
 
-ClusterPtr IStorageCluster::getCluster(ContextPtr context) const
+ClusterPtr IStorageCluster::getClusterImpl(ContextPtr context, const String & cluster_name_)
 {
-    return context->getCluster(cluster_name)->getClusterWithReplicasAsShards(context->getSettingsRef());
+    return context->getCluster(cluster_name_)->getClusterWithReplicasAsShards(context->getSettingsRef());
 }
 
 }

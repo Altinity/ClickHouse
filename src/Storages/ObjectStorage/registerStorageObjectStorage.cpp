@@ -6,6 +6,7 @@
 #include <Storages/ObjectStorage/HDFS/Configuration.h>
 #include <Storages/ObjectStorage/S3/Configuration.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
+#include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
 #include <Storages/StorageFactory.h>
 #include <Poco/Logger.h>
 #include "Common/logger_useful.h"
@@ -19,13 +20,18 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
 }
 
+namespace StorageObjectStorageSetting
+{
+    extern const StorageObjectStorageSettingsString object_storage_cluster;
+}
+
 namespace
 {
 
 // LocalObjectStorage is only supported for Iceberg Datalake operations where Avro format is required. For regular file access, use FileStorage instead.
 #if USE_AWS_S3 || USE_AZURE_BLOB_STORAGE || USE_HDFS || USE_AVRO
 
-std::shared_ptr<StorageObjectStorage>
+StoragePtr
 createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObjectStorage::ConfigurationPtr configuration, ContextPtr context)
 {
     auto & engine_args = args.engine_args;
@@ -36,6 +42,8 @@ createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObject
     auto queue_settings = std::make_unique<StorageObjectStorageSettings>();
 
     queue_settings->loadFromQuery(*args.storage_def);
+
+    auto cluster_name = (*queue_settings)[StorageObjectStorageSetting::object_storage_cluster].value;
 
     StorageObjectStorage::Configuration::initialize(*configuration, args.engine_args, context, false, std::move(queue_settings));
 
@@ -61,7 +69,8 @@ createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObject
     if (args.storage_def->partition_by)
         partition_by = args.storage_def->partition_by->clone();
 
-    return std::make_shared<StorageObjectStorage>(
+    return std::make_shared<StorageObjectStorageCluster>(
+        cluster_name,
         configuration,
         configuration->createObjectStorage(context, /* is_readonly */ false),
         args.getContext(),
@@ -71,7 +80,6 @@ createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObject
         args.comment,
         format_settings,
         args.mode,
-        /* distributed_processing */ false,
         partition_by);
 }
 

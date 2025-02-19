@@ -12,6 +12,7 @@
 #include <Storages/ConstraintsDescription.h>
 #include <Storages/StorageNull.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeConfiguration.h>
+#include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
 
 #include <Interpreters/evaluateConstantExpression.h>
 #include <Interpreters/Context.h>
@@ -37,6 +38,7 @@ namespace DatabaseIcebergSetting
     extern const DatabaseIcebergSettingsString storage_endpoint;
     extern const DatabaseIcebergSettingsString oauth_server_uri;
     extern const DatabaseIcebergSettingsBool vended_credentials;
+    extern const DatabaseIcebergSettingsString object_storage_cluster;
 }
 namespace Setting
 {
@@ -235,7 +237,10 @@ StoragePtr DatabaseIceberg::tryGetTable(const String & name, ContextPtr context_
     /// no table structure in table definition AST.
     StorageObjectStorage::Configuration::initialize(*configuration, args, context_, /* with_table_structure */false, std::move(storage_settings));
 
-    return std::make_shared<StorageObjectStorage>(
+    auto cluster_name = settings[DatabaseIcebergSetting::object_storage_cluster].value;
+
+    return std::make_shared<StorageObjectStorageCluster>(
+        cluster_name,
         configuration,
         configuration->createObjectStorage(context_, /* is_readonly */ false),
         context_,
@@ -243,11 +248,9 @@ StoragePtr DatabaseIceberg::tryGetTable(const String & name, ContextPtr context_
         /* columns */columns,
         /* constraints */ConstraintsDescription{},
         /* comment */"",
-        getFormatSettings(context_),
-        LoadingStrictnessLevel::CREATE,
-        /* distributed_processing */false,
-        /* partition_by */nullptr,
-        /* lazy_init */true);
+        /* format_settings */ getFormatSettings(context_),
+        /* mode */ LoadingStrictnessLevel::CREATE,
+        /* partition_by */nullptr);
 }
 
 DatabaseTablesIteratorPtr DatabaseIceberg::getTablesIterator(

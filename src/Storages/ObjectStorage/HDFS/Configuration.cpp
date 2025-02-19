@@ -235,6 +235,13 @@ void StorageHDFSConfiguration::addStructureAndFormatToArgsIfNeeded(
     }
 }
 
+ASTPtr StorageHDFSConfiguration::createArgsWithAccessData() const
+{
+    auto arguments = std::make_shared<ASTExpressionList>();
+    arguments->children.push_back(std::make_shared<ASTLiteral>(url + path));
+    return arguments;
+}
+
 }
 
 #endif
