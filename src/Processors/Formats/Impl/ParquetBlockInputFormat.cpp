@@ -31,6 +31,7 @@
 #include <Common/FieldVisitorsAccurateComparison.h>
 #include <Processors/Formats/Impl/Parquet/ParquetRecordReader.h>
 #include <Processors/Formats/Impl/Parquet/parquetBloomFilterHash.h>
+#include <Processors/Formats/Impl/ParquetFileMetaDataCache.h>
 #include <Interpreters/convertFieldToType.h>
 
 namespace ProfileEvents
@@ -522,15 +523,6 @@ static std::vector<Range> getHyperrectangleForRowGroup(const parquet::FileMetaDa
     return hyperrectangle;
 }
 
-ParquetFileMetaDataCache::ParquetFileMetaDataCache(UInt64 max_size_bytes)
-    : CacheBase(max_size_bytes) {}
-
-ParquetFileMetaDataCache * ParquetFileMetaDataCache::instance(UInt64 max_size_bytes)
-{
-    static ParquetFileMetaDataCache instance(max_size_bytes);
-    return &instance;
-}
-
 std::shared_ptr<parquet::FileMetaData> ParquetBlockInputFormat::readMetadataFromFile()
 {
     createArrowFileIfNotCreated();
@@ -547,7 +539,7 @@ std::shared_ptr<parquet::FileMetaData> ParquetBlockInputFormat::getFileMetaData(
         return readMetadataFromFile();
     }
 
-    auto [parquet_file_metadata, loaded] = ParquetFileMetaDataCache::instance(metadata_cache.max_size_bytes)->getOrSet(
+    auto [parquet_file_metadata, loaded] = ParquetFileMetaDataCache::instance()->getOrSet(
         metadata_cache.key,
         [&]()
         {
@@ -834,11 +826,10 @@ void ParquetBlockInputFormat::initializeIfNeeded()
     }
 }
 
-void ParquetBlockInputFormat::setStorageRelatedUniqueKey(const ServerSettings & server_settings, const Settings & settings, const String & key_)
+void ParquetBlockInputFormat::setStorageRelatedUniqueKey(const Settings & settings, const String & key_)
 {
     metadata_cache.key = key_;
     metadata_cache.use_cache = settings[Setting::input_format_parquet_use_metadata_cache];
-    metadata_cache.max_size_bytes = server_settings[ServerSetting::input_format_parquet_metadata_cache_max_size];
 }
 
 void ParquetBlockInputFormat::initializeRowGroupBatchReader(size_t row_group_batch_idx)

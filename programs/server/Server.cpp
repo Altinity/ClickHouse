@@ -146,6 +146,10 @@
 #   include <azure/core/diagnostics/logger.hpp>
 #endif
 
+#if USE_PARQUET
+#   include <Processors/Formats/Impl/ParquetFileMetaDataCache.h>
+#endif
+
 
 #include <incbin.h>
 /// A minimal file used when the server is run without installation
@@ -286,6 +290,7 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 primary_index_cache_size;
     extern const ServerSettingsDouble primary_index_cache_size_ratio;
     extern const ServerSettingsBool use_legacy_mongodb_integration;
+    extern const ServerSettingsUInt64 input_format_parquet_metadata_cache_max_size;
 }
 
 }
@@ -2233,6 +2238,10 @@ try
 
     if (dns_cache_updater)
         dns_cache_updater->start();
+
+#if USE_PARQUET
+    ParquetFileMetaDataCache::instance()->setMaxSizeInBytes(server_settings[ServerSetting::input_format_parquet_metadata_cache_max_size]);
+#endif
 
     /// Set current database name before loading tables and databases because
     /// system logs may copy global context.
