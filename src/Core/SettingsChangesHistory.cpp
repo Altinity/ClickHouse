@@ -57,46 +57,22 @@ String ClickHouseVersion::toString() const
 /// Note: please check if the key already exists to prevent duplicate entries.
 static std::initializer_list<std::pair<ClickHouseVersion, SettingsChangesHistory::SettingsChanges>> settings_changes_history_initializer =
 {
-    {"24.12",
+    {"24.8.14",
         {
+            {"query_plan_merge_filters", false, true, "Allow to merge filters in the query plan. This is required to properly support filter-push-down with a new analyzer."}, // #71539 via https://github.com/Altinity/ClickHouse/pull/640
         }
     },
-    {"24.11",
+    {"24.8.11",
         {
-            {"push_external_roles_in_interserver_queries", false, true, "New setting."},
-            {"enable_job_stack_trace", false, true, "Enable by default collecting stack traces from job's scheduling."},
-            {"allow_suspicious_types_in_group_by", true, false, "Don't allow Variant/Dynamic types in GROUP BY by default"},
-            {"allow_suspicious_types_in_order_by", true, false, "Don't allow Variant/Dynamic types in ORDER BY by default"},
-            {"distributed_cache_discard_connection_if_unread_data", true, true, "New setting"},
-            {"filesystem_cache_enable_background_download_for_metadata_files_in_packed_storage", true, true, "New setting"},
-            {"filesystem_cache_enable_background_download_during_fetch", true, true, "New setting"},
-            {"azure_check_objects_after_upload", false, false, "Check each uploaded object in azure blob storage to be sure that upload was successful"},
-            {"backup_restore_keeper_max_retries", 20, 1000, "Should be big enough so the whole operation BACKUP or RESTORE operation won't fail because of a temporary [Zoo]Keeper failure in the middle of it."},
-            {"backup_restore_failure_after_host_disconnected_for_seconds", 0, 3600, "New setting."},
-            {"backup_restore_keeper_max_retries_while_initializing", 0, 20, "New setting."},
-            {"backup_restore_keeper_max_retries_while_handling_error", 0, 20, "New setting."},
-            {"backup_restore_finish_timeout_after_error_sec", 0, 180, "New setting."},
-            {"query_plan_merge_filters", false, true, "Allow to merge filters in the query plan. This is required to properly support filter-push-down with a new analyzer."},
-            {"parallel_replicas_local_plan", false, true, "Use local plan for local replica in a query with parallel replicas"},
-            {"filesystem_cache_prefer_bigger_buffer_size", true, true, "New setting"},
-            {"read_in_order_use_virtual_row", false, false, "Use virtual row while reading in order of primary key or its monotonic function fashion. It is useful when searching over multiple parts as only relevant ones are touched."},
-        }
-    },
-    {"24.10",
-        {
-        }
-    },
-    {"24.9",
-        {
-            {"enable_parallel_replicas", false, false, "Parallel replicas with read tasks became the Beta tier feature."},
-            {"parallel_replicas_mode", "read_tasks", "read_tasks", "This setting was introduced as a part of making parallel replicas feature Beta"},
-            {"parallel_replicas_mark_segment_size", 128, 0, "Value for this setting now determined automatically"},
-            {"parallel_replicas_local_plan", false, false, "Use local plan for local replica in a query with parallel replicas"}
+            {"parallel_replicas_mark_segment_size", 128, 0, "Value for this setting now determined automatically"}, // #68424 via https://github.com/Altinity/ClickHouse/pull/542
+            {"parallel_replicas_local_plan", false, false, "Use local plan for local replica in a query with parallel replicas"}, // #64448 via https://github.com/Altinity/ClickHouse/pull/542
+            {"parallel_replicas_mode", "read_tasks", "read_tasks", "This setting was introduced as a part of making parallel replicas feature Beta"}, // #63151 via https://github.com/Altinity/ClickHouse/pull/542
+            {"push_external_roles_in_interserver_queries", false, true, "New setting."}, // #70332 via https://github.com/Altinity/ClickHouse/pull/542
         }
     },
     {"24.8",
         {
-	    {"input_format_parquet_bloom_filter_push_down", false, true, "When reading Parquet files, skip whole row groups based on the WHERE/PREWHERE expressions and bloom filter in the Parquet metadata."},
+            {"input_format_parquet_bloom_filter_push_down", false, true, "When reading Parquet files, skip whole row groups based on the WHERE/PREWHERE expressions and bloom filter in the Parquet metadata."},
             {"enable_named_columns_in_function_tuple", false, false, "Retroactively disabled by default due to critical bugs."},
             {"rows_before_aggregation", false, false, "Provide exact value for rows_before_aggregation statistic, represents the number of rows read before aggregation"},
             {"restore_replace_external_table_functions_to_null", false, false, "New setting."},
