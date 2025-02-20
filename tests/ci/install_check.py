@@ -48,7 +48,10 @@ def prepare_test_scripts():
 set -e
 trap "bash -ex /packages/preserve_logs.sh" ERR
 systemctl start clickhouse-server
-clickhouse-client -q 'SELECT version()'"""
+clickhouse-client -q 'SELECT version()'
+echo "Check Stacktrace"
+output=$(clickhouse-local --stacktrace --query="SELECT throwIf(1,'throw')" 2>&1 >/dev/null || true)
+echo "$output" | grep 'FunctionThrowIf::executeImpl'"""
     keeper_test = r"""#!/bin/bash
 set -e
 trap "bash -ex /packages/preserve_logs.sh" ERR
