@@ -294,7 +294,7 @@ def build_and_push_image(
 
 
 def main():
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.DEBUG)
     stopwatch = Stopwatch()
     makedirs(TEMP_PATH, exist_ok=True)
 
