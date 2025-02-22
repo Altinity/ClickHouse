@@ -19,11 +19,12 @@ echo "$script_dir"
 repo_dir=ch
 BINARY_TO_DOWNLOAD=${BINARY_TO_DOWNLOAD:="clang-18_debug_none_unsplitted_disable_False_binary"}
 BINARY_URL_TO_DOWNLOAD=${BINARY_URL_TO_DOWNLOAD:="https://clickhouse-builds.s3.amazonaws.com/$PR_TO_TEST/$SHA_TO_TEST/clickhouse_build_check/$BINARY_TO_DOWNLOAD/clickhouse"}
+BASE_REF=${BASE_REF:="master"}
 
 function git_clone_with_retry
 {
     for _ in 1 2 3 4; do
-        if git clone --depth 1 https://github.com/Altinity/ClickHouse.git -- "$1" 2>&1 | ts '%Y-%m-%d %H:%M:%S';then
+        if git clone --depth 1 https://github.com/Altinity/ClickHouse.git -b "${BASE_REF}" -- "$1" 2>&1 | ts '%Y-%m-%d %H:%M:%S';then
             return 0
         else
             sleep 0.5
@@ -50,7 +51,7 @@ function clone
                 git checkout "$SHA_TO_TEST"
                 echo "Checked out nominal SHA $SHA_TO_TEST for PR $PR_TO_TEST"
             fi
-            git diff --name-only master HEAD | tee ci-changed-files.txt
+            git diff --name-only ${BASE_REF} HEAD | tee ci-changed-files.txt
         else
             if [ -v SHA_TO_TEST ]; then
                 git fetch --depth 2 origin "$SHA_TO_TEST"
