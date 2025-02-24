@@ -1,5 +1,17 @@
 List of pull requests contributed by Altinity develoeprs to ClickHouse server. It does not include documentation changes.
 
+## 2025
+  * Update index.md	[75952](https://github.com/ClickHouse/ClickHouse/pull/75952)	by @filimonov
+  * Merge parquet bloom filter and min/max evaluation	[71383](https://github.com/ClickHouse/ClickHouse/pull/71383)	by @arthurpassos
+  * Reintroduce respect `ttl_only_drop_parts` on `materialize ttl`, #65488	[72751](https://github.com/ClickHouse/ClickHouse/pull/72751)	by @zvonand
+  * Set parquet compression level only if compression codec supports it	[74659](https://github.com/ClickHouse/ClickHouse/pull/74659)	by @arthurpassos
+  * Compression level for parquet output format	[73651](https://github.com/ClickHouse/ClickHouse/pull/73651)	by @arthurpassos
+  * Fix UBSan error in `ParquetDataBuffer`	[74534](https://github.com/ClickHouse/ClickHouse/pull/74534)	by @arthurpassos
+  * Support parquet integer logical types on native reader	[72105](https://github.com/ClickHouse/ClickHouse/pull/72105)	by @arthurpassos
+  * add sequenceMatchEvents aggregate function	[72349](https://github.com/ClickHouse/ClickHouse/pull/72349)	by @UnamedRus
+  * Fix issue #66112	[74128](https://github.com/ClickHouse/ClickHouse/pull/74128)	by @ianton-ru
+  * Fix 03210_variant_with_aggregate_function_type test	[74012](https://github.com/ClickHouse/ClickHouse/pull/74012)	by @ianton-ru
+
 ## 2024
   * [Experiment] what if reorder compare of columns in Merge	[63780](https://github.com/ClickHouse/ClickHouse/pull/63780)	by @UnamedRus
   * Fix if condition in #63151	[73504](https://github.com/ClickHouse/ClickHouse/pull/73504)	by @zvonand
