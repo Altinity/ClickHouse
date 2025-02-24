@@ -1,0 +1,29 @@
+{
+    "02920_alter_column_of_projections":{
+        "reason": "Fails on asan,msan,tsan,ubsan,release,Aarch64"
+    },
+    "02888_system_tables_with_inaccsessible_table_function":{
+        "reason": "Fails on asan,debug,msan,tsan,ubsan,release,Aarch64"
+    },
+    "02907_backup_mv_with_no_inner_table":{
+        "reason": "Fails on asan,debug,msan,tsan,ubsan,release,Aarch64"
+    },
+    "01710_projection_fix_crash":{
+        "reason": "Fails on debug"
+    },
+    "01193_metadata_loading":{
+        "reason": "Fails on Aarch64"
+    },
+    "test_storage_mongodb/test.py::test_secure_connection[True]":{
+        "reason": "Fails on asan, asan analyzer, release, tsan"
+    },
+    "test_dictionaries_all_layouts_separate_sources/test_mongo_uri.py::test_simple_ssl[flat-True]":{
+        "reason": "Fails on asan, asan analyzer, release, tsan"
+    },
+    "test_mysql_database_engine/test.py::test_mysql_ddl_for_mysql_database":{
+        "reason": "Fails on asan analyzer"
+    },
+    "test_parallel_replicas_skip_shards/test.py::test_skip_unavailable_shards":{
+        "reason": "Fails on asan analyzer"
+    }
+}
