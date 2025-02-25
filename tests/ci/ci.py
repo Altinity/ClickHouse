@@ -1209,12 +1209,13 @@ def main() -> int:
         )
 
         # NOTE (vnemkov) Job might have not checked out tags, hence can't properly compute version number.
-        # If there is pre-computed version number from `RunConfig` then reuse it
+        # BUT if there is pre-computed version from `RunConfig` then we can reuse it.
         pre_configured_version = indata.get('version', None)
-        if pre_configured_version is not None:
+        git = Git(True)
+        if pre_configured_version is not None and git.latest_tag:
             print(f"Updating version in repo files from '{get_version_from_repo()}' to '{pre_configured_version}'")
 
-            pre_configured_version = get_version_from_string(pre_configured_version, Git(True))
+            pre_configured_version = get_version_from_string(pre_configured_version, git)
             # need to set description, otherwise subsequent call to get_version_from_repo() fails
             pre_configured_version.with_description(pre_configured_version.flavour)
 
