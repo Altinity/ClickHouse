@@ -30,6 +30,7 @@ SET(VERSION_MINOR {minor})
 SET(VERSION_PATCH {patch})
 SET(VERSION_GITHASH {githash})
 SET(VERSION_TWEAK {tweak})
+SET(VERSION_FLAVOUR {flavour})
 SET(VERSION_DESCRIBE {describe})
 SET(VERSION_STRING {string})
 # end of autochange
@@ -154,6 +155,10 @@ class ClickHouseVersion:
         return self._description
 
     @property
+    def flavour(self) -> str:
+        return self._flavour
+
+    @property
     def string(self):
         version_as_string = ".".join(
             (str(self.major), str(self.minor), str(self.patch), str(self.tweak))
@@ -182,6 +187,7 @@ class ClickHouseVersion:
             "githash": self.githash,
             "describe": self.describe,
             "string": self.string,
+            "flavour": self.flavour
         }
 
     def as_tuple(self) -> Tuple[int, int, int, int]:

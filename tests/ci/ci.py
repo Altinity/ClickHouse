@@ -1212,8 +1212,12 @@ def main() -> int:
         # If there is pre-computed version number from `RunConfig` then reuse it
         pre_configured_version = indata.get('version', None)
         if pre_configured_version is not None:
-            print(f"Updating version in repo files from : {get_version_from_repo()} to {pre_configured_version}")
-            pre_configured_version = get_version_from_string(pre_configured_version)
+            print(f"Updating version in repo files from '{get_version_from_repo()}' to '{pre_configured_version}'")
+
+            pre_configured_version = get_version_from_string(pre_configured_version, Git(True))
+            # need to set description, otherwise subsequent call to get_version_from_repo() fails
+            pre_configured_version.with_description(pre_configured_version.flavour)
+
             update_cmake_version(pre_configured_version)
 
         if job_report.job_skipped and not args.force:
