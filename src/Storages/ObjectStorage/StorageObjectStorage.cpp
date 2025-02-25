@@ -280,7 +280,7 @@ public:
             num_streams = 1;
         }
 
-        const size_t max_parsing_threads = num_streams >= max_threads ? 1 : (max_threads / std::max(num_streams, 1ul));
+        const size_t max_parsing_threads = (distributed_processing || num_streams >= max_threads) ? 1 : (max_threads / std::max(num_streams, 1ul));
 
         for (size_t i = 0; i < num_streams; ++i)
         {
