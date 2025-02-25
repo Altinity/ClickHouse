@@ -1212,7 +1212,7 @@ def main() -> int:
         # BUT if there is pre-computed version from `RunConfig` then we can reuse it.
         pre_configured_version = indata.get('version', None)
         git = Git(True)
-        if pre_configured_version is not None and git.latest_tag:
+        if pre_configured_version is not None and git.commits_since_latest == 0:
             print(f"Updating version in repo files from '{get_version_from_repo()}' to '{pre_configured_version}'")
 
             pre_configured_version = get_version_from_string(pre_configured_version, git)
