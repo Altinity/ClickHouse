@@ -1943,11 +1943,6 @@ public:
             flags);
     }
 
-    SinkPtr createSinkForHivePartition(const String & partition_id) override
-    {
-        return createSinkForPartition(partition_id);
-    }
-
 private:
     const String path;
     StorageMetadataPtr metadata_snapshot;
