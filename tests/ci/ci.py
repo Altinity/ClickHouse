@@ -1813,7 +1813,7 @@ def _get_ext_check_name(check_name: str) -> str:
 
 
 def main() -> int:
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.DEBUG)
     exit_code = 0
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
