@@ -67,7 +67,11 @@ from ci_cache import CiCache
 from ci_settings import CiSettings
 from ci_buddy import CIBuddy
 from stopwatch import Stopwatch
-from version_helper import get_version_from_repo
+from version_helper import (
+    get_version_from_repo,
+    get_version_from_string,
+    update_cmake_version
+)
 
 # pylint: disable=too-many-lines
 
@@ -1203,6 +1207,19 @@ def main() -> int:
         print(
             f"Check if rerun for name: [{check_name}], extended name [{check_name_with_group}]"
         )
+
+        # NOTE (vnemkov) Job might have not checked out git tags, so it can't properly compute version number.
+        # BUT if there is pre-computed version from `RunConfig` then we can reuse it.
+        pre_configured_version = indata.get('version', None)
+        git = Git(True)
+        if pre_configured_version is not None and git.commits_since_latest == 0:
+            print(f"Updating version in repo files from '{get_version_from_repo()}' to '{pre_configured_version}'")
+
+            pre_configured_version = get_version_from_string(pre_configured_version, git)
+            # need to set description, otherwise subsequent call (perhaps from other script) to get_version_from_repo() fails
+            pre_configured_version.with_description(pre_configured_version.flavour)
+
+            update_cmake_version(pre_configured_version)
 
         if job_report.job_skipped and not args.force:
             print(
