@@ -64,6 +64,7 @@ static std::initializer_list<std::pair<ClickHouseVersion, SettingsChangesHistory
     },
     {"24.8.11",
         {
+            {"enable_parallel_replicas", false, false, "Parallel replicas with read tasks became the Beta tier feature."}, // #63151 via https://github.com/Altinity/ClickHouse/pull/542
             {"parallel_replicas_mark_segment_size", 128, 0, "Value for this setting now determined automatically"}, // #68424 via https://github.com/Altinity/ClickHouse/pull/542
             {"parallel_replicas_local_plan", false, false, "Use local plan for local replica in a query with parallel replicas"}, // #64448 via https://github.com/Altinity/ClickHouse/pull/542
             {"parallel_replicas_mode", "read_tasks", "read_tasks", "This setting was introduced as a part of making parallel replicas feature Beta"}, // #63151 via https://github.com/Altinity/ClickHouse/pull/542
