@@ -9,6 +9,7 @@
 #include <Storages/Statistics/Statistics.h>
 #include <Columns/ColumnsNumber.h>
 #include <Parsers/queryToString.h>
+#include <Interpreters/Context.h>
 #include <Interpreters/Squashing.h>
 #include <Interpreters/MergeTreeTransaction.h>
 #include <Interpreters/PreparedSets.h>
@@ -63,14 +64,6 @@ namespace ErrorCodes
 
 namespace MutationHelpers
 {
-
-static bool checkOperationIsNotCanceled(ActionBlocker & merges_blocker, MergeListEntry * mutate_entry)
-{
-    if (merges_blocker.isCancelled() || (*mutate_entry)->is_cancelled)
-        throw Exception(ErrorCodes::ABORTED, "Cancelled mutating parts");
-
-    return true;
-}
 
 static bool haveMutationsOfDynamicColumns(const MergeTreeData::DataPartPtr & data_part, const MutationCommands & commands)
 {
@@ -984,7 +977,7 @@ struct MutationContext
 {
     MergeTreeData * data;
     MergeTreeDataMergerMutator * mutator;
-    ActionBlocker * merges_blocker;
+    PartitionActionBlocker * merges_blocker;
     TableLockHolder * holder;
     MergeListEntry * mutate_entry;
 
@@ -1047,6 +1040,17 @@ struct MutationContext
     bool need_prefix = true;
 
     scope_guard temporary_directory_lock;
+
+    bool checkOperationIsNotCanceled() const
+    {
+        if (new_data_part ? merges_blocker->isCancelledForPartition(new_data_part->info.partition_id) : merges_blocker->isCancelled()
+            || (*mutate_entry)->is_cancelled)
+        {
+            throw Exception(ErrorCodes::ABORTED, "Cancelled mutating parts");
+        }
+
+        return true;
+    }
 
     /// Whether we need to count lightweight delete rows in this mutation
     bool count_lightweight_deleted_rows;
@@ -1315,9 +1319,7 @@ bool PartMergerWriter::mutateOriginalPartAndPrepareProjections()
         Block cur_block;
         Block projection_header;
 
-        MutationHelpers::checkOperationIsNotCanceled(*ctx->merges_blocker, ctx->mutate_entry);
-
-        if (!ctx->mutating_executor->pull(cur_block))
+        if (!ctx->checkOperationIsNotCanceled() || !ctx->mutating_executor->pull(cur_block))
         {
             finalizeTempProjections();
             return false;
@@ -2015,7 +2017,7 @@ MutateTask::MutateTask(
     const MergeTreeTransactionPtr & txn,
     MergeTreeData & data_,
     MergeTreeDataMergerMutator & mutator_,
-    ActionBlocker & merges_blocker_,
+    PartitionActionBlocker & merges_blocker_,
     bool need_prefix_)
     : ctx(std::make_shared<MutationContext>())
 {
@@ -2057,7 +2059,7 @@ bool MutateTask::execute()
         }
         case State::NEED_EXECUTE:
         {
-            MutationHelpers::checkOperationIsNotCanceled(*ctx->merges_blocker, ctx->mutate_entry);
+            ctx->checkOperationIsNotCanceled();
 
             if (task->executeStep())
                 return true;
@@ -2150,7 +2152,7 @@ static bool canSkipMutationCommandForPart(const MergeTreeDataPartPtr & part, con
 bool MutateTask::prepare()
 {
     ProfileEvents::increment(ProfileEvents::MutationTotalParts);
-    MutationHelpers::checkOperationIsNotCanceled(*ctx->merges_blocker, ctx->mutate_entry);
+    ctx->checkOperationIsNotCanceled();
 
     if (ctx->future_part->parts.size() != 1)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Trying to mutate {} parts, not one. "
