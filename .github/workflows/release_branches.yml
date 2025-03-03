@@ -601,13 +601,6 @@ jobs:
           cd "$GITHUB_WORKSPACE/tests/ci"
           python3 finish_check.py
       - name: Create and upload combined report
-          IS_VALID_URL=$(echo $REPORT_LINK | grep -E '^https?://')
-          if [[ -n $IS_VALID_URL ]]; then
-            echo "Combined CI Report: [View Report]($REPORT_LINK)" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "Error: $REPORT_LINK" >> $GITHUB_STEP_SUMMARY
-            exit 1
-          fi        if: ${{ !cancelled() }}
         env:
           CHECKS_DATABASE_HOST: ${{ secrets.CHECKS_DATABASE_HOST }}
           CHECKS_DATABASE_USER: ${{ secrets.CHECKS_DATABASE_USER }}
