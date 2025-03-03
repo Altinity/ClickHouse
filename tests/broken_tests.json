@@ -18,5 +18,41 @@
     },
     "02700_s3_part_INT_MAX": {
         "reason": "fails with asan"
+    },
+    "test_backward_compatibility/test_aggregate_function_state.py::test_backward_compatability_for_avg":{
+        "reason": "not run by upstream"
+    },
+    "test_backward_compatibility/test_aggregate_function_state.py::test_backward_compatability_for_uniq_exact[1000]":{
+        "reason": "not run by upstream"
+    },
+    "test_backward_compatibility/test_aggregate_function_state.py::test_backward_compatability_for_uniq_exact[500000] ":{
+        "reason": "not run by upstream"
+    },
+    "test_backward_compatibility/test_aggregate_function_state.py::test_backward_compatability_for_uniq_exact_variadic[1000]":{
+        "reason": "not run by upstream"
+    },
+    "test_backward_compatibility/test_aggregate_function_state.py::test_backward_compatability_for_uniq_exact_variadic[500000]":{
+        "reason": "not run by upstream"
+    },
+    "test_dictionaries_all_layouts_separate_sources/test_mongo.py::test_simple_ssl[cache-True] ":{
+        "reason": "errors upstream"
+    },
+    "test_dictionaries_all_layouts_separate_sources/test_mongo.py::test_simple_ssl[direct-True]":{
+        "reason": "errors upstream"
+    },
+    "test_dictionaries_all_layouts_separate_sources/test_mongo.py::test_simple_ssl[flat-True]":{
+        "reason": "errors upstream"
+    },
+    "test_dictionaries_all_layouts_separate_sources/test_mongo.py::test_simple_ssl[hashed-True]":{
+        "reason": "errors upstream"
+    },
+    "test_dictionaries_all_layouts_separate_sources/test_mongo_uri.py::test_simple_ssl[flat-True]":{
+        "reason": "errors upstream"
+    },
+    "test_storage_mongodb/test.py::test_secure_connection[True]":{
+        "reason": "fails upstream"
+    },
+    "test_table_function_mongodb/test.py::test_secure_connection[True]":{
+        "reason": "fails upstream"
     }
 }
