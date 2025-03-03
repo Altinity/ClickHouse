@@ -15,6 +15,12 @@
 namespace DB
 {
 
+namespace Setting
+{
+extern const SettingsBool use_hive_partitioning;
+}
+
+
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
@@ -69,8 +75,12 @@ createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObject
     if (args.storage_def->partition_by)
         partition_by = args.storage_def->partition_by->clone();
 
-    return std::make_shared<StorageObjectStorageCluster>(
-        cluster_name,
+    if (context->getSettingsRef()[Setting::use_hive_partitioning] && configuration->withPartitionWildcard())
+    {
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "The _partition_id macro can't be used with hive partitioning");
+    }
+
+    return std::make_shared<StorageObjectStorage>(
         configuration,
         configuration->createObjectStorage(context, /* is_readonly */ false),
         args.getContext(),
