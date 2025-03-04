@@ -34,7 +34,7 @@
     "test_backward_compatibility/test_aggregate_function_state.py::test_backward_compatability_for_uniq_exact_variadic[500000]":{
         "reason": "not run by upstream"
     },
-    "test_dictionaries_all_layouts_separate_sources/test_mongo.py::test_simple_ssl[cache-True] ":{
+    "test_dictionaries_all_layouts_separate_sources/test_mongo.py::test_simple_ssl[cache-True]": {
         "reason": "errors upstream"
     },
     "test_dictionaries_all_layouts_separate_sources/test_mongo.py::test_simple_ssl[direct-True]":{
