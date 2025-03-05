@@ -231,7 +231,7 @@ def main():
             )
 
     combined_report = (
-        ci_running_report.replace("ClickHouse CI running for", "Combined CI Report for")
+        ci_running_report.replace("ClickHouse CI Running for", "Combined CI Report for")
         .replace(
             "<table>",
             f"""<h2>Table of Contents</h2>
