@@ -85,7 +85,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Compatibility check (amd64)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
   CompatibilityCheckAarch64:
     needs: [RunConfig, BuilderDebAarch64]
@@ -194,7 +194,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Docker server image
-      runner_type: altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx41, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
   DockerKeeperImage:
     needs: [RunConfig, BuilderDebRelease, BuilderDebAarch64]
@@ -203,7 +203,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Docker keeper image
-      runner_type: altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx41, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
 ############################################################################################
 ##################################### BUILD REPORTER #######################################
@@ -280,7 +280,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Install packages (amd64)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
       run_command: |
         python3 install_check.py "$CHECK_NAME"
@@ -305,7 +305,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (release)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatelessTestAarch64:
     needs: [RunConfig, BuilderDebAarch64]
@@ -323,7 +323,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (asan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatelessTestTsan:
     needs: [RunConfig, BuilderDebTsan]
@@ -332,7 +332,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (tsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatelessTestMsan:
     needs: [RunConfig, BuilderDebMsan]
@@ -341,7 +341,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (msan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatelessTestUBsan:
     needs: [RunConfig, BuilderDebUBsan]
@@ -350,7 +350,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (ubsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatelessTestDebug:
     needs: [RunConfig, BuilderDebDebug]
@@ -359,7 +359,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (debug)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
 ##############################################################################################
 ############################ FUNCTIONAl STATEFUL TESTS #######################################
@@ -371,7 +371,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (release)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatefulTestAarch64:
     needs: [RunConfig, BuilderDebAarch64]
@@ -389,7 +389,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (asan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatefulTestTsan:
     needs: [RunConfig, BuilderDebTsan]
@@ -398,7 +398,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (tsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatefulTestMsan:
     needs: [RunConfig, BuilderDebMsan]
@@ -407,7 +407,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (msan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatefulTestUBsan:
     needs: [RunConfig, BuilderDebUBsan]
@@ -416,7 +416,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (ubsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatefulTestDebug:
     needs: [RunConfig, BuilderDebDebug]
@@ -425,7 +425,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateful tests (debug)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
 ##############################################################################################
 ######################################### STRESS TESTS #######################################
@@ -437,7 +437,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stress test (asan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
   StressTestTsan:
     needs: [RunConfig, BuilderDebTsan]
@@ -446,7 +446,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stress test (tsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
   StressTestMsan:
     needs: [RunConfig, BuilderDebMsan]
@@ -455,7 +455,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stress test (msan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
   StressTestUBsan:
     needs: [RunConfig, BuilderDebUBsan]
@@ -464,7 +464,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stress test (ubsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
   StressTestDebug:
     needs: [RunConfig, BuilderDebDebug]
@@ -473,7 +473,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stress test (debug)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
 #############################################################################################
 ############################# INTEGRATION TESTS #############################################
@@ -485,7 +485,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Integration tests (asan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
   IntegrationTestsAnalyzerAsan:
     needs: [RunConfig, BuilderDebAsan]
@@ -494,7 +494,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Integration tests (asan, old analyzer)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
   IntegrationTestsTsan:
     needs: [RunConfig, BuilderDebTsan]
@@ -503,7 +503,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Integration tests (tsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
   IntegrationTestsRelease:
     needs: [RunConfig, BuilderDebRelease]
@@ -512,7 +512,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Integration tests (release)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
 #############################################################################################
 ##################################### REGRESSION TESTS ######################################
@@ -544,7 +544,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Sign release
-      runner_type: altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx41, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
   SignAarch64:
     needs: [RunConfig, BuilderDebAarch64]
@@ -553,7 +553,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Sign aarch64
-      runner_type: altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-system-ubuntu-22.04
+      runner_type: altinity-on-demand, altinity-type-cpx41, altinity-image-x86-system-ubuntu-22.04
       data: ${{ needs.RunConfig.outputs.data }}
   FinishCheck:
     if: ${{ !cancelled() }}
