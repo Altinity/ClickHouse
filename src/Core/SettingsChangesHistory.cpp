@@ -109,8 +109,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
     {"24.12.2.20000",
         // Altinity Antalya modifications
         {
-            {"input_format_parquet_use_metadata_cache", false, false, "New setting"}, // https://github.com/Altinity/ClickHouse/pull/586
-            {"input_format_parquet_use_metadata_cache", false, true, "Turn optimization ON by default"},
+            {"input_format_parquet_use_metadata_cache", true, true, "New setting, turned ON by default"}, // https://github.com/Altinity/ClickHouse/pull/586
         }
     },
     {"24.12",
