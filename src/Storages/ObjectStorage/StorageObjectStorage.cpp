@@ -58,6 +58,9 @@ String StorageObjectStorage::getPathSample(ContextPtr context)
     if (context->getSettingsRef()[Setting::use_hive_partitioning])
         local_distributed_processing = false;
 
+    if (!configuration->isArchive() && !configuration->isPathWithGlobs() && !local_distributed_processing)
+        return configuration->getPath();
+
     auto file_iterator = StorageObjectStorageSource::createFileIterator(
         configuration,
         query_settings,
@@ -69,9 +72,6 @@ String StorageObjectStorage::getPathSample(ContextPtr context)
         nullptr, // read_keys
         {} // file_progress_callback
     );
-
-    if (!configuration->isArchive() && !configuration->isPathWithGlobs() && !local_distributed_processing)
-        return configuration->getPath();
 
     if (auto file = file_iterator->next(0))
         return file->getPath();
@@ -188,6 +188,13 @@ void StorageObjectStorage::Configuration::update(ObjectStoragePtr object_storage
 {
     IObjectStorage::ApplyNewSettingsOptions options{.allow_client_change = !isStaticConfiguration()};
     object_storage_ptr->applyNewSettings(context->getConfigRef(), getTypeName() + ".", context, options);
+    updated = true;
+}
+
+void StorageObjectStorage::Configuration::updateIfRequired(ObjectStoragePtr object_storage_ptr, ContextPtr local_context)
+{
+    if (!updated)
+        update(object_storage_ptr, local_context);
 }
 
 bool StorageObjectStorage::hasExternalDynamicMetadata() const

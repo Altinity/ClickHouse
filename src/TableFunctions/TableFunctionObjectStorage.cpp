@@ -156,10 +156,14 @@ StoragePtr TableFunctionObjectStorage<Definition, Configuration>::executeImpl(
             parallel_replicas_cluster_name,
             configuration,
             getObjectStorage(context, !is_insert_query),
+            context,
             StorageID(getDatabaseName(), table_name),
             columns,
             ConstraintsDescription{},
-            context);
+            /* comment */ String{},
+            /* format_settings */ std::nullopt, /// No format_settings
+            /* mode */ LoadingStrictnessLevel::CREATE,
+            /* partition_by */ nullptr);
 
         storage->startup();
         return storage;
