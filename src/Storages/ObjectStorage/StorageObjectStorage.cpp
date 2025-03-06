@@ -101,7 +101,15 @@ StorageObjectStorage::StorageObjectStorage(
     , distributed_processing(distributed_processing_)
     , log(getLogger(fmt::format("Storage{}({})", configuration->getEngineName(), table_id_.getFullTableName())))
 {
-    try
+    if (configuration->partitioning_style != "auto" && configuration->withPartitionWildcard())
+    {
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "The {} macro can't be used with {} partitioning style",
+                        PartitionedSink::PARTITION_ID_WILDCARD, configuration->partitioning_style);
+    }
+
+    bool do_lazy_init = lazy_init && !columns_.empty() && !configuration->format.empty();
+    bool failed_init = false;
+    auto do_init = [&]()
     {
         if (!lazy_init)
         {
@@ -393,7 +401,7 @@ SinkToStoragePtr StorageObjectStorage::write(
 
         if (partition_by_ast)
         {
-            auto partition_strategy = PartitionStrategyProvider::get(partition_by_ast, sample_block, local_context, configuration->format);
+            auto partition_strategy = PartitionStrategyProvider::get(partition_by_ast, sample_block, local_context, configuration->format, configuration->partitioning_style);
             return std::make_shared<PartitionedStorageObjectStorageSink>(
                 partition_strategy, object_storage, configuration, format_settings, sample_block, local_context);
         }
