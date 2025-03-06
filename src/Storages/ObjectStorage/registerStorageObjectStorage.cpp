@@ -75,11 +75,6 @@ createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObject
     if (args.storage_def->partition_by)
         partition_by = args.storage_def->partition_by->clone();
 
-//    if (context->getSettingsRef()[Setting::use_hive_partitioning] && configuration->withPartitionWildcard())
-//    {
-//        throw Exception(ErrorCodes::BAD_ARGUMENTS, "The _partition_id macro can't be used with hive partitioning");
-//    }
-
     return std::make_shared<StorageObjectStorage>(
         configuration,
         configuration->createObjectStorage(context, /* is_readonly */ false),
