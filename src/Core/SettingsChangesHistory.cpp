@@ -172,6 +172,12 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             /// Release closed. Please use 25.1
         });
         addSettingsChanges(settings_changes_history, "24.11",
+            {"object_storage_cluster", "", "", "New setting"},
+            {"object_storage_max_nodes", 0, 0, "New setting"},
+            {"input_format_parquet_use_metadata_cache", 0, 1, "Optimization by default"},
+        }
+    },
+    {"24.11",
         {
             {"validate_mutation_query", false, true, "New setting to validate mutation queries by default."},
             {"enable_job_stack_trace", false, true, "Enable by default collecting stack traces from job's scheduling."},
