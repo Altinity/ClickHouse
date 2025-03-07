@@ -146,7 +146,6 @@ namespace CurrentMetrics
 
 namespace DB
 {
-
 namespace FailPoints
 {
     extern const char replicated_queue_fail_next_entry[];
@@ -3885,6 +3884,12 @@ void StorageReplicatedMergeTree::mergeSelectingTask()
                     return AttemptStatus::NeedRetry;
                 }
 
+                bool cleanup = future_merged_part->final
+                    && storage_settings_ptr->allow_experimental_replacing_merge_with_cleanup
+                    && storage_settings_ptr->enable_replacing_merge_with_cleanup_for_min_age_to_force_merge
+                    && storage_settings_ptr->min_age_to_force_merge_seconds
+                    && storage_settings_ptr->min_age_to_force_merge_on_partition_only;
+
                 create_result = createLogEntryToMergeParts(
                     zookeeper,
                     future_merged_part->parts,
@@ -3893,7 +3898,7 @@ void StorageReplicatedMergeTree::mergeSelectingTask()
                     future_merged_part->part_format,
                     deduplicate,
                     deduplicate_by_columns,
-                    /*cleanup*/ false,
+                    cleanup,
                     nullptr,
                     merge_predicate->getVersion(),
                     future_merged_part->merge_type);
@@ -5890,7 +5895,7 @@ bool StorageReplicatedMergeTree::optimize(
                         parts_collector,
                         merge_predicate,
                         MergeSelectorApplier{
-                            .max_total_size_to_merge = (*storage_settings_ptr)[MergeTreeSetting::max_bytes_to_merge_at_max_space_in_pool],
+                            .max_total_size_to_merge = storage_settings_ptr->max_bytes_to_merge_at_max_space_in_pool,
                             .merge_with_ttl_allowed = false,
                             .aggressive = true,
                         },
@@ -5917,7 +5922,7 @@ bool StorageReplicatedMergeTree::optimize(
                         .explanation = PreformattedMessage::create("Can't construct future part from source parts. Probably there was a drop part/partition user query."),
                     });
 
-                if ((*storage_settings.get())[MergeTreeSetting::assign_part_uuids])
+                if (storage_settings.get()->assign_part_uuids)
                     future_part->uuid = UUIDHelpers::generateV4();
 
                 return future_part;

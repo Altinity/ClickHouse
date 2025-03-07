@@ -48,7 +48,6 @@
 namespace DB
 {
 
-
 namespace ErrorCodes
 {
     extern const int NOT_IMPLEMENTED;
@@ -982,7 +981,7 @@ std::expected<MergeMutateSelectedEntryPtr, SelectMergeFailure> StorageMergeTree:
             });
         }
 
-        if ((*getSettings())[MergeTreeSetting::assign_part_uuids])
+        if (getSettings()->assign_part_uuids)
             future_part->uuid = UUIDHelpers::generateV4();
 
         return future_part;
@@ -997,7 +996,7 @@ std::expected<MergeMutateSelectedEntryPtr, SelectMergeFailure> StorageMergeTree:
             });
 
         UInt64 max_source_parts_size = CompactionStatistics::getMaxSourcePartsSizeForMerge(*this);
-        bool merge_with_ttl_allowed = getTotalMergesWithTTLInMergeList() < (*getSettings())[MergeTreeSetting::max_number_of_merges_with_ttl_in_pool];
+        bool merge_with_ttl_allowed = getTotalMergesWithTTLInMergeList() < getSettings()->max_number_of_merges_with_ttl_in_pool;
 
         /// TTL requirements is much more strict than for regular merge, so
         /// if regular not possible, than merge with ttl is also not possible.
@@ -1405,7 +1404,13 @@ bool StorageMergeTree::scheduleDataProcessingJob(BackgroundJobsAssignee & assign
         if (is_cancelled(merge_entry))
             return false;
 
-        auto task = std::make_shared<MergePlainMergeTreeTask>(*this, metadata_snapshot, /* deduplicate */ false, Names{}, /* cleanup */ false, merge_entry, shared_lock, common_assignee_trigger);
+        bool cleanup = merge_entry->future_part->final
+            && getSettings()->allow_experimental_replacing_merge_with_cleanup
+            && getSettings()->enable_replacing_merge_with_cleanup_for_min_age_to_force_merge
+            && getSettings()->min_age_to_force_merge_seconds
+            && getSettings()->min_age_to_force_merge_on_partition_only;
+
+        auto task = std::make_shared<MergePlainMergeTreeTask>(*this, metadata_snapshot, /* deduplicate */ false, Names{}, cleanup, merge_entry, shared_lock, common_assignee_trigger);
         task->setCurrentTransaction(std::move(transaction_for_merge), std::move(txn));
         bool scheduled = assignee.scheduleMergeMutateTask(task);
         /// The problem that we already booked a slot for TTL merge, but a merge list entry will be created only in a prepare method

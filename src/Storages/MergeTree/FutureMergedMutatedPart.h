@@ -23,6 +23,7 @@ struct FutureMergedMutatedPart
     MergeTreePartInfo part_info;
     MergeTreeData::DataPartsVector parts;
     MergeType merge_type = MergeType::Regular;
+    bool final = false;
 
     const MergeTreePartition & getPartition() const { return parts.front()->partition; }
 
