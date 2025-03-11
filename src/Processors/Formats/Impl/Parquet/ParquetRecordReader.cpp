@@ -243,14 +243,8 @@ std::unique_ptr<ParquetColumnReader> ColReaderFactory::fromInt32INT(const parque
         case 32:
         {
             if (int_type.is_signed())
-<<<<<<< HEAD
-                return makeLeafReader<DataTypeInt32>();
-            else
-                return makeLeafReader<DataTypeUInt32>();
-=======
                 return makeLeafReader<DataTypeInt32, int32_t>();
             return makeLeafReader<DataTypeUInt32, int32_t>();
->>>>>>> 92a1f0c562a (approach1)
         }
         default:
             return throwUnsupported(PreformattedMessage::create(", bit width: {}", int_type.bit_width()));
@@ -264,14 +258,8 @@ std::unique_ptr<ParquetColumnReader> ColReaderFactory::fromInt64INT(const parque
         case 64:
         {
             if (int_type.is_signed())
-<<<<<<< HEAD
-                return makeLeafReader<DataTypeInt64>();
-            else
-                return makeLeafReader<DataTypeUInt64>();
-=======
-                return makeLeafReader<DataTypeInt64, int64_t>();
-            return makeLeafReader<DataTypeUInt64, int64_t>();
->>>>>>> 92a1f0c562a (approach1)
+            	return makeLeafReader<DataTypeInt64, int64_t>();
+	    return makeLeafReader<DataTypeUInt64, int64_t>();
         }
         default:
             return throwUnsupported(PreformattedMessage::create(", bit width: {}", int_type.bit_width()));
