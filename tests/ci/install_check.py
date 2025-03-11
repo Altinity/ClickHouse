@@ -31,7 +31,10 @@ test_env='TEST_THE_DEFAULT_PARAMETER=15'
 echo "$test_env" >> /etc/default/clickhouse
 systemctl restart clickhouse-server
 clickhouse-client -q 'SELECT version()'
-grep "$test_env" /proc/$(cat /var/run/clickhouse-server/clickhouse-server.pid)/environ"""
+grep "$test_env" /proc/$(cat /var/run/clickhouse-server/clickhouse-server.pid)/environ
+echo "Check Stacktrace"
+output=$(clickhouse-local --stacktrace --query="SELECT throwIf(1,'throw')" 2>&1 >/dev/null || true)
+echo "$output" | grep 'FunctionThrowIf::executeImpl'"""
     initd_test = r"""#!/bin/bash
 set -e
 trap "bash -ex /packages/preserve_logs.sh" ERR
@@ -89,6 +92,7 @@ cp /var/log/clickhouse-keeper/clickhouse-keeper.* /tests_logs/ || :
 chmod a+rw -R /tests_logs
 exit 1
 """
+
     (TEMP_PATH / "server_test.sh").write_text(server_test, encoding="utf-8")
     (TEMP_PATH / "initd_test.sh").write_text(initd_test, encoding="utf-8")
     (TEMP_PATH / "keeper_test.sh").write_text(keeper_test, encoding="utf-8")
