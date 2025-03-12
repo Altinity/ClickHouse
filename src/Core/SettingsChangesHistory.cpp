@@ -60,6 +60,7 @@ static std::initializer_list<std::pair<ClickHouseVersion, SettingsChangesHistory
     {"24.8.14",
         {
             {"query_plan_merge_filters", false, true, "Allow to merge filters in the query plan. This is required to properly support filter-push-down with a new analyzer."}, // #71539 via https://github.com/Altinity/ClickHouse/pull/640
+            {"allow_reorder_prewhere_conditions", false, true, "New setting."}, // #71539 via https://github.com/Altinity/ClickHouse/pull/640
         }
     },
     {"24.8.11",
