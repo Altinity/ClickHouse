@@ -54,7 +54,7 @@ def get_checks_known_fails(client: Client, job_url: str, known_fails: dict):
         len(df.columns) - 1,
         "reason",
         df["test_name"]
-        .cat.remove_unused_categories()
+        .astype(str)
         .apply(
             lambda test_name: known_fails[test_name].get("reason", "No reason given")
         ),
