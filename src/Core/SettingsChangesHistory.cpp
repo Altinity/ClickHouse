@@ -57,30 +57,24 @@ String ClickHouseVersion::toString() const
 /// Note: please check if the key already exists to prevent duplicate entries.
 static std::initializer_list<std::pair<ClickHouseVersion, SettingsChangesHistory::SettingsChanges>> settings_changes_history_initializer =
 {
-    {"24.12",
+    {"24.8.14",
         {
+            {"query_plan_merge_filters", false, true, "Allow to merge filters in the query plan. This is required to properly support filter-push-down with a new analyzer."}, // #71539 via https://github.com/Altinity/ClickHouse/pull/640
+            {"allow_reorder_prewhere_conditions", false, true, "New setting."}, // #71539 via https://github.com/Altinity/ClickHouse/pull/640
         }
     },
-    {"24.11",
+    {"24.8.11",
         {
-            {"push_external_roles_in_interserver_queries", false, true, "New setting."}
-        }
-    },
-    {"24.10",
-        {
-        }
-    },
-    {"24.9",
-        {
-            {"enable_parallel_replicas", false, false, "Parallel replicas with read tasks became the Beta tier feature."},
-            {"parallel_replicas_mode", "read_tasks", "read_tasks", "This setting was introduced as a part of making parallel replicas feature Beta"},
-            {"parallel_replicas_mark_segment_size", 128, 0, "Value for this setting now determined automatically"},
-            {"parallel_replicas_local_plan", false, false, "Use local plan for local replica in a query with parallel replicas"}
+            {"enable_parallel_replicas", false, false, "Parallel replicas with read tasks became the Beta tier feature."}, // #63151 via https://github.com/Altinity/ClickHouse/pull/542
+            {"parallel_replicas_mark_segment_size", 128, 0, "Value for this setting now determined automatically"}, // #68424 via https://github.com/Altinity/ClickHouse/pull/542
+            {"parallel_replicas_local_plan", false, false, "Use local plan for local replica in a query with parallel replicas"}, // #64448 via https://github.com/Altinity/ClickHouse/pull/542
+            {"parallel_replicas_mode", "read_tasks", "read_tasks", "This setting was introduced as a part of making parallel replicas feature Beta"}, // #63151 via https://github.com/Altinity/ClickHouse/pull/542
+            {"push_external_roles_in_interserver_queries", false, true, "New setting."}, // #70332 via https://github.com/Altinity/ClickHouse/pull/542
         }
     },
     {"24.8",
         {
-	    {"input_format_parquet_bloom_filter_push_down", false, true, "When reading Parquet files, skip whole row groups based on the WHERE/PREWHERE expressions and bloom filter in the Parquet metadata."},
+            {"input_format_parquet_bloom_filter_push_down", false, true, "When reading Parquet files, skip whole row groups based on the WHERE/PREWHERE expressions and bloom filter in the Parquet metadata."},
             {"enable_named_columns_in_function_tuple", false, false, "Retroactively disabled by default due to critical bugs."},
             {"rows_before_aggregation", false, false, "Provide exact value for rows_before_aggregation statistic, represents the number of rows read before aggregation"},
             {"restore_replace_external_table_functions_to_null", false, false, "New setting."},
