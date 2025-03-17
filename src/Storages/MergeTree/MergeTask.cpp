@@ -108,6 +108,20 @@ static void addMissedColumnsToSerializationInfos(
     }
 }
 
+bool MergeTask::GlobalRuntimeContext::isCancelled() const
+{
+    return (future_part ? merges_blocker->isCancelledForPartition(future_part->part_info.partition_id) : merges_blocker->isCancelled())
+        || merge_list_element_ptr->is_cancelled.load(std::memory_order_relaxed);
+}
+
+void MergeTask::GlobalRuntimeContext::checkOperationIsNotCanceled() const
+{
+    if (isCancelled())
+    {
+        throw Exception(ErrorCodes::ABORTED, "Cancelled merging parts");
+    }
+}
+
 /// PK columns are sorted and merged, ordinary columns are gathered using info from merge step
 void MergeTask::ExecuteAndFinalizeHorizontalPart::extractMergingAndGatheringColumns() const
 {
@@ -193,8 +207,7 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare()
     }
     const String local_tmp_suffix = global_ctx->parent_part ? ctx->suffix : "";
 
-    if (global_ctx->merges_blocker->isCancelled() || global_ctx->merge_list_element_ptr->is_cancelled.load(std::memory_order_relaxed))
-        throw Exception(ErrorCodes::ABORTED, "Cancelled merging parts");
+    global_ctx->checkOperationIsNotCanceled();
 
     /// We don't want to perform merge assigned with TTL as normal merge, so
     /// throw exception
@@ -274,6 +287,14 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare()
     if (enabledBlockOffsetColumn(global_ctx))
         addGatheringColumn(global_ctx, BlockOffsetColumn::name, BlockOffsetColumn::type);
 
+    MergeTreeData::IMutationsSnapshot::Params params
+    {
+        .metadata_version = global_ctx->metadata_snapshot->getMetadataVersion(),
+        .min_part_metadata_version = MergeTreeData::getMinMetadataVersion(global_ctx->future_part->parts),
+    };
+
+    auto mutations_snapshot = global_ctx->data->getMutationsSnapshot(params);
+
     SerializationInfo::Settings info_settings =
     {
         .ratio_of_defaults_for_sparse = global_ctx->data->getSettings()->ratio_of_defaults_for_sparse_serialization,
@@ -281,10 +302,12 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare()
     };
 
     SerializationInfoByName infos(global_ctx->storage_columns, info_settings);
+    global_ctx->alter_conversions.reserve(global_ctx->future_part->parts.size());
 
     for (const auto & part : global_ctx->future_part->parts)
     {
         global_ctx->new_data_part->ttl_infos.update(part->ttl_infos);
+
         if (global_ctx->metadata_snapshot->hasAnyTTL() && !part->checkAllTTLCalculated(global_ctx->metadata_snapshot))
         {
             LOG_INFO(ctx->log, "Some TTL values were not calculated for part {}. Will calculate them forcefully during merge.", part->name);
@@ -305,6 +328,8 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare()
 
             infos.add(part_infos);
         }
+
+        global_ctx->alter_conversions.push_back(MergeTreeData::getAlterConversionsForPart(part, mutations_snapshot, global_ctx->metadata_snapshot, global_ctx->context));
     }
 
     const auto & local_part_min_ttl = global_ctx->new_data_part->ttl_infos.part_min_ttl;
@@ -428,9 +453,10 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare()
     ctx->is_cancelled = [merges_blocker = global_ctx->merges_blocker,
         ttl_merges_blocker = global_ctx->ttl_merges_blocker,
         need_remove = ctx->need_remove_expired_values,
-        merge_list_element = global_ctx->merge_list_element_ptr]() -> bool
+        merge_list_element = global_ctx->merge_list_element_ptr,
+        partition_id = global_ctx->future_part->part_info.partition_id]() -> bool
     {
-        return merges_blocker->isCancelled()
+        return merges_blocker->isCancelledForPartition(partition_id)
             || (need_remove && ttl_merges_blocker->isCancelled())
             || merge_list_element->is_cancelled.load(std::memory_order_relaxed);
     };
@@ -563,8 +589,7 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::finalize() const
     global_ctx->merging_executor.reset();
     global_ctx->merged_pipeline.reset();
 
-    if (global_ctx->merges_blocker->isCancelled() || global_ctx->merge_list_element_ptr->is_cancelled.load(std::memory_order_relaxed))
-        throw Exception(ErrorCodes::ABORTED, "Cancelled merging parts");
+    global_ctx->checkOperationIsNotCanceled();
 
     if (ctx->need_remove_expired_values && global_ctx->ttl_merges_blocker->isCancelled())
         throw Exception(ErrorCodes::ABORTED, "Cancelled merging parts with expired TTL");
@@ -657,6 +682,7 @@ Pipe MergeTask::VerticalMergeStage::createPipeForReadingOneColumn(const String &
             *global_ctx->data,
             global_ctx->storage_snapshot,
             global_ctx->future_part->parts[part_num],
+            global_ctx->alter_conversions[part_num],
             Names{column_name},
             /*mark_ranges=*/ {},
             global_ctx->input_rows_filtered,
@@ -756,8 +782,7 @@ bool MergeTask::VerticalMergeStage::executeVerticalMergeForOneColumn() const
     {
         Block block;
 
-        if (global_ctx->merges_blocker->isCancelled()
-            || global_ctx->merge_list_element_ptr->is_cancelled.load(std::memory_order_relaxed)
+        if (global_ctx->isCancelled()
             || !ctx->executor->pull(block))
             return false;
 
@@ -773,8 +798,7 @@ bool MergeTask::VerticalMergeStage::executeVerticalMergeForOneColumn() const
 void MergeTask::VerticalMergeStage::finalizeVerticalMergeForOneColumn() const
 {
     const String & column_name = ctx->it_name_and_type->name;
-    if (global_ctx->merges_blocker->isCancelled() || global_ctx->merge_list_element_ptr->is_cancelled.load(std::memory_order_relaxed))
-        throw Exception(ErrorCodes::ABORTED, "Cancelled merging parts");
+    global_ctx->checkOperationIsNotCanceled();
 
     ctx->executor.reset();
     auto changed_checksums = ctx->column_to->fillChecksums(global_ctx->new_data_part, global_ctx->checksums_gathered_columns);
@@ -1107,13 +1131,14 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::createMergedStream()
     global_ctx->horizontal_stage_progress = std::make_unique<MergeStageProgress>(
         ctx->column_sizes ? ctx->column_sizes->keyColumnsWeight() : 1.0);
 
-    for (const auto & part : global_ctx->future_part->parts)
+    for (size_t i = 0; i < global_ctx->future_part->parts.size(); ++i)
     {
         Pipe pipe = createMergeTreeSequentialSource(
             MergeTreeSequentialSourceType::Merge,
             *global_ctx->data,
             global_ctx->storage_snapshot,
-            part,
+            global_ctx->future_part->parts[i],
+            global_ctx->alter_conversions[i],
             global_ctx->merging_columns.getNames(),
             /*mark_ranges=*/ {},
             global_ctx->input_rows_filtered,

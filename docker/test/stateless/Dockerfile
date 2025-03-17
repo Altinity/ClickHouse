@@ -1,7 +1,7 @@
 # rebuild in #33610
-# docker build -t clickhouse/stateless-test .
+# docker build -t altinityinfra/stateless-test .
 ARG FROM_TAG=latest
-FROM clickhouse/test-base:$FROM_TAG
+FROM altinityinfra/test-base:$FROM_TAG
 
 ARG odbc_driver_url="https://github.com/ClickHouse/clickhouse-odbc/releases/download/v1.1.6.20200320/clickhouse-odbc-1.1.6-Linux.tar.gz"
 
@@ -87,7 +87,7 @@ ENV MINIO_ROOT_PASSWORD="clickhouse"
 ENV EXPORT_S3_STORAGE_POLICIES=1
 ENV CLICKHOUSE_GRPC_CLIENT="/usr/share/clickhouse-utils/grpc-client/clickhouse-grpc-client.py"
 
-RUN npm install -g azurite@3.30.0 \
+RUN npm install -g azurite@^3.33.0 \
     && npm install -g tslib && npm install -g node
 
 COPY run.sh /

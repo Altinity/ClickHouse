@@ -16,7 +16,7 @@ from stopwatch import Stopwatch
 from tee_popen import TeePopen
 from ci_config import CI
 
-IMAGE_NAME = "clickhouse/fuzzer"
+IMAGE_NAME = "altinityinfra/fuzzer"
 
 
 def get_run_command(
@@ -30,6 +30,7 @@ def get_run_command(
         f"-e PR_TO_TEST={pr_info.number}",
         f"-e SHA_TO_TEST={pr_info.sha}",
         f"-e BINARY_URL_TO_DOWNLOAD='{build_url}'",
+        f"-e BASE_REF='{pr_info.base_ref}'"
     ]
 
     env_str = " ".join(envs)

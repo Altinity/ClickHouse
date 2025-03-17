@@ -365,15 +365,12 @@ class CI:
         ),
         JobNames.STRESS_TEST_ASAN: CommonJobConfigs.STRESS_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_ASAN],
-            random_bucket="stress_with_sanitizer",
         ),
         JobNames.STRESS_TEST_UBSAN: CommonJobConfigs.STRESS_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_UBSAN],
-            random_bucket="stress_with_sanitizer",
         ),
         JobNames.STRESS_TEST_MSAN: CommonJobConfigs.STRESS_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_MSAN],
-            random_bucket="stress_with_sanitizer",
         ),
         JobNames.STRESS_TEST_AZURE_TSAN: CommonJobConfigs.STRESS_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_TSAN], release_only=True
@@ -400,26 +397,30 @@ class CI:
             required_builds=[BuildNames.PACKAGE_DEBUG], pr_only=True
         ),
         JobNames.INTEGRATION_TEST_ASAN: CommonJobConfigs.INTEGRATION_TEST.with_properties(
-            required_builds=[BuildNames.PACKAGE_ASAN], release_only=True, num_batches=4
+            required_builds=[BuildNames.PACKAGE_ASAN], num_batches=4,
+            timeout=9000,  # the job timed out with default value (7200)
         ),
         JobNames.INTEGRATION_TEST_ASAN_OLD_ANALYZER: CommonJobConfigs.INTEGRATION_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_ASAN],
             num_batches=6,
+            timeout=12000,  # the job timed out with default value (7200)
         ),
         JobNames.INTEGRATION_TEST_TSAN: CommonJobConfigs.INTEGRATION_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_TSAN],
             num_batches=6,
-            timeout=9000,  # the job timed out with default value (7200)
+            timeout=12000,  # the job timed out with default value (7200)
         ),
         JobNames.INTEGRATION_TEST_ARM: CommonJobConfigs.INTEGRATION_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_AARCH64],
             num_batches=6,
             runner_type=Runners.FUNC_TESTER_ARM,
+            timeout=12000,  # the job timed out with default value (7200)
         ),
         JobNames.INTEGRATION_TEST: CommonJobConfigs.INTEGRATION_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_RELEASE],
             num_batches=4,
-            release_only=True,
+            #release_only=True,
+            timeout=12000,  # the job timed out with default value (7200)
         ),
         JobNames.INTEGRATION_TEST_FLAKY: CommonJobConfigs.INTEGRATION_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_ASAN],
@@ -469,7 +470,7 @@ class CI:
         JobNames.STATELESS_TEST_FLAKY_ASAN: CommonJobConfigs.STATELESS_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_ASAN],
             pr_only=True,
-            timeout=3600,
+            timeout=3 * 3600,
             # TODO: approach with reference job names does not work because digest may not be calculated if job skipped in wf
             # reference_job_name=JobNames.STATELESS_TEST_RELEASE,
         ),
@@ -530,7 +531,7 @@ class CI:
         JobNames.DOCS_CHECK: JobConfig(
             digest=DigestConfig(
                 include_paths=["**/*.md", "./docs", "tests/ci/docs_check.py"],
-                docker=["clickhouse/docs-builder"],
+                docker=["altinityinfra/docs-builder"],
             ),
             run_command="docs_check.py",
             runner_type=Runners.FUNC_TESTER,
@@ -540,7 +541,7 @@ class CI:
             digest=DigestConfig(
                 include_paths=["./tests/queries/0_stateless/"],
                 exclude_files=[".md"],
-                docker=["clickhouse/fasttest"],
+                docker=["altinityinfra/fasttest"],
             ),
             timeout=2400,
             runner_type=Runners.BUILDER,
@@ -554,6 +555,14 @@ class CI:
             run_command="bugfix_validate_check.py",
             timeout=900,
             runner_type=Runners.STYLE_CHECKER,
+        ),
+        JobNames.SIGN_RELEASE: JobConfig(
+            required_builds=[BuildNames.PACKAGE_RELEASE],
+            runner_type=Runners.STYLE_CHECKER
+        ),
+        JobNames.SIGN_AARCH64: JobConfig(
+            required_builds=[BuildNames.PACKAGE_AARCH64],
+            runner_type=Runners.STYLE_CHECKER_ARM
         ),
     }
 

@@ -9,6 +9,7 @@
 #include <Storages/Statistics/Statistics.h>
 #include <Columns/ColumnsNumber.h>
 #include <Parsers/queryToString.h>
+#include <Interpreters/Context.h>
 #include <Interpreters/Squashing.h>
 #include <Interpreters/MergeTreeTransaction.h>
 #include <Interpreters/PreparedSets.h>
@@ -64,14 +65,6 @@ namespace ErrorCodes
 namespace MutationHelpers
 {
 
-static bool checkOperationIsNotCanceled(ActionBlocker & merges_blocker, MergeListEntry * mutate_entry)
-{
-    if (merges_blocker.isCancelled() || (*mutate_entry)->is_cancelled)
-        throw Exception(ErrorCodes::ABORTED, "Cancelled mutating parts");
-
-    return true;
-}
-
 static bool haveMutationsOfDynamicColumns(const MergeTreeData::DataPartPtr & data_part, const MutationCommands & commands)
 {
     for (const auto & command : commands)
@@ -114,6 +107,7 @@ static UInt64 getExistingRowsCount(const Block & block)
 static void splitAndModifyMutationCommands(
     MergeTreeData::DataPartPtr part,
     StorageMetadataPtr metadata_snapshot,
+    AlterConversionsPtr alter_conversions,
     const MutationCommands & commands,
     MutationCommands & for_interpreter,
     MutationCommands & for_file_renames,
@@ -178,8 +172,6 @@ static void splitAndModifyMutationCommands(
             }
 
         }
-
-        auto alter_conversions = part->storage.getAlterConversionsForPart(part);
 
         /// We don't add renames from commands, instead we take them from rename_map.
         /// It's important because required renames depend not only on part's data version (i.e. mutation version)
@@ -296,7 +288,6 @@ static void splitAndModifyMutationCommands(
             }
         }
 
-        auto alter_conversions = part->storage.getAlterConversionsForPart(part);
         /// We don't add renames from commands, instead we take them from rename_map.
         /// It's important because required renames depend not only on part's data version (i.e. mutation version)
         /// but also on part's metadata version. Why we have such logic only for renames? Because all other types of alter
@@ -986,7 +977,7 @@ struct MutationContext
 {
     MergeTreeData * data;
     MergeTreeDataMergerMutator * mutator;
-    ActionBlocker * merges_blocker;
+    PartitionActionBlocker * merges_blocker;
     TableLockHolder * holder;
     MergeListEntry * mutate_entry;
 
@@ -1049,6 +1040,17 @@ struct MutationContext
     bool need_prefix = true;
 
     scope_guard temporary_directory_lock;
+
+    bool checkOperationIsNotCanceled() const
+    {
+        if (new_data_part ? merges_blocker->isCancelledForPartition(new_data_part->info.partition_id) : merges_blocker->isCancelled()
+            || (*mutate_entry)->is_cancelled)
+        {
+            throw Exception(ErrorCodes::ABORTED, "Cancelled mutating parts");
+        }
+
+        return true;
+    }
 
     /// Whether we need to count lightweight delete rows in this mutation
     bool count_lightweight_deleted_rows;
@@ -1317,9 +1319,7 @@ bool PartMergerWriter::mutateOriginalPartAndPrepareProjections()
         Block cur_block;
         Block projection_header;
 
-        MutationHelpers::checkOperationIsNotCanceled(*ctx->merges_blocker, ctx->mutate_entry);
-
-        if (!ctx->mutating_executor->pull(cur_block))
+        if (!ctx->checkOperationIsNotCanceled() || !ctx->mutating_executor->pull(cur_block))
         {
             finalizeTempProjections();
             return false;
@@ -2017,7 +2017,7 @@ MutateTask::MutateTask(
     const MergeTreeTransactionPtr & txn,
     MergeTreeData & data_,
     MergeTreeDataMergerMutator & mutator_,
-    ActionBlocker & merges_blocker_,
+    PartitionActionBlocker & merges_blocker_,
     bool need_prefix_)
     : ctx(std::make_shared<MutationContext>())
 {
@@ -2059,7 +2059,7 @@ bool MutateTask::execute()
         }
         case State::NEED_EXECUTE:
         {
-            MutationHelpers::checkOperationIsNotCanceled(*ctx->merges_blocker, ctx->mutate_entry);
+            ctx->checkOperationIsNotCanceled();
 
             if (task->executeStep())
                 return true;
@@ -2152,13 +2152,22 @@ static bool canSkipMutationCommandForPart(const MergeTreeDataPartPtr & part, con
 bool MutateTask::prepare()
 {
     ProfileEvents::increment(ProfileEvents::MutationTotalParts);
-    MutationHelpers::checkOperationIsNotCanceled(*ctx->merges_blocker, ctx->mutate_entry);
+    ctx->checkOperationIsNotCanceled();
 
     if (ctx->future_part->parts.size() != 1)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Trying to mutate {} parts, not one. "
             "This is a bug.", ctx->future_part->parts.size());
 
     ctx->num_mutations = std::make_unique<CurrentMetrics::Increment>(CurrentMetrics::PartMutation);
+
+    MergeTreeData::IMutationsSnapshot::Params params
+    {
+        .metadata_version = ctx->metadata_snapshot->getMetadataVersion(),
+        .min_part_metadata_version = ctx->source_part->getMetadataVersion(),
+    };
+
+    auto mutations_snapshot = ctx->data->getMutationsSnapshot(params);
+    auto alter_conversions = MergeTreeData::getAlterConversionsForPart(ctx->source_part, mutations_snapshot, ctx->metadata_snapshot, ctx->context);
 
     auto context_for_reading = Context::createCopy(ctx->context);
 
@@ -2174,7 +2183,7 @@ bool MutateTask::prepare()
             ctx->commands_for_part.emplace_back(command);
 
     if (ctx->source_part->isStoredOnDisk() && !isStorageTouchedByMutations(
-        ctx->source_part, ctx->metadata_snapshot, ctx->commands_for_part, context_for_reading))
+        ctx->source_part, mutations_snapshot, ctx->metadata_snapshot, ctx->commands_for_part, context_for_reading))
     {
         NameSet files_to_copy_instead_of_hardlinks;
         auto settings_ptr = ctx->data->getSettings();
@@ -2234,8 +2243,13 @@ bool MutateTask::prepare()
     context_for_reading->setSetting("read_from_filesystem_cache_if_exists_otherwise_bypass_cache", 1);
 
     MutationHelpers::splitAndModifyMutationCommands(
-        ctx->source_part, ctx->metadata_snapshot,
-        ctx->commands_for_part, ctx->for_interpreter, ctx->for_file_renames, ctx->log);
+        ctx->source_part,
+        ctx->metadata_snapshot,
+        alter_conversions,
+        ctx->commands_for_part,
+        ctx->for_interpreter,
+        ctx->for_file_renames,
+        ctx->log);
 
     ctx->stage_progress = std::make_unique<MergeStageProgress>(1.0);
 
@@ -2247,7 +2261,8 @@ bool MutateTask::prepare()
         settings.apply_deleted_mask = false;
 
         ctx->interpreter = std::make_unique<MutationsInterpreter>(
-            *ctx->data, ctx->source_part, ctx->metadata_snapshot, ctx->for_interpreter,
+            *ctx->data, ctx->source_part, alter_conversions,
+            ctx->metadata_snapshot, ctx->for_interpreter,
             ctx->metadata_snapshot->getColumns().getNamesOfPhysical(), context_for_reading, settings);
 
         ctx->materialized_indices = ctx->interpreter->grabMaterializedIndices();

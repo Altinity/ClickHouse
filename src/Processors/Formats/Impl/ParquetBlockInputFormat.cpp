@@ -14,6 +14,8 @@
 #include <arrow/status.h>
 #include <parquet/arrow/reader.h>
 #include <parquet/arrow/schema.h>
+#include <parquet/bloom_filter.h>
+#include <parquet/bloom_filter_reader.h>
 #include <parquet/file_reader.h>
 #include <parquet/statistics.h>
 #include "ArrowBufferedStreams.h"
@@ -25,6 +27,7 @@
 #include <DataTypes/DataTypeNullable.h>
 #include <Common/FieldVisitorsAccurateComparison.h>
 #include <Processors/Formats/Impl/Parquet/ParquetRecordReader.h>
+#include <Processors/Formats/Impl/Parquet/parquetBloomFilterHash.h>
 #include <Interpreters/convertFieldToType.h>
 
 namespace CurrentMetrics
@@ -43,6 +46,7 @@ namespace ErrorCodes
     extern const int INCORRECT_DATA;
     extern const int CANNOT_READ_ALL_DATA;
     extern const int CANNOT_PARSE_NUMBER;
+    extern const int LOGICAL_ERROR;
 }
 
 #define THROW_ARROW_NOT_OK(status)                                     \
@@ -264,6 +268,72 @@ static Field decodePlainParquetValueSlow(const std::string & data, parquet::Type
     return field;
 }
 
+struct ParquetBloomFilter final : public KeyCondition::BloomFilter
+{
+    explicit ParquetBloomFilter(std::unique_ptr<parquet::BloomFilter> && parquet_bf_)
+        : parquet_bf(std::move(parquet_bf_)) {}
+
+    bool findAnyHash(const std::vector<uint64_t> & hashes) override
+    {
+        for (const auto hash : hashes)
+        {
+            if (parquet_bf->FindHash(hash))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+private:
+    std::unique_ptr<parquet::BloomFilter> parquet_bf;
+};
+
+static KeyCondition::ColumnIndexToBloomFilter buildColumnIndexToBF(
+    parquet::BloomFilterReader & bf_reader,
+    int row_group,
+    const std::vector<ArrowFieldIndexUtil::ClickHouseIndexToParquetIndex> & clickhouse_column_index_to_parquet_index,
+    const std::unordered_set<std::size_t> & filtering_columns
+)
+{
+    auto rg_bf = bf_reader.RowGroup(row_group);
+
+    if (!rg_bf)
+    {
+        return {};
+    }
+
+    KeyCondition::ColumnIndexToBloomFilter index_to_column_bf;
+
+    for (const auto & [clickhouse_index, parquet_indexes] : clickhouse_column_index_to_parquet_index)
+    {
+        if (!filtering_columns.contains(clickhouse_index))
+        {
+            continue;
+        }
+
+        // Complex / nested types contain more than one index. We don't support those.
+        if (parquet_indexes.size() > 1)
+        {
+            continue;
+        }
+
+        auto parquet_index = parquet_indexes[0];
+
+        auto parquet_bf = rg_bf->GetColumnBloomFilter(parquet_index);
+
+        if (!parquet_bf)
+        {
+            continue;
+        }
+
+        index_to_column_bf[clickhouse_index] = std::make_unique<ParquetBloomFilter>(std::move(parquet_bf));
+    }
+
+    return index_to_column_bf;
+}
+
 /// Range of values for each column, based on statistics in the Parquet metadata.
 /// This is lower/upper bounds, not necessarily exact min and max, e.g. the min/max can be just
 /// missing in the metadata.
@@ -426,6 +496,61 @@ static std::vector<Range> getHyperrectangleForRowGroup(const parquet::FileMetaDa
     return hyperrectangle;
 }
 
+std::unordered_set<std::size_t> getBloomFilterFilteringColumnKeys(const KeyCondition::RPN & rpn)
+{
+    std::unordered_set<std::size_t> column_keys;
+
+    for (const auto & element : rpn)
+    {
+        if (auto bf_data = element.bloom_filter_data)
+        {
+            for (const auto index : bf_data->key_columns)
+            {
+                column_keys.insert(index);
+            }
+        }
+    }
+
+    return column_keys;
+}
+
+const parquet::ColumnDescriptor * getColumnDescriptorIfBloomFilterIsPresent(
+    const std::unique_ptr<parquet::RowGroupMetaData> & parquet_rg_metadata,
+    const std::vector<ArrowFieldIndexUtil::ClickHouseIndexToParquetIndex> & clickhouse_column_index_to_parquet_index,
+    std::size_t clickhouse_column_index)
+{
+    if (clickhouse_column_index_to_parquet_index.size() <= clickhouse_column_index)
+    {
+        return nullptr;
+    }
+
+    const auto & parquet_indexes = clickhouse_column_index_to_parquet_index[clickhouse_column_index].parquet_indexes;
+
+    // complex types like structs, tuples and maps will have more than one index.
+    // we don't support those for now
+    if (parquet_indexes.size() > 1)
+    {
+        return nullptr;
+    }
+
+    if (parquet_indexes.empty())
+    {
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Column maps to 0 parquet leaf columns, raise an issue and try the query with `input_format_parquet_bloom_filter_push_down=false`");
+    }
+
+    auto parquet_column_index = parquet_indexes[0];
+
+    const auto * parquet_column_descriptor = parquet_rg_metadata->schema()->Column(parquet_column_index);
+
+    bool column_has_bloom_filter = parquet_rg_metadata->ColumnChunk(parquet_column_index)->bloom_filter_offset().has_value();
+    if (!column_has_bloom_filter)
+    {
+        return nullptr;
+    }
+
+    return parquet_column_descriptor;
+}
+
 ParquetBlockInputFormat::ParquetBlockInputFormat(
     ReadBuffer & buf,
     const Block & header_,
@@ -471,9 +596,27 @@ void ParquetBlockInputFormat::initializeIfNeeded()
     ArrowFieldIndexUtil field_util(
         format_settings.parquet.case_insensitive_column_matching,
         format_settings.parquet.allow_missing_columns);
-    column_indices = field_util.findRequiredIndices(getPort().getHeader(), *schema);
+
+    auto index_mapping = field_util.findRequiredIndices(getPort().getHeader(), *schema, *metadata);
+
+    for (const auto & [clickhouse_header_index, parquet_indexes] : index_mapping)
+    {
+        for (auto parquet_index : parquet_indexes)
+        {
+            column_indices.push_back(parquet_index);
+        }
+    }
 
     int num_row_groups = metadata->num_row_groups();
+
+    if (num_row_groups == 0)
+    {
+        return;
+    }
+
+    const auto bf_reader_properties = parquet::default_reader_properties();
+    std::unique_ptr<parquet::BloomFilterReader> bf_reader;
+
     row_group_batches.reserve(num_row_groups);
 
     auto adaptive_chunk_size = [&](int row_group_idx) -> size_t
@@ -494,20 +637,97 @@ void ParquetBlockInputFormat::initializeIfNeeded()
         return std::min(std::max(preferred_num_rows, MIN_ROW_NUM), static_cast<size_t>(format_settings.parquet.max_block_size));
     };
 
+    std::unordered_set<std::size_t> filtering_columns;
+
+    std::unique_ptr<KeyCondition> key_condition_with_bloom_filter_data;
+
+    if (key_condition)
+    {
+        key_condition_with_bloom_filter_data = std::make_unique<KeyCondition>(*key_condition);
+
+        if (format_settings.parquet.bloom_filter_push_down)
+        {
+            bf_reader = parquet::BloomFilterReader::Make(arrow_file, metadata, bf_reader_properties, nullptr);
+
+            auto hash_one = [&](size_t column_idx, const Field & f) -> std::optional<uint64_t>
+            {
+                const auto * parquet_column_descriptor
+                    = getColumnDescriptorIfBloomFilterIsPresent(metadata->RowGroup(0), index_mapping, column_idx);
+
+                if (!parquet_column_descriptor)
+                {
+                    return std::nullopt;
+                }
+
+                return parquetTryHashField(f, parquet_column_descriptor);
+            };
+
+            auto hash_many = [&](size_t column_idx, const ColumnPtr & column) -> std::optional<std::vector<uint64_t>>
+            {
+                const auto * parquet_column_descriptor
+                    = getColumnDescriptorIfBloomFilterIsPresent(metadata->RowGroup(0), index_mapping, column_idx);
+
+                if (!parquet_column_descriptor)
+                {
+                    return std::nullopt;
+                }
+
+                auto nested_column = column;
+
+                if (const auto & nullable_column = checkAndGetColumn<ColumnNullable>(column.get()))
+                {
+                    nested_column = nullable_column->getNestedColumnPtr();
+                }
+
+                return parquetTryHashColumn(nested_column.get(), parquet_column_descriptor);
+            };
+
+            key_condition_with_bloom_filter_data->prepareBloomFilterData(hash_one, hash_many);
+
+            filtering_columns = getBloomFilterFilteringColumnKeys(key_condition_with_bloom_filter_data->getRPN());
+        }
+    }
+
+    auto skip_row_group_based_on_filters = [&](int row_group)
+    {
+        if (!format_settings.parquet.filter_push_down && !format_settings.parquet.bloom_filter_push_down)
+        {
+            return false;
+        }
+
+        KeyCondition::ColumnIndexToBloomFilter column_index_to_bloom_filter;
+
+        const auto & header = getPort().getHeader();
+
+        std::vector<Range> hyperrectangle(header.columns(), Range::createWholeUniverse());
+
+        if (format_settings.parquet.filter_push_down)
+        {
+            hyperrectangle = getHyperrectangleForRowGroup(*metadata, row_group, header, format_settings);
+        }
+
+        if (format_settings.parquet.bloom_filter_push_down)
+        {
+            column_index_to_bloom_filter = buildColumnIndexToBF(*bf_reader, row_group, index_mapping, filtering_columns);
+        }
+
+        bool maybe_exists = key_condition_with_bloom_filter_data->checkInHyperrectangle(hyperrectangle, getPort().getHeader().getDataTypes(), column_index_to_bloom_filter).can_be_true;
+
+        return !maybe_exists;
+    };
+
     for (int row_group = 0; row_group < num_row_groups; ++row_group)
     {
         if (skip_row_groups.contains(row_group))
             continue;
 
-        if (format_settings.parquet.filter_push_down && key_condition
-            && !key_condition
-                    ->checkInHyperrectangle(
-                        getHyperrectangleForRowGroup(*metadata, row_group, getPort().getHeader(), format_settings),
-                        getPort().getHeader().getDataTypes())
-                    .can_be_true)
+        if (key_condition_with_bloom_filter_data && skip_row_group_based_on_filters(row_group))
+        {
             continue;
+        }
 
-        if (row_group_batches.empty() || row_group_batches.back().total_bytes_compressed >= min_bytes_for_seek)
+        // When single-threaded parsing, can prefetch row groups, so need to put all row groups in the same row_group_batch
+    if (row_group_batches.empty() || row_group_batches.back().total_bytes_compressed >= min_bytes_for_seek)
             row_group_batches.emplace_back();
 
         row_group_batches.back().row_groups_idxs.push_back(row_group);

@@ -67,7 +67,11 @@ from ci_cache import CiCache
 from ci_settings import CiSettings
 from ci_buddy import CIBuddy
 from stopwatch import Stopwatch
-from version_helper import get_version_from_repo
+from version_helper import (
+    get_version_from_repo,
+    get_version_from_string,
+    update_cmake_version
+)
 
 # pylint: disable=too-many-lines
 
@@ -389,7 +393,7 @@ def _pre_action(s3, job_name, batch, indata, pr_info):
             _get_ext_check_name(job_name),
         )
         ClickHouseHelper().insert_events_into(
-            db="default", table="checks", events=prepared_events
+            db="gh-data", table="checks", events=prepared_events
         )
     print(f"Pre action done. Report files [{reports_files}] have been downloaded")
 
@@ -973,7 +977,7 @@ def _add_build_to_version_history(
 
     print(f"::notice ::Log Adding record to versions history: {data}")
 
-    ch_helper.insert_event_into(db="default", table="version_history", event=data)
+    ch_helper.insert_event_into(db="gh-data", table="version_history", event=data)
 
 
 def _run_test(job_name: str, run_command: str) -> int:
@@ -1204,6 +1208,19 @@ def main() -> int:
             f"Check if rerun for name: [{check_name}], extended name [{check_name_with_group}]"
         )
 
+        # NOTE (vnemkov) Job might have not checked out git tags, so it can't properly compute version number.
+        # BUT if there is pre-computed version from `RunConfig` then we can reuse it.
+        pre_configured_version = indata.get('version', None)
+        git = Git(True)
+        if pre_configured_version is not None and git.commits_since_latest == 0:
+            print(f"Updating version in repo files from '{get_version_from_repo()}' to '{pre_configured_version}'")
+
+            pre_configured_version = get_version_from_string(pre_configured_version, git)
+            # need to set description, otherwise subsequent call (perhaps from other script) to get_version_from_repo() fails
+            pre_configured_version.with_description(pre_configured_version.flavour)
+
+            update_cmake_version(pre_configured_version)
+
         if job_report.job_skipped and not args.force:
             print(
                 f"Commit status or Build Report is already present - job will be skipped with status: [{job_report.status}]"
@@ -1319,7 +1336,7 @@ def main() -> int:
                 job_report.check_name or _get_ext_check_name(args.job_name),
             )
             ch_helper.insert_events_into(
-                db="default", table="checks", events=prepared_events
+                db="gh-data", table="checks", events=prepared_events
             )
 
         elif job_report.job_skipped:
@@ -1385,7 +1402,7 @@ def main() -> int:
                 _get_ext_check_name(args.job_name),
             )
             ClickHouseHelper().insert_events_into(
-                db="default", table="checks", events=prepared_events
+                db="gh-data", table="checks", events=prepared_events
             )
     ### POST action: end
 

@@ -9,7 +9,6 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from env_helper import GITHUB_REPOSITORY
 from get_robot_token import get_parameter_from_ssm
 from pr_info import PRInfo
 from report import TestResults
@@ -212,13 +211,17 @@ def prepare_tests_results_for_clickhouse(
     report_url: str,
     check_name: str,
 ) -> List[dict]:
-    base_ref = pr_info.base_ref
-    base_repo = pr_info.base_name
-    head_ref = pr_info.head_ref
-    head_repo = pr_info.head_name
-    pull_request_url = f"https://github.com/{GITHUB_REPOSITORY}/commits/{head_ref}"
+    pull_request_url = "https://github.com/Altinity/ClickHouse/commits/master"
+    base_ref = "master"
+    head_ref = "master"
+    base_repo = pr_info.repo_full_name
+    head_repo = pr_info.repo_full_name
     if pr_info.number != 0:
         pull_request_url = pr_info.pr_html_url
+        base_ref = pr_info.base_ref
+        base_repo = pr_info.base_name
+        head_ref = pr_info.head_ref
+        head_repo = pr_info.head_name
 
     common_properties = {
         "pull_request_number": pr_info.number,
