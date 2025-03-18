@@ -23,8 +23,14 @@ BASE_REF=${BASE_REF:="master"}
 
 function git_clone_with_retry
 {
+    git init "$1"
+    git remote add origin https://github.com/Altinity/ClickHouse.git
+
     for _ in 1 2 3 4; do
-        if git clone --depth 1 https://github.com/Altinity/ClickHouse.git -b "${BASE_REF}" -- "$1" 2>&1 | ts '%Y-%m-%d %H:%M:%S';then
+        if (cd "$1" \
+            && git fetch --depth 1 origin "${BASE_REF}" \
+            && git checkout FETCH_HEAD ) 2>&1 \
+            | ts '%Y-%m-%d %H:%M:%S'; then
             return 0
         else
             sleep 0.5
