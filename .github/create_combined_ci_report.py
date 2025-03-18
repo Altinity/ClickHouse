@@ -117,6 +117,7 @@ def get_regression_fails(client: Client, job_url: str):
             WHERE job_url='{job_url}'
             AND status IN ('Fail', 'Error')
             """
+    print(query)
     df = client.query_dataframe(query)
     df = drop_prefix_rows(df, "test_name")
     df["job_name"] = df["job_name"].str.title()
