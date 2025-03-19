@@ -22,7 +22,7 @@ def docker_login(relogin: bool = True) -> None:
         Shell.check(  # pylint: disable=unexpected-keyword-arg
             "docker login --username 'altinityinfra' --password-stdin",
             strict=True,
-            stdin_str=get_parameter_from_ssm("dockerhub-password"),
+            stdin_str=os.getenv("DOCKER_PASSWORD"),
             encoding="utf-8",
         )
 
