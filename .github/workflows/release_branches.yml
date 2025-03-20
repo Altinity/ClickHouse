@@ -648,3 +648,25 @@ jobs:
             echo "Error: $REPORT_LINK" >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
+  LeakCheck:
+    if: ${{ !cancelled() }}
+    needs: FinishCheck
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
+    env:
+      PREFIX: ${{ github.event.pull_request.number || 0 }}/${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Checkout scripts repo
+        uses: actions/checkout@v4
+        with:
+          repository: Altinity/actions
+          ref: 982f9516f7c8c5eb7f18a7f66e0f6098f57635f5
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install dpkg-dev rpm2cpio cpio
+      - name: Run leak check 1
+        run: |
+          python3 scripts/scan_s3_artifacts.py altinity-build-artifacts ${{ env.PREFIX }}
+      - name: Run leak check 2
+        run: |
+          python3 scripts/scan_s3_artifacts.py altinity-build-artifacts PRs/${{ env.PREFIX }}
