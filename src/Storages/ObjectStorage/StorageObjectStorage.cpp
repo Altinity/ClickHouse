@@ -112,26 +112,31 @@ StorageObjectStorage::StorageObjectStorage(
     bool failed_init = false;
     auto do_init = [&]()
     {
-        if (!lazy_init)
+        try
         {
             if (configuration->hasExternalDynamicMetadata())
                 configuration->updateAndGetCurrentSchema(object_storage, context);
             else
                 configuration->update(object_storage, context);
         }
-    }
-    catch (...)
-    {
-        // If we don't have format or schema yet, we can't ignore failed configuration update, because relevant configuration is crucial for format and schema inference
-        if (mode <= LoadingStrictnessLevel::CREATE || columns_.empty() || (configuration->format == "auto"))
+        catch (...)
         {
-            throw;
+            // If we don't have format or schema yet, we can't ignore failed configuration update,
+            // because relevant configuration is crucial for format and schema inference
+            if (mode <= LoadingStrictnessLevel::CREATE || columns_.empty() || (configuration->format == "auto"))
+            {
+                throw;
+            }
+            else
+            {
+                tryLogCurrentException(log);
+                failed_init = true;
+            }
         }
-        else
-        {
-            tryLogCurrentException(log);
-        }
-    }
+    };
+
+    if (!do_lazy_init)
+        do_init();
 
     std::string sample_path;
     ColumnsDescription columns{columns_};
