@@ -663,7 +663,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install dpkg-dev rpm2cpio cpio
+          sudo apt-get install -y dpkg-dev rpm2cpio cpio
       - name: Run leak check 1
         run: |
           python3 scripts/scan_s3_artifacts.py altinity-build-artifacts ${{ env.PREFIX }}
