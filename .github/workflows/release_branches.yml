@@ -659,7 +659,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Altinity/actions
-          ref: 982f9516f7c8c5eb7f18a7f66e0f6098f57635f5
+          ref: a617d7c75203e08cfcfff0766b01ace3c58235e5
       - name: Install dependencies
         run: |
           sudo apt-get update
