@@ -5,15 +5,16 @@ import logging
 import os
 import subprocess
 import sys
+from os import path as p
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from env_helper import TEMP_PATH
+module_dir = p.abspath(p.dirname(__file__))
 
 SCRIPT_PATH = Path(__file__).absolute()
 IMAGE_TYPE = "binary-builder"
 IMAGE_NAME = f"altinityinfra/{IMAGE_TYPE}"
-
+TEMP_PATH = os.getenv("TEMP_PATH", p.abspath(p.join(module_dir, "./tmp")))
 
 class BuildException(Exception):
     pass
