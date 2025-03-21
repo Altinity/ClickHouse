@@ -13,7 +13,7 @@ from botocore.exceptions import NoCredentialsError
 DATABASE_HOST_VAR = "CHECKS_DATABASE_HOST"
 DATABASE_USER_VAR = "CHECKS_DATABASE_USER"
 DATABASE_PASSWORD_VAR = "CHECKS_DATABASE_PASSWORD"
-S3_BUCKET = "altinity-build-artifacts"
+S3_BUCKET = "altinity-test-new-credentials"
 
 
 def get_checks_fails(client: Client, job_url: str):
