@@ -126,10 +126,6 @@ std::shared_ptr<StorageObjectStorageSource::IIterator> StorageObjectStorageSourc
     if (distributed_processing)
         return std::make_shared<ReadTaskIterator>(local_context->getReadTaskCallback(), local_context->getSettingsRef()[Setting::max_threads]);
 
-    if (configuration->isNamespaceWithGlobs())
-        throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                        "Expression can not have wildcards inside {} name", configuration->getNamespaceType());
-
     const bool is_archive = configuration->isArchive();
 
     configuration->updateIfRequired(object_storage, local_context);
@@ -620,10 +616,6 @@ StorageObjectStorageSource::GlobIterator::GlobIterator(
     , local_context(context_)
     , file_progress_callback(file_progress_callback_)
 {
-    if (configuration->isNamespaceWithGlobs())
-    {
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Expression can not have wildcards inside namespace name");
-    }
     if (configuration->isPathWithGlobs())
     {
         const auto key_with_globs = configuration_->getPath();

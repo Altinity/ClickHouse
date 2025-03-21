@@ -15,12 +15,6 @@
 namespace DB
 {
 
-namespace Setting
-{
-extern const SettingsBool use_hive_partitioning;
-}
-
-
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
@@ -52,6 +46,10 @@ createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObject
     auto cluster_name = (*queue_settings)[StorageObjectStorageSetting::object_storage_cluster].value;
 
     StorageObjectStorage::Configuration::initialize(*configuration, args.engine_args, context, false, std::move(queue_settings));
+
+    if (configuration->isNamespaceWithGlobs())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "Expression can not have wildcards inside {} name", configuration->getNamespaceType());
 
     // Use format settings from global server context + settings from
     // the SETTINGS clause of the create query. Settings from current
