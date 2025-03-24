@@ -23,6 +23,7 @@
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ParserCreateQuery.h>
 #include <Parsers/parseQuery.h>
+#include <Storages/AlterCommands.h>
 #include <Storages/IStorage.h>
 #include <Storages/StorageFactory.h>
 #include <TableFunctions/TableFunctionFactory.h>
@@ -914,6 +915,11 @@ void DatabaseOnDisk::checkTableNameLengthUnlocked(const String & database_name_,
             "The max length of table name for database {} is {}, current length is {}",
             database_name_, allowed_max_length, escaped_name_length);
     }
+}
+
+void DatabaseOnDisk::alterDatabaseComment(const AlterCommand & command)
+{
+    DB::updateDatabaseCommentWithMetadataFile(shared_from_this(), command);
 }
 
 }
