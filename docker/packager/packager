@@ -93,7 +93,7 @@ def run_docker_image_with_env(
 
     if aws_secrets:
         # Pass AWS credentials via file rather than via env to avoid leaking secrets
-        env_part = {"AWS_CONFIG_FILE": "/root/.aws/credentials"}
+        env_part = {"AWS_CONFIG_FILE": "/clickhouse/.aws/credentials"}
         host_aws_config_file_path = Path(TEMP_PATH) / 'aws_config'
         with open(host_aws_config_file_path, 'wt') as f:
             f.write("[default]")
