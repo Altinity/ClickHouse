@@ -1,3 +1,4 @@
+#include <regex>
 #include <Storages/PartitionStrategy.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTLiteral.h>
@@ -27,19 +28,23 @@ namespace
         return exp_analyzer->getRequiredColumns();
     }
 
-    static std::string formatToFileExtension(const std::string & format)
+    /*
+     * This isn't ideal, but I guess multiple formats can be specified and introduced.
+     * So I think it is simpler to keep it this way.
+     *
+     * Or perhaps implement something like `IInputFormat::getFileExtension()`
+     */
+    std::string formatToFileExtension(const std::string & format)
     {
-        if (format == "Parquet")
+        std::string lower_case_format;
+        lower_case_format.resize(format.size());
+
+        for (std::size_t i = 0; i < format.size(); i++)
         {
-            return "parquet";
+            lower_case_format[i] = tolower(format[i]);
         }
 
-        if (format == "CSV")
-        {
-            return "csv";
-        }
-
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Not implemented for format {}", format);
+        return lower_case_format;
     }
 }
 
