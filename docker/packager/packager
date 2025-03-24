@@ -98,9 +98,9 @@ def run_docker_image_with_env(
         with open(host_aws_config_file_path, 'wt') as f:
             f.write("[default]")
             for key, value in aws_secrets.items():
-                f.write(f"{key}={value}")
+                f.write(f"\n{key}={value}")
 
-        extra_parts = f" --volume={host_aws_config_file_path}:{env_part['AWS_CONFIG_FILE']} "
+        extra_parts = f"--volume={host_aws_config_file_path}:{env_part['AWS_CONFIG_FILE']}"
 
     env_part = " -e ".join(env_variables)
     if env_part:
