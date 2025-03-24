@@ -108,35 +108,28 @@ StorageObjectStorage::StorageObjectStorage(
                         PartitionedSink::PARTITION_ID_WILDCARD, configuration->partitioning_style);
     }
 
-    bool do_lazy_init = lazy_init && !columns_.empty() && !configuration->format.empty();
-    bool failed_init = false;
-    auto do_init = [&]()
+    try
     {
-        try
+        if (!lazy_init)
         {
             if (configuration->hasExternalDynamicMetadata())
                 configuration->updateAndGetCurrentSchema(object_storage, context);
             else
                 configuration->update(object_storage, context);
         }
-        catch (...)
+    }
+    catch (...)
+    {
+        // If we don't have format or schema yet, we can't ignore failed configuration update, because relevant configuration is crucial for format and schema inference
+        if (mode <= LoadingStrictnessLevel::CREATE || columns_.empty() || (configuration->format == "auto"))
         {
-            // If we don't have format or schema yet, we can't ignore failed configuration update,
-            // because relevant configuration is crucial for format and schema inference
-            if (mode <= LoadingStrictnessLevel::CREATE || columns_.empty() || (configuration->format == "auto"))
-            {
-                throw;
-            }
-            else
-            {
-                tryLogCurrentException(log);
-                failed_init = true;
-            }
+            throw;
         }
-    };
-
-    if (!do_lazy_init)
-        do_init();
+        else
+        {
+            tryLogCurrentException(log);
+        }
+    }
 
     std::string sample_path;
     ColumnsDescription columns{columns_};
