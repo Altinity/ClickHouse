@@ -582,6 +582,10 @@ void StorageObjectStorage::Configuration::initialize(
     else
         configuration.fromAST(engine_args, local_context, with_table_structure);
 
+    if (configuration.isNamespaceWithGlobs())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "Expression can not have wildcards inside {} name", configuration.getNamespaceType());
+
     if (configuration.format == "auto")
     {
         if (configuration.isDataLakeConfiguration())

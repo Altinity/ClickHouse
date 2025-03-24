@@ -47,10 +47,6 @@ createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObject
 
     StorageObjectStorage::Configuration::initialize(*configuration, args.engine_args, context, false, std::move(queue_settings));
 
-    if (configuration->isNamespaceWithGlobs())
-        throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                        "Expression can not have wildcards inside {} name", configuration->getNamespaceType());
-
     // Use format settings from global server context + settings from
     // the SETTINGS clause of the create query. Settings from current
     // session and user are ignored.
