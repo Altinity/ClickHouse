@@ -16,12 +16,20 @@
 #    include <QueryPipeline/QueryPipelineBuilder.h>
 #    include <IO/Operators.h>
 #    include <Interpreters/Context.h>
+#    include <Interpreters/DatabaseCatalog.h>
 #    include <Interpreters/evaluateConstantExpression.h>
 #    include <Parsers/ASTCreateQuery.h>
 #    include <Parsers/ASTFunction.h>
 #    include <Parsers/ParserCreateQuery.h>
 #    include <Parsers/parseQuery.h>
 #    include <Parsers/queryToString.h>
+#    include <Processors/Executors/PullingPipelineExecutor.h>
+#    include <Processors/Sources/MySQLSource.h>
+#    include <QueryPipeline/QueryPipelineBuilder.h>
+#    include <Storages/AlterCommands.h>
+#    include <Storages/MySQL/MySQLHelpers.h>
+#    include <Storages/MySQL/MySQLSettings.h>
+#    include <Storages/NamedCollectionsHelpers.h>
 #    include <Storages/StorageMySQL.h>
 #    include <Storages/MySQL/MySQLSettings.h>
 #    include <Storages/MySQL/MySQLHelpers.h>
@@ -409,6 +417,11 @@ StoragePtr DatabaseMySQL::detachTable(ContextPtr /* context */, const String & t
 
     remove_or_detach_tables.emplace(table_name);
     return local_tables_cache[table_name].second;
+}
+
+void DatabaseMySQL::alterDatabaseComment(const AlterCommand & command)
+{
+    DB::updateDatabaseCommentWithMetadataFile(shared_from_this(), command);
 }
 
 String DatabaseMySQL::getMetadataPath() const
