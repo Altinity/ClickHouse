@@ -49,6 +49,21 @@ name: Testing workflow
       AWS_ACCESS_KEY_ID:
         description: the access key id to the aws s3 bucket.
         required: true
+      CLICKHOUSE_TEST_STAT_LOGIN:
+        description: username for ci db.
+        required: true
+      CLICKHOUSE_TEST_STAT_PASSWORD: 
+        description: password for ci db.
+        required: true
+      CLICKHOUSE_TEST_STAT_URL: 
+        description: url for ci db.
+        required: true
+      DOCKER_PASSWORD: 
+        description: token to upload docker images.
+        required: true
+      ROBOT_TOKEN:
+        description: token to update ci status.
+        required: true
 
 env:
   # Force the stdout and stderr streams to be unbuffered

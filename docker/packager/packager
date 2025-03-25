@@ -14,7 +14,8 @@ module_dir = p.abspath(p.dirname(__file__))
 SCRIPT_PATH = Path(__file__).absolute()
 IMAGE_TYPE = "binary-builder"
 IMAGE_NAME = f"altinityinfra/{IMAGE_TYPE}"
-TEMP_PATH = os.getenv("TEMP_PATH", p.abspath(p.join(module_dir, "./tmp")))
+DEFAULT_TMP_PATH = SCRIPT_PATH.parent.absolute() / 'tmp'
+TEMP_PATH = Path(os.getenv("TEMP_PATH", DEFAULT_TMP_PATH))
 
 class BuildException(Exception):
     pass
