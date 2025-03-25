@@ -5,11 +5,8 @@ import logging
 import os
 import subprocess
 import sys
-from os import path as p
 from pathlib import Path
 from typing import Dict, List, Optional
-
-module_dir = p.abspath(p.dirname(__file__))
 
 SCRIPT_PATH = Path(__file__).absolute()
 IMAGE_TYPE = "binary-builder"
