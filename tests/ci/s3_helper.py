@@ -76,7 +76,9 @@ class S3Helper:
             file_content = file_path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             logging.warning("Failed to read file %s, unknown encoding", file_path)
-        scan_file_for_sensitive_data(file_content, file_path.name)
+        else:
+            scan_file_for_sensitive_data(file_content, file_path.name)
+
         logging.debug(
             "Start uploading %s to bucket=%s path=%s", file_path, bucket_name, s3_path
         )
