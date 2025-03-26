@@ -6,8 +6,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from env_helper import ROOT_DIR, DOCKER_TAG
-from get_robot_token import get_parameter_from_ssm
+from env_helper import ROOT_DIR, DOCKER_TAG, DOCKER_PASSWORD
 from ci_utils import Shell
 
 IMAGES_FILE_PATH = Path("docker/images.json")
@@ -22,7 +21,7 @@ def docker_login(relogin: bool = True) -> None:
         Shell.check(  # pylint: disable=unexpected-keyword-arg
             "docker login --username 'altinityinfra' --password-stdin",
             strict=True,
-            stdin_str=get_parameter_from_ssm("dockerhub-password"),
+            stdin_str=DOCKER_PASSWORD,
             encoding="utf-8",
         )
 
