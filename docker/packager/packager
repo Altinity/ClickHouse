@@ -6,12 +6,13 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 SCRIPT_PATH = Path(__file__).absolute()
 IMAGE_TYPE = "binary-builder"
 IMAGE_NAME = f"altinityinfra/{IMAGE_TYPE}"
-
+DEFAULT_TMP_PATH = SCRIPT_PATH.parent.absolute() / 'tmp'
+TEMP_PATH = Path(os.getenv("TEMP_PATH", DEFAULT_TMP_PATH))
 
 class BuildException(Exception):
     pass
@@ -82,9 +83,22 @@ def run_docker_image_with_env(
     ch_root: Path,
     cargo_cache_dir: Path,
     ccache_dir: Optional[Path],
+    aws_secrets : Optional[Dict[str,str]]
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     cargo_cache_dir.mkdir(parents=True, exist_ok=True)
+    extra_parts = ""
+
+    if aws_secrets:
+        # Pass AWS credentials via file rather than via env to avoid leaking secrets
+        env_part = {"AWS_CONFIG_FILE": "/home/clickhouse/.aws/credentials"}
+        host_aws_config_file_path = Path(TEMP_PATH) / 'aws_config'
+        with open(host_aws_config_file_path, 'wt') as f:
+            f.write("[default]")
+            for key, value in aws_secrets.items():
+                f.write(f"\n{key}={value}")
+
+        extra_parts = f"--volume={host_aws_config_file_path}:{env_part['AWS_CONFIG_FILE']}"
 
     env_part = " -e ".join(env_variables)
     if env_part:
@@ -107,6 +121,7 @@ def run_docker_image_with_env(
     cmd = (
         f"docker run --network=host --user={user} --rm {ccache_mount} "
         f"--volume={output_dir}:/output --volume={ch_root}:/build {env_part} "
+        f" {extra_parts} "
         f"--volume={cargo_cache_dir}:/rust/cargo/registry {interactive} {image_name}"
     )
 
@@ -130,11 +145,9 @@ def parse_env_variables(
     sanitizer: str,
     package_type: str,
     cache: str,
-    s3_access_key_id: str,
     s3_bucket: str,
     s3_directory: str,
     s3_rw_access: bool,
-    s3_secret_access_key: str,
     clang_tidy: bool,
     version: str,
     official: bool,
@@ -319,10 +332,6 @@ def parse_env_variables(
         result.append(f"SCCACHE_S3_KEY_PREFIX={sccache_dir}")
         if not s3_rw_access:
             result.append("SCCACHE_S3_NO_CREDENTIALS=true")
-        if s3_access_key_id:
-            result.append(f"AWS_ACCESS_KEY_ID={s3_access_key_id}")
-        if s3_secret_access_key:
-            result.append(f"AWS_SECRET_ACCESS_KEY={s3_secret_access_key}")
 
     if clang_tidy:
         # `CTCACHE_DIR` has the same purpose as the `CCACHE_DIR` above.
@@ -539,11 +548,9 @@ def main() -> None:
         args.sanitizer,
         args.package_type,
         args.cache,
-        args.s3_access_key_id,
         args.s3_bucket,
         args.s3_directory,
         args.s3_rw_access,
-        args.s3_secret_access_key,
         args.clang_tidy,
         args.version,
         args.official,
@@ -562,6 +569,10 @@ def main() -> None:
         ch_root,
         args.cargo_cache_dir,
         args.ccache_dir,
+        {
+            "aws_access_key_id" : args.s3_access_key_id,
+            "aws_secret_access_key" : args.s3_secret_access_key
+        }
     )
     logging.info("Output placed into %s", args.output_dir)
 
