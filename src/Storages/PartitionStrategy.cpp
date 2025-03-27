@@ -1,4 +1,4 @@
-#include <regex>
+#include <Common/re2.h>
 #include <Storages/PartitionStrategy.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTLiteral.h>
