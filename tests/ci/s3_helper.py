@@ -20,7 +20,7 @@ from env_helper import (
     S3_URL,
 )
 
-sensitive_var_pattern = re.compile(r"[A-Z_]*(SECRET|PASSWORD|ACCESS_KEY|TOKEN)[A-Z_]*(?!=clickhouse\s)")
+sensitive_var_pattern = re.compile(r"[A-Z_]*(SECRET|PASSWORD|ACCESS_KEY|TOKEN)[A-Z_]*(?!=clickhouse$)")
 sensitive_strings = {var: value for var, value in os.environ.items() 
                      if sensitive_var_pattern.match(var)}
 
