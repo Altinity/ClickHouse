@@ -6,7 +6,6 @@
 #include <Interpreters/ExpressionAnalyzer.h>
 #include <Storages/PartitionedSink.h>
 #include <Functions/generateSnowflakeID.h>
-#include <Interpreters/Context.h>
 
 #include "Interpreters/ExternalLoaderDictionaryStorageConfigRepository.h"
 
@@ -62,7 +61,7 @@ StringfiedPartitionStrategy::StringfiedPartitionStrategy(ASTPtr partition_by_, c
 
 StringfiedPartitionStrategy::PartitionExpressionActionsAndColumnName StringfiedPartitionStrategy::getExpression()
 {
-    StringfiedPartitionStrategy::PartitionExpressionActionsAndColumnName actions_with_column_name;
+    PartitionExpressionActionsAndColumnName actions_with_column_name;
 
     ASTs arguments(1, partition_by);
     ASTPtr partition_by_string = makeASTFunction("toString", std::move(arguments));
@@ -88,7 +87,7 @@ HiveStylePartitionStrategy::HiveStylePartitionStrategy(ASTPtr partition_by_, con
 
 HiveStylePartitionStrategy::PartitionExpressionActionsAndColumnName HiveStylePartitionStrategy::getExpression()
 {
-    StringfiedPartitionStrategy::PartitionExpressionActionsAndColumnName actions_with_column_name;
+    PartitionExpressionActionsAndColumnName actions_with_column_name;
 
     const Names partition_expression_required_columns = extractPartitionRequiredColumns(partition_by, sample_block, context);
     ASTs concat_args;
