@@ -8,6 +8,8 @@
 #include <Functions/generateSnowflakeID.h>
 #include <Interpreters/Context.h>
 
+#include "Interpreters/ExternalLoaderDictionaryStorageConfigRepository.h"
+
 namespace DB
 {
 
@@ -26,25 +28,6 @@ namespace
         auto syntax_result = TreeRewriter(context).analyze(pby_clone, sample_block.getNamesAndTypesList());
         auto exp_analyzer = ExpressionAnalyzer(pby_clone, syntax_result, context).getActions(false);
         return exp_analyzer->getRequiredColumns();
-    }
-
-    /*
-     * This isn't ideal, but I guess multiple formats can be specified and introduced.
-     * So I think it is simpler to keep it this way.
-     *
-     * Or perhaps implement something like `IInputFormat::getFileExtension()`
-     */
-    std::string formatToFileExtension(const std::string & format)
-    {
-        std::string lower_case_format;
-        lower_case_format.resize(format.size());
-
-        for (std::size_t i = 0; i < format.size(); i++)
-        {
-            lower_case_format[i] = tolower(format[i]);
-        }
-
-        return lower_case_format;
     }
 }
 
@@ -155,7 +138,14 @@ std::string HiveStylePartitionStrategy::getPath(
         path += prefix + "/";
     }
 
-    return path + partition_key + "/" + std::to_string(generateSnowflakeID()) + "." + formatToFileExtension(file_format);
+    /*
+     * File extension is toLower(format)
+     * This isn't ideal, but I guess multiple formats can be specified and introduced.
+     * So I think it is simpler to keep it this way.
+     *
+     * Or perhaps implement something like `IInputFormat::getFileExtension()`
+     */
+    return path + partition_key + "/" + std::to_string(generateSnowflakeID()) + "." + Poco::toLower(file_format);
 }
 
 }

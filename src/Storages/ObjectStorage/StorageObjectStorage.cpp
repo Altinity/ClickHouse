@@ -83,13 +83,15 @@ namespace
                 configuration->partitioning_style);
         }
 
-        if (configuration->withPartitionWildcard() && !partitioning_style_to_wildcard_acceptance.at(configuration->partitioning_style))
+        bool has_partition_wildcard = configuration->withPartitionWildcard();
+
+        if (has_partition_wildcard && !partitioning_style_to_wildcard_acceptance.at(configuration->partitioning_style))
         {
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "The {} wildcard can't be used with {} partitioning style",
                 PartitionedSink::PARTITION_ID_WILDCARD, configuration->partitioning_style);
         }
 
-        if (!configuration->withPartitionWildcard() && partitioning_style_to_wildcard_acceptance.at(configuration->partitioning_style))
+        if (!has_partition_wildcard && partitioning_style_to_wildcard_acceptance.at(configuration->partitioning_style))
         {
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
                 "Partitioning style '{}' requires {} wildcard",
