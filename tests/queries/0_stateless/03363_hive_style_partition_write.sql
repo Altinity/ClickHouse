@@ -1,6 +1,6 @@
 -- Tags: no-parallel, no-fasttest, no-random-settings
 
-DROP TABLE IF EXISTS t_03363_parquet, t_03363_parquet_read;
+DROP TABLE IF EXISTS t_03363_parquet, t_03363_parquet_read, t_03363_csv, t_03363_csv_read;
 
 CREATE TABLE t_03363_parquet (year UInt16, country String, counter UInt8)
 ENGINE = S3(s3_conn, filename = 't_03363_parquet', format = Parquet, partitioning_style='hive')
@@ -50,10 +50,22 @@ ENGINE = S3(s3_conn, filename = 't_03363_csv/**.csv', format = CSV);
 select distinct on (counter) replaceRegexpAll(_path, '/[0-9]+\\.csv', '/<snowflakeid>.csv') AS _path, counter from t_03363_csv_read order by counter SETTINGS use_hive_partitioning=1;
 
 -- s3 table function
-INSERT INTO FUNCTION s3(s3_conn_hive_partitioning_style, filename='t_03363_function', format=Parquet) PARTITION BY (year, country) SELECT * FROM t_03363_parquet_read;
-select distinct on (counter) replaceRegexpAll(_path, '/[0-9]+\\.parquet', '/<snowflakeid>.parquet') AS _path, counter from s3(s3_conn_hive_partitioning_style, filename='t_03363_function/**.parquet') order by counter SETTINGS use_hive_partitioning=1;
+INSERT INTO FUNCTION s3(s3_conn, filename='t_03363_function', format=Parquet, partitioning_style='hive') PARTITION BY (year, country) SELECT * FROM t_03363_parquet_read;
+select distinct on (counter) replaceRegexpAll(_path, '/[0-9]+\\.parquet', '/<snowflakeid>.parquet') AS _path, counter from s3(s3_conn, filename='t_03363_function/**.parquet') order by counter SETTINGS use_hive_partitioning=1;
 
 -- hive with partition id placeholder
 CREATE TABLE t_03363_s3_sink (year UInt16, country String, counter UInt8)
 ENGINE = S3(s3_conn, filename = 't_03363_parquet/{_partition_id}', format = Parquet, partitioning_style='hive')
-PARTITION BY (year, country) -- {serverError BAD_ARGUMENTS};
+PARTITION BY (year, country); -- {serverError BAD_ARGUMENTS};
+
+-- unknown partitioning style
+CREATE TABLE t_03363_s3_sink (year UInt16, country String, counter UInt8)
+ENGINE = S3(s3_conn, filename = 't_03363_parquet', format = Parquet, partitioning_style='abc')
+PARTITION BY (year, country); -- {serverError BAD_ARGUMENTS};
+
+-- auto partitioning style without partition_id wildcard
+CREATE TABLE t_03363_s3_sink (year UInt16, country String, counter UInt8)
+ENGINE = S3(s3_conn, filename = 't_03363_parquet', format = Parquet)
+PARTITION BY (year, country); -- {serverError BAD_ARGUMENTS};
+
+DROP TABLE IF EXISTS t_03363_parquet, t_03363_parquet_read, t_03363_csv, t_03363_csv_read;

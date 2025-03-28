@@ -53,6 +53,65 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
+namespace
+{
+    std::optional<std::string> extractNamedArgument(ASTs & arguments, const std::string & argument_name, ASTs::iterator & argument_position)
+    {
+        for (auto arg_it = arguments.begin(); arg_it != arguments.end(); ++arg_it)
+        {
+            auto argument = *arg_it;
+            const auto * type_ast_function = argument->as<ASTFunction>();
+
+            if (!type_ast_function || type_ast_function->name != "equals" || !type_ast_function->arguments || type_ast_function->arguments->children.size() != 2)
+            {
+                continue;
+            }
+
+            auto name = type_ast_function->arguments->children[0]->as<ASTIdentifier>();
+
+            if (name && name->name() == argument_name)
+            {
+                auto value = type_ast_function->arguments->children[1]->as<ASTLiteral>();
+
+                if (!value)
+                {
+                    throw Exception(
+                        ErrorCodes::BAD_ARGUMENTS,
+                        "Wrong parameter type for '{}'",
+                        name->name());
+                }
+
+                if (value->value.getType() != Field::Types::String)
+                {
+                    throw Exception(
+                        ErrorCodes::BAD_ARGUMENTS,
+                        "Wrong parameter type for '{}'",
+                        name->name());
+                }
+
+                argument_position = arg_it;
+
+                return value->value.safeGet<String>();
+            }
+        }
+
+        return std::nullopt;
+    }
+
+    std::optional<std::string> extractNamedArgumentAndRemoveFromList(ASTs & arguments, const std::string & argument_name)
+    {
+        ASTs::iterator iterator;
+        auto named_arg_opt = extractNamedArgument(arguments, argument_name, iterator);
+
+        if (named_arg_opt)
+        {
+            arguments.erase(iterator);
+        }
+
+        return named_arg_opt;
+    }
+}
+
 static const std::unordered_set<std::string_view> required_configuration_keys = {
     "url",
 };
@@ -195,6 +254,8 @@ void StorageS3Configuration::fromNamedCollection(const NamedCollection & collect
 void StorageS3Configuration::fromAST(ASTs & args, ContextPtr context, bool with_structure)
 {
     size_t count = StorageURL::evalArgsAndCollectHeaders(args, headers_from_ast, context);
+
+    partitioning_style = extractNamedArgumentAndRemoveFromList(args, "partitioning_style").value_or("auto");
 
     if (count == 0 || count > getMaxNumberOfArguments(with_structure))
         throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH,
@@ -390,8 +451,6 @@ void StorageS3Configuration::fromAST(ASTs & args, ContextPtr context, bool with_
 
     if (no_sign_request)
         auth_settings[S3AuthSetting::no_sign_request] = no_sign_request;
-
-    partitioning_style = "hive";
 
     static_configuration = !auth_settings[S3AuthSetting::access_key_id].value.empty() || auth_settings[S3AuthSetting::no_sign_request].changed;
     auth_settings[S3AuthSetting::no_sign_request] = no_sign_request;
