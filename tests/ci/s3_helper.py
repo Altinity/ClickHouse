@@ -21,23 +21,31 @@ from env_helper import (
 )
 
 sensitive_var_pattern = re.compile(
-  r"\b[A-Z_]*(SECRET|PASSWORD|ACCESS_KEY|TOKEN)[A-Z_]*\b(?!=clickhouse$)(?!: \*{3}$)"
+    r"\b[A-Z_]*(SECRET|PASSWORD|ACCESS_KEY|TOKEN)[A-Z_]*\b(?!=clickhouse$)(?!: \*{3}$)"
 )
-sensitive_strings = {var: value for var, value in os.environ.items() 
-                     if sensitive_var_pattern.match(var)}
+sensitive_strings = {
+    var: value for var, value in os.environ.items() if sensitive_var_pattern.match(var)
+}
+
 
 def scan_file_for_sensitive_data(file_content, file_name):
     """
     Scan the content of a file for sensitive strings.
     Raises ValueError if any sensitive values are found.
     """
+
+    def clean_line(line):
+        for name, value in sensitive_strings.items():
+            line = line.replace(value, f"SECRET[{name}]")
+        return line
+
     matches = []
     for line_number, line in enumerate(file_content.splitlines(), start=1):
         for match in sensitive_var_pattern.finditer(line):
-            matches.append((file_name, line_number, match.group(0)))
+            matches.append((file_name, line_number, clean_line(line)))
         for name, value in sensitive_strings.items():
             if value in line:
-                matches.append((file_name, line_number, f"SECRET[{name}]"))
+                matches.append((file_name, line_number, clean_line(line)))
 
     if not matches:
         return
@@ -47,6 +55,7 @@ def scan_file_for_sensitive_data(file_content, file_name):
         logging.error(f"{file_name}:{line_number}: {match}")
 
     raise ValueError(f"Sensitive values found in {file_name}")
+
 
 def _flatten_list(lst):
     result = []
