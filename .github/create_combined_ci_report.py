@@ -276,7 +276,7 @@ def main():
         exit(0)
 
     # Upload the report to S3
-    s3_client = boto3.client("s3")
+    s3_client = boto3.client("s3", endpoint_url=os.getenv("S3_URL"))
 
     try:
         s3_client.put_object(
