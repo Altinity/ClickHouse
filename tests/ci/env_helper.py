@@ -34,6 +34,9 @@ S3_BUILDS_BUCKET_PUBLIC = "altinity-build-artifacts"
 S3_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 S3_TEST_REPORTS_BUCKET = os.getenv("S3_TEST_REPORTS_BUCKET", "altinity-build-artifacts")
 
+SCCACHE_ACCESS_KEY_ID = os.getenv("SCCACHE_ACCESS_KEY_ID")
+SCCACHE_SECRET_ACCESS_KEY = os.getenv("SCCACHE_SECRET_ACCESS_KEY")
+
 S3_URL = os.getenv("S3_URL", "https://s3.amazonaws.com")
 S3_DOWNLOAD = os.getenv("S3_DOWNLOAD", S3_URL)
 S3_ARTIFACT_DOWNLOAD_TEMPLATE = (

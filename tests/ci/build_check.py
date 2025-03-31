@@ -10,7 +10,7 @@ from typing import Tuple
 
 import docker_images_helper
 from ci_config import CI
-from env_helper import REPO_COPY, S3_BUILDS_BUCKET, TEMP_PATH, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY
+from env_helper import REPO_COPY, S3_BUILDS_BUCKET, TEMP_PATH, SCCACHE_ACCESS_KEY_ID, SCCACHE_SECRET_ACCESS_KEY
 from git_helper import Git
 from pr_info import PRInfo, EventType
 from report import FAILURE, SUCCESS, JobReport, StatusType
@@ -67,8 +67,8 @@ def get_packager_cmd(
     cmd += " --cache=sccache"
     cmd += " --s3-rw-access"
     cmd += f" --s3-bucket={S3_BUILDS_BUCKET}"
-    cmd += f" --s3-access-key-id={S3_ACCESS_KEY_ID}"
-    cmd += f" --s3-secret-access-key={S3_SECRET_ACCESS_KEY}"
+    cmd += f" --s3-access-key-id={SCCACHE_ACCESS_KEY_ID}"
+    cmd += f" --s3-secret-access-key={SCCACHE_SECRET_ACCESS_KEY}"
 
     if build_config.additional_pkgs:
         cmd += " --additional-pkgs"
@@ -238,7 +238,7 @@ def main():
             pr_info.sha,
             build_name,
         )
-    )    
+    )
     src_path = temp_path / "build_source.src.tar.gz"
     s3_path = s3_path_prefix + "/clickhouse-" + version.string + ".src.tar.gz"
     logging.info("s3_path %s", s3_path)
@@ -251,7 +251,7 @@ def main():
     else:
         logging.info("Source tar doesn't exist")
         print("Source tar doesn't exist")
-    
+
     if build_status != SUCCESS:
         # We check if docker works, because if it's down, it's infrastructure
         try:
