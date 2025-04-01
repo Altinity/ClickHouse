@@ -1126,7 +1126,7 @@ std::optional<QueryPipeline> StorageDistributed::distributedWriteFromClusterStor
         predicate = filter->getOutputs().at(0);
 
     /// Select query is needed for pruining on virtual columns
-    auto extension = src_storage_cluster.getTaskIteratorExtension(predicate, local_context);
+    auto extension = src_storage_cluster.getTaskIteratorExtension(predicate, local_context, 1 /* number_of_replicas */);
 
     auto dst_cluster = getCluster();
 

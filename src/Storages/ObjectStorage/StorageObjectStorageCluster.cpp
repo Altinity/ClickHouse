@@ -17,6 +17,8 @@
 #include <Storages/ObjectStorage/Utils.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSource.h>
 #include <Storages/extractTableFunctionArgumentsFromSelectQuery.h>
+#include <Storages/ObjectStorage/StorageObjectStorageStableTaskDistributor.h>
+
 
 namespace DB
 {
@@ -279,19 +281,19 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
 }
 
 RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExtension(
-    const ActionsDAG::Node * predicate, const ContextPtr & local_context) const
+    const ActionsDAG::Node * predicate, const ContextPtr & local_context, const size_t number_of_replicas) const
 {
     auto iterator = StorageObjectStorageSource::createFileIterator(
         configuration, configuration->getQuerySettings(local_context), object_storage, /* distributed_processing */false,
         local_context, predicate, getVirtualsList(), nullptr, local_context->getFileProgressCallback());
 
-    auto callback = std::make_shared<std::function<String()>>([iterator]() mutable -> String
-    {
-        auto object_info = iterator->next(0);
-        if (object_info)
-            return object_info->getPath();
-        return "";
-    });
+    auto task_distributor = std::make_shared<StorageObjectStorageStableTaskDistributor>(iterator, number_of_replicas);
+
+    auto callback = std::make_shared<TaskIterator>(
+        [task_distributor](size_t number_of_current_replica) mutable -> String {
+            return task_distributor->getNextTask(number_of_current_replica).value_or("");
+        });
+
     return RemoteQueryExecutor::Extension{ .task_iterator = std::move(callback) };
 }
 

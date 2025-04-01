@@ -34,6 +34,7 @@ namespace Setting
     extern const SettingsBool async_query_sending_for_remote;
     extern const SettingsBool async_socket_for_remote;
     extern const SettingsBool skip_unavailable_shards;
+    extern const SettingsNonZeroUInt64 max_parallel_replicas;
 }
 
 namespace ErrorCodes
@@ -59,15 +60,19 @@ void ReadFromCluster::applyFilters(ActionDAGNodes added_filter_nodes)
     if (filter_actions_dag)
         predicate = filter_actions_dag->getOutputs().at(0);
 
-    createExtension(predicate);
+    auto max_replicas_to_use = static_cast<UInt64>(cluster->getShardsInfo().size());
+    if (context->getSettingsRef()[Setting::max_parallel_replicas] > 1)
+        max_replicas_to_use = std::min(max_replicas_to_use, context->getSettingsRef()[Setting::max_parallel_replicas].value);
+
+    createExtension(predicate, max_replicas_to_use);
 }
 
-void ReadFromCluster::createExtension(const ActionsDAG::Node * predicate)
+void ReadFromCluster::createExtension(const ActionsDAG::Node * predicate, size_t number_of_replicas)
 {
     if (extension)
         return;
 
-    extension = storage->getTaskIteratorExtension(predicate, context);
+    extension = storage->getTaskIteratorExtension(predicate, context, number_of_replicas);
 }
 
 /// The code executes on initiator
@@ -155,8 +160,6 @@ SinkToStoragePtr IStorageCluster::write(
 
 void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
 {
-    createExtension(nullptr);
-
     const Scalars & scalars = context->hasQueryContext() ? context->getQueryContext()->getScalars() : Scalars{};
     const bool add_agg_info = processed_stage == QueryProcessingStage::WithMergeableState;
 
@@ -164,29 +167,47 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
     auto new_context = updateSettings(context->getSettingsRef());
     const auto & current_settings = new_context->getSettingsRef();
     auto timeouts = ConnectionTimeouts::getTCPTimeoutsWithFailover(current_settings);
+
+    size_t replica_index = 0;
+    auto max_replicas_to_use = static_cast<UInt64>(cluster->getShardsInfo().size());
+    if (current_settings[Setting::max_parallel_replicas] > 1)
+        max_replicas_to_use = std::min(max_replicas_to_use, current_settings[Setting::max_parallel_replicas].value);
+
+    createExtension(nullptr, max_replicas_to_use);
+
     for (const auto & shard_info : cluster->getShardsInfo())
     {
-        auto try_results = shard_info.pool->getMany(timeouts, current_settings, PoolMode::GET_MANY);
-        for (auto & try_result : try_results)
-        {
-            auto remote_query_executor = std::make_shared<RemoteQueryExecutor>(
-                std::vector<IConnectionPool::Entry>{try_result},
-                queryToString(query_to_send),
-                getOutputHeader(),
-                new_context,
-                /*throttler=*/nullptr,
-                scalars,
-                Tables(),
-                processed_stage,
-                extension);
+        /// We're taking all replicas as shards,
+        /// so each shard will have only one address to connect to.
+        auto try_results = shard_info.pool->getMany(
+            timeouts,
+            current_settings,
+            PoolMode::GET_ONE,
+            {},
+            /*skip_unavailable_endpoints=*/true);
 
-            remote_query_executor->setLogger(log);
-            pipes.emplace_back(std::make_shared<RemoteSource>(
-                remote_query_executor,
-                add_agg_info,
-                current_settings[Setting::async_socket_for_remote],
-                current_settings[Setting::async_query_sending_for_remote]));
-        }
+        if (try_results.empty())
+            continue;
+
+        IConnections::ReplicaInfo replica_info{ .number_of_current_replica = replica_index++ };
+
+        auto remote_query_executor = std::make_shared<RemoteQueryExecutor>(
+            std::vector<IConnectionPool::Entry>{try_results.front()},
+            queryToString(query_to_send),
+            getOutputHeader(),
+            new_context,
+            /*throttler=*/nullptr,
+            scalars,
+            Tables(),
+            processed_stage,
+            RemoteQueryExecutor::Extension{.task_iterator = extension->task_iterator, .replica_info = std::move(replica_info)});
+
+        remote_query_executor->setLogger(log);
+        pipes.emplace_back(std::make_shared<RemoteSource>(
+            remote_query_executor,
+            add_agg_info,
+            current_settings[Setting::async_socket_for_remote],
+            current_settings[Setting::async_query_sending_for_remote]));
     }
 
     auto pipe = Pipe::unitePipes(std::move(pipes));
