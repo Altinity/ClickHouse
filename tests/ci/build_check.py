@@ -10,7 +10,7 @@ from typing import Tuple
 
 import docker_images_helper
 from ci_config import CI
-from env_helper import REPO_COPY, S3_BUILDS_BUCKET, TEMP_PATH, SCCACHE_ACCESS_KEY_ID, SCCACHE_SECRET_ACCESS_KEY
+from env_helper import REPO_COPY, S3_BUILDS_BUCKET, TEMP_PATH, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY
 from git_helper import Git
 from pr_info import PRInfo, EventType
 from report import FAILURE, SUCCESS, JobReport, StatusType
@@ -67,8 +67,8 @@ def get_packager_cmd(
     cmd += " --cache=sccache"
     cmd += " --s3-rw-access"
     cmd += f" --s3-bucket={S3_BUILDS_BUCKET}"
-    cmd += f" --s3-access-key-id={SCCACHE_ACCESS_KEY_ID}"
-    cmd += f" --s3-secret-access-key={SCCACHE_SECRET_ACCESS_KEY}"
+    cmd += f" --s3-access-key-id={S3_ACCESS_KEY_ID}"
+    cmd += f" --s3-secret-access-key={S3_SECRET_ACCESS_KEY}"
 
     if build_config.additional_pkgs:
         cmd += " --additional-pkgs"
