@@ -295,6 +295,8 @@ def _pre_action(s3, job_name, batch, indata, pr_info):
         #   testing), otherwise reports won't be found
         if not (pr_info.is_scheduled or pr_info.is_dispatched):
             report_prefix = Utils.normalize_string(pr_info.head_ref)
+    elif pr_info.is_pr:
+        report_prefix = str(pr_info.number)
     print(
         f"Use report prefix [{report_prefix}], pr_num [{pr_info.number}], head_ref [{pr_info.head_ref}]"
     )
