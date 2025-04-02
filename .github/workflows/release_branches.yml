@@ -7,6 +7,11 @@ env:
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  CLICKHOUSE_TEST_STAT_LOGIN: ${{ secrets.CLICKHOUSE_TEST_STAT_LOGIN }}
+  CLICKHOUSE_TEST_STAT_PASSWORD: ${{ secrets.CLICKHOUSE_TEST_STAT_PASSWORD }}
+  CLICKHOUSE_TEST_STAT_URL: ${{ secrets.CLICKHOUSE_TEST_STAT_URL }}
+  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+  ROBOT_TOKEN: ${{ secrets.ROBOT_TOKEN }}
 
 on: # yamllint disable-line rule:truthy
   pull_request:
@@ -471,23 +476,23 @@ jobs:
 #############################################################################################
   RegressionTestsRelease:
     needs: [BuilderDebRelease]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'regression') }}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
       runner_type: altinity-on-demand, altinity-type-cx52, altinity-image-x86-app-docker-ce, altinity-setup-regression
-      commit: a170f32119a5c872e5ff209b8f39e13acc2d6626
+      commit: bd31e738c0cedaca253d15a05ed245c41b6e0b6a
       arch: release
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout_minutes: 300
   RegressionTestsAarch64:
     needs: [BuilderDebAarch64]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'regression') && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'aarch64') }}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
       runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-app-docker-ce, altinity-setup-regression
-      commit: a170f32119a5c872e5ff209b8f39e13acc2d6626
+      commit: bd31e738c0cedaca253d15a05ed245c41b6e0b6a
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout_minutes: 300
@@ -570,7 +575,7 @@ jobs:
           CHECKS_DATABASE_USER: ${{ secrets.CHECKS_DATABASE_USER }}
           CHECKS_DATABASE_PASSWORD: ${{ secrets.CHECKS_DATABASE_PASSWORD }}
           COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          PR_NUMBER: ${{ github.event.number }}
+          PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
           ACTIONS_RUN_URL: ${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}
         shell: bash
         run: |

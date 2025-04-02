@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from env_helper import GITHUB_REPOSITORY
+from env_helper import CLICKHOUSE_TEST_STAT_URL, CLICKHOUSE_TEST_STAT_PASSWORD, CLICKHOUSE_TEST_STAT_LOGIN
 from get_robot_token import get_parameter_from_ssm
 from pr_info import PRInfo
 from report import TestResults
@@ -28,12 +28,12 @@ class ClickHouseHelper:
         self, url: Optional[str] = None, auth: Optional[Dict[str, str]] = None
     ):
         if url is None:
-            url = get_parameter_from_ssm("clickhouse-test-stat-url")
+            url = CLICKHOUSE_TEST_STAT_URL
 
         self.url = url
         self.auth = auth or {
-            "X-ClickHouse-User": get_parameter_from_ssm("clickhouse-test-stat-login"),
-            "X-ClickHouse-Key": get_parameter_from_ssm("clickhouse-test-stat-password"),
+            "X-ClickHouse-User": CLICKHOUSE_TEST_STAT_LOGIN,
+            "X-ClickHouse-Key": CLICKHOUSE_TEST_STAT_PASSWORD,
         }
 
     @staticmethod
