@@ -3,8 +3,6 @@
 #include <Interpreters/ExpressionActions.h>
 #include <Parsers/IAST_fwd.h>
 
-#include <Processors/Chunk.h>
-
 namespace DB
 {
 
@@ -23,23 +21,6 @@ struct PartitionStrategy
     virtual PartitionExpressionActionsAndColumnName getExpression() = 0;
     virtual std::string getPath(const std::string & prefix, const std::string & partition_key) = 0;
 
-    virtual Chunk getChunkWithoutPartitionColumnsIfNeeded(const Chunk & chunk)
-    {
-        Chunk result;
-
-        for (const auto & column : chunk.getColumns())
-        {
-            result.addColumn(column);
-        }
-
-        return result;
-    }
-
-    virtual Block getBlockWithoutPartitionColumnsIfNeeded()
-    {
-        return sample_block;
-    }
-
 protected:
     ASTPtr partition_by;
     Block sample_block;
@@ -53,11 +34,10 @@ struct PartitionStrategyProvider
         const Block & sample_block,
         ContextPtr context,
         const std::string & file_format,
-        const std::string & partitioning_style = "",
-        bool omit_partition_columns_from_file = true);
+        const std::string & partitioning_style = "");
 };
 
-struct StringfiedPartitionStrategy : PartitionStrategy
+struct StringfiedPartitionStrategy : public PartitionStrategy
 {
     StringfiedPartitionStrategy(ASTPtr partition_by_, const Block & sample_block_, ContextPtr context_);
 
@@ -65,27 +45,15 @@ struct StringfiedPartitionStrategy : PartitionStrategy
     std::string getPath(const std::string & prefix, const std::string & partition_key) override;
 };
 
-struct HiveStylePartitionStrategy : PartitionStrategy
+struct HiveStylePartitionStrategy : public PartitionStrategy
 {
-    HiveStylePartitionStrategy(
-        ASTPtr partition_by_,
-        const Block & sample_block_,
-        ContextPtr context_,
-        const std::string & file_format_,
-        bool write_partition_columns_into_files_);
+    HiveStylePartitionStrategy(ASTPtr partition_by_, const Block & sample_block_, ContextPtr context_, const std::string & file_format_);
 
     PartitionExpressionActionsAndColumnName getExpression() override;
     std::string getPath(const std::string & prefix, const std::string & partition_key) override;
-    Chunk getChunkWithoutPartitionColumnsIfNeeded(const Chunk & chunk) override;
-    Block getBlockWithoutPartitionColumnsIfNeeded() override;
 
 private:
     std::string file_format;
-    bool write_partition_columns_into_files;
-    Names partition_expression_required_columns;
-    std::unordered_set<std::string> partition_expression_required_columns_set;
-    PartitionExpressionActionsAndColumnName actions_with_column_name;
-    Block block_without_partition_columns;
 };
 
 }

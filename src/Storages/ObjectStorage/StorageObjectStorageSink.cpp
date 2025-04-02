@@ -164,7 +164,7 @@ SinkPtr PartitionedStorageObjectStorageSink::createSinkForPartition(const String
         object_storage,
         configuration,
         format_settings,
-        getPartitionStrategy()->getBlockWithoutPartitionColumnsIfNeeded(),
+        sample_block,
         context,
         file_path
     );
