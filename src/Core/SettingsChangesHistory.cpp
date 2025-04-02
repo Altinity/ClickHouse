@@ -79,6 +79,7 @@ static std::initializer_list<std::pair<ClickHouseVersion, SettingsChangesHistory
             {"least_greatest_legacy_null_behavior", true, false, "New setting"},
             {"object_storage_cluster", "", "", "New setting"},
             {"object_storage_max_nodes", 0, 0, "New setting"},
+            {"use_hive_partitioning", 0, 1, "Upstream made it the default"}
         }
     },
     {"24.11",
