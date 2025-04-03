@@ -21,7 +21,7 @@ from env_helper import (
 )
 
 sensitive_var_pattern = re.compile(
-    r"\b[A-Z_]*(SECRET|PASSWORD|ACCESS_KEY|TOKEN)[A-Z_]*\b(?!=clickhouse$)(?!: \*{3}$)"
+    r"\b[A-Z_]*(SECRET|PASSWORD|ACCESS_KEY|TOKEN)[A-Z_]*\b(?!=clickhouse$)(?!: \*{3}$)(?! '\[HIDDEN\]')(?!%)"
 )
 sensitive_strings = {
     var: value for var, value in os.environ.items() if sensitive_var_pattern.match(var)
