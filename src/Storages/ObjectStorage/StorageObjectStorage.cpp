@@ -50,77 +50,6 @@ namespace StorageObjectStorageSetting
 extern const StorageObjectStorageSettingsBool allow_dynamic_metadata_for_data_lakes;
 }
 
-namespace
-{
-    void sanityCheckPartitioningConfiguration(
-        const ASTPtr & table_level_partition_by,
-        const ASTPtr & query_partition_by,
-        const std::string & partition_strategy,
-        bool has_partition_wildcard)
-    {
-        if (!table_level_partition_by && !query_partition_by)
-        {
-            // do we want to assert that `partition_strategy` is not set to something different style AND
-            // wildcard is not set either?
-            return;
-        }
-
-        if (table_level_partition_by && query_partition_by)
-        {
-            // should never happen because parser should not allow that
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Table level partition expression and query level partition expression can't be specified together, this is a bug");
-        }
-
-        static std::unordered_map<std::string, bool> partition_strategy_to_wildcard_acceptance =
-        {
-            {"auto", true},
-            {"hive", false}
-        };
-
-        if (!partition_strategy_to_wildcard_acceptance.contains(partition_strategy))
-        {
-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "Unknown partitioning style '{}'",
-                partition_strategy);
-        }
-
-        if (has_partition_wildcard && !partition_strategy_to_wildcard_acceptance.at(partition_strategy))
-        {
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "The {} wildcard can't be used with {} partitioning style",
-                PartitionedSink::PARTITION_ID_WILDCARD, partition_strategy);
-        }
-
-        if (!has_partition_wildcard && partition_strategy_to_wildcard_acceptance.at(partition_strategy))
-        {
-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "Partitioning style '{}' requires {} wildcard",
-                partition_strategy,
-                PartitionedSink::PARTITION_ID_WILDCARD);
-        }
-    }
-
-    ASTPtr getPartitionByAst(const ASTPtr & table_level_partition_by, const ASTPtr & query, const StorageObjectStorage::ConfigurationPtr & configuration)
-    {
-        ASTPtr query_partition_by = nullptr;
-        if (const auto insert_query = query->as<ASTInsertQuery>())
-        {
-            if (insert_query->partition_by)
-            {
-                query_partition_by = insert_query->partition_by;
-            }
-        }
-
-        sanityCheckPartitioningConfiguration(table_level_partition_by, query_partition_by, configuration->partition_strategy, configuration->withPartitionWildcard());
-
-        if (table_level_partition_by)
-        {
-            return table_level_partition_by;
-        }
-
-        return query_partition_by;
-    }
-}
-
 String StorageObjectStorage::getPathSample(ContextPtr context)
 {
     auto query_settings = configuration->getQuerySettings(context);
@@ -173,11 +102,6 @@ StorageObjectStorage::StorageObjectStorage(
     , distributed_processing(distributed_processing_)
     , log(getLogger(fmt::format("Storage{}({})", configuration->getEngineName(), table_id_.getFullTableName())))
 {
-    // this function needs to be called in the constructor so we can validate table definition at creation time
-    // it is also being called during `write` because this code is also used by table functions and, unfortunately,
-    // at creation time the partition by is not available (maybe this needs to be fixed)
-    sanityCheckPartitioningConfiguration(partition_by, nullptr, configuration->partition_strategy, configuration->withPartitionWildcard());
-
     try
     {
         if (!lazy_init)
@@ -216,6 +140,21 @@ StorageObjectStorage::StorageObjectStorage(
 
     setVirtuals(VirtualColumnUtils::getVirtualsForFileLikeStorage(metadata.columns, context, sample_path, format_settings));
     setInMemoryMetadata(metadata);
+
+    // perhaps it is worth adding some extra safeguards for cases like
+    // create table s3_table engine=s3('{_partition_id}'); -- partition id wildcard set, but no partition expression
+    // create table s3_table engine=s3(partition_strategy='hive'); -- partition strategy set, but no partition expression
+    if (partition_by)
+    {
+        partition_strategy = PartitionStrategyFactory::get(
+                partition_by,
+                metadata.getSampleBlock(),
+                context,
+                configuration->format,
+                configuration->withPartitionWildcard(),
+                configuration->partition_strategy,
+                configuration->hive_partition_strategy_write_partition_columns_into_files);
+    }
 }
 
 String StorageObjectStorage::getName() const
@@ -434,7 +373,7 @@ void StorageObjectStorage::read(
 }
 
 SinkToStoragePtr StorageObjectStorage::write(
-    const ASTPtr & query,
+    const ASTPtr &,
     const StorageMetadataPtr & metadata_snapshot,
     ContextPtr local_context,
     bool /* async_insert */)
@@ -457,15 +396,8 @@ SinkToStoragePtr StorageObjectStorage::write(
                         configuration->getPath());
     }
 
-    if (ASTPtr partition_by_ast = getPartitionByAst(partition_by, query, configuration))
+    if (partition_strategy)
     {
-        auto partition_strategy = PartitionStrategyFactory::get(
-            partition_by_ast,
-            sample_block,
-            local_context,
-            configuration->format,
-            configuration->partition_strategy,
-            configuration->hive_partition_strategy_write_partition_columns_into_files);
         return std::make_shared<PartitionedStorageObjectStorageSink>(
             partition_strategy, object_storage, configuration, format_settings, sample_block, local_context);
     }

@@ -18,6 +18,7 @@ namespace DB
 class ReadBufferIterator;
 class SchemaCache;
 class NamedCollection;
+struct PartitionStrategy;
 
 namespace ErrorCodes
 {
@@ -153,6 +154,7 @@ protected:
     const std::optional<FormatSettings> format_settings;
     const ASTPtr partition_by;
     const bool distributed_processing;
+    std::shared_ptr<PartitionStrategy> partition_strategy;
 
     LoggerPtr log;
 };
