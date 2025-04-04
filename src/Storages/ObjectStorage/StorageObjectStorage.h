@@ -247,9 +247,6 @@ public:
     String compression_method = "auto";
     String structure = "auto";
     std::string partition_strategy = "auto";
-    /*
-     * Only supported by hive partitioning style for now
-     */
     bool hive_partition_strategy_write_partition_columns_into_files = false;
 
     virtual void update(ObjectStoragePtr object_storage, ContextPtr local_context);
