@@ -10,7 +10,7 @@ env:
   AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
   # Point S3_URL to R2 endpoint
   S3_URL: ${{ secrets.R2_ENDPOINT }}
-  S3_DOWNLOAD: ${{ secrets.R2_ENDPOINT }}
+  S3_DOWNLOAD: https://build-artifacts.altinity.io
   CLICKHOUSE_TEST_STAT_LOGIN: ${{ secrets.CLICKHOUSE_TEST_STAT_LOGIN }}
   CLICKHOUSE_TEST_STAT_PASSWORD: ${{ secrets.CLICKHOUSE_TEST_STAT_PASSWORD }}
   CLICKHOUSE_TEST_STAT_URL: ${{ secrets.CLICKHOUSE_TEST_STAT_URL }}

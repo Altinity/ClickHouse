@@ -361,7 +361,10 @@ class S3Helper:
 
     @staticmethod
     def s3_url(bucket: str, key: str) -> str:
-        url = f"{S3_DOWNLOAD}/{bucket}/{key}"
+        if 'r2.cloudflarestorage.com' in S3_URL:
+            url = f"{S3_DOWNLOAD}/{key}"
+        else:
+            url = f"{S3_DOWNLOAD}/{bucket}/{key}"
         # last two replacements are specifics of AWS urls:
         # https://jamesd3142.wordpress.com/2018/02/28/amazon-s3-and-the-plus-symbol/
         url = url.replace("+", "%2B").replace(" ", "%20")
