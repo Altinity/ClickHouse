@@ -13,7 +13,7 @@ IMAGE_TYPE = "binary-builder"
 IMAGE_NAME = f"altinityinfra/{IMAGE_TYPE}"
 DEFAULT_TMP_PATH = SCRIPT_PATH.parent.absolute() / 'tmp'
 TEMP_PATH = Path(os.getenv("TEMP_PATH", DEFAULT_TMP_PATH))
-AWS_ENDPOINT_URL = os.getenv("S3_URL")
+SCCACHE_ENDPOINT = os.getenv("S3_URL")
 
 class BuildException(Exception):
     pass
@@ -99,7 +99,7 @@ def run_docker_image_with_env(
             for key, value in aws_secrets.items():
                 f.write(f"\n{key}={value}")
 
-        extra_parts = f"--volume={host_aws_config_file_path}:{env_part['AWS_CONFIG_FILE']} -e AWS_ENDPOINT_URL={AWS_ENDPOINT_URL}"
+        extra_parts = f"--volume={host_aws_config_file_path}:{env_part['AWS_CONFIG_FILE']} -e SCCACHE_ENDPOINT={SCCACHE_ENDPOINT} -e SCCACHE_REGION=auto"
 
     env_part = " -e ".join(env_variables)
     if env_part:
