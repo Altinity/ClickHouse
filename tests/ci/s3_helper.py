@@ -103,6 +103,7 @@ class S3Helper:
                 logging.info("Processing file without compression")
             logging.info("File is too large, do not provide content type")
 
+        metadata["ACL"] = "public-read"
         self.client.upload_file(file_path, bucket_name, s3_path, ExtraArgs=metadata)
         url = self.s3_url(bucket_name, s3_path)
         logging.info("Upload %s to %s Meta: %s", file_path, url, metadata)
