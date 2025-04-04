@@ -1252,6 +1252,7 @@ Set the quoting rule for identifiers in SHOW CREATE query
 Set the quoting style for identifiers in SHOW CREATE query
 )", 0) \
     DECLARE(Bool, input_format_parquet_use_metadata_cache, true, R"(Enable parquet file metadata caching)", 0) \
+
 // End of FORMAT_FACTORY_SETTINGS
 
 #define OBSOLETE_FORMAT_SETTINGS(M, ALIAS) \

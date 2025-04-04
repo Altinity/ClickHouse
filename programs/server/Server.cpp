@@ -290,6 +290,11 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 primary_index_cache_size;
     extern const ServerSettingsDouble primary_index_cache_size_ratio;
     extern const ServerSettingsBool use_legacy_mongodb_integration;
+    extern const ServerSettingsBool dictionaries_lazy_load;
+    extern const ServerSettingsBool wait_dictionaries_load_at_startup;
+    extern const ServerSettingsUInt64 max_prefixes_deserialization_thread_pool_size;
+    extern const ServerSettingsUInt64 max_prefixes_deserialization_thread_pool_free_size;
+    extern const ServerSettingsUInt64 prefixes_deserialization_thread_pool_thread_pool_queue_size;
     extern const ServerSettingsUInt64 input_format_parquet_metadata_cache_max_size;
 }
 
@@ -2238,6 +2243,8 @@ try
 
     if (dns_cache_updater)
         dns_cache_updater->start();
+
+    auto replicas_reconnector = ReplicasReconnector::init(global_context);
 
 #if USE_PARQUET
     ParquetFileMetaDataCache::instance()->setMaxSizeInBytes(server_settings[ServerSetting::input_format_parquet_metadata_cache_max_size]);
