@@ -199,16 +199,20 @@ def get_creation_expression(
     storage_type_in_named_collection=False,
     **kwargs,
 ):
-    settings_suffix = ""
-    if allow_dynamic_metadata_for_data_lakes or object_storage_cluster or explicit_metadata_path:
-        settings = []
-        if allow_dynamic_metadata_for_data_lakes:
-            settings.append("allow_dynamic_metadata_for_data_lakes = 1")
-        if explicit_metadata_path:
-            settings.append(f"iceberg_metadata_file_path = '{explicit_metadata_path}'")
-        if object_storage_cluster:
-            settings.append(f"object_storage_cluster = 'cluster_simple'")
-        settings_suffix = " SETTINGS " + ", ".join(settings)
+    settings_array = []
+    if allow_dynamic_metadata_for_data_lakes:
+        settings_array.append("allow_dynamic_metadata_for_data_lakes = 1")
+
+    if explicit_metadata_path:
+        settings_array.append(f"iceberg_metadata_file_path = '{explicit_metadata_path}'")
+
+    if object_storage_cluster:
+        settings_array.append(f"object_storage_cluster = 'cluster_simple'")
+
+    if settings_array:
+        settings_expression = " SETTINGS " + ", ".join(settings_array)
+    else:
+        settings_expression = ""
 
     storage_arg = storage_type
     engine_part = ""
@@ -244,7 +248,7 @@ def get_creation_expression(
                     DROP TABLE IF EXISTS {table_name};
                     CREATE TABLE {table_name}
                     ENGINE=Iceberg{engine_part}({storage_arg}, filename = 'iceberg_data/default/{table_name}/', format={format}, url = 'http://minio1:9001/{bucket}/')"""
-                    + settings_suffix
+                    + settings_expression
                 )
 
     elif storage_type == "azure":
@@ -264,7 +268,7 @@ def get_creation_expression(
                     DROP TABLE IF EXISTS {table_name};
                     CREATE TABLE {table_name}
                     ENGINE=Iceberg{engine_part}({storage_arg}, container = {cluster.azure_container_name}, storage_account_url = '{cluster.env_variables["AZURITE_STORAGE_ACCOUNT_URL"]}', blob_path = '/iceberg_data/default/{table_name}/', format={format})"""
-                    + settings_suffix
+                    + settings_expression
                 )
 
     elif storage_type == "local":
@@ -280,7 +284,7 @@ def get_creation_expression(
                 DROP TABLE IF EXISTS {table_name};
                 CREATE TABLE {table_name}
                 ENGINE=Iceberg{engine_part}({storage_arg}, path = '/iceberg_data/default/{table_name}/', format={format})"""
-                + settings_suffix
+                + settings_expression
             )
 
     else:
