@@ -71,7 +71,9 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
     metadata.setColumns(columns);
     metadata.setConstraints(constraints_);
 
-    if (sample_path.empty() && context_->getSettingsRef()[Setting::use_hive_partitioning])
+    if (sample_path.empty()
+            && context_->getSettingsRef()[Setting::use_hive_partitioning]
+            && !configuration->withPartitionWildcard())
         sample_path = getPathSample(metadata, context_);
 
     setVirtuals(VirtualColumnUtils::getVirtualsForFileLikeStorage(metadata.columns, context_, sample_path));
