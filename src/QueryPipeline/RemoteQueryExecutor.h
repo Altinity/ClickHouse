@@ -1,7 +1,5 @@
 #pragma once
 
-#include <variant>
-
 #include <Client/ConnectionPool.h>
 #include <Client/IConnections.h>
 #include <Client/ConnectionPoolWithFailover.h>
@@ -61,7 +59,8 @@ public:
         const Scalars & scalars_ = Scalars(),
         const Tables & external_tables_ = Tables(),
         QueryProcessingStage::Enum stage_ = QueryProcessingStage::Complete,
-        std::optional<Extension> extension_ = std::nullopt);
+        std::optional<Extension> extension_ = std::nullopt,
+        ConnectionPoolWithFailoverPtr connection_pool_with_failover_ = nullptr);
 
     /// Takes already set connection.
     RemoteQueryExecutor(
@@ -304,7 +303,7 @@ private:
       */
     bool got_duplicated_part_uuids = false;
 
-    bool has_postponed_packet = false;
+    bool packet_in_progress = false;
 
     bool is_remote_function = false;
     UInt32 shard_count = 0;
@@ -318,6 +317,8 @@ private:
     LoggerPtr log = nullptr;
 
     GetPriorityForLoadBalancing::Func priority_func;
+
+    const bool read_packet_type_separately = false;
 
     /// Send all scalars to remote servers
     void sendScalars();
@@ -350,9 +351,6 @@ private:
 
     /// Process packet for read and return data block if possible.
     ReadResult processPacket(Packet packet);
-
-    /// Reads packet by packet
-    Block readPackets();
 };
 
 }

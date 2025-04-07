@@ -29,7 +29,13 @@ function download
 {
     # Historically there were various paths for the performance test package.
     # Test all of them.
+    if [[ "$BUILD_NAME" == *"release"* ]]; then
+        build_name_new="build_amd_release"
+    else
+        build_name_new="build_arm_release"
+    fi
     declare -a urls_to_try=(
+        "$S3_URL/REFs/master/$REF_SHA/$build_name_new/performance.tar.zst"
         "$S3_URL/PRs/$left_pr/$left_sha/$BUILD_NAME/performance.tar.zst"
         "$S3_URL/$left_pr/$left_sha/$BUILD_NAME/performance.tar.zst"
     )

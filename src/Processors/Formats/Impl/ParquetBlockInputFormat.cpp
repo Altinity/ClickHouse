@@ -1,11 +1,11 @@
 #include "ParquetBlockInputFormat.h"
-#include <boost/algorithm/string/case_conv.hpp>
 
 #if USE_PARQUET
 
 #include <Core/Settings.h>
 #include <Core/ServerSettings.h>
 #include <Common/ProfileEvents.h>
+#include <Columns/ColumnNullable.h>
 #include <Common/logger_useful.h>
 #include <Common/ThreadPool.h>
 #include <Formats/FormatFactory.h>
@@ -33,6 +33,8 @@
 #include <Processors/Formats/Impl/Parquet/parquetBloomFilterHash.h>
 #include <Processors/Formats/Impl/ParquetFileMetaDataCache.h>
 #include <Interpreters/convertFieldToType.h>
+
+#include <boost/algorithm/string/case_conv.hpp>
 
 namespace ProfileEvents
 {
@@ -69,6 +71,7 @@ namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int INCORRECT_DATA;
+    extern const int CANNOT_ALLOCATE_MEMORY;
     extern const int CANNOT_READ_ALL_DATA;
     extern const int CANNOT_PARSE_NUMBER;
     extern const int LOGICAL_ERROR;
@@ -765,8 +768,6 @@ void ParquetBlockInputFormat::initializeIfNeeded()
         }
     }
 
-    bool has_row_groups_to_read = false;
-
     auto skip_row_group_based_on_filters = [&](int row_group)
     {
         if (!format_settings.parquet.filter_push_down && !format_settings.parquet.bloom_filter_push_down)
@@ -795,6 +796,7 @@ void ParquetBlockInputFormat::initializeIfNeeded()
         return !maybe_exists;
     };
 
+    bool has_row_groups_to_read = false;
     for (int row_group = 0; row_group < num_row_groups; ++row_group)
     {
         if (skip_row_groups.contains(row_group))
@@ -949,13 +951,9 @@ void ParquetBlockInputFormat::scheduleRowGroup(size_t row_group_batch_idx)
     pool->scheduleOrThrowOnError(
         [this, row_group_batch_idx, thread_group = CurrentThread::getGroup()]()
         {
-            if (thread_group)
-                CurrentThread::attachToGroupIfDetached(thread_group);
-            SCOPE_EXIT_SAFE(if (thread_group) CurrentThread::detachFromGroupIfNotDetached(););
-
             try
             {
-                setThreadName("ParquetDecoder");
+                ThreadGroupSwitcher switcher(thread_group, "ParquetDecoder");
 
                 threadFunction(row_group_batch_idx);
             }
@@ -1255,7 +1253,7 @@ NamesAndTypesList ParquetSchemaReader::readSchema()
         format_settings.parquet.skip_columns_with_unsupported_types_in_schema_inference,
         format_settings.schema_inference_make_columns_nullable != 0);
     if (format_settings.schema_inference_make_columns_nullable == 1)
-        return getNamesAndRecursivelyNullableTypes(header);
+        return getNamesAndRecursivelyNullableTypes(header, format_settings);
     return header.getNamesAndTypesList();
 }
 

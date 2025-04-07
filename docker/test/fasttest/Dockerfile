@@ -54,6 +54,7 @@ RUN mkdir /tmp/ccache \
         -DCMAKE_BUILD_TYPE=None \
         -DZSTD_FROM_INTERNET=ON \
         -DREDIS_STORAGE_BACKEND=OFF \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -Wno-dev \
         -B build \
         -S . \

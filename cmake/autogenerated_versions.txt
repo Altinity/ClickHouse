@@ -2,17 +2,17 @@
 
 # NOTE: VERSION_REVISION has nothing common with DBMS_TCP_PROTOCOL_VERSION,
 # only DBMS_TCP_PROTOCOL_VERSION should be incremented on protocol changes.
-SET(VERSION_REVISION 54494)
-SET(VERSION_MAJOR 24)
-SET(VERSION_MINOR 12)
+SET(VERSION_REVISION 54496)
+SET(VERSION_MAJOR 25)
+SET(VERSION_MINOR 2)
 SET(VERSION_PATCH 2)
-SET(VERSION_GITHASH a6d2b2e35b221d8bd94f31542e54468a138a2144)
+SET(VERSION_GITHASH 09989205d6fd661fb2683cbb1390fe4fcedaa548)
 
 # This is the 'base' tweak of the version, build scripts will
 # increment this by number of commits since previous tag.
 SET(VERSION_TWEAK 20000)
 SET(VERSION_FLAVOUR altinityantalya)
 
-SET(VERSION_DESCRIBE v24.12.2.20000.altinityantalya)
-SET(VERSION_STRING 24.12.2.20000.altinityantalya)
+SET(VERSION_DESCRIBE v25.2.2.20000.altinityantalya)
+SET(VERSION_STRING 25.2.2.20000.altinityantalya)
 # end of autochange

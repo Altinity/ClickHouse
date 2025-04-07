@@ -27,6 +27,8 @@ env:
   AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
   S3_URL: ${{ secrets.R2_ENDPOINT }}
   S3_DOWNLOAD: https://build-artifacts.altinity.io
+  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
 
 jobs:
   DockerBuildAarch64:

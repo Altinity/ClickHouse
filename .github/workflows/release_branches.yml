@@ -24,11 +24,7 @@ on: # yamllint disable-line rule:truthy
       - reopened
       - opened
     branches:
-      - 'antalya'
-  release:
-    types:
-      - published
-      - prereleased
+      - '*'
   push:
     branches:
       - 'antalya'
@@ -117,6 +113,7 @@ jobs:
       data: ${{ needs.RunConfig.outputs.data }}
       # always rebuild on release branches to be able to publish from any commit
       force: true
+      runner_type: builder-aarch64
   BuilderDebAsan:
     needs: [RunConfig, BuildDockers]
     if: ${{ !failure() && !cancelled() }}
@@ -275,7 +272,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (aarch64)
-      runner_type: altinity-func-tester-aarch64
+      runner_type: func-tester-aarch64
       data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatelessTestAsan:
     needs: [RunConfig, BuilderDebAsan]
@@ -320,72 +317,6 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (debug)
-      runner_type: altinity-func-tester
-      data: ${{ needs.RunConfig.outputs.data }}
-##############################################################################################
-############################ FUNCTIONAl STATEFUL TESTS #######################################
-##############################################################################################
-  FunctionalStatefulTestRelease:
-    needs: [RunConfig, BuilderDebRelease]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_test.yml
-    secrets: inherit
-    with:
-      test_name: Stateful tests (release)
-      runner_type: altinity-func-tester
-      data: ${{ needs.RunConfig.outputs.data }}
-  FunctionalStatefulTestAarch64:
-    needs: [RunConfig, BuilderDebAarch64]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_test.yml
-    secrets: inherit
-    with:
-      test_name: Stateful tests (aarch64)
-      runner_type: altinity-func-tester-aarch64
-      data: ${{ needs.RunConfig.outputs.data }}
-  FunctionalStatefulTestAsan:
-    needs: [RunConfig, BuilderDebAsan]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_test.yml
-    secrets: inherit
-    with:
-      test_name: Stateful tests (asan)
-      runner_type: altinity-func-tester
-      data: ${{ needs.RunConfig.outputs.data }}
-  FunctionalStatefulTestTsan:
-    needs: [RunConfig, BuilderDebTsan]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_test.yml
-    secrets: inherit
-    with:
-      test_name: Stateful tests (tsan)
-      runner_type: altinity-func-tester
-      data: ${{ needs.RunConfig.outputs.data }}
-  FunctionalStatefulTestMsan:
-    needs: [RunConfig, BuilderDebMsan]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_test.yml
-    secrets: inherit
-    with:
-      test_name: Stateful tests (msan)
-      runner_type: altinity-func-tester
-      data: ${{ needs.RunConfig.outputs.data }}
-  FunctionalStatefulTestUBsan:
-    needs: [RunConfig, BuilderDebUBsan]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_test.yml
-    secrets: inherit
-    with:
-      test_name: Stateful tests (ubsan)
-      runner_type: altinity-func-tester
-      data: ${{ needs.RunConfig.outputs.data }}
-  FunctionalStatefulTestDebug:
-    needs: [RunConfig, BuilderDebDebug]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_test.yml
-    secrets: inherit
-    with:
-      test_name: Stateful tests (debug)
       runner_type: altinity-func-tester
       data: ${{ needs.RunConfig.outputs.data }}
 ##############################################################################################
@@ -480,23 +411,23 @@ jobs:
 #############################################################################################
   RegressionTestsRelease:
     needs: [BuilderDebRelease]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'regression') }}
+    if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
       runner_type: altinity-on-demand, altinity-type-cx52, altinity-image-x86-app-docker-ce, altinity-setup-regression
-      commit: bd31e738c0cedaca253d15a05ed245c41b6e0b6a
+      commit: a170f32119a5c872e5ff209b8f39e13acc2d6626
       arch: release
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout_minutes: 300
   RegressionTestsAarch64:
     needs: [BuilderDebAarch64]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'regression') && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'aarch64') }}
+    if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
       runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-app-docker-ce, altinity-setup-regression
-      commit: bd31e738c0cedaca253d15a05ed245c41b6e0b6a
+      commit: a170f32119a5c872e5ff209b8f39e13acc2d6626
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout_minutes: 300
@@ -533,13 +464,6 @@ jobs:
       - FunctionalStatelessTestTsan
       - FunctionalStatelessTestMsan
       - FunctionalStatelessTestUBsan
-      - FunctionalStatefulTestDebug
-      - FunctionalStatefulTestRelease
-      - FunctionalStatefulTestAarch64
-      - FunctionalStatefulTestAsan
-      - FunctionalStatefulTestTsan
-      - FunctionalStatefulTestMsan
-      - FunctionalStatefulTestUBsan
       - StressTestDebug
       - StressTestAsan
       - StressTestTsan
@@ -579,7 +503,7 @@ jobs:
           CHECKS_DATABASE_USER: ${{ secrets.CHECKS_DATABASE_USER }}
           CHECKS_DATABASE_PASSWORD: ${{ secrets.CHECKS_DATABASE_PASSWORD }}
           COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
+          PR_NUMBER: ${{ github.event.number }}
           ACTIONS_RUN_URL: ${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}
         shell: bash
         run: |

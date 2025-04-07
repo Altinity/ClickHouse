@@ -17,6 +17,7 @@
 #include <Processors/QueryPlan/ExpressionStep.h>
 #include <Processors/QueryPlan/FilterStep.h>
 #include <Processors/QueryPlan/JoinStep.h>
+#include <Processors/QueryPlan/JoinStepLogical.h>
 #include <Processors/QueryPlan/SortingStep.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/StorageDummy.h>
@@ -105,6 +106,11 @@ std::vector<const QueryNode *> getSupportingParallelReplicasQuery(const IQueryTr
                 query_tree_node = array_join_node.getTableExpression().get();
                 break;
             }
+            case QueryTreeNodeType::CROSS_JOIN:
+            {
+                /// TODO: We can parallelize one table
+                return {};
+            }
             case QueryTreeNodeType::JOIN:
             {
                 const auto & join_node = query_tree_node->as<JoinNode &>();
@@ -113,7 +119,7 @@ std::vector<const QueryNode *> getSupportingParallelReplicasQuery(const IQueryTr
 
                 if (join_kind == JoinKind::Left || (join_kind == JoinKind::Inner && join_strictness == JoinStrictness::All))
                     query_tree_node = join_node.getLeftTableExpression().get();
-                else if (join_kind == JoinKind::Right)
+                else if (join_kind == JoinKind::Right && join_strictness != JoinStrictness::RightAny)
                     query_tree_node = join_node.getRightTableExpression().get();
                 else
                     return {};
@@ -232,7 +238,8 @@ const QueryNode * findQueryForParallelReplicas(
 
         while (!nodes_to_check.empty())
         {
-            const auto & [next_node_to_check, inside_join] = nodes_to_check.top();
+            /// Copy to avoid container overflow (we call pop() in the next line).
+            const auto [next_node_to_check, inside_join] = nodes_to_check.top();
             nodes_to_check.pop();
             const auto & children = next_node_to_check->children;
             auto * step = next_node_to_check->step.get();
@@ -264,9 +271,14 @@ const QueryNode * findQueryForParallelReplicas(
             else
             {
                 const auto * join = typeid_cast<JoinStep *>(step);
+                const auto * join_logical = typeid_cast<JoinStepLogical *>(step);
+                if (join_logical && join_logical->hasPreparedJoinStorage())
+                    /// JoinStepLogical with prepared storage is converted to FilledJoinStep, not regular JoinStep.
+                    join_logical = nullptr;
+
                 /// We've checked that JOIN is INNER/LEFT/RIGHT on query tree level before.
                 /// Don't distribute UNION node.
-                if (!join)
+                if (!join && !join_logical)
                     return res;
 
                 for (const auto & child : children)
@@ -408,6 +420,11 @@ static const TableNode * findTableForParallelReplicas(const IQueryTreeNode * que
                 query_tree_node = array_join_node.getTableExpression().get();
                 break;
             }
+            case QueryTreeNodeType::CROSS_JOIN:
+            {
+                /// TODO: We can parallelize one table
+                return nullptr;
+            }
             case QueryTreeNodeType::JOIN:
             {
                 const auto & join_node = query_tree_node->as<JoinNode &>();
@@ -496,7 +513,8 @@ JoinTreeQueryPlan buildQueryPlanForParallelReplicas(
         processed_stage,
         modified_query_ast,
         context,
-        storage_limits);
+        storage_limits,
+        nullptr);
 
     auto converting = ActionsDAG::makeConvertingActions(
         header.getColumnsWithTypeAndName(),

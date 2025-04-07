@@ -121,7 +121,7 @@ void registerTableFunctionIcebergCluster(TableFunctionFactory & factory)
         {.documentation
          = {.description = R"(The table function can be used to read the Iceberg table stored on S3 object store in parallel for many nodes in a specified cluster.)",
             .examples{{"icebergS3Cluster", "SELECT * FROM icebergS3Cluster(cluster, url, [, NOSIGN | access_key_id, secret_access_key, [session_token]], format, [,compression])", ""}},
-            .categories{"DataLake"}},
+            .category{""}},
          .allow_readonly = false});
 #endif
 
@@ -130,7 +130,7 @@ void registerTableFunctionIcebergCluster(TableFunctionFactory & factory)
         {.documentation
          = {.description = R"(The table function can be used to read the Iceberg table stored on Azure object store in parallel for many nodes in a specified cluster.)",
             .examples{{"icebergAzureCluster", "SELECT * FROM icebergAzureCluster(cluster, connection_string|storage_account_url, container_name, blobpath, [account_name, account_key, format, compression])", ""}},
-            .categories{"DataLake"}},
+            .category{""}},
          .allow_readonly = false});
 #endif
 
@@ -139,21 +139,21 @@ void registerTableFunctionIcebergCluster(TableFunctionFactory & factory)
         {.documentation
          = {.description = R"(The table function can be used to read the Iceberg table stored on HDFS virtual filesystem in parallel for many nodes in a specified cluster.)",
             .examples{{"icebergHDFSCluster", "SELECT * FROM icebergHDFSCluster(cluster, uri, [format], [structure], [compression_method])", ""}},
-            .categories{"DataLake"}},
+            .category{""}},
          .allow_readonly = false});
 #endif
 }
 #endif
 
 #if USE_AWS_S3
-#if USE_PARQUET
+#if USE_PARQUET && USE_DELTA_KERNEL_RS
 void registerTableFunctionDeltaLakeCluster(TableFunctionFactory & factory)
 {
     factory.registerFunction<TableFunctionDeltaLakeCluster>(
         {.documentation
          = {.description = R"(The table function can be used to read the DeltaLake table stored on object store in parallel for many nodes in a specified cluster.)",
             .examples{{"deltaLakeCluster", "SELECT * FROM deltaLakeCluster(cluster, url, access_key_id, secret_access_key)", ""}},
-            .categories{"DataLake"}},
+            .category{""}},
          .allow_readonly = false});
 }
 #endif
@@ -164,7 +164,7 @@ void registerTableFunctionHudiCluster(TableFunctionFactory & factory)
         {.documentation
          = {.description = R"(The table function can be used to read the Hudi table stored on object store in parallel for many nodes in a specified cluster.)",
             .examples{{"hudiCluster", "SELECT * FROM hudiCluster(cluster, url, access_key_id, secret_access_key)", ""}},
-            .categories{"DataLake"}},
+            .category{""}},
          .allow_readonly = false});
 }
 #endif
@@ -176,7 +176,7 @@ void registerDataLakeClusterTableFunctions(TableFunctionFactory & factory)
     registerTableFunctionIcebergCluster(factory);
 #endif
 #if USE_AWS_S3
-#if USE_PARQUET
+#if USE_PARQUET && USE_DELTA_KERNEL_RS
     registerTableFunctionDeltaLakeCluster(factory);
 #endif
     registerTableFunctionHudiCluster(factory);

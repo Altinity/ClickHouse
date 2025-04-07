@@ -52,13 +52,13 @@ name: Testing workflow
       CLICKHOUSE_TEST_STAT_LOGIN:
         description: username for ci db.
         required: true
-      CLICKHOUSE_TEST_STAT_PASSWORD: 
+      CLICKHOUSE_TEST_STAT_PASSWORD:
         description: password for ci db.
         required: true
-      CLICKHOUSE_TEST_STAT_URL: 
+      CLICKHOUSE_TEST_STAT_URL:
         description: url for ci db.
         required: true
-      DOCKER_PASSWORD: 
+      DOCKER_PASSWORD:
         description: token to upload docker images.
         required: true
       ROBOT_TOKEN:

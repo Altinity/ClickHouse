@@ -54,7 +54,7 @@ def get_checks_known_fails(client: Client, job_url: str, known_fails: dict):
         len(df.columns) - 1,
         "reason",
         df["test_name"]
-        .astype(str)
+        .cat.remove_unused_categories()
         .apply(
             lambda test_name: known_fails[test_name].get("reason", "No reason given")
         ),
@@ -111,13 +111,12 @@ def get_regression_fails(client: Client, job_url: str):
                     job_name,
                     report_url as results_link
                FROM `gh-data`.clickhouse_regression_results
-               GROUP BY architecture, test_name, job_url, job_name, report_url
-               ORDER BY length(test_name) DESC
+               GROUP BY architecture, test_name, job_url, job_name, report_url, start_time
+               ORDER BY start_time DESC, length(test_name) DESC
             )
             WHERE job_url='{job_url}'
             AND status IN ('Fail', 'Error')
             """
-
     df = client.query_dataframe(query)
     df = drop_prefix_rows(df, "test_name")
     df["job_name"] = df["job_name"].str.title()

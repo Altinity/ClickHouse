@@ -576,7 +576,6 @@ void ParquetRleDictReader<TColumnVector>::readBatch(
 }
 
 
-
 template class ParquetPlainValuesReader<ColumnUInt8, int32_t>;
 template class ParquetPlainValuesReader<ColumnInt8, int32_t>;
 template class ParquetPlainValuesReader<ColumnUInt16, int32_t>;
@@ -604,7 +603,6 @@ template class ParquetRleDictReader<ColumnInt32>;
 template class ParquetRleDictReader<ColumnUInt32>;
 template class ParquetRleDictReader<ColumnInt64>;
 template class ParquetRleDictReader<ColumnUInt64>;
-template class ParquetRleDictReader<ColumnBFloat16>;
 template class ParquetRleDictReader<ColumnFloat32>;
 template class ParquetRleDictReader<ColumnFloat64>;
 template class ParquetRleDictReader<ColumnDecimal<Decimal32>>;

@@ -1,5 +1,5 @@
 ARG FROM_TAG=latest
-FROM clickhouse/stateless-test:$FROM_TAG
+FROM altinityinfra/stateless-test:$FROM_TAG
 
 USER root
 

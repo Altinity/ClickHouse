@@ -1,6 +1,14 @@
 List of pull requests contributed by Altinity develoeprs to ClickHouse server. It does not include documentation changes.
 
 ## 2025
+  * system.kafka_consumers improvements	[77700](https://github.com/ClickHouse/ClickHouse/pull/77700)	by @ilejn
+  * Fix incorrect S3 uri parsing when key is not specified on path style	[78185](https://github.com/ClickHouse/ClickHouse/pull/78185)	by @arthurpassos
+  * Fix block device time metrics calculation	[78211](https://github.com/ClickHouse/ClickHouse/pull/78211)	by @filimonov
+  * Add support for hasAll function in token_bf index	[77662](https://github.com/ClickHouse/ClickHouse/pull/77662)	by @UnamedRus
+  * cppkafka minor change	[77624](https://github.com/ClickHouse/ClickHouse/pull/77624)	by @filimonov
+  * librdkafka 2.8	[76621](https://github.com/ClickHouse/ClickHouse/pull/76621)	by @filimonov
+  * Autodiscovery dynamic clusters	[76001](https://github.com/ClickHouse/ClickHouse/pull/76001)	by @ianton-ru
+  * Better pause / unpause in intergration tests	[76711](https://github.com/ClickHouse/ClickHouse/pull/76711)	by @filimonov
   * Update index.md	[75952](https://github.com/ClickHouse/ClickHouse/pull/75952)	by @filimonov
   * Merge parquet bloom filter and min/max evaluation	[71383](https://github.com/ClickHouse/ClickHouse/pull/71383)	by @arthurpassos
   * Reintroduce respect `ttl_only_drop_parts` on `materialize ttl`, #65488	[72751](https://github.com/ClickHouse/ClickHouse/pull/72751)	by @zvonand

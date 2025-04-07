@@ -1155,7 +1155,13 @@ private:
 
         calculateMinMaxFlags();
 
-        auto new_flags = function(flags, min_flags_with_children, max_flags_with_children, level, grant_option);
+        auto new_flags = function(
+            flags,
+            min_flags_with_children,
+            max_flags_with_children,
+            level,
+            grant_option,
+            isLeaf() || wildcard_grant);
 
         if (new_flags != flags)
         {
@@ -1183,6 +1189,9 @@ AccessRights::AccessRights(const AccessRights & src)
 
 AccessRights & AccessRights::operator =(const AccessRights & src)
 {
+    if (&src == this)
+        return *this;
+
     if (src.root)
         root = std::make_unique<Node>(*src.root);
     else
@@ -1637,7 +1646,8 @@ void AccessRights::modifyFlags(const ModifyFlagsFunction & function)
     if (!root)
         return;
 
-    bool flags_added, flags_removed;
+    bool flags_added;
+    bool flags_removed;
     root->modifyFlags(function, false, flags_added, flags_removed);
     if (flags_removed && root_with_grant_option)
         root_with_grant_option->makeIntersection(*root);

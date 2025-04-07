@@ -73,6 +73,16 @@ void TableFunctionObjectStorage<Definition, Configuration>::parseArguments(const
         throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH, "Table function '{}' must have arguments.", getName());
 
     auto & args = args_func.at(0)->children;
+    for (auto * it = args.begin(); it != args.end(); ++it)
+    {
+        ASTSetQuery * settings_ast = (*it)->as<ASTSetQuery>();
+        if (settings_ast)
+        {
+            settings.loadFromQuery(*settings_ast);
+            args.erase(it);
+            break;
+        }
+    }
     parseArgumentsImpl(args, context);
 }
 
@@ -137,7 +147,7 @@ void registerTableFunctionObjectStorage(TableFunctionFactory & factory)
             .description=R"(The table function can be used to read the data stored on GCS.)",
             .examples{{"gcs", "SELECT * FROM gcs(url, access_key_id, secret_access_key)", ""}
         },
-        .categories{"DataLake"}},
+        .category{""}},
         .allow_readonly = false
     });
 
@@ -148,7 +158,7 @@ void registerTableFunctionObjectStorage(TableFunctionFactory & factory)
             .description=R"(The table function can be used to read the data stored on COSN.)",
             .examples{{"cosn", "SELECT * FROM cosn(url, access_key_id, secret_access_key)", ""}
         },
-        .categories{"DataLake"}},
+        .category{""}},
         .allow_readonly = false
     });
     factory.registerFunction<TableFunctionObjectStorage<OSSDefinition, StorageS3Configuration>>(
@@ -158,7 +168,7 @@ void registerTableFunctionObjectStorage(TableFunctionFactory & factory)
             .description=R"(The table function can be used to read the data stored on OSS.)",
             .examples{{"oss", "SELECT * FROM oss(url, access_key_id, secret_access_key)", ""}
         },
-        .categories{"DataLake"}},
+        .category{""}},
         .allow_readonly = false
     });
 #endif
@@ -195,7 +205,7 @@ template class TableFunctionObjectStorage<IcebergAzureClusterDefinition, Storage
 template class TableFunctionObjectStorage<IcebergHDFSClusterDefinition, StorageHDFSIcebergConfiguration>;
 #endif
 
-#if USE_PARQUET && USE_AWS_S3
+#if USE_PARQUET && USE_AWS_S3 && USE_DELTA_KERNEL_RS
 template class TableFunctionObjectStorage<DeltaLakeClusterDefinition, StorageS3DeltaLakeConfiguration>;
 #endif
 
@@ -211,14 +221,14 @@ void registerTableFunctionIceberg(TableFunctionFactory & factory)
         {.documentation
          = {.description = R"(The table function can be used to read the Iceberg table stored on S3 object store. Alias to icebergS3)",
             .examples{{"iceberg", "SELECT * FROM iceberg(url, access_key_id, secret_access_key)", ""}},
-            .categories{"DataLake"}},
+            .category{""}},
          .allow_readonly = false});
 #endif
     factory.registerFunction<TableFunctionIcebergLocal>(
         {.documentation
          = {.description = R"(The table function can be used to read the Iceberg table stored locally.)",
             .examples{{"icebergLocal", "SELECT * FROM icebergLocal(filename)", ""}},
-            .categories{"DataLake"}},
+            .category{""}},
          .allow_readonly = false});
 }
 #endif
