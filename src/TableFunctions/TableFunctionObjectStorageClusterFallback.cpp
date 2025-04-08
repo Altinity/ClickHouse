@@ -15,6 +15,7 @@ namespace Setting
 namespace ErrorCodes
 {
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
+    extern const int BAD_ARGUMENTS;
 }
 
 struct S3ClusterFallbackDefinition
@@ -122,6 +123,16 @@ StoragePtr TableFunctionObjectStorageClusterFallback<Definition, Base>::executeI
     }
     else
         return BaseSimple::executeImpl(ast_function, context, table_name, cached_columns, is_insert_query);
+}
+
+template <typename Definition, typename Base>
+void TableFunctionObjectStorageClusterFallback<Definition, Base>::validateUseToCreateTable() const
+{
+    if (is_cluster_function)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "Table function '{}' cannot be used to create a table in cluster mode",
+            getName());
 }
 
 #if USE_AWS_S3
