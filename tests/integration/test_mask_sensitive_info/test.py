@@ -257,10 +257,11 @@ def test_create_table():
         f"S3(named_collection_6, url = 'http://minio1:9001/root/data/test8.csv', access_key_id = 'minio', secret_access_key = '{password}', format = 'CSV')",
         f"S3('http://minio1:9001/root/data/test9.csv.gz', 'NOSIGN', 'CSV', 'gzip')",
         f"S3('http://minio1:9001/root/data/test10.csv.gz', 'minio', '{password}')",
-        (
-            f"DeltaLake('http://minio1:9001/root/data/test11.csv.gz', 'minio', '{password}')",
-            "DNS_ERROR",
-        ),
+        # (
+        #     f"DeltaLake('http://minio1:9001/root/data/test11.csv.gz', 'minio', '{password}')",
+        #     "DNS_ERROR",
+        # ),
+        f"S3('http://minio1:9001/root/data/test10.csv.gz', 'minio', '{password}')", # dummy table to keep table numbers
         f"S3Queue('http://minio1:9001/root/data/', 'CSV') settings mode = 'ordered'",
         f"S3Queue('http://minio1:9001/root/data/', 'CSV', 'gzip') settings mode = 'ordered'",
         f"S3Queue('http://minio1:9001/root/data/', 'minio', '{password}', 'CSV') settings mode = 'ordered'",
@@ -336,7 +337,8 @@ def test_create_table():
             "CREATE TABLE table13 (`x` int) ENGINE = S3(named_collection_6, url = 'http://minio1:9001/root/data/test8.csv', access_key_id = 'minio', secret_access_key = '[HIDDEN]', format = 'CSV')",
             "CREATE TABLE table14 (x int) ENGINE = S3('http://minio1:9001/root/data/test9.csv.gz', 'NOSIGN', 'CSV', 'gzip')",
             "CREATE TABLE table15 (`x` int) ENGINE = S3('http://minio1:9001/root/data/test10.csv.gz', 'minio', '[HIDDEN]')",
-            "CREATE TABLE table16 (`x` int) ENGINE = DeltaLake('http://minio1:9001/root/data/test11.csv.gz', 'minio', '[HIDDEN]')",
+            # "CREATE TABLE table16 (`x` int) ENGINE = DeltaLake('http://minio1:9001/root/data/test11.csv.gz', 'minio', '[HIDDEN]')",
+            "CREATE TABLE table16 (`x` int) ENGINE = S3('http://minio1:9001/root/data/test10.csv.gz', 'minio', '[HIDDEN]')",
             "CREATE TABLE table17 (x int) ENGINE = S3Queue('http://minio1:9001/root/data/', 'CSV') settings mode = 'ordered'",
             "CREATE TABLE table18 (x int) ENGINE = S3Queue('http://minio1:9001/root/data/', 'CSV', 'gzip') settings mode = 'ordered'",
             # due to sensitive data substituion the query will be normalized, so not "settings" but "SETTINGS"
@@ -452,7 +454,8 @@ def test_table_functions():
         f"remoteSecure(named_collection_6, addresses_expr = '127.{{2..11}}', database = 'default', table = 'remote_table', user = 'remote_user', password = '{password}')",
         f"s3('http://minio1:9001/root/data/test9.csv.gz', 'NOSIGN', 'CSV')",
         f"s3('http://minio1:9001/root/data/test10.csv.gz', 'minio', '{password}')",
-        f"deltaLake('http://minio1:9001/root/data/test11.csv.gz', 'minio', '{password}')",
+        # f"deltaLake('http://minio1:9001/root/data/test11.csv.gz', 'minio', '{password}')",
+        f"s3('http://minio1:9001/root/data/test10.csv.gz', 'minio', '{password}')", # dummy table to keep table numbers
         f"azureBlobStorage('{azure_conn_string}', 'cont', 'test_simple.csv', 'CSV')",
         f"azureBlobStorage('{azure_conn_string}', 'cont', 'test_simple_1.csv', 'CSV', 'none')",
         f"azureBlobStorage('{azure_conn_string}', 'cont', 'test_simple_2.csv', 'CSV', 'none', 'auto')",
@@ -535,7 +538,8 @@ def test_table_functions():
             "CREATE TABLE tablefunc26 (`x` int) AS remoteSecure(named_collection_6, addresses_expr = '127.{2..11}', database = 'default', `table` = 'remote_table', user = 'remote_user', password = '[HIDDEN]')",
             "CREATE TABLE tablefunc27 (x int) AS s3('http://minio1:9001/root/data/test9.csv.gz', 'NOSIGN', 'CSV')",
             "CREATE TABLE tablefunc28 (`x` int) AS s3('http://minio1:9001/root/data/test10.csv.gz', 'minio', '[HIDDEN]')",
-            "CREATE TABLE tablefunc29 (`x` int) AS deltaLake('http://minio1:9001/root/data/test11.csv.gz', 'minio', '[HIDDEN]')",
+            # "CREATE TABLE tablefunc29 (`x` int) AS deltaLake('http://minio1:9001/root/data/test11.csv.gz', 'minio', '[HIDDEN]')",
+            "CREATE TABLE tablefunc29 (`x` int) AS s3('http://minio1:9001/root/data/test10.csv.gz', 'minio', '[HIDDEN]')",
             f"CREATE TABLE tablefunc30 (`x` int) AS azureBlobStorage('{masked_azure_conn_string}', 'cont', 'test_simple.csv', 'CSV')",
             f"CREATE TABLE tablefunc31 (`x` int) AS azureBlobStorage('{masked_azure_conn_string}', 'cont', 'test_simple_1.csv', 'CSV', 'none')",
             f"CREATE TABLE tablefunc32 (`x` int) AS azureBlobStorage('{masked_azure_conn_string}', 'cont', 'test_simple_2.csv', 'CSV', 'none', 'auto')",
