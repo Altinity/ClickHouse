@@ -15,7 +15,7 @@ def get_spark_for_iceberg(result_path):
         pyspark.sql.SparkSession.builder.appName("spark_test")
         .config(
             "spark.jars.packages",
-            "org.apache.iceberg:iceberg-spark-runtime-3.3_2.12:1.1.0",
+            "org.apache.iceberg:iceberg-spark-runtime-3.5_2.13:1.8.1",
         )
         .config(
             "spark.sql.catalog.spark_catalog",
