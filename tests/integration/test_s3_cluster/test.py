@@ -957,7 +957,7 @@ def test_hive_partitioning(started_cluster, allow_experimental_analyzer):
     )
     cluster_optimized_traffic = int(cluster_optimized_traffic)
     assert cluster_optimized_traffic == optimized_traffic
-
+    
     node.query("SET allow_experimental_analyzer = DEFAULT")
 
 
