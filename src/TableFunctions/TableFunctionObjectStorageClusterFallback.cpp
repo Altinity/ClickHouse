@@ -38,6 +38,13 @@ struct HDFSClusterFallbackDefinition
     static constexpr auto storage_type_cluster_name = "HDFSCluster";
 };
 
+struct IcebergClusterFallbackDefinition
+{
+    static constexpr auto name = "iceberg";
+    static constexpr auto storage_type_name = "UNDEFINED";
+    static constexpr auto storage_type_cluster_name = "IcebergCluster";
+};
+
 struct IcebergS3ClusterFallbackDefinition
 {
     static constexpr auto name = "icebergS3";
@@ -129,6 +136,10 @@ using TableFunctionAzureClusterFallback = TableFunctionObjectStorageClusterFallb
 using TableFunctionHDFSClusterFallback = TableFunctionObjectStorageClusterFallback<HDFSClusterFallbackDefinition, TableFunctionHDFSCluster>;
 #endif
 
+#if USE_AVRO
+using TableFunctionIcebergClusterFallback = TableFunctionObjectStorageClusterFallback<IcebergClusterFallbackDefinition, TableFunctionIcebergCluster>;
+#endif
+
 #if USE_AVRO && USE_AWS_S3
 using TableFunctionIcebergS3ClusterFallback = TableFunctionObjectStorageClusterFallback<IcebergS3ClusterFallbackDefinition, TableFunctionIcebergS3Cluster>;
 #endif
@@ -205,6 +216,36 @@ void registerTableFunctionObjectStorageClusterFallback(TableFunctionFactory & fa
                     "hdfs",
                     "SELECT * FROM hdfs(url, format, compression, structure]) "
                     "SETTINGS object_storage_cluster='cluster'", ""
+                },
+            }
+        },
+        .allow_readonly = false
+    }
+    );
+#endif
+
+#if USE_AVRO
+    factory.registerFunction<TableFunctionIcebergClusterFallback>(
+    {
+        .documentation = {
+            .description=R"(The table function can be used to read the Iceberg table stored on different object store in parallel for many nodes in a specified cluster or from single node.)",
+            .examples{
+                {
+                    "iceberg",
+                    "SELECT * FROM iceberg(url, access_key_id, secret_access_key, storage_type='s3')", ""
+                },
+                {
+                    "iceberg",
+                    "SELECT * FROM iceberg(url, access_key_id, secret_access_key, storage_type='s3') "
+                    "SETTINGS object_storage_cluster='cluster'", ""
+                },
+                {
+                    "iceberg",
+                    "SELECT * FROM iceberg(url, access_key_id, secret_access_key, storage_type='azure')", ""
+                },
+                {
+                    "iceberg",
+                    "SELECT * FROM iceberg(url, storage_type='hdfs') SETTINGS object_storage_cluster='cluster'", ""
                 },
             }
         },

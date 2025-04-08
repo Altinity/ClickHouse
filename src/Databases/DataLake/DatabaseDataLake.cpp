@@ -405,7 +405,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
 
     /// with_table_structure = false: because there will be
     /// no table structure in table definition AST.
-    StorageObjectStorage::Configuration::initialize(*configuration, args, context_copy, /* with_table_structure */false, storage_settings);
+    configuration->initialize(args, context_copy, /* with_table_structure */false, storage_settings);
 
     auto cluster_name = settings[DatabaseDataLakeSetting::object_storage_cluster].value;
     
