@@ -291,7 +291,56 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
     }
 
     if (cluster_name_in_settings || !endsWith(table_function->name, "Cluster"))
+    {
         configuration->addStructureAndFormatToArgsIfNeeded(args, structure, configuration->format, context, /*with_structure=*/true);
+
+        /// Convert to old-stype *Cluster table function.
+        /// This allows to use old clickhouse versions in cluster.
+        static std::unordered_map<std::string, std::string> function_to_cluster_function = {
+            {"s3", "s3Cluster"},
+            {"azureBlobStorage", "azureBlobStorageCluster"},
+            {"hdfs", "hdfsCluster"},
+            {"iceberg", "icebergS3Cluster"},
+            {"icebergS3", "icebergS3Cluster"},
+            {"icebergAzure", "icebergAzureCluster"},
+            {"icebergHDFS", "icebergHDFSCluster"},
+            {"deltaLake", "deltaLakeCluster"},
+            {"hudi", "hudiCluster"},
+        };
+
+        auto p = function_to_cluster_function.find(table_function->name);
+        if (p == function_to_cluster_function.end())
+        {
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "Can't find cluster name for table function {}",
+                table_function->name);
+        }
+
+        table_function->name = p->second;
+
+        auto cluster_name = getClusterName(context);
+        auto cluster_name_arg = std::make_shared<ASTLiteral>(cluster_name);
+        args.insert(args.begin(), cluster_name_arg);
+
+        auto * select_query = query->as<ASTSelectQuery>();
+        if (!select_query)
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "Expected SELECT query from table function {}",
+                configuration->getEngineName());
+
+        auto settings = select_query->settings();
+        if (settings)
+        {
+            auto & settings_ast = settings->as<ASTSetQuery &>();
+            if (settings_ast.changes.removeSetting("object_storage_cluster") && settings_ast.changes.empty())
+            {
+                select_query->setExpression(ASTSelectQuery::Expression::SETTINGS, {});
+            }
+            /// No throw if not found - `object_storage_cluster` can be global setting.
+        }
+    }
     else
     {
         ASTPtr cluster_name_arg = args.front();
