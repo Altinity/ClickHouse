@@ -577,14 +577,14 @@ try
         }
 
         /// Advice the user to send it manually.
-        if (std::string_view(VERSION_OFFICIAL).contains("official build"))
+        if (std::string_view(VERSION_OFFICIAL).contains("altinity build"))
         {
             const auto & date_lut = DateLUT::instance();
 
             /// Approximate support period, upper bound.
             if (time(nullptr) - date_lut.makeDate(2000 + VERSION_MAJOR, VERSION_MINOR, 1) < (365 + 30) * 86400)
             {
-                LOG_FATAL(log, "Report this error to https://github.com/ClickHouse/ClickHouse/issues");
+                LOG_FATAL(log, "Report this error to https://github.com/Altinity/ClickHouse/issues");
             }
             else
             {
@@ -593,7 +593,7 @@ try
         }
         else
         {
-            LOG_FATAL(log, "This ClickHouse version is not official and should be upgraded to the official build.");
+            // LOG_FATAL(log, "This ClickHouse version is not official and should be upgraded to the official build.");
         }
     }
 

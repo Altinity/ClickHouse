@@ -36,4 +36,26 @@ AND type = 'QueryFinish'
 ORDER BY event_time desc
 LIMIT 1;
 
+SYSTEM DROP PARQUET METADATA CACHE;
+
+SELECT COUNT(*)
+FROM s3(s3_conn, filename = 'test_03262_*', format = Parquet)
+SETTINGS input_format_parquet_use_metadata_cache=1, optimize_count_from_files=0, log_comment='test_03262_parquet_metadata_cache_cache_empty';
+
+SYSTEM FLUSH LOGS;
+
+SELECT ProfileEvents['ParquetMetaDataCacheHits']
+FROM system.query_log
+where log_comment = 'test_03262_parquet_metadata_cache_cache_empty'
+AND type = 'QueryFinish'
+ORDER BY event_time desc
+LIMIT 1;
+
+SELECT ProfileEvents['ParquetMetaDataCacheMisses']
+FROM system.query_log
+where log_comment = 'test_03262_parquet_metadata_cache_cache_empty'
+AND type = 'QueryFinish'
+ORDER BY event_time desc
+LIMIT 1;
+
 DROP TABLE t_parquet_03262;

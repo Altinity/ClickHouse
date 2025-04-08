@@ -272,7 +272,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Stateless tests (aarch64)
-      runner_type: func-tester-aarch64
+      runner_type: altinity-func-tester-aarch64
       data: ${{ needs.RunConfig.outputs.data }}
   FunctionalStatelessTestAsan:
     needs: [RunConfig, BuilderDebAsan]
@@ -411,22 +411,22 @@ jobs:
 #############################################################################################
   RegressionTestsRelease:
     needs: [BuilderDebRelease]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'regression') }}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
-      runner_type: altinity-on-demand, altinity-type-cx52, altinity-image-x86-app-docker-ce, altinity-setup-regression
+      runner_type: altinity-on-demand, altinity-regression-tester
       commit: a170f32119a5c872e5ff209b8f39e13acc2d6626
       arch: release
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout_minutes: 300
   RegressionTestsAarch64:
     needs: [BuilderDebAarch64]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'regression') && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'aarch64') }}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
-      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-app-docker-ce, altinity-setup-regression
+      runner_type: altinity-on-demand, altinity-regression-tester-aarch64
       commit: a170f32119a5c872e5ff209b8f39e13acc2d6626
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
