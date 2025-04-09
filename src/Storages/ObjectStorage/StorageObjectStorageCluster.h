@@ -30,7 +30,9 @@ public:
     std::string getName() const override;
 
     RemoteQueryExecutor::Extension getTaskIteratorExtension(
-        const ActionsDAG::Node * predicate, const ContextPtr & context) const override;
+        const ActionsDAG::Node * predicate,
+        const ContextPtr & context,
+        std::optional<std::vector<std::string>> ids_of_replicas) const override;
 
     String getPathSample(StorageInMemoryMetadata metadata, ContextPtr context);
 

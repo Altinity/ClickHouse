@@ -230,7 +230,7 @@ StoragePtr DatabaseIceberg::tryGetTable(const String & name, ContextPtr context_
 
     /// with_table_structure = false: because there will be
     /// no table structure in table definition AST.
-    StorageObjectStorage::Configuration::initialize(*configuration, args, context_, /* with_table_structure */false, storage_settings.get());
+    configuration->initialize(args, context_, /* with_table_structure */false, storage_settings.get());
 
     auto cluster_name = settings[DatabaseIcebergSetting::object_storage_cluster].value;
 

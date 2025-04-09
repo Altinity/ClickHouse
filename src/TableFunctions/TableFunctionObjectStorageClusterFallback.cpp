@@ -15,6 +15,7 @@ namespace Setting
 namespace ErrorCodes
 {
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
+    extern const int BAD_ARGUMENTS;
 }
 
 struct S3ClusterFallbackDefinition
@@ -36,6 +37,13 @@ struct HDFSClusterFallbackDefinition
     static constexpr auto name = "hdfs";
     static constexpr auto storage_type_name = "HDFS";
     static constexpr auto storage_type_cluster_name = "HDFSCluster";
+};
+
+struct IcebergClusterFallbackDefinition
+{
+    static constexpr auto name = "iceberg";
+    static constexpr auto storage_type_name = "UNDEFINED";
+    static constexpr auto storage_type_cluster_name = "IcebergCluster";
 };
 
 struct IcebergS3ClusterFallbackDefinition
@@ -117,6 +125,16 @@ StoragePtr TableFunctionObjectStorageClusterFallback<Definition, Base>::executeI
         return BaseSimple::executeImpl(ast_function, context, table_name, cached_columns, is_insert_query);
 }
 
+template <typename Definition, typename Base>
+void TableFunctionObjectStorageClusterFallback<Definition, Base>::validateUseToCreateTable() const
+{
+    if (is_cluster_function)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "Table function '{}' cannot be used to create a table in cluster mode",
+            getName());
+}
+
 #if USE_AWS_S3
 using TableFunctionS3ClusterFallback = TableFunctionObjectStorageClusterFallback<S3ClusterFallbackDefinition, TableFunctionS3Cluster>;
 #endif
@@ -127,6 +145,10 @@ using TableFunctionAzureClusterFallback = TableFunctionObjectStorageClusterFallb
 
 #if USE_HDFS
 using TableFunctionHDFSClusterFallback = TableFunctionObjectStorageClusterFallback<HDFSClusterFallbackDefinition, TableFunctionHDFSCluster>;
+#endif
+
+#if USE_AVRO
+using TableFunctionIcebergClusterFallback = TableFunctionObjectStorageClusterFallback<IcebergClusterFallbackDefinition, TableFunctionIcebergCluster>;
 #endif
 
 #if USE_AVRO && USE_AWS_S3
@@ -205,6 +227,36 @@ void registerTableFunctionObjectStorageClusterFallback(TableFunctionFactory & fa
                     "hdfs",
                     "SELECT * FROM hdfs(url, format, compression, structure]) "
                     "SETTINGS object_storage_cluster='cluster'", ""
+                },
+            }
+        },
+        .allow_readonly = false
+    }
+    );
+#endif
+
+#if USE_AVRO
+    factory.registerFunction<TableFunctionIcebergClusterFallback>(
+    {
+        .documentation = {
+            .description=R"(The table function can be used to read the Iceberg table stored on different object store in parallel for many nodes in a specified cluster or from single node.)",
+            .examples{
+                {
+                    "iceberg",
+                    "SELECT * FROM iceberg(url, access_key_id, secret_access_key, storage_type='s3')", ""
+                },
+                {
+                    "iceberg",
+                    "SELECT * FROM iceberg(url, access_key_id, secret_access_key, storage_type='s3') "
+                    "SETTINGS object_storage_cluster='cluster'", ""
+                },
+                {
+                    "iceberg",
+                    "SELECT * FROM iceberg(url, access_key_id, secret_access_key, storage_type='azure')", ""
+                },
+                {
+                    "iceberg",
+                    "SELECT * FROM iceberg(url, storage_type='hdfs') SETTINGS object_storage_cluster='cluster'", ""
                 },
             }
         },

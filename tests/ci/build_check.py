@@ -250,7 +250,7 @@ def main():
             build_name,
         )
     )
-    src_path = temp_path / "build_source.src.tar.gz"
+    src_path = Path(TEMP_PATH) / "build_source.src.tar.gz"
     s3_path = s3_path_prefix + "/clickhouse-" + version.string + ".src.tar.gz"
     logging.info("s3_path %s", s3_path)
     if src_path.exists():

@@ -167,8 +167,7 @@ public:
     using Path = std::string;
     using Paths = std::vector<Path>;
 
-    static void initialize(
-        Configuration & configuration,
+    virtual void initialize(
         ASTs & engine_args,
         ContextPtr local_context,
         bool with_table_structure,
@@ -260,9 +259,11 @@ public:
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method createArgsWithAccessData is not supported by storage {}", getEngineName());
     }
 
-protected:
     virtual void fromNamedCollection(const NamedCollection & collection, ContextPtr context) = 0;
     virtual void fromAST(ASTs & args, ContextPtr context, bool with_structure) = 0;
+
+    virtual ObjectStorageType extractDynamicStorageType(ASTs & /* args */, ContextPtr /* context */, ASTPtr * /* type_arg */ = nullptr) const
+    { return ObjectStorageType::None; }
 
     void assertInitialized() const;
 

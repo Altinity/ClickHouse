@@ -17,6 +17,8 @@
 #include <Storages/ObjectStorage/Utils.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSource.h>
 #include <Storages/extractTableFunctionArgumentsFromSelectQuery.h>
+#include <Storages/ObjectStorage/StorageObjectStorageStableTaskDistributor.h>
+
 
 namespace DB
 {
@@ -181,6 +183,7 @@ void StorageObjectStorageCluster::updateQueryForDistributedEngineIfNeeded(ASTPtr
         {"S3", "s3"},
         {"Azure", "azureBlobStorage"},
         {"HDFS", "hdfs"},
+        {"Iceberg", "iceberg"},
         {"IcebergS3", "icebergS3"},
         {"IcebergAzure", "icebergAzure"},
         {"IcebergHDFS", "icebergHDFS"},
@@ -267,9 +270,60 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
             configuration->getEngineName());
     }
 
+    ASTPtr object_storage_type_arg;
+    configuration->extractDynamicStorageType(args, context, &object_storage_type_arg);
     if (cluster_name_in_settings)
     {
         configuration->addStructureAndFormatToArgsIfNeeded(args, structure, configuration->format, context, /*with_structure=*/true);
+
+        /// Convert to old-stype *Cluster table function.
+        /// This allows to use old clickhouse versions in cluster.
+        static std::unordered_map<std::string, std::string> function_to_cluster_function = {
+            {"s3", "s3Cluster"},
+            {"azureBlobStorage", "azureBlobStorageCluster"},
+            {"hdfs", "hdfsCluster"},
+            {"iceberg", "icebergS3Cluster"},
+            {"icebergS3", "icebergS3Cluster"},
+            {"icebergAzure", "icebergAzureCluster"},
+            {"icebergHDFS", "icebergHDFSCluster"},
+            {"deltaLake", "deltaLakeCluster"},
+            {"hudi", "hudiCluster"},
+        };
+
+        ASTFunction * table_function = extractTableFunctionFromSelectQuery(query);
+
+        auto p = function_to_cluster_function.find(table_function->name);
+        if (p == function_to_cluster_function.end())
+        {
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "Can't find cluster name for table function {}",
+                table_function->name);
+        }
+
+        table_function->name = p->second;
+
+        auto cluster_name = getClusterName(context);
+        auto cluster_name_arg = std::make_shared<ASTLiteral>(cluster_name);
+        args.insert(args.begin(), cluster_name_arg);
+
+        auto * select_query = query->as<ASTSelectQuery>();
+        if (!select_query)
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "Expected SELECT query from table function {}",
+                configuration->getEngineName());
+
+        auto settings = select_query->settings();
+        if (settings)
+        {
+            auto & settings_ast = settings->as<ASTSetQuery &>();
+            if (settings_ast.changes.removeSetting("object_storage_cluster") && settings_ast.changes.empty())
+            {
+                select_query->setExpression(ASTSelectQuery::Expression::SETTINGS, {});
+            }
+            /// No throw if not found - `object_storage_cluster` can be global setting.
+        }
     }
     else
     {
@@ -278,22 +332,26 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
         configuration->addStructureAndFormatToArgsIfNeeded(args, structure, configuration->format, context, /*with_structure=*/true);
         args.insert(args.begin(), cluster_name_arg);
     }
+    if (object_storage_type_arg)
+        args.insert(args.end(), object_storage_type_arg);
 }
 
 RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExtension(
-    const ActionsDAG::Node * predicate, const ContextPtr & local_context) const
+    const ActionsDAG::Node * predicate,
+    const ContextPtr & local_context,
+    std::optional<std::vector<std::string>> ids_of_replicas) const
 {
     auto iterator = StorageObjectStorageSource::createFileIterator(
         configuration, configuration->getQuerySettings(local_context), object_storage, /* distributed_processing */false,
         local_context, predicate, getVirtualsList(), nullptr, local_context->getFileProgressCallback());
 
-    auto callback = std::make_shared<std::function<String()>>([iterator]() mutable -> String
-    {
-        auto object_info = iterator->next(0);
-        if (object_info)
-            return object_info->getPath();
-        return "";
-    });
+    auto task_distributor = std::make_shared<StorageObjectStorageStableTaskDistributor>(iterator, ids_of_replicas);
+
+    auto callback = std::make_shared<TaskIterator>(
+        [task_distributor](size_t number_of_current_replica) mutable -> String {
+            return task_distributor->getNextTask(number_of_current_replica).value_or("");
+        });
+
     return RemoteQueryExecutor::Extension{ .task_iterator = std::move(callback) };
 }
 

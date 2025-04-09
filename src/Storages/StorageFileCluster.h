@@ -27,7 +27,10 @@ public:
         const ConstraintsDescription & constraints_);
 
     std::string getName() const override { return "FileCluster"; }
-    RemoteQueryExecutor::Extension getTaskIteratorExtension(const ActionsDAG::Node * predicate, const ContextPtr & context) const override;
+    RemoteQueryExecutor::Extension getTaskIteratorExtension(
+        const ActionsDAG::Node * predicate,
+        const ContextPtr & context,
+        std::optional<std::vector<std::string>> ids_of_nodes) const override;
 
 private:
     void updateQueryToSendIfNeeded(ASTPtr & query, const StorageSnapshotPtr & storage_snapshot, const ContextPtr & context) override;

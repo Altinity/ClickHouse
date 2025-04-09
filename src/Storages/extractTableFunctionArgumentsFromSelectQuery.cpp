@@ -11,7 +11,7 @@
 namespace DB
 {
 
-ASTExpressionList * extractTableFunctionArgumentsFromSelectQuery(ASTPtr & query)
+ASTFunction * extractTableFunctionFromSelectQuery(ASTPtr & query)
 {
     auto * select_query = query->as<ASTSelectQuery>();
     if (!select_query || !select_query->tables())
@@ -23,6 +23,14 @@ ASTExpressionList * extractTableFunctionArgumentsFromSelectQuery(ASTPtr & query)
         return nullptr;
 
     auto * table_function = table_expression->table_function->as<ASTFunction>();
+    return table_function;
+}
+
+ASTExpressionList * extractTableFunctionArgumentsFromSelectQuery(ASTPtr & query)
+{
+    auto * table_function = extractTableFunctionFromSelectQuery(query);
+    if (!table_function)
+        return nullptr;
     return table_function->arguments->as<ASTExpressionList>();
 }
 

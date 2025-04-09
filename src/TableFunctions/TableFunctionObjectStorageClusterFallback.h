@@ -26,6 +26,8 @@ public:
 
     String getName() const override { return name; }
 
+    void validateUseToCreateTable() const override;
+
 private:
     const char * getStorageTypeName() const override
     {
