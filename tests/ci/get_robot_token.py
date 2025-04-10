@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import logging
+import os
 import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
@@ -10,7 +11,7 @@ from github.AuthenticatedUser import AuthenticatedUser
 from github.GithubException import BadCredentialsException
 from github.NamedUser import NamedUser
 
-from env_helper import ROBOT_TOKEN
+ROBOT_TOKEN = os.getenv("ROBOT_TOKEN")
 
 @dataclass
 class Token:
