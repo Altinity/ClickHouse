@@ -15,6 +15,7 @@ TEMP_PATH = os.getenv("TEMP_PATH", p.abspath(p.join(module_dir, "./tmp")))
 REPORT_PATH = f"{TEMP_PATH}/reports"
 # FIXME: latest should not be used in CI, set temporary for transition to "docker with digest as a tag"
 DOCKER_TAG = os.getenv("DOCKER_TAG", "latest")
+DOCKER_PASSWORD = os.getenv("DOCKER_PASSWORD")
 CACHES_PATH = os.getenv("CACHES_PATH", TEMP_PATH)
 CLOUDFLARE_TOKEN = os.getenv("CLOUDFLARE_TOKEN")
 GITHUB_EVENT_PATH = os.getenv("GITHUB_EVENT_PATH", "")
