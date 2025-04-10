@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from env_helper import ROOT_DIR, DOCKER_TAG, DOCKER_PASSWORD
-from ci_utils import Shell
 
 IMAGES_FILE_PATH = Path("docker/images.json")
 
@@ -28,8 +27,7 @@ def docker_login(relogin: bool = True) -> None:
         logging.info('Doing docker login')
         subprocess.check_output(  # pylint: disable=unexpected-keyword-arg
             "docker login --username 'altinityinfra' --password-stdin",
-            strict=True,
-            stdin_str=DOCKER_PASSWORD,
+            input=DOCKER_PASSWORD,
             encoding="utf-8",
             shell=True,
         )
@@ -57,7 +55,7 @@ def pull_image(image: DockerImage) -> DockerImage:
         )
         logging.info("Pulling image %s - done", image)
     except Exception as ex:
-        logging.info("Got execption pulling docker %s", ex)
+        logging.info("Got exception pulling docker %s", ex)
         raise ex
     return image
 
