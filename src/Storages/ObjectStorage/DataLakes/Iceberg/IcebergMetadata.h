@@ -118,8 +118,6 @@ private:
 
     void updateState(const ContextPtr & local_context, bool metadata_file_changed);
 
-    Strings getDataFiles(const ActionsDAG * filter_dag) const;
-
     void updateSnapshot();
 
     Iceberg::ManifestListPtr getManifestList(const String & filename) const;
@@ -135,7 +133,9 @@ private:
 
     std::optional<String> getRelevantManifestList(const Poco::JSON::Object::Ptr & metadata);
 
-    Poco::JSON::Object::Ptr readJSON(const String & metadata_file_path, const ContextPtr & local_context) const;
+    Strings getDataFilesImpl(const ActionsDAG * filter_dag) const;
+
+    Iceberg::ManifestFilePtr tryGetManifestFile(const String & filename) const;
 };
 }
 
