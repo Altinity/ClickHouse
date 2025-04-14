@@ -54,6 +54,8 @@
 #include <Parsers/makeASTForLogicalFunction.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 
+#include <absl/container/flat_hash_map.h>
+
 
 namespace DB
 {
@@ -144,26 +146,26 @@ NameSet getVirtualNamesForFileLikeStorage()
     return getCommonVirtualsForFileLikeStorage().getNameSet();
 }
 
-static std::unordered_map<std::string, std::string> parseHivePartitioningKeysAndValues(const String & path)
+using HivePartitioningKeysAndValues = absl::flat_hash_map<std::string_view, std::string_view>;
+static HivePartitioningKeysAndValues parseHivePartitioningKeysAndValues(const String & path)
 {
-    std::string pattern = "([^/]+)=([^/]+)/";
+    const static RE2 pattern_re("([^/]+)=([^/]+)/");
     re2::StringPiece input_piece(path);
 
-    std::unordered_map<std::string, std::string> key_values;
-    std::string key;
-    std::string value;
-    std::unordered_map<std::string, std::string> used_keys;
-    while (RE2::FindAndConsume(&input_piece, pattern, &key, &value))
+    HivePartitioningKeysAndValues result;
+    std::string_view key;
+    std::string_view value;
+
+    while (RE2::FindAndConsume(&input_piece, pattern_re, &key, &value))
     {
-        auto it = used_keys.find(key);
-        if (it != used_keys.end() && it->second != value)
+        auto it = result.find(key);
+        if (it != result.end() && it->second != value)
             throw Exception(ErrorCodes::INCORRECT_DATA, "Path '{}' to file with enabled hive-style partitioning contains duplicated partition key {} with different values, only unique keys are allowed", path, key);
-        used_keys.insert({key, value});
 
         auto col_name = key;
-        key_values[col_name] = value;
+        result[col_name] = value;
     }
-    return key_values;
+    return result;
 }
 
 VirtualColumnsDescription getVirtualsForFileLikeStorage(ColumnsDescription & storage_columns, const ContextPtr & context, const std::string & path, std::optional<FormatSettings> format_settings_)
@@ -199,13 +201,15 @@ VirtualColumnsDescription getVirtualsForFileLikeStorage(ColumnsDescription & sto
         auto format_settings = format_settings_ ? *format_settings_ : getFormatSettings(context);
         for (auto & item : map)
         {
-            auto type = tryInferDataTypeByEscapingRule(item.second, format_settings, FormatSettings::EscapingRule::Raw);
+            const std::string name(item.second);
+
+            auto type = tryInferDataTypeByEscapingRule(name, format_settings, FormatSettings::EscapingRule::Raw);
             if (type == nullptr)
                 type = std::make_shared<DataTypeString>();
             if (type->canBeInsideLowCardinality())
-                add_virtual({item.first, std::make_shared<DataTypeLowCardinality>(type)}, true);
+                add_virtual({name, std::make_shared<DataTypeLowCardinality>(type)}, true);
             else
-                add_virtual({item.first, type}, true);
+                add_virtual({name, type}, true);
         }
     }
 
@@ -231,7 +235,7 @@ static void addPathAndFileToVirtualColumns(Block & block, const String & path, s
 
     if (use_hive_partitioning)
     {
-        auto keys_and_values = parseHivePartitioningKeysAndValues(path);
+        const auto keys_and_values = parseHivePartitioningKeysAndValues(path);
         for (const auto & [key, value] : keys_and_values)
         {
             if (const auto * column = block.findByName(key))
@@ -285,7 +289,7 @@ void addRequestedFileLikeStorageVirtualsToChunk(
     Chunk & chunk, const NamesAndTypesList & requested_virtual_columns,
     VirtualsForFileLikeStorage virtual_values, ContextPtr context)
 {
-    std::unordered_map<std::string, std::string> hive_map;
+    HivePartitioningKeysAndValues hive_map;
     if (context->getSettingsRef()[Setting::use_hive_partitioning])
         hive_map = parseHivePartitioningKeysAndValues(virtual_values.path);
 

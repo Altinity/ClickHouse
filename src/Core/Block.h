@@ -5,6 +5,8 @@
 #include <Core/ColumnsWithTypeAndName.h>
 #include <Core/NamesAndTypes.h>
 
+#include <Common/StringHashForHeterogeneousLookup.h>
+
 #include <initializer_list>
 #include <vector>
 
@@ -30,7 +32,7 @@ class Block
 {
 private:
     using Container = ColumnsWithTypeAndName;
-    using IndexByName = std::unordered_map<String, size_t>;
+    using IndexByName = std::unordered_map<String, size_t, StringHashForHeterogeneousLookup, StringHashForHeterogeneousLookup::transparent_key_equal>;
 
     Container data;
     IndexByName index_by_name;
@@ -70,6 +72,13 @@ public:
             const_cast<const Block *>(this)->findByName(name, case_insensitive));
     }
 
+    ColumnWithTypeAndName* findByName(const std::string_view & name, bool case_insensitive = false)
+    {
+        return const_cast<ColumnWithTypeAndName *>(
+            const_cast<const Block *>(this)->findByName(name, case_insensitive));
+    }
+
+    const ColumnWithTypeAndName * findByName(const std::string_view & name, bool case_insensitive) const;
     const ColumnWithTypeAndName * findByName(const std::string & name, bool case_insensitive = false) const;
     std::optional<ColumnWithTypeAndName> findSubcolumnByName(const std::string & name) const;
     std::optional<ColumnWithTypeAndName> findColumnOrSubcolumnByName(const std::string & name) const;
