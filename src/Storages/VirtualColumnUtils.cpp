@@ -149,7 +149,7 @@ NameSet getVirtualNamesForFileLikeStorage()
 using HivePartitioningKeysAndValues = absl::flat_hash_map<std::string_view, std::string_view>;
 static HivePartitioningKeysAndValues parseHivePartitioningKeysAndValues(const String & path)
 {
-    const static RE2 pattern_re("([^/]+)=([^/]+)/");
+    const static RE2 pattern_re("([^/]+)=([^/]*)/");
     re2::StringPiece input_piece(path);
 
     HivePartitioningKeysAndValues result;
