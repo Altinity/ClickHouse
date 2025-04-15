@@ -1,6 +1,6 @@
-# docker build -t clickhouse/integration-test-with-unity-catalog .
+# docker build -t altinityinfra/integration-test-with-unity-catalog .
 ARG FROM_TAG=latest
-FROM clickhouse/integration-test:$FROM_TAG
+FROM altinityinfra/integration-test:$FROM_TAG
 
 RUN apt-get update && env DEBIAN_FRONTEND=noninteractive apt-get -y install openjdk-17-jdk-headless && update-alternatives --config java && update-alternatives --config javac
 

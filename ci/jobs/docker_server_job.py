@@ -62,7 +62,7 @@ def main():
 
     args = parse_args()
     image_path = "./ci/docker/clickhouse-server"
-    image_repo = "clickhouse/clickhouse-server"
+    image_repo = "altinityinfra/clickhouse-server"
     platforms = "linux/arm64,linux/amd64"
 
     if args.no_arm:

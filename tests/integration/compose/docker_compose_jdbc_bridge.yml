@@ -1,6 +1,6 @@
 services:
   bridge1:
-    image: clickhouse/jdbc-bridge
+    image: altinityinfra/jdbc-bridge
     command: |
       /bin/bash -c 'cat << EOF > config/datasources/self.json
       {

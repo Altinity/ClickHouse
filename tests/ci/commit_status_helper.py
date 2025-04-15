@@ -151,13 +151,16 @@ def set_status_comment(commit: Commit, pr_info: PRInfo) -> None:
     one, so the method does nothing for simple pushes and pull requests with
     `release`/`release-lts` labels"""
 
-    if GITHUB_REPOSITORY == GITHUB_UPSTREAM_REPOSITORY or pr_info.is_merge_queue:
-        # CI Running status is deprecated for ClickHouse repo
+    if pr_info.is_merge_queue:
+        # skip report creation for the MQ
         return
 
     # to reduce number of parameters, the Github is constructed on the fly
-    gh = Github()
-    gh.__requester = commit._requester  # type:ignore #pylint:disable=protected-access
+    gh = Github(**commit.requester.kwargs)
+    # Check that requests work at all
+    logging.info('Rate limit response for current GH token: %s',
+            gh.requester.graphql_query('rateLimit { limit remaining resetAt used }', {}))
+
     repo = get_repo(gh)
     statuses = sorted(get_commit_filtered_statuses(commit), key=lambda x: x.context)
     statuses = [
