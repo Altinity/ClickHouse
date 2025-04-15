@@ -1,4 +1,4 @@
-# docker build -t clickhouse/stateless-test .
+# docker build -t altinityinfra/stateless-test .
 FROM ubuntu:22.04
 
 # ARG for quick switch to a given ubuntu mirror

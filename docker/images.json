@@ -70,10 +70,6 @@
             "docker/packager/binary-builder"
         ]
     },
-    "docker/test/style": {
-        "name": "altinityinfra/style-test",
-        "dependent": []
-    },
     "docker/test/integration/s3_proxy": {
         "name": "altinityinfra/s3-proxy",
         "dependent": []
