@@ -9,7 +9,6 @@ import subprocess
 import tempfile
 from contextlib import contextmanager
 from multiprocessing import Pool, cpu_count
-from time import sleep
 from typing import Any, List, Literal, Optional
 
 import __main__
@@ -17,6 +16,7 @@ import __main__
 from ci_utils import Shell
 
 logger = logging.getLogger(__name__)
+
 class VersionType:
     LTS = "lts"
     NEW = "new"
@@ -40,7 +40,7 @@ RELEASE_BRANCH_REGEXP = r"\A\d+[.]\d+\Z"
 TAG_REGEXP = (
     r"\Av\d{2}"  # First two digits of major part
     r"([.][1-9]\d*){3}"  # minor.patch.tweak parts
-    fr"[.-]({'|'.join(VersionType.VALID)})\Z"  # suffix with a version type
+    fr"[\.-]({'|'.join(VersionType.VALID)})\Z"  # suffix with a version type
 )
 SHA_REGEXP = re.compile(r"\A([0-9]|[a-f]){40}\Z")
 
@@ -143,19 +143,11 @@ def unshallow(thin: bool = True) -> None:
     )
 
 
-def checkout_submodule(name: str, retry: int = 3) -> None:
+def checkout_submodule(name: str) -> None:
     """checkout the single submodule by its name"""
-    start_sleep = 5
-    for n in range(retry):
-        if Shell.check(
-            f"git submodule update --depth=1 --single-branch {name}", cwd=git_runner.cwd
-        ):
-            return
-        if n < retry - 1:
-            # progressive sleep before retry
-            sleep(start_sleep * (n + 1))
-
-    raise subprocess.SubprocessError(f"Unable to retreive submodule {name}")
+    Shell.check(
+        f"git submodule update --depth=1 --single-branch {name}", cwd=git_runner.cwd
+    )
 
 
 def checkout_submodules() -> None:
@@ -250,6 +242,7 @@ class Git:
         self.sha_short = ""
         self.commits_since_latest = 0
         self.commits_since_new = 0
+        self.commits_since_upstream = 0 # commits since upstream tag
         self.update()
 
     def update(self):
@@ -268,13 +261,19 @@ class Git:
             return
         self._update_tags()
 
+    def _commits_since(self, ref_name):
+        return int(
+            self.run(f"git rev-list {ref_name}..HEAD --count")
+        )
+
     def _update_tags(self, suppress_stderr: bool = False) -> None:
         stderr = subprocess.DEVNULL if suppress_stderr else None
         self.latest_tag = self.run("git describe --tags --abbrev=0", stderr=stderr)
-        # Format should be: {latest_tag}-{commits_since_tag}-g{sha_short}
-        self.commits_since_latest = int(
-            self.run(f"git rev-list {self.latest_tag}..HEAD --count")
-        )
+        self.commits_since_latest = self._commits_since(self.latest_tag)
+
+        latest_upstream_tag = self.run("git describe --tags --abbrev=0 --match='*-*'", stderr=stderr)
+        self.commits_since_upstream = self._commits_since(latest_upstream_tag)
+
         if self.latest_tag.endswith("-new"):
             # We won't change the behaviour of the the "latest_tag"
             # So here we set "new_tag" to the previous tag in the graph, that will allow
@@ -283,9 +282,7 @@ class Git:
                 f"git describe --tags --abbrev=0 --exclude='{self.latest_tag}'",
                 stderr=stderr,
             )
-            self.commits_since_new = int(
-                self.run(f"git rev-list {self.new_tag}..HEAD --count")
-            )
+            self.commits_since_new = self._commits_since(self.new_tag)
 
     @staticmethod
     def check_tag(value: str) -> None:
