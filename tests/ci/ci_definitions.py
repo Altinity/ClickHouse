@@ -431,7 +431,7 @@ class CommonJobConfigs:
         digest=DigestConfig(
             include_paths=[
                 "./tests/queries/0_stateless/",
-                "./tests/queries/1_stateful/",
+                "./tests/ci/stress.py",
                 "./tests/clickhouse-test",
                 "./tests/config",
                 "./tests/*.txt",
@@ -471,6 +471,18 @@ class CommonJobConfigs:
     )
     ASTFUZZER_TEST = JobConfig(
         job_name_keyword="ast",
+        digest=DigestConfig(
+            include_paths=[
+                "./tests/ci/ci_fuzzer_check.py",
+            ],
+            docker=["altinityinfra/fuzzer"],
+        ),
+        run_command="ci_fuzzer_check.py",
+        run_always=True,
+        runner_type=Runners.FUZZER_UNIT_TESTER,
+    )
+    BUZZHOUSE_TEST = JobConfig(
+        job_name_keyword="buzzhouse",
         digest=DigestConfig(
             include_paths=[
                 "./tests/ci/ci_fuzzer_check.py",
@@ -603,6 +615,7 @@ class CommonJobConfigs:
 REQUIRED_CHECKS = [
     StatusNames.PR_CHECK,
     JobNames.BUILD_CHECK,
+    JobNames.DOCS_CHECK,
     JobNames.FAST_TEST,
     JobNames.STATELESS_TEST_RELEASE,
     JobNames.STATELESS_TEST_ASAN,
