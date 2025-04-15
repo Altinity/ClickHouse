@@ -9,7 +9,6 @@ from typing import Any, Dict, List, Optional
 from env_helper import ROOT_DIR, DOCKER_TAG, DOCKER_PASSWORD
 from ci_utils import Shell
 from env_helper import DOCKER_TAG, ROOT_DIR
-from get_robot_token import get_parameter_from_ssm
 
 IMAGES_FILE_PATH = Path("docker/images.json")
 
