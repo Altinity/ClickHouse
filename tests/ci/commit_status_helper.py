@@ -100,6 +100,9 @@ def post_commit_status(
             break
         except Exception as ex:
             if i == RETRY - 1:
+                logging.exception(f'After %u retries. \n\treport url: %s,\n\tdescription=%s\n\tstate=%s,\n\tcommit=%s (%s)'
+                        , RETRY, report_url, description, state, commit, commit.url
+                        , exc_info=True, stack_info=True)
                 raise ex
             time.sleep(i)
     if pr_info and check_name not in (
