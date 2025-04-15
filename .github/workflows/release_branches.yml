@@ -21,7 +21,7 @@ on: # yamllint disable-line rule:truthy
       - opened
     branches:
       - 'antalya'
-      - '**/25.3'
+      - '**/25.3*'
   release:
     types:
       - published
