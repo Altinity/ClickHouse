@@ -27,7 +27,7 @@ class CiSettings:
 
     do_not_test: bool = False
     no_ci_cache: bool = False
-    upload_all: bool = False
+    upload_all: bool = True
     no_merge_commit: bool = False
     woolen_wolfdog: bool = False
 
