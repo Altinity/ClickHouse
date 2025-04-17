@@ -1,5 +1,6 @@
 #include <Common/AsyncTaskExecutor.h>
 #include <base/scope_guard.h>
+#include <fmt/format.h>
 
 
 namespace DB
@@ -129,4 +130,3 @@ String getSocketTimeoutExceededMessageByTimeoutType(AsyncEventTimeoutType type, 
 }
 
 }
-
