@@ -13,6 +13,7 @@
 
 <h1>Altinity Antalya</h1>
 
+- [Feature Matrix](Antalya.md)
 - [github releases](https://github.com/Altinity/ClickHouse/releases?q=altinityantalya&expanded=false)
 - [docker images](https://hub.docker.com/r/altinity/clickhouse-server/tags?page=1&name=altinityantalya)
 - [packages](https://builds.altinity.cloud/#altinityantalya)

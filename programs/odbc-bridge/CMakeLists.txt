@@ -22,6 +22,7 @@ target_link_libraries(clickhouse-odbc-bridge PRIVATE
     dbms
     bridge
     clickhouse_parsers
+    clickhouse_functions_extractkeyvaluepairs
     ch_contrib::nanodbc
     ch_contrib::unixodbc
 )

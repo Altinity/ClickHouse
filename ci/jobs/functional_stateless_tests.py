@@ -63,10 +63,10 @@ def main():
             batch_num, total_batches = map(int, to.split("/"))
 
     # TODO: find a way to work with Azure secret so it's ok for local tests as well, for now keep azure disabled
-    os.environ["AZURE_CONNECTION_STRING"] = Shell.get_output(
-        f"aws ssm get-parameter --region us-east-1 --name azure_connection_string --with-decryption --output text --query Parameter.Value",
-        verbose=True,
-    )
+    # os.environ["AZURE_CONNECTION_STRING"] = Shell.get_output(
+    #     f"aws ssm get-parameter --region us-east-1 --name azure_connection_string --with-decryption --output text --query Parameter.Value",
+    #     verbose=True,
+    # )
     no_azure = False
     if not os.environ["AZURE_CONNECTION_STRING"]:
         no_azure = True
