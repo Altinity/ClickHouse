@@ -42,7 +42,8 @@ RUN curl https://sh.rustup.rs -sSf | bash -s -- -y && \
     rustup target add powerpc64le-unknown-linux-gnu && \
     rustup target add x86_64-unknown-linux-musl && \
     rustup target add aarch64-unknown-linux-musl && \
-    rustup target add riscv64gc-unknown-linux-gnu
+    rustup target add riscv64gc-unknown-linux-gnu && \
+    which rustc && rustc --version
 
 # Download and install mold 2.0 for s390x build
 RUN curl -Lo /tmp/mold.tar.gz "https://github.com/rui314/mold/releases/download/v2.0.0/mold-2.0.0-x86_64-linux.tar.gz" \
