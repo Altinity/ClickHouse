@@ -36,7 +36,8 @@ function download
     fi
     declare -a urls_to_try=(
         "$S3_URL/REFs/master/$REF_SHA/$build_name_new/performance.tar.zst"
-        "$S3_URL/PRs/0/$REF_SHA/$BUILD_NAME/performance.tar.zst"
+        "$S3_URL/PRs/$left_pr/$left_sha/$BUILD_NAME/performance.tar.zst"
+        "$S3_URL/$left_pr/$left_sha/$BUILD_NAME/performance.tar.zst"
     )
 
     for path in "${urls_to_try[@]}"

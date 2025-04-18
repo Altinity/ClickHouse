@@ -45,7 +45,7 @@ class CiMetadata:
         self.sync_pr_run_id = 0
 
         if self.pr_number:
-            self.s3_path = f"{self._S3_PREFIX}/PRs/{self.pr_number}/"
+            self.s3_path = f"{self._S3_PREFIX}/{self.pr_number}/"
         else:
             self.s3_path = f"{self._S3_PREFIX}/{self.git_ref}/{self.sha}/"
 
@@ -58,7 +58,7 @@ class CiMetadata:
             and GITHUB_REPOSITORY != GITHUB_UPSTREAM_REPOSITORY
         ):
             self.upstream_pr_number = int(self.git_ref.split("/pr/", maxsplit=1)[1])
-            self.s3_path_upstream = f"{self._S3_PREFIX}/PRs/{self.upstream_pr_number}/"
+            self.s3_path_upstream = f"{self._S3_PREFIX}/{self.upstream_pr_number}/"
 
         self._updated = False
 
