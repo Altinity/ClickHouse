@@ -389,11 +389,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         if (!object_info || object_info->getPath().empty())
             return {};
 
-        if (!object_info->metadata)
-        {
-            const auto & path = object_info->isArchive() ? object_info->getPathToArchive() : object_info->getPath();
-            object_info->metadata = object_storage->getObjectMetadata(path);
-        }
+        object_info->loadMetadata(object_storage);
     }
     while (query_settings.skip_empty_files && object_info->metadata->size_bytes == 0);
 

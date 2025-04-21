@@ -97,4 +97,14 @@ WriteSettings IObjectStorage::patchSettings(const WriteSettings & write_settings
     return write_settings;
 }
 
+
+void RelativePathWithMetadata::loadMetadata(ObjectStoragePtr object_storage)
+{
+    if (!metadata)
+    {
+        const auto & path = isArchive() ? getPathToArchive() : getPath();
+        metadata = object_storage->tryGetObjectMetadata(path);
+    }
+}
+
 }
