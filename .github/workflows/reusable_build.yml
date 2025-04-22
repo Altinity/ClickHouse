@@ -94,6 +94,7 @@ jobs:
         with:
           job_type: build_check
       - name: Create source tar
+        if: ${{ inputs.build_name == 'package_release' }} 
         run: |
           mkdir -p "$TEMP_PATH/build_check/package_release"
           cd .. && tar czf $TEMP_PATH/build_source.src.tar.gz ClickHouse/
