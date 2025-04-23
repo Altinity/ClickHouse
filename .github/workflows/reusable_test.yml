@@ -77,9 +77,6 @@ env:
   CLICKHOUSE_TEST_STAT_URL: ${{ secrets.CLICKHOUSE_TEST_STAT_URL }}
   DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
   ROBOT_TOKEN: ${{ secrets.ROBOT_TOKEN }}
-  AZURE_ACCOUNT_NAME: dummyaccount1
-  AZURE_STORAGE_KEY: dummykey1
-  AZURE_CONTAINER_NAME: dummycontainer1
 
 jobs:
   runner_labels_setup:
@@ -133,6 +130,13 @@ jobs:
           ${{ toJson(fromJson(inputs.data).docker_data.images) }}
           DOCKER_JSON
           EOF
+
+          # Set Azure credentials only for stateless tests
+          if [[ "${{ inputs.test_name }}" == "Stateless"* ]]; then
+            echo "AZURE_ACCOUNT_NAME=dummyaccount1" >> "$GITHUB_ENV"
+            echo "AZURE_STORAGE_KEY=dummykey1" >> "$GITHUB_ENV"
+            echo "AZURE_CONTAINER_NAME=dummycontainer1" >> "$GITHUB_ENV"
+          fi
       - name: Common setup
         uses: ./.github/actions/common_setup
         with:
