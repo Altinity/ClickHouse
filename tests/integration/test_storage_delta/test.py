@@ -1148,10 +1148,15 @@ deltaLake(
         'http://{started_cluster.minio_ip}:{started_cluster.minio_port}/root/{table_name}' ,
         '{minio_access_key}',
         '{minio_secret_key}',
-        SETTINGS allow_experimental_delta_kernel_rs={use_delta_kernel})
+    SETTINGS allow_experimental_delta_kernel_rs=0)
     """
 
-    num_files = int(node.query(f"SELECT uniqExact(_path) FROM {delta_function}"))
+    num_files = int(
+        node.query(
+            f"SELECT uniqExact(_path) FROM {delta_function}",
+            settings={"allow_experimental_delta_kernel_rs": 1},
+        )
+    )
     assert num_files == 5
 
     new_data = [
@@ -1172,10 +1177,19 @@ deltaLake(
         "b\tNullable(Int32)\t\t\t\t\t\n"
         "c\tNullable(Int32)\t\t\t\t\t\n"
         "d\tNullable(String)\t\t\t\t\t\n"
-        "e\tNullable(String)" == node.query(f"DESCRIBE TABLE {delta_function}").strip()
+        "e\tNullable(String)"
+        == node.query(
+            f"DESCRIBE TABLE {delta_function}",
+            settings={"allow_experimental_delta_kernel_rs": 1},
+        ).strip()
     )
 
-    num_files = int(node.query(f"SELECT uniqExact(_path) FROM {delta_function}"))
+    num_files = int(
+        node.query(
+            f"SELECT uniqExact(_path) FROM {delta_function}",
+            settings={"allow_experimental_delta_kernel_rs": 1},
+        )
+    )
     assert num_files == 6
 
     query_id = f"{table_name}-{uuid.uuid4()}"
@@ -1184,6 +1198,7 @@ deltaLake(
         in node.query(
             f" SELECT a FROM {delta_function} WHERE c = 7 and d = 'aa'",
             query_id=query_id,
+            settings={"allow_experimental_delta_kernel_rs": 1},
         ).strip()
     )
 
@@ -1206,6 +1221,7 @@ deltaLake(
         in node.query(
             f"SELECT a FROM {delta_function} WHERE c = 7 and d = 'bb'",
             query_id=query_id,
+            settings={"allow_experimental_delta_kernel_rs": 1},
         ).strip()
     )
 

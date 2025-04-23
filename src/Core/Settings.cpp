@@ -6122,6 +6122,9 @@ Enable PRQL - an alternative to SQL.
     DECLARE(Bool, enable_adaptive_memory_spill_scheduler, false, R"(
 Trigger processor to spill data into external storage adpatively. grace join is supported at present.
 )", EXPERIMENTAL) \
+    DECLARE(Bool, allow_experimental_delta_kernel_rs, false, R"(
+Allow experimental delta-kernel-rs implementation.
+)", EXPERIMENTAL) \
     DECLARE(String, object_storage_cluster, "", R"(
 Cluster to make distributed requests to object storages with alternative syntax.
 )", EXPERIMENTAL) \

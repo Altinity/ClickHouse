@@ -70,6 +70,15 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         {
             // Altinity Antalya modifications atop of 25.3
             {"lock_object_storage_task_distribution_ms", 0, 0, "New setting."},
+            {"geotoh3_lon_lat_input_order", true, false, "A new setting for legacy behaviour to set lon and lat order"},
+            {"secondary_indices_enable_bulk_filtering", false, true, "A new algorithm for filtering by data skipping indices"},
+            {"implicit_table_at_top_level", "", "", "A new setting, used in clickhouse-local"},
+            {"use_skip_indexes_if_final_exact_mode", 0, 0, "This setting was introduced to help FINAL query return correct results with skip indexes"},
+            {"parallel_replicas_insert_select_local_pipeline", false, false, "Use local pipeline during distributed INSERT SELECT with parallel replicas. Currently disabled due to performance issues"},
+            {"page_cache_block_size", 1048576, 1048576, "Made this setting adjustable on a per-query level."},
+            {"page_cache_lookahead_blocks", 16, 16, "Made this setting adjustable on a per-query level."},
+            {"output_format_pretty_glue_chunks", "0", "auto", "A new setting to make Pretty formats prettier."},
+            {"allow_experimental_delta_kernel_rs", false, false, "New setting"},
         });
         addSettingsChanges(settings_changes_history, "25.2.1.20000",
         {

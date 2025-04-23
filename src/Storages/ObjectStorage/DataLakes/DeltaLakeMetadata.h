@@ -12,9 +12,14 @@
 #include <Storages/ObjectStorage/DataLakes/DeltaLakeMetadataDeltaKernel.h>
 #include <Disks/ObjectStorages/IObjectStorage.h>
 #include <Poco/JSON/Object.h>
+#include <Core/Settings.h>
 
 namespace DB
 {
+namespace Setting
+{
+extern const SettingsBool allow_experimental_delta_kernel_rs;
+}
 
 struct DeltaLakePartitionColumn
 {
@@ -61,9 +66,11 @@ public:
 
         bool enable_delta_kernel = query_settings_ref[Setting::allow_experimental_delta_kernel_rs];
         if (enable_delta_kernel)
+        {
             return std::make_unique<DeltaLakeMetadataDeltaKernel>(
                 object_storage,
                 configuration);
+        }
         else
             return std::make_unique<DeltaLakeMetadata>(object_storage, configuration, local_context);
 #else
