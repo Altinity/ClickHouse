@@ -61,7 +61,7 @@ jobs:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     steps:
       - name: Setup git-cache proxy
-        run: git config --global url."http://116.202.10.13:8765/".insteadOf http://
+        run: git config --global url."http://116.202.10.13:8765/".insteadOf https://
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
