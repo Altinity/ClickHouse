@@ -80,18 +80,17 @@ jobs:
           DOCKER_JSON
           EOF
           python3 "$GITHUB_WORKSPACE"/tests/ci/ci_config.py --build-name "${{inputs.build_name}}" >> "$GITHUB_ENV"
-      - name: Dummy checkout for contrib # in order to check that it doesn't break build
+      - name: Apply sparse checkout for contrib
         # This step is done in GITHUB_WORKSPACE,
         # because it's broken in REPO_COPY for some reason
         # See also update-submodules.sh
-        # if: ${{ env.BUILD_SPARSE_CHECKOUT == 'true' }}
+        if: ${{ env.BUILD_SPARSE_CHECKOUT == 'true' }}
         run: |
           rm -rf "$GITHUB_WORKSPACE/contrib" && echo 'removed'
           git -C "$GITHUB_WORKSPACE" checkout .  && echo 'restored'
           "$GITHUB_WORKSPACE/contrib/update-submodules.sh" && echo 'OK'
           du -hs "$GITHUB_WORKSPACE/contrib" ||:
           find "$GITHUB_WORKSPACE/contrib" -type f | wc -l ||:
-          ls -lahR ./contrib/aws/*
       - name: Common setup
         uses: ./.github/actions/common_setup
         with:
