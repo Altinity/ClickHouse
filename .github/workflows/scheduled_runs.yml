@@ -39,10 +39,10 @@
 #       fail-fast: false
 #       matrix:
 #         branch: 
-#           - customizations/22.8.21
-#           - customizations/23.3.19
-#           - customizations/23.8.16
-#           - customizations/24.3.14
+#           # - customizations/22.8.21
+#           # - customizations/23.3.19
+#           # - customizations/23.8.16
+#           # - customizations/24.3.14
 #           - customizations/24.8.11
 #     name: ${{ matrix.branch }}
 #     if: github.event.schedule != '0 0 * * *'

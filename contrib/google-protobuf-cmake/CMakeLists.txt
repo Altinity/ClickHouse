@@ -369,6 +369,7 @@ else ()
         execute_process(
             COMMAND ${CMAKE_COMMAND}
                 "-G${CMAKE_GENERATOR}"
+                "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
                 "-DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}"
                 "-DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}"
                 "-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
