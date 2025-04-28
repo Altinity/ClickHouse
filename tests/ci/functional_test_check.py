@@ -38,10 +38,10 @@ NO_CHANGES_MSG = "Nothing to run"
 class SensitiveFormatter(logging.Formatter):
     @staticmethod
     def _filter(s):
-        s = re.sub(r"(.*)(AZURE_STORAGE_KEY.*\')(.*)", r"\1AZURE_STORAGE_KEY\3", s)
-        s = re.sub(r"(.*)(AZURE_ACCOUNT_NAME.*\')(.*)", r"\1AZURE_ACCOUNT_NAME\3", s)
+        s = re.sub(r"(.*)(AZURE_STORAGE_KEY\S*\')(.*)", r"\1AZURE_STORAGE_KEY\3", s)
+        s = re.sub(r"(.*)(AZURE_ACCOUNT_NAME\S*\')(.*)", r"\1AZURE_ACCOUNT_NAME\3", s)
         s = re.sub(
-            r"(.*)(AZURE_CONTAINER_NAME.*\')(.*)", r"\1AZURE_CONTAINER_NAME\3", s
+            r"(.*)(AZURE_CONTAINER_NAME\S*\')(.*)", r"\1AZURE_CONTAINER_NAME\3", s
         )
         return s
 
