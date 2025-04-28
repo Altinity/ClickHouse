@@ -56,17 +56,11 @@ def get_additional_envs(
     result = []
     # Get Azure credentials from environment variables
     azure_account_name = os.environ.get("AZURE_ACCOUNT_NAME")
-    azure_storage_key = os.environ.get("AZURE_STORAGE_KEY")
-    azure_container_name = os.environ.get("AZURE_CONTAINER_NAME")
 
     if azure_account_name:
         result.append(f"AZURE_ACCOUNT_NAME='{azure_account_name}'")
-
-    if azure_storage_key:
-        result.append(f"AZURE_STORAGE_KEY='{azure_storage_key}'")
-
-    if azure_container_name:
-        result.append(f"AZURE_CONTAINER_NAME='{azure_container_name}'")
+        result.append(f"AZURE_STORAGE_KEY='{os.environ['AZURE_STORAGE_KEY']}'")
+        result.append(f"AZURE_CONTAINER_NAME='{os.environ['AZURE_CONTAINER_NAME']}'")
 
     if "DatabaseReplicated" in check_name:
         result.append("USE_DATABASE_REPLICATED=1")
