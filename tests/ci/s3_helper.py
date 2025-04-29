@@ -21,9 +21,7 @@ from env_helper import (
     S3_URL,
 )
 
-sensitive_var_pattern = re.compile(
-    r"\b[A-Z_]*(?<!WRONG)(SECRET_|_SECRET|_PASSWORD|ACCESS_KEY|STORAGE_KEY|TOKEN|CONTAINER_NAME|ACCOUNT)[A-Z_]*\b(?!%)(?!=clickhouse$)(?!=minio)(?!: \*{3}$)"
-)
+sensitive_var_pattern = re.compile(r"[A-Z_]*(SECRET|PASSWORD|KEY|TOKEN|AZURE)[A-Z_]*")
 sensitive_strings = {
     var: value for var, value in os.environ.items() if sensitive_var_pattern.match(var)
 }
@@ -42,8 +40,6 @@ def scan_file_for_sensitive_data(file_content, file_name):
 
     matches = []
     for line_number, line in enumerate(file_content.splitlines(), start=1):
-        for match in sensitive_var_pattern.finditer(line):
-            matches.append((file_name, line_number, clean_line(line)))
         for name, value in sensitive_strings.items():
             if value in line:
                 matches.append((file_name, line_number, clean_line(line)))
@@ -87,7 +83,7 @@ class S3Helper:
         try:
             file_content = file_path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
-            logging.warning("Failed to read file %s, unknown encoding", file_path)
+            logging.warning("Failed to scan file %s, unknown encoding", file_path)
         else:
             scan_file_for_sensitive_data(file_content, file_path.name)
 
