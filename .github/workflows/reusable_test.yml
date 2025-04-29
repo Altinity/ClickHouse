@@ -145,6 +145,7 @@ jobs:
             echo "AZURE_ACCOUNT_NAME=${{ secrets.AZURE_ACCOUNT_NAME }}" >> "$GITHUB_ENV"
             echo "AZURE_STORAGE_KEY=${{ secrets.AZURE_STORAGE_KEY }}" >> "$GITHUB_ENV"
             echo "AZURE_CONTAINER_NAME=${{ secrets.AZURE_CONTAINER_NAME }}" >> "$GITHUB_ENV"
+            echo "AZURE_STORAGE_ACCOUNT_URL=https://${{ secrets.AZURE_ACCOUNT_NAME }}.blob.core.windows.net/" >> "$GITHUB_ENV"
             echo "Configured Azure credentials"
           fi
       - name: Common setup

@@ -43,6 +43,11 @@ class SensitiveFormatter(logging.Formatter):
         s = re.sub(
             r"(.*)(AZURE_CONTAINER_NAME\S*\')(.*)", r"\1AZURE_CONTAINER_NAME\3", s
         )
+        s = re.sub(
+            r"(.*)(AZURE_STORAGE_ACCOUNT_URL\S*\')(.*)",
+            r"\1AZURE_STORAGE_ACCOUNT_URL\3",
+            s,
+        )
         return s
 
     def format(self, record):
@@ -61,7 +66,9 @@ def get_additional_envs(
         result.append(f"AZURE_ACCOUNT_NAME='{azure_account_name}'")
         result.append(f"AZURE_STORAGE_KEY='{os.environ['AZURE_STORAGE_KEY']}'")
         result.append(f"AZURE_CONTAINER_NAME='{os.environ['AZURE_CONTAINER_NAME']}'")
-
+        result.append(
+            f"AZURE_STORAGE_ACCOUNT_URL='{os.environ['AZURE_STORAGE_ACCOUNT_URL']}'"
+        )
     if "DatabaseReplicated" in check_name:
         result.append("USE_DATABASE_REPLICATED=1")
     if "DatabaseOrdinary" in check_name:
