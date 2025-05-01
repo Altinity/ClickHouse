@@ -1,8 +1,8 @@
 ---
-name: Bug report
-about: Report something broken in an Altinity Stable Build 
+name: Altinity Stable Bug report
+about: Report something broken in an Altinity Stable Build
 title: ''
-labels: 'potential bug'
+labels: stable
 assignees: ''
 
 ---

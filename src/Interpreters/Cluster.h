@@ -304,6 +304,9 @@ private:
         ShardInfoInsertPathForInternalReplication insert_paths = {},
         bool internal_replication = false);
 
+    /// Reduce size of cluster to max_hosts
+    void constrainShardInfoAndAddressesToMaxHosts(size_t max_hosts);
+
     /// Inter-server secret
     String secret;
 

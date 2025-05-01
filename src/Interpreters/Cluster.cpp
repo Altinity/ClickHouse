@@ -790,6 +790,7 @@ Cluster::Cluster(Cluster::ReplicasAsShardsTag, const Cluster & from, const Setti
 
                 if (address.is_local)
                     info.local_addresses.push_back(address);
+                addresses_with_failover.emplace_back(Addresses({address}));
 
                 auto pool = ConnectionPoolFactory::instance().get(
                     static_cast<unsigned>(settings[Setting::distributed_connections_pool_size]),
@@ -832,24 +833,34 @@ Cluster::Cluster(Cluster::ReplicasAsShardsTag, const Cluster & from, const Setti
     secret = from.secret;
     name = from.name;
 
-    if (max_hosts > 0 && shards_info.size() > max_hosts)
-    {
-        pcg64_fast gen{randomSeed()};
-        std::shuffle(shards_info.begin(), shards_info.end(), gen);
-        shards_info.resize(max_hosts);
-
-        shard_num = 0;
-        for (auto & shard_info : shards_info)
-            shard_info.shard_num = ++shard_num;
-    }
+    constrainShardInfoAndAddressesToMaxHosts(max_hosts);
 
     for (size_t i = 0; i < shards_info.size(); ++i)
-    {
-        addresses_with_failover.emplace_back(shards_info[i].local_addresses);
         slot_to_shard.insert(std::end(slot_to_shard), shards_info[i].weight, i);
-    }
 
     initMisc();
+}
+
+
+void Cluster::constrainShardInfoAndAddressesToMaxHosts(size_t max_hosts)
+{
+    if (max_hosts == 0 || shards_info.size() <= max_hosts)
+        return;
+
+    pcg64_fast gen{randomSeed()};
+    std::shuffle(shards_info.begin(), shards_info.end(), gen);
+    shards_info.resize(max_hosts);
+
+    AddressesWithFailover addresses_with_failover_;
+
+    UInt32 shard_num = 0;
+    for (auto & shard_info : shards_info)
+    {
+        addresses_with_failover_.push_back(addresses_with_failover[shard_info.shard_num - 1]);
+        shard_info.shard_num = ++shard_num;
+    }
+
+    addresses_with_failover.swap(addresses_with_failover_);
 }
 
 

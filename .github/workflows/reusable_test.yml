@@ -167,6 +167,16 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           python3 "$GITHUB_WORKSPACE/tests/ci/ci.py" --infile ${{ toJson(inputs.data) }} --mark-success --job-name '${{inputs.test_name}}' --batch ${{matrix.batch}}
+      - name: Update workflow report
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/create_workflow_report
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHECKS_DATABASE_HOST: ${{ secrets.CHECKS_DATABASE_HOST }}
+          CHECKS_DATABASE_USER: ${{ secrets.CHECKS_DATABASE_USER }}
+          CHECKS_DATABASE_PASSWORD: ${{ secrets.CHECKS_DATABASE_PASSWORD }}
+        with:
+          final: false
       - name: Clean
         if: always()
         uses: ./.github/actions/clean

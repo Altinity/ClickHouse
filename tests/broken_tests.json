@@ -37,5 +37,14 @@
     },
     "test_attach_partition_using_copy/test.py::test_only_destination_replicated": {
         "reason": "Fails on TSAN"
+    },
+    "02766_prql": {
+        "reason": "PRQL is disabled in Antalya branch"
+    },
+    "02833_local_with_dialect": {
+        "reason": "PRQL is disabled in Antalya branch"
+    },
+    "03003_prql_panic": {
+        "reason": "PRQL is disabled in Antalya branch"
     }
 }
