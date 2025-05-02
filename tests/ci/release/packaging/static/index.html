@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.0/dist/js/bootstrap.bundle.min.js" crossorigin="anonymous">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Arimo&display=swap" rel="stylesheet">
+
+    <style type="text/css">
+        body{
+            font-family: 'Arimo', sans-serif;
+            color:  #667373;
+        }
+        .header {
+            max-width: 1280px;
+            margin:  0 auto;
+            font-size: 30px;
+        }
+
+    </style>
+
+    <title>{{ repo_title }}</title>
+</head>
+<body>
+
+    <main role="main" class="container-fluid">
+      <div class="row bg-dark bg-opacity-75 p-3">
+          <h1 class="p-0 text-white header"><a href="https://altinity.com" target="_blank" title="Altinity.com website" ><img src="logo-altinity-white.png" alt="Altinity" style="max-width:150px; vertical-align: -8px;" /></a> {{ repo_subtitle }}</h1>
+      </div>
+      <div class="container p-5" id="altinitystable">
+        <p class="h3" style="color:black;"><a href="https://{{ repo_dns_name }}/#altinitystable" style="color:inherit;text-decoration:none;">Altinity Stable Build</a></p>
+        <div class="container">
+            <p>
+                Production-ready build of ClickHouse® with long-term support. (<a href="https://docs.altinity.com/altinitystablebuilds/">Documentation</a>).
+                <br>
+                <br>
+            </p>
+            <p class="h5">How to download:</p>
+            <p>RHEL, CentOS, Amazon Linux, Fedora:</p>
+            <div class="container">
+                <code>
+                    sudo $(type -p dnf || type -p yum) install curl gnupg2
+                    <br/>
+                    sudo curl https://{{ repo_dns_name }}/yum-repo/{{ repo_name }}.repo -o /etc/yum.repos.d/{{ repo_name }}.repo
+                    <br/>
+                    sudo $(type -p dnf || type -p yum) install {{ repo_install_packages }}
+                </code>
+            </div>
+        </div>
+        <p></p>
+        <div class="container">
+            <p>Ubuntu, Debian:</p>
+            <div class="container">
+                <code>
+                    sudo apt-get update
+                    <br/>
+                    sudo apt-get install curl gnupg2 apt-transport-https ca-certificates dialog
+                    <br/>
+                    sudo sh -c 'mkdir -p /usr/share/keyrings &amp;&amp; curl -s https://{{ repo_dns_name }}/apt-repo/pubkey.gpg | gpg --dearmor &gt; /usr/share/keyrings/{{ repo_name }}-archive-keyring.gpg'
+                    <br/>
+                    sudo sh -c 'echo "deb [signed-by=/usr/share/keyrings/{{ repo_name }}-archive-keyring.gpg] https://{{ repo_dns_name }}/apt-repo stable main" &gt; /etc/apt/sources.list.d/{{ repo_name }}.list'
+                    <br/>
+                    sudo apt-get update
+                    <br/>
+                    sudo apt-get install {{ repo_install_packages }}
+                </code>
+            </div>
+        </div>
+        <p></p>
+        <div class="container">
+            <p>Browse repo files:</p>
+            <div class="container">
+                <a href="/yum-repo/">yum-repo/</a>
+                <br>
+                <a href="/apt-repo/">apt-repo/</a>
+                <br>
+                <a href="/tgz-repo/">tgz-repo/</a> 
+                <br>
+                <a href="/bin-repo/">bin-repo/</a>
+            </div>
+        </div>
+      </div>
+      <p></p>
+      <div class="container p-5" id="altinityfips">
+        <p class="h3" style="color:black;"><a href="https://{{ repo_dns_name }}/#altinityfips" style="color:inherit;text-decoration:none;">Altinity Stable FIPS-Compatible Build</a></p>
+        <div class="container">
+            <p>
+                Production-ready build of ClickHouse® with FIPS-compatible BoringSSL crypto libraries. (<a href="https://docs.altinity.com/altinitystablebuilds/fips-compatible-altinity-builds">Documentation</a>)
+                <br/>
+                <br/>
+            </p>
+            <p class="h5">How to download:</p>
+            <p>RHEL, CentOS, Amazon Linux, Fedora:</p>
+            <div class="container">
+                <code>
+                    sudo $(type -p dnf || type -p yum) install curl gnupg2
+                    <br/>
+                    sudo curl https://{{ repo_dns_name }}/fips-yum-repo/{{ repo_name }}.repo -o /etc/yum.repos.d/{{ repo_name }}.repo
+                    <br/>
+                    sudo $(type -p dnf || type -p yum) install {{ repo_install_packages }}
+                </code>
+            </div>
+        </div>
+        <p></p>
+        <div class="container">
+            <p>Ubuntu, Debian:</p>
+            <div class="container">
+                <code>
+                    sudo apt-get update
+                    <br/>
+                    sudo apt-get install curl gnupg2 apt-transport-https ca-certificates dialog
+                    <br/>
+                    sudo sh -c 'mkdir -p /usr/share/keyrings &amp;&amp; curl -s https://{{ repo_dns_name }}/fips-apt-repo/pubkey.gpg | gpg --dearmor &gt; /usr/share/keyrings/{{ repo_name }}-archive-keyring.gpg'
+                    <br/>
+                    sudo sh -c 'echo "deb [signed-by=/usr/share/keyrings/{{ repo_name }}-archive-keyring.gpg] https://{{ repo_dns_name }}/fips-apt-repo stable main" &gt; /etc/apt/sources.list.d/{{ repo_name }}.list'
+                    <br/>
+                    sudo apt-get update
+                    <br/>
+                    sudo apt-get install {{ repo_install_packages }}
+                </code>
+            </div>
+        </div>
+        <p></p>
+        <div class="container">
+            <p>Browse repo files: </p>
+            <div class="container">
+                <a href="/fips-yum-repo/">fips-yum-repo/</a>
+                <br>
+                <a href="/fips-apt-repo/">fips-apt-repo/</a>
+                <br>
+                <a href="/fips-tgz-repo/">fips-tgz-repo/</a>
+                <br>
+                <a href="/fips-bin-repo/">fips-bin-repo/</a>
+            </div>
+        </div>
+      </div>
+      <p></p>
+      <div class="container p-5" id="altinityantalya">
+        <p class="h3" style="color:black;"><a href="https://{{ repo_dns_name }}/#altinityantalya" style="color:inherit;text-decoration:none;">Altinity Antalya Build</a></p>
+        <div class="container">
+            <p>
+                Experimental build of ClickHouse® incorporating features and fixes from the future Altinity Stable Build releases. <b>Not for production use.</b>
+                <br/>
+                <br/>
+            </p>
+            <p class="h5">How to download:</p>
+            <p>RHEL, CentOS, Amazon Linux, Fedora:</p>
+            <div class="container">
+                <code>
+                    sudo $(type -p dnf || type -p yum) install curl gnupg2
+                    <br/>
+                    sudo curl https://{{ repo_dns_name }}/antalya-yum-repo/{{ repo_name }}.repo -o /etc/yum.repos.d/{{ repo_name }}.repo
+                    <br/>
+                    sudo $(type -p dnf || type -p yum) install {{ repo_install_packages }}
+                </code>
+            </div>
+        </div>
+        <p></p>
+        <div class="container">
+            <p>Ubuntu, Debian:</p>
+            <div class="container">
+                <code>
+                    sudo apt-get update
+                    <br/>
+                    sudo apt-get install curl gnupg2 apt-transport-https ca-certificates dialog
+                    <br/>
+                    sudo sh -c 'mkdir -p /usr/share/keyrings &amp;&amp; curl -s https://{{ repo_dns_name }}/antalya-apt-repo/pubkey.gpg | gpg --dearmor &gt; /usr/share/keyrings/{{ repo_name }}-archive-keyring.gpg'
+                    <br/>
+                    sudo sh -c 'echo "deb [signed-by=/usr/share/keyrings/{{ repo_name }}-archive-keyring.gpg] https://{{ repo_dns_name }}/antalya-apt-repo stable main" &gt; /etc/apt/sources.list.d/{{ repo_name }}.list'
+                    <br/>
+                    sudo apt-get update
+                    <br/>
+                    sudo apt-get install {{ repo_install_packages }}
+                </code>
+            </div>
+        </div>
+        <p></p>
+        <div class="container">
+            <p>Browse repo files: </p>
+            <div class="container">
+                <a href="/antalya-yum-repo/">antalya-yum-repo/</a>
+                <br>
+                <a href="/antalya-apt-repo/">antalya-apt-repo/</a>
+                <br>
+                <a href="/antalya-tgz-repo/">antalya-tgz-repo/</a>
+                <br>
+                <a href="/antalya-bin-repo/">antalya-bin-repo/</a>
+            </div>
+        </div>
+      </div>
+
+    </main><!-- /.container -->
+
+<script src="bootstrap.bundle.min.js" integrity="sha384-U1DAWAznBHeqEIlVSCgzq+c9gqGAJn5c/t99JyeKa9xxaYpSvHU5awsuZVVFIhvj" crossorigin="anonymous"></script>
+
+</body></html>
