@@ -112,17 +112,7 @@ void ReadFromCluster::createExtension(const ActionsDAG::Node * predicate)
     if (extension)
         return;
 
-    std::vector<std::string> ids_of_hosts;
-    for (const auto & shard : cluster->getShardsInfo())
-    {
-        if (shard.per_replica_pools.empty())
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Cluster {} with empty shard {}", cluster->getName(), shard.shard_num);
-        if (!shard.per_replica_pools[0])
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Cluster {}, shard {} with empty node", cluster->getName(), shard.shard_num);
-        ids_of_hosts.push_back(shard.per_replica_pools[0]->getAddress());
-    }
-
-    extension = storage->getTaskIteratorExtension(predicate, context, ids_of_hosts);
+    extension = storage->getTaskIteratorExtension(predicate, context, cluster);
 }
 
 /// The code executes on initiator

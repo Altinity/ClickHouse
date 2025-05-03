@@ -27,7 +27,7 @@ public:
     RemoteQueryExecutor::Extension getTaskIteratorExtension(
         const ActionsDAG::Node * predicate,
         const ContextPtr & context,
-        std::optional<std::vector<std::string>> ids_of_replicas) const override;
+        ClusterPtr cluster) const override;
 
     String getPathSample(StorageInMemoryMetadata metadata, ContextPtr context);
 

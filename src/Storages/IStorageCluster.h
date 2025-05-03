@@ -36,7 +36,7 @@ public:
     virtual RemoteQueryExecutor::Extension getTaskIteratorExtension(
         const ActionsDAG::Node * predicate,
         const ContextPtr & context,
-        std::optional<std::vector<std::string>> ids_of_hosts = std::nullopt) const = 0;
+        ClusterPtr cluster) const = 0;
 
     QueryProcessingStage::Enum getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageSnapshotPtr &, SelectQueryInfo &) const override;
 

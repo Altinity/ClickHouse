@@ -8,9 +8,9 @@ namespace DB
 
 StorageObjectStorageStableTaskDistributor::StorageObjectStorageStableTaskDistributor(
     std::shared_ptr<IObjectIterator> iterator_,
-    std::optional<std::vector<std::string>> ids_of_nodes_)
+    std::vector<std::string> ids_of_nodes_)
     : iterator(std::move(iterator_))
-    , connection_to_files(ids_of_nodes_.has_value() ? ids_of_nodes_.value().size() : 1)
+    , connection_to_files(ids_of_nodes_.size())
     , ids_of_nodes(ids_of_nodes_)
     , iterator_exhausted(false)
 {
@@ -38,11 +38,7 @@ std::optional<String> StorageObjectStorageStableTaskDistributor::getNextTask(siz
 
 size_t StorageObjectStorageStableTaskDistributor::getReplicaForFile(const String & file_path)
 {
-    if (!ids_of_nodes.has_value())
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "No list of nodes inside Task Distributer.");
-
-    const auto & ids_of_nodes_value = ids_of_nodes.value();
-    size_t nodes_count = ids_of_nodes_value.size();
+    size_t nodes_count = ids_of_nodes.size();
 
     /// Trivial case
     if (nodes_count < 2)
@@ -50,10 +46,10 @@ size_t StorageObjectStorageStableTaskDistributor::getReplicaForFile(const String
 
     /// Rendezvous hashing
     size_t best_id = 0;
-    UInt64 best_weight = sipHash64(ids_of_nodes_value[0] + file_path);
+    UInt64 best_weight = sipHash64(ids_of_nodes[0] + file_path);
     for (size_t id = 1; id < nodes_count; ++id)
     {
-        UInt64 weight = sipHash64(ids_of_nodes_value[id] + file_path);
+        UInt64 weight = sipHash64(ids_of_nodes[id] + file_path);
         if (weight > best_weight)
         {
             best_weight = weight;
@@ -66,6 +62,14 @@ size_t StorageObjectStorageStableTaskDistributor::getReplicaForFile(const String
 std::optional<String> StorageObjectStorageStableTaskDistributor::getPreQueuedFile(size_t number_of_current_replica)
 {
     std::lock_guard lock(mutex);
+
+    if (connection_to_files.size() <= number_of_current_replica)
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "Replica number {} is out of range. Expected range: [0, {})",
+            number_of_current_replica,
+            connection_to_files.size()
+        );
 
     auto & files = connection_to_files[number_of_current_replica];
 
