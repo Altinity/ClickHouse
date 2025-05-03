@@ -68,6 +68,22 @@ public:
 
     void addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const override;
 
+    std::optional<UInt64> totalRows(ContextPtr query_context) const override
+    {
+        if (pure_storage)
+            return pure_storage->totalRows(query_context);
+        configuration->update(object_storage, query_context);
+        return configuration->totalRows();
+    }
+
+    std::optional<UInt64> totalBytes(ContextPtr query_context) const override
+    {
+        if (pure_storage)
+            return pure_storage->totalBytes(query_context);
+        configuration->update(object_storage, query_context);
+        return configuration->totalBytes();
+    }
+
 private:
     void updateQueryToSendIfNeeded(
         ASTPtr & query,
