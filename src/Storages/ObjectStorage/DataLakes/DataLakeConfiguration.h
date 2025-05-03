@@ -172,8 +172,9 @@ private:
     LoggerPtr log = getLogger("DataLakeConfiguration");
     const DataLakeStorageSettingsPtr settings;
 
-    void assertInitialized() const
+    void assertInitialized() const override
     {
+        BaseStorageConfiguration::assertInitialized();
         if (!current_metadata)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Metadata is not initialized");
     }
@@ -258,6 +259,7 @@ public:
     std::string getEngineName() const override { return getImpl().getEngineName(); }
     std::string getNamespaceType() const override { return getImpl().getNamespaceType(); }
 
+    Path getFullPath() const override { return getImpl().getFullPath(); }
     Path getPath() const override { return getImpl().getPath(); }
     void setPath(const Path & path) override { getImpl().setPath(path); }
 
@@ -274,9 +276,14 @@ public:
         ASTs & args, const String & structure_, const String & format_, ContextPtr context, bool with_structure) override
         { getImpl().addStructureAndFormatToArgsIfNeeded(args, structure_, format_, context, with_structure); }
 
+    bool withPartitionWildcard() const override { return getImpl().withPartitionWildcard(); }
+    bool withGlobsIgnorePartitionWildcard() const override { return getImpl().withGlobsIgnorePartitionWildcard(); }
+    bool isPathWithGlobs() const override { return getImpl().isPathWithGlobs(); }
+    bool isNamespaceWithGlobs() const override { return getImpl().isNamespaceWithGlobs(); }
     std::string getPathWithoutGlobs() const override { return getImpl().getPathWithoutGlobs(); }
 
     bool isArchive() const override { return getImpl().isArchive(); }
+    bool isPathInArchiveWithGlobs() const override { return getImpl().isPathInArchiveWithGlobs(); }
     std::string getPathInArchive() const override { return getImpl().getPathInArchive(); }
 
     void check(ContextPtr context) const override { getImpl().check(context); }
@@ -443,6 +450,8 @@ protected:
         ObjectStorageType type = extractDynamicStorageType(args, context, nullptr);
         createDynamicStorage(type);
     }
+
+    void assertInitialized() const override { return getImpl().assertInitialized(); }
 
 private:
     inline StorageObjectStorage::Configuration & getImpl() const

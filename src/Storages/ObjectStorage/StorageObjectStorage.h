@@ -219,15 +219,15 @@ public:
     virtual void addStructureAndFormatToArgsIfNeeded(
         ASTs & args, const String & structure_, const String & format_, ContextPtr context, bool with_structure) = 0;
 
-    bool withPartitionWildcard() const;
+    virtual bool withPartitionWildcard() const;
     bool withGlobs() const { return isPathWithGlobs() || isNamespaceWithGlobs(); }
-    bool withGlobsIgnorePartitionWildcard() const;
-    bool isPathWithGlobs() const;
-    bool isNamespaceWithGlobs() const;
+    virtual bool withGlobsIgnorePartitionWildcard() const;
+    virtual bool isPathWithGlobs() const;
+    virtual bool isNamespaceWithGlobs() const;
     virtual std::string getPathWithoutGlobs() const;
 
     virtual bool isArchive() const { return false; }
-    bool isPathInArchiveWithGlobs() const;
+    virtual bool isPathInArchiveWithGlobs() const;
     virtual std::string getPathInArchive() const;
 
     virtual void check(ContextPtr context) const;
@@ -304,14 +304,14 @@ public:
     virtual void setCompressionMethod(const String & compression_method_) { compression_method = compression_method_; }
     virtual void setStructure(const String & structure_) { structure = structure_; }
 
+    virtual void assertInitialized() const;
+
 private:
     String format = "auto";
     String compression_method = "auto";
     String structure = "auto";
 
 protected:
-    void assertInitialized() const;
-
     bool initialized = false;
 };
 
