@@ -486,7 +486,7 @@ def _print_results(result: Any, outfile: Optional[str], pretty: bool = False) ->
             raise AssertionError(f"Unexpected type for 'res': {type(result)}")
 
 
-def _configure_docker_jobs(docker_digest_or_latest: bool) -> Dict:
+def _configure_docker_jobs(docker_digest_or_latest: bool, force_rebuild: bool = False) -> Dict:
     print("::group::Docker images check")
     # generate docker jobs data
     docker_digester = DockerDigester()
@@ -498,7 +498,7 @@ def _configure_docker_jobs(docker_digest_or_latest: bool) -> Dict:
     # FIXME: we need login as docker manifest inspect goes directly to one of the *.docker.com hosts instead of "registry-mirrors" : ["http://dockerhub-proxy.dockerhub-proxy-zone:5000"]
     #   find if it's possible to use the setting of /etc/docker/daemon.json (https://github.com/docker/cli/issues/4484#issuecomment-1688095463)
     docker_images_helper.docker_login()
-    missing_multi_dict = check_missing_images_on_dockerhub(imagename_digest_dict)
+    missing_multi_dict = imagename_digest_dict if force_rebuild else check_missing_images_on_dockerhub(imagename_digest_dict)
     missing_multi = list(missing_multi_dict)
     missing_amd64 = []
     missing_aarch64 = []
@@ -1121,7 +1121,7 @@ def main() -> int:
         print(f"Got CH version for this commit: [{version}]")
 
         docker_data = (
-            _configure_docker_jobs(args.docker_digest_or_latest)
+            _configure_docker_jobs(args.docker_digest_or_latest, True)
             if not args.skip_docker
             else {}
         )
