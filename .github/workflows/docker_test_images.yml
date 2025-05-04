@@ -33,8 +33,8 @@ env:
 jobs:
   DockerBuildAarch64:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
-    if: |
-      !failure() && !cancelled() && toJson(fromJson(inputs.data).docker_data.missing_aarch64) != '[]'
+    # if: |
+    #   !failure() && !cancelled() && toJson(fromJson(inputs.data).docker_data.missing_aarch64) != '[]'
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
@@ -48,8 +48,8 @@ jobs:
             --missing-images '${{ toJson(fromJson(inputs.data).docker_data.missing_aarch64) }}'
   DockerBuildAmd64:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
-    if: |
-      !failure() && !cancelled() && toJson(fromJson(inputs.data).docker_data.missing_amd64) != '[]'
+    # if: |
+    #   !failure() && !cancelled() && toJson(fromJson(inputs.data).docker_data.missing_amd64) != '[]'
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
