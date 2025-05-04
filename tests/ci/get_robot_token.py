@@ -62,6 +62,7 @@ def get_parameters_from_ssm(
 # we are using only one robot and keeping the method signature. In the future we might reconsider
 # having multiple robot tokens
 def get_best_robot_token():
+    assert ROBOT_TOKEN is not None, "Robot token is requested, but it is not set in env"
     return ROBOT_TOKEN
 
 def get_best_robot_token_original(tokens_path: str = "/github-tokens") -> str:
