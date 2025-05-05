@@ -60,6 +60,8 @@ jobs:
       GITHUB_JOB_OVERRIDDEN: Build-${{inputs.build_name}}
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     steps:
+#      - name: Setup git-cache proxy
+#        run: git config --global url."http://116.202.10.13:8765/".insteadOf https://
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
         with:
@@ -78,7 +80,7 @@ jobs:
           DOCKER_JSON
           EOF
           python3 "$GITHUB_WORKSPACE"/tests/ci/ci_config.py --build-name "${{inputs.build_name}}" >> "$GITHUB_ENV"
-      - name: Apply sparse checkout for contrib # in order to check that it doesn't break build
+      - name: Apply sparse checkout for contrib
         # This step is done in GITHUB_WORKSPACE,
         # because it's broken in REPO_COPY for some reason
         # See also update-submodules.sh
@@ -94,6 +96,7 @@ jobs:
         with:
           job_type: build_check
       - name: Create source tar
+        if: ${{ inputs.build_name == 'package_release' }} 
         run: |
           mkdir -p "$TEMP_PATH/build_check/package_release"
           cd .. && tar czf $TEMP_PATH/build_source.src.tar.gz ClickHouse/
