@@ -23,8 +23,8 @@ StoragePtr TableFunctionObjectStorageCluster<Definition, Configuration>::execute
 
     ColumnsDescription columns;
 
-    if (configuration->structure != "auto")
-        columns = parseColumnsListFromString(configuration->structure, context);
+    if (configuration->getStructure() != "auto")
+        columns = parseColumnsListFromString(configuration->getStructure(), context);
     else if (!Base::structure_hint.empty())
         columns = Base::structure_hint;
     else if (!cached_columns.empty())

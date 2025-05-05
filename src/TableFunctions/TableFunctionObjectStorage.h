@@ -115,15 +115,16 @@ public:
 
     String getName() const override { return name; }
 
-    bool hasStaticStructure() const override { return configuration->structure != "auto"; }
+    bool hasStaticStructure() const override { return configuration->getStructure() != "auto"; }
 
-    bool needStructureHint() const override { return configuration->structure == "auto"; }
+    bool needStructureHint() const override { return configuration->getStructure() == "auto"; }
 
     void setStructureHint(const ColumnsDescription & structure_hint_) override { structure_hint = structure_hint_; }
 
     bool supportsReadingSubsetOfColumns(const ContextPtr & context) override
     {
-        return configuration->format != "auto" && FormatFactory::instance().checkIfFormatSupportsSubsetOfColumns(configuration->format, context);
+        return configuration->getFormat() != "auto"
+            && FormatFactory::instance().checkIfFormatSupportsSubsetOfColumns(configuration->getFormat(), context);
     }
 
     std::unordered_set<String> getVirtualsToCheckBeforeUsingStructureHint() const override

@@ -84,7 +84,7 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
 {
     ColumnsDescription columns{columns_};
     std::string sample_path;
-    resolveSchemaAndFormat(columns, configuration->format, object_storage, configuration, {}, sample_path, context_);
+    resolveSchemaAndFormat(columns, object_storage, configuration, {}, sample_path, context_);
     configuration->check(context_);
 
     StorageInMemoryMetadata metadata;
@@ -292,7 +292,7 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
 
     if (cluster_name_in_settings || !endsWith(table_function->name, "Cluster"))
     {
-        configuration->addStructureAndFormatToArgsIfNeeded(args, structure, configuration->format, context, /*with_structure=*/true);
+        configuration->addStructureAndFormatToArgsIfNeeded(args, structure, configuration->getFormat(), context, /*with_structure=*/true);
 
         /// Convert to old-stype *Cluster table function.
         /// This allows to use old clickhouse versions in cluster.
@@ -345,7 +345,7 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
     {
         ASTPtr cluster_name_arg = args.front();
         args.erase(args.begin());
-        configuration->addStructureAndFormatToArgsIfNeeded(args, structure, configuration->format, context, /*with_structure=*/true);
+        configuration->addStructureAndFormatToArgsIfNeeded(args, structure, configuration->getFormat(), context, /*with_structure=*/true);
         args.insert(args.begin(), cluster_name_arg);
     }
     if (settings_temporary_storage)
@@ -438,7 +438,7 @@ void StorageObjectStorageCluster::truncate(
 
 void StorageObjectStorageCluster::addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const
 {
-    configuration->addStructureAndFormatToArgsIfNeeded(args, "", configuration->format, context, /*with_structure=*/false);
+    configuration->addStructureAndFormatToArgsIfNeeded(args, "", configuration->getFormat(), context, /*with_structure=*/false);
 }
 
 }

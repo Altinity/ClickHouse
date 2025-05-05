@@ -95,9 +95,9 @@ protected:
 
     const char * getStorageTypeName() const override { return Definition::storage_type_name; }
 
-    bool hasStaticStructure() const override { return Base::getConfiguration()->structure != "auto"; }
+    bool hasStaticStructure() const override { return Base::getConfiguration()->getStructure() != "auto"; }
 
-    bool needStructureHint() const override { return Base::getConfiguration()->structure == "auto"; }
+    bool needStructureHint() const override { return Base::getConfiguration()->getStructure() == "auto"; }
 
     void setStructureHint(const ColumnsDescription & structure_hint_) override { Base::structure_hint = structure_hint_; }
 };

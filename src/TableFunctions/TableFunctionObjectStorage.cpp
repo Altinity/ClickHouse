@@ -109,16 +109,16 @@ template <typename Definition, typename Configuration>
 ColumnsDescription TableFunctionObjectStorage<
     Definition, Configuration>::getActualTableStructure(ContextPtr context, bool is_insert_query) const
 {
-    if (configuration->structure == "auto")
+    if (configuration->getStructure() == "auto")
     {
         context->checkAccess(getSourceAccessType());
         ColumnsDescription columns;
         auto storage = getObjectStorage(context, !is_insert_query);
         std::string sample_path;
-        resolveSchemaAndFormat(columns, configuration->format, storage, configuration, std::nullopt, sample_path, context);
+        resolveSchemaAndFormat(columns, storage, configuration, std::nullopt, sample_path, context);
         return columns;
     }
-    return parseColumnsListFromString(configuration->structure, context);
+    return parseColumnsListFromString(configuration->getStructure(), context);
 }
 
 template <typename Definition, typename Configuration>
@@ -132,8 +132,8 @@ StoragePtr TableFunctionObjectStorage<Definition, Configuration>::executeImpl(
     chassert(configuration);
     ColumnsDescription columns;
 
-    if (configuration->structure != "auto")
-        columns = parseColumnsListFromString(configuration->structure, context);
+    if (configuration->getStructure() != "auto")
+        columns = parseColumnsListFromString(configuration->getStructure(), context);
     else if (!structure_hint.empty())
         columns = structure_hint;
     else if (!cached_columns.empty())

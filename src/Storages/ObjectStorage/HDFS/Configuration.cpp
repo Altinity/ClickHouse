@@ -111,23 +111,23 @@ void StorageHDFSConfiguration::fromAST(ASTs & args, ContextPtr context, bool wit
 
     if (args.size() > 1)
     {
-        format = checkAndGetLiteralArgument<String>(args[1], "format_name");
+        setFormat(checkAndGetLiteralArgument<String>(args[1], "format_name"));
     }
 
     if (with_structure)
     {
         if (args.size() > 2)
         {
-            structure = checkAndGetLiteralArgument<String>(args[2], "structure");
+            setStructure(checkAndGetLiteralArgument<String>(args[2], "structure"));
         }
         if (args.size() > 3)
         {
-            compression_method = checkAndGetLiteralArgument<String>(args[3], "compression_method");
+            setCompressionMethod(checkAndGetLiteralArgument<String>(args[3], "compression_method"));
         }
     }
     else if (args.size() > 2)
     {
-        compression_method = checkAndGetLiteralArgument<String>(args[2], "compression_method");
+        setCompressionMethod(checkAndGetLiteralArgument<String>(args[2], "compression_method"));
     }
 
     setURL(url_str);
@@ -143,10 +143,10 @@ void StorageHDFSConfiguration::fromNamedCollection(const NamedCollection & colle
     else
         url_str = collection.get<String>("url");
 
-    format = collection.getOrDefault<String>("format", "auto");
-    compression_method = collection.getOrDefault<String>("compression_method",
-                                                         collection.getOrDefault<String>("compression", "auto"));
-    structure = collection.getOrDefault<String>("structure", "auto");
+    setFormat(collection.getOrDefault<String>("format", "auto"));
+    setCompressionMethod(collection.getOrDefault<String>("compression_method",
+                                                         collection.getOrDefault<String>("compression", "auto")));
+    setStructure(collection.getOrDefault<String>("structure", "auto"));
 
     setURL(url_str);
 }
