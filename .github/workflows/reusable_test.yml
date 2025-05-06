@@ -64,6 +64,15 @@ name: Testing workflow
       ROBOT_TOKEN:
         description: token to update ci status.
         required: true
+      AZURE_ACCOUNT_NAME:
+        description: Azure storage account name
+        required: false
+      AZURE_STORAGE_KEY:
+        description: Azure storage access key
+        required: false
+      AZURE_CONTAINER_NAME:
+        description: Azure container name
+        required: false
 
 env:
   # Force the stdout and stderr streams to be unbuffered
@@ -130,6 +139,15 @@ jobs:
           ${{ toJson(fromJson(inputs.data).docker_data.images) }}
           DOCKER_JSON
           EOF
+
+          # Set Azure credentials only for stateless tests
+          if [[ "${{ inputs.test_name }}" == "Stateless"* ]]; then
+            echo "AZURE_ACCOUNT_NAME=${{ secrets.AZURE_ACCOUNT_NAME }}" >> "$GITHUB_ENV"
+            echo "AZURE_STORAGE_KEY=${{ secrets.AZURE_STORAGE_KEY }}" >> "$GITHUB_ENV"
+            echo "AZURE_CONTAINER_NAME=${{ secrets.AZURE_CONTAINER_NAME }}" >> "$GITHUB_ENV"
+            echo "AZURE_STORAGE_ACCOUNT_URL=https://${{ secrets.AZURE_ACCOUNT_NAME }}.blob.core.windows.net/" >> "$GITHUB_ENV"
+            echo "Configured Azure credentials"
+          fi
       - name: Common setup
         uses: ./.github/actions/common_setup
         with:
