@@ -20,7 +20,7 @@
         "reason": "KNOWN fails with asan"
     },
     "02783_parsedatetimebesteffort_syslog": {
-        "reason": "INVESTIGATE"
+        "reason": "NEEDSFIX - fixed upstream, needs backport"
     },
     "test_backward_compatibility/test_aggregate_function_state.py::test_backward_compatability_for_avg":{
         "reason": "KNOWN not run by upstream"
@@ -59,7 +59,7 @@
         "reason": "KNOWN fails upstream"
     },
     "test_reload_certificate/test.py::test_chain_reload": {
-        "reason": "INVESTIGATE"
+        "reason": "NEEDSFIX - fixed upstream, needs backport"
     },
     "test_dictionaries_all_layouts_separate_sources/test_mongo.py::test_simple_ssl[flat-True]": {
         "reason": "INVESTIGATE"
