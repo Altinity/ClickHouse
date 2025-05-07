@@ -434,7 +434,7 @@ def get_cves(pr_number, commit_sha):
 def url_to_html_link(url: str) -> str:
     if not url:
         return ""
-    text = url.split("/")[-1]
+    text = url.split("/")[-1].replace("__", "_")
     if not text:
         text = "results"
     return f'<a href="{url}">{text}</a>'
@@ -442,7 +442,7 @@ def url_to_html_link(url: str) -> str:
 
 def format_test_name_for_linewrap(text: str) -> str:
     """Tweak the test name to improve line wrapping."""
-    return text.replace(".py::", "/")
+    return f'<span style="line-break: anywhere;">{text}</span>'
 
 
 def format_test_status(text: str) -> str:

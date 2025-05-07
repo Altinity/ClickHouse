@@ -938,7 +938,7 @@ class ClickhouseIntegrationTestsRunner:
             )
 
             for fail_status in ("ERROR", "FAILED"):
-                for failed_test in group_counters[fail_status]:
+                for failed_test in group_counters[fail_status].copy():
                     if failed_test in known_broken_tests.keys():
                         fail_message = known_broken_tests[failed_test].get("message")
                         if not fail_message:
