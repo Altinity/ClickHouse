@@ -34,9 +34,17 @@ def hash_file(file_path):
     return hash_file_path
 
 def sign_file(file_path):
+    priv_key_file_path = 'priv.key'
+    with open(priv_key_file_path, 'x') as f:
+        f.write(GPG_BINARY_SIGNING_KEY)
+
     out_file_path = f'{file_path}.gpg'
+
+    os.system(f'echo {GPG_BINARY_SIGNING_PASSPHRASE} | gpg --batch --import {priv_key_file_path}')
     os.system(f'gpg -o {out_file_path} --pinentry-mode=loopback --batch --yes --passphrase {GPG_BINARY_SIGNING_PASSPHRASE} --sign {file_path}')
     print(f"Signed {file_path}")
+    os.remove(priv_key_file_path)
+
     return out_file_path
 
 def extract_public_key():
