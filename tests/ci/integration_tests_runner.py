@@ -244,9 +244,9 @@ class ClickhouseIntegrationTestsRunner:
                 continue
         message = "Pulling images failed for 5 attempts. Will fail the worker."
         logging.error(message)
-        kill_ci_runner(message)
-        # We pass specific retcode to to ci/integration_test_check.py to skip status reporting and restart job
-        sys.exit(13)
+        # kill_ci_runner(message)
+        # # We pass specific retcode to to ci/integration_test_check.py to skip status reporting and restart job
+        # sys.exit(13)
 
     @staticmethod
     def _parse_report(
