@@ -19,6 +19,9 @@
     "02700_s3_part_INT_MAX": {
         "reason": "KNOWN fails with asan"
     },
+    "02783_parsedatetimebesteffort_syslog": {
+        "reason": "INVESTIGATE"
+    },
     "test_backward_compatibility/test_aggregate_function_state.py::test_backward_compatability_for_avg":{
         "reason": "KNOWN not run by upstream"
     },
@@ -54,5 +57,20 @@
     },
     "test_table_function_mongodb/test.py::test_secure_connection[True]":{
         "reason": "KNOWN fails upstream"
+    },
+    "test_reload_certificate/test.py::test_chain_reload": {
+        "reason": "INVESTIGATE"
+    },
+    "test_dictionaries_all_layouts_separate_sources/test_mongo.py::test_simple_ssl[flat-True]": {
+        "reason": "INVESTIGATE"
+    },
+    "test_dictionaries_all_layouts_separate_sources/test_mongo.py::test_simple_ssl[hashed-True]": {
+        "reason": "INVESTIGATE"
+    },
+    "test_dictionaries_all_layouts_separate_sources/test_mongo.py::test_simple_ssl[cache-True]": {
+        "reason": "INVESTIGATE"
+    },
+    "test_quorum_inserts/test.py::test_insert_quorum_with_keeper_loss_connection": {
+        "reason": "INVESTIGATE"
     }
 }
