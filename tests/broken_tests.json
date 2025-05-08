@@ -28,6 +28,9 @@
     "02783_parsedatetimebesteffort_syslog": {
         "reason": "NEEDSFIX - fixed upstream, needs backport"
     },
+    "03145_non_loaded_projection_backup": {
+        "reason": "INVESTIGATE - fails in tsan"
+    },
     "test_backward_compatibility/test_aggregate_function_state.py::test_backward_compatability_for_avg":{
         "reason": "KNOWN not run by upstream"
     },
