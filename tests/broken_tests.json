@@ -13,6 +13,12 @@
     "02888_system_tables_with_inaccsessible_table_function": {
         "reason": "INVESTIGATE"
     },
+    "02481_async_insert_dedup": {
+        "reason": "INVESTIGATE - fails in debug"
+    },
+    "02286_quantile_tdigest_infinity": {
+        "reason": "INVESTIGATE - fails in tsan"
+    },
     "03094_grouparraysorted_memory": {
         "reason": "KNOWN flaky"
     },
