@@ -274,6 +274,8 @@ public:
 #endif
 
 
+    virtual bool supportsListObjectsCache() { return false; }
+
 private:
     mutable std::mutex throttlers_mutex;
     ThrottlerPtr remote_read_throttler;

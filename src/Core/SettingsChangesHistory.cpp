@@ -68,6 +68,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         /// Note: please check if the key already exists to prevent duplicate entries.
         addSettingsChanges(settings_changes_history, "25.4",
         {
+            // Altinity Antalya modifications atop of 25.2
+            {"use_object_storage_list_objects_cache", true, false, "New setting."},
         });
         addSettingsChanges(settings_changes_history, "25.3",
         {
