@@ -84,6 +84,11 @@ def main():
     print(f'Uploaded public key to {s3_pubkey_path}')
     os.remove(pub_key_file_path)
 
+    # Copy public key to TEMP_PATH for artifact upload
+    artifact_pubkey_path = os.path.join(TEMP_PATH, 'public.gpg')
+    os.rename(pub_key_file_path, artifact_pubkey_path)
+    print(f'Copied public key to {artifact_pubkey_path} for artifact upload')
+    
     for f in os.listdir(TEMP_PATH):
         full_path = os.path.join(TEMP_PATH, f)
         if os.path.isdir(full_path):
