@@ -85,6 +85,16 @@ public:
         return std::nullopt;
     }
 
+    std::optional<String> tryGetSamplePathFromMetadata() const override
+    {
+        if (!current_metadata)
+            return std::nullopt;
+        auto data_files = current_metadata->getDataFiles();
+        if (!data_files.empty())
+            return data_files[0];
+        return std::nullopt;
+    }
+
     std::optional<size_t> totalRows() override
     {
         if (!current_metadata)
@@ -447,6 +457,11 @@ protected:
     {
         ObjectStorageType type = extractDynamicStorageType(args, context);
         createDynamicStorage(type);
+    }
+
+    std::optional<String> tryGetSamplePathFromMetadata() const override
+    {
+        return getImpl().tryGetSamplePathFromMetadata();
     }
 
 private:

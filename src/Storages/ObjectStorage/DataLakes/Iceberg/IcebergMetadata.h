@@ -42,6 +42,11 @@ public:
         const Poco::JSON::Object::Ptr & metadata_object,
         IcebergMetadataFilesCachePtr cache_ptr);
 
+    /// Get data files. On first request it reads manifest_list file and iterates through manifest files to find all data files.
+    /// All subsequent calls when the same data snapshot is relevant will return saved list of files (because it cannot be changed
+    /// without changing metadata file). Drops on every snapshot update.
+    Strings getDataFiles() const override { return getDataFilesImpl(nullptr); }
+
     /// Get table schema parsed from metadata.
     NamesAndTypesList getTableSchema() const override
     {
@@ -118,7 +123,7 @@ private:
 
     void updateState(const ContextPtr & local_context, bool metadata_file_changed);
 
-    Strings getDataFiles(const ActionsDAG * filter_dag) const;
+    Strings getDataFilesImpl(const ActionsDAG * filter_dag) const;
 
     void updateSnapshot();
 
