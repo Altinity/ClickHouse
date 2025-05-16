@@ -53,9 +53,6 @@ export ZOOKEEPER_FAULT_INJECTION=1
 # available for dump via clickhouse-local
 configure
 
-# NOTE(strtgbb): Our azure_storage_conf.xml is still expecting azurite
-azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --debug /azurite_log &
-
 /repo/tests/docker_scripts/setup_minio.sh stateless # to have a proper environment
 
 config_logs_export_cluster /etc/clickhouse-server/config.d/system_logs_export.yaml

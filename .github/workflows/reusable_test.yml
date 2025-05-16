@@ -141,7 +141,7 @@ jobs:
           EOF
 
           # Set Azure credentials only for stateless tests
-          if [[ "${{ inputs.test_name }}" == "Stateless"* ]]; then
+          if [[ "${{ inputs.test_name }}" == "Stateless"* || "${{ inputs.test_name }}" == "Stress"* ]]; then
             echo "AZURE_ACCOUNT_NAME=${{ secrets.AZURE_ACCOUNT_NAME }}" >> "$GITHUB_ENV"
             echo "AZURE_STORAGE_KEY=${{ secrets.AZURE_STORAGE_KEY }}" >> "$GITHUB_ENV"
             echo "AZURE_CONTAINER_NAME=${{ secrets.AZURE_CONTAINER_NAME }}" >> "$GITHUB_ENV"
