@@ -18,7 +18,9 @@
     "docker/test/integration/base": {
         "only_amd64": true,
         "name": "altinityinfra/integration-test",
-        "dependent": []
+	"dependent": [
+            "docker/test/integration/clickhouse_with_unity_catalog"
+        ]
     },
     "docker/test/fuzzer": {
         "name": "altinityinfra/fuzzer",
@@ -161,6 +163,10 @@
     },
     "docker/test/integration/nginx_dav": {
         "name": "altinityinfra/nginx-dav",
+        "dependent": []
+    },
+    "docker/test/integration/clickhouse_with_unity_catalog": {
+        "name": "clickhouse/integration-test-with-unity-catalog",
         "dependent": []
     }
 }
