@@ -166,7 +166,7 @@
         "dependent": []
     },
     "docker/test/integration/clickhouse_with_unity_catalog": {
-        "name": "clickhouse/integration-test-with-unity-catalog",
+        "name": "altinityinfra/integration-test-with-unity-catalog",
         "dependent": []
     }
 }
