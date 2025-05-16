@@ -256,5 +256,17 @@
     },
     "test_reload_clusters_config/test.py::test_update_one_cluster": {
         "reason": "INVESTIGATE - Fails on ASAN old analyzer"
+    },
+    "test_refreshable_mv/test.py::test_replicated_db_startup_race": {
+        "reason": "NEEDSFIX - Bad sed syntax"
+    },
+    "test_database_delta/test.py::test_complex_table_schema": {
+        "reason": "Investigate - Timeout"
+    },
+    "test_database_delta/test.py::test_multiple_schemes_tables": {
+        "reason": "Investigate - Cluster fails to start"
+    },
+    "test_database_delta/test.py::test_embedded_database_and_tables": {
+        "reason": "Investigate - Cluster fails to start"
     }
 }
