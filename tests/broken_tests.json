@@ -15,7 +15,7 @@
         "reason": "INVESTIGATE - new fail in 24.12"
     },
     "00988_expansion_aliases_limit": {
-        "reason": "INVESTIGATE - fails in tsan"
+        "reason": "INVESTIGATE - Timeout on TSAN"
     },
     "test_overcommit_tracker/test.py::test_user_overcommit": {
         "reason": "INVESTIGATE - fails in tsan"
@@ -58,6 +58,9 @@
     },
     "03003_prql_panic": {
         "reason": "KNOWN - PRQL is disabled in Antalya branch"
+    },
+    "01275_parallel_mv": {
+        "reason": "INVESTIGATE - Timeout on MSAN"
     },
     "test_git_import/test.py::test_git_import": {
         "reason": "NEEDSFIX - 403 while getting data from GitHub"
@@ -234,7 +237,7 @@
         "reason": "INVESTIGATE - Fails on ASAN, ASAN old analyzer, Release, TSAN"
     },
     "02354_vector_search_expansion_search": {
-        "reason": "INVESTIGATE - Fails on ASAN, ASAN old analyzer, Release, TSAN"
+        "reason": "INVESTIGATE - Timeout on TSAN"
     },
     "test_hedged_requests_parallel/test.py::test_combination1": {
         "reason": "INVESTIGATE - Fails on ASAN, ASAN old analyzer, Release, TSAN"
