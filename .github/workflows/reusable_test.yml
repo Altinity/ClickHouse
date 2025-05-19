@@ -137,6 +137,7 @@ jobs:
         with:
           job_type: test
       - name: Docker setup
+        if: ${{ !contains(inputs.name, 'Docker') }}
         uses: ./.github/actions/docker_setup
         with:
           test_name: ${{ inputs.test_name }}
