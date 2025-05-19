@@ -12,9 +12,7 @@ RUN arch=${TARGETARCH:-amd64} \
     && ln -s "${rarch}-linux-gnu" /lib/linux-gnu
 
 
-# As of Nov 3rd 2024, alpine:3.20.3 has 1 "unknown"-type CVE:
-# * https://security.alpinelinux.org/vuln/CVE-2024-9143
-FROM alpine:3.20.3
+FROM alpine:3.21.3
 
 ENV LANG=en_US.UTF-8 \
     LANGUAGE=en_US:en \
