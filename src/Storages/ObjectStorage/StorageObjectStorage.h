@@ -206,8 +206,10 @@ public:
         ASTs & args, const String & structure_, const String & format_, ContextPtr context, bool with_structure) = 0;
 
     virtual bool withPartitionWildcard() const;
+    virtual bool withSnowflakeIdWildcard() const;
     bool withGlobs() const { return isPathWithGlobs() || isNamespaceWithGlobs(); }
     virtual bool withGlobsIgnorePartitionWildcard() const;
+    virtual bool withGlobsIgnorePartitionWildcardAndSnowflakeIdWildcard() const;
     virtual bool isPathWithGlobs() const;
     virtual bool isNamespaceWithGlobs() const;
     virtual std::string getPathWithoutGlobs() const;

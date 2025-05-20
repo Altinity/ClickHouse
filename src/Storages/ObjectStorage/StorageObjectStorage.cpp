@@ -36,6 +36,7 @@ namespace Setting
     extern const SettingsMaxThreads max_threads;
     extern const SettingsBool optimize_count_from_files;
     extern const SettingsBool use_hive_partitioning;
+    extern const SettingsBool object_storage_treat_key_wildcard_as_star;
 }
 
 namespace ErrorCodes
@@ -373,21 +374,38 @@ void StorageObjectStorage::read(
     if (update_configuration_on_read)
         configuration->update(object_storage, local_context);
 
-    if (partition_by && configuration->withPartitionWildcard())
+    auto config_clone = configuration->clone();
+
+    if (config_clone->withPartitionWildcard() || config_clone->withSnowflakeIdWildcard())
     {
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-                        "Reading from a partitioned {} storage is not implemented yet",
-                        getName());
+        /*
+         * Replace `_partition_id` and `_snowflake_id` wildcards with `*` so that any files that match this pattern can be retrieved.
+         */
+        if (local_context->getSettingsRef()[Setting::object_storage_treat_key_wildcard_as_star])
+        {
+            const auto path_without_partition_id_wildcard = PartitionedSink::replaceWildcards(config_clone->getPath(), "*");
+
+            const auto no_key_related_wildcard_path = replaceSnowflakeIdWildcard(path_without_partition_id_wildcard, "*");
+
+            config_clone->setPath(no_key_related_wildcard_path);
+        }
+
+        if (config_clone->withPartitionWildcard() || config_clone->withSnowflakeIdWildcard())
+        {
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                   "Reading from a globbed path {} is not implemented yet, except for `_snowflake_id` and `_partition_id on storage {}`",
+                   config_clone->getPath(), getName());
+        }
     }
 
-    const auto read_from_format_info = configuration->prepareReadingFromFormat(
+    const auto read_from_format_info = config_clone->prepareReadingFromFormat(
         object_storage, column_names, storage_snapshot, supportsSubsetOfColumns(local_context), local_context);
     const bool need_only_count = (query_info.optimize_trivial_count || read_from_format_info.requested_columns.empty())
         && local_context->getSettingsRef()[Setting::optimize_count_from_files];
 
     auto read_step = std::make_unique<ReadFromObjectStorageStep>(
         object_storage,
-        configuration,
+        config_clone,
         fmt::format("{}({})", getName(), getStorageID().getFullTableName()),
         column_names,
         getVirtualsList(),
@@ -421,7 +439,7 @@ SinkToStoragePtr StorageObjectStorage::write(
                         configuration->getPath());
     }
 
-    if (configuration->withGlobsIgnorePartitionWildcard())
+    if (configuration->withGlobsIgnorePartitionWildcardAndSnowflakeIdWildcard())
     {
         throw Exception(ErrorCodes::DATABASE_ACCESS_DENIED,
                         "Path '{}' contains globs, so the table is in readonly mode",
@@ -659,11 +677,27 @@ bool StorageObjectStorage::Configuration::withPartitionWildcard() const
         || getNamespace().find(PARTITION_ID_WILDCARD) != String::npos;
 }
 
+bool StorageObjectStorage::Configuration::withSnowflakeIdWildcard() const
+{
+    static const String PARTITION_ID_WILDCARD = "{_snowflake_id}";
+    return getPath().find(PARTITION_ID_WILDCARD) != String::npos
+        || getNamespace().find(PARTITION_ID_WILDCARD) != String::npos;
+}
+
 bool StorageObjectStorage::Configuration::withGlobsIgnorePartitionWildcard() const
 {
     if (!withPartitionWildcard())
         return withGlobs();
     return PartitionedSink::replaceWildcards(getPath(), "").find_first_of("*?{") != std::string::npos;
+}
+
+bool StorageObjectStorage::Configuration::withGlobsIgnorePartitionWildcardAndSnowflakeIdWildcard() const
+{
+    const auto path_without_partition_id_wildcard = PartitionedSink::replaceWildcards(getPath(), "");
+
+    const auto path_without_snowflake_id_wildcard = replaceSnowflakeIdWildcard(path_without_partition_id_wildcard, "");
+
+    return path_without_snowflake_id_wildcard.find_first_of("*?{") != std::string::npos;
 }
 
 bool StorageObjectStorage::Configuration::isPathWithGlobs() const

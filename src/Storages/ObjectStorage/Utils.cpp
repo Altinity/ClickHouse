@@ -1,9 +1,18 @@
 #include <Storages/ObjectStorage/Utils.h>
 #include <Disks/ObjectStorages/IObjectStorage.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
+#include <Core/Settings.h>
+#include <boost/algorithm/string/replace.hpp>
+#include <Functions/generateSnowflakeID.h>
+#include <Storages/ObjectStorage/StorageObjectStorageSink.h>
 
 namespace DB
 {
+
+namespace Setting
+{
+    extern const SettingsBool object_storage_treat_key_wildcard_as_star;
+}
 
 namespace ErrorCodes
 {
@@ -51,6 +60,19 @@ void resolveSchemaAndFormat(
     std::string & sample_path,
     const ContextPtr & context)
 {
+    /*
+    * Replace `_partition_id` and `_snowflake_id` wildcards with `*` so that any files that match this pattern can be retrieved.
+    */
+    auto old_path = configuration->getPath();
+    if (context->getSettingsRef()[Setting::object_storage_treat_key_wildcard_as_star])
+    {
+        const auto path_without_partition_id_wildcard = PartitionedSink::replaceWildcards(configuration->getPath(), "*");
+
+        const auto no_key_related_wildcard_path = replaceSnowflakeIdWildcard(path_without_partition_id_wildcard, "*");
+
+        configuration->setPath(no_key_related_wildcard_path);
+    }
+
     if (columns.empty())
     {
         if (configuration->getFormat() == "auto")
@@ -68,6 +90,9 @@ void resolveSchemaAndFormat(
         configuration->setFormat(StorageObjectStorage::resolveFormatFromData(object_storage, configuration, format_settings, sample_path, context));
     }
 
+    // restored globbed path
+    configuration->setPath(old_path);
+
     if (!columns.hasOnlyOrdinary())
     {
         /// We don't allow special columns.
@@ -75,6 +100,16 @@ void resolveSchemaAndFormat(
                         "Special columns are not supported for {} storage"
                         "like MATERIALIZED, ALIAS or EPHEMERAL", configuration->getTypeName());
     }
+}
+
+std::string replaceSnowflakeIdWildcard(const std::string & input, const std::string & snowflake_id)
+{
+    return boost::replace_all_copy(input, "{_snowflake_id}", snowflake_id);
+}
+
+std::string fillSnowflakeIdWildcard(const std::string & input)
+{
+    return replaceSnowflakeIdWildcard(input, std::to_string(generateSnowflakeID()));
 }
 
 }

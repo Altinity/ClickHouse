@@ -5952,6 +5952,9 @@ Normally this setting should be set in user profile (users.xml or queries like `
 
 Note that initially (24.12) there was a server setting (`send_settings_to_client`), but latter it got replaced with this client setting, for better usability.
 )", 0) \
+    DECLARE(Bool, object_storage_treat_key_wildcard_as_star, false, R"(
+Upon reading from object storage (e.g, s3, azure and etc), treat {_snowflake_id} and {_partition_id} as *. This will allow symmetrical reads and writes using a single table.
+)", 0) \
     \
     /* ####################################################### */ \
     /* ########### START OF EXPERIMENTAL FEATURES ############ */ \

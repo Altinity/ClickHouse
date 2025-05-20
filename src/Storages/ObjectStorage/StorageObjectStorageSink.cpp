@@ -5,6 +5,7 @@
 #include <Core/Settings.h>
 #include <Storages/ObjectStorage/Utils.h>
 #include <base/defines.h>
+#include <Storages/ObjectStorage/Utils.h>
 
 namespace DB
 {
@@ -20,6 +21,22 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
 }
 
+namespace
+{
+void validateKey(const String & str)
+{
+    /// See:
+    /// - https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html
+    /// - https://cloud.ibm.com/apidocs/cos/cos-compatibility#putobject
+
+    if (str.empty() || str.size() > 1024)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Incorrect key length (not empty, max 1023 characters), got: {}", str.size());
+
+    if (!UTF8::isValidUTF8(reinterpret_cast<const UInt8 *>(str.data()), str.size()))
+        throw Exception(ErrorCodes::CANNOT_PARSE_TEXT, "Incorrect non-UTF8 sequence in key");
+}
+}
+
 StorageObjectStorageSink::StorageObjectStorageSink(
     ObjectStoragePtr object_storage,
     ConfigurationPtr configuration,
@@ -31,7 +48,11 @@ StorageObjectStorageSink::StorageObjectStorageSink(
     , sample_block(sample_block_)
 {
     const auto & settings = context->getSettingsRef();
-    const auto path = blob_path.empty() ? configuration->getPaths().back() : blob_path;
+    auto path = blob_path.empty() ? configuration->getPaths().back() : blob_path;
+    path = fillSnowflakeIdWildcard(path);
+
+    validateKey(path);
+
     const auto chosen_compression_method = chooseCompressionMethod(path, configuration->getCompressionMethod());
 
     auto buffer = object_storage->writeObject(
@@ -121,6 +142,8 @@ StorageObjectStorageSink::~StorageObjectStorageSink()
 
 SinkPtr PartitionedStorageObjectStorageSink::createSinkForPartition(const String & partition_id)
 {
+    validatePartitionKey(partition_id, true);
+
     auto partition_bucket = replaceWildcards(configuration->getNamespace(), partition_id);
     validateNamespace(partition_bucket);
 
@@ -141,21 +164,6 @@ SinkPtr PartitionedStorageObjectStorageSink::createSinkForPartition(const String
         context,
         partition_key
     );
-}
-
-void PartitionedStorageObjectStorageSink::validateKey(const String & str)
-{
-    /// See:
-    /// - https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html
-    /// - https://cloud.ibm.com/apidocs/cos/cos-compatibility#putobject
-
-    if (str.empty() || str.size() > 1024)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Incorrect key length (not empty, max 1023 characters), got: {}", str.size());
-
-    if (!UTF8::isValidUTF8(reinterpret_cast<const UInt8 *>(str.data()), str.size()))
-        throw Exception(ErrorCodes::CANNOT_PARSE_TEXT, "Incorrect non-UTF8 sequence in key");
-
-    validatePartitionKey(str, true);
 }
 
 void PartitionedStorageObjectStorageSink::validateNamespace(const String & str)

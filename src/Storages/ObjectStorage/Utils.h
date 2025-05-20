@@ -21,4 +21,8 @@ void resolveSchemaAndFormat(
     std::string & sample_path,
     const ContextPtr & context);
 
+std::string replaceSnowflakeIdWildcard(const std::string & input, const std::string & snowflake_id);
+
+std::string fillSnowflakeIdWildcard(const std::string & input);
+
 }

@@ -147,6 +147,13 @@ struct Data
 
 }
 
+uint64_t generateSnowflakeID()
+{
+    Data data;
+    SnowflakeId snowflake_id = data.reserveRange(getMachineId(), 1);
+    return fromSnowflakeId(snowflake_id);
+}
+
 class FunctionGenerateSnowflakeID : public IFunction
 {
 public:
