@@ -25,4 +25,6 @@ std::string replaceSnowflakeIdWildcard(const std::string & input, const std::str
 
 std::string fillSnowflakeIdWildcard(const std::string & input);
 
+std::string getPathWithKeyRelatedWildcardsReplacedWithStar(const std::string & path);
+
 }

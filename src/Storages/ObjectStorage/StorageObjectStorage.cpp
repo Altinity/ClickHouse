@@ -36,7 +36,7 @@ namespace Setting
     extern const SettingsMaxThreads max_threads;
     extern const SettingsBool optimize_count_from_files;
     extern const SettingsBool use_hive_partitioning;
-    extern const SettingsBool object_storage_treat_key_wildcard_as_star;
+    extern const SettingsBool object_storage_treat_key_related_wildcards_as_star;
 }
 
 namespace ErrorCodes
@@ -381,19 +381,16 @@ void StorageObjectStorage::read(
         /*
          * Replace `_partition_id` and `_snowflake_id` wildcards with `*` so that any files that match this pattern can be retrieved.
          */
-        if (local_context->getSettingsRef()[Setting::object_storage_treat_key_wildcard_as_star])
+        if (local_context->getSettingsRef()[Setting::object_storage_treat_key_related_wildcards_as_star])
         {
-            const auto path_without_partition_id_wildcard = PartitionedSink::replaceWildcards(config_clone->getPath(), "*");
-
-            const auto no_key_related_wildcard_path = replaceSnowflakeIdWildcard(path_without_partition_id_wildcard, "*");
-
-            config_clone->setPath(no_key_related_wildcard_path);
+            config_clone->setPath(getPathWithKeyRelatedWildcardsReplacedWithStar(config_clone->getPath()));
         }
 
         if (config_clone->withPartitionWildcard() || config_clone->withSnowflakeIdWildcard())
         {
             throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-                   "Reading from a globbed path {} is not implemented yet, except for `_snowflake_id` and `_partition_id on storage {}`",
+                   "Reading from a globbed path {} on storage {} is not implemented yet,"
+                   "except when the only globs are `_snowflake_id` and/or `_partition_id` with `object_storage_treat_key_related_wildcards_as_star=1`",
                    config_clone->getPath(), getName());
         }
     }

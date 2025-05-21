@@ -11,7 +11,7 @@ namespace DB
 
 namespace Setting
 {
-    extern const SettingsBool object_storage_treat_key_wildcard_as_star;
+    extern const SettingsBool object_storage_treat_key_related_wildcards_as_star;
 }
 
 namespace ErrorCodes
@@ -63,14 +63,10 @@ void resolveSchemaAndFormat(
     /*
     * Replace `_partition_id` and `_snowflake_id` wildcards with `*` so that any files that match this pattern can be retrieved.
     */
-    auto old_path = configuration->getPath();
-    if (context->getSettingsRef()[Setting::object_storage_treat_key_wildcard_as_star])
+    const auto old_path = configuration->getPath();
+    if (context->getSettingsRef()[Setting::object_storage_treat_key_related_wildcards_as_star])
     {
-        const auto path_without_partition_id_wildcard = PartitionedSink::replaceWildcards(configuration->getPath(), "*");
-
-        const auto no_key_related_wildcard_path = replaceSnowflakeIdWildcard(path_without_partition_id_wildcard, "*");
-
-        configuration->setPath(no_key_related_wildcard_path);
+        configuration->setPath(getPathWithKeyRelatedWildcardsReplacedWithStar(configuration->getPath()));
     }
 
     if (columns.empty())
@@ -110,6 +106,11 @@ std::string replaceSnowflakeIdWildcard(const std::string & input, const std::str
 std::string fillSnowflakeIdWildcard(const std::string & input)
 {
     return replaceSnowflakeIdWildcard(input, std::to_string(generateSnowflakeID()));
+}
+
+std::string getPathWithKeyRelatedWildcardsReplacedWithStar(const std::string & path)
+{
+    return replaceSnowflakeIdWildcard(PartitionedSink::replaceWildcards(path, "*"), "*");
 }
 
 }
