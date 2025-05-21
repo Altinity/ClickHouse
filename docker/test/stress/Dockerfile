@@ -1,7 +1,7 @@
 # rebuild in #33610
 # docker build -t altinityinfra/stress-test .
 ARG FROM_TAG=latest
-FROM altinityinfra/stateful-test:$FROM_TAG
+FROM altinityinfra/stateful-test:ce3c0a6ed901
 
 RUN apt-get update -y \
     && env DEBIAN_FRONTEND=noninteractive \
