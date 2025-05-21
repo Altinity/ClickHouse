@@ -1,9 +1,9 @@
 #pragma once
 
-#include <base/types.h>
-#include <Common/ProfileEvents.h>
+#include <functional>
 #include <IO/Progress.h>
 #include <Storages/MergeTree/MergeList.h>
+#include <base/types.h>
 
 
 namespace ProfileEvents
@@ -47,27 +47,23 @@ struct MergeStageProgress
 class MergeProgressCallback
 {
 public:
+    // It should throw an exception in case the operation should be cancelled
+    using CancellationChecker = std::function<void()>;
+
     MergeProgressCallback(
-        MergeListElement * merge_list_element_ptr_, UInt64 & watch_prev_elapsed_, MergeStageProgress & stage_)
+        MergeListElement * merge_list_element_ptr_,
+        UInt64 & watch_prev_elapsed_,
+        MergeStageProgress & stage_,
+        CancellationChecker && cancellation_checker_)
         : merge_list_element_ptr(merge_list_element_ptr_)
         , watch_prev_elapsed(watch_prev_elapsed_)
         , stage(stage_)
+        , cancellation_checker(std::move(cancellation_checker_))
     {
         updateWatch();
     }
 
-    MergeListElement * merge_list_element_ptr;
-    UInt64 & watch_prev_elapsed;
-    MergeStageProgress & stage;
-
-    void updateWatch()
-    {
-        UInt64 watch_curr_elapsed = merge_list_element_ptr->watch.elapsed();
-        ProfileEvents::increment(ProfileEvents::MergesTimeMilliseconds, (watch_curr_elapsed - watch_prev_elapsed) / 1000000);
-        watch_prev_elapsed = watch_curr_elapsed;
-    }
-
-    void operator() (const Progress & value)
+    void operator()(const Progress & value)
     {
         ProfileEvents::increment(ProfileEvents::MergedUncompressedBytes, value.read_bytes);
         if (stage.is_first)
@@ -76,6 +72,8 @@ public:
             ProfileEvents::increment(ProfileEvents::Merge);
         }
         updateWatch();
+
+        cancellation_checker();
 
         merge_list_element_ptr->bytes_read_uncompressed += value.read_bytes;
         if (stage.is_first)
@@ -90,6 +88,19 @@ public:
                 std::memory_order_relaxed);
         }
     }
+
+private:
+    MergeListElement * merge_list_element_ptr;
+    UInt64 & watch_prev_elapsed;
+    MergeStageProgress & stage;
+    CancellationChecker cancellation_checker;
+
+    void updateWatch()
+    {
+        UInt64 watch_curr_elapsed = merge_list_element_ptr->watch.elapsed();
+        watch_prev_elapsed = watch_curr_elapsed;
+    }
+
 };
 
 }

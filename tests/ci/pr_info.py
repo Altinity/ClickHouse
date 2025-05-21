@@ -71,11 +71,9 @@ def get_pr_for_commit(sha, ref):
             if pr["head"]["ref"] in ref:
                 return pr
             our_prs.append(pr)
-        print(
-            f"Cannot find PR with required ref {ref}, sha {sha} - returning first one"
-        )
-        first_pr = our_prs[0]
-        return first_pr
+        logging.warning("Cannot find PR with required ref %s, sha %s", ref, sha)
+        # first_pr = our_prs[0]
+        return None
     except Exception as ex:
         print(f"Cannot fetch PR info from commit {ref}, {sha}", ex)
     return None
@@ -121,8 +119,10 @@ class PRInfo:
         ref = github_event.get("ref", "refs/heads/master")
         if ref and ref.startswith("refs/heads/"):
             ref = ref[11:]
+        self.ref : str = ref # e.g. "refs/pull/509/merge" or "refs/tags/v24.3.12.76.altinitystable"
+
         # Default values
-        self.base_ref = ""  # type: str
+        self.base_ref = github_event.get("base_ref","")  # type: str
         self.base_name = ""  # type: str
         self.head_ref = ""  # type: str
         self.head_name = ""  # type: str
@@ -166,11 +166,11 @@ class PRInfo:
             # master or backport/xx.x/xxxxx - where the PR will be merged
             self.base_ref = github_event["pull_request"]["base"]["ref"]
             # ClickHouse/ClickHouse
-            self.base_name = github_event["pull_request"]["base"]["repo"]["full_name"]
+            self.base_name = github_event["pull_request"]["base"]["repo"]["full_name"]  # type: str
             # any_branch-name - the name of working branch name
             self.head_ref = github_event["pull_request"]["head"]["ref"]
             # UserName/ClickHouse or ClickHouse/ClickHouse
-            self.head_name = github_event["pull_request"]["head"]["repo"]["full_name"]
+            self.head_name = github_event["pull_request"]["head"]["repo"]["full_name"]  # type: str
             self.body = github_event["pull_request"]["body"]
             self.labels = {
                 label["name"] for label in github_event["pull_request"]["labels"]
@@ -225,16 +225,21 @@ class PRInfo:
             pull_request = get_pr_for_commit(self.sha, github_event["ref"])
 
             if pull_request is None or pull_request["state"] == "closed":
-                # it's merged PR to master
+                # it's merged PR to master, or there is no PR (build against specific commit or tag)
                 self.number = 0
                 self.labels = set()
                 self.base_ref = ref
                 self.base_name = self.repo_full_name
                 self.head_ref = ref
                 self.head_name = self.repo_full_name
-                self.diff_urls.append(
-                    self.compare_url(github_event["before"], self.sha)
-                )
+
+                before_sha = github_event["before"]
+                # in case of just a tag on existing commit, "before_sha" is 0000000000000000000000000000000000000000
+                # Hence it is a special case and basically nothing changed, there is no need to compose a diff url
+                if not all(x == '0' for x in before_sha):
+                    self.diff_urls.append(
+                        self.compare_url(before_sha, self.sha)
+                    )
             else:
                 self.number = pull_request["number"]
                 self.labels = {label["name"] for label in pull_request["labels"]}
@@ -287,7 +292,9 @@ class PRInfo:
             self.sha = os.getenv(
                 "GITHUB_SHA", "0000000000000000000000000000000000000000"
             )
-            self.number = 0
+            self.number = 1
+            self.commit_html_url = f"{repo_prefix}/commit/{self.sha}"
+            self.pr_html_url = f"{repo_prefix}/commits/{ref}"
             self.base_ref = ref
             self.base_name = self.repo_full_name
             self.head_ref = ref
@@ -350,9 +357,6 @@ class PRInfo:
     def fetch_changed_files(self):
         if self.changed_files_requested:
             return
-
-        if not getattr(self, "diff_urls", False):
-            raise TypeError("The event does not have diff URLs")
 
         for diff_url in self.diff_urls:
             response = get_gh_api(

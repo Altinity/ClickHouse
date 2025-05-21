@@ -4,6 +4,7 @@ import os
 import logging
 import argparse
 import csv
+import json
 
 OK_SIGN = "[ OK "
 FAIL_SIGN = "[ FAIL "
@@ -206,6 +207,7 @@ if __name__ == "__main__":
     parser.add_argument("--out-results-file", default="/test_output/test_results.tsv")
     parser.add_argument("--out-status-file", default="/test_output/check_status.tsv")
     parser.add_argument("--broken-tests", default="/analyzer_tech_debt.txt")
+    parser.add_argument("--broken-tests-json", default="/broken_tests.json")
     args = parser.parse_args()
 
     broken_tests = list()
@@ -213,6 +215,14 @@ if __name__ == "__main__":
         logging.info(f"File {args.broken_tests} with broken tests found")
         with open(args.broken_tests) as f:
             broken_tests = f.read().splitlines()
+
+    if os.path.exists(args.broken_tests_json):
+        logging.info(f"File {args.broken_tests_json} with broken tests found")
+
+        with open(args.broken_tests_json) as f:
+            broken_tests.extend(json.load(f).keys())
+
+    if broken_tests:
         logging.info(f"Broken tests in the list: {len(broken_tests)}")
 
     state, description, test_results = process_result(args.in_results_dir, broken_tests)

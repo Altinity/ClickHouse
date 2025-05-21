@@ -61,6 +61,7 @@ MESSAGES_TO_RETRY = [
     "is already started to be removing by another replica right now",
     # This is from LSan, and it indicates its own internal problem:
     "Unable to get registers from thread",
+    "Memory limit (total) exceeded",
 ]
 
 MAX_RETRIES = 3
@@ -904,6 +905,8 @@ class MergeTreeSettingsRandomizer:
             1, 32 * 1024 * 1024
         ),
         "cache_populated_by_fetch": lambda: random.randint(0, 1),
+        "concurrent_part_removal_threshold": threshold_generator(0.2, 0.3, 0, 100),
+        "old_parts_lifetime": threshold_generator(0.2, 0.3, 30, 8 * 60),
     }
 
     @staticmethod

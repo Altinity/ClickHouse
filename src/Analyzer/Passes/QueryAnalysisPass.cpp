@@ -10,6 +10,8 @@
 #include <IO/Operators.h>
 
 #include <DataTypes/IDataType.h>
+#include <Common/FieldVisitorToString.h>
+
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeNullable.h>
@@ -5105,7 +5107,7 @@ ProjectionName QueryAnalyzer::resolveWindow(QueryTreeNodePtr & node, IdentifierR
         auto window_node_it = scope_window_name_to_window_node.find(parent_window_name);
         if (window_node_it == scope_window_name_to_window_node.end())
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "Window '{}' does not exists. In scope {}",
+                "Window '{}' does not exist. In scope {}",
                 parent_window_name,
                 nearest_query_scope->scope_node->formatASTForErrorMessage());
 
@@ -5880,7 +5882,7 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
     {
         if (!AggregateFunctionFactory::instance().isAggregateFunctionName(function_name))
         {
-            throw Exception(ErrorCodes::UNKNOWN_AGGREGATE_FUNCTION, "Aggregate function with name '{}' does not exists. In scope {}{}",
+            throw Exception(ErrorCodes::UNKNOWN_AGGREGATE_FUNCTION, "Aggregate function with name '{}' does not exist. In scope {}{}",
                             function_name, scope.scope_node->formatASTForErrorMessage(),
                             getHintsErrorMessageSuffix(AggregateFunctionFactory::instance().getHints(function_name)));
         }
@@ -5962,7 +5964,7 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
             auto hints = name_prompter.getHints(function_name, possible_function_names);
 
             throw Exception(ErrorCodes::UNKNOWN_FUNCTION,
-                "Function with name '{}' does not exists. In scope {}{}",
+                "Function with name '{}' does not exist. In scope {}{}",
                 function_name,
                 scope.scope_node->formatASTForErrorMessage(),
                 getHintsErrorMessageSuffix(hints));
@@ -6248,7 +6250,8 @@ ProjectionNames QueryAnalyzer::resolveFunction(QueryTreeNodePtr & node, Identifi
   *
   * 4. If node has alias, update its value in scope alias map. Deregister alias from expression_aliases_in_resolve_process.
   */
-ProjectionNames QueryAnalyzer::resolveExpressionNode(QueryTreeNodePtr & node, IdentifierResolveScope & scope, bool allow_lambda_expression, bool allow_table_expression)
+ProjectionNames QueryAnalyzer::resolveExpressionNode(
+    QueryTreeNodePtr & node, IdentifierResolveScope & scope, bool allow_lambda_expression, bool allow_table_expression)
 {
     checkStackSize();
 
@@ -7266,7 +7269,44 @@ void QueryAnalyzer::resolveTableFunction(QueryTreeNodePtr & table_function_node,
             table_name = table_identifier[1];
         }
 
-        auto parametrized_view_storage = scope_context->getQueryContext()->buildParametrizedViewStorage(function_ast, database_name, table_name);
+        /// Collect parametrized view arguments
+        NameToNameMap view_params;
+        for (const auto & argument : table_function_node_typed.getArguments())
+        {
+            if (auto * arg_func = argument->as<FunctionNode>())
+            {
+                if (arg_func->getFunctionName() != "equals")
+                    continue;
+
+                auto nodes = arg_func->getArguments().getNodes();
+                if (nodes.size() != 2)
+                    continue;
+
+                if (auto * identifier_node = nodes[0]->as<IdentifierNode>())
+                {
+                    resolveExpressionNode(nodes[1], scope, /* allow_lambda_expression */false, /* allow_table_function */false);
+                    if (auto * constant = nodes[1]->as<ConstantNode>())
+                    {
+                        /// Serialize the constant value using datatype specific
+                        /// interfaces to match the deserialization in ReplaceQueryParametersVistor.
+                        WriteBufferFromOwnString buf;
+                        const auto & value = constant->getValue();
+                        auto real_type = constant->getResultType();
+                        auto temporary_column  = real_type->createColumn();
+                        temporary_column->insert(value);
+                        real_type->getDefaultSerialization()->serializeTextEscaped(*temporary_column, 0, buf, {});
+                        view_params[identifier_node->getIdentifier().getFullName()] = buf.str();
+                    }
+                }
+            }
+        }
+
+        auto context = scope_context->getQueryContext();
+        auto parametrized_view_storage = context->buildParametrizedViewStorage(
+            database_name,
+            table_name,
+            view_params);
+
         if (parametrized_view_storage)
         {
             auto fake_table_node = std::make_shared<TableNode>(parametrized_view_storage, scope_context);
@@ -8085,7 +8125,7 @@ void QueryAnalyzer::resolveQuery(const QueryTreeNodePtr & query_node, Identifier
             auto window_node_it = scope.window_name_to_window_node.find(parent_window_name);
             if (window_node_it == scope.window_name_to_window_node.end())
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "Window '{}' does not exists. In scope {}",
+                    "Window '{}' does not exist. In scope {}",
                     parent_window_name,
                     scope.scope_node->formatASTForErrorMessage());
 

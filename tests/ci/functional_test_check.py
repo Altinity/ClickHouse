@@ -50,9 +50,9 @@ def get_additional_envs(
 
 def get_image_name(check_name: str) -> str:
     if "stateless" in check_name.lower():
-        return "clickhouse/stateless-test"
+        return "altinityinfra/stateless-test"
     if "stateful" in check_name.lower():
-        return "clickhouse/stateful-test"
+        return "altinityinfra/stateful-test"
     raise ValueError(f"Cannot deduce image name based on check name {check_name}")
 
 
@@ -96,6 +96,9 @@ def get_run_command(
         f"--volume={repo_path}/tests/analyzer_tech_debt.txt:/analyzer_tech_debt.txt "
         if "analyzer" not in check_name
         else ""
+    )
+    volume_with_broken_test += (
+        f"--volume={repo_path}/tests/broken_tests.json:/broken_tests.json "
     )
 
     return (

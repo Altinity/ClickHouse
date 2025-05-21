@@ -7,6 +7,12 @@ SET(VERSION_MAJOR 24)
 SET(VERSION_MINOR 3)
 SET(VERSION_PATCH 18)
 SET(VERSION_GITHASH b163637e2f74f7b0427f9c029653aef12cfc981c)
-SET(VERSION_DESCRIBE v24.3.18.1-lts)
-SET(VERSION_STRING 24.3.18.1)
+
+# This is the 'base' tweak of the version, build scripts will
+# increment this by number of commits since previous tag.
+SET(VERSION_TWEAK 10000)
+SET(VERSION_FLAVOUR altinitystable)
+
+SET(VERSION_DESCRIBE v24.3.18.76.altinitystable)
+SET(VERSION_STRING 24.3.18.76.altinitystable)
 # end of autochange

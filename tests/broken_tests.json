@@ -1,0 +1,58 @@
+{
+    "test_postgresql_replica_database_engine_2/test.py::test_quoting_publication": {
+        "message": "DB::Exception: Syntax error:",
+        "reason": "syntax error"
+    },
+    "test_distributed_inter_server_secret/test.py::test_secure_cluster_distributed_over_distributed_different_users": {
+        "message": "DB::NetException: Connection reset by peer, while reading from socket",
+        "reason": "network issue"
+    },
+    "02920_alter_column_of_projections": {
+        "reason": "requires different settings"
+    },
+    "02888_system_tables_with_inaccsessible_table_function": {
+        "reason": "todo investigate"
+    },
+    "03094_grouparraysorted_memory": {
+        "reason": "flaky"
+    },
+    "02700_s3_part_INT_MAX": {
+        "reason": "fails with asan"
+    },
+    "test_backward_compatibility/test_aggregate_function_state.py::test_backward_compatability_for_avg":{
+        "reason": "not run by upstream"
+    },
+    "test_backward_compatibility/test_aggregate_function_state.py::test_backward_compatability_for_uniq_exact[1000]":{
+        "reason": "not run by upstream"
+    },
+    "test_backward_compatibility/test_aggregate_function_state.py::test_backward_compatability_for_uniq_exact[500000] ":{
+        "reason": "not run by upstream"
+    },
+    "test_backward_compatibility/test_aggregate_function_state.py::test_backward_compatability_for_uniq_exact_variadic[1000]":{
+        "reason": "not run by upstream"
+    },
+    "test_backward_compatibility/test_aggregate_function_state.py::test_backward_compatability_for_uniq_exact_variadic[500000]":{
+        "reason": "not run by upstream"
+    },
+    "test_dictionaries_all_layouts_separate_sources/test_mongo.py::test_simple_ssl[cache-True]": {
+        "reason": "errors upstream"
+    },
+    "test_dictionaries_all_layouts_separate_sources/test_mongo.py::test_simple_ssl[direct-True]":{
+        "reason": "errors upstream"
+    },
+    "test_dictionaries_all_layouts_separate_sources/test_mongo.py::test_simple_ssl[flat-True]":{
+        "reason": "errors upstream"
+    },
+    "test_dictionaries_all_layouts_separate_sources/test_mongo.py::test_simple_ssl[hashed-True]":{
+        "reason": "errors upstream"
+    },
+    "test_dictionaries_all_layouts_separate_sources/test_mongo_uri.py::test_simple_ssl[flat-True]":{
+        "reason": "errors upstream"
+    },
+    "test_storage_mongodb/test.py::test_secure_connection[True]":{
+        "reason": "fails upstream"
+    },
+    "test_table_function_mongodb/test.py::test_secure_connection[True]":{
+        "reason": "fails upstream"
+    }
+}

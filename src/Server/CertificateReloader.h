@@ -31,6 +31,14 @@ class CertificateReloader
 public:
     using stat_t = struct stat;
 
+    struct Data
+    {
+        Poco::Crypto::X509Certificate::List certs_chain;
+        Poco::Crypto::EVPPKey key;
+
+        Data(std::string cert_path, std::string key_path, std::string pass_phrase);
+    };
+
     /// Singleton
     CertificateReloader(CertificateReloader const &) = delete;
     void operator=(CertificateReloader const &) = delete;
@@ -68,17 +76,12 @@ private:
     File cert_file{"certificate"};
     File key_file{"key"};
 
-    struct Data
-    {
-        Poco::Crypto::X509Certificate::List certs_chain;
-        Poco::Crypto::EVPPKey key;
-
-        Data(std::string cert_path, std::string key_path, std::string pass_phrase);
-    };
-
     MultiVersion<Data> data;
     bool init_was_not_made = true;
 };
+
+/// A callback for OpenSSL
+int setCertificateCallback(SSL * ssl, const CertificateReloader::Data * current_data, LoggerPtr log);
 
 }
 

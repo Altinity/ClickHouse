@@ -1578,6 +1578,9 @@ try
                     new_server_settings.http_connections_store_limit,
                 });
 
+            if (global_context->isServerCompletelyStarted())
+                CannotAllocateThreadFaultInjector::setFaultProbability(new_server_settings.cannot_allocate_thread_fault_injection_probability);
+
             ProfileEvents::increment(ProfileEvents::MainConfigLoads);
 
             /// Must be the last.
@@ -2066,6 +2069,8 @@ try
 
         startup_watch.stop();
         ProfileEvents::increment(ProfileEvents::ServerStartupMilliseconds, startup_watch.elapsedMilliseconds());
+
+        CannotAllocateThreadFaultInjector::setFaultProbability(server_settings.cannot_allocate_thread_fault_injection_probability);
 
         try
         {
