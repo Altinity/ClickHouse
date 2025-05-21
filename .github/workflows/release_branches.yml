@@ -572,8 +572,8 @@ jobs:
       - name: Create and upload combined report
         env:
           CHECKS_DATABASE_HOST: ${{ secrets.CHECKS_DATABASE_HOST }}
-          CHECKS_DATABASE_USER: ${{ secrets.CHECKS_DATABASE_USER }}
-          CHECKS_DATABASE_PASSWORD: ${{ secrets.CHECKS_DATABASE_PASSWORD }}
+          CHECKS_DATABASE_USER: ${{ secrets.CLICKHOUSE_TEST_STAT_LOGIN }}
+          CHECKS_DATABASE_PASSWORD: ${{ secrets.CLICKHOUSE_TEST_STAT_PASSWORD }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number || 0  }}
