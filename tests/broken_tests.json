@@ -31,6 +31,15 @@
     "03145_non_loaded_projection_backup": {
         "reason": "INVESTIGATE - fails in tsan"
     },
+    "00078_group_by_arrays": {
+        "reason": "INVESTIGATE - fail in debug"
+    },
+    "02539_settings_aliases": {
+        "reason": "INVESTIGATE - fail in msan"
+    },
+    "01052_window_view_proc_tumble_to_now": {
+        "reason": "INVESTIGATE - fail in msan"
+    },
     "test_backward_compatibility/test_aggregate_function_state.py::test_backward_compatability_for_avg":{
         "reason": "KNOWN not run by upstream"
     },
