@@ -665,6 +665,7 @@ StorageObjectStorage::Configuration::Configuration(const Configuration & other)
     format = other.format;
     compression_method = other.compression_method;
     structure = other.structure;
+    storage_settings = other.storage_settings;
 }
 
 bool StorageObjectStorage::Configuration::withPartitionWildcard() const
