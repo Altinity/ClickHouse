@@ -1,58 +1,94 @@
 {
     "test_postgresql_replica_database_engine_2/test.py::test_quoting_publication": {
         "message": "DB::Exception: Syntax error:",
-        "reason": "syntax error"
+        "reason": "NEEDSFIX syntax error"
     },
     "test_distributed_inter_server_secret/test.py::test_secure_cluster_distributed_over_distributed_different_users": {
         "message": "DB::NetException: Connection reset by peer, while reading from socket",
-        "reason": "network issue"
+        "reason": "NEEDSFIX network issue"
     },
     "02920_alter_column_of_projections": {
-        "reason": "requires different settings"
+        "reason": "NEEDSFIX requires different settings"
     },
     "02888_system_tables_with_inaccsessible_table_function": {
-        "reason": "todo investigate"
+        "reason": "INVESTIGATE"
+    },
+    "02481_async_insert_dedup": {
+        "reason": "INVESTIGATE - fails in debug"
+    },
+    "02286_quantile_tdigest_infinity": {
+        "reason": "INVESTIGATE - fails in tsan"
     },
     "03094_grouparraysorted_memory": {
-        "reason": "flaky"
+        "reason": "KNOWN flaky"
     },
     "02700_s3_part_INT_MAX": {
-        "reason": "fails with asan"
+        "reason": "KNOWN fails with asan"
+    },
+    "02783_parsedatetimebesteffort_syslog": {
+        "reason": "NEEDSFIX - fixed upstream, needs backport"
+    },
+    "03145_non_loaded_projection_backup": {
+        "reason": "INVESTIGATE - fails in tsan"
+    },
+    "00078_group_by_arrays": {
+        "reason": "INVESTIGATE - fail in debug"
+    },
+    "02539_settings_aliases": {
+        "reason": "INVESTIGATE - fail in msan"
+    },
+    "01052_window_view_proc_tumble_to_now": {
+        "reason": "INVESTIGATE - fail in msan"
     },
     "test_backward_compatibility/test_aggregate_function_state.py::test_backward_compatability_for_avg":{
-        "reason": "not run by upstream"
+        "reason": "KNOWN not run by upstream"
     },
     "test_backward_compatibility/test_aggregate_function_state.py::test_backward_compatability_for_uniq_exact[1000]":{
-        "reason": "not run by upstream"
+        "reason": "KNOWN not run by upstream"
     },
     "test_backward_compatibility/test_aggregate_function_state.py::test_backward_compatability_for_uniq_exact[500000] ":{
-        "reason": "not run by upstream"
+        "reason": "KNOWN not run by upstream"
     },
     "test_backward_compatibility/test_aggregate_function_state.py::test_backward_compatability_for_uniq_exact_variadic[1000]":{
-        "reason": "not run by upstream"
+        "reason": "KNOWN not run by upstream"
     },
     "test_backward_compatibility/test_aggregate_function_state.py::test_backward_compatability_for_uniq_exact_variadic[500000]":{
-        "reason": "not run by upstream"
+        "reason": "KNOWN not run by upstream"
     },
     "test_dictionaries_all_layouts_separate_sources/test_mongo.py::test_simple_ssl[cache-True]": {
-        "reason": "errors upstream"
+        "reason": "KNOWN errors upstream"
     },
     "test_dictionaries_all_layouts_separate_sources/test_mongo.py::test_simple_ssl[direct-True]":{
-        "reason": "errors upstream"
+        "reason": "KNOWN errors upstream"
     },
     "test_dictionaries_all_layouts_separate_sources/test_mongo.py::test_simple_ssl[flat-True]":{
-        "reason": "errors upstream"
+        "reason": "KNOWN errors upstream"
     },
     "test_dictionaries_all_layouts_separate_sources/test_mongo.py::test_simple_ssl[hashed-True]":{
-        "reason": "errors upstream"
+        "reason": "KNOWN errors upstream"
     },
     "test_dictionaries_all_layouts_separate_sources/test_mongo_uri.py::test_simple_ssl[flat-True]":{
-        "reason": "errors upstream"
+        "reason": "KNOWN errors upstream"
     },
     "test_storage_mongodb/test.py::test_secure_connection[True]":{
-        "reason": "fails upstream"
+        "reason": "KNOWN fails upstream"
     },
     "test_table_function_mongodb/test.py::test_secure_connection[True]":{
-        "reason": "fails upstream"
+        "reason": "KNOWN fails upstream"
+    },
+    "test_reload_certificate/test.py::test_chain_reload": {
+        "reason": "NEEDSFIX - fixed upstream, needs backport"
+    },
+    "test_dictionaries_all_layouts_separate_sources/test_mongo.py::test_simple_ssl[flat-True]": {
+        "reason": "INVESTIGATE"
+    },
+    "test_dictionaries_all_layouts_separate_sources/test_mongo.py::test_simple_ssl[hashed-True]": {
+        "reason": "INVESTIGATE"
+    },
+    "test_dictionaries_all_layouts_separate_sources/test_mongo.py::test_simple_ssl[cache-True]": {
+        "reason": "INVESTIGATE"
+    },
+    "test_quorum_inserts/test.py::test_insert_quorum_with_keeper_loss_connection": {
+        "reason": "INVESTIGATE"
     }
 }

@@ -486,8 +486,8 @@ jobs:
 ##################################### REGRESSION TESTS ######################################
 #############################################################################################
   RegressionTestsRelease:
-    needs: [BuilderDebRelease]
-    if: ${{ !failure() && !cancelled() }}
+    needs: [RunConfig, BuilderDebRelease]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'regression')}}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
@@ -497,8 +497,8 @@ jobs:
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout_minutes: 300
   RegressionTestsAarch64:
-    needs: [BuilderDebAarch64]
-    if: ${{ !failure() && !cancelled() }}
+    needs: [RunConfig, BuilderDebAarch64]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'regression') && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'aarch64')}}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
