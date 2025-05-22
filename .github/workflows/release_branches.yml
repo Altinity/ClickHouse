@@ -577,6 +577,23 @@ jobs:
       test_name: Sign aarch64
       runner_type: altinity-on-demand, altinity-func-tester
       data: ${{ needs.RunConfig.outputs.data }}
+  GrypeScan:
+    needs: [RunConfig, DockerServerImage, DockerKeeperImage]
+    if: ${{ !failure() && !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: server
+            suffix: ''
+          - image: server
+            suffix: '-alpine'
+          - image: keeper
+            suffix: ''
+    uses: ./.github/workflows/grype_scan.yml
+    secrets: inherit
+    with:
+      docker_image: altinityinfra/clickhouse-${{ matrix.image }}:${{ github.event.pull_request.number || 0 }}-${{ fromJson(needs.RunConfig.outputs.data).version }}${{ matrix.suffix }}
   FinishCheck:
     if: ${{ !cancelled() }}
     needs:
@@ -611,6 +628,7 @@ jobs:
       - CompatibilityCheckAarch64
       - RegressionTestsRelease
       - RegressionTestsAarch64
+      - GrypeScan
       - SignRelease
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     steps:
