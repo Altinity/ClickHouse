@@ -148,9 +148,9 @@ def get_run_details(run_url: str) -> dict:
     return response.json()
 
 
-def get_checks_fails(client: Client, job_url: str):
+def get_checks_fails(client: Client, commit_sha: str, branch_name: str):
     """
-    Get tests that did not succeed for the given job URL.
+    Get tests that did not succeed for the given commit and branch.
     Exclude checks that have status 'error' as they are counted in get_checks_errors.
     """
     query = f"""SELECT job_status, job_name, status as test_status, test_name, results_link
@@ -163,19 +163,21 @@ def get_checks_fails(client: Client, job_url: str):
                     report_url as results_link,
                     task_url
                 FROM `gh-data`.checks
+                WHERE commit_sha='{commit_sha}' AND head_ref='{branch_name}'
                 GROUP BY check_name, test_name, report_url, task_url
             )
-            WHERE task_url LIKE '{job_url}%'
-            AND test_status IN ('FAIL', 'ERROR')
+            WHERE test_status IN ('FAIL', 'ERROR')
             AND job_status!='error'
             ORDER BY job_name, test_name
             """
     return client.query_dataframe(query)
 
 
-def get_checks_known_fails(client: Client, job_url: str, known_fails: dict):
+def get_checks_known_fails(
+    client: Client, commit_sha: str, branch_name: str, known_fails: dict
+):
     """
-    Get tests that are known to fail for the given job URL.
+    Get tests that are known to fail for the given commit and branch.
     """
     if len(known_fails) == 0:
         return pd.DataFrame()
@@ -190,10 +192,10 @@ def get_checks_known_fails(client: Client, job_url: str, known_fails: dict):
                 report_url as results_link,
                 task_url
             FROM `gh-data`.checks
+            WHERE commit_sha='{commit_sha}' AND head_ref='{branch_name}'
             GROUP BY check_name, test_name, report_url, task_url
         )
-        WHERE task_url LIKE '{job_url}%'
-        AND test_status='BROKEN'
+        WHERE test_status='BROKEN'
         AND test_name IN ({','.join(f"'{test}'" for test in known_fails.keys())})
         ORDER BY job_name, test_name
         """
@@ -213,9 +215,9 @@ def get_checks_known_fails(client: Client, job_url: str, known_fails: dict):
     return df
 
 
-def get_checks_errors(client: Client, job_url: str):
+def get_checks_errors(client: Client, commit_sha: str, branch_name: str):
     """
-    Get checks that have status 'error' for the given job URL.
+    Get checks that have status 'error' for the given commit and branch.
     """
     query = f"""SELECT job_status, job_name, status as test_status, test_name, results_link
             FROM (
@@ -227,10 +229,10 @@ def get_checks_errors(client: Client, job_url: str):
                     report_url as results_link,
                     task_url
                 FROM `gh-data`.checks
+                WHERE commit_sha='{commit_sha}' AND head_ref='{branch_name}'
                 GROUP BY check_name, test_name, report_url, task_url
             )
-            WHERE task_url LIKE '{job_url}%'
-            AND job_status=='error'
+            WHERE job_status=='error'
             ORDER BY job_name, test_name
             """
     return client.query_dataframe(query)
@@ -431,7 +433,7 @@ def get_cves(pr_number, commit_sha):
 def url_to_html_link(url: str) -> str:
     if not url:
         return ""
-    text = url.split("/")[-1].replace("__", "_")
+    text = url.split("/")[-1].split("?")[0]
     if not text:
         text = "results"
     return f'<a href="{url}">{text}</a>'
@@ -447,7 +449,7 @@ def format_test_status(text: str) -> str:
     color = (
         "red"
         if text.lower().startswith("fail")
-        else "orange" if text.lower() in ("error", "broken") else "green"
+        else "orange" if text.lower() in ("error", "broken", "pending") else "green"
     )
     return f'<span style="font-weight: bold; color: {color}">{text}</span>'
 
@@ -523,12 +525,15 @@ def main():
         settings={"use_numpy": True},
     )
 
+    run_details = get_run_details(args.actions_run_url)
+    branch_name = run_details.get("head_branch", "unknown branch")
+
     fail_results = {
         "job_statuses": get_commit_statuses(args.commit_sha),
-        "checks_fails": get_checks_fails(db_client, args.actions_run_url),
+        "checks_fails": get_checks_fails(db_client, args.commit_sha, branch_name),
         "checks_known_fails": [],
         "pr_new_fails": [],
-        "checks_errors": get_checks_errors(db_client, args.actions_run_url),
+        "checks_errors": get_checks_errors(db_client, args.commit_sha, branch_name),
         "regression_fails": get_regression_fails(db_client, args.actions_run_url),
         "docker_images_cves": (
             [] if not args.cves else get_cves(args.pr_number, args.commit_sha)
@@ -549,12 +554,10 @@ def main():
 
         if known_fails:
             fail_results["checks_known_fails"] = get_checks_known_fails(
-                db_client, args.actions_run_url, known_fails
+                db_client, args.commit_sha, branch_name, known_fails
             )
 
     if args.pr_number == 0:
-        run_details = get_run_details(args.actions_run_url)
-        branch_name = run_details.get("head_branch", "unknown branch")
         pr_info_html = f"Release ({branch_name})"
     else:
         try:
