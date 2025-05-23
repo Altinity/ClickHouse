@@ -23,6 +23,7 @@ RUN apt-get update -y \
     && rm -rf /var/lib/apt/lists/* /var/cache/debconf /tmp/*
 
 COPY run.sh /
+COPY functions.sh /
 
 ENV EXPORT_S3_STORAGE_POLICIES=1
 
