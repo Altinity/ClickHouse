@@ -85,6 +85,11 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"parallel_replicas_for_cluster_engines", false, true, "New setting."},
             /// Release closed. Please use 25.4
         });
+        addSettingsChanges(settings_changes_history, "24.12.2.20000",
+        {
+            // Altinity Antalya modifications atop of 24.12
+            {"input_format_parquet_use_metadata_cache", true, true, "New setting, turned ON by default"}, // https://github.com/Altinity/ClickHouse/pull/586
+        });
         addSettingsChanges(settings_changes_history, "25.2",
         {
             /// Release closed. Please use 25.3
@@ -106,13 +111,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             /// Release closed. Please use 25.3
         });
         addSettingsChanges(settings_changes_history, "25.1",
-    {"24.12.2.20000",
-        // Altinity Antalya modifications
-        {
-            {"input_format_parquet_use_metadata_cache", true, true, "New setting, turned ON by default"}, // https://github.com/Altinity/ClickHouse/pull/586
-        }
-    },
-    {"24.12",
         {
             /// Release closed. Please use 25.2
             {"allow_not_comparable_types_in_order_by", true, false, "Don't allow not comparable types in order by by default"},
@@ -179,11 +177,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             /// Release closed. Please use 25.1
         });
         addSettingsChanges(settings_changes_history, "24.11",
-            {"object_storage_cluster", "", "", "New setting"},
-            {"object_storage_max_nodes", 0, 0, "New setting"},
-        }
-    },
-    {"24.11",
         {
             {"validate_mutation_query", false, true, "New setting to validate mutation queries by default."},
             {"enable_job_stack_trace", false, true, "Enable by default collecting stack traces from job's scheduling."},
