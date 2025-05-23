@@ -5,6 +5,7 @@ from pathlib import Path
 from itertools import combinations
 import json
 from datetime import datetime
+from functools import lru_cache
 
 import pandas as pd
 from jinja2 import Environment, FileSystemLoader
@@ -124,6 +125,7 @@ def get_pr_info_from_number(pr_number: str) -> dict:
     return response.json()
 
 
+@lru_cache
 def get_run_details(run_url: str) -> dict:
     """
     Fetch run details for a given run URL.
@@ -151,13 +153,23 @@ def get_checks_fails(client: Client, job_url: str):
     Get tests that did not succeed for the given job URL.
     Exclude checks that have status 'error' as they are counted in get_checks_errors.
     """
-    columns = "check_status as job_status, check_name as job_name, test_status, test_name, report_url as results_link"
-    query = f"""SELECT {columns} FROM `gh-data`.checks
-                WHERE task_url LIKE '{job_url}%'
-                AND test_status IN ('FAIL', 'ERROR')
-                AND check_status!='error'
-                ORDER BY check_name, test_name
-                """
+    query = f"""SELECT job_status, job_name, status as test_status, test_name, results_link
+            FROM (
+                SELECT
+                    argMax(check_status, check_start_time) as job_status,
+                    check_name as job_name,
+                    argMax(test_status, check_start_time) as status,
+                    test_name,
+                    report_url as results_link,
+                    task_url
+                FROM `gh-data`.checks
+                GROUP BY check_name, test_name, report_url, task_url
+            )
+            WHERE task_url LIKE '{job_url}%'
+            AND test_status IN ('FAIL', 'ERROR')
+            AND job_status!='error'
+            ORDER BY job_name, test_name
+            """
     return client.query_dataframe(query)
 
 
@@ -165,14 +177,26 @@ def get_checks_known_fails(client: Client, job_url: str, known_fails: dict):
     """
     Get tests that are known to fail for the given job URL.
     """
-    assert len(known_fails) > 0, "cannot query the database with empty known fails"
-    columns = "check_status as job_status, check_name as job_name, test_status, test_name, report_url as results_link"
-    query = f"""SELECT {columns} FROM `gh-data`.checks
-                WHERE task_url LIKE '{job_url}%'
-                AND test_status='BROKEN'
-                AND test_name IN ({','.join(f"'{test}'" for test in known_fails.keys())})
-                ORDER BY test_name, check_name
-                """
+    if len(known_fails) == 0:
+        return pd.DataFrame()
+
+    query = f"""SELECT job_status, job_name, status as test_status, test_name, results_link
+        FROM (
+            SELECT
+                argMax(check_status, check_start_time) as job_status,
+                check_name as job_name,
+                argMax(test_status, check_start_time) as status,
+                test_name,
+                report_url as results_link,
+                task_url
+            FROM `gh-data`.checks
+            GROUP BY check_name, test_name, report_url, task_url
+        )
+        WHERE task_url LIKE '{job_url}%'
+        AND test_status='BROKEN'
+        AND test_name IN ({','.join(f"'{test}'" for test in known_fails.keys())})
+        ORDER BY job_name, test_name
+        """
 
     df = client.query_dataframe(query)
 
@@ -193,12 +217,22 @@ def get_checks_errors(client: Client, job_url: str):
     """
     Get checks that have status 'error' for the given job URL.
     """
-    columns = "check_status as job_status, check_name as job_name, test_status, test_name, report_url as results_link"
-    query = f"""SELECT {columns} FROM `gh-data`.checks
-                WHERE task_url LIKE '{job_url}%'
-                AND check_status=='error'
-                ORDER BY check_name, test_name
-                """
+    query = f"""SELECT job_status, job_name, status as test_status, test_name, results_link
+            FROM (
+                SELECT
+                    argMax(check_status, check_start_time) as job_status,
+                    check_name as job_name,
+                    argMax(test_status, check_start_time) as status,
+                    test_name,
+                    report_url as results_link,
+                    task_url
+                FROM `gh-data`.checks
+                GROUP BY check_name, test_name, report_url, task_url
+            )
+            WHERE task_url LIKE '{job_url}%'
+            AND job_status=='error'
+            ORDER BY job_name, test_name
+            """
     return client.query_dataframe(query)
 
 
@@ -231,20 +265,113 @@ def get_regression_fails(client: Client, job_url: str):
                     architecture as arch,
                     test_name,
                     argMax(result, start_time) AS status,
-                    job_url,
                     job_name,
-                    report_url as results_link
+                    report_url as results_link,
+                    job_url
                FROM `gh-data`.clickhouse_regression_results
                GROUP BY architecture, test_name, job_url, job_name, report_url
                ORDER BY length(test_name) DESC
             )
-            WHERE job_url='{job_url}'
+            WHERE job_url LIKE '{job_url}%'
             AND status IN ('Fail', 'Error')
             """
     df = client.query_dataframe(query)
     df = drop_prefix_rows(df, "test_name")
     df["job_name"] = df["job_name"].str.title()
     return df
+
+
+def get_new_fails_this_pr(
+    client: Client,
+    pr_info: dict,
+    checks_fails: pd.DataFrame,
+    regression_fails: pd.DataFrame,
+):
+    """
+    Get tests that failed in the PR but passed in the base branch.
+    Compares both checks and regression test results.
+    """
+    base_sha = pr_info.get("base", {}).get("sha")
+    if not base_sha:
+        raise Exception("No base SHA found for PR")
+
+    # Modify tables to have the same columns
+    if len(checks_fails) > 0:
+        checks_fails = checks_fails.copy().drop(columns=["job_status"])
+    if len(regression_fails) > 0:
+        regression_fails = regression_fails.copy()
+        regression_fails["job_name"] = regression_fails.apply(
+            lambda row: f"{row['arch']} {row['job_name']}".strip(), axis=1
+        )
+        regression_fails["test_status"] = regression_fails["status"]
+
+    # Combine both types of fails and select only desired columns
+    desired_columns = ["job_name", "test_name", "test_status", "results_link"]
+    all_pr_fails = pd.concat([checks_fails, regression_fails], ignore_index=True)[
+        desired_columns
+    ]
+    if len(all_pr_fails) == 0:
+        return pd.DataFrame()
+
+    # Get all checks from the base branch that didn't fail
+    base_checks_query = f"""SELECT job_name, status as test_status, test_name, results_link
+            FROM (
+                SELECT
+                    check_name as job_name,
+                    argMax(test_status, check_start_time) as status,
+                    test_name,
+                    report_url as results_link,
+                    task_url
+                FROM `gh-data`.checks
+                WHERE commit_sha='{base_sha}'
+                GROUP BY check_name, test_name, report_url, task_url
+            )
+            WHERE test_status NOT IN ('FAIL', 'ERROR')
+            ORDER BY job_name, test_name
+            """
+    base_checks = client.query_dataframe(base_checks_query)
+
+    # Get regression results from base branch that didn't fail
+    base_regression_query = f"""SELECT arch, job_name, status, test_name, results_link
+            FROM (
+               SELECT
+                    architecture as arch,
+                    test_name,
+                    argMax(result, start_time) AS status,
+                    job_url,
+                    job_name,
+                    report_url as results_link
+               FROM `gh-data`.clickhouse_regression_results
+               WHERE results_link LIKE'%/{base_sha}/%'
+               GROUP BY architecture, test_name, job_url, job_name, report_url
+               ORDER BY length(test_name) DESC
+            )
+            WHERE status NOT IN ('Fail', 'Error')
+            """
+    base_regression = client.query_dataframe(base_regression_query)
+    if len(base_regression) > 0:
+        base_regression["job_name"] = base_regression.apply(
+            lambda row: f"{row['arch']} {row['job_name']}".strip(), axis=1
+        )
+        base_regression["test_status"] = base_regression["status"]
+        base_regression = base_regression.drop(columns=["arch", "status"])
+
+    # Combine base results
+    base_results = pd.concat([base_checks, base_regression], ignore_index=True)
+
+    # Find tests that failed in PR but passed in base
+    pr_failed_tests = set(zip(all_pr_fails["job_name"], all_pr_fails["test_name"]))
+    base_passed_tests = set(zip(base_results["job_name"], base_results["test_name"]))
+
+    new_fails = pr_failed_tests.intersection(base_passed_tests)
+
+    # Filter PR results to only include new fails
+    mask = all_pr_fails.apply(
+        lambda row: (row["job_name"], row["test_name"]) in new_fails, axis=1
+    )
+    new_fails_df = all_pr_fails[mask]
+
+    return new_fails_df
 
 
 def get_cves(pr_number, commit_sha):
@@ -304,7 +431,7 @@ def get_cves(pr_number, commit_sha):
 def url_to_html_link(url: str) -> str:
     if not url:
         return ""
-    text = url.split("/")[-1]
+    text = url.split("/")[-1].replace("__", "_")
     if not text:
         text = "results"
     return f'<a href="{url}">{text}</a>'
@@ -312,7 +439,7 @@ def url_to_html_link(url: str) -> str:
 
 def format_test_name_for_linewrap(text: str) -> str:
     """Tweak the test name to improve line wrapping."""
-    return text.replace(".py::", "/")
+    return f'<span style="line-break: anywhere;">{text}</span>'
 
 
 def format_test_status(text: str) -> str:
@@ -400,6 +527,7 @@ def main():
         "job_statuses": get_commit_statuses(args.commit_sha),
         "checks_fails": get_checks_fails(db_client, args.actions_run_url),
         "checks_known_fails": [],
+        "pr_new_fails": [],
         "checks_errors": get_checks_errors(db_client, args.actions_run_url),
         "regression_fails": get_regression_fails(db_client, args.actions_run_url),
         "docker_images_cves": (
@@ -427,13 +555,21 @@ def main():
             )
 
     if args.pr_number == 0:
-        pr_info_html = "Release"
+        run_details = get_run_details(args.actions_run_url)
+        branch_name = run_details.get("head_branch", "unknown branch")
+        pr_info_html = f"Release ({branch_name})"
     else:
         try:
             pr_info = get_pr_info_from_number(args.pr_number)
             pr_info_html = f"""<a href="https://github.com/{GITHUB_REPO}/pull/{pr_info["number"]}">
                     #{pr_info.get("number")} ({pr_info.get("base", {}).get('ref')} <- {pr_info.get("head", {}).get('ref')})  {pr_info.get("title")}
                     </a>"""
+            fail_results["pr_new_fails"] = get_new_fails_this_pr(
+                db_client,
+                pr_info,
+                fail_results["checks_fails"],
+                fail_results["regression_fails"],
+            )
         except Exception as e:
             pr_info_html = e
 
@@ -450,9 +586,12 @@ def main():
     context = {
         "title": "ClickHouse® CI Workflow Run Report",
         "github_repo": GITHUB_REPO,
+        "s3_bucket": S3_BUCKET,
         "pr_info_html": pr_info_html,
+        "pr_number": args.pr_number,
         "workflow_id": args.actions_run_url.split("/")[-1],
         "commit_sha": args.commit_sha,
+        "base_sha": "" if args.pr_number == 0 else pr_info.get("base", {}).get("sha"),
         "date": f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC",
         "is_preview": args.mark_preview,
         "counts": {
@@ -466,6 +605,7 @@ def main():
                 if not args.known_fails
                 else len(fail_results["checks_known_fails"])
             ),
+            "pr_new_fails": len(fail_results["pr_new_fails"]),
         },
         "ci_jobs_status_html": format_results_as_html_table(
             fail_results["job_statuses"]
@@ -487,6 +627,7 @@ def main():
             if not args.known_fails
             else format_results_as_html_table(fail_results["checks_known_fails"])
         ),
+        "new_fails_html": format_results_as_html_table(fail_results["pr_new_fails"]),
     }
 
     # Render the template with the context

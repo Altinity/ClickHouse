@@ -83,6 +83,7 @@
 #include <Storages/System/attachInformationSchemaTables.h>
 #include <Storages/Cache/ExternalDataSourceCache.h>
 #include <Storages/Cache/registerRemoteFileMetadatas.h>
+#include <Storages/Cache/ObjectStorageListObjectsCache.h>
 #include <AggregateFunctions/registerAggregateFunctions.h>
 #include <Functions/UserDefined/IUserDefinedSQLObjectsStorage.h>
 #include <Functions/registerFunctions.h>
@@ -318,6 +319,9 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 max_prefixes_deserialization_thread_pool_free_size;
     extern const ServerSettingsUInt64 prefixes_deserialization_thread_pool_thread_pool_queue_size;
     extern const ServerSettingsUInt64 input_format_parquet_metadata_cache_max_size;
+    extern const ServerSettingsUInt64 object_storage_list_objects_cache_size;
+    extern const ServerSettingsUInt64 object_storage_list_objects_cache_max_entries;
+    extern const ServerSettingsUInt64 object_storage_list_objects_cache_ttl;
 }
 
 }
@@ -2326,6 +2330,10 @@ try
 
     if (dns_cache_updater)
         dns_cache_updater->start();
+
+    ObjectStorageListObjectsCache::instance().setMaxSizeInBytes(server_settings[ServerSetting::object_storage_list_objects_cache_size]);
+    ObjectStorageListObjectsCache::instance().setMaxCount(server_settings[ServerSetting::object_storage_list_objects_cache_max_entries]);
+    ObjectStorageListObjectsCache::instance().setTTL(server_settings[ServerSetting::object_storage_list_objects_cache_ttl]);
 
     auto replicas_reconnector = ReplicasReconnector::init(global_context);
     ParquetFileMetaDataCache::instance()->setMaxSizeInBytes(server_settings[ServerSetting::input_format_parquet_metadata_cache_max_size]);

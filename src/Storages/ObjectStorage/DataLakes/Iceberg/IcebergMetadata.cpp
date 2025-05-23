@@ -609,7 +609,7 @@ ManifestFilePtr IcebergMetadata::getManifestFile(const String & filename, Int64 
     return create_fn();
 }
 
-Strings IcebergMetadata::getDataFiles(const ActionsDAG * filter_dag) const
+Strings IcebergMetadata::getDataFilesImpl(const ActionsDAG * filter_dag) const
 {
     if (!relevant_snapshot)
         return {};
@@ -716,7 +716,7 @@ ObjectIterator IcebergMetadata::iterate(
     FileProgressCallback callback,
     size_t /* list_batch_size */) const
 {
-    return createKeysIterator(getDataFiles(filter_dag), object_storage, callback);
+    return createKeysIterator(getDataFilesImpl(filter_dag), object_storage, callback);
 }
 
 }

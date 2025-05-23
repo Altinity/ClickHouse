@@ -6108,8 +6108,15 @@ Limit for hosts used for request in object storage cluster table functions - azu
 Possible values:
 - Positive integer.
 - 0 — All hosts in cluster.
+)", EXPERIMENTAL)                       \
+    DECLARE(Bool, use_object_storage_list_objects_cache, false, R"(
+Cache the list of objects returned by list objects calls in object storage
+)", EXPERIMENTAL) \
+    DECLARE(Bool, object_storage_remote_initiator, false, R"(
+Execute request to object storage as remote on one of object_storage_cluster nodes.
 )", EXPERIMENTAL) \
     \
+
     /* ####################################################### */ \
     /* ############ END OF EXPERIMENTAL FEATURES ############# */ \
     /* ####################################################### */ \

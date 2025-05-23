@@ -173,8 +173,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CHECKS_DATABASE_HOST: ${{ secrets.CHECKS_DATABASE_HOST }}
-          CHECKS_DATABASE_USER: ${{ secrets.CHECKS_DATABASE_USER }}
-          CHECKS_DATABASE_PASSWORD: ${{ secrets.CHECKS_DATABASE_PASSWORD }}
+          CHECKS_DATABASE_USER: ${{ secrets.CLICKHOUSE_TEST_STAT_LOGIN }}
+          CHECKS_DATABASE_PASSWORD: ${{ secrets.CLICKHOUSE_TEST_STAT_PASSWORD }}
         with:
           final: false
       - name: Clean

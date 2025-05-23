@@ -9,6 +9,8 @@ on: # yamllint disable-line rule:truthy
   push:
     branches:
       - 'master'
+  workflow_dispatch:
+      
 jobs:
   RunConfig:
     runs-on: [self-hosted, style-checker-aarch64]

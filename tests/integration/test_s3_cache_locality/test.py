@@ -75,7 +75,7 @@ def started_cluster():
 
 def check_s3_gets(cluster, node, expected_result, cluster_first, cluster_second, enable_filesystem_cache):
     for host in list(cluster.instances.values()):
-        host.query("SYSTEM DROP FILESYSTEM CACHE 'raw_s3_cache'")
+        host.query("SYSTEM DROP FILESYSTEM CACHE 'raw_s3_cache'", timeout=30)
 
     query_id_first = str(uuid.uuid4())
     result_first = node.query(
@@ -87,7 +87,8 @@ def check_s3_gets(cluster, node, expected_result, cluster_first, cluster_second,
           enable_filesystem_cache={enable_filesystem_cache},
           filesystem_cache_name='raw_s3_cache'
         """,
-        query_id=query_id_first
+        query_id=query_id_first,
+        timeout=30,
     )
     assert result_first == expected_result
     query_id_second = str(uuid.uuid4())
@@ -100,13 +101,14 @@ def check_s3_gets(cluster, node, expected_result, cluster_first, cluster_second,
           enable_filesystem_cache={enable_filesystem_cache},
           filesystem_cache_name='raw_s3_cache'
         """,
-        query_id=query_id_second
+        query_id=query_id_second,
+        timeout=30,
     )
     assert result_second == expected_result
 
-    node.query("SYSTEM FLUSH LOGS")
-    node.query(f"SYSTEM FLUSH LOGS ON CLUSTER {cluster_first}")
-    node.query(f"SYSTEM FLUSH LOGS ON CLUSTER {cluster_second}")
+    node.query("SYSTEM FLUSH LOGS", timeout=30)
+    node.query(f"SYSTEM FLUSH LOGS ON CLUSTER {cluster_first}", timeout=30)
+    node.query(f"SYSTEM FLUSH LOGS ON CLUSTER {cluster_second}", timeout=30)
 
     s3_get_first = node.query(
         f"""
@@ -114,7 +116,8 @@ def check_s3_gets(cluster, node, expected_result, cluster_first, cluster_second,
           FROM clusterAllReplicas('{cluster_first}', system.query_log)
           WHERE type='QueryFinish'
             AND initial_query_id='{query_id_first}'
-        """
+        """,
+        timeout=30,
     )
     s3_get_second = node.query(
         f"""
@@ -122,7 +125,8 @@ def check_s3_gets(cluster, node, expected_result, cluster_first, cluster_second,
           FROM clusterAllReplicas('{cluster_second}', system.query_log)
           WHERE type='QueryFinish'
             AND initial_query_id='{query_id_second}'
-        """
+        """,
+        timeout=30,
     )
 
     return int(s3_get_first), int(s3_get_second)

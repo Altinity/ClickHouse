@@ -2,7 +2,7 @@ name: Scheduled Altinity Stable Builds
 
 on:
   schedule:
-    - cron: '0 0 * * 6' #Weekly run for stable versions 
+    - cron: '0 0 * * 6' #Weekly run for stable versions
     - cron: '0 0 * * *' #Daily run for antalya versions
   # Make sure that any changes to this file is actually tested with PRs
   pull_request:
@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        branch: 
+        branch:
           - antalya
     name: ${{ matrix.branch }}
     if: github.event.schedule != '0 0 * * 6'
@@ -32,14 +32,19 @@ jobs:
           -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
           -H "X-GitHub-Api-Version: 2022-11-28" \
           https://api.github.com/repos/Altinity/ClickHouse/actions/workflows/release_branches.yml/dispatches \
-          -d '{"ref":"${{ matrix.branch }}"}'
+          -d '{
+            "ref": "${{ matrix.branch }}",
+            "inputs": {
+              "workflow_name": "Scheduled Runs"
+            }
+          }'
 
   WeeklyRuns:
     strategy:
       fail-fast: false
       matrix:
-        branch: 
-          - customizations/24.8.11
+        branch:
+          - customizations/24.8.14
     name: ${{ matrix.branch }}
     if: github.event.schedule != '0 0 * * *'
     runs-on: ubuntu-latest
@@ -52,4 +57,9 @@ jobs:
           -H "Authorization: Bearer ${{ secrets.TOKEN }}" \
           -H "X-GitHub-Api-Version: 2022-11-28" \
           https://api.github.com/repos/Altinity/ClickHouse/actions/workflows/release_branches.yml/dispatches \
-          -d '{"ref":"${{ matrix.branch }}"}'
+          -d '{
+            "ref": "${{ matrix.branch }}",
+            "inputs": {
+              "workflow_name": "Scheduled Runs"
+            }
+          }'

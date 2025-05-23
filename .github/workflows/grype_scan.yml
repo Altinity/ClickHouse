@@ -76,6 +76,7 @@ jobs:
           if: always()
           id: create_summary
           run: |
+            jq -r '"**Image**: \(.source.target.userInput)"' result.json >> $GITHUB_STEP_SUMMARY
             jq -r '.distro | "**Distro**: \(.name):\(.version)"' result.json >> $GITHUB_STEP_SUMMARY
             if jq -e '.matches | length == 0' result.json > /dev/null; then
               echo "No CVEs" >> $GITHUB_STEP_SUMMARY

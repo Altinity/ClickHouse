@@ -83,6 +83,16 @@ public:
         return std::nullopt;
     }
 
+    std::optional<String> tryGetSamplePathFromMetadata() const override
+    {
+        if (!current_metadata)
+            return std::nullopt;
+        auto data_files = current_metadata->getDataFiles();
+        if (!data_files.empty())
+            return data_files[0];
+        return std::nullopt;
+    }
+
     std::optional<size_t> totalRows() override
     {
         if (!current_metadata)
@@ -468,7 +478,12 @@ public:
         createDynamicStorage(type);
     }
 
-    virtual void assertInitialized() const override { return getImpl().assertInitialized(); }
+    void assertInitialized() const override { return getImpl().assertInitialized(); }
+
+    std::optional<String> tryGetSamplePathFromMetadata() const override
+    {
+        return getImpl().tryGetSamplePathFromMetadata();
+    }
 
 private:
     inline StorageObjectStorage::Configuration & getImpl() const

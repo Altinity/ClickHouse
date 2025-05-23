@@ -10,7 +10,7 @@ SET(VERSION_GITHASH 09989205d6fd661fb2683cbb1390fe4fcedaa548)
 
 # This is the 'base' tweak of the version, build scripts will
 # increment this by number of commits since previous tag.
-SET(VERSION_TWEAK 20000)
+SET(VERSION_TWEAK 28000)
 SET(VERSION_FLAVOUR altinityantalya)
 
 SET(VERSION_DESCRIBE v25.2.2.20000.altinityantalya)

@@ -72,7 +72,8 @@ public:
         bool distributed_processing_ = false,
         ASTPtr partition_by_ = nullptr,
         bool is_table_function_ = false,
-        bool lazy_init = false);
+        bool lazy_init = false,
+        std::optional<std::string> sample_path_ = std::nullopt);
 
     String getName() const override;
 
@@ -246,6 +247,7 @@ public:
         ContextPtr local_context);
 
     virtual std::optional<ColumnsDescription> tryGetTableStructureFromMetadata() const;
+    virtual std::optional<String> tryGetSamplePathFromMetadata() const;
 
     virtual bool supportsFileIterator() const { return false; }
     virtual ObjectIterator iterate(

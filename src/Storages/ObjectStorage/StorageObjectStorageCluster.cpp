@@ -111,7 +111,10 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         format_settings_,
         mode_,
         /* distributed_processing */false,
-        partition_by_);
+        partition_by_,
+        /* is_table_function */false,
+        /* lazy_init */false,
+        sample_path);
 
     auto virtuals_ = getVirtualsPtr();
     if (virtuals_)
@@ -339,12 +342,13 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
 
 RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExtension(
     const ActionsDAG::Node * predicate,
+    const std::optional<ActionsDAG> & filter_actions_dag,
     const ContextPtr & local_context,
     ClusterPtr cluster) const
 {
     auto iterator = StorageObjectStorageSource::createFileIterator(
         configuration, configuration->getQuerySettings(local_context), object_storage, /* distributed_processing */false,
-        local_context, predicate, {}, getVirtualsList(), nullptr, local_context->getFileProgressCallback());
+        local_context, predicate, filter_actions_dag, getVirtualsList(), nullptr, local_context->getFileProgressCallback());
 
     std::vector<std::string> ids_of_hosts;
     for (const auto & shard : cluster->getShardsInfo())

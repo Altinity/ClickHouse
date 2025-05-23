@@ -90,7 +90,8 @@ StorageObjectStorage::StorageObjectStorage(
     bool distributed_processing_,
     ASTPtr partition_by_,
     bool is_table_function_,
-    bool lazy_init)
+    bool lazy_init,
+    std::optional<std::string> sample_path_)
     : IStorage(table_id_)
     , configuration(configuration_)
     , object_storage(object_storage_)
@@ -130,7 +131,7 @@ StorageObjectStorage::StorageObjectStorage(
     if (!do_lazy_init)
         do_init();
 
-    std::string sample_path;
+    std::string sample_path = sample_path_.value_or("");
     ColumnsDescription columns{columns_};
     resolveSchemaAndFormat(columns, object_storage, configuration, format_settings, sample_path, context);
     configuration->check(context);
@@ -352,6 +353,11 @@ std::optional<ColumnsDescription> StorageObjectStorage::Configuration::tryGetTab
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method tryGetTableStructureFromMetadata is not implemented for basic configuration");
 }
 
+std::optional<String> StorageObjectStorage::Configuration::tryGetSamplePathFromMetadata() const
+{
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method tryGetSamplePathFromMetadata is not implemented for basic configuration");
+}
+
 void StorageObjectStorage::read(
     QueryPlan & query_plan,
     const Names & column_names,
@@ -522,9 +528,7 @@ ColumnsDescription StorageObjectStorage::resolveSchemaFromData(
 
         auto table_structure = configuration->tryGetTableStructureFromMetadata();
         if (table_structure)
-        {
             return table_structure.value();
-        }
     }
 
     ObjectInfos read_keys;

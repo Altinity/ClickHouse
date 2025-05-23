@@ -16,7 +16,7 @@ import sys
 import time
 from collections import OrderedDict, defaultdict
 from itertools import chain
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import yaml  # type: ignore[import-untyped]
 
@@ -27,7 +27,7 @@ from report import JOB_TIMEOUT_TEST_NAME
 from stopwatch import Stopwatch
 from tee_popen import TeePopen
 
-MAX_RETRY = 3
+MAX_RETRY = 2
 NUM_WORKERS = 10
 SLEEP_BETWEEN_RETRIES = 5
 PARALLEL_GROUP_SIZE = 100
@@ -116,16 +116,19 @@ def get_counters(fname: str) -> Dict[str, List[str]]:
             #
             #     test_mysql_protocol/test.py::test_golang_client
             #     [gw0] [  7%] ERROR test_mysql_protocol/test.py::test_golang_client
+            #     [gw1] SKIPPED test_odbc_interaction/test.py:56: Sanitizers cannot work with third-party shared libraries
             #
             # And only the line with test status should be matched
             if not (".py::" in line and " " in line):
                 continue
 
             line = line.strip()
-            # [gw0] [  7%] ERROR test_mysql_protocol/test.py::test_golang_client
-            # ^^^^^^^^^^^^^
+            # Remove worker info and progress percentage if present
             if line.strip().startswith("["):
-                line = re.sub(r"^\[[^\[\]]*\] \[[^\[\]]*\] ", "", line)
+                # Handle both formats:
+                # [gw0] [  7%] ERROR test_mysql_protocol/test.py::test_golang_client
+                # [gw1] SKIPPED test_odbc_interaction/test.py:56: Sanitizers cannot work with third-party shared libraries
+                line = re.sub(r"^\[[^\[\]]*\] (?:\[[^\[\]]*\] )?", "", line)
 
             line_arr = line.split(" ")
             if len(line_arr) < 2:
@@ -137,6 +140,7 @@ def get_counters(fname: str) -> Dict[str, List[str]]:
             #     ERROR test_mysql_protocol/test.py::test_golang_client
             #     PASSED test_replicated_users/test.py::test_rename_replicated[QUOTA]
             #     PASSED test_drop_is_lock_free/test.py::test_query_is_lock_free[detach part]
+            #     SKIPPED test_odbc_interaction/test.py:56: Sanitizers cannot work with third-party shared libraries
             #
             state = line_arr.pop(0)
             test_name = " ".join(line_arr)
@@ -526,6 +530,69 @@ class ClickhouseIntegrationTestsRunner:
             for test in current_counters[state]:
                 main_counters[state].append(test)
 
+    def _handle_broken_tests(
+        self,
+        counters: Dict[str, List[str]],
+        known_broken_tests: Dict[str, Dict[str, str]],
+        log_paths: Union[Dict[str, List[str]], List[str]],
+    ) -> None:
+
+        def get_log_paths(test_name):
+            """Could be a list of logs for all tests or a dict with test name as a key"""
+            if isinstance(log_paths, dict):
+                return log_paths[test_name]
+            return log_paths
+
+        broken_tests_log = os.path.join(self.result_path, "broken_tests_handler.log")
+
+        with open(broken_tests_log, "a") as log_file:
+            log_file.write(f"{len(known_broken_tests)} Known broken tests\n")
+            for status, tests in counters.items():
+                log_file.write(f"Total tests in {status} state: {len(tests)}\n")
+
+            for fail_status in ("ERROR", "FAILED"):
+                for failed_test in counters[fail_status].copy():
+                    log_file.write(
+                        f"Checking test {failed_test} (status: {fail_status})\n"
+                    )
+                    if failed_test not in known_broken_tests.keys():
+                        log_file.write(
+                            f"Test {failed_test} is not in known broken tests\n"
+                        )
+                    else:
+                        fail_message = known_broken_tests[failed_test].get("message")
+
+                        if not fail_message:
+                            log_file.write(
+                                "No fail message specified, marking as broken\n"
+                            )
+                            mark_as_broken = True
+                        else:
+                            log_file.write(
+                                f"Looking for fail message: {fail_message}\n"
+                            )
+                            mark_as_broken = False
+                            for log_path in get_log_paths(failed_test):
+                                if log_path.endswith(".log"):
+                                    log_file.write(f"Checking log file: {log_path}\n")
+                                    with open(log_path) as test_log:
+                                        if fail_message in test_log.read():
+                                            log_file.write(
+                                                "Found fail message in logs\n"
+                                            )
+                                            mark_as_broken = True
+                                            break
+
+                        if mark_as_broken:
+                            log_file.write(f"Moving test to BROKEN state\n")
+                            counters[fail_status].remove(failed_test)
+                            counters["BROKEN"].append(failed_test)
+                        else:
+                            log_file.write("Test not marked as broken\n")
+
+            for status, tests in counters.items():
+                log_file.write(f"Total tests in {status} state: {len(tests)}\n")
+
     def _get_runner_image_cmd(self):
         image_cmd = ""
         if self._can_run_with(
@@ -811,6 +878,7 @@ class ClickhouseIntegrationTestsRunner:
         }  # type: Dict
         tests_times = defaultdict(float)  # type: Dict
         tests_log_paths = defaultdict(list)
+        known_broken_tests = self._get_broken_tests_list(self.repo_path)
         id_counter = 0
         for test_to_run in tests_to_run:
             tries_num = 1 if should_fail else FLAKY_TRIES_COUNT
@@ -827,6 +895,10 @@ class ClickhouseIntegrationTestsRunner:
                     1,
                     FLAKY_REPEAT_COUNT,
                 )
+
+                # Handle broken tests on the group counters that contain test results for a single group
+                self._handle_broken_tests(group_counters, known_broken_tests, log_paths)
+
                 id_counter = id_counter + 1
                 for counter, value in group_counters.items():
                     logging.info(
@@ -989,8 +1061,6 @@ class ClickhouseIntegrationTestsRunner:
             " ".join(not_found_tests[:3]),
         )
 
-        known_broken_tests = self._get_broken_tests_list(self.repo_path)
-
         grouped_tests = self.group_test_by_file(filtered_sequential_tests)
         i = 0
         for par_group in chunks(filtered_parallel_tests, PARALLEL_GROUP_SIZE):
@@ -1008,6 +1078,7 @@ class ClickhouseIntegrationTestsRunner:
         tests_times = defaultdict(float)
         tests_log_paths = defaultdict(list)
         items_to_run = list(grouped_tests.items())
+        known_broken_tests = self._get_broken_tests_list(self.repo_path)
         logging.info("Total test groups %s", len(items_to_run))
         if self.shuffle_test_groups():
             logging.info("Shuffling test groups")
@@ -1021,24 +1092,8 @@ class ClickhouseIntegrationTestsRunner:
                 group, tests, MAX_RETRY, NUM_WORKERS, 0
             )
 
-            for fail_status in ("ERROR", "FAILED"):
-                for failed_test in group_counters[fail_status]:
-                    if failed_test in known_broken_tests.keys():
-                        fail_message = known_broken_tests[failed_test].get("message")
-                        if not fail_message:
-                            mark_as_broken = True
-                        else:
-                            mark_as_broken = False
-                            for log_path in log_paths:
-                                if log_path.endswith(".log"):
-                                    with open(log_path) as log_file:
-                                        if fail_message in log_file.read():
-                                            mark_as_broken = True
-                                            break
-
-                        if mark_as_broken:
-                            group_counters[fail_status].remove(failed_test)
-                            group_counters["BROKEN"].append(failed_test)
+            # Handle broken tests on the group counters that contain test results for a single group
+            self._handle_broken_tests(group_counters, known_broken_tests, log_paths)
 
             total_tests = 0
             for counter, value in group_counters.items():
@@ -1062,6 +1117,7 @@ class ClickhouseIntegrationTestsRunner:
             if len(counters["FAILED"]) + len(counters["ERROR"]) >= 20:
                 logging.info("Collected more than 20 failed/error tests, stopping")
                 break
+
         if counters["FAILED"] or counters["ERROR"]:
             logging.info(
                 "Overall status failure, because we have tests in FAILED or ERROR state"

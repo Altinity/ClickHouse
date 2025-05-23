@@ -1,10 +1,10 @@
 - name: Copy new rpms
-  shell: mv /home/runner/.cache/tmp/packages/{{ item }} {{ local_repo_path }}/{{ repo_prefix }}yum-repo/{{ item }}"
+  shell: "mv /home/runner/.cache/tmp/packages/{{ item }} {{ local_repo_path }}/{{ repo_prefix }}yum-repo/{{ item }}"
   loop: "{{ rpm_pkg_names }}"
 
 - name: Copy library-bridge and obdc-bridge if version is 24.8
   when: (pkgver | regex_replace('^(\\d+\\.\\d+).*$', '\\1')) is version('24.8', '==')
-  shell: mv /home/runner/.cache/tmp/packages/{{ item }} {{ local_repo_path }}/{{ repo_prefix }}yum-repo/{{ item }}"
+  shell: "mv /home/runner/.cache/tmp/packages/{{ item }} {{ local_repo_path }}/{{ repo_prefix }}yum-repo/{{ item }}"
   loop:
     - "clickhouse-library-bridge-{{ pkgver }}.x86_64.rpm"
     - "clickhouse-library-bridge-{{ pkgver }}.aarch64.rpm"
@@ -14,15 +14,15 @@
 - name: Create rpmmacros file
   template:
     src: "rpmmacros.j2"
-    dest: "{{ local_repo_path }}/rpmmacros"
+    dest: "/home/runner/.cache/tmp/rpmmacros"
 
 - name: Sign new RPMs
-  shell: 'rpmsign --addsign --load "{{ local_repo_path }}/rpmmacros" "{{ local_repo_path }}/{{ repo_prefix }}yum-repo/{{ item }}"'
+  shell: 'GPG_TTY=$(tty) rpmsign --addsign --load "/home/runner/.cache/tmp/rpmmacros" "{{ local_repo_path }}/{{ repo_prefix }}yum-repo/{{ item }}"'
   loop: "{{ rpm_pkg_names }}"
 
 - name: Sign library-bridge and obdc-bridge if version is 24.8
   when: (pkgver | regex_replace('^(\\d+\\.\\d+).*$', '\\1')) is version('24.8', '==')
-  shell: 'rpmsign --addsign --load "{{ local_repo_path }}/rpmmacros" "{{ local_repo_path }}/{{ repo_prefix }}yum-repo/{{ item }}"'
+  shell: 'GPG_TTY=$(tty) rpmsign --addsign --load "/home/runner/.cache/tmp/rpmmacros" "{{ local_repo_path }}/{{ repo_prefix }}yum-repo/{{ item }}"'
   loop:
     - "clickhouse-library-bridge-{{ pkgver }}.x86_64.rpm"
     - "clickhouse-library-bridge-{{ pkgver }}.aarch64.rpm"
