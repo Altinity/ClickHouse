@@ -82,10 +82,10 @@ setup_minio() {
   local test_type=$1
   ./mc alias set clickminio http://localhost:11111 clickhouse clickhouse
   ./mc admin user add clickminio test testtest
-  ./mc admin policy set clickminio readwrite user=test
-  ./mc mb clickminio/test
+  ./mc admin policy attach clickminio readwrite --user=test
+  ./mc mb --ignore-existing clickminio/test
   if [ "$test_type" = "stateless" ]; then
-    ./mc policy set public clickminio/test
+    ./mc anonymous set public clickminio/test
   fi
 }
 
