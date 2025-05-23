@@ -24,6 +24,10 @@ RUN apt-get update -y \
 
 COPY run.sh /
 COPY functions.sh /
+COPY setup_minio.sh /
+COPY attach_gdb.lib /
+COPY utils.lib /
+COPY stress_tests.lib /
 
 ENV EXPORT_S3_STORAGE_POLICIES=1
 
