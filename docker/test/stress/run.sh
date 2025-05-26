@@ -7,7 +7,7 @@
 dmesg --clear
 # shellcheck disable=SC1091
 source /setup_export_logs.sh
-source /functions.sh
+
 set -x
 
 # we mount tests folder from repo to /usr/share
