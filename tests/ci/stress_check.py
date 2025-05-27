@@ -42,6 +42,9 @@ def get_additional_envs(check_name: str) -> List[str]:
     # so we need this ENV to be able to disable the randomization
     # of feature flags
     result.append("RANDOMIZE_KEEPER_FEATURE_FLAGS=1")
+    # if "azure" in check_name:
+    #     result.append("USE_AZURE_STORAGE_FOR_MERGE_TREE=1")
+
     if "s3" in check_name:
         result.append("USE_S3_STORAGE_FOR_MERGE_TREE=1")
 
@@ -73,6 +76,7 @@ def get_run_command(
         # a static link, don't use S3_URL or S3_DOWNLOAD
         "-e S3_URL='https://s3.amazonaws.com/clickhouse-datasets' "
         f"{ci_logs_args}"
+        "--tmpfs /tmp/clickhouse "
         f"--volume={build_path}:/package_folder "
         f"--volume={result_path}:/test_output "
         f"--volume={repo_tests_path}/..:/repo "
@@ -156,12 +160,10 @@ def run_stress_test(upgrade_check: bool = False) -> None:
     packages_path = temp_path / "packages"
     packages_path.mkdir(parents=True, exist_ok=True)
 
-    if check_name in ("amd_release", "amd_debug", "arm_release"):
+    if check_name.startswith("amd_") or check_name.startswith("arm_"):
         # this is praktika based CI
         print("Copy input *.deb artifacts")
-        assert Shell.check(
-            f"cp /tmp/praktika/input/*.deb {packages_path}", verbose=True
-        )
+        assert Shell.check(f"cp {REPO_COPY}/ci/tmp/*.deb {packages_path}", verbose=True)
         docker_image = pull_image(get_docker_image("altinityinfra/stateful-test"))
     else:
         download_all_deb_packages(check_name, reports_path, packages_path)

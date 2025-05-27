@@ -182,6 +182,8 @@ StorageSystemTables::StorageSystemTables(const StorageID & table_id_)
         {"parts", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>()), "The total number of parts in this table."},
         {"active_parts", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>()), "The number of active parts in this table."},
         {"total_marks", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>()), "The total number of marks in all parts in this table."},
+        {"active_on_fly_data_mutations", std::make_shared<DataTypeUInt64>(), "Total number of active data mutations (UPDATEs and DELETEs) suitable for applying on the fly."},
+        {"active_on_fly_metadata_mutations", std::make_shared<DataTypeUInt64>(), "Total number of active metadata mutations (RENAMEs) suitable for applying on the fly."},
         {"lifetime_rows", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>()),
             "Total number of rows INSERTed since server start (only for Buffer tables)."
         },
@@ -339,24 +341,41 @@ protected:
                         if (columns_mask[src_index++])
                             res_columns[res_index++]->insert(table.second->getName());
 
-                        const auto & settings = context->getSettingsRef();
                         while (src_index < columns_mask.size())
                         {
                             // total_rows
                             if (src_index == 19 && columns_mask[src_index])
                             {
-                                if (auto total_rows = table.second->totalRows(settings))
-                                    res_columns[res_index++]->insert(*total_rows);
-                                else
+                                try
+                                {
+                                    if (auto total_rows = table.second->totalRows(context))
+                                        res_columns[res_index++]->insert(*total_rows);
+                                    else
+                                        res_columns[res_index++]->insertDefault();
+                                }
+                                catch (const Exception &)
+                                {
+                                    /// Even if the method throws, it should not prevent querying system.tables.
+                                    tryLogCurrentException("StorageSystemTables");
                                     res_columns[res_index++]->insertDefault();
+                                }
                             }
                             // total_bytes
                             else if (src_index == 20 && columns_mask[src_index])
                             {
-                                if (auto total_bytes = table.second->totalBytes(settings))
-                                    res_columns[res_index++]->insert(*total_bytes);
-                                else
+                                try
+                                {
+                                    if (auto total_bytes = table.second->totalBytes(context))
+                                        res_columns[res_index++]->insert(*total_bytes);
+                                    else
+                                        res_columns[res_index++]->insertDefault();
+                                }
+                                catch (const Exception &)
+                                {
+                                    /// Even if the method throws, it should not prevent querying system.tables.
+                                    tryLogCurrentException("StorageSystemTables");
                                     res_columns[res_index++]->insertDefault();
+                                }
                             }
                             /// Fill the rest columns with defaults
                             else if (columns_mask[src_index])
@@ -568,33 +587,63 @@ protected:
                         res_columns[res_index++]->insertDefault();
                 }
 
-                auto settings = context->getSettingsRef();
-                settings[Setting::select_sequential_consistency] = 0;
+                ContextMutablePtr context_copy = Context::createCopy(context);
+                Settings settings_copy = context_copy->getSettingsCopy();
+                settings_copy[Setting::select_sequential_consistency] = 0;
+                context_copy->setSettings(settings_copy);
+
                 if (columns_mask[src_index++])
                 {
-                    auto total_rows = table ? table->totalRows(settings) : std::nullopt;
-                    if (total_rows)
-                        res_columns[res_index++]->insert(*total_rows);
-                    else
+                    try
+                    {
+                        auto total_rows = table ? table->totalRows(context) : std::nullopt;
+                        if (total_rows)
+                            res_columns[res_index++]->insert(*total_rows);
+                        else
+                            res_columns[res_index++]->insertDefault();
+                    }
+                    catch (const Exception &)
+                    {
+                        /// Even if the method throws, it should not prevent querying system.tables.
+                        tryLogCurrentException("StorageSystemTables");
                         res_columns[res_index++]->insertDefault();
+                    }
                 }
 
                 if (columns_mask[src_index++])
                 {
-                    auto total_bytes = table->totalBytes(settings);
-                    if (total_bytes)
-                        res_columns[res_index++]->insert(*total_bytes);
-                    else
+                    try
+                    {
+                        auto total_bytes = table->totalBytes(context_copy);
+                        if (total_bytes)
+                            res_columns[res_index++]->insert(*total_bytes);
+                        else
+                            res_columns[res_index++]->insertDefault();
+                    }
+                    catch (const Exception &)
+                    {
+                        /// Even if the method throws, it should not prevent querying system.tables.
+                        tryLogCurrentException("StorageSystemTables");
                         res_columns[res_index++]->insertDefault();
+                    }
                 }
 
                 if (columns_mask[src_index++])
                 {
-                    auto total_bytes_uncompressed = table->totalBytesUncompressed(settings);
-                    if (total_bytes_uncompressed)
-                        res_columns[res_index++]->insert(*total_bytes_uncompressed);
-                    else
+                    try
+                    {
+                        auto total_bytes_uncompressed = table->totalBytesUncompressed(context_copy->getSettingsRef());
+                        if (total_bytes_uncompressed)
+                            res_columns[res_index++]->insert(*total_bytes_uncompressed);
+                        else
+                            res_columns[res_index++]->insertDefault();
+                    }
+                    catch (const Exception &)
+                    {
+                        /// Even if the method throws, it should not prevent querying system.tables.
+                        tryLogCurrentException("StorageSystemTables");
                         res_columns[res_index++]->insertDefault();
+                    }
                 }
 
                 auto table_merge_tree = std::dynamic_pointer_cast<MergeTreeData>(table);
@@ -617,9 +666,23 @@ protected:
                 if (columns_mask[src_index++])
                 {
                     if (table_merge_tree)
-                    {
                         res_columns[res_index++]->insert(table_merge_tree->getTotalMarksCount());
-                    }
+                    else
+                        res_columns[res_index++]->insertDefault();
+                }
+
+                if (columns_mask[src_index++])
+                {
+                    if (table_merge_tree)
+                        res_columns[res_index++]->insert(table_merge_tree->getNumberOnFlyDataMutations());
+                    else
+                        res_columns[res_index++]->insertDefault();
+                }
+
+                if (columns_mask[src_index++])
+                {
+                    if (table_merge_tree)
+                        res_columns[res_index++]->insert(table_merge_tree->getNumberOnFlyMetadataMutations());
                     else
                         res_columns[res_index++]->insertDefault();
                 }

@@ -4,12 +4,12 @@
 #include <Parsers/IAST_fwd.h>
 #include <Processors/Formats/IInputFormat.h>
 #include <Storages/IStorage.h>
-#include <Storages/ObjectStorage/DataLakes/PartitionColumns.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSettings.h>
+#include <Storages/ObjectStorage/IObjectIterator.h>
 #include <Storages/prepareReadingFromFormat.h>
 #include <Common/threadPoolCallbackRunner.h>
-#include "Interpreters/ActionsDAG.h"
-#include "Storages/ColumnsDescription.h"
+#include <Interpreters/ActionsDAG.h>
+#include <Storages/ColumnsDescription.h>
 
 #include <memory>
 namespace DB
@@ -18,6 +18,8 @@ namespace DB
 class ReadBufferIterator;
 class SchemaCache;
 class NamedCollection;
+struct StorageObjectStorageSettings;
+using StorageObjectStorageSettingsPtr = std::shared_ptr<StorageObjectStorageSettings>;
 
 namespace ErrorCodes
 {
@@ -69,7 +71,9 @@ public:
         LoadingStrictnessLevel mode,
         bool distributed_processing_ = false,
         ASTPtr partition_by_ = nullptr,
-        bool lazy_init = false);
+        bool is_table_function_ = false,
+        bool lazy_init = false,
+        std::optional<std::string> sample_path_ = std::nullopt);
 
     String getName() const override;
 
@@ -127,7 +131,7 @@ public:
 
     static std::pair<ColumnsDescription, std::string> resolveSchemaAndFormatFromData(
         const ObjectStoragePtr & object_storage,
-        const ConfigurationPtr & configuration,
+        ConfigurationPtr & configuration,
         const std::optional<FormatSettings> & format_settings,
         std::string & sample_path,
         const ContextPtr & context);
@@ -138,6 +142,8 @@ public:
 
     void updateExternalDynamicMetadata(ContextPtr) override;
 
+    std::optional<UInt64> totalRows(ContextPtr query_context) const override;
+    std::optional<UInt64> totalBytes(ContextPtr query_context) const override;
 protected:
     String getPathSample(ContextPtr context);
 
@@ -153,6 +159,7 @@ protected:
     const std::optional<FormatSettings> format_settings;
     const ASTPtr partition_by;
     const bool distributed_processing;
+    bool update_configuration_on_read;
 
     LoggerPtr log;
 };
@@ -167,12 +174,11 @@ public:
     using Path = std::string;
     using Paths = std::vector<Path>;
 
-    static void initialize(
-        Configuration & configuration,
+    virtual void initialize(
         ASTs & engine_args,
         ContextPtr local_context,
         bool with_table_structure,
-        std::unique_ptr<StorageObjectStorageSettings> settings);
+        StorageObjectStorageSettingsPtr settings);
 
     /// Storage type: s3, hdfs, azure, local.
     virtual ObjectStorageType getType() const = 0;
@@ -183,6 +189,7 @@ public:
     /// buckets in S3. If object storage doesn't have any namepaces return empty string.
     virtual std::string getNamespaceType() const { return "namespace"; }
 
+    virtual Path getFullPath() const { return ""; }
     virtual Path getPath() const = 0;
     virtual void setPath(const Path & path) = 0;
 
@@ -198,15 +205,15 @@ public:
     virtual void addStructureAndFormatToArgsIfNeeded(
         ASTs & args, const String & structure_, const String & format_, ContextPtr context, bool with_structure) = 0;
 
-    bool withPartitionWildcard() const;
+    virtual bool withPartitionWildcard() const;
     bool withGlobs() const { return isPathWithGlobs() || isNamespaceWithGlobs(); }
-    bool withGlobsIgnorePartitionWildcard() const;
-    bool isPathWithGlobs() const;
-    bool isNamespaceWithGlobs() const;
+    virtual bool withGlobsIgnorePartitionWildcard() const;
+    virtual bool isPathWithGlobs() const;
+    virtual bool isNamespaceWithGlobs() const;
     virtual std::string getPathWithoutGlobs() const;
 
     virtual bool isArchive() const { return false; }
-    bool isPathInArchiveWithGlobs() const;
+    virtual bool isPathInArchiveWithGlobs() const;
     virtual std::string getPathInArchive() const;
 
     virtual void check(ContextPtr context) const;
@@ -216,10 +223,10 @@ public:
     virtual ConfigurationPtr clone() = 0;
     virtual bool isStaticConfiguration() const { return true; }
 
-    void setPartitionColumns(const DataLakePartitionColumns & columns) { partition_columns = columns; }
-    const DataLakePartitionColumns & getPartitionColumns() const { return partition_columns; }
-
     virtual bool isDataLakeConfiguration() const { return false; }
+
+    virtual std::optional<size_t> totalRows() { return {}; }
+    virtual std::optional<size_t> totalBytes() { return {}; }
 
     virtual bool hasExternalDynamicMetadata() { return false; }
 
@@ -240,25 +247,53 @@ public:
         ContextPtr local_context);
 
     virtual std::optional<ColumnsDescription> tryGetTableStructureFromMetadata() const;
+    virtual std::optional<String> tryGetSamplePathFromMetadata() const;
 
+    virtual bool supportsFileIterator() const { return false; }
+    virtual ObjectIterator iterate(
+        const ActionsDAG * /* filter_dag */,
+        std::function<void(FileProgress)> /* callback */,
+        size_t /* list_batch_size */)
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method iterate() is not implemented for configuration type {}", getTypeName());
+    }
+
+    virtual void update(ObjectStoragePtr object_storage, ContextPtr local_context);
+    virtual void updateIfRequired(ObjectStoragePtr object_storage, ContextPtr local_context);
+
+    /// Create arguments for table function with path and access parameters
+    virtual ASTPtr createArgsWithAccessData() const
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method createArgsWithAccessData is not supported by storage {}", getEngineName());
+    }
+
+    virtual const StorageObjectStorageSettings & getSettingsRef() const;
+
+    virtual void fromNamedCollection(const NamedCollection & collection, ContextPtr context) = 0;
+    virtual void fromAST(ASTs & args, ContextPtr context, bool with_structure) = 0;
+
+    virtual ObjectStorageType extractDynamicStorageType(ASTs & /* args */, ContextPtr /* context */, ASTPtr * /* type_arg */ = nullptr) const
+    { return ObjectStorageType::None; }
+
+    virtual void assertInitialized() const;
+
+    virtual const String & getFormat() const { return format; }
+    virtual const String & getCompressionMethod() const { return compression_method; }
+    virtual const String & getStructure() const { return structure; }
+
+    virtual void setFormat(const String & format_) { format = format_; }
+    virtual void setCompressionMethod(const String & compression_method_) { compression_method = compression_method_; }
+    virtual void setStructure(const String & structure_) { structure = structure_; }
+
+private:
     String format = "auto";
     String compression_method = "auto";
     String structure = "auto";
 
-    virtual void update(ObjectStoragePtr object_storage, ContextPtr local_context);
-
-
-protected:
-    virtual void fromNamedCollection(const NamedCollection & collection, ContextPtr context) = 0;
-    virtual void fromAST(ASTs & args, ContextPtr context, bool with_structure) = 0;
-
-
-    void assertInitialized() const;
-
     bool initialized = false;
-    DataLakePartitionColumns partition_columns;
+    std::atomic<bool> updated = false;
 
-    bool allow_dynamic_metadata_for_data_lakes;
+    StorageObjectStorageSettingsPtr storage_settings;
 };
 
 }

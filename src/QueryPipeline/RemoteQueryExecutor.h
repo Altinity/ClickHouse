@@ -1,7 +1,5 @@
 #pragma once
 
-#include <variant>
-
 #include <Client/ConnectionPool.h>
 #include <Client/IConnections.h>
 #include <Client/ConnectionPoolWithFailover.h>
@@ -30,7 +28,7 @@ class RemoteQueryExecutorReadContext;
 class ParallelReplicasReadingCoordinator;
 
 /// This is the same type as StorageS3Source::IteratorWrapper
-using TaskIterator = std::function<String()>;
+using TaskIterator = std::function<String(size_t)>;
 
 /// This class allows one to launch queries on remote replicas of one shard and get results
 class RemoteQueryExecutor
@@ -61,7 +59,8 @@ public:
         const Scalars & scalars_ = Scalars(),
         const Tables & external_tables_ = Tables(),
         QueryProcessingStage::Enum stage_ = QueryProcessingStage::Complete,
-        std::optional<Extension> extension_ = std::nullopt);
+        std::optional<Extension> extension_ = std::nullopt,
+        ConnectionPoolWithFailoverPtr connection_pool_with_failover_ = nullptr);
 
     /// Takes already set connection.
     RemoteQueryExecutor(
@@ -213,6 +212,10 @@ public:
 
     void setLogger(LoggerPtr logger) { log = logger; }
 
+    void setRemoteFunction(bool is_remote_function_ = true) { is_remote_function = is_remote_function_; }
+
+    void setShardCount(UInt32 shard_count_) { shard_count = shard_count_; }
+
     const Block & getHeader() const { return header; }
 
     IConnections & getConnections() { return *connections; }
@@ -300,7 +303,10 @@ private:
       */
     bool got_duplicated_part_uuids = false;
 
-    bool has_postponed_packet = false;
+    bool packet_in_progress = false;
+
+    bool is_remote_function = false;
+    UInt32 shard_count = 0;
 
     /// Parts uuids, collected from remote replicas
     std::vector<UUID> duplicated_part_uuids;
@@ -311,6 +317,8 @@ private:
     LoggerPtr log = nullptr;
 
     GetPriorityForLoadBalancing::Func priority_func;
+
+    const bool read_packet_type_separately = false;
 
     /// Send all scalars to remote servers
     void sendScalars();
@@ -343,9 +351,6 @@ private:
 
     /// Process packet for read and return data block if possible.
     ReadResult processPacket(Packet packet);
-
-    /// Reads packet by packet
-    Block readPackets();
 };
 
 }

@@ -1,6 +1,7 @@
 #include <Processors/Executors/CompletedPipelineExecutor.h>
 #include <Processors/Executors/PullingPipelineExecutor.h>
 #include <Processors/Formats/Impl/ParquetBlockOutputFormat.h>
+#include <Processors/QueryPlan/BuildQueryPipelineSettings.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
 #include <Processors/QueryPlan/QueryPlan.h>
 #include <Processors/Sinks/EmptySink.h>
@@ -57,8 +58,8 @@ void exportMTPartToStorage(const MergeTreeData & source_data, const MergeTreeDat
         context,
         getLogger("abcde"));
 
-    auto pipeline_settings = BuildQueryPipelineSettings::fromContext(context);
-    auto optimization_settings = QueryPlanOptimizationSettings::fromContext(context);
+    auto pipeline_settings = BuildQueryPipelineSettings(context);
+    auto optimization_settings = QueryPlanOptimizationSettings(context);
     auto builder = plan.buildQueryPipeline(optimization_settings, pipeline_settings);
 
     QueryPipeline pipeline = QueryPipelineBuilder::getPipeline(std::move(*builder));

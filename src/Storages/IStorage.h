@@ -9,13 +9,11 @@
 #include <Storages/CheckResults.h>
 #include <Storages/ColumnDependency.h>
 #include <Storages/IStorage_fwd.h>
-#include <Storages/SelectQueryDescription.h>
 #include <Storages/StorageInMemoryMetadata.h>
 #include <Storages/VirtualColumnsDescription.h>
 #include <Storages/TableLockHolder.h>
 #include <Storages/StorageSnapshot.h>
 #include <Common/ActionLock.h>
-#include <Common/Exception.h>
 #include <Common/RWLock.h>
 #include <Common/TypePromotion.h>
 #include <DataTypes/Serializations/SerializationInfo.h>
@@ -25,11 +23,6 @@
 
 namespace DB
 {
-
-namespace ErrorCodes
-{
-    extern const int NOT_IMPLEMENTED;
-}
 
 using StorageActionBlockType = size_t;
 
@@ -70,6 +63,11 @@ class BackupEntriesCollector;
 class RestorerFromBackup;
 
 class ConditionSelectivityEstimator;
+
+class ActionsDAG;
+
+class IObjectStorage;
+using ObjectStoragePtr = std::shared_ptr<IObjectStorage>;
 
 struct ColumnSize
 {
@@ -378,7 +376,7 @@ public:
         size_t /*num_streams*/);
 
     /// Returns true if FINAL modifier must be added to SELECT query depending on required columns.
-    /// It's needed for ReplacingMergeTree wrappers such as MaterializedMySQL and MaterializedPostrgeSQL
+    /// It's needed for ReplacingMergeTree wrappers such as MaterializedPostrgeSQL
     virtual bool needRewriteQueryWithFinal(const Names & /*column_names*/) const { return false; }
 
 private:
@@ -449,10 +447,7 @@ public:
         const ASTPtr & /*query*/,
         const StorageMetadataPtr & /*metadata_snapshot*/,
         ContextPtr /*context*/,
-        bool /*async_insert*/)
-    {
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method write is not supported by storage {}", getName());
-    }
+        bool /*async_insert*/);
 
     /** Writes the data to a table in distributed manner.
       * It is supposed that implementation looks into SELECT part of the query and executes distributed
@@ -481,10 +476,7 @@ public:
         const ASTPtr & /*query*/,
         const StorageMetadataPtr & /* metadata_snapshot */,
         ContextPtr /* context */,
-        TableExclusiveLockHolder &)
-    {
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Truncate is not supported by storage {}", getName());
-    }
+        TableExclusiveLockHolder &);
 
     virtual void checkTableCanBeRenamed(const StorageID & /*new_name*/) const {}
 
@@ -511,10 +503,7 @@ public:
     virtual void alter(const AlterCommands & params, ContextPtr context, AlterLockHolder & alter_lock_holder);
 
     /// Updates metadata that can be changed by other processes
-    virtual void updateExternalDynamicMetadata(ContextPtr)
-    {
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method updateExternalDynamicMetadata is not supported by storage {}", getName());
-    }
+    virtual void updateExternalDynamicMetadata(ContextPtr);
 
     /** Checks that alter commands can be applied to storage. For example, columns can be modified,
       * or primary key can be changes, etc.
@@ -552,38 +541,20 @@ public:
         bool /*deduplicate*/,
         const Names & /* deduplicate_by_columns */,
         bool /*cleanup*/,
-        ContextPtr /*context*/)
-    {
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method optimize is not supported by storage {}", getName());
-    }
+        ContextPtr /*context*/);
 
     /// Mutate the table contents
-    virtual void mutate(const MutationCommands &, ContextPtr)
-    {
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Mutations are not supported by storage {}", getName());
-    }
+    virtual void mutate(const MutationCommands &, ContextPtr);
 
     /// Cancel a mutation.
-    virtual CancellationCode killMutation(const String & /*mutation_id*/)
-    {
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Mutations are not supported by storage {}", getName());
-    }
+    virtual CancellationCode killMutation(const String & /*mutation_id*/);
 
-    virtual void waitForMutation(const String & /*mutation_id*/, bool /*wait_for_another_mutation*/)
-    {
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Mutations are not supported by storage {}", getName());
-    }
+    virtual void waitForMutation(const String & /*mutation_id*/, bool /*wait_for_another_mutation*/);
 
-    virtual void setMutationCSN(const String & /*mutation_id*/, UInt64 /*csn*/)
-    {
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Mutations are not supported by storage {}", getName());
-    }
+    virtual void setMutationCSN(const String & /*mutation_id*/, UInt64 /*csn*/);
 
     /// Cancel a part move to shard.
-    virtual CancellationCode killPartMoveToShard(const UUID & /*task_uuid*/)
-    {
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Part moves between shards are not supported by storage {}", getName());
-    }
+    virtual CancellationCode killPartMoveToShard(const UUID & /*task_uuid*/);
 
     /** If the table have to do some complicated work on startup,
       *  that must be postponed after creation of table object
@@ -702,7 +673,7 @@ public:
     /// - For total_rows column in system.tables
     ///
     /// Does takes underlying Storage (if any) into account.
-    virtual std::optional<UInt64> totalRows(const Settings &) const { return {}; }
+    virtual std::optional<UInt64> totalRows(ContextPtr) const { return {}; }
 
     /// Same as above but also take partition predicate into account.
     virtual std::optional<UInt64> totalRowsByPartitionPredicate(const ActionsDAG &, ContextPtr) const { return {}; }
@@ -720,7 +691,7 @@ public:
     /// Memory part should be estimated as a resident memory size.
     /// In particular, alloctedBytes() is preferable over bytes()
     /// when considering in-memory blocks.
-    virtual std::optional<UInt64> totalBytes(const Settings &) const { return {}; }
+    virtual std::optional<UInt64> totalBytes(ContextPtr) const { return {}; }
 
     /// If it is possible to quickly determine exact number of uncompressed bytes for the table on storage:
     /// - disk (uncompressed)
@@ -770,7 +741,7 @@ public:
         const StorageSnapshotPtr & storage_snapshot,
         SelectQueryInfo & query_info,
         ContextPtr context,
-        std::string storage_name);
+        std::shared_ptr<IStorage> storage_);
 
 private:
     /// Lock required for alter queries (lockForAlter).

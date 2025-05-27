@@ -1,10 +1,10 @@
-# docker build -t clickhouse/fasttest .
+# docker build -t altinityinfra/fasttest .
 FROM ubuntu:22.04
 
 # ARG for quick switch to a given ubuntu mirror
 ARG apt_archive="http://archive.ubuntu.com"
 RUN sed -i "s|http://archive.ubuntu.com|$apt_archive|g" /etc/apt/sources.list
-ARG LLVM_APT_VERSION="1:19.1.4~*"
+ARG LLVM_APT_VERSION="1:19.1.4"
 
 ENV DEBIAN_FRONTEND=noninteractive LLVM_VERSION=19
 
@@ -27,7 +27,7 @@ RUN apt-get update \
     && echo "deb https://apt.llvm.org/${CODENAME}/ llvm-toolchain-${CODENAME}-${LLVM_VERSION} main" >> \
         /etc/apt/sources.list \
     && apt-get update \
-    && apt-get install --yes --no-install-recommends --verbose-versions llvm-${LLVM_VERSION}>=${LLVM_APT_VERSION} \
+    && apt-get satisfy --yes --no-install-recommends "llvm-${LLVM_VERSION} (>= ${LLVM_APT_VERSION})" \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/debconf /tmp/*
 
@@ -62,7 +62,7 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/debconf /tmp/*
 
-COPY --from=altinityinfra/cctools:0de95b3aeb28 /opt/gdb /opt/gdb
+COPY --from=altinityinfra/cctools:0d6b90a7a490 /opt/gdb /opt/gdb
 # Give suid to gdb to grant it attach permissions
 RUN chmod u+s /opt/gdb/bin/gdb
 ENV PATH="/opt/gdb/bin:${PATH}"
@@ -111,5 +111,4 @@ RUN arch=${TARGETARCH:-amd64} \
     && dpkg -i /tmp/nfpm.deb \
     && rm /tmp/nfpm.deb
 
-ENV PYTHONPATH="/wd"
 ENV PYTHONUNBUFFERED=1

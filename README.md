@@ -9,9 +9,22 @@
     <img alt="Altinity company logo" src="/docs/logo_horizontal_blue_black.png">
 </picture>
 
+</div>
+
+<h1>Altinity Antalya</h1>
+
+- [Feature Matrix](Antalya.md)
+- [github releases](https://github.com/Altinity/ClickHouse/releases?q=altinityantalya&expanded=false)
+- [docker images](https://hub.docker.com/r/altinity/clickhouse-server/tags?page=1&name=altinityantalya)
+- [packages](https://builds.altinity.cloud/#altinityantalya)
+
+**Altinity Antalya** is an experimental build of ClickHouse® incorporating features and fixes from the future Altinity Stable Build releases. It is **Not for production use**.
+
 <h1>Altinity Stable Builds®</h1>
 
-</div>
+- [github releases](https://github.com/Altinity/ClickHouse/releases?q=altinitystable&expanded=false)
+- [docker images](https://hub.docker.com/r/altinity/clickhouse-server/tags?page=1&name=altinitystable)
+- [packages](https://builds.altinity.cloud/#altinitystable)
 
 **Altinity Stable Builds** are releases of ClickHouse® that undergo rigorous testing to verify they are secure and ready for production use. Among other things, they are: 
 
@@ -57,4 +70,4 @@ ClickHouse’s thousands of core features are all well-tested and stable. To mai
 
 <hr>
 
-*©2024 Altinity Inc. All rights reserved. Altinity®, Altinity.Cloud®, and Altinity Stable Builds® are registered trademarks of Altinity, Inc. ClickHouse® is a registered trademark of ClickHouse, Inc.*
+*©2025 Altinity Inc. All rights reserved. Altinity®, Altinity.Cloud®, and Altinity Stable Builds® are registered trademarks of Altinity, Inc. ClickHouse® is a registered trademark of ClickHouse, Inc.*

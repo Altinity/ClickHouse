@@ -17,7 +17,13 @@
 #include <IO/UncompressedCache.h>
 #include <IO/MMappedFileCache.h>
 
+#include "config.h"
+#if USE_AWS_S3
+#include <IO/S3/Client.h>
+#endif
+
 #include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/MergeTree/PrimaryIndexCache.h>
 #include <Storages/StorageMergeTree.h>
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/MarkCache.h>
@@ -322,12 +328,10 @@ void ServerAsynchronousMetrics::updateImpl(TimePoint update_time, TimePoint curr
 
                 if (MergeTreeData * table_merge_tree = dynamic_cast<MergeTreeData *>(table.get()))
                 {
-                    const auto & settings = getContext()->getSettingsRef();
-
                     calculateMax(max_part_count_for_partition, table_merge_tree->getMaxPartsCountAndSizeForPartition().first);
 
-                    size_t bytes = table_merge_tree->totalBytes(settings).value();
-                    size_t rows = table_merge_tree->totalRows(settings).value();
+                    size_t bytes = table_merge_tree->totalBytes(getContext()).value();
+                    size_t rows = table_merge_tree->totalRows(getContext()).value();
                     size_t parts = table_merge_tree->getActivePartsCount();
 
                     total_number_of_bytes += bytes;

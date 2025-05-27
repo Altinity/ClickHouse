@@ -78,6 +78,8 @@ public:
 
     virtual bool supportsReadingSubsetOfColumns(const ContextPtr &) { return true; }
 
+    virtual void validateUseToCreateTable() const {}
+
     /// Create storage according to the query.
     StoragePtr
     execute(const ASTPtr & ast_function, ContextPtr context, const std::string & table_name, ColumnsDescription cached_columns_ = {}, bool use_global_context = false, bool is_insert = false) const;

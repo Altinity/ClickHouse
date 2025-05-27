@@ -328,14 +328,16 @@ size_t StorageJoin::getSize(ContextPtr context) const
     return join->getTotalRowCount();
 }
 
-std::optional<UInt64> StorageJoin::totalRows(const Settings &settings) const
+std::optional<UInt64> StorageJoin::totalRows(ContextPtr query_context) const
 {
+    const auto & settings = query_context->getSettingsRef();
     TableLockHolder holder = tryLockTimed(rwlock, RWLockImpl::Read, RWLockImpl::NO_QUERY, settings[Setting::lock_acquire_timeout]);
     return join->getTotalRowCount();
 }
 
-std::optional<UInt64> StorageJoin::totalBytes(const Settings &settings) const
+std::optional<UInt64> StorageJoin::totalBytes(ContextPtr query_context) const
 {
+    const auto & settings = query_context->getSettingsRef();
     TableLockHolder holder = tryLockTimed(rwlock, RWLockImpl::Read, RWLockImpl::NO_QUERY, settings[Setting::lock_acquire_timeout]);
     return join->getTotalByteCount();
 }
@@ -363,6 +365,20 @@ void StorageJoin::convertRightBlock(Block & block) const
 
 void registerStorageJoin(StorageFactory & factory)
 {
+    auto has_builtin_fn = [](std::string_view name)
+    {
+        static const std::unordered_set<std::string_view> valid_settings
+            = {"join_use_nulls",
+               "max_rows_in_join",
+               "max_bytes_in_join",
+               "join_overflow_mode",
+               "join_any_take_last_row",
+               "any_join_distinct_right_table_keys",
+               "disk",
+               "persistent"};
+        return valid_settings.contains(name);
+    };
+
     auto creator_fn = [](const StorageFactory::Arguments & args)
     {
         /// Join(ANY, LEFT, k1, k2, ...)
@@ -490,7 +506,13 @@ void registerStorageJoin(StorageFactory & factory)
             persistent);
     };
 
-    factory.registerStorage("Join", creator_fn, StorageFactory::StorageFeatures{ .supports_settings = true, });
+    factory.registerStorage(
+        "Join",
+        creator_fn,
+        StorageFactory::StorageFeatures{
+            .supports_settings = true,
+            .has_builtin_setting_fn = has_builtin_fn,
+        });
 }
 
 template <typename T>

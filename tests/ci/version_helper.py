@@ -30,6 +30,7 @@ SET(VERSION_MINOR {minor})
 SET(VERSION_PATCH {patch})
 SET(VERSION_GITHASH {githash})
 SET(VERSION_TWEAK {tweak})
+SET(VERSION_FLAVOUR {flavour})
 SET(VERSION_DESCRIBE {describe})
 SET(VERSION_STRING {string})
 # end of autochange
@@ -83,6 +84,7 @@ class ClickHouseVersion:
             self._tweak = 1
         else:
             self._major += 1
+            self._minor = 1
             self._revision += 1
             self._patch = 1
             self._tweak = 1
@@ -154,6 +156,10 @@ class ClickHouseVersion:
         return self._description
 
     @property
+    def flavour(self) -> str:
+        return self._flavour
+
+    @property
     def string(self):
         version_as_string = ".".join(
             (str(self.major), str(self.minor), str(self.patch), str(self.tweak))
@@ -182,6 +188,7 @@ class ClickHouseVersion:
             "githash": self.githash,
             "describe": self.describe,
             "string": self.string,
+            "flavour": self.flavour
         }
 
     def as_tuple(self) -> Tuple[int, int, int, int]:
@@ -310,12 +317,12 @@ def get_version_from_repo(
             f'current commit: {git.sha}\n'
             f'current brach: {git.branch}'
         )
-        if git.commits_since_latest == 0:
+        if git.latest_tag and git.commits_since_latest == 0:
             # Tag has a priority over the version written in CMake.
             # Version must match (except tweak, flavour, description, etc.) to avoid accidental mess.
             if not (version_from_tag.major == cmake_version.major \
-                and version_from_tag.minor == cmake_version.minor \
-                and version_from_tag.patch == cmake_version.patch):
+                    and version_from_tag.minor == cmake_version.minor \
+                    and version_from_tag.patch == cmake_version.patch):
                 raise RuntimeError(f"Version generated from tag ({version_from_tag}) should have same major, minor, and patch values as version generated from cmake ({cmake_version})")
 
             # Don't need to reset version completely, mostly because revision part is not set in tag, but must be preserved
@@ -323,9 +330,9 @@ def get_version_from_repo(
             cmake_version._flavour = version_from_tag._flavour
             cmake_version.tweak = version_from_tag.tweak
         else:
-            # We've had some number of commits since the latest tag.
-            logging.debug(f"Bumping the TWEAK of version from cmake {cmake_version} by {git.commits_since_latest}")
-            cmake_version.tweak = cmake_version.tweak + git.commits_since_latest
+            # We've had some number of commits since the latest (upstream) tag.
+            logging.debug(f"Bumping the TWEAK of version from cmake {cmake_version} by {git.commits_since_upstream}")
+            cmake_version.tweak = cmake_version.tweak + git.commits_since_upstream
 
     return cmake_version
 

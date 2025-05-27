@@ -217,6 +217,7 @@ public:
         ShardInfoInsertPathForInternalReplication insert_path_for_internal_replication;
         /// Number of the shard, the indexation begins with 1
         UInt32 shard_num = 0;
+        String name;
         UInt32 weight = 1;
         Addresses local_addresses;
         /// nullptr if there are no remote addresses
@@ -265,7 +266,7 @@ public:
     std::unique_ptr<Cluster> getClusterWithMultipleShards(const std::vector<size_t> & indices) const;
 
     /// Get a new Cluster that contains all servers (all shards with all replicas) from existing cluster as independent shards.
-    std::unique_ptr<Cluster> getClusterWithReplicasAsShards(const Settings & settings, size_t max_replicas_from_shard = 0) const;
+    std::unique_ptr<Cluster> getClusterWithReplicasAsShards(const Settings & settings, size_t max_replicas_from_shard = 0, size_t max_hosts = 0) const;
 
     /// Returns false if cluster configuration doesn't allow to use it for cross-replication.
     /// NOTE: true does not mean, that it's actually a cross-replication cluster.
@@ -291,16 +292,20 @@ private:
 
     /// For getClusterWithReplicasAsShards implementation
     struct ReplicasAsShardsTag {};
-    Cluster(ReplicasAsShardsTag, const Cluster & from, const Settings & settings, size_t max_replicas_from_shard);
+    Cluster(ReplicasAsShardsTag, const Cluster & from, const Settings & settings, size_t max_replicas_from_shard, size_t max_hosts);
 
     void addShard(
         const Settings & settings,
         Addresses addresses,
         bool treat_local_as_remote,
         UInt32 current_shard_num,
+        String current_shard_name = "",
         UInt32 weight = 1,
         ShardInfoInsertPathForInternalReplication insert_paths = {},
         bool internal_replication = false);
+
+    /// Reduce size of cluster to max_hosts
+    void constrainShardInfoAndAddressesToMaxHosts(size_t max_hosts);
 
     /// Inter-server secret
     String secret;

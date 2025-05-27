@@ -10,8 +10,6 @@ namespace DB
 
 class Context;
 
-class StorageS3Settings;
-class StorageAzureBlobSettings;
 class StorageS3Configuration;
 class StorageAzureConfiguration;
 
@@ -31,6 +29,12 @@ struct HDFSClusterDefinition
 {
     static constexpr auto name = "hdfsCluster";
     static constexpr auto storage_type_name = "HDFSCluster";
+};
+
+struct IcebergClusterDefinition
+{
+    static constexpr auto name = "icebergCluster";
+    static constexpr auto storage_type_name = "UNDEFINED";
 };
 
 struct IcebergS3ClusterDefinition
@@ -91,9 +95,9 @@ protected:
 
     const char * getStorageTypeName() const override { return Definition::storage_type_name; }
 
-    bool hasStaticStructure() const override { return Base::getConfiguration()->structure != "auto"; }
+    bool hasStaticStructure() const override { return Base::getConfiguration()->getStructure() != "auto"; }
 
-    bool needStructureHint() const override { return Base::getConfiguration()->structure == "auto"; }
+    bool needStructureHint() const override { return Base::getConfiguration()->getStructure() == "auto"; }
 
     void setStructureHint(const ColumnsDescription & structure_hint_) override { Base::structure_hint = structure_hint_; }
 };
@@ -110,6 +114,8 @@ using TableFunctionAzureBlobCluster = TableFunctionObjectStorageCluster<AzureClu
 using TableFunctionHDFSCluster = TableFunctionObjectStorageCluster<HDFSClusterDefinition, StorageHDFSConfiguration>;
 #endif
 
+using TableFunctionIcebergCluster = TableFunctionObjectStorageCluster<IcebergClusterDefinition, StorageIcebergConfiguration>;
+
 #if USE_AVRO && USE_AWS_S3
 using TableFunctionIcebergS3Cluster = TableFunctionObjectStorageCluster<IcebergS3ClusterDefinition, StorageS3IcebergConfiguration>;
 #endif
@@ -122,7 +128,7 @@ using TableFunctionIcebergAzureCluster = TableFunctionObjectStorageCluster<Icebe
 using TableFunctionIcebergHDFSCluster = TableFunctionObjectStorageCluster<IcebergHDFSClusterDefinition, StorageHDFSIcebergConfiguration>;
 #endif
 
-#if USE_AWS_S3 && USE_PARQUET
+#if USE_AWS_S3 && USE_PARQUET && USE_DELTA_KERNEL_RS
 using TableFunctionDeltaLakeCluster = TableFunctionObjectStorageCluster<DeltaLakeClusterDefinition, StorageS3DeltaLakeConfiguration>;
 #endif
 

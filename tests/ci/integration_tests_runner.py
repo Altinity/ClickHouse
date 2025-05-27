@@ -14,9 +14,11 @@ import string
 import subprocess
 import sys
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from itertools import chain
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
+
+import yaml  # type: ignore[import-untyped]
 
 from ci_utils import kill_ci_runner
 from env_helper import IS_CI
@@ -25,7 +27,7 @@ from report import JOB_TIMEOUT_TEST_NAME
 from stopwatch import Stopwatch
 from tee_popen import TeePopen
 
-MAX_RETRY = 3
+MAX_RETRY = 2
 NUM_WORKERS = 10
 SLEEP_BETWEEN_RETRIES = 5
 PARALLEL_GROUP_SIZE = 100
@@ -49,13 +51,13 @@ NO_CHANGES_MSG = "Nothing to run"
 # Examples:
 # - has_test(['foobar'], 'foobar[param]') == True
 # - has_test(['foobar[param]'], 'foobar') == True
-def has_test(tests, test_to_match):
+def has_test(tests: List[str], test_to_match: str) -> bool:
     for test in tests:
         if len(test_to_match) < len(test):
-            if test[0 : len(test_to_match)] == test_to_match:
+            if test.startswith(test_to_match):
                 return True
         else:
-            if test_to_match[0 : len(test)] == test:
+            if test_to_match.startswith(test):
                 return True
     return False
 
@@ -99,7 +101,7 @@ def chunks(lst, n):
         yield lst[i : i + n]
 
 
-def get_counters(fname):
+def get_counters(fname: str) -> Dict[str, List[str]]:
     counters = {
         "ERROR": set([]),
         "PASSED": set([]),
@@ -114,16 +116,19 @@ def get_counters(fname):
             #
             #     test_mysql_protocol/test.py::test_golang_client
             #     [gw0] [  7%] ERROR test_mysql_protocol/test.py::test_golang_client
+            #     [gw1] SKIPPED test_odbc_interaction/test.py:56: Sanitizers cannot work with third-party shared libraries
             #
             # And only the line with test status should be matched
             if not (".py::" in line and " " in line):
                 continue
 
             line = line.strip()
-            # [gw0] [  7%] ERROR test_mysql_protocol/test.py::test_golang_client
-            # ^^^^^^^^^^^^^
+            # Remove worker info and progress percentage if present
             if line.strip().startswith("["):
-                line = re.sub(r"^\[[^\[\]]*\] \[[^\[\]]*\] ", "", line)
+                # Handle both formats:
+                # [gw0] [  7%] ERROR test_mysql_protocol/test.py::test_golang_client
+                # [gw1] SKIPPED test_odbc_interaction/test.py:56: Sanitizers cannot work with third-party shared libraries
+                line = re.sub(r"^\[[^\[\]]*\] (?:\[[^\[\]]*\] )?", "", line)
 
             line_arr = line.split(" ")
             if len(line_arr) < 2:
@@ -135,6 +140,7 @@ def get_counters(fname):
             #     ERROR test_mysql_protocol/test.py::test_golang_client
             #     PASSED test_replicated_users/test.py::test_rename_replicated[QUOTA]
             #     PASSED test_drop_is_lock_free/test.py::test_query_is_lock_free[detach part]
+            #     SKIPPED test_odbc_interaction/test.py:56: Sanitizers cannot work with third-party shared libraries
             #
             state = line_arr.pop(0)
             test_name = " ".join(line_arr)
@@ -278,6 +284,9 @@ class ClickhouseIntegrationTestsRunner:
             self.run_by_hash_total = 0
             self.run_by_hash_num = 0
 
+        self._all_tests = []  # type: List[str]
+        self._tests_by_hash = []  # type: List[str]
+
     def path(self):
         return self.result_path
 
@@ -315,7 +324,7 @@ class ClickhouseIntegrationTestsRunner:
         cmd = (
             f"cd {self.repo_path}/tests/integration && "
             f"timeout --signal=KILL 2h ./runner {self._get_runner_opts()} {image_cmd} "
-            "--pre-pull --command ' echo Pre Pull finished ' "
+            "--command ' echo Pre Pull finished ' "
         )
 
         for i in range(5):
@@ -418,7 +427,10 @@ class ClickhouseIntegrationTestsRunner:
 
         return " ".join(result)
 
-    def _get_all_tests(self) -> List[str]:
+    @property
+    def all_tests(self) -> List[str]:
+        if self._all_tests:
+            return self._all_tests
         image_cmd = self._get_runner_image_cmd()
         runner_opts = self._get_runner_opts()
         out_file_full = os.path.join(self.result_path, "runner_get_all_tests.log")
@@ -453,11 +465,12 @@ class ClickhouseIntegrationTestsRunner:
 
         assert all_tests
 
-        return list(sorted(all_tests))
+        self._all_tests = list(sorted(all_tests))
+        return self._all_tests
 
     @staticmethod
     def _get_parallel_tests_skip_list(repo_path):
-        skip_list_file_path = f"{repo_path}/tests/integration/parallel_skip.json"
+        skip_list_file_path = f"{repo_path}/tests/integration/parallel_skip.yaml"
         if (
             not os.path.isfile(skip_list_file_path)
             or os.path.getsize(skip_list_file_path) == 0
@@ -469,12 +482,25 @@ class ClickhouseIntegrationTestsRunner:
 
         skip_list_tests = []
         with open(skip_list_file_path, "r", encoding="utf-8") as skip_list_file:
-            skip_list_tests = json.load(skip_list_file)
+            skip_list_tests = yaml.safe_load(skip_list_file)
         return list(sorted(skip_list_tests))
 
     @staticmethod
+    def _get_broken_tests_list(repo_path: str) -> dict:
+        skip_list_file_path = f"{repo_path}/tests/broken_tests.json"
+        if (
+            not os.path.isfile(skip_list_file_path)
+            or os.path.getsize(skip_list_file_path) == 0
+        ):
+            return {}
+
+        with open(skip_list_file_path, "r", encoding="utf-8") as skip_list_file:
+            skip_list_tests = json.load(skip_list_file)
+        return skip_list_tests
+
+    @staticmethod
     def group_test_by_file(tests):
-        result = {}  # type: Dict
+        result = OrderedDict()  # type: OrderedDict
         for test in tests:
             test_file = test.split("::")[0]
             if test_file not in result:
@@ -503,6 +529,69 @@ class ClickhouseIntegrationTestsRunner:
         for state in ("SKIPPED",):
             for test in current_counters[state]:
                 main_counters[state].append(test)
+
+    def _handle_broken_tests(
+        self,
+        counters: Dict[str, List[str]],
+        known_broken_tests: Dict[str, Dict[str, str]],
+        log_paths: Union[Dict[str, List[str]], List[str]],
+    ) -> None:
+
+        def get_log_paths(test_name):
+            """Could be a list of logs for all tests or a dict with test name as a key"""
+            if isinstance(log_paths, dict):
+                return log_paths[test_name]
+            return log_paths
+
+        broken_tests_log = os.path.join(self.result_path, "broken_tests_handler.log")
+
+        with open(broken_tests_log, "a") as log_file:
+            log_file.write(f"{len(known_broken_tests)} Known broken tests\n")
+            for status, tests in counters.items():
+                log_file.write(f"Total tests in {status} state: {len(tests)}\n")
+
+            for fail_status in ("ERROR", "FAILED"):
+                for failed_test in counters[fail_status].copy():
+                    log_file.write(
+                        f"Checking test {failed_test} (status: {fail_status})\n"
+                    )
+                    if failed_test not in known_broken_tests.keys():
+                        log_file.write(
+                            f"Test {failed_test} is not in known broken tests\n"
+                        )
+                    else:
+                        fail_message = known_broken_tests[failed_test].get("message")
+
+                        if not fail_message:
+                            log_file.write(
+                                "No fail message specified, marking as broken\n"
+                            )
+                            mark_as_broken = True
+                        else:
+                            log_file.write(
+                                f"Looking for fail message: {fail_message}\n"
+                            )
+                            mark_as_broken = False
+                            for log_path in get_log_paths(failed_test):
+                                if log_path.endswith(".log"):
+                                    log_file.write(f"Checking log file: {log_path}\n")
+                                    with open(log_path) as test_log:
+                                        if fail_message in test_log.read():
+                                            log_file.write(
+                                                "Found fail message in logs\n"
+                                            )
+                                            mark_as_broken = True
+                                            break
+
+                        if mark_as_broken:
+                            log_file.write(f"Moving test to BROKEN state\n")
+                            counters[fail_status].remove(failed_test)
+                            counters["BROKEN"].append(failed_test)
+                        else:
+                            log_file.write("Test not marked as broken\n")
+
+            for status, tests in counters.items():
+                log_file.write(f"Total tests in {status} state: {len(tests)}\n")
 
     def _get_runner_image_cmd(self):
         image_cmd = ""
@@ -640,7 +729,10 @@ class ClickhouseIntegrationTestsRunner:
             test_cmd = " ".join([shlex.quote(test) for test in sorted(test_names)])
             # run in parallel only the first time, re-runs are sequential to give chance to flappy tests to pass.
             parallel_cmd = f" --parallel {num_workers} " if num_workers > 0 and i == 0 else ""
-            repeat_cmd = f" --count {repeat_count} " if repeat_count > 0 else ""
+            # Run flaky tests in a random order to increase chance to catch an error
+            repeat_cmd = (
+                f" --count {repeat_count} --random-order " if repeat_count > 0 else ""
+            )
             # -r -- show extra test summary:
             # -f -- (f)ailed
             # -E -- (E)rror
@@ -673,13 +765,7 @@ class ClickhouseIntegrationTestsRunner:
             for pytest_log_path in glob.glob(
                 os.path.join(self.repo_path, "tests/integration/pytest*.log")
             ):
-                new_name = (
-                    test_group_str
-                    + "_"
-                    + str(i)
-                    + "_"
-                    + os.path.basename(pytest_log_path)
-                )
+                new_name = f"{test_group_str}_{i}_{os.path.basename(pytest_log_path)}"
                 os.rename(
                     pytest_log_path,
                     os.path.join(self.repo_path, "tests/integration", new_name),
@@ -725,7 +811,7 @@ class ClickhouseIntegrationTestsRunner:
             if extra_logs_names or test_data_dirs_diff:
                 extras_result_path = os.path.join(
                     str(self.path()),
-                    "integration_run_" + test_group_str + "_" + str(i) + ".tar.zst",
+                    f"integration_run_{test_group_str}_{i}.tar.zst",
                 )
                 self._compress_logs(
                     os.path.join(self.repo_path, "tests/integration"),
@@ -792,6 +878,7 @@ class ClickhouseIntegrationTestsRunner:
         }  # type: Dict
         tests_times = defaultdict(float)  # type: Dict
         tests_log_paths = defaultdict(list)
+        known_broken_tests = self._get_broken_tests_list(self.repo_path)
         id_counter = 0
         for test_to_run in tests_to_run:
             tries_num = 1 if should_fail else FLAKY_TRIES_COUNT
@@ -808,6 +895,10 @@ class ClickhouseIntegrationTestsRunner:
                     1,
                     FLAKY_REPEAT_COUNT,
                 )
+
+                # Handle broken tests on the group counters that contain test results for a single group
+                self._handle_broken_tests(group_counters, known_broken_tests, log_paths)
+
                 id_counter = id_counter + 1
                 for counter, value in group_counters.items():
                     logging.info(
@@ -817,10 +908,11 @@ class ClickhouseIntegrationTestsRunner:
                         len(value),
                     )
                     counters[counter] += value
+                    for test_name in value:
+                        tests_log_paths[test_name] = log_paths
 
                 for test_name, test_time in group_test_times.items():
                     tests_times[test_name] = test_time
-                    tests_log_paths[test_name] = log_paths
                 if not should_fail and (
                     group_counters["FAILED"] or group_counters["ERROR"]
                 ):
@@ -898,12 +990,15 @@ class ClickhouseIntegrationTestsRunner:
 
         return result_state, status_text, test_result, tests_log_paths
 
-    def _get_tests_by_hash(self) -> List[str]:
+    @property
+    def tests_by_hash(self) -> List[str]:
         "Tries it's best to group the tests equally between groups"
-        all_tests = self._get_all_tests()
+        if self._tests_by_hash:
+            return self._tests_by_hash
         if self.run_by_hash_total == 0:
-            return all_tests
-        grouped_tests = self.group_test_by_file(all_tests)
+            self._tests_by_hash = self.all_tests
+            return self._tests_by_hash
+        grouped_tests = self.group_test_by_file(self.all_tests)
         groups_by_hash = {
             g: [] for g in range(self.run_by_hash_total)
         }  # type: Dict[int, List[str]]
@@ -915,7 +1010,8 @@ class ClickhouseIntegrationTestsRunner:
                 g for g, t in groups_by_hash.items() if len(t) == min_group
             )
             groups_by_hash[group_to_increase].extend(tests_in_group)
-        return groups_by_hash[self.run_by_hash_num]
+        self._tests_by_hash = groups_by_hash[self.run_by_hash_num]
+        return self._tests_by_hash
 
     def run_normal_check(self, build_path):
         self._install_clickhouse(build_path)
@@ -925,38 +1021,46 @@ class ClickhouseIntegrationTestsRunner:
             "Dump iptables before run %s",
             subprocess.check_output("sudo iptables -nvL", shell=True),
         )
-        all_tests = self._get_tests_by_hash()
         parallel_skip_tests = self._get_parallel_tests_skip_list(self.repo_path)
         logging.info(
-            "Found %s tests first 3 %s", len(all_tests), " ".join(all_tests[:3])
+            "Found %s tests first 3 %s",
+            len(self.tests_by_hash),
+            " ".join(self.tests_by_hash[:3]),
         )
+        # For backward compatibility, use file names in filtered_sequential_tests
         filtered_sequential_tests = list(
-            filter(lambda test: has_test(all_tests, test), parallel_skip_tests)
+            set(
+                test_name.split("::", maxsplit=1)[0]
+                for test_name in filter(
+                    lambda test: has_test(parallel_skip_tests, test), self.tests_by_hash
+                )
+            )
         )
         filtered_parallel_tests = list(
             filter(
                 lambda test: not has_test(parallel_skip_tests, test),
-                all_tests,
+                self.tests_by_hash,
             )
         )
         not_found_tests = list(
             filter(
-                lambda test: not has_test(all_tests, test),
+                lambda test: not has_test(self.all_tests, test),
                 parallel_skip_tests,
             )
         )
         logging.info(
             "Found %s tests first 3 %s, parallel %s, other %s",
-            len(all_tests),
-            " ".join(all_tests[:3]),
+            len(self.tests_by_hash),
+            " ".join(self.tests_by_hash[:3]),
             len(filtered_parallel_tests),
-            len(filtered_sequential_tests),
+            len(self.tests_by_hash) - len(filtered_parallel_tests),
         )
         logging.info(
             "Not found %s tests first 3 %s",
             len(not_found_tests),
             " ".join(not_found_tests[:3]),
         )
+
         grouped_tests = self.group_test_by_file(filtered_sequential_tests)
         i = 0
         for par_group in chunks(filtered_parallel_tests, PARALLEL_GROUP_SIZE):
@@ -974,6 +1078,7 @@ class ClickhouseIntegrationTestsRunner:
         tests_times = defaultdict(float)
         tests_log_paths = defaultdict(list)
         items_to_run = list(grouped_tests.items())
+        known_broken_tests = self._get_broken_tests_list(self.repo_path)
         logging.info("Total test groups %s", len(items_to_run))
         if self.shuffle_test_groups():
             logging.info("Shuffling test groups")
@@ -986,6 +1091,10 @@ class ClickhouseIntegrationTestsRunner:
             group_counters, group_test_times, log_paths = self.try_run_test_group(
                 group, tests, MAX_RETRY, NUM_WORKERS, 0
             )
+
+            # Handle broken tests on the group counters that contain test results for a single group
+            self._handle_broken_tests(group_counters, known_broken_tests, log_paths)
+
             total_tests = 0
             for counter, value in group_counters.items():
                 logging.info(
@@ -996,15 +1105,19 @@ class ClickhouseIntegrationTestsRunner:
                     "Totally have %s with status %s", len(counters[counter]), counter
                 )
                 total_tests += len(counters[counter])
-            logging.info("Totally finished tests %s/%s", total_tests, len(all_tests))
+                for test_name in value:
+                    tests_log_paths[test_name] = log_paths
+            logging.info(
+                "Totally finished tests %s/%s", total_tests, len(self.tests_by_hash)
+            )
 
             for test_name, test_time in group_test_times.items():
                 tests_times[test_name] = test_time
-                tests_log_paths[test_name] = log_paths
 
             if len(counters["FAILED"]) + len(counters["ERROR"]) >= 20:
                 logging.info("Collected more than 20 failed/error tests, stopping")
                 break
+
         if counters["FAILED"] or counters["ERROR"]:
             logging.info(
                 "Overall status failure, because we have tests in FAILED or ERROR state"

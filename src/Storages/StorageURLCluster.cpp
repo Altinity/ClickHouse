@@ -7,7 +7,6 @@
 #include <Core/Settings.h>
 #include <DataTypes/DataTypeString.h>
 #include <Interpreters/getHeaderForProcessingStage.h>
-#include <Interpreters/InterpreterSelectQuery.h>
 #include <Interpreters/TranslateQualifiedNamesVisitor.h>
 #include <Interpreters/AddDefaultDatabaseVisitor.h>
 #include <QueryPipeline/RemoteQueryExecutor.h>
@@ -94,11 +93,15 @@ void StorageURLCluster::updateQueryToSendIfNeeded(ASTPtr & query, const StorageS
         expression_list->children, storage_snapshot->metadata->getColumns().getAll().toNamesAndTypesDescription(), format_name, context);
 }
 
-RemoteQueryExecutor::Extension StorageURLCluster::getTaskIteratorExtension(const ActionsDAG::Node * predicate, const ContextPtr & context) const
+RemoteQueryExecutor::Extension StorageURLCluster::getTaskIteratorExtension(
+    const ActionsDAG::Node * predicate,
+    const std::optional<ActionsDAG> & /* filter_actions_dag */,
+    const ContextPtr & context,
+    ClusterPtr) const
 {
     auto iterator = std::make_shared<StorageURLSource::DisclosedGlobIterator>(
         uri, context->getSettingsRef()[Setting::glob_expansion_max_elements], predicate, getVirtualsList(), context);
-    auto callback = std::make_shared<TaskIterator>([iter = std::move(iterator)]() mutable -> String { return iter->next(); });
+    auto callback = std::make_shared<TaskIterator>([iter = std::move(iterator)](size_t) mutable -> String { return iter->next(); });
     return RemoteQueryExecutor::Extension{.task_iterator = std::move(callback)};
 }
 

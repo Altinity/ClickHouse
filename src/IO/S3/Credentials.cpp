@@ -39,6 +39,9 @@ namespace S3
 #    include <aws/core/utils/UUID.h>
 #    include <aws/core/http/HttpClientFactory.h>
 
+#    include <aws/sts/STSClient.h>
+#    include <aws/identity-management/auth/STSAssumeRoleCredentialsProvider.h>
+
 #    include <aws/core/utils/HashingUtils.h>
 #    include <aws/core/platform/FileSystem.h>
 
@@ -349,7 +352,9 @@ bool AWSEC2InstanceProfileConfigLoader::LoadInternal()
         LOG_ERROR(logger, "Failed to parse output from EC2MetadataService.");
         return false;
     }
-    String access_key, secret_key, token;
+    String access_key;
+    String secret_key;
+    String token;
 
     auto credentials_view = credentials_doc.View();
     access_key = credentials_view.GetString("AccessKeyId");
@@ -647,7 +652,8 @@ Aws::String SSOCredentialsProvider::loadAccessTokenFile(const Aws::String & sso_
             return "";
         }
         Aws::Utils::Json::JsonView token_view(token_doc);
-        Aws::String tmp_access_token, expiration_str;
+        Aws::String tmp_access_token;
+        Aws::String expiration_str;
         tmp_access_token = token_view.GetString("accessToken");
         expiration_str = token_view.GetString("expiresAt");
         Aws::Utils::DateTime expiration(expiration_str, Aws::Utils::DateFormat::ISO_8601);
@@ -686,7 +692,35 @@ S3CredentialsProviderChain::S3CredentialsProviderChain(
     /// because it's manually defined by the user
     if (!credentials.IsEmpty())
     {
-        AddProvider(std::make_shared<Aws::Auth::SimpleAWSCredentialsProvider>(credentials));
+        if (credentials_configuration.role_arn.empty())
+            AddProvider(std::make_shared<Aws::Auth::SimpleAWSCredentialsProvider>(credentials));
+        else
+        {
+            auto sts_client_config = Aws::STS::STSClientConfiguration();
+
+            if (!credentials_configuration.sts_endpoint_override.empty())
+            {
+                auto endpoint_uri = Poco::URI(credentials_configuration.sts_endpoint_override);
+
+                String url_without_scheme = endpoint_uri.getHost();
+                if (endpoint_uri.getPort() != 0)
+                    url_without_scheme += ":" + std::to_string(endpoint_uri.getPort());
+
+                sts_client_config.endpointOverride = url_without_scheme;
+                sts_client_config.scheme = endpoint_uri.getScheme() == "https" ? Aws::Http::Scheme::HTTPS : Aws::Http::Scheme::HTTP;
+            }
+
+            AddProvider(std::make_shared<Aws::Auth::STSAssumeRoleCredentialsProvider>(
+                credentials_configuration.role_arn,
+                /* sessionName */ credentials_configuration.role_session_name,
+                /* externalId */ Aws::String(),
+                /* loadFrequency */ Aws::Auth::DEFAULT_CREDS_LOAD_FREQ_SECONDS,
+                std::make_shared<Aws::STS::STSClient>(credentials,
+                                                      /* endpointProvider */ Aws::MakeShared<Aws::STS::STSEndpointProvider>(Aws::STS::STSClient::ALLOCATION_TAG),
+                                                      /* clientConfiguration */ sts_client_config)
+                )
+            );
+        }
         return;
     }
 

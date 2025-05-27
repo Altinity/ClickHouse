@@ -524,7 +524,7 @@ bool ParserAlterCommand::parseImpl(Pos & pos, ASTPtr & node, Expected & expected
                 if (!parser_string_literal.parse(pos, ast_space_name, expected))
                     return false;
 
-                command->move_destination_name = ast_space_name->as<ASTLiteral &>().value.safeGet<const String &>();
+                command->move_destination_name = ast_space_name->as<ASTLiteral &>().value.safeGet<String>();
             }
             else if (s_move_partition.ignore(pos, expected))
             {
@@ -552,7 +552,7 @@ bool ParserAlterCommand::parseImpl(Pos & pos, ASTPtr & node, Expected & expected
                     if (!parser_string_literal.parse(pos, ast_space_name, expected))
                         return false;
 
-                    command->move_destination_name = ast_space_name->as<ASTLiteral &>().value.safeGet<const String &>();
+                    command->move_destination_name = ast_space_name->as<ASTLiteral &>().value.safeGet<String>();
                 }
             }
             else if (s_export_part.ignore(pos, expected))
@@ -662,7 +662,7 @@ bool ParserAlterCommand::parseImpl(Pos & pos, ASTPtr & node, Expected & expected
                 if (!parser_string_literal.parse(pos, ast_from, expected))
                     return false;
 
-                command->from = ast_from->as<ASTLiteral &>().value.safeGet<const String &>();
+                command->from = ast_from->as<ASTLiteral &>().value.safeGet<String>();
                 command->type = ASTAlterCommand::FETCH_PARTITION;
             }
             else if (s_fetch_part.ignore(pos, expected))
@@ -676,7 +676,7 @@ bool ParserAlterCommand::parseImpl(Pos & pos, ASTPtr & node, Expected & expected
                 ASTPtr ast_from;
                 if (!parser_string_literal.parse(pos, ast_from, expected))
                     return false;
-                command->from = ast_from->as<ASTLiteral &>().value.safeGet<const String &>();
+                command->from = ast_from->as<ASTLiteral &>().value.safeGet<String>();
                 command->part = true;
                 command->type = ASTAlterCommand::FETCH_PARTITION;
             }
@@ -704,7 +704,7 @@ bool ParserAlterCommand::parseImpl(Pos & pos, ASTPtr & node, Expected & expected
                     if (!parser_string_literal.parse(pos, ast_with_name, expected))
                         return false;
 
-                    command->with_name = ast_with_name->as<ASTLiteral &>().value.safeGet<const String &>();
+                    command->with_name = ast_with_name->as<ASTLiteral &>().value.safeGet<String>();
                 }
             }
             else if (s_unfreeze.ignore(pos, expected))
@@ -731,7 +731,7 @@ bool ParserAlterCommand::parseImpl(Pos & pos, ASTPtr & node, Expected & expected
                     if (!parser_string_literal.parse(pos, ast_with_name, expected))
                         return false;
 
-                    command->with_name = ast_with_name->as<ASTLiteral &>().value.safeGet<const String &>();
+                    command->with_name = ast_with_name->as<ASTLiteral &>().value.safeGet<String>();
                 }
                 else
                 {

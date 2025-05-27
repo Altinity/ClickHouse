@@ -8,6 +8,7 @@ git_root = p.abspath(p.join(module_dir, "..", ".."))
 
 ROOT_DIR = git_root
 IS_CI = bool(os.getenv("CI"))
+IS_NEW_CI = bool(int(os.getenv("PRAKTIKA", "0")))
 TEMP_PATH = os.getenv("TEMP_PATH", p.abspath(p.join(module_dir, "./tmp")))
 REPORT_PATH = f"{TEMP_PATH}/reports"
 # FIXME: latest should not be used in CI, set temporary for transition to "docker with digest as a tag"
@@ -41,3 +42,8 @@ S3_ARTIFACT_DOWNLOAD_TEMPLATE = (
     "{pr_or_release}/{commit}/{build_name}/{artifact}"
 )
 CI_CONFIG_PATH = f"{TEMP_PATH}/ci_config.json"
+CLICKHOUSE_TEST_STAT_LOGIN = os.getenv("CLICKHOUSE_TEST_STAT_LOGIN")
+CLICKHOUSE_TEST_STAT_PASSWORD = os.getenv("CLICKHOUSE_TEST_STAT_PASSWORD")
+CLICKHOUSE_TEST_STAT_URL = os.getenv("CLICKHOUSE_TEST_STAT_URL")
+DOCKER_PASSWORD = os.getenv("DOCKER_PASSWORD")
+ROBOT_TOKEN = os.getenv("ROBOT_TOKEN")

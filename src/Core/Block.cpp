@@ -3,6 +3,8 @@
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnSparse.h>
 #include <Core/Block.h>
+#include <DataTypes/NestedUtils.h>
+#include <DataTypes/Serializations/SerializationInfo.h>
 #include <IO/Operators.h>
 #include <IO/WriteBufferFromString.h>
 #include <base/sort.h>
@@ -12,6 +14,7 @@
 #include <DataTypes/NestedUtils.h>
 
 #include <iterator>
+#include <ranges>
 
 #include <boost/algorithm/string.hpp>
 
@@ -286,7 +289,7 @@ const ColumnWithTypeAndName & Block::safeGetByPosition(size_t position) const
 }
 
 
-const ColumnWithTypeAndName * Block::findByName(const std::string & name, bool case_insensitive) const
+const ColumnWithTypeAndName * Block::findByName(const std::string_view & name, bool case_insensitive) const
 {
     if (case_insensitive)
     {
@@ -304,6 +307,11 @@ const ColumnWithTypeAndName * Block::findByName(const std::string & name, bool c
         return nullptr;
     }
     return &data[it->second];
+}
+
+const ColumnWithTypeAndName * Block::findByName(const std::string & name, bool case_insensitive) const
+{
+    return findByName(std::string_view{name}, case_insensitive);
 }
 
 std::optional<ColumnWithTypeAndName> Block::findSubcolumnByName(const std::string & name) const
@@ -573,10 +581,12 @@ Block Block::cloneWithColumns(MutableColumns && columns) const
 
     if (num_columns != columns.size())
     {
+        auto dump_columns = std::views::transform([](const auto & col) { return col->dumpStructure(); });
         throw Exception(
             ErrorCodes::LOGICAL_ERROR,
-            "Cannot clone block with columns because block has {} columns, but {} columns given",
-            num_columns, columns.size());
+            "Cannot clone block with columns because block [{}] has {} columns, but {} columns given [{}]",
+            dumpStructure(), num_columns,
+            columns.size(), fmt::join(columns | dump_columns, ", "));
     }
 
     res.reserve(num_columns);
@@ -596,10 +606,12 @@ Block Block::cloneWithColumns(const Columns & columns) const
 
     if (num_columns != columns.size())
     {
+        auto dump_columns = std::views::transform([](const auto & col) { return col->dumpStructure(); });
         throw Exception(
             ErrorCodes::LOGICAL_ERROR,
-            "Cannot clone block with columns because block has {} columns, but {} columns given",
-            num_columns, columns.size());
+            "Cannot clone block with columns because block [{}] has {} columns, but {} columns given [{}]",
+            dumpStructure(), num_columns,
+            columns.size(), fmt::join(columns | dump_columns, ", "));
     }
 
     res.reserve(num_columns);
@@ -744,17 +756,6 @@ Names Block::getDataTypeNames() const
 
     return res;
 }
-
-
-Block::NameMap Block::getNamesToIndexesMap() const
-{
-    NameMap res(index_by_name.size());
-    res.set_empty_key(StringRef{});
-    for (const auto & [name, index] : index_by_name)
-        res[name] = index;
-    return res;
-}
-
 
 bool blocksHaveEqualStructure(const Block & lhs, const Block & rhs)
 {

@@ -75,6 +75,7 @@ RemoteQueryExecutor::RemoteQueryExecutor(
     , stage(stage_)
     , extension(extension_)
     , priority_func(priority_func_)
+    , read_packet_type_separately(context->canUseParallelReplicasOnInitiator() && !context->getSettingsRef()[Setting::use_hedged_requests])
 {
 }
 
@@ -87,10 +88,11 @@ RemoteQueryExecutor::RemoteQueryExecutor(
     const Scalars & scalars_,
     const Tables & external_tables_,
     QueryProcessingStage::Enum stage_,
-    std::optional<Extension> extension_)
+    std::optional<Extension> extension_,
+    ConnectionPoolWithFailoverPtr connection_pool_with_failover_)
     : RemoteQueryExecutor(query_, header_, context_, scalars_, external_tables_, stage_, extension_)
 {
-    create_connections = [this, pool, throttler, extension_](AsyncCallback)
+    create_connections = [this, pool, throttler, extension_, connection_pool_with_failover_](AsyncCallback)
     {
         const Settings & current_settings = context->getSettingsRef();
         auto timeouts = ConnectionTimeouts::getTCPTimeoutsWithFailover(current_settings);
@@ -122,7 +124,11 @@ RemoteQueryExecutor::RemoteQueryExecutor(
         {
             chassert(!fail_message.empty());
             if (result.entry.isNull())
+            {
                 LOG_DEBUG(log, "Failed to connect to replica {}. {}", pool->getAddress(), fail_message);
+                if (connection_pool_with_failover_)
+                    connection_pool_with_failover_->incrementErrorCount(pool);
+            }
             else
                 LOG_DEBUG(log, "Replica is not usable for remote query execution: {}. {}", pool->getAddress(), fail_message);
         }
@@ -398,7 +404,16 @@ void RemoteQueryExecutor::sendQueryUnlocked(ClientInfo::QueryKind query_kind, As
 
     auto timeouts = ConnectionTimeouts::getTCPTimeoutsWithFailover(settings);
     ClientInfo modified_client_info = context->getClientInfo();
-    modified_client_info.query_kind = query_kind;
+
+    /// Doesn't support now "remote('1.1.1.{1,2}')""
+    if (is_remote_function && (shard_count == 1))
+    {
+        modified_client_info.setInitialQuery();
+        modified_client_info.client_name = "ClickHouse server";
+        modified_client_info.interface = ClientInfo::Interface::TCP;
+    }
+    else
+        modified_client_info.query_kind = query_kind;
 
     if (!duplicated_part_uuids.empty())
         connections->sendIgnoredPartUUIDs(duplicated_part_uuids);
@@ -439,7 +454,10 @@ int RemoteQueryExecutor::sendQueryAsync()
         return -1;
 
     if (!read_context)
-        read_context = std::make_unique<ReadContext>(*this, /*suspend_when_query_sent*/ true);
+        read_context = std::make_unique<ReadContext>(
+            *this,
+            /*suspend_when_query_sent*/ true,
+            read_packet_type_separately);
 
     /// If query already sent, do nothing. Note that we cannot use sent_query flag here,
     /// because we can still be in process of sending scalars or external tables.
@@ -509,7 +527,10 @@ RemoteQueryExecutor::ReadResult RemoteQueryExecutor::readAsync()
         if (was_cancelled)
             return ReadResult(Block());
 
-        read_context = std::make_unique<ReadContext>(*this);
+        read_context = std::make_unique<ReadContext>(
+            *this,
+            /*suspend_when_query_sent*/ false,
+            read_packet_type_separately);
         recreate_read_context = false;
     }
 
@@ -519,9 +540,16 @@ RemoteQueryExecutor::ReadResult RemoteQueryExecutor::readAsync()
         if (was_cancelled)
             return ReadResult(Block());
 
-        if (has_postponed_packet)
+        if (packet_in_progress)
         {
-            has_postponed_packet = false;
+            chassert(read_context->readPacketTypeSeparately());
+            chassert(read_context->hasReadTillPacketType());
+
+            /// packet type is handled already, read and parse packet itself
+            if (!read_context->hasReadPacket() && !read_context->read())
+                return ReadResult(read_context->getFileDescriptor());
+
+            packet_in_progress = false;
             auto read_result = processPacket(read_context->getPacket());
             if (read_result.getType() == ReadResult::Type::Data || read_result.getType() == ReadResult::Type::ParallelReplicasToken)
                 return read_result;
@@ -548,6 +576,10 @@ RemoteQueryExecutor::ReadResult RemoteQueryExecutor::readAsync()
 
         /// Check if packet is not ready yet.
         if (read_context->isInProgress())
+            return ReadResult(read_context->getFileDescriptor());
+
+        /// if reading separately packet header and body enabled, try to read packet itself this time
+        if (read_context->readPacketTypeSeparately() && !read_context->hasReadPacket() && !read_context->read())
             return ReadResult(read_context->getFileDescriptor());
 
         auto read_result = processPacket(read_context->getPacket());
@@ -714,8 +746,12 @@ void RemoteQueryExecutor::processReadTaskRequest()
     if (!extension || !extension->task_iterator)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Distributed task iterator is not initialized");
 
+    if (!extension->replica_info)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Replica info is not initialized");
+
     ProfileEvents::increment(ProfileEvents::ReadTaskRequestsReceived);
-    auto response = (*extension->task_iterator)();
+
+    auto response = (*extension->task_iterator)(extension->replica_info->number_of_current_replica);
     connections->sendReadTaskResponse(response);
 }
 
@@ -883,9 +919,7 @@ void RemoteQueryExecutor::sendExternalTables()
                         storage_snapshot, query_info, my_context,
                         read_from_table_stage, DEFAULT_BLOCK_SIZE, 1);
 
-                    auto builder = plan.buildQueryPipeline(
-                        QueryPlanOptimizationSettings::fromContext(my_context),
-                        BuildQueryPipelineSettings::fromContext(my_context));
+                    auto builder = plan.buildQueryPipeline(QueryPlanOptimizationSettings(my_context), BuildQueryPipelineSettings(my_context));
 
                     builder->resize(1);
                     builder->addTransform(std::make_shared<LimitsCheckingTransform>(builder->getHeader(), limits));
@@ -958,30 +992,32 @@ bool RemoteQueryExecutor::processParallelReplicaPacketIfAny()
 {
 #if defined(OS_LINUX)
 
+    if (!read_context->readPacketTypeSeparately())
+        return false;
+
+    OpenTelemetry::SpanHolder span_holder{"RemoteQueryExecutor::processParallelReplicaPacketIfAny"};
+
     std::lock_guard lock(was_cancelled_mutex);
     if (was_cancelled)
         return false;
 
-    if (!read_context || (resent_query && recreate_read_context))
-    {
-        read_context = std::make_unique<ReadContext>(*this);
-        recreate_read_context = false;
-    }
-
-    chassert(!has_postponed_packet);
-
-    read_context->resume();
-    if (read_context->isInProgress()) // <- nothing to process
+    // try to read packet type if hasn't read it yet
+    if (!read_context->hasReadTillPacketType() && !read_context->read())
         return false;
+
+    packet_in_progress = true;
 
     const auto packet_type = read_context->getPacketType();
     if (packet_type == Protocol::Server::MergeTreeReadTaskRequest || packet_type == Protocol::Server::MergeTreeAllRangesAnnouncement)
     {
+        // try to read packet if hasn't read it yet
+        if (!read_context->hasReadPacket() && !read_context->read())
+            return false;
+
+        packet_in_progress = false;
         processPacket(read_context->getPacket());
         return true;
     }
-
-    has_postponed_packet = true;
 
 #endif
 

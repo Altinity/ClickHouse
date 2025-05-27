@@ -2,6 +2,7 @@
 
 #include <Analyzer/TableNode.h>
 #include <Analyzer/Utils.h>
+#include <Interpreters/Context.h>
 #include <Interpreters/InterpreterInsertQuery.h>
 #include <Interpreters/InterpreterSelectQuery.h>
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
@@ -9,6 +10,7 @@
 #include <Interpreters/castColumn.h>
 #include <Interpreters/evaluateConstantExpression.h>
 #include <Interpreters/getColumnFromBlock.h>
+#include <Interpreters/ExpressionActions.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTInsertQuery.h>
@@ -29,7 +31,9 @@
 #include <Storages/AlterCommands.h>
 #include <Storages/StorageFactory.h>
 #include <Storages/StorageValues.h>
+#include <Storages/ReadInOrderOptimizer.h>
 #include <Storages/checkAndGetLiteralArgument.h>
+#include <Storages/IStorage.h>
 #include <base/getThreadId.h>
 #include <base/range.h>
 #include <boost/range/algorithm_ext/erase.hpp>
@@ -41,6 +45,7 @@
 #include <Common/quoteString.h>
 #include <Common/threadPoolCallbackRunner.h>
 #include <Common/typeid_cast.h>
+#include <Core/BackgroundSchedulePool.h>
 #include <Core/Settings.h>
 
 
@@ -468,7 +473,7 @@ void StorageBuffer::read(
     {
         if (query_info.prewhere_info)
         {
-            auto actions_settings = ExpressionActionsSettings::fromContext(local_context);
+            ExpressionActionsSettings actions_settings(local_context);
 
             if (query_info.prewhere_info->row_level_filter)
             {
@@ -1162,16 +1167,16 @@ void StorageBuffer::checkAlterIsPossible(const AlterCommands & commands, Context
     }
 }
 
-std::optional<UInt64> StorageBuffer::totalRows(const Settings & settings) const
+std::optional<UInt64> StorageBuffer::totalRows(ContextPtr query_context) const
 {
     std::optional<UInt64> underlying_rows;
     if (auto destination = getDestinationTable())
-        underlying_rows = destination->totalRows(settings);
+        underlying_rows = destination->totalRows(query_context);
 
     return total_writes.rows + underlying_rows.value_or(0);
 }
 
-std::optional<UInt64> StorageBuffer::totalBytes(const Settings & /*settings*/) const
+std::optional<UInt64> StorageBuffer::totalBytes(ContextPtr) const
 {
     return total_writes.bytes;
 }

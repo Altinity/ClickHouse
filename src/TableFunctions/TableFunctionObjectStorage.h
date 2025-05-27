@@ -65,7 +65,7 @@ struct LocalDefinition
 struct IcebergDefinition
 {
     static constexpr auto name = "iceberg";
-    static constexpr auto storage_type_name = "S3";
+    static constexpr auto storage_type_name = "UNDEFINED";
 };
 
 struct IcebergS3Definition
@@ -112,15 +112,16 @@ public:
 
     String getName() const override { return name; }
 
-    bool hasStaticStructure() const override { return configuration->structure != "auto"; }
+    bool hasStaticStructure() const override { return configuration->getStructure() != "auto"; }
 
-    bool needStructureHint() const override { return configuration->structure == "auto"; }
+    bool needStructureHint() const override { return configuration->getStructure() == "auto"; }
 
     void setStructureHint(const ColumnsDescription & structure_hint_) override { structure_hint = structure_hint_; }
 
     bool supportsReadingSubsetOfColumns(const ContextPtr & context) override
     {
-        return configuration->format != "auto" && FormatFactory::instance().checkIfFormatSupportsSubsetOfColumns(configuration->format, context);
+        return configuration->getFormat() != "auto"
+            && FormatFactory::instance().checkIfFormatSupportsSubsetOfColumns(configuration->getFormat(), context);
     }
 
     std::unordered_set<String> getVirtualsToCheckBeforeUsingStructureHint() const override
@@ -130,7 +131,7 @@ public:
 
     virtual void parseArgumentsImpl(ASTs & args, const ContextPtr & context)
     {
-        StorageObjectStorage::Configuration::initialize(*getConfiguration(), args, context, true, nullptr);
+        getConfiguration()->initialize(args, context, true, settings);
     }
 
     static void updateStructureAndFormatArgumentsIfNeeded(
@@ -163,6 +164,7 @@ protected:
     mutable ConfigurationPtr configuration;
     mutable ObjectStoragePtr object_storage;
     ColumnsDescription structure_hint;
+    std::shared_ptr<StorageObjectStorageSettings> settings;
 
     std::vector<size_t> skipAnalysisForArguments(const QueryTreeNodePtr & query_node_table_function, ContextPtr context) const override;
 };
@@ -183,8 +185,9 @@ using TableFunctionLocal = TableFunctionObjectStorage<LocalDefinition, StorageLo
 
 
 #if USE_AVRO
+using TableFunctionIceberg = TableFunctionObjectStorage<IcebergDefinition, StorageIcebergConfiguration>;
+
 #    if USE_AWS_S3
-using TableFunctionIceberg = TableFunctionObjectStorage<IcebergDefinition, StorageS3IcebergConfiguration>;
 using TableFunctionIcebergS3 = TableFunctionObjectStorage<IcebergS3Definition, StorageS3IcebergConfiguration>;
 #    endif
 #    if USE_AZURE_BLOB_STORAGE
@@ -196,7 +199,7 @@ using TableFunctionIcebergHDFS = TableFunctionObjectStorage<IcebergHDFSDefinitio
 using TableFunctionIcebergLocal = TableFunctionObjectStorage<IcebergLocalDefinition, StorageLocalIcebergConfiguration>;
 #endif
 #if USE_AWS_S3
-#    if USE_PARQUET
+#    if USE_PARQUET && USE_DELTA_KERNEL_RS
 using TableFunctionDeltaLake = TableFunctionObjectStorage<DeltaLakeDefinition, StorageS3DeltaLakeConfiguration>;
 #    endif
 using TableFunctionHudi = TableFunctionObjectStorage<HudiDefinition, StorageS3HudiConfiguration>;

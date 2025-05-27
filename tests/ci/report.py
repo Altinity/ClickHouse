@@ -23,13 +23,14 @@ from typing import (
 
 from build_download_helper import APIException, get_gh_api
 from ci_config import CI
-from ci_utils import Shell
+from ci_utils import Shell, cd
 from env_helper import (
     GITHUB_JOB,
     GITHUB_REPOSITORY,
     GITHUB_RUN_ID,
     GITHUB_RUN_URL,
     GITHUB_WORKSPACE,
+    REPO_COPY,
     REPORT_PATH,
 )
 
@@ -443,6 +444,7 @@ class JobReport:
                     info=r.raw_logs,
                     links=list(r.log_urls) if r.log_urls else [],
                     duration=r.time,
+                    files=[str(f) for f in r.log_files] if r.log_files else [],
                 )
             )
 
@@ -455,11 +457,14 @@ class JobReport:
             files=(
                 [str(f) for f in self.additional_files] if self.additional_files else []
             ),
+            info=self.description,
         )
 
     @staticmethod
     def get_start_time_from_current():
-        return datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
 
     @classmethod
     def create_dummy(cls, status: str, job_skipped: bool) -> "JobReport":
@@ -481,11 +486,17 @@ class JobReport:
             start_time = datetime.datetime.strptime(
                 self.start_time, "%Y-%m-%d %H:%M:%S"
             )
-            current_time = datetime.datetime.utcnow()
+            current_time = datetime.datetime.now()
             self.duration = (current_time - start_time).total_seconds()
 
     def __post_init__(self):
-        assert self.status in (SUCCESS, ERROR, FAILURE, PENDING)
+        assert self.status.lower() in (
+            SUCCESS,
+            ERROR,
+            FAILURE,
+            PENDING,
+            SKIPPED.lower(),
+        ), f"Invalid status [{self.status}]"
 
     @classmethod
     def exist(cls) -> bool:
@@ -521,7 +532,8 @@ class JobReport:
         # temporary WA to ease integration with praktika
         check_name = os.getenv("JOB_NAME", "")
         if check_name:
-            self.to_praktika_result(job_name=check_name).dump()
+            with cd(REPO_COPY):
+                self.to_praktika_result(job_name=check_name).dump()
 
         return self
 
@@ -588,7 +600,7 @@ class BuildResult:
         loads report from a report file matched with given @pr_number and/or a @head_ref
         """
         report_path = Path(REPORT_PATH) / BuildResult.get_report_name(
-            build_name, pr_number or head_ref
+            build_name, pr_number or CI.Utils.normalize_string(head_ref)
         )
         return cls.load_from_file(report_path)
 
@@ -607,12 +619,13 @@ class BuildResult:
         master_report = None
         any_report = None
         Path(REPORT_PATH).mkdir(parents=True, exist_ok=True)
+        normalized_head_ref = CI.Utils.normalize_string(head_ref)
         for file in Path(REPORT_PATH).iterdir():
             if f"{build_name}.json" in file.name:
                 any_report = file
                 if "_master_" in file.name:
                     master_report = file
-                elif f"_{head_ref}_" in file.name:
+                elif f"_{normalized_head_ref}_" in file.name:
                     ref_report = file
                 elif pr_number and f"_{pr_number}_" in file.name:
                     pr_report = file

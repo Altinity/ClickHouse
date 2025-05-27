@@ -23,7 +23,7 @@ namespace ErrorCodes
 ReadBufferIterator::ReadBufferIterator(
     ObjectStoragePtr object_storage_,
     ConfigurationPtr configuration_,
-    const FileIterator & file_iterator_,
+    const ObjectIterator & file_iterator_,
     const std::optional<FormatSettings> & format_settings_,
     SchemaCache & schema_cache_,
     ObjectInfos & read_keys_,
@@ -38,8 +38,8 @@ ReadBufferIterator::ReadBufferIterator(
     , read_keys(read_keys_)
     , prev_read_keys_size(read_keys_.size())
 {
-    if (configuration->format != "auto")
-        format = configuration->format;
+    if (configuration->getFormat() != "auto")
+        format = configuration->getFormat();
 }
 
 SchemaCache::Key ReadBufferIterator::getKeyForSchemaCache(const ObjectInfo & object_info, const String & format_name) const
@@ -74,10 +74,7 @@ std::optional<ColumnsDescription> ReadBufferIterator::tryGetColumnsFromCache(
         const auto & object_info = (*it);
         auto get_last_mod_time = [&] -> std::optional<time_t>
         {
-            const auto & path = object_info->isArchive() ? object_info->getPathToArchive() : object_info->getPath();
-            if (!object_info->metadata)
-                object_info->metadata = object_storage->tryGetObjectMetadata(path);
-
+            object_info->loadMetadata(object_storage);
             return object_info->metadata
                 ? std::optional<time_t>(object_info->metadata->last_modified.epochTime())
                 : std::nullopt;
@@ -149,10 +146,9 @@ std::unique_ptr<ReadBuffer> ReadBufferIterator::recreateLastReadBuffer()
 {
     auto context = getContext();
 
-    const auto & path = current_object_info->isArchive() ? current_object_info->getPathToArchive() : current_object_info->getPath();
     auto impl = StorageObjectStorageSource::createReadBuffer(*current_object_info, object_storage, context, getLogger("ReadBufferIterator"));
 
-    const auto compression_method = chooseCompressionMethod(current_object_info->getFileName(), configuration->compression_method);
+    const auto compression_method = chooseCompressionMethod(current_object_info->getFileName(), configuration->getCompressionMethod());
     const auto zstd_window = static_cast<int>(context->getSettingsRef()[Setting::zstd_window_log_max]);
 
     return wrapReadBufferWithCompressionMethod(std::move(impl), compression_method, zstd_window);
@@ -248,6 +244,8 @@ ReadBufferIterator::Data ReadBufferIterator::next()
             prev_read_keys_size = read_keys.size();
         }
 
+        current_object_info->loadMetadata(object_storage);
+
         if (query_settings.skip_empty_files
             && current_object_info->metadata && current_object_info->metadata->size_bytes == 0)
             continue;
@@ -268,13 +266,13 @@ ReadBufferIterator::Data ReadBufferIterator::next()
         using ObjectInfoInArchive = StorageObjectStorageSource::ArchiveIterator::ObjectInfoInArchive;
         if (const auto * object_info_in_archive = dynamic_cast<const ObjectInfoInArchive *>(current_object_info.get()))
         {
-            compression_method = chooseCompressionMethod(filename, configuration->compression_method);
+            compression_method = chooseCompressionMethod(filename, configuration->getCompressionMethod());
             const auto & archive_reader = object_info_in_archive->archive_reader;
             read_buf = archive_reader->readFile(object_info_in_archive->path_in_archive, /*throw_on_not_found=*/true);
         }
         else
         {
-            compression_method = chooseCompressionMethod(filename, configuration->compression_method);
+            compression_method = chooseCompressionMethod(filename, configuration->getCompressionMethod());
             read_buf = StorageObjectStorageSource::createReadBuffer(*current_object_info, object_storage, getContext(), getLogger("ReadBufferIterator"));
         }
 

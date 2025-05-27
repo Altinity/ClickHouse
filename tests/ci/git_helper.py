@@ -7,7 +7,13 @@ import os.path as p
 import re
 import subprocess
 import tempfile
+from contextlib import contextmanager
+from multiprocessing import Pool, cpu_count
 from typing import Any, List, Literal, Optional
+
+import __main__
+
+from ci_utils import Shell
 
 logger = logging.getLogger(__name__)
 
@@ -17,13 +23,14 @@ class VersionType:
     PRESTABLE = "altinityedge"
     STABLE = "altinitystable"
     TESTING = "altinitytest"
+    ANTALYA = "altinityantalya"
 
-    VALID = (NEW, TESTING, PRESTABLE, STABLE, LTS,
+    VALID = (NEW, TESTING, PRESTABLE, STABLE, LTS, ANTALYA,
             # NOTE (vnemkov): we don't use those directly, but it is used in unit-tests
-             "stable",
-             "prestable",
-             "testing",
-            )
+            "stable",
+            "prestable",
+            "testing",
+    )
 
 # ^ and $ match subline in `multiple\nlines`
 # \A and \Z match only start and end of the whole string
@@ -33,7 +40,7 @@ RELEASE_BRANCH_REGEXP = r"\A\d+[.]\d+\Z"
 TAG_REGEXP = (
     r"\Av\d{2}"  # First two digits of major part
     r"([.][1-9]\d*){3}"  # minor.patch.tweak parts
-    fr"[.-]({'|'.join(VersionType.VALID)})\Z"  # suffix with a version type
+    fr"[\.-]({'|'.join(VersionType.VALID)})\Z"  # suffix with a version type
 )
 SHA_REGEXP = re.compile(r"\A([0-9]|[a-f]){40}\Z")
 
@@ -128,6 +135,72 @@ def is_shallow() -> bool:
     return git_runner.run("git rev-parse --is-shallow-repository") == "true"
 
 
+def unshallow(thin: bool = True) -> None:
+    filter_arg = "--filter=tree:0" if thin else ""
+    Shell.check(
+        f"git fetch --unshallow --prune --no-recurse-submodules {filter_arg}  origin",
+        cwd=git_runner.cwd,
+    )
+
+
+def checkout_submodule(name: str) -> None:
+    """checkout the single submodule by its name"""
+    Shell.check(
+        f"git submodule update --depth=1 --single-branch {name}", cwd=git_runner.cwd
+    )
+
+
+def checkout_submodules() -> None:
+    """Parallel checkout of submodules. Argument `--jobs` does not really parallelize"""
+    jobs = min([cpu_count(), 20])
+    Shell.check("git submodule sync", cwd=git_runner.cwd)
+    Shell.check("git submodule init", cwd=git_runner.cwd)
+    # Get all submodule path
+    submodules = {
+        s.split("\n", maxsplit=1)[1]
+        for s in git_runner(
+            "git config --file .gitmodules --null --get-regexp '^submodule[.].+[.]path$'"
+        ).split("\0")
+        if "\n" in s
+    }
+
+    with Pool(jobs) as pool:
+        pool.map(checkout_submodule, submodules)
+
+
+@contextmanager
+def clear_repo():
+    def ref():
+        return git_runner("git branch --show-current") or git_runner(
+            "git rev-parse HEAD"
+        )
+
+    orig_ref = ref()
+    try:
+        yield
+    finally:
+        current_ref = ref()
+        if orig_ref != current_ref:
+            git_runner(f"git checkout -f {orig_ref}")
+
+
+@contextmanager
+def stash():
+    # diff.ignoreSubmodules=all don't show changed submodules
+    need_stash = bool(git_runner("git -c diff.ignoreSubmodules=all diff HEAD"))
+    if need_stash:
+        script = (
+            __main__.__file__ if hasattr(__main__, "__file__") else "unknown script"
+        )
+        git_runner(f"git stash push --no-keep-index -m 'running {script}'")
+    try:
+        with clear_repo():
+            yield
+    finally:
+        if need_stash:
+            git_runner("git stash pop")
+
+
 def get_tags() -> List[str]:
     if is_shallow():
         raise RuntimeError("attempt to run on a shallow repository")
@@ -169,6 +242,7 @@ class Git:
         self.sha_short = ""
         self.commits_since_latest = 0
         self.commits_since_new = 0
+        self.commits_since_upstream = 0 # commits since upstream tag
         self.update()
 
     def update(self):
@@ -187,13 +261,19 @@ class Git:
             return
         self._update_tags()
 
+    def _commits_since(self, ref_name):
+        return int(
+            self.run(f"git rev-list {ref_name}..HEAD --count")
+        )
+
     def _update_tags(self, suppress_stderr: bool = False) -> None:
         stderr = subprocess.DEVNULL if suppress_stderr else None
         self.latest_tag = self.run("git describe --tags --abbrev=0", stderr=stderr)
-        # Format should be: {latest_tag}-{commits_since_tag}-g{sha_short}
-        self.commits_since_latest = int(
-            self.run(f"git rev-list {self.latest_tag}..HEAD --count")
-        )
+        self.commits_since_latest = self._commits_since(self.latest_tag)
+
+        latest_upstream_tag = self.run("git describe --tags --abbrev=0 --match='*-*'", stderr=stderr)
+        self.commits_since_upstream = self._commits_since(latest_upstream_tag)
+
         if self.latest_tag.endswith("-new"):
             # We won't change the behaviour of the the "latest_tag"
             # So here we set "new_tag" to the previous tag in the graph, that will allow
@@ -202,9 +282,7 @@ class Git:
                 f"git describe --tags --abbrev=0 --exclude='{self.latest_tag}'",
                 stderr=stderr,
             )
-            self.commits_since_new = int(
-                self.run(f"git rev-list {self.new_tag}..HEAD --count")
-            )
+            self.commits_since_new = self._commits_since(self.new_tag)
 
     @staticmethod
     def check_tag(value: str) -> None:

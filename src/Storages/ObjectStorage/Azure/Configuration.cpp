@@ -15,6 +15,7 @@
 #include <azure/identity/managed_identity_credential.hpp>
 #include <azure/identity/workload_identity_credential.hpp>
 #include <Core/Settings.h>
+#include <Common/RemoteHostFilter.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTFunction.h>
 
@@ -53,6 +54,7 @@ const std::unordered_set<std::string_view> optional_configuration_keys = {
     "account_key",
     "connection_string",
     "storage_account_url",
+    "storage_type",
 };
 
 void StorageAzureConfiguration::check(ContextPtr context) const
@@ -132,8 +134,6 @@ void StorageAzureConfiguration::fromNamedCollection(const NamedCollection & coll
 
     String connection_url;
     String container_name;
-    std::optional<String> account_name;
-    std::optional<String> account_key;
 
     if (collection.has("connection_string"))
         connection_url = collection.get<String>("connection_string");
@@ -149,9 +149,9 @@ void StorageAzureConfiguration::fromNamedCollection(const NamedCollection & coll
     if (collection.has("account_key"))
         account_key = collection.get<String>("account_key");
 
-    structure = collection.getOrDefault<String>("structure", "auto");
-    format = collection.getOrDefault<String>("format", format);
-    compression_method = collection.getOrDefault<String>("compression_method", collection.getOrDefault<String>("compression", "auto"));
+    setStructure(collection.getOrDefault<String>("structure", "auto"));
+    setFormat(collection.getOrDefault<String>("format", getFormat()));
+    setCompressionMethod(collection.getOrDefault<String>("compression_method", collection.getOrDefault<String>("compression", "auto")));
 
     blobs_paths = {blob_path};
     connection_params = getConnectionParams(connection_url, container_name, account_name, account_key, context);
@@ -173,13 +173,9 @@ void StorageAzureConfiguration::fromAST(ASTs & engine_args, ContextPtr context, 
 
     std::unordered_map<std::string_view, size_t> engine_args_to_idx;
 
-
     String connection_url = checkAndGetLiteralArgument<String>(engine_args[0], "connection_string/storage_account_url");
     String container_name = checkAndGetLiteralArgument<String>(engine_args[1], "container");
     blob_path = checkAndGetLiteralArgument<String>(engine_args[2], "blobpath");
-
-    std::optional<String> account_name;
-    std::optional<String> account_key;
 
     auto is_format_arg = [] (const std::string & s) -> bool
     {
@@ -191,12 +187,12 @@ void StorageAzureConfiguration::fromAST(ASTs & engine_args, ContextPtr context, 
         auto fourth_arg = checkAndGetLiteralArgument<String>(engine_args[3], "format/account_name");
         if (is_format_arg(fourth_arg))
         {
-            format = fourth_arg;
+            setFormat(fourth_arg);
         }
         else
         {
             if (with_structure)
-                structure = fourth_arg;
+                setStructure(fourth_arg);
             else
                 throw Exception(
                     ErrorCodes::BAD_ARGUMENTS,
@@ -208,8 +204,8 @@ void StorageAzureConfiguration::fromAST(ASTs & engine_args, ContextPtr context, 
         auto fourth_arg = checkAndGetLiteralArgument<String>(engine_args[3], "format/account_name");
         if (is_format_arg(fourth_arg))
         {
-            format = fourth_arg;
-            compression_method = checkAndGetLiteralArgument<String>(engine_args[4], "compression");
+            setFormat(fourth_arg);
+            setCompressionMethod(checkAndGetLiteralArgument<String>(engine_args[4], "compression"));
         }
         else
         {
@@ -224,9 +220,9 @@ void StorageAzureConfiguration::fromAST(ASTs & engine_args, ContextPtr context, 
         {
             if (with_structure)
             {
-                format = fourth_arg;
-                compression_method = checkAndGetLiteralArgument<String>(engine_args[4], "compression");
-                structure = checkAndGetLiteralArgument<String>(engine_args[5], "structure");
+                setFormat(fourth_arg);
+                setCompressionMethod(checkAndGetLiteralArgument<String>(engine_args[4], "compression"));
+                setStructure(checkAndGetLiteralArgument<String>(engine_args[5], "structure"));
             }
             else
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "Format and compression must be last arguments");
@@ -238,12 +234,12 @@ void StorageAzureConfiguration::fromAST(ASTs & engine_args, ContextPtr context, 
             auto sixth_arg = checkAndGetLiteralArgument<String>(engine_args[5], "format/structure");
             if (is_format_arg(sixth_arg))
             {
-                format = sixth_arg;
+                setFormat(sixth_arg);
             }
             else
             {
                 if (with_structure)
-                    structure = sixth_arg;
+                    setStructure(sixth_arg);
                 else
                     throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown format {}", sixth_arg);
             }
@@ -262,8 +258,8 @@ void StorageAzureConfiguration::fromAST(ASTs & engine_args, ContextPtr context, 
         auto sixth_arg = checkAndGetLiteralArgument<String>(engine_args[5], "format/account_name");
         if (!is_format_arg(sixth_arg))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown format {}", sixth_arg);
-        format = sixth_arg;
-        compression_method = checkAndGetLiteralArgument<String>(engine_args[6], "compression");
+        setFormat(sixth_arg);
+        setCompressionMethod(checkAndGetLiteralArgument<String>(engine_args[6], "compression"));
     }
     else if (with_structure && engine_args.size() == 8)
     {
@@ -273,9 +269,9 @@ void StorageAzureConfiguration::fromAST(ASTs & engine_args, ContextPtr context, 
         auto sixth_arg = checkAndGetLiteralArgument<String>(engine_args[5], "format");
         if (!is_format_arg(sixth_arg))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown format {}", sixth_arg);
-        format = sixth_arg;
-        compression_method = checkAndGetLiteralArgument<String>(engine_args[6], "compression");
-        structure = checkAndGetLiteralArgument<String>(engine_args[7], "structure");
+        setFormat(sixth_arg);
+        setCompressionMethod (checkAndGetLiteralArgument<String>(engine_args[6], "compression"));
+        setStructure(checkAndGetLiteralArgument<String>(engine_args[7], "structure"));
     }
 
     blobs_paths = {blob_path};
@@ -442,6 +438,22 @@ void StorageAzureConfiguration::addStructureAndFormatToArgsIfNeeded(
                 args[7] = structure_literal;
         }
     }
+}
+
+ASTPtr StorageAzureConfiguration::createArgsWithAccessData() const
+{
+    auto arguments = std::make_shared<ASTExpressionList>();
+
+    arguments->children.push_back(std::make_shared<ASTLiteral>(connection_params.endpoint.storage_account_url));
+    arguments->children.push_back(std::make_shared<ASTIdentifier>(connection_params.endpoint.container_name));
+    arguments->children.push_back(std::make_shared<ASTLiteral>(blob_path));
+    if (account_name && account_key)
+    {
+        arguments->children.push_back(std::make_shared<ASTLiteral>(*account_name));
+        arguments->children.push_back(std::make_shared<ASTLiteral>(*account_key));
+    }
+
+    return arguments;
 }
 
 }

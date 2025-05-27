@@ -28,11 +28,18 @@
 #include "config.h"
 
 #if USE_AZURE_BLOB_STORAGE
-#include <Disks/ObjectStorages/AzureBlobStorage/AzureBlobStorageCommon.h>
+namespace DB::AzureBlobStorage
+{
+class ContainerClientWrapper;
+using ContainerClient = ContainerClientWrapper;
+}
 #endif
 
 #if USE_AWS_S3
-#include <IO/S3/Client.h>
+namespace DB::S3
+{
+class Client;
+}
 #endif
 
 namespace DB
@@ -76,6 +83,8 @@ struct RelativePathWithMetadata
     virtual bool isArchive() const { return false; }
     virtual std::string getPathToArchive() const { throw Exception(ErrorCodes::LOGICAL_ERROR, "Not an archive"); }
     virtual size_t fileSizeInArchive() const { throw Exception(ErrorCodes::LOGICAL_ERROR, "Not an archive"); }
+
+    void loadMetadata(ObjectStoragePtr object_storage);
 };
 
 struct ObjectKeyWithMetadata
@@ -227,6 +236,10 @@ public:
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method 'generateObjectKeyPrefixForDirectoryPath' is not implemented");
     }
 
+    /// Returns whether this object storage generates a random blob name for each object.
+    /// This function returns false if this object storage just adds some constant string to a passed path to generate a blob name.
+    virtual bool areObjectKeysRandom() const = 0;
+
     /// Get unique id for passed absolute path in object storage.
     virtual std::string getUniqueId(const std::string & path) const { return path; }
 
@@ -262,6 +275,8 @@ public:
     virtual std::shared_ptr<const S3::Client> tryGetS3StorageClient() { return nullptr; }
 #endif
 
+
+    virtual bool supportsListObjectsCache() { return false; }
 
 private:
     mutable std::mutex throttlers_mutex;

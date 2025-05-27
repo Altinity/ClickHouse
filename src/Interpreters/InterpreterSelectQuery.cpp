@@ -26,6 +26,7 @@
 #include <Interpreters/InterpreterSelectQuery.h>
 #include <Interpreters/InterpreterSelectWithUnionQuery.h>
 #include <Interpreters/InterpreterSetQuery.h>
+#include <Interpreters/ExpressionActions.h>
 #include <Interpreters/evaluateConstantExpression.h>
 #include <Interpreters/convertFieldToType.h>
 #include <Interpreters/addTypeConversionToAST.h>
@@ -67,6 +68,7 @@
 #include <Processors/QueryPlan/TotalsHavingStep.h>
 #include <Processors/QueryPlan/WindowStep.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
+#include <Processors/QueryPlan/ObjectFilterStep.h>
 #include <Processors/Sources/NullSource.h>
 #include <Processors/Sources/SourceFromSingleChunk.h>
 #include <Processors/Transforms/AggregatingTransform.h>
@@ -78,8 +80,10 @@
 #include <Storages/StorageMerge.h>
 #include <Storages/StorageValues.h>
 #include <Storages/StorageView.h>
+#include <Storages/ReadInOrderOptimizer.h>
 
 #include <Columns/Collator.h>
+#include <Columns/ColumnAggregateFunction.h>
 #include <Core/ColumnNumbers.h>
 #include <Core/Field.h>
 #include <Core/ProtocolDefines.h>
@@ -186,6 +190,7 @@ namespace Setting
     extern const SettingsUInt64 min_count_to_compile_aggregate_expression;
     extern const SettingsBool enable_software_prefetch_in_aggregation;
     extern const SettingsBool optimize_group_by_constant_keys;
+    extern const SettingsBool use_hive_partitioning;
 }
 
 namespace ServerSetting
@@ -223,6 +228,7 @@ FilterDAGInfoPtr generateFilterActions(
     const StorageMetadataPtr & metadata_snapshot,
     Names & prerequisite_columns,
     PreparedSetsPtr prepared_sets)
+try
 {
     auto filter_info = std::make_shared<FilterDAGInfo>();
 
@@ -284,6 +290,11 @@ FilterDAGInfoPtr generateFilterActions(
     }
 
     return filter_info;
+}
+catch (Exception & e)
+{
+    e.addMessage("While applying a row policy (see system.row_policies)");
+    throw;
 }
 
 InterpreterSelectQuery::InterpreterSelectQuery(
@@ -405,7 +416,7 @@ ASTPtr parseAdditionalFilterConditionForTable(
 {
     for (const auto & additional_filter : additional_table_filters)
     {
-        const auto & tuple = additional_filter.safeGet<const Tuple &>();
+        const auto & tuple = additional_filter.safeGet<Tuple>();
         const auto & table = tuple.at(0).safeGet<String>();
         const auto & filter = tuple.at(1).safeGet<String>();
 
@@ -527,7 +538,7 @@ InterpreterSelectQuery::InterpreterSelectQuery(
     {
         if (context->getSettingsRef()[Setting::enable_global_with_statement])
             ApplyWithAliasVisitor::visit(query_ptr);
-        ApplyWithSubqueryVisitor::visit(query_ptr);
+        ApplyWithSubqueryVisitor(context).visit(query_ptr);
     }
 
     query_info.query = query_ptr->clone();
@@ -617,7 +628,7 @@ InterpreterSelectQuery::InterpreterSelectQuery(
     /// Check support for parallel replicas for non-replicated storage (plain MergeTree)
     bool is_plain_merge_tree = storage && storage->isMergeTree() && !storage->supportsReplication();
     if (is_plain_merge_tree && settings[Setting::allow_experimental_parallel_reading_from_replicas] > 0
-        && !settings[Setting::allow_experimental_parallel_reading_from_replicas])
+        && !settings[Setting::parallel_replicas_for_non_replicated_merge_tree])
     {
         if (settings[Setting::allow_experimental_parallel_reading_from_replicas] == 1)
         {
@@ -1124,8 +1135,7 @@ BlockIO InterpreterSelectQuery::execute()
 
     buildQueryPlan(query_plan);
 
-    auto builder = query_plan.buildQueryPipeline(
-        QueryPlanOptimizationSettings::fromContext(context), BuildQueryPipelineSettings::fromContext(context));
+    auto builder = query_plan.buildQueryPipeline(QueryPlanOptimizationSettings(context), BuildQueryPipelineSettings(context));
 
     res.pipeline = QueryPipelineBuilder::getPipeline(std::move(*builder));
 
@@ -1957,6 +1967,22 @@ void InterpreterSelectQuery::executeImpl(QueryPlan & query_plan, std::optional<P
 
         if (expressions.second_stage || from_aggregation_stage)
         {
+            if (settings[Setting::use_hive_partitioning]
+                && !expressions.first_stage
+                && expressions.hasWhere())
+            {
+                if (typeid_cast<ReadFromCluster *>(query_plan.getRootNode()->step.get()))
+                {
+                    auto object_filter_step = std::make_unique<ObjectFilterStep>(
+                        query_plan.getCurrentHeader(),
+                        expressions.before_where->dag.clone(),
+                        getSelectQuery().where()->getColumnName());
+
+                    object_filter_step->setStepDescription("WHERE");
+                    query_plan.addStep(std::move(object_filter_step));
+                }
+            }
+
             if (from_aggregation_stage)
             {
                 /// No need to aggregate anything, since this was done on remote shards.
@@ -2455,7 +2481,7 @@ std::optional<UInt64> InterpreterSelectQuery::getTrivialCount(UInt64 allow_exper
         /// require reading some data (but much faster than reading columns).
         /// Set a special flag in query info so the storage will see it and optimize count in read() method.
         query_info.optimize_trivial_count = optimize_trivial_count;
-        return storage->totalRows(settings);
+        return storage->totalRows(context);
     }
 
     // It's possible to optimize count() given only partition predicates

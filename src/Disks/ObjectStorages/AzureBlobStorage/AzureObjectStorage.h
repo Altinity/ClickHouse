@@ -31,6 +31,8 @@ public:
         const String & object_namespace_,
         const String & description_);
 
+    bool supportsListObjectsCache() override { return true; }
+
     void listObjects(const std::string & path, RelativePathsWithMetadata & children, size_t max_keys) const override;
 
     ObjectStorageIteratorPtr iterate(const std::string & path_prefix, size_t max_keys) const override;
@@ -91,6 +93,8 @@ public:
         ContextPtr context) override;
 
     ObjectStorageKey generateObjectKeyForPath(const std::string & path, const std::optional<std::string> & key_prefix) const override;
+
+    bool areObjectKeysRandom() const override { return true; }
 
     bool isRemote() const override { return true; }
 

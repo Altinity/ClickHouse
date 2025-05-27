@@ -17,11 +17,17 @@
 #include <IO/SharedThreadPools.h>
 #include <Poco/Timestamp.h>
 #include <Common/Exception.h>
+#include <Common/FailPoint.h>
 #include <Common/SharedLockGuard.h>
 #include <Common/SharedMutex.h>
 #include <Common/logger_useful.h>
 #include <Common/setThreadName.h>
+#include <Common/thread_local_rng.h>
 #include "CommonPathPrefixKeyGenerator.h"
+
+#if USE_AZURE_BLOB_STORAGE
+#    include <azure/storage/common/storage_exception.hpp>
+#endif
 
 
 namespace DB
@@ -30,6 +36,11 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
+}
+
+namespace FailPoints
+{
+extern const char plain_rewritable_object_storage_azure_not_found_on_init[];
 }
 
 namespace
@@ -108,7 +119,6 @@ void loadDirectoryTree(
 
 std::shared_ptr<InMemoryDirectoryPathMap> loadPathPrefixMap(const std::string & metadata_key_prefix, ObjectStoragePtr object_storage)
 {
-    auto result = std::make_shared<InMemoryDirectoryPathMap>();
     using Map = InMemoryDirectoryPathMap::Map;
 
     ThreadPool & pool = getIOThreadPool().get();
@@ -157,8 +167,19 @@ std::shared_ptr<InMemoryDirectoryPathMap> loadPathPrefixMap(const std::string & 
                             return;
                         /// Assuming that local and the object storage clocks are synchronized.
                         last_modified = object_metadata->last_modified;
+#if USE_AZURE_BLOB_STORAGE
+                        fiu_do_on(FailPoints::plain_rewritable_object_storage_azure_not_found_on_init, {
+                            std::bernoulli_distribution fault(0.25);
+                            if (fault(thread_local_rng))
+                            {
+                                LOG_TEST(log, "Fault injection");
+                                throw Azure::Storage::StorageException::CreateFromResponse(std::make_unique<Azure::Core::Http::RawResponse>(
+                                    1, 0, Azure::Core::Http::HttpStatusCode::NotFound, "Fault injected"));
+                            }
+                        });
+#endif
                     }
-    #if USE_AWS_S3
+#if USE_AWS_S3
                     catch (const S3Exception & e)
                     {
                         /// It is ok if a directory was removed just now.
@@ -166,7 +187,15 @@ std::shared_ptr<InMemoryDirectoryPathMap> loadPathPrefixMap(const std::string & 
                             return;
                         throw;
                     }
-    #endif
+#endif
+#if USE_AZURE_BLOB_STORAGE
+                    catch (const Azure::Storage::StorageException & e)
+                    {
+                        if (e.StatusCode == Azure::Core::Http::HttpStatusCode::NotFound)
+                            return;
+                        throw;
+                    }
+#endif
                     catch (...)
                     {
                         throw;
@@ -176,13 +205,10 @@ std::shared_ptr<InMemoryDirectoryPathMap> loadPathPrefixMap(const std::string & 
                     chassert(remote_metadata_path.string().starts_with(metadata_key_prefix));
                     auto suffix = remote_metadata_path.string().substr(metadata_key_prefix.size());
                     auto rel_path = std::filesystem::path(std::move(suffix));
-                    std::pair<Map::iterator, bool> res;
-                    {
-                        std::lock_guard lock(mutex);
-                        res = map.emplace(
-                            std::filesystem::path(local_path).parent_path(),
-                            InMemoryDirectoryPathMap::RemotePathInfo{rel_path.parent_path(), last_modified.epochTime(), {}});
-                    }
+                    std::lock_guard lock(mutex);
+                    std::pair<Map::iterator, bool> res = map.emplace(
+                        std::filesystem::path(local_path).parent_path(),
+                        InMemoryDirectoryPathMap::RemotePathInfo{rel_path.parent_path(), last_modified.epochTime(), {}});
 
                     /// This can happen if table replication is enabled, then the same local path is written
                     /// in `prefix.path` of each replica.
@@ -207,12 +233,14 @@ std::shared_ptr<InMemoryDirectoryPathMap> loadPathPrefixMap(const std::string & 
     InMemoryDirectoryPathMap::FileNames unique_filenames;
     LOG_DEBUG(log, "Loaded metadata for {} files, found {} directories", num_files, map.size());
     loadDirectoryTree(map, unique_filenames, object_storage);
+
+    auto result = std::make_shared<InMemoryDirectoryPathMap>();
+    auto metric = object_storage->getMetadataStorageMetrics().directory_map_size;
     {
         std::lock_guard lock(result->mutex);
         result->map = std::move(map);
         result->unique_filenames = std::move(unique_filenames);
 
-        auto metric = object_storage->getMetadataStorageMetrics().directory_map_size;
         CurrentMetrics::add(metric, result->map.size());
     }
     return result;

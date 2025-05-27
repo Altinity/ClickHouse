@@ -81,6 +81,8 @@ public:
 
     ObjectStorageType getType() const override { return ObjectStorageType::S3; }
 
+    bool supportsListObjectsCache() override { return true; }
+
     bool exists(const StoredObject & object) const override;
 
     std::unique_ptr<ReadBufferFromFileBase> readObject( /// NOLINT
@@ -150,6 +152,8 @@ public:
     bool supportParallelWrite() const override { return true; }
 
     ObjectStorageKey generateObjectKeyForPath(const std::string & path, const std::optional<std::string> & key_prefix) const override;
+
+    bool areObjectKeysRandom() const override;
 
     bool isReadOnly() const override { return s3_settings.get()->read_only; }
 

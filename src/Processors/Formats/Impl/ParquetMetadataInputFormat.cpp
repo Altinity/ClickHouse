@@ -22,7 +22,16 @@
 #include <parquet/statistics.h>
 #include "ArrowBufferedStreams.h"
 #include <DataTypes/NestedUtils.h>
+#include <Core/Settings.h>
+#include <Common/ProfileEvents.h>
+#include <Processors/Formats/Impl/ParquetFileMetaDataCache.h>
 
+
+namespace ProfileEvents
+{
+extern const Event ParquetMetaDataCacheHits;
+extern const Event ParquetMetaDataCacheMisses;
+}
 
 namespace DB
 {
@@ -30,6 +39,11 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+}
+
+namespace Setting
+{
+extern const SettingsBool input_format_parquet_use_metadata_cache;
 }
 
 static NamesAndTypesList getHeaderForParquetMetadata()
@@ -76,6 +90,7 @@ static NamesAndTypesList getHeaderForParquetMetadata()
                  std::make_shared<DataTypeUInt64>(),
                  std::make_shared<DataTypeUInt64>(),
                  std::make_shared<DataTypeUInt64>(),
+                 std::make_shared<DataTypeUInt64>(),
                  std::make_shared<DataTypeArray>(
                      std::make_shared<DataTypeTuple>(
                          DataTypes{
@@ -92,10 +107,10 @@ static NamesAndTypesList getHeaderForParquetMetadata()
                                      std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>()),
                                      std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>())},
                                  Names{"num_values", "null_count", "distinct_count", "min", "max"}),
-                             DataTypeFactory::instance().get("Bool"),
+                             std::make_shared<DataTypeInt64>(),
                          },
-                         Names{"name", "path", "total_compressed_size", "total_uncompressed_size", "have_statistics", "statistics", "have_bloom_filter"}))},
-             Names{"num_columns", "num_rows", "total_uncompressed_size", "total_compressed_size", "columns"}))},
+                         Names{"name", "path", "total_compressed_size", "total_uncompressed_size", "have_statistics", "statistics", "bloom_filter_bytes"}))},
+             Names{"file_offset", "num_columns", "num_rows", "total_uncompressed_size", "total_compressed_size", "columns"}))},
     };
     return names_and_types;
 }
@@ -129,10 +144,35 @@ void checkHeader(const Block & header)
 static std::shared_ptr<parquet::FileMetaData> getFileMetadata(
     ReadBuffer & in,
     const FormatSettings & format_settings,
-    std::atomic<int> & is_stopped)
+    std::atomic<int> & is_stopped,
+    ParquetMetadataInputFormat::Cache metadata_cache)
 {
-    auto arrow_file = asArrowFile(in, format_settings, is_stopped, "Parquet", PARQUET_MAGIC_BYTES, /* avoid_buffering */ true);
-    return parquet::ReadMetaData(arrow_file);
+    // in-memory cache is not implemented for local file operations, only for remote files
+    // there is a chance the user sets `input_format_parquet_use_metadata_cache=1` for a local file operation
+    // and the cache_key won't be set. Therefore, we also need to check for metadata_cache.key
+    if (!metadata_cache.use_cache || metadata_cache.key.empty())
+    {
+        auto arrow_file = asArrowFile(in, format_settings, is_stopped, "Parquet", PARQUET_MAGIC_BYTES, /* avoid_buffering */ true);
+        return parquet::ReadMetaData(arrow_file);
+    }
+
+    auto [parquet_file_metadata, loaded] = ParquetFileMetaDataCache::instance()->getOrSet(
+        metadata_cache.key,
+        [&]()
+        {
+            auto arrow_file = asArrowFile(in, format_settings, is_stopped, "Parquet", PARQUET_MAGIC_BYTES, /* avoid_buffering */ true);
+            return parquet::ReadMetaData(arrow_file);
+        }
+    );
+
+    if (loaded)
+        ProfileEvents::increment(ProfileEvents::ParquetMetaDataCacheMisses);
+    else
+        ProfileEvents::increment(ProfileEvents::ParquetMetaDataCacheHits);
+
+    return parquet_file_metadata;
+
+
 }
 
 ParquetMetadataInputFormat::ParquetMetadataInputFormat(ReadBuffer & in_, Block header_, const FormatSettings & format_settings_)
@@ -147,7 +187,7 @@ Chunk ParquetMetadataInputFormat::read()
     if (done)
         return res;
 
-    auto metadata = getFileMetadata(*in, format_settings, is_stopped);
+    auto metadata = getFileMetadata(*in, format_settings, is_stopped, metadata_cache);
 
     const auto & header = getPort().getHeader();
     auto names_and_types = getHeaderForParquetMetadata();
@@ -313,16 +353,18 @@ void ParquetMetadataInputFormat::fillRowGroupsMetadata(const std::shared_ptr<par
     for (int32_t i = 0; i != metadata->num_row_groups(); ++i)
     {
         auto row_group_metadata = metadata->RowGroup(i);
+        /// file_offset
+        assert_cast<ColumnUInt64 &>(row_groups_column.getColumn(0)).insertValue(row_group_metadata->file_offset());
         /// num_columns
-        assert_cast<ColumnUInt64 &>(row_groups_column.getColumn(0)).insertValue(row_group_metadata->num_columns());
+        assert_cast<ColumnUInt64 &>(row_groups_column.getColumn(1)).insertValue(row_group_metadata->num_columns());
         /// num_rows
-        assert_cast<ColumnUInt64 &>(row_groups_column.getColumn(1)).insertValue(row_group_metadata->num_rows());
+        assert_cast<ColumnUInt64 &>(row_groups_column.getColumn(2)).insertValue(row_group_metadata->num_rows());
         /// total_uncompressed_size
-        assert_cast<ColumnUInt64 &>(row_groups_column.getColumn(2)).insertValue(row_group_metadata->total_byte_size());
+        assert_cast<ColumnUInt64 &>(row_groups_column.getColumn(3)).insertValue(row_group_metadata->total_byte_size());
         /// total_compressed_size
-        assert_cast<ColumnUInt64 &>(row_groups_column.getColumn(3)).insertValue(row_group_metadata->total_compressed_size());
+        assert_cast<ColumnUInt64 &>(row_groups_column.getColumn(4)).insertValue(row_group_metadata->total_compressed_size());
         /// columns
-        fillColumnChunksMetadata(row_group_metadata, row_groups_column.getColumn(4));
+        fillColumnChunksMetadata(row_group_metadata, row_groups_column.getColumn(5));
     }
     row_groups_array_column.getOffsets().push_back(row_groups_column.size());
 }
@@ -351,8 +393,7 @@ void ParquetMetadataInputFormat::fillColumnChunksMetadata(const std::unique_ptr<
             fillColumnStatistics(column_chunk_metadata->statistics(), tuple_column.getColumn(5), row_group_metadata->schema()->Column(column_i)->type_length());
         else
             tuple_column.getColumn(5).insertDefault();
-        bool have_bloom_filter = column_chunk_metadata->bloom_filter_offset().has_value();
-        assert_cast<ColumnUInt8 &>(tuple_column.getColumn(6)).insertValue(have_bloom_filter);
+        assert_cast<ColumnInt64 &>(tuple_column.getColumn(6)).insertValue(column_chunk_metadata->bloom_filter_length().value_or(0));
     }
     array_column.getOffsets().push_back(tuple_column.size());
 }
@@ -484,6 +525,12 @@ void ParquetMetadataInputFormat::resetParser()
 {
     IInputFormat::resetParser();
     done = false;
+}
+
+void ParquetMetadataInputFormat::setStorageRelatedUniqueKey(const Settings & settings, const String & key_)
+{
+    metadata_cache.key = key_;
+    metadata_cache.use_cache = settings[Setting::input_format_parquet_use_metadata_cache];
 }
 
 ParquetMetadataSchemaReader::ParquetMetadataSchemaReader(ReadBuffer & in_)

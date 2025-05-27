@@ -79,10 +79,22 @@ def wait_rabbitmq_to_start(rabbitmq_docker_id, cookie, timeout=180):
             time.sleep(0.5)
 
 
-def kill_rabbitmq(rabbitmq_id):
-    p = subprocess.Popen(("docker", "stop", rabbitmq_id), stdout=subprocess.PIPE)
-    p.wait(timeout=60)
-    return p.returncode == 0
+def kill_rabbitmq(rabbitmq_id, rabbitmq_cookie):
+    try:
+        p = subprocess.Popen(("docker", "stop", rabbitmq_id), stdout=subprocess.PIPE)
+        p.wait(timeout=30)
+        return p.returncode == 0
+    except Exception as ex:
+        print("Exception stopping rabbit MQ, will try forcefully", ex)
+        try:
+            p = subprocess.Popen(
+                ("docker", "stop", "-s", "9", rabbitmq_id), stdout=subprocess.PIPE
+            )
+            p.wait(timeout=30)
+            return p.returncode == 0
+        except Exception as e:
+            print("Exception stopping rabbit MQ forcefully", e)
+            revive_rabbitmq(rabbitmq_id, rabbitmq_cookie)
 
 
 def revive_rabbitmq(rabbitmq_id, cookie):
@@ -2183,7 +2195,7 @@ def test_rabbitmq_restore_failed_connection_without_losses_1(rabbitmq_cluster):
     else:
         pytest.fail(f"Time limit of 180 seconds reached. The count is still 0.")
 
-    kill_rabbitmq(rabbitmq_cluster.rabbitmq_docker_id)
+    kill_rabbitmq(rabbitmq_cluster.rabbitmq_docker_id, rabbitmq_cluster.rabbitmq_cookie)
     time.sleep(4)
     revive_rabbitmq(
         rabbitmq_cluster.rabbitmq_docker_id, rabbitmq_cluster.rabbitmq_cookie
@@ -2270,7 +2282,7 @@ def test_rabbitmq_restore_failed_connection_without_losses_2(rabbitmq_cluster):
     else:
         pytest.fail(f"Time limit of 180 seconds reached. The count is still 0.")
 
-    kill_rabbitmq(rabbitmq_cluster.rabbitmq_docker_id)
+    kill_rabbitmq(rabbitmq_cluster.rabbitmq_docker_id, rabbitmq_cluster.rabbitmq_cookie)
     time.sleep(8)
     revive_rabbitmq(
         rabbitmq_cluster.rabbitmq_docker_id, rabbitmq_cluster.rabbitmq_cookie
@@ -3490,11 +3502,11 @@ def test_block_based_formats_1(rabbitmq_cluster):
 
     data = []
     for message in insert_messages:
-        splitted = message.split("\n")
-        assert splitted[0] == " \x1b[1mkey\x1b[0m   \x1b[1mvalue\x1b[0m"
-        assert splitted[1] == ""
-        assert splitted[-1] == ""
-        data += [line.split() for line in splitted[2:-1]]
+        split = message.split("\n")
+        assert split[0] == " \x1b[1mkey\x1b[0m   \x1b[1mvalue\x1b[0m"
+        assert split[1] == ""
+        assert split[-1] == ""
+        data += [line.split() for line in split[2:-1]]
 
     assert data == [
         ["0", "0"],
@@ -4081,3 +4093,62 @@ def test_rabbitmq_reject_broken_messages(rabbitmq_cluster):
         i += 2
 
     connection.close()
+
+
+def test_rabbitmq_json_type(rabbitmq_cluster):
+    instance.query(
+        """
+        SET allow_experimental_json_type=1;
+        CREATE TABLE test.rabbitmq (data JSON)
+            ENGINE = RabbitMQ
+            SETTINGS rabbitmq_host_port = 'rabbitmq1:5672',
+                     rabbitmq_exchange_name = 'json_type',
+                     rabbitmq_format = 'JSONAsObject',
+                     rabbitmq_commit_on_select = 1,
+                     rabbitmq_flush_interval_ms=1000,
+                     rabbitmq_max_block_size=100,
+                     rabbitmq_queue_base = 'json_type',
+                     rabbitmq_row_delimiter = '\\n';
+        CREATE TABLE test.view (a Int64)
+            ENGINE = MergeTree()
+            ORDER BY a;
+        CREATE MATERIALIZED VIEW test.consumer TO test.view AS
+            SELECT data.a::Int64 as a FROM test.rabbitmq;
+        """
+    )
+
+    credentials = pika.PlainCredentials("root", "clickhouse")
+    parameters = pika.ConnectionParameters(
+        rabbitmq_cluster.rabbitmq_ip, rabbitmq_cluster.rabbitmq_port, "/", credentials
+    )
+    connection = pika.BlockingConnection(parameters)
+    channel = connection.channel()
+
+    messages = [
+        '{"a" : 1}',
+        '{"a" : 2}',
+    ]
+
+    for message in messages:
+        channel.basic_publish(exchange="json_type", routing_key="", body=message)
+    connection.close()
+
+    while int(instance.query("SELECT count() FROM test.view")) < 2:
+        time.sleep(1)
+
+    result = instance.query("SELECT * FROM test.view ORDER BY a;")
+
+    expected = """\
+1
+2
+"""
+
+    assert TSV(result) == TSV(expected)
+
+    instance.query(
+        """
+        DROP TABLE test.view;
+        DROP TABLE test.consumer;
+        DROP TABLE test.rabbitmq;
+    """
+    )
