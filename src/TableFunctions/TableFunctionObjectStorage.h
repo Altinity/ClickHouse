@@ -5,6 +5,7 @@
 #include <Storages/ObjectStorage/DataLakes/DataLakeConfiguration.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSettings.h>
+#include <Storages/ObjectStorage/DataLakes/DataLakeStorageSettings.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <TableFunctions/ITableFunction.h>
 
@@ -107,11 +108,15 @@ struct HudiDefinition
     static constexpr auto storage_type_name = "S3";
 };
 
-template <typename Definition, typename Configuration>
+template <typename Definition, typename Configuration, bool is_data_lake = false>
 class TableFunctionObjectStorage : public ITableFunction
 {
 public:
     static constexpr auto name = Definition::name;
+    using Settings = typename std::conditional_t<
+        is_data_lake,
+        DataLakeStorageSettings,
+        StorageObjectStorageSettings>;
 
     String getName() const override { return name; }
 
@@ -134,7 +139,7 @@ public:
 
     virtual void parseArgumentsImpl(ASTs & args, const ContextPtr & context)
     {
-        getConfiguration()->initialize(args, context, true, settings);
+        getConfiguration()->initialize(args, context, true);
     }
 
     static void updateStructureAndFormatArgumentsIfNeeded(
@@ -143,7 +148,10 @@ public:
       const String & format,
       const ContextPtr & context)
     {
-        Configuration().addStructureAndFormatToArgsIfNeeded(args, structure, format, context, /*with_structure=*/true);
+        if constexpr (is_data_lake)
+            Configuration(createEmptySettings()).addStructureAndFormatToArgsIfNeeded(args, structure, format, context, /*with_structure=*/true);
+        else
+            Configuration().addStructureAndFormatToArgsIfNeeded(args, structure, format, context, /*with_structure=*/true);
     }
 
 protected:
@@ -164,10 +172,12 @@ protected:
     ObjectStoragePtr getObjectStorage(const ContextPtr & context, bool create_readonly) const;
     ConfigurationPtr getConfiguration() const;
 
+    static std::shared_ptr<Settings> createEmptySettings();
+
     mutable ConfigurationPtr configuration;
     mutable ObjectStoragePtr object_storage;
     ColumnsDescription structure_hint;
-    std::shared_ptr<StorageObjectStorageSettings> settings;
+    std::shared_ptr<Settings> settings;
 
     std::vector<size_t> skipAnalysisForArguments(const QueryTreeNodePtr & query_node_table_function, ContextPtr context) const override;
 };
@@ -191,20 +201,20 @@ using TableFunctionLocal = TableFunctionObjectStorage<LocalDefinition, StorageLo
 using TableFunctionIceberg = TableFunctionObjectStorage<IcebergDefinition, StorageIcebergConfiguration>;
 
 #    if USE_AWS_S3
-using TableFunctionIcebergS3 = TableFunctionObjectStorage<IcebergS3Definition, StorageS3IcebergConfiguration>;
+using TableFunctionIcebergS3 = TableFunctionObjectStorage<IcebergS3Definition, StorageS3IcebergConfiguration, true>;
 #    endif
 #    if USE_AZURE_BLOB_STORAGE
-using TableFunctionIcebergAzure = TableFunctionObjectStorage<IcebergAzureDefinition, StorageAzureIcebergConfiguration>;
+using TableFunctionIcebergAzure = TableFunctionObjectStorage<IcebergAzureDefinition, StorageAzureIcebergConfiguration, true>;
 #    endif
 #    if USE_HDFS
-using TableFunctionIcebergHDFS = TableFunctionObjectStorage<IcebergHDFSDefinition, StorageHDFSIcebergConfiguration>;
+using TableFunctionIcebergHDFS = TableFunctionObjectStorage<IcebergHDFSDefinition, StorageHDFSIcebergConfiguration, true>;
 #    endif
-using TableFunctionIcebergLocal = TableFunctionObjectStorage<IcebergLocalDefinition, StorageLocalIcebergConfiguration>;
+using TableFunctionIcebergLocal = TableFunctionObjectStorage<IcebergLocalDefinition, StorageLocalIcebergConfiguration, true>;
 #endif
 #if USE_AWS_S3
 #    if USE_PARQUET && USE_DELTA_KERNEL_RS
-using TableFunctionDeltaLake = TableFunctionObjectStorage<DeltaLakeDefinition, StorageS3DeltaLakeConfiguration>;
+using TableFunctionDeltaLake = TableFunctionObjectStorage<DeltaLakeDefinition, StorageS3DeltaLakeConfiguration, true>;
 #    endif
-using TableFunctionHudi = TableFunctionObjectStorage<HudiDefinition, StorageS3HudiConfiguration>;
+using TableFunctionHudi = TableFunctionObjectStorage<HudiDefinition, StorageS3HudiConfiguration, true>;
 #endif
 }

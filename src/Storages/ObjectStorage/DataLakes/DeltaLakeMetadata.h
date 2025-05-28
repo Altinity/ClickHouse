@@ -15,11 +15,6 @@
 
 namespace DB
 {
-namespace StorageObjectStorageSetting
-{
-extern const StorageObjectStorageSettingsBool allow_experimental_delta_kernel_rs;
-extern const StorageObjectStorageSettingsBool delta_lake_read_schema_same_as_table_schema;
-}
 
 struct DeltaLakePartitionColumn
 {

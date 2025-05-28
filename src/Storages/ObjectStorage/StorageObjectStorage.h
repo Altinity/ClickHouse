@@ -9,8 +9,10 @@
 #include <Common/threadPoolCallbackRunner.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Storages/ColumnsDescription.h>
+#include <Storages/ObjectStorage/DataLakes/DataLakeStorageSettings.h>
 
 #include <memory>
+
 namespace DB
 {
 
@@ -176,8 +178,7 @@ public:
     virtual void initialize(
         ASTs & engine_args,
         ContextPtr local_context,
-        bool with_table_structure,
-        StorageObjectStorageSettingsPtr settings);
+        bool with_table_structure);
 
     /// Storage type: s3, hdfs, azure, local.
     virtual ObjectStorageType getType() const = 0;
@@ -260,7 +261,10 @@ public:
     virtual void update(ObjectStoragePtr object_storage, ContextPtr local_context);
     virtual void updateIfRequired(ObjectStoragePtr object_storage, ContextPtr local_context);
 
-    const StorageObjectStorageSettings & getSettingsRef() const;
+    virtual const DataLakeStorageSettings & getDataLakeSettings() const
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method getDataLakeSettings() is not implemented for configuration type {}", getTypeName());
+    }
 
     /// Create arguments for table function with path and access parameters
     virtual ASTPtr createArgsWithAccessData() const
@@ -291,8 +295,6 @@ private:
 
     bool initialized = false;
     std::atomic<bool> updated = false;
-
-    StorageObjectStorageSettingsPtr storage_settings;
 };
 
 }

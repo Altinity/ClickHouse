@@ -7,11 +7,11 @@
 #include <Storages/ObjectStorage/DataLakes/HudiMetadata.h>
 #include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
+#include <Storages/ObjectStorage/DataLakes/DataLakeStorageSettings.h>
 #include <Storages/ObjectStorage/HDFS/Configuration.h>
 #include <Storages/ObjectStorage/Local/Configuration.h>
 #include <Storages/ObjectStorage/S3/Configuration.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
-#include <Storages/ObjectStorage/StorageObjectStorageSettings.h>
 #include <Storages/StorageFactory.h>
 #include <Common/logger_useful.h>
 #include <Storages/ColumnsDescription.h>
@@ -33,13 +33,13 @@ namespace DB
 
 namespace ErrorCodes
 {
-extern const int FORMAT_VERSION_TOO_OLD;
-extern const int LOGICAL_ERROR;
+    extern const int FORMAT_VERSION_TOO_OLD;
+    extern const int LOGICAL_ERROR;
 }
 
-namespace StorageObjectStorageSetting
+namespace DataLakeStorageSetting
 {
-extern const StorageObjectStorageSettingsBool allow_dynamic_metadata_for_data_lakes;
+    extern DataLakeStorageSettingsBool allow_dynamic_metadata_for_data_lakes;
 }
 
 
@@ -52,7 +52,11 @@ class DataLakeConfiguration : public BaseStorageConfiguration, public std::enabl
 public:
     using Configuration = StorageObjectStorage::Configuration;
 
+    explicit DataLakeConfiguration(DataLakeStorageSettingsPtr settings_) : settings(settings_) {}
+
     bool isDataLakeConfiguration() const override { return true; }
+
+    const DataLakeStorageSettings & getDataLakeSettings() const override { return *settings; }
 
     std::string getEngineName() const override { return DataLakeMetadata::name + BaseStorageConfiguration::getEngineName(); }
 
@@ -119,7 +123,7 @@ public:
 
     bool hasExternalDynamicMetadata() override
     {
-        return BaseStorageConfiguration::getSettingsRef()[StorageObjectStorageSetting::allow_dynamic_metadata_for_data_lakes]
+        return (*settings)[DataLakeStorageSetting::allow_dynamic_metadata_for_data_lakes]
             && current_metadata
             && current_metadata->supportsExternalMetadataChange();
     }
@@ -162,6 +166,7 @@ public:
 private:
     DataLakeMetadataPtr current_metadata;
     LoggerPtr log = getLogger("DataLakeConfiguration");
+    const DataLakeStorageSettingsPtr settings;
 
     ReadFromFormatInfo prepareReadingFromFormat(
         ObjectStoragePtr object_storage,
@@ -284,6 +289,9 @@ class StorageIcebergConfiguration : public StorageObjectStorage::Configuration, 
     friend class StorageObjectStorage::Configuration;
 
 public:
+    StorageIcebergConfiguration() = default;
+    explicit StorageIcebergConfiguration(DataLakeStorageSettingsPtr settings_) : settings(settings_) {}
+
     ObjectStorageType getType() const override { return getImpl().getType(); }
 
     std::string getTypeName() const override { return getImpl().getTypeName(); }
@@ -373,11 +381,10 @@ public:
     void initialize(
         ASTs & engine_args,
         ContextPtr local_context,
-        bool with_table_structure,
-        std::shared_ptr<StorageObjectStorageSettings> settings) override
+        bool with_table_structure) override
     {
         createDynamicConfiguration(engine_args, local_context);
-        getImpl().initialize(engine_args, local_context, with_table_structure, settings);
+        getImpl().initialize(engine_args, local_context, with_table_structure);
     }
 
     ASTPtr createArgsWithAccessData() const override
@@ -506,21 +513,21 @@ private:
         {
 #    if USE_AWS_S3
             case ObjectStorageType::S3:
-                impl = std::make_unique<StorageS3IcebergConfiguration>();
+                impl = std::make_unique<StorageS3IcebergConfiguration>(settings);
                 break;
 #    endif
 #    if USE_AZURE_BLOB_STORAGE
             case ObjectStorageType::Azure:
-                impl = std::make_unique<StorageAzureIcebergConfiguration>();
+                impl = std::make_unique<StorageAzureIcebergConfiguration>(settings);
                 break;
 #    endif
 #    if USE_HDFS
             case ObjectStorageType::HDFS:
-                impl = std::make_unique<StorageHDFSIcebergConfiguration>();
+                impl = std::make_unique<StorageHDFSIcebergConfiguration>(settings);
                 break;
 #    endif
             case ObjectStorageType::Local:
-                impl = std::make_unique<StorageLocalIcebergConfiguration>();
+                impl = std::make_unique<StorageLocalIcebergConfiguration>(settings);
                 break;
             default:
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Unsuported DataLake storage {}", type);
@@ -528,6 +535,7 @@ private:
     }
 
     std::shared_ptr<StorageObjectStorage::Configuration> impl;
+    DataLakeStorageSettingsPtr settings;
 };
 #endif
 

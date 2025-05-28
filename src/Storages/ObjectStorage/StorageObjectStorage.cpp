@@ -607,8 +607,7 @@ SchemaCache & StorageObjectStorage::getSchemaCache(const ContextPtr & context, c
 void StorageObjectStorage::Configuration::initialize(
     ASTs & engine_args,
     ContextPtr local_context,
-    bool with_table_structure,
-    StorageObjectStorageSettingsPtr settings)
+    bool with_table_structure)
 {
     if (auto named_collection = tryGetNamedCollectionWithOverrides(engine_args, local_context))
         fromNamedCollection(*named_collection, local_context);
@@ -632,13 +631,7 @@ void StorageObjectStorage::Configuration::initialize(
     else
         FormatFactory::instance().checkFormatName(format);
 
-    storage_settings = settings;
     initialized = true;
-}
-
-const StorageObjectStorageSettings & StorageObjectStorage::Configuration::getSettingsRef() const
-{
-    return *storage_settings;
 }
 
 void StorageObjectStorage::Configuration::check(ContextPtr) const

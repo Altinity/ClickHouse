@@ -307,11 +307,9 @@ private:
 TableSnapshot::TableSnapshot(
     KernelHelperPtr helper_,
     DB::ObjectStoragePtr object_storage_,
-    bool read_schema_same_as_table_schema_,
     LoggerPtr log_)
     : helper(helper_)
     , object_storage(object_storage_)
-    , read_schema_same_as_table_schema(read_schema_same_as_table_schema_)
     , log(log_)
 {
 }

@@ -15,6 +15,7 @@
 #include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
 #include <Storages/ObjectStorage/DataLakes/Common.h>
+#include <Storages/ObjectStorage/DataLakes/DataLakeConfiguration.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSource.h>
 
 #include <Processors/Formats/Impl/ArrowBufferedStreams.h>
@@ -54,6 +55,12 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
 }
+
+namespace Setting
+{
+    extern const SettingsBool allow_experimental_delta_kernel_rs;
+}
+
 
 namespace
 {
