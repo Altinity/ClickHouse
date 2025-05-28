@@ -41,6 +41,8 @@ def get_additional_envs(
     if "analyzer" in check_name:
         result.append("USE_OLD_ANALYZER=1")
 
+    result.append("NUM_TRIES=3")
+
     if run_by_hash_total != 0:
         result.append(f"RUN_BY_HASH_NUM={run_by_hash_num}")
         result.append(f"RUN_BY_HASH_TOTAL={run_by_hash_total}")

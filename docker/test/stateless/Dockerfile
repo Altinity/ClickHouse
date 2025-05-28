@@ -64,7 +64,7 @@ RUN mkdir -p /tmp/clickhouse-odbc-tmp \
 ENV TZ=Europe/Amsterdam
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-ENV NUM_TRIES=3
+ENV NUM_TRIES=1
 ENV MAX_RUN_TIME=0
 
 # Unrelated to vars in setup_minio.sh, but should be the same there
