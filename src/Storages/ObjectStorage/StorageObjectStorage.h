@@ -134,7 +134,7 @@ public:
 
     static std::pair<ColumnsDescription, std::string> resolveSchemaAndFormatFromData(
         const ObjectStoragePtr & object_storage,
-        const ConfigurationPtr & configuration,
+        ConfigurationPtr & configuration,
         const std::optional<FormatSettings> & format_settings,
         std::string & sample_path,
         const ContextPtr & context);
@@ -189,8 +189,7 @@ public:
     using Paths = std::vector<Path>;
 
     /// Initialize configuration from either AST or NamedCollection.
-    static void initialize(
-        Configuration & configuration_to_initialize,
+    virtual void initialize(
         ASTs & engine_args,
         ContextPtr local_context,
         bool with_table_structure);
@@ -285,14 +284,32 @@ public:
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method getDataLakeSettings() is not implemented for configuration type {}", getTypeName());
     }
 
+    /// Create arguments for table function with path and access parameters
+    virtual ASTPtr createArgsWithAccessData() const
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method createArgsWithAccessData is not supported by storage {}", getEngineName());
+    }
+
+    virtual void fromNamedCollection(const NamedCollection & collection, ContextPtr context) = 0;
+    virtual void fromAST(ASTs & args, ContextPtr context, bool with_structure) = 0;
+
+    virtual ObjectStorageType extractDynamicStorageType(ASTs & /* args */, ContextPtr /* context */, ASTPtr * /* type_arg */ = nullptr) const
+    { return ObjectStorageType::None; }
+
+    virtual const String & getFormat() const { return format; }
+    virtual const String & getCompressionMethod() const { return compression_method; }
+    virtual const String & getStructure() const { return structure; }
+
+    virtual void setFormat(const String & format_) { format = format_; }
+    virtual void setCompressionMethod(const String & compression_method_) { compression_method = compression_method_; }
+    virtual void setStructure(const String & structure_) { structure = structure_; }
+
+private:
     String format = "auto";
     String compression_method = "auto";
     String structure = "auto";
 
 protected:
-    virtual void fromNamedCollection(const NamedCollection & collection, ContextPtr context) = 0;
-    virtual void fromAST(ASTs & args, ContextPtr context, bool with_structure) = 0;
-
     void assertInitialized() const;
 
     bool initialized = false;

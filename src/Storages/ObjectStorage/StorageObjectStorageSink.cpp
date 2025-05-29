@@ -33,7 +33,7 @@ StorageObjectStorageSink::StorageObjectStorageSink(
     , sample_block(sample_block_)
 {
     const auto & settings = context->getSettingsRef();
-    const auto chosen_compression_method = chooseCompressionMethod(path, configuration->compression_method);
+    const auto chosen_compression_method = chooseCompressionMethod(path, configuration->getCompressionMethod());
 
     auto buffer = object_storage->writeObject(
         StoredObject(path), WriteMode::Rewrite, std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());
@@ -45,7 +45,7 @@ StorageObjectStorageSink::StorageObjectStorageSink(
         static_cast<int>(settings[Setting::output_format_compression_zstd_window_log]));
 
     writer = FormatFactory::instance().getOutputFormatParallelIfPossible(
-        configuration->format, *write_buf, sample_block, context, format_settings_);
+        configuration->getFormat(), *write_buf, sample_block, context, format_settings_);
 }
 
 void StorageObjectStorageSink::consume(Chunk & chunk)
