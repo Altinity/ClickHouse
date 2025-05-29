@@ -93,7 +93,9 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
     metadata.setColumns(columns);
     metadata.setConstraints(constraints_);
 
-    if (sample_path.empty() && context_->getSettingsRef()[Setting::use_hive_partitioning])
+    if (sample_path.empty()
+            && context_->getSettingsRef()[Setting::use_hive_partitioning]
+            && !configuration->withPartitionWildcard())
         sample_path = getPathSample(metadata, context_);
 
     setVirtuals(VirtualColumnUtils::getVirtualsForFileLikeStorage(metadata.columns, context_, sample_path));
@@ -365,7 +367,7 @@ RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExten
 {
     auto iterator = StorageObjectStorageSource::createFileIterator(
         configuration, configuration->getQuerySettings(local_context), object_storage, /* distributed_processing */false,
-        local_context, predicate, {}, virtual_columns, nullptr, local_context->getFileProgressCallback(), /*ignore_archive_globs=*/true);
+        local_context, predicate, {}, getVirtualsList(), nullptr, local_context->getFileProgressCallback(), /*ignore_archive_globs=*/true);
 
     std::vector<std::string> ids_of_hosts;
     for (const auto & shard : cluster->getShardsInfo())

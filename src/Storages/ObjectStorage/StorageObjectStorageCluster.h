@@ -107,7 +107,6 @@ private:
     const String engine_name;
     StorageObjectStorage::ConfigurationPtr configuration;
     const ObjectStoragePtr object_storage;
-    NamesAndTypesList virtual_columns;
     bool cluster_name_in_settings;
 
     /// non-clustered storage to fall back on pure realisation if needed
