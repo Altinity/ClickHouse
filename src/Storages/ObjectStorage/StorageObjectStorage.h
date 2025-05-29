@@ -128,7 +128,7 @@ public:
 
     static std::pair<ColumnsDescription, std::string> resolveSchemaAndFormatFromData(
         const ObjectStoragePtr & object_storage,
-        const ConfigurationPtr & configuration,
+        ConfigurationPtr & configuration,
         const std::optional<FormatSettings> & format_settings,
         std::string & sample_path,
         const ContextPtr & context);
@@ -168,8 +168,7 @@ public:
     using Path = std::string;
     using Paths = std::vector<Path>;
 
-    static void initialize(
-        Configuration & configuration_to_initialize,
+    virtual void initialize(
         ASTs & engine_args,
         ContextPtr local_context,
         bool with_table_structure,
@@ -248,21 +247,40 @@ public:
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method iterate() is not implemented for configuration type {}", getTypeName());
     }
 
+    virtual void update(ObjectStoragePtr object_storage, ContextPtr local_context);
+    void updateIfRequired(ObjectStoragePtr object_storage, ContextPtr local_context);
+
+    const StorageObjectStorageSettings & getSettingsRef() const;
+
+    /// Create arguments for table function with path and access parameters
+    virtual ASTPtr createArgsWithAccessData() const
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method createArgsWithAccessData is not supported by storage {}", getEngineName());
+    }
+
+    virtual void fromNamedCollection(const NamedCollection & collection, ContextPtr context) = 0;
+    virtual void fromAST(ASTs & args, ContextPtr context, bool with_structure) = 0;
+
+    virtual ObjectStorageType extractDynamicStorageType(ASTs & /* args */, ContextPtr /* context */, ASTPtr * /* type_arg */ = nullptr) const
+    { return ObjectStorageType::None; }
+
+    void assertInitialized() const;
+
+    virtual const String & getFormat() const { return format; }
+    virtual const String & getCompressionMethod() const { return compression_method; }
+    virtual const String & getStructure() const { return structure; }
+
+    virtual void setFormat(const String & format_) { format = format_; }
+    virtual void setCompressionMethod(const String & compression_method_) { compression_method = compression_method_; }
+    virtual void setStructure(const String & structure_) { structure = structure_; }
+
+private:
     String format = "auto";
     String compression_method = "auto";
     String structure = "auto";
 
-    virtual void update(ObjectStoragePtr object_storage, ContextPtr local_context);
-
-    const StorageObjectStorageSettings & getSettingsRef() const;
-
-protected:
-    virtual void fromNamedCollection(const NamedCollection & collection, ContextPtr context) = 0;
-    virtual void fromAST(ASTs & args, ContextPtr context, bool with_structure) = 0;
-
-    void assertInitialized() const;
-
     bool initialized = false;
+    std::atomic<bool> updated = false;
 
     StorageObjectStorageSettingsPtr storage_settings;
 };

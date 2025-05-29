@@ -39,6 +39,12 @@ namespace Setting
     extern const SettingsBool parallel_replicas_local_plan;
     extern const SettingsString cluster_for_parallel_replicas;
     extern const SettingsNonZeroUInt64 max_parallel_replicas;
+    extern const SettingsUInt64 object_storage_max_nodes;
+}
+
+namespace ErrorCodes
+{
+    extern const int NOT_IMPLEMENTED;
 }
 
 IStorageCluster::IStorageCluster(
@@ -112,7 +118,7 @@ void ReadFromCluster::createExtension(const ActionsDAG::Node * predicate)
     if (extension)
         return;
 
-    extension = storage->getTaskIteratorExtension(predicate, context);
+    extension = storage->getTaskIteratorExtension(predicate, context, cluster);
 }
 
 /// The code executes on initiator
@@ -123,13 +129,21 @@ void IStorageCluster::read(
     SelectQueryInfo & query_info,
     ContextPtr context,
     QueryProcessingStage::Enum processed_stage,
-    size_t /*max_block_size*/,
-    size_t /*num_streams*/)
+    size_t max_block_size,
+    size_t num_streams)
 {
+    auto cluster_name_from_settings = getClusterName(context);
+
+    if (cluster_name_from_settings.empty())
+    {
+        readFallBackToPure(query_plan, column_names, storage_snapshot, query_info, context, processed_stage, max_block_size, num_streams);
+        return;
+    }
+
     storage_snapshot->check(column_names);
 
     updateBeforeRead(context);
-    auto cluster = getCluster(context);
+    auto cluster = getClusterImpl(context, cluster_name_from_settings, context->getSettingsRef()[Setting::object_storage_max_nodes]);
 
     /// Calculate the header. This is significant, because some columns could be thrown away in some cases like query with count(*)
 
@@ -176,10 +190,22 @@ void IStorageCluster::read(
     query_plan.addStep(std::move(reading));
 }
 
+SinkToStoragePtr IStorageCluster::write(
+    const ASTPtr & query,
+    const StorageMetadataPtr & metadata_snapshot,
+    ContextPtr context,
+    bool async_insert)
+{
+    auto cluster_name_from_settings = getClusterName(context);
+
+    if (cluster_name_from_settings.empty())
+        return writeFallBackToPure(query, metadata_snapshot, context, async_insert);
+
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method write is not supported by storage {}", getName());
+}
+
 void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
 {
-    createExtension(nullptr);
-
     const Scalars & scalars = context->hasQueryContext() ? context->getQueryContext()->getScalars() : Scalars{};
     const bool add_agg_info = processed_stage == QueryProcessingStage::WithMergeableState;
 
@@ -191,6 +217,10 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
     auto max_replicas_to_use = static_cast<UInt64>(cluster->getShardsInfo().size());
     if (current_settings[Setting::max_parallel_replicas] > 1)
         max_replicas_to_use = std::min(max_replicas_to_use, current_settings[Setting::max_parallel_replicas].value);
+
+    size_t replica_index = 0;
+
+    createExtension(nullptr);
 
     for (const auto & shard_info : cluster->getShardsInfo())
     {
@@ -209,6 +239,8 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
         if (try_results.empty())
             continue;
 
+        IConnections::ReplicaInfo replica_info{ .number_of_current_replica = replica_index++ };
+
         auto remote_query_executor = std::make_shared<RemoteQueryExecutor>(
             std::vector<IConnectionPool::Entry>{try_results.front()},
             query_to_send->formatWithSecretsOneLine(),
@@ -218,7 +250,7 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
             scalars,
             Tables(),
             processed_stage,
-            extension);
+            RemoteQueryExecutor::Extension{.task_iterator = extension->task_iterator, .replica_info = std::move(replica_info)});
 
         remote_query_executor->setLogger(log);
         pipes.emplace_back(std::make_shared<RemoteSource>(
@@ -262,9 +294,9 @@ ContextPtr ReadFromCluster::updateSettings(const Settings & settings)
     return new_context;
 }
 
-ClusterPtr IStorageCluster::getCluster(ContextPtr context) const
+ClusterPtr IStorageCluster::getClusterImpl(ContextPtr context, const String & cluster_name_, size_t max_hosts)
 {
-    return context->getCluster(cluster_name)->getClusterWithReplicasAsShards(context->getSettingsRef());
+    return context->getCluster(cluster_name_)->getClusterWithReplicasAsShards(context->getSettingsRef(), /* max_replicas_from_shard */ 0, max_hosts);
 }
 
 }

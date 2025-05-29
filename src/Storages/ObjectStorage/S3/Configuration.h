@@ -97,6 +97,8 @@ public:
         ContextPtr context,
         bool with_structure) override;
 
+    ASTPtr createArgsWithAccessData() const override;
+
 private:
     void extractExtraCreds(ASTs & args, ContextPtr context);
     void fromNamedCollection(const NamedCollection & collection, ContextPtr context) override;

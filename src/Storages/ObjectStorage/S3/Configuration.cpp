@@ -79,7 +79,8 @@ static const std::unordered_set<std::string_view> optional_configuration_keys = 
     "max_single_part_upload_size",
     "max_connections",
     "expiration_window_seconds",
-    "no_sign_request"
+    "no_sign_request",
+    "storage_type",
 };
 
 String StorageS3Configuration::getDataSourceDescription() const
@@ -185,9 +186,9 @@ void StorageS3Configuration::fromNamedCollection(const NamedCollection & collect
     auth_settings[S3AuthSetting::expiration_window_seconds] = collection.getOrDefault<UInt64>("expiration_window_seconds", S3::DEFAULT_EXPIRATION_WINDOW_SECONDS);
     auth_settings[S3AuthSetting::session_token] = collection.getOrDefault<String>("session_token", "");
 
-    format = collection.getOrDefault<String>("format", format);
-    compression_method = collection.getOrDefault<String>("compression_method", collection.getOrDefault<String>("compression", "auto"));
-    structure = collection.getOrDefault<String>("structure", "auto");
+    setFormat(collection.getOrDefault<String>("format", getFormat()));
+    setCompressionMethod(collection.getOrDefault<String>("compression_method", collection.getOrDefault<String>("compression", "auto")));
+    setStructure(collection.getOrDefault<String>("structure", "auto"));
 
     request_settings = S3::S3RequestSettings(collection, settings, /* validate_settings */true);
 
@@ -428,18 +429,18 @@ void StorageS3Configuration::fromAST(ASTs & args, ContextPtr context, bool with_
 
     if (engine_args_to_idx.contains("format"))
     {
-        format = checkAndGetLiteralArgument<String>(args[engine_args_to_idx["format"]], "format");
+        auto format_ = checkAndGetLiteralArgument<String>(args[engine_args_to_idx["format"]], "format");
         /// Set format to configuration only of it's not 'auto',
         /// because we can have default format set in configuration.
-        if (format != "auto")
-            format = format;
+        if (format_ != "auto")
+            setFormat(format_);
     }
 
     if (engine_args_to_idx.contains("structure"))
-        structure = checkAndGetLiteralArgument<String>(args[engine_args_to_idx["structure"]], "structure");
+        setStructure(checkAndGetLiteralArgument<String>(args[engine_args_to_idx["structure"]], "structure"));
 
     if (engine_args_to_idx.contains("compression_method"))
-        compression_method = checkAndGetLiteralArgument<String>(args[engine_args_to_idx["compression_method"]], "compression_method");
+        setCompressionMethod(checkAndGetLiteralArgument<String>(args[engine_args_to_idx["compression_method"]], "compression_method"));
 
     if (engine_args_to_idx.contains("access_key_id"))
         auth_settings[S3AuthSetting::access_key_id] = checkAndGetLiteralArgument<String>(args[engine_args_to_idx["access_key_id"]], "access_key_id");
@@ -682,6 +683,7 @@ ASTPtr StorageS3Configuration::createArgsWithAccessData() const
         arguments->children.push_back(std::make_shared<ASTLiteral>(auth_settings[S3AuthSetting::secret_access_key].value));
         if (!auth_settings[S3AuthSetting::session_token].value.empty())
             arguments->children.push_back(std::make_shared<ASTLiteral>(auth_settings[S3AuthSetting::session_token].value));
+
         if (format != "auto")
             arguments->children.push_back(std::make_shared<ASTLiteral>(format));
         if (!compression_method.empty())

@@ -23,6 +23,9 @@ If enabled, the engine would use delta-kernel-rs for DeltaLake metadata parsing
     DECLARE(String, iceberg_metadata_file_path, "", R"(
 Explicit path to desired Iceberg metadata file, should be relative to path in object storage. Make sense for table function use case only.
 )", 0) \
+    DECLARE(String, object_storage_cluster, "", R"(
+Cluster for distributed requests
+)", 0) \
 
 // clang-format on
 
