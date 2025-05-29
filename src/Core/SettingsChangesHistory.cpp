@@ -66,6 +66,12 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         /// controls new feature and it's 'true' by default, use 'false' as previous_value).
         /// It's used to implement `compatibility` setting (see https://github.com/ClickHouse/ClickHouse/issues/35972)
         /// Note: please check if the key already exists to prevent duplicate entries.
+        addSettingsChanges(settings_changes_history, "25.2.1.20000",
+        {
+            // Altinity Antalya modifications atop of 25.2
+            {"object_storage_cluster", "", "", "New setting"},
+            {"object_storage_max_nodes", 0, 0, "New setting"},
+        });
         addSettingsChanges(settings_changes_history, "25.4",
         {
         });
@@ -87,6 +93,11 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"iceberg_snapshot_id", 0, 0, "New setting."},
             {"parallel_replicas_for_cluster_engines", false, true, "New setting."},
             /// Release closed. Please use 25.4
+        });
+        addSettingsChanges(settings_changes_history, "24.12.2.20000",
+        {
+            // Altinity Antalya modifications atop of 24.12
+            {"input_format_parquet_use_metadata_cache", true, true, "New setting, turned ON by default"}, // https://github.com/Altinity/ClickHouse/pull/586
         });
         addSettingsChanges(settings_changes_history, "25.2",
         {

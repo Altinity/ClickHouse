@@ -157,6 +157,10 @@
 #   include <azure/core/diagnostics/logger.hpp>
 #endif
 
+#if USE_PARQUET
+#   include <Processors/Formats/Impl/ParquetFileMetaDataCache.h>
+#endif
+
 
 #include <incbin.h>
 /// A minimal file used when the server is run without installation
@@ -320,6 +324,7 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 page_cache_max_size;
     extern const ServerSettingsDouble page_cache_free_memory_ratio;
     extern const ServerSettingsUInt64 page_cache_lookahead_blocks;
+    extern const ServerSettingsUInt64 input_format_parquet_metadata_cache_max_size;
 }
 
 }
@@ -2393,6 +2398,7 @@ try
         dns_cache_updater->start();
 
     auto replicas_reconnector = ReplicasReconnector::init(global_context);
+    ParquetFileMetaDataCache::instance()->setMaxSizeInBytes(server_settings[ServerSetting::input_format_parquet_metadata_cache_max_size]);
 
     /// Set current database name before loading tables and databases because
     /// system logs may copy global context.
