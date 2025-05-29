@@ -100,8 +100,8 @@ StorageObjectStorage::StorageObjectStorage(
     , distributed_processing(distributed_processing_)
     , log(getLogger(fmt::format("Storage{}({})", configuration->getEngineName(), table_id_.getFullTableName())))
 {
-    update_configuration_on_read = !is_table_function_ || do_lazy_init;
     bool do_lazy_init = lazy_init && !columns_.empty() && !configuration->getFormat().empty();
+    update_configuration_on_read = !is_table_function_ || do_lazy_init;
     bool failed_init = false;
     auto do_init = [&]()
     {
