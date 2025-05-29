@@ -577,6 +577,23 @@ jobs:
       test_name: Sign aarch64
       runner_type: altinity-on-demand, altinity-func-tester
       data: ${{ needs.RunConfig.outputs.data }}
+  GrypeScan:
+    needs: [RunConfig, DockerServerImage, DockerKeeperImage]
+    if: ${{ !failure() && !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: server
+            suffix: ''
+          - image: server
+            suffix: '-alpine'
+          - image: keeper
+            suffix: ''
+    uses: ./.github/workflows/grype_scan.yml
+    secrets: inherit
+    with:
+      docker_image: altinityinfra/clickhouse-${{ matrix.image }}:${{ github.event.pull_request.number || 0 }}-${{ fromJson(needs.RunConfig.outputs.data).version }}${{ matrix.suffix }}
   FinishCheck:
     if: ${{ !cancelled() }}
     needs:
@@ -611,6 +628,7 @@ jobs:
       - CompatibilityCheckAarch64
       - RegressionTestsRelease
       - RegressionTestsAarch64
+      - GrypeScan
       - SignRelease
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     steps:
@@ -642,9 +660,9 @@ jobs:
           ACTIONS_RUN_URL: ${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}
         shell: bash
         run: |
-          pip install clickhouse-driver==0.2.8 numpy==1.26.4 pandas==2.2.0
+          pip install clickhouse-driver==0.2.8 numpy==1.26.4 pandas==2.0.3
 
-          REPORT_LINK=$(python3 .github/create_combined_ci_report.py --pr-number $PR_NUMBER --commit-sha $COMMIT_SHA --actions-run-url $ACTIONS_RUN_URL --known-fails tests/broken_tests.json)
+          REPORT_LINK=$(python3 .github/create_workflow_report.py --pr-number $PR_NUMBER --commit-sha $COMMIT_SHA --actions-run-url $ACTIONS_RUN_URL --known-fails tests/broken_tests.json --cves)
 
           IS_VALID_URL=$(echo $REPORT_LINK | grep -E '^https?://')
           if [[ -n $IS_VALID_URL ]]; then
