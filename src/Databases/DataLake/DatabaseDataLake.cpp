@@ -15,6 +15,7 @@
 #include <Storages/ConstraintsDescription.h>
 #include <Storages/StorageNull.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeConfiguration.h>
+#include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
 
 #include <Interpreters/evaluateConstantExpression.h>
 #include <Interpreters/Context.h>
@@ -40,6 +41,7 @@ namespace DatabaseDataLakeSetting
     extern const DatabaseDataLakeSettingsString storage_endpoint;
     extern const DatabaseDataLakeSettingsString oauth_server_uri;
     extern const DatabaseDataLakeSettingsBool vended_credentials;
+    extern const DatabaseDataLakeSettingsString object_storage_cluster;
 
 
     extern const DatabaseDataLakeSettingsString aws_access_key_id;
@@ -403,9 +405,12 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
 
     /// with_table_structure = false: because there will be
     /// no table structure in table definition AST.
-    StorageObjectStorage::Configuration::initialize(*configuration, args, context_copy, /* with_table_structure */false, storage_settings);
+    configuration->initialize(args, context_copy, /* with_table_structure */false, storage_settings);
 
-    return std::make_shared<StorageObjectStorage>(
+    auto cluster_name = settings[DatabaseDataLakeSetting::object_storage_cluster].value;
+    
+    return std::make_shared<StorageObjectStorageCluster>(
+        cluster_name,
         configuration,
         configuration->createObjectStorage(context_copy, /* is_readonly */ false),
         context_copy,
@@ -415,9 +420,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
         /* comment */"",
         getFormatSettings(context_copy),
         LoadingStrictnessLevel::CREATE,
-        /* distributed_processing */false,
-        /* partition_by */nullptr,
-        /* lazy_init */true);
+        /* partition_by */nullptr);
 }
 
 DatabaseTablesIteratorPtr DatabaseDataLake::getTablesIterator(

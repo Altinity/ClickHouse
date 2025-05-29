@@ -58,6 +58,9 @@ String StorageObjectStorage::getPathSample(ContextPtr context)
     if (context->getSettingsRef()[Setting::use_hive_partitioning])
         local_distributed_processing = false;
 
+    if (!configuration->isArchive() && !configuration->isPathWithGlobs() && !local_distributed_processing)
+        return configuration->getPath();
+
     auto file_iterator = StorageObjectStorageSource::createFileIterator(
         configuration,
         query_settings,
@@ -69,9 +72,6 @@ String StorageObjectStorage::getPathSample(ContextPtr context)
         nullptr, // read_keys
         {} // file_progress_callback
     );
-
-    if (!configuration->isArchive() && !configuration->isPathWithGlobs() && !local_distributed_processing)
-        return configuration->getPath();
 
     if (auto file = file_iterator->next(0))
         return file->getPath();
@@ -99,7 +99,7 @@ StorageObjectStorage::StorageObjectStorage(
     , distributed_processing(distributed_processing_)
     , log(getLogger(fmt::format("Storage{}({})", configuration->getEngineName(), table_id_.getFullTableName())))
 {
-    bool do_lazy_init = lazy_init && !columns_.empty() && !configuration->format.empty();
+    bool do_lazy_init = lazy_init && !columns_.empty() && !configuration->getFormat().empty();
     bool failed_init = false;
     auto do_init = [&]()
     {
@@ -114,7 +114,7 @@ StorageObjectStorage::StorageObjectStorage(
         {
             // If we don't have format or schema yet, we can't ignore failed configuration update,
             // because relevant configuration is crucial for format and schema inference
-            if (mode <= LoadingStrictnessLevel::CREATE || columns_.empty() || (configuration->format == "auto"))
+            if (mode <= LoadingStrictnessLevel::CREATE || columns_.empty() || (configuration->getFormat() == "auto"))
             {
                 throw;
             }
@@ -131,7 +131,7 @@ StorageObjectStorage::StorageObjectStorage(
 
     std::string sample_path;
     ColumnsDescription columns{columns_};
-    resolveSchemaAndFormat(columns, configuration->format, object_storage, configuration, format_settings, sample_path, context);
+    resolveSchemaAndFormat(columns, object_storage, configuration, format_settings, sample_path, context);
     configuration->check(context);
 
     StorageInMemoryMetadata metadata;
@@ -171,23 +171,30 @@ String StorageObjectStorage::getName() const
 
 bool StorageObjectStorage::prefersLargeBlocks() const
 {
-    return FormatFactory::instance().checkIfOutputFormatPrefersLargeBlocks(configuration->format);
+    return FormatFactory::instance().checkIfOutputFormatPrefersLargeBlocks(configuration->getFormat());
 }
 
 bool StorageObjectStorage::parallelizeOutputAfterReading(ContextPtr context) const
 {
-    return FormatFactory::instance().checkParallelizeOutputAfterReading(configuration->format, context);
+    return FormatFactory::instance().checkParallelizeOutputAfterReading(configuration->getFormat(), context);
 }
 
 bool StorageObjectStorage::supportsSubsetOfColumns(const ContextPtr & context) const
 {
-    return FormatFactory::instance().checkIfFormatSupportsSubsetOfColumns(configuration->format, context, format_settings);
+    return FormatFactory::instance().checkIfFormatSupportsSubsetOfColumns(configuration->getFormat(), context, format_settings);
 }
 
 void StorageObjectStorage::Configuration::update(ObjectStoragePtr object_storage_ptr, ContextPtr context)
 {
     IObjectStorage::ApplyNewSettingsOptions options{.allow_client_change = !isStaticConfiguration()};
     object_storage_ptr->applyNewSettings(context->getConfigRef(), getTypeName() + ".", context, options);
+    updated = true;
+}
+
+void StorageObjectStorage::Configuration::updateIfRequired(ObjectStoragePtr object_storage_ptr, ContextPtr local_context)
+{
+    if (!updated)
+        update(object_storage_ptr, local_context);
 }
 
 bool StorageObjectStorage::hasExternalDynamicMetadata() const
@@ -273,7 +280,7 @@ public:
             num_streams = 1;
         }
 
-        const size_t max_parsing_threads = num_streams >= max_threads ? 1 : (max_threads / std::max(num_streams, 1ul));
+        const size_t max_parsing_threads = (distributed_processing || num_streams >= max_threads) ? 1 : (max_threads / std::max(num_streams, 1ul));
 
         for (size_t i = 0; i < num_streams; ++i)
         {
@@ -508,7 +515,7 @@ ColumnsDescription StorageObjectStorage::resolveSchemaFromData(
 
     ObjectInfos read_keys;
     auto iterator = createReadBufferIterator(object_storage, configuration, format_settings, read_keys, context);
-    auto schema = readSchemaFromFormat(configuration->format, format_settings, *iterator, context);
+    auto schema = readSchemaFromFormat(configuration->getFormat(), format_settings, *iterator, context);
     sample_path = iterator->getLastFilePath();
     return schema;
 }
@@ -529,7 +536,7 @@ std::string StorageObjectStorage::resolveFormatFromData(
 
 std::pair<ColumnsDescription, std::string> StorageObjectStorage::resolveSchemaAndFormatFromData(
     const ObjectStoragePtr & object_storage,
-    const ConfigurationPtr & configuration,
+    ConfigurationPtr & configuration,
     const std::optional<FormatSettings> & format_settings,
     std::string & sample_path,
     const ContextPtr & context)
@@ -538,13 +545,13 @@ std::pair<ColumnsDescription, std::string> StorageObjectStorage::resolveSchemaAn
     auto iterator = createReadBufferIterator(object_storage, configuration, format_settings, read_keys, context);
     auto [columns, format] = detectFormatAndReadSchema(format_settings, *iterator, context);
     sample_path = iterator->getLastFilePath();
-    configuration->format = format;
+    configuration->setFormat(format);
     return std::pair(columns, format);
 }
 
 void StorageObjectStorage::addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const
 {
-    configuration->addStructureAndFormatToArgsIfNeeded(args, "", configuration->format, context, /*with_structure=*/false);
+    configuration->addStructureAndFormatToArgsIfNeeded(args, "", configuration->getFormat(), context, /*with_structure=*/false);
 }
 
 SchemaCache & StorageObjectStorage::getSchemaCache(const ContextPtr & context, const std::string & storage_type_name)
@@ -579,36 +586,35 @@ SchemaCache & StorageObjectStorage::getSchemaCache(const ContextPtr & context, c
 }
 
 void StorageObjectStorage::Configuration::initialize(
-    Configuration & configuration_to_initialize,
     ASTs & engine_args,
     ContextPtr local_context,
     bool with_table_structure,
     StorageObjectStorageSettingsPtr settings)
 {
     if (auto named_collection = tryGetNamedCollectionWithOverrides(engine_args, local_context))
-        configuration_to_initialize.fromNamedCollection(*named_collection, local_context);
+        fromNamedCollection(*named_collection, local_context);
     else
-        configuration_to_initialize.fromAST(engine_args, local_context, with_table_structure);
+        fromAST(engine_args, local_context, with_table_structure);
 
-    if (configuration_to_initialize.format == "auto")
+    if (format == "auto")
     {
-        if (configuration_to_initialize.isDataLakeConfiguration())
+        if (isDataLakeConfiguration())
         {
-            configuration_to_initialize.format = "Parquet";
+            format = "Parquet";
         }
         else
         {
-            configuration_to_initialize.format
+            format
                 = FormatFactory::instance()
-                      .tryGetFormatFromFileName(configuration_to_initialize.isArchive() ? configuration_to_initialize.getPathInArchive() : configuration_to_initialize.getPath())
+                      .tryGetFormatFromFileName(isArchive() ? getPathInArchive() : getPath())
                       .value_or("auto");
         }
     }
     else
-        FormatFactory::instance().checkFormatName(configuration_to_initialize.format);
+        FormatFactory::instance().checkFormatName(format);
 
-    configuration_to_initialize.storage_settings = settings;
-    configuration_to_initialize.initialized = true;
+    storage_settings = settings;
+    initialized = true;
 }
 
 const StorageObjectStorageSettings & StorageObjectStorage::Configuration::getSettingsRef() const
