@@ -40,7 +40,10 @@ public:
     ClusterPtr getCluster(ContextPtr context) const { return getClusterImpl(context, cluster_name); }
 
     /// Query is needed for pruning by virtual columns (_file, _path)
-    virtual RemoteQueryExecutor::Extension getTaskIteratorExtension(const ActionsDAG::Node * predicate, const ContextPtr & context) const = 0;
+    virtual RemoteQueryExecutor::Extension getTaskIteratorExtension(
+        const ActionsDAG::Node * predicate,
+        const ContextPtr & context,
+        ClusterPtr cluster) const = 0;
 
     QueryProcessingStage::Enum getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageSnapshotPtr &, SelectQueryInfo &) const override;
 

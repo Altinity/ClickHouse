@@ -19,6 +19,7 @@
 #include <Storages/ObjectStorage/Utils.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSource.h>
 #include <Storages/extractTableFunctionFromSelectQuery.h>
+#include <Storages/ObjectStorage/StorageObjectStorageStableTaskDistributor.h>
 
 namespace DB
 {
@@ -357,24 +358,34 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
 }
 
 RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExtension(
-    const ActionsDAG::Node * predicate, const ContextPtr & local_context) const
+    const ActionsDAG::Node * predicate,
+    const ContextPtr & local_context,
+    ClusterPtr cluster) const
 {
     auto iterator = StorageObjectStorageSource::createFileIterator(
         configuration, configuration->getQuerySettings(local_context), object_storage, /* distributed_processing */false,
         local_context, predicate, virtual_columns, nullptr, local_context->getFileProgressCallback(), /*ignore_archive_globs=*/true);
 
-    auto callback = std::make_shared<std::function<String()>>([iterator]() mutable -> String
+    std::vector<std::string> ids_of_hosts;
+    for (const auto & shard : cluster->getShardsInfo())
     {
-        auto object_info = iterator->next(0);
-        if (!object_info)
-            return "";
+        if (shard.per_replica_pools.empty())
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Cluster {} with empty shard {}", cluster->getName(), shard.shard_num);
+        for (const auto & replica : shard.per_replica_pools)
+        {
+            if (!replica)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Cluster {}, shard {} with empty node", cluster->getName(), shard.shard_num);
+            ids_of_hosts.push_back(replica->getAddress());
+        }
+    }
 
-        auto archive_object_info = std::dynamic_pointer_cast<StorageObjectStorageSource::ArchiveIterator::ObjectInfoInArchive>(object_info);
-        if (archive_object_info)
-            return archive_object_info->getPathToArchive();
+    auto task_distributor = std::make_shared<StorageObjectStorageStableTaskDistributor>(iterator, ids_of_hosts);
 
-        return object_info->getPath();
-    });
+    auto callback = std::make_shared<TaskIterator>(
+        [task_distributor](size_t number_of_current_replica) mutable -> String {
+            return task_distributor->getNextTask(number_of_current_replica).value_or("");
+        });
+
     return RemoteQueryExecutor::Extension{ .task_iterator = std::move(callback) };
 }
 
