@@ -684,9 +684,10 @@ ASTPtr StorageS3Configuration::createArgsWithAccessData() const
         if (!auth_settings[S3AuthSetting::session_token].value.empty())
             arguments->children.push_back(std::make_shared<ASTLiteral>(auth_settings[S3AuthSetting::session_token].value));
 
-        if (format != "auto")
+        if (const auto & format = getFormat(); format != "auto")
             arguments->children.push_back(std::make_shared<ASTLiteral>(format));
-        if (!compression_method.empty())
+
+        if (const auto & compression_method = getCompressionMethod(); !compression_method.empty())
             arguments->children.push_back(std::make_shared<ASTLiteral>(compression_method));
 
         if (!auth_settings[S3AuthSetting::role_arn].value.empty())
