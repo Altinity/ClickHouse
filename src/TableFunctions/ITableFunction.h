@@ -78,7 +78,7 @@ public:
 
     virtual bool supportsReadingSubsetOfColumns(const ContextPtr &) { return true; }
 
-    virtual bool canBeUsedToCreateTable() const { return true; }
+    virtual void validateUseToCreateTable() const {}
 
     /// Create storage according to the query.
     StoragePtr

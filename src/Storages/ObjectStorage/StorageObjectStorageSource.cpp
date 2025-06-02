@@ -148,6 +148,8 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
                         "Expression can not have wildcards inside {} name", configuration->getNamespaceType());
 
+    configuration->updateIfRequired(object_storage, local_context);
+
     std::unique_ptr<IObjectIterator> iterator;
     if (configuration->isPathWithGlobs())
     {
@@ -358,7 +360,7 @@ Chunk StorageObjectStorageSource::generate()
 void StorageObjectStorageSource::addNumRowsToCache(const ObjectInfo & object_info, size_t num_rows)
 {
     const auto cache_key = getKeyForSchemaCache(
-        getUniqueStoragePathIdentifier(*configuration, object_info), configuration->format, format_settings, read_context);
+        getUniqueStoragePathIdentifier(*configuration, object_info), configuration->getFormat(), format_settings, read_context);
     schema_cache.addNumRows(cache_key, num_rows);
 }
 
@@ -424,7 +426,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
         const auto cache_key = getKeyForSchemaCache(
             getUniqueStoragePathIdentifier(*configuration, *object_info),
-            configuration->format,
+            configuration->getFormat(),
             format_settings,
             context_);
 
@@ -455,13 +457,13 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         CompressionMethod compression_method;
         if (const auto * object_info_in_archive = dynamic_cast<const ArchiveIterator::ObjectInfoInArchive *>(object_info.get()))
         {
-            compression_method = chooseCompressionMethod(configuration->getPathInArchive(), configuration->compression_method);
+            compression_method = chooseCompressionMethod(configuration->getPathInArchive(), configuration->getCompressionMethod());
             const auto & archive_reader = object_info_in_archive->archive_reader;
             read_buf = archive_reader->readFile(object_info_in_archive->path_in_archive, /*throw_on_not_found=*/true);
         }
         else
         {
-            compression_method = chooseCompressionMethod(object_info->getFileName(), configuration->compression_method);
+            compression_method = chooseCompressionMethod(object_info->getFileName(), configuration->getCompressionMethod());
             read_buf = createReadBuffer(*object_info, object_storage, context_, log);
         }
 
@@ -479,7 +481,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
 
         auto input_format = FormatFactory::instance().getInput(
-            configuration->format,
+            configuration->getFormat(),
             *read_buf,
             initial_header,
             context_,

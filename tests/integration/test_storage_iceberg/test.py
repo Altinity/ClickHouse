@@ -631,6 +631,27 @@ def count_secondary_subqueries(started_cluster, query_id, expected, comment):
         assert int(cluster_secondary_queries) == expected
 
 
+def count_secondary_subqueries(started_cluster, query_id, expected, comment):
+    for node_name, replica in started_cluster.instances.items():
+        cluster_secondary_queries = (
+            replica.query(
+                f"""
+                SELECT count(*) FROM system.query_log
+                WHERE
+                    type = 'QueryFinish'
+                    AND NOT is_initial_query
+                    AND initial_query_id='{query_id}'
+            """
+            )
+            .strip()
+        )
+
+        logging.info(
+            f"[{node_name}] cluster_secondary_queries {comment}: {cluster_secondary_queries}"
+        )
+        assert int(cluster_secondary_queries) == expected
+
+
 @pytest.mark.parametrize("format_version", ["1", "2"])
 @pytest.mark.parametrize("storage_type", ["s3", "azure"])
 def test_cluster_table_function(started_cluster, format_version, storage_type):
@@ -822,6 +843,14 @@ def test_cluster_table_function(started_cluster, format_version, storage_type):
     count_secondary_subqueries(started_cluster, query_id_pure_table_engine_cluster_with_type_arg, 1, "table engine with cluster setting with storage type in args")
     count_secondary_subqueries(started_cluster, query_id_pure_table_engine_with_type_in_nc, 0, "table engine with storage type in named collection")
     count_secondary_subqueries(started_cluster, query_id_pure_table_engine_cluster_with_type_in_nc, 1, "table engine with cluster setting with storage type in named collection")
+
+    select_remote_cluster = (
+        instance.query(f"SELECT * FROM remote('node2',{table_function_expr_cluster})")
+        .strip()
+        .split()
+    )
+    assert len(select_remote_cluster) == 600
+    assert select_remote_cluster == select_regular
 
 
 @pytest.mark.parametrize("format_version", ["1", "2"])
