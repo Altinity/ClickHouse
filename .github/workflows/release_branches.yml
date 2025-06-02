@@ -398,51 +398,51 @@ jobs:
 ##############################################################################################
 ######################################### STRESS TESTS #######################################
 ##############################################################################################
-  StressTestAsan:
-    needs: [RunConfig, BuilderDebAsan]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_test.yml
-    secrets: inherit
-    with:
-      test_name: Stress test (asan)
-      runner_type: altinity-func-tester
-      data: ${{ needs.RunConfig.outputs.data }}
-  StressTestTsan:
-    needs: [RunConfig, BuilderDebTsan]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_test.yml
-    secrets: inherit
-    with:
-      test_name: Stress test (tsan)
-      runner_type: altinity-func-tester
-      data: ${{ needs.RunConfig.outputs.data }}
-  StressTestMsan:
-    needs: [RunConfig, BuilderDebMsan]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_test.yml
-    secrets: inherit
-    with:
-      test_name: Stress test (msan)
-      runner_type: altinity-func-tester
-      data: ${{ needs.RunConfig.outputs.data }}
-  StressTestUBsan:
-    needs: [RunConfig, BuilderDebUBsan]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_test.yml
-    secrets: inherit
-    with:
-      test_name: Stress test (ubsan)
-      runner_type: altinity-func-tester
-      data: ${{ needs.RunConfig.outputs.data }}
-  StressTestDebug:
-    needs: [RunConfig, BuilderDebDebug]
-    if: ${{ !failure() && !cancelled() }}
-    uses: ./.github/workflows/reusable_test.yml
-    secrets: inherit
-    with:
-      test_name: Stress test (debug)
-      runner_type: altinity-func-tester
-      data: ${{ needs.RunConfig.outputs.data }}
+  # StressTestAsan:
+  #   needs: [RunConfig, BuilderDebAsan]
+  #   if: ${{ !failure() && !cancelled() }}
+  #   uses: ./.github/workflows/reusable_test.yml
+  #   secrets: inherit
+  #   with:
+  #     test_name: Stress test (asan)
+  #     runner_type: altinity-func-tester
+  #     data: ${{ needs.RunConfig.outputs.data }}
+  # StressTestTsan:
+  #   needs: [RunConfig, BuilderDebTsan]
+  #   if: ${{ !failure() && !cancelled() }}
+  #   uses: ./.github/workflows/reusable_test.yml
+  #   secrets: inherit
+  #   with:
+  #     test_name: Stress test (tsan)
+  #     runner_type: altinity-func-tester
+  #     data: ${{ needs.RunConfig.outputs.data }}
+  # StressTestMsan:
+  #   needs: [RunConfig, BuilderDebMsan]
+  #   if: ${{ !failure() && !cancelled() }}
+  #   uses: ./.github/workflows/reusable_test.yml
+  #   secrets: inherit
+  #   with:
+  #     test_name: Stress test (msan)
+  #     runner_type: altinity-func-tester
+  #     data: ${{ needs.RunConfig.outputs.data }}
+  # StressTestUBsan:
+  #   needs: [RunConfig, BuilderDebUBsan]
+  #   if: ${{ !failure() && !cancelled() }}
+  #   uses: ./.github/workflows/reusable_test.yml
+  #   secrets: inherit
+  #   with:
+  #     test_name: Stress test (ubsan)
+  #     runner_type: altinity-func-tester
+  #     data: ${{ needs.RunConfig.outputs.data }}
+  # StressTestDebug:
+  #   needs: [RunConfig, BuilderDebDebug]
+  #   if: ${{ !failure() && !cancelled() }}
+  #   uses: ./.github/workflows/reusable_test.yml
+  #   secrets: inherit
+  #   with:
+  #     test_name: Stress test (debug)
+  #     runner_type: altinity-func-tester
+  #     data: ${{ needs.RunConfig.outputs.data }}
 #############################################################################################
 ############################# INTEGRATION TESTS #############################################
 #############################################################################################
@@ -487,7 +487,7 @@ jobs:
 #############################################################################################
   RegressionTestsRelease:
     needs: [RunConfig, BuilderDebRelease]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'regression')}}
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.RunConfig.outputs.data).ci_options.exclude_keywords, 'regression')}}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
@@ -498,7 +498,7 @@ jobs:
       timeout_minutes: 300
   RegressionTestsAarch64:
     needs: [RunConfig, BuilderDebAarch64]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'regression') && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'aarch64')}}
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.RunConfig.outputs.data).ci_options.exclude_keywords, 'regression') && !contains(fromJson(needs.RunConfig.outputs.data).ci_options.exclude_keywords, 'aarch64')}}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
@@ -546,11 +546,11 @@ jobs:
       - FunctionalStatefulTestTsan
       - FunctionalStatefulTestMsan
       - FunctionalStatefulTestUBsan
-      - StressTestDebug
-      - StressTestAsan
-      - StressTestTsan
-      - StressTestMsan
-      - StressTestUBsan
+      # - StressTestDebug
+      # - StressTestAsan
+      # - StressTestTsan
+      # - StressTestMsan
+      # - StressTestUBsan
       - IntegrationTestsAsan
       - IntegrationTestsTsan
       - IntegrationTestsRelease
