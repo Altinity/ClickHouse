@@ -48,14 +48,17 @@ def sign_file(file_path):
     return out_file_path
 
 def extract_public_key():
-    # Import private key directly from environment variable
-    import_cmd = f'echo {GPG_BINARY_SIGNING_PASSPHRASE} | gpg --batch --import'
-    subprocess.run(import_cmd, shell=True, input=GPG_BINARY_SIGNING_KEY.encode())
+    priv_key_file_path = 'priv.key'
+    with open(priv_key_file_path, 'x') as f:
+        f.write(GPG_BINARY_SIGNING_KEY)
+
+    os.system(f'echo {GPG_BINARY_SIGNING_PASSPHRASE} | gpg --batch --import {priv_key_file_path}')
 
     # Export public key
     pub_key_file_path = 'pub.key'
-    os.system(f'gpg --export --armor > {pub_key_file_path}')
+    os.system(f'gpg --output {pub_key_file_path} --export {priv_key_file_path}')
     print(f"Extracted public key to {pub_key_file_path}")
+    os.remove(priv_key_file_path)
     return pub_key_file_path
 
 def main():
@@ -82,7 +85,6 @@ def main():
     s3_pubkey_path = s3_path_prefix / "public.gpg"
     s3_helper.upload_build_file_to_s3(Path(pub_key_file_path), str(s3_pubkey_path))
     print(f'Uploaded public key to {s3_pubkey_path}')
-    os.remove(pub_key_file_path)
 
     # Copy public key to TEMP_PATH for artifact upload
     artifact_pubkey_path = os.path.join(TEMP_PATH, 'public.gpg')
