@@ -3,6 +3,7 @@
 #include <Common/logger_useful.h>
 #include <Common/setThreadName.h>
 #include <IO/HTTPCommon.h>
+#include <Server/HTTPResponseHeaderWriter.h>
 #include <Server/HTTP/WriteBufferFromHTTPServerResponse.h>
 #include <Server/HTTP/sendExceptionToHTTPClient.h>
 #include <Server/IServer.h>
