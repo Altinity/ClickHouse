@@ -40,6 +40,12 @@
     "01052_window_view_proc_tumble_to_now": {
         "reason": "INVESTIGATE - fail in msan"
     },
+    "02969_auto_format_detection": {
+        "reason": "KNOWN crash in ubsan 1/2"
+    },
+    "Tests are not finished": {
+        "reason": "KNOWN crash in ubsan 1/2"
+    },
     "test_backward_compatibility/test_aggregate_function_state.py::test_backward_compatability_for_avg":{
         "reason": "KNOWN not run by upstream"
     },
