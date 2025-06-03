@@ -1,6 +1,5 @@
 {
     "test_postgresql_replica_database_engine_2/test.py::test_quoting_publication": {
-        "message": "DB::Exception: Syntax error:",
         "reason": "NEEDSFIX syntax error"
     },
     "test_distributed_inter_server_secret/test.py::test_secure_cluster_distributed_over_distributed_different_users": {
