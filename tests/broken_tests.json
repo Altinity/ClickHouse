@@ -90,5 +90,8 @@
     },
     "test_quorum_inserts/test.py::test_insert_quorum_with_keeper_loss_connection": {
         "reason": "INVESTIGATE"
-    }
+    },
+    "test_postgresql_replica_database_engine": {
+        "reason": "KNOWN fails upstream"
+    },
 }
