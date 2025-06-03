@@ -203,12 +203,6 @@ static inline auto createHandlersFactoryFromConfig(
                 handler->addFiltersFromConfig(config, prefix + "." + key);
                 main_handler_factory->addHandler(std::move(handler));
             }
-            else if (handler_type == "merges")
-            {
-                auto handler = createWebUIHandlerFactory<MergesWebUIRequestHandler>(server, config, prefix + "." + key, common_headers_override);
-                handler->addFiltersFromConfig(config, prefix + "." + key);
-                main_handler_factory->addHandler(std::move(handler));
-            }
             else if (handler_type == "js")
             {
                 // NOTE: JavaScriptWebUIRequestHandler only makes sense for paths other then /js/uplot.js, /js/lz-string.js

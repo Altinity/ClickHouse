@@ -72,11 +72,6 @@ void BinaryWebUIRequestHandler::handleRequest(HTTPServerRequest & request, HTTPS
     handle(request, response, {reinterpret_cast<const char *>(gresource_binary_htmlData), gresource_binary_htmlSize}, http_response_headers_override);
 }
 
-void MergesWebUIRequestHandler::handleRequest(HTTPServerRequest & request, HTTPServerResponse & response, const ProfileEvents::Event &)
-{
-    handle(request, response, {reinterpret_cast<const char *>(gresource_merges_htmlData), gresource_merges_htmlSize}, http_response_headers_override);
-}
-
 void JavaScriptWebUIRequestHandler::handleRequest(HTTPServerRequest & request, HTTPServerResponse & response, const ProfileEvents::Event &)
 {
     if (request.getURI() == "/js/uplot.js")
