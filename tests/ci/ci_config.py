@@ -1176,7 +1176,7 @@ CI_CONFIG = CIConfig(
         ),
         JobNames.STATELESS_TEST_UBSAN: TestConfig(
             Build.PACKAGE_UBSAN,
-            job_config=JobConfig(num_batches=2, **statless_test_common_params),  # type: ignore
+            job_config=JobConfig(num_batches=8, **statless_test_common_params),  # type: ignore
         ),
         JobNames.STATELESS_TEST_DEBUG: TestConfig(
             Build.PACKAGE_DEBUG,
