@@ -127,6 +127,7 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
     bool distributed_processing,
     const ContextPtr & local_context,
     const ActionsDAG::Node * predicate,
+    const std::optional<ActionsDAG> & filter_actions_dag,
     const NamesAndTypesList & virtual_columns,
     ObjectInfos * read_keys,
     std::function<void(FileProgress)> file_progress_callback,
@@ -173,7 +174,10 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
     }
     else if (configuration->supportsFileIterator())
     {
-        return configuration->iterate();
+        return configuration->iterate(
+            filter_actions_dag.has_value() ? &filter_actions_dag.value() : nullptr,
+            file_progress_callback,
+            query_settings.list_object_keys_size);
     }
     else
     {
@@ -407,11 +411,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         if (!object_info || object_info->getPath().empty())
             return {};
 
-        if (!object_info->metadata)
-        {
-            const auto & path = object_info->isArchive() ? object_info->getPathToArchive() : object_info->getPath();
-            object_info->metadata = object_storage->getObjectMetadata(path);
-        }
+        object_info->loadMetadata(object_storage);
     }
     while (query_settings.skip_empty_files && object_info->metadata->size_bytes == 0);
 

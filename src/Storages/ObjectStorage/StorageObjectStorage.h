@@ -70,7 +70,9 @@ public:
         LoadingStrictnessLevel mode,
         bool distributed_processing_ = false,
         ASTPtr partition_by_ = nullptr,
-        bool lazy_init = false);
+        bool is_table_function_ = false,
+        bool lazy_init = false,
+        std::optional<std::string> sample_path_ = std::nullopt);
 
     String getName() const override;
 
@@ -139,6 +141,8 @@ public:
 
     void updateExternalDynamicMetadata(ContextPtr) override;
 
+    std::optional<UInt64> totalRows(ContextPtr query_context) const override;
+    std::optional<UInt64> totalBytes(ContextPtr query_context) const override;
 protected:
     String getPathSample(ContextPtr context);
 
@@ -154,6 +158,7 @@ protected:
     const std::optional<FormatSettings> format_settings;
     const ASTPtr partition_by;
     const bool distributed_processing;
+    bool update_configuration_on_read;
 
     LoggerPtr log;
 };
@@ -199,15 +204,15 @@ public:
     virtual void addStructureAndFormatToArgsIfNeeded(
         ASTs & args, const String & structure_, const String & format_, ContextPtr context, bool with_structure) = 0;
 
-    bool withPartitionWildcard() const;
+    virtual bool withPartitionWildcard() const;
     bool withGlobs() const { return isPathWithGlobs() || isNamespaceWithGlobs(); }
-    bool withGlobsIgnorePartitionWildcard() const;
-    bool isPathWithGlobs() const;
-    bool isNamespaceWithGlobs() const;
+    virtual bool withGlobsIgnorePartitionWildcard() const;
+    virtual bool isPathWithGlobs() const;
+    virtual bool isNamespaceWithGlobs() const;
     virtual std::string getPathWithoutGlobs() const;
 
     virtual bool isArchive() const { return false; }
-    bool isPathInArchiveWithGlobs() const;
+    virtual bool isPathInArchiveWithGlobs() const;
     virtual std::string getPathInArchive() const;
 
     virtual void check(ContextPtr context) const;
@@ -219,7 +224,8 @@ public:
 
     virtual bool isDataLakeConfiguration() const { return false; }
 
-    virtual void implementPartitionPruning(const ActionsDAG &) { }
+    virtual std::optional<size_t> totalRows() { return {}; }
+    virtual std::optional<size_t> totalBytes() { return {}; }
 
     virtual bool hasExternalDynamicMetadata() { return false; }
 
@@ -240,15 +246,19 @@ public:
         ContextPtr local_context);
 
     virtual std::optional<ColumnsDescription> tryGetTableStructureFromMetadata() const;
+    virtual std::optional<String> tryGetSamplePathFromMetadata() const;
 
     virtual bool supportsFileIterator() const { return false; }
-    virtual ObjectIterator iterate()
+    virtual ObjectIterator iterate(
+        const ActionsDAG * /* filter_dag */,
+        std::function<void(FileProgress)> /* callback */,
+        size_t /* list_batch_size */)
     {
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method iterate() is not implemented for configuration type {}", getTypeName());
     }
 
     virtual void update(ObjectStoragePtr object_storage, ContextPtr local_context);
-    void updateIfRequired(ObjectStoragePtr object_storage, ContextPtr local_context);
+    virtual void updateIfRequired(ObjectStoragePtr object_storage, ContextPtr local_context);
 
     const StorageObjectStorageSettings & getSettingsRef() const;
 
@@ -264,7 +274,7 @@ public:
     virtual ObjectStorageType extractDynamicStorageType(ASTs & /* args */, ContextPtr /* context */, ASTPtr * /* type_arg */ = nullptr) const
     { return ObjectStorageType::None; }
 
-    void assertInitialized() const;
+    virtual void assertInitialized() const;
 
     virtual const String & getFormat() const { return format; }
     virtual const String & getCompressionMethod() const { return compression_method; }

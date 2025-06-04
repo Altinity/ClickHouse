@@ -37,7 +37,6 @@ namespace Setting
     extern const SettingsMaxThreads max_threads;
     extern const SettingsBool optimize_count_from_files;
     extern const SettingsBool use_hive_partitioning;
-    extern const SettingsBool use_iceberg_partition_pruning;
 }
 
 namespace ErrorCodes
@@ -68,6 +67,7 @@ String StorageObjectStorage::getPathSample(ContextPtr context)
         local_distributed_processing,
         context,
         {}, // predicate
+        {},
         {}, // virtual_columns
         nullptr, // read_keys
         {} // file_progress_callback
@@ -90,7 +90,9 @@ StorageObjectStorage::StorageObjectStorage(
     LoadingStrictnessLevel mode,
     bool distributed_processing_,
     ASTPtr partition_by_,
-    bool lazy_init)
+    bool is_table_function_,
+    bool lazy_init,
+    std::optional<std::string> sample_path_)
     : IStorage(table_id_)
     , configuration(configuration_)
     , object_storage(object_storage_)
@@ -100,6 +102,7 @@ StorageObjectStorage::StorageObjectStorage(
     , log(getLogger(fmt::format("Storage{}({})", configuration->getEngineName(), table_id_.getFullTableName())))
 {
     bool do_lazy_init = lazy_init && !columns_.empty() && !configuration->getFormat().empty();
+    update_configuration_on_read = !is_table_function_ || do_lazy_init;
     bool failed_init = false;
     auto do_init = [&]()
     {
@@ -129,7 +132,7 @@ StorageObjectStorage::StorageObjectStorage(
     if (!do_lazy_init)
         do_init();
 
-    std::string sample_path;
+    std::string sample_path = sample_path_.value_or("");
     ColumnsDescription columns{columns_};
     resolveSchemaAndFormat(columns, object_storage, configuration, format_settings, sample_path, context);
     configuration->check(context);
@@ -209,6 +212,18 @@ void StorageObjectStorage::updateExternalDynamicMetadata(ContextPtr context_ptr)
     setInMemoryMetadata(metadata);
 }
 
+std::optional<UInt64> StorageObjectStorage::totalRows(ContextPtr query_context) const
+{
+    configuration->update(object_storage, query_context);
+    return configuration->totalRows();
+}
+
+std::optional<UInt64> StorageObjectStorage::totalBytes(ContextPtr query_context) const
+{
+    configuration->update(object_storage, query_context);
+    return configuration->totalBytes();
+}
+
 namespace
 {
 class ReadFromObjectStorageStep : public SourceStepWithFilter
@@ -250,21 +265,12 @@ public:
     void applyFilters(ActionDAGNodes added_filter_nodes) override
     {
         SourceStepWithFilter::applyFilters(std::move(added_filter_nodes));
-        const ActionsDAG::Node * predicate = nullptr;
-        if (filter_actions_dag.has_value())
-        {
-            predicate = filter_actions_dag->getOutputs().at(0);
-            if (getContext()->getSettingsRef()[Setting::use_iceberg_partition_pruning])
-            {
-                configuration->implementPartitionPruning(*filter_actions_dag);
-            }
-        }
-        createIterator(predicate);
+        createIterator();
     }
 
     void initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &) override
     {
-        createIterator(nullptr);
+        createIterator();
 
         Pipes pipes;
         auto context = getContext();
@@ -316,14 +322,19 @@ private:
     size_t num_streams;
     const bool distributed_processing;
 
-    void createIterator(const ActionsDAG::Node * predicate)
+    void createIterator()
     {
         if (iterator_wrapper)
             return;
+
+        const ActionsDAG::Node * predicate = nullptr;
+        if (filter_actions_dag.has_value())
+            predicate = filter_actions_dag->getOutputs().at(0);
+
         auto context = getContext();
         iterator_wrapper = StorageObjectStorageSource::createFileIterator(
             configuration, configuration->getQuerySettings(context), object_storage, distributed_processing,
-            context, predicate, virtual_columns, nullptr, context->getFileProgressCallback());
+            context, predicate, filter_actions_dag, virtual_columns, nullptr, context->getFileProgressCallback());
     }
 };
 }
@@ -343,6 +354,11 @@ std::optional<ColumnsDescription> StorageObjectStorage::Configuration::tryGetTab
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method tryGetTableStructureFromMetadata is not implemented for basic configuration");
 }
 
+std::optional<String> StorageObjectStorage::Configuration::tryGetSamplePathFromMetadata() const
+{
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method tryGetSamplePathFromMetadata is not implemented for basic configuration");
+}
+
 void StorageObjectStorage::read(
     QueryPlan & query_plan,
     const Names & column_names,
@@ -353,7 +369,11 @@ void StorageObjectStorage::read(
     size_t max_block_size,
     size_t num_streams)
 {
-    configuration->update(object_storage, local_context);
+    /// We did configuration->update() in constructor,
+    /// so in case of table function there is no need to do the same here again.
+    if (update_configuration_on_read)
+        configuration->update(object_storage, local_context);
+
     if (partition_by && configuration->withPartitionWildcard())
     {
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
@@ -484,6 +504,7 @@ std::unique_ptr<ReadBufferIterator> StorageObjectStorage::createReadBufferIterat
         false/* distributed_processing */,
         context,
         {}/* predicate */,
+        {},
         {}/* virtual_columns */,
         &read_keys);
 
@@ -508,9 +529,7 @@ ColumnsDescription StorageObjectStorage::resolveSchemaFromData(
 
         auto table_structure = configuration->tryGetTableStructureFromMetadata();
         if (table_structure)
-        {
             return table_structure.value();
-        }
     }
 
     ObjectInfos read_keys;
@@ -680,4 +699,5 @@ void StorageObjectStorage::Configuration::assertInitialized() const
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Configuration was not initialized before usage");
     }
 }
+
 }

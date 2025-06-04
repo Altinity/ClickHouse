@@ -39,6 +39,12 @@ public:
         return std::make_unique<HudiMetadata>(object_storage, configuration, local_context);
     }
 
+protected:
+    ObjectIterator iterate(
+        const ActionsDAG * filter_dag,
+        FileProgressCallback callback,
+        size_t list_batch_size) const override;
+
 private:
     const ObjectStoragePtr object_storage;
     const ConfigurationObserverPtr configuration;
