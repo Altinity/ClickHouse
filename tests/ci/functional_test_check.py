@@ -73,7 +73,7 @@ def get_run_command(
     additional_options.append("--print-time")
 
     if "Stateless" in check_name and "ubsan" in check_name:
-        additional_options.append("--sequential=''")
+        additional_options.append('--sequential=""')
 
     if tests_to_run:
         additional_options += tests_to_run
