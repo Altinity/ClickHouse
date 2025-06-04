@@ -2232,7 +2232,7 @@ def test_partition_pruning(started_cluster, storage_type, run_on_cluster):
             "use_iceberg_partition_pruning": 1
         }
         return check_validity_and_get_prunned_files_general(
-            instance, TABLE_NAME, settings1, settings2, 'IcebergPartitionPrunedFiles', select_expression
+            instance, TABLE_NAME, settings1, settings2, 'IcebergPartitionPrunnedFiles', select_expression
         )
 
     assert (
@@ -2859,7 +2859,7 @@ def test_minmax_pruning(started_cluster, storage_type):
             "input_format_parquet_filter_push_down": 0,
         }
         return check_validity_and_get_prunned_files_general(
-            instance, TABLE_NAME, settings1, settings2, 'IcebergMinMaxIndexPrunedFiles', select_expression
+            instance, TABLE_NAME, settings1, settings2, 'IcebergMinMaxIndexPrunnedFiles', select_expression
         )
 
     assert (
@@ -3120,7 +3120,7 @@ def test_minmax_pruning_with_null(started_cluster, storage_type, run_on_cluster)
             "input_format_parquet_filter_push_down": 0,
         }
         return check_validity_and_get_prunned_files_general(
-            instance, TABLE_NAME, settings1, settings2, 'IcebergMinMaxIndexPrunedFiles', select_expression
+            instance, TABLE_NAME, settings1, settings2, 'IcebergMinMaxIndexPrunnedFiles', select_expression
         )
 
     assert (
@@ -3224,7 +3224,7 @@ def test_bucket_partition_pruning(started_cluster, storage_type):
             TABLE_NAME,
             settings1,
             settings2,
-            "IcebergPartitionPrunedFiles",
+            "IcebergPartitionPrunnedFiles",
             select_expression,
         )
 
