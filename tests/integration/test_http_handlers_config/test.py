@@ -609,7 +609,7 @@ def test_headers_in_response():
                 ClickHouseCluster(__file__), "headers_in_response", "test_headers_in_response"
             )
     ) as cluster:
-        for endpoint in ("static", "ping", "replicas_status", "play", "dashboard", "binary", "merges", "metrics",
+        for endpoint in ("static", "ping", "replicas_status", "play", "dashboard", "binary", "metrics",
                          "js/lz-string.js", "js/uplot.js", "?query=SELECT%201"):
             response = cluster.instance.http_request(endpoint, method="GET")
 

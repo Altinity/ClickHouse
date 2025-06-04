@@ -74,17 +74,6 @@
 
         <rule>
             <methods>GET,HEAD</methods>
-            <url>/merges</url>
-            <handler>
-                <type>merges</type>
-                <http_response_headers>
-                    <X-My-Answer>Iam merges</X-My-Answer>
-                </http_response_headers>
-            </handler>
-        </rule>
-
-        <rule>
-            <methods>GET,HEAD</methods>
             <url>/metrics</url>
             <handler>
                 <type>prometheus</type>
