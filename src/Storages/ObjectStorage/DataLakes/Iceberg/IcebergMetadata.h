@@ -24,7 +24,7 @@
 namespace DB
 {
 
-class IcebergMetadata : public IDataLakeMetadata, private WithContext
+class IcebergMetadata : public IDataLakeMetadata
 {
 public:
     using ConfigurationObserverPtr = StorageObjectStorage::ConfigurationObserverPtr;
@@ -116,6 +116,8 @@ private:
     std::optional<Iceberg::IcebergSnapshot> relevant_snapshot;
     Int64 relevant_snapshot_id{-1};
     String table_location;
+
+    ContextPtr context;
 
     mutable std::optional<Strings> cached_unprunned_files_for_last_processed_snapshot;
 
