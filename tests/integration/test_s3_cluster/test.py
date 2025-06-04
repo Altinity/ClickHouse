@@ -158,7 +158,7 @@ def test_count(started_cluster):
     s3_distributed_alt_syntax = node.query(
         f"""
     SELECT count(*) from s3(
-        'http://minio1:9001/root/data/{clickhouse,database}/*',
+        'http://minio1:9001/root/data/{{clickhouse,database}}/*',
         'minio', '{minio_secret_key}', 'CSV',
         'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
         SETTINGS object_storage_cluster = 'cluster_simple'"""
@@ -293,14 +293,14 @@ def test_wrong_cluster(started_cluster):
     assert "not found" in error
 
     error = node.query_and_get_error(
-        """
+        f"""
     SELECT count(*) from s3(
-        'http://minio1:9001/root/data/{clickhouse,database}/*',
-        'minio', 'minio123', 'CSV', 'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
+        'http://minio1:9001/root/data/{{clickhouse,database}}/*',
+        'minio', '{minio_secret_key}', 'CSV', 'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
     UNION ALL
     SELECT count(*) from s3(
-        'http://minio1:9001/root/data/{clickhouse,database}/*',
-        'minio', 'minio123', 'CSV', 'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
+        'http://minio1:9001/root/data/{{clickhouse,database}}/*',
+        'minio', '{minio_secret_key}', 'CSV', 'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
     SETTINGS object_storage_cluster = 'non_existing_cluster'
     """
     )
@@ -378,10 +378,10 @@ def test_unset_skip_unavailable_shards(started_cluster):
     assert result == "10\n"
 
     result = node.query(
-        """
+        f"""
     SELECT count(*) from s3(
         'http://minio1:9001/root/data/clickhouse/part1.csv',
-        'minio', 'minio123', 'CSV', 'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
+        'minio', '{minio_secret_key}', 'CSV', 'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
     SETTINGS object_storage_cluster = 'cluster_non_existent_port'
     """
     )
@@ -597,28 +597,28 @@ def test_cluster_format_detection(started_cluster):
     assert result == expected_result
 
     result = node.query(
-        """SELECT * FROM s3('http://minio1:9001/root/data/generated/*', 'minio', '{minio_secret_key}') order by c1, c2
+        f"""SELECT * FROM s3('http://minio1:9001/root/data/generated/*', 'minio', '{minio_secret_key}') order by c1, c2
         SETTINGS object_storage_cluster = 'cluster_simple'"""
     )
 
     assert result == expected_result
 
     result = node.query(
-        """SELECT * FROM s3('http://minio1:9001/root/data/generated/*', 'minio', '{minio_secret_key}', auto, 'a String, b UInt64') order by a, b
+        f"""SELECT * FROM s3('http://minio1:9001/root/data/generated/*', 'minio', '{minio_secret_key}', auto, 'a String, b UInt64') order by a, b
         SETTINGS object_storage_cluster = 'cluster_simple'"""
     )
 
     assert result == expected_result
 
     result = node.query(
-        """SELECT * FROM s3('http://minio1:9001/root/data/generated/*', 'minio', 'minio123') order by c1, c2
+        f"""SELECT * FROM s3('http://minio1:9001/root/data/generated/*', 'minio', '{minio_secret_key}') order by c1, c2
         SETTINGS object_storage_cluster = 'cluster_simple'"""
     )
 
     assert result == expected_result
 
     result = node.query(
-        """SELECT * FROM s3('http://minio1:9001/root/data/generated/*', 'minio', 'minio123', auto, 'a String, b UInt64') order by a, b
+        f"""SELECT * FROM s3('http://minio1:9001/root/data/generated/*', 'minio', '{minio_secret_key}', auto, 'a String, b UInt64') order by a, b
         SETTINGS object_storage_cluster = 'cluster_simple'"""
     )
 
@@ -714,7 +714,7 @@ def test_remote_hedged(started_cluster):
         f"""
     SELECT * from s3(
         'http://minio1:9001/root/data/{{clickhouse,database}}/*',
-        'minio', 'minio{minio_secret_key}123', 'CSV',
+        'minio', '{minio_secret_key}', 'CSV',
         'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
     ORDER BY (name, value, polygon)
     LIMIT 1

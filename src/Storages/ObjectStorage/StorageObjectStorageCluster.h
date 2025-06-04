@@ -31,6 +31,7 @@ public:
 
     RemoteQueryExecutor::Extension getTaskIteratorExtension(
         const ActionsDAG::Node * predicate,
+        const std::optional<ActionsDAG> & filter_actions_dag,
         const ContextPtr & context,
         ClusterPtr cluster) const override;
 
@@ -67,6 +68,22 @@ public:
         TableExclusiveLockHolder &) override;
 
     void addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const override;
+
+    std::optional<UInt64> totalRows(ContextPtr query_context) const override
+    {
+        if (pure_storage)
+            return pure_storage->totalRows(query_context);
+        configuration->update(object_storage, query_context);
+        return configuration->totalRows();
+    }
+
+    std::optional<UInt64> totalBytes(ContextPtr query_context) const override
+    {
+        if (pure_storage)
+            return pure_storage->totalBytes(query_context);
+        configuration->update(object_storage, query_context);
+        return configuration->totalBytes();
+    }
 
 private:
     void updateQueryToSendIfNeeded(

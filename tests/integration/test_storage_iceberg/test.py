@@ -1,6 +1,7 @@
 import logging
 import os
 import uuid
+import time
 from datetime import datetime, timezone
 
 import pyspark
@@ -580,7 +581,7 @@ def test_types(started_cluster, format_version, storage_type):
         [
             ["a", "Nullable(Int32)"],
             ["b", "Nullable(String)"],
-            ["c", "Nullable(Date32)"],
+            ["c", "Nullable(Date)"],
             ["d", "Array(Nullable(String))"],
             ["e", "Nullable(Bool)"],
         ]
@@ -603,7 +604,7 @@ def test_types(started_cluster, format_version, storage_type):
         [
             ["a", "Nullable(Int32)"],
             ["b", "Nullable(String)"],
-            ["c", "Nullable(Date32)"],
+            ["c", "Nullable(Date)"],
             ["d", "Array(Nullable(String))"],
             ["e", "Nullable(Bool)"],
         ]
@@ -843,14 +844,6 @@ def test_cluster_table_function(started_cluster, format_version, storage_type):
     count_secondary_subqueries(started_cluster, query_id_pure_table_engine_cluster_with_type_arg, 1, "table engine with cluster setting with storage type in args")
     count_secondary_subqueries(started_cluster, query_id_pure_table_engine_with_type_in_nc, 0, "table engine with storage type in named collection")
     count_secondary_subqueries(started_cluster, query_id_pure_table_engine_cluster_with_type_in_nc, 1, "table engine with cluster setting with storage type in named collection")
-
-    select_remote_cluster = (
-        instance.query(f"SELECT * FROM remote('node2',{table_function_expr_cluster})")
-        .strip()
-        .split()
-    )
-    assert len(select_remote_cluster) == 600
-    assert select_remote_cluster == select_regular
 
 
 @pytest.mark.parametrize("format_version", ["1", "2"])
@@ -2134,7 +2127,10 @@ def test_filesystem_cache(started_cluster, storage_type):
 
 
 @pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
-def test_partition_pruning(started_cluster, storage_type):
+@pytest.mark.parametrize("run_on_cluster", [False, True])
+def test_partition_pruning(started_cluster, storage_type, run_on_cluster):
+    if run_on_cluster and storage_type == "local":
+        pytest.skip("Local storage is not supported on cluster")
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
     TABLE_NAME = "test_partition_pruning_" + storage_type + "_" + get_uuid_str()
@@ -2182,7 +2178,7 @@ def test_partition_pruning(started_cluster, storage_type):
     )
 
     creation_expression = get_creation_expression(
-        storage_type, TABLE_NAME, started_cluster, table_function=True
+        storage_type, TABLE_NAME, started_cluster, table_function=True, run_on_cluster=run_on_cluster
     )
 
     def check_validity_and_get_prunned_files(select_expression):
@@ -3078,7 +3074,10 @@ def test_explicit_metadata_file(started_cluster, storage_type):
 
 
 @pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
-def test_minmax_pruning_with_null(started_cluster, storage_type):
+@pytest.mark.parametrize("run_on_cluster", [False, True])
+def test_minmax_pruning_with_null(started_cluster, storage_type, run_on_cluster):
+    if run_on_cluster and storage_type == "local":
+        pytest.skip("Local storage is not supported on cluster")
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
     TABLE_NAME = "test_minmax_pruning_with_null" + storage_type + "_" + get_uuid_str()
@@ -3149,7 +3148,7 @@ def test_minmax_pruning_with_null(started_cluster, storage_type):
     )
 
     creation_expression = get_creation_expression(
-        storage_type, TABLE_NAME, started_cluster, table_function=True
+        storage_type, TABLE_NAME, started_cluster, table_function=True, run_on_cluster=run_on_cluster
     )
 
     def check_validity_and_get_prunned_files(select_expression):

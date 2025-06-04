@@ -116,6 +116,7 @@ void StorageURLCluster::updateQueryToSendIfNeeded(ASTPtr & query, const StorageS
 
 RemoteQueryExecutor::Extension StorageURLCluster::getTaskIteratorExtension(
     const ActionsDAG::Node * predicate,
+    const std::optional<ActionsDAG> & /* filter_actions_dag */,
     const ContextPtr & context,
     ClusterPtr) const
 {

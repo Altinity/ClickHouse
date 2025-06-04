@@ -51,7 +51,7 @@ services:
   mc:
     depends_on:
       - minio
-    image: minio/mc
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
     container_name: mc
     environment:
       - AWS_ACCESS_KEY_ID=minio

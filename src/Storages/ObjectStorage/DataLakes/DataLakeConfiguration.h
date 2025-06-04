@@ -290,6 +290,7 @@ public:
     std::string getEngineName() const override { return getImpl().getEngineName(); }
     std::string getNamespaceType() const override { return getImpl().getNamespaceType(); }
 
+    Path getFullPath() const override { return getImpl().getFullPath(); }
     Path getPath() const override { return getImpl().getPath(); }
     void setPath(const Path & path) override { getImpl().setPath(path); }
 
@@ -306,9 +307,14 @@ public:
         ASTs & args, const String & structure_, const String & format_, ContextPtr context, bool with_structure) override
         { getImpl().addStructureAndFormatToArgsIfNeeded(args, structure_, format_, context, with_structure); }
 
+    bool withPartitionWildcard() const override { return getImpl().withPartitionWildcard(); }
+    bool withGlobsIgnorePartitionWildcard() const override { return getImpl().withGlobsIgnorePartitionWildcard(); }
+    bool isPathWithGlobs() const override { return getImpl().isPathWithGlobs(); }
+    bool isNamespaceWithGlobs() const override { return getImpl().isNamespaceWithGlobs(); }
     std::string getPathWithoutGlobs() const override { return getImpl().getPathWithoutGlobs(); }
 
     bool isArchive() const override { return getImpl().isArchive(); }
+    bool isPathInArchiveWithGlobs() const override { return getImpl().isPathInArchiveWithGlobs(); }
     std::string getPathInArchive() const override { return getImpl().getPathInArchive(); }
 
     void check(ContextPtr context) const override { getImpl().check(context); }
@@ -350,8 +356,19 @@ public:
     std::optional<ColumnsDescription> tryGetTableStructureFromMetadata() const override
         { return getImpl().tryGetTableStructureFromMetadata(); }
 
+    bool supportsFileIterator() const override { return getImpl().supportsFileIterator(); }
+    ObjectIterator iterate(
+        const ActionsDAG * filter_dag,
+        std::function<void(FileProgress)> callback,
+        size_t list_batch_size) override
+    {
+        return getImpl().iterate(filter_dag, callback, list_batch_size);
+    }
+
     void update(ObjectStoragePtr object_storage, ContextPtr local_context) override
         { return getImpl().update(object_storage, local_context); }
+    void updateIfRequired(ObjectStoragePtr object_storage, ContextPtr local_context) override
+        { return getImpl().updateIfRequired(object_storage, local_context); }
 
     void initialize(
         ASTs & engine_args,
@@ -376,7 +393,6 @@ public:
     void setCompressionMethod(const String & compression_method_) override { getImpl().setCompressionMethod(compression_method_); }
     void setStructure(const String & structure_) override { getImpl().setStructure(structure_); }
 
-protected:
     void fromNamedCollection(const NamedCollection & collection, ContextPtr context) override
         { return getImpl().fromNamedCollection(collection, context); }
     void fromAST(ASTs & args, ContextPtr context, bool with_structure) override
@@ -463,6 +479,9 @@ protected:
     {
         return getImpl().tryGetSamplePathFromMetadata();
     }
+
+    virtual void assertInitialized() const override { return getImpl().assertInitialized(); }
+
 
 private:
     inline StorageObjectStorage::Configuration & getImpl() const

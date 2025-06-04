@@ -307,7 +307,7 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
             {"s3", "s3Cluster"},
             {"azureBlobStorage", "azureBlobStorageCluster"},
             {"hdfs", "hdfsCluster"},
-            {"iceberg", "icebergS3Cluster"},
+            {"iceberg", "icebergCluster"},
             {"icebergS3", "icebergS3Cluster"},
             {"icebergAzure", "icebergAzureCluster"},
             {"icebergHDFS", "icebergHDFSCluster"},
@@ -365,12 +365,13 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
 
 RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExtension(
     const ActionsDAG::Node * predicate,
+    const std::optional<ActionsDAG> & filter_actions_dag,
     const ContextPtr & local_context,
     ClusterPtr cluster) const
 {
     auto iterator = StorageObjectStorageSource::createFileIterator(
         configuration, configuration->getQuerySettings(local_context), object_storage, /* distributed_processing */false,
-        local_context, predicate, {}, getVirtualsList(), nullptr, local_context->getFileProgressCallback(), /*ignore_archive_globs=*/true);
+        local_context, predicate, filter_actions_dag, getVirtualsList(), nullptr, local_context->getFileProgressCallback(), /*ignore_archive_globs=*/true);
 
     std::vector<std::string> ids_of_hosts;
     for (const auto & shard : cluster->getShardsInfo())
