@@ -1,5 +1,7 @@
 import pytest
 from helpers.cluster import ClickHouseCluster
+from helpers.config_cluster import minio_secret_key
+
 import time
 
 cluster = ClickHouseCluster(__file__)
@@ -18,11 +20,11 @@ def started_cluster():
 
 
 def test_clear_cache_on_cluster(started_cluster):
-    node1.query("INSERT INTO TABLE FUNCTION s3('http://minio1:9001/root/data/test_clear_cache/{_partition_id}.parquet', 'minio', 'minio123', 'Parquet') PARTITION BY number SELECT number FROM numbers(1, 3)")
+    node1.query(f"INSERT INTO TABLE FUNCTION s3('http://minio1:9001/root/data/test_clear_cache/{{_partition_id}}.parquet', 'minio', '{minio_secret_key}', 'Parquet') PARTITION BY number SELECT number FROM numbers(1, 3)")
 
-    node1.query("SELECT * FROM s3('http://minio1:9001/root/data/test_clear_cache/1.parquet', 'minio', 'minio123', 'Parquet') SETTINGS log_comment='cold_cache'")
-    node2.query("SELECT * FROM s3('http://minio1:9001/root/data/test_clear_cache/2.parquet', 'minio', 'minio123', 'Parquet') SETTINGS log_comment='cold_cache'")
-    node3.query("SELECT * FROM s3('http://minio1:9001/root/data/test_clear_cache/3.parquet', 'minio', 'minio123', 'Parquet') SETTINGS log_comment='cold_cache'")
+    node1.query(f"SELECT * FROM s3('http://minio1:9001/root/data/test_clear_cache/1.parquet', 'minio', '{minio_secret_key}', 'Parquet') SETTINGS log_comment='cold_cache'")
+    node2.query(f"SELECT * FROM s3('http://minio1:9001/root/data/test_clear_cache/2.parquet', 'minio', '{minio_secret_key}', 'Parquet') SETTINGS log_comment='cold_cache'")
+    node3.query(f"SELECT * FROM s3('http://minio1:9001/root/data/test_clear_cache/3.parquet', 'minio', '{minio_secret_key}', 'Parquet') SETTINGS log_comment='cold_cache'")
 
     node1.query("SYSTEM FLUSH LOGS ON CLUSTER parquet_clear_cache_cluster")
 
@@ -33,9 +35,9 @@ def test_clear_cache_on_cluster(started_cluster):
     assert(cold_cache_result_n1 == cold_cache_result_n2 == cold_cache_result_n3)
     assert(cold_cache_result_n1 == '0\n')
 
-    node1.query("SELECT * FROM s3('http://minio1:9001/root/data/test_clear_cache/1.parquet', 'minio', 'minio123', 'Parquet') SETTINGS log_comment='hot_cache'")
-    node2.query("SELECT * FROM s3('http://minio1:9001/root/data/test_clear_cache/2.parquet', 'minio', 'minio123', 'Parquet') SETTINGS log_comment='hot_cache'")
-    node3.query("SELECT * FROM s3('http://minio1:9001/root/data/test_clear_cache/3.parquet', 'minio', 'minio123', 'Parquet') SETTINGS log_comment='hot_cache'")
+    node1.query(f"SELECT * FROM s3('http://minio1:9001/root/data/test_clear_cache/1.parquet', 'minio', '{minio_secret_key}', 'Parquet') SETTINGS log_comment='hot_cache'")
+    node2.query(f"SELECT * FROM s3('http://minio1:9001/root/data/test_clear_cache/2.parquet', 'minio', '{minio_secret_key}', 'Parquet') SETTINGS log_comment='hot_cache'")
+    node3.query(f"SELECT * FROM s3('http://minio1:9001/root/data/test_clear_cache/3.parquet', 'minio', '{minio_secret_key}', 'Parquet') SETTINGS log_comment='hot_cache'")
 
     node1.query("SYSTEM FLUSH LOGS ON CLUSTER parquet_clear_cache_cluster")
 
@@ -48,9 +50,9 @@ def test_clear_cache_on_cluster(started_cluster):
 
     node1.query("SYSTEM DROP PARQUET METADATA CACHE ON CLUSTER parquet_clear_cache_cluster")
 
-    node1.query("SELECT * FROM s3('http://minio1:9001/root/data/test_clear_cache/1.parquet', 'minio', 'minio123', 'Parquet') SETTINGS log_comment='cache_after_drop'")
-    node2.query("SELECT * FROM s3('http://minio1:9001/root/data/test_clear_cache/2.parquet', 'minio', 'minio123', 'Parquet') SETTINGS log_comment='cache_after_drop'")
-    node3.query("SELECT * FROM s3('http://minio1:9001/root/data/test_clear_cache/3.parquet', 'minio', 'minio123', 'Parquet') SETTINGS log_comment='cache_after_drop'")
+    node1.query(f"SELECT * FROM s3('http://minio1:9001/root/data/test_clear_cache/1.parquet', 'minio', '{minio_secret_key}', 'Parquet') SETTINGS log_comment='cache_after_drop'")
+    node2.query(f"SELECT * FROM s3('http://minio1:9001/root/data/test_clear_cache/2.parquet', 'minio', '{minio_secret_key}', 'Parquet') SETTINGS log_comment='cache_after_drop'")
+    node3.query(f"SELECT * FROM s3('http://minio1:9001/root/data/test_clear_cache/3.parquet', 'minio', '{minio_secret_key}', 'Parquet') SETTINGS log_comment='cache_after_drop'")
 
     node1.query("SYSTEM FLUSH LOGS ON CLUSTER parquet_clear_cache_cluster")
 

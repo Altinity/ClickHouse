@@ -1135,9 +1135,6 @@ std::optional<QueryPipeline> StorageDistributed::distributedWriteFromClusterStor
     if (filter)
         predicate = filter->getOutputs().at(0);
 
-    /// Select query is needed for pruining on virtual columns
-    auto extension = src_storage_cluster.getTaskIteratorExtension(predicate, local_context);
-
     auto dst_cluster = getCluster();
 
     auto new_query = std::dynamic_pointer_cast<ASTInsertQuery>(query.clone());
@@ -1164,8 +1161,13 @@ std::optional<QueryPipeline> StorageDistributed::distributedWriteFromClusterStor
     const auto & current_settings = query_context->getSettingsRef();
     auto timeouts = ConnectionTimeouts::getTCPTimeoutsWithFailover(current_settings);
 
-    /// Here we take addresses from destination cluster and assume source table exists on these nodes
     const auto cluster = getCluster();
+
+    /// Select query is needed for pruining on virtual columns
+    auto extension = src_storage_cluster.getTaskIteratorExtension(predicate, filter, local_context, cluster);
+
+    /// Here we take addresses from destination cluster and assume source table exists on these nodes
+    size_t replica_index = 0;
     for (const auto & replicas : cluster->getShardsInfo())
     {
         /// Skip unavailable hosts if necessary
@@ -1174,6 +1176,8 @@ std::optional<QueryPipeline> StorageDistributed::distributedWriteFromClusterStor
         /// There will be only one replica, because we consider each replica as a shard
         for (const auto & try_result : try_results)
         {
+            IConnections::ReplicaInfo replica_info{ .number_of_current_replica = replica_index++ };
+
             auto remote_query_executor = std::make_shared<RemoteQueryExecutor>(
                 std::vector<IConnectionPool::Entry>{try_result},
                 new_query_str,
@@ -1183,7 +1187,7 @@ std::optional<QueryPipeline> StorageDistributed::distributedWriteFromClusterStor
                 Scalars{},
                 Tables{},
                 QueryProcessingStage::Complete,
-                extension);
+                RemoteQueryExecutor::Extension{.task_iterator = extension.task_iterator, .replica_info = std::move(replica_info)});
 
             QueryPipeline remote_pipeline(std::make_shared<RemoteSource>(
                 remote_query_executor, false, settings[Setting::async_socket_for_remote], settings[Setting::async_query_sending_for_remote]));
@@ -1513,7 +1517,7 @@ Cluster::Addresses StorageDistributed::parseAddresses(const std::string & name) 
     return addresses;
 }
 
-std::optional<UInt64> StorageDistributed::totalBytes(const Settings &) const
+std::optional<UInt64> StorageDistributed::totalBytes(ContextPtr) const
 {
     UInt64 total_bytes = 0;
     for (const auto & status : getDirectoryQueueStatuses())
@@ -1837,7 +1841,7 @@ void StorageDistributed::delayInsertOrThrowIfNeeded() const
         !(*distributed_settings)[DistributedSetting::bytes_to_delay_insert])
         return;
 
-    UInt64 total_bytes = *totalBytes(getContext()->getSettingsRef());
+    UInt64 total_bytes = *totalBytes(getContext());
 
     if ((*distributed_settings)[DistributedSetting::bytes_to_throw_insert] && total_bytes > (*distributed_settings)[DistributedSetting::bytes_to_throw_insert])
     {
@@ -1858,12 +1862,12 @@ void StorageDistributed::delayInsertOrThrowIfNeeded() const
         do {
             delayed_ms += step_ms;
             std::this_thread::sleep_for(std::chrono::milliseconds(step_ms));
-        } while (*totalBytes(getContext()->getSettingsRef()) > (*distributed_settings)[DistributedSetting::bytes_to_delay_insert] && delayed_ms < (*distributed_settings)[DistributedSetting::max_delay_to_insert]*1000);
+        } while (*totalBytes(getContext()) > (*distributed_settings)[DistributedSetting::bytes_to_delay_insert] && delayed_ms < (*distributed_settings)[DistributedSetting::max_delay_to_insert]*1000);
 
         ProfileEvents::increment(ProfileEvents::DistributedDelayedInserts);
         ProfileEvents::increment(ProfileEvents::DistributedDelayedInsertsMilliseconds, delayed_ms);
 
-        UInt64 new_total_bytes = *totalBytes(getContext()->getSettingsRef());
+        UInt64 new_total_bytes = *totalBytes(getContext());
         LOG_INFO(log, "Too many bytes pending for async INSERT: was {}, now {}, INSERT was delayed to {} ms",
             formatReadableSizeWithBinarySuffix(total_bytes),
             formatReadableSizeWithBinarySuffix(new_total_bytes),

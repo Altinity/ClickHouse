@@ -5901,8 +5901,9 @@ void StorageReplicatedMergeTree::foreachActiveParts(Func && func, bool select_se
     }
 }
 
-std::optional<UInt64> StorageReplicatedMergeTree::totalRows(const Settings & settings) const
+std::optional<UInt64> StorageReplicatedMergeTree::totalRows(ContextPtr query_context) const
 {
+    const auto & settings = query_context->getSettingsRef();
     UInt64 res = 0;
     foreachActiveParts([&res](auto & part) { res += part->rows_count; }, settings[Setting::select_sequential_consistency]);
     return res;
@@ -5915,8 +5916,9 @@ std::optional<UInt64> StorageReplicatedMergeTree::totalRowsByPartitionPredicate(
     return totalRowsByPartitionPredicateImpl(filter_actions_dag, local_context, parts);
 }
 
-std::optional<UInt64> StorageReplicatedMergeTree::totalBytes(const Settings & settings) const
+std::optional<UInt64> StorageReplicatedMergeTree::totalBytes(ContextPtr query_context) const
 {
+    const auto & settings = query_context->getSettingsRef();
     UInt64 res = 0;
     foreachActiveParts([&res](auto & part) { res += part->getBytesOnDisk(); }, settings[Setting::select_sequential_consistency]);
     return res;
@@ -5993,7 +5995,6 @@ SinkToStoragePtr StorageReplicatedMergeTree::write(const ASTPtr & /*query*/, con
 std::optional<QueryPipeline> StorageReplicatedMergeTree::distributedWriteFromClusterStorage(const std::shared_ptr<IStorageCluster> & src_storage_cluster, const ASTInsertQuery & query, ContextPtr local_context)
 {
     const auto & settings = local_context->getSettingsRef();
-    auto extension = src_storage_cluster->getTaskIteratorExtension(nullptr, local_context);
 
     /// Here we won't check that the cluster formed from table replicas is a subset of a cluster specified in s3Cluster/hdfsCluster table function
     auto src_cluster = src_storage_cluster->getCluster(local_context);
@@ -6012,6 +6013,9 @@ std::optional<QueryPipeline> StorageReplicatedMergeTree::distributedWriteFromClu
     ContextMutablePtr query_context = Context::createCopy(local_context);
     query_context->increaseDistributedDepth();
 
+    auto extension = src_storage_cluster->getTaskIteratorExtension(nullptr, {}, local_context, src_cluster);
+
+    size_t replica_index = 0;
     for (const auto & replicas : src_cluster->getShardsAddresses())
     {
         /// There will be only one replica, because we consider each replica as a shard
@@ -6026,6 +6030,8 @@ std::optional<QueryPipeline> StorageReplicatedMergeTree::distributedWriteFromClu
                 node.secure
             );
 
+            IConnections::ReplicaInfo replica_info{ .number_of_current_replica = replica_index++ };
+
             auto remote_query_executor = std::make_shared<RemoteQueryExecutor>(
                 connection,
                 query_str,
@@ -6035,7 +6041,7 @@ std::optional<QueryPipeline> StorageReplicatedMergeTree::distributedWriteFromClu
                 Scalars{},
                 Tables{},
                 QueryProcessingStage::Complete,
-                extension);
+                RemoteQueryExecutor::Extension{.task_iterator = extension.task_iterator, .replica_info = std::move(replica_info)});
 
             QueryPipeline remote_pipeline(std::make_shared<RemoteSource>(
                 remote_query_executor, false, settings[Setting::async_socket_for_remote], settings[Setting::async_query_sending_for_remote]));

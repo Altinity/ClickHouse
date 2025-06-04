@@ -4268,6 +4268,10 @@ The maximum size of serialized literal in bytes to replace in `UPDATE` and `DELE
 The probability of a fault injection during table creation after creating metadata in ZooKeeper
 )", 0) \
     \
+    DECLARE(Bool, use_iceberg_metadata_files_cache, true, R"(
+If turned on, iceberg table function and iceberg storage may utilize the iceberg metadata files cache.
+)", 0) \
+    \
     DECLARE(Bool, use_query_cache, false, R"(
 If turned on, `SELECT` queries may utilize the [query cache](../query-cache.md). Parameters [enable_reads_from_query_cache](#enable_reads_from_query_cache)
 and [enable_writes_to_query_cache](#enable_writes_to_query_cache) control in more detail how the cache is used.
@@ -5706,6 +5710,12 @@ When the ratio of rows containing NULL values to the total number of rows exceed
     DECLARE(Int64, prefer_warmed_unmerged_parts_seconds, 0, R"(
 Only has an effect in ClickHouse Cloud. If a merged part is less than this many seconds old and is not pre-warmed (see [cache_populated_by_fetch](merge-tree-settings.md/#cache_populated_by_fetch)), but all its source parts are available and pre-warmed, SELECT queries will read from those parts instead. Only for Replicated-/SharedMergeTree. Note that this only checks whether CacheWarmer processed the part; if the part was fetched into cache by something else, it'll still be considered cold until CacheWarmer gets to it; if it was warmed, then evicted from cache, it'll still be considered warm.
 )", 0) \
+    DECLARE(Int64, iceberg_timestamp_ms, 0, R"(
+Query Iceberg table using the snapshot that was current at a specific timestamp.
+)", 0) \
+    DECLARE(Int64, iceberg_snapshot_id, 0, R"(
+Query Iceberg table using the specific snapshot id.
+)", 0) \
     DECLARE(Bool, allow_deprecated_error_prone_window_functions, false, R"(
 Allow usage of deprecated error prone window functions (neighbor, runningAccumulate, runningDifferenceStartingWithFirstValue, runningDifference)
 )", 0) \
@@ -6111,6 +6121,15 @@ Enable PRQL - an alternative to SQL.
 )", EXPERIMENTAL) \
     DECLARE(Bool, enable_adaptive_memory_spill_scheduler, false, R"(
 Trigger processor to spill data into external storage adpatively. grace join is supported at present.
+)", EXPERIMENTAL) \
+    DECLARE(String, object_storage_cluster, "", R"(
+Cluster to make distributed requests to object storages with alternative syntax.
+)", EXPERIMENTAL) \
+    DECLARE(UInt64, object_storage_max_nodes, 0, R"(
+Limit for hosts used for request in object storage cluster table functions - azureBlobStorageCluster, s3Cluster, hdfsCluster, etc.
+Possible values:
+- Positive integer.
+- 0 — All hosts in cluster.
 )", EXPERIMENTAL) \
     \
     /** Experimental tsToGrid aggregate function. */ \

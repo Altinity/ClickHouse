@@ -44,7 +44,7 @@ Strings HudiMetadata::getDataFilesImpl() const
 {
     auto configuration_ptr = configuration.lock();
     auto log = getLogger("HudiMetadata");
-    const auto keys = listFiles(*object_storage, *configuration_ptr, "", Poco::toLower(configuration_ptr->format));
+    const auto keys = listFiles(*object_storage, *configuration_ptr, "", Poco::toLower(configuration_ptr->getFormat()));
 
     using Partition = std::string;
     using FileID = std::string;
@@ -91,11 +91,19 @@ HudiMetadata::HudiMetadata(ObjectStoragePtr object_storage_, ConfigurationObserv
 {
 }
 
-Strings HudiMetadata::getDataFiles() const
+Strings HudiMetadata::getDataFiles(const ActionsDAG *) const
 {
     if (data_files.empty())
         data_files = getDataFilesImpl();
     return data_files;
+}
+
+ObjectIterator HudiMetadata::iterate(
+    const ActionsDAG * filter_dag,
+    FileProgressCallback callback,
+    size_t /* list_batch_size */) const
+{
+    return createKeysIterator(getDataFiles(filter_dag), object_storage, callback);
 }
 
 }

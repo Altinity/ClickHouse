@@ -128,6 +128,7 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
     bool distributed_processing,
     const ContextPtr & local_context,
     const ActionsDAG::Node * predicate,
+    const std::optional<ActionsDAG> & filter_actions_dag,
     const NamesAndTypesList & virtual_columns,
     ObjectInfos * read_keys,
     std::function<void(FileProgress)> file_progress_callback,
@@ -148,6 +149,8 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
     if (configuration->isNamespaceWithGlobs())
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
                         "Expression can not have wildcards inside {} name", configuration->getNamespaceType());
+
+    configuration->updateIfRequired(object_storage, local_context);
 
     std::unique_ptr<IObjectIterator> iterator;
     if (configuration->isPathWithGlobs())
@@ -197,7 +200,10 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
     }
     else if (configuration->supportsFileIterator())
     {
-        return configuration->iterate();
+        return configuration->iterate(
+            filter_actions_dag.has_value() ? &filter_actions_dag.value() : nullptr,
+            file_progress_callback,
+            query_settings.list_object_keys_size);
     }
     else
     {
@@ -384,7 +390,7 @@ Chunk StorageObjectStorageSource::generate()
 void StorageObjectStorageSource::addNumRowsToCache(const ObjectInfo & object_info, size_t num_rows)
 {
     const auto cache_key = getKeyForSchemaCache(
-        getUniqueStoragePathIdentifier(*configuration, object_info), configuration->format, format_settings, read_context);
+        getUniqueStoragePathIdentifier(*configuration, object_info), configuration->getFormat(), format_settings, read_context);
     schema_cache.addNumRows(cache_key, num_rows);
 }
 
@@ -431,11 +437,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         if (!object_info || object_info->getPath().empty())
             return {};
 
-        if (!object_info->metadata)
-        {
-            const auto & path = object_info->isArchive() ? object_info->getPathToArchive() : object_info->getPath();
-            object_info->metadata = object_storage->getObjectMetadata(path);
-        }
+        object_info->loadMetadata(object_storage);
     }
     while (query_settings.skip_empty_files && object_info->metadata->size_bytes == 0);
 
@@ -450,7 +452,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
         const auto cache_key = getKeyForSchemaCache(
             getUniqueStoragePathIdentifier(*configuration, *object_info),
-            configuration->format,
+            configuration->getFormat(),
             format_settings,
             context_);
 
@@ -481,13 +483,13 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         CompressionMethod compression_method;
         if (const auto * object_info_in_archive = dynamic_cast<const ArchiveIterator::ObjectInfoInArchive *>(object_info.get()))
         {
-            compression_method = chooseCompressionMethod(configuration->getPathInArchive(), configuration->compression_method);
+            compression_method = chooseCompressionMethod(configuration->getPathInArchive(), configuration->getCompressionMethod());
             const auto & archive_reader = object_info_in_archive->archive_reader;
             read_buf = archive_reader->readFile(object_info_in_archive->path_in_archive, /*throw_on_not_found=*/true);
         }
         else
         {
-            compression_method = chooseCompressionMethod(object_info->getFileName(), configuration->compression_method);
+            compression_method = chooseCompressionMethod(object_info->getFileName(), configuration->getCompressionMethod());
             read_buf = createReadBuffer(*object_info, object_storage, context_, log);
         }
 
@@ -505,7 +507,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
 
         auto input_format = FormatFactory::instance().getInput(
-            configuration->format,
+            configuration->getFormat(),
             *read_buf,
             initial_header,
             context_,
@@ -524,6 +526,9 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
         if (need_only_count)
             input_format->needOnlyCount();
+
+        if (!object_info->getPath().empty())
+            input_format->setStorageRelatedUniqueKey(context_->getSettingsRef(), object_info->getPath() + ":" + object_info->metadata->etag);
 
         builder.init(Pipe(input_format));
 
