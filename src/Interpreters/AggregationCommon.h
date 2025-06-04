@@ -11,7 +11,6 @@
 #include <Columns/ColumnsNumber.h>
 #include <Columns/ColumnFixedString.h>
 #include <Columns/ColumnLowCardinality.h>
-#include <Common/logger_useful.h>
 
 #if defined(__SSSE3__) && !defined(MEMORY_SANITIZER)
 #include <tmmintrin.h>
@@ -134,15 +133,6 @@ static inline T ALWAYS_INLINE packFixed(
         size_t index = i;
         const IColumn * column = key_columns[j];
         auto column_possibly_converted = column->convertToFullColumnIfSparse()->convertToFullColumnIfConst();
-
-        // TODO(vnemkov): debug logging, remove before merging.
-        if (!checkColumn<const ColumnFixedSizeHelper>(column)) {
-            LOG_WARNING(::getLogger("AggregationCommon"), "column is of unsupported type: {}, trying unwrapping", column->getName());
-            if (!checkColumn<const ColumnFixedSizeHelper>(column_possibly_converted.get()))
-            {
-                LOG_ERROR(::getLogger("AggregationCommon"), "unwrapped column is of unsupported type too ({})... this will fail at later stage under UBSAN.", column_possibly_converted->getName());
-            }
-        }
         column = column_possibly_converted.get();
 
         if constexpr (has_low_cardinality)
@@ -239,15 +229,6 @@ static inline T ALWAYS_INLINE packFixed(
 
         const IColumn * key_column = key_columns[j];
         auto column_possibly_converted = key_column->convertToFullColumnIfSparse()->convertToFullColumnIfConst();
-
-        // TODO(vnemkov): debug logging, remove before merging.
-        if (!checkColumn<const ColumnFixedSizeHelper>(key_column)) {
-            LOG_WARNING(::getLogger("AggregationCommon"), "column is of unsupported type: {}, trying unwrapping", key_column->getName());
-            if (!checkColumn<const ColumnFixedSizeHelper>(column_possibly_converted.get()))
-            {
-                LOG_ERROR(::getLogger("AggregationCommon"), "unwrapped column is of unsupported type too ({})... this will fail at later stage under UBSAN.", column_possibly_converted->getName());
-            }
-        }
         key_column = column_possibly_converted.get();
 
         switch (key_sizes[j])
