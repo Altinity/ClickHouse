@@ -31,6 +31,7 @@ public:
 
     RemoteQueryExecutor::Extension getTaskIteratorExtension(
         const ActionsDAG::Node * predicate,
+        const std::optional<ActionsDAG> & filter_actions_dag,
         const ContextPtr & context,
         ClusterPtr cluster) const override;
 
