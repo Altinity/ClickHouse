@@ -24,7 +24,7 @@
 namespace DB
 {
 
-class IcebergMetadata : public IDataLakeMetadata, private WithContext
+class IcebergMetadata : public IDataLakeMetadata
 {
 public:
     using ConfigurationObserverPtr = StorageObjectStorage::ConfigurationObserverPtr;
@@ -41,6 +41,11 @@ public:
         Int32 format_version_,
         const Poco::JSON::Object::Ptr & metadata_object,
         IcebergMetadataFilesCachePtr cache_ptr);
+
+    /// Get data files. On first request it reads manifest_list file and iterates through manifest files to find all data files.
+    /// All subsequent calls when the same data snapshot is relevant will return saved list of files (because it cannot be changed
+    /// without changing metadata file). Drops on every snapshot update.
+    Strings getDataFiles() const override { return getDataFilesImpl(nullptr); }
 
     /// Get table schema parsed from metadata.
     NamesAndTypesList getTableSchema() const override
@@ -113,6 +118,8 @@ private:
     std::optional<Iceberg::IcebergSnapshot> relevant_snapshot;
     Int64 relevant_snapshot_id{-1};
     String table_location;
+
+    ContextPtr context;
 
     mutable std::optional<Strings> cached_unprunned_files_for_last_processed_snapshot;
 

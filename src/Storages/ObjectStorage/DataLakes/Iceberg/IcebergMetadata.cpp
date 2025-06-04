@@ -131,8 +131,7 @@ IcebergMetadata::IcebergMetadata(
     Int32 format_version_,
     const Poco::JSON::Object::Ptr & metadata_object_,
     IcebergMetadataFilesCachePtr cache_ptr)
-    : WithContext(context_)
-    , object_storage(std::move(object_storage_))
+    : object_storage(std::move(object_storage_))
     , configuration(std::move(configuration_))
     , schema_processor(IcebergSchemaProcessor())
     , log(getLogger("IcebergMetadata"))
@@ -142,6 +141,7 @@ IcebergMetadata::IcebergMetadata(
     , format_version(format_version_)
     , relevant_snapshot_schema_id(-1)
     , table_location(last_metadata_object->getValue<String>(TABLE_LOCATION_FIELD))
+    , context(context_)
 {
     updateState(context_, true);
 }
@@ -646,8 +646,8 @@ ManifestListPtr IcebergMetadata::getManifestList(const String & filename) const
     {
         ManifestList manifest_list;
         StorageObjectStorage::ObjectInfo object_info(filename);
-        auto manifest_list_buf = StorageObjectStorageSource::createReadBuffer(object_info, object_storage, getContext(), log);
-        AvroForIcebergDeserializer manifest_list_deserializer(std::move(manifest_list_buf), filename, getFormatSettings(getContext()));
+        auto manifest_list_buf = StorageObjectStorageSource::createReadBuffer(object_info, object_storage, context, log);
+        AvroForIcebergDeserializer manifest_list_deserializer(std::move(manifest_list_buf), filename, getFormatSettings(context));
 
         ManifestFileCacheKeys manifest_file_cache_keys;
 
@@ -693,8 +693,8 @@ ManifestFilePtr IcebergMetadata::getManifestFile(const String & filename, Int64 
     auto create_fn = [&]()
     {
         ObjectInfo manifest_object_info(filename);
-        auto buffer = StorageObjectStorageSource::createReadBuffer(manifest_object_info, object_storage, getContext(), log);
-        AvroForIcebergDeserializer manifest_file_deserializer(std::move(buffer), filename, getFormatSettings(getContext()));
+        auto buffer = StorageObjectStorageSource::createReadBuffer(manifest_object_info, object_storage, context, log);
+        AvroForIcebergDeserializer manifest_file_deserializer(std::move(buffer), filename, getFormatSettings(context));
         auto [schema_id, schema_object] = parseTableSchemaFromManifestFile(manifest_file_deserializer, filename);
         schema_processor.addIcebergTableSchema(schema_object);
         return std::make_shared<ManifestFileContent>(
@@ -706,7 +706,7 @@ ManifestFilePtr IcebergMetadata::getManifestFile(const String & filename, Int64 
             schema_processor,
             inherited_sequence_number,
             table_location,
-            getContext());
+            context);
     };
 
     if (manifest_cache)
@@ -723,7 +723,7 @@ Strings IcebergMetadata::getDataFilesImpl(const ActionsDAG * filter_dag) const
     if (!relevant_snapshot)
         return {};
 
-    bool use_partition_pruning = filter_dag && getContext()->getSettingsRef()[Setting::use_iceberg_partition_pruning];
+    bool use_partition_pruning = filter_dag && context->getSettingsRef()[Setting::use_iceberg_partition_pruning];
 
     if (!use_partition_pruning && cached_unprunned_files_for_last_processed_snapshot.has_value())
         return cached_unprunned_files_for_last_processed_snapshot.value();
@@ -734,7 +734,7 @@ Strings IcebergMetadata::getDataFilesImpl(const ActionsDAG * filter_dag) const
         ManifestFilesPruner pruner(
             schema_processor, relevant_snapshot_schema_id,
             use_partition_pruning ? filter_dag : nullptr,
-            *manifest_file_ptr, getContext());
+            *manifest_file_ptr, context);
         const auto & data_files_in_manifest = manifest_file_ptr->getFiles();
         for (const auto & manifest_file_entry : data_files_in_manifest)
         {
