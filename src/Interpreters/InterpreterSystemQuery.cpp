@@ -437,6 +437,7 @@ BlockIO InterpreterSystemQuery::execute()
             getContext()->checkAccess(AccessType::SYSTEM_DROP_OBJECT_STORAGE_LIST_OBJECTS_CACHE);
             ObjectStorageListObjectsCache::instance().clear();
             break;
+        }
         case Type::DROP_PARQUET_METADATA_CACHE:
         {
 #if USE_PARQUET
