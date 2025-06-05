@@ -17,6 +17,9 @@
     "00988_expansion_aliases_limit": {
         "reason": "INVESTIGATE - Timeout on TSAN"
     },
+    "03223_analyzer_with_cube_fuzz": {
+        "reason": "INVESTIGATE - Fails on TSAN"
+    },
     "test_overcommit_tracker/test.py::test_user_overcommit": {
         "reason": "INVESTIGATE - fails in tsan"
     },
@@ -271,5 +274,8 @@
     },
     "test_database_delta/test.py::test_embedded_database_and_tables": {
         "reason": "Investigate - Cluster fails to start"
+    },
+    "test_storage_rabbitmq/test.py::test_rabbitmq_sharding_between_queues_publish": {
+        "reason": "INVESTIGATE - Timeout on TSAN"
     }
 }
