@@ -253,11 +253,17 @@ def get_commit_statuses(sha: str) -> pd.DataFrame:
         for item in all_data
     ]
 
-    return (
-        pd.DataFrame(parsed)
-        .sort_values(by=["job_status", "job_name"], ascending=[True, True])
-        .reset_index(drop=True)
-    )
+    # Create DataFrame
+    df = pd.DataFrame(parsed)
+
+    # Drop duplicates keeping the first occurrence (newest status for each context)
+    # GitHub returns statuses in reverse chronological order
+    df = df.drop_duplicates(subset=["job_name"], keep="first")
+
+    # Sort by status and job name
+    return df.sort_values(
+        by=["job_status", "job_name"], ascending=[True, True]
+    ).reset_index(drop=True)
 
 
 def get_pr_info_from_number(pr_number: str) -> dict:
@@ -291,13 +297,23 @@ def get_checks_fails(client: Client, job_url: str):
     Get tests that did not succeed for the given job URL.
     Exclude checks that have status 'error' as they are counted in get_checks_errors.
     """
-    columns = "check_status as job_status, check_name as job_name, test_status, test_name, report_url as results_link"
-    query = f"""SELECT {columns} FROM `gh-data`.checks
-                WHERE task_url LIKE '{job_url}%'
-                AND test_status IN ('FAIL', 'ERROR')
-                AND check_status!='error'
-                ORDER BY check_name, test_name
-                """
+    query = f"""SELECT job_status, job_name, status as test_status, test_name, results_link
+            FROM (
+                SELECT
+                    argMax(check_status, check_start_time) as job_status,
+                    check_name as job_name,
+                    argMax(test_status, check_start_time) as status,
+                    test_name,
+                    report_url as results_link,
+                    task_url
+                FROM `gh-data`.checks
+                GROUP BY check_name, test_name, report_url, task_url
+            )
+            WHERE task_url LIKE '{job_url}%'
+            AND test_status IN ('FAIL', 'ERROR')
+            AND job_status!='error'
+            ORDER BY job_name, test_name
+            """
     return client.query_dataframe(query)
 
 
@@ -305,14 +321,26 @@ def get_checks_known_fails(client: Client, job_url: str, known_fails: dict):
     """
     Get tests that are known to fail for the given job URL.
     """
-    assert len(known_fails) > 0, "cannot query the database with empty known fails"
-    columns = "check_status as job_status, check_name as job_name, test_status, test_name, report_url as results_link"
-    query = f"""SELECT {columns} FROM `gh-data`.checks
-                WHERE task_url LIKE '{job_url}%'
-                AND test_status='BROKEN'
-                AND test_name IN ({','.join(f"'{test}'" for test in known_fails.keys())})
-                ORDER BY test_name, check_name
-                """
+    if len(known_fails) == 0:
+        return pd.DataFrame()
+
+    query = f"""SELECT job_status, job_name, status as test_status, test_name, results_link
+        FROM (
+            SELECT
+                argMax(check_status, check_start_time) as job_status,
+                check_name as job_name,
+                argMax(test_status, check_start_time) as status,
+                test_name,
+                report_url as results_link,
+                task_url
+            FROM `gh-data`.checks
+            GROUP BY check_name, test_name, report_url, task_url
+        )
+        WHERE task_url LIKE '{job_url}%'
+        AND test_status='BROKEN'
+        AND test_name IN ({','.join(f"'{test}'" for test in known_fails.keys())})
+        ORDER BY job_name, test_name
+        """
 
     df = client.query_dataframe(query)
 
@@ -333,12 +361,22 @@ def get_checks_errors(client: Client, job_url: str):
     """
     Get checks that have status 'error' for the given job URL.
     """
-    columns = "check_status as job_status, check_name as job_name, test_status, test_name, report_url as results_link"
-    query = f"""SELECT {columns} FROM `gh-data`.checks
-                WHERE task_url LIKE '{job_url}%'
-                AND check_status=='error'
-                ORDER BY check_name, test_name
-                """
+    query = f"""SELECT job_status, job_name, status as test_status, test_name, results_link
+            FROM (
+                SELECT
+                    argMax(check_status, check_start_time) as job_status,
+                    check_name as job_name,
+                    argMax(test_status, check_start_time) as status,
+                    test_name,
+                    report_url as results_link,
+                    task_url
+                FROM `gh-data`.checks
+                GROUP BY check_name, test_name, report_url, task_url
+            )
+            WHERE task_url LIKE '{job_url}%'
+            AND job_status=='error'
+            ORDER BY job_name, test_name
+            """
     return client.query_dataframe(query)
 
 

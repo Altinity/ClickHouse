@@ -649,12 +649,13 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           python3 ./tests/ci/ci_buddy.py --check-wf-status
-      - name: Create and upload combined report
+      - name: Create and upload report
         if: ${{ !cancelled() }}
         env:
           CHECKS_DATABASE_HOST: ${{ secrets.CHECKS_DATABASE_HOST }}
           CHECKS_DATABASE_USER: ${{ secrets.CLICKHOUSE_TEST_STAT_LOGIN }}
           CHECKS_DATABASE_PASSWORD: ${{ secrets.CLICKHOUSE_TEST_STAT_PASSWORD }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
           ACTIONS_RUN_URL: ${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}
@@ -663,6 +664,8 @@ jobs:
           pip install clickhouse-driver==0.2.8 numpy==1.26.4 pandas==2.0.3
 
           REPORT_LINK=$(python3 .github/create_workflow_report.py --pr-number $PR_NUMBER --commit-sha $COMMIT_SHA --actions-run-url $ACTIONS_RUN_URL --known-fails tests/broken_tests.json --cves)
+
+          echo $REPORT_LINK
 
           IS_VALID_URL=$(echo $REPORT_LINK | grep -E '^https?://')
           if [[ -n $IS_VALID_URL ]]; then
