@@ -71,10 +71,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             // Altinity Antalya modifications atop of 25.2
             {"object_storage_cluster", "", "", "New setting"},
             {"object_storage_max_nodes", 0, 0, "New setting"},
-        });
-        addSettingsChanges(settings_changes_history, "25.4",
-        {
-            // Altinity Antalya modifications atop of 25.2
             {"use_object_storage_list_objects_cache", true, false, "New setting."},
         });
         addSettingsChanges(settings_changes_history, "25.3",
