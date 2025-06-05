@@ -47,7 +47,7 @@ createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObject
 
     auto cluster_name = (*storage_settings)[StorageObjectStorageSetting::object_storage_cluster].value;
 
-configuration->initialize(args.engine_args, context, false, storage_settings);
+    configuration->initialize(args.engine_args, context, false, storage_settings);
 
     // Use format settings from global server context + settings from
     // the SETTINGS clause of the create query. Settings from current

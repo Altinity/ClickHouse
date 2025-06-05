@@ -22,7 +22,6 @@
 
 #include <memory>
 #include <string>
-#include <unordered_map>
 
 #include <Common/ErrorCodes.h>
 
@@ -71,8 +70,6 @@ public:
                     ErrorCodes::FORMAT_VERSION_TOO_OLD,
                     "Metadata is not consinsent with the one which was used to infer table schema. Please, retry the query.");
             }
-            if (!supportsFileIterator())
-                BaseStorageConfiguration::setPaths(current_metadata->getDataFiles());
         }
     }
 
@@ -88,11 +85,22 @@ public:
         return std::nullopt;
     }
 
-    void implementPartitionPruning(const ActionsDAG & filter_dag) override
+    std::optional<String> tryGetSamplePathFromMetadata() const override
     {
-        if (!current_metadata || !current_metadata->supportsPartitionPruning())
-            return;
-        BaseStorageConfiguration::setPaths(current_metadata->makePartitionPruning(filter_dag));
+        if (!current_metadata)
+            return std::nullopt;
+        auto data_files = current_metadata->getDataFiles();
+        if (!data_files.empty())
+            return data_files[0];
+        return std::nullopt;
+    }
+
+    std::optional<size_t> totalRows() override
+    {
+        if (!current_metadata)
+            return {};
+
+        return current_metadata->totalRows();
     }
 
     std::shared_ptr<NamesAndTypesList> getInitialSchemaByPath(const String & data_path) const override
@@ -121,25 +129,19 @@ public:
         ContextPtr context) override
     {
         BaseStorageConfiguration::update(object_storage, context);
-        if (updateMetadataObjectIfNeeded(object_storage, context))
-        {
-            if (!supportsFileIterator())
-                BaseStorageConfiguration::setPaths(current_metadata->getDataFiles());
-        }
-
+        updateMetadataObjectIfNeeded(object_storage, context);
         return ColumnsDescription{current_metadata->getTableSchema()};
     }
 
-    bool supportsFileIterator() const override
-    {
-        chassert(current_metadata);
-        return current_metadata->supportsFileIterator();
-    }
+    bool supportsFileIterator() const override { return true; }
 
-    ObjectIterator iterate() override
+    ObjectIterator iterate(
+        const ActionsDAG * filter_dag,
+        IDataLakeMetadata::FileProgressCallback callback,
+        size_t list_batch_size) override
     {
         chassert(current_metadata);
-        return current_metadata->iterate();
+        return current_metadata->iterate(filter_dag, callback, list_batch_size);
     }
 
     /// This is an awful temporary crutch,
@@ -288,6 +290,7 @@ public:
     std::string getEngineName() const override { return getImpl().getEngineName(); }
     std::string getNamespaceType() const override { return getImpl().getNamespaceType(); }
 
+    Path getFullPath() const override { return getImpl().getFullPath(); }
     Path getPath() const override { return getImpl().getPath(); }
     void setPath(const Path & path) override { getImpl().setPath(path); }
 
@@ -304,9 +307,14 @@ public:
         ASTs & args, const String & structure_, const String & format_, ContextPtr context, bool with_structure) override
         { getImpl().addStructureAndFormatToArgsIfNeeded(args, structure_, format_, context, with_structure); }
 
+    bool withPartitionWildcard() const override { return getImpl().withPartitionWildcard(); }
+    bool withGlobsIgnorePartitionWildcard() const override { return getImpl().withGlobsIgnorePartitionWildcard(); }
+    bool isPathWithGlobs() const override { return getImpl().isPathWithGlobs(); }
+    bool isNamespaceWithGlobs() const override { return getImpl().isNamespaceWithGlobs(); }
     std::string getPathWithoutGlobs() const override { return getImpl().getPathWithoutGlobs(); }
 
     bool isArchive() const override { return getImpl().isArchive(); }
+    bool isPathInArchiveWithGlobs() const override { return getImpl().isPathInArchiveWithGlobs(); }
     std::string getPathInArchive() const override { return getImpl().getPathInArchive(); }
 
     void check(ContextPtr context) const override { getImpl().check(context); }
@@ -348,8 +356,19 @@ public:
     std::optional<ColumnsDescription> tryGetTableStructureFromMetadata() const override
         { return getImpl().tryGetTableStructureFromMetadata(); }
 
+    bool supportsFileIterator() const override { return getImpl().supportsFileIterator(); }
+    ObjectIterator iterate(
+        const ActionsDAG * filter_dag,
+        std::function<void(FileProgress)> callback,
+        size_t list_batch_size) override
+    {
+        return getImpl().iterate(filter_dag, callback, list_batch_size);
+    }
+
     void update(ObjectStoragePtr object_storage, ContextPtr local_context) override
         { return getImpl().update(object_storage, local_context); }
+    void updateIfRequired(ObjectStoragePtr object_storage, ContextPtr local_context) override
+        { return getImpl().updateIfRequired(object_storage, local_context); }
 
     void initialize(
         ASTs & engine_args,
@@ -374,7 +393,6 @@ public:
     void setCompressionMethod(const String & compression_method_) override { getImpl().setCompressionMethod(compression_method_); }
     void setStructure(const String & structure_) override { getImpl().setStructure(structure_); }
 
-protected:
     void fromNamedCollection(const NamedCollection & collection, ContextPtr context) override
         { return getImpl().fromNamedCollection(collection, context); }
     void fromAST(ASTs & args, ContextPtr context, bool with_structure) override
@@ -456,6 +474,14 @@ protected:
         ObjectStorageType type = extractDynamicStorageType(args, context);
         createDynamicStorage(type);
     }
+
+    std::optional<String> tryGetSamplePathFromMetadata() const override
+    {
+        return getImpl().tryGetSamplePathFromMetadata();
+    }
+
+    virtual void assertInitialized() const override { return getImpl().assertInitialized(); }
+
 
 private:
     inline StorageObjectStorage::Configuration & getImpl() const
