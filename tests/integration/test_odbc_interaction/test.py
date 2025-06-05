@@ -285,7 +285,7 @@ CREATE TABLE {}(id UInt32, name String, age UInt32, money UInt32, column_x Nulla
 
 
 def test_table_function_odbc_with_named_collection(started_cluster):
-    skip_test_sanitizers(node1)
+    skip_test_msan(node1)
 
     mysql_setup = node1.odbc_drivers["MySQL"]
 
@@ -488,7 +488,7 @@ def test_sqlite_simple_select_storage_works(started_cluster):
 
 
 def test_table_engine_odbc_named_collection(started_cluster):
-    skip_test_sanitizers(node1)
+    skip_test_msan(node1)
 
     sqlite_setup = node1.odbc_drivers["SQLite3"]
     sqlite_db = sqlite_setup["Database"]
