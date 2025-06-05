@@ -72,9 +72,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"object_storage_cluster", "", "", "New setting"},
             {"object_storage_max_nodes", 0, 0, "New setting"},
         });
-        addSettingsChanges(settings_changes_history, "25.4",
-        {
-        });
         addSettingsChanges(settings_changes_history, "25.3",
         {
             /// Release closed. Please use 25.4
