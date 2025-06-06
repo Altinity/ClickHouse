@@ -49,7 +49,7 @@ jobs:
           run: |
             python3 ./tests/ci/version_helper.py | tee /tmp/version_info
             source /tmp/version_info
-            echo "docker_image=${{ inputs.docker_image }}:${{ github.event.pull_request.number || 0 }}-$CLICKHOUSE_VERSION_STRING" >> $GITHUB_OUTPUT
+            echo "docker_image=${{ inputs.docker_image }}:$PR_NUMBER-$CLICKHOUSE_VERSION_STRING" >> $GITHUB_OUTPUT
             echo "commit_sha=$CLICKHOUSE_VERSION_GITHASH" >> $GITHUB_OUTPUT
 
         - name: Run Grype Scan
@@ -67,9 +67,9 @@ jobs:
           env:
             S3_BUCKET: "altinity-build-artifacts"
             COMMIT_SHA: ${{ steps.set_version.outputs.commit_sha || github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-            PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
             DOCKER_IMAGE: ${{ steps.set_version.outputs.docker_image || inputs.docker_image }}
           run: |
+            echo "PR_NUMBER=$PR_NUMBER"
             ./.github/grype/transform_and_upload_results_s3.sh
 
         - name: Create step summary

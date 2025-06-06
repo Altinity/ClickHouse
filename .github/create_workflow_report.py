@@ -506,6 +506,16 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
 
+    if args.pr_number is None or args.commit_sha is None:
+        run_details = get_run_details(args.actions_run_url)
+        if args.pr_number is None:
+            if len(run_details["pull_requests"]) > 0:
+                args.pr_number = run_details["pull_requests"][0]["number"]
+            else:
+                args.pr_number = 0
+        if args.commit_sha is None:
+            args.commit_sha = run_details["head_commit"]["id"]
+
     db_client = Client(
         host=os.getenv(DATABASE_HOST_VAR),
         user=os.getenv(DATABASE_USER_VAR),
