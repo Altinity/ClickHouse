@@ -241,8 +241,16 @@ bool isQueryOrUnionNode(const QueryTreeNodePtr & node)
     return isQueryOrUnionNode(node.get());
 }
 
-bool isDependentColumn(IdentifierResolveScope * scope_to_check, const QueryTreeNodePtr & column_source)
+bool checkCorrelatedColumn(
+    const IdentifierResolveScope * scope_to_check,
+    const QueryTreeNodePtr & column
+)
 {
+    const auto * current_scope = scope_to_check;
+    chassert(column->getNodeType() == QueryTreeNodeType::COLUMN);
+    auto * column_node = column->as<ColumnNode>();
+    auto column_source = column_node->getColumnSource();
+
     /// The case of lambda argument. Example:
     /// arrayMap(X -> X + Y, [0])
     ///
@@ -253,8 +261,15 @@ bool isDependentColumn(IdentifierResolveScope * scope_to_check, const QueryTreeN
 
     while (scope_to_check != nullptr)
     {
+        /// Check if column source is in the FROM section of the current scope (query).
         if (scope_to_check->registered_table_expression_nodes.contains(column_source))
-            return false;
+            break;
+
+        /// Previous check wouldn't work in the case of resolution of alias columns.
+        /// In that case table expression is not registered yet and table expression data is being computed.
+        if (scope_to_check->table_expressions_in_resolve_process.contains(column_source.get()))
+            break;
+
         if (isQueryOrUnionNode(scope_to_check->scope_node))
             return true;
         scope_to_check = scope_to_check->parent_scope;
