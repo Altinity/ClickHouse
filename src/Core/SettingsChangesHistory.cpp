@@ -162,6 +162,10 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"parallel_replicas_insert_select_local_pipeline", false, false, "Use local pipeline during distributed INSERT SELECT with parallel replicas. Currently disabled due to performance issues"},
             {"parallel_hash_join_threshold", 0, 0, "New setting"},
             /// Release closed. Please use 25.5
+            // Altinity Antalya modifications atop of 25.2
+            {"object_storage_cluster", "", "", "New setting"},
+            {"object_storage_max_nodes", 0, 0, "New setting"},
+            {"use_object_storage_list_objects_cache", true, false, "New setting."},
         });
         addSettingsChanges(settings_changes_history, "25.3",
         {
