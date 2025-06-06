@@ -1122,7 +1122,7 @@ def main() -> int:
         git = Git(True)
         version = get_version_from_repo(git = git).string
         print(f"""Got CH version for this commit: [{version}]
-            latest tag:{git.latest_tag} ({git.commits_since_latest} commits back),
+            latest tag: {git.latest_tag} ({git.commits_since_latest} commits back),
             latest upstream tag: {git.latest_upstream_tag} ({git.commits_since_upstream} commits back)
         """)
 
