@@ -1,6 +1,5 @@
 {
     "test_postgresql_replica_database_engine_2/test.py::test_quoting_publication": {
-        "message": "DB::Exception: Syntax error:",
         "reason": "NEEDSFIX syntax error"
     },
     "test_distributed_inter_server_secret/test.py::test_secure_cluster_distributed_over_distributed_different_users": {
@@ -90,5 +89,110 @@
     },
     "test_quorum_inserts/test.py::test_insert_quorum_with_keeper_loss_connection": {
         "reason": "INVESTIGATE"
+    },
+    "test_postgresql_replica_database_engine_2/test.py::test_add_new_table_to_replication": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_2/test.py::test_database_with_single_non_default_schema": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_2/test.py::test_table_schema_changes_2": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_2/test.py::test_generated_columns": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_2/test.py::test_remove_table_from_replication": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_2/test.py::test_symbols_in_publication_name": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_2/test.py::test_toast": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_2/test.py::test_dependent_loading": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_2/test.py::test_database_with_multiple_non_default_schemas_1": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_2/test.py::test_table_override": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_2/test.py::test_predefined_connection_configuration": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_2/test.py::test_replica_consumer": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_2/test.py::test_database_with_multiple_non_default_schemas_2": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_2/test.py::test_materialized_view": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_2/test.py::test_default_columns": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_2/test.py::test_too_many_parts": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_1/test.py::test_concurrent_transactions": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_1/test.py::test_abrupt_connection_loss_while_heavy_replication": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_1/test.py::test_multiple_databases": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_1/test.py::test_single_transaction": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_1/test.py::test_user_managed_slots": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_1/test.py::test_virtual_columns": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_1/test.py::test_table_schema_changes": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_1/test.py::test_restart_server_while_replication_startup_not_finished": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_1/test.py::test_quoting_1": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_1/test.py::test_changing_replica_identity_value": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_1/test.py::test_clickhouse_restart": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_1/test.py::test_load_and_sync_subset_of_database_tables": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_1/test.py::test_replica_identity_index": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_1/test.py::test_abrupt_server_restart_while_heavy_replication": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_1/test.py::test_quoting_2": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_1/test.py::test_many_concurrent_queries": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_1/test.py::test_different_data_types": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_1/test.py::test_replicating_dml": {
+        "reason": "KNOWN fails upstream"
+    },
+    "test_postgresql_replica_database_engine_1/test.py::test_load_and_sync_all_database_tables": {
+        "reason": "KNOWN fails upstream"
     }
 }

@@ -132,6 +132,9 @@ static inline T ALWAYS_INLINE packFixed(
     {
         size_t index = i;
         const IColumn * column = key_columns[j];
+        auto column_possibly_converted = column->convertToFullColumnIfSparse()->convertToFullColumnIfConst();
+        column = column_possibly_converted.get();
+
         if constexpr (has_low_cardinality)
         {
             if (const IColumn * positions = (*low_cardinality_positions)[j])
@@ -224,26 +227,30 @@ static inline T ALWAYS_INLINE packFixed(
         if (is_null)
             continue;
 
+        const IColumn * key_column = key_columns[j];
+        auto column_possibly_converted = key_column->convertToFullColumnIfSparse()->convertToFullColumnIfConst();
+        key_column = column_possibly_converted.get();
+
         switch (key_sizes[j])
         {
             case 1:
-                memcpy(bytes + offset, static_cast<const ColumnFixedSizeHelper *>(key_columns[j])->getRawDataBegin<1>() + i, 1);
+                memcpy(bytes + offset, static_cast<const ColumnFixedSizeHelper *>(key_column)->getRawDataBegin<1>() + i, 1);
                 offset += 1;
                 break;
             case 2:
-                memcpy(bytes + offset, static_cast<const ColumnFixedSizeHelper *>(key_columns[j])->getRawDataBegin<2>() + i * 2, 2);
+                memcpy(bytes + offset, static_cast<const ColumnFixedSizeHelper *>(key_column)->getRawDataBegin<2>() + i * 2, 2);
                 offset += 2;
                 break;
             case 4:
-                memcpy(bytes + offset, static_cast<const ColumnFixedSizeHelper *>(key_columns[j])->getRawDataBegin<4>() + i * 4, 4);
+                memcpy(bytes + offset, static_cast<const ColumnFixedSizeHelper *>(key_column)->getRawDataBegin<4>() + i * 4, 4);
                 offset += 4;
                 break;
             case 8:
-                memcpy(bytes + offset, static_cast<const ColumnFixedSizeHelper *>(key_columns[j])->getRawDataBegin<8>() + i * 8, 8);
+                memcpy(bytes + offset, static_cast<const ColumnFixedSizeHelper *>(key_column)->getRawDataBegin<8>() + i * 8, 8);
                 offset += 8;
                 break;
             default:
-                memcpy(bytes + offset, static_cast<const ColumnFixedSizeHelper *>(key_columns[j])->getRawDataBegin<1>() + i * key_sizes[j], key_sizes[j]);
+                memcpy(bytes + offset, static_cast<const ColumnFixedSizeHelper *>(key_column)->getRawDataBegin<1>() + i * key_sizes[j], key_sizes[j]);
                 offset += key_sizes[j];
         }
     }
