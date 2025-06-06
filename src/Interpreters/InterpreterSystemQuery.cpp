@@ -47,6 +47,7 @@
 #include <Access/Common/AllowedClientHosts.h>
 #include <Databases/DatabaseReplicated.h>
 #include <Disks/ObjectStorages/IMetadataStorage.h>
+#include <Storages/Cache/ObjectStorageListObjectsCache.h>
 #include <Storages/StorageDistributed.h>
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/Freeze.h>
@@ -429,6 +430,12 @@ BlockIO InterpreterSystemQuery::execute()
         {
             getContext()->checkAccess(AccessType::SYSTEM_DROP_QUERY_CACHE);
             getContext()->clearQueryResultCache(query.query_result_cache_tag);
+            break;
+        }
+        case Type::DROP_OBJECT_STORAGE_LIST_OBJECTS_CACHE:
+        {
+            getContext()->checkAccess(AccessType::SYSTEM_DROP_OBJECT_STORAGE_LIST_OBJECTS_CACHE);
+            ObjectStorageListObjectsCache::instance().clear();
             break;
         }
         case Type::DROP_PARQUET_METADATA_CACHE:
@@ -1488,6 +1495,7 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
         case Type::DROP_SCHEMA_CACHE:
         case Type::DROP_FORMAT_SCHEMA_CACHE:
         case Type::DROP_PARQUET_METADATA_CACHE:
+        case Type::DROP_OBJECT_STORAGE_LIST_OBJECTS_CACHE:
         case Type::DROP_S3_CLIENT_CACHE:
         {
             required_access.emplace_back(AccessType::SYSTEM_DROP_CACHE);

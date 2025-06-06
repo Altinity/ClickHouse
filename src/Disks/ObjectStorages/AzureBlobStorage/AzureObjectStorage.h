@@ -31,6 +31,8 @@ public:
         const String & object_namespace_,
         const String & description_);
 
+    bool supportsListObjectsCache() override { return true; }
+
     void listObjects(const std::string & path, RelativePathsWithMetadata & children, size_t max_keys) const override;
 
     ObjectStorageIteratorPtr iterate(const std::string & path_prefix, size_t max_keys) const override;
