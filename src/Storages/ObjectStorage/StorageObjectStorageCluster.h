@@ -41,24 +41,6 @@ public:
 
     String getClusterName(ContextPtr context) const override;
 
-    bool hasExternalDynamicMetadata() const override
-    {
-        return (pure_storage && pure_storage->hasExternalDynamicMetadata())
-            || configuration->hasExternalDynamicMetadata();
-    }
-
-    void updateExternalDynamicMetadata(ContextPtr context_ptr) override
-    {
-        if (pure_storage && pure_storage->hasExternalDynamicMetadata())
-            pure_storage->updateExternalDynamicMetadata(context_ptr);
-        if (configuration->hasExternalDynamicMetadata())
-        {
-            StorageInMemoryMetadata metadata;
-            metadata.setColumns(configuration->updateAndGetCurrentSchema(object_storage, context_ptr));
-            IStorageCluster::setInMemoryMetadata(metadata);
-        }
-    }
-
     QueryProcessingStage::Enum getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageSnapshotPtr &, SelectQueryInfo &) const override;
 
     void truncate(
@@ -69,21 +51,8 @@ public:
 
     void addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const override;
 
-    std::optional<UInt64> totalRows(ContextPtr query_context) const override
-    {
-        if (pure_storage)
-            return pure_storage->totalRows(query_context);
-        configuration->update(object_storage, query_context);
-        return configuration->totalRows();
-    }
-
-    std::optional<UInt64> totalBytes(ContextPtr query_context) const override
-    {
-        if (pure_storage)
-            return pure_storage->totalBytes(query_context);
-        configuration->update(object_storage, query_context);
-        return configuration->totalBytes();
-    }
+    std::optional<UInt64> totalRows(ContextPtr query_context) const override;
+    std::optional<UInt64> totalBytes(ContextPtr query_context) const override;
 
 private:
     void updateQueryToSendIfNeeded(

@@ -642,22 +642,15 @@ def test_partition_columns(started_cluster, use_delta_kernel):
     assert len(files) > 0
     print(f"Uploaded files: {files}")
 
-    result = instance.query(
-        f"describe table deltaLake('http://{started_cluster.minio_ip}:{started_cluster.minio_port}/{bucket}/{result_file}/', 'minio', '{minio_secret_key}', SETTINGS allow_experimental_delta_kernel_rs={use_delta_kernel})"
-    ).strip()
+    table_function = f"deltaLake('http://{started_cluster.minio_ip}:{started_cluster.minio_port}/{bucket}/{result_file}/', 'minio', '{minio_secret_key}', SETTINGS allow_experimental_delta_kernel_rs={use_delta_kernel})"
+    result = instance.query(f"describe table {table_function}").strip()
 
     assert (
         result
         == "a\tNullable(Int32)\t\t\t\t\t\nb\tNullable(String)\t\t\t\t\t\nc\tNullable(Date32)\t\t\t\t\t\nd\tNullable(Int32)\t\t\t\t\t\ne\tNullable(Bool)"
     )
 
-    result = int(
-        instance.query(
-            f"""SELECT count()
-            FROM deltaLake('http://{started_cluster.minio_ip}:{started_cluster.minio_port}/{bucket}/{result_file}/', 'minio', '{minio_secret_key}', SETTINGS allow_experimental_delta_kernel_rs={use_delta_kernel})
-            """
-        )
-    )
+    result = int(instance.query(f"SELECT count() FROM {table_function}"))
     assert result == num_rows
 
     query_id = f"query_with_filter_{TABLE_NAME}"
@@ -1217,3 +1210,42 @@ deltaLake(
     )
 
     check_pruned(num_files - 1, query_id)
+
+
+@pytest.mark.parametrize("new_analyzer", ["1", "0"])
+def test_cluster_function(started_cluster, new_analyzer):
+    instance = started_cluster.instances["node1"]
+    table_name = randomize_table_name("test_cluster_function")
+
+    schema = pa.schema([("a", pa.int32()), ("b", pa.string())])
+    data = [
+        pa.array([1, 2, 3, 4, 5], type=pa.int32()),
+        pa.array(["aa", "bb", "cc", "aa", "bb"], type=pa.string()),
+    ]
+
+    storage_options = {
+        "AWS_ENDPOINT_URL": f"http://{started_cluster.minio_ip}:{started_cluster.minio_port}",
+        "AWS_ACCESS_KEY_ID": minio_access_key,
+        "AWS_SECRET_ACCESS_KEY": minio_secret_key,
+        "AWS_ALLOW_HTTP": "true",
+        "AWS_S3_ALLOW_UNSAFE_RENAME": "true",
+    }
+    path = f"s3://root/{table_name}"
+    table = pa.Table.from_arrays(data, schema=schema)
+    write_deltalake(path, table, storage_options=storage_options)
+
+    table_function = f"""
+deltaLakeCluster(cluster,
+        'http://{started_cluster.minio_ip}:{started_cluster.minio_port}/root/{table_name}' ,
+        '{minio_access_key}',
+        '{minio_secret_key}',
+        SETTINGS allow_experimental_delta_kernel_rs=1)
+    """
+    instance.query(
+        f"SELECT * FROM {table_function} SETTINGS allow_experimental_analyzer={new_analyzer}"
+    )
+    assert 5 == int(
+        instance.query(
+            f"SELECT count() FROM {table_function} SETTINGS allow_experimental_analyzer={new_analyzer}"
+        )
+    )

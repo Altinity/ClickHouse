@@ -86,6 +86,15 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
     , object_storage(object_storage_)
     , cluster_name_in_settings(false)
 {
+    /// We allow exceptions to be thrown on update(),
+    /// because Cluster engine can only be used as table function,
+    /// so no lazy initialization is allowed.
+    configuration->update(
+        object_storage,
+        context_,
+        /* if_not_updated_before */false,
+        /* check_consistent_with_previous_metadata */true);
+
     ColumnsDescription columns{columns_};
     std::string sample_path;
     resolveSchemaAndFormat(columns, object_storage, configuration, {}, sample_path, context_);
@@ -128,6 +137,30 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
 std::string StorageObjectStorageCluster::getName() const
 {
     return configuration->getEngineName();
+}
+
+std::optional<UInt64> StorageObjectStorageCluster::totalRows(ContextPtr query_context) const
+{
+    if (pure_storage)
+        return pure_storage->totalRows(query_context);
+    configuration->update(
+        object_storage,
+        query_context,
+        /* if_not_updated_before */false,
+        /* check_consistent_with_previous_metadata */true);
+    return configuration->totalRows();
+}
+
+std::optional<UInt64> StorageObjectStorageCluster::totalBytes(ContextPtr query_context) const
+{
+    if (pure_storage)
+        return pure_storage->totalBytes(query_context);
+    configuration->update(
+        object_storage,
+        query_context,
+        /* if_not_updated_before */false,
+        /* check_consistent_with_previous_metadata */true);
+    return configuration->totalBytes();
 }
 
 void StorageObjectStorageCluster::updateQueryForDistributedEngineIfNeeded(ASTPtr & query, ContextPtr context)

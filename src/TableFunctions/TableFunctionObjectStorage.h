@@ -149,7 +149,13 @@ public:
       const ContextPtr & context)
     {
         if constexpr (is_data_lake)
-            Configuration(createEmptySettings()).addStructureAndFormatToArgsIfNeeded(args, structure, format, context, /*with_structure=*/true);
+        {
+            Configuration configuration(createEmptySettings());
+            if (configuration.getFormat() == "auto")
+                configuration.setFormat("Parquet"); /// Default format of data lakes.
+
+            configuration.addStructureAndFormatToArgsIfNeeded(args, structure, format, context, /*with_structure=*/true);
+        }
         else
             Configuration().addStructureAndFormatToArgsIfNeeded(args, structure, format, context, /*with_structure=*/true);
     }

@@ -139,15 +139,16 @@ public:
 
     void addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const override;
 
-    bool hasExternalDynamicMetadata() const override;
-
-    void updateExternalDynamicMetadata(ContextPtr) override;
+    bool updateExternalDynamicMetadataIfExists(ContextPtr query_context) override;
 
     std::optional<UInt64> totalRows(ContextPtr query_context) const override;
     std::optional<UInt64> totalBytes(ContextPtr query_context) const override;
+
 protected:
+    /// Get path sample for hive partitioning implementation.
     String getPathSample(ContextPtr context);
 
+    /// Creates ReadBufferIterator for schema inference implementation.
     static std::unique_ptr<ReadBufferIterator> createReadBufferIterator(
         const ObjectStoragePtr & object_storage,
         const ConfigurationPtr & configuration,
@@ -155,12 +156,21 @@ protected:
         ObjectInfos & read_keys,
         const ContextPtr & context);
 
+    /// Storage configuration (S3, Azure, HDFS, Local, DataLake).
+    /// Contains information about table engine configuration
+    /// and underlying storage access.
     ConfigurationPtr configuration;
+    /// `object_storage` to allow direct access to data storage.
     const ObjectStoragePtr object_storage;
     const std::optional<FormatSettings> format_settings;
+    /// Partition by expression from CREATE query.
     const ASTPtr partition_by;
+    /// Whether this engine is a part of according Cluster engine implementation.
+    /// (One of the reading replicas, not the initiator).
     const bool distributed_processing;
-    bool update_configuration_on_read;
+    /// Whether we need to call `configuration->update()`
+    /// (e.g. refresh configuration) on each read() method call.
+    bool update_configuration_on_read_write = true;
 
     LoggerPtr log;
 };
@@ -175,6 +185,7 @@ public:
     using Path = std::string;
     using Paths = std::vector<Path>;
 
+    /// Initialize configuration from either AST or NamedCollection.
     virtual void initialize(
         ASTs & engine_args,
         ContextPtr local_context,
@@ -239,6 +250,8 @@ public:
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method updateAndGetCurrentSchema is not supported by storage {}", getEngineName());
     }
 
+    virtual void modifyFormatSettings(FormatSettings &) const {}
+
     virtual ReadFromFormatInfo prepareReadingFromFormat(
         ObjectStoragePtr object_storage,
         const Strings & requested_columns,
@@ -258,8 +271,17 @@ public:
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method iterate() is not implemented for configuration type {}", getTypeName());
     }
 
-    virtual void update(ObjectStoragePtr object_storage, ContextPtr local_context);
-    virtual void updateIfRequired(ObjectStoragePtr object_storage, ContextPtr local_context);
+    /// Returns true, if metadata is of the latest version, false if unknown.
+    virtual bool update(
+        ObjectStoragePtr object_storage,
+        ContextPtr local_context,
+        bool if_not_updated_before,
+        bool check_consistent_with_previous_metadata);
+    virtual bool updateIfRequired(
+        ObjectStoragePtr object_storage,
+        ContextPtr local_context,
+        bool if_not_updated_before,
+        bool check_consistent_with_previous_metadata);
 
     virtual const DataLakeStorageSettings & getDataLakeSettings() const
     {

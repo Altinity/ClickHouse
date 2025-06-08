@@ -51,29 +51,60 @@ void resolveSchemaAndFormat(
     std::string & sample_path,
     const ContextPtr & context)
 {
+    if (configuration->getFormat() == "auto")
+    {
+        if (configuration->isDataLakeConfiguration())
+        {
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "Format must be already specified for {} storage.",
+                configuration->getTypeName());
+        }
+    }
+
     if (columns.empty())
     {
-        if (configuration->getFormat() == "auto")
+        if (configuration->isDataLakeConfiguration())
         {
-            std::string format;
-            std::tie(columns, format) =
-                StorageObjectStorage::resolveSchemaAndFormatFromData(object_storage, configuration, format_settings, sample_path, context);
-            configuration->setFormat(format);
+            auto table_structure = configuration->tryGetTableStructureFromMetadata();
+            if (table_structure)
+                columns = table_structure.value();
         }
-        else
-            columns = StorageObjectStorage::resolveSchemaFromData(object_storage, configuration, format_settings, sample_path, context);
+
+        if (columns.empty())
+        {
+            if (configuration->getFormat() == "auto")
+            {
+                std::string format;
+                std::tie(columns, format) = StorageObjectStorage::resolveSchemaAndFormatFromData(
+                    object_storage, configuration, format_settings, sample_path, context);
+                configuration->setFormat(format);
+            }
+            else
+            {
+                chassert(!configuration->getFormat().empty());
+                columns = StorageObjectStorage::resolveSchemaFromData(object_storage, configuration, format_settings, sample_path, context);
+            }
+        }
     }
     else if (configuration->getFormat() == "auto")
     {
         configuration->setFormat(StorageObjectStorage::resolveFormatFromData(object_storage, configuration, format_settings, sample_path, context));
     }
 
+    validateSupportedColumns(columns, *configuration);
+}
+
+void validateSupportedColumns(
+    ColumnsDescription & columns,
+    const StorageObjectStorage::Configuration & configuration)
+{
     if (!columns.hasOnlyOrdinary())
     {
         /// We don't allow special columns.
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                        "Special columns are not supported for {} storage"
-                        "like MATERIALIZED, ALIAS or EPHEMERAL", configuration->getTypeName());
+            "Special columns like MATERIALIZED, ALIAS or EPHEMERAL are not supported for {} storage.",
+            configuration.getTypeName());
     }
 }
 

@@ -151,7 +151,7 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
                         "Expression can not have wildcards inside {} name", configuration->getNamespaceType());
 
-    configuration->updateIfRequired(object_storage, local_context);
+    configuration->updateIfRequired(object_storage, local_context, true, true);
 
     std::unique_ptr<IObjectIterator> iterator;
     if (configuration->isPathWithGlobs())
