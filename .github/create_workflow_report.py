@@ -5,6 +5,7 @@ from pathlib import Path
 from itertools import combinations
 import json
 from datetime import datetime
+from functools import lru_cache
 
 import requests
 import pandas as pd
@@ -194,6 +195,29 @@ script = """
 logo = """
 <p><img class="logo" src="data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz48c3ZnIGlkPSJhIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA0NjEuNTUgMTA1Ljk5Ij48ZGVmcz48c3R5bGU+LmJ7ZmlsbDojZmZmO30uY3tmaWxsOiMxOTlkY2Y7fTwvc3R5bGU+PC9kZWZzPjxnPjxwb2x5Z29uIGNsYXNzPSJjIiBwb2ludHM9Ii4wOSA1MC45NiA2Ni44NiAxMi4xMiA0NS44OCAwIDQ1Ljg4IC4wNCAyMi45NCAxMy4zIDIyLjkzIDEzLjMgMjIuOTMgMTMuMyAuMDkgMjYuNDkgLjA5IDI2LjQ5IC4wOSAyNi40OSAwIDI2LjU0IC4wOSAyNi41OSAuMDkgNTAuOTYiLz48cG9seWdvbiBjbGFzcz0iYyIgcG9pbnRzPSI0LjIxIDUzLjE5IDIyLjk0IDY0LjA4IDIyLjk0IDQyLjI5IDQuMjEgNTMuMTkiLz48cG9seWdvbiBjbGFzcz0iYyIgcG9pbnRzPSI0My43NSA4MC43OSAuMjMgNTUuNTEgLjA5IDU1LjU5IC4wOSA3OS40MyAwIDc5LjQ4IC4wOSA3OS41NCAuMDkgMTA1Ljk5IDIyLjggOTIuODggMjIuOCA5Mi44OCA0My43NSA4MC43OSIvPjxwb2x5Z29uIGNsYXNzPSJjIiBwb2ludHM9IjY0LjIyIDM2Ljk2IDY2Ljc5IDM4LjQ1IDg5LjYxIDI1LjE3IDcwLjkyIDE0LjM4IDQ4LjAzIDI3LjcgNjQuMTggMzcuMDIgNjQuMjIgMzYuOTYiLz48Zz48cG9seWdvbiBjbGFzcz0iYyIgcG9pbnRzPSI3Ni4zMyA0NCA5MS42NiA1Mi45MiA5MS42NiA1Mi44MiA5MS42MyA1Mi44MyA3Ni4zMyA0NCIvPjxwb2x5Z29uIGNsYXNzPSJjIiBwb2ludHM9IjY4LjcxIDQ0LjIgNjguNzEgOTIuNTEgOTEuNjYgMTA1Ljc2IDkxLjY2IDU3LjU1IDY4LjcxIDQ0LjIiLz48L2c+PHBvbHlnb24gY2xhc3M9ImMiIHBvaW50cz0iNzAuNzcgNDAuNzYgNzYuMjggNDMuOTcgOTEuNjYgNTIuODUgOTEuNjYgMjguNjEgNzAuNzcgNDAuNzYiLz48L2c+PHBhdGggY2xhc3M9ImIiIGQ9Ik0xNDkuOTIsMjkuNjZoMTIuMzhsMTkuNzIsNDYuNjdoLTEzLjc3bC0zLjM4LTguMjdoLTE3Ljg3bC0zLjMxLDguMjdoLTEzLjVsMTkuNzItNDYuNjdabTExLjI1LDI4LjRsLTUuMTYtMTMuMTctNS4yMywxMy4xN2gxMC4zOVoiLz48cGF0aCBjbGFzcz0iYiIgZD0iTTE4Ni41MywyOS45OWgxMi44NHYzNS4wOGgyMi40NHYxMS4yNWgtMzUuMjhWMjkuOTlaIi8+PHBhdGggY2xhc3M9ImIiIGQ9Ik0yMzAsNDEuMjVoLTEzLjl2LTExLjI1aDQwLjY0djExLjI1aC0xMy45djM1LjA4aC0xMi44NFY0MS4yNVoiLz48cGF0aCBjbGFzcz0iYiIgZD0iTTI2Mi42MywyOS45OWgxMi45MXY0Ni4zM2gtMTIuOTFWMjkuOTlaIi8+PHBhdGggY2xhc3M9ImIiIGQ9Ik0yODQuMDEsMjkuOTloMTEuOThsMTkuMDYsMjQuNDlWMjkuOTloMTIuNzF2NDYuMzNoLTExLjI1bC0xOS43OS0yNS40MnYyNS40MmgtMTIuNzFWMjkuOTlaIi8+PHBhdGggY2xhc3M9ImIiIGQ9Ik0zMzYuMjQsMjkuOTloMTIuOTF2NDYuMzNoLTEyLjkxVjI5Ljk5WiIvPjxwYXRoIGNsYXNzPSJiIiBkPSJNMzY4Ljk0LDQxLjI1aC0xMy45di0xMS4yNWg0MC42NHYxMS4yNWgtMTMuOXYzNS4wOGgtMTIuODRWNDEuMjVaIi8+PHBhdGggY2xhc3M9ImIiIGQ9Ik00MTYuNjgsNTguOThsLTE3LjYxLTI4Ljk5aDE0LjYzbDkuNTMsMTYuODgsOS42LTE2Ljg4aDE0LjM2bC0xNy42MSwyOC43OXYxNy41NGgtMTIuOTF2LTE3LjM0WiIvPjxnPjxwYXRoIGNsYXNzPSJiIiBkPSJNNDU3Ljk5LDM0Ljg5Yy4yOS0uMDksLjU0LS4yNCwuNzMtLjQ0LC4yNS0uMjUsLjM3LS41OCwuMzctMSwwLS40Ny0uMTgtLjg1LS41My0xLjEyLS4zNC0uMjYtLjc5LS40LTEuMzMtLjRoLTIuMDZjLS4wNywwLS4xMiwuMDYtLjEyLC4xMnY0LjYxYzAsLjA3LC4wNiwuMTIsLjEyLC4xMmguNjhjLjA3LDAsLjEyLS4wNiwuMTItLjEydi0xLjYyaC45OWwxLjI5LDEuNjlzLjA2LC4wNSwuMSwuMDVoLjg0cy4wOS0uMDMsLjExLS4wN2MuMDItLjA0LC4wMi0uMDktLjAxLS4xM2wtMS4zMi0xLjcxWm0uMTUtMS40YzAsLjIzLS4wOCwuMzktLjI1LC41MS0uMTgsLjEzLS40MiwuMTktLjcyLC4xOWgtMS4xOXYtMS4zOWgxLjIzYy4zLDAsLjU0LC4wNiwuNywuMTksLjE1LC4xMiwuMjMsLjI4LC4yMywuNVoiLz48cGF0aCBjbGFzcz0iYiIgZD0iTTQ2MS4yLDMyLjY5Yy0uMjQtLjU2LS41Ny0xLjA1LS45OC0xLjQ3LS40MS0uNDItLjktLjc1LTEuNDYtLjk5LS41Ni0uMjQtMS4xNy0uMzYtMS44Mi0uMzZzLTEuMjYsLjEyLTEuODIsLjM3Yy0uNTYsLjI1LTEuMDYsLjU4LTEuNDgsMS0uNDIsLjQyLS43NSwuOTItLjk4LDEuNDctLjI0LC41Ni0uMzYsMS4xNi0uMzYsMS43OXMuMTIsMS4yMywuMzYsMS43OWMuMjQsLjU2LC41NiwxLjA1LC45OCwxLjQ3LC40MSwuNDIsLjksLjc1LDEuNDYsLjk5LC41NiwuMjQsMS4xNywuMzYsMS44MSwuMzZzMS4yNi0uMTIsMS44Mi0uMzdjLjU2LS4yNSwxLjA2LS41OCwxLjQ3LTEsLjQyLS40MiwuNzUtLjkyLC45OC0xLjQ3LC4yNC0uNTYsLjM2LTEuMTYsLjM2LTEuNzlzLS4xMi0xLjIzLS4zNi0xLjc5Wm0tLjMsMS43OWMwLC41NC0uMSwxLjA2LS4zLDEuNTUtLjIsLjQ5LS40OCwuOTEtLjg0LDEuMjctLjM1LC4zNi0uNzgsLjY1LTEuMjcsLjg2LS40OSwuMjEtMS4wMiwuMzItMS41NywuMzJzLTEuMDktLjExLTEuNTYtLjMxYy0uNDgtLjIxLS45LS41LTEuMjUtLjg2LS4zNS0uMzYtLjYzLS43OC0uODMtMS4yNy0uMi0uNDgtLjMtMS0uMy0xLjU0cy4xLTEuMDYsLjMtMS41NWMuMi0uNDgsLjQ4LS45MSwuODQtMS4yNywuMzYtLjM2LC43OC0uNjUsMS4yNi0uODYsLjQ4LS4yMSwxLjAxLS4zMiwxLjU4LS4zMnMxLjA5LC4xMSwxLjU3LC4zMWMuNDgsLjIxLC45LC41LDEuMjUsLjg2LC4zNSwuMzYsLjYzLC43OCwuODMsMS4yNywuMiwuNDgsLjMsMSwuMywxLjU0WiIvPjwvZz48L3N2Zz4=" alt="logo"/></p>
 """
+
+
+@lru_cache
+def get_run_details(run_url: str) -> dict:
+    """
+    Fetch run details for a given run URL.
+    """
+    run_id = run_url.split("/")[-1]
+
+    headers = {
+        "Authorization": f"token {os.getenv('GITHUB_TOKEN')}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/runs/{run_id}"
+    response = requests.get(url, headers=headers)
+
+    if response.status_code != 200:
+        raise Exception(
+            f"Failed to fetch run details: {response.status_code} {response.text}"
+        )
+
+    return response.json()
 
 
 def get_commit_statuses(sha: str) -> pd.DataFrame:
@@ -589,7 +613,9 @@ def main():
             )
 
     if args.pr_number == "0":
-        pr_info_html = "Release"
+        run_details = get_run_details(args.actions_run_url)
+        branch_name = run_details.get("head_branch", "unknown branch")
+        pr_info_html = f"Release ({branch_name})"
     else:
         try:
             pr_info = get_pr_info_from_number(args.pr_number)
