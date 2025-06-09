@@ -594,6 +594,7 @@ jobs:
     secrets: inherit
     with:
       docker_image: altinityinfra/clickhouse-${{ matrix.image }}
+      version: ${{ fromJson(needs.RunConfig.outputs.data).version }}
       tag-suffix: ${{ matrix.suffix }}
   FinishCheck:
     if: ${{ !cancelled() }}
