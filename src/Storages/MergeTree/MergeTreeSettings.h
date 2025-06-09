@@ -205,7 +205,7 @@ struct Settings;
     M(Bool, cache_populated_by_fetch, false, "Only available in ClickHouse Cloud", 0) \
     M(Bool, force_read_through_cache_for_merges, false, "Force read-through filesystem cache for merges", 0) \
     M(Bool, allow_experimental_replacing_merge_with_cleanup, false, "Allow experimental CLEANUP merges for ReplacingMergeTree with is_deleted column.", 0) \
-    M(Bool, enable_replacing_merge_with_cleanup_for_min_age_to_force_merge, false, "Whether to use CLEANUP merges for ReplacingMergeTree when merging partitions down to a single part. Requires allow_experimental_replacing_merge_with_cleanup, min_age_to_force_merge_seconds and min_age_to_force_merge_on_partition_only to be enabled.", 0) \
+    M(MergeSelectorAlgorithm, merge_selector_algorithm, MergeSelectorAlgorithm::SIMPLE, "The algorithm to select parts for merges assignment", 0) \
     \
     /** Compress marks and primary key. */ \
     M(Bool, compress_marks, true, "Marks support compression, reduce mark file size and speed up network transmission.", 0) \

@@ -52,23 +52,6 @@ namespace CurrentMetrics
 namespace DB
 {
 
-namespace MergeTreeSetting
-{
-    extern const MergeTreeSettingsUInt64 max_bytes_to_merge_at_max_space_in_pool;
-    extern const MergeTreeSettingsUInt64 max_bytes_to_merge_at_min_space_in_pool;
-    extern const MergeTreeSettingsUInt64 max_number_of_mutations_for_replica;
-    extern const MergeTreeSettingsUInt64 max_parts_to_merge_at_once;
-    extern const MergeTreeSettingsInt64 merge_with_recompression_ttl_timeout;
-    extern const MergeTreeSettingsInt64 merge_with_ttl_timeout;
-    extern const MergeTreeSettingsBool min_age_to_force_merge_on_partition_only;
-    extern const MergeTreeSettingsUInt64 min_age_to_force_merge_seconds;
-    extern const MergeTreeSettingsUInt64 number_of_free_entries_in_pool_to_execute_optimize_entire_partition;
-    extern const MergeTreeSettingsUInt64 number_of_free_entries_in_pool_to_execute_mutation;
-    extern const MergeTreeSettingsUInt64 number_of_free_entries_in_pool_to_lower_max_size_of_merge;
-    extern const MergeTreeSettingsBool ttl_only_drop_parts;
-    extern const MergeTreeSettingsMergeSelectorAlgorithm merge_selector_algorithm;
-}
-
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
@@ -477,7 +460,7 @@ SelectPartsDecision MergeTreeDataMergerMutator::selectPartsToMergeFromRanges(
         {
             .merge_due_times = next_delete_ttl_merge_times_by_partition,
             .current_time = current_time,
-            .merge_cooldown_time = (*data_settings)[MergeTreeSetting::merge_with_ttl_timeout],
+            .merge_cooldown_time = data_settings->merge_with_ttl_timeout,
             .only_drop_parts = true,
             .dry_run = dry_run
         };
@@ -497,7 +480,7 @@ SelectPartsDecision MergeTreeDataMergerMutator::selectPartsToMergeFromRanges(
             {
                 .merge_due_times = next_delete_ttl_merge_times_by_partition,
                 .current_time = current_time,
-                .merge_cooldown_time = (*data_settings)[MergeTreeSetting::merge_with_ttl_timeout],
+                .merge_cooldown_time = data_settings->merge_with_ttl_timeout,
                 .only_drop_parts = false,
                 .dry_run = dry_run
             };
@@ -514,7 +497,7 @@ SelectPartsDecision MergeTreeDataMergerMutator::selectPartsToMergeFromRanges(
             {
                 .merge_due_times = next_recompress_ttl_merge_times_by_partition,
                 .current_time = current_time,
-                .merge_cooldown_time = (*data_settings)[MergeTreeSetting::merge_with_recompression_ttl_timeout],
+                .merge_cooldown_time = data_settings->merge_with_recompression_ttl_timeout,
                 .recompression_ttls = metadata_snapshot->getRecompressionTTLs(),
                 .dry_run = dry_run,
             };
@@ -529,15 +512,15 @@ SelectPartsDecision MergeTreeDataMergerMutator::selectPartsToMergeFromRanges(
 
     if (parts_to_merge.empty())
     {
-        auto merge_selector_algorithm = (*data_settings)[MergeTreeSetting::merge_selector_algorithm];
+        auto merge_selector_algorithm = data_settings->merge_selector_algorithm;
         std::any merge_settings;
         if (merge_selector_algorithm == MergeSelectorAlgorithm::SIMPLE)
         {
             SimpleMergeSelector::Settings simple_merge_settings;
             /// Override value from table settings
-            simple_merge_settings.max_parts_to_merge_at_once = (*data_settings)[MergeTreeSetting::max_parts_to_merge_at_once];
-            if (!(*data_settings)[MergeTreeSetting::min_age_to_force_merge_on_partition_only])
-                simple_merge_settings.min_age_to_force_merge = (*data_settings)[MergeTreeSetting::min_age_to_force_merge_seconds];
+            simple_merge_settings.max_parts_to_merge_at_once = data_settings->max_parts_to_merge_at_once;
+            if (!data_settings->min_age_to_force_merge_on_partition_only)
+                simple_merge_settings.min_age_to_force_merge = data_settings->min_age_to_force_merge_seconds;
 
             if (aggressive)
                 simple_merge_settings.base = 1;
