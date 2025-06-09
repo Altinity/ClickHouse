@@ -569,25 +569,12 @@ jobs:
         run: |
           cd "$GITHUB_WORKSPACE/tests/ci"
           python3 finish_check.py
-      - name: Create and upload combined report
+      - name: Create and upload report
+        uses: ./.github/actions/create_workflow_report@b229c9e6f9d1e100ba32f271b6bba112d9894afb
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CHECKS_DATABASE_HOST: ${{ secrets.CHECKS_DATABASE_HOST }}
           CHECKS_DATABASE_USER: ${{ secrets.CLICKHOUSE_TEST_STAT_LOGIN }}
           CHECKS_DATABASE_PASSWORD: ${{ secrets.CLICKHOUSE_TEST_STAT_PASSWORD }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number || 0  }}
-          ACTIONS_RUN_URL: ${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}
-        shell: bash
-        run: |
-          pip install clickhouse-driver==0.2.8 numpy==1.26.4 pandas==2.0.3
-
-          REPORT_LINK=$(python3 .github/create_workflow_report.py --pr-number $PR_NUMBER --commit-sha $COMMIT_SHA --actions-run-url $ACTIONS_RUN_URL --known-fails tests/broken_tests.json --cves)
-
-          IS_VALID_URL=$(echo $REPORT_LINK | grep -E '^https?://')
-          if [[ -n $IS_VALID_URL ]]; then
-            echo "Combined CI Report: [View Report]($REPORT_LINK)" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "Error: $REPORT_LINK" >> $GITHUB_STEP_SUMMARY
-            exit 1
-          fi
+        with:
+          final: true
