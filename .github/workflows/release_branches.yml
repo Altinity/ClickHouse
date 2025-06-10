@@ -570,7 +570,7 @@ jobs:
           cd "$GITHUB_WORKSPACE/tests/ci"
           python3 finish_check.py
       - name: Create and upload report
-        uses: ./.github/actions/create_workflow_report@b229c9e6f9d1e100ba32f271b6bba112d9894afb
+        uses: ./.github/actions/create_workflow_report
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CHECKS_DATABASE_HOST: ${{ secrets.CHECKS_DATABASE_HOST }}
