@@ -233,7 +233,6 @@ void StorageS3Configuration::extractExtraCreds(ASTs & args, ContextPtr context)
             }
 
             extra_creds_it = arg_it;
-            continue;
         }
     }
 
