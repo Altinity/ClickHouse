@@ -11,6 +11,8 @@
 #    include <aws/core/config/AWSProfileConfigLoader.h>
 #    include <aws/core/auth/AWSCredentialsProviderChain.h>
 #    include <aws/core/auth/bearer-token-provider/SSOBearerTokenProvider.h>
+#    include <aws/sts/STSClient.h>
+#    include <aws/sts/model/AssumeRoleRequest.h>
 
 #    include <IO/S3/PocoHTTPClient.h>
 #    include <IO/S3Defines.h>
@@ -105,6 +107,32 @@ private:
     std::shared_ptr<AWSEC2InstanceProfileConfigLoader> ec2_metadata_config_loader;
     Int64 load_frequency_ms;
     LoggerPtr logger;
+};
+
+class AWSInstanceMetadataAssumeRoleCredentialsProvider : public Aws::Auth::AWSCredentialsProvider
+{
+public:
+    explicit AWSInstanceMetadataAssumeRoleCredentialsProvider(
+        const Aws::String & role_arn_,
+        const Aws::String & session_name_,
+        DB::S3::PocoHTTPClientConfiguration aws_client_configuration,
+        uint64_t expiration_window_seconds_);
+
+    Aws::Auth::AWSCredentials GetAWSCredentials() override;
+
+protected:
+    void Reload() override;
+
+private:
+    void refreshIfExpired();
+
+    std::shared_ptr<AWSInstanceProfileCredentialsProvider> metadata_provider;
+    std::unique_ptr<Aws::STS::STSClient> sts_client;
+    Aws::Auth::AWSCredentials credentials;
+    Aws::String role_arn;
+    Aws::String session_name;
+    LoggerPtr logger;
+    uint64_t expiration_window_seconds;
 };
 
 class AwsAuthSTSAssumeRoleWebIdentityCredentialsProvider : public Aws::Auth::AWSCredentialsProvider
