@@ -149,7 +149,7 @@ std::optional<std::pair<Int64, int>> ReplicatedMergeTreeZooKeeperMergePredicate:
     if (in_partition == queue.mutations_by_partition.end())
         return {};
 
-    UInt64 mutations_limit = (*queue.storage.getSettings())[MergeTreeSetting::replicated_max_mutations_in_one_entry];
+    UInt64 mutations_limit = queue.storage.getSettings()->replicated_max_mutations_in_one_entry;
     UInt64 mutations_count = 0;
 
     Int64 current_version = queue.getCurrentMutationVersion(part->info.partition_id, part->info.getDataVersion());

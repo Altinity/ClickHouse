@@ -93,13 +93,13 @@ UInt64 getMaxSourcePartsSizeForMerge(const MergeTreeData & data, size_t max_coun
     /// One entry is probably the entry where this function is executed.
     /// This will protect from bad settings.
     UInt64 max_size = 0;
-    if (scheduled_tasks_count <= 1 || free_entries >= (*data_settings)[MergeTreeSetting::number_of_free_entries_in_pool_to_lower_max_size_of_merge])
-        max_size = (*data_settings)[MergeTreeSetting::max_bytes_to_merge_at_max_space_in_pool];
+    if (scheduled_tasks_count <= 1 || free_entries >= data_settings->number_of_free_entries_in_pool_to_lower_max_size_of_merge)
+        max_size = data_settings->max_bytes_to_merge_at_max_space_in_pool;
     else
         max_size = static_cast<UInt64>(interpolateExponential(
-            (*data_settings)[MergeTreeSetting::max_bytes_to_merge_at_min_space_in_pool],
-            (*data_settings)[MergeTreeSetting::max_bytes_to_merge_at_max_space_in_pool],
-            static_cast<double>(free_entries) / (*data_settings)[MergeTreeSetting::number_of_free_entries_in_pool_to_lower_max_size_of_merge]));
+            data_settings->max_bytes_to_merge_at_min_space_in_pool,
+            data_settings->max_bytes_to_merge_at_max_space_in_pool,
+            static_cast<double>(free_entries) / data_settings->number_of_free_entries_in_pool_to_lower_max_size_of_merge));
 
     return std::min(max_size, static_cast<UInt64>(data.getStoragePolicy()->getMaxUnreservedFreeSpace() / DISK_USAGE_COEFFICIENT_TO_SELECT));
 }
@@ -110,8 +110,8 @@ UInt64 getMaxSourcePartSizeForMutation(const MergeTreeData & data)
     const auto data_settings = data.getSettings();
     size_t occupied = CurrentMetrics::values[CurrentMetrics::BackgroundMergesAndMutationsPoolTask].load(std::memory_order_relaxed);
 
-    if ((*data_settings)[MergeTreeSetting::max_number_of_mutations_for_replica] > 0 &&
-        occupied >= (*data_settings)[MergeTreeSetting::max_number_of_mutations_for_replica])
+    if (data_settings->max_number_of_mutations_for_replica > 0 &&
+        occupied >= data_settings->max_number_of_mutations_for_replica)
         return 0;
 
     /// A DataPart can be stored only at a single disk. Get the maximum reservable free space at all disks.
@@ -120,7 +120,7 @@ UInt64 getMaxSourcePartSizeForMutation(const MergeTreeData & data)
 
     /// Allow mutations only if there are enough threads, otherwise, leave free threads for merges.
     if (occupied <= 1
-        || max_tasks_count - occupied >= (*data_settings)[MergeTreeSetting::number_of_free_entries_in_pool_to_execute_mutation])
+        || max_tasks_count - occupied >= data_settings->number_of_free_entries_in_pool_to_execute_mutation)
         return static_cast<UInt64>(disk_space / DISK_USAGE_COEFFICIENT_TO_RESERVE);
 
     return 0;

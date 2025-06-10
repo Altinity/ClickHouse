@@ -43,7 +43,7 @@ std::optional<MergeSelectorChoice> tryChooseTTLMerge(
 {
     /// Delete parts - 1 priority
     {
-        const size_t max_size = (*data_settings)[MergeTreeSetting::max_bytes_to_merge_at_max_space_in_pool];
+        const size_t max_size = data_settings->MergeTreeSetting;
         TTLPartDeleteMergeSelector drop_ttl_selector(next_delete_times, current_time);
 
         /// The size of the completely expired part of TTL drop is not affected by the merge pressure and the size of the storage space
