@@ -55,29 +55,34 @@ void TableMetadata::setLocation(const std::string & location_)
     if (!with_location)
         throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Data location was not requested");
 
+    location = location_;
+
+    if (!endpoint.empty())
+        parseLocation();
+}
+
+void TableMetadata::parseLocation() const
+{
     /// Location has format:
     /// s3://<bucket>/path/to/table/data.
     /// We want to split s3://<bucket> and path/to/table/data.
 
-    auto pos = location_.find("://");
+    auto pos = location.find("://");
     if (pos == std::string::npos)
-        throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "Unexpected location format: {}", location_);
+        throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "Location format incompatible with endpoint override: {}", location);
 
     auto pos_to_bucket = pos + std::strlen("://");
-    auto pos_to_path = location_.substr(pos_to_bucket).find('/');
+    auto pos_to_path = location.substr(pos_to_bucket).find('/');
 
     if (pos_to_path == std::string::npos)
-        throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "Unexpected location format: {}", location_);
+        throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "Location format incompatible with endpoint override: {}", location);
 
     pos_to_path = pos_to_bucket + pos_to_path;
 
-    location_without_path = location_.substr(0, pos_to_path);
-    path = location_.substr(pos_to_path + 1);
-    bucket = location_.substr(pos_to_bucket, pos_to_path - pos_to_bucket);
+    path = location.substr(pos_to_path + 1);
+    bucket = location.substr(pos_to_bucket, pos_to_path - pos_to_bucket);
 
-    LOG_TEST(getLogger("TableMetadata"),
-             "Parsed location without path: {}, path: {}",
-             location_without_path, path);
+    LOG_TEST(getLogger("TableMetadata"), "Parsed location, path: {}", path);
 }
 
 std::string TableMetadata::getLocation() const
@@ -88,7 +93,7 @@ std::string TableMetadata::getLocation() const
     if (!endpoint.empty())
         return constructLocation(endpoint);
 
-    return std::filesystem::path(location_without_path) / path;
+    return location;
 }
 
 std::string TableMetadata::getLocationWithEndpoint(const std::string & endpoint_) const
@@ -99,24 +104,30 @@ std::string TableMetadata::getLocationWithEndpoint(const std::string & endpoint_
     if (endpoint_.empty())
         throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "Passed endpoint is empty");
 
+    if (path.empty())
+        parseLocation();
+
     return constructLocation(endpoint_);
 }
 
 std::string TableMetadata::constructLocation(const std::string & endpoint_) const
 {
-    std::string location = endpoint_;
-    if (location.ends_with('/'))
-        location.pop_back();
+    std::string location_ = endpoint_;
+    if (location_.ends_with('/'))
+        location_.pop_back();
 
-    if (location.ends_with(bucket))
-        return std::filesystem::path(location) / path / "";
+    if (location_.ends_with(bucket))
+        return std::filesystem::path(location_) / path / "";
     else
-        return std::filesystem::path(location) / bucket / path / "";
+        return std::filesystem::path(location_) / bucket / path / "";
 }
 
 void TableMetadata::setEndpoint(const std::string & endpoint_)
 {
     endpoint = endpoint_;
+
+    if (!endpoint.empty() && path.empty())
+        parseLocation();
 }
 
 void TableMetadata::setSchema(const DB::NamesAndTypesList & schema_)
@@ -163,12 +174,12 @@ std::optional<DataLakeSpecificProperties> TableMetadata::getDataLakeSpecificProp
 
 StorageType TableMetadata::getStorageType() const
 {
-    return parseStorageTypeFromLocation(location_without_path);
+    return parseStorageTypeFromLocation(location);
 }
 
 bool TableMetadata::hasLocation() const
 {
-    return !location_without_path.empty();
+    return !location.empty();
 }
 bool TableMetadata::hasSchema() const
 {

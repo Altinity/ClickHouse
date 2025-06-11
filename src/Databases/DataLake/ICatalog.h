@@ -74,14 +74,15 @@ public:
     std::string getReasonWhyTableIsUnreadable() const { return reason_why_table_is_not_readable; }
 
 private:
+    std::string location;
+
     /// Starts with s3://, file://, etc.
     /// For example, `s3://bucket/`
-    std::string location_without_path;
     /// Path to table's data: `/path/to/table/data/`
-    std::string path;
+    mutable std::string path;
     DB::NamesAndTypesList schema;
 
-    std::string bucket;
+    mutable std::string bucket;
     /// Endpoint is set and used in case we have non-AWS storage implementation, for example, Minio.
     /// Also not all catalogs support non-AWS storages.
     std::string endpoint;
@@ -102,6 +103,9 @@ private:
     bool with_datalake_specific_metadata = false;
 
     std::string constructLocation(const std::string & endpoint_) const;
+
+    /// Parse location, get bucket and path
+    void parseLocation() const;
 };
 
 
