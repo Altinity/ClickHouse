@@ -447,7 +447,7 @@ def format_test_status(text: str) -> str:
     color = (
         "red"
         if text.lower().startswith("fail")
-        else "orange" if text.lower() in ("error", "broken") else "green"
+        else "orange" if text.lower() in ("error", "broken", "pending") else "green"
     )
     return f'<span style="font-weight: bold; color: {color}">{text}</span>'
 
@@ -537,9 +537,7 @@ def main():
 
     # get_cves returns ... in the case where no Grype result files were found.
     # This might occur when run in preview mode.
-    cves_not_checked = not args.cves or (
-        args.mark_preview and fail_results["docker_images_cves"] is ...
-    )
+    cves_not_checked = not args.cves or fail_results["docker_images_cves"] is ...
 
     if args.known_fails:
         if not os.path.exists(args.known_fails):
@@ -595,7 +593,7 @@ def main():
         "date": f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC",
         "is_preview": args.mark_preview,
         "counts": {
-            "jobs_status": f"{sum(fail_results['job_statuses']['job_status'] != 'success')} fail/error",
+            "jobs_status": f"{sum(fail_results['job_statuses']['job_status'] != 'success')} fail/error/pending",
             "checks_errors": len(fail_results["checks_errors"]),
             "checks_new_fails": len(fail_results["checks_fails"]),
             "regression_new_fails": len(fail_results["regression_fails"]),
