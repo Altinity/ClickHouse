@@ -69,6 +69,14 @@ jobs:
       - name: Re-create GH statuses for skipped jobs if any
         run: |
             python3 "$GITHUB_WORKSPACE/tests/ci/ci.py" --infile ${{ runner.temp }}/ci_run_data.json --update-gh-statuses
+      - name: Note report location to summary
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
+          COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          REPORT_LINK=https://s3.amazonaws.com/altinity-build-artifacts/$PR_NUMBER/$COMMIT_SHA/ci_run_report.html
+          echo "Workflow Run Report: [View Report]($REPORT_LINK)" >> $GITHUB_STEP_SUMMARY
+
   BuildDockers:
     needs: [RunConfig]
     if: ${{ !failure() && !cancelled() }}
@@ -653,7 +661,7 @@ jobs:
           python3 ./tests/ci/ci_buddy.py --check-wf-status
       - name: Create and upload report
         if: ${{ !cancelled() }}
-        uses: ./.github/actions/create_workflow_report@b229c9e6f9d1e100ba32f271b6bba112d9894afb
+        uses: ./.github/actions/create_workflow_report
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CHECKS_DATABASE_HOST: ${{ secrets.CHECKS_DATABASE_HOST }}
