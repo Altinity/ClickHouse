@@ -159,6 +159,16 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           python3 "$GITHUB_WORKSPACE/tests/ci/ci.py" --infile ${{ toJson(inputs.data) }} --post --job-name '${{inputs.test_name}}'
+      - name: Update workflow report
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/create_workflow_report
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHECKS_DATABASE_HOST: ${{ secrets.CHECKS_DATABASE_HOST }}
+          CHECKS_DATABASE_USER: ${{ secrets.CLICKHOUSE_TEST_STAT_LOGIN }}
+          CHECKS_DATABASE_PASSWORD: ${{ secrets.CLICKHOUSE_TEST_STAT_PASSWORD }}
+        with:
+          final: false
       - name: Mark as done
         if: ${{ !cancelled() }}
         run: |
