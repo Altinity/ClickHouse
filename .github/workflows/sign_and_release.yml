@@ -512,7 +512,7 @@ jobs:
           fi
 
           echo "Processing GPG key..."
-          if ! aws secretsmanager get-secret-value --secret-id arn:aws:secretsmanager:us-east-1:446527654354:secret:altinity_staging_gpg-Rqbe8S --query SecretString --output text | sed -e "s/^'//" -e "s/'$//" | jq -r '.altinity_staging_gpg | @base64d' | gpg --quiet --batch --import >/dev/null 2>&1; then
+          if ! aws secretsmanager get-secret-value --secret-id arn:aws:secretsmanager:us-east-1:446527654354:secret:altinity_${RELEASE_ENVIRONMENT}_gpg-Rqbe8S --query SecretString --output text | sed -e "s/^'//" -e "s/'$//" | jq -r '.altinity_${RELEASE_ENVIRONMENT}_gpg | @base64d' | gpg --quiet --batch --import >/dev/null 2>&1; then
             echo "Failed to import GPG key"
             exit 1
           fi
