@@ -84,7 +84,14 @@ std::string getProperFilePathFromMetadataInfo(std::string_view data_path, std::s
     }
     else
     {
-        throw ::DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "Expected to find '{}' in data path: '{}'", common_path, data_path);
+        /// Data files can have different path
+        pos = data_path.find("://");
+        if (pos == std::string::npos)
+            throw ::DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "Unexpected data path: '{}'", data_path);
+        pos = data_path.find("/", pos + 3);
+        if (pos == std::string::npos)
+            throw ::DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "Unexpected data path: '{}'", data_path);
+        return std::string(data_path.substr(pos));
     }
 }
 
