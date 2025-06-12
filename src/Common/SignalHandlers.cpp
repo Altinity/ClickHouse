@@ -577,7 +577,7 @@ try
         }
 
         /// Advice the user to send it manually.
-        if (std::string_view(VERSION_OFFICIAL).contains("official build"))
+        if (std::string_view(VERSION_OFFICIAL).contains("altinity build"))
         {
             const auto & date_lut = DateLUT::instance();
 
