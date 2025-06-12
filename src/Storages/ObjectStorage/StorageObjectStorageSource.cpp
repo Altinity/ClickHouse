@@ -19,6 +19,7 @@
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Storages/Cache/SchemaCache.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
+#include <Storages/ObjectStorage/StorageObjectStorageStableTaskDistributor.h>
 #include <Storages/ObjectStorage/DataLakes/DeltaLake/ObjectInfoWithPartitionColumns.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeConfiguration.h>
 #include <Storages/VirtualColumnUtils.h>
@@ -430,16 +431,32 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
     ObjectInfoPtr object_info;
     auto query_settings = configuration->getQuerySettings(context_);
 
+    bool not_a_path = false;
+
     do
     {
+        not_a_path = false;
         object_info = file_iterator->next(processor);
 
         if (!object_info || object_info->getPath().empty())
             return {};
 
+        StorageObjectStorageStableTaskDistributor::CommandInTaskResponse command(object_info->getPath());
+        if (command.is_parsed())
+        {
+            auto retry_after_us = command.get_retry_after_us();
+            if (retry_after_us.has_value())
+            {
+                not_a_path = true;
+                /// TODO: Make asyncronous waiting without sleep in thread
+                sleepForMicroseconds(std::min(100000ul, retry_after_us.value()));
+                continue;
+            }
+        }
+
         object_info->loadMetadata(object_storage);
     }
-    while (query_settings.skip_empty_files && object_info->metadata->size_bytes == 0);
+    while (not_a_path || (query_settings.skip_empty_files && object_info->metadata->size_bytes == 0));
 
     QueryPipelineBuilder builder;
     std::shared_ptr<ISource> source;

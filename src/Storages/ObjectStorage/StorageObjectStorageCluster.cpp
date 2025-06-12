@@ -27,6 +27,7 @@ namespace Setting
 {
     extern const SettingsBool use_hive_partitioning;
     extern const SettingsString object_storage_cluster;
+    extern const SettingsUInt64 lock_object_storage_task_distribution_ms;
 }
 
 namespace ErrorCodes
@@ -386,7 +387,10 @@ RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExten
         }
     }
 
-    auto task_distributor = std::make_shared<StorageObjectStorageStableTaskDistributor>(iterator, ids_of_hosts);
+    auto task_distributor = std::make_shared<StorageObjectStorageStableTaskDistributor>(
+        iterator,
+        ids_of_hosts,
+        local_context->getSettingsRef()[Setting::lock_object_storage_task_distribution_ms]);
 
     auto callback = std::make_shared<TaskIterator>(
         [task_distributor](size_t number_of_current_replica) mutable -> String {
