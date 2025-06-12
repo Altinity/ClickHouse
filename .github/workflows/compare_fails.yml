@@ -31,7 +31,7 @@ env:
 
 jobs:
   compare:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     steps:
       - name: Check commit status
         run: |
@@ -90,7 +90,7 @@ jobs:
           cat comparison_results.md >> $GITHUB_STEP_SUMMARY
 
       - name: Upload comparison results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: comparison-results
           path: |
