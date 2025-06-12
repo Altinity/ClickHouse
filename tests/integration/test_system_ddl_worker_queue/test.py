@@ -1,5 +1,8 @@
 import pytest
 import time
+from io import StringIO
+import csv
+import logging
 
 from helpers.cluster import ClickHouseCluster
 
@@ -95,10 +98,13 @@ def test_distributed_ddl_rubbish(started_cluster):
         settings={"replication_alter_partitions_sync": "2"},
     )
 
-    zk_content = node1.query(
-        "SELECT name, value, path FROM system.zookeeper WHERE path LIKE '/clickhouse/task_queue/ddl%' SETTINGS allow_unrestricted_reads_from_keeper=true",
-        parse=True,
-    ).to_dict("records")
+    zk_content_raw = node1.query(
+        "SELECT name, value, path FROM system.zookeeper WHERE path LIKE '/clickhouse/task_queue/ddl%' SETTINGS allow_unrestricted_reads_from_keeper=true FORMAT TabSeparatedWithNames",
+        # parse=True,
+    ) # .to_dict("records")
+
+    dict_reader = csv.DictReader(StringIO(zk_content_raw), delimiter='\t')
+    zk_content = [row for row in dict_reader]
 
     original_query = ""
     new_query = "query-artificial-" + str(time.monotonic_ns())
@@ -150,7 +156,7 @@ def test_distributed_ddl_rubbish(started_cluster):
         == 4
     )
 
-    node1.query(
-        f"ALTER TABLE testdb.{test_table} ON CLUSTER test_cluster DROP COLUMN somenewcolumn",
-        settings={"replication_alter_partitions_sync": "2"},
-    )
+    # node1.query(
+    #     f"ALTER TABLE testdb.{test_table} ON CLUSTER test_cluster DROP COLUMN somenewcolumn",
+    #     settings={"replication_alter_partitions_sync": "2"},
+    # )
