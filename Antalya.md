@@ -17,7 +17,7 @@
 | Parquet file metadata caching: use cache for parquetmetadata format|https://github.com/Altinity/ClickHouse/pull/636|24.12.2||
 | Parquet file metadata caching: turn cache on by default|https://github.com/Altinity/ClickHouse/pull/669, https://github.com/Altinity/ClickHouse/pull/674|24.12.2||
 | <   **SWARMS**   >||||
-| Restart cluster tasks on connection lost|https://github.com/Altinity/ClickHouse/pull/780|`25.3.3` (planned)||
+| Restart cluster tasks on connection lost|https://github.com/Altinity/ClickHouse/pull/780|`25.3.x` (planned)||
 | Setting object_storage_max_nodes|https://github.com/Altinity/ClickHouse/pull/677|25.2.2||
 | Rendezvous hashing filesystem cache|https://github.com/Altinity/ClickHouse/pull/709|25.2.2|https://github.com/ClickHouse/ClickHouse/pull/77326|25.5.1
 | Convert functions with object_storage_cluster setting to cluster functions|https://github.com/Altinity/ClickHouse/pull/712|25.2.2||
@@ -28,14 +28,13 @@
 | Limit parsing threads for distibuted case|https://github.com/Altinity/ClickHouse/pull/648|24.12.2||
 | Distributed request to tables with Object Storage Engines|https://github.com/Altinity/ClickHouse/pull/615|24.12.2||
 | <   **CATALOGS**   >||||
-| Unity catalog integration||`25.3.3` (planned)|https://github.com/ClickHouse/ClickHouse/pull/76988|25.3.1
-| Glue catalog integration||`25.3.3` (planned)|https://github.com/ClickHouse/ClickHouse/pull/77257|25.3.1
+| Unity catalog integration|same as upstream =>|25.3.3|https://github.com/ClickHouse/ClickHouse/pull/76988|25.3.1
+| Glue catalog integration|same as upstream =>|25.3.3|https://github.com/ClickHouse/ClickHouse/pull/77257|25.3.1
 | General engine definition for Iceberg tables|https://github.com/Altinity/ClickHouse/pull/675|25.2.2|https://github.com/ClickHouse/ClickHouse/pull/77125|
 | RBAC for S3|https://github.com/Altinity/ClickHouse/pull/688|25.2.2||
 | Iceberg REST Catalog integration|same as upstream =>|24.12.2|https://github.com/ClickHouse/ClickHouse/pull/71542|24.12.1
 | <   **TIERED STORAGE**   >||||
-| Wildcard support for object storage|https://github.com/Altinity/ClickHouse/pull/789|`25.3.3` (planned)||
-| Write to Merge tables|https://github.com/Altinity/ClickHouse/pull/683|`25.3.3` (planned)||
+| Write to Merge tables|https://github.com/Altinity/ClickHouse/pull/683|`25.3.x` (planned)||
 | Better S3 URL parsing for Hive partitioning|https://github.com/Altinity/ClickHouse/pull/700|25.2.2|https://github.com/ClickHouse/ClickHouse/pull/78185|25.5.1
 | s3Cluster hive partitioning for old analyzer|https://github.com/Altinity/ClickHouse/pull/703|25.2.2||
 | Support partition pruning in DeltaLake engine|https://github.com/Altinity/ClickHouse/pull/733|25.2.2|https://github.com/ClickHouse/ClickHouse/pull/78486|25.4.1
