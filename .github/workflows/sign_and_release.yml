@@ -439,7 +439,10 @@ jobs:
 
   sign-and-publish:
     needs: [extract-package-info, copy-packages]
-    runs-on: arc-runners-clickhouse-signer
+    runs-on: ${{
+      inputs.release_environment == 'staging' && 'arc-runners-clickhouse-signer' ||
+      inputs.release_environment == 'production' && 'arc-runners-clickhouse-signer-prod'
+     }}
     env:
       REPO_DNS_NAME: ${{ inputs.release_environment == 'production' && 'builds.altinity.cloud' || 'builds.staging.altinity.cloud' }}
       REPO_NAME: ${{ inputs.release_environment == 'production' && 'altinity' || 'altinity-staging' }}
@@ -463,6 +466,9 @@ jobs:
           repository: Altinity/ClickHouse
           ref: antalya
           path: ClickHouse
+
+      - name: One time repo download
+        run: aws s3 cp s3://builds.altinity.cloud/Blue/ /home/runner/.cache/prod --recursive
 
       - name: Download packages
         run: |
