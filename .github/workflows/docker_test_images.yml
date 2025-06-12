@@ -10,7 +10,7 @@ name: Build docker images
         description: set latest tag for resulting multiarch manifest
         required: false
         type: boolean
-        default: false    
+        default: false
     secrets:
       secret_envs:
         description: if given, it's passed to the environments
@@ -26,10 +26,12 @@ env:
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
 
 jobs:
   DockerBuildAarch64:
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cax41, altinity-image-arm-snapshot-22.04-arm, altinity-startup-snapshot, altinity-setup-none]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
     if: |
       !failure() && !cancelled() && toJson(fromJson(inputs.data).docker_data.missing_aarch64) != '[]'
     steps:
@@ -44,7 +46,7 @@ jobs:
             --image-tags '${{ toJson(fromJson(inputs.data).docker_data.images) }}' \
             --missing-images '${{ toJson(fromJson(inputs.data).docker_data.missing_aarch64) }}'
   DockerBuildAmd64:
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     if: |
       !failure() && !cancelled() && toJson(fromJson(inputs.data).docker_data.missing_amd64) != '[]'
     steps:
@@ -60,7 +62,7 @@ jobs:
             --missing-images '${{ toJson(fromJson(inputs.data).docker_data.missing_amd64) }}'
   DockerMultiArchManifest:
     needs: [DockerBuildAmd64, DockerBuildAarch64]
-    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     if: |
       !failure() && !cancelled() && (toJson(fromJson(inputs.data).docker_data.missing_multi) != '[]' || inputs.set_latest)
     steps:
