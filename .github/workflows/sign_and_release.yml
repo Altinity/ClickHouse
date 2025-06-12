@@ -467,9 +467,6 @@ jobs:
           ref: antalya
           path: ClickHouse
 
-      - name: One time repo download
-        run: aws s3 cp s3://builds.altinity.cloud/Blue/ /home/runner/.cache/prod --recursive
-
       - name: Download packages
         run: |
           if ! aws s3 sync "${DEST_URL}/packages/ARM_PACKAGES/" /home/runner/.cache/tmp/packages --exact-timestamps; then
