@@ -12,4 +12,6 @@ jobs:
       #   with:
       #     version: 2
       #     arch: arm64
+      - run: apt-ftparchive contents /home/runner/.cache/productio/apt-repo/pool/main > Contents-test
+      - run: cat Contents-test
       - run: ls -la /home/runner/.cache/production/apt-repo/dists/stable 
