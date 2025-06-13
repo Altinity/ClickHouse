@@ -7,23 +7,9 @@ jobs:
   sign-and-publish:
     runs-on: arc-runners-clickhouse-signer-prod
     steps:
-      - name: Install aws cli
-        uses: unfor19/install-aws-cli-action@v1
-        with:
-          version: 2
-          arch: arm64
-      - run: ls /home/runner/.cache/
-
-      - name: check production dir
-        run: rm -rf /home/runner/.cache/production
-
-      - name: check prod dir
-        run: rm -rf /home/runner/.cache/prod
-
-      - name: run first time runner setup
-        run: |
-          mkdir -p /home/runner/.cache/production
-          aws s3 cp s3://builds.altinity.cloud/Blue/ /home/runner/.cache/production --recursive
-
-      - name: sanity check
-        run: ls /home/runner/.cache/production
+      # - name: Install aws cli
+      #   uses: unfor19/install-aws-cli-action@v1
+      #   with:
+      #     version: 2
+      #     arch: arm64
+      - run: ls /home/runner/.cache/production/apt-repo/dists/stable 
