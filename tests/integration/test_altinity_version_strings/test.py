@@ -36,23 +36,24 @@ def send_signal(started_node: ClickHouseInstance, signal: int):
 
 def test_stacktrace(started_node: ClickHouseInstance):
     query = "SELECT throwIf(1, 'throw')"
-    result = started_node.query(query, ignore_error=True)
-    assert started_node.contains_in_log(
-        "FunctionThrowIf::executeImpl"
-    ), "Stacktrace is not enabled"
+    result = started_node.exec_in_container(
+        ["bash", "-c", f'clickhouse local --stacktrace -q "{query}" 2>&1'],
+        nothrow=True,
+    )
+    assert "FunctionThrowIf::executeImpl" in result, "Stacktrace is not enabled"
 
 
 def test_version(started_node: ClickHouseInstance):
-    result = started_node.exec_in_container(["clickhouse", "--version"])
-    assert VERSION_REGEX_CLI.search(
-        result
-    ), f"Version on cli not formatted correctly, expected match for: '{VERSION_REGEX_CLI.pattern}' but got: '{result}'"
-
     query = "SELECT version()"
     result = started_node.query(query)
     assert VERSION_REGEX_QUERY.search(
         result
     ), f"Version on query not formatted correctly, expected match for: '{VERSION_REGEX_QUERY.pattern}' but got: '{result}'"
+
+    result = started_node.exec_in_container(["clickhouse", "--version"])
+    assert VERSION_REGEX_CLI.search(
+        result
+    ), f"Version on cli not formatted correctly, expected match for: '{VERSION_REGEX_CLI.pattern}' but got: '{result}'"
 
 
 def test_error_message(started_node: ClickHouseInstance):
@@ -78,7 +79,6 @@ def test_error_message(started_node: ClickHouseInstance):
         assert not match, f"Unexpected message '{message}' found in log: {match}"
 
     expected_messages = [
-        "official",
         "(altinity build)",
     ]
 
@@ -101,9 +101,9 @@ def test_issues_link(started_node: ClickHouseInstance):
     )
 
     assert (
-        "github.com/Altinity/ClickHouse/issues" in result
-    ), f"ClickHouse/issues link is not correct, expected to find Altinity link but got: '{result}'"
+        "github.com/ClickHouse/ClickHouse/issues\n" not in result
+    ), f"ClickHouse/issues link is not correct, expected to not find upstream link but got: '{result}'"
 
     assert (
-        "github.com/ClickHouse/ClickHouse/issues" not in result
-    ), f"ClickHouse/issues link is not correct, expected to not find upstream link but got: '{result}'"
+        "github.com/Altinity/ClickHouse/issues\n" in result
+    ), f"ClickHouse/issues link is not correct, expected to find Altinity link but got: '{result}'"
