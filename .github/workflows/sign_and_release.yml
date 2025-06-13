@@ -15,3 +15,9 @@ jobs:
     runs-on: arc-runners-clickhouse-signer-prod
     steps:
       - run: ls /home/runner/.cache/
+
+      - name: check production dir
+        run: /home/runner/.cache/production/
+
+      - name: check prod dir
+        run: /home/runner/.cache/prod/
