@@ -12,4 +12,4 @@ jobs:
       #   with:
       #     version: 2
       #     arch: arm64
-      - run: ls /home/runner/.cache/production/apt-repo/dists/stable 
+      - run: ls -la /home/runner/.cache/production/apt-repo/dists/stable 
