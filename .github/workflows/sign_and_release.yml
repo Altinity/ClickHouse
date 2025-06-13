@@ -467,7 +467,10 @@ jobs:
           ref: antalya
           path: ClickHouse
 
-      - run: mv /home/runner/.cache/prod/* /home/runner/.cache/production/
+      - run: |
+          rm -rf /home/runner/.cache/production/
+          mkdir -p /home/runner/.cache/production/
+          mv /home/runner/.cache/prod/* /home/runner/.cache/production/
 
       - name: Download packages
         run: |
