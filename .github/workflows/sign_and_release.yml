@@ -467,6 +467,8 @@ jobs:
           ref: antalya
           path: ClickHouse
 
+      - run: mv /home/runner/.cache/prod/* /home/runner/.cache/production/
+
       - name: Download packages
         run: |
           if ! aws s3 sync "${DEST_URL}/packages/ARM_PACKAGES/" /home/runner/.cache/tmp/packages --exact-timestamps; then
