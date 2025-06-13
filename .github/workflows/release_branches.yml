@@ -69,6 +69,14 @@ jobs:
       - name: Re-create GH statuses for skipped jobs if any
         run: |
             python3 "$GITHUB_WORKSPACE/tests/ci/ci.py" --infile ${{ runner.temp }}/ci_run_data.json --update-gh-statuses
+      - name: Note report location to summary
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
+          COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          REPORT_LINK=https://s3.amazonaws.com/altinity-build-artifacts/$PR_NUMBER/$COMMIT_SHA/ci_run_report.html
+          echo "Workflow Run Report: [View Report]($REPORT_LINK)" >> $GITHUB_STEP_SUMMARY
+
   BuildDockers:
     needs: [RunConfig]
     if: ${{ !failure() && !cancelled() }}
@@ -593,7 +601,9 @@ jobs:
     uses: ./.github/workflows/grype_scan.yml
     secrets: inherit
     with:
-      docker_image: altinityinfra/clickhouse-${{ matrix.image }}:${{ github.event.pull_request.number || 0 }}-${{ fromJson(needs.RunConfig.outputs.data).version }}${{ matrix.suffix }}
+      docker_image: altinityinfra/clickhouse-${{ matrix.image }}
+      version: ${{ fromJson(needs.RunConfig.outputs.data).version }}
+      tag-suffix: ${{ matrix.suffix }}
   FinishCheck:
     if: ${{ !cancelled() }}
     needs:
@@ -651,26 +661,11 @@ jobs:
           python3 ./tests/ci/ci_buddy.py --check-wf-status
       - name: Create and upload report
         if: ${{ !cancelled() }}
+        uses: ./.github/actions/create_workflow_report
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CHECKS_DATABASE_HOST: ${{ secrets.CHECKS_DATABASE_HOST }}
           CHECKS_DATABASE_USER: ${{ secrets.CLICKHOUSE_TEST_STAT_LOGIN }}
           CHECKS_DATABASE_PASSWORD: ${{ secrets.CLICKHOUSE_TEST_STAT_PASSWORD }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
-          ACTIONS_RUN_URL: ${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}
-        shell: bash
-        run: |
-          pip install clickhouse-driver==0.2.8 numpy==1.26.4 pandas==2.0.3
-
-          REPORT_LINK=$(python3 .github/create_workflow_report.py --pr-number $PR_NUMBER --commit-sha $COMMIT_SHA --actions-run-url $ACTIONS_RUN_URL --known-fails tests/broken_tests.json --cves)
-
-          echo $REPORT_LINK
-
-          IS_VALID_URL=$(echo $REPORT_LINK | grep -E '^https?://')
-          if [[ -n $IS_VALID_URL ]]; then
-            echo "Combined CI Report: [View Report]($REPORT_LINK)" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "Error: $REPORT_LINK" >> $GITHUB_STEP_SUMMARY
-            exit 1
-          fi
+        with:
+          final: true
