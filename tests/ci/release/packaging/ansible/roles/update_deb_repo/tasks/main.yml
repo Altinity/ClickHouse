@@ -29,6 +29,14 @@
     src: "apt-ftparchive.conf.j2"
     dest: "/home/runner/.cache/tmp/apt-ftparchive.conf"
 
+- name: Check config
+  shell: "cat /home/runner/.cache/tmp/apt-ftparchive.conf"
+  register: debug
+
+- name: Print config
+  debug:
+    msg: "{{ debug.stdout }}"
+
 - name: Set up apt-ftparchive-stable config
   template:
     src: "apt-ftparchive-{{ repo_deb_dist }}.conf"
