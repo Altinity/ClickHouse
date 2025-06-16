@@ -42,6 +42,14 @@
     src: "apt-ftparchive-{{ repo_deb_dist }}.conf"
     dest: "/home/runner/.cache/tmp/apt-ftparchive-{{ repo_deb_dist }}.conf"
 
+- name: Check build files
+  shell: "ls -la {{ local_repo_path }}/{{ repo_prefix }}apt-repo/dists/{{ repo_deb_dist }}"
+  register: debug
+
+- name: Print build files
+  debug:
+    msg: "{{ debug.stdout }}"
+
 - name: Build {{ repo_prefix }}apt repo
   become: yes
   shell:
@@ -52,7 +60,7 @@
       apt-ftparchive -c /home/runner/.cache/tmp/apt-ftparchive-{{ repo_deb_dist }}.conf release dists/{{ repo_deb_dist }} > dists/{{ repo_deb_dist }}/Release
 
 - name: Check build files
-  shell: "ls {{ local_repo_path }}/{{ repo_prefix }}apt-repo/dists/{{ repo_deb_dist }}"
+  shell: "ls -la {{ local_repo_path }}/{{ repo_prefix }}apt-repo/dists/{{ repo_deb_dist }}"
   register: debug
 
 - name: Print build files
@@ -66,6 +74,14 @@
       set -xe
       gpg -a --yes --output dists/{{ repo_deb_dist }}/Release.gpg --detach-sign dists/{{ repo_deb_dist }}/Release
       gpg -a --yes --clearsign --output dists/{{ repo_deb_dist }}/InRelease --detach-sign dists/{{ repo_deb_dist }}/Release
+
+- name: Check build files
+  shell: "ls -la {{ local_repo_path }}/{{ repo_prefix }}apt-repo/dists/{{ repo_deb_dist }}"
+  register: debug
+
+- name: Print build files
+  debug:
+    msg: "{{ debug.stdout }}"
 
 - name: Get file info for contents of generated repo
   stat:
