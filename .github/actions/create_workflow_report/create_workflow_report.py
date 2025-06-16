@@ -537,9 +537,7 @@ def main():
 
     # get_cves returns ... in the case where no Grype result files were found.
     # This might occur when run in preview mode.
-    cves_not_checked = not args.cves or (
-        args.mark_preview and fail_results["docker_images_cves"] is ...
-    )
+    cves_not_checked = not args.cves or fail_results["docker_images_cves"] is ...
 
     if args.known_fails:
         if not os.path.exists(args.known_fails):
