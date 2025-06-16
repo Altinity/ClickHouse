@@ -141,6 +141,7 @@ ManifestFileContent::ManifestFileContent(
     const IcebergSchemaProcessor & schema_processor,
     Int64 inherited_sequence_number,
     const String & table_location,
+    const String & common_namespace,
     DB::ContextPtr context)
 {
     this->schema_id = schema_id_;
@@ -205,7 +206,11 @@ ManifestFileContent::ManifestFileContent(
         }
         const auto status = ManifestEntryStatus(manifest_file_deserializer.getValueFromRowByName(i, COLUMN_STATUS_NAME, TypeIndex::Int32).safeGet<UInt64>());
 
-        const auto file_path = getProperFilePathFromMetadataInfo(manifest_file_deserializer.getValueFromRowByName(i, SUBCOLUMN_FILE_PATH_NAME, TypeIndex::String).safeGet<String>(), common_path, table_location);
+        const auto file_path = getProperFilePathFromMetadataInfo(
+            manifest_file_deserializer.getValueFromRowByName(i, SUBCOLUMN_FILE_PATH_NAME, TypeIndex::String).safeGet<String>(),
+            common_path,
+            table_location,
+            common_namespace);
 
         /// NOTE: This is weird, because in manifest file partition looks like this:
         /// {

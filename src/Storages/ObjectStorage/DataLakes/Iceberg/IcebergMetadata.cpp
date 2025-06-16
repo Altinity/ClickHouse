@@ -487,7 +487,7 @@ void IcebergMetadata::updateSnapshot()
 
             relevant_snapshot = IcebergSnapshot{
                 getManifestList(getProperFilePathFromMetadataInfo(
-                    snapshot->getValue<String>(MANIFEST_LIST_PATH_FIELD), configuration_ptr->getPath(), table_location)),
+                    snapshot->getValue<String>(MANIFEST_LIST_PATH_FIELD), configuration_ptr->getPath(), table_location, configuration_ptr->getNamespace())),
                 relevant_snapshot_id, total_rows, total_bytes};
 
             if (!snapshot->has("schema-id"))
@@ -654,7 +654,7 @@ ManifestListPtr IcebergMetadata::getManifestList(const String & filename) const
         for (size_t i = 0; i < manifest_list_deserializer.rows(); ++i)
         {
             const std::string file_path = manifest_list_deserializer.getValueFromRowByName(i, MANIFEST_FILE_PATH_COLUMN, TypeIndex::String).safeGet<std::string>();
-            const auto manifest_file_name = getProperFilePathFromMetadataInfo(file_path, configuration_ptr->getPath(), table_location);
+            const auto manifest_file_name = getProperFilePathFromMetadataInfo(file_path, configuration_ptr->getPath(), table_location, configuration_ptr->getNamespace());
             Int64 added_sequence_number = 0;
             if (format_version > 1)
                 added_sequence_number = manifest_list_deserializer.getValueFromRowByName(i, SEQUENCE_NUMBER_COLUMN, TypeIndex::Int64).safeGet<Int64>();
@@ -706,6 +706,7 @@ ManifestFilePtr IcebergMetadata::getManifestFile(const String & filename, Int64 
             schema_processor,
             inherited_sequence_number,
             table_location,
+            configuration_ptr->getNamespace(),
             context);
     };
 
