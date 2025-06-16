@@ -26,11 +26,13 @@
 
 - name: Set up apt-ftparchive config
   template:
-    src: "{{ item }}"
-    dest: "/home/runner/.cache/tmp/{{ item }}"
-  loop:
-    - "apt-ftparchive.conf"
-    - "apt-ftparchive-{{ repo_deb_dist }}.conf"
+    src: "apt-ftparchive.conf.j2"
+    dest: "/home/runner/.cache/tmp/apt-ftparchive.conf"
+
+- name: Set up apt-ftparchive-stable config
+  template:
+    src: "apt-ftparchive-{{ repo_deb_dist }}.conf"
+    dest: "/home/runner/.cache/tmp/apt-ftparchive-{{ repo_deb_dist }}.conf"
 
 - name: Build {{ repo_prefix }}apt repo
   become: yes
