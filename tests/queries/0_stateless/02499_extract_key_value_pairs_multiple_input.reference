@@ -392,3 +392,4 @@ WITH
     ) AS x
 SELECT
     x;
+{'key':'quoted_value','second_key':'0'}
