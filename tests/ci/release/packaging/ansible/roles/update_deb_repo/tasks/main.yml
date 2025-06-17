@@ -26,7 +26,7 @@
 
 - name: Set up apt-ftparchive config
   template:
-    src: "apt-ftparchive.conf.j2"
+    src: "apt-ftparchive.conf"
     dest: "/home/runner/.cache/tmp/apt-ftparchive.conf"
 
 - name: Check config
