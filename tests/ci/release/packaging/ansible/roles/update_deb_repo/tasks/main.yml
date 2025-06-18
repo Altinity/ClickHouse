@@ -2,6 +2,14 @@
   shell: "mv /home/runner/.cache/tmp/packages/{{ item }} {{ local_repo_path }}/{{ repo_prefix }}apt-repo/pool/main/{{ item }}"
   loop: "{{ deb_pkg_names }}"
 
+- name: Check config
+  shell: "ls -la {{ local_repo_path }}/apt-repo/pool/main/"
+  register: debug
+
+- name: Print config
+  debug:
+    msg: "{{ debug.stdout }}"
+
 - name: Copy library-bridge and obdc-bridge if version newer than 24.8
   when: (pkgver | regex_replace('^(\\d+\\.\\d+).*$', '\\1')) is version('24.8', '==')
   shell: "mv /home/runner/.cache/tmp/packages/{{ item }} {{ local_repo_path }}/{{ repo_prefix }}apt-repo/pool/main/{{ item }}"
@@ -58,14 +66,6 @@
       set -xe
       gpg -a --yes --output dists/{{ repo_deb_dist }}/Release.gpg --detach-sign dists/{{ repo_deb_dist }}/Release
       gpg -a --yes --clearsign --output dists/{{ repo_deb_dist }}/InRelease --detach-sign dists/{{ repo_deb_dist }}/Release
-
-- name: Check build files
-  shell: "ls -la {{ local_repo_path }}/{{ repo_prefix }}apt-repo/dists/{{ repo_deb_dist }}"
-  register: debug
-
-- name: Print build files
-  debug:
-    msg: "{{ debug.stdout }}"
 
 - name: Get file info for contents of generated repo
   stat:
