@@ -66,7 +66,7 @@
   community.aws.cloudfront_distribution:
     region: "{{ aws_region }}"
     state: present
-    caller_reference: "{{ now(utc=True, fmt='%Y-%m-%dT%H:%M:%S.%f%Z') }}"
+    caller_reference: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.CallerReference }}"
     origins:
       - id: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.Origins.Items[0].Id }}"
         domain_name: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.Origins.Items[0].DomainName }}"
