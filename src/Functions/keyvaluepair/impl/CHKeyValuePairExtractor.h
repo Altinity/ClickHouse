@@ -102,7 +102,17 @@ private:
             }
             case State::FLUSH_PAIR:
             {
-                return flushPair(file, key, value, row_offset);
+                incrementRowOffset(row_offset);
+                return state_handler.flushPair(file, key, value);
+            }
+            case State::FLUSH_PAIR_AFTER_QUOTED_VALUE:
+            {
+                incrementRowOffset(row_offset);
+                return state_handler.flushPairAfterQuotedValue(file, key, value);
+            }
+            case State::WAITING_PAIR_DELIMITER:
+            {
+                return state_handler.waitPairDelimiter(file);
             }
             case State::END:
             {
@@ -111,8 +121,7 @@ private:
         }
     }
 
-    NextState flushPair(const std::string_view & file, auto & key,
-                        auto & value, uint64_t & row_offset)
+    void incrementRowOffset(uint64_t & row_offset)
     {
         row_offset++;
 
@@ -120,11 +129,6 @@ private:
         {
             throw Exception(ErrorCodes::LIMIT_EXCEEDED, "Number of pairs produced exceeded the limit of {}", max_number_of_pairs);
         }
-
-        key.commit();
-        value.commit();
-
-        return {0, file.empty() ? State::END : State::WAITING_KEY};
     }
 
     void reset(auto & key, auto & value)
