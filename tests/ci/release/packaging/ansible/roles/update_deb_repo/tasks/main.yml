@@ -89,6 +89,11 @@
     msg: "{{ debug.stdout }}"
 
 - name: Sync repos between source and target
-  shell: "aws s3 sync --delete '{{ local_repo_path }}/{{ item }}' '{{ s3_repo_target_path }}/{{ release_environment }}/{{ item }}'"
+  shell: "aws s3 sync --delete '{{ local_repo_path }}/{{ item }}' '{{ s3_repo_target_path }}/{{ item }}'"
+  loop: "{{ apt_repos }}"
+  when: cloudfront_origin_path != ""
+
+- name: Sync apt repos between source and target
+  shell: "aws s3 sync --delete '{{ local_repo_path }}/{{ item }}' '{{ s3_repo_target_path }}/{{ item }}'"
   loop: "{{ apt_repos }}"
   when: cloudfront_origin_path != ""
