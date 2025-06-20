@@ -64,20 +64,28 @@ String trim(const String & str)
 std::vector<String> splitTypeArguments(const String & type_str)
 {
     std::vector<String> args;
-    int depth = 0;
+    int angle_depth = 0;
+    int paren_depth = 0;
     size_t start = 0;
-    for (size_t i = 0; i < type_str.size(); i++)
+
+    for (size_t i = 0; i < type_str.size(); ++i)
     {
-        if (type_str[i] == '<')
-            depth++;
-        else if (type_str[i] == '>')
-            depth--;
-        else if (type_str[i] == ',' && depth == 0)
+        char c = type_str[i];
+        if (c == '<')
+            angle_depth++;
+        else if (c == '>')
+            angle_depth--;
+        else if (c == '(')
+            paren_depth++;
+        else if (c == ')')
+            paren_depth--;
+        else if (c == ',' && angle_depth == 0 && paren_depth == 0)
         {
             args.push_back(trim(type_str.substr(start, i - start)));
             start = i + 1;
         }
     }
+
     args.push_back(trim(type_str.substr(start)));
     return args;
 }
