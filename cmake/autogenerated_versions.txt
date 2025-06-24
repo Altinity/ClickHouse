@@ -8,11 +8,12 @@ SET(VERSION_MINOR 3)
 SET(VERSION_PATCH 3)
 SET(VERSION_GITHASH c4bfe68b052e4a15f731077d86d83b9bc2e5b71f)
 
-# This is the 'base' tweak of the version, build scripts will
-# increment this by number of commits since previous tag.
-SET(VERSION_TWEAK 20000)
-SET(VERSION_FLAVOUR altinityantalya)
+#10000 for altinitystable candidates
+#20000 for altinityedge candidates
+SET(VERSION_TWEAK 10000)
+SET(VERSION_FLAVOUR altinitytest)
 
-SET(VERSION_DESCRIBE v25.3.3.20000.altinityantalya)
-SET(VERSION_STRING 25.3.3.20000.altinityantalya)
+SET(VERSION_DESCRIBE v24.3.3.10000.altinitytest)
+SET(VERSION_STRING 24.3.3.10000.altinitytest)
+
 # end of autochange
