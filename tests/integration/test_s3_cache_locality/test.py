@@ -110,8 +110,8 @@ def check_s3_gets(cluster, node, expected_result, cluster_first, cluster_second,
     )
     assert result_second == expected_result
 
-    for host in list(cluster.instances.values()):
-        host.query("SYSTEM FLUSH LOGS")
+    node.query(f"SYSTEM FLUSH LOGS ON CLUSTER {cluster_first}")
+    node.query(f"SYSTEM FLUSH LOGS ON CLUSTER {cluster_second}")
 
     s3_get_first = node.query(
         f"""
