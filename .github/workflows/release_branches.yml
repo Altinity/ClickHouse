@@ -7,6 +7,11 @@ env:
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  CLICKHOUSE_TEST_STAT_LOGIN: ${{ secrets.CLICKHOUSE_TEST_STAT_LOGIN }}
+  CLICKHOUSE_TEST_STAT_PASSWORD: ${{ secrets.CLICKHOUSE_TEST_STAT_PASSWORD }}
+  CLICKHOUSE_TEST_STAT_URL: ${{ secrets.CLICKHOUSE_TEST_STAT_URL }}
+  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+  ROBOT_TOKEN: ${{ secrets.ROBOT_TOKEN }}
 
 on: # yamllint disable-line rule:truthy
   pull_request:
@@ -16,7 +21,7 @@ on: # yamllint disable-line rule:truthy
       - opened
     branches:
       # Anything/24.8 (e.g customizations/24.8.x)
-      - '**/24.8*'
+      - '**24.8*'
   release:
     types:
       - published
@@ -64,6 +69,14 @@ jobs:
       - name: Re-create GH statuses for skipped jobs if any
         run: |
             python3 "$GITHUB_WORKSPACE/tests/ci/ci.py" --infile ${{ runner.temp }}/ci_run_data.json --update-gh-statuses
+      - name: Note report location to summary
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
+          COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          REPORT_LINK=https://s3.amazonaws.com/altinity-build-artifacts/$PR_NUMBER/$COMMIT_SHA/ci_run_report.html
+          echo "Workflow Run Report: [View Report]($REPORT_LINK)" >> $GITHUB_STEP_SUMMARY
+
   BuildDockers:
     needs: [RunConfig]
     if: ${{ !failure() && !cancelled() }}
@@ -533,24 +546,24 @@ jobs:
 ##################################### REGRESSION TESTS ######################################
 #############################################################################################
   RegressionTestsRelease:
-    needs: [BuilderDebRelease]
-    if: ${{ !failure() && !cancelled() }}
+    needs: [RunConfig, BuilderDebRelease]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'regression') }}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
       runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-app-docker-ce, altinity-setup-regression
-      commit: 11dcb1ad771e6afebcb06bcc7bf1c1d8b184d838
+      commit: e3c00be97a045aa04e9d1a6ec50cc64f4c387b70
       arch: release
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout_minutes: 300
   RegressionTestsAarch64:
-    needs: [BuilderDebAarch64]
-    if: ${{ !failure() && !cancelled() }}
+    needs: [RunConfig, BuilderDebAarch64]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'regression') && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'aarch64')}}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
       runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-app-docker-ce, altinity-setup-regression
-      commit: 11dcb1ad771e6afebcb06bcc7bf1c1d8b184d838
+      commit: e3c00be97a045aa04e9d1a6ec50cc64f4c387b70
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout_minutes: 300
@@ -572,6 +585,25 @@ jobs:
       test_name: Sign aarch64
       runner_type: altinity-on-demand, altinity-func-tester
       data: ${{ needs.RunConfig.outputs.data }}
+  GrypeScan:
+    needs: [RunConfig, DockerServerImage, DockerKeeperImage]
+    if: ${{ !failure() && !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: server
+            suffix: ''
+          - image: server
+            suffix: '-alpine'
+          - image: keeper
+            suffix: ''
+    uses: ./.github/workflows/grype_scan.yml
+    secrets: inherit
+    with:
+      docker_image: altinityinfra/clickhouse-${{ matrix.image }}
+      version: ${{ fromJson(needs.RunConfig.outputs.data).version }}
+      tag-suffix: ${{ matrix.suffix }}
   FinishCheck:
     if: ${{ !cancelled() }}
     needs:
@@ -606,6 +638,7 @@ jobs:
       - CompatibilityCheckAarch64
       - RegressionTestsRelease
       - RegressionTestsAarch64
+      - GrypeScan
       - SignRelease
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     steps:
@@ -626,25 +659,13 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           python3 ./tests/ci/ci_buddy.py --check-wf-status
-      - name: Create and upload combined report
+      - name: Create and upload report
         if: ${{ !cancelled() }}
+        uses: ./.github/actions/create_workflow_report
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CHECKS_DATABASE_HOST: ${{ secrets.CHECKS_DATABASE_HOST }}
-          CHECKS_DATABASE_USER: ${{ secrets.CHECKS_DATABASE_USER }}
-          CHECKS_DATABASE_PASSWORD: ${{ secrets.CHECKS_DATABASE_PASSWORD }}
-          COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-          PR_NUMBER: ${{ github.event.number }}
-          ACTIONS_RUN_URL: ${{ github.event.repository.html_url }}/actions/runs/${{ github.run_id }}
-        shell: bash
-        run: |
-          pip install clickhouse-driver==0.2.8 numpy==1.26.4 pandas==2.2.0
-
-          REPORT_LINK=$(python3 .github/create_combined_ci_report.py --pr-number $PR_NUMBER --commit-sha $COMMIT_SHA --actions-run-url $ACTIONS_RUN_URL --known-fails tests/broken_tests.json)
-
-          IS_VALID_URL=$(echo $REPORT_LINK | grep -E '^https?://')
-          if [[ -n $IS_VALID_URL ]]; then
-            echo "Combined CI Report: [View Report]($REPORT_LINK)" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "Error: $REPORT_LINK" >> $GITHUB_STEP_SUMMARY
-            exit 1
-          fi
+          CHECKS_DATABASE_USER: ${{ secrets.CLICKHOUSE_TEST_STAT_LOGIN }}
+          CHECKS_DATABASE_PASSWORD: ${{ secrets.CLICKHOUSE_TEST_STAT_PASSWORD }}
+        with:
+          final: true

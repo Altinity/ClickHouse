@@ -10,6 +10,7 @@ from github.AuthenticatedUser import AuthenticatedUser
 from github.GithubException import BadCredentialsException
 from github.NamedUser import NamedUser
 
+from env_helper import ROBOT_TOKEN
 
 @dataclass
 class Token:
@@ -56,20 +57,11 @@ def get_parameters_from_ssm(
 
     return results
 
-
-ROBOT_TOKEN = None  # type: Optional[Token]
-
 # NOTE(Arthur Passos): Original CI code uses the "_original" version of this method. Each robot token is rate limited
 # and the original implementation selects the "best one". To make it simpler and iterate faster,
 # we are using only one robot and keeping the method signature. In the future we might reconsider
 # having multiple robot tokens
-def get_best_robot_token(token_prefix_env_name="github_robot_token"):
-    # Re-use already fetched token (same as in get_best_robot_token_original)
-    # except here we assume it is always a string (since we use only one token and don't do token rotation)
-    global ROBOT_TOKEN
-    if ROBOT_TOKEN is not None:
-        return ROBOT_TOKEN
-    ROBOT_TOKEN = get_parameter_from_ssm(token_prefix_env_name)
+def get_best_robot_token():
     return ROBOT_TOKEN
 
 def get_best_robot_token_original(tokens_path: str = "/github-tokens") -> str:
