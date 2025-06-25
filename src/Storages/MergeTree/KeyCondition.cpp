@@ -134,7 +134,7 @@ static String extractFixedPrefixFromRegularExpression(const String & regexp)
                     case '-':
                         fixed_prefix += *pos;
                         ++pos;
-                    break;
+                        break;
                     default:
                         /// all other escape sequences are not supported
                             pos = end;
