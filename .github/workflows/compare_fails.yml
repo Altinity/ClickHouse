@@ -88,7 +88,7 @@ jobs:
         run: |
           git clone https://github.com/Altinity/actions.git
           cd actions
-          git checkout c5751cefd4f56bd7300b5f6d84a5ae9d0b686772
+          git checkout 4623f919ee2738bea69aad405879562476736932
           python3 scripts/compare_ci_fails.py \
             --current-ref ${{ inputs.current_ref || github.sha }} \
             --previous-ref ${{ inputs.previous_ref || steps.default_refs.outputs.PREVIOUS_TAG_COMMIT }} \
