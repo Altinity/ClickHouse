@@ -4,12 +4,29 @@ on:
   workflow_dispatch:
 
 jobs:
-  sign-and-publish:
+  sync-staging:
+    runs-on: arc-runners-clickhouse-signer
+    steps:
+      - name: Install aws cli
+        uses: unfor19/install-aws-cli-action@v1
+        with:
+          version: 2
+          arch: arm64
+
+      - name: sync latest repo changes
+        run: |
+          aws s3 sync s3://builds.altinity.cloud/Blue/ /home/runner/.cache/staging
+
+  sync-prod:
     runs-on: arc-runners-clickhouse-signer-prod
     steps:
-      # - name: Install aws cli
-      #   uses: unfor19/install-aws-cli-action@v1
-      #   with:
-      #     version: 2
-      #     arch: arm64
-      - run: ls -la /home/runner/.cache/production/apt-repo/pool/main 
+      - name: Install aws cli
+        uses: unfor19/install-aws-cli-action@v1
+        with:
+          version: 2
+          arch: arm64
+
+      - name: sync latest repo changes
+        run: |
+          aws s3 sync s3://builds.altinity.cloud/Green/ /home/runner/.cache/production
+          
