@@ -4,11 +4,17 @@ on:
   workflow_dispatch:
 
 jobs:
-  sync-staging:
+  check-staging:
     runs-on: arc-runners-clickhouse-signer
     steps:
       - name: check space
         run: du -sh /home/runner/.cache/staging
+
+  check-prod:
+    runs-on: arc-runners-clickhouse-signer-prod
+    steps:
+      - name: check space
+        run: du -sh /home/runner/.cache/production
       # - name: Install aws cli
       #   uses: unfor19/install-aws-cli-action@v1
       #   with:
