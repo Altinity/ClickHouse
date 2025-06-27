@@ -32,3 +32,5 @@
       - "Active path (current live site): {{ s3_repo_source_path }}"
       - "Target path (to be updated):     {{ s3_repo_target_path }}"
 
+- name: Sync any changes from repo
+  shell: 'aws s3 sync "{{ s3_repo_source_path }}" "{{ local_repo_path }}"'
