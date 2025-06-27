@@ -8,13 +8,13 @@ jobs:
     runs-on: arc-runners-clickhouse-signer
     steps:
       - name: check space
-        run: du -sh /home/runner/.cache/staging
+        run: ls -la /home/runner/.cache/staging/apt-repo
 
   check-prod:
     runs-on: arc-runners-clickhouse-signer-prod
     steps:
       - name: check space
-        run: du -sh /home/runner/.cache/production
+        run: ls -la /home/runner/.cache/production/apt-repo
       # - name: Install aws cli
       #   uses: unfor19/install-aws-cli-action@v1
       #   with:
