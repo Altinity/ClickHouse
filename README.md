@@ -13,12 +13,13 @@
 
 <h1>Altinity Antalya</h1>
 
-- [Feature Matrix](Antalya.md)
-- [github releases](https://github.com/Altinity/ClickHouse/releases?q=altinityantalya&expanded=false)
-- [docker images](https://hub.docker.com/r/altinity/clickhouse-server/tags?page=1&name=altinityantalya)
-- [packages](https://builds.altinity.cloud/#altinityantalya)
+- [Feature matrix](Antalya.md)
+- [Project roadmap](https://github.com/Altinity/ClickHouse/issues/804)
+- [Github releases](https://github.com/Altinity/ClickHouse/releases?q=altinityantalya&expanded=false)
+- [Docker images](https://hub.docker.com/r/altinity/clickhouse-server/tags?page=1&name=altinityantalya)
+- [Packages](https://builds.altinity.cloud/#altinityantalya)
 
-**Altinity Antalya** is an experimental build of ClickHouse® incorporating features and fixes from the future Altinity Stable Build releases. It is **Not for production use**.
+Project Antalya makes ClickHouse the query engine for Data Lakes that use [Iceberg](https://iceberg.apache.org/) as the table format, store data as columns in [Parquet](https://parquet.apache.org/), all hosted on [S3](https://aws.amazon.com/s3/)-compatible storage. 
 
 <h1>Altinity Stable Builds®</h1>
 
