@@ -21,11 +21,6 @@ To define an access token processor, add `access_token_processors` section to `c
 ```xml
 <clickhouse>
     <access_token_processors>
-        <gogoogle>
-            <provider>Google</provider>
-            <email_filter>^[A-Za-z0-9._%+-]+@example\.com$</email_filter>
-            <cache_lifetime>600</cache_lifetime>
-        </gogoogle>
         <azuure>
             <provider>azure</provider>
             <client_id>CLIENT_ID</client_id>
@@ -41,9 +36,10 @@ Different providers have different sets of parameters.
 
 **Parameters**
 
-- `provider` -- name of identity provider. Mandatory, case-insensitive. Supported options: "Google", "Azure".
+- `provider` -- name of identity provider. Mandatory, case-insensitive. Supported option: "Azure".
 - `cache_lifetime` --  maximum lifetime of cached token (in seconds). Optional, default: 3600.
-- `email_filter` -- Regex for validation of user emails. Optional parameter, only for Google IdP.
+
+[//]: # (- `email_filter` -- Regex for validation of user emails. Optional parameter, only for Google IdP.)
 - `client_id` -- Azure AD (Entra ID) client ID. Optional parameter, only for Azure IdP.
 - `tenant_id` -- Azure AD (Entra ID) tenant ID. Optional parameter, only for Azure IdP.
 
@@ -94,7 +90,7 @@ All this implies that the SQL-driven [Access Control and Account Management](/do
 ```xml
 <clickhouse>
     <token>
-        <processor>gogoogle</processor>
+        <processor>azuuree</processor>
         <roles>
             <token_test_role_1 />
         </roles>

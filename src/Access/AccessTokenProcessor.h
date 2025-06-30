@@ -21,7 +21,6 @@ namespace ErrorCodes
     extern const int INVALID_CONFIG_PARAMETER;
 }
 
-class GoogleAccessTokenProcessor;
 
 class IAccessTokenProcessor
 {
@@ -57,24 +56,6 @@ protected:
     const String name;
     const UInt64 cache_invalidation_interval;
     re2::RE2 email_regex;
-};
-
-
-class GoogleAccessTokenProcessor : public IAccessTokenProcessor
-{
-public:
-    GoogleAccessTokenProcessor(const String & name_,
-                               const UInt64 cache_invalidation_interval_,
-                               const String & email_regex_str)
-                               : IAccessTokenProcessor(name_, cache_invalidation_interval_, email_regex_str) {}
-
-    bool resolveAndValidate(const TokenCredentials & credentials) override;
-
-private:
-    [[maybe_unused]] static const Poco::URI token_info_uri;
-    static const Poco::URI user_info_uri;
-
-    std::unordered_map<String, String> getUserInfo(const String & token) const;
 };
 
 
