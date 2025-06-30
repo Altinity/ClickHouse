@@ -61,7 +61,7 @@ jobs:
             TAG_SUFFIX: ${{ inputs.tag-suffix }}
             SPECIFIED_VERSION: ${{ inputs.version }}
           run: |
-            python3 ./tests/ci/version_helper.py | tee /tmp/version_info
+            python3 ./tests/ci/version_helper.py | grep = | tee /tmp/version_info
             source /tmp/version_info
             if [ -z "$SPECIFIED_VERSION" ]; then
                 VERSION=$CLICKHOUSE_VERSION_STRING
