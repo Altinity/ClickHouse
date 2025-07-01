@@ -23,7 +23,7 @@ on: # yamllint disable-line rule:truthy
       - '*'
   push:
     branches:
-      - 'antalya'
+      - 'releases/*'
     tags:
       - '*'
   workflow_dispatch:
