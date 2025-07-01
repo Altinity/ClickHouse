@@ -27,6 +27,11 @@ on: # yamllint disable-line rule:truthy
     tags:
       - '*'
   workflow_dispatch:
+    inputs:
+      workflow_name:
+        description: 'Name of the workflow'
+        required: false
+        type: string
 
 jobs:
   RunConfig:
@@ -437,7 +442,7 @@ jobs:
     secrets: inherit
     with:
       runner_type: altinity-on-demand, altinity-regression-tester
-      commit: 88c93f843cd48cd9defc6cec6b98d6b98f94adde
+      commit: f30c3f3474febb8ad6fc6f0af8900ab9f04576f5
       arch: release
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout_minutes: 300
@@ -448,7 +453,7 @@ jobs:
     secrets: inherit
     with:
       runner_type: altinity-on-demand, altinity-regression-tester-aarch64
-      commit: 88c93f843cd48cd9defc6cec6b98d6b98f94adde
+      commit: f30c3f3474febb8ad6fc6f0af8900ab9f04576f5
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout_minutes: 300
