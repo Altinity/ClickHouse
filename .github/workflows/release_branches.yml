@@ -27,6 +27,11 @@ on: # yamllint disable-line rule:truthy
     tags:
       - '*'
   workflow_dispatch:
+    inputs:
+      workflow_name:
+        description: 'Name of the workflow'
+        required: false
+        type: string
 
 jobs:
   RunConfig:
