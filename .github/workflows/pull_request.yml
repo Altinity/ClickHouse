@@ -17,21 +17,38 @@ env:
 permissions: write-all
 
 jobs:
+<<<<<<< HEAD
 
   config_workflow:
-    runs-on: [self-hosted, style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cax41, altinity-in-hel1, altinity-image-arm-app-docker-ce]
     needs: []
     name: "Config Workflow"
+||||||| 204fd5b5431
+  RunConfig:
+    runs-on: [self-hosted, style-checker-aarch64]
+=======
+  RunConfig:
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cax41, altinity-in-hel1, altinity-image-arm-app-docker-ce]
+>>>>>>> altinity/antalya
     outputs:
       data: ${{ steps.run.outputs.DATA }}
     steps:
+<<<<<<< HEAD
       - name: Checkout code
         uses: actions/checkout@v4
+||||||| 204fd5b5431
+      - name: Check out repository code
+        uses: ClickHouse/checkout@v1
+=======
+      - name: Check out repository code
+        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f
+>>>>>>> altinity/antalya
         with:
           ref: ${{ env.CHECKOUT_REF }}
 
       - name: Prepare env script
         run: |
+<<<<<<< HEAD
           rm -rf ./ci/tmp ./ci/tmp ./ci/tmp
           mkdir -p ./ci/tmp ./ci/tmp ./ci/tmp
           cat > ./ci/tmp/praktika_setup_env.sh << 'ENV_SETUP_SCRIPT_EOF'
@@ -40,12 +57,251 @@ jobs:
           ${{ needs.config_workflow.outputs.data }}
           EOF
           cat > ./ci/tmp/workflow_status.json << 'EOF'
+||||||| 204fd5b5431
+            python3 "$GITHUB_WORKSPACE/tests/ci/ci.py" --infile ${{ runner.temp }}/ci_run_data.json --update-gh-statuses
+  BuildDockers:
+    needs: [RunConfig]
+    if: ${{ !failure() && !cancelled() && toJson(fromJson(needs.RunConfig.outputs.data).docker_data.missing_multi) != '[]' }}
+    uses: ./.github/workflows/docker_test_images.yml
+    with:
+      data: ${{ needs.RunConfig.outputs.data }}
+  StyleCheck:
+    needs: [RunConfig, BuildDockers]
+    if: ${{ !failure() && !cancelled() && contains(fromJson(needs.RunConfig.outputs.data).jobs_data.jobs_to_do, 'Style check')}}
+    uses: ./.github/workflows/reusable_test.yml
+    with:
+      test_name: Style check
+      runner_type: style-checker-aarch64
+      run_command: |
+          python3 style_check.py
+      data: ${{ needs.RunConfig.outputs.data }}
+    secrets:
+      robot_git_token: ${{secrets.ROBOT_CLICKHOUSE_SSH_KEY}}
+  FastTest:
+    needs: [RunConfig, BuildDockers, StyleCheck]
+    if: ${{ !failure() && !cancelled() && contains(fromJson(needs.RunConfig.outputs.data).jobs_data.jobs_to_do, 'Fast test') }}
+    uses: ./.github/workflows/reusable_test.yml
+    with:
+      test_name: Fast test
+      runner_type: builder
+      data: ${{ needs.RunConfig.outputs.data }}
+      run_command: |
+          python3 fast_test_check.py
+
+  ################################# Main stages #################################
+  # for main CI chain
+  #
+  Builds_1:
+    needs: [RunConfig, StyleCheck, FastTest]
+    if: ${{ !failure() && !cancelled() && contains(fromJson(needs.RunConfig.outputs.data).stages_data.stages_to_do, 'Builds_1') }}
+    # using callable wf (reusable_stage.yml) allows grouping all nested jobs under a tab
+    uses: ./.github/workflows/reusable_build_stage.yml
+    with:
+      stage: Builds_1
+      data: ${{ needs.RunConfig.outputs.data }}
+  Tests_1:
+    needs: [RunConfig, Builds_1]
+    if: ${{ !failure() && !cancelled() && contains(fromJson(needs.RunConfig.outputs.data).stages_data.stages_to_do, 'Tests_1') }}
+    uses: ./.github/workflows/reusable_test_stage.yml
+    with:
+      stage: Tests_1
+      data: ${{ needs.RunConfig.outputs.data }}
+  Builds_2:
+    needs: [RunConfig, Builds_1]
+    if: ${{ !failure() && !cancelled() && contains(fromJson(needs.RunConfig.outputs.data).stages_data.stages_to_do, 'Builds_2') }}
+    uses: ./.github/workflows/reusable_build_stage.yml
+    with:
+      stage: Builds_2
+      data: ${{ needs.RunConfig.outputs.data }}
+  # stage for running non-required checks without being blocked by required checks (Test_1) if corresponding settings is selected
+  Tests_2_ww:
+    needs: [RunConfig, Builds_1]
+    if: ${{ !failure() && !cancelled() && contains(fromJson(needs.RunConfig.outputs.data).stages_data.stages_to_do, 'Tests_2_ww') }}
+    uses: ./.github/workflows/reusable_test_stage.yml
+    with:
+      stage: Tests_2_ww
+      data: ${{ needs.RunConfig.outputs.data }}
+  Tests_2:
+    needs: [RunConfig, Builds_1, Tests_1]
+    if: ${{ !failure() && !cancelled() && contains(fromJson(needs.RunConfig.outputs.data).stages_data.stages_to_do, 'Tests_2') }}
+    uses: ./.github/workflows/reusable_test_stage.yml
+    with:
+      stage: Tests_2
+      data: ${{ needs.RunConfig.outputs.data }}
+
+  ################################# Reports #################################
+  # Reports should run even if Builds_1/2 fail - run them separately (not in Tests_1/2/3)
+  Builds_Report:
+    # run report check for failed builds to indicate the CI error
+    if: ${{ !cancelled()
+      && needs.RunConfig.result == 'success'
+      && needs.StyleCheck.result != 'failure'
+      && needs.FastTest.result != 'failure'
+      && needs.BuildDockers.result != 'failure'
+      && contains(fromJson(needs.RunConfig.outputs.data).jobs_data.jobs_to_do, 'Builds') }}
+    needs: [RunConfig, BuildDockers, StyleCheck, FastTest, Builds_1, Builds_2]
+    uses: ./.github/workflows/reusable_test.yml
+    with:
+      test_name: Builds
+      runner_type: style-checker-aarch64
+      data: ${{ needs.RunConfig.outputs.data }}
+
+  CheckReadyForMerge:
+    if: ${{ !cancelled() }}
+    # Test_2 or Test_3 do not have the jobs required for Mergeable check,
+    #  however, set them as "needs" to get all checks results before the automatic merge occurs.
+    needs: [RunConfig, BuildDockers, StyleCheck, FastTest, Builds_1, Builds_2, Builds_Report, Tests_1, Tests_2_ww, Tests_2]
+    runs-on: [self-hosted, style-checker-aarch64]
+    steps:
+      - name: Check out repository code
+        uses: ClickHouse/checkout@v1
+        with:
+          filter: tree:0
+      - name: Check and set merge status
+        if: ${{ needs.StyleCheck.result == 'success' }}
+        run: |
+          cd "$GITHUB_WORKSPACE/tests/ci"
+          export WORKFLOW_RESULT_FILE="/tmp/workflow_results.json"
+          cat > "$WORKFLOW_RESULT_FILE" << 'EOF'
+=======
+            python3 "$GITHUB_WORKSPACE/tests/ci/ci.py" --infile ${{ runner.temp }}/ci_run_data.json --update-gh-statuses
+  BuildDockers:
+    needs: [RunConfig]
+    if: ${{ !failure() && !cancelled() && toJson(fromJson(needs.RunConfig.outputs.data).docker_data.missing_multi) != '[]' }}
+    uses: ./.github/workflows/docker_test_images.yml
+    with:
+      data: ${{ needs.RunConfig.outputs.data }}
+  StyleCheck:
+    needs: [RunConfig, BuildDockers]
+    if: ${{ !failure() && !cancelled() && contains(fromJson(needs.RunConfig.outputs.data).jobs_data.jobs_to_do, 'Style check')}}
+    uses: ./.github/workflows/reusable_test.yml
+    with:
+      test_name: Style check
+      runner_type: altinity-on-demand, altinity-type-cax41, altinity-in-hel1, altinity-image-arm-app-docker-ce
+      run_command: |
+          python3 style_check.py --no-push
+      data: ${{ needs.RunConfig.outputs.data }}
+  FastTest:
+    needs: [RunConfig, BuildDockers, StyleCheck]
+    if: ${{ !failure() && !cancelled() && contains(fromJson(needs.RunConfig.outputs.data).jobs_data.jobs_to_do, 'Fast test') }}
+    uses: ./.github/workflows/reusable_test.yml
+    with:
+      test_name: Fast test
+      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-in-ash, altinity-image-x86-app-docker-ce
+      data: ${{ needs.RunConfig.outputs.data }}
+      run_command: |
+          python3 fast_test_check.py
+
+  ################################# Main stages #################################
+  # for main CI chain
+  #
+  Builds_1:
+    needs: [RunConfig, StyleCheck, FastTest]
+    if: ${{ !failure() && !cancelled() && contains(fromJson(needs.RunConfig.outputs.data).stages_data.stages_to_do, 'Builds_1') }}
+    # using callable wf (reusable_stage.yml) allows grouping all nested jobs under a tab
+    uses: ./.github/workflows/reusable_build_stage.yml
+    with:
+      stage: Builds_1
+      data: ${{ needs.RunConfig.outputs.data }}
+  Tests_1:
+    needs: [RunConfig, Builds_1]
+    if: ${{ !failure() && !cancelled() && contains(fromJson(needs.RunConfig.outputs.data).stages_data.stages_to_do, 'Tests_1') }}
+    uses: ./.github/workflows/reusable_test_stage.yml
+    with:
+      stage: Tests_1
+      data: ${{ needs.RunConfig.outputs.data }}
+  Builds_2:
+    needs: [RunConfig, Builds_1]
+    if: ${{ !failure() && !cancelled() && contains(fromJson(needs.RunConfig.outputs.data).stages_data.stages_to_do, 'Builds_2') }}
+    uses: ./.github/workflows/reusable_build_stage.yml
+    with:
+      stage: Builds_2
+      data: ${{ needs.RunConfig.outputs.data }}
+  # stage for running non-required checks without being blocked by required checks (Test_1) if corresponding settings is selected
+  Tests_2_ww:
+    needs: [RunConfig, Builds_1]
+    if: ${{ !failure() && !cancelled() && contains(fromJson(needs.RunConfig.outputs.data).stages_data.stages_to_do, 'Tests_2_ww') }}
+    uses: ./.github/workflows/reusable_test_stage.yml
+    with:
+      stage: Tests_2_ww
+      data: ${{ needs.RunConfig.outputs.data }}
+  Tests_2:
+    needs: [RunConfig, Builds_1, Tests_1]
+    if: ${{ !failure() && !cancelled() && contains(fromJson(needs.RunConfig.outputs.data).stages_data.stages_to_do, 'Tests_2') }}
+    uses: ./.github/workflows/reusable_test_stage.yml
+    with:
+      stage: Tests_2
+      data: ${{ needs.RunConfig.outputs.data }}
+
+  ################################# Reports #################################
+  # Reports should run even if Builds_1/2 fail - run them separately (not in Tests_1/2/3)
+  Builds_Report:
+    # run report check for failed builds to indicate the CI error
+    if: ${{ !cancelled()
+      && needs.RunConfig.result == 'success'
+      && needs.StyleCheck.result != 'failure'
+      && needs.FastTest.result != 'failure'
+      && needs.BuildDockers.result != 'failure'
+      && contains(fromJson(needs.RunConfig.outputs.data).jobs_data.jobs_to_do, 'Builds') }}
+    needs: [RunConfig, BuildDockers, StyleCheck, FastTest, Builds_1, Builds_2]
+    uses: ./.github/workflows/reusable_test.yml
+    with:
+      test_name: Builds
+      runner_type: altinity-on-demand, altinity-type-cax41, altinity-in-hel1, altinity-image-arm-app-docker-ce
+      data: ${{ needs.RunConfig.outputs.data }}
+
+  CheckReadyForMerge:
+    if: ${{ !cancelled() }}
+    # Test_2 or Test_3 do not have the jobs required for Mergeable check,
+    #  however, set them as "needs" to get all checks results before the automatic merge occurs.
+    needs: [RunConfig, BuildDockers, StyleCheck, FastTest, Builds_1, Builds_2, Builds_Report, Tests_1, Tests_2_ww, Tests_2]
+    runs-on: [self-hosted, style-checker-aarch64]
+    steps:
+      - name: Check out repository code
+        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f
+        with:
+          filter: tree:0
+      - name: Check and set merge status
+        if: ${{ needs.StyleCheck.result == 'success' }}
+        run: |
+          cd "$GITHUB_WORKSPACE/tests/ci"
+          export WORKFLOW_RESULT_FILE="/tmp/workflow_results.json"
+          cat > "$WORKFLOW_RESULT_FILE" << 'EOF'
+>>>>>>> altinity/antalya
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+<<<<<<< HEAD
       - name: Run
         id: run
+||||||| 204fd5b5431
+  ################################# Stage Final #################################
+  #
+  FinishCheck:
+    if: ${{ !failure() && !cancelled() }}
+    needs: [RunConfig, BuildDockers, StyleCheck, FastTest, Builds_1, Builds_2, Builds_Report, Tests_1, Tests_2_ww, Tests_2]
+    runs-on: [self-hosted, style-checker-aarch64]
+    steps:
+      - name: Check out repository code
+        uses: ClickHouse/checkout@v1
+        with:
+          filter: tree:0
+      - name: Finish label
+=======
+  ################################# Stage Final #################################
+  #
+  FinishCheck:
+    if: ${{ !failure() && !cancelled() }}
+    needs: [RunConfig, BuildDockers, StyleCheck, FastTest, Builds_1, Builds_2, Builds_Report, Tests_1, Tests_2_ww, Tests_2]
+    runs-on: [self-hosted, altinity-on-demand, altinity-type-cpx41, altinity-in-ash, altinity-image-x86-app-docker-ce]
+    steps:
+      - name: Check out repository code
+        uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f
+        with:
+          filter: tree:0
+      - name: Finish label
+>>>>>>> altinity/antalya
         run: |
           . ./ci/tmp/praktika_setup_env.sh
           set -o pipefail
@@ -55,6 +311,7 @@ jobs:
             python3 -m praktika run 'Config Workflow' --workflow "PR" --ci |& tee ./ci/tmp/job.log
           fi
 
+<<<<<<< HEAD
   dockers_build_arm:
     runs-on: [self-hosted, style-checker-aarch64]
     needs: [config_workflow]
@@ -4386,3 +4643,40 @@ jobs:
           else
             python3 -m praktika run 'Finish Workflow' --workflow "PR" --ci |& tee ./ci/tmp/job.log
           fi
+||||||| 204fd5b5431
+#############################################################################################
+###################################### JEPSEN TESTS #########################################
+#############################################################################################
+  # This is special test NOT INCLUDED in FinishCheck
+  # When it's skipped, all dependent tasks will be skipped too.
+  # DO NOT add it there
+  Jepsen:
+    # we need concurrency as the job uses dedicated instances in the cloud
+    concurrency:
+      group: jepsen
+    if: ${{ !failure() && !cancelled() && contains(fromJson(needs.RunConfig.outputs.data).jobs_data.jobs_to_do, 'ClickHouse Keeper Jepsen') }}
+    needs: [RunConfig, Builds_1]
+    uses: ./.github/workflows/reusable_test.yml
+    with:
+      test_name: ClickHouse Keeper Jepsen
+      runner_type: style-checker-aarch64
+      data: ${{ needs.RunConfig.outputs.data }}
+=======
+#############################################################################################
+###################################### JEPSEN TESTS #########################################
+#############################################################################################
+  # This is special test NOT INCLUDED in FinishCheck
+  # When it's skipped, all dependent tasks will be skipped too.
+  # DO NOT add it there
+  Jepsen:
+    # we need concurrency as the job uses dedicated instances in the cloud
+    concurrency:
+      group: jepsen
+    if: ${{ !failure() && !cancelled() && contains(fromJson(needs.RunConfig.outputs.data).jobs_data.jobs_to_do, 'ClickHouse Keeper Jepsen') }}
+    needs: [RunConfig, Builds_1]
+    uses: ./.github/workflows/reusable_test.yml
+    with:
+      test_name: ClickHouse Keeper Jepsen
+      runner_type: altinity-on-demand, altinity-type-cax41, altinity-in-hel1, altinity-image-arm-app-docker-ce
+      data: ${{ needs.RunConfig.outputs.data }}
+>>>>>>> altinity/antalya
