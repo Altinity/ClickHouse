@@ -15,6 +15,9 @@ from typing import Any
 
 from integration_test_images import get_docker_env
 
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "ci")))
+from digest_helper import DockerDigester
+from ci import check_missing_images_on_dockerhub
 
 def random_str(length: int = 6) -> str:
     alphabet = string.ascii_lowercase + string.digits
@@ -265,7 +268,7 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--docker-image-version",
-        default="latest",
+        default=None,
         help="Version of docker image which runner will use to run tests",
     )
 
@@ -392,6 +395,56 @@ if __name__ == "__main__":
                 env_tags += env_tag
             else:
                 logging.info("Unknown image %s", image)
+
+    # Get the image tags that CICD generates for the current branch.
+    # These tags will be used to populate unspecified arguments (--docker-image-version, --docker-compose-images-tags)
+    # If the files an image depends on have been changed, the tag will not exist until CI job has been run.
+    # These files change rarely, so it is usually safe to assume the tags exist.
+
+    docker_digester = DockerDigester()
+    imagename_digest_dict = (
+        docker_digester.get_all_digests()
+    )  # 'image name - digest' mapping
+    if args.docker_image_version is None:
+        args.docker_image_version = imagename_digest_dict[
+            DIND_INTEGRATION_TESTS_IMAGE_NAME
+        ]
+        print(
+            f"Calculated digest {args.docker_image_version} for DIND integration tests image"
+        )
+        missing_images = check_missing_images_on_dockerhub(
+            {
+                DIND_INTEGRATION_TESTS_IMAGE_NAME: args.docker_image_version,
+            }
+        )
+        if missing_images:
+            print(
+                f"Error: The following Docker image with calculated digest does not exist: {missing_images}."
+                "\nPlease specify manually with --docker-image-version"
+            )
+            sys.exit(1)
+
+    if "DOCKER_BASE_TAG" not in env_tags:
+        BASE_INTEGRATION_TEST_IMAGE_NAME = "altinityinfra/integration-test"
+        base_integration_image_tag = imagename_digest_dict[
+            BASE_INTEGRATION_TEST_IMAGE_NAME
+        ]
+        env_tags += get_docker_env(
+            BASE_INTEGRATION_TEST_IMAGE_NAME,
+            base_integration_image_tag,
+        )
+        print(
+            f"Calculated digest {base_integration_image_tag} for base integration test image"
+        )
+        missing_images = check_missing_images_on_dockerhub(
+            {BASE_INTEGRATION_TEST_IMAGE_NAME: base_integration_image_tag}
+        )
+        if missing_images:
+            print(
+                f"Error: The following Docker image with calculated digest does not exist: {missing_images}."
+                "\nPlease specify manually with --docker-compose-images-tags"
+            )
+            sys.exit(1)
 
     # create named volume which will be used inside to store images and other docker related files,
     # to avoid redownloading it every time
