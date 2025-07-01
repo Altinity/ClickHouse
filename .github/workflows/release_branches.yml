@@ -20,7 +20,7 @@ on: # yamllint disable-line rule:truthy
       - reopened
       - opened
     branches:
-      - '*'
+      - 'releases/*'
   push:
     branches:
       - 'antalya'
