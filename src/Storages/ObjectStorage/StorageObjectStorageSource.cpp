@@ -438,21 +438,25 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         not_a_path = false;
         object_info = file_iterator->next(processor);
 
-        if (!object_info || object_info->getPath().empty())
+        if (!object_info)
             return {};
 
-        StorageObjectStorageStableTaskDistributor::CommandInTaskResponse command(object_info->getPath());
-        if (command.is_parsed())
+        if (object_info->getCommand().is_parsed())
         {
-            auto retry_after_us = command.get_retry_after_us();
+            auto retry_after_us = object_info->getCommand().get_retry_after_us();
             if (retry_after_us.has_value())
             {
                 not_a_path = true;
                 /// TODO: Make asyncronous waiting without sleep in thread
-                sleepForMicroseconds(std::min(100000ul, retry_after_us.value()));
+                /// Now this sleep is on executor node in worker thread
+                /// Does not block query initiator
+                sleepForMicroseconds(std::min(Poco::Timestamp::TimeDiff(100000ul), retry_after_us.value()));
                 continue;
             }
         }
+
+        if (object_info->getPath().empty())
+            return {};
 
         object_info->loadMetadata(object_storage);
     }

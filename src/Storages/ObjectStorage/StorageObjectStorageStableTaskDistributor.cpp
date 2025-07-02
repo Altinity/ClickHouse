@@ -3,10 +3,6 @@
 #include <consistent_hashing.h>
 #include <optional>
 
-#include <Poco/JSON/Object.h>
-#include <Poco/JSON/Parser.h>
-#include <Poco/JSON/JSONException.h>
-
 namespace DB
 {
 
@@ -169,7 +165,7 @@ std::optional<String> StorageObjectStorageStableTaskDistributor::getAnyUnprocess
     /// Limit time of node activity to keep task in queue
     Poco::Timestamp activity_limit;
     Poco::Timestamp oldest_activity;
-    if (lock_object_storage_task_distribution_us)
+    if (lock_object_storage_task_distribution_us > 0)
         activity_limit -= lock_object_storage_task_distribution_us;
 
     std::lock_guard lock(mutex);
@@ -181,7 +177,7 @@ std::optional<String> StorageObjectStorageStableTaskDistributor::getAnyUnprocess
         while (it != unprocessed_files.end())
         {
             auto last_activity = last_node_activity.find(it->second);
-            if (!lock_object_storage_task_distribution_us
+            if (lock_object_storage_task_distribution_us <= 0
                 || last_activity == last_node_activity.end()
                 || activity_limit > last_activity->second)
             {
@@ -211,7 +207,7 @@ std::optional<String> StorageObjectStorageStableTaskDistributor::getAnyUnprocess
 
         /// All unprocessed files owned by alive replicas with recenlty activity
         /// Need to retry after (oldest_activity - activity_limit) microseconds
-        CommandInTaskResponse response;
+        RelativePathWithMetadata::CommandInTaskResponse response;
         response.set_retry_after_us(oldest_activity - activity_limit);
         return response.to_string();
     }
@@ -224,38 +220,6 @@ void StorageObjectStorageStableTaskDistributor::saveLastNodeActivity(size_t numb
     Poco::Timestamp now;
     std::lock_guard lock(mutex);
     last_node_activity[number_of_current_replica] = now;
-}
-
-StorageObjectStorageStableTaskDistributor::CommandInTaskResponse::CommandInTaskResponse(const std::string & task)
-{
-    Poco::JSON::Parser parser;
-    try
-    {
-        auto json = parser.parse(task).extract<Poco::JSON::Object::Ptr>();
-        if (!json)
-            return;
-
-        successfully_parsed = true;
-
-        if (json->has("retry_after_us"))
-            retry_after_us = json->getValue<size_t>("retry_after_us");
-    }
-    catch (const Poco::JSON::JSONException &)
-    { /// Not a JSON
-        return;
-    }
-}
-
-std::string StorageObjectStorageStableTaskDistributor::CommandInTaskResponse::to_string() const
-{
-    Poco::JSON::Object json;
-    if (retry_after_us.has_value())
-        json.set("retry_after_us", retry_after_us.value());
-
-    std::ostringstream oss;
-    oss.exceptions(std::ios::failbit);
-    Poco::JSON::Stringifier::stringify(json, oss);
-    return oss.str();
 }
 
 }

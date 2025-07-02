@@ -75,7 +75,8 @@ def started_cluster():
         cluster.shutdown()
 
 
-def check_s3_gets(cluster, node, expected_result, cluster_first, cluster_second, enable_filesystem_cache, lock=False):
+def check_s3_gets(cluster, node, expected_result, cluster_first, cluster_second, enable_filesystem_cache,
+                  lock_object_storage_task_distribution_ms):
     for host in list(cluster.instances.values()):
         host.query("SYSTEM DROP FILESYSTEM CACHE 'raw_s3_cache'", ignore_error=True)
 
@@ -84,8 +85,8 @@ def check_s3_gets(cluster, node, expected_result, cluster_first, cluster_second,
         "filesystem_cache_name": "'raw_s3_cache'",
         }
 
-    if lock:
-        settings["lock_object_storage_task_distribution_ms"] = 30000
+    if lock_object_storage_task_distribution_ms > 0:
+        settings["lock_object_storage_task_distribution_ms"] = lock_object_storage_task_distribution_ms
 
     query_id_first = str(uuid.uuid4())
     result_first = node.query(
@@ -133,20 +134,21 @@ def check_s3_gets(cluster, node, expected_result, cluster_first, cluster_second,
     return int(s3_get_first), int(s3_get_second)
 
 
-def check_s3_gets_repeat(cluster, node, expected_result, cluster_first, cluster_second, enable_filesystem_cache, lock=False):
+def check_s3_gets_repeat(cluster, node, expected_result, cluster_first, cluster_second, enable_filesystem_cache,
+                         lock_object_storage_task_distribution_ms):
     # Repeat test several times to get average result
-    iterations = 1 if lock else 10
+    iterations = 1 if lock_object_storage_task_distribution_ms > 0 else 10
     s3_get_first_sum = 0
     s3_get_second_sum = 0
     for _ in range(iterations):
-        (s3_get_first, s3_get_second) = check_s3_gets(cluster, node, expected_result, cluster_first, cluster_second, enable_filesystem_cache, lock)
+        (s3_get_first, s3_get_second) = check_s3_gets(cluster, node, expected_result, cluster_first, cluster_second, enable_filesystem_cache, lock_object_storage_task_distribution_ms)
         s3_get_first_sum += s3_get_first
         s3_get_second_sum += s3_get_second
     return s3_get_first_sum, s3_get_second_sum
 
 
-@pytest.mark.parametrize("lock", [False, True])
-def test_cache_locality(started_cluster, lock):
+@pytest.mark.parametrize("lock_object_storage_task_distribution_ms ", [0, 30000])
+def test_cache_locality(started_cluster, lock_object_storage_task_distribution_ms):
     node = started_cluster.instances["clickhouse0"]
 
     expected_result = node.query(
@@ -158,36 +160,36 @@ def test_cache_locality(started_cluster, lock):
     )
 
     # Algorithm does not give 100% guarantee, so add 10% on dispersion
-    dispersion = 0.0 if lock else 0.1
+    dispersion = 0.0 if lock_object_storage_task_distribution_ms > 0 else 0.1
 
     # No cache
-    (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_12345', 'cluster_12345', 0, lock)
+    (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_12345', 'cluster_12345', 0, lock_object_storage_task_distribution_ms)
     assert s3_get_second == s3_get_first
 
     # With cache
-    (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_12345', 'cluster_12345', 1, lock)
+    (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_12345', 'cluster_12345', 1, lock_object_storage_task_distribution_ms)
     assert s3_get_second <= s3_get_first * dispersion
 
     # Different nodes order
-    (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_12345', 'cluster_34512', 1, lock)
+    (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_12345', 'cluster_34512', 1, lock_object_storage_task_distribution_ms)
     assert s3_get_second <= s3_get_first * dispersion
 
     # No last node
-    (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_12345', 'cluster_1234', 1, lock)
+    (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_12345', 'cluster_1234', 1, lock_object_storage_task_distribution_ms)
     assert s3_get_second <= s3_get_first * (0.211 + dispersion) # actual value - 24 for 100 files, 211 for 1000
 
     # No first node
-    (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_12345', 'cluster_2345', 1, lock)
+    (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_12345', 'cluster_2345', 1, lock_object_storage_task_distribution_ms)
     assert s3_get_second <= s3_get_first * (0.189 + dispersion) # actual value - 12 for 100 files, 189 for 1000
 
     # No first node, different nodes order
-    (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_12345', 'cluster_4523', 1, lock)
+    (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_12345', 'cluster_4523', 1, lock_object_storage_task_distribution_ms)
     assert s3_get_second <= s3_get_first * (0.189 + dispersion)
 
     # Add new node, different nodes order
-    (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_4523', 'cluster_12345', 1, lock)
+    (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_4523', 'cluster_12345', 1, lock_object_storage_task_distribution_ms)
     assert s3_get_second <= s3_get_first * (0.189 + dispersion)
 
     # New node and old node, different nodes order
-    (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_1234', 'cluster_4523', 1, lock)
+    (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_1234', 'cluster_4523', 1, lock_object_storage_task_distribution_ms)
     assert s3_get_second <= s3_get_first * (0.400 + dispersion) # actual value - 36 for 100 files, 400 for 1000

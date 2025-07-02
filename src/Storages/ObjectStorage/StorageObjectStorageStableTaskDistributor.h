@@ -20,24 +20,6 @@ namespace DB
 class StorageObjectStorageStableTaskDistributor
 {
 public:
-    class CommandInTaskResponse
-    {
-    public:
-        CommandInTaskResponse() {}
-        CommandInTaskResponse(const std::string & task);
-
-        bool is_parsed() const { return successfully_parsed; }
-        void set_retry_after_us(uint64_t time_us) { retry_after_us = time_us; }
-
-        std::string to_string() const;
-
-        std::optional<uint64_t> get_retry_after_us() const { return retry_after_us; }
-
-    private:
-        bool successfully_parsed = false;
-        std::optional<uint64_t> retry_after_us;
-    };
-
     StorageObjectStorageStableTaskDistributor(
         std::shared_ptr<IObjectIterator> iterator_,
         std::vector<std::string> ids_of_nodes_,
