@@ -569,9 +569,9 @@ AWSInstanceMetadataAssumeRoleCredentialsProvider::AWSInstanceMetadataAssumeRoleC
     retryable_errors.push_back("IDPCommunicationError");
     retryable_errors.push_back("InvalidIdentityToken");
     aws_client_configuration.retryStrategy = std::make_shared<Aws::Client::SpecifiedRetryableErrorsRetryStrategy>(
-        retryable_errors, /*maxRetries=*/3);
+        retryable_errors, /*maxRetries=*/ 3);
 
-    sts_client = std::make_unique<Aws::STS::STSClient>(aws_client_configuration);
+    sts_client = std::make_unique<Aws::STS::STSClient>(metadata_provider, aws_client_configuration);
 
     LOG_INFO(logger, "Created STS AssumeRole provider using EC2 instance metadata");
 }
@@ -622,7 +622,7 @@ void AWSInstanceMetadataAssumeRoleCredentialsProvider::refreshIfExpired()
         return;
 
     guard.UpgradeToWriterLock();
-    if (!areCredentialsEmptyOrExpired(credentials, expiration_window_seconds)) // double-checked lock
+    if (!areCredentialsEmptyOrExpired(credentials, expiration_window_seconds))
         return;
 
     Reload();
