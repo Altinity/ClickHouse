@@ -515,7 +515,7 @@ void IcebergMetadata::updateSnapshot(Poco::JSON::Object::Ptr metadata_object)
 
             relevant_snapshot = IcebergSnapshot{
                 getManifestList(getProperFilePathFromMetadataInfo(
-                    snapshot->getValue<String>(f_manifest_list), configuration_ptr->getPath(), table_location)),
+                    snapshot->getValue<String>(f_manifest_list), configuration_ptr->getPath(), table_location, configuration_ptr->getNamespace())),
                 relevant_snapshot_id, total_rows, total_bytes};
 
             if (!snapshot->has(f_schema_id))
@@ -678,7 +678,7 @@ ManifestFileCacheKeys IcebergMetadata::getManifestList(const String & filename) 
         for (size_t i = 0; i < manifest_list_deserializer.rows(); ++i)
         {
             const std::string file_path = manifest_list_deserializer.getValueFromRowByName(i, f_manifest_path, TypeIndex::String).safeGet<std::string>();
-            const auto manifest_file_name = getProperFilePathFromMetadataInfo(file_path, configuration_ptr->getPath(), table_location);
+            const auto manifest_file_name = getProperFilePathFromMetadataInfo(file_path, configuration_ptr->getPath(), table_location, configuration_ptr->getNamespace());
             Int64 added_sequence_number = 0;
             if (format_version > 1)
                 added_sequence_number = manifest_list_deserializer.getValueFromRowByName(i, f_sequence_number, TypeIndex::Int64).safeGet<Int64>();
@@ -805,6 +805,7 @@ ManifestFilePtr IcebergMetadata::getManifestFile(const String & filename, Int64 
             schema_processor,
             inherited_sequence_number,
             table_location,
+            configuration_ptr->getNamespace(),
             getContext());
     };
 
