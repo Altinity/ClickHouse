@@ -57,12 +57,13 @@ public:
     {
 #if USE_DELTA_KERNEL_RS
         auto configuration_ptr = configuration.lock();
-        const auto & settings_ref = configuration_ptr->getSettingsRef();
-        if (settings_ref[StorageObjectStorageSetting::allow_experimental_delta_kernel_rs])
+        const auto & query_settings_ref = local_context->getSettingsRef();
+
+        bool enable_delta_kernel = query_settings_ref[Setting::allow_experimental_delta_kernel_rs];
+        if (enable_delta_kernel)
             return std::make_unique<DeltaLakeMetadataDeltaKernel>(
                 object_storage,
-                configuration,
-                settings_ref[StorageObjectStorageSetting::delta_lake_read_schema_same_as_table_schema]);
+                configuration);
         else
             return std::make_unique<DeltaLakeMetadata>(object_storage, configuration, local_context);
 #else
