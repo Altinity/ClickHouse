@@ -128,7 +128,7 @@ public:
     {
         _assertInitialized();
         return (*settings)[DataLakeStorageSetting::allow_dynamic_metadata_for_data_lakes]
-            && current_metadata->supportsExternalMetadataChange();
+            && current_metadata->supportsSchemaEvolution();
     }
 
     bool supportsFileIterator() const override { return true; }

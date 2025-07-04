@@ -79,6 +79,7 @@ using StorageObjectStorageSettingsPtr = std::shared_ptr<StorageObjectStorageSett
 
 #define LIST_OF_STORAGE_OBJECT_STORAGE_SETTINGS(M, ALIAS) \
     STORAGE_OBJECT_STORAGE_RELATED_SETTINGS(M, ALIAS) \
+    OBSOLETE_SETTINGS(M, ALIAS) \
     LIST_OF_ALL_FORMAT_SETTINGS(M, ALIAS)
 
 }
