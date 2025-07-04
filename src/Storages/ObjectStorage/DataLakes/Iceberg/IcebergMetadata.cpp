@@ -293,7 +293,7 @@ static CompressionMethod getCompressionMethodFromMetadataFile(const String & pat
     return compression_method;
 }
 
-static MetadatafileWithInfo getMetadataFileAndVersion(const std::string & path)
+static MetadataFileWithInfo getMetadataFileAndVersion(const std::string & path)
 {
     String file_name(path.begin() + path.find_last_of('/') + 1, path.end());
     String version_str;
@@ -414,7 +414,7 @@ static MetadataFileWithInfo getLatestMetadataFileAndVersion(
     return {latest_metadata_file_info.version, latest_metadata_file_info.path, getCompressionMethodFromMetadataFile(latest_metadata_file_info.path)};
 }
 
-static std::pair<Int32, String> getLatestOrExplicitMetadataFileAndVersion(
+static MetadataFileWithInfo getLatestOrExplicitMetadataFileAndVersion(
     const ObjectStoragePtr & object_storage,
     const StorageObjectStorage::Configuration & configuration,
     const ContextPtr & local_context,
