@@ -711,6 +711,26 @@ def test_cluster_table_function(started_cluster, format_version, storage_type):
         instance.query(f"SELECT * FROM {table_function_expr}").strip().split()
     )
 
+    # Cluster Query with node1 as coordinator
+    table_function_expr_cluster = get_creation_expression(
+        storage_type,
+        TABLE_NAME,
+        started_cluster,
+        table_function=True,
+        run_on_cluster=True,
+    )
+
+    select_cluster = (
+        instance.query(f"SELECT * FROM {table_function_expr_cluster}").strip().split()
+    )
+
+    # Simple size check
+    assert len(select_regular) == 600
+    assert len(select_cluster) == 600
+
+    # Actual check
+    assert select_cluster == select_regular
+
     def make_query_from_function(
             run_on_cluster=False,
             alt_syntax=False,
