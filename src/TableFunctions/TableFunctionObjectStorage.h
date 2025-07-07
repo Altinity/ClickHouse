@@ -204,7 +204,7 @@ using TableFunctionLocal = TableFunctionObjectStorage<LocalDefinition, StorageLo
 
 
 #if USE_AVRO
-using TableFunctionIceberg = TableFunctionObjectStorage<IcebergDefinition, StorageIcebergConfiguration>;
+using TableFunctionIceberg = TableFunctionObjectStorage<IcebergDefinition, StorageIcebergConfiguration, true>;
 
 #    if USE_AWS_S3
 using TableFunctionIcebergS3 = TableFunctionObjectStorage<IcebergS3Definition, StorageS3IcebergConfiguration, true>;

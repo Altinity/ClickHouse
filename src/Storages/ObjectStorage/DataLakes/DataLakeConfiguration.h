@@ -240,7 +240,6 @@ class StorageIcebergConfiguration : public StorageObjectStorage::Configuration, 
     friend class StorageObjectStorage::Configuration;
 
 public:
-    StorageIcebergConfiguration() = default;
     explicit StorageIcebergConfiguration(DataLakeStorageSettingsPtr settings_) : settings(settings_) {}
 
     ObjectStorageType getType() const override { return getImpl().getType(); }

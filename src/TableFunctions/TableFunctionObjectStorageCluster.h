@@ -114,7 +114,7 @@ using TableFunctionAzureBlobCluster = TableFunctionObjectStorageCluster<AzureClu
 using TableFunctionHDFSCluster = TableFunctionObjectStorageCluster<HDFSClusterDefinition, StorageHDFSConfiguration>;
 #endif
 
-using TableFunctionIcebergCluster = TableFunctionObjectStorageCluster<IcebergClusterDefinition, StorageIcebergConfiguration>;
+using TableFunctionIcebergCluster = TableFunctionObjectStorageCluster<IcebergClusterDefinition, StorageIcebergConfiguration, true>;
 
 #if USE_AVRO && USE_AWS_S3
 using TableFunctionIcebergS3Cluster = TableFunctionObjectStorageCluster<IcebergS3ClusterDefinition, StorageS3IcebergConfiguration, true>;

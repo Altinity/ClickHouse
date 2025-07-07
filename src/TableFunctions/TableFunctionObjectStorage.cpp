@@ -275,7 +275,7 @@ template class TableFunctionObjectStorage<HDFSClusterDefinition, StorageHDFSConf
 template class TableFunctionObjectStorage<LocalDefinition, StorageLocalConfiguration>;
 
 #if USE_AVRO
-template class TableFunctionObjectStorage<IcebergClusterDefinition, StorageIcebergConfiguration>;
+template class TableFunctionObjectStorage<IcebergClusterDefinition, StorageIcebergConfiguration, true>;
 #endif
 
 #if USE_AVRO && USE_AWS_S3
