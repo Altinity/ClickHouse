@@ -6142,6 +6142,9 @@ Cache the list of objects returned by list objects calls in object storage
     DECLARE(Bool, object_storage_remote_initiator, false, R"(
 Execute request to object storage as remote on one of object_storage_cluster nodes.
 )", EXPERIMENTAL) \
+    DECLARE(UInt64, lock_object_storage_task_distribution_ms, 0, R"(
+In object storage distribution queries do not distibute tasks on non-prefetched nodes until prefetched node is active.
+)", EXPERIMENTAL) \
     \
 
     /* ####################################################### */ \
