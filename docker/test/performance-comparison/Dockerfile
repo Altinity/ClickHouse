@@ -48,7 +48,7 @@ RUN mkdir /fg && cd /fg \
 
 COPY run.sh /
 
-COPY --from=altinityinfra/cctools:0de95b3aeb28 /opt/gdb /opt/gdb
+COPY --from=clickhouse/cctools:425d6927d1efbd790bdb /opt/gdb /opt/gdb
 ENV PATH="/opt/gdb/bin:${PATH}"
 
 # aws cli to acquire secrets and params from ssm

@@ -83,10 +83,10 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/debconf /tmp/*
 
-COPY --from=altinityinfra/cctools:0de95b3aeb28 /opt/gdb /opt/gdb
+COPY --from=clickhouse/cctools:425d6927d1efbd790bdb /opt/gdb /opt/gdb
 ENV PATH="/opt/gdb/bin:${PATH}"
 
-COPY --from=altinityinfra/cctools:0de95b3aeb28 \
+COPY --from=clickhouse/cctools:425d6927d1efbd790bdb \
   /opt/openssl-fips/openssl.cnf \
   /opt/openssl-fips/fipsmodule.cnf \
   /opt/openssl-fips/fips.so \
