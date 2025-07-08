@@ -13,7 +13,7 @@ build_digest_config = Job.CacheDigestConfig(
         "./programs",
         "./rust",
         "./ci/jobs/build_clickhouse.py",
-        "./ci/jobs/scripts/job_hooks/build_profile_hook.py",
+        # "./ci/jobs/scripts/job_hooks/build_profile_hook.py",
     ],
     with_git_submodules=True,
 )
@@ -153,7 +153,7 @@ class JobConfigs:
         digest_config=build_digest_config,
         post_hooks=[
             "python3 ./ci/jobs/scripts/job_hooks/build_master_head_hook.py",
-            "python3 ./ci/jobs/scripts/job_hooks/build_profile_hook.py",
+            # "python3 ./ci/jobs/scripts/job_hooks/build_profile_hook.py",
         ],
     ).parametrize(
         parameter=[
@@ -241,7 +241,7 @@ class JobConfigs:
         digest_config=build_digest_config,
         post_hooks=[
             "python3 ./ci/jobs/scripts/job_hooks/build_master_head_hook.py",
-            "python3 ./ci/jobs/scripts/job_hooks/build_profile_hook.py",
+            # "python3 ./ci/jobs/scripts/job_hooks/build_profile_hook.py",
         ],
     ).parametrize(
         parameter=[
