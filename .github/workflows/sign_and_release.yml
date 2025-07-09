@@ -4,24 +4,17 @@ on:
   workflow_dispatch:
 
 jobs:
-  check-staging:
-    runs-on: arc-runners-clickhouse-signer
-    steps:
-      - name: check space
-        run: ls -la /home/runner/.cache/staging/yum-repo
 
   check-prod:
     runs-on: arc-runners-clickhouse-signer-prod
     steps:
-      - name: check space
-        run: ls -la /home/runner/.cache/production/yum-repo
-      # - name: Install aws cli
-      #   uses: unfor19/install-aws-cli-action@v1
-      #   with:
-      #     version: 2
-      #     arch: arm64
+      - name: Install aws cli
+        uses: unfor19/install-aws-cli-action@v1
+        with:
+          version: 2
+          arch: arm64
 
-      # - name: sync latest repo changes
-      #   run: |
-      #     aws s3 sync s3://builds.staging.altinity.cloud/Blue/ /home/runner/.cache/staging
+      - name: sync latest repo changes
+        run: |
+          aws s3 sync s3://builds.altinity.cloud/Blue/ /home/runner/.cache/production
 
