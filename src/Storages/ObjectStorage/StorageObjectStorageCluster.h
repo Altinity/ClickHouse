@@ -51,6 +51,8 @@ public:
 
     void addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const override;
 
+    bool updateExternalDynamicMetadataIfExists(ContextPtr context) override;
+
     std::optional<UInt64> totalRows(ContextPtr query_context) const override;
     std::optional<UInt64> totalBytes(ContextPtr query_context) const override;
 
