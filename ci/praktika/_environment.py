@@ -26,9 +26,9 @@ class _Environment(MetaClasses.Serializable):
     BASE_BRANCH: str
     RUN_ID: str
     RUN_URL: str
-    INSTANCE_TYPE: str
-    INSTANCE_ID: str
-    INSTANCE_LIFE_CYCLE: str
+    # INSTANCE_TYPE: str
+    # INSTANCE_ID: str
+    # INSTANCE_LIFE_CYCLE: str
     PR_BODY: str
     PR_TITLE: str
     USER_LOGIN: str
@@ -183,14 +183,14 @@ class _Environment(MetaClasses.Serializable):
             COMMIT_URL=COMMIT_URL,
             RUN_URL=RUN_URL,
             BASE_BRANCH=BASE_BRANCH,
-            INSTANCE_TYPE=INSTANCE_TYPE,
-            INSTANCE_ID=INSTANCE_ID,
+            # INSTANCE_TYPE=INSTANCE_TYPE,
+            # INSTANCE_ID=INSTANCE_ID,
             PR_BODY=PR_BODY,
             PR_TITLE=PR_TITLE,
             USER_LOGIN=USER_LOGIN,
             FORK_NAME=FORK_NAME,
             PR_LABELS=PR_LABELS,
-            INSTANCE_LIFE_CYCLE=INSTANCE_LIFE_CYCLE,
+            # INSTANCE_LIFE_CYCLE=INSTANCE_LIFE_CYCLE,
             REPORT_INFO=[],
             LINKED_PR_NUMBER=LINKED_PR_NUMBER,
         )
