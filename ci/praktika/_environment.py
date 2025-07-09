@@ -138,23 +138,24 @@ class _Environment(MetaClasses.Serializable):
             else:
                 assert False, "TODO: not supported"
 
-            INSTANCE_TYPE = (
-                os.getenv("INSTANCE_TYPE", None)
-                or Shell.get_output("ec2metadata --instance-type")
-                or ""
-            )
-            INSTANCE_ID = (
-                os.getenv("INSTANCE_ID", None)
-                or Shell.get_output("ec2metadata --instance-id")
-                or ""
-            )
-            INSTANCE_LIFE_CYCLE = (
-                os.getenv("INSTANCE_LIFE_CYCLE", None)
-                or Shell.get_output(
-                    "curl -s --fail http://169.254.169.254/latest/meta-data/instance-life-cycle"
-                )
-                or ""
-            )
+            # NOTE (strtgbb): Disable instance metadata, we don't use it
+            # INSTANCE_TYPE = (
+            #     os.getenv("INSTANCE_TYPE", None)
+            #     or Shell.get_output("ec2metadata --instance-type")
+            #     or ""
+            # )
+            # INSTANCE_ID = (
+            #     os.getenv("INSTANCE_ID", None)
+            #     or Shell.get_output("ec2metadata --instance-id")
+            #     or ""
+            # )
+            # INSTANCE_LIFE_CYCLE = (
+            #     os.getenv("INSTANCE_LIFE_CYCLE", None)
+            #     or Shell.get_output(
+            #         "curl -s --fail http://169.254.169.254/latest/meta-data/instance-life-cycle"
+            #     )
+            #     or ""
+            # )
 
         else:
             print("WARNING: Local execution - dummy Environment will be generated")
