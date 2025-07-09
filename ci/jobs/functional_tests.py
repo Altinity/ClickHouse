@@ -223,12 +223,13 @@ def main():
 
     if res and JobStages.INSTALL_CLICKHOUSE in stages:
 
-        def configure_log_export():
-            if not info.is_local_run:
-                print("prepare log export config")
-                return CH.create_log_export_config()
-            else:
-                print("skip log export config for local run")
+        # NOTE (strtgbb): Disable log export throughout this file, it depends on aws ssm, which we don't have configured
+        # def configure_log_export():
+        #     if not info.is_local_run:
+        #         print("prepare log export config")
+        #         return CH.create_log_export_config()
+        #     else:
+        #         print("skip log export config for local run")
 
         commands = [
             f"chmod +x {ch_path}/clickhouse",
@@ -269,7 +270,7 @@ def main():
                 )
             os.environ["GLOBAL_TAGS"] = "no-random-settings"
 
-        commands.append(configure_log_export)
+        # commands.append(configure_log_export)
 
         results.append(
             Result.from_commands_run(name="Install ClickHouse", command=commands)
@@ -302,28 +303,28 @@ def main():
                     res = res and CH.attach_gdb()
                 else:
                     print("Skipping gdb attachment for asan build")
-            if res:
-                if not Info().is_local_run:
-                    if not CH.start_log_exports(stop_watch.start_time):
-                        info.add_workflow_report_message(
-                            "WARNING: Failed to start log export"
-                        )
-                        print("Failed to start log export")
-                if not CH.create_minio_log_tables():
-                    info.add_workflow_report_message(
-                        "WARNING: Failed to create minio log tables"
-                    )
-                    print("Failed to create minio log tables")
+            # if res:
+            #     if not Info().is_local_run:
+            #         if not CH.start_log_exports(stop_watch.start_time):
+            #             info.add_workflow_report_message(
+            #                 "WARNING: Failed to start log export"
+            #             )
+            #             print("Failed to start log export")
+            #     if not CH.create_minio_log_tables():
+            #         info.add_workflow_report_message(
+            #             "WARNING: Failed to create minio log tables"
+            #         )
+            #         print("Failed to create minio log tables")
 
-                res = (
-                    CH.prepare_stateful_data(
-                        with_s3_storage=is_s3_storage,
-                        is_db_replicated=is_database_replicated,
-                    )
-                    and CH.insert_system_zookeeper_config()
-                )
-            if res:
-                print("stateful data prepared")
+            #     res = (
+            #         CH.prepare_stateful_data(
+            #             with_s3_storage=is_s3_storage,
+            #             is_db_replicated=is_database_replicated,
+            #         )
+            #         and CH.insert_system_zookeeper_config()
+            #     )
+            # if res:
+            #     print("stateful data prepared")
             return res
 
         results.append(
@@ -351,8 +352,8 @@ def main():
         else:
             run_specific_tests(tests=tests, runs=50 if is_flaky_check else 1)
 
-        if not info.is_local_run:
-            CH.stop_log_exports()
+        # if not info.is_local_run:
+        #     CH.stop_log_exports()
         results.append(FTResultsProcessor(wd=temp_dir).run())
         test_result = results[-1]
 
