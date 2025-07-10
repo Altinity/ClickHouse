@@ -24,7 +24,8 @@ public:
         const String & comment_,
         std::optional<FormatSettings> format_settings_,
         LoadingStrictnessLevel mode_,
-        ASTPtr partition_by_ = nullptr
+        ASTPtr partition_by_ = nullptr,
+        bool lazy_init = false
     );
 
     std::string getName() const override;
