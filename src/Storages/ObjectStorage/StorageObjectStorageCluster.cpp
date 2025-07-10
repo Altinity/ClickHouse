@@ -80,7 +80,8 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
     const String & comment_,
     std::optional<FormatSettings> format_settings_,
     LoadingStrictnessLevel mode_,
-    ASTPtr partition_by_
+    ASTPtr partition_by_,
+    bool lazy_init
 )
     : IStorageCluster(
         cluster_name_, table_id_, getLogger(fmt::format("{}({})", configuration_->getEngineName(), table_id_.table_name)))
@@ -88,26 +89,67 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
     , object_storage(object_storage_)
     , cluster_name_in_settings(false)
 {
-    /// We allow exceptions to be thrown on update(),
-    /// because Cluster engine can only be used as table function,
-    /// so no lazy initialization is allowed.
-    configuration->update(
-        object_storage,
-        context_,
-        /* if_not_updated_before */false,
-        /* check_consistent_with_previous_metadata */true);
+    const bool need_resolve_columns_or_format = columns_.empty() || (configuration->getFormat() == "auto");
+    const bool need_resolve_sample_path = context_->getSettingsRef()[Setting::use_hive_partitioning]
+        && !configuration->isDataLakeConfiguration();
+    const bool do_lazy_init = lazy_init && !need_resolve_columns_or_format && !need_resolve_sample_path;
+
+    auto log_ = getLogger("StorageObjectStorageCluster");
+
+    bool updated_configuration = false;
+    try
+    {
+        if (!do_lazy_init)
+        {
+            /// We allow exceptions to be thrown on update(),
+            /// because Cluster engine can only be used as table function,
+            /// so no lazy initialization is allowed.
+            configuration->update(
+                object_storage,
+                context_,
+                /* if_not_updated_before */false,
+                /* check_consistent_with_previous_metadata */true);
+            updated_configuration = true;
+        }
+    }
+    catch (...)
+    {
+        // If we don't have format or schema yet, we can't ignore failed configuration update,
+        // because relevant configuration is crucial for format and schema inference
+        if (mode_ <= LoadingStrictnessLevel::CREATE || need_resolve_columns_or_format)
+        {
+            throw;
+        }
+        tryLogCurrentException(log_);
+    }
 
     ColumnsDescription columns{columns_};
     std::string sample_path;
-    resolveSchemaAndFormat(columns, object_storage, configuration, {}, sample_path, context_);
+    if (need_resolve_columns_or_format)
+        resolveSchemaAndFormat(columns, object_storage, configuration, {}, sample_path, context_);
+    else
+        validateSupportedColumns(columns, *configuration);
     configuration->check(context_);
 
     StorageInMemoryMetadata metadata;
     metadata.setColumns(columns);
     metadata.setConstraints(constraints_);
 
-    if (sample_path.empty() && context_->getSettingsRef()[Setting::use_hive_partitioning] && !configuration->isDataLakeConfiguration())
-        sample_path = getPathSample(metadata, context_);
+    if (updated_configuration && sample_path.empty() && need_resolve_sample_path)
+    {
+        try
+        {
+            sample_path = getPathSample(metadata, context_);
+        }
+        catch (...)
+        {
+            LOG_WARNING(
+                log_,
+                "Failed to list object storage, cannot use hive partitioning. "
+                "Error: {}",
+                getCurrentExceptionMessage(true));
+        }
+    }
 
     setVirtuals(VirtualColumnUtils::getVirtualsForFileLikeStorage(
         metadata.columns, context_, sample_path, std::nullopt, configuration->isDataLakeConfiguration()));
@@ -124,7 +166,9 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         format_settings_,
         mode_,
         /* distributed_processing */false,
-        partition_by_);
+        partition_by_,
+        /* is_table_function */false,
+        /* lazy_init */lazy_init);
 
     auto virtuals_ = getVirtualsPtr();
     if (virtuals_)

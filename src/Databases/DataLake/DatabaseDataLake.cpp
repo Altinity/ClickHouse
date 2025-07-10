@@ -445,7 +445,8 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
         /* comment */"",
         getFormatSettings(context_copy),
         LoadingStrictnessLevel::CREATE,
-        /* partition_by */nullptr);
+        /* partition_by */nullptr,
+        /* lazy_init */true);
 }
 
 DatabaseTablesIteratorPtr DatabaseDataLake::getTablesIterator(
