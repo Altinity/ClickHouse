@@ -439,7 +439,7 @@ jobs:
 #############################################################################################
   RegressionTestsRelease:
     needs: [RunConfig, BuilderDebRelease]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'regression')}}
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'regression') && contains('push,workflow_dispatch', github.event_name)}}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
@@ -450,7 +450,7 @@ jobs:
       timeout_minutes: 300
   RegressionTestsAarch64:
     needs: [RunConfig, BuilderDebAarch64]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'regression') && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'aarch64')}}
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'regression') && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'aarch64') && contains('push,workflow_dispatch', github.event_name)}}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
