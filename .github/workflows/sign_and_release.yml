@@ -466,7 +466,7 @@ jobs:
     uses: Altinity/ClickHouse/.github/workflows/repo-sanity-checks.yml@antalya
 
   copy-to-released:
-    needs: [sign-and-publish]
+    needs: [extract-package-info, sign-and-publish]
     if: ${{ inputs.release_environment == 'production' }}
     runs-on: [altinity-style-checker-aarch64, altinity-on-demand]
     env:
