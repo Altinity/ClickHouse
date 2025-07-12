@@ -800,8 +800,6 @@ PagerDuty
 ParallelFormattingOutputFormatThreads
 ParallelFormattingOutputFormatThreadsActive
 ParallelParsingInputFormat
-ParallelParsingInputFormatThreads
-ParallelParsingInputFormatThreadsActive
 ParallelReplicasMode
 ParquetCompression
 ParquetMetadata
