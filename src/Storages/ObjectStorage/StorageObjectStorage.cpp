@@ -85,7 +85,7 @@ String StorageObjectStorage::getPathSample(ContextPtr context)
 }
 
 StorageObjectStorage::StorageObjectStorage(
-    ConfigurationPtr configuration_,
+    StorageObjectStorageConfigurationPtr configuration_,
     ObjectStoragePtr object_storage_,
     ContextPtr context,
     const StorageID & table_id_,
@@ -223,16 +223,6 @@ bool StorageObjectStorage::supportsSubsetOfColumns(const ContextPtr & context) c
     return FormatFactory::instance().checkIfFormatSupportsSubsetOfColumns(configuration->format, context, format_settings);
 }
 
-bool StorageObjectStorage::Configuration::update( ///NOLINT
-    ObjectStoragePtr object_storage_ptr,
-    ContextPtr context,
-    bool /* if_not_updated_before */,
-    bool /* check_consistent_with_previous_metadata */)
-{
-    IObjectStorage::ApplyNewSettingsOptions options{.allow_client_change = !isStaticConfiguration()};
-    object_storage_ptr->applyNewSettings(context->getConfigRef(), getTypeName() + ".", context, options);
-    return true;
-}
 
 IDataLakeMetadata * StorageObjectStorage::getExternalMetadata(ContextPtr query_context)
 {
@@ -296,22 +286,6 @@ std::optional<UInt64> StorageObjectStorage::totalBytes(ContextPtr query_context)
         /* check_consistent_with_previous_metadata */true);
 
     return configuration->totalBytes(query_context);
-}
-
-ReadFromFormatInfo StorageObjectStorage::Configuration::prepareReadingFromFormat(
-    ObjectStoragePtr,
-    const Strings & requested_columns,
-    const StorageSnapshotPtr & storage_snapshot,
-    bool supports_subset_of_columns,
-    ContextPtr local_context,
-    const PrepareReadingFromFormatHiveParams & hive_parameters)
-{
-    return DB::prepareReadingFromFormat(requested_columns, storage_snapshot, local_context, supports_subset_of_columns, hive_parameters);
-}
-
-std::optional<ColumnsDescription> StorageObjectStorage::Configuration::tryGetTableStructureFromMetadata() const
-{
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method tryGetTableStructureFromMetadata is not implemented for basic configuration");
 }
 
 void StorageObjectStorage::read(
@@ -468,7 +442,7 @@ void StorageObjectStorage::truncate(
 
 std::unique_ptr<ReadBufferIterator> StorageObjectStorage::createReadBufferIterator(
     const ObjectStoragePtr & object_storage,
-    const ConfigurationPtr & configuration,
+    const StorageObjectStorageConfigurationPtr & configuration,
     const std::optional<FormatSettings> & format_settings,
     ObjectInfos & read_keys,
     const ContextPtr & context)
@@ -492,7 +466,7 @@ std::unique_ptr<ReadBufferIterator> StorageObjectStorage::createReadBufferIterat
 
 ColumnsDescription StorageObjectStorage::resolveSchemaFromData(
     const ObjectStoragePtr & object_storage,
-    const ConfigurationPtr & configuration,
+    const StorageObjectStorageConfigurationPtr & configuration,
     const std::optional<FormatSettings> & format_settings,
     std::string & sample_path,
     const ContextPtr & context)
@@ -506,7 +480,7 @@ ColumnsDescription StorageObjectStorage::resolveSchemaFromData(
 
 std::string StorageObjectStorage::resolveFormatFromData(
     const ObjectStoragePtr & object_storage,
-    const ConfigurationPtr & configuration,
+    const StorageObjectStorageConfigurationPtr & configuration,
     const std::optional<FormatSettings> & format_settings,
     std::string & sample_path,
     const ContextPtr & context)
@@ -520,7 +494,7 @@ std::string StorageObjectStorage::resolveFormatFromData(
 
 std::pair<ColumnsDescription, std::string> StorageObjectStorage::resolveSchemaAndFormatFromData(
     const ObjectStoragePtr & object_storage,
-    const ConfigurationPtr & configuration,
+    const StorageObjectStorageConfigurationPtr & configuration,
     const std::optional<FormatSettings> & format_settings,
     std::string & sample_path,
     const ContextPtr & context)
@@ -567,154 +541,6 @@ SchemaCache & StorageObjectStorage::getSchemaCache(const ContextPtr & context, c
         return schema_cache;
     }
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Unsupported storage type: {}", storage_type_name);
-}
-
-void StorageObjectStorage::Configuration::initialize(
-    Configuration & configuration_to_initialize,
-    ASTs & engine_args,
-    ContextPtr local_context,
-    bool with_table_structure)
-{
-    if (auto named_collection = tryGetNamedCollectionWithOverrides(engine_args, local_context))
-        configuration_to_initialize.fromNamedCollection(*named_collection, local_context);
-    else
-        configuration_to_initialize.fromAST(engine_args, local_context, with_table_structure);
-
-    if (configuration_to_initialize.isNamespaceWithGlobs())
-        throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                        "Expression can not have wildcards inside {} name", configuration_to_initialize.getNamespaceType());
-
-    if (configuration_to_initialize.isDataLakeConfiguration())
-    {
-        if (configuration_to_initialize.partition_strategy_type != PartitionStrategyFactory::StrategyType::NONE)
-        {
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "The `partition_strategy` argument is incompatible with data lakes");
-        }
-    }
-    else if (configuration_to_initialize.partition_strategy_type == PartitionStrategyFactory::StrategyType::NONE)
-    {
-        // Promote to wildcard in case it is not data lake to make it backwards compatible
-        configuration_to_initialize.partition_strategy_type = PartitionStrategyFactory::StrategyType::WILDCARD;
-    }
-
-    if (configuration_to_initialize.format == "auto")
-    {
-        if (configuration_to_initialize.isDataLakeConfiguration())
-        {
-            configuration_to_initialize.format = "Parquet";
-        }
-        else
-        {
-            configuration_to_initialize.format
-                = FormatFactory::instance()
-                      .tryGetFormatFromFileName(configuration_to_initialize.isArchive() ? configuration_to_initialize.getPathInArchive() : configuration_to_initialize.getRawPath().path)
-                      .value_or("auto");
-        }
-    }
-    else
-        FormatFactory::instance().checkFormatName(configuration_to_initialize.format);
-
-    /// It might be changed on `StorageObjectStorage::Configuration::initPartitionStrategy`
-    configuration_to_initialize.read_path = configuration_to_initialize.getRawPath();
-    configuration_to_initialize.initialized = true;
-
-}
-
-void StorageObjectStorage::Configuration::initPartitionStrategy(ASTPtr partition_by, const ColumnsDescription & columns, ContextPtr context)
-{
-    partition_strategy = PartitionStrategyFactory::get(
-        partition_strategy_type,
-        partition_by,
-        columns.getOrdinary(),
-        context,
-        format,
-        getRawPath().hasGlobs(),
-        getRawPath().hasPartitionWildcard(),
-        partition_columns_in_data_file);
-
-    if (partition_strategy)
-    {
-        read_path = partition_strategy->getPathForRead(getRawPath().path);
-        LOG_DEBUG(getLogger("StorageObjectStorageConfiguration"), "Initialized partition strategy {}", magic_enum::enum_name(partition_strategy_type));
-    }
-}
-
-const StorageObjectStorage::Configuration::Path & StorageObjectStorage::Configuration::getPathForRead() const
-{
-    return read_path;
-}
-
-StorageObjectStorage::Configuration::Path StorageObjectStorage::Configuration::getPathForWrite(const std::string & partition_id) const
-{
-    auto raw_path = getRawPath();
-
-    if (!partition_strategy)
-    {
-        return raw_path;
-    }
-
-    return Path {partition_strategy->getPathForWrite(raw_path.path, partition_id)};
-}
-
-
-bool StorageObjectStorage::Configuration::Path::hasPartitionWildcard() const
-{
-    static const String PARTITION_ID_WILDCARD = "{_partition_id}";
-    return path.find(PARTITION_ID_WILDCARD) != String::npos;
-}
-
-bool StorageObjectStorage::Configuration::Path::hasGlobsIgnorePartitionWildcard() const
-{
-    if (!hasPartitionWildcard())
-        return hasGlobs();
-    return PartitionedSink::replaceWildcards(path, "").find_first_of("*?{") != std::string::npos;
-}
-
-bool StorageObjectStorage::Configuration::Path::hasGlobs() const
-{
-    return path.find_first_of("*?{") != std::string::npos;
-}
-
-std::string StorageObjectStorage::Configuration::Path::cutGlobs(bool supports_partial_prefix) const
-{
-    if (supports_partial_prefix)
-    {
-        return path.substr(0, path.find_first_of("*?{"));
-    }
-
-    auto first_glob_pos = path.find_first_of("*?{");
-    auto end_of_path_without_globs = path.substr(0, first_glob_pos).rfind('/');
-    if (end_of_path_without_globs == std::string::npos || end_of_path_without_globs == 0)
-        return "/";
-    return path.substr(0, end_of_path_without_globs);
-}
-
-void StorageObjectStorage::Configuration::check(ContextPtr) const
-{
-    FormatFactory::instance().checkFormatName(format);
-}
-
-bool StorageObjectStorage::Configuration::isNamespaceWithGlobs() const
-{
-    return getNamespace().find_first_of("*?{") != std::string::npos;
-}
-
-bool StorageObjectStorage::Configuration::isPathInArchiveWithGlobs() const
-{
-    return getPathInArchive().find_first_of("*?{") != std::string::npos;
-}
-
-std::string StorageObjectStorage::Configuration::getPathInArchive() const
-{
-    throw Exception(ErrorCodes::LOGICAL_ERROR, "Path {} is not archive", getRawPath().path);
-}
-
-void StorageObjectStorage::Configuration::assertInitialized() const
-{
-    if (!initialized)
-    {
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "Configuration was not initialized before usage");
-    }
 }
 
 }
