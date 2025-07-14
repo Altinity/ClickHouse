@@ -16,7 +16,7 @@ workflow = Workflow.Config(
     base_branches=[BASE_BRANCH, "releases/*", "antalya-*"],
     jobs=[
         JobConfigs.style_check,
-        JobConfigs.docs_job,
+        # JobConfigs.docs_job, # NOTE (strtgbb): we don't build docs
         JobConfigs.fast_test,
         *JobConfigs.tidy_build_jobs,
         *JobConfigs.tidy_arm_build_jobs,
