@@ -82,17 +82,17 @@ workflow = Workflow.Config(
     enable_merge_ready_status=True,
     enable_commit_status_on_failure=True,
     pre_hooks=[
-        can_be_trusted,
+        # can_be_trusted, # NOTE (strtgbb): relies on labels we don't use
         "python3 ./ci/jobs/scripts/workflow_hooks/store_data.py",
-        "python3 ./ci/jobs/scripts/workflow_hooks/pr_description.py",
+        # "python3 ./ci/jobs/scripts/workflow_hooks/pr_description.py", # NOTE (strtgbb): relies on labels we don't use
         "python3 ./ci/jobs/scripts/workflow_hooks/version_log.py",
-        "python3 ./ci/jobs/scripts/workflow_hooks/quick_sync.py",
+        # "python3 ./ci/jobs/scripts/workflow_hooks/quick_sync.py", # NOTE (strtgbb): we don't do this
         "python3 ./ci/jobs/scripts/workflow_hooks/new_tests_check.py",
     ],
     workflow_filter_hooks=[should_skip_job],
     post_hooks=[
-        "python3 ./ci/jobs/scripts/workflow_hooks/feature_docs.py",
-        "python3 ./ci/jobs/scripts/workflow_hooks/can_be_merged.py",
+        # "python3 ./ci/jobs/scripts/workflow_hooks/feature_docs.py", # NOTE (strtgbb): we don't build docs
+        # "python3 ./ci/jobs/scripts/workflow_hooks/can_be_merged.py", # NOTE (strtgbb): relies on labels we don't use
     ],
 )
 
