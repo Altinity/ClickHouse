@@ -13,6 +13,7 @@ workflow = Workflow.Config(
     event=Workflow.Event.PUSH,
     branches=[BASE_BRANCH, "releases/*", "antalya-*"],
     jobs=[
+        JobConfigs.fast_test,  # NOTE (strtgbb): for debugging
         *JobConfigs.tidy_build_jobs,
         *JobConfigs.build_jobs,
         *[
