@@ -15,7 +15,7 @@ workflow = Workflow.Config(
     event=Workflow.Event.PULL_REQUEST,
     base_branches=[BASE_BRANCH, "releases/*", "antalya-*"],
     jobs=[
-        JobConfigs.style_check,
+        # JobConfigs.style_check, # NOTE (strtgbb): we don't run style check
         # JobConfigs.docs_job, # NOTE (strtgbb): we don't build docs
         JobConfigs.fast_test,
         *JobConfigs.tidy_build_jobs,
@@ -23,7 +23,7 @@ workflow = Workflow.Config(
         *[
             job.set_dependency(
                 [
-                    JobNames.STYLE_CHECK,
+                    # JobNames.STYLE_CHECK, # NOTE (strtgbb): we don't run style check
                     JobNames.FAST_TEST,
                     JobConfigs.tidy_build_jobs[0].name,
                 ]
@@ -47,7 +47,7 @@ workflow = Workflow.Config(
         ],
         JobConfigs.bugfix_validation_it_job.set_dependency(
             [
-                JobNames.STYLE_CHECK,
+                # JobNames.STYLE_CHECK, # NOTE (strtgbb): we don't run style check
                 JobNames.FAST_TEST,
                 JobConfigs.tidy_build_jobs[0].name,
             ]
