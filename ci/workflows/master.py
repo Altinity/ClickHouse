@@ -11,7 +11,7 @@ from ci.workflows.pull_request import (
 workflow = Workflow.Config(
     name="MasterCI",
     event=Workflow.Event.PUSH,
-    branches=[BASE_BRANCH, "releases/*"],
+    branches=[BASE_BRANCH, "releases/*", "antalya-*"],
     jobs=[
         *JobConfigs.tidy_build_jobs,
         *JobConfigs.build_jobs,

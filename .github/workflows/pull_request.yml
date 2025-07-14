@@ -5,7 +5,7 @@ name: PR
 on:
   workflow_dispatch:
   pull_request:
-    branches: ['antalya', 'releases/*']
+    branches: ['antalya', 'releases/*', 'antalya-*']
 
 env:
   # Force the stdout and stderr streams to be unbuffered
