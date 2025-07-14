@@ -14,7 +14,10 @@ jobs:
           version: 2
           arch: arm64
 
-      - name: sync latest repo changes
-        run: |
-          aws s3 sync s3://builds.altinity.cloud/Blue/ /home/runner/.cache/production
+      # - name: sync latest repo changes
+      #   run: |
+      #     aws s3 sync s3://builds.altinity.cloud/Blue/ /home/runner/.cache/production
 
+      - name: overwrite green stable apt repo with blue stable apt repo
+        run: |
+          aws s3 cp --recursive --exclude "pool/main/*" s3://builds.altinity.cloud/Blue/apt-repo/ s3://builds.altinity.cloud/Green/apt-repo/
