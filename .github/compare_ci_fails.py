@@ -1,1 +1,0 @@
-../../altinity-actions/scripts/compare_ci_fails.py
