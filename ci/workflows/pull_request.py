@@ -79,7 +79,7 @@ workflow = Workflow.Config(
     enable_cache=True,
     enable_report=True,
     enable_cidb=True,
-    enable_merge_ready_status=True,
+    enable_merge_ready_status=False,  # NOTE (strtgbb): we don't use this, TODO, see if we can use it
     enable_commit_status_on_failure=True,
     pre_hooks=[
         # can_be_trusted, # NOTE (strtgbb): relies on labels we don't use
