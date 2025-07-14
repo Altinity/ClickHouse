@@ -5,7 +5,7 @@ name: MasterCI
 on:
   workflow_dispatch:
   push:
-    branches: ['antalya', 'releases/*']
+    branches: ['antalya', 'releases/*', 'antalya-*']
 
 env:
   # Force the stdout and stderr streams to be unbuffered
