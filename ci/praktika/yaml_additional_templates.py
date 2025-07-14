@@ -45,7 +45,7 @@ class AltinityWorkflowTemplates:
       version: ${{ fromJson(needs.config_workflow.outputs.data).custom_data.version.string }}
       tag-suffix: ${{ matrix.suffix }}
   GrypeScanKeeper:
-      needs: [config_workflow,  docker_keeper_image]
+      needs: [config_workflow, docker_keeper_image]
       if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VyIGtlZXBlciBpbWFnZQ==') }}
       uses: ./.github/workflows/grype_scan.yml
       secrets: inherit
@@ -55,7 +55,7 @@ class AltinityWorkflowTemplates:
 
   RegressionTestsRelease:
     needs: [config_workflow, build_amd_release]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).ci_settings.exclude_keywords, 'regression')}}
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFtZF9yZWxlYXNlKQ==') && !contains(fromJson(needs.config_workflow.outputs.data).pull_request.body, '[x] <!---ci_exclude_regression-->')}}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
@@ -67,7 +67,7 @@ class AltinityWorkflowTemplates:
       workflow_config: ${{ needs.config_workflow.outputs.data }}
   RegressionTestsAarch64:
     needs: [config_workflow, build_arm_release]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).ci_settings.exclude_keywords, 'regression') && !contains(fromJson(needs.config_workflow.outputs.data).ci_settings.exclude_keywords, 'aarch64')}}
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFybV9yZWxlYXNlKQ==') && !contains(fromJson(needs.config_workflow.outputs.data).pull_request.body, '[x] <!---ci_exclude_regression-->') && !contains(fromJson(needs.config_workflow.outputs.data).pull_request.body, '[x] <!---ci_exclude_aarch64-->')}}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:

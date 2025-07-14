@@ -143,7 +143,8 @@ class PRInfo:
         ref = github_event.get("ref", "refs/heads/master")
         if ref and ref.startswith("refs/heads/"):
             ref = ref[11:]
-        self.ref = ref # type: str e.g. "refs/pull/509/merge" or "refs/tags/v24.3.12.76.altinitystable"
+        # e.g. "refs/pull/509/merge" or "refs/tags/v24.3.12.76.altinitystable"
+        self.ref = ref  # type: str
         # Default values
         self.base_ref = github_event.get("base_ref","")  # type: str
         self.base_name = ""  # type: str

@@ -15,15 +15,15 @@ workflow = Workflow.Config(
     event=Workflow.Event.PULL_REQUEST,
     base_branches=[BASE_BRANCH, "releases/*", "antalya-*"],
     jobs=[
-        JobConfigs.style_check,
-        JobConfigs.docs_job,
+        # JobConfigs.style_check, # NOTE (strtgbb): we don't run style check
+        # JobConfigs.docs_job, # NOTE (strtgbb): we don't build docs
         JobConfigs.fast_test,
         *JobConfigs.tidy_build_jobs,
         *JobConfigs.tidy_arm_build_jobs,
         *[
             job.set_dependency(
                 [
-                    JobNames.STYLE_CHECK,
+                    # JobNames.STYLE_CHECK, # NOTE (strtgbb): we don't run style check
                     JobNames.FAST_TEST,
                     JobConfigs.tidy_build_jobs[0].name,
                 ]
@@ -47,7 +47,7 @@ workflow = Workflow.Config(
         ],
         JobConfigs.bugfix_validation_it_job.set_dependency(
             [
-                JobNames.STYLE_CHECK,
+                # JobNames.STYLE_CHECK, # NOTE (strtgbb): we don't run style check
                 JobNames.FAST_TEST,
                 JobConfigs.tidy_build_jobs[0].name,
             ]
@@ -79,20 +79,20 @@ workflow = Workflow.Config(
     enable_cache=True,
     enable_report=True,
     enable_cidb=True,
-    enable_merge_ready_status=True,
+    enable_merge_ready_status=False,  # NOTE (strtgbb): we don't use this, TODO, see if we can use it
     enable_commit_status_on_failure=True,
     pre_hooks=[
-        can_be_trusted,
+        # can_be_trusted, # NOTE (strtgbb): relies on labels we don't use
         "python3 ./ci/jobs/scripts/workflow_hooks/store_data.py",
-        "python3 ./ci/jobs/scripts/workflow_hooks/pr_description.py",
+        # "python3 ./ci/jobs/scripts/workflow_hooks/pr_description.py", # NOTE (strtgbb): relies on labels we don't use
         "python3 ./ci/jobs/scripts/workflow_hooks/version_log.py",
-        "python3 ./ci/jobs/scripts/workflow_hooks/quick_sync.py",
+        # "python3 ./ci/jobs/scripts/workflow_hooks/quick_sync.py", # NOTE (strtgbb): we don't do this
         "python3 ./ci/jobs/scripts/workflow_hooks/new_tests_check.py",
     ],
     workflow_filter_hooks=[should_skip_job],
     post_hooks=[
-        "python3 ./ci/jobs/scripts/workflow_hooks/feature_docs.py",
-        "python3 ./ci/jobs/scripts/workflow_hooks/can_be_merged.py",
+        # "python3 ./ci/jobs/scripts/workflow_hooks/feature_docs.py", # NOTE (strtgbb): we don't build docs
+        # "python3 ./ci/jobs/scripts/workflow_hooks/can_be_merged.py", # NOTE (strtgbb): relies on labels we don't use
     ],
 )
 
