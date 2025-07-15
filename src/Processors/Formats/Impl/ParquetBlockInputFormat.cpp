@@ -31,11 +31,8 @@
 #include <Common/FieldAccurateComparison.h>
 #include <Processors/Formats/Impl/Parquet/ParquetRecordReader.h>
 #include <Processors/Formats/Impl/Parquet/parquetBloomFilterHash.h>
-<<<<<<< HEAD
 #include <Interpreters/Context.h>
-=======
 #include <Processors/Formats/Impl/ParquetFileMetaDataCache.h>
->>>>>>> 51bf757e88b (Merge pull request #795 from Altinity/parquet_metadata_caching_forward_port_25.3)
 #include <Interpreters/convertFieldToType.h>
 
 #include <boost/algorithm/string/case_conv.hpp>
@@ -43,13 +40,10 @@
 namespace ProfileEvents
 {
     extern const Event ParquetFetchWaitTimeMicroseconds;
-<<<<<<< HEAD
     extern const Event ParquetReadRowGroups;
     extern const Event ParquetPrunedRowGroups;
-=======
     extern const Event ParquetMetaDataCacheHits;
     extern const Event ParquetMetaDataCacheMisses;
->>>>>>> 51bf757e88b (Merge pull request #795 from Altinity/parquet_metadata_caching_forward_port_25.3)
 }
 
 namespace CurrentMetrics
