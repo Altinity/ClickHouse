@@ -6,7 +6,7 @@ namespace DB
 {
 
 ParquetFileMetaDataCache::ParquetFileMetaDataCache()
-    : CacheBase<String, parquet::FileMetaData>(0)
+    : CacheBase<String, parquet::FileMetaData>(CurrentMetrics::end(), CurrentMetrics::end(), 0)
 {}
 
 ParquetFileMetaDataCache * ParquetFileMetaDataCache::instance()
