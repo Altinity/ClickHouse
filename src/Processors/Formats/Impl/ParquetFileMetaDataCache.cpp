@@ -1,6 +1,6 @@
 #include <Processors/Formats/Impl/ParquetFileMetaDataCache.h>
 
-#ifdef USE_PARQUET
+#if USE_PARQUET
 
 namespace DB
 {
