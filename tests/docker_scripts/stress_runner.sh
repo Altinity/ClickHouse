@@ -57,6 +57,10 @@ configure
 
 config_logs_export_cluster /etc/clickhouse-server/config.d/system_logs_export.yaml
 
+# NOTE(strtgbb): Trying to avoid errors that may be related to running out of resources
+export CLICKHOUSE_MAX_THREADS=8
+export CLICKHOUSE_MAX_CONCURRENT_QUERIES=4
+
 start_server
 
 setup_logs_replication

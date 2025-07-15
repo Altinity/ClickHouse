@@ -8,6 +8,9 @@ if(NOT ENABLE_SSL)
   return()
 endif()
 
+project(ch-openssl)
+cmake_minimum_required(VERSION 3.5)
+
 # Below build description was generated from these steps:
 # - Checkout OpenSSL in the desired version (e.g. 3.2)
 # - Take a brief look (but not too long to save your mental sanity) at the supported build options (*)
