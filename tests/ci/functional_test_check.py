@@ -18,7 +18,6 @@ from clickhouse_helper import CiLogsCredentials
 from docker_images_helper import DockerImage, get_docker_image
 from download_release_packages import download_last_release
 from env_helper import REPO_COPY, REPORT_PATH, TEMP_PATH
-from get_robot_token import get_parameter_from_ssm
 from pr_info import PRInfo
 from report import (
     ERROR,
@@ -39,9 +38,17 @@ NO_CHANGES_MSG = "Nothing to run"
 class SensitiveFormatter(logging.Formatter):
     @staticmethod
     def _filter(s):
-        return re.sub(
-            r"(.*)(AZURE_CONNECTION_STRING.*\')(.*)", r"\1AZURE_CONNECTION_STRING\3", s
+        s = re.sub(r"(.*)(AZURE_STORAGE_KEY\S*\')(.*)", r"\1AZURE_STORAGE_KEY\3", s)
+        s = re.sub(r"(.*)(AZURE_ACCOUNT_NAME\S*\')(.*)", r"\1AZURE_ACCOUNT_NAME\3", s)
+        s = re.sub(
+            r"(.*)(AZURE_CONTAINER_NAME\S*\')(.*)", r"\1AZURE_CONTAINER_NAME\3", s
         )
+        s = re.sub(
+            r"(.*)(AZURE_STORAGE_ACCOUNT_URL\S*\')(.*)",
+            r"\1AZURE_STORAGE_ACCOUNT_URL\3",
+            s,
+        )
+        return s
 
     def format(self, record):
         original = logging.Formatter.format(self, record)
@@ -52,8 +59,16 @@ def get_additional_envs(
     check_name: str, run_by_hash_num: int, run_by_hash_total: int
 ) -> List[str]:
     result = []
-    azure_connection_string = get_parameter_from_ssm("azure_connection_string")
-    result.append(f"AZURE_CONNECTION_STRING='{azure_connection_string}'")
+    # Get Azure credentials from environment variables
+    azure_account_name = os.environ.get("AZURE_ACCOUNT_NAME")
+
+    if azure_account_name:
+        result.append(f"AZURE_ACCOUNT_NAME='{azure_account_name}'")
+        result.append(f"AZURE_STORAGE_KEY='{os.environ['AZURE_STORAGE_KEY']}'")
+        result.append(f"AZURE_CONTAINER_NAME='{os.environ['AZURE_CONTAINER_NAME']}'")
+        result.append(
+            f"AZURE_STORAGE_ACCOUNT_URL='{os.environ['AZURE_STORAGE_ACCOUNT_URL']}'"
+        )
     if "DatabaseReplicated" in check_name:
         result.append("USE_DATABASE_REPLICATED=1")
     if "DatabaseOrdinary" in check_name:
@@ -67,9 +82,6 @@ def get_additional_envs(
         result.append("RANDOMIZE_OBJECT_KEY_TYPE=1")
     if "analyzer" in check_name:
         result.append("USE_OLD_ANALYZER=1")
-    if "azure" in check_name:
-        assert "USE_S3_STORAGE_FOR_MERGE_TREE=1" not in result
-        result.append("USE_AZURE_STORAGE_FOR_MERGE_TREE=1")
 
     if run_by_hash_total != 0:
         result.append(f"RUN_BY_HASH_NUM={run_by_hash_num}")
@@ -80,9 +92,9 @@ def get_additional_envs(
 
 def get_image_name(check_name: str) -> str:
     if "stateless" in check_name.lower() or "validation" in check_name.lower():
-        return "clickhouse/stateless-test"
+        return "altinityinfra/stateless-test"
     if "stateful" in check_name.lower():
-        return "clickhouse/stateful-test"
+        return "altinityinfra/stateful-test"
     raise ValueError(f"Cannot deduce image name based on check name {check_name}")
 
 

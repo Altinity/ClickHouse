@@ -6,12 +6,13 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 SCRIPT_PATH = Path(__file__).absolute()
 IMAGE_TYPE = "binary-builder"
-IMAGE_NAME = f"clickhouse/{IMAGE_TYPE}"
-
+IMAGE_NAME = f"altinityinfra/{IMAGE_TYPE}"
+DEFAULT_TMP_PATH = SCRIPT_PATH.parent.absolute() / 'tmp'
+TEMP_PATH = Path(os.getenv("TEMP_PATH", DEFAULT_TMP_PATH))
 
 class BuildException(Exception):
     pass
@@ -68,9 +69,22 @@ def run_docker_image_with_env(
     ch_root: Path,
     cargo_cache_dir: Path,
     ccache_dir: Optional[Path],
+    aws_secrets : Optional[Dict[str,str]]
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     cargo_cache_dir.mkdir(parents=True, exist_ok=True)
+    extra_parts = ""
+
+    if aws_secrets:
+        # Pass AWS credentials via file rather than via env to avoid leaking secrets
+        env_part = {"AWS_CONFIG_FILE": "/home/clickhouse/.aws/credentials"}
+        host_aws_config_file_path = Path(TEMP_PATH) / 'aws_config'
+        with open(host_aws_config_file_path, 'wt') as f:
+            f.write("[default]")
+            for key, value in aws_secrets.items():
+                f.write(f"\n{key}={value}")
+
+        extra_parts = f"--volume={host_aws_config_file_path}:{env_part['AWS_CONFIG_FILE']}"
 
     env_part = " -e ".join(env_variables)
     if env_part:
@@ -93,6 +107,7 @@ def run_docker_image_with_env(
     cmd = (
         f"docker run --network=host --user={user} --rm {ccache_mount} "
         f"--volume={output_dir}:/output --volume={ch_root}:/build {env_part} "
+        f" {extra_parts} "
         f"--volume={cargo_cache_dir}:/rust/cargo/registry {interactive} {image_name} /build/docker/packager/binary-builder/build.sh"
     )
 
@@ -436,6 +451,14 @@ def parse_args() -> argparse.Namespace:
         help="a directory with ccache",
     )
     parser.add_argument(
+        "--s3-access-key-id",
+        help="an S3 access key id used for sscache bucket",
+    )
+    parser.add_argument(
+        "--s3-secret-access-key",
+        help="an S3 secret access key used for sscache bucket",
+    )
+    parser.add_argument(
         "--s3-bucket",
         help="an S3 bucket used for sscache and clang-tidy-cache",
     )
@@ -541,6 +564,10 @@ def main() -> None:
         ch_root,
         args.cargo_cache_dir,
         args.ccache_dir,
+        {
+            "aws_access_key_id" : args.s3_access_key_id,
+            "aws_secret_access_key" : args.s3_secret_access_key
+        }
     )
     logging.info("Output placed into %s", args.output_dir)
 
