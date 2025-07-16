@@ -277,7 +277,7 @@ class Git:
 
     def _update_tags(self, suppress_stderr: bool = False) -> None:
         stderr = subprocess.DEVNULL if suppress_stderr else None
-        self.latest_tag = self.run("git describe --tags --abbrev=0", stderr=stderr)
+        self.latest_tag = self.run("git describe --tags --abbrev=0 --match='v*'", stderr=stderr)
         self.commits_since_latest = self._commits_since(self.latest_tag)
 
         self.latest_upstream_tag = self.run("git describe --tags --abbrev=0 --match='*-*'", stderr=stderr)
