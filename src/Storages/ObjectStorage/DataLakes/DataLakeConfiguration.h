@@ -13,7 +13,8 @@
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/StorageFactory.h>
 #include <Common/logger_useful.h>
-#include "Storages/ColumnsDescription.h"
+#include <Storages/ColumnsDescription.h>
+#include <Formats/FormatParserGroup.h>
 
 #include <memory>
 #include <string>
@@ -164,6 +165,11 @@ public:
     {
         assertInitialized();
         current_metadata->modifyFormatSettings(settings_);
+    }
+
+    ColumnMapperPtr getColumnMapper() const override
+    {
+        return current_metadata->getColumnMapper();
     }
 
 private:
