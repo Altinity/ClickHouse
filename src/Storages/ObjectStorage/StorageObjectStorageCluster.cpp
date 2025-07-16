@@ -58,7 +58,9 @@ String StorageObjectStorageCluster::getPathSample(StorageInMemoryMetadata metada
         {},
         metadata.getColumns().getAll(), // virtual_columns
         nullptr, // read_keys
-        {} // file_progress_callback
+        {}, // file_progress_callback
+        false, // ignore_archive_globs
+        true // skip_object_metadata
     );
 
     if (auto file = file_iterator->next(0))
