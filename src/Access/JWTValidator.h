@@ -61,6 +61,9 @@ class JWKSValidator : public IJWTValidator
 public:
     explicit JWKSValidator(const String & name_, std::shared_ptr<IJWKSProvider> provider_)
         : IJWTValidator(name_), provider(provider_) {}
+
+    explicit JWKSValidator(const String & name_, const String & uri, const size_t refresh_ms_)
+        : JWKSValidator(name_, std::make_shared<JWKSClient>(uri, refresh_ms_)) {}
 private:
     void validateImpl(const jwt::decoded_jwt<jwt::traits::kazuho_picojson> & token) const override;
 

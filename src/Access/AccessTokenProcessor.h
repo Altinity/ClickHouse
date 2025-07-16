@@ -106,24 +106,28 @@ public:
     OpenIDAccessTokenProcessor(const String & name_,
                               const UInt64 cache_invalidation_interval_,
                               const String & email_regex_str,
-                              const String & openid_config_endpoint_);
+                              const String & openid_config_endpoint_,
+                              const String & groups_claim_name_);
 
     /// Specify endpoints manually
     OpenIDAccessTokenProcessor(const String & name_,
                                const UInt64 cache_invalidation_interval_,
                                const String & email_regex_str,
                                const String & userinfo_endpoint_,
-                               const String & token_introspection_endpoint_)
-        : IAccessTokenProcessor(name_, cache_invalidation_interval_, email_regex_str),
-        userinfo_endpoint(userinfo_endpoint_), token_introspection_endpoint(token_introspection_endpoint_) {}
+                               const String & token_introspection_endpoint_,
+                               const String & jwks_uri_,
+                               const String & groups_claim_name_);
 
     bool resolveAndValidate(const TokenCredentials & credentials) override;
 private:
-    const Poco::URI userinfo_endpoint;
-    const Poco::URI token_introspection_endpoint;
+    Poco::URI userinfo_endpoint;
+    Poco::URI token_introspection_endpoint;
 
+    /// Access token is often a valid JWT, so we can validate it locally to avoid unnecesary network requests.
+    std::optional<JWKSValidator> jwt_validator = std::nullopt;
 
-    String validateTokenAndGetUsername(const String & token) const;
+    /// groups are expected under /userinfo endpoint under specified name
+    const String groups_claim_name;
 };
 
 }

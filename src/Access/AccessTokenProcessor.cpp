@@ -128,7 +128,7 @@ std::unique_ptr<IAccessTokenProcessor> IAccessTokenProcessor::parseTokenProcesso
 
             if (is_auto && !is_manual)
             {
-                return std::make_unique<OpenIDAccessTokenProcessor>(name, cache_lifetime, email_regex_str, config.getString(prefix + ".configuration_endpoint"));
+                return std::make_unique<OpenIDAccessTokenProcessor>(name, cache_lifetime, email_regex_str, config.getString(prefix + ".configuration_endpoint"), config.getString(prefix + ".groups_claim_name", ""));
             }
             else if (!is_auto && is_manual)
             {
@@ -335,57 +335,120 @@ String AzureAccessTokenProcessor::validateTokenAndGetUsername(const String & tok
     return getValueByKey(user_info_json, "sub");
 }
 
+
 OpenIDAccessTokenProcessor::OpenIDAccessTokenProcessor(const String & name_,
                            const UInt64 cache_invalidation_interval_,
                            const String & email_regex_str,
-                           const String & openid_config_endpoint_)
+                           const String & userinfo_endpoint_,
+                           const String & token_introspection_endpoint_,
+                           const String & jwks_uri_,
+                           const String & groups_claim_name_)
+    : IAccessTokenProcessor(name_, cache_invalidation_interval_, email_regex_str),
+    userinfo_endpoint(userinfo_endpoint_), token_introspection_endpoint(token_introspection_endpoint_), groups_claim_name(groups_claim_name_)
+{
+    if (!jwks_uri_.empty())
+    {
+        jwt_validator.emplace(name_ + "jwks_val", jwks_uri_, cache_invalidation_interval_);
+    }
+}
+
+OpenIDAccessTokenProcessor::OpenIDAccessTokenProcessor(const String & name_,
+                           const UInt64 cache_invalidation_interval_,
+                           const String & email_regex_str,
+                           const String & openid_config_endpoint_,
+                           const String & groups_claim_name_)
     : IAccessTokenProcessor(name_, cache_invalidation_interval_, email_regex_str)
 {
     const picojson::object openid_config = getObjectFromURI(Poco::URI(openid_config_endpoint_));
 
     if (!openid_config.contains("userinfo_endpoint") || !openid_config.contains("introspection_endpoint"))
         throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "{}: Cannot extract userinfo_endpoint or introspection_endpoint from OIDC configuration, consider manual configuration.", name);
+
+    OpenIDAccessTokenProcessor(name_,
+                               cache_invalidation_interval_,
+                               email_regex_str,
+                               getValueByKey(openid_config, "userinfo_endpoint"),
+                               getValueByKey(openid_config, "introspection_endpoint"),
+                               openid_config.contains("jwks_uri") ? getValueByKey(openid_config, "jwks_uri") : "",
+                               groups_claim_name_);
 }
 
 bool OpenIDAccessTokenProcessor::resolveAndValidate(const TokenCredentials & credentials)
 {
     const String & token = credentials.getToken();
+    String username;
+    picojson::object user_info_json;
 
-    try
+    if (jwt_validator.has_value() && jwt_validator.value().validate("", token, username))
     {
-        String username = validateTokenAndGetUsername(token);
-        if (!username.empty())
+
+        try
         {
-            /// Credentials are passed as const everywhere up the flow, so we have to comply,
-            /// in this case const_cast looks acceptable.
-            const_cast<TokenCredentials &>(credentials).setUserName(username);
-        }
-        else
-            LOG_TRACE(getLogger("AccessTokenProcessor"), "{}: Failed to get username with token", name);
+            auto decoded_token = jwt::decode(token);
+            user_info_json = decoded_token.get_payload_json();
 
+            /// TODO: Now we work only with Keycloak -- and it provides expires_at in token itself. Need to add actual token introspection logic for other OIDC providers.
+            if (decoded_token.has_expires_at())
+                const_cast<TokenCredentials &>(credentials).setExpiresAt(decoded_token.get_expires_at());
+        }
+        catch (const std::exception & ex)
+        {
+            LOG_TRACE(getLogger("AccessTokenProcessor"), "{}: Failed to process token as JWT: {}", name, ex.what());
+        }
     }
-    catch (...)
+
+    /// If username or user info is empty -- local validation failed, trying introspection via provider
+    if (username.empty() || user_info_json.empty())
     {
+        try
+        {
+            user_info_json = getObjectFromURI(userinfo_endpoint, token);
+            username = getValueByKey(user_info_json, "sub");
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    if (user_info_json.empty())
+    {
+        LOG_TRACE(getLogger("AccessTokenProcessor"), "{}: Failed to obtain user info", name);
+        return false;
+    }
+    else if (username.empty())
+    {
+        LOG_TRACE(getLogger("AccessTokenProcessor"), "{}: Failed to get username", name);
         return false;
     }
 
+    /// Credentials are passed as const everywhere up the flow, so we have to comply,
+    /// in this case const_cast is acceptable.
+    const_cast<TokenCredentials &>(credentials).setUserName(username);
+
+    /// For now, list of groups is expected in a claim with specified name either in token itself or in userinfo response (Keycloak works this way)
+    /// TODO: add support for custom endpoints for retrieving groups. Keycloak lists groups in /userinfo and token itself, which is not always the case.
+    if (!groups_claim_name.empty() && user_info_json.contains(groups_claim_name))
+    {
+        if (!user_info_json[groups_claim_name].is<picojson::array>())
+        {
+            LOG_TRACE(getLogger("AccessTokenProcessor"),
+                      "{}: Failed to extract groups: invalid content in user data", name);
+            return true;
+        }
+
+        std::set<String> external_groups_names;
+
+        picojson::array groups_array = user_info_json[groups_claim_name].get<picojson::array>();
+        for (const auto & group: groups_array)
+        {
+            if (group.is<std::string>())
+                external_groups_names.insert(group.get<std::string>());
+        }
+        const_cast<TokenCredentials &>(credentials).setGroups(external_groups_names);
+    }
+
     return true;
-
-    /// TODO: add proper groups functionality
-//    try
-//    {
-//        const_cast<TokenCredentials &>(credentials).setExpiresAt(jwt::decode(token).get_expires_at());
-//    }
-//    catch (...) {
-//        LOG_TRACE(getLogger("AccessTokenProcessor"),
-//                  "{}: No expiration data found in a valid token, will use default cache lifetime", name);
-//    }
-}
-
-String OpenIDAccessTokenProcessor::validateTokenAndGetUsername(const String & token) const
-{
-    picojson::object user_info_json = getObjectFromURI(userinfo_endpoint, token);
-    return getValueByKey(user_info_json, "sub");
 }
 
 }
