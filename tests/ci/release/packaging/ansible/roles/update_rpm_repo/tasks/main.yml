@@ -45,7 +45,7 @@
     src: "repo.j2"
     dest: "{{ local_repo_path }}/{{ repo_prefix }}yum-repo/{{ repo_name }}.repo"
 
-- name: Sync repos between source and target
-  shell: 'aws s3 sync --delete "{{ local_repo_path }}/{{ item }}" "{{ s3_repo_target_path }}/{{ release_environment }}/{{ item }}"'
+- name: Sync yum repos between source and target
+  shell: 'aws s3 sync "{{ local_repo_path }}/{{ item }}" "{{ s3_repo_target_path }}/{{ item }}"'
   loop: "{{ yum_repos }}"
   when: cloudfront_origin_path != ""

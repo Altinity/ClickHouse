@@ -239,110 +239,6 @@ jobs:
           version: 2
           arch: amd64
 
-      # - name: Download signed hash artifacts
-      #   run: |
-      #     run_id=$(echo "${{ inputs.workflow_url }}" | grep -oE '[0-9]+$')
-      #     mkdir -p signed-hashes/amd64 signed-hashes/arm64
-
-      #     # Download AMD64 hashes
-      #     artifact_id=$(curl -s \
-      #       -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-      #       -H "Accept: application/vnd.github.v3+json" \
-      #       "https://api.github.com/repos/Altinity/ClickHouse/actions/runs/$run_id/artifacts?per_page=1000" \
-      #       | jq -r --arg NAME "Sign release signed-hashes" '.artifacts[] | select(.name == $NAME) | .id')
-      #     if [ -z "$artifact_id" ] || [ "$artifact_id" == "null" ]; then
-      #       echo "Error: Could not find artifact 'Sign release signed-hashes' for run $run_id"
-      #       exit 1
-      #     fi
-      #     if ! curl -L \
-      #       -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-      #       -H "Accept: application/vnd.github.v3+json" \
-      #       -o "signed-hashes/amd64/hashes.zip" \
-      #       "https://api.github.com/repos/Altinity/ClickHouse/actions/artifacts/$artifact_id/zip"; then
-      #       echo "Error: Failed to download AMD64 hashes"
-      #       exit 1
-      #     fi
-      #     unzip -o "signed-hashes/amd64/hashes.zip" -d signed-hashes/amd64
-
-      #     # Download ARM64 hashes
-      #     artifact_id=$(curl -s \
-      #       -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-      #       -H "Accept: application/vnd.github.v3+json" \
-      #       "https://api.github.com/repos/Altinity/ClickHouse/actions/runs/$run_id/artifacts?per_page=1000" \
-      #       | jq -r --arg NAME "Sign aarch64 signed-hashes" '.artifacts[] | select(.name == $NAME) | .id')
-      #     if [ -z "$artifact_id" ] || [ "$artifact_id" == "null" ]; then
-      #       echo "Error: Could not find artifact 'Sign aarch64 signed-hashes' for run $run_id"
-      #       exit 1
-      #     fi
-      #     if ! curl -L \
-      #       -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-      #       -H "Accept: application/vnd.github.v3+json" \
-      #       -o "signed-hashes/arm64/hashes.zip" \
-      #       "https://api.github.com/repos/Altinity/ClickHouse/actions/artifacts/$artifact_id/zip"; then
-      #       echo "Error: Failed to download ARM64 hashes"
-      #       exit 1
-      #     fi
-      #     unzip -o "signed-hashes/arm64/hashes.zip" -d signed-hashes/arm64
-
-      # - name: Download packages for verification
-      #   run: |
-      #     # Create temporary directories for downloaded packages
-      #     mkdir -p /tmp/arm_packages /tmp/amd_packages
-
-      #     # Download ARM packages
-      #     echo "Downloading ARM packages for verification..."
-      #     if ! aws s3 sync "${SRC_URL}/package_aarch64/" /tmp/arm_packages; then
-      #       echo "Failed to download ARM packages"
-      #       exit 1
-      #     fi
-
-      #     # Download AMD packages
-      #     echo "Downloading AMD packages for verification..."
-      #     if ! aws s3 sync "${SRC_URL}/package_release/" /tmp/amd_packages; then
-      #       echo "Failed to download AMD packages"
-      #       exit 1
-      #     fi
-
-      # - name: Verify ARM packages
-      #   run: |
-      #     cd signed-hashes/arm64
-      #     # Verify all files
-      #     find /tmp/arm_packages -type f | while read -r file; do
-      #       if [ -f "$file" ]; then
-      #         file_name=$(basename "$file")
-      #         echo "Verifying $file_name..."
-
-      #         if ! gpg --verify "$file_name.sha256.gpg" 2>/dev/null; then
-      #           echo "GPG verification failed for $file_name"
-      #           exit 1
-      #         fi
-      #         if ! sha256sum -c "$file_name.sha256.gpg" 2>/dev/null; then
-      #           echo "SHA256 verification failed for $file_name"
-      #           exit 1
-      #         fi
-      #       fi
-      #     done
-
-      # - name: Verify AMD packages
-      #   run: |
-      #     cd signed-hashes/amd64
-      #     # Verify all files
-      #     find /tmp/amd_packages -type f | while read -r file; do
-      #       if [ -f "$file" ]; then
-      #         file_name=$(basename "$file")
-      #         echo "Verifying $file_name..."
-
-      #         if ! gpg --verify "$file_name.sha256.gpg" 2>/dev/null; then
-      #           echo "GPG verification failed for $file_name"
-      #           exit 1
-      #         fi
-      #         if ! sha256sum -c "$file_name.sha256.gpg" 2>/dev/null; then
-      #           echo "SHA256 verification failed for $file_name"
-      #           exit 1
-      #         fi
-      #       fi
-      #     done
-
       - name: Move verified packages to destination
         run: |
           # Move ARM packages
@@ -423,19 +319,19 @@ jobs:
             exit 1
           fi
 
-  # publish-docker:
-  #   needs: extract-package-info
-  #   strategy:
-  #     matrix:
-  #       image_type: [server, keeper]
-  #       variant: ['', '-alpine']
-  #   uses: ./.github/workflows/docker_publish.yml
-  #   with:
-  #     docker_image: altinityinfra/clickhouse-${{ matrix.image_type }}:${{ needs.extract-package-info.outputs.docker_version }}${{ matrix.variant }}
-  #     release_environment: ${{ inputs.release_environment }}
-  #     upload_artifacts: false
-  #     s3_upload_path: "${{ needs.extract-package-info.outputs.dest_url }}/docker_images/${{ matrix.image_type }}${{ matrix.variant }}/"
-  #   secrets: inherit
+  publish-docker:
+    needs: extract-package-info
+    strategy:
+      matrix:
+        image_type: [server, keeper]
+        variant: ['', '-alpine']
+    uses: ./.github/workflows/docker_publish.yml
+    with:
+      docker_image: altinityinfra/clickhouse-${{ matrix.image_type }}:${{ needs.extract-package-info.outputs.docker_version }}${{ matrix.variant }}
+      release_environment: ${{ inputs.release_environment }}
+      upload_artifacts: false
+      s3_upload_path: "${{ needs.extract-package-info.outputs.dest_url }}/docker_images/${{ matrix.image_type }}${{ matrix.variant }}/"
+    secrets: inherit
 
   sign-and-publish:
     needs: [extract-package-info, copy-packages]
@@ -570,7 +466,7 @@ jobs:
     uses: Altinity/ClickHouse/.github/workflows/repo-sanity-checks.yml@antalya
 
   copy-to-released:
-    needs: [sign-and-publish]
+    needs: [extract-package-info, sign-and-publish]
     if: ${{ inputs.release_environment == 'production' }}
     runs-on: [altinity-style-checker-aarch64, altinity-on-demand]
     env:

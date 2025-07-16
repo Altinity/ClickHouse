@@ -62,7 +62,7 @@
 - name: Export GPG public key to repo
   shell: "gpg --export --armor '{{ gpg_key_name }}' > '{{ local_repo_path }}/{{ repo_prefix }}apt-repo/pubkey.gpg'"
 
-- name: Sync repos between source and target
-  shell: "aws s3 sync --delete '{{ local_repo_path }}/{{ item }}' '{{ s3_repo_target_path }}/{{ release_environment }}/{{ item }}'"
+- name: Sync apt repos between source and target
+  shell: "aws s3 sync '{{ local_repo_path }}/{{ item }}' '{{ s3_repo_target_path }}/{{ item }}'"
   loop: "{{ apt_repos }}"
   when: cloudfront_origin_path != ""
