@@ -163,7 +163,7 @@ def get_checks_fails(client: Client, commit_sha: str, branch_name: str):
                     report_url as results_link,
                     task_url
                 FROM `gh-data`.checks
-                WHERE commit_sha='{commit_sha}' AND head_ref='{branch_name}'
+                WHERE commit_sha='{commit_sha}'
                 GROUP BY check_name, test_name, report_url, task_url
             )
             WHERE test_status IN ('FAIL', 'ERROR')
@@ -192,7 +192,7 @@ def get_checks_known_fails(
                 report_url as results_link,
                 task_url
             FROM `gh-data`.checks
-            WHERE commit_sha='{commit_sha}' AND head_ref='{branch_name}'
+            WHERE commit_sha='{commit_sha}'
             GROUP BY check_name, test_name, report_url, task_url
         )
         WHERE test_status='BROKEN'
@@ -229,7 +229,7 @@ def get_checks_errors(client: Client, commit_sha: str, branch_name: str):
                     report_url as results_link,
                     task_url
                 FROM `gh-data`.checks
-                WHERE commit_sha='{commit_sha}' AND head_ref='{branch_name}'
+                WHERE commit_sha='{commit_sha}'
                 GROUP BY check_name, test_name, report_url, task_url
             )
             WHERE job_status=='error'
