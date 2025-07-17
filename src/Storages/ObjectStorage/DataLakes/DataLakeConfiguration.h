@@ -349,6 +349,18 @@ public:
     void setCompressionMethod(const String & compression_method_) override { getImpl().setCompressionMethod(compression_method_); }
     void setStructure(const String & structure_) override { getImpl().setStructure(structure_); }
 
+    bool supportsFileIterator() const override { return getImpl().supportsFileIterator(); }
+
+    ObjectIterator iterate(
+        const ActionsDAG * filter_dag,
+        IDataLakeMetadata::FileProgressCallback callback,
+        size_t list_batch_size,
+        ContextPtr context) override
+    {
+        return getImpl().iterate(filter_dag, callback, list_batch_size, context);
+    }
+
+
 protected:
     void fromNamedCollection(const NamedCollection & collection, ContextPtr context) override
         { return getImpl().fromNamedCollection(collection, context); }
