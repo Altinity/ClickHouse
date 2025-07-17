@@ -96,9 +96,8 @@ private:
 
     std::optional<RemoteQueryExecutor::Extension> extension;
 
-    void createExtension(const ActionsDAG::Node * predicate);
+    void createExtension(const ActionsDAG::Node * predicate, size_t number_of_replicas);
     ContextPtr updateSettings(const Settings & settings);
 };
-
 
 }

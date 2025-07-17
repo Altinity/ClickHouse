@@ -53,6 +53,7 @@
 #include <Storages/StorageDistributed.h>
 #include <Storages/StorageDummy.h>
 #include <Storages/StorageMerge.h>
+#include <Storages/IStorageCluster.h>
 
 #include <AggregateFunctions/IAggregateFunction.h>
 
