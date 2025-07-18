@@ -38,7 +38,7 @@ namespace
         PartitionedSink::validatePartitionKey(str, true);
     }
 
-    void validateNamespace(const String & str, StorageObjectStorageConfigurationPtr configuration)
+    void validateNamespace(const String & str, StorageObjectStorage::ConfigurationPtr configuration)
     {
         configuration->validateNamespace(str);
 
@@ -167,7 +167,7 @@ SinkPtr PartitionedStorageObjectStorageSink::createSinkForPartition(const String
         object_storage,
         configuration,
         format_settings,
-        std::make_shared<Block>(partition_strategy->getFormatHeader()),
+        partition_strategy->getFormatHeader(),
         context
     );
 }

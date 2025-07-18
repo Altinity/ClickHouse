@@ -280,6 +280,20 @@ bool StorageObjectStorage::Configuration::update( ///NOLINT
     return true;
 }
 
+void StorageObjectStorage::Configuration::initPartitionStrategy(ASTPtr partition_by, const ColumnsDescription & columns, ContextPtr context)
+{
+
+    partition_strategy = PartitionStrategyFactory::get(
+        partition_strategy_type,
+        partition_by,
+        columns.getOrdinary(),
+        context,
+        format,
+        getRawPath().withGlobs(),
+        getRawPath().withPartitionWildcard(),
+        partition_columns_in_data_file);
+}
+
 IDataLakeMetadata * StorageObjectStorage::getExternalMetadata(ContextPtr query_context)
 {
     configuration->update(
@@ -454,7 +468,7 @@ private:
         auto context = getContext();
         iterator_wrapper = StorageObjectStorageSource::createFileIterator(
             configuration, configuration->getQuerySettings(context), object_storage, distributed_processing,
-            context, predicate, filter_actions_dag, virtual_columns, nullptr, context->getFileProgressCallback());
+            context, predicate, filter_actions_dag, virtual_columns, info.hive_partition_columns_to_read_from_file_path, nullptr, context->getFileProgressCallback());
     }
 };
 }
@@ -464,9 +478,10 @@ ReadFromFormatInfo StorageObjectStorage::Configuration::prepareReadingFromFormat
     const Strings & requested_columns,
     const StorageSnapshotPtr & storage_snapshot,
     bool supports_subset_of_columns,
-    ContextPtr local_context)
+    ContextPtr local_context,
+    const PrepareReadingFromFormatHiveParams & hive_params)
 {
-    return DB::prepareReadingFromFormat(requested_columns, storage_snapshot, local_context, supports_subset_of_columns);
+    return DB::prepareReadingFromFormat(requested_columns, storage_snapshot, local_context, supports_subset_of_columns, hive_params);
 }
 
 std::optional<ColumnsDescription> StorageObjectStorage::Configuration::tryGetTableStructureFromMetadata() const
@@ -752,7 +767,7 @@ void StorageObjectStorage::Configuration::initialize(
         {
             configuration_to_initialize.format
                 = FormatFactory::instance()
-                      .tryGetFormatFromFileName(configuration_to_initialize.isArchive() ? configuration_to_initialize.getPathInArchive() : configuration_to_initialize.getPath())
+                      .tryGetFormatFromFileName(configuration_to_initialize.isArchive() ? configuration_to_initialize.getPathInArchive() : configuration_to_initialize.getRawPath().path)
                       .value_or("auto");
         }
     }
@@ -767,33 +782,65 @@ void StorageObjectStorage::Configuration::check(ContextPtr) const
     FormatFactory::instance().checkFormatName(format);
 }
 
-bool StorageObjectStorage::Configuration::withPartitionWildcard() const
+StorageObjectStorage::Configuration::Path StorageObjectStorage::Configuration::getPathForRead() const
 {
-    static const String PARTITION_ID_WILDCARD = "{_partition_id}";
-    return getPath().find(PARTITION_ID_WILDCARD) != String::npos
-        || getNamespace().find(PARTITION_ID_WILDCARD) != String::npos;
+    auto raw_path = getRawPath();
+
+    if (!partition_strategy)
+    {
+        return raw_path;
+    }
+
+    return Path {partition_strategy->getPathForRead(raw_path.path)};
 }
 
-bool StorageObjectStorage::Configuration::withGlobsIgnorePartitionWildcard() const
+StorageObjectStorage::Configuration::Path StorageObjectStorage::Configuration::getPathForWrite(const std::string & partition_id) const
+{
+    auto raw_path = getRawPath();
+
+    if (!partition_strategy)
+    {
+        return raw_path;
+    }
+
+    return Path {partition_strategy->getPathForWrite(raw_path.path, partition_id)};
+}
+
+bool StorageObjectStorage::Configuration::Path::withPartitionWildcard() const
+{
+    static const String PARTITION_ID_WILDCARD = "{_partition_id}";
+    return path.find(PARTITION_ID_WILDCARD) != String::npos;
+}
+
+bool StorageObjectStorage::Configuration::Path::withGlobsIgnorePartitionWildcard() const
 {
     if (!withPartitionWildcard())
         return withGlobs();
-    return PartitionedSink::replaceWildcards(getPath(), "").find_first_of("*?{") != std::string::npos;
+    return PartitionedSink::replaceWildcards(path, "").find_first_of("*?{") != std::string::npos;
 }
 
-bool StorageObjectStorage::Configuration::isPathWithGlobs() const
+bool StorageObjectStorage::Configuration::Path::withGlobs() const
 {
-    return getPath().find_first_of("*?{") != std::string::npos;
+    return path.find_first_of("*?{") != std::string::npos;
+}
+
+std::string StorageObjectStorage::Configuration::Path::getWithoutGlobs() const
+{
+    if (allow_partial_prefix)
+    {
+        return path.substr(0, path.find_first_of("*?{"));
+    }
+
+    auto first_glob_pos = path.find_first_of("*?{");
+    auto end_of_path_without_globs = path.substr(0, first_glob_pos).rfind('/');
+    if (end_of_path_without_globs == std::string::npos || end_of_path_without_globs == 0)
+        return "/";
+    return path.substr(0, end_of_path_without_globs);
 }
 
 bool StorageObjectStorage::Configuration::isNamespaceWithGlobs() const
 {
     return getNamespace().find_first_of("*?{") != std::string::npos;
-}
-
-std::string StorageObjectStorage::Configuration::getPathWithoutGlobs() const
-{
-    return getPath().substr(0, getPath().find_first_of("*?{"));
 }
 
 bool StorageObjectStorage::Configuration::isPathInArchiveWithGlobs() const
@@ -803,7 +850,7 @@ bool StorageObjectStorage::Configuration::isPathInArchiveWithGlobs() const
 
 std::string StorageObjectStorage::Configuration::getPathInArchive() const
 {
-    throw Exception(ErrorCodes::LOGICAL_ERROR, "Path {} is not archive", getPath());
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "Path {} is not archive", getRawPath().path);
 }
 
 void StorageObjectStorage::Configuration::assertInitialized() const
