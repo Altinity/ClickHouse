@@ -59,18 +59,6 @@ ObjectStoragePtr StorageHDFSConfiguration::createObjectStorage( /// NOLINT
         url, std::move(hdfs_settings), context->getConfigRef(), /* lazy_initialize */true);
 }
 
-std::string StorageHDFSConfiguration::getPathWithoutGlobs() const
-{
-    /// Unlike s3 and azure, which are object storages,
-    /// hdfs is a filesystem, so it cannot list files by partual prefix,
-    /// only by directory.
-    auto first_glob_pos = path.find_first_of("*?{");
-    auto end_of_path_without_globs = path.substr(0, first_glob_pos).rfind('/');
-    if (end_of_path_without_globs == std::string::npos || end_of_path_without_globs == 0)
-        return "/";
-    return path.substr(0, end_of_path_without_globs);
-}
-
 StorageObjectStorage::QuerySettings StorageHDFSConfiguration::getQuerySettings(const ContextPtr & context) const
 {
     const auto & settings = context->getSettingsRef();

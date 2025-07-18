@@ -31,7 +31,7 @@ PartitionedSink::PartitionedSink(
     : SinkToStorage(sample_block_)
     , partition_strategy(partition_strategy_)
     , context(context_)
-    , source_header(source_header_)
+    , sample_block(sample_block_)
 {
 }
 
