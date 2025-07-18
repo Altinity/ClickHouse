@@ -44,7 +44,7 @@ namespace ErrorCodes
 void StorageHDFSConfiguration::check(ContextPtr context) const
 {
     context->getRemoteHostFilter().checkURL(Poco::URI(url));
-    checkHDFSURL(fs::path(url) / path.substr(1));
+    checkHDFSURL(fs::path(url) / path.path.substr(1));
     Configuration::check(context);
 }
 
@@ -70,6 +70,7 @@ std::string StorageHDFSConfiguration::getPathWithoutGlobs() const
         return "/";
     return path.substr(0, end_of_path_without_globs);
 }
+
 StorageObjectStorage::QuerySettings StorageHDFSConfiguration::getQuerySettings(const ContextPtr & context) const
 {
     const auto & settings = context->getSettingsRef();
@@ -154,13 +155,13 @@ void StorageHDFSConfiguration::setURL(const std::string & url_)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Bad HDFS URL: {}. It should have the following structure 'hdfs://<host_name>:<port>/path'", url_);
 
     path = url_.substr(pos + 1);
-    if (!path.starts_with('/'))
-        path = '/' + path;
+    if (!path.path.starts_with('/'))
+        path = '/' + path.path;
 
     url = url_.substr(0, pos);
     paths = {path};
 
-    LOG_TRACE(getLogger("StorageHDFSConfiguration"), "Using URL: {}, path: {}", url, path);
+    LOG_TRACE(getLogger("StorageHDFSConfiguration"), "Using URL: {}, path: {}", url, path.path);
 }
 
 void StorageHDFSConfiguration::addStructureAndFormatToArgsIfNeeded(
