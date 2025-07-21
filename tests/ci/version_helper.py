@@ -4,7 +4,12 @@ from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser, ArgumentType
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional, Set, Tuple, Union
 
-from pr_info import PRInfo  # grype scan needs to know the PR number
+try:
+    # grype scan needs to know the PR number
+    # But non-grype jobs might be missing dependencies
+    from pr_info import PRInfo
+except ImportError:
+    PRInfo = None
 
 from git_helper import TWEAK, Git, get_tags, git_runner, removeprefix, VersionType
 
@@ -540,10 +545,11 @@ def main():
         update_cmake_version(version)
 
     # grype scan needs to know the PR number
-    pr_info = PRInfo()
-    print(f"PR_NUMBER={pr_info.number}")
-    if args.export:
-        print(f"export PR_NUMBER")
+    if PRInfo:
+        pr_info = PRInfo()
+        print(f"PR_NUMBER={pr_info.number}")
+        if args.export:
+            print(f"export PR_NUMBER")
 
     for k, v in version.as_dict().items():
         name = f"CLICKHOUSE_VERSION_{k.upper()}"
