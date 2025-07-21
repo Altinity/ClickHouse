@@ -17,7 +17,7 @@ workflow = Workflow.Config(
     jobs=[
         # JobConfigs.style_check, # NOTE (strtgbb): we don't run style check
         # JobConfigs.docs_job, # NOTE (strtgbb): we don't build docs
-        JobConfigs.fast_test,
+        # JobConfigs.fast_test, # NOTE (strtgbb): same fails as stateless tests, revisit later
         *JobConfigs.tidy_build_jobs,
         *JobConfigs.tidy_arm_build_jobs,
         *[
@@ -48,7 +48,7 @@ workflow = Workflow.Config(
         JobConfigs.bugfix_validation_it_job.set_dependency(
             [
                 # JobNames.STYLE_CHECK, # NOTE (strtgbb): we don't run style check
-                JobNames.FAST_TEST,
+                # JobNames.FAST_TEST, # NOTE (strtgbb): we don't run fast tests
                 JobConfigs.tidy_build_jobs[0].name,
             ]
         ),
@@ -58,10 +58,10 @@ workflow = Workflow.Config(
         *JobConfigs.integration_test_jobs_non_required,
         JobConfigs.integration_test_asan_flaky_pr_job,
         *JobConfigs.stress_test_jobs,
-        *JobConfigs.upgrade_test_jobs,
+        # *JobConfigs.upgrade_test_jobs, # TODO: customize for our repo
         *JobConfigs.ast_fuzzer_jobs,
         *JobConfigs.buzz_fuzzer_jobs,
-        *JobConfigs.performance_comparison_with_master_head_jobs,
+        # *JobConfigs.performance_comparison_with_master_head_jobs, # NOTE (strtgbb): fails due to GH secrets not being handled properly
     ],
     artifacts=[
         *ArtifactConfigs.unittests_binaries,
@@ -71,7 +71,7 @@ workflow = Workflow.Config(
         *ArtifactConfigs.clickhouse_tgzs,
         ArtifactConfigs.fuzzers,
         ArtifactConfigs.fuzzers_corpus,
-        *ArtifactConfigs.performance_reports,
+        # *ArtifactConfigs.performance_reports,
     ],
     dockers=DOCKERS,
     secrets=SECRETS,

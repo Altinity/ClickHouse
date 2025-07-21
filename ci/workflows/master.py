@@ -13,7 +13,6 @@ workflow = Workflow.Config(
     event=Workflow.Event.PUSH,
     branches=[BASE_BRANCH, "releases/*", "antalya-*"],
     jobs=[
-        JobConfigs.fast_test,  # NOTE (strtgbb): for debugging
         *JobConfigs.tidy_build_jobs,
         *JobConfigs.build_jobs,
         *[
@@ -40,7 +39,7 @@ workflow = Workflow.Config(
         *JobConfigs.stress_test_azure_master_jobs,
         *JobConfigs.ast_fuzzer_jobs,
         *JobConfigs.buzz_fuzzer_jobs,
-        *JobConfigs.performance_comparison_with_master_head_jobs,
+        # *JobConfigs.performance_comparison_with_master_head_jobs, # NOTE (strtgbb): fails due to GH secrets not being handled properly
         *JobConfigs.clickbench_master_jobs,
         *JobConfigs.sqlancer_master_jobs,
         JobConfigs.sqltest_master_job,

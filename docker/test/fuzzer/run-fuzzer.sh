@@ -23,7 +23,7 @@ BINARY_URL_TO_DOWNLOAD=${BINARY_URL_TO_DOWNLOAD:="https://clickhouse-builds.s3.a
 function git_clone_with_retry
 {
     for _ in 1 2 3 4; do
-        if git clone --depth 1 https://github.com/ClickHouse/ClickHouse.git -- "$1" 2>&1 | ts '%Y-%m-%d %H:%M:%S';then
+        if git clone --depth 1 https://github.com/Altinity/ClickHouse.git -- "$1" 2>&1 | ts '%Y-%m-%d %H:%M:%S';then
             return 0
         else
             sleep 0.5
