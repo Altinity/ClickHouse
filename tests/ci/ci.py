@@ -1365,10 +1365,10 @@ def main() -> int:
                 error_description = f"Out Of Memory, exit_code {job_report.exit_code}"
             else:
                 error_description = f"Unknown, exit_code {job_report.exit_code}"
-            CIBuddy().post_job_error(
-                error_description + f" after {int(job_report.duration)}s",
-                job_name=_get_ext_check_name(args.job_name),
-            )
+            # CIBuddy().post_job_error(
+            #     error_description + f" after {int(job_report.duration)}s",
+            #     job_name=_get_ext_check_name(args.job_name),
+            # )
             if CI.is_test_job(args.job_name):
                 gh = GitHub(get_best_robot_token(), per_page=100)
                 commit = get_commit(gh, pr_info.sha)
@@ -1478,10 +1478,10 @@ def main() -> int:
                     )
                 else:
                     error_description = f"Unknown, exit_code {job_report.exit_code}"
-                CIBuddy().post_job_error(
-                    error_description + f" after {int(job_report.duration)}s",
-                    job_name=_get_ext_check_name(args.job_name),
-                )
+                # CIBuddy().post_job_error(
+                #     error_description + f" after {int(job_report.duration)}s",
+                #     job_name=_get_ext_check_name(args.job_name),
+                # )
         except Exception:
             traceback.print_exc()
             print("Post failed")
