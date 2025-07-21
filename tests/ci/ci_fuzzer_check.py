@@ -34,6 +34,7 @@ def get_run_command(
         f"-e SHA_TO_TEST={pr_info.sha}",
         f"-e BINARY_URL_TO_DOWNLOAD='{build_url}'",
         f"-e FUZZER_TO_RUN='{fuzzer_name}'",
+        f"-e BASE_BRANCH='{pr_info.base_ref}'",
     ]
 
     env_str = " ".join(envs)

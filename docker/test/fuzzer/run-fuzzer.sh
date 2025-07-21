@@ -50,7 +50,21 @@ function clone
                 git checkout "$SHA_TO_TEST"
                 echo "Checked out nominal SHA $SHA_TO_TEST for PR $PR_TO_TEST"
             fi
-            git diff --name-only master HEAD | tee ci-changed-files.txt
+            # Use BASE_BRANCH from environment variable if available, otherwise fall back to master
+            if [ -n "$BASE_BRANCH" ]; then
+                echo "Using base branch from environment: $BASE_BRANCH"
+                # Fetch the specific base branch first
+                git fetch --depth 1 origin "+refs/heads/$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH" || {
+                    echo "ERROR: Could not fetch base branch: $BASE_BRANCH"
+                    echo "Available remote branches:"
+                    git branch -r
+                    exit 1
+                }
+                git diff --name-only "origin/$BASE_BRANCH" HEAD | tee ci-changed-files.txt
+            else
+                echo "No BASE_BRANCH environment variable, using master"
+                git diff --name-only master HEAD | tee ci-changed-files.txt
+            fi
         else
             if [ -v SHA_TO_TEST ]; then
                 git fetch --depth 2 origin "$SHA_TO_TEST"
