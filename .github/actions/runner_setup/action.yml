@@ -16,5 +16,4 @@ runs:
     - name: Install awscli
       shell: bash
       run: |
-          .github/retry.sh 3 10 sudo apt-get update
-          .github/retry.sh 3 10 sudo apt-get install -y awscli
+          .github/retry.sh 10 30 sudo apt-get install -y awscli
