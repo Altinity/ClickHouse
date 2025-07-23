@@ -304,29 +304,30 @@ def main():
             #         res = res and CH.attach_gdb()
             #     else:
             #         print("Skipping gdb attachment for asan build")
-            # NOTE (strtgbb): Disable log tables, we don't use them
-            # if res:
-            #     if not Info().is_local_run:
-            #         if not CH.start_log_exports(stop_watch.start_time):
-            #             info.add_workflow_report_message(
-            #                 "WARNING: Failed to start log export"
-            #             )
-            #             print("Failed to start log export")
-            #     if not CH.create_minio_log_tables():
-            #         info.add_workflow_report_message(
-            #             "WARNING: Failed to create minio log tables"
-            #         )
-            #         print("Failed to create minio log tables")
 
-            #     res = (
-            #         CH.prepare_stateful_data(
-            #             with_s3_storage=is_s3_storage,
-            #             is_db_replicated=is_database_replicated,
-            #         )
-            #         and CH.insert_system_zookeeper_config()
-            #     )
-            # if res:
-            #     print("stateful data prepared")
+            if res:
+                # NOTE (strtgbb): Disable log tables, we don't use them
+                # if not Info().is_local_run:
+                #     if not CH.start_log_exports(stop_watch.start_time):
+                #         info.add_workflow_report_message(
+                #             "WARNING: Failed to start log export"
+                #         )
+                #         print("Failed to start log export")
+                # if not CH.create_minio_log_tables():
+                #     info.add_workflow_report_message(
+                #         "WARNING: Failed to create minio log tables"
+                #     )
+                #     print("Failed to create minio log tables")
+
+                res = (
+                    CH.prepare_stateful_data(
+                        with_s3_storage=is_s3_storage,
+                        is_db_replicated=is_database_replicated,
+                    )
+                    and CH.insert_system_zookeeper_config()
+                )
+            if res:
+                print("stateful data prepared")
             return res
 
         results.append(
