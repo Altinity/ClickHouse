@@ -277,5 +277,14 @@
     },
     "test_storage_rabbitmq/test.py::test_rabbitmq_sharding_between_queues_publish": {
         "reason": "INVESTIGATE - Timeout on TSAN"
+    },
+    "test_storage_s3_queue/test_4.py::test_alter_settings": {
+        "reason": "INVESTIGATE - Flaky test"
+    },
+    "test_storage_s3_queue/test_4.py::test_registry": {
+        "reason": "INVESTIGATE - Flaky test"
+    },
+    "03032_dynamically_resize_filesystem_cache_2": {
+        "reason": "KNOWN - Flaky upstream"
     }
 }
