@@ -317,8 +317,6 @@ public:
         bool if_not_updated_before,
         bool check_consistent_with_previous_metadata);
 
-    void initPartitionStrategy(ASTPtr partition_by, const ColumnsDescription & columns, ContextPtr context);
-
     const StorageObjectStorageSettings & getSettingsRef() const;
     virtual const DataLakeStorageSettings & getDataLakeSettings() const
     {
