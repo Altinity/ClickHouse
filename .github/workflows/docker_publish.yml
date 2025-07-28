@@ -78,6 +78,18 @@ jobs:
           NEW_TAG=$(echo "$VERSION_OUTPUT" | sed -E 's/.*version ([0-9.]+[^ ]*).*/\1/')
           echo "Cleaned version: $NEW_TAG"
 
+          # Extract version from input image tag and validate
+          INPUT_VERSION=$(echo "$IMAGE" | sed -E 's|.*:.*-([0-9.]+[^ ]*).*|\1|')
+
+          # Validate that versions match
+          if [ "$NEW_TAG" != "$INPUT_VERSION" ]; then
+            echo "ERROR: Version mismatch!"
+            echo "  Version from container: $NEW_TAG"
+            echo "  Version from input tag: $INPUT_VERSION"
+            echo "  Input image: $IMAGE"
+            exit 1
+          fi
+
           # Append "-prerelease" if necessary and determine repository
           if [ "${{ github.event.inputs.release_environment || inputs.release_environment }}" = "staging" ]; then
             NEW_TAG="${NEW_TAG}-prerelease"
