@@ -15,6 +15,7 @@ namespace DB
 {
 
 class Context;
+class ASTInsertQuery;
 
 /** Interface for table functions.
   *

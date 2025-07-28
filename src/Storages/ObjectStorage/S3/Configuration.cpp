@@ -168,6 +168,9 @@ void StorageS3Configuration::fromNamedCollection(const NamedCollection & collect
     else
         url = S3::URI(collection.get<String>("url"), settings[Setting::allow_archive_path_syntax]);
 
+    partition_strategy_name = collection.getOrDefault<String>("partition_strategy", "wildcard");
+    partition_columns_in_data_file = collection.getOrDefault<bool>("partition_columns_in_data_file", partition_strategy_name != "hive");
+
     auth_settings[S3AuthSetting::access_key_id] = collection.getOrDefault<String>("access_key_id", "");
     auth_settings[S3AuthSetting::secret_access_key] = collection.getOrDefault<String>("secret_access_key", "");
     auth_settings[S3AuthSetting::use_environment_credentials] = collection.getOrDefault<UInt64>("use_environment_credentials", 1);

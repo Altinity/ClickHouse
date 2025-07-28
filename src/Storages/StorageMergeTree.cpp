@@ -18,6 +18,7 @@
 #include <Interpreters/TransactionLog.h>
 #include <Parsers/ASTCheckQuery.h>
 #include <Parsers/ASTFunction.h>
+#include <Parsers/ASTInsertQuery.h>
 #include <Parsers/ASTPartition.h>
 #include <Planner/Utils.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
@@ -47,6 +48,7 @@
 #include <Common/escapeForFileName.h>
 #include "Core/BackgroundSchedulePool.h"
 #include "Core/Names.h"
+#include "ObjectStorage/MergeTree/StorageObjectStorageSinkMTPartImportDecorator.h"
 
 namespace DB
 {
@@ -484,6 +486,82 @@ void StorageMergeTree::alter(
     }
 }
 
+/*
+ * For now, this function is meant to be used when exporting to different formats (i.e, the case where data needs to be re-encoded / serialized)
+ * For the cases where this is not necessary, there are way more optimal ways of doing that, such as hard links implemented by `movePartitionToTable`
+ * */
+void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, ContextPtr query_context)
+{
+    String dest_database = query_context->resolveDatabase(command.to_database);
+    auto dest_storage = DatabaseCatalog::instance().getTable({dest_database, command.to_table}, query_context);
+
+    /// The target table and the source table are the same.
+    if (dest_storage->getStorageID() == this->getStorageID())
+        return;
+
+    auto query = std::make_shared<ASTInsertQuery>();
+
+    String partition_id = getPartitionIDFromQuery(command.partition, getContext());
+
+    background_moves_assignee.scheduleMoveTask(std::make_shared<ExecutableLambdaAdapter>(
+        [this, query_context, partition_id, dest_storage] () mutable
+    {
+        const auto src_parts = getVisibleDataPartsVectorInPartition(getContext(), partition_id);
+
+        if (src_parts.empty())
+        {
+            return true;
+        }
+
+        auto lock1 = lockForShare(query_context->getCurrentQueryId(), query_context->getSettingsRef()[Setting::lock_acquire_timeout]);
+        auto lock2 = dest_storage->lockForShare(query_context->getCurrentQueryId(), query_context->getSettingsRef()[Setting::lock_acquire_timeout]);
+        auto merges_blocker = stopMergesAndWait();
+
+        /// todo should stopMergesAndWait be accounted as well?
+        const auto start_time = std::chrono::system_clock::now();
+
+        dest_storage->importMergeTreePartition(*this, src_parts, getContext(), [&](MergeTreePartImportStats stats)
+        {
+            auto table_id = getStorageID();
+            auto part_log = getContext()->getPartLog(table_id.database_name);
+            if (!part_log)
+                return;
+
+            PartLogElement part_log_elem;
+            part_log_elem.event_type = PartLogElement::Type::EXPORT_PART;
+            part_log_elem.merge_algorithm = PartLogElement::PartMergeAlgorithm::UNDECIDED;
+            part_log_elem.merge_reason = PartLogElement::MergeReasonType::NOT_A_MERGE;
+
+            part_log_elem.database_name = table_id.database_name;
+            part_log_elem.table_name = table_id.table_name;
+            part_log_elem.table_uuid = table_id.uuid;
+            part_log_elem.partition_id = MergeTreePartInfo::fromPartName(stats.part->name, format_version).getPartitionId();
+            // construct event_time and event_time_microseconds using the same time point
+            // so that the two times will always be equal up to a precision of a second.
+            const auto time_now = std::chrono::system_clock::now();
+            part_log_elem.event_time = timeInSeconds(time_now);
+            part_log_elem.event_time_microseconds = timeInMicroseconds(time_now);
+
+            part_log_elem.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(start_time - time_now).count() / 1000000;
+            part_log_elem.error = static_cast<UInt16>(stats.status.code);
+            part_log_elem.exception = stats.status.message;
+            part_log_elem.path_on_disk = stats.file_path;
+            part_log_elem.part_name = stats.part->name;
+            part_log_elem.bytes_compressed_on_disk = stats.bytes_on_disk;
+            part_log_elem.rows = stats.part->rows_count;
+            part_log_elem.disk_name = dest_storage->getName();
+            part_log_elem.part_type = stats.part->getType();
+            part_log_elem.source_part_names = {stats.part->name};
+            part_log_elem.rows_read = stats.read_rows;
+            part_log_elem.bytes_read_uncompressed = stats.read_bytes;
+
+            part_log->add(std::move(part_log_elem));
+        });
+
+        /// Perhaps this is a good way to trigger re-tries?
+        return true;
+    }, moves_assignee_trigger, getStorageID()));
+}
 
 /// While exists, marks parts as 'currently_merging_mutating_parts' and reserves free space on filesystem.
 CurrentlyMergingPartsTagger::CurrentlyMergingPartsTagger(

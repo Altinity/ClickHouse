@@ -106,6 +106,8 @@
 
 #include <Poco/Util/LayeredConfiguration.h>
 
+#include "StorageSystemExports.h"
+
 #if defined(__ELF__) && !defined(OS_FREEBSD)
 #include <Storages/System/StorageSystemSymbols.h>
 #endif
@@ -206,6 +208,7 @@ void attachSystemTablesServer(ContextPtr context, IDatabase & system_database, b
     attach<StorageSystemHistogramMetrics>(context, system_database, "histogram_metrics", "Contains histogram metrics which can be calculated instantly and exported in the Prometheus format. For example, the keeper response time. This table is always up to date.");
     attach<StorageSystemMerges>(context, system_database, "merges", "Contains a list of merges currently executing merges of MergeTree tables and their progress. Each merge operation is represented by a single row.");
     attach<StorageSystemMoves>(context, system_database, "moves", "Contains information about in-progress data part moves of MergeTree tables. Each data part movement is represented by a single row.");
+    attach<StorageSystemExports>(context, system_database, "exports", "Contains information about in-progress data part exports of MergeTree tables. Each data part movement is represented by a single row.");
     attach<StorageSystemMutations>(context, system_database, "mutations", "Contains a list of mutations and their progress. Each mutation command is represented by a single row.");
     attachNoDescription<StorageSystemReplicas>(context, system_database, "replicas", "Contains information and status of all table replicas on current server. Each replica is represented by a single row.");
     attach<StorageSystemReplicationQueue>(context, system_database, "replication_queue", "Contains information about tasks from replication queues stored in ClickHouse Keeper, or ZooKeeper, for each table replica.");

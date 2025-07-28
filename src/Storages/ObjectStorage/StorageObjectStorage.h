@@ -16,7 +16,7 @@
 
 #include <memory>
 
-#include <Storages/IPartitionStrategy.h>
+#include <Storages/ObjectStorage/FilePathGenerator.h>
 
 namespace DB
 {
@@ -97,6 +97,12 @@ public:
         const StorageMetadataPtr & metadata_snapshot,
         ContextPtr context,
         bool async_insert) override;
+
+    void importMergeTreePartition(
+        const MergeTreeData & merge_tree_data,
+        const std::vector<DataPartPtr> & data_parts,
+        ContextPtr /*context*/,
+        std::function<void(MergeTreePartImportStats)> part_log) override;
 
     void truncate(
         const ASTPtr & query,
@@ -311,6 +317,9 @@ public:
         bool if_not_updated_before,
         bool check_consistent_with_previous_metadata);
 
+    void initPartitionStrategy(ASTPtr partition_by, const ColumnsDescription & columns, ContextPtr context);
+
+    const StorageObjectStorageSettings & getSettingsRef() const;
     virtual const DataLakeStorageSettings & getDataLakeSettings() const
     {
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method getDataLakeSettings() is not implemented for configuration type {}", getTypeName());

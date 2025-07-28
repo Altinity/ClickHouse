@@ -18,8 +18,11 @@
 #include <Common/RWLock.h>
 #include <Common/TypePromotion.h>
 #include <DataTypes/Serializations/SerializationInfo.h>
+#include <Storages/MergeTree/MergeTreeDataFormatVersion.h>
 
 #include <optional>
+
+#include "MergeTree/RangesInDataPart.h"
 
 
 namespace DB
@@ -66,6 +69,12 @@ class RestorerFromBackup;
 class ConditionSelectivityEstimator;
 
 class ActionsDAG;
+
+class MergeTreeData;
+
+class IMergeTreeDataPart;
+
+struct MergeTreePartImportStats;
 
 /** Storage. Describes the table. Responsible for
   * - storage of the table data;
@@ -435,6 +444,12 @@ public:
         const StorageMetadataPtr & /*metadata_snapshot*/,
         ContextPtr /*context*/,
         bool /*async_insert*/);
+
+    virtual void importMergeTreePartition(
+        const MergeTreeData &,
+        const std::vector<DataPartPtr> &,
+        ContextPtr /*context*/,
+        std::function<void(MergeTreePartImportStats)>) {}
 
     /** Writes the data to a table in distributed manner.
       * It is supposed that implementation looks into SELECT part of the query and executes distributed

@@ -96,6 +96,7 @@ struct RelativePathWithMetadata
     virtual ~RelativePathWithMetadata() = default;
 
     virtual std::string getFileName() const { return std::filesystem::path(relative_path).filename(); }
+    virtual std::string getFileNameWithoutExtension() const { return std::filesystem::path(relative_path).stem(); }
     virtual std::string getPath() const { return relative_path; }
     virtual bool isArchive() const { return false; }
     virtual std::string getPathToArchive() const { throw Exception(ErrorCodes::LOGICAL_ERROR, "Not an archive"); }

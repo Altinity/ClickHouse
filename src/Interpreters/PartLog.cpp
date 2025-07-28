@@ -69,6 +69,7 @@ ColumnsDescription PartLogElement::getColumnsDescription()
             {"MovePart",      static_cast<Int8>(MOVE_PART)},
             {"MergePartsStart", static_cast<Int8>(MERGE_PARTS_START)},
             {"MutatePartStart", static_cast<Int8>(MUTATE_PART_START)},
+            {"ExportPart",      static_cast<Int8>(EXPORT_PART)},
         }
     );
 
@@ -109,7 +110,8 @@ ColumnsDescription PartLogElement::getColumnsDescription()
             "RemovePart — Removing or detaching a data part using [DETACH PARTITION](/sql-reference/statements/alter/partition#detach-partitionpart)."
             "MutatePartStart — Mutating of a data part has started, "
             "MutatePart — Mutating of a data part has finished, "
-            "MovePart — Moving the data part from the one disk to another one."},
+            "MovePart — Moving the data part from the one disk to another one."
+            "ExportPart — Exporting the data part from a merge tree table to one (e.g, object storage)."},
         {"merge_reason", std::move(merge_reason_datatype),
             "The reason for the event with type MERGE_PARTS. Can have one of the following values: "
             "NotAMerge — The current event has the type other than MERGE_PARTS, "

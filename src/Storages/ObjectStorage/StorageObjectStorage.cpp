@@ -1,5 +1,7 @@
 #include <Core/ColumnWithTypeAndName.h>
+#include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
+#include "MergeTree/StorageObjectStorageSinkMTPartImportDecorator.h"
 
 #include <Common/logger_useful.h>
 #include <Core/Settings.h>
@@ -29,8 +31,13 @@
 #include <Storages/ColumnsDescription.h>
 #include <Storages/HivePartitioningUtils.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSettings.h>
+#include <Poco/String.h>
 
 #include <Poco/Logger.h>
+#include <Processors/Executors/CompletedPipelineExecutor.h>
+#include <Processors/QueryPlan/BuildQueryPipelineSettings.h>
+#include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
+#include <Storages/MergeTree/MergeTreeSequentialSource.h>
 
 namespace DB
 {
@@ -538,6 +545,152 @@ void StorageObjectStorage::read(
     query_plan.addStep(std::move(read_step));
 }
 
+void StorageObjectStorage::importMergeTreePartition(
+    const MergeTreeData & merge_tree_data,
+    const std::vector<DataPartPtr> & data_parts,
+    ContextPtr local_context,
+    std::function<void(MergeTreePartImportStats)> part_log)
+{
+    if (data_parts.empty())
+        return;
+
+    RelativePathsWithMetadata relative_paths_with_metadata;
+    object_storage->listObjects("", relative_paths_with_metadata, 1000);
+
+    std::vector<QueryPlanPtr> part_plans;
+    part_plans.reserve(data_parts.size());
+
+    auto metadata_snapshot = merge_tree_data.getInMemoryMetadataPtr();
+    Names columns_to_read = metadata_snapshot->getColumns().getNamesOfPhysical();
+    StorageSnapshotPtr storage_snapshot = merge_tree_data.getStorageSnapshot(metadata_snapshot, local_context);
+
+    QueryPlan plan;
+
+    // todo arthur
+    MergeTreeSequentialSourceType read_type = MergeTreeSequentialSourceType::Merge;
+
+    bool apply_deleted_mask = true;
+    bool read_with_direct_io = false;
+    bool prefetch = false;
+
+    QueryPipeline root_pipeline;
+
+    std::vector<ExportsList::EntryPtr> export_list_entries;
+
+    std::vector<StoredObject> files_to_be_deleted;
+    for (const auto & data_part : data_parts)
+    {
+        bool upload_part = true;
+        for (const auto & object_with_metadata : relative_paths_with_metadata)
+        {
+            const auto remote_object_filename = object_with_metadata->getFileNameWithoutExtension();
+            if (remote_object_filename == data_part->name)
+            {
+                upload_part = false;
+                break;
+            }
+
+            const auto remote_fake_part = MergeTreePartInfo::tryParsePartName(remote_object_filename, merge_tree_data.format_version);
+
+            if (!remote_fake_part)
+            {
+                continue;
+            }
+
+            /// If the part does not intersect, proceed to the next file
+            if (data_part->info.isDisjoint(remote_fake_part.value()))
+            {
+                continue;
+            }
+
+            files_to_be_deleted.emplace_back(object_with_metadata->relative_path);
+        }
+
+        if (!upload_part)
+        {
+            continue;
+        }
+
+        const auto partition_columns = configuration->partition_strategy->getPartitionColumns();
+
+        auto block_with_partition_values = data_part->partition.getBlockWithPartitionValues(partition_columns);
+
+        const auto column_with_partition_key = configuration->partition_strategy->computePartitionKey(block_with_partition_values);
+
+        const auto file_path = configuration->file_path_generator->getWritingPath(column_with_partition_key->getDataAt(0).toString(), data_part->name);
+
+        export_list_entries.emplace_back(local_context->getGlobalContext()->getExportsList().insert(
+            merge_tree_data.getStorageID(),
+            getStorageID(),
+            data_part->name,
+            file_path
+        ));
+
+        MergeTreeData::IMutationsSnapshot::Params params
+        {
+            .metadata_version = metadata_snapshot->getMetadataVersion(),
+            .min_part_metadata_version = data_part->getMetadataVersion(),
+        };
+
+        auto mutations_snapshot = merge_tree_data.getMutationsSnapshot(params);
+
+        auto alter_conversions = MergeTreeData::getAlterConversionsForPart(
+            data_part,
+            mutations_snapshot,
+            local_context);
+
+        QueryPlan plan_for_part;
+
+        createReadFromPartStep(
+            read_type,
+            plan_for_part,
+            merge_tree_data,
+            storage_snapshot,
+            RangesInDataPart(data_part),
+            alter_conversions,
+            nullptr,
+            columns_to_read,
+            nullptr,
+            apply_deleted_mask,
+            std::nullopt,
+            read_with_direct_io,
+            prefetch,
+            local_context,
+            getLogger("ExportPartition"));
+
+        QueryPlanOptimizationSettings optimization_settings(local_context);
+        auto pipeline_settings = BuildQueryPipelineSettings(local_context);
+        auto builder = plan_for_part.buildQueryPipeline(optimization_settings, pipeline_settings);
+        auto pipeline = QueryPipelineBuilder::getPipeline(std::move(*builder));
+
+        auto sink = std::make_shared<StorageObjectStorageSinkMTPartImportDecorator>(
+            data_part,
+            file_path,
+            object_storage,
+            configuration,
+            format_settings,
+            metadata_snapshot->getSampleBlock(),
+            part_log,
+            local_context
+        );
+
+        pipeline.complete(sink);
+
+        root_pipeline.addCompletedPipeline(std::move(pipeline));
+    }
+
+    if (root_pipeline.completed())
+    {
+        root_pipeline.setNumThreads(local_context->getSettingsRef()[Setting::max_threads]);
+
+        /// shouldn't this be part of the sink and or pipeline?
+        object_storage->removeObjectsIfExist(files_to_be_deleted);
+
+        CompletedPipelineExecutor exec(root_pipeline);
+        exec.execute();
+    }
+}
+
 SinkToStoragePtr StorageObjectStorage::write(
     const ASTPtr &,
     const StorageMetadataPtr & metadata_snapshot,
@@ -577,7 +730,8 @@ SinkToStoragePtr StorageObjectStorage::write(
 
     if (configuration->partition_strategy)
     {
-        return std::make_shared<PartitionedStorageObjectStorageSink>(object_storage, configuration, format_settings, sample_block, local_context);
+        auto sink_creator = std::make_shared<PartitionedStorageObjectStorageSink>(object_storage, configuration, configuration->file_path_generator, format_settings, sample_block, local_context);
+        return std::make_shared<PartitionedSink>(configuration->partition_strategy, sink_creator, local_context, sample_block);
     }
 
     auto paths = configuration->getPaths();
@@ -755,6 +909,18 @@ void StorageObjectStorage::Configuration::initialize(
     {
         // Promote to wildcard in case it is not data lake to make it backwards compatible
         configuration_to_initialize.partition_strategy_type = PartitionStrategyFactory::StrategyType::WILDCARD;
+    }
+
+    if (configuration_to_initialize.partition_strategy_type == PartitionStrategyFactory::StrategyType::HIVE)
+    {
+        configuration_to_initialize.file_path_generator = std::make_shared<ObjectStorageAppendFilePathGenerator>(
+            configuration_to_initialize.getRawPath().path,
+            configuration_to_initialize.format,
+            std::make_shared<SnowflakeObjectStorageFilenameGenerator>());
+    }
+    else
+    {
+        configuration_to_initialize.file_path_generator = std::make_shared<ObjectStorageWildcardFilePathGenerator>(configuration_to_initialize.getRawPath().path);
     }
 
     if (configuration_to_initialize.format == "auto")
