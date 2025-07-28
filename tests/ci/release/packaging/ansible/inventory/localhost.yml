@@ -19,6 +19,8 @@ all:
         - "clickhouse-common-static_{{ pkgver }}_arm64.deb"
         - "clickhouse-common-static-dbg_{{ pkgver }}_arm64.deb"
         - "clickhouse-server_{{ pkgver }}_arm64.deb"
+        - "clickhouse-keeper_{{ pkgver }}_amd64.deb"
+        - "clickhouse-keeper_{{ pkgver }}_arm64.deb"
       rpm_pkg_names:
         - "clickhouse-client-{{ pkgver }}.x86_64.rpm"
         - "clickhouse-common-static-{{ pkgver }}.x86_64.rpm"
@@ -28,6 +30,8 @@ all:
         - "clickhouse-common-static-{{ pkgver }}.aarch64.rpm"
         - "clickhouse-common-static-dbg-{{ pkgver }}.aarch64.rpm"
         - "clickhouse-server-{{ pkgver }}.aarch64.rpm"
+        - "clickhouse-keeper-{{ pkgver }}.x86_64.rpm"
+        - "clickhouse-keeper-{{ pkgver }}.aarch64.rpm
       tgz_pkg_names:
         - "clickhouse-client-{{ pkgver }}-amd64.tgz"
         - "clickhouse-common-static-{{ pkgver }}-amd64.tgz"
@@ -37,6 +41,8 @@ all:
         - "clickhouse-common-static-{{ pkgver }}-arm64.tgz"
         - "clickhouse-common-static-dbg-{{ pkgver }}-arm64.tgz"
         - "clickhouse-server-{{ pkgver }}-arm64.tgz"
+        - "clickhouse-keeper-{{ pkgver }}-amd64.tgz"
+        - "clickhouse-keeper-{{ pkgver }}-arm64.tgz"
       sha512_pkg_names:
         - "clickhouse-client-{{ pkgver }}-amd64.tgz.sha512"
         - "clickhouse-common-static-{{ pkgver }}-amd64.tgz.sha512"
@@ -46,6 +52,8 @@ all:
         - "clickhouse-common-static-{{ pkgver }}-arm64.tgz.sha512"
         - "clickhouse-common-static-dbg-{{ pkgver }}-arm64.tgz.sha512"
         - "clickhouse-server-{{ pkgver }}-arm64.tgz.sha512"
+        - "clickhouse-keeper-{{ pkgver }}-amd64.tgz.sha512"
+        - "clickhouse-keeper-{{ pkgver }}-arm64.tgz.sha512"
       tgz_repos:
         - "tgz-repo"
         - "fips-tgz-repo"
