@@ -31,7 +31,7 @@ all:
         - "clickhouse-common-static-dbg-{{ pkgver }}.aarch64.rpm"
         - "clickhouse-server-{{ pkgver }}.aarch64.rpm"
         - "clickhouse-keeper-{{ pkgver }}.x86_64.rpm"
-        - "clickhouse-keeper-{{ pkgver }}.aarch64.rpm
+        - "clickhouse-keeper-{{ pkgver }}.aarch64.rpm"
       tgz_pkg_names:
         - "clickhouse-client-{{ pkgver }}-amd64.tgz"
         - "clickhouse-common-static-{{ pkgver }}-amd64.tgz"
