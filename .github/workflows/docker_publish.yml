@@ -78,6 +78,12 @@ jobs:
           NEW_TAG=$(echo "$VERSION_OUTPUT" | sed -E 's/.*version ([0-9.]+[^ ]*).*/\1/')
           echo "Cleaned version: $NEW_TAG"
 
+          # Append alpine tag is necessary
+          if [[ "$IMAGE" == *-alpine* ]]; then
+            NEW_TAG="${NEW_TAG}-alpine"
+          fi
+          echo "New tag: $NEW_TAG"
+
           # Extract version from input image tag and validate
           INPUT_VERSION=$(echo "$IMAGE" | sed -E 's|.*:.*-([0-9.]+[^ ]*).*|\1|')
 
@@ -98,11 +104,6 @@ jobs:
             REPO_NAME="altinity"
           fi
           echo "Repository: $REPO_NAME"
-
-          if [[ "$IMAGE" == *-alpine* ]]; then
-            NEW_TAG="${NEW_TAG}-alpine"
-          fi
-          echo "New tag: $NEW_TAG"
 
           # Export the new tag and repository
           echo "NEW_TAG=$NEW_TAG" >> $GITHUB_ENV
