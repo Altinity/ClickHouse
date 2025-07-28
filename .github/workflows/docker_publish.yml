@@ -78,23 +78,28 @@ jobs:
           NEW_TAG=$(echo "$VERSION_OUTPUT" | sed -E 's/.*version ([0-9.]+[^ ]*).*/\1/')
           echo "Cleaned version: $NEW_TAG"
 
-          # Append "-prerelease" if necessary
+          # Append "-prerelease" if necessary and determine repository
           if [ "${{ github.event.inputs.release_environment || inputs.release_environment }}" = "staging" ]; then
             NEW_TAG="${NEW_TAG}-prerelease"
+            REPO_NAME="altinityinfra"
+          else
+            REPO_NAME="altinity"
           fi
+          echo "Repository: $REPO_NAME"
 
           if [[ "$IMAGE" == *-alpine* ]]; then
             NEW_TAG="${NEW_TAG}-alpine"
           fi
           echo "New tag: $NEW_TAG"
 
-          # Export the new tag
+          # Export the new tag and repository
           echo "NEW_TAG=$NEW_TAG" >> $GITHUB_ENV
+          echo "REPO_NAME=$REPO_NAME" >> $GITHUB_ENV
 
       - name: Process multiarch manifest
         run: |
-          echo "Re-tag multiarch image $IMAGE to altinity/$COMPONENT:$NEW_TAG"
-          docker buildx imagetools create --tag "altinity/$COMPONENT:$NEW_TAG" "$IMAGE"
+          echo "Re-tag multiarch image $IMAGE to $REPO_NAME/$COMPONENT:$NEW_TAG"
+          docker buildx imagetools create --tag "$REPO_NAME/$COMPONENT:$NEW_TAG" "$IMAGE"
 
           # Create directory for image archives
           mkdir -p image_archives
@@ -103,15 +108,15 @@ jobs:
           for PLATFORM in "linux/amd64" "linux/arm64"; do
             echo "Pulling and saving image for $PLATFORM..."
             # Pull the specific platform image
-            docker pull --platform $PLATFORM "altinity/$COMPONENT:$NEW_TAG"
+            docker pull --platform $PLATFORM "$REPO_NAME/$COMPONENT:$NEW_TAG"
 
             # Save the image to a tar file
             ARCH=$(echo $PLATFORM | cut -d'/' -f2)
-            docker save "altinity/$COMPONENT:$NEW_TAG" -o "image_archives/${COMPONENT}-${NEW_TAG}-${ARCH}.tar"
+            docker save "$REPO_NAME/$COMPONENT:$NEW_TAG" -o "image_archives/${COMPONENT}-${NEW_TAG}-${ARCH}.tar"
           done
 
           # Save manifest inspection
-          docker buildx imagetools inspect "altinity/$COMPONENT:$NEW_TAG" > image_archives/manifest.txt
+          docker buildx imagetools inspect "$REPO_NAME/$COMPONENT:$NEW_TAG" > image_archives/manifest.txt
 
           # Compress the archives
           cd image_archives
