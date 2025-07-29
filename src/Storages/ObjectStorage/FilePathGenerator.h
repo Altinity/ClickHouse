@@ -3,6 +3,7 @@
 #include <string>
 #include <Storages/PartitionedSink.h>
 #include <Storages/ObjectStorage/ObjectStorageFilenameGenerator.h>
+#include <Poco/String.h>
 
 namespace DB
 {
@@ -38,7 +39,7 @@ namespace DB
             const std::string & raw_path_,
             const std::string & file_format_,
             const std::shared_ptr<ObjectStorageFilenameGenerator> & filename_generator_)
-        : raw_path(raw_path_), file_format(file_format_), filename_generator(filename_generator_){}
+        : raw_path(raw_path_), file_format(Poco::toLower(file_format_)), filename_generator(filename_generator_){}
 
         std::string getWritingPath(const std::string & partition_id, std::optional<std::string> filename_override) const override
         {
