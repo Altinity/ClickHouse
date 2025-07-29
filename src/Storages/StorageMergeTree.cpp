@@ -74,6 +74,8 @@ namespace Setting
     extern const SettingsBool parallel_replicas_for_non_replicated_merge_tree;
     extern const SettingsBool throw_on_unsupported_query_inside_transaction;
     extern const SettingsUInt64 max_parts_to_move;
+    extern const SettingsBool export_merge_tree_partition_background_execution;
+    extern const SettingsBool allow_experimental_export_merge_tree_partition;
 }
 
 namespace MergeTreeSetting
@@ -492,6 +494,13 @@ void StorageMergeTree::alter(
  * */
 void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, ContextPtr query_context)
 {
+
+    if (!query_context->getSettingsRef()[Setting::allow_experimental_export_merge_tree_partition])
+    {
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+            "Exporting merge tree partition is experimental. Set `allow_experimental_export_merge_tree_partition` to enable it");
+    }
+
     String dest_database = query_context->resolveDatabase(command.to_database);
     auto dest_storage = DatabaseCatalog::instance().getTable({dest_database, command.to_table}, query_context);
 
@@ -503,8 +512,7 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
 
     String partition_id = getPartitionIDFromQuery(command.partition, getContext());
 
-    background_moves_assignee.scheduleMoveTask(std::make_shared<ExecutableLambdaAdapter>(
-        [this, query_context, partition_id, dest_storage] () mutable
+    auto export_partition_function = [this, query_context, partition_id, dest_storage] () mutable
     {
         const auto src_parts = getVisibleDataPartsVectorInPartition(getContext(), partition_id);
 
@@ -560,7 +568,17 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
 
         /// Perhaps this is a good way to trigger re-tries?
         return true;
-    }, moves_assignee_trigger, getStorageID()));
+    };
+
+    if (query_context->getSettingsRef()[Setting::export_merge_tree_partition_background_execution])
+    {
+        background_moves_assignee.scheduleMoveTask(
+           std::make_shared<ExecutableLambdaAdapter>(export_partition_function, moves_assignee_trigger, getStorageID()));
+    }
+    else
+    {
+        export_partition_function();
+    }
 }
 
 /// While exists, marks parts as 'currently_merging_mutating_parts' and reserves free space on filesystem.

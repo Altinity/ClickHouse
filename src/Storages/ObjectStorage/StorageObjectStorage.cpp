@@ -555,7 +555,7 @@ void StorageObjectStorage::importMergeTreePartition(
         return;
 
     RelativePathsWithMetadata relative_paths_with_metadata;
-    object_storage->listObjects("", relative_paths_with_metadata, 1000);
+    object_storage->listObjects(configuration->getRawPath().path, relative_paths_with_metadata, 1000);
 
     std::vector<QueryPlanPtr> part_plans;
     part_plans.reserve(data_parts.size());

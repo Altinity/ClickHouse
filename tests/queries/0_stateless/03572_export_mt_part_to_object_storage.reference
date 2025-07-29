@@ -1,0 +1,46 @@
+---- Insert some more data in the already exported partition
+test/s3_table_NAME/year=2020/2020_1_1_0.parquet
+test/s3_table_NAME/year=2020/2020_1_1_0.parquet
+test/s3_table_NAME/year=2020/2020_1_1_0.parquet
+---- Export the parts, only the diff should be exported
+---- New data part should appear (2020_2_2_0.parquet) with id 5 and 6
+test/s3_table_NAME/year=2020/2020_1_1_0.parquet
+test/s3_table_NAME/year=2020/2020_1_1_0.parquet
+test/s3_table_NAME/year=2020/2020_1_1_0.parquet
+test/s3_table_NAME/year=2020/2020_3_3_0.parquet
+test/s3_table_NAME/year=2020/2020_3_3_0.parquet
+---- Merge all parts
+---- Nothing should be exported even though the parts in the merge tree table have been merged
+---- Check the parts in the remote storage have not been touched
+test/s3_table_NAME/year=2020/2020_1_3_1.parquet
+test/s3_table_NAME/year=2020/2020_1_3_1.parquet
+test/s3_table_NAME/year=2020/2020_1_3_1.parquet
+test/s3_table_NAME/year=2020/2020_1_3_1.parquet
+test/s3_table_NAME/year=2020/2020_1_3_1.parquet
+---- Yet another part
+---- Merge the new part
+---- The new part that cover everything should be exported
+---- Assert there is only one data part
+test/s3_table_NAME/year=2020/2020_1_4_2.parquet
+test/s3_table_NAME/year=2020/2020_1_4_2.parquet
+test/s3_table_NAME/year=2020/2020_1_4_2.parquet
+test/s3_table_NAME/year=2020/2020_1_4_2.parquet
+test/s3_table_NAME/year=2020/2020_1_4_2.parquet
+test/s3_table_NAME/year=2020/2020_1_4_2.parquet
+---- Finally, export the other partition (2021)
+---- Assert both partitions are there
+test/s3_table_NAME/year=2020/2020_1_4_2.parquet
+test/s3_table_NAME/year=2020/2020_1_4_2.parquet
+test/s3_table_NAME/year=2020/2020_1_4_2.parquet
+test/s3_table_NAME/year=2021/2021_2_2_2.parquet
+test/s3_table_NAME/year=2020/2020_1_4_2.parquet
+test/s3_table_NAME/year=2020/2020_1_4_2.parquet
+test/s3_table_NAME/year=2020/2020_1_4_2.parquet
+---- Selecting from merge tree to have a sample of what the data in remote storage should look like
+1	2020
+2	2020
+3	2020
+4	2021
+5	2020
+6	2020
+7	2020

@@ -6874,6 +6874,12 @@ Possible values:
     DECLARE_WITH_ALIAS(Bool, allow_experimental_time_series_aggregate_functions, false, R"(
 Experimental timeSeries* aggregate functions for Prometheus-like timeseries resampling, rate, delta calculation.
 )", EXPERIMENTAL, allow_experimental_ts_to_grid_aggregate_function) \
+    DECLARE_WITH_ALIAS(Bool, allow_experimental_export_merge_tree_partition, false, R"(
+Experimental export merge tree partition.
+)", EXPERIMENTAL, allow_experimental_export_merge_tree_partition) \
+    DECLARE_WITH_ALIAS(Bool, export_merge_tree_partition_background_execution, true, R"(
+    Process exports asynchronously in background threads
+)", EXPERIMENTAL, export_merge_tree_partition_background_execution) \
     \
     /* ####################################################### */ \
     /* ############ END OF EXPERIMENTAL FEATURES ############# */ \
