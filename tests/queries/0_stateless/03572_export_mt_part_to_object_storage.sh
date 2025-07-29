@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../shell_config.sh
+. "$CURDIR"/../shell_config.sh
+
 mt_table="mt_table_${RANDOM}"
 s3_table="s3_table_${RANDOM}"
 
