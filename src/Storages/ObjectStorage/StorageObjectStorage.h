@@ -331,6 +331,7 @@ public:
     /// And alternative is with hive partitioning, when they are contained in file path.
     bool partition_columns_in_data_file = true;
     std::shared_ptr<IPartitionStrategy> partition_strategy;
+    std::shared_ptr<ObjectStorageFilePathGenerator> file_path_generator;
 
 protected:
     virtual void fromNamedCollection(const NamedCollection & collection, ContextPtr context) = 0;

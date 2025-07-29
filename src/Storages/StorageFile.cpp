@@ -1997,7 +1997,7 @@ public:
     }
 
 private:
-    std::shared_ptr<PartitionStrategy> partition_strategy;
+    std::shared_ptr<IPartitionStrategy> partition_strategy;
     const String path;
     StorageMetadataPtr metadata_snapshot;
     String table_name_for_log;

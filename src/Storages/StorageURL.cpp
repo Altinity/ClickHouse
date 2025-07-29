@@ -772,7 +772,7 @@ public:
     }
 
 private:
-    std::shared_ptr<PartitionStrategy> partition_strategy;
+    std::shared_ptr<IPartitionStrategy> partition_strategy;
     const String uri;
     const String format;
     const std::optional<FormatSettings> format_settings;
