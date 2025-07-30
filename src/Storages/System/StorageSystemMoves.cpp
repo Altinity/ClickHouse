@@ -27,9 +27,8 @@ void StorageSystemMoves::fillData(MutableColumns & res_columns, ContextPtr conte
 {
     const auto access = context->getAccess();
     const bool check_access_for_tables = !access->isGranted(AccessType::SHOW_TABLES);
-    const auto & move_list = context->getMovesList();
 
-    for (const auto & move : move_list.get())
+    for (const auto & move : context->getMovesList().get())
     {
         if (check_access_for_tables && !access->isGranted(AccessType::SHOW_TABLES, move.database, move.table))
             continue;
