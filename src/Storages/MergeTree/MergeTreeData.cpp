@@ -5940,7 +5940,7 @@ Pipe MergeTreeData::alterPartition(
                 }
             }
             break;
-            case PartitionCommand::EXPORT_PART:
+            case PartitionCommand::EXPORT_PARTITION:
             {
                 exportPartitionToTable(command, query_context);
                 break;

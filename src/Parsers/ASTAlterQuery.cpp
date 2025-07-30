@@ -355,7 +355,7 @@ void ASTAlterCommand::formatImpl(WriteBuffer & ostr, const FormatSettings & sett
             ostr << quoteString(move_destination_name);
         }
     }
-    else if (type == ASTAlterCommand::EXPORT_PART)
+    else if (type == ASTAlterCommand::EXPORT_PARTITION)
     {
         ostr << (settings.hilite ? hilite_keyword : "") << "EXPORT " << (part ? "PART " : "PARTITION ")
              << (settings.hilite ? hilite_none : "");
