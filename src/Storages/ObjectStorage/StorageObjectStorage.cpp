@@ -1,15 +1,15 @@
 #include <Core/ColumnWithTypeAndName.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
-#include "MergeTree/StorageObjectStorageSinkMTPartImportDecorator.h"
+#include "MergeTree/StorageObjectStorageMergeTreePartImporterSink.h"
 
-#include <Common/logger_useful.h>
 #include <Core/Settings.h>
 #include <Formats/FormatFactory.h>
-#include <Parsers/ASTInsertQuery.h>
 #include <Formats/ReadSchemaUtils.h>
-#include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Interpreters/Context.h>
+#include <Parsers/ASTInsertQuery.h>
+#include <QueryPipeline/QueryPipelineBuilder.h>
+#include <Common/logger_useful.h>
 
 #include <Processors/Sources/NullSource.h>
 #include <Processors/QueryPlan/QueryPlan.h>
@@ -663,7 +663,7 @@ void StorageObjectStorage::importMergeTreePartition(
         auto builder = plan_for_part.buildQueryPipeline(optimization_settings, pipeline_settings);
         auto pipeline = QueryPipelineBuilder::getPipeline(std::move(*builder));
 
-        auto sink = std::make_shared<StorageObjectStorageSinkMTPartImportDecorator>(
+        auto sink = std::make_shared<StorageObjectStorageMergeTreePartImporterSink>(
             data_part,
             file_path,
             object_storage,

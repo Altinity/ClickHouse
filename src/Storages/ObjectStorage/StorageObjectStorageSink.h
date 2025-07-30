@@ -8,6 +8,7 @@ namespace DB
 {
 class StorageObjectStorageSink : public SinkToStorage
 {
+friend class StorageObjectStorageMergeTreePartImporterSink;
 public:
     using ConfigurationPtr = StorageObjectStorage::ConfigurationPtr;
 

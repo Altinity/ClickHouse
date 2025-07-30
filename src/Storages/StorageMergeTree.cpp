@@ -48,7 +48,7 @@
 #include <Common/escapeForFileName.h>
 #include "Core/BackgroundSchedulePool.h"
 #include "Core/Names.h"
-#include "ObjectStorage/MergeTree/StorageObjectStorageSinkMTPartImportDecorator.h"
+#include "ObjectStorage/MergeTree/StorageObjectStorageMergeTreePartImporterSink.h"
 
 namespace DB
 {
