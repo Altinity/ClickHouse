@@ -47,7 +47,7 @@ env:
 
 jobs:
   republish:
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
     outputs:
       image_archives_path: ${{ steps.set_path.outputs.image_archives_path }}
     steps:

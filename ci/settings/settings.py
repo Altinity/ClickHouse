@@ -5,10 +5,10 @@ S3_REPORT_BUCKET_HTTP_ENDPOINT = "s3.amazonaws.com/clickhouse-test-reports"
 
 
 class RunnerLabels:
-    STYLE_CHECK_AMD = ["self-hosted", "altinity-on-demand", "altinity-style-checker"]
+    STYLE_CHECK_AMD = ["self-hosted", "altinity-aws-ec2-runners", "altinity-style-checker"]
     STYLE_CHECK_ARM = [
         "self-hosted",
-        "altinity-on-demand",
+        "altinity-aws-ec2-runners",
         "altinity-style-checker-aarch64",
     ]
 

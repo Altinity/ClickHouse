@@ -35,7 +35,7 @@ env:
 jobs:
     grype_scan:
         name: Grype Scan
-        runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
+        runs-on: [self-hosted, altinity-ec2-runners, altinity-style-checker-aarch64]
         steps:
         - name: Checkout repository
           uses: actions/checkout@v4

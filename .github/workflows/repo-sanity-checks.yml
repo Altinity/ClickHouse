@@ -7,7 +7,7 @@ on:
     
 jobs:
   sanity-checks:
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker]
     strategy:
       fail-fast: false  # Continue with other combinations if one fails
       matrix:

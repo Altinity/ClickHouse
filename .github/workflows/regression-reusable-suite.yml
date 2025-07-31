@@ -65,7 +65,7 @@ jobs:
     name: ${{ format('{0}{1}', inputs.job_name != '' && inputs.job_name || inputs.suite_name, inputs.part != '' && format('_{0}', inputs.part) || '') }}
     runs-on: [
       "self-hosted",
-      "altinity-on-demand",
+      "altinity-aws-ec2-runners",
       "${{ inputs.runner_type }}",
     ]
     timeout-minutes: ${{ inputs.timeout_minutes }}

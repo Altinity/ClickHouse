@@ -31,7 +31,7 @@ env:
 
 jobs:
   Compare:
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
     steps:
       - name: Check commit status
         run: |

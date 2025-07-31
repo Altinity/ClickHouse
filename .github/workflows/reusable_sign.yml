@@ -78,7 +78,7 @@ jobs:
         run: |
 
           # Prepend self-hosted
-          input="self-hosted, altinity-on-demand, ${input}"
+          input="self-hosted, altinity-aws-ec2-runners, ${input}"
 
           # Remove all whitespace
           input="$(echo ${input} | tr -d [:space:])"

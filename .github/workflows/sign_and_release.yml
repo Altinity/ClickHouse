@@ -27,7 +27,23 @@ env:
 
 jobs:
   extract-package-info:
+<<<<<<< HEAD
     runs-on: [altinity-style-checker-aarch64, altinity-on-demand]
+||||||| parent of f905df4ff88 (make jobs ec2 only)
+    runs-on: [altinity-style-checker-aarch64, altinity-on-demand]
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      FOLDER_TIME: ${{ inputs.folder_time }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+=======
+    runs-on: [altinity-style-checker-aarch64, altinity-aws-ec2-runners]
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      FOLDER_TIME: ${{ inputs.folder_time }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+>>>>>>> f905df4ff88 (make jobs ec2 only)
     outputs:
       docker_version: ${{ env.DOCKER_VERSION }}-${{ env.PACKAGE_VERSION }}
       commit_hash: ${{ env.COMMIT_HASH }}
@@ -217,7 +233,7 @@ jobs:
 
   copy-packages:
     needs: extract-package-info
-    runs-on: [altinity-func-tester, altinity-on-demand]
+    runs-on: [altinity-func-tester, altinity-aws-ec2-runners]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -392,7 +408,7 @@ jobs:
 
   copy-test-results:
     needs: extract-package-info
-    runs-on: [altinity-style-checker-aarch64, altinity-on-demand]
+    runs-on: [altinity-style-checker-aarch64, altinity-aws-ec2-runners]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -534,7 +550,7 @@ jobs:
   copy-to-released:
     needs: [sign-and-publish]
     if: ${{ inputs.release_environment == 'production' }}
-    runs-on: [altinity-style-checker-aarch64, altinity-on-demand]
+    runs-on: [altinity-style-checker-aarch64, altinity-aws-ec2-runners]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
