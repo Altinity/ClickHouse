@@ -8,32 +8,55 @@
     <source media="(prefers-color-scheme: light)" srcset="/docs/logo_horizontal_blue_black.png">
     <img alt="Altinity company logo" src="/docs/logo_horizontal_blue_black.png">
 </picture>
-
+<h3>Welcome to the Altinity GitHub repository for Project Antalya and Altinity Stable® Builds of ClickHouse®.</h3> 
+ClickHouse® is a registered trademark of ClickHouse, Inc.; Altinity is not affiliated with or associated 
+with ClickHouse, Inc.
 </div>
 
-<h1>Altinity Antalya</h1>
+<h1>Project Antalya Builds</h1>
 
+**Project Antalya Builds** extend ClickHouse® code to improve cost-efficiency, performance, 
+and scalability of real-time analytic systems through deep integration with data lakes. 
+We're delivering a new foundation of real-time analtyics that will operate for the next decade. 
+
+- Fast I/O for Parquet files on S3 to match MergeTree performance
+- Iceberg tables as performant shared storage that is 10x cheaper than replicated block storage
+- Swarm clusters of stateless servers for scalable, cheap, and fast query response
+- Tiered storage to archive MergeTree cold data automatically to efficient, fast Iceberg data (In Development)
+- 100% open source with full compatibility with existing ClickHouse features
+
+Here are links for more information.  
+- [Getting Started with Altinity’s Project Antalya blog article](https://altinity.com/blog/getting-started-with-altinitys-project-antalya)
+- [Project Antalya official documentation](https://docs.altinity.com/altinityantalya/)
 - [Feature matrix](Antalya.md)
 - [Project roadmap](https://github.com/Altinity/ClickHouse/issues/804)
 - [Github releases](https://github.com/Altinity/ClickHouse/releases?q=altinityantalya&expanded=false)
 - [Docker images](https://hub.docker.com/r/altinity/clickhouse-server/tags?page=1&name=altinityantalya)
 - [Packages](https://builds.altinity.cloud/#altinityantalya)
+- [Log an Issue](https://github.com/Altinity/ClickHouse/issues)
 
-Project Antalya makes ClickHouse the query engine for Data Lakes that use [Iceberg](https://iceberg.apache.org/) as the table format, store data as columns in [Parquet](https://parquet.apache.org/), all hosted on [S3](https://aws.amazon.com/s3/)-compatible storage. 
+We gladly welcome pull requests. Join the [AltinityDB slack workspace](https://altinity.com/slack) 
+for help getting started. 
 
 <h1>Altinity Stable Builds®</h1>
 
-- [github releases](https://github.com/Altinity/ClickHouse/releases?q=altinitystable&expanded=false)
-- [docker images](https://hub.docker.com/r/altinity/clickhouse-server/tags?page=1&name=altinitystable)
-- [packages](https://builds.altinity.cloud/#altinitystable)
-
-**Altinity Stable Builds** are releases of ClickHouse® that undergo rigorous testing to verify they are secure and ready for production use. Among other things, they are: 
+**Altinity Stable Builds** are builds of ClickHouse® intended for reliable enterprise use with long intervals
+between major upgrades. Builds undergo rigorous testing to verify security and readiness for production 
+use. Among other things, they are: 
 
 * Supported for three years
 * Validated against client libraries and visualization tools
+* Supplied with careful release notes, with special attention to upgrade
 * Tested for cloud use, including Kubernetes
 * 100% open source and 100% compatible with ClickHouse upstream builds
 * Available in FIPS-compatible versions
+
+Here links for more information. 
+
+- [Altinity Stable official documentation](https://docs.altinity.com/altinitystablebuilds/)
+- [github releases](https://github.com/Altinity/ClickHouse/releases?q=altinitystable&expanded=false)
+- [docker images](https://hub.docker.com/r/altinity/clickhouse-server/tags?page=1&name=altinitystable)
+- [packages](https://builds.altinity.cloud/#altinitystable)
 
 **We encourage you to use Altinity Stable Builds whether you're an Altinity Support customer or not.**
 
