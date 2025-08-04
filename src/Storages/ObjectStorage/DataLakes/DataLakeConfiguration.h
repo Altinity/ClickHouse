@@ -370,15 +370,15 @@ public:
 
 protected:
     void fromNamedCollection(const NamedCollection & collection, ContextPtr context) override
-        { return getImpl().fromNamedCollection(collection, context); }
+        { getImpl().fromNamedCollection(collection, context); }
     void fromAST(ASTs & args, ContextPtr context, bool with_structure) override
-        { return getImpl().fromAST(args, context, with_structure); }
+        { getImpl().fromAST(args, context, with_structure); }
 
     /// Find storage_type argument and remove it from args if exists.
     /// Return storage type.
     ObjectStorageType extractDynamicStorageType(ASTs & args, ContextPtr context, ASTPtr * type_arg) const override
     {
-        static const auto storage_type_name = "storage_type";
+        static const auto * const storage_type_name = "storage_type";
 
         if (auto named_collection = tryGetNamedCollectionWithOverrides(args, context))
         {
@@ -388,20 +388,20 @@ protected:
             }
         }
 
-        auto type_it = args.end();
+        auto * type_it = args.end();
 
         /// S3 by default for backward compatibility
         /// Iceberg without storage_type == IcebergS3
         ObjectStorageType type = ObjectStorageType::S3;
 
-        for (auto arg_it = args.begin(); arg_it != args.end(); ++arg_it)
+        for (auto * arg_it = args.begin(); arg_it != args.end(); ++arg_it)
         {
             const auto * type_ast_function = (*arg_it)->as<ASTFunction>();
 
             if (type_ast_function && type_ast_function->name == "equals"
                 && type_ast_function->arguments && type_ast_function->arguments->children.size() == 2)
             {
-                auto name = type_ast_function->arguments->children[0]->as<ASTIdentifier>();
+                auto * name = type_ast_function->arguments->children[0]->as<ASTIdentifier>();
 
                 if (name && name->name() == storage_type_name)
                 {
@@ -412,7 +412,7 @@ protected:
                             "DataLake can have only one key-value argument: storage_type='type'.");
                     }
 
-                    auto value = type_ast_function->arguments->children[1]->as<ASTLiteral>();
+                    auto * value = type_ast_function->arguments->children[1]->as<ASTLiteral>();
 
                     if (!value)
                     {
@@ -451,7 +451,7 @@ protected:
         createDynamicStorage(type);
     }
 
-    void assertInitialized() const override { return getImpl().assertInitialized(); }
+    void assertInitialized() const override { getImpl().assertInitialized(); }
 
 private:
     inline StorageObjectStorage::Configuration & getImpl() const
