@@ -2,8 +2,8 @@
 
 name: NightlyJepsen
 on:
-  schedule:
-    - cron: 13 4 * * *
+  # schedule:
+  #   - cron: 13 4 * * *
   workflow_dispatch:
 
 concurrency:

@@ -35,6 +35,6 @@ tests/ci/cancel_and_rerun_workflow_lambda/app.py
 - [x] <!---ci_exclude_msan--> All with MSAN
 - [x] <!---ci_exclude_ubsan--> All with UBSAN
 - [ ] <!---ci_exclude_coverage--> All with Coverage
-- [ ] <!---ci_exclude_aarch64--> All with Aarch64
+- [ ] <!---ci_exclude_aarch64|arm--> All with Aarch64
 - [x] <!---ci_exclude_regression--> All Regression
 - [ ] <!---no_ci_cache--> Disable CI Cache
