@@ -14,6 +14,11 @@ on:
         description: 'The version of the package to release'
         required: true
         type: string
+      docker_release:
+        description: 'Publish Docker images'
+        required: true
+        default: true
+        type: boolean
       GPG_PASSPHRASE:
         description: 'GPG passphrase for signing (required for production releases)'
         required: false
@@ -320,6 +325,7 @@ jobs:
           fi
 
   publish-docker:
+    if: ${{ github.event.inputs.docker_release == 'true' }}
     needs: extract-package-info
     strategy:
       matrix:
