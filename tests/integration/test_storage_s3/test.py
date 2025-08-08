@@ -16,6 +16,8 @@ from helpers.mock_servers import start_mock_servers
 from helpers.network import PartitionManager
 from helpers.s3_tools import prepare_s3_bucket
 from helpers.test_tools import exec_query_with_retry
+from helpers.config_cluster import minio_secret_key
+from helpers.s3_queue_common import generate_random_string
 
 MINIO_INTERNAL_PORT = 9001
 
@@ -2519,4 +2521,131 @@ def test_filesystem_cache(started_cluster):
         instance.query(
             f"SELECT ProfileEvents['S3GetObject'] FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
         )
+    )
+    instance.query("SYSTEM FLUSH LOGS")
+
+    total_count = int(
+        instance.query(
+            f"SELECT count() FROM system.text_log WHERE query_id = '{query_id}' and message ilike '%Boundary alignment:%'"
+        )
+    )
+    assert total_count > 0
+    count = int(
+        instance.query(
+            f"SELECT count() FROM system.text_log WHERE query_id = '{query_id}' and message ilike '%Boundary alignment: 0%'"
+        )
+    )
+    assert count == total_count
+
+
+def test_key_value_args(started_cluster):
+    node = started_cluster.instances["dummy"]
+    restricted_node = started_cluster.instances["restricted_dummy"]
+    table_name = f"test_key_value_args_{generate_random_string()}"
+    bucket = started_cluster.minio_bucket
+
+    url = f"http://{started_cluster.minio_host}:{started_cluster.minio_port}/{bucket}/{table_name}_data"
+
+    # Check format.
+    assert (
+        "The data format cannot be detected by the contents"
+        in node.query_and_get_error(
+            f"insert into function s3('{url}', structure = 'a Int32, b String') select number, toString(number) from numbers(10) settings s3_truncate_on_insert=1"
+        )
+    )
+    node.query(
+        f"insert into function s3('{url}', format = TSVRaw, structure = 'a Int32, b String') select number, toString(number) from numbers(10) settings s3_truncate_on_insert=1"
+    )
+    node.query(
+        f"insert into function s3('{url}', 'TSVRaw', structure = 'a Int32, b String') select number, toString(number) from numbers(10) settings s3_truncate_on_insert=1"
+    )
+
+    # Check structure.
+    assert (
+        "a\tInt32\t\t\t\t\t\nb\tString"
+        in node.query(
+            f"describe table s3('{url}', format = TSVRaw, structure = 'a Int32, b String')"
+        ).strip()
+    )
+    assert 2 == int(
+        node.query(
+            f"select a from s3('{url}', format = TSVRaw, structure = 'a Int32, b String') where b = '2'"
+        )
+    )
+
+    # Check access_key_id, secret_access_key
+    assert (
+        "The request signature we calculated does not match the signature you provided"
+        in node.query_and_get_error(
+            f"insert into function s3('{url}', structure = 'a Int32, b String', access_key_id = 'minio', secret_access_key = 'keko', format = 'TSVRaw') select number, toString(number) from numbers(10) settings s3_truncate_on_insert=1"
+        )
+    )
+    node.query(
+        f"insert into function s3('{url}', structure = 'a Int32, b String', access_key_id = 'minio', secret_access_key = '{minio_secret_key}', format = 'TSVRaw') select number, toString(number) from numbers(10) settings s3_truncate_on_insert=1"
+    )
+    assert 2 == int(
+        node.query(
+            f"select a from s3('{url}', format = TSVRaw, access_key_id = 'minio', secret_access_key = '{minio_secret_key}', structure = 'a Int32, b String') where b = '2'"
+        )
+    )
+
+    # Check session_token
+    assert "Failed to get object info" in node.query_and_get_error(
+        f"select a from s3('{url}', format = TSVRaw, access_key_id = 'minio', secret_access_key = '{minio_secret_key}', structure = 'a Int32, b String', session_token = 'kek') where b = '2'"
+    )
+
+    # Check structure
+    assert "Cannot parse DateTime" in node.query_and_get_error(
+        f"select a from s3('{url}', format = TSVRaw, access_key_id = 'minio', secret_access_key = '{minio_secret_key}', structure = 'a Int32, b DateTime') where b = '2'"
+    )
+
+    # Check compression_method
+    assert "inflate failed" in node.query_and_get_error(
+        f"select a from s3('{url}', format = TSVRaw, structure = 'a Int32, b String', access_key_id = 'minio', secret_access_key = '{minio_secret_key}', compression_method = 'gzip') where b = '2'"
+    )
+    assert 2 == int(
+        node.query(
+            f"select a from s3('{url}', format = TSVRaw, structure = 'a Int32, b String', access_key_id = 'minio', secret_access_key = '{minio_secret_key}', compression_method = 'none') where b = '2'"
+        )
+    )
+
+    # Check partition strategy
+    assert "is not supported" in node.query_and_get_error(
+        f"insert into function s3('{url}', format = TSVRaw, structure = 'a Int32, b String', partition_strategy='hivy') partition by b select number, toString(number) from numbers(10) settings s3_truncate_on_insert=1"
+    )
+    node.query(
+        f"insert into function s3('{url}', format = TSVRaw, structure = 'a Int32, b String', partition_strategy='hive') partition by b select number, toString(number) from numbers(10) settings s3_truncate_on_insert=1"
+    )
+
+    # Check order - positional args before key-value
+    assert (
+        "Expected positional arguments to go before key-value arguments"
+        in node.query_and_get_error(
+            f"insert into function s3('{url}', structure = 'a Int32, b String', partition_strategy='hive', TSV) partition by b select number, toString(number) from numbers(10) settings s3_truncate_on_insert=1"
+        )
+    )
+
+    # Check s3Cluster
+    assert 2 == int(
+        node.query(
+            f"select a from s3Cluster(cluster, '{url}', TSVRaw, structure = 'a Int32, b String', access_key_id = 'minio', secret_access_key = '{minio_secret_key}', compression_method = 'none') where b = '2'",
+        )
+    )
+    assert 2 == int(
+        node.query(
+            f"select a from s3Cluster(cluster, '{url}', format = TSVRaw, structure = 'a Int32, b String', access_key_id = 'minio', secret_access_key = '{minio_secret_key}', compression_method = 'none') where b = '2'",
+        )
+    )
+    assert 2 == int(
+        node.query(
+            f"select a from s3Cluster(cluster, '{url}', structure = 'a Int32, b String', access_key_id = 'minio', secret_access_key = '{minio_secret_key}', compression_method = 'none') where b = '2'",
+        )
+    )
+
+    node.query(
+        f"CREATE TABLE {table_name} (a Int32, b String) engine = S3('{url}', format = TSVRaw, access_key_id = 'minio', secret_access_key = '{minio_secret_key}', compression_method = 'gzip')"
+    )
+    assert (
+        f"S3(\\'{url}\\', \\'TSVRaw\\', format = \\'TSVRaw\\', access_key_id = \\'minio\\', secret_access_key = \\'[HIDDEN]\\', compression_method = \\'gzip\\')"
+        in node.query(f"SHOW CREATE TABLE {table_name}")
     )
