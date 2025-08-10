@@ -1857,6 +1857,9 @@ class TestCase:
         if result.status == TestStatus.FAIL and self.testcase_args:
             description_full += "Database: " + self.testcase_args.testcase_database
 
+        if result.status == TestStatus.FAIL:
+            description_full += "\nSystem disk usage:\n" + subprocess.check_output("df -h", shell=True).decode('utf-8')
+
         result.description = description_full
         return result
 
