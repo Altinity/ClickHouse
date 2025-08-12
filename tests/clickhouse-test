@@ -1313,14 +1313,22 @@ class TestCase:
                 )
 
             database = f"test_{random_str()}"
+            command = f"{args.client}" \
+                    + " -q" \
+                    + " 'CREATE DATABASE IF NOT EXISTS " \
+                        + database \
+                        + get_db_engine(testcase_args, database) \
+                    + "' " \
+                    + TestCase.cli_format_settings(get_create_database_settings(args, testcase_args))
 
-            clickhouse_execute(
-                args,
-                "CREATE DATABASE IF NOT EXISTS "
-                + database
-                + get_db_engine(testcase_args, database),
-                settings=get_create_database_settings(args, testcase_args),
-            )
+            subprocess.check_call(command, shell=True)
+            # clickhouse_execute(
+            #     args,
+            #     "CREATE DATABASE IF NOT EXISTS "
+            #     + database
+            #     + get_db_engine(testcase_args, database),
+            #     settings=get_create_database_settings(args, testcase_args),
+            # )
 
             os.environ["CLICKHOUSE_DATABASE"] = database
             # Set temporary directory to match the randomly generated database,
