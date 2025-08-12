@@ -2010,13 +2010,14 @@ class TestCase:
             )
 
         # pylint:disable-next=consider-using-with; TODO: fix
-        with autokill_subprocess(Popen(command, shell=True, env=tests_env, start_new_session=True)) as proc:
-            try:
-                proc.wait(args.timeout)
-            except subprocess.TimeoutExpired:
-                # Whether the test timed out will be decided later
-                print(f"!!! Timeout: {args.timeout}")
-                pass
+        with Popen(command, shell=True, env=tests_env, start_new_session=True) as proc:
+            with autokill_subprocess(proc) as proc:
+                try:
+                    proc.wait(args.timeout)
+                except subprocess.TimeoutExpired:
+                    # Whether the test timed out will be decided later
+                    print(f"!!! Timeout: {args.timeout}")
+                    pass
 
         total_time = (datetime.now() - start_time).total_seconds()
 

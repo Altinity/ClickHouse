@@ -70,7 +70,7 @@ def run_tests(
 ):
     assert not (no_parallel and no_sequiential)
     test_output_file = f"{temp_dir}/test_result.txt"
-    nproc = int(Utils.cpu_count() / 2)
+    nproc = int(Utils.cpu_count() / 8)
     if batch_num and batch_total:
         extra_args += (
             f" --run-by-hash-total {batch_total} --run-by-hash-num {batch_num-1}"
