@@ -36,6 +36,8 @@ import tempfile
 import traceback
 from functools import cache
 import urllib.parse
+from contextlib import contextmanager
+import sys
 
 # for crc32
 import zlib
@@ -65,6 +67,7 @@ MESSAGES_TO_RETRY = [
     "ConnectionPoolWithFailover: Connection failed at try",
     "DB::Exception: New table appeared in database being dropped or detached. Try again",
     "is already started to be removing by another replica right now",
+    "(UNKNOWN_DATABASE)",
     # This is from LSan, and it indicates its own internal problem:
     "Unable to get registers from thread",
 ]
@@ -435,14 +438,25 @@ def clickhouse_execute_http(
     max_http_retries=5,
     retry_error_codes=False,
 ):
-    if base_args.secure:
-        client = http.client.HTTPSConnection(
-            host=base_args.tcp_host, port=base_args.http_port, timeout=timeout
-        )
-    else:
-        client = http.client.HTTPConnection(
-            host=base_args.tcp_host, port=base_args.http_port, timeout=timeout
-        )
+
+    # make sure client connections are always properly terminated
+    @contextmanager
+    def make_http_client():
+        if base_args.secure:
+            client = http.client.HTTPSConnection(
+                host=base_args.tcp_host, port=base_args.http_port, timeout=timeout
+            )
+        else:
+            client = http.client.HTTPConnection(
+                host=base_args.tcp_host, port=base_args.http_port, timeout=timeout
+            )
+        try:
+            client.connect()
+            yield client
+        finally:
+            client.close()
+            del client
+
 
     timeout = int(timeout)
     params = {
@@ -464,22 +478,23 @@ def clickhouse_execute_http(
     if default_format is not None:
         params["default_format"] = default_format
 
-    for i in range(max_http_retries):
-        try:
-            client.request(
-                "POST",
-                f"/?{base_args.client_options_query_str}{urllib.parse.urlencode(params)}",
-                body=body,
-            )
-            res = client.getresponse()
-            data = res.read()
-            if res.status == 200 or (not retry_error_codes):
-                break
-        except Exception as ex:
-            if i == max_http_retries - 1:
-                raise ex
-            client.close()
-            sleep(i + 1)
+    with make_http_client() as client:
+        for i in range(max_http_retries):
+            try:
+                client.request(
+                    "POST",
+                    f"/?{base_args.client_options_query_str}{urllib.parse.urlencode(params)}",
+                    body=body,
+                )
+                res = client.getresponse()
+                data = res.read()
+                if res.status == 200 or (not retry_error_codes):
+                    break
+            except Exception as ex:
+                if i == max_http_retries - 1:
+                    raise ex
+                client.close()
+                sleep(i + 1)
 
     if res.status != 200:
         raise HTTPError(data.decode(), res.status)
@@ -665,6 +680,18 @@ def need_retry(args, stdout, stderr, total_time):
         msg in stderr for msg in MESSAGES_TO_RETRY
     )
 
+@contextmanager
+def autokill_subprocess(proc : Optional[Popen]):
+    try:
+        yield proc
+    finally:
+        if proc is not None:
+            if proc.poll() is None:
+                # seems to be still running
+                print(f"child process {proc} is still running and will be force killed")
+                proc.kill()
+            # to properly cleanup stdin, stdout, etc...
+            proc.__exit__(*sys.exc_info())
 
 def get_processlist_size(args):
     if args.replicated_database:
@@ -1594,6 +1621,7 @@ class TestCase:
             if proc.returncode is None:
                 f = io.StringIO()
                 with redirect_stdout(f):
+                    cleanup_child_processes(proc.pid)
                     kill_process_group(os.getpgid(proc.pid))
                 kill_output = f.getvalue()
 
@@ -1858,7 +1886,23 @@ class TestCase:
             description_full += "Database: " + self.testcase_args.testcase_database
 
         if result.status == TestStatus.FAIL:
-            description_full += "\nSystem disk usage:\n" + subprocess.check_output("df -h", shell=True).decode('utf-8')
+            for description, command in [
+                ("OS info", "lsb_release -idrc"),
+                ("disk usage", "df -h"),
+                ("RAM usage", "free -h"),
+                # ("child processes", ("ps -f -g ", {'env' : {"LIBPROC_HIDE_KERNEL" : "1"}})),
+                ("ALL processes", ("ps xj", {'env' : {"LIBPROC_HIDE_KERNEL" : "1"}})),
+            ]:
+                try:
+                    if isinstance(command, str):
+                        output = subprocess.check_output(command, shell=True)
+                    else:
+                        command, kwargs = command
+                        output = subprocess.check_output(command, **kwargs, shell=True)
+                except Exception as e:
+                    print(f"Failed to execute post-failure command '{command}', got exception: {e}")
+                else:
+                    description_full += f"\n{description} :\n{output.decode('utf-8')}"
 
         result.description = description_full
         return result
@@ -1966,13 +2010,13 @@ class TestCase:
             )
 
         # pylint:disable-next=consider-using-with; TODO: fix
-        proc = Popen(command, shell=True, env=tests_env, start_new_session=True)
-
-        try:
-            proc.wait(args.timeout)
-        except subprocess.TimeoutExpired:
-            # Whether the test timed out will be decided later
-            pass
+        with autokill_subprocess(Popen(command, shell=True, env=tests_env, start_new_session=True)) as proc:
+            try:
+                proc.wait(args.timeout)
+            except subprocess.TimeoutExpired:
+                # Whether the test timed out will be decided later
+                print(f"!!! Timeout: {args.timeout}")
+                pass
 
         total_time = (datetime.now() - start_time).total_seconds()
 
@@ -2062,6 +2106,7 @@ class TestCase:
                 )
 
                 result = self.process_result_impl(proc, total_time)
+
                 result.check_if_need_retry(
                     args, result.description, result.description, self.runs_count
                 )
@@ -2671,6 +2716,7 @@ def run_tests_array(
                         args, test_suite, client_options, server_logs_level
                     )
                     test_result = test_case.process_result(test_result, MESSAGES)
+
                 except TimeoutError:
                     break
                 finally:
