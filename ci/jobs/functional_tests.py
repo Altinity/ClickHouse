@@ -70,7 +70,7 @@ def run_tests(
 ):
     assert not (no_parallel and no_sequiential)
     test_output_file = f"{temp_dir}/test_result.txt"
-    nproc = int(Utils.cpu_count() / 8)
+    nproc = 1 #int(Utils.cpu_count() / 2)
     if batch_num and batch_total:
         extra_args += (
             f" --run-by-hash-total {batch_total} --run-by-hash-num {batch_num-1}"
@@ -81,11 +81,13 @@ def run_tests(
         extra_args += " --shard"
     if "--no-zookeeper" not in extra_args:
         extra_args += " --zookeeper"
+
     # Remove --report-logs-stats, it hides sanitizer errors in def reportLogStats(args): clickhouse_execute(args, "SYSTEM FLUSH LOGS")
     command = f"clickhouse-test --testname --check-zookeeper-session --hung-check --trace \
                 --capture-client-stacktrace --queries ./tests/queries --test-runs 1 \
                 {'--no-parallel' if no_parallel else ''}  {'--no-sequential' if no_sequiential else ''} \
                 --jobs {nproc} {extra_args} \
+                --sequential \
                 --queries ./tests/queries -- '{test}' | ts '%Y-%m-%d %H:%M:%S' \
                 | tee -a \"{test_output_file}\""
     if Path(test_output_file).exists():
@@ -95,10 +97,11 @@ def run_tests(
 
 def run_specific_tests(tests, runs=1):
     test_output_file = f"{temp_dir}/test_result.txt"
-    nproc = int(Utils.cpu_count() / 2)
+    nproc = 1 #int(Utils.cpu_count() / 2)
     # Remove --report-logs-stats, it hides sanitizer errors in def reportLogStats(args): clickhouse_execute(args, "SYSTEM FLUSH LOGS")
     command = f"clickhouse-test --testname --shard --zookeeper --check-zookeeper-session --hung-check \
         --capture-client-stacktrace --queries ./tests/queries --test-runs {runs} \
+        --sequential \
         --jobs {nproc} --order=random -- {' '.join(tests)} | ts '%Y-%m-%d %H:%M:%S' | tee -a \"{test_output_file}\""
     if Path(test_output_file).exists():
         Path(test_output_file).unlink()
