@@ -1894,12 +1894,20 @@ class TestCase:
             description_full += "Database: " + self.testcase_args.testcase_database
 
         if result.status == TestStatus.FAIL:
+            def query(q_str : str):
+                return "f{args.client} -q '{q_str}'"
+
             for description, command in [
-                ("OS info", "lsb_release -idrc"),
+                # ("OS info", "lsb_release -idrc"),
                 ("disk usage", "df -h"),
                 ("RAM usage", "free -h"),
                 # ("child processes", ("ps -f -g ", {'env' : {"LIBPROC_HIDE_KERNEL" : "1"}})),
-                ("ALL processes", ("ps xj", {'env' : {"LIBPROC_HIDE_KERNEL" : "1"}})),
+                # ("ALL processes", ("ps xj", {'env' : {"LIBPROC_HIDE_KERNEL" : "1"}})),
+                ("system parameters", "sysctl -a"),
+                ("CH Databases",       query("SHOW DATABASES")),
+                ("CH Warnings",        query("SELECT * FROM system.warnings")),
+                ("CH Open sessions",   query("SELECT event_time, client_address, client_port, interface, user, auth_type FROM system.session_log WHERE type == 'LoginSuccess' AND auth_id NOT IN (SELECT auth_id FROM system.session_log WHERE type == 'Logout') ORDER BY event_time")),
+                ("CH Metrics",         query("SELECT metric, value FROM  system.metrics WHERE value != 0"))
             ]:
                 try:
                     if isinstance(command, str):
@@ -1910,7 +1918,7 @@ class TestCase:
                 except Exception as e:
                     print(f"Failed to execute post-failure command '{command}', got exception: {e}")
                 else:
-                    description_full += f"\n{description} :\n{output.decode('utf-8')}"
+                    description_full += f"\n{description}:\n{command}\n\n{output.decode('utf-8')}"
 
         result.description = description_full
         return result
