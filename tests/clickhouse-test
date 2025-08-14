@@ -2238,7 +2238,7 @@ class TestCase:
         time_passed = (datetime.now() - args.testcase_start_time).total_seconds()
         timeout = max(args.timeout - time_passed, 20)
 
-        self._cleanup_database(args, timeout)
+        # self._cleanup_database(args, timeout)
         shutil.rmtree(args.test_tmp_dir)
 
     def _cleanup_database(self, args, timeout):
