@@ -87,7 +87,7 @@ def run_tests(
                 --capture-client-stacktrace --queries ./tests/queries --test-runs 1 \
                 {'--no-parallel' if no_parallel else ''}  {'--no-sequential' if no_sequiential else ''} \
                 --jobs {nproc} {extra_args} \
-                --sequential \
+                --sequential=1 \
                 --queries ./tests/queries -- '{test}' | ts '%Y-%m-%d %H:%M:%S' \
                 | tee -a \"{test_output_file}\""
     if Path(test_output_file).exists():
@@ -101,7 +101,7 @@ def run_specific_tests(tests, runs=1):
     # Remove --report-logs-stats, it hides sanitizer errors in def reportLogStats(args): clickhouse_execute(args, "SYSTEM FLUSH LOGS")
     command = f"clickhouse-test --testname --shard --zookeeper --check-zookeeper-session --hung-check \
         --capture-client-stacktrace --queries ./tests/queries --test-runs {runs} \
-        --sequential \
+        --sequential=1 \
         --jobs {nproc} --order=random -- {' '.join(tests)} | ts '%Y-%m-%d %H:%M:%S' | tee -a \"{test_output_file}\""
     if Path(test_output_file).exists():
         Path(test_output_file).unlink()
