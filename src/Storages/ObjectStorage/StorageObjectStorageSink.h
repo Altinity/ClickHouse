@@ -50,8 +50,7 @@ public:
         const std::shared_ptr<ObjectStorageFilePathGenerator> & file_path_generator_,
         std::optional<FormatSettings> format_settings_,
         const Block & sample_block_,
-        ContextPtr context_,
-        std::optional<std::string> filename_override_ = std::nullopt);
+        ContextPtr context_);
 
     SinkPtr createSinkForPartition(const String & partition_id) override;
 
@@ -64,7 +63,6 @@ private:
     const std::optional<FormatSettings> format_settings;
     const Block sample_block;
     const ContextPtr context;
-    std::optional<std::string> filename_override;
 };
 
 }

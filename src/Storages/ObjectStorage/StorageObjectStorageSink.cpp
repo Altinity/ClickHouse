@@ -133,8 +133,7 @@ PartitionedStorageObjectStorageSink::PartitionedStorageObjectStorageSink(
     const std::shared_ptr<ObjectStorageFilePathGenerator> & file_path_generator_,
     std::optional<FormatSettings> format_settings_,
     const Block & sample_block_,
-    ContextPtr context_,
-    std::optional<std::string> filename_override_)
+    ContextPtr context_)
     : object_storage(object_storage_)
     , configuration(configuration_)
     , file_path_generator(file_path_generator_)
@@ -142,7 +141,6 @@ PartitionedStorageObjectStorageSink::PartitionedStorageObjectStorageSink(
     , format_settings(format_settings_)
     , sample_block(sample_block_)
     , context(context_)
-    , filename_override(filename_override_)
 {
 }
 
@@ -154,7 +152,7 @@ StorageObjectStorageSink::~StorageObjectStorageSink()
 
 SinkPtr PartitionedStorageObjectStorageSink::createSinkForPartition(const String & partition_id)
 {
-    auto file_path = file_path_generator->getWritingPath(partition_id, filename_override);
+    auto file_path = file_path_generator->getWritingPath(partition_id);
 
     validateNamespace(configuration->getNamespace(), configuration);
     validateKey(file_path);

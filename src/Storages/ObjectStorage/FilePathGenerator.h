@@ -10,7 +10,7 @@ namespace DB
     struct ObjectStorageFilePathGenerator
     {
         virtual ~ObjectStorageFilePathGenerator() = default;
-        virtual std::string getWritingPath(const std::string & partition_id, std::optional<std::string> filename_override = {}) const = 0;
+        virtual std::string getWritingPath(const std::string & partition_id) const = 0;
         virtual std::string getReadingPath() const = 0;
     };
 
@@ -18,7 +18,7 @@ namespace DB
     {
         explicit ObjectStorageWildcardFilePathGenerator(const std::string & raw_path_) : raw_path(raw_path_) {}
 
-        std::string getWritingPath(const std::string & partition_id, std::optional<std::string> /**/ = {}) const override
+        std::string getWritingPath(const std::string & partition_id) const override
         {
             return PartitionedSink::replaceWildcards(raw_path, partition_id);
         }
@@ -41,9 +41,9 @@ namespace DB
             const std::shared_ptr<ObjectStorageFilenameGenerator> & filename_generator_)
         : raw_path(raw_path_), file_format(Poco::toLower(file_format_)), filename_generator(filename_generator_){}
 
-        std::string getWritingPath(const std::string & partition_id, std::optional<std::string> filename_override) const override
+        std::string getWritingPath(const std::string & partition_id) const override
         {
-            return raw_path + "/" + partition_id + "/"  + (filename_override ? *filename_override : filename_generator->generate()) + "." + file_format;
+            return raw_path + "/" + partition_id + "/"  + filename_generator->generate() + "." + file_format;
         }
 
         std::string getReadingPath() const override

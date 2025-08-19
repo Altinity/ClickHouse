@@ -554,9 +554,6 @@ void StorageObjectStorage::importMergeTreePartition(
     if (data_parts.empty())
         return;
 
-    RelativePathsWithMetadata relative_paths_with_metadata;
-    object_storage->listObjects(configuration->getRawPath().path, relative_paths_with_metadata, 1000);
-
     std::vector<QueryPlanPtr> part_plans;
     part_plans.reserve(data_parts.size());
 
@@ -580,44 +577,13 @@ void StorageObjectStorage::importMergeTreePartition(
     std::vector<StoredObject> files_to_be_deleted;
     for (const auto & data_part : data_parts)
     {
-        bool upload_part = true;
-        for (const auto & object_with_metadata : relative_paths_with_metadata)
-        {
-            const auto remote_object_filename = object_with_metadata->getFileNameWithoutExtension();
-            if (remote_object_filename == data_part->name)
-            {
-                upload_part = false;
-                break;
-            }
-
-            const auto remote_fake_part = MergeTreePartInfo::tryParsePartName(remote_object_filename, merge_tree_data.format_version);
-
-            if (!remote_fake_part)
-            {
-                continue;
-            }
-
-            /// If the part does not intersect, proceed to the next file
-            if (data_part->info.isDisjoint(remote_fake_part.value()))
-            {
-                continue;
-            }
-
-            files_to_be_deleted.emplace_back(object_with_metadata->relative_path);
-        }
-
-        if (!upload_part)
-        {
-            continue;
-        }
-
         const auto partition_columns = configuration->partition_strategy->getPartitionColumns();
 
         auto block_with_partition_values = data_part->partition.getBlockWithPartitionValues(partition_columns);
 
         const auto column_with_partition_key = configuration->partition_strategy->computePartitionKey(block_with_partition_values);
 
-        const auto file_path = configuration->file_path_generator->getWritingPath(column_with_partition_key->getDataAt(0).toString(), data_part->name);
+        const auto file_path = configuration->file_path_generator->getWritingPath(column_with_partition_key->getDataAt(0).toString());
 
         export_list_entries.emplace_back(local_context->getGlobalContext()->getExportsList().insert(
             merge_tree_data.getStorageID(),
@@ -682,9 +648,6 @@ void StorageObjectStorage::importMergeTreePartition(
     if (root_pipeline.completed())
     {
         root_pipeline.setNumThreads(local_context->getSettingsRef()[Setting::max_threads]);
-
-        /// shouldn't this be part of the sink and or pipeline?
-        object_storage->removeObjectsIfExist(files_to_be_deleted);
 
         CompletedPipelineExecutor exec(root_pipeline);
         exec.execute();
