@@ -2615,6 +2615,8 @@ def run_tests_array(
         proc_name = multiprocessing.current_process().name
         print(f"Running {about}{num_tests} {test_suite.suite} tests ({proc_name}).")
 
+    print('!!!!!', multiprocessing.current_process().name, '\n'.join(all_tests))
+
     while True:
         if all_tests:
             try:
