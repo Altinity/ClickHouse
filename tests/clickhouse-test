@@ -1285,8 +1285,7 @@ class TestCase:
                     random.SystemRandom().choice(alphabet) for _ in range(length)
                 )
 
-            database = f"test_{random_str()}"
-
+            database = f"test_{os.getpid()}_{random_str(16)}"
             clickhouse_execute(
                 args,
                 "CREATE DATABASE IF NOT EXISTS "
