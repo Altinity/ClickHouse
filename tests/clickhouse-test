@@ -2949,7 +2949,7 @@ def do_run_tests(
         # TODO: add shuffle for sequential tests
         random.shuffle(test_suite.parallel_tests)
 
-        batch_size = len(test_suite.parallel_tests) // jobs
+        batch_size = math.ceil(len(test_suite.parallel_tests) / jobs)
         manager = multiprocessing.Manager()
         parallel_tests = manager.list()
         parallel_tests.extend(test_suite.parallel_tests)
@@ -3010,6 +3010,7 @@ def do_run_tests(
             for p in processes[:]:
                 if not p.is_alive():
                     processes.remove(p)
+
     if test_suite.sequential_tests:
         run_tests_array(
             (
