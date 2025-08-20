@@ -2956,11 +2956,14 @@ def do_run_tests(
 
         processes = []
         for _ in range(jobs):
+            tests_to_run = parallel_tests[:batch_size]
+            del parallel_tests[:batch_size]
+
             process = multiprocessing.Process(
                 target=run_tests_process,
                 args=(
                     (
-                        parallel_tests,
+                        tests_to_run,
                         batch_size,
                         test_suite,
                         True,
@@ -2973,6 +2976,9 @@ def do_run_tests(
             )
             processes.append(process)
             process.start()
+
+        # all of the tests are taken int account
+        assert(len(parallel_tests) == 0)
 
         while processes:
             sleep(0.1)
