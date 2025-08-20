@@ -337,31 +337,76 @@ class JobConfigs:
     )
     functional_tests_jobs_required = common_ft_job_config.parametrize(
         parameter=[
-            "amd_asan, distributed plan, 1/2",
-            "amd_asan, distributed plan, 2/2",
-            "amd_binary",
-            "amd_binary, old analyzer, s3 storage, DatabaseReplicated, 1/2",
-            "amd_binary, old analyzer, s3 storage, DatabaseReplicated, 2/2",
-            "amd_binary, ParallelReplicas, s3 storage",
-            "amd_debug, AsyncInsert, s3 storage",
+            "amd_asan, distributed plan, 1/2", #1
+            "amd_asan, distributed plan, 2/2", #2
+            "amd_binary, 1/16", #3
+            "amd_binary, 2/16", #4
+            "amd_binary, 3/16", #5
+            "amd_binary, 4/16", #6
+            "amd_binary, 5/16", #7
+            "amd_binary, 6/16", #8
+            "amd_binary, 7/16", #9
+            "amd_binary, 8/16", #10
+            "amd_binary, 9/16", #11
+            "amd_binary, 10/16", #12
+            "amd_binary, 11/16", #13
+            "amd_binary, 12/16", #14
+            "amd_binary, 13/16", #15
+            "amd_binary, 14/16", #16
+            "amd_binary, 15/16", #17
+            "amd_binary, 16/16", #18
+            "amd_binary, old analyzer, s3 storage, DatabaseReplicated, 1/2", #19
+            "amd_binary, old analyzer, s3 storage, DatabaseReplicated, 2/2", #20
+            "amd_binary, ParallelReplicas, s3 storage", #21
+            "amd_debug, AsyncInsert, s3 storage", #22
         ],
         runs_on=[
-            RunnerLabels.FUNC_TESTER_AMD,
-            RunnerLabels.FUNC_TESTER_AMD,
-            RunnerLabels.FUNC_TESTER_AMD,
-            RunnerLabels.FUNC_TESTER_AMD,
-            RunnerLabels.FUNC_TESTER_AMD,
-            RunnerLabels.FUNC_TESTER_AMD,
-            RunnerLabels.FUNC_TESTER_AMD,
+            RunnerLabels.FUNC_TESTER_AMD, # 1
+            RunnerLabels.FUNC_TESTER_AMD, # 2
+            RunnerLabels.FUNC_TESTER_AMD, # 3
+            RunnerLabels.FUNC_TESTER_AMD, # 4
+            RunnerLabels.FUNC_TESTER_AMD, # 5
+            RunnerLabels.FUNC_TESTER_AMD, # 6
+            RunnerLabels.FUNC_TESTER_AMD, # 7
+            RunnerLabels.FUNC_TESTER_AMD, # 8
+            RunnerLabels.FUNC_TESTER_AMD, # 9
+            RunnerLabels.FUNC_TESTER_AMD, # 10
+            RunnerLabels.FUNC_TESTER_AMD, # 11
+            RunnerLabels.FUNC_TESTER_AMD, # 12
+            RunnerLabels.FUNC_TESTER_AMD, # 13
+            RunnerLabels.FUNC_TESTER_AMD, # 14
+            RunnerLabels.FUNC_TESTER_AMD, # 15
+            RunnerLabels.FUNC_TESTER_AMD, # 16
+            RunnerLabels.FUNC_TESTER_AMD, # 17
+            RunnerLabels.FUNC_TESTER_AMD, # 18
+            RunnerLabels.FUNC_TESTER_AMD, # 19
+            RunnerLabels.FUNC_TESTER_AMD, # 20
+            RunnerLabels.FUNC_TESTER_AMD, # 21
+            RunnerLabels.FUNC_TESTER_AMD, # 22
         ],
         requires=[
-            [ArtifactNames.CH_AMD_ASAN],
-            [ArtifactNames.CH_AMD_ASAN],
-            [ArtifactNames.CH_AMD_BINARY],
-            [ArtifactNames.CH_AMD_BINARY],
-            [ArtifactNames.CH_AMD_BINARY],
-            [ArtifactNames.CH_AMD_BINARY],
-            [ArtifactNames.CH_AMD_DEBUG],
+            [ArtifactNames.CH_AMD_ASAN], # 1
+            [ArtifactNames.CH_AMD_ASAN], # 2
+            [ArtifactNames.CH_AMD_BINARY], # 3
+            [ArtifactNames.CH_AMD_BINARY], # 4
+            [ArtifactNames.CH_AMD_BINARY], # 5
+            [ArtifactNames.CH_AMD_BINARY], # 6
+            [ArtifactNames.CH_AMD_BINARY], # 7
+            [ArtifactNames.CH_AMD_BINARY], # 8
+            [ArtifactNames.CH_AMD_BINARY], # 9
+            [ArtifactNames.CH_AMD_BINARY], # 10
+            [ArtifactNames.CH_AMD_BINARY], # 11
+            [ArtifactNames.CH_AMD_BINARY], # 12
+            [ArtifactNames.CH_AMD_BINARY], # 13
+            [ArtifactNames.CH_AMD_BINARY], # 14
+            [ArtifactNames.CH_AMD_BINARY], # 15
+            [ArtifactNames.CH_AMD_BINARY], # 16
+            [ArtifactNames.CH_AMD_BINARY], # 17
+            [ArtifactNames.CH_AMD_BINARY], # 18
+            [ArtifactNames.CH_AMD_BINARY], # 19
+            [ArtifactNames.CH_AMD_BINARY], # 20
+            [ArtifactNames.CH_AMD_BINARY], # 21
+            [ArtifactNames.CH_AMD_DEBUG], # 22
         ],
     )
     functional_tests_jobs_coverage = common_ft_job_config.set_allow_merge_on_failure(
