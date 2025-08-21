@@ -49,6 +49,7 @@
 #include "Core/BackgroundSchedulePool.h"
 #include "Core/Names.h"
 #include "ObjectStorage/MergeTree/StorageObjectStorageMergeTreePartImporterSink.h"
+#include "Storages/MergeTree/MergeTreeExportPartEntry.h"
 
 namespace DB
 {
@@ -175,6 +176,7 @@ StorageMergeTree::StorageMergeTree(
     increment.set(getMaxBlockNumber());
 
     loadMutations();
+    loadExportPartition();
     loadDeduplicationLog();
 
     prewarmCaches(
@@ -488,13 +490,95 @@ void StorageMergeTree::alter(
     }
 }
 
+void StorageMergeTree::exportPartsImpl(
+    const std::vector<DataPartPtr> & src_parts,
+    const String & /*commit_id*/,
+    const StoragePtr & dest_storage)
+{
+    /// todo should stopMergesAndWait be accounted as well?
+    const auto start_time = std::chrono::system_clock::now();
+
+    dest_storage->importMergeTreePartition(*this, src_parts, getContext(), [&](MergeTreePartImportStats stats)
+    {
+        auto table_id = getStorageID();
+
+        if (stats.status.code != 0)
+        {
+            LOG_ERROR(log, "Error importing part {}: {}", stats.part->name, stats.status.message);
+            return;
+        }
+
+        auto export_entry_it = export_part_entries.end();
+        for (auto it = export_part_entries.begin(); it != export_part_entries.end(); ++it)
+        {
+            if (it->second.part_name == stats.part->name)
+            {
+                export_entry_it = it;
+                break;
+            }
+        }
+
+        if (export_entry_it == export_part_entries.end())
+        {
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Export entry not found for part {}", stats.part->name);
+        }
+
+        export_entry_it->second.remove();
+        export_part_entries.erase(export_entry_it);
+
+        auto part_log = getContext()->getPartLog(table_id.database_name);
+        if (!part_log)
+            return;
+
+        PartLogElement part_log_elem;
+        part_log_elem.event_type = PartLogElement::Type::EXPORT_PART;
+        part_log_elem.merge_algorithm = PartLogElement::PartMergeAlgorithm::UNDECIDED;
+        part_log_elem.merge_reason = PartLogElement::MergeReasonType::NOT_A_MERGE;
+
+        part_log_elem.database_name = table_id.database_name;
+        part_log_elem.table_name = table_id.table_name;
+        part_log_elem.table_uuid = table_id.uuid;
+        part_log_elem.partition_id = MergeTreePartInfo::fromPartName(stats.part->name, format_version).getPartitionId();
+        // construct event_time and event_time_microseconds using the same time point
+        // so that the two times will always be equal up to a precision of a second.
+        const auto time_now = std::chrono::system_clock::now();
+        part_log_elem.event_time = timeInSeconds(time_now);
+        part_log_elem.event_time_microseconds = timeInMicroseconds(time_now);
+
+        part_log_elem.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(start_time - time_now).count() / 1000000;
+        part_log_elem.error = static_cast<UInt16>(stats.status.code);
+        part_log_elem.exception = stats.status.message;
+        part_log_elem.path_on_disk = stats.file_path;
+        part_log_elem.part_name = stats.part->name;
+        part_log_elem.bytes_compressed_on_disk = stats.bytes_on_disk;
+        part_log_elem.rows = stats.part->rows_count;
+        part_log_elem.disk_name = dest_storage->getName();
+        part_log_elem.part_type = stats.part->getType();
+        part_log_elem.source_part_names = {stats.part->name};
+        part_log_elem.rows_read = stats.read_rows;
+        part_log_elem.bytes_read_uncompressed = stats.read_bytes;
+
+        part_log->add(std::move(part_log_elem));
+    });
+
+    for (const auto & part : src_parts)
+    {
+        if (!currently_merging_mutating_parts.contains(part))
+        {
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Part {} is not in currently_merging_mutating_parts", part->name);
+        }
+
+        currently_merging_mutating_parts.erase(part);
+        dropPart(part->name, false, getContext());
+    }
+}
+
 /*
  * For now, this function is meant to be used when exporting to different formats (i.e, the case where data needs to be re-encoded / serialized)
  * For the cases where this is not necessary, there are way more optimal ways of doing that, such as hard links implemented by `movePartitionToTable`
  * */
 void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, ContextPtr query_context)
 {
-
     if (!query_context->getSettingsRef()[Setting::allow_experimental_export_merge_tree_partition])
     {
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
@@ -514,6 +598,8 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
 
     auto export_partition_function = [this, query_context, partition_id, dest_storage] () mutable
     {
+        auto lock1 = lockForShare(query_context->getCurrentQueryId(), query_context->getSettingsRef()[Setting::lock_acquire_timeout]);
+        auto merges_blocker = stopMergesAndWait();
         const auto src_parts = getVisibleDataPartsVectorInPartition(getContext(), partition_id);
 
         if (src_parts.empty())
@@ -521,52 +607,30 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
             return true;
         }
 
-        auto lock1 = lockForShare(query_context->getCurrentQueryId(), query_context->getSettingsRef()[Setting::lock_acquire_timeout]);
-        auto lock2 = dest_storage->lockForShare(query_context->getCurrentQueryId(), query_context->getSettingsRef()[Setting::lock_acquire_timeout]);
-        auto merges_blocker = stopMergesAndWait();
-
-        /// todo should stopMergesAndWait be accounted as well?
-        const auto start_time = std::chrono::system_clock::now();
-
-        dest_storage->importMergeTreePartition(*this, src_parts, getContext(), [&](MergeTreePartImportStats stats)
+        std::string commit_id;
         {
-            auto table_id = getStorageID();
-            auto part_log = getContext()->getPartLog(table_id.database_name);
-            if (!part_log)
-                return;
+            std::random_device rd;
+            std::mt19937_64 gen(rd());
+            std::uniform_int_distribution<uint64_t> dis;
+            uint64_t random_value = dis(gen);
+            std::ostringstream oss;
+            oss << std::hex << random_value;
+            commit_id = oss.str();
+        }
 
-            PartLogElement part_log_elem;
-            part_log_elem.event_type = PartLogElement::Type::EXPORT_PART;
-            part_log_elem.merge_algorithm = PartLogElement::PartMergeAlgorithm::UNDECIDED;
-            part_log_elem.merge_reason = PartLogElement::MergeReasonType::NOT_A_MERGE;
+        for (const auto & part : src_parts)
+        {
+            MergeTreeExportPartEntry entry(part->name, commit_id, getStoragePolicy()->getAnyDisk(), relative_data_path, dest_storage->getStorageID());
+            entry.write();
+            export_part_entries.emplace(entry.commit_id, std::move(entry));
+            
+            // do I need the lock if I already did `stopMergesAndWait`?
+            // std::lock_guard lock(currently_processing_in_background_mutex);
+            currently_merging_mutating_parts.insert(part);
+        }
 
-            part_log_elem.database_name = table_id.database_name;
-            part_log_elem.table_name = table_id.table_name;
-            part_log_elem.table_uuid = table_id.uuid;
-            part_log_elem.partition_id = MergeTreePartInfo::fromPartName(stats.part->name, format_version).getPartitionId();
-            // construct event_time and event_time_microseconds using the same time point
-            // so that the two times will always be equal up to a precision of a second.
-            const auto time_now = std::chrono::system_clock::now();
-            part_log_elem.event_time = timeInSeconds(time_now);
-            part_log_elem.event_time_microseconds = timeInMicroseconds(time_now);
+        exportPartsImpl(src_parts, commit_id, dest_storage);
 
-            part_log_elem.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(start_time - time_now).count() / 1000000;
-            part_log_elem.error = static_cast<UInt16>(stats.status.code);
-            part_log_elem.exception = stats.status.message;
-            part_log_elem.path_on_disk = stats.file_path;
-            part_log_elem.part_name = stats.part->name;
-            part_log_elem.bytes_compressed_on_disk = stats.bytes_on_disk;
-            part_log_elem.rows = stats.part->rows_count;
-            part_log_elem.disk_name = dest_storage->getName();
-            part_log_elem.part_type = stats.part->getType();
-            part_log_elem.source_part_names = {stats.part->name};
-            part_log_elem.rows_read = stats.read_rows;
-            part_log_elem.bytes_read_uncompressed = stats.read_bytes;
-
-            part_log->add(std::move(part_log_elem));
-        });
-
-        /// Perhaps this is a good way to trigger re-tries?
         return true;
     };
 
@@ -1096,6 +1160,136 @@ void StorageMergeTree::loadMutations()
 
     if (!current_mutations_by_version.empty())
         increment.value = std::max(increment.value.load(), current_mutations_by_version.rbegin()->first);
+}
+
+void StorageMergeTree::loadExportPartition()
+{
+    std::lock_guard lock(currently_processing_in_background_mutex);
+
+    for (const auto & disk : getDisks())
+    {
+        for (auto it = disk->iterateDirectory(relative_data_path); it->isValid(); it->next())
+        {
+            if (startsWith(it->name(), "export_part_"))
+            {
+                MergeTreeExportPartEntry entry(disk, it->path());
+
+                /// Check if part still exists
+                auto part = getPartIfExists(entry.part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
+                
+                if (!part)
+                {
+                    LOG_WARNING(log, "Part {} not found during export partition load, removing export entry", entry.part_name);
+                    entry.remove();
+                    continue;
+                }
+
+                // Lock the part to prevent merging
+                auto currently_mutating_parts_insert_result = currently_merging_mutating_parts.insert(part);
+                if (!currently_mutating_parts_insert_result.second)
+                {
+                    LOG_WARNING(log, "Part {} already exists in currently_merging_mutating_parts during export load", entry.part_name);
+                    continue;
+                }
+
+                LOG_INFO(log, "Loaded export part entry: {} -> {}", entry.part_name, entry.destination_storage_id.getNameForLogs());
+
+                // Add to export entries
+                export_part_entries.emplace(entry.commit_id, std::move(entry));
+            }
+        }
+    }
+
+    // Restart export process for any remaining entries
+    if (!export_part_entries.empty())
+    {
+        restartExportProcess();
+    }
+}
+
+void StorageMergeTree::restartExportProcess()
+{
+    /// no need for locking because currently_processing_in_background_mutex is already locked and won't allow those parts to be merged
+
+    // Group parts by commit_id to restart exports
+    std::map<String, std::vector<DataPartPtr>> parts_by_commit;
+    
+    for (const auto & entry : export_part_entries)
+    {
+        auto part = getPartIfExists(entry.second.part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
+        if (part)
+        {
+            parts_by_commit[entry.second.commit_id].push_back(part);
+        }
+    }
+
+    // Restart export for each commit group
+    for (const auto & [commit_id, parts] : parts_by_commit)
+    {
+        if (!parts.empty())
+        {
+            // Get destination storage from the first part's entry
+            auto entry_it = export_part_entries.find(commit_id);
+            if (entry_it != export_part_entries.end())
+            {
+                StoragePtr destination_storage = reconstructDestinationStorage(entry_it->second.destination_storage_id);
+                if (destination_storage)
+                {
+                    LOG_INFO(log, "Restarting export for {} parts with commit_id: {} -> {}", 
+                             parts.size(), commit_id, entry_it->second.destination_storage_id.getNameForLogs());
+                    
+                    background_moves_assignee.scheduleMoveTask(
+                        std::make_shared<ExecutableLambdaAdapter>(
+                            [this, parts, commit_id, destination_storage]()
+                            {
+                                exportPartsImpl(parts, commit_id, destination_storage);
+                                return true;
+                            },
+                            moves_assignee_trigger,
+                            getStorageID()
+                        )
+                    );
+                }
+                else
+                {
+                    LOG_ERROR(log, "Failed to reconstruct destination storage for commit_id: {}", commit_id);
+                }
+            }
+        }
+    }
+}
+
+StoragePtr StorageMergeTree::reconstructDestinationStorage(const StorageID & storage_id) const
+{
+    try
+    {
+        if (storage_id.empty())
+        {
+            LOG_WARNING(log, "Empty StorageID provided for destination storage reconstruction");
+            return nullptr;
+        }
+
+        // Resolve the StorageID to get the actual storage
+        auto resolved_storage_id = getContext()->resolveStorageID(storage_id);
+        
+        // Get the storage from DatabaseCatalog
+        auto storage = DatabaseCatalog::instance().tryGetTable(resolved_storage_id, getContext());
+        
+        if (!storage)
+        {
+            LOG_ERROR(log, "Failed to find destination storage: {}", storage_id.getNameForLogs());
+            return nullptr;
+        }
+
+        LOG_DEBUG(log, "Successfully reconstructed destination storage: {}", storage_id.getNameForLogs());
+        return storage;
+    }
+    catch (const Exception & e)
+    {
+        LOG_ERROR(log, "Exception while reconstructing destination storage {}: {}", 
+                  storage_id.getNameForLogs(), e.message());
+        return nullptr;
+    }
 }
 
 std::expected<MergeMutateSelectedEntryPtr, SelectMergeFailure> StorageMergeTree::selectPartsToMerge(

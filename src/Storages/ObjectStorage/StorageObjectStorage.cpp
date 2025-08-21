@@ -22,6 +22,8 @@
 #include <Storages/NamedCollectionsHelpers.h>
 #include <Storages/ObjectStorage/ReadBufferIterator.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSink.h>
+#include <Storages/StorageMergeTree.h>
+#include <Common/randomSeed.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSource.h>
 #include <Storages/ObjectStorage/Utils.h>
 #include <Storages/StorageFactory.h>
@@ -570,11 +572,10 @@ void StorageObjectStorage::importMergeTreePartition(
     bool read_with_direct_io = false;
     bool prefetch = false;
 
-    QueryPipeline root_pipeline;
+    QueryPipeline export_pipeline;
 
     std::vector<ExportsList::EntryPtr> export_list_entries;
 
-    std::vector<StoredObject> files_to_be_deleted;
     for (const auto & data_part : data_parts)
     {
         const auto partition_columns = configuration->partition_strategy->getPartitionColumns();
@@ -641,17 +642,38 @@ void StorageObjectStorage::importMergeTreePartition(
         );
 
         pipeline.complete(sink);
-
-        root_pipeline.addCompletedPipeline(std::move(pipeline));
+        export_pipeline.addCompletedPipeline(std::move(pipeline));
     }
 
-    if (root_pipeline.completed())
+    if (!export_pipeline.completed())
     {
-        root_pipeline.setNumThreads(local_context->getSettingsRef()[Setting::max_threads]);
-
-        CompletedPipelineExecutor exec(root_pipeline);
-        exec.execute();
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Root pipeline is not completed");
     }
+
+    export_pipeline.setNumThreads(local_context->getSettingsRef()[Setting::max_threads]);
+
+    CompletedPipelineExecutor exec(export_pipeline);
+    exec.execute();
+
+    Strings exported_paths;
+    exported_paths.reserve(export_list_entries.size());
+    for (const auto & entry : export_list_entries)
+    {
+        const auto info = entry->operator->()->getInfo();
+        exported_paths.emplace_back(info.destination_path);
+    }
+
+    // Generate commit id and write commit file
+    pcg64_fast rng(randomSeed());
+    const String commit_id = toString(rng());
+    const String commit_object = configuration->getRawPath().path + "/commit_" + commit_id;
+    auto out = object_storage->writeObject(StoredObject(commit_object), WriteMode::Rewrite, /* attributes= */ {}, DBMS_DEFAULT_BUFFER_SIZE, local_context->getWriteSettings());
+    for (const auto & p : exported_paths)
+    {
+        out->write(p.data(), p.size());
+        out->write("\n", 1);
+    }
+    out->finalize();
 }
 
 SinkToStoragePtr StorageObjectStorage::write(
@@ -1007,3 +1029,4 @@ void StorageObjectStorage::Configuration::assertInitialized() const
 }
 
 }
+

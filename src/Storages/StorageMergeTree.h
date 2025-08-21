@@ -17,6 +17,7 @@
 
 #include <Disks/StoragePolicy.h>
 #include <Common/SimpleIncrement.h>
+#include "Storages/MergeTree/MergeTreeExportPartEntry.h"
 
 
 namespace DB
@@ -120,6 +121,13 @@ public:
 
     MergeTreeDeduplicationLog * getDeduplicationLog() { return deduplication_log.get(); }
 
+    /// Begin an export on a partition: persist a lock marker and acquire a partition-level merges blocker.
+    /// Returns a generated commit id (string) that can be used to create a commit file in the destination.
+    String beginExportPartitionLock(const String & partition_id);
+
+    /// Finish an export on a partition: remove the persisted lock marker and release the blocker.
+    void endExportPartitionLock(const String & partition_id);
+
 private:
 
     /// Mutex and condvar for synchronous mutations wait
@@ -152,6 +160,7 @@ private:
     DataParts currently_merging_mutating_parts;
 
     std::map<UInt64, MergeTreeMutationEntry> current_mutations_by_version;
+    std::multimap<String, MergeTreeExportPartEntry> export_part_entries;
 
     /// Unfinished mutations that are required for AlterConversions.
     MutationCounters mutation_counters;
@@ -167,6 +176,14 @@ private:
     std::map<Int64, PreparedSetsCachePtr::weak_type> mutation_prepared_sets_cache;
 
     void loadMutations();
+    /// Load persisted export partition locks and re-apply partition-level merge blockers.
+    void loadExportPartition();
+
+    /// Restart export process for parts that were being exported before restart
+    void restartExportProcess();
+
+    /// Reconstruct destination storage from StorageID
+    StoragePtr reconstructDestinationStorage(const StorageID & storage_id) const;
 
     /// Load and initialize deduplication logs. Even if deduplication setting
     /// equals zero creates object with deduplication window equals zero.
@@ -285,6 +302,8 @@ private:
 
     void assertNotReadonly() const;
 
+    void exportPartsImpl(const std::vector<DataPartPtr> & parts, const String & commit_id, const StoragePtr & dest_storage);
+
     friend class MergeTreeSink;
     friend class MergeTreeData;
     friend class MergePlainMergeTreeTask;
@@ -382,19 +401,19 @@ private:
 
         void resetMutationFailures()
         {
-            std::unique_lock _lock(parts_info_lock);
+            std::unique_lock parts_lock(parts_info_lock);
             failed_mutation_parts.clear();
         }
 
         void removePartFromFailed(const String & part_name)
         {
-            std::unique_lock _lock(parts_info_lock);
+            std::unique_lock parts_lock(parts_info_lock);
             failed_mutation_parts.erase(part_name);
         }
 
         void addPartMutationFailure (const String& part_name, size_t max_postpone_time_ms_)
         {
-            std::unique_lock _lock(parts_info_lock);
+            std::unique_lock parts_lock(parts_info_lock);
             auto part_info_it = failed_mutation_parts.find(part_name);
             if (part_info_it == failed_mutation_parts.end())
             {
@@ -407,8 +426,7 @@ private:
 
         bool partCanBeMutated(const String& part_name)
         {
-
-            std::unique_lock _lock(parts_info_lock);
+            std::unique_lock parts_lock(parts_info_lock);
             auto iter = failed_mutation_parts.find(part_name);
             if (iter == failed_mutation_parts.end())
                 return true;
@@ -419,6 +437,9 @@ private:
     PartMutationBackoffPolicy mutation_backoff_policy;
 
     MutationsSnapshotPtr getMutationsSnapshot(const IMutationsSnapshot::Params & params) const override;
+
+    /// Holds active ActionLocks that block merges per-partition for in-progress exports.
+    std::unordered_map<String, ActionLock> export_partition_locks;
 };
 
 }

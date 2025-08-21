@@ -57,6 +57,7 @@ void StorageObjectStorageMergeTreePartImporterSink::onFinish()
 void StorageObjectStorageMergeTreePartImporterSink::onException(std::exception_ptr exception)
 {
     sink->onException(exception);
+    stats.status = ExecutionStatus(-1, "Error importing part");
     part_log(stats);
 }
 
