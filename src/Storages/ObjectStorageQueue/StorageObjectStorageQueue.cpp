@@ -210,16 +210,15 @@ StorageObjectStorageQueue::StorageObjectStorageQueue(
     , reschedule_processing_interval_ms((*queue_settings_)[ObjectStorageQueueSetting::polling_min_timeout_ms])
     , log(getLogger(fmt::format("Storage{}Queue ({})", configuration->getEngineName(), table_id_.getFullTableName())))
 {
-    const auto & read_path = configuration->getPathForRead();
-    if (read_path.path.empty())
+    if (configuration->getPath().empty())
     {
-        configuration->setPathForRead({"/*"});
+        configuration->setPath("/*");
     }
-    else if (read_path.path.ends_with('/'))
+    else if (configuration->getPath().ends_with('/'))
     {
-        configuration->setPathForRead({read_path.path + '*'});
+        configuration->setPath(configuration->getPath() + '*');
     }
-    else if (!read_path.hasGlobs())
+    else if (!configuration->isPathWithGlobs())
     {
         throw Exception(ErrorCodes::BAD_QUERY_PARAMETER, "ObjectStorageQueue url must either end with '/' or contain globs");
     }
@@ -242,7 +241,7 @@ StorageObjectStorageQueue::StorageObjectStorageQueue(
     storage_metadata.setComment(comment);
     if (engine_args->settings)
         storage_metadata.settings_changes = engine_args->settings->ptr();
-    setVirtuals(VirtualColumnUtils::getVirtualsForFileLikeStorage(storage_metadata.columns));
+    setVirtuals(VirtualColumnUtils::getVirtualsForFileLikeStorage(storage_metadata.columns, context_));
     setInMemoryMetadata(storage_metadata);
 
     LOG_INFO(log, "Using zookeeper path: {}", zk_path.string());

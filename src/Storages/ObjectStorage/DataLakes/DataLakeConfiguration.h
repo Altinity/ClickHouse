@@ -184,8 +184,7 @@ private:
         const Strings & requested_columns,
         const StorageSnapshotPtr & storage_snapshot,
         bool supports_subset_of_columns,
-        ContextPtr local_context,
-        const PrepareReadingFromFormatHiveParams &) override
+        ContextPtr local_context) override
     {
         if (!current_metadata)
         {
