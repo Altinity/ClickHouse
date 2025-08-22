@@ -858,7 +858,7 @@ ManifestFilePtr IcebergMetadata::getManifestFile(ContextPtr local_context, const
     return create_fn();
 }
 
-Strings IcebergMetadata::getDataFiles(const ActionsDAG * filter_dag, ContextPtr local_context) const
+FilesWithSizeAndCount IcebergMetadata::getDataFiles(const ActionsDAG * filter_dag, ContextPtr local_context) const
 {
     bool use_partition_pruning = filter_dag && local_context->getSettingsRef()[Setting::use_iceberg_partition_pruning];
 
@@ -868,7 +868,7 @@ Strings IcebergMetadata::getDataFiles(const ActionsDAG * filter_dag, ContextPtr 
             return cached_unprunned_files_for_last_processed_snapshot.value();
     }
 
-    Strings data_files;
+    FilesWithSizeAndCount data_files;
     {
         SharedLockGuard lock(mutex);
 
@@ -890,7 +890,13 @@ Strings IcebergMetadata::getDataFiles(const ActionsDAG * filter_dag, ContextPtr 
                     if (!pruner.canBePruned(manifest_file_entry))
                     {
                         if (std::holds_alternative<DataFileEntry>(manifest_file_entry.file))
-                            data_files.push_back(std::get<DataFileEntry>(manifest_file_entry.file).file_name);
+                        {
+                            FileWithSizeAndCount file_entry;
+                            file_entry.path = std::get<DataFileEntry>(manifest_file_entry.file).file_name;
+                            file_entry.size_bytes = std::get<DataFileEntry>(manifest_file_entry.file).file_size_bytes;
+                            file_entry.record_count = std::get<DataFileEntry>(manifest_file_entry.file).record_count;
+                            data_files.push_back(file_entry);
+                        }
                     }
                 }
             }
@@ -973,6 +979,67 @@ std::optional<size_t> IcebergMetadata::totalBytes(ContextPtr local_context) cons
     return result;
 }
 
+namespace
+{
+
+class IcebergManifestAwareKeysIterator final : public IObjectIterator
+{
+public:
+    using FileProgressCallback = IDataLakeMetadata::FileProgressCallback;
+
+    explicit IcebergManifestAwareKeysIterator(FilesWithSizeAndCount && files, ObjectStoragePtr object_storage_, FileProgressCallback cb)
+        : data_files(std::move(files)), object_storage(object_storage_), callback(std::move(cb))
+    {}
+
+    size_t estimatedKeysCount() override
+    {
+        return data_files.size();
+    }
+
+    ObjectInfoPtr next(size_t) override
+    {
+        while (true)
+        {
+            const size_t i = index.fetch_add(1, std::memory_order_relaxed);
+            if (i >= data_files.size())
+                return nullptr;
+
+            const auto & key = data_files[i];
+
+            if (key.size_bytes != 0)
+            {
+                // Don't aactually read files from network: we already have their data in metadata
+                if (callback)
+                    callback(DB::FileProgress(0, 0));
+
+                // Iceberg files are generally immutable, and last_modified is not used in any related logic.
+                // Also, etag and attributes are also not used
+                ObjectMetadata md = {key.size_bytes, {}, {}, {{"record_count", toString(key.record_count)}}};
+                return std::make_shared<ObjectInfo>(key.path, md);
+            }
+            else
+            {
+                // Size is 0 -- suspicious, fallback to reading file metadata from the file itself
+                auto object_metadata = object_storage->getObjectMetadata(key.path);
+
+                if (callback)
+                    callback(FileProgress(0, object_metadata.size_bytes));
+
+                return std::make_shared<ObjectInfo>(key.path, std::move(object_metadata));
+            }
+        }
+    }
+
+private:
+    FilesWithSizeAndCount data_files;
+    ObjectStoragePtr object_storage;
+    std::atomic<size_t> index{0};
+    FileProgressCallback callback;
+};
+
+}
+
+
 ObjectIterator IcebergMetadata::iterate(
     const ActionsDAG * filter_dag,
     FileProgressCallback callback,
@@ -980,7 +1047,7 @@ ObjectIterator IcebergMetadata::iterate(
     ContextPtr local_context) const
 {
     SharedLockGuard lock(mutex);
-    return createKeysIterator(getDataFiles(filter_dag, local_context), object_storage, callback);
+    return std::make_shared<IcebergManifestAwareKeysIterator>(getDataFiles(filter_dag, local_context), object_storage, callback);
 }
 
 NamesAndTypesList IcebergMetadata::getTableSchema() const
@@ -993,6 +1060,39 @@ std::tuple<Int64, Int32> IcebergMetadata::getVersion() const
 {
     SharedLockGuard lock(mutex);
     return std::make_tuple(relevant_snapshot_id, relevant_snapshot_schema_id);
+}
+
+ReadFromFormatInfo IcebergMetadata::prepareReadingFromFormat(
+    const Strings & requested_columns,
+    const StorageSnapshotPtr & storage_snapshot,
+    const ContextPtr & context,
+    bool supports_subset_of_columns)
+{
+    auto info = DB::prepareReadingFromFormat(requested_columns, storage_snapshot, context, supports_subset_of_columns);
+
+    // Check if only virtual columns are requested.
+    bool no_physical_columns = info.requested_columns.empty();
+    bool only_supported_virtuals = !info.requested_virtual_columns.empty();
+    if (only_supported_virtuals)
+    {
+        for (const auto & [virt_col_name, _] : info.requested_virtual_columns)
+        {
+            if (!(virt_col_name == "_path" || virt_col_name == "_file"))
+            {
+                only_supported_virtuals = false;
+                break;
+            }
+        }
+    }
+
+    if (no_physical_columns && only_supported_virtuals)
+    {
+        // If the query only needs _path or _file, we can avoid reading data files completely.
+        // The pipeline will be fed from manifests.
+        info.format_header.clear();
+    }
+
+    return info;
 }
 
 }

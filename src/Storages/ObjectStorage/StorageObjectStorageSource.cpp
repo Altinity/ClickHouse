@@ -238,6 +238,71 @@ void StorageObjectStorageSource::lazyInitialize()
 
 Chunk StorageObjectStorageSource::generate()
 {
+    // Virtual-only mode: no physical columns requested.
+    if (auto object_info = file_iterator->next(0);
+        read_from_format_info.format_header.columns() == 0 &&
+        object_info && object_info->metadata.has_value() &&
+        object_info->metadata->attributes.contains("record_count"))
+    {
+        if (!object_info)
+            return {};
+
+        const auto & header = getPort().getHeader();
+
+        int path_pos = -1;
+        int file_pos = -1;
+        for (size_t i = 0; i < header.columns(); ++i)
+        {
+            const auto & col = header.getByPosition(i);
+            if (col.name == "_path")
+                path_pos = static_cast<int>(i);
+            else if (col.name == "_file")
+                file_pos = static_cast<int>(i);
+        }
+
+        const String & key = object_info->getPath();
+
+        // Extract multiplicity (rows per file) from attributes["record_count"]
+        UInt64 multiplicity = 1;
+        if (object_info->metadata.has_value())
+        {
+            if (auto it2 = object_info->metadata.value().attributes.find("record_count"); it2 != object_info->metadata.value().attributes.end())
+            {
+                try { multiplicity = std::stoull(it2->second); } catch (...) { /* keep default */ }
+            }
+        }
+
+        if (multiplicity == 0)
+            return {};
+
+        Columns cols(header.columns());
+
+        for (size_t i = 0; i < header.columns(); ++i)
+        {
+            const auto & elem = header.getByPosition(i);
+            const auto & type = elem.type;
+
+            if (static_cast<int>(i) == path_pos)
+            {
+                cols[i] = type->createColumnConst(multiplicity, key);
+            }
+            else if (static_cast<int>(i) == file_pos)
+            {
+                const size_t slash = key.find_last_of('/');
+                const size_t start = (slash == String::npos) ? 0 : (slash + 1);
+                const String file_name = key.substr(start);
+                cols[i] = type->createColumnConst(multiplicity, file_name);
+            }
+            else
+            {
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected non-virtual column in virtual-only mode. This is a bug.");
+            }
+        }
+
+
+        return Chunk(std::move(cols), multiplicity);
+    }
+
 
     lazyInitialize();
 

@@ -27,6 +27,15 @@
 namespace DB
 {
 
+struct FileWithSizeAndCount
+{
+    String path;
+    UInt64 size_bytes;
+    UInt64 record_count;
+};
+
+using FilesWithSizeAndCount = std::vector<FileWithSizeAndCount>;
+
 class IcebergMetadata : public IDataLakeMetadata
 {
 public:
@@ -107,11 +116,11 @@ private:
     Int64 relevant_snapshot_id TSA_GUARDED_BY(mutex) {-1};
     const String table_location;
 
-    mutable std::optional<Strings> cached_unprunned_files_for_last_processed_snapshot TSA_GUARDED_BY(cached_unprunned_files_for_last_processed_snapshot_mutex);
+    mutable std::optional<FilesWithSizeAndCount> cached_unprunned_files_for_last_processed_snapshot TSA_GUARDED_BY(cached_unprunned_files_for_last_processed_snapshot_mutex);
     mutable std::mutex cached_unprunned_files_for_last_processed_snapshot_mutex;
 
     void updateState(const ContextPtr & local_context, Poco::JSON::Object::Ptr metadata_object, bool metadata_file_changed) TSA_REQUIRES(mutex);
-    Strings getDataFiles(const ActionsDAG * filter_dag, ContextPtr local_context) const;
+    FilesWithSizeAndCount getDataFiles(const ActionsDAG * filter_dag, ContextPtr local_context) const;
 
     void updateSnapshot(ContextPtr local_context, Poco::JSON::Object::Ptr metadata_object) TSA_REQUIRES(mutex);
     ManifestFileCacheKeys getManifestList(ContextPtr local_context, const String & filename) const;
@@ -122,6 +131,13 @@ private:
 
     std::optional<String> getRelevantManifestList(const Poco::JSON::Object::Ptr & metadata);
     Iceberg::ManifestFilePtr tryGetManifestFile(const String & filename) const;
+
+    ReadFromFormatInfo prepareReadingFromFormat(
+        const Strings & requested_columns,
+        const StorageSnapshotPtr & storage_snapshot,
+        const ContextPtr & context,
+        bool supports_subset_of_columns) override;
+
 };
 }
 

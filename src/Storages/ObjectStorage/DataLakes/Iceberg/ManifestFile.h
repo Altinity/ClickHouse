@@ -33,6 +33,8 @@ enum class FileContentType : uint8_t
 struct DataFileEntry
 {
     String file_name;
+    UInt64 file_size_bytes = 0;   // total size of the data file
+    UInt64 record_count = 0;      // total rows in the data file
 };
 
 struct ColumnInfo

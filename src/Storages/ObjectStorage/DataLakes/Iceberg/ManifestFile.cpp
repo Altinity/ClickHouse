@@ -282,7 +282,19 @@ ManifestFileContent::ManifestFileContent(
             columns_infos[column_id].hyperrectangle.emplace(*left, true, *right, true);
         }
 
-        FileEntry file = FileEntry{DataFileEntry{file_path}};
+        // Try to parse file metadata directly from the manifest to avoid excessive file reads later.
+        UInt64 file_size_bytes = 0;
+        UInt64 record_count = 0;
+
+        if (manifest_file_deserializer.hasPath(c_data_file_file_size_in_bytes))
+            file_size_bytes = manifest_file_deserializer
+                .getValueFromRowByName(i, c_data_file_file_size_in_bytes, TypeIndex::Int64).safeGet<UInt64>();
+
+        if (manifest_file_deserializer.hasPath(c_data_file_record_count))
+            record_count = manifest_file_deserializer
+                .getValueFromRowByName(i, c_data_file_record_count, TypeIndex::Int64).safeGet<UInt64>();
+
+        FileEntry file = FileEntry{DataFileEntry{file_path, file_size_bytes, record_count}};
 
         Int64 added_sequence_number = 0;
         if (format_version_ > 1)
