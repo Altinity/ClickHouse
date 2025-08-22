@@ -17,7 +17,7 @@
 
 #include <Disks/StoragePolicy.h>
 #include <Common/SimpleIncrement.h>
-#include "Storages/MergeTree/MergeTreeExportPartEntry.h"
+#include "Storages/MergeTree/MergeTreeExportManifest.h"
 
 
 namespace DB
@@ -160,7 +160,9 @@ private:
     DataParts currently_merging_mutating_parts;
 
     std::map<UInt64, MergeTreeMutationEntry> current_mutations_by_version;
-    std::multimap<String, MergeTreeExportPartEntry> export_part_entries;
+    
+    std::mutex export_partition_commit_id_to_manifest_mutex;
+    std::map<String, std::shared_ptr<MergeTreeExportManifest>> export_partition_commit_id_to_manifest;
 
     /// Unfinished mutations that are required for AlterConversions.
     MutationCounters mutation_counters;
@@ -181,6 +183,8 @@ private:
 
     /// Restart export process for parts that were being exported before restart
     void restartExportProcess();
+
+    void commitExportPartition(const std::shared_ptr<MergeTreeExportManifest> & manifest, const StoragePtr & dest_storage, ContextPtr context);
 
     /// Reconstruct destination storage from StorageID
     StoragePtr reconstructDestinationStorage(const StorageID & storage_id) const;
@@ -302,7 +306,7 @@ private:
 
     void assertNotReadonly() const;
 
-    void exportPartsImpl(const std::vector<DataPartPtr> & parts, const String & commit_id, const StoragePtr & dest_storage);
+    void exportPartsImpl(const CurrentlyMovingPartsTaggerPtr & moving_tagger, const String & commit_id, const StoragePtr & dest_storage);
 
     friend class MergeTreeSink;
     friend class MergeTreeData;

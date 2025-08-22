@@ -214,6 +214,9 @@ public:
         virtuals.set(std::make_unique<VirtualColumnsDescription>(std::move(virtuals_)));
     }
 
+    /// Write an export commit file containing the list of exported remote paths
+    virtual void writeExportCommit(const String &, const Strings &, ContextPtr) {throw Exception(ErrorCodes::NOT_IMPLEMENTED, "writeExportCommit is not implemented for storage type {}", getName());}
+
     /// Return list of virtual columns (like _part, _table, etc). In the vast
     /// majority of cases virtual columns are static constant part of Storage
     /// class and don't depend on Storage object. But sometimes we have fake

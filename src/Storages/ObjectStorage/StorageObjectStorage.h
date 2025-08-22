@@ -104,6 +104,9 @@ public:
         ContextPtr /*context*/,
         std::function<void(MergeTreePartImportStats)> part_log) override;
 
+    /// Write an export commit file containing the list of exported remote paths
+    void writeExportCommit(const String & commit_id, const Strings & exported_paths, ContextPtr local_context) override;
+
     void truncate(
         const ASTPtr & query,
         const StorageMetadataPtr & metadata_snapshot,

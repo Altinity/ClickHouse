@@ -49,7 +49,9 @@
 #include "Core/BackgroundSchedulePool.h"
 #include "Core/Names.h"
 #include "ObjectStorage/MergeTree/StorageObjectStorageMergeTreePartImporterSink.h"
-#include "Storages/MergeTree/MergeTreeExportPartEntry.h"
+#include "Storages/MergeTree/MergeMutateSelectedEntry.h"
+#include "Storages/MergeTree/MergeTreeExportManifest.h"
+#include "Storages/MergeTree/MergeTreePartInfo.h"
 
 namespace DB
 {
@@ -491,15 +493,21 @@ void StorageMergeTree::alter(
 }
 
 void StorageMergeTree::exportPartsImpl(
-    const std::vector<DataPartPtr> & src_parts,
-    const String & /*commit_id*/,
+    const CurrentlyMovingPartsTaggerPtr & moving_tagger,
+    const String & commit_id,
     const StoragePtr & dest_storage)
 {
-    /// todo should stopMergesAndWait be accounted as well?
     const auto start_time = std::chrono::system_clock::now();
+
+    std::vector<DataPartPtr> src_parts;
+    for (const auto & part : moving_tagger->parts_to_move)
+    {
+        src_parts.push_back(part.part);
+    }
 
     dest_storage->importMergeTreePartition(*this, src_parts, getContext(), [&](MergeTreePartImportStats stats)
     {
+        std::lock_guard lock(export_partition_commit_id_to_manifest_mutex);
         auto table_id = getStorageID();
 
         if (stats.status.code != 0)
@@ -508,23 +516,14 @@ void StorageMergeTree::exportPartsImpl(
             return;
         }
 
-        auto export_entry_it = export_part_entries.end();
-        for (auto it = export_part_entries.begin(); it != export_part_entries.end(); ++it)
+        auto manifest = export_partition_commit_id_to_manifest[commit_id];
+        if (!manifest)
         {
-            if (it->second.part_name == stats.part->name)
-            {
-                export_entry_it = it;
-                break;
-            }
+            LOG_ERROR(log, "Export manifest not found for commit_id: {}", commit_id);
+            return;
         }
 
-        if (export_entry_it == export_part_entries.end())
-        {
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Export entry not found for part {}", stats.part->name);
-        }
-
-        export_entry_it->second.remove();
-        export_part_entries.erase(export_entry_it);
+        manifest->updateRemotePath(stats.part->name, stats.file_path);
 
         auto part_log = getContext()->getPartLog(table_id.database_name);
         if (!part_log)
@@ -560,17 +559,6 @@ void StorageMergeTree::exportPartsImpl(
 
         part_log->add(std::move(part_log_elem));
     });
-
-    for (const auto & part : src_parts)
-    {
-        if (!currently_merging_mutating_parts.contains(part))
-        {
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Part {} is not in currently_merging_mutating_parts", part->name);
-        }
-
-        currently_merging_mutating_parts.erase(part);
-        dropPart(part->name, false, getContext());
-    }
 }
 
 /*
@@ -596,40 +584,78 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
 
     String partition_id = getPartitionIDFromQuery(command.partition, getContext());
 
-    auto export_partition_function = [this, query_context, partition_id, dest_storage] () mutable
+    auto lock1 = lockForShare(query_context->getCurrentQueryId(), query_context->getSettingsRef()[Setting::lock_acquire_timeout]);
+    auto merges_blocker = stopMergesAndWait();
+    std::lock_guard lock(currently_processing_in_background_mutex);
+    std::lock_guard lock2(export_partition_commit_id_to_manifest_mutex);
+
+    const auto all_parts = getVisibleDataPartsVectorInPartition(getContext(), partition_id);
+
+    if (all_parts.empty())
     {
-        auto lock1 = lockForShare(query_context->getCurrentQueryId(), query_context->getSettingsRef()[Setting::lock_acquire_timeout]);
-        auto merges_blocker = stopMergesAndWait();
-        const auto src_parts = getVisibleDataPartsVectorInPartition(getContext(), partition_id);
+        return;
+    }
 
-        if (src_parts.empty())
-        {
-            return true;
-        }
+    std::vector<DataPartPtr> src_parts;
 
-        std::string commit_id;
-        {
-            std::random_device rd;
-            std::mt19937_64 gen(rd());
-            std::uniform_int_distribution<uint64_t> dis;
-            uint64_t random_value = dis(gen);
-            std::ostringstream oss;
-            oss << std::hex << random_value;
-            commit_id = oss.str();
-        }
+    std::vector<MergeTreeMoveEntry> move_part_entries;
 
-        for (const auto & part : src_parts)
+    for (const auto & part : all_parts)
+    {
+        bool part_being_exported = false;
+        /// check all manifests to see if the part is already being exported
+        /// if so, skip it
+        for (const auto & [commit_id, manifest] : export_partition_commit_id_to_manifest)
         {
-            MergeTreeExportPartEntry entry(part->name, commit_id, getStoragePolicy()->getAnyDisk(), relative_data_path, dest_storage->getStorageID());
-            entry.write();
-            export_part_entries.emplace(entry.commit_id, std::move(entry));
+            auto parts_being_exported_in_this_commit = manifest->items;
+
             
-            // do I need the lock if I already did `stopMergesAndWait`?
-            // std::lock_guard lock(currently_processing_in_background_mutex);
-            currently_merging_mutating_parts.insert(part);
+            for (const auto & item : parts_being_exported_in_this_commit)
+            {
+                if (item.part_name == part->name)
+                {
+                    part_being_exported = true;
+                    break;
+                }
+            }
         }
 
-        exportPartsImpl(src_parts, commit_id, dest_storage);
+        if (part_being_exported)
+        {
+            continue;
+        }
+
+        src_parts.emplace_back(part);
+        move_part_entries.emplace_back(part, nullptr);
+    }
+
+    if (move_part_entries.empty())
+    {
+        return;
+    }
+
+    auto moving_tagger = std::make_shared<CurrentlyMovingPartsTagger>(std::move(move_part_entries), *this);
+
+    std::string commit_id;
+    {
+        std::random_device rd;
+        std::mt19937_64 gen(rd());
+        std::uniform_int_distribution<uint64_t> dis;
+        uint64_t random_value = dis(gen);
+        std::ostringstream oss;
+        oss << std::hex << random_value;
+        commit_id = oss.str();
+    }
+
+    const auto manifest = MergeTreeExportManifest::create(getStoragePolicy()->getAnyDisk(), relative_data_path, commit_id, dest_storage->getStorageID(), src_parts);
+
+    export_partition_commit_id_to_manifest[commit_id] = manifest;
+
+    auto export_partition_function = [this, query_context, partition_id, dest_storage, commit_id, manifest, moving_tagger] () mutable
+    {
+        exportPartsImpl(moving_tagger, commit_id, dest_storage);
+
+        commitExportPartition(manifest, dest_storage, getContext());
 
         return true;
     };
@@ -641,7 +667,9 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
     }
     else
     {
-        export_partition_function();
+        /// async always
+        background_moves_assignee.scheduleMoveTask(
+            std::make_shared<ExecutableLambdaAdapter>(export_partition_function, moves_assignee_trigger, getStorageID()));
     }
 }
 
@@ -1164,96 +1192,106 @@ void StorageMergeTree::loadMutations()
 
 void StorageMergeTree::loadExportPartition()
 {
-    std::lock_guard lock(currently_processing_in_background_mutex);
-
     for (const auto & disk : getDisks())
     {
         for (auto it = disk->iterateDirectory(relative_data_path); it->isValid(); it->next())
         {
-            if (startsWith(it->name(), "export_part_"))
+            const auto & name = it->name();
+            if (startsWith(name, "export_") && endsWith(name, ".json"))
             {
-                MergeTreeExportPartEntry entry(disk, it->path());
-
-                /// Check if part still exists
-                auto part = getPartIfExists(entry.part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
-                
-                if (!part)
+                try
                 {
-                    LOG_WARNING(log, "Part {} not found during export partition load, removing export entry", entry.part_name);
-                    entry.remove();
-                    continue;
+                    auto manifest = MergeTreeExportManifest::read(disk, fs::path(relative_data_path) / name);
+                    export_partition_commit_id_to_manifest[manifest->commit_id] = manifest;
+                    LOG_DEBUG(log, "Loaded export commit manifest: {} (commit_id: {})", name, manifest->commit_id);
                 }
-
-                // Lock the part to prevent merging
-                auto currently_mutating_parts_insert_result = currently_merging_mutating_parts.insert(part);
-                if (!currently_mutating_parts_insert_result.second)
+                catch (const std::exception & ex)
                 {
-                    LOG_WARNING(log, "Part {} already exists in currently_merging_mutating_parts during export load", entry.part_name);
-                    continue;
+                    LOG_ERROR(log, "Failed to load export commit manifest {}: {}", name, ex.what());
                 }
-
-                LOG_INFO(log, "Loaded export part entry: {} -> {}", entry.part_name, entry.destination_storage_id.getNameForLogs());
-
-                // Add to export entries
-                export_part_entries.emplace(entry.commit_id, std::move(entry));
             }
         }
     }
 
-    // Restart export process for any remaining entries
-    if (!export_part_entries.empty())
+    if (!export_partition_commit_id_to_manifest.empty())
     {
         restartExportProcess();
     }
 }
 
-void StorageMergeTree::restartExportProcess()
+void StorageMergeTree::commitExportPartition(const std::shared_ptr<MergeTreeExportManifest> & manifest, const StoragePtr & dest_storage, ContextPtr local_context)
 {
-    /// no need for locking because currently_processing_in_background_mutex is already locked and won't allow those parts to be merged
-
-    // Group parts by commit_id to restart exports
-    std::map<String, std::vector<DataPartPtr>> parts_by_commit;
+    std::lock_guard lock(export_partition_commit_id_to_manifest_mutex);
+    dest_storage->writeExportCommit(manifest->commit_id, manifest->exportedPaths(), local_context);
+    auto parts_lock = lockParts();
     
-    for (const auto & entry : export_part_entries)
+    std::vector<MergeTreeDataPartPtr> parts_to_remove;
+    for (const auto & manifest_item : manifest->items)
     {
-        auto part = getPartIfExists(entry.second.part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
-        if (part)
+        /// todo fix this, maybe ther eis a better way to get a data part object. Or maybe there is a better way to drop parts
+        /// actually, it is not safe to do this because I am not holding the lock on currently_merging_mutating_parts
+        auto part = getPartIfExistsUnlocked(manifest_item.part_name, {MergeTreeDataPartState::Active}, parts_lock);
+        if (!part)
         {
-            parts_by_commit[entry.second.commit_id].push_back(part);
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Part {} not found when committing export", manifest_item.part_name);
         }
+
+        parts_to_remove.push_back(part);        
     }
 
-    // Restart export for each commit group
-    for (const auto & [commit_id, parts] : parts_by_commit)
+    removePartsFromWorkingSet(nullptr, parts_to_remove, true, &parts_lock);
+    manifest->remove();
+    export_partition_commit_id_to_manifest.erase(manifest->commit_id);
+}
+
+
+void StorageMergeTree::restartExportProcess()
+{
+    /// I suppose I don't need to lock it here because it is during the startup
+    for (const auto & [commit_id, manifest] : export_partition_commit_id_to_manifest)
     {
-        if (!parts.empty())
+        auto destination_storage = reconstructDestinationStorage(manifest->destination_storage_id);
+        if (!destination_storage)
         {
-            // Get destination storage from the first part's entry
-            auto entry_it = export_part_entries.find(commit_id);
-            if (entry_it != export_part_entries.end())
+            LOG_ERROR(log, "Failed to reconstruct destination storage: {}", manifest->destination_storage_id.getNameForLogs());
+            continue;
+        }
+
+        auto pending_part_names = manifest->pendingParts();
+
+        if (pending_part_names.empty())
+        {
+            LOG_DEBUG(log, "No pending parts found for commit_id: {}, uploading commit file", commit_id);
+            commitExportPartition(manifest, destination_storage, getContext());
+        }
+        else
+        {
+            std::vector<MergeTreeMoveEntry> move_part_entries;
+
+            for (const auto & part_name : pending_part_names)
             {
-                StoragePtr destination_storage = reconstructDestinationStorage(entry_it->second.destination_storage_id);
-                if (destination_storage)
+                auto part = getPartIfExists(part_name, {MergeTreeDataPartState::Active});
+
+                if (!part)
                 {
-                    LOG_INFO(log, "Restarting export for {} parts with commit_id: {} -> {}", 
-                             parts.size(), commit_id, entry_it->second.destination_storage_id.getNameForLogs());
-                    
-                    background_moves_assignee.scheduleMoveTask(
-                        std::make_shared<ExecutableLambdaAdapter>(
-                            [this, parts, commit_id, destination_storage]()
-                            {
-                                exportPartsImpl(parts, commit_id, destination_storage);
-                                return true;
-                            },
-                            moves_assignee_trigger,
-                            getStorageID()
-                        )
-                    );
+                    throw Exception(ErrorCodes::LOGICAL_ERROR, "Part {} not found", part_name);
                 }
-                else
-                {
-                    LOG_ERROR(log, "Failed to reconstruct destination storage for commit_id: {}", commit_id);
-                }
+
+                move_part_entries.emplace_back(part, nullptr);
+            }
+    
+            if (!move_part_entries.empty())
+            {
+                auto moving_tagger = std::make_shared<CurrentlyMovingPartsTagger>(std::move(move_part_entries), *this);
+                background_moves_assignee.scheduleMoveTask(
+                    std::make_shared<ExecutableLambdaAdapter>(
+                        [this, moving_tagger, commit_id, destination_storage, manifest](){
+                            exportPartsImpl(moving_tagger, commit_id, destination_storage);
+                            commitExportPartition(manifest, destination_storage, getContext());
+                            return true;
+                        },
+                        moves_assignee_trigger,
+                        getStorageID()));
             }
         }
     }

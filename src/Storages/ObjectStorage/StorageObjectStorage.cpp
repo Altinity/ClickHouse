@@ -655,18 +655,20 @@ void StorageObjectStorage::importMergeTreePartition(
     CompletedPipelineExecutor exec(export_pipeline);
     exec.execute();
 
-    Strings exported_paths;
-    exported_paths.reserve(export_list_entries.size());
-    for (const auto & entry : export_list_entries)
+    // NOTE: Do not write commit file here. The caller manages commit via JSON manifest.
+}
+
+void StorageObjectStorage::writeExportCommit(const String & commit_id, const Strings & exported_paths, ContextPtr local_context)
+{
+    const String commit_object = configuration->getRawPath().path + "/commit_" + commit_id;
+
+    /// if file already exists, nothing to be done
+    if (object_storage->exists(StoredObject(commit_object)))
     {
-        const auto info = entry->operator->()->getInfo();
-        exported_paths.emplace_back(info.destination_path);
+        LOG_DEBUG(getLogger("StorageObjectStorage"), "Commit file already exists, nothing to be done: {}", commit_object);
+        return;
     }
 
-    // Generate commit id and write commit file
-    pcg64_fast rng(randomSeed());
-    const String commit_id = toString(rng());
-    const String commit_object = configuration->getRawPath().path + "/commit_" + commit_id;
     auto out = object_storage->writeObject(StoredObject(commit_object), WriteMode::Rewrite, /* attributes= */ {}, DBMS_DEFAULT_BUFFER_SIZE, local_context->getWriteSettings());
     for (const auto & p : exported_paths)
     {
