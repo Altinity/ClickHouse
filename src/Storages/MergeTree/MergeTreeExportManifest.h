@@ -25,6 +25,7 @@ namespace DB
  * Layout on disk (pretty-printed JSON):
  * {
  *   "commit_id": "<id>",
+ *   "partition_id": "<partition_id>",
  *   "destination": "<database>.<table>",
  *   "parts": [ {"part_name": "name", "remote_path": "path-or-empty"}, ... ]
  * }
@@ -42,8 +43,10 @@ struct MergeTreeExportManifest
     };
 
     String commit_id;
+    String partition_id;
     StorageID destination_storage_id;
     std::vector<Item> items;
+    bool completed = false;
 
     std::filesystem::path file_path;
     DiskPtr disk;
@@ -52,14 +55,16 @@ struct MergeTreeExportManifest
         const DiskPtr & disk_,
         const String & path_prefix,
         const String & commit_id_,
+        const String & partition_id_,
         const StorageID & destination_storage_id_,
         const std::vector<DataPartPtr> & data_parts)
     {
         auto manifest = std::make_shared<MergeTreeExportManifest>();
         manifest->disk = disk_;
         manifest->commit_id = commit_id_;
+        manifest->partition_id = partition_id_;
         manifest->destination_storage_id = destination_storage_id_;
-        manifest->file_path = std::filesystem::path(path_prefix) / ("export_" + commit_id_ + ".json");
+        manifest->file_path = std::filesystem::path(path_prefix) / ("export_partition_" + partition_id_ + "_commit_" + commit_id_ + ".json");
         manifest->items.reserve(data_parts.size());
         for (const auto & data_part : data_parts)
             manifest->items.push_back({data_part->name, {}});
@@ -86,12 +91,16 @@ struct MergeTreeExportManifest
 
         if (root->has("commit_id"))
             manifest->commit_id = root->getValue<String>("commit_id");
+        if (root->has("partition_id"))
+            manifest->partition_id = root->getValue<String>("partition_id");
         if (root->has("destination"))
         {
             const auto destination = root->getValue<String>("destination");
             if (!destination.empty())
                 manifest->destination_storage_id = StorageID(QualifiedTableName::parseFromString(destination));
         }
+        if (root->has("completed"))
+            manifest->completed = root->getValue<bool>("completed");
 
         manifest->items.clear();
         if (root->has("parts"))
@@ -124,7 +133,9 @@ struct MergeTreeExportManifest
 
         Poco::JSON::Object::Ptr root(new Poco::JSON::Object());
         root->set("commit_id", commit_id);
+        root->set("partition_id", partition_id);
         root->set("destination", destination_storage_id.getQualifiedName().getFullName());
+        root->set("completed", completed);
 
         Poco::JSON::Array::Ptr parts(new Poco::JSON::Array());
         for (const auto & i : items)
@@ -144,17 +155,23 @@ struct MergeTreeExportManifest
         out->sync();
     }
 
-    void updateRemotePath(const String & part_name, const String & remote_path)
+    void updateRemotePathAndWrite(const String & part_name, const String & remote_path)
     {
         for (auto & i : items)
         {
             if (i.part_name == part_name)
             {
                 i.remote_path = remote_path;
-                write();
-                return;
+                break;
             }
         }
+        write();
+    }
+
+    void updateCompleted(bool completed_)
+    {
+        completed = completed_;
+        write();
     }
 
     std::vector<String> pendingParts() const
@@ -173,11 +190,6 @@ struct MergeTreeExportManifest
             if (!i.remote_path.empty())
                 res.push_back(i.remote_path);
         return res;
-    }
-
-    void remove() const
-    {
-        disk->removeFileIfExists(file_path);
     }
 };
 

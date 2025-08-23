@@ -121,13 +121,6 @@ public:
 
     MergeTreeDeduplicationLog * getDeduplicationLog() { return deduplication_log.get(); }
 
-    /// Begin an export on a partition: persist a lock marker and acquire a partition-level merges blocker.
-    /// Returns a generated commit id (string) that can be used to create a commit file in the destination.
-    String beginExportPartitionLock(const String & partition_id);
-
-    /// Finish an export on a partition: remove the persisted lock marker and release the blocker.
-    void endExportPartitionLock(const String & partition_id);
-
 private:
 
     /// Mutex and condvar for synchronous mutations wait
@@ -158,6 +151,11 @@ private:
     /// Parts that currently participate in merge or mutation.
     /// This set have to be used with `currently_processing_in_background_mutex`.
     DataParts currently_merging_mutating_parts;
+
+    /// Should be used with `currently_processing_in_background_mutex`.
+    /// Holds partition ids that have already been exported.
+    /// A partition can be exported only once.
+    std::unordered_set<std::string> already_exported_partition_ids;
 
     std::map<UInt64, MergeTreeMutationEntry> current_mutations_by_version;
     
@@ -226,6 +224,7 @@ private:
     void setMutationCSN(const String & mutation_id, CSN csn) override;
 
     friend struct CurrentlyMergingPartsTagger;
+    friend struct CurrentlyExportingPartsTagger;
     friend class MergeTreeMergePredicate;
 
     std::expected<MergeMutateSelectedEntryPtr, SelectMergeFailure> selectPartsToMerge(
@@ -306,7 +305,7 @@ private:
 
     void assertNotReadonly() const;
 
-    void exportPartsImpl(const CurrentlyMovingPartsTaggerPtr & moving_tagger, const String & commit_id, const StoragePtr & dest_storage);
+    void exportPartsImpl(const CurrentlyExportingPartsTaggerPtr & exports_tagger, const String & commit_id, const StoragePtr & dest_storage);
 
     friend class MergeTreeSink;
     friend class MergeTreeData;
@@ -441,9 +440,6 @@ private:
     PartMutationBackoffPolicy mutation_backoff_policy;
 
     MutationsSnapshotPtr getMutationsSnapshot(const IMutationsSnapshot::Params & params) const override;
-
-    /// Holds active ActionLocks that block merges per-partition for in-progress exports.
-    std::unordered_map<String, ActionLock> export_partition_locks;
 };
 
 }
