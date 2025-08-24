@@ -238,8 +238,10 @@ void StorageObjectStorageSource::lazyInitialize()
 
 Chunk StorageObjectStorageSource::generate()
 {
+    lazyInitialize();
+
     // Virtual-only mode: no physical columns requested.
-    if (auto object_info = file_iterator->next(0);
+    if (auto object_info = reader.getObjectInfo();
         read_from_format_info.format_header.columns() == 0 &&
         object_info && object_info->metadata.has_value() &&
         object_info->metadata->attributes.contains("record_count"))
@@ -303,8 +305,6 @@ Chunk StorageObjectStorageSource::generate()
         return Chunk(std::move(cols), multiplicity);
     }
 
-
-    lazyInitialize();
 
     while (true)
     {
