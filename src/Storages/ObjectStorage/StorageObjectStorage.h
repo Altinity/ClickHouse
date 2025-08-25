@@ -105,7 +105,7 @@ public:
         std::function<void(MergeTreePartImportStats)> part_log) override;
 
     /// Write an export commit file containing the list of exported remote paths
-    void writeExportCommit(const String & commit_id, const String & partition_id, const Strings & exported_paths, ContextPtr local_context) override;
+    void commitExportPartitionTransaction(const String & transaction_id, const String & partition_id, const Strings & exported_paths, ContextPtr local_context) override;
 
     void truncate(
         const ASTPtr & query,

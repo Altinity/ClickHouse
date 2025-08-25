@@ -159,8 +159,8 @@ private:
 
     std::map<UInt64, MergeTreeMutationEntry> current_mutations_by_version;
     
-    std::mutex export_partition_commit_id_to_manifest_mutex;
-    std::map<String, std::shared_ptr<MergeTreeExportManifest>> export_partition_commit_id_to_manifest;
+    std::map<String, std::shared_ptr<MergeTreeExportManifest>> export_partition_transaction_id_to_manifest;
+    std::mutex export_partition_transaction_id_to_manifest_mutex;
 
     /// Unfinished mutations that are required for AlterConversions.
     MutationCounters mutation_counters;
@@ -179,13 +179,13 @@ private:
     /// Load persisted export partition locks and re-apply partition-level merge blockers.
     void loadExportPartition();
 
+    /// Read export partition manifests from disk and populate internal data structures
+    void readExportPartitionManifests();
+
     /// Restart export process for parts that were being exported before restart
-    void restartExportProcess();
+    void resumeExportPartitionTasks();
 
-    void commitExportPartition(const std::shared_ptr<MergeTreeExportManifest> & manifest, const StoragePtr & dest_storage, ContextPtr context);
-
-    /// Reconstruct destination storage from StorageID
-    StoragePtr reconstructDestinationStorage(const StorageID & storage_id) const;
+    void commitExportPartitionTask(const std::shared_ptr<MergeTreeExportManifest> & manifest, const StoragePtr & dest_storage, ContextPtr context);
 
     /// Load and initialize deduplication logs. Even if deduplication setting
     /// equals zero creates object with deduplication window equals zero.
@@ -305,7 +305,7 @@ private:
 
     void assertNotReadonly() const;
 
-    void exportPartsImpl(const CurrentlyExportingPartsTaggerPtr & exports_tagger, const String & commit_id, const StoragePtr & dest_storage);
+    void exportPartsImpl(const CurrentlyExportingPartsTaggerPtr & exports_tagger, const String & transaction_id, const StoragePtr & dest_storage);
 
     friend class MergeTreeSink;
     friend class MergeTreeData;

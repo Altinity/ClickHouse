@@ -214,9 +214,8 @@ public:
         virtuals.set(std::make_unique<VirtualColumnsDescription>(std::move(virtuals_)));
     }
 
-    /// Write an export commit file containing the list of exported remote paths
-    virtual void writeExportCommit(
-        const String & /* commit_id */,
+    virtual void commitExportPartitionTransaction(
+        const String & /* transaction_id */,
         const String & /* partition_id */,
         const Strings & /* exported_paths */,
         ContextPtr /* local_context */)

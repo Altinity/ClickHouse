@@ -24,7 +24,7 @@ namespace DB
  * JSON manifest for exporting a set of parts to object storage.
  * Layout on disk (pretty-printed JSON):
  * {
- *   "commit_id": "<id>",
+ *   "transaction_id": "<id>",
  *   "partition_id": "<partition_id>",
  *   "destination": "<database>.<table>",
  *   "parts": [ {"part_name": "name", "remote_path": "path-or-empty"}, ... ]
@@ -42,7 +42,7 @@ struct MergeTreeExportManifest
         String remote_path; // empty until uploaded
     };
 
-    String commit_id;
+    String transaction_id;
     String partition_id;
     StorageID destination_storage_id;
     std::vector<Item> items;
@@ -61,7 +61,7 @@ struct MergeTreeExportManifest
     {
         auto manifest = std::make_shared<MergeTreeExportManifest>();
         manifest->disk = disk_;
-        manifest->commit_id = commit_id_;
+        manifest->transaction_id = commit_id_;
         manifest->partition_id = partition_id_;
         manifest->destination_storage_id = destination_storage_id_;
         manifest->file_path = std::filesystem::path(path_prefix) / ("export_partition_" + partition_id_ + "_commit_" + commit_id_ + ".json");
@@ -89,7 +89,7 @@ struct MergeTreeExportManifest
         if (!root)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid export manifest JSON: {}", file_path_);
 
-        manifest->commit_id = root->getValue<String>("commit_id");
+        manifest->transaction_id = root->getValue<String>("transaction_id");
         manifest->partition_id = root->getValue<String>("partition_id");
         const auto destination = root->getValue<String>("destination");
         manifest->destination_storage_id = StorageID(QualifiedTableName::parseFromString(destination));
@@ -114,7 +114,7 @@ struct MergeTreeExportManifest
         auto out = disk->writeFile(file_path, DBMS_DEFAULT_BUFFER_SIZE, WriteMode::Rewrite);
 
         Poco::JSON::Object::Ptr root(new Poco::JSON::Object());
-        root->set("commit_id", commit_id);
+        root->set("transaction_id", transaction_id);
         root->set("partition_id", partition_id);
         root->set("destination", destination_storage_id.getQualifiedName().getFullName());
         root->set("completed", completed);
