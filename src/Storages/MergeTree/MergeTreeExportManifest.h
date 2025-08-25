@@ -8,14 +8,11 @@
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
-#include "Storages/MergeTree/RangesInDataPart.h"
 #include <Poco/JSON/Object.h>
 #include <Poco/JSON/Array.h>
 #include <Poco/JSON/Parser.h>
 #include <Poco/JSON/Stringifier.h>
 #include <Poco/Dynamic/Var.h>
-#include <memory>
-#include <sstream>
 
 namespace DB
 {
@@ -54,17 +51,17 @@ struct MergeTreeExportManifest
     static std::shared_ptr<MergeTreeExportManifest> create(
         const DiskPtr & disk_,
         const String & path_prefix,
-        const String & commit_id_,
+        const String & transaction_id_,
         const String & partition_id_,
         const StorageID & destination_storage_id_,
         const std::vector<DataPartPtr> & data_parts)
     {
         auto manifest = std::make_shared<MergeTreeExportManifest>();
         manifest->disk = disk_;
-        manifest->transaction_id = commit_id_;
+        manifest->transaction_id = transaction_id_;
         manifest->partition_id = partition_id_;
         manifest->destination_storage_id = destination_storage_id_;
-        manifest->file_path = std::filesystem::path(path_prefix) / ("export_partition_" + partition_id_ + "_commit_" + commit_id_ + ".json");
+        manifest->file_path = std::filesystem::path(path_prefix) / ("export_partition_" + partition_id_ + "_transaction_" + transaction_id_ + ".json");
         manifest->items.reserve(data_parts.size());
         for (const auto & data_part : data_parts)
             manifest->items.push_back({data_part->name, ""});
@@ -177,5 +174,3 @@ struct MergeTreeExportManifest
 };
 
 }
-
-

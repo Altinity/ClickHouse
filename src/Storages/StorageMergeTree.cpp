@@ -47,11 +47,12 @@
 #include <Common/ProfileEventsScope.h>
 #include <Common/escapeForFileName.h>
 #include "Core/BackgroundSchedulePool.h"
-#include "Core/Names.h"
-#include "ObjectStorage/MergeTree/StorageObjectStorageMergeTreePartImporterSink.h"
-#include "Storages/MergeTree/MergeMutateSelectedEntry.h"
-#include "Storages/MergeTree/MergeTreeExportManifest.h"
-#include "Storages/MergeTree/MergeTreePartInfo.h"
+#include <Core/Names.h>
+#include <Functions/generateSnowflakeID.h>
+#include <Storages/ObjectStorage/MergeTree/StorageObjectStorageMergeTreePartImporterSink.h>
+#include <Storages/MergeTree/MergeMutateSelectedEntry.h>
+#include <Storages/MergeTree/MergeTreeExportManifest.h>
+#include <Storages/MergeTree/MergeTreePartInfo.h>
 
 namespace DB
 {
@@ -597,16 +598,7 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
 
     auto exports_tagger = std::make_shared<CurrentlyExportingPartsTagger>(std::move(all_parts), *this);
 
-    std::string transaction_id;
-    {
-        std::random_device rd;
-        std::mt19937_64 gen(rd());
-        std::uniform_int_distribution<uint64_t> dis;
-        uint64_t random_value = dis(gen);
-        std::ostringstream oss;
-        oss << std::hex << random_value;
-        transaction_id = oss.str();
-    }
+    const auto transaction_id = std::to_string(generateSnowflakeID());
 
     const auto manifest = MergeTreeExportManifest::create(
         getStoragePolicy()->getAnyDisk(),
