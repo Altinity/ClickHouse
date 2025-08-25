@@ -532,6 +532,7 @@ void StorageMergeTree::exportPartsImpl(
         manifest->updateRemotePathAndWrite(stats.part->name, stats.file_path);
 
         auto part_log = getContext()->getPartLog(table_id.database_name);
+
         if (!part_log)
             return;
 
@@ -1259,7 +1260,7 @@ void StorageMergeTree::loadExportPartition()
 void StorageMergeTree::commitExportPartition(const std::shared_ptr<MergeTreeExportManifest> & manifest, const StoragePtr & dest_storage, ContextPtr local_context)
 {
     std::lock_guard lock(export_partition_commit_id_to_manifest_mutex);
-    dest_storage->writeExportCommit(manifest->commit_id, manifest->exportedPaths(), local_context);
+    dest_storage->writeExportCommit(manifest->commit_id, manifest->partition_id, manifest->exportedPaths(), local_context);
     manifest->completed = true;
     manifest->write();
     export_partition_commit_id_to_manifest.erase(manifest->commit_id);

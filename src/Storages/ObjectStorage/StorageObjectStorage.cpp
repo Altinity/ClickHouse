@@ -565,8 +565,8 @@ void StorageObjectStorage::importMergeTreePartition(
 
     QueryPlan plan;
 
-    // todo arthur
-    MergeTreeSequentialSourceType read_type = MergeTreeSequentialSourceType::Merge;
+    /// using the mutations type for now
+    MergeTreeSequentialSourceType read_type = MergeTreeSequentialSourceType::Mutation;
 
     bool apply_deleted_mask = true;
     bool read_with_direct_io = false;
@@ -658,9 +658,9 @@ void StorageObjectStorage::importMergeTreePartition(
     // NOTE: Do not write commit file here. The caller manages commit via JSON manifest.
 }
 
-void StorageObjectStorage::writeExportCommit(const String & commit_id, const Strings & exported_paths, ContextPtr local_context)
+void StorageObjectStorage::writeExportCommit(const String & commit_id, const String & partition_id, const Strings & exported_paths, ContextPtr local_context)
 {
-    const String commit_object = configuration->getRawPath().path + "/commit_" + commit_id;
+    const String commit_object = configuration->getRawPath().path + "/commit_" + partition_id + "_" + commit_id;
 
     /// if file already exists, nothing to be done
     if (object_storage->exists(StoredObject(commit_object)))

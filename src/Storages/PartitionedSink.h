@@ -48,15 +48,9 @@ public:
 
     void onFinish() override;
 
-    void assumeSamePartition() {
-        assume_same_partition = true;
-    }
-
     static void validatePartitionKey(const String & str, bool allow_slash);
 
     static String replaceWildcards(const String & haystack, const String & partition_id);
-
-    ChunkSplitStatistics getPartitioningStats() const;
 
 private:
     std::shared_ptr<IPartitionStrategy> partition_strategy;
@@ -70,11 +64,6 @@ private:
     Arena partition_keys_arena;
 
     SinkPtr getSinkForPartitionKey(StringRef partition_key);
-    ChunkSplitStatistics partitioning_stats;
-    bool assume_same_partition = false;
-    std::shared_ptr<SinkToStorage> sink_to_storage;
-
-    void consumeAssumeSamePartition(Chunk & chunk);
 };
 
 }

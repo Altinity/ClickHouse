@@ -215,7 +215,14 @@ public:
     }
 
     /// Write an export commit file containing the list of exported remote paths
-    virtual void writeExportCommit(const String &, const Strings &, ContextPtr) {throw Exception(ErrorCodes::NOT_IMPLEMENTED, "writeExportCommit is not implemented for storage type {}", getName());}
+    virtual void writeExportCommit(
+        const String & /* commit_id */,
+        const String & /* partition_id */,
+        const Strings & /* exported_paths */,
+        ContextPtr /* local_context */)
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "writeExportCommit is not implemented for storage type {}", getName());
+    }
 
     /// Return list of virtual columns (like _part, _table, etc). In the vast
     /// majority of cases virtual columns are static constant part of Storage

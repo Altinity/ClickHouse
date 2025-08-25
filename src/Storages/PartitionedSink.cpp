@@ -9,7 +9,6 @@
 #include <Processors/ISource.h>
 #include <boost/algorithm/string/replace.hpp>
 #include <Common/ArenaUtils.h>
-#include "boost/iostreams/concepts.hpp"
 
 
 namespace DB
@@ -46,42 +45,13 @@ SinkPtr PartitionedSink::getSinkForPartitionKey(StringRef partition_key)
     return it->second;
 }
 
-PartitionedSink::ChunkSplitStatistics PartitionedSink::getPartitioningStats() const
-{
-    return partitioning_stats;
-}
-
-void PartitionedSink::consumeAssumeSamePartition(Chunk & source_chunk)
-{
-    if (!sink_to_storage)
-    {
-        const ColumnPtr partition_by_result_column = partition_strategy->computePartitionKey(source_chunk);
-        auto partition_key = partition_by_result_column->getDataAt(0);
-        sink_to_storage = sink_creator->createSinkForPartition(partition_key.toString());
-    }
-
-    auto format_chunk = partition_strategy->getFormatChunk(source_chunk);
-    sink_to_storage->consume(format_chunk);
-}
-
 void PartitionedSink::consume(Chunk & source_chunk)
 {
-    if (assume_same_partition)
-    {
-        consumeAssumeSamePartition(source_chunk);
-        return;
-    }
-
-    auto start_calc = std::chrono::system_clock::now();
     const ColumnPtr partition_by_result_column = partition_strategy->computePartitionKey(source_chunk);
-    auto end_calc = std::chrono::system_clock::now();
-
-    partitioning_stats.time_spent_on_partition_calculation +=
-std::chrono::duration_cast<std::chrono::microseconds>(end_calc - start_calc).count();
 
     /// Not all columns are serialized using the format writer (e.g, hive partitioning stores partition columns in the file path)
     auto format_chunk = partition_strategy->getFormatChunk(source_chunk);
-    const auto columns_to_consume = format_chunk.getColumns();
+    const auto & columns_to_consume = format_chunk.getColumns();
 
     if (columns_to_consume.empty())
     {
@@ -89,8 +59,6 @@ std::chrono::duration_cast<std::chrono::microseconds>(end_calc - start_calc).cou
                         "No column to write as all columns are specified as partition columns. "
                         "Consider setting `partition_columns_in_data_file=1`");
     }
-
-    auto start_split = std::chrono::system_clock::now();
 
     size_t chunk_rows = source_chunk.getNumRows();
     chunk_row_index_to_partition_index.resize(chunk_rows);
@@ -132,10 +100,6 @@ std::chrono::duration_cast<std::chrono::microseconds>(end_calc - start_calc).cou
         }
     }
 
-    auto end_split = std::chrono::system_clock::now();
-
-    partitioning_stats.time_spent_on_chunk_split += std::chrono::duration_cast<std::chrono::microseconds>(end_split - start_split).count();
-
     for (const auto & [partition_key, partition_index] : partition_id_to_chunk_index)
     {
         auto sink = getSinkForPartitionKey(partition_key);
@@ -145,11 +109,6 @@ std::chrono::duration_cast<std::chrono::microseconds>(end_calc - start_calc).cou
 
 void PartitionedSink::onException(std::exception_ptr exception)
 {
-    if (assume_same_partition && sink_to_storage)
-    {
-        sink_to_storage->onException(exception);
-        return;
-    }
     for (auto & [_, sink] : partition_id_to_sink)
     {
         sink->onException(exception);
@@ -158,11 +117,6 @@ void PartitionedSink::onException(std::exception_ptr exception)
 
 void PartitionedSink::onFinish()
 {
-    if (assume_same_partition && sink_to_storage)
-    {
-        sink_to_storage->onFinish();
-        return;
-    }
     for (auto & [_, sink] : partition_id_to_sink)
     {
         sink->onFinish();
@@ -195,11 +149,6 @@ PartitionedSink::~PartitionedSink()
 {
     if (isCancelled())
     {
-        if (assume_same_partition && sink_to_storage)
-        {
-            sink_to_storage->cancel();
-            return;
-        }
         for (auto &item: partition_id_to_sink)
             item.second->cancel();
     }
