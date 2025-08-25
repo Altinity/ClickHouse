@@ -630,9 +630,9 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
     }
     else
     {
-        /// async always
-        background_moves_assignee.scheduleMoveTask(
-            std::make_shared<ExecutableLambdaAdapter>(export_partition_function, moves_assignee_trigger, getStorageID()));
+        exportPartsImpl(exports_tagger, transaction_id, dest_storage);
+
+        commitExportPartitionTask(manifest, dest_storage, getContext());
     }
 }
 
