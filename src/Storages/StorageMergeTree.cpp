@@ -505,13 +505,7 @@ void StorageMergeTree::exportPartsImpl(
 
     const auto start_time = std::chrono::system_clock::now();
 
-    std::vector<DataPartPtr> src_parts;
-    for (const auto & part : exports_tagger->parts_to_export)
-    {
-        src_parts.push_back(part);
-    }
-
-    dest_storage->importMergeTreePartition(*this, src_parts, getContext(), [&](MergeTreePartImportStats stats)
+    dest_storage->importMergeTreePartition(*this, exports_tagger->parts_to_export, getContext(), [&](MergeTreePartImportStats stats)
     {
         std::lock_guard lock(export_partition_commit_id_to_manifest_mutex);
         auto table_id = getStorageID();
@@ -522,14 +516,7 @@ void StorageMergeTree::exportPartsImpl(
             return;
         }
 
-        auto manifest = export_partition_commit_id_to_manifest[commit_id];
-        if (!manifest)
-        {
-            LOG_ERROR(log, "Export manifest not found for commit_id: {}", commit_id);
-            return;
-        }
-
-        manifest->updateRemotePathAndWrite(stats.part->name, stats.file_path);
+        export_partition_commit_id_to_manifest[commit_id]->updateRemotePathAndWrite(stats.part->name, stats.file_path);
 
         auto part_log = getContext()->getPartLog(table_id.database_name);
 
@@ -583,16 +570,24 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
     String dest_database = query_context->resolveDatabase(command.to_database);
     auto dest_storage = DatabaseCatalog::instance().getTable({dest_database, command.to_table}, query_context);
 
-    /// The target table and the source table are the same.
     if (dest_storage->getStorageID() == this->getStorageID())
-        return;
-
-    auto query = std::make_shared<ASTInsertQuery>();
+    {
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Exporting to the same table is not allowed");
+    }
 
     String partition_id = getPartitionIDFromQuery(command.partition, getContext());
 
     auto lock1 = lockForShare(query_context->getCurrentQueryId(), query_context->getSettingsRef()[Setting::lock_acquire_timeout]);
     auto merges_blocker = stopMergesAndWaitForPartition(partition_id);
+
+    auto all_parts = getVisibleDataPartsVectorInPartition(getContext(), partition_id);
+
+    if (all_parts.empty())
+    {
+        LOG_INFO(log, "No parts to export for partition {}, skipping", partition_id);
+        return;
+    }
+
     std::lock_guard lock(currently_processing_in_background_mutex);
 
     if (!already_exported_partition_ids.emplace(partition_id).second)
@@ -600,54 +595,7 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
         throw Exception(ErrorCodes::PART_IS_LOCKED, "Partition {} has already been exported", partition_id);
     }
 
-    std::lock_guard lock2(export_partition_commit_id_to_manifest_mutex);
-
-    const auto all_parts = getVisibleDataPartsVectorInPartition(getContext(), partition_id);
-
-    if (all_parts.empty())
-    {
-        return;
-    }
-
-    std::vector<DataPartPtr> src_parts;
-
-    std::vector<DataPartPtr> parts_to_export;
-
-    for (const auto & part : all_parts)
-    {
-        bool part_being_exported = false;
-        /// check all manifests to see if the part is already being exported
-        /// if so, skip it
-        for (const auto & [commit_id, manifest] : export_partition_commit_id_to_manifest)
-        {
-            auto parts_being_exported_in_this_commit = manifest->items;
-
-            
-            for (const auto & item : parts_being_exported_in_this_commit)
-            {
-                if (item.part_name == part->name)
-                {
-                    part_being_exported = true;
-                    break;
-                }
-            }
-        }
-
-        if (part_being_exported)
-        {
-            continue;
-        }
-
-        src_parts.emplace_back(part);
-        parts_to_export.emplace_back(part);
-    }
-
-    if (parts_to_export.empty())
-    {
-        return;
-    }
-
-    auto exports_tagger = std::make_shared<CurrentlyExportingPartsTagger>(std::move(parts_to_export), *this);
+    auto exports_tagger = std::make_shared<CurrentlyExportingPartsTagger>(std::move(all_parts), *this);
 
     std::string commit_id;
     {
@@ -660,9 +608,19 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
         commit_id = oss.str();
     }
 
-    const auto manifest = MergeTreeExportManifest::create(getStoragePolicy()->getAnyDisk(), relative_data_path, commit_id, partition_id, dest_storage->getStorageID(), src_parts);
+    const auto manifest = MergeTreeExportManifest::create(
+        getStoragePolicy()->getAnyDisk(),
+        relative_data_path,
+        commit_id,
+        partition_id,
+        dest_storage->getStorageID(),
+        exports_tagger->parts_to_export);
 
-    export_partition_commit_id_to_manifest[commit_id] = manifest;
+    {
+        std::lock_guard lock2(export_partition_commit_id_to_manifest_mutex);
+
+        export_partition_commit_id_to_manifest[commit_id] = manifest;
+    }
 
     auto export_partition_function = [this, query_context, partition_id, dest_storage, commit_id, manifest, exports_tagger] () mutable
     {
@@ -1234,13 +1192,25 @@ void StorageMergeTree::loadExportPartition()
         for (auto it = disk->iterateDirectory(relative_data_path); it->isValid(); it->next())
         {
             const auto & name = it->name();
-            if (startsWith(name, "export_") && endsWith(name, ".json"))
+            if (startsWith(name, "export_"))
             {
                 try
                 {
                     auto manifest = MergeTreeExportManifest::read(disk, fs::path(relative_data_path) / name);
-                    export_partition_commit_id_to_manifest[manifest->commit_id] = manifest;
+
                     already_exported_partition_ids.insert(manifest->partition_id);
+
+                    if (manifest->completed)
+                    {
+                        LOG_INFO(
+                            log,
+                            "Export commit {} of partition {} to destination storage {} already completed, skipping",
+                            manifest->commit_id,
+                            manifest->partition_id,
+                            manifest->destination_storage_id.getNameForLogs());
+                        continue;
+                    }
+                    
                     LOG_DEBUG(log, "Loaded export commit manifest: {} (commit_id: {})", name, manifest->commit_id);
                 }
                 catch (const std::exception & ex)
@@ -1251,10 +1221,7 @@ void StorageMergeTree::loadExportPartition()
         }
     }
 
-    if (!export_partition_commit_id_to_manifest.empty())
-    {
-        restartExportProcess();
-    }
+    restartExportProcess();
 }
 
 void StorageMergeTree::commitExportPartition(const std::shared_ptr<MergeTreeExportManifest> & manifest, const StoragePtr & dest_storage, ContextPtr local_context)
@@ -1266,23 +1233,10 @@ void StorageMergeTree::commitExportPartition(const std::shared_ptr<MergeTreeExpo
     export_partition_commit_id_to_manifest.erase(manifest->commit_id);
 }
 
-
 void StorageMergeTree::restartExportProcess()
 {
-    /// I suppose I don't need to lock it here because it is during the startup
     for (const auto & [commit_id, manifest] : export_partition_commit_id_to_manifest)
     {
-        if (manifest->completed)
-        {
-            LOG_INFO(
-                log,
-                "Export commit {} of partition {} to destination storage {} already completed, skipping",
-                commit_id,
-                manifest->partition_id,
-                manifest->destination_storage_id.getNameForLogs());
-            continue;
-        }
-
         auto destination_storage = reconstructDestinationStorage(manifest->destination_storage_id);
         if (!destination_storage)
         {

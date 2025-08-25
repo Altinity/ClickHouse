@@ -67,7 +67,7 @@ struct MergeTreeExportManifest
         manifest->file_path = std::filesystem::path(path_prefix) / ("export_partition_" + partition_id_ + "_commit_" + commit_id_ + ".json");
         manifest->items.reserve(data_parts.size());
         for (const auto & data_part : data_parts)
-            manifest->items.push_back({data_part->name, {}});
+            manifest->items.push_back({data_part->name, ""});
         manifest->write();
         return manifest;
     }
@@ -89,39 +89,21 @@ struct MergeTreeExportManifest
         if (!root)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid export manifest JSON: {}", file_path_);
 
-        if (root->has("commit_id"))
-            manifest->commit_id = root->getValue<String>("commit_id");
-        if (root->has("partition_id"))
-            manifest->partition_id = root->getValue<String>("partition_id");
-        if (root->has("destination"))
-        {
-            const auto destination = root->getValue<String>("destination");
-            if (!destination.empty())
-                manifest->destination_storage_id = StorageID(QualifiedTableName::parseFromString(destination));
-        }
-        if (root->has("completed"))
-            manifest->completed = root->getValue<bool>("completed");
+        manifest->commit_id = root->getValue<String>("commit_id");
+        manifest->partition_id = root->getValue<String>("partition_id");
+        const auto destination = root->getValue<String>("destination");
+        manifest->destination_storage_id = StorageID(QualifiedTableName::parseFromString(destination));
+        manifest->completed = root->getValue<bool>("completed");
 
         manifest->items.clear();
-        if (root->has("parts"))
+        auto parts = root->get("parts").extract<Poco::JSON::Array::Ptr>();
+        for (unsigned int i = 0; i < parts->size(); ++i)
         {
-            auto parts = root->get("parts").extract<Poco::JSON::Array::Ptr>();
-            if (parts)
-            {
-                for (unsigned int i = 0; i < parts->size(); ++i)
-                {
-                    const auto part_obj = parts->getObject(i);
-                    if (!part_obj)
-                        continue;
-                    Item item;
-                    if (part_obj->has("part_name"))
-                        item.part_name = part_obj->getValue<String>("part_name");
-                    if (part_obj->has("remote_path"))
-                        item.remote_path = part_obj->getValue<String>("remote_path");
-                    if (!item.part_name.empty())
-                        manifest->items.push_back(std::move(item));
-                }
-            }
+            const auto part_obj = parts->getObject(i);
+            Item item;
+            item.part_name = part_obj->getValue<String>("part_name");
+            item.remote_path = part_obj->getValue<String>("remote_path");
+            manifest->items.push_back(std::move(item));
         }
 
         return manifest;
@@ -168,12 +150,6 @@ struct MergeTreeExportManifest
         write();
     }
 
-    void updateCompleted(bool completed_)
-    {
-        completed = completed_;
-        write();
-    }
-
     std::vector<String> pendingParts() const
     {
         std::vector<String> res;
@@ -186,9 +162,16 @@ struct MergeTreeExportManifest
     std::vector<String> exportedPaths() const
     {
         std::vector<String> res;
+        res.reserve(items.size());
+
         for (const auto & i : items)
+        {
             if (!i.remote_path.empty())
+            {
                 res.push_back(i.remote_path);
+            }
+        }
+
         return res;
     }
 };
