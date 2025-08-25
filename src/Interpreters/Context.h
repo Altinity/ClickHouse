@@ -32,8 +32,6 @@
 #include <mutex>
 #include <optional>
 
-#include "Storages/ExportsList.h"
-
 
 namespace Poco::Net
 {
@@ -90,6 +88,7 @@ class AsynchronousMetrics;
 class BackgroundSchedulePool;
 class MergeList;
 class MovesList;
+class ExportsList;
 class ReplicatedFetchList;
 class RefreshSet;
 class Cluster;

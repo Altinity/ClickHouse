@@ -24,6 +24,7 @@ namespace DB
  *   "transaction_id": "<id>",
  *   "partition_id": "<partition_id>",
  *   "destination": "<database>.<table>",
+ *   "completed": <true/false>,
  *   "parts": [ {"part_name": "name", "remote_path": "path-or-empty"}, ... ]
  * }
  */

@@ -19,6 +19,7 @@
 #include <Processors/Transforms/ExtractColumnsTransform.h>
 
 #include <Storages/Cache/SchemaCache.h>
+#include <Storages/ExportsList.h>
 #include <Storages/NamedCollectionsHelpers.h>
 #include <Storages/ObjectStorage/ReadBufferIterator.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSink.h>

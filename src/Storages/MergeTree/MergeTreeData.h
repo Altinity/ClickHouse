@@ -1239,20 +1239,6 @@ protected:
     /// under lockForShare if rename is possible.
     String relative_data_path;
 
-    /// RAII Wrapper for atomic work with currently moving parts
-    /// Acquire them in constructor and remove them in destructor
-    /// Uses data.currently_moving_parts_mutex
-    struct CurrentlyMovingPartsTagger
-    {
-        MergeTreeMovingParts parts_to_move;
-        MergeTreeData & data;
-        CurrentlyMovingPartsTagger(MergeTreeMovingParts && moving_parts_, MergeTreeData & data_);
-
-        ~CurrentlyMovingPartsTagger();
-    };
-
-    using CurrentlyMovingPartsTaggerPtr = std::shared_ptr<CurrentlyMovingPartsTagger>;
-
 private:
     /// Columns and secondary indices sizes can be calculated lazily.
     mutable std::mutex columns_and_secondary_indices_sizes_mutex;
@@ -1687,7 +1673,19 @@ private:
         DataPartsVector * out_covered_parts,
         bool rename_in_transaction);
 
+    /// RAII Wrapper for atomic work with currently moving parts
+    /// Acquire them in constructor and remove them in destructor
+    /// Uses data.currently_moving_parts_mutex
+    struct CurrentlyMovingPartsTagger
+    {
+        MergeTreeMovingParts parts_to_move;
+        MergeTreeData & data;
+        CurrentlyMovingPartsTagger(MergeTreeMovingParts && moving_parts_, MergeTreeData & data_);
 
+        ~CurrentlyMovingPartsTagger();
+    };
+
+    using CurrentlyMovingPartsTaggerPtr = std::shared_ptr<CurrentlyMovingPartsTagger>;
 
     /// Moves part to specified space, used in ALTER ... MOVE ... queries
     std::future<MovePartsOutcome> movePartsToSpace(const CurrentlyMovingPartsTaggerPtr & moving_tagger, const ReadSettings & read_settings, const WriteSettings & write_settings, bool async);
