@@ -23,3 +23,11 @@ test/s3_table_NAME/year=2020/SNOWFLAKE_ID.parquet	3	2020
 test/s3_table_NAME/year=2021/SNOWFLAKE_ID.parquet	4	2021
 test/s3_table_NAME/year=2020/SNOWFLAKE_ID.parquet	5	2020
 test/s3_table_NAME/year=2020/SNOWFLAKE_ID.parquet	6	2020
+---- Round trip check: create a new MergeTree table as SELECT * from s3_table
+---- Data in roundtrip MergeTree table (should match s3_table)
+1	2020
+2	2020
+3	2020
+4	2021
+5	2020
+6	2020

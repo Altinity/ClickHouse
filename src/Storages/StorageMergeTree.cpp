@@ -630,9 +630,9 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
     }
     else
     {
-        exportPartsImpl(exports_tagger, transaction_id, dest_storage);
-
-        commitExportPartitionTask(manifest, dest_storage, getContext());
+        /// always in the background for now. I need to sort out the locks
+        background_moves_assignee.scheduleMoveTask(
+            std::make_shared<ExecutableLambdaAdapter>(export_partition_function, moves_assignee_trigger, getStorageID()));
     }
 }
 
