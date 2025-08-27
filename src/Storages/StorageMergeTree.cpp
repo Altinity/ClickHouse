@@ -1202,7 +1202,9 @@ void StorageMergeTree::readExportPartitionManifests()
                             manifest->destination_storage_id.getNameForLogs());
                         continue;
                     }
-                    
+
+                    export_partition_transaction_id_to_manifest.emplace(manifest->transaction_id, manifest);
+
                     LOG_DEBUG(log, "Loaded export transaction manifest: {} (transaction_id: {})", name, manifest->transaction_id);
                 }
                 catch (const std::exception & ex)
