@@ -7,12 +7,13 @@ CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 mt_table="mt_table_${RANDOM}"
 s3_table="s3_table_${RANDOM}"
 mt_table_roundtrip="mt_table_roundtrip_${RANDOM}"
+invalid_schema_table="invalid_schema_table_${RANDOM}"
 
 query() {
     $CLICKHOUSE_CLIENT --query "$1"
 }
 
-query "DROP TABLE IF EXISTS $mt_table, $s3_table, $mt_table_roundtrip"
+query "DROP TABLE IF EXISTS $mt_table, $s3_table, $mt_table_roundtrip, $invalid_schema_table"
 
 query "CREATE TABLE $mt_table (id UInt64, year UInt16) ENGINE = MergeTree() PARTITION BY year ORDER BY tuple()"
 query "CREATE TABLE $s3_table (id UInt64, year UInt16) ENGINE = S3(s3_conn, filename='$s3_table', format=Parquet, partition_strategy='hive') PARTITION BY year"
@@ -48,6 +49,16 @@ query "CREATE TABLE $mt_table_roundtrip ENGINE = MergeTree() PARTITION BY year O
 
 echo "---- Data in roundtrip MergeTree table (should match s3_table)"
 query "SELECT DISTINCT ON (id) * FROM $mt_table_roundtrip ORDER BY id"
+
+# Create a table with a different partition key and export a partition to it. It should throw
+query "CREATE TABLE $invalid_schema_table (id UInt64, x UInt16) ENGINE = S3(s3_conn, filename='$invalid_schema_table', format=Parquet, partition_strategy='hive') PARTITION BY x"
+query "ALTER TABLE $mt_table EXPORT PARTITION ID '2020' TO TABLE $invalid_schema_table SETTINGS allow_experimental_export_merge_tree_partition = 1, export_merge_tree_partition_background_execution = 0 -- {serverError BAD_ARGUMENTS}"
+
+query "DROP TABLE $invalid_schema_table"
+
+# The only partition strategy that supports exports is hive. Wildcard should throw
+query "CREATE TABLE $invalid_schema_table (id UInt64, year UInt16) ENGINE = S3(s3_conn, filename='$invalid_schema_table/{_partition_id}', format=Parquet, partition_strategy='wildcard') PARTITION BY (id, year)"
+query "ALTER TABLE $mt_table EXPORT PARTITION ID '2020' TO TABLE $invalid_schema_table SETTINGS allow_experimental_export_merge_tree_partition = 1, export_merge_tree_partition_background_execution = 0 -- {serverError NOT_IMPLEMENTED}"
 
 query "SYSTEM START MERGES"
 query "DROP TABLE IF EXISTS $mt_table, $s3_table, $mt_table_roundtrip"
