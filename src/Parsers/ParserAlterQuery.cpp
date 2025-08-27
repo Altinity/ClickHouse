@@ -82,7 +82,6 @@ bool ParserAlterCommand::parseImpl(Pos & pos, ASTPtr & node, Expected & expected
     ParserKeyword s_forget_partition(Keyword::FORGET_PARTITION);
     ParserKeyword s_move_partition(Keyword::MOVE_PARTITION);
     ParserKeyword s_move_part(Keyword::MOVE_PART);
-    ParserKeyword s_export_part(Keyword::EXPORT_PART);
     ParserKeyword s_export_partition(Keyword::EXPORT_PARTITION);
     ParserKeyword s_drop_detached_partition(Keyword::DROP_DETACHED_PARTITION);
     ParserKeyword s_drop_detached_part(Keyword::DROP_DETACHED_PART);
@@ -572,23 +571,6 @@ bool ParserAlterCommand::parseImpl(Pos & pos, ASTPtr & node, Expected & expected
                     return false;
 
                 command->type = ASTAlterCommand::EXPORT_PARTITION;
-
-                if (!s_to_table.ignore(pos, expected))
-                {
-                    return false;
-                }
-
-                if (!parseDatabaseAndTableName(pos, expected, command->to_database, command->to_table))
-                    return false;
-                command->move_destination_type = DataDestinationType::TABLE;
-            }
-            else if (s_export_part.ignore(pos, expected))
-            {
-                if (!parser_partition.parse(pos, command_partition, expected))
-                    return false;
-
-                command->type = ASTAlterCommand::EXPORT_PARTITION;
-                command->part = true;
 
                 if (!s_to_table.ignore(pos, expected))
                 {

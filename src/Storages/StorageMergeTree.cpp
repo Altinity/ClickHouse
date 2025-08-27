@@ -576,9 +576,25 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Exporting to the same table is not allowed");
     }
 
+    if (!dest_storage->supportsImportMergeTreePartition())
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Destination storage {} does not support importing merge tree partitions", dest_storage->getName());
+
+    auto query_to_string = [] (const ASTPtr & ast)
+    {
+        return ast ? ast->formatWithSecretsOneLine() : "";
+    };
+
+    auto src_snapshot = getInMemoryMetadataPtr();
+    auto destination_snapshot = dest_storage->getInMemoryMetadataPtr();
+
+    if (query_to_string(src_snapshot->getPartitionKeyAST()) != query_to_string(destination_snapshot->getPartitionKeyAST()))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
+
     String partition_id = getPartitionIDFromQuery(command.partition, getContext());
 
-    auto lock1 = lockForShare(query_context->getCurrentQueryId(), query_context->getSettingsRef()[Setting::lock_acquire_timeout]);
+    auto lock1 = lockForShare(
+        query_context->getCurrentQueryId(),
+        query_context->getSettingsRef()[Setting::lock_acquire_timeout]);
     auto merges_blocker = stopMergesAndWaitForPartition(partition_id);
 
     auto all_parts = getVisibleDataPartsVectorInPartition(getContext(), partition_id);
@@ -716,7 +732,7 @@ CurrentlyExportingPartsTagger::CurrentlyExportingPartsTagger(std::vector<DataPar
     /// assume it is already locked
     for (const auto & part : parts_to_export)
         if (!storage.currently_merging_mutating_parts.emplace(part).second)
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot export part '{}'. It's already exporting.", part->name);
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Tagging already tagged part {}. This is a bug.", part->name);
 }
 
 CurrentlyExportingPartsTagger::~CurrentlyExportingPartsTagger()

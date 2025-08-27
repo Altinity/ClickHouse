@@ -98,6 +98,8 @@ public:
         ContextPtr context,
         bool async_insert) override;
 
+    bool supportsImportMergeTreePartition() const override;
+
     void importMergeTreePartition(
         const MergeTreeData & merge_tree_data,
         const std::vector<DataPartPtr> & data_parts,

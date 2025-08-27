@@ -548,6 +548,11 @@ void StorageObjectStorage::read(
     query_plan.addStep(std::move(read_step));
 }
 
+bool StorageObjectStorage::supportsImportMergeTreePartition() const
+{
+    return configuration->partition_strategy != nullptr && configuration->partition_strategy_type == PartitionStrategyFactory::StrategyType::HIVE;
+}
+
 void StorageObjectStorage::importMergeTreePartition(
     const MergeTreeData & merge_tree_data,
     const std::vector<DataPartPtr> & data_parts,

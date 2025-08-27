@@ -454,6 +454,8 @@ public:
         ContextPtr /*context*/,
         bool /*async_insert*/);
 
+    virtual bool supportsImportMergeTreePartition() const { return false; }
+
     virtual void importMergeTreePartition(
         const MergeTreeData &,
         const std::vector<DataPartPtr> &,
