@@ -92,6 +92,18 @@
         "reason": "INVESTIGATE - timeout",
         "message": "Timeout! Killing process group"
     },
+    "02098_hashed_array_dictionary_simple_key": {
+        "reason": "INVESTIGATE - timeout, unstable",
+        "message": "Timeout! Killing process group"
+    },
+    "00596_limit_on_expanded_ast": {
+        "reason": "INVESTIGATE - timeout, unstable",
+        "message": "Timeout! Killing process group"
+    },
+    "01513_optimize_aggregation_in_order_memory_long": {
+        "reason": "INVESTIGATE - timeout, unstable",
+        "message": "Timeout! Killing process group"
+    },
     "01651_lc_insert_tiny_log_2": {
         "reason": "INVESTIGATE - timeout",
         "message": "Timeout! Killing process group"
@@ -111,6 +123,9 @@
         "message": "Could not calculate available disk space (statvfs)"
     },
     "00157_cache_dictionary": {
+        "reason": "INVESTIGATE - Timeout in ClickHouse query"
+    },
+    "00284_external_aggregation": {
         "reason": "INVESTIGATE - Timeout in ClickHouse query"
     },
     "01655_plan_optimizations_optimize_read_in_window_order_long": {
