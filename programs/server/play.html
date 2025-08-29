@@ -483,11 +483,9 @@
 </head>
 
 <body>
-    <div id="menu">
-        <div id="databases-icon" class="menu-icon">
-            <svg id="databases-toggle" viewBox="0 0 150 150">
-                <path d="m19 72 82-48L75 9 19 42zm5 3 23 14V62zm49 34L19 78v62zm28-52 29-17-24-13-28 17zm3 7v60l28 16V80zm2-4 26 15V45z" fill="#199DCF"/>
-            </svg>
+    <div id="controls">
+        <div id="inputs">
+            <input class="monospace shadow" id="url" type="text" value="http://localhost:8123/" placeholder="url" /><input class="monospace shadow" id="user" type="text" value="default" placeholder="user" /><input class="monospace shadow" id="password" type="password" placeholder="password" />
         </div>
         <div id="query_div">
             <textarea autofocus spellcheck="false" data-gramm="false" class="monospace shadow" id="query"></textarea>
