@@ -104,6 +104,14 @@
         "reason": "INVESTIGATE - timeout, unstable",
         "message": "Timeout! Killing process group"
     },
+    "03305_mergine_aggregated_filter_push_down": {
+        "reason": "INVESTIGATE - timeout on tsan, unstable",
+        "message": "Timeout! Killing process group"
+    },
+    "02455_one_row_from_csv_memory_usage": {
+        "reason": "INVESTIGATE - timeout on tsan, unstable",
+        "message": "Timeout! Killing process group"
+    },
     "01651_lc_insert_tiny_log_2": {
         "reason": "INVESTIGATE - timeout",
         "message": "Timeout! Killing process group"
