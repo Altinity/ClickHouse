@@ -1,4 +1,12 @@
 {
+    "02700_s3_part_INT_MAX": {
+        "reason": "INVESTIGATE - Sometimes out of memory with msan",
+        "message": "DB::Exception: (total) memory limit exceeded"
+    },
+    "00180_no_seek_avoiding_when_reading_from_cache": {
+        "reason": "INVESTIGATE - Sometimes out of memory with msan",
+        "message": "DB::Exception: (total) memory limit exceeded"
+    },
     "01880_remote_ipv6": {
         "reason": "INVESTIGATE - Fails on debug build"
     },
