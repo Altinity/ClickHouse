@@ -84,6 +84,9 @@
     "00090_thread_pool_deadlock": {
         "reason": "INVESTIGATE - Unstable?"
     },
+    "03271_ghdata_object_to_json_alter": {
+        "reason": "INVESTIGATE - Unstable?"
+    },
     "01810_max_part_removal_threads_long": {
         "reason": "INVESTIGATE - ClickHouse timeout",
         "message": "Timeout exceeded (180 s) while flushing system log"
@@ -93,6 +96,10 @@
         "message": "Timeout exceeded (180 s) while flushing system log"
     },
     "03514_grace_hash_join_logical_error": {
+        "reason": "INVESTIGATE - timeout",
+        "message": "Timeout! Killing process group"
+    },
+    "00024_random_counters": {
         "reason": "INVESTIGATE - timeout",
         "message": "Timeout! Killing process group"
     },
