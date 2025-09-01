@@ -13,6 +13,7 @@
 #include <Poco/JSON/Parser.h>
 #include <Poco/JSON/Stringifier.h>
 #include <Poco/Dynamic/Var.h>
+#include <Storages/MergeTree/IMergeTreeDataPart.h>
 
 namespace DB
 {
@@ -30,6 +31,8 @@ namespace DB
  */
 struct MergeTreeExportManifest
 {
+    using DataPartPtr = std::shared_ptr<const IMergeTreeDataPart>;
+
     MergeTreeExportManifest()
         : destination_storage_id(StorageID::createEmpty())
     {}

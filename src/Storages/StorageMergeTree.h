@@ -185,8 +185,6 @@ private:
     /// Restart export process for parts that were being exported before restart
     void resumeExportPartitionTasks();
 
-    void commitExportPartitionTask(const std::shared_ptr<MergeTreeExportManifest> & manifest, const StoragePtr & dest_storage, ContextPtr context);
-
     /// Load and initialize deduplication logs. Even if deduplication setting
     /// equals zero creates object with deduplication window equals zero.
     void loadDeduplicationLog();
@@ -305,12 +303,11 @@ private:
 
     void assertNotReadonly() const;
 
-    void exportPartsImpl(const CurrentlyExportingPartsTaggerPtr & exports_tagger, const String & transaction_id, const StoragePtr & dest_storage);
-
     friend class MergeTreeSink;
     friend class MergeTreeData;
     friend class MergePlainMergeTreeTask;
     friend class MutatePlainMergeTreeTask;
+    friend class ExportPartitionPlainMergeTreeTask;
 
     struct DataValidationTasks : public IStorage::DataValidationTasksBase
     {

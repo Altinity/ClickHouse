@@ -48,6 +48,8 @@
 #include <Common/escapeForFileName.h>
 #include "Core/BackgroundSchedulePool.h"
 #include <Core/Names.h>
+#include <Storages/ObjectStorage/MergeTree/ExportPartitionPlainMergeTreeTask.h>
+#include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Functions/generateSnowflakeID.h>
 #include <Storages/ObjectStorage/MergeTree/StorageObjectStorageMergeTreePartImporterSink.h>
 #include <Storages/MergeTree/MergeMutateSelectedEntry.h>
@@ -493,69 +495,6 @@ void StorageMergeTree::alter(
     }
 }
 
-void StorageMergeTree::exportPartsImpl(
-    const CurrentlyExportingPartsTaggerPtr & exports_tagger,
-    const String & transaction_id,
-    const StoragePtr & dest_storage)
-{
-    if (exports_tagger->parts_to_export.empty())
-    {
-        LOG_INFO(log, "No parts to export for transaction {}, skipping", transaction_id);
-        return;
-    }
-
-    const auto start_time = std::chrono::system_clock::now();
-
-    dest_storage->importMergeTreePartition(*this, exports_tagger->parts_to_export, getContext(), [&](MergeTreePartImportStats stats)
-    {
-        std::lock_guard lock(export_partition_transaction_id_to_manifest_mutex);
-        auto table_id = getStorageID();
-
-        if (stats.status.code != 0)
-        {
-            LOG_ERROR(log, "Error importing part {}: {}", stats.part->name, stats.status.message);
-            return;
-        }
-
-        export_partition_transaction_id_to_manifest[transaction_id]->updateRemotePathAndWrite(stats.part->name, stats.file_path);
-
-        auto part_log = getContext()->getPartLog(table_id.database_name);
-
-        if (!part_log)
-            return;
-
-        PartLogElement part_log_elem;
-        part_log_elem.event_type = PartLogElement::Type::EXPORT_PART;
-        part_log_elem.merge_algorithm = PartLogElement::PartMergeAlgorithm::UNDECIDED;
-        part_log_elem.merge_reason = PartLogElement::MergeReasonType::NOT_A_MERGE;
-
-        part_log_elem.database_name = table_id.database_name;
-        part_log_elem.table_name = table_id.table_name;
-        part_log_elem.table_uuid = table_id.uuid;
-        part_log_elem.partition_id = MergeTreePartInfo::fromPartName(stats.part->name, format_version).getPartitionId();
-        // construct event_time and event_time_microseconds using the same time point
-        // so that the two times will always be equal up to a precision of a second.
-        const auto time_now = std::chrono::system_clock::now();
-        part_log_elem.event_time = timeInSeconds(time_now);
-        part_log_elem.event_time_microseconds = timeInMicroseconds(time_now);
-
-        part_log_elem.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(start_time - time_now).count() / 1000000;
-        part_log_elem.error = static_cast<UInt16>(stats.status.code);
-        part_log_elem.exception = stats.status.message;
-        part_log_elem.path_on_disk = stats.file_path;
-        part_log_elem.part_name = stats.part->name;
-        part_log_elem.bytes_compressed_on_disk = stats.bytes_on_disk;
-        part_log_elem.rows = stats.part->rows_count;
-        part_log_elem.disk_name = dest_storage->getName();
-        part_log_elem.part_type = stats.part->getType();
-        part_log_elem.source_part_names = {stats.part->name};
-        part_log_elem.rows_read = stats.read_rows;
-        part_log_elem.bytes_read_uncompressed = stats.read_bytes;
-
-        part_log->add(std::move(part_log_elem));
-    });
-}
-
 /*
  * For now, this function is meant to be used when exporting to different formats (i.e, the case where data needs to be re-encoded / serialized)
  * For the cases where this is not necessary, there are way more optimal ways of doing that, such as hard links implemented by `movePartitionToTable`
@@ -630,26 +569,15 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
         export_partition_transaction_id_to_manifest[transaction_id] = manifest;
     }
 
-    auto export_partition_function = [this, query_context, partition_id, dest_storage, transaction_id, manifest, exports_tagger] () mutable
-    {
-        exportPartsImpl(exports_tagger, transaction_id, dest_storage);
+    auto task = std::make_shared<ExportPartitionPlainMergeTreeTask>(
+        *this,
+        exports_tagger,
+        dest_storage,
+        getContext(),
+        manifest,
+        moves_assignee_trigger);
 
-        commitExportPartitionTask(manifest, dest_storage, getContext());
-
-        return true;
-    };
-
-    if (query_context->getSettingsRef()[Setting::export_merge_tree_partition_background_execution])
-    {
-        background_moves_assignee.scheduleMoveTask(
-           std::make_shared<ExecutableLambdaAdapter>(export_partition_function, moves_assignee_trigger, getStorageID()));
-    }
-    else
-    {
-        /// always in the background for now. I need to sort out the locks
-        background_moves_assignee.scheduleMoveTask(
-            std::make_shared<ExecutableLambdaAdapter>(export_partition_function, moves_assignee_trigger, getStorageID()));
-    }
+    background_moves_assignee.scheduleMoveTask(task);
 }
 
 /// While exists, marks parts as 'currently_merging_mutating_parts' and reserves free space on filesystem.
@@ -1264,15 +1192,16 @@ void StorageMergeTree::resumeExportPartitionTasks()
         }
 
         auto exports_tagger = std::make_shared<CurrentlyExportingPartsTagger>(std::move(parts_to_export), *this);
-        background_moves_assignee.scheduleMoveTask(
-            std::make_shared<ExecutableLambdaAdapter>(
-                [this, exports_tagger, transaction_id, destination_storage, manifest](){
-                    exportPartsImpl(exports_tagger, transaction_id, destination_storage);
-                    commitExportPartitionTask(manifest, destination_storage, getContext());
-                    return true;
-                },
-                moves_assignee_trigger,
-                getStorageID()));
+
+        auto task = std::make_shared<ExportPartitionPlainMergeTreeTask>(
+            *this,
+            exports_tagger,
+            destination_storage,
+            getContext(),
+            manifest,
+            moves_assignee_trigger);
+
+        background_moves_assignee.scheduleMoveTask(task);
     }
 }
 
@@ -1282,14 +1211,6 @@ void StorageMergeTree::loadExportPartition()
     resumeExportPartitionTasks();
 }
 
-void StorageMergeTree::commitExportPartitionTask(const std::shared_ptr<MergeTreeExportManifest> & manifest, const StoragePtr & dest_storage, ContextPtr local_context)
-{
-    std::lock_guard lock(export_partition_transaction_id_to_manifest_mutex);
-    dest_storage->commitExportPartitionTransaction(manifest->transaction_id, manifest->partition_id, manifest->exportedPaths(), local_context);
-    manifest->completed = true;
-    manifest->write();
-    export_partition_transaction_id_to_manifest.erase(manifest->transaction_id);
-}
 
 std::expected<MergeMutateSelectedEntryPtr, SelectMergeFailure> StorageMergeTree::selectPartsToMerge(
     const StorageMetadataPtr & metadata_snapshot,
