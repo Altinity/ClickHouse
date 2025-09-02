@@ -135,6 +135,10 @@
         "reason": "INVESTIGATE - Memory limit exceeded",
         "message": "DB::Exception: (total) memory limit exceeded:"
     },
+    "02477_single_value_data_string_regression": {
+        "reason": "INVESTIGATE - Memory limit exceeded",
+        "message": "DB::Exception: (total) memory limit exceeded:"
+    },
     "02241_filesystem_cache_on_write_operations": {
         "reason": "INVESTIGATE - Unstable?"
     },
@@ -178,6 +182,10 @@
         "message": "Timeout! Killing process group"
     },
     "02675_sparse_columns_clear_column": {
+        "reason": "INVESTIGATE - Timeout in ClickHouse query",
+        "message": "Timeout exceeded (180 s) while flushing system log"
+    },
+    "02585_query_status_deadlock": {
         "reason": "INVESTIGATE - Timeout in ClickHouse query",
         "message": "Timeout exceeded (180 s) while flushing system log"
     },
