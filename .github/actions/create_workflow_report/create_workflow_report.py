@@ -370,6 +370,77 @@ def get_new_fails_this_pr(
     return new_fails_df
 
 
+def get_test_instability_scores(client: Client, branch_name: str):
+    """
+    Calculate test instability metrics.
+    """
+    query = f"""WITH test_results AS (
+                SELECT check_start_time, head_ref, base_ref, check_name, test_name, test_status
+                FROM `gh-data`.checks
+                WHERE (head_ref = '{branch_name}' OR base_ref = '{branch_name}')
+                    AND test_status IN ('OK', 'FAIL', 'BROKEN')
+                    AND check_start_time > now() - INTERVAL 4 WEEK
+                ORDER BY check_start_time
+                ),
+                test_sequences AS (
+                SELECT check_name, test_name, head_ref, base_ref, groupArray(if(test_status = 'OK', 'pass', 'fail')) AS status_array
+                FROM test_results
+                GROUP BY head_ref, base_ref, check_name, test_name
+                ),
+                flip_results AS (
+                SELECT check_name, test_name, base_ref, head_ref,
+                    length(status_array) AS total_runs,
+                    arraySum(
+                        arrayMap(
+                            i -> status_array[i - 1] = 'pass' AND status_array[i] = 'fail' ? 1 : 0,
+                            arraySlice(arrayEnumerate(status_array), 2)
+                        )
+                    ) AS num_pass_to_fail
+                FROM test_sequences
+                WHERE total_runs >= 3 -- ensure decent sample size for this check-test-branch combination
+                )
+                SELECT check_name as job_name, test_name,
+                    if(base_ref = '', head_ref, base_ref) as version,
+                    sum(total_runs) as runs,
+                    sum(num_pass_to_fail) as sudden_fails,
+                    round(2 * sudden_fails / runs, 2) as instability
+                FROM flip_results
+                GROUP BY job_name, test_name, version
+                ORDER BY instability DESC
+                """
+    df = client.query_dataframe(query)[["job_name", "test_name", "instability"]]
+    df.to_csv("checks_instability_scores.csv", index=False)
+    # Set the index to make it compatible with pandas join operations
+    if len(df) > 0:
+        df = df.set_index(["job_name", "test_name"])
+    return df
+
+
+def join_instability_scores(
+    df: pd.DataFrame, instability_scores: pd.DataFrame
+) -> pd.DataFrame:
+    """
+    Join instability scores to a DataFrame based on job_name and test_name.
+
+    Args:
+        df: DataFrame to join with
+        instability_scores: DataFrame with instability scores (must have MultiIndex on job_name, test_name)
+
+    Returns:
+        DataFrame with instability scores joined
+    """
+    if len(df) == 0 or len(instability_scores) == 0:
+        return df
+
+    # Fill missing instability scores with 0
+    df = df.join(
+        instability_scores,
+        on=["job_name", "test_name"],
+        how="left",
+    ).fillna({"instability": 0})
+    return df
+
+
 @lru_cache
 def get_workflow_config() -> dict:
     workflow_config_files = glob("./ci/tmp/workflow_config*.json")
@@ -711,9 +782,11 @@ def create_workflow_report(
 
     if pr_number == 0:
         pr_info_html = f"Release ({branch_name})"
+        base_branch = branch_name
     else:
         try:
             pr_info = get_pr_info_from_number(pr_number)
+            base_branch = pr_info.get("base", {}).get("ref")
             pr_info_html = f"""<a href="https://github.com/{GITHUB_REPO}/pull/{pr_info["number"]}">
                     #{pr_info.get("number")} ({pr_info.get("base", {}).get('ref')} <- {pr_info.get("head", {}).get('ref')})  {pr_info.get("title")}
                     </a>"""
@@ -729,6 +802,21 @@ def create_workflow_report(
     fail_results["job_statuses"] = backfill_skipped_statuses(
         fail_results["job_statuses"], pr_number, branch_name, commit_sha
     )
+
+    checks_instability_scores = get_test_instability_scores(db_client, base_branch)
+    if len(checks_instability_scores) > 0:
+        for table in [
+            "checks_fails",
+            "checks_errors",
+            "regression_fails",
+            "checks_known_fails",
+            "pr_new_fails",
+        ]:
+            if table not in fail_results:
+                continue
+            fail_results[table] = join_instability_scores(
+                fail_results[table], checks_instability_scores
+            )
 
     high_cve_count = 0
     if not cves_not_checked and len(fail_results["docker_images_cves"]) > 0:
