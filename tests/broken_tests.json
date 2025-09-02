@@ -34,6 +34,10 @@
     "02483_elapsed_time": {
         "reason": "INVESTIGATE - Unstable?"
     },
+    "03223_analyzer_with_cube_fuzz": {
+        "reason": "INVESTIGATE - Sometimes QUERY_WAS_CANCELLED",
+        "message": "is killed in pending state."
+    },
     "02967_parallel_replicas_join_algo_and_analyzer_2": {
         "reason": "INVESTIGATE - Timeout. Unstable?"
     },
