@@ -303,9 +303,10 @@ def get_new_fails_this_pr(
 
     # Combine both types of fails and select only desired columns
     desired_columns = ["job_name", "test_name", "test_status", "results_link"]
-    all_pr_fails = pd.concat([checks_fails, regression_fails], ignore_index=True)[
-        desired_columns
-    ]
+    all_pr_fails = pd.concat(
+        [df for df in [checks_fails, regression_fails] if len(df) > 0],
+        ignore_index=True,
+    )[desired_columns]
     if len(all_pr_fails) == 0:
         return pd.DataFrame()
 
@@ -353,7 +354,9 @@ def get_new_fails_this_pr(
         base_regression = base_regression.drop(columns=["arch", "status"])
 
     # Combine base results
-    base_results = pd.concat([base_checks, base_regression], ignore_index=True)
+    base_results = pd.concat(
+        [df for df in [base_checks, base_regression] if len(df) > 0], ignore_index=True
+    )
 
     # Find tests that failed in PR but passed in base
     pr_failed_tests = set(zip(all_pr_fails["job_name"], all_pr_fails["test_name"]))
