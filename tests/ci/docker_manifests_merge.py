@@ -18,8 +18,8 @@ from clickhouse_helper import (
 )
 from commit_status_helper import format_description, get_commit, post_commit_status
 from docker_images_helper import IMAGES_FILE_PATH, get_image_names
-from env_helper import RUNNER_TEMP, REPO_COPY
-from get_robot_token import get_best_robot_token, get_parameter_from_ssm
+from env_helper import DOCKER_PASSWORD, RUNNER_TEMP, REPO_COPY
+from get_robot_token import get_best_robot_token
 from git_helper import Runner
 from pr_info import PRInfo
 from report import TestResults, TestResult
@@ -251,7 +251,7 @@ def main():
     if args.push:
         subprocess.check_output(  # pylint: disable=unexpected-keyword-arg
             "docker login --username 'altinityinfra' --password-stdin",
-            input=get_parameter_from_ssm("dockerhub-password"),
+            input=DOCKER_PASSWORD,
             encoding="utf-8",
             shell=True,
         )

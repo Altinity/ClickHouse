@@ -9,6 +9,7 @@ env:
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
   DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+  ROBOT_TOKEN: ${{ secrets.ROBOT_TOKEN }}
 
 on: # yamllint disable-line rule:truthy
   pull_request:
@@ -640,8 +641,8 @@ jobs:
     secrets: inherit
     with:
       runner_type: altinity-on-demand, altinity-regression-tester
-      commit: 53d73ed32155a8a17ee0d0cdb15aee96c98010a2
-      arch: release 
+      commit: c5f44e1c6fdc201a22f3f073b2311de10d2695b0
+      arch: release
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
   RegressionTestsAarch64:
@@ -650,7 +651,7 @@ jobs:
     secrets: inherit
     with:
       runner_type: altinity-on-demand, altinity-regression-tester-aarch64
-      commit: 53d73ed32155a8a17ee0d0cdb15aee96c98010a2
+      commit: c5f44e1c6fdc201a22f3f073b2311de10d2695b0
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
