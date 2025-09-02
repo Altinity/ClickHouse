@@ -23,7 +23,7 @@ query "SYSTEM STOP MERGES"
 query "INSERT INTO $mt_table VALUES (1, 2020), (2, 2020), (3, 2020), (4, 2021)"
 query "INSERT INTO $mt_table VALUES (5, 2020), (6, 2020)"
 
-query "ALTER TABLE $mt_table EXPORT PARTITION ID '2020' TO TABLE $s3_table SETTINGS allow_experimental_export_merge_tree_partition = 1, export_merge_tree_partition_background_execution = 0"
+query "ALTER TABLE $mt_table EXPORT PARTITION ID '2020' TO TABLE $s3_table SETTINGS allow_experimental_export_merge_tree_partition = 1"
 
 echo "---- Querying merge tree for comparison. It should include both partitions (2020 and 2021)"
 query "SELECT * FROM $mt_table ORDER BY id"
@@ -38,7 +38,7 @@ echo "---- Check for commit file for partition 2020"
 $CLICKHOUSE_CLIENT --query "SELECT replaceRegexpAll(replaceRegexpAll(remote_file_path, '$s3_table', 's3_table_NAME'), '[^/]+\\.parquet', 'SNOWFLAKE_ID.parquet') FROM s3(s3_conn, filename='$s3_table/commit_2020_*', format='LineAsString', structure='remote_file_path String')"
 
 echo "---- Finally, export the other partition (2021)"
-query "ALTER TABLE $mt_table EXPORT PARTITION ID '2021' TO TABLE $s3_table SETTINGS allow_experimental_export_merge_tree_partition = 1, export_merge_tree_partition_background_execution = 0"
+query "ALTER TABLE $mt_table EXPORT PARTITION ID '2021' TO TABLE $s3_table SETTINGS allow_experimental_export_merge_tree_partition = 1"
 
 echo "---- Assert both partitions are there"
 query "SELECT DISTINCT ON (id) replaceRegexpAll(replaceRegexpAll(_path, '$s3_table', 's3_table_NAME'), '[^/]+\\.parquet', 'SNOWFLAKE_ID.parquet'), * FROM $s3_table ORDER BY id"
@@ -52,13 +52,9 @@ query "SELECT DISTINCT ON (id) * FROM $mt_table_roundtrip ORDER BY id"
 
 # Create a table with a different partition key and export a partition to it. It should throw
 query "CREATE TABLE $invalid_schema_table (id UInt64, x UInt16) ENGINE = S3(s3_conn, filename='$invalid_schema_table', format=Parquet, partition_strategy='hive') PARTITION BY x"
-query "ALTER TABLE $mt_table EXPORT PARTITION ID '2020' TO TABLE $invalid_schema_table SETTINGS allow_experimental_export_merge_tree_partition = 1, export_merge_tree_partition_background_execution = 0 -- {serverError BAD_ARGUMENTS}"
+query "ALTER TABLE $mt_table EXPORT PARTITION ID '2020' TO TABLE $invalid_schema_table SETTINGS allow_experimental_export_merge_tree_partition = 1 -- {serverError BAD_ARGUMENTS}"
 
 query "DROP TABLE $invalid_schema_table"
-
-# The only partition strategy that supports exports is hive. Wildcard should throw
-query "CREATE TABLE $invalid_schema_table (id UInt64, year UInt16) ENGINE = S3(s3_conn, filename='$invalid_schema_table/{_partition_id}', format=Parquet, partition_strategy='wildcard') PARTITION BY (id, year)"
-query "ALTER TABLE $mt_table EXPORT PARTITION ID '2020' TO TABLE $invalid_schema_table SETTINGS allow_experimental_export_merge_tree_partition = 1, export_merge_tree_partition_background_execution = 0 -- {serverError NOT_IMPLEMENTED}"
 
 query "SYSTEM START MERGES"
 query "DROP TABLE IF EXISTS $mt_table, $s3_table, $mt_table_roundtrip"

@@ -119,6 +119,7 @@ namespace ErrorCodes
     extern const int TABLE_IS_READ_ONLY;
     extern const int TOO_MANY_PARTS;
     extern const int PART_IS_LOCKED;
+    extern const int INCOMPATIBLE_COLUMNS;
 }
 
 namespace ActionLocks
@@ -526,6 +527,9 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
     auto src_snapshot = getInMemoryMetadataPtr();
     auto destination_snapshot = dest_storage->getInMemoryMetadataPtr();
 
+    if (destination_snapshot->getColumns().getAllPhysical().sizeOfDifference(src_snapshot->getColumns().getAllPhysical()))
+        throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS, "Tables have different structure");
+
     if (query_to_string(src_snapshot->getPartitionKeyAST()) != query_to_string(destination_snapshot->getPartitionKeyAST()))
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
 
@@ -536,6 +540,7 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
         query_context->getSettingsRef()[Setting::lock_acquire_timeout]);
     auto merges_blocker = stopMergesAndWaitForPartition(partition_id);
 
+    /// todo is getVisible the right api? Shouldn't it be get parts for internal usage
     auto all_parts = getVisibleDataPartsVectorInPartition(getContext(), partition_id);
 
     if (all_parts.empty())
@@ -544,7 +549,9 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
         return;
     }
 
-    std::lock_guard lock(currently_processing_in_background_mutex);
+    /// Do not put this in a scope because `CurrentlyExportingPartsTagger` instantiated above relies on this already being locked
+    /// shitty design I came up with huh
+    std::lock_guard lock_background_mutex(currently_processing_in_background_mutex);
 
     if (!already_exported_partition_ids.emplace(partition_id).second)
     {
@@ -564,7 +571,7 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
         exports_tagger->parts_to_export);
 
     {
-        std::lock_guard lock2(export_partition_transaction_id_to_manifest_mutex);
+        std::lock_guard lock(export_partition_transaction_id_to_manifest_mutex);
 
         export_partition_transaction_id_to_manifest[transaction_id] = manifest;
     }
@@ -1162,6 +1169,8 @@ void StorageMergeTree::readExportPartitionManifests()
 
 void StorageMergeTree::resumeExportPartitionTasks()
 {
+    /// Initially I opted for having two separate methods: read and resume because I wanted to schedule the tasks in order
+    /// but it turns out the background executor schedules tasks based on their priority, so it is likely this is not needed anymore.
     for (const auto & [transaction_id, manifest] : export_partition_transaction_id_to_manifest)
     {
         auto destination_storage = DatabaseCatalog::instance().tryGetTable(manifest->destination_storage_id, getContext());
@@ -1191,6 +1200,9 @@ void StorageMergeTree::resumeExportPartitionTasks()
             parts_to_export.emplace_back(part);
         }
 
+        /// TODO: this locks the parts that have not been exported yet. Should we also lock the already exported parts as well?
+        /// There is some inconsistency with in-progress exports. The parts will not be unlocked until all parts have been exported OR a re-start happens
+        /// I just checked and mutations handle it slightly different. Tagger will actually contain a single part, which is released as soon as it finishes.
         auto exports_tagger = std::make_shared<CurrentlyExportingPartsTagger>(std::move(parts_to_export), *this);
 
         auto task = std::make_shared<ExportPartitionPlainMergeTreeTask>(
@@ -2707,6 +2719,7 @@ ActionLock StorageMergeTree::getActionLock(StorageActionBlockType action_type)
     return {};
 }
 
+/// TODO arthur do I need to do something about this?
 void StorageMergeTree::onActionLockRemove(StorageActionBlockType action_type)
 {
     if (action_type == ActionLocks::PartsMerge ||  action_type == ActionLocks::PartsTTLMerge)
