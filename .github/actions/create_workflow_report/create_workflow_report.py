@@ -399,20 +399,22 @@ def get_test_instability_scores(client: Client, branch_name: str):
                 FROM test_sequences
                 WHERE total_runs >= 3 -- ensure decent sample size for this check-test-branch combination
                 )
-                SELECT check_name as job_name, test_name,
+                SELECT
+                    replaceRegexpOne(check_name, ', [1-9/]*\\)$', '') as job_name_base, -- remove group number
+                    test_name,
                     if(base_ref = '', head_ref, base_ref) as version,
                     sum(total_runs) as runs,
                     sum(num_pass_to_fail) as sudden_fails,
                     round(2 * sudden_fails / runs, 2) as instability
                 FROM flip_results
-                GROUP BY job_name, test_name, version
+                GROUP BY job_name_base, test_name, version
                 ORDER BY instability DESC
                 """
-    df = client.query_dataframe(query)[["job_name", "test_name", "instability"]]
-    df.to_csv("checks_instability_scores.csv", index=False)
+    df = client.query_dataframe(query)[["job_name_base", "test_name", "instability"]]
+
     # Set the index to make it compatible with pandas join operations
     if len(df) > 0:
-        df = df.set_index(["job_name", "test_name"])
+        df = df.set_index(["job_name_base", "test_name"])
     return df
 
 
@@ -420,11 +422,12 @@ def join_instability_scores(
     df: pd.DataFrame, instability_scores: pd.DataFrame
 ) -> pd.DataFrame:
     """
-    Join instability scores to a DataFrame based on job_name and test_name.
+    Join instability scores to a DataFrame based on job_name_base and test_name.
+    Uses fuzzy matching on job_name (ignoring group numbers).
 
     Args:
         df: DataFrame to join with
-        instability_scores: DataFrame with instability scores (must have MultiIndex on job_name, test_name)
+        instability_scores: DataFrame with instability scores (must have MultiIndex on job_name_base, test_name)
 
     Returns:
         DataFrame with instability scores joined
@@ -432,13 +435,24 @@ def join_instability_scores(
     if len(df) == 0 or len(instability_scores) == 0:
         return df
 
-    # Fill missing instability scores with 0
-    df = df.join(
+    # Create a copy to avoid modifying the original
+    df_copy = df.copy()
+
+    # Add a base job name column for joining (strip group numbers)
+    df_copy["job_name_base"] = df_copy["job_name"].str.replace(
+        r", [1-9/]*\)$", "", regex=True
+    )
+
+    # Join on the base job name and test name
+    result = df_copy.join(
         instability_scores,
-        on=["job_name", "test_name"],
+        on=["job_name_base", "test_name"],
         how="left",
-    ).fillna({"instability": 0})
-    return df
+    )
+
+    # Remove the temporary column and fill missing values
+    result = result.drop(columns=["job_name_base"]).fillna({"instability": 0})
+    return result
 
 
 @lru_cache
