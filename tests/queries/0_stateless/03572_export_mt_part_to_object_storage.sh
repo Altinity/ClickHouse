@@ -52,7 +52,7 @@ query "SELECT DISTINCT ON (id) * FROM $mt_table_roundtrip ORDER BY id"
 
 # Create a table with a different partition key and export a partition to it. It should throw
 query "CREATE TABLE $invalid_schema_table (id UInt64, x UInt16) ENGINE = S3(s3_conn, filename='$invalid_schema_table', format=Parquet, partition_strategy='hive') PARTITION BY x"
-query "ALTER TABLE $mt_table EXPORT PARTITION ID '2020' TO TABLE $invalid_schema_table SETTINGS allow_experimental_export_merge_tree_partition = 1 -- {serverError BAD_ARGUMENTS}"
+query "ALTER TABLE $mt_table EXPORT PARTITION ID '2020' TO TABLE $invalid_schema_table SETTINGS allow_experimental_export_merge_tree_partition = 1 -- {serverError INCOMPATIBLE_COLUMNS}"
 
 query "DROP TABLE $invalid_schema_table"
 
