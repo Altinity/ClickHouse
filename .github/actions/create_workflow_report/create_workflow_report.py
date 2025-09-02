@@ -375,7 +375,8 @@ def get_test_instability_scores(client: Client, branch_name: str):
     Calculate test instability metrics.
     """
     query = f"""WITH test_results AS (
-                SELECT check_start_time, head_ref, base_ref, check_name, test_name, test_status
+                SELECT check_start_time, head_ref, base_ref, test_name, test_status,
+                    replaceRegexpOne(check_name, ', [1-9/]*\\)$', '') as job_name_base -- remove group number
                 FROM `gh-data`.checks
                 WHERE (head_ref = '{branch_name}' OR base_ref = '{branch_name}')
                     AND test_status IN ('OK', 'FAIL', 'BROKEN')
@@ -383,12 +384,12 @@ def get_test_instability_scores(client: Client, branch_name: str):
                 ORDER BY check_start_time
                 ),
                 test_sequences AS (
-                SELECT check_name, test_name, head_ref, base_ref, groupArray(if(test_status = 'OK', 'pass', 'fail')) AS status_array
+                SELECT job_name_base, test_name, head_ref, base_ref, groupArray(if(test_status = 'OK', 'pass', 'fail')) AS status_array
                 FROM test_results
-                GROUP BY head_ref, base_ref, check_name, test_name
+                GROUP BY head_ref, base_ref, job_name_base, test_name
                 ),
                 flip_results AS (
-                SELECT check_name, test_name, base_ref, head_ref,
+                SELECT job_name_base, test_name, base_ref, head_ref,
                     length(status_array) AS total_runs,
                     arraySum(
                         arrayMap(
@@ -400,7 +401,7 @@ def get_test_instability_scores(client: Client, branch_name: str):
                 WHERE total_runs >= 3 -- ensure decent sample size for this check-test-branch combination
                 )
                 SELECT
-                    replaceRegexpOne(check_name, ', [1-9/]*\\)$', '') as job_name_base, -- remove group number
+                    job_name_base,
                     test_name,
                     if(base_ref = '', head_ref, base_ref) as version,
                     sum(total_runs) as runs,
@@ -410,11 +411,20 @@ def get_test_instability_scores(client: Client, branch_name: str):
                 GROUP BY job_name_base, test_name, version
                 ORDER BY instability DESC
                 """
-    df = client.query_dataframe(query)[["job_name_base", "test_name", "instability"]]
+
+    try:
+        df = client.query_dataframe(query)[
+            ["job_name_base", "test_name", "instability"]
+        ]
+
+    except Exception as e:
+        print(f"Error getting test instability scores: {e}")
+        return pd.DataFrame()
 
     # Set the index to make it compatible with pandas join operations
     if len(df) > 0:
         df = df.set_index(["job_name_base", "test_name"])
+
     return df
 
 
@@ -444,11 +454,15 @@ def join_instability_scores(
     )
 
     # Join on the base job name and test name
-    result = df_copy.join(
-        instability_scores,
-        on=["job_name_base", "test_name"],
-        how="left",
-    )
+    try:
+        result = df_copy.join(
+            instability_scores,
+            on=["job_name_base", "test_name"],
+            how="left",
+        )
+    except Exception as e:
+        print(f"Error joining instability scores: {e}")
+        return df
 
     # Remove the temporary column and fill missing values
     result = result.drop(columns=["job_name_base"]).fillna({"instability": 0})
