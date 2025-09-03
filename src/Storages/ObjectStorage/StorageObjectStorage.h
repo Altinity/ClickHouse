@@ -101,12 +101,6 @@ public:
 
     bool supportsImportMergeTreePartition() const override;
 
-    void importMergeTreePartition(
-        const MergeTreeData & merge_tree_data,
-        const std::vector<DataPartPtr> & data_parts,
-        ContextPtr /*context*/,
-        std::function<void(MergeTreePartImportStats)> part_log) override;
-
     void importMergeTreePart(
         const MergeTreeData & merge_tree_data,
         const DataPartPtr & data_part,
