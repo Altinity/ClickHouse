@@ -6877,9 +6877,9 @@ Experimental timeSeries* aggregate functions for Prometheus-like timeseries resa
     DECLARE_WITH_ALIAS(Bool, allow_experimental_export_merge_tree_partition, false, R"(
 Experimental export merge tree partition.
 )", EXPERIMENTAL, allow_experimental_export_merge_tree_partition) \
-    DECLARE_WITH_ALIAS(Bool, export_merge_tree_partition_individual_part_executor, true, R"(
+    DECLARE_WITH_ALIAS(Bool, export_merge_tree_partition_executor, false, R"(
     Use the part task instead of the partition task
-)", EXPERIMENTAL, export_merge_tree_partition_background_execution) \
+)", EXPERIMENTAL, export_merge_tree_partition_executor) \
     \
     /* ####################################################### */ \
     /* ############ END OF EXPERIMENTAL FEATURES ############# */ \

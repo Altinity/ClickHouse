@@ -96,6 +96,8 @@ public:
     /// Return introspection information about currently processing or recently processed mutations.
     std::vector<MergeTreeMutationStatus> getMutationsStatus() const override;
 
+    std::vector<MergeTreeExportStatus> getExportsStatus() const override;
+
     CancellationCode killMutation(const String & mutation_id) override;
 
     /// Makes backup entries to backup the data of the storage.
@@ -160,7 +162,7 @@ private:
     std::map<UInt64, MergeTreeMutationEntry> current_mutations_by_version;
     
     std::map<String, std::shared_ptr<MergeTreeExportManifest>> export_partition_transaction_id_to_manifest;
-    std::mutex export_partition_transaction_id_to_manifest_mutex;
+    mutable std::mutex export_partition_transaction_id_to_manifest_mutex; /// mutable because of getExportsStatus
 
     /// Unfinished mutations that are required for AlterConversions.
     MutationCounters mutation_counters;

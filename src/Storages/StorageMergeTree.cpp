@@ -82,7 +82,7 @@ namespace Setting
     extern const SettingsBool throw_on_unsupported_query_inside_transaction;
     extern const SettingsUInt64 max_parts_to_move;
     extern const SettingsBool allow_experimental_export_merge_tree_partition;
-    extern const SettingsBool export_merge_tree_partition_individual_part_executor;
+    extern const SettingsBool export_merge_tree_partition_executor;
 }
 
 namespace MergeTreeSetting
@@ -559,8 +559,6 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
         throw Exception(ErrorCodes::PART_IS_LOCKED, "Partition {} has already been exported", partition_id);
     }
 
-    
-
     const auto transaction_id = std::to_string(generateSnowflakeID());
 
     /// TODO missing parts lock here with tagger
@@ -578,7 +576,7 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
         export_partition_transaction_id_to_manifest[transaction_id] = manifest;
     }
 
-    if (getContext()->getSettingsRef()[Setting::export_merge_tree_partition_individual_part_executor])
+    if (!getContext()->getSettingsRef()[Setting::export_merge_tree_partition_executor])
     {
         for (const auto & part : all_parts)
         {
@@ -981,6 +979,33 @@ std::map<std::string, MutationCommands> StorageMergeTree::getUnfinishedMutationC
     return result;
 }
 
+
+std::vector<MergeTreeExportStatus> StorageMergeTree::getExportsStatus() const
+{
+    std::lock_guard lock(export_partition_transaction_id_to_manifest_mutex);
+    std::vector<MergeTreeExportStatus> result;
+
+    auto source_database = getStorageID().database_name;
+    auto source_table = getStorageID().table_name;
+
+    for (const auto & [transaction_id, manifest] : export_partition_transaction_id_to_manifest)
+    {
+        MergeTreeExportStatus status;
+
+        status.transaction_id = transaction_id;
+        status.source_database = source_database;
+        status.source_table = source_table;
+        status.destination_database = manifest->destination_storage_id.database_name;
+        status.destination_table = manifest->destination_storage_id.table_name;
+        status.create_time = 0;
+        status.parts_to_do_names = manifest->pendingParts();
+        status.status = manifest->status;
+
+        result.emplace_back(std::move(status));
+    }
+    return result;
+}
+
 std::vector<MergeTreeMutationStatus> StorageMergeTree::getMutationsStatus() const
 {
     std::lock_guard lock(currently_processing_in_background_mutex);
@@ -1157,17 +1182,20 @@ void StorageMergeTree::readExportPartitionManifests()
                 {
                     auto manifest = MergeTreeExportManifest::read(disk, fs::path(relative_data_path) / name);
 
-                    already_exported_partition_ids.insert(manifest->partition_id);
-
-                    if (manifest->completed)
+                    if (manifest->status != MergeTreeExportManifest::Status::failed)
                     {
-                        LOG_INFO(
-                            log,
-                            "Export transaction {} of partition {} to destination storage {} already completed, skipping",
-                            manifest->transaction_id,
-                            manifest->partition_id,
-                            manifest->destination_storage_id.getNameForLogs());
-                        continue;
+                        already_exported_partition_ids.insert(manifest->partition_id);
+
+                        if (manifest->status == MergeTreeExportManifest::Status::completed)
+                        {
+                            LOG_INFO(
+                                log,
+                                "Export transaction {} of partition {} to destination storage {} already completed, skipping",
+                                manifest->transaction_id,
+                                manifest->partition_id,
+                                manifest->destination_storage_id.getNameForLogs());
+                            continue;
+                        }
                     }
 
                     export_partition_transaction_id_to_manifest.emplace(manifest->transaction_id, manifest);
@@ -1189,6 +1217,9 @@ void StorageMergeTree::resumeExportPartitionTasks()
     /// but it turns out the background executor schedules tasks based on their priority, so it is likely this is not needed anymore.
     for (const auto & [transaction_id, manifest] : export_partition_transaction_id_to_manifest)
     {
+        if (manifest->status != MergeTreeExportManifest::Status::pending)
+            continue;
+
         auto destination_storage = DatabaseCatalog::instance().tryGetTable(manifest->destination_storage_id, getContext());
         if (!destination_storage)
         {
@@ -1216,7 +1247,7 @@ void StorageMergeTree::resumeExportPartitionTasks()
             parts_to_export.emplace_back(part);
         }
 
-        if (getContext()->getSettingsRef()[Setting::export_merge_tree_partition_individual_part_executor])
+        if (!getContext()->getSettingsRef()[Setting::export_merge_tree_partition_executor])
         {
             for (const auto & part : parts_to_export)
             {

@@ -14,6 +14,8 @@
 #include <Poco/JSON/Stringifier.h>
 #include <Poco/Dynamic/Var.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
+#include <ctime>
+#include <magic_enum.hpp>
 
 namespace DB
 {
@@ -25,16 +27,24 @@ namespace DB
  *   "transaction_id": "<id>",
  *   "partition_id": "<partition_id>",
  *   "destination": "<database>.<table>",
- *   "completed": <true/false>,
+ *   "create_time": <unix_timestamp>,
+ *   "status": "<pending|completed|failed>",
  *   "parts": [ {"part_name": "name", "remote_path": "path-or-empty"}, ... ]
  * }
  */
 struct MergeTreeExportManifest
 {
     using DataPartPtr = std::shared_ptr<const IMergeTreeDataPart>;
+    
+    enum class Status {
+        pending,
+        completed, 
+        failed
+    };
 
     MergeTreeExportManifest()
         : destination_storage_id(StorageID::createEmpty())
+        , status(Status::pending)
     {}
 
     struct Item
@@ -42,12 +52,14 @@ struct MergeTreeExportManifest
         String part_name;
         String remote_path; // empty until uploaded
     };
+    
 
     String transaction_id;
     String partition_id;
     StorageID destination_storage_id;
+    time_t create_time = 0;
     std::vector<Item> items;
-    bool completed = false;
+    Status status = Status::pending;
 
     std::filesystem::path file_path;
     DiskPtr disk;
@@ -65,6 +77,7 @@ struct MergeTreeExportManifest
         manifest->transaction_id = transaction_id_;
         manifest->partition_id = partition_id_;
         manifest->destination_storage_id = destination_storage_id_;
+        manifest->create_time = std::time(nullptr);
         manifest->file_path = std::filesystem::path(path_prefix) / ("export_partition_" + partition_id_ + "_transaction_" + transaction_id_ + ".json");
         manifest->items.reserve(data_parts.size());
         for (const auto & data_part : data_parts)
@@ -94,7 +107,11 @@ struct MergeTreeExportManifest
         manifest->partition_id = root->getValue<String>("partition_id");
         const auto destination = root->getValue<String>("destination");
         manifest->destination_storage_id = StorageID(QualifiedTableName::parseFromString(destination));
-        manifest->completed = root->getValue<bool>("completed");
+        
+        manifest->create_time = root->getValue<UInt64>("create_time");
+        
+        String status_str = root->getValue<String>("status");
+        manifest->status = magic_enum::enum_cast<Status>(status_str).value();
 
         manifest->items.clear();
         auto parts = root->get("parts").extract<Poco::JSON::Array::Ptr>();
@@ -118,7 +135,8 @@ struct MergeTreeExportManifest
         root->set("transaction_id", transaction_id);
         root->set("partition_id", partition_id);
         root->set("destination", destination_storage_id.getQualifiedName().getFullName());
-        root->set("completed", completed);
+        root->set("create_time", static_cast<UInt64>(create_time));
+        root->set("status", String(magic_enum::enum_name(status)));
 
         Poco::JSON::Array::Ptr parts(new Poco::JSON::Array());
         for (const auto & i : items)
@@ -138,7 +156,7 @@ struct MergeTreeExportManifest
         out->sync();
     }
 
-    void deleteFile()
+    void deleteFile() const
     {
         disk->removeFile(file_path);
     }

@@ -18,6 +18,7 @@
 #include <Storages/MergeTree/MergeTreeIndices.h>
 #include <Storages/MergeTree/MergeTreePartInfo.h>
 #include <Storages/MergeTree/MergeTreeMutationStatus.h>
+#include <Storages/MergeTree/MergeTreeExportStatus.h>
 #include <Storages/MergeTree/MergeList.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Storages/MergeTree/MergeTreeDataPartBuilder.h>
@@ -966,6 +967,7 @@ public:
         bool must_on_same_disk);
 
     virtual std::vector<MergeTreeMutationStatus> getMutationsStatus() const = 0;
+    virtual std::vector<MergeTreeExportStatus> getExportsStatus() const { return {}; }
 
     /// Returns true if table can create new parts with adaptive granularity
     /// Has additional constraint in replicated version

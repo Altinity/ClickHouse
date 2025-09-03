@@ -189,7 +189,7 @@ bool ExportPartitionPlainMergeTreeTask::commitExport()
         manifest->exportedPaths(),
         context);
     
-    manifest->completed = true;
+    manifest->status = MergeTreeExportManifest::Status::completed;
     manifest->write();
 
     storage.export_partition_transaction_id_to_manifest.erase(manifest->transaction_id);
@@ -204,7 +204,7 @@ bool ExportPartitionPlainMergeTreeTask::commitExport()
 void ExportPartitionPlainMergeTreeTask::onCompleted()
 {
     std::lock_guard lock(storage.export_partition_transaction_id_to_manifest_mutex);
-    task_result_callback(manifest->completed);
+    task_result_callback(manifest->status == MergeTreeExportManifest::Status::completed);
 }
 
 void ExportPartitionPlainMergeTreeTask::cancel() noexcept

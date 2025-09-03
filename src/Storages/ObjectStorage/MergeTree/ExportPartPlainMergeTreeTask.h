@@ -43,6 +43,7 @@ private:
         NEED_PREPARE,
         NEED_EXECUTE,
         NEED_COMMIT,
+        FAILED,
         SUCCESS
     };
 

@@ -57,40 +57,51 @@ bool ExportPartPlainMergeTreeTask::executeStep()
             if (executeExport())
             {
                 state = State::NEED_COMMIT;
-                return true;
             }
-
-            if (retry_count < max_retries)
+            else if (retry_count < max_retries)
             {
                 retry_count++;
                 LOG_INFO(getLogger("ExportPartPlainMergeTreeTask"),
                 "Retrying export attempt {} for part {}",
                 retry_count, exports_tagger->parts_to_export[0]->name);
                 state = State::NEED_EXECUTE;
-
-                return true;
+            }
+            else
+            {
+                state = State::FAILED;
             }
 
-            return false;
+            return true;
         }
         case State::NEED_COMMIT:
         {
             if (commitExport())
             {
                 state = State::SUCCESS;
-                return true;
             }
-
-            if (retry_count < max_retries)
+            else if (retry_count < max_retries)
             {
                 retry_count++;
                 LOG_INFO(getLogger("ExportPartPlainMergeTreeTask"),
                 "Retrying export attempt {} for part {}",
                 retry_count, exports_tagger->parts_to_export[0]->name);
                 state = State::NEED_COMMIT;
-
-                return true;
             }
+            else
+            {
+                state = State::FAILED;
+            }
+
+            return true;
+        }
+        case State::FAILED:
+        {
+            std::lock_guard lock(storage.export_partition_transaction_id_to_manifest_mutex);
+
+            manifest->status = MergeTreeExportManifest::Status::failed;
+            manifest->write();
+
+            storage.already_exported_partition_ids.erase(manifest->partition_id);
 
             return false;
         }
@@ -171,7 +182,7 @@ bool ExportPartPlainMergeTreeTask::commitExport()
             manifest->partition_id,
             manifest->exportedPaths(),
             context);
-        manifest->completed = true;
+        manifest->status = MergeTreeExportManifest::Status::completed;
         manifest->write();
         storage.export_partition_transaction_id_to_manifest.erase(manifest->transaction_id);
         LOG_INFO(getLogger("ExportMergeTreePartitionToObjectStorageTask"),
