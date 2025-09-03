@@ -50,6 +50,28 @@ class StorageDistributed final : public IStorage, WithContext
     friend class StorageSystemDistributionQueue;
 
 public:
+    /// Structure to hold table function AST, predicate, optional StorageID, and cached physical columns for the segment
+    struct HybridSegment
+    {
+        ASTPtr table_function_ast;
+        ASTPtr predicate_ast;
+        std::optional<StorageID> storage_id; // For table identifiers instead of table functions
+        ColumnsDescription actual_columns;
+
+        HybridSegment(ASTPtr table_function_ast_, ASTPtr predicate_ast_, ColumnsDescription actual_columns_)
+            : table_function_ast(std::move(table_function_ast_))
+            , predicate_ast(std::move(predicate_ast_))
+            , actual_columns(std::move(actual_columns_))
+        {}
+
+        HybridSegment(ASTPtr table_function_ast_, ASTPtr predicate_ast_, StorageID storage_id_, ColumnsDescription actual_columns_)
+            : table_function_ast(std::move(table_function_ast_))
+            , predicate_ast(std::move(predicate_ast_))
+            , storage_id(std::move(storage_id_))
+            , actual_columns(std::move(actual_columns_))
+        {}
+    };
+
     StorageDistributed(
         const StorageID & id_,
         const ColumnsDescription & columns_,
@@ -70,7 +92,12 @@ public:
 
     ~StorageDistributed() override;
 
-    std::string getName() const override { return "Distributed"; }
+    std::string getName() const override
+    {
+        return (segments.empty() && !base_segment_predicate)
+            ? "Distributed"
+            : "Hybrid";
+    }
 
     bool supportsSampling() const override { return true; }
     bool supportsFinal() const override { return true; }
@@ -137,6 +164,18 @@ public:
     void flushClusterNodesAllData(ContextPtr context, const SettingsChanges & settings_changes);
 
     size_t getShardCount() const;
+
+    /// Set optional predicate applied to the base segment
+    void setBaseSegmentPredicate(ASTPtr predicate) { base_segment_predicate = std::move(predicate); }
+
+    /// Set segment definitions for Hybrid engine along with cached schema info
+    void setHybridLayout(ColumnsDescription base_segment_columns_, std::vector<HybridSegment> segments_);
+
+    /// Getter methods for ClusterProxy::executeQuery
+    StorageID getRemoteStorageID() const { return remote_storage; }
+    ExpressionActionsPtr getShardingKeyExpression() const { return sharding_key_expr; }
+    const DistributedSettings * getDistributedSettings() const { return distributed_settings.get(); }
+    bool isRemoteFunction() const { return is_remote_function; }
 
     bool initializeDiskOnConfigChange(const std::set<String> & new_added_disks) override;
 
@@ -273,6 +312,13 @@ private:
     pcg64 rng;
 
     bool is_remote_function;
+
+    /// Additional filter expression for Hybrid engine
+    ASTPtr base_segment_predicate;
+
+    /// Additional segments for Hybrid engine
+    std::vector<HybridSegment> segments;
+    ColumnsDescription base_segment_columns;
 };
 
 }
