@@ -47,6 +47,7 @@
 #include <Common/ProfileEventsScope.h>
 #include <Common/escapeForFileName.h>
 #include "Core/BackgroundSchedulePool.h"
+#include "Storages/ObjectStorage/MergeTree/ExportPartPlainMergeTreeTask.h"
 #include <Core/Names.h>
 #include <Storages/ObjectStorage/MergeTree/ExportPartitionPlainMergeTreeTask.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
@@ -80,8 +81,8 @@ namespace Setting
     extern const SettingsBool parallel_replicas_for_non_replicated_merge_tree;
     extern const SettingsBool throw_on_unsupported_query_inside_transaction;
     extern const SettingsUInt64 max_parts_to_move;
-    extern const SettingsBool export_merge_tree_partition_background_execution;
     extern const SettingsBool allow_experimental_export_merge_tree_partition;
+    extern const SettingsBool export_merge_tree_partition_individual_part_executor;
 }
 
 namespace MergeTreeSetting
@@ -558,17 +559,18 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
         throw Exception(ErrorCodes::PART_IS_LOCKED, "Partition {} has already been exported", partition_id);
     }
 
-    auto exports_tagger = std::make_shared<CurrentlyExportingPartsTagger>(std::move(all_parts), *this);
+    
 
     const auto transaction_id = std::to_string(generateSnowflakeID());
 
+    /// TODO missing parts lock here with tagger
     const auto manifest = MergeTreeExportManifest::create(
         getStoragePolicy()->getAnyDisk(),
         relative_data_path,
         transaction_id,
         partition_id,
         dest_storage->getStorageID(),
-        exports_tagger->parts_to_export);
+        all_parts);
 
     {
         std::lock_guard lock(export_partition_transaction_id_to_manifest_mutex);
@@ -576,15 +578,29 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
         export_partition_transaction_id_to_manifest[transaction_id] = manifest;
     }
 
-    auto task = std::make_shared<ExportPartitionPlainMergeTreeTask>(
-        *this,
-        exports_tagger,
-        dest_storage,
-        getContext(),
-        manifest,
-        moves_assignee_trigger);
+    if (getContext()->getSettingsRef()[Setting::export_merge_tree_partition_individual_part_executor])
+    {
+        for (const auto & part : all_parts)
+        {
+            auto tagger = std::make_shared<CurrentlyExportingPartsTagger>(std::vector<DataPartPtr>{part}, *this);
+            auto task = std::make_shared<ExportPartPlainMergeTreeTask>(*this, tagger, dest_storage, getContext(), manifest, moves_assignee_trigger);
+            background_moves_assignee.scheduleMoveTask(task);
+        }
+    }
+    else
+    {
+        auto exports_tagger = std::make_shared<CurrentlyExportingPartsTagger>(std::move(all_parts), *this);
 
-    background_moves_assignee.scheduleMoveTask(task);
+        auto task = std::make_shared<ExportPartitionPlainMergeTreeTask>(
+            *this,
+            exports_tagger,
+            dest_storage,
+            getContext(),
+            manifest,
+            moves_assignee_trigger);
+    
+        background_moves_assignee.scheduleMoveTask(task);
+    }
 }
 
 /// While exists, marks parts as 'currently_merging_mutating_parts' and reserves free space on filesystem.
@@ -1200,20 +1216,33 @@ void StorageMergeTree::resumeExportPartitionTasks()
             parts_to_export.emplace_back(part);
         }
 
-        /// TODO: this locks the parts that have not been exported yet. Should we also lock the already exported parts as well?
-        /// There is some inconsistency with in-progress exports. The parts will not be unlocked until all parts have been exported OR a re-start happens
-        /// I just checked and mutations handle it slightly different. Tagger will actually contain a single part, which is released as soon as it finishes.
-        auto exports_tagger = std::make_shared<CurrentlyExportingPartsTagger>(std::move(parts_to_export), *this);
+        if (getContext()->getSettingsRef()[Setting::export_merge_tree_partition_individual_part_executor])
+        {
+            for (const auto & part : parts_to_export)
+            {
+                auto tagger = std::make_shared<CurrentlyExportingPartsTagger>(std::vector<DataPartPtr>{part}, *this);
+                auto task = std::make_shared<ExportPartPlainMergeTreeTask>(*this, tagger, destination_storage, getContext(), manifest, moves_assignee_trigger);
+                background_moves_assignee.scheduleMoveTask(task);
+            }
+        }
+        else
+        {
+            /// TODO: this locks the parts that have not been exported yet. Should we also lock the already exported parts as well?
+            /// There is some inconsistency with in-progress exports. The parts will not be unlocked until all parts have been exported OR a re-start happens
+            /// I just checked and mutations handle it slightly different. Tagger will actually contain a single part, which is released as soon as it finishes.
+            auto exports_tagger = std::make_shared<CurrentlyExportingPartsTagger>(std::move(parts_to_export), *this);
 
-        auto task = std::make_shared<ExportPartitionPlainMergeTreeTask>(
-            *this,
-            exports_tagger,
-            destination_storage,
-            getContext(),
-            manifest,
-            moves_assignee_trigger);
+            auto task = std::make_shared<ExportPartitionPlainMergeTreeTask>(
+                *this,
+                exports_tagger,
+                destination_storage,
+                getContext(),
+                manifest,
+                moves_assignee_trigger);
 
-        background_moves_assignee.scheduleMoveTask(task);
+            background_moves_assignee.scheduleMoveTask(task);
+        }
+
     }
 }
 

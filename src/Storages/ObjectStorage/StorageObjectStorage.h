@@ -7,6 +7,7 @@
 #include <Storages/ObjectStorage/IObjectIterator.h>
 #include <Storages/prepareReadingFromFormat.h>
 #include <Common/threadPoolCallbackRunner.h>
+#include "Storages/MergeTree/RangesInDataPart.h"
 #include <Interpreters/ActionsDAG.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
@@ -105,6 +106,13 @@ public:
         const std::vector<DataPartPtr> & data_parts,
         ContextPtr /*context*/,
         std::function<void(MergeTreePartImportStats)> part_log) override;
+
+    void importMergeTreePart(
+        const MergeTreeData & merge_tree_data,
+        const DataPartPtr & data_part,
+        ContextPtr,
+        std::function<void(MergeTreePartImportStats)> part_log
+    ) override;
 
     /// Write an export commit file containing the list of exported remote paths
     void commitExportPartitionTransaction(const String & transaction_id, const String & partition_id, const Strings & exported_paths, ContextPtr local_context) override;

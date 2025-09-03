@@ -168,7 +168,13 @@ void ExportPartitionPlainMergeTreeTask::executeExport()
     {
         LOG_ERROR(getLogger("ExportMergeTreePartitionToObjectStorageTask"),
             "Export attempt failed completely: {}", getCurrentExceptionMessage(true));
-        
+
+        std::lock_guard lock(storage.export_partition_transaction_id_to_manifest_mutex);
+        manifest->deleteFile();
+        storage.already_exported_partition_ids.erase(manifest->partition_id);
+        storage.export_partition_transaction_id_to_manifest.erase(manifest->transaction_id);
+
+
         throw;
     }
 }

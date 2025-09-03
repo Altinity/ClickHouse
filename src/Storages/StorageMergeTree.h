@@ -308,6 +308,7 @@ private:
     friend class MergePlainMergeTreeTask;
     friend class MutatePlainMergeTreeTask;
     friend class ExportPartitionPlainMergeTreeTask;
+    friend class ExportPartPlainMergeTreeTask;
 
     struct DataValidationTasks : public IStorage::DataValidationTasksBase
     {

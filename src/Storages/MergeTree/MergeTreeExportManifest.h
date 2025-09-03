@@ -138,6 +138,11 @@ struct MergeTreeExportManifest
         out->sync();
     }
 
+    void deleteFile()
+    {
+        disk->removeFile(file_path);
+    }
+
     void updateRemotePathAndWrite(const String & part_name, const String & remote_path)
     {
         for (auto & i : items)

@@ -553,6 +553,90 @@ bool StorageObjectStorage::supportsImportMergeTreePartition() const
     return configuration->partition_strategy != nullptr && configuration->partition_strategy_type == PartitionStrategyFactory::StrategyType::HIVE;
 }
 
+void StorageObjectStorage::importMergeTreePart(
+    const MergeTreeData & merge_tree_data,
+    const DataPartPtr & data_part,
+    ContextPtr local_context,
+    std::function<void(MergeTreePartImportStats)> part_log
+)
+{
+    auto metadata_snapshot = merge_tree_data.getInMemoryMetadataPtr();
+    Names columns_to_read = metadata_snapshot->getColumns().getNamesOfPhysical();
+    StorageSnapshotPtr storage_snapshot = merge_tree_data.getStorageSnapshot(metadata_snapshot, local_context);
+
+    QueryPlan plan;
+
+    /// using the mutations type for now
+    MergeTreeSequentialSourceType read_type = MergeTreeSequentialSourceType::Mutation;
+
+    bool apply_deleted_mask = true;
+    bool read_with_direct_io = false;
+    bool prefetch = false;
+    
+    const auto partition_columns = configuration->partition_strategy->getPartitionColumns();
+
+    auto block_with_partition_values = data_part->partition.getBlockWithPartitionValues(partition_columns);
+
+    const auto column_with_partition_key = configuration->partition_strategy->computePartitionKey(block_with_partition_values);
+
+    const auto file_path = configuration->file_path_generator->getWritingPath(column_with_partition_key->getDataAt(0).toString());
+
+    MergeTreeData::IMutationsSnapshot::Params params
+    {
+        .metadata_version = metadata_snapshot->getMetadataVersion(),
+        .min_part_metadata_version = data_part->getMetadataVersion(),
+    };
+
+    auto mutations_snapshot = merge_tree_data.getMutationsSnapshot(params);
+
+    auto alter_conversions = MergeTreeData::getAlterConversionsForPart(
+        data_part,
+        mutations_snapshot,
+        local_context);
+
+    QueryPlan plan_for_part;
+
+    createReadFromPartStep(
+        read_type,
+        plan_for_part,
+        merge_tree_data,
+        storage_snapshot,
+        RangesInDataPart(data_part),
+        alter_conversions,
+        nullptr,
+        columns_to_read,
+        nullptr,
+        apply_deleted_mask,
+        std::nullopt,
+        read_with_direct_io,
+        prefetch,
+        local_context,
+        getLogger("ExportPartition"));
+
+    QueryPlanOptimizationSettings optimization_settings(local_context);
+    auto pipeline_settings = BuildQueryPipelineSettings(local_context);
+    auto builder = plan_for_part.buildQueryPipeline(optimization_settings, pipeline_settings);
+    auto pipeline = QueryPipelineBuilder::getPipeline(std::move(*builder));
+
+    auto sink = std::make_shared<StorageObjectStorageMergeTreePartImporterSink>(
+        data_part,
+        file_path,
+        object_storage,
+        configuration,
+        format_settings,
+        metadata_snapshot->getSampleBlock(),
+        part_log,
+        local_context
+    );
+
+    pipeline.complete(sink);
+
+    pipeline.setNumThreads(local_context->getSettingsRef()[Setting::max_threads]);
+
+    CompletedPipelineExecutor exec(pipeline);
+    exec.execute();
+}
+
 void StorageObjectStorage::importMergeTreePartition(
     const MergeTreeData & merge_tree_data,
     const std::vector<DataPartPtr> & data_parts,
