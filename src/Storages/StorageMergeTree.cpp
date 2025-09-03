@@ -997,7 +997,7 @@ std::vector<MergeTreeExportStatus> StorageMergeTree::getExportsStatus() const
         status.source_table = source_table;
         status.destination_database = manifest->destination_storage_id.database_name;
         status.destination_table = manifest->destination_storage_id.table_name;
-        status.create_time = 0;
+        status.create_time = manifest->create_time;
         status.parts_to_do_names = manifest->pendingParts();
         status.status = manifest->status;
 
