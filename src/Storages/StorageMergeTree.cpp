@@ -49,7 +49,6 @@
 #include "Core/BackgroundSchedulePool.h"
 #include "Storages/ObjectStorage/MergeTree/ExportPartPlainMergeTreeTask.h"
 #include <Core/Names.h>
-#include <Storages/ObjectStorage/MergeTree/ExportPartitionPlainMergeTreeTask.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Functions/generateSnowflakeID.h>
 #include <Storages/ObjectStorage/MergeTree/StorageObjectStorageMergeTreePartImporterSink.h>
@@ -82,7 +81,6 @@ namespace Setting
     extern const SettingsBool throw_on_unsupported_query_inside_transaction;
     extern const SettingsUInt64 max_parts_to_move;
     extern const SettingsBool allow_experimental_export_merge_tree_partition;
-    extern const SettingsBool export_merge_tree_partition_executor;
 }
 
 namespace MergeTreeSetting
@@ -576,27 +574,10 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
         export_partition_transaction_id_to_manifest[transaction_id] = manifest;
     }
 
-    if (!getContext()->getSettingsRef()[Setting::export_merge_tree_partition_executor])
+    for (const auto & part : all_parts)
     {
-        for (const auto & part : all_parts)
-        {
-            auto tagger = std::make_shared<CurrentlyExportingPartsTagger>(std::vector<DataPartPtr>{part}, *this);
-            auto task = std::make_shared<ExportPartPlainMergeTreeTask>(*this, tagger, dest_storage, getContext(), manifest, moves_assignee_trigger);
-            background_moves_assignee.scheduleMoveTask(task);
-        }
-    }
-    else
-    {
-        auto exports_tagger = std::make_shared<CurrentlyExportingPartsTagger>(std::move(all_parts), *this);
-
-        auto task = std::make_shared<ExportPartitionPlainMergeTreeTask>(
-            *this,
-            exports_tagger,
-            dest_storage,
-            getContext(),
-            manifest,
-            moves_assignee_trigger);
-    
+        auto tagger = std::make_shared<CurrentlyExportingPartsTagger>(std::vector<DataPartPtr>{part}, *this);
+        auto task = std::make_shared<ExportPartPlainMergeTreeTask>(*this, tagger, dest_storage, getContext(), manifest, moves_assignee_trigger);
         background_moves_assignee.scheduleMoveTask(task);
     }
 }
@@ -1247,33 +1228,12 @@ void StorageMergeTree::resumeExportPartitionTasks()
             parts_to_export.emplace_back(part);
         }
 
-        if (!getContext()->getSettingsRef()[Setting::export_merge_tree_partition_executor])
+        for (const auto & part : parts_to_export)
         {
-            for (const auto & part : parts_to_export)
-            {
-                auto tagger = std::make_shared<CurrentlyExportingPartsTagger>(std::vector<DataPartPtr>{part}, *this);
-                auto task = std::make_shared<ExportPartPlainMergeTreeTask>(*this, tagger, destination_storage, getContext(), manifest, moves_assignee_trigger);
-                background_moves_assignee.scheduleMoveTask(task);
-            }
-        }
-        else
-        {
-            /// TODO: this locks the parts that have not been exported yet. Should we also lock the already exported parts as well?
-            /// There is some inconsistency with in-progress exports. The parts will not be unlocked until all parts have been exported OR a re-start happens
-            /// I just checked and mutations handle it slightly different. Tagger will actually contain a single part, which is released as soon as it finishes.
-            auto exports_tagger = std::make_shared<CurrentlyExportingPartsTagger>(std::move(parts_to_export), *this);
-
-            auto task = std::make_shared<ExportPartitionPlainMergeTreeTask>(
-                *this,
-                exports_tagger,
-                destination_storage,
-                getContext(),
-                manifest,
-                moves_assignee_trigger);
-
+            auto tagger = std::make_shared<CurrentlyExportingPartsTagger>(std::vector<DataPartPtr>{part}, *this);
+            auto task = std::make_shared<ExportPartPlainMergeTreeTask>(*this, tagger, destination_storage, getContext(), manifest, moves_assignee_trigger);
             background_moves_assignee.scheduleMoveTask(task);
         }
-
     }
 }
 
