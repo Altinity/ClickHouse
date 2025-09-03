@@ -99,6 +99,10 @@
         "reason": "INVESTIGATE - ClickHouse timeout",
         "message": "Timeout exceeded (180 s) while flushing system log"
     },
+    "01283_max_threads_simple_query_optimization": {
+        "reason": "INVESTIGATE - ClickHouse timeout",
+        "message": "Timeout exceeded (180 s) while flushing system log"
+    },
     "03514_grace_hash_join_logical_error": {
         "reason": "INVESTIGATE - timeout",
         "message": "Timeout! Killing process group"
