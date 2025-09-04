@@ -34,7 +34,6 @@
 #include <Storages/MarkCache.h>
 #include <Storages/MergeTree/MergeList.h>
 #include <Storages/MergeTree/MovesList.h>
-#include <Storages/ExportsList.h>
 #include <Storages/MergeTree/ReplicatedFetchList.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
@@ -464,7 +463,6 @@ struct ContextSharedPart : boost::noncopyable
     GlobalOvercommitTracker global_overcommit_tracker;
     MergeList merge_list;                                       /// The list of executable merge (for (Replicated)?MergeTree)
     MovesList moves_list;                                       /// The list of executing moves (for (Replicated)?MergeTree)
-    ExportsList exports_list;                                   /// The list of executing exports MergeTree -> Object storage
     ReplicatedFetchList replicated_fetch_list;
     RefreshSet refresh_set;                                 /// The list of active refreshes (for MaterializedView)
     ConfigurationPtr users_config TSA_GUARDED_BY(mutex);                              /// Config with the users, profiles and quotas sections.
@@ -1150,8 +1148,6 @@ MergeList & Context::getMergeList() { return shared->merge_list; }
 const MergeList & Context::getMergeList() const { return shared->merge_list; }
 MovesList & Context::getMovesList() { return shared->moves_list; }
 const MovesList & Context::getMovesList() const { return shared->moves_list; }
-ExportsList & Context::getExportsList() { return shared->exports_list; }
-const ExportsList & Context::getExportsList() const { return shared->exports_list; }
 ReplicatedFetchList & Context::getReplicatedFetchList() { return shared->replicated_fetch_list; }
 const ReplicatedFetchList & Context::getReplicatedFetchList() const { return shared->replicated_fetch_list; }
 RefreshSet & Context::getRefreshSet() { return shared->refresh_set; }

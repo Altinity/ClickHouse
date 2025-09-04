@@ -1,6 +1,5 @@
 #include <Access/ContextAccess.h>
 #include <Interpreters/Context.h>
-#include <Storages/ExportsList.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/System/StorageSystemExports.h>
 #include "Columns/ColumnString.h"
