@@ -71,6 +71,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         addSettingsChanges(settings_changes_history, "25.6.5.2000",
         {
             {"output_format_parquet_enum_as_byte_array", true, true, "Enable writing Enum as byte array in Parquet by default"},
+            {"allow_experimental_export_merge_tree_partition", true, false, "Enable experimental export merge tree partition"},
         });
         addSettingsChanges(settings_changes_history, "25.6",
         {
