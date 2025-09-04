@@ -44,6 +44,7 @@ RUN apt-get update \
         clang-${LLVM_VERSION} \
         clang-tidy-${LLVM_VERSION} \
         cmake='3.*' \
+        cmake-data='3.*' \
         gdb='12.1*' \
         git='1:2.34.*' \
         gperf='3.1*' \
