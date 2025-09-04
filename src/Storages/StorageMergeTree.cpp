@@ -559,7 +559,14 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
 
     const auto transaction_id = std::to_string(generateSnowflakeID());
 
-    /// TODO missing parts lock here with tagger
+    std::vector<std::shared_ptr<CurrentlyExportingPartsTagger>> taggers;
+    taggers.reserve(all_parts.size());
+
+    for (const auto & part : all_parts)
+    {
+        taggers.push_back(std::make_shared<CurrentlyExportingPartsTagger>(part, *this));
+    }
+
     const auto manifest = MergeTreeExportManifest::create(
         getStoragePolicy()->getAnyDisk(),
         relative_data_path,
@@ -574,9 +581,8 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
         export_partition_transaction_id_to_manifest[transaction_id] = manifest;
     }
 
-    for (const auto & part : all_parts)
+    for (const auto & tagger : taggers)
     {
-        auto tagger = std::make_shared<CurrentlyExportingPartsTagger>(std::vector<DataPartPtr>{part}, *this);
         auto task = std::make_shared<ExportPartPlainMergeTreeTask>(*this, tagger, dest_storage, getContext(), manifest, moves_assignee_trigger);
         background_moves_assignee.scheduleMoveTask(task);
     }
@@ -656,25 +662,21 @@ CurrentlyMergingPartsTagger::~CurrentlyMergingPartsTagger()
     storage.currently_processing_in_background_condition.notify_all();
 }
 
-CurrentlyExportingPartsTagger::CurrentlyExportingPartsTagger(std::vector<DataPartPtr> && parts_to_export_, StorageMergeTree & storage_)
-    : parts_to_export(std::move(parts_to_export_)), storage(storage_)
+CurrentlyExportingPartsTagger::CurrentlyExportingPartsTagger(DataPartPtr part_to_export_, StorageMergeTree & storage_)
+    : part_to_export(std::move(part_to_export_)), storage(storage_)
 {
     /// assume it is already locked
-    for (const auto & part : parts_to_export)
-        if (!storage.currently_merging_mutating_parts.emplace(part).second)
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Tagging already tagged part {}. This is a bug.", part->name);
+    if (!storage.currently_merging_mutating_parts.emplace(part_to_export).second)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Tagging already tagged part {}. This is a bug.", part_to_export->name);
 }
 
 CurrentlyExportingPartsTagger::~CurrentlyExportingPartsTagger()
 {
     std::lock_guard lock(storage.currently_processing_in_background_mutex);
 
-    for (const auto & part : parts_to_export)
-    {
-        if (!storage.currently_merging_mutating_parts.contains(part))
-            std::terminate();
-        storage.currently_merging_mutating_parts.erase(part);
-    }
+    if (!storage.currently_merging_mutating_parts.contains(part_to_export))
+        std::terminate();
+    storage.currently_merging_mutating_parts.erase(part_to_export);
 
     storage.currently_processing_in_background_condition.notify_all();
 }
@@ -1230,7 +1232,7 @@ void StorageMergeTree::resumeExportPartitionTasks()
 
         for (const auto & part : parts_to_export)
         {
-            auto tagger = std::make_shared<CurrentlyExportingPartsTagger>(std::vector<DataPartPtr>{part}, *this);
+            auto tagger = std::make_shared<CurrentlyExportingPartsTagger>(part, *this);
             auto task = std::make_shared<ExportPartPlainMergeTreeTask>(*this, tagger, destination_storage, getContext(), manifest, moves_assignee_trigger);
             background_moves_assignee.scheduleMoveTask(task);
         }

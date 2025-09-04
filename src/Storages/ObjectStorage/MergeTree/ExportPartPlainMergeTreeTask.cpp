@@ -63,7 +63,7 @@ bool ExportPartPlainMergeTreeTask::executeStep()
                 retry_count++;
                 LOG_INFO(getLogger("ExportPartPlainMergeTreeTask"),
                 "Retrying export attempt {} for part {}",
-                retry_count, exports_tagger->parts_to_export[0]->name);
+                retry_count, exports_tagger->part_to_export->name);
                 state = State::NEED_EXECUTE;
             }
             else
@@ -84,7 +84,7 @@ bool ExportPartPlainMergeTreeTask::executeStep()
                 retry_count++;
                 LOG_INFO(getLogger("ExportPartPlainMergeTreeTask"),
                 "Retrying export attempt {} for part {}",
-                retry_count, exports_tagger->parts_to_export[0]->name);
+                retry_count, exports_tagger->part_to_export->name);
                 state = State::NEED_COMMIT;
             }
             else
@@ -157,7 +157,7 @@ bool ExportPartPlainMergeTreeTask::executeExport()
     {
         destination_storage->importMergeTreePart(
             storage,
-            exports_tagger->parts_to_export[0],
+            exports_tagger->part_to_export,
             context,
             part_log_wrapper);
 
@@ -165,7 +165,7 @@ bool ExportPartPlainMergeTreeTask::executeExport()
     }
     catch (...)
     {
-        LOG_ERROR(getLogger("ExportPartPlainMergeTreeTask"), "Failed to export part {}", exports_tagger->parts_to_export[0]->name);
+        LOG_ERROR(getLogger("ExportPartPlainMergeTreeTask"), "Failed to export part {}", exports_tagger->part_to_export->name);
         
         return false;
     }
