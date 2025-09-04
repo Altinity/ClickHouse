@@ -10,7 +10,7 @@ name: Build docker images
         description: set latest tag for resulting multiarch manifest
         required: false
         type: boolean
-        default: false    
+        default: false
     secrets:
       secret_envs:
         description: if given, it's passed to the environments
@@ -26,6 +26,9 @@ env:
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+
 
 jobs:
   DockerBuildAarch64:
