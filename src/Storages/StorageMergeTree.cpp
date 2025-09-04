@@ -548,8 +548,6 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
         return;
     }
 
-    std::vector<std::shared_ptr<CurrentlyExportingPartsTagger>> taggers;
-
     {
         /// Do not put this in a scope because `CurrentlyExportingPartsTagger` instantiated above relies on this already being locked
         /// shitty design I came up with huh
@@ -559,12 +557,11 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
         {
             throw Exception(ErrorCodes::PART_IS_LOCKED, "Partition {} has already been exported", partition_id);
         }
-        
-        taggers.reserve(all_parts.size());
 
         for (const auto & part : all_parts)
         {
-            taggers.push_back(std::make_shared<CurrentlyExportingPartsTagger>(part, *this));
+            if (!currently_merging_mutating_parts.emplace(part).second)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Tagging already tagged part {}. This is a bug.", part->name);
         }
     }
 
@@ -584,14 +581,7 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
         export_partition_transaction_id_to_manifest[transaction_id] = manifest;
     }
 
-    for (const auto & tagger : taggers)
-    {
-        auto task = std::make_shared<ExportPartPlainMergeTreeTask>(*this, tagger, dest_storage, getContext(), manifest, moves_assignee_trigger);
-        if (!background_moves_assignee.scheduleMoveTask(task))
-        {
-            LOG_ERROR(log, "Failed to schedule export task for part {}", tagger->part_to_export->name);
-        }
-    }
+    background_moves_assignee.trigger();
 }
 
 /// While exists, marks parts as 'currently_merging_mutating_parts' and reserves free space on filesystem.
@@ -1198,58 +1188,53 @@ void StorageMergeTree::readExportPartitionManifests()
             }
         }
     }
+
+    background_moves_assignee.trigger();
 }
 
 void StorageMergeTree::resumeExportPartitionTasks()
 {
     /// Initially I opted for having two separate methods: read and resume because I wanted to schedule the tasks in order
     /// but it turns out the background executor schedules tasks based on their priority, so it is likely this is not needed anymore.
-    for (const auto & [transaction_id, manifest] : export_partition_transaction_id_to_manifest)
-    {
-        if (manifest->status != MergeTreeExportManifest::Status::pending)
-            continue;
+    // for (const auto & [transaction_id, manifest] : export_partition_transaction_id_to_manifest)
+    // {
+    //     if (manifest->status != MergeTreeExportManifest::Status::pending)
+    //         continue;
 
-        auto destination_storage = DatabaseCatalog::instance().tryGetTable(manifest->destination_storage_id, getContext());
-        if (!destination_storage)
-        {
-            LOG_ERROR(log, "Failed to reconstruct destination storage: {}", manifest->destination_storage_id.getNameForLogs());
-            continue;
-        }
+    //     auto destination_storage = DatabaseCatalog::instance().tryGetTable(manifest->destination_storage_id, getContext());
+    //     if (!destination_storage)
+    //     {
+    //         LOG_ERROR(log, "Failed to reconstruct destination storage: {}", manifest->destination_storage_id.getNameForLogs());
+    //         continue;
+    //     }
 
-        auto pending_part_names = manifest->pendingParts();
+    //     auto pending_part_names = manifest->pendingParts();
 
-        /// apparently, it is possible that pending parts are empty
-        /// if it is empty, I have to somehow commit and mark as completed..
+    //     /// apparently, it is possible that pending parts are empty
+    //     /// if it is empty, I have to somehow commit and mark as completed..
 
-        std::vector<DataPartPtr> parts_to_export;
+    //     std::vector<DataPartPtr> parts_to_export;
 
-        for (const auto & part_name : pending_part_names)
-        {
-            auto part = getPartIfExists(part_name, {MergeTreeDataPartState::Active});
+    //     for (const auto & part_name : pending_part_names)
+    //     {
+    //         auto part = getPartIfExists(part_name, {MergeTreeDataPartState::Active});
 
-            if (!part)
-            {
-                LOG_ERROR(log, "Part {} is present in the manifest file {}, but not found in the storage {}",
-                    part_name,
-                    manifest->transaction_id,
-                    getStorageID().getNameForLogs());
-                manifest->status = MergeTreeExportManifest::Status::failed;
-                manifest->write();
+    //         if (!part)
+    //         {
+    //             LOG_ERROR(log, "Part {} is present in the manifest file {}, but not found in the storage {}",
+    //                 part_name,
+    //                 manifest->transaction_id,
+    //                 getStorageID().getNameForLogs());
+    //             manifest->status = MergeTreeExportManifest::Status::failed;
+    //             manifest->write();
 
-                already_exported_partition_ids.erase(manifest->partition_id);
-                continue;
-            }
+    //             already_exported_partition_ids.erase(manifest->partition_id);
+    //             continue;
+    //         }
 
-            parts_to_export.emplace_back(part);
-        }
-
-        for (const auto & part : parts_to_export)
-        {
-            auto tagger = std::make_shared<CurrentlyExportingPartsTagger>(part, *this);
-            auto task = std::make_shared<ExportPartPlainMergeTreeTask>(*this, tagger, destination_storage, getContext(), manifest, moves_assignee_trigger);
-            background_moves_assignee.scheduleMoveTask(task);
-        }
-    }
+    //         parts_to_export.emplace_back(part);
+    //     }
+    // }
 }
 
 void StorageMergeTree::loadExportPartition()
@@ -1660,6 +1645,57 @@ UInt32 StorageMergeTree::getMaxLevelInBetween(const PartProperties & left, const
     }
 
     return level;
+}
+
+
+bool StorageMergeTree::scheduleDataMovingJob(BackgroundJobsAssignee & assignee)
+{
+    if (MergeTreeData::scheduleDataMovingJob(assignee))
+    {
+        return true;
+    }
+
+    /// Try to schedule one export part task if any pending export exists
+    {
+        std::lock_guard lock(export_partition_transaction_id_to_manifest_mutex);
+        for (const auto & [transaction_id, manifest] : export_partition_transaction_id_to_manifest)
+        {
+            if (manifest->status != MergeTreeExportManifest::Status::pending)
+                continue;
+
+            auto destination_storage = DatabaseCatalog::instance().tryGetTable(manifest->destination_storage_id, getContext());
+            if (!destination_storage)
+            {
+                LOG_ERROR(log, "Failed to reconstruct destination storage: {}", manifest->destination_storage_id.getNameForLogs());
+                continue;
+            }
+
+            for (auto & item : manifest->items)
+            {
+                if (item.in_progress)
+                    continue;
+
+                auto part = getPartIfExists(item.part_name, {MergeTreeDataPartState::Active});
+                if (!part)
+                {
+                    LOG_ERROR(log, "Part {} is present in the manifest file {}, but not found in the storage {}",
+                        item.part_name,
+                        manifest->transaction_id,
+                        getStorageID().getNameForLogs());
+                    manifest->status = MergeTreeExportManifest::Status::failed;
+                    manifest->write();
+                    already_exported_partition_ids.erase(manifest->partition_id);
+                    continue;
+                }
+
+                auto task = std::make_shared<ExportPartPlainMergeTreeTask>(*this, part, destination_storage, getContext(), manifest, moves_assignee_trigger);
+                item.in_progress = background_moves_assignee.scheduleMoveTask(task);
+                return true;
+
+            }
+        }
+    }
+    return false;
 }
 
 bool StorageMergeTree::scheduleDataProcessingJob(BackgroundJobsAssignee & assignee)
@@ -2949,8 +2985,8 @@ MutationCounters StorageMergeTree::getMutationCounters() const
 
 void StorageMergeTree::startBackgroundMovesIfNeeded()
 {
-    if (areBackgroundMovesNeeded())
-        background_moves_assignee.start();
+    // if (areBackgroundMovesNeeded())
+    background_moves_assignee.start();
 }
 
 std::unique_ptr<MergeTreeSettings> StorageMergeTree::getDefaultSettings() const

@@ -51,6 +51,7 @@ struct MergeTreeExportManifest
     {
         String part_name;
         String remote_path; // empty until uploaded
+        bool in_progress = false; /// this is just a hackish workaround for now
     };
     
 
@@ -172,6 +173,15 @@ struct MergeTreeExportManifest
             }
         }
         write();
+    }
+
+    void setInProgress(const String & part_name)
+    {
+        for (auto & i : items)
+        {
+            if (i.part_name == part_name)
+                i.in_progress = true;
+        }
     }
 
     std::vector<String> pendingParts() const

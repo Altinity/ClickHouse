@@ -18,7 +18,7 @@ class ExportPartPlainMergeTreeTask : public IExecutableTask
 public:
     ExportPartPlainMergeTreeTask(
         StorageMergeTree & storage_,
-        const std::shared_ptr<CurrentlyExportingPartsTagger> & exports_tagger_,
+        const DataPartPtr & part_to_export_,
         const StoragePtr & destination_storage_,
         ContextPtr context_,
         std::shared_ptr<MergeTreeExportManifest> manifest_,
@@ -50,7 +50,7 @@ private:
     State state{State::NEED_PREPARE};
 
     StorageMergeTree & storage;
-    std::shared_ptr<CurrentlyExportingPartsTagger> exports_tagger;
+    DataPartPtr part_to_export;
     StoragePtr destination_storage;
     ContextPtr context;
     std::shared_ptr<MergeTreeExportManifest> manifest;

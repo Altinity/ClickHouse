@@ -11,14 +11,14 @@ namespace DB
 
 ExportPartPlainMergeTreeTask::ExportPartPlainMergeTreeTask(
     StorageMergeTree & storage_,
-    const std::shared_ptr<CurrentlyExportingPartsTagger> & exports_tagger_,
+    const DataPartPtr & part_to_export_,
     const StoragePtr & destination_storage_,
     ContextPtr context_,
     std::shared_ptr<MergeTreeExportManifest> manifest_,
     IExecutableTask::TaskResultCallback & task_result_callback_,
     size_t max_retries_)
     : storage(storage_)
-    , exports_tagger(exports_tagger_)
+    , part_to_export(part_to_export_)
     , destination_storage(destination_storage_)
     , context(std::move(context_))
     , manifest(std::move(manifest_))
@@ -63,7 +63,7 @@ bool ExportPartPlainMergeTreeTask::executeStep()
                 retry_count++;
                 LOG_INFO(getLogger("ExportPartPlainMergeTreeTask"),
                 "Retrying export attempt {} for part {}",
-                retry_count, exports_tagger->part_to_export->name);
+                retry_count, part_to_export->name);
                 state = State::NEED_EXECUTE;
             }
             else
@@ -84,7 +84,7 @@ bool ExportPartPlainMergeTreeTask::executeStep()
                 retry_count++;
                 LOG_INFO(getLogger("ExportPartPlainMergeTreeTask"),
                 "Retrying export attempt {} for part {}",
-                retry_count, exports_tagger->part_to_export->name);
+                retry_count, part_to_export->name);
                 state = State::NEED_COMMIT;
             }
             else
@@ -101,16 +101,23 @@ bool ExportPartPlainMergeTreeTask::executeStep()
             manifest->status = MergeTreeExportManifest::Status::failed;
             manifest->write();
 
-            storage.already_exported_partition_ids.erase(manifest->partition_id);
+            /// this is a mess, what if several fail? I need to re-think the architecture
+            /// I'll leave this commented out for now
+            // storage.already_exported_partition_ids.erase(manifest->partition_id);
+
+            storage.currently_merging_mutating_parts.erase(part_to_export);
 
             return false;
         }
         case State::SUCCESS:
         {
+            storage.currently_merging_mutating_parts.erase(part_to_export);
+
             return false;
         }
     }
 
+    storage.currently_merging_mutating_parts.erase(part_to_export);
     return false;
 }
 
@@ -157,7 +164,7 @@ bool ExportPartPlainMergeTreeTask::executeExport()
     {
         destination_storage->importMergeTreePart(
             storage,
-            exports_tagger->part_to_export,
+            part_to_export,
             context,
             part_log_wrapper);
 
@@ -165,7 +172,7 @@ bool ExportPartPlainMergeTreeTask::executeExport()
     }
     catch (...)
     {
-        LOG_ERROR(getLogger("ExportPartPlainMergeTreeTask"), "Failed to export part {}", exports_tagger->part_to_export->name);
+        LOG_ERROR(getLogger("ExportPartPlainMergeTreeTask"), "Failed to export part {}", part_to_export->name);
         
         return false;
     }

@@ -119,6 +119,8 @@ public:
 
     bool scheduleDataProcessingJob(BackgroundJobsAssignee & assignee) override;
 
+    bool scheduleDataMovingJob(BackgroundJobsAssignee & assignee) override;
+
     std::map<std::string, MutationCommands> getUnfinishedMutationCommands() const override;
 
     MergeTreeDeduplicationLog * getDeduplicationLog() { return deduplication_log.get(); }

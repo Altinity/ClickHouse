@@ -55,8 +55,8 @@ struct CurrentlyExportingPartsTagger
 {
     DataPartPtr part_to_export;
     StorageMergeTree & storage;
-    CurrentlyExportingPartsTagger(DataPartPtr part_to_export_, StorageMergeTree & storage_);
     ~CurrentlyExportingPartsTagger();
+    CurrentlyExportingPartsTagger(DataPartPtr part_to_export_, StorageMergeTree & storage_);
 };
 
 using CurrentlyExportingPartsTaggerPtr = std::shared_ptr<CurrentlyExportingPartsTagger>;
