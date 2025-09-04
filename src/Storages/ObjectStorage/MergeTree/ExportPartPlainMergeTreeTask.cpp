@@ -126,19 +126,7 @@ bool ExportPartPlainMergeTreeTask::executeExport()
         return false;
 
     std::function<void(MergeTreePartImportStats)> part_log_wrapper = [this](MergeTreePartImportStats stats) {
-
-        std::lock_guard lock(storage.export_partition_transaction_id_to_manifest_mutex);
         auto table_id = storage.getStorageID();
-
-        if (stats.status.code != 0)
-        {
-            LOG_INFO(getLogger("ExportMergeTreePartitionToObjectStorageTask"), "Error importing part {}: {}", stats.part->name, stats.status.message);
-            return;
-        }
-
-        storage.export_partition_transaction_id_to_manifest[manifest->transaction_id]->updateRemotePathAndWrite(
-            stats.part->name, 
-            stats.file_path);
 
         UInt64 elapsed_ns = stopwatch_ptr->elapsedNanoseconds();
 
@@ -151,6 +139,18 @@ bool ExportPartPlainMergeTreeTask::executeExport()
             {stats.part},
             nullptr,
             nullptr);
+
+        if (stats.status.code != 0)
+        {
+            LOG_INFO(getLogger("ExportMergeTreePartitionToObjectStorageTask"), "Error importing part {}: {}", stats.part->name, stats.status.message);
+            return;
+        }
+
+        std::lock_guard lock(storage.export_partition_transaction_id_to_manifest_mutex);
+
+        storage.export_partition_transaction_id_to_manifest[manifest->transaction_id]->updateRemotePathAndWrite(
+            stats.part->name, 
+            stats.file_path);
     };
 
     try
