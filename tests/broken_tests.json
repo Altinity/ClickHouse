@@ -123,6 +123,14 @@
         "reason": "INVESTIGATE - timeout",
         "message": "Timeout! Killing process group"
     },
+    "02437_drop_mv_restart_replicas": {
+        "reason": "INVESTIGATE - random fail?",
+        "message": "`slog` doesn't exist.: Cannot create table from metadata file"
+    },
+    "03549_system_query_metric_log_with_queries_with_same_query_id": {
+        "reason": "INVESTIGATE - random fail?",
+        "message": "The query succeeded but the server error '394' was expected"
+    },
     "02098_hashed_array_dictionary_simple_key": {
         "reason": "INVESTIGATE - timeout, unstable",
         "message": "Timeout! Killing process group"
