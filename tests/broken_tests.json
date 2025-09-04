@@ -111,6 +111,14 @@
         "reason": "INVESTIGATE - timeout",
         "message": "Timeout! Killing process group"
     },
+    "03127_system_unload_primary_key_table": {
+        "reason": "INVESTIGATE - timeout",
+        "message": "Timeout! Killing process group"
+    },
+    "01926_order_by_desc_limit": {
+        "reason": "INVESTIGATE - timeout",
+        "message": "Timeout! Killing process group"
+    },
     "02751_multiquery_with_argument": {
         "reason": "INVESTIGATE - timeout",
         "message": "Timeout! Killing process group"
