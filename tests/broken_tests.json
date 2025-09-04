@@ -91,6 +91,9 @@
     "03271_ghdata_object_to_json_alter": {
         "reason": "INVESTIGATE - Unstable?"
     },
+    "03396_s3_do_not_retry_dns_errors": {
+        "reason": "INVESTIGATE - Unstable?"
+    },
     "01810_max_part_removal_threads_long": {
         "reason": "INVESTIGATE - ClickHouse timeout",
         "message": "Timeout exceeded (180 s) while flushing system log"
@@ -125,6 +128,14 @@
     },
     "02003_memory_limit_in_client": {
         "reason": "INVESTIGATE - timeout",
+        "message": "Timeout! Killing process group"
+    },
+    "03237_insert_sparse_columns_mem": {
+        "reason": "INVESTIGATE - timeout on tsan",
+        "message": "Timeout! Killing process group"
+    },
+    "03401_normal_projection_with_part_offset": {
+        "reason": "INVESTIGATE - timeout on tsan",
         "message": "Timeout! Killing process group"
     },
     "02437_drop_mv_restart_replicas": {
