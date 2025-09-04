@@ -17,8 +17,8 @@ from build_check import get_release_or_pr
 from clickhouse_helper import ClickHouseHelper, prepare_tests_results_for_clickhouse
 from commit_status_helper import format_description, get_commit, post_commit_status
 from docker_images_check import DockerImage
-from env_helper import CI, GITHUB_RUN_URL, RUNNER_TEMP, S3_BUILDS_BUCKET, S3_DOWNLOAD
-from get_robot_token import get_best_robot_token, get_parameter_from_ssm
+from env_helper import DOCKER_PASSWORD, CI, GITHUB_RUN_URL, RUNNER_TEMP, S3_BUILDS_BUCKET, S3_DOWNLOAD
+from get_robot_token import get_best_robot_token
 from git_helper import Git
 from pr_info import PRInfo
 from report import TestResults, TestResult
@@ -342,7 +342,7 @@ def main():
     if args.push:
         subprocess.check_output(  # pylint: disable=unexpected-keyword-arg
             "docker login --username 'altinityinfra' --password-stdin",
-            input=get_parameter_from_ssm("dockerhub-password"),
+            input=DOCKER_PASSWORD,
             encoding="utf-8",
             shell=True,
         )
