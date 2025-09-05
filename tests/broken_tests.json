@@ -66,6 +66,10 @@
     "03321_clickhouse_local_initialization_not_too_slow_even_under_sanitizers": {
         "reason": "INVESTIGATE - Unstable?"
     },
+    "02915_input_table_function_in_subquery": {
+        "reason": "INVESTIGATE - Unstable? Sometimes Access Denied.",
+        "message": "DB::Exception: Message: Access Denied., bucket test"
+    },
     "00984_parser_stack_overflow": {
         "reason": "INVESTIGATE - Timeout in ClickHouse query"
     },
@@ -115,6 +119,10 @@
         "message": "Timeout! Killing process group"
     },
     "03127_system_unload_primary_key_table": {
+        "reason": "INVESTIGATE - timeout",
+        "message": "Timeout! Killing process group"
+    },
+    "02969_auto_format_detection": {
         "reason": "INVESTIGATE - timeout",
         "message": "Timeout! Killing process group"
     },
