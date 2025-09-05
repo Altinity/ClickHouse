@@ -243,6 +243,10 @@
     "test_storage_rabbitmq/test.py::test_rabbitmq_sharding_between_queues_publish": {
         "reason": "INVESTIGATE - Unstable?"
     },
+    "test_storage_rabbitmq/test.py::test_rabbitmq_mv_combo": {
+        "reason": "INVESTIGATE - Timeout on tsan",
+        "message": "Failed: Time limit of 60 seconds reached. The result did not match the expected value."
+    },
     "test_backup_restore_on_cluster/test_different_versions.py::test_different_versions": {
         "reason": "INVESTIGATE - NETLINK_ERROR",
         "message": "NETLINK_ERROR"
