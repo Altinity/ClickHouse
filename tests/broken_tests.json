@@ -56,6 +56,10 @@
     "02354_vector_search_expansion_search": {
         "reason": "INVESTIGATE - Timeout on TSAN. Unstable?"
     },
+    "02760_dictionaries_memory": {
+        "reason": "INVESTIGATE - Timeout on TSAN.",
+        "message": "Timeout exceeded while receiving data from server."
+    },
     "03441_deltalake_clickhouse_public_datasets": {
         "reason": "INVESTIGATE - S3 sometimes unreachable",
         "message": "Error interacting with object store: Generic S3 error: Error performing GET"
@@ -269,5 +273,25 @@
     },
     "test_overcommit_tracker/test.py::test_user_overcommit": {
         "reason": "INVESTIGATE - Unstable?"
+    },
+    "test_database_hms/test.py::test_list_tables": {
+        "reason": "INVESTIGATE - Strange fail sometimes",
+        "message": "failed to solve: failed to read expected number of bytes: unexpected EOF"
+    },
+    "test_database_hms/test.py::test_many_namespaces": {
+        "reason": "INVESTIGATE - Strange fail sometimes",
+        "message": "failed to solve: failed to read expected number of bytes: unexpected EOF"
+    },
+    "test_database_hms/test.py::test_select": {
+        "reason": "INVESTIGATE - Strange fail sometimes",
+        "message": "failed to solve: failed to read expected number of bytes: unexpected EOF"
+    },
+    "test_database_hms/test.py::test_hide_sensitive_info": {
+        "reason": "INVESTIGATE - Strange fail sometimes",
+        "message": "failed to solve: failed to read expected number of bytes: unexpected EOF"
+    },
+    "test_database_hms/test.py::test_tables_with_same_location": {
+        "reason": "INVESTIGATE - Strange fail sometimes",
+        "message": "failed to solve: failed to read expected number of bytes: unexpected EOF"
     }
 }
