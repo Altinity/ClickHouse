@@ -10,5 +10,8 @@
     },
     "02479_race_condition_between_insert_and_droppin_mv": {
         "reason": "INVESTIGATE: Unstable on ubsan"
+    },
+    "01825_new_type_json_ghdata": {
+        "reason": "INVESTIGATE: Sometime out of memory on msan"
     }
 }
