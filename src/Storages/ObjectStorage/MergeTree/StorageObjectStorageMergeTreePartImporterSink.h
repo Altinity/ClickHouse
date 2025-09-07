@@ -2,13 +2,10 @@
 
 #include <Interpreters/Context.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSink.h>
-#include "Core/Settings.h"
-#include "Disks/ObjectStorages/IObjectStorage.h"
-#include "Disks/ObjectStorages/StoredObject.h"
-#include "Formats/FormatFactory.h"
-#include "IO/CompressionMethod.h"
-#include "Processors/Formats/IOutputFormat.h"
-#include "Storages/MergeTree/IMergeTreeDataPart.h"
+#include <Disks/ObjectStorages/IObjectStorage.h>
+#include <Formats/FormatFactory.h>
+#include <Processors/Formats/IOutputFormat.h>
+#include <Storages/MergeTree/IMergeTreeDataPart.h>
 
 namespace DB
 {

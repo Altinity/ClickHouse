@@ -38,42 +38,29 @@ String StorageObjectStorageMergeTreePartImporterSink::getName() const
 
 void StorageObjectStorageMergeTreePartImporterSink::consume(Chunk & chunk)
 {
-    if (stats.status.code != 0)
-        return;
-
-    try
-    {
-        sink->consume(chunk);
-        stats.read_bytes += chunk.bytes();
-        stats.read_rows += chunk.getNumRows();
-
-        stats.status = ExecutionStatus(0, "Success");
-    } catch (...) {
-        stats.status = ExecutionStatus(-1, "Error importing part");
-        part_log(stats);
-    }
+    sink->consume(chunk);
+    stats.read_bytes += chunk.bytes();
+    stats.read_rows += chunk.getNumRows();
 }
 
 void StorageObjectStorageMergeTreePartImporterSink::onFinish()
 {
-    if (stats.status.code != 0)
-    {
-        sink->cancel();
-        return;
-    }
-
     sink->onFinish();
+
     if (const auto object_metadata = object_storage->tryGetObjectMetadata(stats.file_path))
     {
         stats.bytes_on_disk = object_metadata->size_bytes;
     }
+
     part_log(stats);
 }
 
-void StorageObjectStorageMergeTreePartImporterSink::onException(std::exception_ptr)
+void StorageObjectStorageMergeTreePartImporterSink::onException(std::exception_ptr exception)
 {
-    /// we should not reach here
-    std::terminate();
+    sink->onException(exception);
+
+    stats.status = ExecutionStatus(-1, "Error importing part");
+    part_log(stats);
 }
 
 }
