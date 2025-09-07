@@ -101,23 +101,18 @@ bool ExportPartPlainMergeTreeTask::executeStep()
             manifest->status = MergeTreeExportManifest::Status::failed;
             manifest->write();
 
-            /// this is a mess, what if several fail? I need to re-think the architecture
-            /// I'll leave this commented out for now
-            // storage.already_exported_partition_ids.erase(manifest->partition_id);
-
-            storage.currently_merging_mutating_parts.erase(part_to_export);
+            /// doesn't sound ideal, but it is actually ok to allow this partition to be re-exported as soon as a single part fails
+            /// this is because the ongoing export will never commit, so it won't cause duplicates
+            storage.already_exported_partition_ids.erase(manifest->partition_id);
 
             return false;
         }
         case State::SUCCESS:
         {
-            storage.currently_merging_mutating_parts.erase(part_to_export);
-
             return false;
         }
     }
 
-    storage.currently_merging_mutating_parts.erase(part_to_export);
     return false;
 }
 

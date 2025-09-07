@@ -52,6 +52,7 @@ struct MergeTreeExportManifest
         String part_name;
         String remote_path; // empty until uploaded
         bool in_progress = false; /// this is just a hackish workaround for now
+        DataPartPtr part; // hold reference to part so it does not get deleted from disk even if it is outdated. Should be null once we are done with it
     };
     
 
@@ -82,12 +83,15 @@ struct MergeTreeExportManifest
         manifest->file_path = std::filesystem::path(path_prefix) / ("export_partition_" + partition_id_ + "_transaction_" + transaction_id_ + ".json");
         manifest->items.reserve(data_parts.size());
         for (const auto & data_part : data_parts)
-            manifest->items.push_back({data_part->name, ""});
+            manifest->items.emplace_back(data_part->name, "", false, data_part);
         manifest->write();
         return manifest;
     }
 
-    static std::shared_ptr<MergeTreeExportManifest> read(const DiskPtr & disk_, const String & file_path_)
+    /// will not fill parts ref, maybe I should.
+    static std::shared_ptr<MergeTreeExportManifest> read(
+        const DiskPtr & disk_,
+        const String & file_path_)
     {
         auto manifest = std::make_shared<MergeTreeExportManifest>();
         manifest->disk = disk_;

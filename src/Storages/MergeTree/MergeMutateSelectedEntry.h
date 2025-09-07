@@ -51,14 +51,4 @@ struct MergeMutateSelectedEntry
 
 using MergeMutateSelectedEntryPtr = std::shared_ptr<MergeMutateSelectedEntry>;
 
-struct CurrentlyExportingPartsTagger
-{
-    DataPartPtr part_to_export;
-    StorageMergeTree & storage;
-    ~CurrentlyExportingPartsTagger();
-    CurrentlyExportingPartsTagger(DataPartPtr part_to_export_, StorageMergeTree & storage_);
-};
-
-using CurrentlyExportingPartsTaggerPtr = std::shared_ptr<CurrentlyExportingPartsTagger>;
-
 }

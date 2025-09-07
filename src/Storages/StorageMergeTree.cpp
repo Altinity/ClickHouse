@@ -47,6 +47,7 @@
 #include <Common/ProfileEventsScope.h>
 #include <Common/escapeForFileName.h>
 #include "Core/BackgroundSchedulePool.h"
+#include "Storages/MergeTree/MergeTreeDataPartState.h"
 #include "Storages/ObjectStorage/MergeTree/ExportPartPlainMergeTreeTask.h"
 #include <Core/Names.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
@@ -549,19 +550,11 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
     }
 
     {
-        /// Do not put this in a scope because `CurrentlyExportingPartsTagger` instantiated above relies on this already being locked
-        /// shitty design I came up with huh
         std::lock_guard lock_background_mutex(currently_processing_in_background_mutex);
 
         if (!already_exported_partition_ids.emplace(partition_id).second)
         {
             throw Exception(ErrorCodes::PART_IS_LOCKED, "Partition {} has already been exported", partition_id);
-        }
-
-        for (const auto & part : all_parts)
-        {
-            if (!currently_merging_mutating_parts.emplace(part).second)
-                throw Exception(ErrorCodes::LOGICAL_ERROR, "Tagging already tagged part {}. This is a bug.", part->name);
         }
     }
 
@@ -657,26 +650,6 @@ CurrentlyMergingPartsTagger::~CurrentlyMergingPartsTagger()
 
     storage.currently_processing_in_background_condition.notify_all();
 }
-
-CurrentlyExportingPartsTagger::CurrentlyExportingPartsTagger(DataPartPtr part_to_export_, StorageMergeTree & storage_)
-    : part_to_export(std::move(part_to_export_)), storage(storage_)
-{
-    /// assume it is already locked
-    if (!storage.currently_merging_mutating_parts.emplace(part_to_export).second)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "Tagging already tagged part {}. This is a bug.", part_to_export->name);
-}
-
-CurrentlyExportingPartsTagger::~CurrentlyExportingPartsTagger()
-{
-    std::lock_guard lock(storage.currently_processing_in_background_mutex);
-
-    if (!storage.currently_merging_mutating_parts.contains(part_to_export))
-        std::terminate();
-    storage.currently_merging_mutating_parts.erase(part_to_export);
-
-    storage.currently_processing_in_background_condition.notify_all();
-}
-
 
 Int64 StorageMergeTree::startMutation(const MutationCommands & commands, ContextPtr query_context)
 {
@@ -1150,6 +1123,7 @@ void StorageMergeTree::loadMutations()
 
 void StorageMergeTree::readExportPartitionManifests()
 {
+    static const auto states = {MergeTreeDataPartState::Active, MergeTreeDataPartState::Deleting, MergeTreeDataPartState::Outdated, MergeTreeDataPartState::DeleteOnDestroy};
     for (const auto & disk : getDisks())
     {
         for (auto it = disk->iterateDirectory(relative_data_path); it->isValid(); it->next())
@@ -1174,6 +1148,28 @@ void StorageMergeTree::readExportPartitionManifests()
                                 manifest->partition_id,
                                 manifest->destination_storage_id.getNameForLogs());
                             continue;
+                        }
+                    }
+
+                    for (auto & item : manifest->items)
+                    {
+                        /// if this part has not been pushed yet
+                        if (item.remote_path.empty())
+                        {
+                            item.part = getPartIfExists(item.part_name, states);
+
+                            if (!item.part)
+                            {
+                                LOG_ERROR(log, "Part {} is present in the manifest file {}, but not found in the storage {}",
+                                    item.part_name,
+                                    manifest->transaction_id,
+                                    getStorageID().getNameForLogs());
+
+                                manifest->status = MergeTreeExportManifest::Status::failed;
+                                manifest->write();
+                                already_exported_partition_ids.erase(manifest->partition_id);
+                                continue;
+                            }
                         }
                     }
 
@@ -1670,12 +1666,13 @@ bool StorageMergeTree::scheduleDataMovingJob(BackgroundJobsAssignee & assignee)
                 continue;
             }
 
+            static const auto states = {MergeTreeDataPartState::Active, MergeTreeDataPartState::Deleting, MergeTreeDataPartState::Outdated, MergeTreeDataPartState::DeleteOnDestroy};
             for (auto & item : manifest->items)
             {
                 if (item.in_progress)
                     continue;
 
-                auto part = getPartIfExists(item.part_name, {MergeTreeDataPartState::Active});
+                auto part = getPartIfExists(item.part_name, states);
                 if (!part)
                 {
                     LOG_ERROR(log, "Part {} is present in the manifest file {}, but not found in the storage {}",
