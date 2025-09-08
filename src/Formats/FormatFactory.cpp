@@ -568,8 +568,12 @@ OutputFormatPtr FormatFactory::getOutputFormatParallelIfPossible(
     auto format_settings = _format_settings ? *_format_settings : getFormatSettings(context);
     const Settings & settings = context->getSettingsRef();
 
-    if (settings[Setting::output_format_parallel_formatting] && getCreators(name).supports_parallel_formatting
-        && !settings[Setting::output_format_json_array_of_rows])
+    const bool parallel_formatting_enabled = settings[Setting::output_format_parallel_formatting];
+    const bool supports_parallel_formatting = getCreators(name).supports_parallel_formatting;
+
+    bool are_we_doing_parallel_formatting = parallel_formatting_enabled && supports_parallel_formatting && !settings[Setting::output_format_json_array_of_rows];
+
+    if (are_we_doing_parallel_formatting)
     {
         auto formatter_creator = [output_getter, sample, format_settings] (WriteBuffer & output) -> OutputFormatPtr
         {

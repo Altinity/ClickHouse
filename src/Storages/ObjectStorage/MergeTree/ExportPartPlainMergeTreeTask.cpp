@@ -5,9 +5,15 @@
 #include <Common/logger_useful.h>
 #include <Storages/ObjectStorage/MergeTree/StorageObjectStorageMergeTreePartImporterSink.h>
 #include <Storages/StorageMergeTree.h>
+#include <Core/Settings.h>
 
 namespace DB
 {
+
+namespace Setting
+{
+    extern const SettingsBool output_format_parallel_formatting;
+}
 
 ExportPartPlainMergeTreeTask::ExportPartPlainMergeTreeTask(
     StorageMergeTree & storage_,
@@ -157,10 +163,16 @@ bool ExportPartPlainMergeTreeTask::executeExport()
 
     try
     {
+        auto context_copy = Context::createCopy(context);
+
+        /// Manually disable parallelism because the idea is to control parallelism with tasks, not with formatting
+        context_copy->setSetting("output_format_parallel_formatting", false);
+        context_copy->setSetting("max_threads", 1);
+
         destination_storage->importMergeTreePart(
             storage,
             part_to_export,
-            context,
+            context_copy,
             part_log_wrapper);
 
         return true;
