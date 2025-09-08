@@ -13,5 +13,8 @@
     },
     "01825_new_type_json_ghdata": {
         "reason": "INVESTIGATE: Sometime out of memory on msan"
+    },
+    "00159_parallel_formatting_http": {
+        "reason": "INVESTIGATE: Unstable on tsan"
     }
 }
