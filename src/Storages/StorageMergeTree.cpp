@@ -46,9 +46,10 @@
 #include <Common/MemoryTracker.h>
 #include <Common/ProfileEventsScope.h>
 #include <Common/escapeForFileName.h>
-#include "Core/BackgroundSchedulePool.h"
-#include "Storages/MergeTree/MergeTreeDataPartState.h"
-#include "Storages/ObjectStorage/MergeTree/ExportPartPlainMergeTreeTask.h"
+#include <Core/BackgroundSchedulePool.h>
+#include <Core/ServerSettings.h>
+#include <Storages/MergeTree/MergeTreeDataPartState.h>
+#include <Storages/ObjectStorage/MergeTree/ExportPartPlainMergeTreeTask.h>
 #include <Core/Names.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Functions/generateSnowflakeID.h>
@@ -82,6 +83,11 @@ namespace Setting
     extern const SettingsBool throw_on_unsupported_query_inside_transaction;
     extern const SettingsUInt64 max_parts_to_move;
     extern const SettingsBool allow_experimental_export_merge_tree_partition;
+}
+
+namespace ServerSetting
+{
+    extern const ServerSettingsUInt64 export_merge_tree_partition_max_retries;
 }
 
 namespace MergeTreeSetting
@@ -1685,10 +1691,18 @@ bool StorageMergeTree::scheduleDataMovingJob(BackgroundJobsAssignee & assignee)
                     continue;
                 }
 
-                auto task = std::make_shared<ExportPartPlainMergeTreeTask>(*this, part, destination_storage, getContext(), manifest, moves_assignee_trigger);
+                auto task = std::make_shared<ExportPartPlainMergeTreeTask>(
+                    *this,
+                    part,
+                    destination_storage,
+                    getContext(),
+                    manifest,
+                    moves_assignee_trigger,
+                    getContext()->getServerSettings()[ServerSetting::export_merge_tree_partition_max_retries]);
                 item.in_progress = background_moves_assignee.scheduleMoveTask(task);
-                return true;
 
+                /// todo arthur is returning true always correct?
+                return true;
             }
         }
     }
