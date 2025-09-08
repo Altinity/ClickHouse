@@ -193,6 +193,9 @@
     "02241_filesystem_cache_on_write_operations": {
         "reason": "INVESTIGATE - Unstable?"
     },
+    "02443_detach_attach_partition": {
+        "reason": "INVESTIGATE - Unstable? (msan)"
+    },
     "01903_correct_block_size_prediction_with_default": {
         "reason": "INVESTIGATE - Timeout. Unstable?"
     },
