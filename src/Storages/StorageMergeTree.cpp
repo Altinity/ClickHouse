@@ -2996,7 +2996,7 @@ MutationCounters StorageMergeTree::getMutationCounters() const
 
 void StorageMergeTree::startBackgroundMovesIfNeeded()
 {
-    // if (areBackgroundMovesNeeded())
+    /// always starting it regardless of areBackgroundMovesNeeded() because we need it for exports
     background_moves_assignee.start();
 }
 
