@@ -23,7 +23,7 @@ public:
         ContextPtr context_,
         std::shared_ptr<MergeTreeExportManifest> manifest_,
         IExecutableTask::TaskResultCallback & task_result_callback_,
-        size_t max_retries_ = 3);
+        size_t max_retries_);
 
     void onCompleted() override;
     bool executeStep() override;

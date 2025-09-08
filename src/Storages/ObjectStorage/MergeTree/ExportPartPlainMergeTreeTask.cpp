@@ -10,11 +10,6 @@
 namespace DB
 {
 
-namespace Setting
-{
-    extern const SettingsBool output_format_parallel_formatting;
-}
-
 ExportPartPlainMergeTreeTask::ExportPartPlainMergeTreeTask(
     StorageMergeTree & storage_,
     const DataPartPtr & part_to_export_,

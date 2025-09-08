@@ -565,20 +565,31 @@ void StorageObjectStorage::importMergeTreePart(
 
     QueryPlan plan;
 
-    /// using the mutations type for now
-    MergeTreeSequentialSourceType read_type = MergeTreeSequentialSourceType::Mutation;
+    /// using the mutations type for now. This impacts in the throttling strategy
+    MergeTreeSequentialSourceType read_type = MergeTreeSequentialSourceType::Export;
 
+    /// todo implement these settings
     bool apply_deleted_mask = true;
     bool read_with_direct_io = false;
     bool prefetch = false;
     
-    const auto partition_columns = configuration->partition_strategy->getPartitionColumns();
+    std::string partition_key;
 
-    auto block_with_partition_values = data_part->partition.getBlockWithPartitionValues(partition_columns);
+    if (configuration->partition_strategy)
+    {
+        const auto partition_columns = configuration->partition_strategy->getPartitionColumns();
 
-    const auto column_with_partition_key = configuration->partition_strategy->computePartitionKey(block_with_partition_values);
+        auto block_with_partition_values = data_part->partition.getBlockWithPartitionValues(partition_columns);
+    
+        const auto column_with_partition_key = configuration->partition_strategy->computePartitionKey(block_with_partition_values);
 
-    const auto file_path = configuration->file_path_generator->getWritingPath(column_with_partition_key->getDataAt(0).toString());
+        if (!column_with_partition_key->empty())
+        {
+            partition_key = column_with_partition_key->getDataAt(0).toString();
+        }
+    }
+
+    const auto file_path = configuration->file_path_generator->getWritingPath(partition_key);
 
     MergeTreeData::IMutationsSnapshot::Params params
     {
