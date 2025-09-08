@@ -142,6 +142,10 @@
         "reason": "INVESTIGATE - timeout",
         "message": "Timeout! Killing process group"
     },
+    "00377_shard_group_uniq_array_of_string_array": {
+        "reason": "INVESTIGATE - timeout on tsan",
+        "message": "Timeout! Killing process group"
+    },
     "03237_insert_sparse_columns_mem": {
         "reason": "INVESTIGATE - timeout on tsan",
         "message": "Timeout! Killing process group"
