@@ -357,7 +357,7 @@ def main():
 
         # if not info.is_local_run:
         #     CH.stop_log_exports()
-        results.append(FTResultsProcessor(wd=temp_dir).run())
+        results.append(FTResultsProcessor(wd=temp_dir, test_options=test_options).run())
         test_result = results[-1]
 
         # invert result status for bugfix validation

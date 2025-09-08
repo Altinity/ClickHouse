@@ -474,6 +474,8 @@ class ClickhouseIntegrationTestsRunner:
         log_paths: Union[Dict[str, List[str]], List[str]],
     ) -> None:
 
+        context_name = self.params["context_name"]
+
         def get_log_paths(test_name):
             """Could be a list of logs for all tests or a dict with test name as a key"""
             if isinstance(log_paths, dict):
@@ -496,36 +498,39 @@ class ClickhouseIntegrationTestsRunner:
                         log_file.write(
                             f"Test {failed_test} is not in known broken tests\n"
                         )
+                        continue
+
+                    check_types = known_broken_tests[failed_test].get("check_types")
+                    fail_message = known_broken_tests[failed_test].get("message")
+
+                    if check_types and not any(
+                        check_type in context_name for check_type in check_types
+                    ):
+                        log_file.write(
+                            f"Test {context_name} {failed_test} is only known to be broken for check types {check_types}\n"
+                        )
+                        mark_as_broken = False
+                    elif not fail_message:
+                        log_file.write("No fail message specified, marking as broken\n")
+                        mark_as_broken = True
                     else:
-                        fail_message = known_broken_tests[failed_test].get("message")
+                        log_file.write(f"Looking for fail message: {fail_message}\n")
+                        mark_as_broken = False
+                        for log_path in get_log_paths(failed_test):
+                            if log_path.endswith(".log"):
+                                log_file.write(f"Checking log file: {log_path}\n")
+                                with open(log_path) as test_log:
+                                    if fail_message in test_log.read():
+                                        log_file.write("Found fail message in logs\n")
+                                        mark_as_broken = True
+                                        break
 
-                        if not fail_message:
-                            log_file.write(
-                                "No fail message specified, marking as broken\n"
-                            )
-                            mark_as_broken = True
-                        else:
-                            log_file.write(
-                                f"Looking for fail message: {fail_message}\n"
-                            )
-                            mark_as_broken = False
-                            for log_path in get_log_paths(failed_test):
-                                if log_path.endswith(".log"):
-                                    log_file.write(f"Checking log file: {log_path}\n")
-                                    with open(log_path) as test_log:
-                                        if fail_message in test_log.read():
-                                            log_file.write(
-                                                "Found fail message in logs\n"
-                                            )
-                                            mark_as_broken = True
-                                            break
-
-                        if mark_as_broken:
-                            log_file.write(f"Moving test to BROKEN state\n")
-                            counters[fail_status].remove(failed_test)
-                            counters["BROKEN"].append(failed_test)
-                        else:
-                            log_file.write("Test not marked as broken\n")
+                    if mark_as_broken:
+                        log_file.write(f"Moving test to BROKEN state\n")
+                        counters[fail_status].remove(failed_test)
+                        counters["BROKEN"].append(failed_test)
+                    else:
+                        log_file.write("Test not marked as broken\n")
 
             for status, tests in counters.items():
                 log_file.write(f"Total tests in {status} state: {len(tests)}\n")
