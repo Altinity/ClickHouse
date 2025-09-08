@@ -7,6 +7,7 @@
 #include <Disks/ObjectStorages/IObjectStorage.h>
 #include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeStorageSettings.h>
+#include <Storages/IPartitionStrategy.h>
 
 
 namespace DB
