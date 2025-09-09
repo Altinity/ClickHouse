@@ -13,7 +13,7 @@
 
 namespace DB
 {
-struct IcebergDataObjectInfo : public RelativePathWithMetadata, std::enable_shared_from_this<IcebergDataObjectInfo>
+struct IcebergDataObjectInfo : public PathWithMetadata, std::enable_shared_from_this<IcebergDataObjectInfo>
 {
     using IcebergDataObjectInfoPtr = std::shared_ptr<IcebergDataObjectInfo>;
 
@@ -21,6 +21,12 @@ struct IcebergDataObjectInfo : public RelativePathWithMetadata, std::enable_shar
     /// It is used to filter position deletes objects by data file path.
     /// It is also used to create a filter for the data object in the position delete transform.
     explicit IcebergDataObjectInfo(Iceberg::ManifestFileEntry data_manifest_file_entry_);
+    
+    /// Constructor with resolved storage and key for files that may be outside table location
+    explicit IcebergDataObjectInfo(
+        Iceberg::ManifestFileEntry data_manifest_file_entry_,
+        ObjectStoragePtr resolved_storage,
+        const String & resolved_key);
 
     std::shared_ptr<ISimpleTransform> getPositionDeleteTransformer(
         ObjectStoragePtr object_storage,

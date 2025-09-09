@@ -500,17 +500,17 @@ void IcebergMetadata::updateSnapshot(ContextPtr local_context, Poco::JSON::Objec
             }
 
             auto [partition_key, sorting_key] = extractIcebergKeys(metadata_object);
+
+            auto [storage_to_use, key_in_storage] = resolveObjectStorageForPath(persistent_components.table_location, snapshot->getValue<String>(f_manifest_list), object_storage, secondary_storages, local_context);
+
             relevant_snapshot = std::make_shared<IcebergDataSnapshot>(
                 getManifestList(
-                object_storage,
+                    storage_to_use,
                 configuration_ptr,
                 persistent_components,
-                local_context,
-                getProperFilePathFromMetadataInfo(
-                    snapshot->getValue<String>(f_manifest_list),
-                    configuration_ptr->getPathForRead().path,
-                    persistent_components.table_location,
-                    configuration_ptr->getNamespace()),
+                    local_context,
+                    key_in_storage,
+                    makeAbsolutePath(persistent_components.table_location, snapshot->getValue<String>(f_manifest_list)),
                 log),
                 relevant_snapshot_id,
                 total_rows,
@@ -548,6 +548,7 @@ bool IcebergMetadata::optimize(const StorageMetadataPtr & metadata_snapshot, Con
             snapshots_info,
             persistent_components,
             object_storage,
+            secondary_storages,
             configuration_ptr,
             format_settings,
             sample_block,
@@ -925,9 +926,10 @@ std::optional<size_t> IcebergMetadata::totalRows(ContextPtr local_context) const
             persistent_components,
             local_context,
             log,
-            manifest_list_entry.manifest_file_path,
+            manifest_list_entry.manifest_file_absolute_path,
             manifest_list_entry.added_sequence_number,
-            manifest_list_entry.added_snapshot_id);
+            manifest_list_entry.added_snapshot_id,
+            secondary_storages);
         auto data_count = manifest_file_ptr->getRowsCountInAllFilesExcludingDeleted(FileContentType::DATA);
         auto position_deletes_count = manifest_file_ptr->getRowsCountInAllFilesExcludingDeleted(FileContentType::POSITION_DELETE);
         if (!data_count.has_value() || !position_deletes_count.has_value())
@@ -965,9 +967,10 @@ std::optional<size_t> IcebergMetadata::totalBytes(ContextPtr local_context) cons
             persistent_components,
             local_context,
             log,
-            manifest_list_entry.manifest_file_path,
+            manifest_list_entry.manifest_file_absolute_path,
             manifest_list_entry.added_sequence_number,
-            manifest_list_entry.added_snapshot_id);
+            manifest_list_entry.added_snapshot_id,
+            secondary_storages);
         auto count = manifest_file_ptr->getBytesCountInAllDataFilesExcludingDeleted();
         if (!count.has_value())
             return {};

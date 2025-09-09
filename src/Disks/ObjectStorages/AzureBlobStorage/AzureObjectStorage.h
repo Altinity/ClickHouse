@@ -37,7 +37,7 @@ public:
 
     bool supportsListObjectsCache() override { return true; }
 
-    void listObjects(const std::string & path, RelativePathsWithMetadata & children, size_t max_keys) const override;
+    void listObjects(const std::string & path, PathsWithMetadata & children, size_t max_keys) const override;
 
     /// Sanitizer build may crash with max_keys=1; this looks like a false positive.
     ObjectStorageIteratorPtr iterate(const std::string & path_prefix, size_t max_keys) const override;

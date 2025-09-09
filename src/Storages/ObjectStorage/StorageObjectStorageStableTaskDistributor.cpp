@@ -165,7 +165,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getMatchingFileFromIter
         }
         else
         {
-            file_path = object_info->getPath();
+            file_path = object_info->getAbsolutePath().value_or(object_info->getPath());
         }
 
         size_t file_replica_idx = getReplicaForFile(file_path);
@@ -245,7 +245,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(s
 
         /// All unprocessed files owned by alive replicas with recenlty activity
         /// Need to retry after (oldest_activity - activity_limit) microseconds
-        RelativePathWithMetadata::CommandInTaskResponse response;
+        PathWithMetadata::CommandInTaskResponse response;
         response.set_retry_after_us(oldest_activity - activity_limit);
         return std::make_shared<ObjectInfo>(response.to_string());
     }

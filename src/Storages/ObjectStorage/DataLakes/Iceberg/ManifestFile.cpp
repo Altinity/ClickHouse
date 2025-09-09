@@ -8,9 +8,9 @@
 #include <Interpreters/IcebergMetadataLog.h>
 
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
-#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.h>
+#include <Storages/ObjectStorage/Utils.h>
 
 #include <Core/TypeId.h>
 #include <DataTypes/DataTypesDecimal.h>
@@ -150,7 +150,6 @@ ManifestFileContent::ManifestFileContent(
     Int64 inherited_sequence_number,
     Int64 inherited_snapshot_id,
     const String & table_location,
-    const String & common_namespace,
     DB::ContextPtr context,
     const String & path_to_manifest_file_)
     : path_to_manifest_file(path_to_manifest_file_)
@@ -244,7 +243,6 @@ ManifestFileContent::ManifestFileContent(
             content_type = FileContentType(manifest_file_deserializer.getValueFromRowByName(i, c_data_file_content, TypeIndex::Int32).safeGet<UInt64>());
         const auto status = ManifestEntryStatus(manifest_file_deserializer.getValueFromRowByName(i, f_status, TypeIndex::Int32).safeGet<UInt64>());
 
-
         if (status == ManifestEntryStatus::DELETED)
             continue;
 
@@ -289,11 +287,9 @@ ManifestFileContent::ManifestFileContent(
 
         const auto file_path_key
             = manifest_file_deserializer.getValueFromRowByName(i, c_data_file_file_path, TypeIndex::String).safeGet<String>();
-        const auto file_path = getProperFilePathFromMetadataInfo(
-            manifest_file_deserializer.getValueFromRowByName(i, c_data_file_file_path, TypeIndex::String).safeGet<String>(),
-            common_path,
+        const auto file_path = makeAbsolutePath(
             table_location,
-            common_namespace);
+            manifest_file_deserializer.getValueFromRowByName(i, c_data_file_file_path, TypeIndex::String).safeGet<String>());
 
         /// NOTE: This is weird, because in manifest file partition looks like this:
         /// {

@@ -108,13 +108,12 @@ struct ObjectMetadata
 };
 
 
-struct DataFileInfo;
 class DataFileMetaInfo;
 using DataFileMetaInfoPtr = std::shared_ptr<DataFileMetaInfo>;
 
 struct DataLakeObjectMetadata;
 
-struct RelativePathWithMetadata
+struct PathWithMetadata
 {
     class CommandInTaskResponse
     {
@@ -143,28 +142,35 @@ struct RelativePathWithMetadata
     std::optional<DataFileMetaInfoPtr> file_meta_info;
     /// Retry request after short pause
     CommandInTaskResponse command;
+    std::optional<String> absolute_path;
+    std::optional<ObjectStoragePtr> object_storage_to_use = std::nullopt;
 
-    RelativePathWithMetadata() = default;
+    PathWithMetadata() = default;
 
-    explicit RelativePathWithMetadata(String command_or_path, std::optional<ObjectMetadata> metadata_ = std::nullopt)
+    explicit PathWithMetadata(
+        const String & command_or_path,
+        std::optional<ObjectMetadata> metadata_ = std::nullopt,
+        std::optional<String> absolute_path_ = std::nullopt,
+        std::optional<ObjectStoragePtr> object_storage_to_use_ = std::nullopt)
         : relative_path(std::move(command_or_path))
         , metadata(std::move(metadata_))
         , command(relative_path)
+        , absolute_path(absolute_path_)
+        , object_storage_to_use(object_storage_to_use_)
     {
         if (command.is_parsed())
             relative_path = "";
     }
 
-    explicit RelativePathWithMetadata(const DataFileInfo & info, std::optional<ObjectMetadata> metadata_ = std::nullopt);
+    PathWithMetadata(const PathWithMetadata & other) = default;
 
-    RelativePathWithMetadata(const RelativePathWithMetadata & other) = default;
-
-    virtual ~RelativePathWithMetadata() = default;
+    virtual ~PathWithMetadata() = default;
 
     virtual std::string getFileName() const { return std::filesystem::path(relative_path).filename(); }
     virtual std::string getFileNameWithoutExtension() const { return std::filesystem::path(relative_path).stem(); }
 
     virtual std::string getPath() const { return relative_path; }
+    virtual std::optional<std::string> getAbsolutePath() const { return absolute_path; }
     virtual bool isArchive() const { return false; }
     virtual std::string getPathToArchive() const { throw Exception(ErrorCodes::LOGICAL_ERROR, "Not an archive"); }
     virtual size_t fileSizeInArchive() const { throw Exception(ErrorCodes::LOGICAL_ERROR, "Not an archive"); }
@@ -176,6 +182,8 @@ struct RelativePathWithMetadata
     const CommandInTaskResponse & getCommand() const { return command; }
 
     void loadMetadata(ObjectStoragePtr object_storage, bool ignore_non_existent_file = true);
+
+    std::optional<ObjectStoragePtr> getObjectStorage() const { return object_storage_to_use; }
 };
 
 struct ObjectKeyWithMetadata
@@ -191,8 +199,8 @@ struct ObjectKeyWithMetadata
     {}
 };
 
-using RelativePathWithMetadataPtr = std::shared_ptr<RelativePathWithMetadata>;
-using RelativePathsWithMetadata = std::vector<RelativePathWithMetadataPtr>;
+using PathWithMetadataPtr = std::shared_ptr<PathWithMetadata>;
+using PathsWithMetadata = std::vector<PathWithMetadataPtr>;
 using ObjectKeysWithMetadata = std::vector<ObjectKeyWithMetadata>;
 
 class IObjectStorageIterator;
@@ -233,7 +241,7 @@ public:
     virtual bool existsOrHasAnyChild(const std::string & path) const;
 
     /// List objects recursively by certain prefix.
-    virtual void listObjects(const std::string & path, RelativePathsWithMetadata & children, size_t max_keys) const;
+    virtual void listObjects(const std::string & path, PathsWithMetadata & children, size_t max_keys) const;
 
     /// List objects recursively by certain prefix. Use it instead of listObjects, if you want to list objects lazily.
     virtual ObjectStorageIteratorPtr iterate(const std::string & path_prefix, size_t max_keys) const;

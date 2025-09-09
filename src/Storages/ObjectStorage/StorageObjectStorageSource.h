@@ -179,6 +179,7 @@ private:
     std::atomic_size_t index = 0;
     bool is_archive;
     ObjectStoragePtr object_storage;
+    mutable std::map<String, ObjectStoragePtr> secondary_storages; // Sometimes data can be located on a different storage
     /// path_to_archive -> archive reader.
     std::unordered_map<std::string, std::shared_ptr<IArchiveReader>> archive_readers;
     std::mutex archive_readers_mutex;
