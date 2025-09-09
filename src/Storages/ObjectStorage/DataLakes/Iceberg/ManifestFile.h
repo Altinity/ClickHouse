@@ -88,13 +88,11 @@ public:
     explicit ManifestFileContent(
         const AvroForIcebergDeserializer & manifest_file_deserializer,
         Int32 format_version_,
-        const String & common_path,
         Int32 schema_id_,
         Poco::JSON::Object::Ptr schema_object_,
         const DB::IcebergSchemaProcessor & schema_processor,
         Int64 inherited_sequence_number,
-        const std::string & table_location,
-        const std::string & common_namespace,
+         std::string table_location_,
         DB::ContextPtr context);
 
     const std::vector<ManifestFileEntry> & getFiles() const;
@@ -123,6 +121,8 @@ private:
     std::vector<ManifestFileEntry> files;
 
     std::set<Int32> column_ids_which_have_bounds;
+
+    std::string table_location;
 
 };
 

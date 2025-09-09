@@ -166,7 +166,7 @@ protected:
 class StorageObjectStorageSource::ReadTaskIterator : public IObjectIterator, WithContext
 {
 public:
-    ReadTaskIterator(const ReadTaskCallback & callback_, size_t max_threads_count, ContextPtr context_);
+    ReadTaskIterator(const ReadTaskCallback & callback_, size_t max_threads_count, ContextPtr context_, ObjectStoragePtr object_storage_);
 
     ObjectInfoPtr next(size_t) override;
 
@@ -177,6 +177,8 @@ private:
     ReadTaskCallback callback;
     ObjectInfos buffer;
     std::atomic_size_t index = 0;
+    ObjectStoragePtr object_storage;
+    mutable std::map<String, ObjectStoragePtr> secondary_storages; // Sometimes data can be located on a different storage
 };
 
 class StorageObjectStorageSource::GlobIterator : public IObjectIterator, WithContext

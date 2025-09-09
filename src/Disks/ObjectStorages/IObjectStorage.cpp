@@ -32,12 +32,12 @@ const MetadataStorageMetrics & IObjectStorage::getMetadataStorageMetrics() const
 
 bool IObjectStorage::existsOrHasAnyChild(const std::string & path) const
 {
-    RelativePathsWithMetadata files;
+    PathsWithMetadata files;
     listObjects(path, files, 1);
     return !files.empty();
 }
 
-void IObjectStorage::listObjects(const std::string &, RelativePathsWithMetadata &, size_t) const
+void IObjectStorage::listObjects(const std::string &, PathsWithMetadata &, size_t) const
 {
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "listObjects() is not supported");
 }
@@ -45,7 +45,7 @@ void IObjectStorage::listObjects(const std::string &, RelativePathsWithMetadata 
 
 ObjectStorageIteratorPtr IObjectStorage::iterate(const std::string & path_prefix, size_t max_keys) const
 {
-    RelativePathsWithMetadata files;
+    PathsWithMetadata files;
     listObjects(path_prefix, files, max_keys);
 
     return std::make_shared<ObjectStorageIteratorFromList>(std::move(files));
@@ -104,9 +104,15 @@ WriteSettings IObjectStorage::patchSettings(const WriteSettings & write_settings
     return write_settings;
 }
 
-RelativePathWithMetadata::RelativePathWithMetadata(const String & task_string, std::optional<ObjectMetadata> metadata_)
+PathWithMetadata::PathWithMetadata(
+    const String & task_string,
+    std::optional<ObjectMetadata> metadata_,
+    std::optional<String> absolute_path_,
+    std::optional<ObjectStoragePtr> object_storage_to_use_)
     : metadata(std::move(metadata_))
     , command(task_string)
+    , absolute_path(absolute_path_)
+    , object_storage_to_use(object_storage_to_use_)
 {
     if (!command.isParsed())
         relative_path = task_string;
@@ -119,14 +125,20 @@ RelativePathWithMetadata::RelativePathWithMetadata(const String & task_string, s
     }
 }
 
-RelativePathWithMetadata::RelativePathWithMetadata(const DataFileInfo & info, std::optional<ObjectMetadata> metadata_)
+PathWithMetadata::PathWithMetadata(
+    const DataFileInfo & info,
+    std::optional<ObjectMetadata> metadata_,
+    std::optional<String> absolute_path_,
+    std::optional<ObjectStoragePtr> object_storage_to_use_)
     : metadata(std::move(metadata_))
+    , absolute_path(absolute_path_)
+    , object_storage_to_use(object_storage_to_use_)
 {
     relative_path = info.file_path;
     file_meta_info = info.file_meta_info;
 }
 
-void RelativePathWithMetadata::loadMetadata(ObjectStoragePtr object_storage, bool ignore_non_existent_file)
+void PathWithMetadata::loadMetadata(ObjectStoragePtr object_storage, bool ignore_non_existent_file)
 {
     if (!metadata)
     {
@@ -143,7 +155,7 @@ void RelativePathWithMetadata::loadMetadata(ObjectStoragePtr object_storage, boo
     }
 }
 
-RelativePathWithMetadata::CommandInTaskResponse::CommandInTaskResponse(const std::string & task)
+PathWithMetadata::CommandInTaskResponse::CommandInTaskResponse(const std::string & task)
 {
     Poco::JSON::Parser parser;
     try
@@ -167,7 +179,7 @@ RelativePathWithMetadata::CommandInTaskResponse::CommandInTaskResponse(const std
     }
 }
 
-std::string RelativePathWithMetadata::CommandInTaskResponse::toString() const
+std::string PathWithMetadata::CommandInTaskResponse::toString() const
 {
     Poco::JSON::Object json;
 

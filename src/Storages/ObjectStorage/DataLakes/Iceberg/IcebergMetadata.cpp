@@ -13,12 +13,12 @@
 #include <Storages/ObjectStorage/DataLakes/Common.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSource.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeStorageSettings.h>
-#include "Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadataFilesCache.h"
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadataFilesCache.h>
+#include <Storages/ObjectStorage/Utils.h>
 #include <Interpreters/ExpressionActions.h>
 #include <IO/CompressedReadBufferWrapper.h>
 
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
-#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/AvroForIcebergDeserializer.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Snapshot.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.h>
@@ -752,8 +752,7 @@ void IcebergMetadata::updateSnapshot(ContextPtr local_context, Poco::JSON::Objec
 
             auto [partition_key, sorting_key] = extractIcebergKeys(metadata_object);
             relevant_snapshot = IcebergSnapshot{
-                getManifestList(local_context, getProperFilePathFromMetadataInfo(
-                    snapshot->getValue<String>(f_manifest_list), configuration_ptr->getPathForRead().path, table_location, configuration_ptr->getNamespace())),
+                getManifestList(local_context, snapshot->getValue<String>(f_manifest_list)),
                 relevant_snapshot_id, total_rows, total_bytes, partition_key, sorting_key};
 
             if (!snapshot->has(f_schema_id))
@@ -863,7 +862,12 @@ std::optional<Int32> IcebergMetadata::getSchemaVersionByFileIfOutdated(String da
 {
     auto schema_id_it = schema_id_by_data_file.find(data_path);
     if (schema_id_it == schema_id_by_data_file.end())
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Cannot find manifest file for data file: {}", data_path);
+    {
+        std::string error_msg = "";
+        for (const auto & sch : schema_id_by_data_file)
+            error_msg += "Schema id: " + std::to_string(sch.second) + " for file: " + sch.first + "\n";
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Cannot find manifest file for data file: {}.\n Contents:\n{}", data_path, error_msg);
+    }
 
     auto schema_id = schema_id_it->second;
     if (schema_id == relevant_snapshot_schema_id)
@@ -905,7 +909,7 @@ void IcebergMetadata::initializeSchemasFromManifestList(ContextPtr local_context
         for (const auto & manifest_file_entry : manifest_file_ptr->getFiles())
         {
             if (std::holds_alternative<DataFileEntry>(manifest_file_entry.file))
-                schema_id_by_data_file.emplace(std::get<DataFileEntry>(manifest_file_entry.file).file_name, manifest_file_ptr->getSchemaId());
+                schema_id_by_data_file.emplace(makeAbsolutePath(table_location, std::get<DataFileEntry>(manifest_file_entry.file).file_name), manifest_file_ptr->getSchemaId());
         }
     }
 
@@ -918,28 +922,32 @@ ManifestFileCacheKeys IcebergMetadata::getManifestList(ContextPtr local_context,
     if (configuration_ptr == nullptr)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Configuration is expired");
 
+    const String full_filename = makeAbsolutePath(table_location, filename);
+
     auto create_fn = [&]()
     {
-        StorageObjectStorage::ObjectInfo object_info(filename);
+        auto [storage_to_use, key] = resolveObjectStorageForPath(
+            table_location, filename, object_storage, secondary_storages, local_context);
+
+        StorageObjectStorage::ObjectInfo object_info(key, std::nullopt, full_filename);
 
         auto read_settings = local_context->getReadSettings();
         /// Do not utilize filesystem cache if more precise cache enabled
         if (manifest_cache)
             read_settings.enable_filesystem_cache = false;
 
-        auto manifest_list_buf = StorageObjectStorageSource::createReadBuffer(object_info, object_storage, local_context, log, read_settings);
-        AvroForIcebergDeserializer manifest_list_deserializer(std::move(manifest_list_buf), filename, getFormatSettings(local_context));
+        auto manifest_list_buf = StorageObjectStorageSource::createReadBuffer(object_info, storage_to_use, local_context, log, read_settings);
+        AvroForIcebergDeserializer manifest_list_deserializer(std::move(manifest_list_buf), key, getFormatSettings(local_context));
 
         ManifestFileCacheKeys manifest_file_cache_keys;
 
         for (size_t i = 0; i < manifest_list_deserializer.rows(); ++i)
         {
-            const std::string file_path = manifest_list_deserializer.getValueFromRowByName(i, f_manifest_path, TypeIndex::String).safeGet<std::string>();
-            const auto manifest_file_name = getProperFilePathFromMetadataInfo(file_path, configuration_ptr->getPathForRead().path, table_location, configuration_ptr->getNamespace());
+            const std::string manifest_file_path = makeAbsolutePath(table_location, manifest_list_deserializer.getValueFromRowByName(i, f_manifest_path, TypeIndex::String).safeGet<std::string>());
             Int64 added_sequence_number = 0;
             if (format_version > 1)
                 added_sequence_number = manifest_list_deserializer.getValueFromRowByName(i, f_sequence_number, TypeIndex::Int64).safeGet<Int64>();
-            manifest_file_cache_keys.emplace_back(manifest_file_name, added_sequence_number);
+            manifest_file_cache_keys.emplace_back(manifest_file_path, added_sequence_number);
         }
         /// We only return the list of {file name, seq number} for cache.
         /// Because ManifestList holds a list of ManifestFilePtr which consume much memory space.
@@ -949,7 +957,7 @@ ManifestFileCacheKeys IcebergMetadata::getManifestList(ContextPtr local_context,
 
     ManifestFileCacheKeys manifest_file_cache_keys;
     if (manifest_cache)
-        manifest_file_cache_keys = manifest_cache->getOrSetManifestFileCacheKeys(IcebergMetadataFilesCache::getKey(configuration_ptr, filename), create_fn);
+        manifest_file_cache_keys = manifest_cache->getOrSetManifestFileCacheKeys(IcebergMetadataFilesCache::getKey(configuration_ptr, full_filename), create_fn);
     else
         manifest_file_cache_keys = create_fn();
     return manifest_file_cache_keys;
@@ -1049,35 +1057,40 @@ ManifestFilePtr IcebergMetadata::getManifestFile(ContextPtr local_context, const
 {
     auto configuration_ptr = configuration.lock();
 
+    const String full_filename = makeAbsolutePath(table_location, filename);
+
     auto create_fn = [&]()
     {
-        ObjectInfo manifest_object_info(filename);
+        // Select proper storage and key for the manifest file
+        auto [storage_to_use, key] = resolveObjectStorageForPath(
+            table_location, full_filename, object_storage, secondary_storages, local_context);
+
+
+        ObjectInfo manifest_object_info(key, std::nullopt, full_filename);
 
         auto read_settings = local_context->getReadSettings();
         /// Do not utilize filesystem cache if more precise cache enabled
         if (manifest_cache)
             read_settings.enable_filesystem_cache = false;
 
-        auto buffer = StorageObjectStorageSource::createReadBuffer(manifest_object_info, object_storage, local_context, log, read_settings);
-        AvroForIcebergDeserializer manifest_file_deserializer(std::move(buffer), filename, getFormatSettings(local_context));
-        auto [schema_id, schema_object] = parseTableSchemaFromManifestFile(manifest_file_deserializer, filename);
+        auto buffer = StorageObjectStorageSource::createReadBuffer(manifest_object_info, storage_to_use, local_context, log, read_settings);
+        AvroForIcebergDeserializer manifest_file_deserializer(std::move(buffer), full_filename, getFormatSettings(local_context));
+        auto [schema_id, schema_object] = parseTableSchemaFromManifestFile(manifest_file_deserializer, full_filename);
         schema_processor.addIcebergTableSchema(schema_object);
         return std::make_shared<ManifestFileContent>(
             manifest_file_deserializer,
             format_version,
-            configuration_ptr->getPathForRead().path,
             schema_id,
             schema_object,
             schema_processor,
             inherited_sequence_number,
             table_location,
-            configuration_ptr->getNamespace(),
             local_context);
     };
 
     if (manifest_cache)
     {
-        auto manifest_file = manifest_cache->getOrSetManifestFile(IcebergMetadataFilesCache::getKey(configuration_ptr, filename), create_fn);
+        auto manifest_file = manifest_cache->getOrSetManifestFile(IcebergMetadataFilesCache::getKey(configuration_ptr, full_filename), create_fn);
         schema_processor.addIcebergTableSchema(manifest_file->getSchemaObject());
         return manifest_file;
     }
@@ -1220,6 +1233,77 @@ std::optional<String> IcebergMetadata::sortingKey(ContextPtr) const
 }
 
 
+namespace
+{
+class IcebergKeysIterator : public IObjectIterator
+{
+public:
+    IcebergKeysIterator(
+        DataFileInfos && data_files_,
+        const std::string & table_location_,
+        ObjectStoragePtr object_storage_,
+        std::map<String, ObjectStoragePtr> & secondary_storages_,
+        IDataLakeMetadata::FileProgressCallback callback_,
+        ContextPtr local_context_,
+        StorageObjectStorage::ConfigurationPtr configuration_ptr_)
+        : data_files(data_files_)
+        , table_location(table_location_)
+        , object_storage(object_storage_)
+        , secondary_storages(secondary_storages_)
+        , callback(callback_)
+        , local_context(local_context_)
+        , configuration_ptr(configuration_ptr_)
+    {
+    }
+
+    size_t estimatedKeysCount() override
+    {
+        return data_files.size();
+    }
+
+    ObjectInfoPtr next(size_t) override
+    {
+        size_t current_index = index.fetch_add(1, std::memory_order_relaxed);
+        if (current_index >= data_files.size())
+            return nullptr;
+
+        const auto & data_file_info = data_files[current_index];
+
+        auto absolute_path = data_file_info.absolute_uri.value_or(makeAbsolutePath(table_location, data_file_info.file_path));
+
+        // Route to correct storage
+        auto [storage_to_use, key] = resolveObjectStorageForPath(
+            table_location, data_file_info.absolute_uri.value_or(data_file_info.file_path), object_storage, secondary_storages, local_context);
+
+        auto object_metadata = storage_to_use->getObjectMetadata(key);
+
+        if (callback)
+            callback(FileProgress(0, object_metadata.size_bytes));
+
+        return std::make_shared<ObjectInfo>(key, std::move(object_metadata), absolute_path, storage_to_use);
+    }
+
+private:
+    DataFileInfos data_files;
+    const String table_location;
+    ObjectStoragePtr object_storage;
+    std::map<String, ObjectStoragePtr> & secondary_storages;
+    std::atomic<size_t> index = 0;
+    IDataLakeMetadata::FileProgressCallback callback;
+    ContextPtr local_context;
+    StorageObjectStorage::ConfigurationPtr configuration_ptr;
+};
+}
+
+ObjectIterator IcebergMetadata::createIcebergKeysIterator(
+    DataFileInfos && data_files_,
+    ObjectStoragePtr,
+    IDataLakeMetadata::FileProgressCallback callback_,
+    ContextPtr local_context)
+{
+    return std::make_shared<IcebergKeysIterator>(std::move(data_files_), table_location, object_storage, secondary_storages, callback_, local_context, configuration.lock());
+}
+
 ObjectIterator IcebergMetadata::iterate(
     const ActionsDAG * filter_dag,
     FileProgressCallback callback,
@@ -1227,7 +1311,8 @@ ObjectIterator IcebergMetadata::iterate(
     ContextPtr local_context) const
 {
     SharedLockGuard lock(mutex);
-    return createKeysIterator(getDataFilesImpl(filter_dag, local_context), object_storage, callback);
+    /// Yes, it is terrible, but OK for proof of concept
+    return const_cast<IcebergMetadata*>(this)->createIcebergKeysIterator(getDataFilesImpl(filter_dag, local_context), object_storage, callback, local_context);
 }
 
 NamesAndTypesList IcebergMetadata::getTableSchema() const

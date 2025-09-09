@@ -4,9 +4,10 @@
 #if USE_AVRO
 
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
-#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.h>
+
+#include <Storages/ObjectStorage/Utils.h>
 
 #include <DataTypes/DataTypesDecimal.h>
 #include <Poco/JSON/Parser.h>
@@ -122,15 +123,14 @@ using namespace DB;
 ManifestFileContent::ManifestFileContent(
     const AvroForIcebergDeserializer & manifest_file_deserializer,
     Int32 format_version_,
-    const String & common_path,
     Int32 schema_id_,
     Poco::JSON::Object::Ptr schema_object_,
     const IcebergSchemaProcessor & schema_processor,
     Int64 inherited_sequence_number,
-    const String & table_location,
-    const String & common_namespace,
+    std::string table_location_,
     DB::ContextPtr context)
 {
+    this->table_location = std::move(table_location_);
     this->schema_id = schema_id_;
     this->schema_object = schema_object_;
 
@@ -193,11 +193,7 @@ ManifestFileContent::ManifestFileContent(
         }
         const auto status = ManifestEntryStatus(manifest_file_deserializer.getValueFromRowByName(i, f_status, TypeIndex::Int32).safeGet<UInt64>());
 
-        const auto file_path = getProperFilePathFromMetadataInfo(
-            manifest_file_deserializer.getValueFromRowByName(i, c_data_file_file_path, TypeIndex::String).safeGet<String>(),
-            common_path,
-            table_location,
-            common_namespace);
+        const auto file_path = manifest_file_deserializer.getValueFromRowByName(i, c_data_file_file_path, TypeIndex::String).safeGet<String>();
 
         /// NOTE: This is weird, because in manifest file partition looks like this:
         /// {
@@ -287,7 +283,7 @@ ManifestFileContent::ManifestFileContent(
             columns_infos[column_id].hyperrectangle.emplace(*left, true, *right, true);
         }
 
-        FileEntry file = FileEntry{DataFileEntry{file_path}};
+        FileEntry file = FileEntry{DataFileEntry{makeAbsolutePath(table_location, file_path)}};
 
         Int64 added_sequence_number = 0;
         if (format_version_ > 1)

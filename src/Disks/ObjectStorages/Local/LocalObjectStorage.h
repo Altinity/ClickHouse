@@ -62,7 +62,7 @@ public:
 
     ObjectMetadata getObjectMetadata(const std::string & path) const override;
 
-    void listObjects(const std::string & path, RelativePathsWithMetadata & children, size_t max_keys) const override;
+    void listObjects(const std::string & path, PathsWithMetadata & children, size_t max_keys) const override;
 
     bool existsOrHasAnyChild(const std::string & path) const override;
 

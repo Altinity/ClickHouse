@@ -58,6 +58,7 @@ struct DataFileInfo
 {
     std::string file_path;
     std::optional<DataFileMetaInfoPtr> file_meta_info;
+    std::optional<std::string> absolute_uri;
 
     explicit DataFileInfo(const std::string & file_path_)
         : file_path(file_path_) {}
@@ -123,7 +124,7 @@ public:
     virtual std::optional<String> sortingKey(ContextPtr) const { return {}; }
 
 protected:
-    ObjectIterator createKeysIterator(
+    virtual ObjectIterator createKeysIterator(
         DataFileInfos && data_files_,
         ObjectStoragePtr object_storage_,
         IDataLakeMetadata::FileProgressCallback callback_) const;

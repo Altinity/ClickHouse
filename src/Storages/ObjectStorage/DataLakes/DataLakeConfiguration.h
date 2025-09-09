@@ -356,7 +356,7 @@ public:
     IDataLakeMetadata * getExternalMetadata() override { return getImpl().getExternalMetadata(); }
 
     std::shared_ptr<NamesAndTypesList> getInitialSchemaByPath(ContextPtr context, const String & path) const override
-        { return getImpl().getInitialSchemaByPath(context, path); }
+    { return getImpl().getInitialSchemaByPath(context, path); }
 
     std::shared_ptr<const ActionsDAG> getSchemaTransformer(ContextPtr context, const String & path) const override
         { return getImpl().getSchemaTransformer(context, path); }

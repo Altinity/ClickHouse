@@ -84,6 +84,12 @@ public:
     std::optional<String> sortingKey(ContextPtr) const override;
 
 protected:
+    ObjectIterator createIcebergKeysIterator(
+        DataFileInfos && data_files_,
+        ObjectStoragePtr,
+        IDataLakeMetadata::FileProgressCallback callback_,
+        ContextPtr local_context);
+
     ObjectIterator iterate(
         const ActionsDAG * filter_dag,
         FileProgressCallback callback,
@@ -92,6 +98,7 @@ protected:
 
 private:
     const ObjectStoragePtr object_storage;
+    mutable std::map<String, ObjectStoragePtr> secondary_storages; // Sometimes data or manifests can be located on another storage
     const ConfigurationObserverPtr configuration;
     mutable IcebergSchemaProcessor schema_processor;
     LoggerPtr log;
@@ -130,6 +137,7 @@ private:
 
     std::optional<String> getRelevantManifestList(const Poco::JSON::Object::Ptr & metadata);
     Iceberg::ManifestFilePtr tryGetManifestFile(const String & filename) const;
+
 };
 }
 

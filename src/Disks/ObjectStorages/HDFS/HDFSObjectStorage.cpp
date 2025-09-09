@@ -167,7 +167,7 @@ ObjectMetadata HDFSObjectStorage::getObjectMetadata(const std::string & path) co
     return metadata;
 }
 
-void HDFSObjectStorage::listObjects(const std::string & path, RelativePathsWithMetadata & children, size_t max_keys) const
+void HDFSObjectStorage::listObjects(const std::string & path, PathsWithMetadata & children, size_t max_keys) const
 {
     initializeHDFSFS();
     LOG_TEST(log, "Trying to list files for {}", path);
@@ -203,7 +203,7 @@ void HDFSObjectStorage::listObjects(const std::string & path, RelativePathsWithM
         }
         else
         {
-            children.emplace_back(std::make_shared<RelativePathWithMetadata>(
+            children.emplace_back(std::make_shared<PathWithMetadata>(
                 String(file_path),
                 ObjectMetadata{
                     static_cast<uint64_t>(ls.file_info[i].mSize),
