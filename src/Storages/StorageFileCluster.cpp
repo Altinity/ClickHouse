@@ -94,14 +94,49 @@ void StorageFileCluster::updateQueryToSendIfNeeded(DB::ASTPtr & query, const Sto
     );
 }
 
+class FileTaskIterator : public TaskIterator
+{
+public:
+    FileTaskIterator(const Strings & files,
+        std::optional<StorageFile::ArchiveInfo> archive_info,
+        const ActionsDAG::Node * predicate,
+        const NamesAndTypesList & virtual_columns,
+        const NamesAndTypesList & hive_partition_columns_to_read_from_file_path,
+        const ContextPtr & context,
+        bool distributed_processing = false)
+        : iterator(files
+            , archive_info
+            , predicate
+            , virtual_columns
+            , hive_partition_columns_to_read_from_file_path
+            , context
+            , distributed_processing) {}
+
+    ~FileTaskIterator() override = default;
+
+    std::string operator()(size_t /* number_of_current_replica */) const override
+    {
+        return iterator.next();
+    }
+
+private:
+    mutable StorageFileSource::FilesIterator iterator;
+};
+
 RemoteQueryExecutor::Extension StorageFileCluster::getTaskIteratorExtension(
     const ActionsDAG::Node * predicate,
     const std::optional<ActionsDAG> & /* filter_actions_dag */,
     const ContextPtr & context,
     ClusterPtr) const
 {
-    auto iterator = std::make_shared<StorageFileSource::FilesIterator>(paths, std::nullopt, predicate, getVirtualsList(), hive_partition_columns_to_read_from_file_path, context);
-    auto callback = std::make_shared<TaskIterator>([iter = std::move(iterator)](size_t) mutable -> String { return iter->next(); });
+    auto callback = std::make_shared<FileTaskIterator>(
+        paths,
+        std::nullopt,
+        predicate,
+        getVirtualsList(),
+        hive_partition_columns_to_read_from_file_path,
+        context
+    );
     return RemoteQueryExecutor::Extension{.task_iterator = std::move(callback)};
 }
 

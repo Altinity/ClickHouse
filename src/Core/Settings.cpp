@@ -6884,6 +6884,9 @@ Possible values:
  - 'Persisted' - use temporary files in object storage,
  - 'Streaming' - stream exchange data over network.
 )", EXPERIMENTAL) \
+    DECLARE(Bool, allow_retries_in_cluster_requests, false, R"(
+Allow retries in cluster request, when one node goes offline
+)", EXPERIMENTAL) \
     DECLARE(Bool, object_storage_remote_initiator, false, R"(
 Execute request to object storage as remote on one of object_storage_cluster nodes.
 )", EXPERIMENTAL) \

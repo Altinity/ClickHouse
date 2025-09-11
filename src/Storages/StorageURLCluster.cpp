@@ -126,15 +126,42 @@ void StorageURLCluster::updateQueryToSendIfNeeded(ASTPtr & query, const StorageS
     );
 }
 
+class UrlTaskIterator : public TaskIterator
+{
+public:
+    UrlTaskIterator(const String & uri,
+        size_t max_addresses,
+        const ActionsDAG::Node * predicate,
+        const NamesAndTypesList & virtual_columns,
+        const NamesAndTypesList & hive_partition_columns_to_read_from_file_path,
+        const ContextPtr & context)
+        : iterator(uri, max_addresses, predicate, virtual_columns, hive_partition_columns_to_read_from_file_path, context) {}
+
+    ~UrlTaskIterator() override = default;
+
+    std::string operator()(size_t /* number_of_current_replica */) const override
+    {
+        return iterator.next();
+    }
+
+private:
+    mutable StorageURLSource::DisclosedGlobIterator iterator;
+};
+
 RemoteQueryExecutor::Extension StorageURLCluster::getTaskIteratorExtension(
     const ActionsDAG::Node * predicate,
     const std::optional<ActionsDAG> & /* filter_actions_dag */,
     const ContextPtr & context,
     ClusterPtr) const
 {
-    auto iterator = std::make_shared<StorageURLSource::DisclosedGlobIterator>(
-        uri, context->getSettingsRef()[Setting::glob_expansion_max_elements], predicate, getVirtualsList(), hive_partition_columns_to_read_from_file_path, context);
-    auto callback = std::make_shared<TaskIterator>([iter = std::move(iterator)](size_t) mutable -> String { return iter->next(); });
+    auto callback = std::make_shared<UrlTaskIterator>(
+        uri,
+        context->getSettingsRef()[Setting::glob_expansion_max_elements],
+        predicate,
+        getVirtualsList(),
+        hive_partition_columns_to_read_from_file_path,
+        context
+    );
     return RemoteQueryExecutor::Extension{.task_iterator = std::move(callback)};
 }
 
