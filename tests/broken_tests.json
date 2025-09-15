@@ -44,10 +44,6 @@
     "02354_vector_search_expansion_search": {
         "reason": "INVESTIGATE - Timeout on TSAN. Unstable?"
     },
-    "03441_deltalake_clickhouse_public_datasets": {
-        "reason": "INVESTIGATE - S3 sometimes unreachable",
-        "message": "Error interacting with object store: Generic S3 error: Error performing GET"
-    },
     "03443_shared_storage_snapshots": {
         "reason": "INVESTIGATE - Unstable?"
     },
