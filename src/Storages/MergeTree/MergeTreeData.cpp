@@ -1,6 +1,7 @@
 #include <Storages/PartitionCommands.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 
+#include <Storages/MergeTree/ExportList.h>
 #include <Access/AccessControl.h>
 #include <AggregateFunctions/AggregateFunctionCount.h>
 #include <Analyzer/QueryTreeBuilder.h>
@@ -5947,23 +5948,15 @@ void MergeTreeData::exportPartToTableImpl(
     const MergeTreeExportManifest & manifest,
     ContextPtr local_context)
 {
-    std::function<void(ImportStats)> part_log_wrapper = [this, manifest](ImportStats stats) {
-        const auto & data_part = manifest.data_part;
-
-        writePartLog(
-            PartLogElement::Type::EXPORT_PART,
-            stats.status,
-            stats.elapsed_ns,
-            data_part->name,
-            data_part,
-            {data_part},
-            nullptr,
-            nullptr);
-
-        std::lock_guard inner_lock(export_manifests_mutex);
-
-        export_manifests.erase(manifest);
-    };
+    auto exports_list_entry = getContext()->getExportsList().insert(
+        getStorageID(),
+        manifest.destination_storage_id,
+        manifest.data_part->getBytesOnDisk(),
+        manifest.data_part->name,
+        manifest.data_part->rows_count,
+        manifest.data_part->getBytesOnDisk(),
+        manifest.data_part->getBytesUncompressedOnDisk(),
+        manifest.create_time);
 
     auto metadata_snapshot = getInMemoryMetadataPtr();
     Names columns_to_read = metadata_snapshot->getColumns().getNamesOfPhysical();
@@ -5994,8 +5987,7 @@ void MergeTreeData::exportPartToTableImpl(
     auto sink = destination_storage->import(
         manifest.data_part->name,
         block_with_partition_values,
-        local_context,
-        part_log_wrapper);
+        local_context);
 
     /// Most likely the file has already been imported, so we can just return
     if (!sink)
@@ -6045,12 +6037,55 @@ void MergeTreeData::exportPartToTableImpl(
     QueryPlanOptimizationSettings optimization_settings(local_context);
     auto pipeline_settings = BuildQueryPipelineSettings(local_context);
     auto builder = plan_for_part.buildQueryPipeline(optimization_settings, pipeline_settings);
+
+    builder->setProgressCallback([&exports_list_entry](const Progress & progress)
+    {
+        (*exports_list_entry)->bytes_read_uncompressed += progress.read_bytes;
+        (*exports_list_entry)->rows_read += progress.read_rows;
+        (*exports_list_entry)->elapsed = (*exports_list_entry)->watch.elapsedSeconds();
+    });
+
     auto pipeline = QueryPipelineBuilder::getPipeline(std::move(*builder));
 
     pipeline.complete(sink);
 
-    CompletedPipelineExecutor exec(pipeline);
-    exec.execute();
+    try
+    {
+        CompletedPipelineExecutor exec(pipeline);
+        exec.execute();
+
+        std::lock_guard inner_lock(export_manifests_mutex);
+        writePartLog(
+            PartLogElement::Type::EXPORT_PART,
+            {},
+            static_cast<UInt64>((*exports_list_entry)->elapsed * 1000000000),
+            manifest.data_part->name,
+            manifest.data_part,
+            {manifest.data_part},
+            nullptr,
+            nullptr);
+
+        export_manifests.erase(manifest);
+    }
+    catch (const Exception &)
+    {
+        tryLogCurrentException(__PRETTY_FUNCTION__, "Exception is in export part task");
+
+        std::lock_guard inner_lock(export_manifests_mutex);
+        writePartLog(
+            PartLogElement::Type::EXPORT_PART,
+            ExecutionStatus::fromCurrentException("", true),
+            static_cast<UInt64>((*exports_list_entry)->elapsed * 1000000000),
+            manifest.data_part->name,
+            manifest.data_part,
+            {manifest.data_part},
+            nullptr,
+            nullptr);
+
+        export_manifests.erase(manifest);
+
+        throw;
+    }
 }
 
 void MergeTreeData::movePartitionToShard(const ASTPtr & /*partition*/, bool /*move_part*/, const String & /*to*/, ContextPtr /*query_context*/)

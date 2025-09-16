@@ -63,8 +63,7 @@ public:
     SinkToStoragePtr import(
         const std::string & /* file_name */,
         Block & /* block_with_partition_values */,
-        ContextPtr /* context */,
-        std::function<void(ImportStats)> /* part_log */) override;
+        ContextPtr /* context */) override;
 
 private:
     void updateQueryToSendIfNeeded(

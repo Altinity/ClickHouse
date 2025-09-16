@@ -612,13 +612,12 @@ bool StorageObjectStorageCluster::supportsImport() const
 SinkToStoragePtr StorageObjectStorageCluster::import(
     const std::string & file_name,
     Block & block_with_partition_values,
-    ContextPtr context,
-    std::function<void(ImportStats)> part_log)
+    ContextPtr context)
 {
     if (pure_storage)
-        return pure_storage->import(file_name, block_with_partition_values, context, part_log);
+        return pure_storage->import(file_name, block_with_partition_values, context);
     
-    return IStorageCluster::import(file_name, block_with_partition_values, context, part_log);
+    return IStorageCluster::import(file_name, block_with_partition_values, context);
 }
 
 

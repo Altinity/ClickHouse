@@ -444,21 +444,10 @@ public:
       return false;
     }
 
-    struct ImportStats
-    {
-        ExecutionStatus status;
-        std::size_t elapsed_ns = 0;
-        std::size_t bytes_on_disk = 0;
-        std::size_t read_rows = 0;
-        std::size_t read_bytes = 0;
-        std::string file_path = "";
-    };
-
     virtual SinkToStoragePtr import(
         const std::string & /* file_name */,
         Block & /* block_with_partition_values */,
-        ContextPtr /* context */,
-        std::function<void(ImportStats)> /* stats_log */)
+        ContextPtr /* context */)
       { 
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Import is not implemented for storage {}", getName());
       }

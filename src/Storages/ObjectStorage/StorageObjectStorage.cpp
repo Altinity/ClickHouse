@@ -27,7 +27,6 @@
 #include <Storages/StorageFactory.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <Common/parseGlobs.h>
-#include <Storages/ObjectStorage/MergeTree/StorageObjectStorageImporterSink.h>
 #include <Databases/LoadingStrictnessLevel.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/HivePartitioningUtils.h>
@@ -454,8 +453,7 @@ bool StorageObjectStorage::supportsImport() const
 SinkToStoragePtr StorageObjectStorage::import(
     const std::string & file_name,
     Block & block_with_partition_values,
-    ContextPtr local_context,
-    std::function<void(ImportStats)> part_log)
+    ContextPtr local_context)
 {
     std::string partition_key;
 
@@ -476,16 +474,14 @@ SinkToStoragePtr StorageObjectStorage::import(
         LOG_INFO(getLogger("StorageObjectStorage"), "File {} already exists, skipping import", file_path);
         return nullptr;
     }
-    
-    return std::make_shared<StorageObjectStorageImporterSink>(
+
+    return std::make_shared<StorageObjectStorageSink>(
         file_path,
         object_storage,
         configuration,
         format_settings,
         getInMemoryMetadataPtr()->getSampleBlock(),
-        part_log,
-        local_context
-    );
+        local_context);
 }
 
 void StorageObjectStorage::truncate(
