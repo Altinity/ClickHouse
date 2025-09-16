@@ -5959,12 +5959,7 @@ void MergeTreeData::exportPartToTableImpl(
         manifest.create_time,
         local_context);
 
-    // Switch to the export's thread group for memory tracking
-    std::optional<ThreadGroupSwitcher> switcher;
-    if (exports_list_entry)
-    {
-        switcher.emplace((*exports_list_entry)->thread_group, "", /*allow_existing_group*/ true);
-    }
+    ThreadGroupSwitcher switcher((*exports_list_entry)->thread_group, "");
 
     auto metadata_snapshot = getInMemoryMetadataPtr();
     Names columns_to_read = metadata_snapshot->getColumns().getNamesOfPhysical();
@@ -8755,7 +8750,7 @@ try
     {
         part_log_elem.rows_read = (*exports_entry)->rows_read;
         part_log_elem.bytes_read_uncompressed = (*exports_entry)->bytes_read_uncompressed;
-        part_log_elem.peak_memory_usage = (*exports_entry)->getMemoryTracker().getPeak();
+        part_log_elem.peak_memory_usage = (*exports_entry)->getPeakMemoryUsage();
     }
 
     if (profile_counters)
