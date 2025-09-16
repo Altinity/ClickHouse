@@ -4,6 +4,7 @@
 #include <Interpreters/StorageID.h>
 #include <Common/Stopwatch.h>
 #include <Common/CurrentMetrics.h>
+#include <Common/ThreadStatus.h>
 #include <Poco/URI.h>
 #include <boost/noncopyable.hpp>
 
@@ -27,6 +28,8 @@ struct ExportInfo
     UInt64 total_size_bytes_compressed;
     UInt64 total_size_bytes_uncompressed;
     UInt64 bytes_read_uncompressed;
+    UInt64 memory_usage;
+    UInt64 peak_memory_usage;
     time_t create_time = 0;
     Float64 elapsed;
 };
@@ -46,6 +49,7 @@ struct ExportsListElement : private boost::noncopyable
     Float64 elapsed {0};
 
     Stopwatch watch;
+    ThreadGroupPtr thread_group;
 
     ExportsListElement(
         const StorageID & source_table_id_,
@@ -55,9 +59,13 @@ struct ExportsListElement : private boost::noncopyable
         UInt64 total_rows_to_read_,
         UInt64 total_size_bytes_compressed_,
         UInt64 total_size_bytes_uncompressed_,
-        time_t create_time_);
+        time_t create_time_,
+        const ContextPtr & context);
 
     ExportInfo getInfo() const;
+
+    UInt64 getMemoryUsage() const;
+    UInt64 getPeakMemoryUsage() const;
 };
 
 
@@ -71,5 +79,7 @@ public:
         : Parent(CurrentMetrics::Export)
     {}
 };
+
+using ExportsListEntry = BackgroundProcessListEntry<ExportsListElement, ExportInfo>;
 
 }

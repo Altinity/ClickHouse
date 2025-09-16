@@ -5956,7 +5956,15 @@ void MergeTreeData::exportPartToTableImpl(
         manifest.data_part->rows_count,
         manifest.data_part->getBytesOnDisk(),
         manifest.data_part->getBytesUncompressedOnDisk(),
-        manifest.create_time);
+        manifest.create_time,
+        local_context);
+
+    // Switch to the export's thread group for memory tracking
+    std::optional<ThreadGroupSwitcher> switcher;
+    if (exports_list_entry)
+    {
+        switcher.emplace((*exports_list_entry)->thread_group, "", /*allow_existing_group*/ true);
+    }
 
     auto metadata_snapshot = getInMemoryMetadataPtr();
     Names columns_to_read = metadata_snapshot->getColumns().getNamesOfPhysical();
@@ -6063,7 +6071,8 @@ void MergeTreeData::exportPartToTableImpl(
             manifest.data_part,
             {manifest.data_part},
             nullptr,
-            nullptr);
+            nullptr,
+            exports_list_entry.get());
 
         export_manifests.erase(manifest);
     }
@@ -6080,7 +6089,8 @@ void MergeTreeData::exportPartToTableImpl(
             manifest.data_part,
             {manifest.data_part},
             nullptr,
-            nullptr);
+            nullptr,
+            exports_list_entry.get());
 
         export_manifests.erase(manifest);
 
@@ -8672,7 +8682,8 @@ void MergeTreeData::writePartLog(
     const DataPartPtr & result_part,
     const DataPartsVector & source_parts,
     const MergeListEntry * merge_entry,
-    std::shared_ptr<ProfileEvents::Counters::Snapshot> profile_counters)
+    std::shared_ptr<ProfileEvents::Counters::Snapshot> profile_counters,
+    const ExportsListEntry * exports_entry)
 try
 {
     auto table_id = getStorageID();
@@ -8739,6 +8750,12 @@ try
 
         part_log_elem.rows = (*merge_entry)->rows_written;
         part_log_elem.peak_memory_usage = (*merge_entry)->getMemoryTracker().getPeak();
+    }
+    else if (exports_entry)
+    {
+        part_log_elem.rows_read = (*exports_entry)->rows_read;
+        part_log_elem.bytes_read_uncompressed = (*exports_entry)->bytes_read_uncompressed;
+        part_log_elem.peak_memory_usage = (*exports_entry)->getMemoryTracker().getPeak();
     }
 
     if (profile_counters)

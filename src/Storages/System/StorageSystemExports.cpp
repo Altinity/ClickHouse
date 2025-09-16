@@ -28,6 +28,8 @@ ColumnsDescription StorageSystemExports::getColumnsDescription()
         {"total_size_bytes_compressed", std::make_shared<DataTypeUInt64>(), "The total size of the compressed data in the exported part."},
         {"total_size_bytes_uncompressed", std::make_shared<DataTypeUInt64>(), "The total size of the uncompressed data in the exported part."},
         {"bytes_read_uncompressed", std::make_shared<DataTypeUInt64>(), "The number of uncompressed bytes read from the exported part."},
+        {"memory_usage", std::make_shared<DataTypeUInt64>(), "Current memory usage in bytes for the export operation."},
+        {"peak_memory_usage", std::make_shared<DataTypeUInt64>(), "Peak memory usage in bytes during the export operation."},
     };
 }
 
@@ -54,6 +56,8 @@ void StorageSystemExports::fillData(MutableColumns & res_columns, ContextPtr con
         res_columns[i++]->insert(export_info.total_size_bytes_compressed);
         res_columns[i++]->insert(export_info.total_size_bytes_uncompressed);
         res_columns[i++]->insert(export_info.bytes_read_uncompressed);
+        res_columns[i++]->insert(export_info.memory_usage);
+        res_columns[i++]->insert(export_info.peak_memory_usage);
     }
 }
 

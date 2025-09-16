@@ -19,6 +19,7 @@
 #include <Storages/MergeTree/MergeTreePartInfo.h>
 #include <Storages/MergeTree/MergeTreeMutationStatus.h>
 #include <Storages/MergeTree/MergeList.h>
+#include <Storages/MergeTree/ExportList.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Storages/MergeTree/MergeTreeDataPartBuilder.h>
 #include <Storages/MergeTree/MergeTreePartsMover.h>
@@ -1509,7 +1510,8 @@ protected:
         const DataPartPtr & result_part,
         const DataPartsVector & source_parts,
         const MergeListEntry * merge_entry,
-        std::shared_ptr<ProfileEvents::Counters::Snapshot> profile_counters);
+        std::shared_ptr<ProfileEvents::Counters::Snapshot> profile_counters,
+        const ExportsListEntry * exports_entry = nullptr);
 
     /// If part is assigned to merge or mutation (possibly replicated)
     /// Should be overridden by children, because they can have different

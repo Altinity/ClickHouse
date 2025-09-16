@@ -11,7 +11,8 @@ ExportsListElement::ExportsListElement(
     UInt64 total_rows_to_read_,
     UInt64 total_size_bytes_compressed_,
     UInt64 total_size_bytes_uncompressed_,
-    time_t create_time_)
+    time_t create_time_,
+    const ContextPtr & context)
 : source_table_id(source_table_id_)
 , destination_table_id(destination_table_id_)
 , part_size(part_size_)
@@ -21,6 +22,7 @@ ExportsListElement::ExportsListElement(
 , total_size_bytes_uncompressed(total_size_bytes_uncompressed_)
 , create_time(create_time_)
 {
+    thread_group = ThreadGroup::createForBackgroundProcess(context);
 }
 
 ExportInfo ExportsListElement::getInfo() const
@@ -36,9 +38,21 @@ ExportInfo ExportsListElement::getInfo() const
     res.total_size_bytes_compressed = total_size_bytes_compressed;
     res.total_size_bytes_uncompressed = total_size_bytes_uncompressed;
     res.bytes_read_uncompressed = bytes_read_uncompressed;
+    res.memory_usage = getMemoryUsage();
+    res.peak_memory_usage = getPeakMemoryUsage();
     res.create_time = create_time;
     res.elapsed = elapsed;
     return res;
+}
+
+UInt64 ExportsListElement::getMemoryUsage() const
+{
+    return thread_group->memory_tracker.get();
+}
+
+UInt64 ExportsListElement::getPeakMemoryUsage() const
+{
+    return thread_group->memory_tracker.getPeak();
 }
 
 }
