@@ -117,8 +117,8 @@ public:
 
     String toString() const;
 
-    String dump() const;
-    void restoreFromDump(const String & range);
+    String serialize() const;
+    void deserialize(const String & range);
 };
 
 Range intersect(const Range & a, const Range & b);

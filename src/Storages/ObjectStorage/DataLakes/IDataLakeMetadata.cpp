@@ -112,7 +112,7 @@ DataFileMetaInfo::DataFileMetaInfo(Poco::JSON::Object::Ptr file_info)
                 std::string r = column->get("range");
                 try
                 {
-                    range.restoreFromDump(r);
+                    range.deserialize(r);
                     column_info.hyperrectangle = std::move(range);
                 }
                 catch (const Exception & e)
@@ -151,7 +151,7 @@ Poco::JSON::Object::Ptr DataFileMetaInfo::toJson() const
             if (column.second.nulls_count.has_value())
                 column_info->set("nulls", column.second.nulls_count.value());
             if (column.second.hyperrectangle.has_value())
-                column_info->set("range", column.second.hyperrectangle.value().dump());
+                column_info->set("range", column.second.hyperrectangle.value().serialize());
 
             columns->add(column_info);
         }
