@@ -49,6 +49,7 @@ jobs:
       repo_prefix: ${{ env.REPO_PREFIX }}
       src_url: ${{ env.SRC_URL }}
       dest_url: ${{ env.DEST_URL }}
+      major_version: ${{ env.MAJOR_VERSION }}
     steps:
       - name: Validate inputs
         run: |
@@ -141,6 +142,13 @@ jobs:
           MAJOR_VERSION=$(echo "$PACKAGE_VERSION" | cut -d. -f1)
           NEEDS_BINARY_PROCESSING=$([ "$MAJOR_VERSION" -ge 24 ] && echo "true" || echo "false")
 
+          #Tweak s3 path is major version is 25 or newer
+          if [ "$MAJOR_VERSION" -ge 25 ]; then
+            SRC_URL=s3://${SRC_BUCKET}/REFs/${SRC_DIR}/${COMMIT_HASH}
+          else
+            SRC_URL=s3://${SRC_BUCKET}/${SRC_DIR}/${COMMIT_HASH}
+          fi
+          
           # Extract feature and set repo prefix
           ALTINITY_BUILD_FEATURE=$(echo "$PACKAGE_VERSION" | rev | cut -d. -f1 | rev)
           case "$ALTINITY_BUILD_FEATURE" in
@@ -172,8 +180,9 @@ jobs:
             echo "TEST_RESULTS_SRC=${TEST_RESULTS_SRC}"
             echo "ALTINITY_BUILD_FEATURE=${ALTINITY_BUILD_FEATURE}"
             echo "REPO_PREFIX=${REPO_PREFIX}"
-            echo "SRC_URL=s3://${SRC_BUCKET}/${SRC_DIR}/${COMMIT_HASH}"
+            echo "SRC_URL=${SRC_URL}"
             echo "DEST_URL=s3://${S3_STORAGE_BUCKET}/builds/stable/v${PACKAGE_VERSION}/${FOLDER_TIME}"
+            echo "MAJOR_VERSION=${MAJOR_VERSION}"
           } >> $GITHUB_ENV
 
       - name: Display Extracted Information
@@ -191,6 +200,7 @@ jobs:
           echo "test_results_src: ${TEST_RESULTS_SRC}"
           echo "src_url: ${SRC_URL}"
           echo "dest_url: ${DEST_URL}"
+          echo "major_version: ${MAJOR_VERSION}"
 
       - name: Install aws cli
         if: ${{ env.NEEDS_BINARY_PROCESSING == 'true' }}
@@ -205,8 +215,10 @@ jobs:
          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
+          ARM_PATH=$([ "$MAJOR_VERSION" -ge 25 ] && echo "build_arm_release" || echo "package_aarch64")
+
           echo "Downloading clickhouse binary..."
-          if ! aws s3 cp "${SRC_URL}/package_aarch64/clickhouse" clickhouse; then
+          if ! aws s3 cp "${SRC_URL}/${ARM_PATH}/clickhouse" clickhouse; then
             echo "Failed to download clickhouse binary"
             exit 1
           fi
@@ -219,11 +231,11 @@ jobs:
           strip clickhouse -o clickhouse-stripped
 
           echo "Uploading processed binaries..."
-          if ! aws s3 cp clickhouse "${SRC_URL}/package_aarch64/arm64-bin/non-self-extracting/"; then
+          if ! aws s3 cp clickhouse "${SRC_URL}/${ARM_PATH}/arm64-bin/non-self-extracting/"; then
             echo "Failed to upload clickhouse binary"
             exit 1
           fi
-          if ! aws s3 cp clickhouse-stripped "${SRC_URL}/package_aarch64/arm64-bin/non-self-extracting/"; then
+          if ! aws s3 cp clickhouse-stripped "${SRC_URL}/${ARM_PATH}/arm64-bin/non-self-extracting/"; then
             echo "Failed to upload stripped clickhouse binary"
             exit 1
           fi
@@ -237,6 +249,7 @@ jobs:
       SRC_URL: ${{ needs.extract-package-info.outputs.src_url }}
       DEST_URL: ${{ needs.extract-package-info.outputs.dest_url }}
       NEEDS_BINARY_PROCESSING: ${{ needs.extract-package-info.outputs.needs_binary_processing }}
+      MAJOR_VERSION: ${{ needs.extract-package-info.outputs.major_version }}
     steps:
       - name: Install aws cli
         uses: unfor19/install-aws-cli-action@v1
@@ -247,15 +260,17 @@ jobs:
       - name: Move verified packages to destination
         run: |
           # Move ARM packages
+          ARM_PATH=$([ "$MAJOR_VERSION" -ge 25 ] && echo "build_arm_release" || echo "package_aarch64")
           echo "Moving verified ARM packages to destination..."
-          if ! aws s3 sync "${SRC_URL}/package_aarch64/" "${DEST_URL}/packages/ARM_PACKAGES/"; then
+          if ! aws s3 sync "${SRC_URL}/${ARM_PATH}/" "${DEST_URL}/packages/ARM_PACKAGES/"; then
             echo "Failed to move ARM packages to destination"
             exit 1
           fi
 
           # Move AMD packages
+          AMD_PATH=$([ "$MAJOR_VERSION" -ge 25 ] && echo "build_amd_release" || echo "package_release")
           echo "Moving verified AMD packages to destination..."
-          if ! aws s3 sync "${SRC_URL}/package_release/" "${DEST_URL}/packages/AMD_PACKAGES/"; then
+          if ! aws s3 sync "${SRC_URL}/${AMD_PATH}/" "${DEST_URL}/packages/AMD_PACKAGES/"; then
             echo "Failed to move AMD packages to destination"
             exit 1
           fi
