@@ -81,6 +81,7 @@ void RemoteQueryExecutorReadContext::Task::run(AsyncCallback async_callback, Sus
             throw;
         read_context.packet.type = Protocol::Server::ConnectionLost;
         read_context.packet.exception = std::make_unique<Exception>(getCurrentExceptionMessageAndPattern(true), getCurrentExceptionCode());
+        read_context.has_read_packet_part = PacketPart::Body;
         suspend_callback();
     }
 }
