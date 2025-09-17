@@ -226,7 +226,7 @@ jobs:
           if [ "$MAJOR_VERSION" -ge 25 ]; then
             echo "Strip the non-extracted binary..."
             strip clickhouse -o clickhouse-stripped
-            aws s3 cp clickhouse-stripped ${SRC_URL}/${ARM_PATH}"
+            aws s3 cp clickhouse-stripped "${SRC_URL}/${ARM_PATH}"
             rm clickhouse-stripped
           fi
           
