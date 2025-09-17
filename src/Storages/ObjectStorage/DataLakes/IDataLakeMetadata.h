@@ -1,10 +1,19 @@
 #pragma once
 #include <Core/NamesAndTypes.h>
 #include <Core/Types.h>
+#include <Core/Range.h>
 #include <boost/noncopyable.hpp>
-#include "Interpreters/ActionsDAG.h"
+#include <Interpreters/ActionsDAG.h>
 #include <Storages/ObjectStorage/IObjectIterator.h>
 #include <Storages/prepareReadingFromFormat.h>
+#include <Poco/JSON/Object.h>
+
+namespace Iceberg
+{
+
+struct ColumnInfo;
+
+};
 
 namespace DB
 {
@@ -12,7 +21,52 @@ namespace DB
 namespace ErrorCodes
 {
 extern const int UNSUPPORTED_METHOD;
-}
+};
+
+class DataFileMetaInfo
+{
+public:
+    DataFileMetaInfo() = default;
+
+    // Extract metadata from Iceberg structure
+    explicit DataFileMetaInfo(const std::unordered_map<Int32, Iceberg::ColumnInfo> & columns_info_);
+
+    // Deserialize from json in distributed requests
+    explicit DataFileMetaInfo(const Poco::JSON::Object::Ptr file_info);
+
+    // Serialize to json in distributed requests
+    Poco::JSON::Object::Ptr toJson() const;
+
+    struct ColumnInfo
+    {
+        std::optional<Int64> rows_count;
+        std::optional<Int64> nulls_count;
+        std::optional<DB::Range> hyperrectangle;
+    };
+
+    std::unordered_map<Int32, ColumnInfo> columns_info;
+};
+
+using DataFileMetaInfoPtr = std::shared_ptr<DataFileMetaInfo>;
+
+struct DataFileInfo
+{
+    std::string file_path;
+    std::optional<DataFileMetaInfoPtr> file_meta_info;
+
+    explicit DataFileInfo(const std::string & file_path_)
+        : file_path(file_path_) {}
+
+    explicit DataFileInfo(std::string && file_path_)
+        : file_path(std::move(file_path_)) {}
+
+    bool operator==(const DataFileInfo & rhs) const
+    {
+        return file_path == rhs.file_path;
+    }
+};
+
+using DataFileInfos = std::vector<DataFileInfo>;
 
 class IDataLakeMetadata : boost::noncopyable
 {
@@ -23,7 +77,7 @@ public:
 
     /// List all data files.
     /// For better parallelization, iterate() method should be used.
-    virtual Strings getDataFiles() const = 0;
+    virtual DataFileInfos getDataFiles() const = 0;
     /// Return iterator to `data files`.
     using FileProgressCallback = std::function<void(FileProgress)>;
     virtual ObjectIterator iterate(
@@ -62,7 +116,7 @@ public:
 
 protected:
     ObjectIterator createKeysIterator(
-        Strings && data_files_,
+        DataFileInfos && data_files_,
         ObjectStoragePtr object_storage_,
         IDataLakeMetadata::FileProgressCallback callback_) const;
 

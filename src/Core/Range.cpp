@@ -9,6 +9,12 @@
 namespace DB
 {
 
+namespace ErrorCodes
+{
+extern const int INCORRECT_DATA;
+};
+
+
 FieldRef::FieldRef(ColumnsWithTypeAndName * columns_, size_t row_idx_, size_t column_idx_)
     : Field((*(*columns_)[column_idx_].column)[row_idx_]), columns(columns_), row_idx(row_idx_), column_idx(column_idx_)
 {
@@ -149,6 +155,13 @@ bool Range::fullBounded() const
 bool Range::isInfinite() const
 {
     return left.isNegativeInfinity() && right.isPositiveInfinity();
+}
+
+/// [x, x]
+bool Range::isPoint() const
+{
+    return fullBounded() && left_included && right_included && equals(left, right)
+        && !left.isNegativeInfinity() && !left.isPositiveInfinity();
 }
 
 bool Range::intersectsRange(const Range & r) const
@@ -330,6 +343,48 @@ String Range::toString() const
     str << applyVisitor(FieldVisitorToString(), right) << (right_included ? ']' : ')');
 
     return str.str();
+}
+
+String Range::dump() const
+{
+    WriteBufferFromOwnString str;
+
+    str << (left_included ? '[' : '(') << left.dump() << ",";
+    str << right.dump() << (right_included ? ']' : ')');
+
+    return str.str();
+}
+
+void Range::restoreFromDump(const String & range)
+{
+    if (range.empty())
+        throw Exception(ErrorCodes::INCORRECT_DATA, "Empty range dump");
+
+    if (range[0] == '[')
+        left_included = true;
+    else if (range[0] == '(')
+        left_included = false;
+    else
+        throw Exception(ErrorCodes::INCORRECT_DATA, "Incorrect range: {}", range);
+
+    if (range[range.size() - 1] == ']')
+        right_included = true;
+    else if (range[range.size() - 1] == ')')
+        right_included = false;
+    else
+        throw Exception(ErrorCodes::INCORRECT_DATA, "Incorrect range: {}", range);
+
+    /// TODO: Strings with comma
+    auto separator = range.find(',');
+    if (separator == std::string::npos || separator == range.size())
+        throw Exception(ErrorCodes::INCORRECT_DATA, "Incorrect range: {}", range);
+
+    std::string_view l(range.data() + 1, separator - 1);
+    std::string_view r(range.data() + separator + 1, range.size() - separator - 2);
+
+    /// TODO: "Decimal64_'1596962100.000000'" can't be parsed by some reason
+    left = Field::restoreFromDump(std::string_view(range.data() + 1, separator - 1));
+    right = Field::restoreFromDump(std::string_view(range.data() + separator + 1, range.size() - separator - 2));
 }
 
 Hyperrectangle intersect(const Hyperrectangle & a, const Hyperrectangle & b)

@@ -158,7 +158,7 @@ struct DeltaLakeMetadataImpl
     struct DeltaLakeMetadata
     {
         NamesAndTypesList schema;
-        Strings data_files;
+        DataFileInfos data_files;
         DeltaLakePartitionColumns partition_columns;
     };
 
@@ -195,7 +195,7 @@ struct DeltaLakeMetadataImpl
                 processMetadataFile(key, current_schema, current_partition_columns, result_files);
         }
 
-        return DeltaLakeMetadata{current_schema, Strings(result_files.begin(), result_files.end()), current_partition_columns};
+        return DeltaLakeMetadata{current_schema, DataFileInfos(result_files.begin(), result_files.end()), current_partition_columns};
     }
 
     /**

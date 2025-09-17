@@ -96,6 +96,12 @@ protected:
     size_t total_rows_in_file = 0;
     LoggerPtr log = getLogger("StorageObjectStorageSource");
 
+    struct ConstColumnWithValue
+    {
+        NameAndTypePair name_and_type;
+        Field value;
+    };
+
     struct ReaderHolder : private boost::noncopyable
     {
     public:
@@ -104,7 +110,8 @@ protected:
             std::unique_ptr<ReadBuffer> read_buf_,
             std::shared_ptr<ISource> source_,
             std::unique_ptr<QueryPipeline> pipeline_,
-            std::unique_ptr<PullingPipelineExecutor> reader_);
+            std::unique_ptr<PullingPipelineExecutor> reader_,
+            std::map<size_t, ConstColumnWithValue> && constant_columns_with_values_);
 
         ReaderHolder() = default;
         ReaderHolder(ReaderHolder && other) noexcept { *this = std::move(other); }
@@ -123,6 +130,9 @@ protected:
         std::shared_ptr<ISource> source;
         std::unique_ptr<QueryPipeline> pipeline;
         std::unique_ptr<PullingPipelineExecutor> reader;
+
+    public:
+        std::map<size_t, ConstColumnWithValue> constant_columns_with_values;
     };
 
     ReaderHolder reader;
@@ -241,6 +251,15 @@ class StorageObjectStorageSource::KeysIterator : public IObjectIterator
 {
 public:
     KeysIterator(
+        const DataFileInfos & file_infos_,
+        ObjectStoragePtr object_storage_,
+        const NamesAndTypesList & virtual_columns_,
+        ObjectInfos * read_keys_,
+        bool ignore_non_existent_files_,
+        bool skip_object_metadata_,
+        std::function<void(FileProgress)> file_progress_callback = {});
+
+    KeysIterator(
         const Strings & keys_,
         ObjectStoragePtr object_storage_,
         const NamesAndTypesList & virtual_columns_,
@@ -253,13 +272,15 @@ public:
 
     ObjectInfoPtr next(size_t processor) override;
 
-    size_t estimatedKeysCount() override { return keys.size(); }
+    size_t estimatedKeysCount() override { return file_infos.size(); }
 
 private:
+    void fillKeys(ObjectInfos * read_keys_);
+
     const ObjectStoragePtr object_storage;
     const NamesAndTypesList virtual_columns;
     const std::function<void(FileProgress)> file_progress_callback;
-    const std::vector<String> keys;
+    const DataFileInfos file_infos;
     std::atomic<size_t> index = 0;
     bool ignore_non_existent_files;
     bool skip_object_metadata;

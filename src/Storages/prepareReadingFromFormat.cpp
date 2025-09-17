@@ -88,6 +88,7 @@ ReadFromFormatInfo prepareReadingFromFormat(
     /// Create header for InputFormat with columns that will be read from the data.
     info.format_header = storage_snapshot->getSampleBlockForColumns(info.columns_description.getNamesOfPhysical());
     info.serialization_hints = getSerializationHintsForFileLikeStorage(storage_snapshot->metadata, context);
+    info.physical_columns = storage_snapshot->metadata->getColumns().getAllPhysical();
     return info;
 }
 

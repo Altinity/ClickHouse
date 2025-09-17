@@ -94,6 +94,8 @@ public:
 
     bool isBlank() const;
 
+    bool isPoint() const;
+
     bool intersectsRange(const Range & r) const;
 
     bool containsRange(const Range & r) const;
@@ -114,6 +116,9 @@ public:
     bool nearByWith(const Range & r) const;
 
     String toString() const;
+
+    String dump() const;
+    void restoreFromDump(const String & range);
 };
 
 Range intersect(const Range & a, const Range & b);

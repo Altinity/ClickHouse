@@ -26,6 +26,8 @@ namespace DB
         SerializationInfoByName serialization_hints;
         /// The list of hive partition columns. It shall be read from the path regardless if it is present in the file
         NamesAndTypesList hive_partition_columns_to_read_from_file_path;
+        /// The list of all physical columns is source. Required sometimes for some read optimization.
+        NamesAndTypesList physical_columns;
     };
 
     struct PrepareReadingFromFormatHiveParams

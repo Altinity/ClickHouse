@@ -896,7 +896,7 @@ ManifestFilePtr IcebergMetadata::getManifestFile(ContextPtr local_context, const
     return create_fn();
 }
 
-Strings IcebergMetadata::getDataFilesImpl(const ActionsDAG * filter_dag, ContextPtr local_context) const
+DataFileInfos IcebergMetadata::getDataFilesImpl(const ActionsDAG * filter_dag, ContextPtr local_context) const
 {
     bool use_partition_pruning = filter_dag && local_context->getSettingsRef()[Setting::use_iceberg_partition_pruning];
 
@@ -906,7 +906,7 @@ Strings IcebergMetadata::getDataFilesImpl(const ActionsDAG * filter_dag, Context
             return cached_unprunned_files_for_last_processed_snapshot.value();
     }
 
-    Strings data_files;
+    DataFileInfos data_files;
     {
         SharedLockGuard lock(mutex);
 
@@ -928,7 +928,10 @@ Strings IcebergMetadata::getDataFilesImpl(const ActionsDAG * filter_dag, Context
                     if (!pruner.canBePruned(manifest_file_entry))
                     {
                         if (std::holds_alternative<DataFileEntry>(manifest_file_entry.file))
-                            data_files.push_back(std::get<DataFileEntry>(manifest_file_entry.file).file_name);
+                        {
+                            data_files.push_back(DataFileInfo(std::get<DataFileEntry>(manifest_file_entry.file).file_name));
+                            data_files.back().file_meta_info = std::make_shared<DataFileMetaInfo>(manifest_file_entry.columns_infos);
+                        }
                     }
                 }
             }

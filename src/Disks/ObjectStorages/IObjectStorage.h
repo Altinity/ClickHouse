@@ -9,6 +9,7 @@
 
 #include <Poco/Timestamp.h>
 #include <Poco/Util/AbstractConfiguration.h>
+#include <Poco/JSON/Object.h>
 #include <Core/Defines.h>
 #include <IO/ReadSettings.h>
 #include <IO/WriteSettings.h>
@@ -101,6 +102,10 @@ struct ObjectMetadata
     ObjectAttributes attributes;
 };
 
+struct DataFileInfo;
+class DataFileMetaInfo;
+using DataFileMetaInfoPtr = std::shared_ptr<DataFileMetaInfo>;
+
 struct RelativePathWithMetadata
 {
     class CommandInTaskResponse
@@ -109,31 +114,35 @@ struct RelativePathWithMetadata
         CommandInTaskResponse() = default;
         explicit CommandInTaskResponse(const std::string & task);
 
-        bool is_parsed() const { return successfully_parsed; }
-        void set_retry_after_us(Poco::Timestamp::TimeDiff time_us) { retry_after_us = time_us; }
+        bool isParsed() const { return successfully_parsed; }
+        void setFilePath(const std::string & file_path_ ) { file_path = file_path_; }
+        void setRetryAfterUs(Poco::Timestamp::TimeDiff time_us) { retry_after_us = time_us; }
+        void setFileMetaInfo(DataFileMetaInfoPtr file_meta_info_ ) { file_meta_info = file_meta_info_; }
 
-        std::string to_string() const;
+        std::string toString() const;
 
-        std::optional<Poco::Timestamp::TimeDiff> get_retry_after_us() const { return retry_after_us; }
+        std::optional<std::string> getFilePath() const { return file_path; }
+
+        std::optional<Poco::Timestamp::TimeDiff> getRetryAfterUs() const { return retry_after_us; }
+
+        std::optional<DataFileMetaInfoPtr> getFileMetaInfo() const { return file_meta_info; }
 
     private:
         bool successfully_parsed = false;
+        std::optional<std::string> file_path;
         std::optional<Poco::Timestamp::TimeDiff> retry_after_us;
+        std::optional<DataFileMetaInfoPtr> file_meta_info;
     };
 
     String relative_path;
     std::optional<ObjectMetadata> metadata;
     CommandInTaskResponse command;
+    std::optional<DataFileMetaInfoPtr> file_meta_info;
 
     RelativePathWithMetadata() = default;
 
-    explicit RelativePathWithMetadata(const String & task_string, std::optional<ObjectMetadata> metadata_ = std::nullopt)
-        : metadata(std::move(metadata_))
-        , command(task_string)
-    {
-        if (!command.is_parsed())
-            relative_path = task_string;
-    }
+    explicit RelativePathWithMetadata(const String & task_string, std::optional<ObjectMetadata> metadata_ = std::nullopt);
+    explicit RelativePathWithMetadata(const DataFileInfo & info, std::optional<ObjectMetadata> metadata_ = std::nullopt);
 
     virtual ~RelativePathWithMetadata() = default;
 
@@ -142,6 +151,10 @@ struct RelativePathWithMetadata
     virtual bool isArchive() const { return false; }
     virtual std::string getPathToArchive() const { throw Exception(ErrorCodes::LOGICAL_ERROR, "Not an archive"); }
     virtual size_t fileSizeInArchive() const { throw Exception(ErrorCodes::LOGICAL_ERROR, "Not an archive"); }
+
+    void setFileMetaInfo(DataFileMetaInfoPtr file_meta_info_ ) { file_meta_info = file_meta_info_; }
+    void setFileMetaInfo(std::optional<DataFileMetaInfoPtr> file_meta_info_ ) { file_meta_info = file_meta_info_; }
+    std::optional<DataFileMetaInfoPtr> getFileMetaInfo() const { return file_meta_info; }
 
     void loadMetadata(ObjectStoragePtr object_storage, bool ignore_non_existent_file);
     const CommandInTaskResponse & getCommand() const { return command; }

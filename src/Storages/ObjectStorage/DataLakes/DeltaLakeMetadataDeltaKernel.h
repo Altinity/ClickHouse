@@ -33,7 +33,7 @@ public:
 
     bool update(const ContextPtr & context) override;
 
-    Strings getDataFiles() const override;
+    DataFileInfos getDataFiles() const override;
 
     NamesAndTypesList getTableSchema() const override;
 

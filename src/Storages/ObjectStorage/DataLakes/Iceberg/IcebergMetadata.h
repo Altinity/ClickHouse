@@ -48,7 +48,7 @@ public:
     /// Get data files. On first request it reads manifest_list file and iterates through manifest files to find all data files.
     /// All subsequent calls when the same data snapshot is relevant will return saved list of files (because it cannot be changed
     /// without changing metadata file). Drops on every snapshot update.
-    Strings getDataFiles() const override { return getDataFilesImpl(nullptr, getContext()); }
+    DataFileInfos getDataFiles() const override { return getDataFilesImpl(nullptr, getContext()); }
 
     /// Get table schema parsed from metadata.
     NamesAndTypesList getTableSchema() const override;
@@ -112,11 +112,11 @@ private:
     Int64 relevant_snapshot_id TSA_GUARDED_BY(mutex) {-1};
     const String table_location;
 
-    mutable std::optional<Strings> cached_unprunned_files_for_last_processed_snapshot TSA_GUARDED_BY(cached_unprunned_files_for_last_processed_snapshot_mutex);
+    mutable std::optional<DataFileInfos> cached_unprunned_files_for_last_processed_snapshot TSA_GUARDED_BY(cached_unprunned_files_for_last_processed_snapshot_mutex);
     mutable std::mutex cached_unprunned_files_for_last_processed_snapshot_mutex;
 
     void updateState(const ContextPtr & local_context, Poco::JSON::Object::Ptr metadata_object, bool metadata_file_changed) TSA_REQUIRES(mutex);
-    Strings getDataFilesImpl(const ActionsDAG * filter_dag, ContextPtr local_context) const;
+    DataFileInfos getDataFilesImpl(const ActionsDAG * filter_dag, ContextPtr local_context) const;
 
     void updateSnapshot(ContextPtr local_context, Poco::JSON::Object::Ptr metadata_object) TSA_REQUIRES(mutex);
     ManifestFileCacheKeys getManifestList(ContextPtr local_context, const String & filename) const;
