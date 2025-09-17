@@ -1,4 +1,4 @@
--- Tags: no-parallel, no-fasttest
+-- Tags: no-parallel, no-fasttest, no-parallel-replicas
 
 DROP TABLE IF EXISTS t_parquet_03262;
 
@@ -10,15 +10,15 @@ INSERT INTO t_parquet_03262 SELECT number FROM numbers(10) SETTINGS s3_truncate_
 
 SELECT COUNT(*)
 FROM s3(s3_conn, filename = 'test_03262_*', format = Parquet)
-SETTINGS input_format_parquet_use_metadata_cache=1, optimize_count_from_files=0;
+SETTINGS input_format_parquet_use_metadata_cache=1, use_query_condition_cache=0,optimize_count_from_files=0;
 
 SELECT COUNT(*)
 FROM s3(s3_conn, filename = 'test_03262_*', format = Parquet)
-SETTINGS input_format_parquet_use_metadata_cache=1, optimize_count_from_files=0, log_comment='test_03262_parquet_metadata_cache';
+SETTINGS input_format_parquet_use_metadata_cache=1, use_query_condition_cache=0, optimize_count_from_files=0, log_comment='test_03262_parquet_metadata_cache';
 
 SELECT COUNT(*)
 FROM s3(s3_conn, filename = 'test_03262_*', format = ParquetMetadata)
-SETTINGS input_format_parquet_use_metadata_cache=1, log_comment='test_03262_parquet_metadata_format_metadata_cache';
+SETTINGS input_format_parquet_use_metadata_cache=1, use_query_condition_cache=0, optimize_count_from_files=0, log_comment='test_03262_parquet_metadata_format_metadata_cache';
 
 SYSTEM FLUSH LOGS;
 
@@ -27,20 +27,20 @@ FROM system.query_log
 where log_comment = 'test_03262_parquet_metadata_cache'
 AND type = 'QueryFinish'
 ORDER BY event_time desc
-LIMIT 1;
+LIMIT 1 SETTINGS use_query_condition_cache=0;
 
 SELECT ProfileEvents['ParquetMetaDataCacheHits']
 FROM system.query_log
 where log_comment = 'test_03262_parquet_metadata_format_metadata_cache'
 AND type = 'QueryFinish'
 ORDER BY event_time desc
-LIMIT 1;
+LIMIT 1 SETTINGS use_query_condition_cache=0;
 
 SYSTEM DROP PARQUET METADATA CACHE;
 
 SELECT COUNT(*)
 FROM s3(s3_conn, filename = 'test_03262_*', format = Parquet)
-SETTINGS input_format_parquet_use_metadata_cache=1, optimize_count_from_files=0, log_comment='test_03262_parquet_metadata_cache_cache_empty';
+SETTINGS input_format_parquet_use_metadata_cache=1, use_query_condition_cache=0, optimize_count_from_files=0, log_comment='test_03262_parquet_metadata_cache_cache_empty';
 
 SYSTEM FLUSH LOGS;
 
@@ -49,13 +49,13 @@ FROM system.query_log
 where log_comment = 'test_03262_parquet_metadata_cache_cache_empty'
 AND type = 'QueryFinish'
 ORDER BY event_time desc
-LIMIT 1;
+LIMIT 1 SETTINGS use_query_condition_cache=0;
 
 SELECT ProfileEvents['ParquetMetaDataCacheMisses']
 FROM system.query_log
 where log_comment = 'test_03262_parquet_metadata_cache_cache_empty'
 AND type = 'QueryFinish'
 ORDER BY event_time desc
-LIMIT 1;
+LIMIT 1 SETTINGS use_query_condition_cache=0;
 
 DROP TABLE t_parquet_03262;

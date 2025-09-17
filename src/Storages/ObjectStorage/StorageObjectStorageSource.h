@@ -163,10 +163,10 @@ protected:
     void lazyInitialize();
 };
 
-class StorageObjectStorageSource::ReadTaskIterator : public IObjectIterator
+class StorageObjectStorageSource::ReadTaskIterator : public IObjectIterator, WithContext
 {
 public:
-    ReadTaskIterator(const ReadTaskCallback & callback_, size_t max_threads_count);
+    ReadTaskIterator(const ReadTaskCallback & callback_, size_t max_threads_count, ContextPtr context_);
 
     ObjectInfoPtr next(size_t) override;
 

@@ -47,6 +47,7 @@
 #include <Common/escapeForFileName.h>
 #include "Core/BackgroundSchedulePool.h"
 #include "Core/Names.h"
+#include "Parsers/ASTLiteral.h"
 
 namespace DB
 {
@@ -109,6 +110,7 @@ namespace ErrorCodes
     extern const int TABLE_IS_READ_ONLY;
     extern const int TOO_MANY_PARTS;
     extern const int PART_IS_LOCKED;
+    extern const int INCOMPATIBLE_COLUMNS;
 }
 
 namespace ActionLocks
@@ -199,7 +201,7 @@ void StorageMergeTree::startup()
     try
     {
         background_operations_assignee.start();
-        startBackgroundMovesIfNeeded();
+        startBackgroundMoves();
         startOutdatedAndUnexpectedDataPartsLoadingTask();
     }
     catch (...)
@@ -2687,12 +2689,6 @@ MutationCounters StorageMergeTree::getMutationCounters() const
 {
     std::lock_guard lock(currently_processing_in_background_mutex);
     return mutation_counters;
-}
-
-void StorageMergeTree::startBackgroundMovesIfNeeded()
-{
-    if (areBackgroundMovesNeeded())
-        background_moves_assignee.start();
 }
 
 std::unique_ptr<MergeTreeSettings> StorageMergeTree::getDefaultSettings() const

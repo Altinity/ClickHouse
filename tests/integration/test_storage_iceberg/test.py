@@ -3410,6 +3410,50 @@ def test_minmax_pruning_for_arrays_and_maps_subfields_disabled(started_cluster, 
 
     instance.query(f"SELECT * FROM {table_select_expression} ORDER BY ALL")
 
+@pytest.mark.parametrize("storage_type", ["s3"])
+def test_system_tables_partition_sorting_keys(started_cluster, storage_type):
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
+
+    table_name = f"test_sys_tables_keys_{storage_type}_{uuid.uuid4().hex[:8]}"
+    fq_table = f"spark_catalog.default.{table_name}"
+
+    spark.sql(f"DROP TABLE IF EXISTS {fq_table}")
+    spark.sql(f"""
+        CREATE TABLE {fq_table} (
+            id INT,
+            ts TIMESTAMP,
+            payload STRING
+        )
+        USING iceberg
+        PARTITIONED BY (bucket(16, id), day(ts))
+        TBLPROPERTIES ('format-version' = '2')
+    """)
+    spark.sql(f"ALTER TABLE {fq_table} WRITE ORDERED BY (id DESC NULLS LAST, hour(ts))")
+    spark.sql(f"""
+        INSERT INTO {fq_table} VALUES
+        (1, timestamp'2024-01-01 10:00:00', 'a'),
+        (2, timestamp'2024-01-02 11:00:00', 'b'),
+        (NULL, timestamp'2024-01-03 12:00:00', 'c')
+    """)
+
+    time.sleep(2)
+    default_upload_directory(
+        started_cluster,
+        storage_type,
+        f"/iceberg_data/default/{table_name}/",
+        f"/iceberg_data/default/{table_name}/",
+    )
+
+    create_iceberg_table(storage_type, instance, table_name, started_cluster)
+
+    res = instance.query(f"""
+        SELECT partition_key, sorting_key
+        FROM system.tables
+        WHERE name = '{table_name}' FORMAT csv
+    """).strip().lower()
+
+    assert res == '"bucket(16, id), day(ts)","iddescnulls last, hour(ts)ascnulls first"'
 
 @pytest.mark.parametrize("storage_type", ["local", "s3"])
 def test_compressed_metadata(started_cluster, storage_type):

@@ -16,6 +16,8 @@ struct IcebergSnapshot
     Int64 snapshot_id;
     std::optional<size_t> total_rows;
     std::optional<size_t> total_bytes;
+    std::optional<String> partition_key;
+    std::optional<String> sorting_key;
 };
 
 struct IcebergHistoryRecord

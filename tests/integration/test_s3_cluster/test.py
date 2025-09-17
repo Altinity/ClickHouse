@@ -4,11 +4,13 @@ import os
 import shutil
 import uuid
 
-from email.errors import HeaderParseError
+import time
+import threading
 
 import pytest
 
 from helpers.cluster import ClickHouseCluster
+from helpers.client import QueryRuntimeException
 from helpers.config_cluster import minio_secret_key
 from helpers.mock_servers import start_mock_servers
 from helpers.test_tools import TSV
@@ -22,6 +24,22 @@ S3_DATA = [
     "data/clickhouse/part123.csv",
     "data/database/part2.csv",
     "data/database/partition675.csv",
+    "data/graceful/part0.csv",
+    "data/graceful/part1.csv",
+    "data/graceful/part2.csv",
+    "data/graceful/part3.csv",
+    "data/graceful/part4.csv",
+    "data/graceful/part5.csv",
+    "data/graceful/part6.csv",
+    "data/graceful/part7.csv",
+    "data/graceful/part8.csv",
+    "data/graceful/part9.csv",
+    "data/graceful/partA.csv",
+    "data/graceful/partB.csv",
+    "data/graceful/partC.csv",
+    "data/graceful/partD.csv",
+    "data/graceful/partE.csv",
+    "data/graceful/partF.csv",
 ]
 
 
@@ -77,6 +95,7 @@ def started_cluster():
             macros={"replica": "node1", "shard": "shard1"},
             with_minio=True,
             with_zookeeper=True,
+            stay_alive=True,
         )
         cluster.add_instance(
             "s0_0_1",
@@ -84,6 +103,7 @@ def started_cluster():
             user_configs=["configs/users.xml"],
             macros={"replica": "replica2", "shard": "shard1"},
             with_zookeeper=True,
+            stay_alive=True,
         )
         cluster.add_instance(
             "s0_1_0",
@@ -91,6 +111,7 @@ def started_cluster():
             user_configs=["configs/users.xml"],
             macros={"replica": "replica1", "shard": "shard2"},
             with_zookeeper=True,
+            stay_alive=True,
         )
 
         logging.info("Starting cluster...")
@@ -1019,3 +1040,182 @@ def test_cluster_hosts_limit(started_cluster):
         """
     )
     assert int(hosts_2) == 2
+
+
+def test_graceful_shutdown(started_cluster):
+    node = started_cluster.instances["s0_0_0"]
+    node_to_shutdown = started_cluster.instances["s0_1_0"]
+
+    expected = TSV("64\tBar\t8\n56\tFoo\t8\n")
+
+    num_lock = threading.Lock()
+    errors = 0
+
+    def query_cycle():
+        nonlocal errors
+        try:
+            i = 0
+            while i < 10:
+                i += 1
+                # Query time 3-4 seconds
+                # Processing single object 1-2 seconds
+                result = node.query(f"""
+                    SELECT sum(value),name,sum(sleep(1)+1) as sleep FROM s3Cluster(
+                        'cluster_simple',
+                        'http://minio1:9001/root/data/graceful/*', 'minio', '{minio_secret_key}', 'CSV',
+                        'value UInt32, name String')
+                    GROUP BY name
+                    ORDER BY name
+                    SETTINGS max_threads=2
+                    """)
+                with num_lock:
+                    if TSV(result) != expected:
+                        errors += 1
+                    if errors >= 1:
+                        break
+        except QueryRuntimeException:
+            with num_lock:
+                errors += 1
+
+    threads = []
+
+    for _ in range(10):
+        thread = threading.Thread(target=query_cycle)
+        thread.start()
+        threads.append(thread)
+        time.sleep(0.2)
+
+    time.sleep(3)
+
+    node_to_shutdown.query("SYSTEM STOP SWARM MODE")
+
+    # enough time to complete processing of objects, started before "SYSTEM STOP SWARM MODE"
+    time.sleep(3)
+
+    node_to_shutdown.stop_clickhouse(kill=True)
+
+    for thread in threads:
+        thread.join()
+
+    node_to_shutdown.start_clickhouse()
+
+    assert errors == 0
+
+
+def test_joins(started_cluster):
+    node = started_cluster.instances["s0_0_0"]
+
+    # Table join_table only exists on the node 's0_0_0'.
+    node.query(
+        """
+        CREATE TABLE IF NOT EXISTS join_table (
+            id UInt32,
+            name String
+        ) ENGINE=MergeTree()
+        ORDER BY id;
+        """
+    )
+
+    node.query(
+        f"""
+        INSERT INTO join_table
+        SELECT value, concat(name, '_jt') FROM s3Cluster('cluster_simple',
+            'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))');
+        """
+    )
+
+    result1 = node.query(
+        f"""
+        SELECT t1.name, t2.name FROM
+            s3Cluster('cluster_simple',
+                'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+                'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') AS t1
+        JOIN
+            join_table AS t2
+        ON t1.value = t2.id
+        ORDER BY t1.name
+        SETTINGS object_storage_cluster_join_mode='local';
+        """
+    )
+
+    res = list(map(str.split, result1.splitlines()))
+    assert len(res) == 25
+
+    for line in res:
+        if len(line) == 2:
+            assert line[1] == f"{line[0]}_jt"
+        else:
+            assert line == ["_jt"] # for empty name
+
+    result2 = node.query(
+        f"""
+        SELECT t1.name, t2.name FROM
+            join_table AS t2
+        JOIN
+            s3Cluster('cluster_simple',
+                'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+                'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') AS t1
+        ON t1.value = t2.id
+        ORDER BY t1.name
+        SETTINGS object_storage_cluster_join_mode='local';
+        """
+    )
+
+    assert result1 == result2
+
+    # With WHERE clause with remote column only
+    result3 = node.query(
+        f"""
+        SELECT t1.name, t2.name FROM
+            s3Cluster('cluster_simple',
+                'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+                'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') AS t1
+        JOIN
+            join_table AS t2
+        ON t1.value = t2.id
+        WHERE (t1.value % 2)
+        ORDER BY t1.name
+        SETTINGS object_storage_cluster_join_mode='local';
+        """
+    )
+
+    res = list(map(str.split, result3.splitlines()))
+    assert len(res) == 8
+
+    # With WHERE clause with local column only
+    result4 = node.query(
+        f"""
+        SELECT t1.name, t2.name FROM
+            s3Cluster('cluster_simple',
+                'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+                'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') AS t1
+        JOIN
+            join_table AS t2
+        ON t1.value = t2.id
+        WHERE (t2.id % 2)
+        ORDER BY t1.name
+        SETTINGS object_storage_cluster_join_mode='local';
+        """
+    )
+
+    assert result3 == result4
+
+    # With WHERE clause with local and remote columns
+    result5 = node.query(
+        f"""
+        SELECT t1.name, t2.name FROM
+            s3Cluster('cluster_simple',
+                'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+                'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') AS t1
+        JOIN
+            join_table AS t2
+        ON t1.value = t2.id
+        WHERE (t1.value % 2) AND ((t2.id % 3) == 2)
+        ORDER BY t1.name
+        SETTINGS object_storage_cluster_join_mode='local';
+        """
+    )
+
+    res = list(map(str.split, result5.splitlines()))
+    assert len(res) == 6

@@ -439,6 +439,31 @@ public:
         ContextPtr /*context*/,
         bool /*async_insert*/);
 
+    virtual bool supportsImport() const
+    {
+      return false;
+    }
+
+    struct ImportStats
+    {
+        ExecutionStatus status;
+        std::size_t elapsed_ns = 0;
+        std::size_t bytes_on_disk = 0;
+        std::size_t read_rows = 0;
+        std::size_t read_bytes = 0;
+        std::string file_path = "";
+    };
+
+    virtual SinkToStoragePtr import(
+        const std::string & /* file_name */,
+        Block & /* block_with_partition_values */,
+        ContextPtr /* context */,
+        std::function<void(ImportStats)> /* stats_log */)
+      { 
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Import is not implemented for storage {}", getName());
+      }
+    
+
     /** Writes the data to a table in distributed manner.
       * It is supposed that implementation looks into SELECT part of the query and executes distributed
       * INSERT SELECT if it is possible with current storage as a receiver and query SELECT part as a producer.

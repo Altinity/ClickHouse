@@ -80,6 +80,9 @@ public:
     std::optional<size_t> totalRows(ContextPtr Local_context) const override;
     std::optional<size_t> totalBytes(ContextPtr Local_context) const override;
 
+    std::optional<String> partitionKey(ContextPtr) const override;
+    std::optional<String> sortingKey(ContextPtr) const override;
+
 protected:
     ObjectIterator iterate(
         const ActionsDAG * filter_dag,

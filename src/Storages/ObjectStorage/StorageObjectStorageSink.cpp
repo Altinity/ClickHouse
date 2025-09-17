@@ -133,8 +133,7 @@ PartitionedStorageObjectStorageSink::PartitionedStorageObjectStorageSink(
     std::optional<FormatSettings> format_settings_,
     const Block & sample_block_,
     ContextPtr context_)
-    : PartitionedSink(configuration_->getPartitionStrategy(), context_, sample_block_)
-    , object_storage(object_storage_)
+    : object_storage(object_storage_)
     , configuration(configuration_)
     , query_settings(configuration_->getQuerySettings(context_))
     , format_settings(format_settings_)
@@ -167,7 +166,7 @@ SinkPtr PartitionedStorageObjectStorageSink::createSinkForPartition(const String
         object_storage,
         configuration,
         format_settings,
-        partition_strategy->getFormatHeader(),
+        configuration->partition_strategy->getFormatHeader(),
         context
     );
 }

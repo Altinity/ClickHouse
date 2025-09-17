@@ -1713,6 +1713,22 @@ Possible values:
 - `global` — Replaces the `IN`/`JOIN` query with `GLOBAL IN`/`GLOBAL JOIN.`
 - `allow` — Allows the use of these types of subqueries.
 )", IMPORTANT) \
+    DECLARE(ObjectStorageClusterJoinMode, object_storage_cluster_join_mode, ObjectStorageClusterJoinMode::ALLOW, R"(
+Changes the behaviour of object storage cluster function or table.
+
+ClickHouse applies this setting when the query contains the product of object storage cluster function ot table, i.e. when the query for a object storage cluster function ot table contains a non-GLOBAL subquery for the object storage cluster function ot table.
+
+Restrictions:
+
+- Only applied for JOIN subqueries.
+- Only if the FROM section uses a object storage cluster function ot table.
+
+Possible values:
+
+- `local` — Replaces the database and table in the subquery with local ones for the destination server (shard), leaving the normal `IN`/`JOIN.`
+- `global` — Unsupported for now. Replaces the `IN`/`JOIN` query with `GLOBAL IN`/`GLOBAL JOIN.`
+- `allow` — Default value. Allows the use of these types of subqueries.
+)", 0) \
     \
     DECLARE(UInt64, max_concurrent_queries_for_all_users, 0, R"(
 Throw exception if the value of this setting is less or equal than the current number of simultaneously processed queries.
@@ -6895,6 +6911,9 @@ Execute request to object storage as remote on one of object_storage_cluster nod
     DECLARE_WITH_ALIAS(Bool, allow_experimental_time_series_aggregate_functions, false, R"(
 Experimental timeSeries* aggregate functions for Prometheus-like timeseries resampling, rate, delta calculation.
 )", EXPERIMENTAL, allow_experimental_ts_to_grid_aggregate_function) \
+    DECLARE_WITH_ALIAS(Bool, allow_experimental_export_merge_tree_part, false, R"(
+Experimental export merge tree part.
+)", EXPERIMENTAL, allow_experimental_export_merge_tree_part) \
     \
 
     /* ####################################################### */ \

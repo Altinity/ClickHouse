@@ -1,5 +1,6 @@
 #include <Core/ColumnWithTypeAndName.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
+#include <Storages/MergeTree/MergeTreePartInfo.h>
 
 #include <Common/logger_useful.h>
 #include <Core/Settings.h>
@@ -26,6 +27,7 @@
 #include <Storages/StorageFactory.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <Common/parseGlobs.h>
+#include <Storages/ObjectStorage/MergeTree/StorageObjectStorageImporterSink.h>
 #include <Databases/LoadingStrictnessLevel.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/HivePartitioningUtils.h>
@@ -424,7 +426,8 @@ SinkToStoragePtr StorageObjectStorage::write(
 
     if (configuration->getPartitionStrategy())
     {
-        return std::make_shared<PartitionedStorageObjectStorageSink>(object_storage, configuration, format_settings, sample_block, local_context);
+        auto sink_creator = std::make_shared<PartitionedStorageObjectStorageSink>(object_storage, configuration, format_settings, sample_block, local_context);
+        return std::make_shared<PartitionedSink>(configuration->partition_strategy, sink_creator, local_context, sample_block);
     }
 
     auto paths = configuration->getPaths();
@@ -441,6 +444,48 @@ SinkToStoragePtr StorageObjectStorage::write(
         format_settings,
         sample_block,
         local_context);
+}
+
+bool StorageObjectStorage::supportsImport() const
+{
+    return configuration->partition_strategy != nullptr && configuration->partition_strategy_type == PartitionStrategyFactory::StrategyType::HIVE;
+}
+
+SinkToStoragePtr StorageObjectStorage::import(
+    const std::string & file_name,
+    Block & block_with_partition_values,
+    ContextPtr local_context,
+    std::function<void(ImportStats)> part_log)
+{
+    std::string partition_key;
+
+    if (configuration->partition_strategy)
+    {
+        const auto column_with_partition_key = configuration->partition_strategy->computePartitionKey(block_with_partition_values);
+
+        if (!column_with_partition_key->empty())
+        {
+            partition_key = column_with_partition_key->getDataAt(0).toString();
+        }
+    }
+
+    const auto file_path = configuration->getPathForWrite(partition_key, file_name).path;
+
+    if (object_storage->exists(StoredObject(file_path)))
+    {
+        LOG_INFO(getLogger("StorageObjectStorage"), "File {} already exists, skipping import", file_path);
+        return nullptr;
+    }
+    
+    return std::make_shared<StorageObjectStorageImporterSink>(
+        file_path,
+        object_storage,
+        configuration,
+        format_settings,
+        getInMemoryMetadataPtr()->getSampleBlock(),
+        part_log,
+        local_context
+    );
 }
 
 void StorageObjectStorage::truncate(
@@ -603,6 +648,17 @@ void StorageObjectStorage::Configuration::initialize(
         setPartitionStrategyType(PartitionStrategyFactory::StrategyType::WILDCARD);
     }
 
+    if (partition_strategy_type == PartitionStrategyFactory::StrategyType::HIVE)
+    {
+        file_path_generator = std::make_shared<ObjectStorageAppendFilePathGenerator>(
+            getRawPath().path,
+            format);
+    }
+    else
+    {
+        file_path_generator = std::make_shared<ObjectStorageWildcardFilePathGenerator>(getRawPath().path);
+    }
+
     if (format == "auto")
     {
         if (isDataLakeConfiguration())
@@ -620,8 +676,7 @@ void StorageObjectStorage::Configuration::initialize(
     else
         FormatFactory::instance().checkFormatName(format);
 
-    /// It might be changed on `StorageObjectStorage::Configuration::initPartitionStrategy`
-    read_path = getRawPath();
+    read_path = file_path_generator->getPathForRead();
     initialized = true;
 }
 
@@ -639,7 +694,6 @@ void StorageObjectStorage::Configuration::initPartitionStrategy(ASTPtr partition
 
     if (partition_strategy)
     {
-        read_path = partition_strategy->getPathForRead(getRawPath().path);
         LOG_DEBUG(getLogger("StorageObjectStorageConfiguration"), "Initialized partition strategy {}", magic_enum::enum_name(partition_strategy_type));
     }
 }
@@ -651,16 +705,13 @@ const StorageObjectStorage::Configuration::Path & StorageObjectStorage::Configur
 
 StorageObjectStorage::Configuration::Path StorageObjectStorage::Configuration::getPathForWrite(const std::string & partition_id) const
 {
-    auto raw_path = getRawPath();
-
-    if (!partition_strategy)
-    {
-        return raw_path;
-    }
-
-    return Path {partition_strategy->getPathForWrite(raw_path.path, partition_id)};
+    return getPathForWrite(partition_id, /* filename_override */ "");
 }
 
+StorageObjectStorage::Configuration::Path StorageObjectStorage::Configuration::getPathForWrite(const std::string & partition_id, const std::string & filename_override) const
+{
+    return Path {file_path_generator->getPathForWrite(partition_id, filename_override)};
+}
 
 bool StorageObjectStorage::Configuration::Path::hasPartitionWildcard() const
 {

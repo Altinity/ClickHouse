@@ -7,6 +7,7 @@
 #include <Storages/ObjectStorage/IObjectIterator.h>
 #include <Storages/prepareReadingFromFormat.h>
 #include <Common/threadPoolCallbackRunner.h>
+#include "Storages/ObjectStorage/ObjectStorageFilePathGenerator.h"
 #include <Interpreters/ActionsDAG.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
@@ -98,6 +99,15 @@ public:
         const StorageMetadataPtr & metadata_snapshot,
         ContextPtr context,
         bool async_insert) override;
+
+
+    bool supportsImport() const override;
+
+    SinkToStoragePtr import(
+        const std::string & /* file_name */,
+        Block & /* block_with_partition_values */,
+        ContextPtr /* context */,
+        std::function<void(ImportStats)> /* part_log */) override;
 
     void truncate(
         const ASTPtr & query,
@@ -228,6 +238,8 @@ public:
     // Path used for writing, it should not be globbed and might contain a partition key
     virtual Path getPathForWrite(const std::string & partition_id) const;
 
+    Path getPathForWrite(const std::string & partition_id, const std::string & filename_override) const;
+
     virtual void setPathForRead(const Path & path)
     {
         read_path = path;
@@ -356,7 +368,6 @@ public:
 
     virtual void assertInitialized() const;
 
-private:
     String format = "auto";
     String compression_method = "auto";
     String structure = "auto";
@@ -373,6 +384,7 @@ private:
     // Path used for reading, by default it is the same as `getRawPath`
     // When using `partition_strategy=hive`, a recursive reading pattern will be appended `'table_root/**.parquet'
     Path read_path;
+    std::shared_ptr<ObjectStorageFilePathGenerator> file_path_generator;
 
 };
 

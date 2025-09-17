@@ -56,10 +56,11 @@ class FTResultsProcessor:
         success_finish: bool = False
         test_end: bool = True
 
-    def __init__(self, wd):
+    def __init__(self, wd, test_options):
         self.tests_output_file = f"{wd}/test_result.txt"
         # self.test_results_parsed_file = f"{wd}/test_result.tsv"
         # self.status_file = f"{wd}/check_status.tsv"
+        self.test_options = test_options
 
     def _process_test_output(self):
         total = 0
@@ -137,6 +138,8 @@ class FTResultsProcessor:
                 if DATABASE_SIGN in line:
                     test_end = True
 
+        test_options_string = ", ".join(self.test_options)
+
         test_results_ = []
         for test in test_results:
             try:
@@ -153,14 +156,25 @@ class FTResultsProcessor:
                 if test[1] == "FAIL":
                     broken_message = None
                     if test[0] in known_broken_tests.keys():
-                        if known_broken_tests[test[0]].get("message"):
-                            if (
-                                known_broken_tests[test[0]]["message"]
-                                in test_results_[-1].info
-                            ):
-                                broken_message = f"\nMarked as broken, matched message: '{known_broken_tests[test[0]]['message']}'"
+                        message = known_broken_tests[test[0]].get("message")
+                        check_types = known_broken_tests[test[0]].get("check_types")
+                        if check_types and not any(
+                            check_type in test_options_string
+                            for check_type in check_types
+                        ):
+                            broken_message = None
+                        elif message:
+                            if message in test_results_[-1].info:
+                                broken_message = (
+                                    f"\nMarked as broken, matched message: '{message}'"
+                                )
                         else:
                             broken_message = f"\nMarked as broken, no message specified"
+
+                        if broken_message and check_types:
+                            broken_message += (
+                                f", matched one or more check types {check_types}"
+                            )
 
                     if broken_message:
                         broken += 1

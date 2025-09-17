@@ -1,0 +1,16 @@
+---- Export 2020_1_1_0 and 2021_2_2_0
+---- Both data parts should appear
+test/s3_table_NAME/year=2020/2020_1_1_0.parquet	1
+test/s3_table_NAME/year=2020/2020_1_1_0.parquet	2
+test/s3_table_NAME/year=2020/2020_1_1_0.parquet	3
+test/s3_table_NAME/year=2021/2021_2_2_0.parquet	4
+---- Export the same part again, it should be idempotent
+test/s3_table_NAME/year=2020/2020_1_1_0.parquet	1
+test/s3_table_NAME/year=2020/2020_1_1_0.parquet	2
+test/s3_table_NAME/year=2020/2020_1_1_0.parquet	3
+test/s3_table_NAME/year=2021/2021_2_2_0.parquet	4
+---- Data in roundtrip MergeTree table (should match s3_table)
+1	2020
+2	2020
+3	2020
+4	2021

@@ -8,6 +8,8 @@ namespace DB
 {
 class StorageObjectStorageSink : public SinkToStorage
 {
+friend class StorageObjectStorageImporterSink;
+
 public:
     using ConfigurationPtr = StorageObjectStorage::ConfigurationPtr;
 
@@ -38,7 +40,7 @@ private:
     void cancelBuffers();
 };
 
-class PartitionedStorageObjectStorageSink : public PartitionedSink
+class PartitionedStorageObjectStorageSink : public PartitionedSink::SinkCreator
 {
 public:
     using ConfigurationPtr = StorageObjectStorage::ConfigurationPtr;

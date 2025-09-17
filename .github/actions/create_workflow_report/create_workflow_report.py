@@ -762,7 +762,7 @@ def create_workflow_report(
         "date": f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC",
         "is_preview": mark_preview,
         "counts": {
-            "jobs_status": f"{sum(fail_results['job_statuses']['job_status'] != 'success')} fail/error",
+            "jobs_status": f"{sum(fail_results['job_statuses']['job_status'].value_counts().get(x, 0) for x in ('failure', 'error'))} fail/error",
             "checks_errors": len(fail_results["checks_errors"]),
             "checks_new_fails": len(fail_results["checks_fails"]),
             "regression_new_fails": len(fail_results["regression_fails"]),

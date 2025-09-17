@@ -271,8 +271,6 @@ private:
     void fillNewPartName(MutableDataPartPtr & part, DataPartsLock & lock);
     void fillNewPartNameAndResetLevel(MutableDataPartPtr & part, DataPartsLock & lock);
 
-    void startBackgroundMovesIfNeeded() override;
-
     BackupEntries backupMutations(UInt64 version, const String & data_path_in_backup) const;
 
     /// Attaches restored parts to the storage.

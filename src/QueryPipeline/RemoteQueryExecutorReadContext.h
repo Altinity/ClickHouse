@@ -88,6 +88,7 @@ private:
     /// None -> Type -> Body -> None
     /// None -> Body -> None
     std::atomic<PacketPart> has_read_packet_part = PacketPart::None;
+    std::atomic_bool has_data_packets = false;
     Packet packet;
 
     RemoteQueryExecutor & executor;

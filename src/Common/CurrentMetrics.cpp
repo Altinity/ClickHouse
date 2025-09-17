@@ -430,6 +430,7 @@
     M(StartupScriptsExecutionState, "State of startup scripts execution: 0 = not finished, 1 = success, 2 = failure.") \
     \
     M(IsServerShuttingDown, "Indicates if the server is shutting down: 0 = no, 1 = yes") \
+    M(IsSwarmModeEnabled, "Indicates if the swarm mode enabled or not: 0 = disabled, 1 = enabled") \
     \
     M(TotalMergeFailures, "Number of all failed merges since startup, including the ones that were aborted") \
     M(NonAbortedMergeFailures, "Number of failed merges since startup, excluding the merges that were aborted") \
