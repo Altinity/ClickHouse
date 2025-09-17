@@ -85,7 +85,7 @@ jobs:
       - name: Extract and Parse JSON File
         run: |
           cd artifact
-          JSON_FILE=$(ls | grep "build_report.*package_release\.json" | head -n 1)
+          JSON_FILE=$(ls | grep -E "report.*release.*\.json" | head -n 1)
           if [ -z "$JSON_FILE" ]; then
             echo "Error: No JSON file matching the pattern was found"
             exit 1
