@@ -79,6 +79,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
             {"object_storage_remote_initiator", false, false, "New setting."},
             {"allow_experimental_export_merge_tree_part", false, false, "New setting."},
+            {"allow_experimental_iceberg_read_optimization", false, false, "New setting."}
         });
         addSettingsChanges(settings_changes_history, "25.6",
         {

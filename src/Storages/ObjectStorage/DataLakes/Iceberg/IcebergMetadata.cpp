@@ -60,6 +60,7 @@ extern const SettingsInt64 iceberg_timestamp_ms;
 extern const SettingsInt64 iceberg_snapshot_id;
 extern const SettingsBool use_iceberg_metadata_files_cache;
 extern const SettingsBool use_iceberg_partition_pruning;
+extern const SettingsBool allow_experimental_iceberg_read_optimization;
 }
 
 
@@ -1091,6 +1092,7 @@ ManifestFilePtr IcebergMetadata::getManifestFile(ContextPtr local_context, const
 DataFileInfos IcebergMetadata::getDataFilesImpl(const ActionsDAG * filter_dag, ContextPtr local_context) const
 {
     bool use_partition_pruning = filter_dag && local_context->getSettingsRef()[Setting::use_iceberg_partition_pruning];
+    bool use_iceberg_read_optimization = local_context->getSettingsRef()[Setting::allow_experimental_iceberg_read_optimization];
 
     {
         std::lock_guard cache_lock(cached_unprunned_files_for_last_processed_snapshot_mutex);
@@ -1122,7 +1124,8 @@ DataFileInfos IcebergMetadata::getDataFilesImpl(const ActionsDAG * filter_dag, C
                         if (std::holds_alternative<DataFileEntry>(manifest_file_entry.file))
                         {
                             data_files.push_back(DataFileInfo(std::get<DataFileEntry>(manifest_file_entry.file).file_name));
-                            data_files.back().file_meta_info = std::make_shared<DataFileMetaInfo>(manifest_file_entry.columns_infos);
+                            if (use_iceberg_read_optimization)
+                                data_files.back().file_meta_info = std::make_shared<DataFileMetaInfo>(manifest_file_entry.columns_infos);
                         }
                     }
                 }
