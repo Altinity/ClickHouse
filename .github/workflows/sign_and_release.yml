@@ -294,7 +294,6 @@ jobs:
       - name: Separate AMD binary
         run: |
           aws s3 mv "${DEST_URL}/packages/AMD_PACKAGES/clickhouse" "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/clickhouse"
-          aws s3 mv "${DEST_URL}/packages/AMD_PACKAGES/clickhouse-stripped" "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/clickhouse-stripped"
 
       - name: Process AMD binary
         if: ${{ env.NEEDS_BINARY_PROCESSING == 'true' }}
@@ -310,6 +309,8 @@ jobs:
             strip clickhouse -o clickhouse-stripped
             aws s3 cp clickhouse-stripped "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/"
             rm clickhouse-stripped
+          else
+            aws s3 mv "${DEST_URL}/packages/AMD_PACKAGES/clickhouse-stripped" "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/clickhouse-stripped"
           fi
           
           chmod +x clickhouse
