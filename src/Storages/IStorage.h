@@ -445,7 +445,7 @@ public:
     }
 
     /*
-      It is kind of hard to describe this API. It is currently only implemented in StorageObjectStorage.
+It is currently only implemented in StorageObjectStorage.
       It is meant to be used to import merge tree data parts into object storage. It is similar to the write API,
       but it won't re-partition the data and should allow the filename to be set by the caller.
     */
