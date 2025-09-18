@@ -1,7 +1,13 @@
 DOCKER_IMAGE=$(echo "$DOCKER_IMAGE" | sed 's/[\/:]/_/g')
 
-S3_PATH="s3://$S3_BUCKET/$PR_NUMBER/$COMMIT_SHA/grype/$DOCKER_IMAGE"
-HTTPS_S3_PATH="https://s3.amazonaws.com/$S3_BUCKET/$PR_NUMBER/$COMMIT_SHA/grype/$DOCKER_IMAGE"
+if [ "$PR_NUMBER" -eq 0 ]; then
+    PREFIX="REFs/$BRANCH/$COMMIT_SHA"
+else
+    PREFIX="PRs/$PR_NUMBER/$COMMIT_SHA"
+fi
+
+S3_PATH="s3://$S3_BUCKET/$PREFIX/grype/$DOCKER_IMAGE"
+HTTPS_S3_PATH="https://s3.amazonaws.com/$S3_BUCKET/$PREFIX/grype/$DOCKER_IMAGE"
 echo "https_s3_path=$HTTPS_S3_PATH" >> $GITHUB_OUTPUT
 
 tfs --no-colors transform nice raw.log nice.log.txt
