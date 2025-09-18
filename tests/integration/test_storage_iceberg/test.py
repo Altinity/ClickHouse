@@ -3453,7 +3453,7 @@ def test_system_tables_partition_sorting_keys(started_cluster, storage_type):
         WHERE name = '{table_name}' FORMAT csv
     """).strip().lower()
 
-    assert res == '"bucket(16, id), day(ts)","iddescnulls last, hour(ts)ascnulls first"'
+    assert res == '"bucket(16, id), day(ts)","id desc nulls last, hour(ts) asc nulls first"'
 
 @pytest.mark.parametrize("storage_type", ["local", "s3"])
 def test_compressed_metadata(started_cluster, storage_type):
