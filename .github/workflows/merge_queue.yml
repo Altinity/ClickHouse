@@ -51,7 +51,12 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
           COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: |
-          REPORT_LINK=https://s3.amazonaws.com/altinity-build-artifacts/$PR_NUMBER/$COMMIT_SHA/ci_run_report.html
+          if [ "$PR_NUMBER" -eq 0 ]; then
+            PREFIX="REFs/$BRANCH/$COMMIT_SHA"
+          else
+            PREFIX="PRs/$PR_NUMBER/$COMMIT_SHA"
+          fi
+          REPORT_LINK=https://s3.amazonaws.com/altinity-build-artifacts/$PREFIX/ci_run_report.html
           echo "Workflow Run Report: [View Report]($REPORT_LINK)" >> $GITHUB_STEP_SUMMARY
 
       - name: Prepare env script
