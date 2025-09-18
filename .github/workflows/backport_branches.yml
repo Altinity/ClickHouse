@@ -64,7 +64,7 @@ jobs:
           COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: |
           if [ "$PR_NUMBER" -eq 0 ]; then
-            PREFIX="REFs/$BRANCH/$COMMIT_SHA"
+            PREFIX="REFs/$GITHUB_REF_NAME/$COMMIT_SHA"
           else
             PREFIX="PRs/$PR_NUMBER/$COMMIT_SHA"
           fi

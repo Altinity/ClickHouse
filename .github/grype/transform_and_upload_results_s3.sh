@@ -1,7 +1,7 @@
 DOCKER_IMAGE=$(echo "$DOCKER_IMAGE" | sed 's/[\/:]/_/g')
 
 if [ "$PR_NUMBER" -eq 0 ]; then
-    PREFIX="REFs/$BRANCH/$COMMIT_SHA"
+    PREFIX="REFs/$GITHUB_REF_NAME/$COMMIT_SHA"
 else
     PREFIX="PRs/$PR_NUMBER/$COMMIT_SHA"
 fi
