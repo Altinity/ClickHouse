@@ -6906,7 +6906,7 @@ Allow retries in cluster request, when one node goes offline
     DECLARE(Bool, object_storage_remote_initiator, false, R"(
 Execute request to object storage as remote on one of object_storage_cluster nodes.
 )", EXPERIMENTAL) \
-    DECLARE(Bool, allow_experimental_iceberg_read_optimization, false, R"(
+    DECLARE(Bool, allow_experimental_iceberg_read_optimization, true, R"(
 Allow Iceberg read optimization based on Iceberg metadata.
 )", EXPERIMENTAL) \
     \

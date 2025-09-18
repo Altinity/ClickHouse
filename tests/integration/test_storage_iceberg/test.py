@@ -3071,6 +3071,7 @@ def test_minmax_pruning(started_cluster, storage_type, is_table_function):
         == 1
     )
 
+
 @pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
 def test_explicit_metadata_file(started_cluster, storage_type):
     instance = started_cluster.instances["node1"]
@@ -3114,6 +3115,7 @@ def test_explicit_metadata_file(started_cluster, storage_type):
         create_iceberg_table(storage_type, instance, TABLE_NAME, started_cluster, explicit_metadata_path=chr(0) + chr(1))
     with pytest.raises(Exception):
         create_iceberg_table(storage_type, instance, TABLE_NAME, started_cluster, explicit_metadata_path="../metadata/v11.metadata.json")
+
 
 @pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
 @pytest.mark.parametrize("run_on_cluster", [False, True])
@@ -3341,6 +3343,7 @@ def test_cluster_table_function_with_partition_pruning(
         run_on_cluster=True,
     )
 
+
 @pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
 def test_minmax_pruning_for_arrays_and_maps_subfields_disabled(started_cluster, storage_type):
     instance = started_cluster.instances["node1"]
@@ -3410,6 +3413,7 @@ def test_minmax_pruning_for_arrays_and_maps_subfields_disabled(started_cluster, 
 
     instance.query(f"SELECT * FROM {table_select_expression} ORDER BY ALL")
 
+
 @pytest.mark.parametrize("storage_type", ["s3"])
 def test_system_tables_partition_sorting_keys(started_cluster, storage_type):
     instance = started_cluster.instances["node1"]
@@ -3455,6 +3459,7 @@ def test_system_tables_partition_sorting_keys(started_cluster, storage_type):
 
     assert res == '"bucket(16, id), day(ts)","iddescnulls last, hour(ts)ascnulls first"'
 
+
 @pytest.mark.parametrize("storage_type", ["local", "s3"])
 def test_compressed_metadata(started_cluster, storage_type):
     instance = started_cluster.instances["node1"]
@@ -3492,3 +3497,203 @@ def test_compressed_metadata(started_cluster, storage_type):
     create_iceberg_table(storage_type, instance, TABLE_NAME, started_cluster, explicit_metadata_path="")
 
     assert instance.query(f"SELECT * FROM {TABLE_NAME} WHERE not ignore(*)") == "1\tAlice\n2\tBob\n"
+
+
+@pytest.mark.parametrize("storage_type", ["s3", "azure"])
+@pytest.mark.parametrize("run_on_cluster", [False, True])
+def test_read_constant_columns_optimization(started_cluster, storage_type, run_on_cluster):
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
+    TABLE_NAME = "test_read_constant_columns_optimization_" + storage_type + "_" + get_uuid_str()
+
+    def execute_spark_query(query: str):
+        return execute_spark_query_general(
+            spark,
+            started_cluster,
+            storage_type,
+            TABLE_NAME,
+            query,
+        )
+
+    execute_spark_query(
+        f"""
+            CREATE TABLE {TABLE_NAME} (
+                tag INT,
+                date DATE,
+                date2 DATE,
+                name VARCHAR(50),
+                number BIGINT
+            )
+            USING iceberg
+            PARTITIONED BY (identity(tag), years(date))
+            OPTIONS('format-version'='2')
+        """
+    )
+
+    execute_spark_query(
+        f"""
+        INSERT INTO {TABLE_NAME} VALUES
+        (1, DATE '2024-01-20', DATE '2024-01-20', 'vasya', 5),
+        (1, DATE '2024-01-20', DATE '2024-01-20', 'vasilisa', 5),
+        (1, DATE '2025-01-20', DATE '2025-01-20', 'vasya', 5),
+        (1, DATE '2025-01-20', DATE '2025-01-20', 'vasya', 5),
+        (2, DATE '2025-01-20', DATE '2025-01-20', 'vasilisa', 5),
+        (2, DATE '2025-01-21', DATE '2025-01-20', 'vasilisa', 5)
+    """
+    )
+
+    execute_spark_query(
+        f"""
+            ALTER TABLE {TABLE_NAME} ALTER COLUMN number FIRST;
+        """
+    )
+
+    execute_spark_query(
+        f"""
+        INSERT INTO {TABLE_NAME} VALUES
+        (5, 3, DATE '2025-01-20', DATE '2024-01-20', 'vasilisa'),
+        (5, 3, DATE '2025-01-20', DATE '2025-01-20', 'vasilisa')
+    """
+    )
+
+    execute_spark_query(
+        f"""
+            ALTER TABLE {TABLE_NAME}
+            ADD COLUMNS (
+                name2 string
+            );
+        """
+    )
+
+    execute_spark_query(
+        f"""
+        INSERT INTO {TABLE_NAME} VALUES
+        (5, 4, DATE '2025-01-20', DATE '2024-01-20', 'vasya', 'iceberg'),
+        (5, 4, DATE '2025-01-20', DATE '2025-01-20', 'vasilisa', 'iceberg'),
+        (5, 5, DATE '2025-01-20', DATE '2024-01-20', 'vasya', 'iceberg'),
+        (5, 5, DATE '2025-01-20', DATE '2024-01-20', 'vasilisa', 'icebreaker'),
+        (5, 6, DATE '2025-01-20', DATE '2024-01-20', 'vasya', 'iceberg'),
+        (5, 6, DATE '2025-01-20', DATE '2024-01-20', 'vasya', 'iceberg')
+    """
+    )
+
+    # Totally must be 7 files
+    # Partitioned column 'tag' is constant in each file
+    # Column 'date' is constant in 6 files, has different values in (2-2025)
+    # Column 'date2' is constant in 4 files (1-2024, 2-2025, 5-2025, 6-2025)
+    # Column 'name' is constant in 3 files (1-2025, 2-2025, 6-2025)
+    # Column 'number' is globally constant
+    # Column 'name2' is present only in 3 files (4-2025, 5-2025, 6-2025), constant in two (4-2025, 6-2025)
+    # Files 1-2025 and 6-2025 have only constant columns
+
+    creation_expression = get_creation_expression(
+        storage_type, TABLE_NAME, started_cluster, table_function=True, run_on_cluster=run_on_cluster
+    )
+
+    # Warm up metadata cache
+    for replica in started_cluster.instances.values():
+        replica.query(f"SELECT * FROM {creation_expression} ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=0")
+
+    all_data_expected_query_id = str(uuid.uuid4())
+    all_data_expected = instance.query(
+        f"SELECT * FROM {creation_expression} ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=0",
+        query_id=all_data_expected_query_id,
+        )
+    const_only_expected_query_id = str(uuid.uuid4())
+    const_only_expected = instance.query(
+        f"SELECT tag, number FROM {creation_expression} ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=0",
+        query_id=const_only_expected_query_id,
+        )
+    const_partial_expected_query_id = str(uuid.uuid4())
+    const_partial_expected = instance.query(
+        f"SELECT tag, date2, number, name FROM {creation_expression} ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=0",
+        query_id=const_partial_expected_query_id,
+        )
+    const_partial2_expected_query_id = str(uuid.uuid4())
+    const_partial2_expected = instance.query(
+        f"SELECT tag, date2, number, name2 FROM {creation_expression} ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=0",
+        query_id=const_partial2_expected_query_id,
+        )
+    count_expected_query_id = str(uuid.uuid4())
+    count_expected = instance.query(
+        f"SELECT count(),tag FROM {creation_expression} GROUP BY ALL ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=0",
+        query_id=count_expected_query_id,
+        )
+
+    all_data_query_id = str(uuid.uuid4())
+    all_data_optimized = instance.query(
+        f"SELECT * FROM {creation_expression} ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=1",
+        query_id=all_data_query_id,
+        )
+    const_only_query_id = str(uuid.uuid4())
+    const_only_optimized = instance.query(
+        f"SELECT tag, number FROM {creation_expression} ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=1",
+        query_id=const_only_query_id,
+        )
+    const_partial_query_id = str(uuid.uuid4())
+    const_partial_optimized = instance.query(
+        f"SELECT tag, date2, number, name FROM {creation_expression} ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=1",
+        query_id=const_partial_query_id,
+        )
+    const_partial2_query_id = str(uuid.uuid4())
+    const_partial2_optimized = instance.query(
+        f"SELECT tag, date2, number, name2 FROM {creation_expression} ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=1",
+        query_id=const_partial2_query_id,
+        )
+    count_query_id = str(uuid.uuid4())
+    count_optimized = instance.query(
+        f"SELECT count(),tag FROM {creation_expression} GROUP BY ALL ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=1",
+        query_id=count_query_id,
+        )
+
+    assert all_data_expected == all_data_optimized
+    assert const_only_expected == const_only_optimized
+    assert const_partial_expected == const_partial_optimized
+    assert const_partial2_expected == const_partial2_optimized
+    assert count_expected == count_optimized
+
+    for replica in started_cluster.instances.values():
+        replica.query("SYSTEM FLUSH LOGS")
+
+    def get_events(query_id, event):
+        res = instance.query(
+            f"""
+            SELECT
+                sum(tupleElement(arrayJoin(ProfileEvents),2)) as value
+            FROM
+                clusterAllReplicas('cluster_simple', system.query_log)
+            WHERE
+                type='QueryFinish'
+                AND tupleElement(arrayJoin(ProfileEvents),1)='{event}'
+                AND initial_query_id='{query_id}'
+            GROUP BY ALL
+            FORMAT CSV
+            """)
+        return int(res)
+
+    event = "S3GetObject" if storage_type == "s3" else "AzureGetObject"
+
+    events_all_data_expected = get_events(all_data_expected_query_id, event)
+    events_const_only_expected = get_events(const_only_expected_query_id, event)
+    events_const_partial_expected = get_events(const_partial_expected_query_id, event)
+    events_const_partial2_expected = get_events(const_partial2_expected_query_id, event)
+    events_count_expected = get_events(count_expected_query_id, event)
+
+    # Without optimization clickhouse reads all 7 files
+    assert events_all_data_expected == 7
+    assert events_const_only_expected == 7
+    assert events_const_partial_expected == 7
+    assert events_const_partial2_expected == 7
+    assert events_count_expected == 7
+
+    events_all_data_optimized = get_events(all_data_query_id, event) # 1-2025, 6-2025 must not be read
+    events_const_only_optimized = get_events(const_only_query_id, event) # All must not be read
+    events_const_partial_optimized = get_events(const_partial_query_id, event) # 1-2025, 6-2025 and 2-2025 must not be read
+    events_const_partial2_optimized = get_events(const_partial2_query_id, event) # 1-2024, 1-2025, 2-2025 and 6-2025 must not be read
+    events_count_optimized = get_events(count_query_id, event) # All must not be read
+
+    assert events_all_data_optimized == 5
+    assert events_const_only_optimized == 0
+    assert events_const_partial_optimized == 4
+    assert events_const_partial2_optimized == 3
+    assert events_count_optimized == 0
