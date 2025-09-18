@@ -113,6 +113,7 @@
 #include <thread>
 #include <unordered_set>
 #include <filesystem>
+#include <utility>
 
 #include <fmt/format.h>
 #include <Poco/Logger.h>
@@ -154,6 +155,10 @@ namespace ProfileEvents
     extern const Event LoadedDataPartsMicroseconds;
     extern const Event RestorePartsSkippedFiles;
     extern const Event RestorePartsSkippedBytes;
+    extern const Event PartsExports;
+    extern const Event PartsExportTotalMilliseconds;
+    extern const Event PartsExportFailures;
+    extern const Event PartsExportDuplicated;
 }
 
 namespace CurrentMetrics
@@ -198,6 +203,8 @@ namespace Setting
     extern const SettingsUInt64 merge_tree_storage_snapshot_sleep_ms;
     extern const SettingsBool allow_experimental_export_merge_tree_part;
     extern const SettingsUInt64 min_bytes_to_use_direct_io;
+    extern const SettingsBool export_merge_tree_part_overwrite_file_if_exists;
+    extern const SettingsBool output_format_parallel_formatting;
 }
 
 namespace MergeTreeSetting
@@ -310,6 +317,7 @@ namespace ErrorCodes
     extern const int CANNOT_FORGET_PARTITION;
     extern const int DATA_TYPE_CANNOT_BE_USED_IN_KEY;
     extern const int UNKNOWN_TABLE;
+    extern const int FILE_ALREADY_EXISTS;
 }
 
 static void checkSuspiciousIndices(const ASTFunction * index_function)
@@ -5932,9 +5940,15 @@ void MergeTreeData::exportPartToTable(const PartitionCommand & command, ContextP
                         part_name, getStorageID().getFullTableName());
 
     {
+        MergeTreeExportManifest manifest(
+            dest_storage->getStorageID(),
+            part,
+            query_context->getSettingsRef()[Setting::export_merge_tree_part_overwrite_file_if_exists],
+            query_context->getSettingsRef()[Setting::output_format_parallel_formatting]);
+
         std::lock_guard lock(export_manifests_mutex);
 
-        if (!export_manifests.emplace(dest_storage->getStorageID(), part).second)  
+        if (!export_manifests.emplace(std::move(manifest)).second)
         {
             throw Exception(ErrorCodes::ABORTED, "Data part '{}' is already being exported to table '{}'",
                             part_name, dest_storage->getStorageID().getFullTableName());
@@ -5948,19 +5962,6 @@ void MergeTreeData::exportPartToTableImpl(
     const MergeTreeExportManifest & manifest,
     ContextPtr local_context)
 {
-    auto exports_list_entry = getContext()->getExportsList().insert(
-        getStorageID(),
-        manifest.destination_storage_id,
-        manifest.data_part->getBytesOnDisk(),
-        manifest.data_part->name,
-        manifest.data_part->rows_count,
-        manifest.data_part->getBytesOnDisk(),
-        manifest.data_part->getBytesUncompressedOnDisk(),
-        manifest.create_time,
-        local_context);
-
-    ThreadGroupSwitcher switcher((*exports_list_entry)->thread_group, "");
-
     auto metadata_snapshot = getInMemoryMetadataPtr();
     Names columns_to_read = metadata_snapshot->getColumns().getNamesOfPhysical();
     StorageSnapshotPtr storage_snapshot = getStorageSnapshot(metadata_snapshot, local_context);
@@ -5987,16 +5988,29 @@ void MergeTreeData::exportPartToTableImpl(
         throw Exception(ErrorCodes::UNKNOWN_TABLE, "Failed to reconstruct destination storage: {}", destination_storage_id_name);
     }
 
-    auto sink = destination_storage->import(
-        manifest.data_part->name,
-        block_with_partition_values,
-        local_context);
+    SinkToStoragePtr sink;
+    std::string destination_file_path;
 
-    /// Most likely the file has already been imported, so we can just return
-    if (!sink)
+    try
     {
-        std::lock_guard inner_lock(export_manifests_mutex);
+        auto context_copy = Context::createCopy(local_context);
+        context_copy->setSetting("output_format_parallel_formatting", manifest.parallel_formatting);
 
+        sink = destination_storage->import(
+            manifest.data_part->name,
+            block_with_partition_values,
+            destination_file_path,
+            manifest.overwrite_file_if_exists,
+            context_copy);
+    }
+    catch (const Exception & e)
+    {
+        if (e.code() == ErrorCodes::FILE_ALREADY_EXISTS)
+        {
+            ProfileEvents::increment(ProfileEvents::PartsExportDuplicated);
+        }
+
+        std::lock_guard inner_lock(export_manifests_mutex);
         export_manifests.erase(manifest);
         return;
     }
@@ -6037,6 +6051,20 @@ void MergeTreeData::exportPartToTableImpl(
         local_context,
         getLogger("ExportPartition"));
 
+    auto exports_list_entry = getContext()->getExportsList().insert(
+        getStorageID(),
+        manifest.destination_storage_id,
+        manifest.data_part->getBytesOnDisk(),
+        manifest.data_part->name,
+        destination_file_path,
+        manifest.data_part->rows_count,
+        manifest.data_part->getBytesOnDisk(),
+        manifest.data_part->getBytesUncompressedOnDisk(),
+        manifest.create_time,
+        local_context);
+
+    ThreadGroupSwitcher switcher((*exports_list_entry)->thread_group, "");
+
     QueryPlanOptimizationSettings optimization_settings(local_context);
     auto pipeline_settings = BuildQueryPipelineSettings(local_context);
     auto builder = plan_for_part.buildQueryPipeline(optimization_settings, pipeline_settings);
@@ -6070,10 +6098,15 @@ void MergeTreeData::exportPartToTableImpl(
             exports_list_entry.get());
 
         export_manifests.erase(manifest);
+
+        ProfileEvents::increment(ProfileEvents::PartsExports);
+        ProfileEvents::increment(ProfileEvents::PartsExportTotalMilliseconds, static_cast<UInt64>((*exports_list_entry)->elapsed * 1000));
     }
-    catch (const Exception &)
+    catch (...)
     {
-        tryLogCurrentException(__PRETTY_FUNCTION__, "Exception is in export part task");
+        tryLogCurrentException(__PRETTY_FUNCTION__, fmt::format("while exporting the part {}. User should retry.", manifest.data_part->name));
+
+        ProfileEvents::increment(ProfileEvents::PartsExportFailures);
 
         std::lock_guard inner_lock(export_manifests_mutex);
         writePartLog(
@@ -8751,6 +8784,7 @@ try
         part_log_elem.rows_read = (*exports_entry)->rows_read;
         part_log_elem.bytes_read_uncompressed = (*exports_entry)->bytes_read_uncompressed;
         part_log_elem.peak_memory_usage = (*exports_entry)->getPeakMemoryUsage();
+        part_log_elem.path_on_disk = (*exports_entry)->destination_file_path;
     }
 
     if (profile_counters)

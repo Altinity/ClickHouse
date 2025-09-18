@@ -28,6 +28,10 @@
     M(AsyncInsertBytes, "Data size in bytes of asynchronous INSERT queries.", ValueType::Bytes) \
     M(AsyncInsertRows, "Number of rows inserted by asynchronous INSERT queries.", ValueType::Number) \
     M(AsyncInsertCacheHits, "Number of times a duplicate hash id has been found in asynchronous INSERT hash id cache.", ValueType::Number) \
+    M(PartsExports, "Number of successful part exports.", ValueType::Number) \
+    M(PartsExportFailures, "Number of failed part exports.", ValueType::Number) \
+    M(PartsExportDuplicated, "Number of part exports that failed because target already exists.", ValueType::Number) \
+    M(PartsExportTotalMilliseconds, "Total time spent on part export operations.", ValueType::Milliseconds) \
     M(FailedQuery, "Number of failed queries.", ValueType::Number) \
     M(FailedSelectQuery, "Same as FailedQuery, but only for SELECT queries.", ValueType::Number) \
     M(FailedInsertQuery, "Same as FailedQuery, but only for INSERT queries.", ValueType::Number) \

@@ -22,6 +22,7 @@ ColumnsDescription StorageSystemExports::getColumnsDescription()
         {"destination_table", std::make_shared<DataTypeString>(), "Name of the destination table."},
         {"create_time", std::make_shared<DataTypeDateTime>(), "Date and time when the export command was submitted for execution."},
         {"part_name", std::make_shared<DataTypeString>(), "Name of the part"},
+        {"destination_file_path", std::make_shared<DataTypeString>(), "File path where the part is being exported."},
         {"elapsed", std::make_shared<DataTypeFloat64>(), "The time elapsed (in seconds) since the export started."},
         {"rows_read", std::make_shared<DataTypeUInt64>(), "The number of rows read from the exported part."},
         {"total_rows_to_read", std::make_shared<DataTypeUInt64>(), "The total number of rows to read from the exported part."},
@@ -50,6 +51,7 @@ void StorageSystemExports::fillData(MutableColumns & res_columns, ContextPtr con
         res_columns[i++]->insert(export_info.destination_table);
         res_columns[i++]->insert(export_info.create_time);
         res_columns[i++]->insert(export_info.part_name);
+        res_columns[i++]->insert(export_info.destination_file_path);
         res_columns[i++]->insert(export_info.elapsed);
         res_columns[i++]->insert(export_info.rows_read);
         res_columns[i++]->insert(export_info.total_rows_to_read);

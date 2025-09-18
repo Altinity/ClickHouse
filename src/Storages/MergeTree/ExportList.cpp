@@ -8,6 +8,7 @@ ExportsListElement::ExportsListElement(
     const StorageID & destination_table_id_,
     UInt64 part_size_,
     const String & part_name_,
+    const String & target_file_name_,
     UInt64 total_rows_to_read_,
     UInt64 total_size_bytes_compressed_,
     UInt64 total_size_bytes_uncompressed_,
@@ -17,6 +18,7 @@ ExportsListElement::ExportsListElement(
 , destination_table_id(destination_table_id_)
 , part_size(part_size_)
 , part_name(part_name_)
+, destination_file_path(target_file_name_)
 , total_rows_to_read(total_rows_to_read_)
 , total_size_bytes_compressed(total_size_bytes_compressed_)
 , total_size_bytes_uncompressed(total_size_bytes_uncompressed_)
@@ -33,6 +35,7 @@ ExportInfo ExportsListElement::getInfo() const
     res.destination_database = destination_table_id.database_name;
     res.destination_table = destination_table_id.table_name;
     res.part_name = part_name;
+    res.destination_file_path = destination_file_path;
     res.rows_read = rows_read;
     res.total_rows_to_read = total_rows_to_read;
     res.total_size_bytes_compressed = total_size_bytes_compressed;

@@ -452,10 +452,12 @@ It is currently only implemented in StorageObjectStorage.
     virtual SinkToStoragePtr import(
         const std::string & /* file_name */,
         Block & /* block_with_partition_values */,
+        std::string & /* destination_file_path */,
+        bool /* overwrite_if_exists */,
         ContextPtr /* context */)
-      { 
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Import is not implemented for storage {}", getName());
-      }
+    {
+      throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Import is not implemented for storage {}", getName());
+    }
     
 
     /** Writes the data to a table in distributed manner.
