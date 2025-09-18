@@ -1125,7 +1125,10 @@ DataFileInfos IcebergMetadata::getDataFilesImpl(const ActionsDAG * filter_dag, C
                         {
                             data_files.push_back(DataFileInfo(std::get<DataFileEntry>(manifest_file_entry.file).file_name));
                             if (use_iceberg_read_optimization)
-                                data_files.back().file_meta_info = std::make_shared<DataFileMetaInfo>(manifest_file_entry.columns_infos);
+                                data_files.back().file_meta_info = std::make_shared<DataFileMetaInfo>(
+                                    schema_processor,
+                                    relevant_snapshot_schema_id,
+                                    manifest_file_entry.columns_infos);
                         }
                     }
                 }

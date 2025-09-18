@@ -340,6 +340,11 @@ Chunk StorageObjectStorageSource::generate()
             {
                 for (const auto & constant_column : reader.constant_columns_with_values)
                 {
+                    LOG_DEBUG(log, "Restore constant column '{}' index {} with value '{}'",
+                        constant_column.second.name_and_type.name,
+                        constant_column.first,
+                        constant_column.second.value
+                    );
                     chunk.addColumn(constant_column.first,
                         constant_column.second.name_and_type.type->createColumnConst(
                             chunk.getNumRows(), constant_column.second.value)->convertToFullColumnIfConst());
@@ -543,77 +548,64 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
     std::map<size_t, ConstColumnWithValue> constant_columns_with_values;
     std::unordered_set<String> constant_columns;
 
+    NamesAndTypesList requested_columns_copy = read_from_format_info.requested_columns;
+
     std::unordered_map<String, std::pair<size_t, NameAndTypePair>> requested_columns_list;
     {
         size_t column_index = 0;
-        for (const auto & column : read_from_format_info.requested_columns)
+        for (const auto & column : requested_columns_copy)
             requested_columns_list[column.getNameInStorage()] = std::make_pair(column_index++, column);
     }
 
-    std::unordered_map<Int32, String> physical_columns_names;
-    Int32 column_counter = 0;
-    /// In Iceberg metadata columns' numbers starts from 1, so preincrement used
-    for (const auto & column : read_from_format_info.physical_columns)
-        physical_columns_names[++column_counter] = column.getNameInStorage();
-    /// now column_counter contains maximum column index
-
-    NamesAndTypesList requested_columns_copy = read_from_format_info.requested_columns;
-
     if (context_->getSettingsRef()[Setting::allow_experimental_iceberg_read_optimization])
     {
-        auto file_meta_data = object_info->getFileMetaInfo();
-        if (file_meta_data.has_value())
+        auto schema = configuration->tryGetTableStructureFromMetadata();
+        if (schema.has_value())
         {
-            for (const auto & column : file_meta_data.value()->columns_info)
+            auto file_meta_data = object_info->getFileMetaInfo();
+            if (file_meta_data.has_value())
             {
-                if (column.second.hyperrectangle.has_value())
+                for (const auto & column : file_meta_data.value()->columns_info)
                 {
-                    if (column.second.hyperrectangle.value().isPoint())
+                    if (column.second.hyperrectangle.has_value())
                     {
-                        auto column_id = column.first;
+                        if (column.second.hyperrectangle.value().isPoint())
+                        {
+                            auto column_name = column.first;
 
-                        if (column_id <= 0 || column_id > column_counter)
-                        { /// Something wrong, ignore file metadata
-                            LOG_WARNING(log, "Incorrect column ID: {}, ignoring file metadata", column_id);
-                            constant_columns.clear();
-                            break;
+                            auto i_column = requested_columns_list.find(column_name);
+                            if (i_column == requested_columns_list.end())
+                                continue;
+
+                            /// isPoint() method checks that left==right
+                            constant_columns_with_values[i_column->second.first] =
+                                ConstColumnWithValue{
+                                    i_column->second.second,
+                                    column.second.hyperrectangle.value().left
+                                };
+                            constant_columns.insert(column_name);
+
+                            LOG_DEBUG(log, "In file {} constant column '{}' id {} type '{}' with value '{}'",
+                                object_info->getPath(),
+                                column_name,
+                                i_column->second.first,
+                                i_column->second.second.type,
+                                column.second.hyperrectangle.value().left.dump());
                         }
-
-                        const auto & column_name = physical_columns_names[column_id];
-
-                        auto i_column = requested_columns_list.find(column_name);
-                        if (i_column == requested_columns_list.end())
-                            continue;
-
-                        /// isPoint() method checks that left==right
-                        constant_columns_with_values[i_column->second.first] =
-                            ConstColumnWithValue{
-                                i_column->second.second,
-                                column.second.hyperrectangle.value().left
-                            };
-                        constant_columns.insert(column_name);
-
-                        LOG_DEBUG(log, "In file {} constant column {} with value {}",
-                            object_info->getPath(), column_name, column.second.hyperrectangle.value().left.dump());
                     }
                 }
             }
-        }
 
-        if (!constant_columns.empty())
-        {
-            size_t original_columns = requested_columns_copy.size();
-            requested_columns_copy = requested_columns_copy.eraseNames(constant_columns);
-            if (requested_columns_copy.size() + constant_columns.size() != original_columns)
+            if (!constant_columns.empty())
             {
-                LOG_WARNING(log, "Can't remove constant columns for file {} correct, fallback to read. Founded constant columns: [{}]",
-                    object_info->getPath(), constant_columns);
-                requested_columns_copy = read_from_format_info.requested_columns;
-                constant_columns.clear();
-                constant_columns_with_values.clear();
+                size_t original_columns = requested_columns_copy.size();
+                requested_columns_copy = requested_columns_copy.eraseNames(constant_columns);
+                if (requested_columns_copy.size() + constant_columns.size() != original_columns)
+                    throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't remove constant columns for file {} correct, fallback to read. Founded constant columns: [{}]",
+                        object_info->getPath(), constant_columns);
+                if (requested_columns_copy.empty())
+                    need_only_count = true;
             }
-            else if (requested_columns_copy.empty())
-                need_only_count = true;
         }
     }
 

@@ -92,12 +92,12 @@ DataFileMetaInfo::DataFileMetaInfo(Poco::JSON::Object::Ptr file_info)
         {
             auto column = columns->getObject(static_cast<UInt32>(i));
 
-            Int32 id;
-            if (column->has("id"))
-                id = column->get("id");
+            std::string name;
+            if (column->has("name"))
+                name = column->get("name").toString();
             else
             {
-                LOG_WARNING(log, "Can't read column id, ignored");
+                LOG_WARNING(log, "Can't read column name, ignored");
                 continue;
             }
 
@@ -117,20 +117,38 @@ DataFileMetaInfo::DataFileMetaInfo(Poco::JSON::Object::Ptr file_info)
                 }
                 catch (const Exception & e)
                 {
-                    LOG_WARNING(log, "Can't read range for column {}, range '{}' ignored, error: {}", id, r, e.what());
+                    LOG_WARNING(log, "Can't read range for column {}, range '{}' ignored, error: {}", name, r, e.what());
                 }
             }
 
-            columns_info[id] = column_info;
+            columns_info[name] = column_info;
         }
     }
 }
 
-DataFileMetaInfo::DataFileMetaInfo(const std::unordered_map<Int32, Iceberg::ColumnInfo> & columns_info_)
+DataFileMetaInfo::DataFileMetaInfo(
+    const IcebergSchemaProcessor & schema_processor,
+    Int32 schema_id,
+    const std::unordered_map<Int32, Iceberg::ColumnInfo> & columns_info_)
 {
+    std::vector<Int32> column_ids;
+    for (const auto & column : columns_info_)
+        column_ids.push_back(column.first);
+    auto name_and_types = schema_processor.tryGetFieldsCharacteristics(schema_id, column_ids);
+    std::unordered_map<Int32, std::string> name_by_index;
+    for (const auto & name_and_type : name_and_types)
+    {
+        const auto name = name_and_type.getNameInStorage();
+        auto index = schema_processor.tryGetColumnIDByName(schema_id, name);
+        if (index.has_value())
+            name_by_index[index.value()] = name;
+    }
+
     for (const auto & column : columns_info_)
     {
-        columns_info[column.first] = {column.second.rows_count, column.second.nulls_count, column.second.hyperrectangle};
+        auto i_name = name_by_index.find(column.first);
+        if (i_name != name_by_index.end())
+            columns_info[i_name->second] = {column.second.rows_count, column.second.nulls_count, column.second.hyperrectangle};
     }
 }
 
@@ -145,7 +163,7 @@ Poco::JSON::Object::Ptr DataFileMetaInfo::toJson() const
         for (const auto & column : columns_info)
         {
             Poco::JSON::Object::Ptr column_info = new Poco::JSON::Object();
-            column_info->set("id", column.first);
+            column_info->set("name", column.first);
             if (column.second.rows_count.has_value())
                 column_info->set("rows", column.second.rows_count.value());
             if (column.second.nulls_count.has_value())

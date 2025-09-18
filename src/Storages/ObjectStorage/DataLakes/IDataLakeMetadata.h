@@ -8,6 +8,8 @@
 #include <Storages/prepareReadingFromFormat.h>
 #include <Poco/JSON/Object.h>
 
+#include <Storages/ObjectStorage/DataLakes/Iceberg/SchemaProcessor.h>
+
 namespace Iceberg
 {
 
@@ -29,7 +31,10 @@ public:
     DataFileMetaInfo() = default;
 
     // Extract metadata from Iceberg structure
-    explicit DataFileMetaInfo(const std::unordered_map<Int32, Iceberg::ColumnInfo> & columns_info_);
+    explicit DataFileMetaInfo(
+        const IcebergSchemaProcessor & schema_processor,
+        Int32 schema_id,
+        const std::unordered_map<Int32, Iceberg::ColumnInfo> & columns_info_);
 
     // Deserialize from json in distributed requests
     explicit DataFileMetaInfo(const Poco::JSON::Object::Ptr file_info);
@@ -44,7 +49,7 @@ public:
         std::optional<DB::Range> hyperrectangle;
     };
 
-    std::unordered_map<Int32, ColumnInfo> columns_info;
+    std::unordered_map<std::string, ColumnInfo> columns_info;
 };
 
 using DataFileMetaInfoPtr = std::shared_ptr<DataFileMetaInfo>;
