@@ -1,6 +1,8 @@
-| Feature | Altinity PR | First Altinity Release | upstream PR | First upstream Release |
+| Feature | PR (Altinity) | First Release (Altinity) | PR (upstream) | First Release (upstream) |
 | ------- | :---: | :---: | :---: | :---: |
 | <   **PERFORMANCE**   >||||
+| Support writing parquet enum as byte array|https://github.com/Altinity/ClickHouse/pull/989|25.6.5|https://github.com/ClickHouse/ClickHouse/pull/81090|25.7.1
+| AWS S3 authentication with an explicitly provided IAM role|https://github.com/Altinity/ClickHouse/pull/986|25.6.5|https://github.com/ClickHouse/ClickHouse/pull/84011|25.8.1
 | Iceberg table pruning in cluster requests|https://github.com/Altinity/ClickHouse/pull/770|25.2.2||
 | ListObjectsV2 cache|https://github.com/Altinity/ClickHouse/pull/743|25.2.2||
 | Improve performance of hive path parsing|https://github.com/Altinity/ClickHouse/pull/734|25.2.2|https://github.com/ClickHouse/ClickHouse/pull/79067|25.5.1
@@ -16,8 +18,13 @@
 | Parquet file metadata caching|https://github.com/Altinity/ClickHouse/pull/586|24.12.2||
 | Parquet file metadata caching: use cache for parquetmetadata format|https://github.com/Altinity/ClickHouse/pull/636|24.12.2||
 | Parquet file metadata caching: turn cache on by default|https://github.com/Altinity/ClickHouse/pull/669, https://github.com/Altinity/ClickHouse/pull/674|24.12.2||
+|---|
 | <   **SWARMS**   >||||
-| Restart cluster tasks on connection lost|https://github.com/Altinity/ClickHouse/pull/780|`25.3.x` (planned)||
+| Restart cluster tasks on connection lost|https://github.com/Altinity/ClickHouse/pull/780|25.6.5||
+| SYSTEM STOP SWARM MODE command for graceful shutdown of swarm node|https://github.com/Altinity/ClickHouse/pull/1014|25.6.5||
+| JOIN with *Cluster table functions and swarm queries|https://github.com/Altinity/ClickHouse/pull/972|25.6.5||
+| Add iceberg_metadata_file_path to query when send it to swarm nodes|https://github.com/Altinity/ClickHouse/pull/898|25.3.3||
+| Setting lock_object_storage_task_distribution_ms to improve cache locality with swarm cluster|https://github.com/Altinity/ClickHouse/pull/866|25.3.3||
 | Setting object_storage_max_nodes|https://github.com/Altinity/ClickHouse/pull/677|25.2.2||
 | Rendezvous hashing filesystem cache|https://github.com/Altinity/ClickHouse/pull/709|25.2.2|https://github.com/ClickHouse/ClickHouse/pull/77326|25.5.1
 | Convert functions with object_storage_cluster setting to cluster functions|https://github.com/Altinity/ClickHouse/pull/712|25.2.2||
@@ -27,16 +34,25 @@
 | Alternative syntax for object storage cluster functions|https://github.com/Altinity/ClickHouse/pull/592|24.12.2|https://github.com/ClickHouse/ClickHouse/pull/70659|25.3.1
 | Limit parsing threads for distibuted case|https://github.com/Altinity/ClickHouse/pull/648|24.12.2||
 | Distributed request to tables with Object Storage Engines|https://github.com/Altinity/ClickHouse/pull/615|24.12.2||
+|---|
 | <   **CATALOGS**   >||||
+| Support TimestampTZ in Glue catalog|https://github.com/Altinity/ClickHouse/pull/992|25.6.5|https://github.com/ClickHouse/ClickHouse/issues/83132|25.7.1
+| Support compressed metadata in Iceberg|https://github.com/Altinity/ClickHouse/pull/1005|25.6.5|https://github.com/ClickHouse/ClickHouse/pull/81451|25.7.1
+| Expose IcebergS3 table metainformation in system.tables|https://github.com/Altinity/ClickHouse/pull/959|25.6.5||
+| Support different warehouses behind Iceberg REST catalog|https://github.com/Altinity/ClickHouse/pull/860|25.3.3||
+| Support for Iceberg partition pruning bucket transform|https://github.com/Altinity/ClickHouse/pull/786|25.3.3|https://github.com/ClickHouse/ClickHouse/pull/79262|25.5.1
 | Unity catalog integration|same as upstream =>|25.3.3|https://github.com/ClickHouse/ClickHouse/pull/76988|25.3.1
 | Glue catalog integration|same as upstream =>|25.3.3|https://github.com/ClickHouse/ClickHouse/pull/77257|25.3.1
 | General engine definition for Iceberg tables|https://github.com/Altinity/ClickHouse/pull/675|25.2.2|https://github.com/ClickHouse/ClickHouse/pull/77125|
 | RBAC for S3|https://github.com/Altinity/ClickHouse/pull/688|25.2.2||
 | Iceberg REST Catalog integration|same as upstream =>|24.12.2|https://github.com/ClickHouse/ClickHouse/pull/71542|24.12.1
+|---|
 | <   **TIERED STORAGE**   >||||
-| Write to Merge tables|https://github.com/Altinity/ClickHouse/pull/683|`25.3.x` (planned)||
+| Support for hive partition style reads and writes|https://github.com/Altinity/ClickHouse/pull/934|25.6.5|https://github.com/ClickHouse/ClickHouse/pull/76802|25.8.1
+| Simple MergeTree part export to object storage|https://github.com/Altinity/ClickHouse/pull/1009|25.6.5|| 
 | Better S3 URL parsing for Hive partitioning|https://github.com/Altinity/ClickHouse/pull/700|25.2.2|https://github.com/ClickHouse/ClickHouse/pull/78185|25.5.1
 | s3Cluster hive partitioning for old analyzer|https://github.com/Altinity/ClickHouse/pull/703|25.2.2||
 | Support partition pruning in DeltaLake engine|https://github.com/Altinity/ClickHouse/pull/733|25.2.2|https://github.com/ClickHouse/ClickHouse/pull/78486|25.4.1
 | Iceberg time travel by snapshots|https://github.com/Altinity/ClickHouse/pull/733|25.2.2|https://github.com/ClickHouse/ClickHouse/pull/77439|25.4.1
 | s3Cluster hive partitioning|https://github.com/Altinity/ClickHouse/pull/584|24.12.2|https://github.com/ClickHouse/ClickHouse/pull/73910|
+|===|
