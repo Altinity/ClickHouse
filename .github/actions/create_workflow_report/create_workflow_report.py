@@ -386,7 +386,7 @@ def get_cached_job(job_name: str) -> dict:
     return workflow_config["cache_jobs"].get(job_name, {})
 
 
-def get_cves(pr_number, commit_sha):
+def get_cves(pr_number, commit_sha, branch):
     """
     Fetch Grype results from S3.
 
@@ -395,19 +395,33 @@ def get_cves(pr_number, commit_sha):
     s3_client = boto3.client("s3", endpoint_url=os.getenv("S3_URL"))
     prefixes_to_check = set()
 
+    def format_prefix(pr_number, commit_sha, branch):
+        if pr_number == 0:
+            return f"REFs/{branch}/{commit_sha}/grype/"
+        else:
+            return f"PRs/{pr_number}/{commit_sha}/grype/"
+
     cached_server_job = get_cached_job("Docker server image")
     if cached_server_job:
         prefixes_to_check.add(
-            f"{cached_server_job['pr_number']}/{cached_server_job['sha']}/grype/"
+            format_prefix(
+                cached_server_job["pr_number"],
+                cached_server_job["sha"],
+                cached_server_job["branch"],
+            )
         )
     cached_keeper_job = get_cached_job("Docker keeper image")
     if cached_keeper_job:
         prefixes_to_check.add(
-            f"{cached_keeper_job['pr_number']}/{cached_keeper_job['sha']}/grype/"
+            format_prefix(
+                cached_keeper_job["pr_number"],
+                cached_keeper_job["sha"],
+                cached_keeper_job["branch"],
+            )
         )
 
     if not prefixes_to_check:
-        prefixes_to_check = {f"{pr_number}/{commit_sha}/grype/"}
+        prefixes_to_check = {format_prefix(pr_number, commit_sha, branch)}
 
     grype_result_dirs = []
     for s3_prefix in prefixes_to_check:
@@ -690,7 +704,7 @@ def create_workflow_report(
         "checks_errors": get_checks_errors(db_client, commit_sha, branch_name),
         "regression_fails": get_regression_fails(db_client, actions_run_url),
         "docker_images_cves": (
-            [] if not check_cves else get_cves(pr_number, commit_sha)
+            [] if not check_cves else get_cves(pr_number, commit_sha, branch_name)
         ),
     }
 
