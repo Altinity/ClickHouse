@@ -823,7 +823,10 @@ def create_workflow_report(
         print(f"Report saved to {report_path}")
         exit(0)
 
-    report_destination_key = f"{pr_number}/{commit_sha}/{report_name}"
+    if pr_number == 0:
+        report_destination_key = f"REFs/{branch_name}/{commit_sha}/{report_name}"
+    else:
+        report_destination_key = f"PRs/{pr_number}/{commit_sha}/{report_name}"
 
     # Upload the report to S3
     s3_client = boto3.client("s3", endpoint_url=os.getenv("S3_URL"))
