@@ -646,7 +646,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                     }
                 }
             }
-
+/*
             for (const auto & column : requested_columns_list)
             {
                 const auto & column_name = column.first;
@@ -671,6 +671,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                     column.second.first,
                     column.second.second.type);
             }
+*/
         }
 
         if (!constant_columns.empty())

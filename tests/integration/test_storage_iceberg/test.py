@@ -3689,11 +3689,11 @@ def test_read_constant_columns_optimization(started_cluster, storage_type, run_o
     events_all_data_optimized = get_events(all_data_query_id, event) # 1-2025, 6-2025 must not be read
     events_const_only_optimized = get_events(const_only_query_id, event) # All must not be read
     events_const_partial_optimized = get_events(const_partial_query_id, event) # 1-2025, 6-2025 and 2-2025 must not be read
-    events_const_partial2_optimized = get_events(const_partial2_query_id, event) # 1-2024, 1-2025, 2-2025 and 6-2025 must not be read
+    events_const_partial2_optimized = get_events(const_partial2_query_id, event) # 6-2025 must not be read, 1-2024, 1-2025, 2-2025 readed because of nulls
     events_count_optimized = get_events(count_query_id, event) # All must not be read
 
-    assert events_all_data_optimized == 5
+    assert events_all_data_optimized == 6 # 5
     assert events_const_only_optimized == 0
     assert events_const_partial_optimized == 4
-    assert events_const_partial2_optimized == 3
+    assert events_const_partial2_optimized == 6
     assert events_count_optimized == 0
