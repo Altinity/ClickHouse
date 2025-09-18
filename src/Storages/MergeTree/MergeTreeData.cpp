@@ -5997,7 +5997,7 @@ void MergeTreeData::exportPartToTableImpl(
         context_copy->setSetting("output_format_parallel_formatting", manifest.parallel_formatting);
 
         sink = destination_storage->import(
-            manifest.data_part->name,
+            manifest.data_part->name + "_" + manifest.data_part->checksums.getTotalChecksumHex(),
             block_with_partition_values,
             destination_file_path,
             manifest.overwrite_file_if_exists,
