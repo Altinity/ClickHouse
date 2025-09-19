@@ -139,7 +139,7 @@ jobs:
                 repo: context.repo.repo,
                 sha: '${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}',
                 state: hasError ? 'error' : hasVulnerabilities ? 'failure' : 'success',
-                target_url: '${{ steps.upload_results.outputs.https_s3_path }}/results.html',
+                target_url: '${{ steps.upload_results.outputs.https_report_path }}',
                 description: hasError ? 'An error occurred' : `Grype Scan Completed with ${totalHighCritical} high/critical vulnerabilities`,
                 context: 'Grype Scan ${{ steps.set_version.outputs.docker_image || inputs.docker_image }}'
               });
