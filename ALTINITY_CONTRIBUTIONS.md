@@ -1,6 +1,27 @@
 List of pull requests contributed by Altinity develoeprs to ClickHouse server. It does not include documentation changes.
 
 ## 2025
+  * Few fixes to object storage hive reads & writes	[85538](https://github.com/ClickHouse/ClickHouse/pull/85538)	by @arthurpassos
+  * Add support for macro expansion in `remote_fs_zero_copy_zookeeper_path`	[85437](https://github.com/ClickHouse/ClickHouse/pull/85437)	by @mkmkme
+  * Rendezvous hashing filesystem cache in (s3/etc)Cluster functions	[82511](https://github.com/ClickHouse/ClickHouse/pull/82511)	by @ianton-ru
+  * Limit disks to search for orphaned parts 	[84710](https://github.com/ClickHouse/ClickHouse/pull/84710)	by @ilejn
+  * Unify parameter names in ODBC and JDBC	[83410](https://github.com/ClickHouse/ClickHouse/pull/83410)	by @zvonand
+  * Bug fix + changes in `extractKeyValuePairs` parsing logic	[80657](https://github.com/ClickHouse/ClickHouse/pull/80657)	by @arthurpassos
+  * Fix match(col, '^…') index analysis with escaped metacharacters to avoid wrong results and crashes	[79969](https://github.com/ClickHouse/ClickHouse/pull/79969)	by @filimonov
+  * Ignore parse error in system.distributed_ddl_queue	[79369](https://github.com/ClickHouse/ClickHouse/pull/79369)	by @ilejn
+  * Add support for Date32, DateTime64 in TTL	[80710](https://github.com/ClickHouse/ClickHouse/pull/80710)	by @zvonand
+  * fix description of distinct step after union lift up optimization	[80330](https://github.com/ClickHouse/ClickHouse/pull/80330)	by @UnamedRus
+  * Write to Merge storage	[77484](https://github.com/ClickHouse/ClickHouse/pull/77484)	by @ianton-ru
+  * Add mapContainsValuesLike/mapContainsValues/mapExtractValuesLike functions	[78171](https://github.com/ClickHouse/ClickHouse/pull/78171)	by @UnamedRus
+  * Resolve macros for autodiscovery clusters	[79696](https://github.com/ClickHouse/ClickHouse/pull/79696)	by @ianton-ru
+  * Split kafka tests (1)	[79700](https://github.com/ClickHouse/ClickHouse/pull/79700)	by @ilejn
+  * Fix LogSeriesLimiter cleanup logic to run only once per interval	[79864](https://github.com/ClickHouse/ClickHouse/pull/79864)	by @filimonov
+  * Embed proxy configuration in some HTTP buffers with the help of builders	[77693](https://github.com/ClickHouse/ClickHouse/pull/77693)	by @arthurpassos
+  * Improve performance of hive path parsing by using `extractKeyValuePairs` instead of regex	[79067](https://github.com/ClickHouse/ClickHouse/pull/79067)	by @arthurpassos
+  * Split kafka tests (1)	[78624](https://github.com/ClickHouse/ClickHouse/pull/78624)	by @ilejn
+  * Fix reference in lambda callback	[78174](https://github.com/ClickHouse/ClickHouse/pull/78174)	by @ianton-ru
+  * Allow empty value on hive partitioning	[78816](https://github.com/ClickHouse/ClickHouse/pull/78816)	by @arthurpassos
+  * Async insert memory preallocation to improve performance	[74945](https://github.com/ClickHouse/ClickHouse/pull/74945)	by @ilejn
   * system.kafka_consumers improvements	[77700](https://github.com/ClickHouse/ClickHouse/pull/77700)	by @ilejn
   * Fix incorrect S3 uri parsing when key is not specified on path style	[78185](https://github.com/ClickHouse/ClickHouse/pull/78185)	by @arthurpassos
   * Fix block device time metrics calculation	[78211](https://github.com/ClickHouse/ClickHouse/pull/78211)	by @filimonov
