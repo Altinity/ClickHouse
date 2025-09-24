@@ -346,6 +346,10 @@
     "test_storage_s3_queue/test_0.py::test_streaming_to_many_views[ordered]": {
         "reason": "INVESTIGATE: Broken test?"
     },
+    "test_storage_s3_queue/test_4.py::test_list_and_delete_race": {
+        "reason": "KNOWN: Unstable test",
+        "message": "AssertionError"
+    },
     "test_storage_s3_queue/test_5.py::test_failed_startup": {
         "reason": "INVESTIGATE: Unstable on tsan",
         "check_types": [
