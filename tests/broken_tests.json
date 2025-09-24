@@ -1,0 +1,409 @@
+{
+    "03455_direct_io_read_array_values": {
+        "reason": "INVESTIGATE - Unstable on tsan",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "00974_text_log_table_not_empty": {
+        "reason": "INVESTIGATE - Unstable on tsan",
+        "message": "curl: (28) Operation timed out",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "00626_replace_partition_from_table": {
+        "reason": "INVESTIGATE - Unstable on tsan",
+        "message": "DB::Exception: Cannot OPTIMIZE table: Current background tasks memory usage",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "01550_mutation_subquery": {
+        "reason": "INVESTIGATE - Unstable on tsan",
+        "message": "DB::Exception: Exception happened during execution of mutation",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "02443_detach_attach_partition": {
+        "reason": "INVESTIGATE - Unstable",
+        "message": "Cannot rename parts to perform operation on them: Code: 521. DB::ErrnoException: Cannot rename"
+    },
+    "03568_mutation_affected_rows_counter": {
+        "reason": "INVESTIGATE - Unstable on tsan",
+        "message": "DB::Exception: Timeout exceeded (180 s) while flushing system log",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "02479_race_condition_between_insert_and_droppin_mv": {
+        "reason": "INVESTIGATE - Timeout in ClickHouse query",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "01037_polygon_dicts_correctness_fast": {
+        "reason": "INVESTIGATE - Timeout in ClickHouse query",
+        "check_types": [
+            "tsan",
+            "msan"
+        ]
+    },
+    "03441_deltalake_clickhouse_public_datasets": {
+        "reason": "INVESTIGATE - S3 sometimes unreachable",
+        "message": "Error interacting with object store: Generic S3 error: Error performing GET"
+    },
+    "03441_deltalake_clickhouse_virtual_columns": {
+        "reason": "INVESTIGATE - S3 sometimes unreachable",
+        "message": "Error interacting with object store: Generic S3 error: Error performing GET"
+    },
+    "03357_join_pk_sharding": {
+        "reason": "INVESTIGATE - Timeout. Unstable?",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "01630_simple_aggregate_all_functions_in_summing_merge_tree": {
+        "reason": "INVESTIGATE - Unstable?",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "03514_grace_hash_join_logical_error": {
+        "reason": "INVESTIGATE - timeout",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "00167_read_bytes_from_fs": {
+        "reason": "INVESTIGATE - Memory limit exceeded",
+        "message": "DB::Exception: (total) memory limit exceeded:"
+    },
+    "02700_s3_part_INT_MAX": {
+        "reason": "INVESTIGATE - Memory limit exceeded",
+        "message": "DB::Exception: (total) memory limit exceeded:"
+    },
+    "01903_correct_block_size_prediction_with_default": {
+        "reason": "INVESTIGATE - Unstable on tsan",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "00157_cache_dictionary": {
+        "reason": "INVESTIGATE - Timeout/Memory limit exceeded in ClickHouse query"
+    },
+    "01655_plan_optimizations_optimize_read_in_window_order_long": {
+        "reason": "INVESTIGATE - Timeout. Unstable on tsan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "02473_optimize_old_parts": {
+        "reason": "INVESTIGATE - Unstable on tsan",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "03216_arrayWithConstant_limits": {
+        "reason": "INVESTIGATE - Timeout. Unstable on tsan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "02099_hashed_array_dictionary_complex_key": {
+        "reason": "INVESTIGATE - Timeout. Unstable on tsan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "03305_mergine_aggregated_filter_push_down": {
+        "reason": "INVESTIGATE - Timeout on tsan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "02760_dictionaries_memory": {
+        "reason": "INVESTIGATE - Timeout on tsan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "03532_json_dynamic_updates": {
+        "reason": "INVESTIGATE - Timeout on tsan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "03094_grouparraysorted_memory": {
+        "reason": "INVESTIGATE - Timeout on tsan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "02784_parallel_replicas_automatic_decision": {
+        "reason": "INVESTIGATE - Timeout on tsan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "01184_long_insert_values_huge_strings": {
+        "reason": "INVESTIGATE - Timeout on tsan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "02389_analyzer_nested_lambda": {
+        "reason": "INVESTIGATE - Timeout on tsan",
+        "message": "Timeout",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "02581_share_big_sets_between_mutation_tasks": {
+        "reason": "INVESTIGATE - Timeout on tsan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "02581_share_big_sets_between_mutation_tasks_with_storage_set": {
+        "reason": "INVESTIGATE - Timeout on tsan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "00596_limit_on_expanded_ast": {
+        "reason": "INVESTIGATE - Timeout on tsan, msan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "tsan",
+            "msan"
+        ]
+    },
+    "00816_long_concurrent_alter_column": {
+        "reason": "INVESTIGATE - Timeout on msan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "msan"
+        ]
+    },
+    "00377_shard_group_uniq_array_of_string_array": {
+        "reason": "INVESTIGATE - Timeout on tsan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "01799_long_uniq_theta_sketch": {
+        "reason": "INVESTIGATE - Timeout on tsan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "00172_hits_joins": {
+        "reason": "INVESTIGATE - Timeout on tsan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "00084_external_aggregation": {
+        "reason": "INVESTIGATE - Timeout on tsan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "00184_parallel_hash_returns_same_res_as_hash": {
+        "reason": "INVESTIGATE - Timeout on tsan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "00429_long_http_bufferization": {
+        "reason": "INVESTIGATE - Timeout on tsan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "02177_issue_31009": {
+        "reason": "INVESTIGATE - Timeout on ubsan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "ubsan"
+        ]
+    },
+    "00159_parallel_formatting_csv_and_friends": {
+        "reason": "INVESTIGATE - Timeout on ubsan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "ubsan"
+        ]
+    },
+    "00024_random_counters": {
+        "reason": "INVESTIGATE - Timeout on tsan, coverage",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "tsan",
+            "coverage"
+        ]
+    },
+    "00159_parallel_formatting_json_and_friends_2": {
+        "reason": "INVESTIGATE - Timeout on tsan",
+        "message": "Timeout",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "01782_field_oom": {
+        "reason": "INVESTIGATE - Timeout on tsan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "03555_json_shared_data_advanced_paths_indexes": {
+        "reason": "INVESTIGATE - Timeout on tsan, msan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "tsan",
+            "msan"
+        ]
+    },
+    "00429_long_http_bufferization": {
+        "reason": "INVESTIGATE - Timeout on msan",
+        "message": "Timeout! Processes left in process group",
+        "check_types": [
+            "msan"
+        ]
+    },
+    "02935_parallel_replicas_settings": {
+        "reason": "INVESTIGATE - Timeout on tsan",
+        "message": "Timeout exceeded (180 s) while flushing system log",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "00284_external_aggregation": {
+        "reason": "INVESTIGATE - Timeout in query on tsan",
+        "message": "DB::Exception: Timeout exceeded",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "00159_parallel_formatting_http": {
+        "reason": "INVESTIGATE - Timeout in curl on tsan",
+        "message": "curl: (28) Operation timed out",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "02676_optimize_old_parts_replicated": {
+        "reason": "INVESTIGATE - Unstable on tsan",
+        "message": "result differs with reference",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "test_grpc_protocol/test.py::test_ipv6_select_one": {
+        "reason": "INVESTIGATE - Internal test timeout",
+        "message": "FutureTimeoutError"
+    },
+    "test_backup_restore_on_cluster/test_different_versions.py::test_different_versions": {
+        "reason": "INVESTIGATE - NETLINK_ERROR",
+        "message": "NETLINK_ERROR"
+    },
+    "test_backup_restore_on_cluster/test_cancel_backup.py::test_shutdown_cancels_backup": {
+        "reason": "INVESTIGATE - NETLINK_ERROR",
+        "message": "NETLINK_ERROR"
+    },
+    "test_backup_restore_on_cluster/test_cancel_backup.py::test_cancel_backup_with_settings": {
+        "reason": "INVESTIGATE - NETLINK_ERROR",
+        "message": "NETLINK_ERROR"
+    },
+    "test_storage_delta/test.py::test_concurrent_queries[False]": {
+        "reason": "INVESTIGATE - NETLINK_ERROR",
+        "message": "NETLINK_ERROR"
+    },
+    "test_storage_s3_queue/test_0.py::test_streaming_to_many_views[unordered]": {
+        "reason": "INVESTIGATE: Broken test?"
+    },
+    "test_storage_s3_queue/test_0.py::test_streaming_to_many_views[ordered]": {
+        "reason": "INVESTIGATE: Broken test?"
+    },
+    "test_storage_s3_queue/test_5.py::test_failed_startup": {
+        "reason": "INVESTIGATE: Unstable on tsan",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "test_storage_s3_queue/test_5.py::test_mv_settings[1-ordered]": {
+        "reason": "INVESTIGATE: Unstable on tsan",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "test_storage_s3_queue/test_5.py::test_persistent_processing_nodes_cleanup": {
+        "reason": "INVESTIGATE: Unstable on tsan",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "test_storage_s3_queue/test_5.py::test_detach_attach_table": {
+        "reason": "INVESTIGATE: Unstable on tsan",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "test_storage_s3_queue/test_5.py::test_persistent_processing": {
+        "reason": "INVESTIGATE: Unstable on tsan",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "test_storage_s3_queue/test_5.py::test_shutdown_order": {
+        "reason": "INVESTIGATE: Unstable on tsan",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "test_storage_s3_queue/test_5.py::test_mv_settings[1-unordered]": {
+        "reason": "INVESTIGATE: Unstable on tsan",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "test_storage_s3_queue/test_5.py::test_mv_settings[9999999999-unordered]": {
+        "reason": "INVESTIGATE: Unstable on tsan",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "test_storage_s3_queue/test_5.py::test_mv_settings[9999999999-ordered]": {
+        "reason": "INVESTIGATE: Unstable on tsan",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "test_storage_s3_queue/test_5.py::test_create_or_replace_table": {
+        "reason": "INVESTIGATE: Unstable on tsan",
+        "check_types": [
+            "tsan"
+        ]
+    }
+}
