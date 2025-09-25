@@ -65,6 +65,8 @@ struct ExportsListElement : private boost::noncopyable
         time_t create_time_,
         const ContextPtr & context);
 
+    ~ExportsListElement();
+
     ExportInfo getInfo() const;
 
     UInt64 getMemoryUsage() const;

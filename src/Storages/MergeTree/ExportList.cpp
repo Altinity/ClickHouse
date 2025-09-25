@@ -27,6 +27,11 @@ ExportsListElement::ExportsListElement(
     thread_group = ThreadGroup::createForBackgroundProcess(context);
 }
 
+ExportsListElement::~ExportsListElement()
+{
+    background_memory_tracker.adjustOnBackgroundTaskEnd(&thread_group->memory_tracker);
+}
+
 ExportInfo ExportsListElement::getInfo() const
 {
     ExportInfo res;
