@@ -96,7 +96,7 @@ bool ExecutingGraph::addEdges(uint64_t node)
     return was_edge_added;
 }
 
-bool ExecutingGraph::expandPipeline(std::stack<uint64_t> & stack, uint64_t pid)
+bool ExecutingGraph::expandPipeline(boost::container::devector<uint64_t> & stack, uint64_t pid)
 {
     auto & cur_node = *nodes[pid];
     Processors new_processors;
@@ -174,7 +174,7 @@ bool ExecutingGraph::expandPipeline(std::stack<uint64_t> & stack, uint64_t pid)
         if (node.status == ExecutingGraph::ExecStatus::Idle)
         {
             node.status = ExecutingGraph::ExecStatus::Preparing;
-            stack.push(updated_node);
+            stack.push_front(updated_node);
         }
     }
 
@@ -215,9 +215,9 @@ void ExecutingGraph::initializeExecution(Queue & queue)
 
 bool ExecutingGraph::updateNode(uint64_t pid, Queue & queue, Queue & async_queue)
 {
-    std::stack<Edge *> updated_edges;
-    std::stack<uint64_t> updated_processors;
-    updated_processors.push(pid);
+    boost::container::devector<Edge *> updated_edges;
+    boost::container::devector<uint64_t> updated_processors;
+    updated_processors.push_back(pid);
 
     std::shared_lock read_lock(nodes_mutex);
 
@@ -227,8 +227,8 @@ bool ExecutingGraph::updateNode(uint64_t pid, Queue & queue, Queue & async_queue
 
         if (updated_processors.empty())
         {
-            auto * edge = updated_edges.top();
-            updated_edges.pop();
+            auto * edge = updated_edges.front();
+            updated_edges.pop_front();
 
             /// Here we have ownership on edge, but node can be concurrently accessed.
 
@@ -248,7 +248,7 @@ bool ExecutingGraph::updateNode(uint64_t pid, Queue & queue, Queue & async_queue
                 if (status == ExecutingGraph::ExecStatus::Idle)
                 {
                     node.status = ExecutingGraph::ExecStatus::Preparing;
-                    updated_processors.push(edge->to);
+                    updated_processors.push_front(edge->to);
                     stack_top_lock = std::move(lock);
                 }
                 else
@@ -258,8 +258,8 @@ bool ExecutingGraph::updateNode(uint64_t pid, Queue & queue, Queue & async_queue
 
         if (!updated_processors.empty())
         {
-            pid = updated_processors.top();
-            updated_processors.pop();
+            pid = updated_processors.front();
+            updated_processors.pop_front();
 
             /// In this method we have ownership on node.
             auto & node = *nodes[pid];
@@ -364,14 +364,14 @@ bool ExecutingGraph::updateNode(uint64_t pid, Queue & queue, Queue & async_queue
                     for (auto it = node.post_updated_output_ports.rbegin(); it != node.post_updated_output_ports.rend(); ++it)
                     {
                         auto * edge = static_cast<ExecutingGraph::Edge *>(*it);
-                        updated_edges.push(edge);
+                        updated_edges.push_front(edge);
                         edge->update_info.trigger();
                     }
 
                     for (auto it = node.post_updated_input_ports.rbegin(); it != node.post_updated_input_ports.rend(); ++it)
                     {
                         auto * edge = static_cast<ExecutingGraph::Edge *>(*it);
-                        updated_edges.push(edge);
+                        updated_edges.push_front(edge);
                         edge->update_info.trigger();
                     }
 
@@ -392,7 +392,7 @@ bool ExecutingGraph::updateNode(uint64_t pid, Queue & queue, Queue & async_queue
                 read_lock.lock();
 
                 /// Add itself back to be prepared again.
-                updated_processors.push(pid);
+                updated_processors.push_front(pid);
             }
         }
     }
