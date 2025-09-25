@@ -1100,3 +1100,122 @@ def test_graceful_shutdown(started_cluster):
     node_to_shutdown.start_clickhouse()
 
     assert errors == 0
+
+
+def test_joins(started_cluster):
+    node = started_cluster.instances["s0_0_0"]
+
+    # Table join_table only exists on the node 's0_0_0'.
+    node.query(
+        """
+        CREATE TABLE IF NOT EXISTS join_table (
+            id UInt32,
+            name String
+        ) ENGINE=MergeTree()
+        ORDER BY id;
+        """
+    )
+
+    node.query(
+        f"""
+        INSERT INTO join_table
+        SELECT value, concat(name, '_jt') FROM s3Cluster('cluster_simple',
+            'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))');
+        """
+    )
+
+    result1 = node.query(
+        f"""
+        SELECT t1.name, t2.name FROM
+            s3Cluster('cluster_simple',
+                'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+                'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') AS t1
+        JOIN
+            join_table AS t2
+        ON t1.value = t2.id
+        ORDER BY t1.name
+        SETTINGS object_storage_cluster_join_mode='local';
+        """
+    )
+
+    res = list(map(str.split, result1.splitlines()))
+    assert len(res) == 25
+
+    for line in res:
+        if len(line) == 2:
+            assert line[1] == f"{line[0]}_jt"
+        else:
+            assert line == ["_jt"] # for empty name
+
+    result2 = node.query(
+        f"""
+        SELECT t1.name, t2.name FROM
+            join_table AS t2
+        JOIN
+            s3Cluster('cluster_simple',
+                'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+                'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') AS t1
+        ON t1.value = t2.id
+        ORDER BY t1.name
+        SETTINGS object_storage_cluster_join_mode='local';
+        """
+    )
+
+    assert result1 == result2
+
+    # With WHERE clause with remote column only
+    result3 = node.query(
+        f"""
+        SELECT t1.name, t2.name FROM
+            s3Cluster('cluster_simple',
+                'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+                'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') AS t1
+        JOIN
+            join_table AS t2
+        ON t1.value = t2.id
+        WHERE (t1.value % 2)
+        ORDER BY t1.name
+        SETTINGS object_storage_cluster_join_mode='local';
+        """
+    )
+
+    res = list(map(str.split, result3.splitlines()))
+    assert len(res) == 8
+
+    # With WHERE clause with local column only
+    result4 = node.query(
+        f"""
+        SELECT t1.name, t2.name FROM
+            s3Cluster('cluster_simple',
+                'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+                'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') AS t1
+        JOIN
+            join_table AS t2
+        ON t1.value = t2.id
+        WHERE (t2.id % 2)
+        ORDER BY t1.name
+        SETTINGS object_storage_cluster_join_mode='local';
+        """
+    )
+
+    assert result3 == result4
+
+    # With WHERE clause with local and remote columns
+    result5 = node.query(
+        f"""
+        SELECT t1.name, t2.name FROM
+            s3Cluster('cluster_simple',
+                'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+                'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') AS t1
+        JOIN
+            join_table AS t2
+        ON t1.value = t2.id
+        WHERE (t1.value % 2) AND ((t2.id % 3) == 2)
+        ORDER BY t1.name
+        SETTINGS object_storage_cluster_join_mode='local';
+        """
+    )
+
+    res = list(map(str.split, result5.splitlines()))
+    assert len(res) == 6

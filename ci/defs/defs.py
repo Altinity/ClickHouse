@@ -397,6 +397,8 @@ class ArtifactNames:
     FUZZERS = "FUZZERS"
     FUZZERS_CORPUS = "FUZZERS_CORPUS"
 
+    BUILD_REPORT_AMD_RELEASE = "build_report_package_release"
+
     PERF_REPORTS_AMD_1 = "PERF_REPORTS_AMD_1"
     PERF_REPORTS_AMD_2 = "PERF_REPORTS_AMD_2"
     PERF_REPORTS_AMD_3 = "PERF_REPORTS_AMD_3"
@@ -504,6 +506,11 @@ class ArtifactConfigs:
         name=ArtifactNames.FUZZERS_CORPUS,
         type=Artifact.Type.S3,
         path=f"{TEMP_DIR}/build/programs/*_seed_corpus.zip",
+    )
+    build_reports = Artifact.Config(
+        name=ArtifactNames.BUILD_REPORT_AMD_RELEASE,
+        type=Artifact.Type.GH,
+        path="./ci/tmp/artifact_report_build_amd_release.json"
     )
     performance_reports = Artifact.Config(
         name="*",

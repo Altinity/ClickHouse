@@ -76,6 +76,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"lock_object_storage_task_distribution_ms", 0, 0, "New setting."},
             {"object_storage_cluster", "", "", "New setting"},
             {"object_storage_max_nodes", 0, 0, "New setting"},
+            {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
             {"object_storage_remote_initiator", false, false, "New setting."},
             {"allow_experimental_export_merge_tree_part", false, false, "New setting."},
             {"export_merge_tree_part_overwrite_file_if_exists", false, false, "New setting."},

@@ -4,12 +4,19 @@ name: ReleaseBranchCI
 
 on:
   workflow_dispatch:
+    inputs:
+      no_cache:
+        description: Run without cache
+        required: false
+        type: boolean
+        default: false
   push:
     branches: ['2[1-9].[1-9][0-9]', '2[1-9].[1-9]']
 
 env:
   # Force the stdout and stderr streams to be unbuffered
   PYTHONUNBUFFERED: 1
+  DISABLE_CI_CACHE: ${{ github.event.inputs.no_cache || '0' }}
   CHECKOUT_REF: ""
   DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
   CLICKHOUSE_TEST_STAT_URL: ${{ secrets.CLICKHOUSE_TEST_STAT_URL }}
@@ -262,6 +269,12 @@ jobs:
           else
             python3 -m praktika run 'Build (amd_release)' --workflow "ReleaseBranchCI" --ci |& tee ./ci/tmp/job.log
           fi
+
+      - name: Upload artifact build_report_package_release
+        uses: actions/upload-artifact@v4
+        with:
+          name: build_report_package_release
+          path: ./ci/tmp/artifact_report_build_amd_release.json
 
   build_amd_asan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
@@ -1870,7 +1883,7 @@ jobs:
     secrets: inherit
     with:
       runner_type: altinity-on-demand, altinity-regression-tester
-      commit: aa4204a74b901a0f2ea7c9f1d631d98221554fb1
+      commit: eadf0647501a547d57c49b71ca256e10c6c304f6
       arch: release
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout_minutes: 300
@@ -1882,7 +1895,7 @@ jobs:
     secrets: inherit
     with:
       runner_type: altinity-on-demand, altinity-regression-tester-aarch64
-      commit: aa4204a74b901a0f2ea7c9f1d631d98221554fb1
+      commit: eadf0647501a547d57c49b71ca256e10c6c304f6
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout_minutes: 300

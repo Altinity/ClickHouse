@@ -60,6 +60,9 @@ public:
     virtual std::optional<size_t> totalRows(ContextPtr) const { return {}; }
     virtual std::optional<size_t> totalBytes(ContextPtr) const { return {}; }
 
+    virtual std::optional<String> partitionKey(ContextPtr) const { return {}; }
+    virtual std::optional<String> sortingKey(ContextPtr) const { return {}; }
+
 protected:
     ObjectIterator createKeysIterator(
         Strings && data_files_,

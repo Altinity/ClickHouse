@@ -180,6 +180,7 @@ class JobConfigs:
                 ArtifactNames.DEB_AMD_RELEASE,
                 ArtifactNames.RPM_AMD_RELEASE,
                 ArtifactNames.TGZ_AMD_RELEASE,
+                ArtifactNames.BUILD_REPORT_AMD_RELEASE,
             ],
             [
                 ArtifactNames.CH_AMD_ASAN,

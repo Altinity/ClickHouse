@@ -123,6 +123,7 @@ OPTIONS_TO_TEST_RUNNER_ARGUMENTS = {
     "ParallelReplicas": "--no-zookeeper --no-shard --no-parallel-replicas",
     "AsyncInsert": " --no-async-insert",
     "DatabaseReplicated": " --no-stateful --replicated-database --jobs 3",
+    "amd_tsan": " --timeout 1200",  # NOTE (strtgbb): tsan is slow, increase the timeout to avoid timeout errors
 }
 
 
@@ -365,7 +366,7 @@ def main():
 
         # if not info.is_local_run:
         #     CH.stop_log_exports()
-        results.append(FTResultsProcessor(wd=temp_dir).run())
+        results.append(FTResultsProcessor(wd=temp_dir, test_options=test_options).run())
         test_result = results[-1]
 
         # invert result status for bugfix validation

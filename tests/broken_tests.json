@@ -1,155 +1,359 @@
 {
+    "02700_s3_part_INT_MAX": {
+        "reason": "INVESTIGATE - Sometimes out of memory with msan",
+        "message": "DB::Exception: (total) memory limit exceeded",
+        "check_types": [
+            "asan",
+            "msan"
+        ]
+    },
+    "00180_no_seek_avoiding_when_reading_from_cache": {
+        "reason": "INVESTIGATE - Sometimes out of memory with msan",
+        "message": "DB::Exception: (total) memory limit exceeded",
+        "check_types": [
+            "msan"
+        ]
+    },
     "01880_remote_ipv6": {
-        "reason": "INVESTIGATE - Fails on debug build"
+        "reason": "INVESTIGATE - Fails on debug build",
+        "check_types": [
+            "debug"
+        ]
     },
     "03315_executable_table_function_threads": {
-        "reason": "INVESTIGATE - Fails on coverage build"
-    },
-    "03403_read_in_order_streams_memory_usage": {
-        "reason": "INVESTIGATE - Unstable?"
-    },
-    "03008_deduplication_mv_generates_several_blocks_replicated": {
-        "reason": "INVESTIGATE - Timeout. Unstable?"
+        "reason": "INVESTIGATE - Timeout",
+        "message": "DB::Exception: Timeout exceeded"
     },
     "00988_expansion_aliases_limit": {
-        "reason": "INVESTIGATE - Timeout. Unstable?"
-    },
-    "03404_read_in_order_streams_memory_usage": {
-        "reason": "INVESTIGATE - Timeout. Unstable?"
+        "reason": "INVESTIGATE - Timeout. Unstable?",
+        "message": "Timeout",
+        "check_types": [
+            "tsan",
+            "msan"
+        ]
     },
     "03532_crash_in_aggregation_because_of_lost_exception": {
-        "reason": "INVESTIGATE - Timeout. Unstable?"
+        "reason": "INVESTIGATE - Timeout. Unstable?",
+        "check_types": [
+            "tsan",
+            "msan"
+        ]
     },
     "03403_read_in_order_streams_memory_usage": {
-        "reason": "INVESTIGATE - Unstable?"
+        "reason": "INVESTIGATE - Unstable"
     },
     "02483_elapsed_time": {
-        "reason": "INVESTIGATE - Unstable?"
+        "reason": "INVESTIGATE - Fail on msan, unstable on tsan",
+        "message": "result differs with reference",
+        "check_types": [
+            "msan",
+            "tsan"
+        ]
     },
-    "02967_parallel_replicas_join_algo_and_analyzer_2": {
-        "reason": "INVESTIGATE - Timeout. Unstable?"
-    },
-    "03008_deduplication_mv_generates_several_blocks_replicated": {
-        "reason": "INVESTIGATE - Timeout. Unstable?"
+    "03223_analyzer_with_cube_fuzz": {
+        "reason": "INVESTIGATE - Sometimes QUERY_WAS_CANCELLED",
+        "message": "is killed in pending state."
     },
     "00111_shard_external_sort_distributed": {
-        "reason": "INVESTIGATE - Timeout in ClickHouse query"
+        "reason": "INVESTIGATE - Timeout in ClickHouse query",
+        "message": "DB::Exception: Timeout exceeded",
+        "check_types": [
+            "tsan",
+            "msan"
+        ]
     },
     "02479_race_condition_between_insert_and_droppin_mv": {
-        "reason": "INVESTIGATE - Timeout in ClickHouse query"
+        "reason": "INVESTIGATE - Timeout in ClickHouse query",
+        "message": "Timeout",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "03273_ghdata_json_to_json_alter": {
+        "reason": "INVESTIGATE - Timeout in ClickHouse query",
+        "message": "DB::Exception: Timeout exceeded",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "02389_analyzer_nested_lambda": {
+        "reason": "INVESTIGATE - Timeout in ClickHouse query",
+        "message": "DB::Exception: Timeout exceeded",
+        "check_types": [
+            "tsan"
+        ]
     },
     "01037_polygon_dicts_correctness_fast": {
-        "reason": "INVESTIGATE - Timeout in ClickHouse query"
+        "reason": "INVESTIGATE - Timeout in ClickHouse query",
+        "message": "DB::Exception: Timeout exceeded",
+        "check_types": [
+            "tsan",
+            "msan"
+        ]
     },
     "02354_vector_search_expansion_search": {
-        "reason": "INVESTIGATE - Timeout on TSAN. Unstable?"
+        "reason": "INVESTIGATE - Timeout on TSAN. Unstable?",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "02760_dictionaries_memory": {
+        "reason": "INVESTIGATE - Timeout on TSAN.",
+        "message": "Timeout exceeded while receiving data from server.",
+        "check_types": [
+            "tsan"
+        ]
     },
     "03441_deltalake_clickhouse_public_datasets": {
         "reason": "INVESTIGATE - S3 sometimes unreachable",
         "message": "Error interacting with object store: Generic S3 error: Error performing GET"
     },
     "03443_shared_storage_snapshots": {
-        "reason": "INVESTIGATE - Unstable?"
+        "reason": "INVESTIGATE - Unstable on tsan",
+        "message": "All iterations has been failed. Unable to test snapshot sharing disabled.",
+        "check_types": [
+            "tsan"
+        ]
     },
     "03321_clickhouse_local_initialization_not_too_slow_even_under_sanitizers": {
-        "reason": "INVESTIGATE - Unstable?"
+        "reason": "INVESTIGATE - Unstable?",
+        "check_types": [
+            "tsan",
+            "msan"
+        ]
+    },
+    "02915_input_table_function_in_subquery": {
+        "reason": "INVESTIGATE - Unstable? Sometimes Access Denied.",
+        "message": "DB::Exception: Message: Access Denied., bucket test"
     },
     "00984_parser_stack_overflow": {
-        "reason": "INVESTIGATE - Timeout in ClickHouse query"
-    },
-    "00804_test_alter_compression_codecs": {
-        "reason": "INVESTIGATE - Timeout in ClickHouse query"
+        "reason": "INVESTIGATE - Unstable on tsan",
+        "check_types": [
+            "tsan"
+        ]
     },
     "03357_join_pk_sharding": {
-        "reason": "INVESTIGATE - Timeout. Unstable?"
+        "reason": "INVESTIGATE - Timeout. Unstable?",
+        "check_types": [
+            "tsan"
+        ]
     },
     "03002_part_log_rmt_fetch_merge_error": {
-        "reason": "INVESTIGATE - Unstable?"
+        "reason": "INVESTIGATE - Unstable?",
+        "check_types": [
+            "tsan"
+        ]
     },
     "01630_simple_aggregate_all_functions_in_summing_merge_tree": {
-        "reason": "INVESTIGATE - Unstable?"
-    },
-    "02841_parallel_replicas_summary": {
-        "reason": "INVESTIGATE - ClickHouse timeout",
-        "message": "Timeout exceeded (180 s) while flushing system log"
+        "reason": "INVESTIGATE - Unstable?",
+        "check_types": [
+            "tsan"
+        ]
     },
     "00090_thread_pool_deadlock": {
+        "reason": "INVESTIGATE - Unstable on msan",
+        "check_types": [
+            "msan"
+        ]
+    },
+    "03271_ghdata_object_to_json_alter": {
+        "reason": "INVESTIGATE - Unstable on tsan",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "03396_s3_do_not_retry_dns_errors": {
         "reason": "INVESTIGATE - Unstable?"
     },
-    "01810_max_part_removal_threads_long": {
+    "01283_max_threads_simple_query_optimization": {
         "reason": "INVESTIGATE - ClickHouse timeout",
-        "message": "Timeout exceeded (180 s) while flushing system log"
-    },
-    "03148_async_queries_in_query_log_errors": {
-        "reason": "INVESTIGATE - ClickHouse timeout",
-        "message": "Timeout exceeded (180 s) while flushing system log"
+        "message": "Timeout exceeded (180 s) while flushing system log",
+        "check_types": [
+            "tsan"
+        ]
     },
     "03514_grace_hash_join_logical_error": {
         "reason": "INVESTIGATE - timeout",
-        "message": "Timeout! Killing process group"
+        "message": "Timeout! Killing process group",
+        "check_types": [
+            "tsan"
+        ]
     },
-    "02751_multiquery_with_argument": {
+    "00024_random_counters": {
         "reason": "INVESTIGATE - timeout",
         "message": "Timeout! Killing process group"
     },
-    "01651_lc_insert_tiny_log_2": {
+    "03127_system_unload_primary_key_table": {
         "reason": "INVESTIGATE - timeout",
-        "message": "Timeout! Killing process group"
+        "message": "Timeout! Killing process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "01926_order_by_desc_limit": {
+        "reason": "INVESTIGATE - timeout",
+        "message": "Timeout! Killing process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "02003_memory_limit_in_client": {
+        "reason": "INVESTIGATE - timeout",
+        "message": "Timeout! Killing process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "00377_shard_group_uniq_array_of_string_array": {
+        "reason": "INVESTIGATE - timeout on tsan",
+        "message": "Timeout! Killing process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "03237_insert_sparse_columns_mem": {
+        "reason": "INVESTIGATE - timeout on tsan",
+        "message": "Timeout! Killing process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "03401_normal_projection_with_part_offset": {
+        "reason": "INVESTIGATE - timeout on tsan",
+        "message": "Timeout! Killing process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "02437_drop_mv_restart_replicas": {
+        "reason": "INVESTIGATE - random fail?",
+        "message": "`slog` doesn't exist.: Cannot create table from metadata file",
+        "check_types": [
+            "asan"
+        ]
+    },
+    "03549_system_query_metric_log_with_queries_with_same_query_id": {
+        "reason": "INVESTIGATE - random fail?",
+        "message": "The query succeeded but the server error '394' was expected",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "02098_hashed_array_dictionary_simple_key": {
+        "reason": "INVESTIGATE - timeout, unstable",
+        "message": "Timeout! Killing process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "00596_limit_on_expanded_ast": {
+        "reason": "INVESTIGATE - timeout, unstable",
+        "message": "Timeout! Killing process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "01513_optimize_aggregation_in_order_memory_long": {
+        "reason": "INVESTIGATE - timeout, unstable",
+        "message": "Timeout! Killing process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "03305_mergine_aggregated_filter_push_down": {
+        "reason": "INVESTIGATE - timeout on tsan, unstable",
+        "message": "Timeout! Killing process group",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "02455_one_row_from_csv_memory_usage": {
+        "reason": "INVESTIGATE - timeout on tsan, unstable",
+        "message": "Timeout! Killing process group",
+        "check_types": [
+            "tsan"
+        ]
     },
     "00167_read_bytes_from_fs": {
         "reason": "INVESTIGATE - Memory limit exceeded",
-        "message": "DB::Exception: (total) memory limit exceeded:"
+        "message": "DB::Exception: (total) memory limit exceeded:",
+        "check_types": [
+            "msan"
+        ]
     },
-    "02241_filesystem_cache_on_write_operations": {
-        "reason": "INVESTIGATE - Unstable?"
+    "02477_single_value_data_string_regression": {
+        "reason": "INVESTIGATE - Memory limit exceeded",
+        "message": "DB::Exception: (total) memory limit exceeded:",
+        "check_types": [
+            "asan"
+        ]
+    },
+    "02443_detach_attach_partition": {
+        "reason": "INVESTIGATE - Unstable? (msan, tsan)",
+        "check_types": [
+            "tsan",
+            "msan"
+        ]
     },
     "01903_correct_block_size_prediction_with_default": {
-        "reason": "INVESTIGATE - Timeout. Unstable?"
-    },
-    "02345_filesystem_local": {
-        "reason": "INVESTIGATE - Occasional statvfs error",
-        "message": "Could not calculate available disk space (statvfs)"
+        "reason": "INVESTIGATE - Timeout. Unstable?",
+        "check_types": [
+            "tsan"
+        ]
     },
     "00157_cache_dictionary": {
-        "reason": "INVESTIGATE - Timeout in ClickHouse query"
+        "reason": "INVESTIGATE - Timeout in ClickHouse query",
+        "check_types": [
+            "coverage"
+        ]
+    },
+    "00284_external_aggregation": {
+        "reason": "INVESTIGATE - Timeout in ClickHouse query",
+        "check_types": [
+            "tsan"
+        ]
     },
     "01655_plan_optimizations_optimize_read_in_window_order_long": {
         "reason": "INVESTIGATE - Timeout. Unstable?",
-        "message": "Timeout! Killing process group"
+        "message": "Timeout! Killing process group",
+        "check_types": [
+            "tsan"
+        ]
     },
-    "02760_dictionaries_memory": {
+    "02967_parallel_replicas_join_algo_and_analyzer_1": {
         "reason": "INVESTIGATE - Timeout. Unstable?",
-        "message": "Timeout! Killing process group"
+        "message": "Timeout! Killing process group",
+        "check_types": [
+            "tsan"
+        ]
     },
     "02435_rollback_cancelled_queries": {
         "reason": "INVESTIGATE - Unstable?",
-        "message": "There is no current transaction. (INVALID_TRANSACTION)"
-    },
-    "02963_remote_read_small_buffer_size_bug": {
-        "reason": "INVESTIGATE - Timeout. Unstable?"
+        "message": "There is no current transaction. (INVALID_TRANSACTION)",
+        "check_types": [
+            "tsan"
+        ]
     },
     "02473_optimize_old_parts": {
-        "reason": "INVESTIGATE - Unstable?"
+        "reason": "INVESTIGATE - Unstable?",
+        "check_types": [
+            "tsan",
+            "asan"
+        ]
     },
-    "02916_glogal_in_cancel_queries": {
-        "reason": "INVESTIGATE - Unstable? All attempts to get table structure failed.",
-        "message": "All attempts to get table structure failed."
-    },
-    "03216_arrayWithConstant_limits": {
-        "reason": "INVESTIGATE - Timeout. Unstable?",
-        "message": "Timeout! Killing process group"
-    },
-    "02675_sparse_columns_clear_column": {
+    "02585_query_status_deadlock": {
         "reason": "INVESTIGATE - Timeout in ClickHouse query",
-        "message": "Timeout exceeded (180 s) while flushing system log"
-    },
-    "02099_hashed_array_dictionary_complex_key": {
-        "reason": "INVESTIGATE - Timeout. Unstable?",
-        "message": "Timeout! Killing process group"
+        "message": "Timeout exceeded (180 s) while flushing system log",
+        "check_types": [
+            "tsan"
+        ]
     },
     "test_library_bridge/test.py::test_ssrf": {
         "reason": "INVESTIGATE - Unstable?",
-        "message": "DB::NetException: Connection refused"
+        "message": "DB::NetException: Connection refused",
+        "check_types": [
+            "tsan"
+        ]
     },
     "test_grpc_protocol/test.py::test_ipv6_select_one": {
         "reason": "INVESTIGATE - Internal test timeout",
@@ -157,6 +361,13 @@
     },
     "test_storage_rabbitmq/test.py::test_rabbitmq_sharding_between_queues_publish": {
         "reason": "INVESTIGATE - Unstable?"
+    },
+    "test_storage_rabbitmq/test.py::test_rabbitmq_mv_combo": {
+        "reason": "INVESTIGATE - Timeout on tsan",
+        "message": "Failed: Time limit of 60 seconds reached. The result did not match the expected value.",
+        "check_types": [
+            "tsan"
+        ]
     },
     "test_backup_restore_on_cluster/test_different_versions.py::test_different_versions": {
         "reason": "INVESTIGATE - NETLINK_ERROR",
@@ -171,6 +382,36 @@
         "message": "NETLINK_ERROR"
     },
     "test_overcommit_tracker/test.py::test_user_overcommit": {
-        "reason": "INVESTIGATE - Unstable?"
+        "reason": "INVESTIGATE - Unstable on tsan",
+        "check_types": [
+            "tsan"
+        ]
+    },
+    "test_s3_cache_locality/test.py::test_cache_locality[0]": {
+        "reason": "INVESTIGATE - Timeout on asan",
+        "message": "Failed: Timeout >900.0s",
+        "check_types": [
+            "asan"
+        ]
+    },
+    "test_database_hms/test.py::test_list_tables": {
+        "reason": "INVESTIGATE - Strange fail sometimes",
+        "message": "failed to solve: failed to read expected number of bytes: unexpected EOF"
+    },
+    "test_database_hms/test.py::test_many_namespaces": {
+        "reason": "INVESTIGATE - Strange fail sometimes",
+        "message": "failed to solve: failed to read expected number of bytes: unexpected EOF"
+    },
+    "test_database_hms/test.py::test_select": {
+        "reason": "INVESTIGATE - Strange fail sometimes",
+        "message": "failed to solve: failed to read expected number of bytes: unexpected EOF"
+    },
+    "test_database_hms/test.py::test_hide_sensitive_info": {
+        "reason": "INVESTIGATE - Strange fail sometimes",
+        "message": "failed to solve: failed to read expected number of bytes: unexpected EOF"
+    },
+    "test_database_hms/test.py::test_tables_with_same_location": {
+        "reason": "INVESTIGATE - Strange fail sometimes",
+        "message": "failed to solve: failed to read expected number of bytes: unexpected EOF"
     }
 }
