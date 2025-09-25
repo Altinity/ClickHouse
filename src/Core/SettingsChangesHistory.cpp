@@ -67,7 +67,11 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         /// controls new feature and it's 'true' by default, use 'false' as previous_value).
         /// It's used to implement `compatibility` setting (see https://github.com/ClickHouse/ClickHouse/issues/35972)
         /// Note: please check if the key already exists to prevent duplicate entries.
-        addSettingsChanges(settings_changes_history, "25.6.5.2000",
+        addSettingsChanges(settings_changes_history, "25.6.5.20364",
+        {
+            {"lock_object_storage_task_distribution_ms", 500, 500, "Raised the value to 500 to avoid hoping tasks between executors."},
+        });
+        addSettingsChanges(settings_changes_history, "25.6.5.20000",
         {
             {"allow_experimental_database_iceberg", false, true, "Turned ON by default for Antalya"},
             {"allow_experimental_database_unity_catalog", false, true, "Turned ON by default for Antalya"},
