@@ -6010,6 +6010,8 @@ void MergeTreeData::exportPartToTableImpl(
             ProfileEvents::increment(ProfileEvents::PartsExportDuplicated);
         }
 
+        ProfileEvents::increment(ProfileEvents::PartsExportFailures);
+
         std::lock_guard inner_lock(export_manifests_mutex);
         export_manifests.erase(manifest);
         return;
