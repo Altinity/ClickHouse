@@ -678,12 +678,7 @@ String composeList(
             if (field->has("direction"))
             {
                 auto d = field->getValue<String>("direction");
-                expr += (Poco::icompare(d, "desc") == 0) ? "DESC" : "ASC";
-            }
-            if (field->has("null-order"))
-            {
-                auto n = field->getValue<String>("null-order");
-                expr += (Poco::icompare(n, "nulls-last") == 0) ? "NULLS LAST" : "NULLS FIRST";
+                expr += (Poco::icompare(d, "desc") == 0) ? " DESC" : " ASC";
             }
         }
 
