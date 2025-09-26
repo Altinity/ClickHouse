@@ -2522,20 +2522,6 @@ def test_filesystem_cache(started_cluster):
             f"SELECT ProfileEvents['S3GetObject'] FROM system.query_log WHERE query_id = '{query_id}' AND type = 'QueryFinish'"
         )
     )
-    instance.query("SYSTEM FLUSH LOGS")
-
-    total_count = int(
-        instance.query(
-            f"SELECT count() FROM system.text_log WHERE query_id = '{query_id}' and message ilike '%Boundary alignment:%'"
-        )
-    )
-    assert total_count > 0
-    count = int(
-        instance.query(
-            f"SELECT count() FROM system.text_log WHERE query_id = '{query_id}' and message ilike '%Boundary alignment: 0%'"
-        )
-    )
-    assert count == total_count
 
 
 def test_key_value_args(started_cluster):

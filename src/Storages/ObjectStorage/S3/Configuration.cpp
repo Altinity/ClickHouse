@@ -636,7 +636,7 @@ void StorageS3Configuration::fromAST(ASTs & args, ContextPtr context, bool with_
     if (auto compression_method_value = getFromPositionOrKeyValue<String>("compression_method", args, engine_args_to_idx, key_value_args);
         compression_method_value.has_value())
     {
-        setCompressionMethod(compression_method);
+        setCompressionMethod(compression_method_value.value());
     }
 
     if (auto partition_strategy_value = getFromPositionOrKeyValue<String>("partition_strategy", args, engine_args_to_idx, key_value_args);
