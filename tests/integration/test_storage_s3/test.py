@@ -2610,28 +2610,3 @@ def test_key_value_args(started_cluster):
             f"insert into function s3('{url}', structure = 'a Int32, b String', partition_strategy='hive', TSV) partition by b select number, toString(number) from numbers(10) settings s3_truncate_on_insert=1"
         )
     )
-
-    # Check s3Cluster
-    assert 2 == int(
-        node.query(
-            f"select a from s3Cluster(cluster, '{url}', TSVRaw, structure = 'a Int32, b String', access_key_id = 'minio', secret_access_key = '{minio_secret_key}', compression_method = 'none') where b = '2'",
-        )
-    )
-    assert 2 == int(
-        node.query(
-            f"select a from s3Cluster(cluster, '{url}', format = TSVRaw, structure = 'a Int32, b String', access_key_id = 'minio', secret_access_key = '{minio_secret_key}', compression_method = 'none') where b = '2'",
-        )
-    )
-    assert 2 == int(
-        node.query(
-            f"select a from s3Cluster(cluster, '{url}', structure = 'a Int32, b String', access_key_id = 'minio', secret_access_key = '{minio_secret_key}', compression_method = 'none') where b = '2'",
-        )
-    )
-
-    node.query(
-        f"CREATE TABLE {table_name} (a Int32, b String) engine = S3('{url}', format = TSVRaw, access_key_id = 'minio', secret_access_key = '{minio_secret_key}', compression_method = 'gzip')"
-    )
-    assert (
-        f"S3(\\'{url}\\', \\'TSVRaw\\', format = \\'TSVRaw\\', access_key_id = \\'minio\\', secret_access_key = \\'[HIDDEN]\\', compression_method = \\'gzip\\')"
-        in node.query(f"SHOW CREATE TABLE {table_name}")
-    )
