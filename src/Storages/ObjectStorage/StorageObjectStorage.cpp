@@ -27,7 +27,6 @@
 #include <Storages/StorageFactory.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <Common/parseGlobs.h>
-#include <Storages/ObjectStorage/MergeTree/StorageObjectStorageImporterSink.h>
 #include <Databases/LoadingStrictnessLevel.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/HivePartitioningUtils.h>
@@ -50,6 +49,7 @@ namespace ErrorCodes
     extern const int NOT_IMPLEMENTED;
     extern const int LOGICAL_ERROR;
     extern const int INCORRECT_DATA;
+    extern const int FILE_ALREADY_EXISTS;
 }
 
 String StorageObjectStorage::getPathSample(ContextPtr context)
@@ -454,8 +454,9 @@ bool StorageObjectStorage::supportsImport() const
 SinkToStoragePtr StorageObjectStorage::import(
     const std::string & file_name,
     Block & block_with_partition_values,
-    ContextPtr local_context,
-    std::function<void(ImportStats)> part_log)
+    std::string & destination_file_path,
+    bool overwrite_if_exists,
+    ContextPtr local_context)
 {
     std::string partition_key;
 
@@ -469,23 +470,20 @@ SinkToStoragePtr StorageObjectStorage::import(
         }
     }
 
-    const auto file_path = configuration->getPathForWrite(partition_key, file_name).path;
+    destination_file_path = configuration->getPathForWrite(partition_key, file_name).path;
 
-    if (object_storage->exists(StoredObject(file_path)))
+    if (!overwrite_if_exists && object_storage->exists(StoredObject(destination_file_path)))
     {
-        LOG_INFO(getLogger("StorageObjectStorage"), "File {} already exists, skipping import", file_path);
-        return nullptr;
+        throw Exception(ErrorCodes::FILE_ALREADY_EXISTS, "File {} already exists", destination_file_path);
     }
-    
-    return std::make_shared<StorageObjectStorageImporterSink>(
-        file_path,
+
+    return std::make_shared<StorageObjectStorageSink>(
+        destination_file_path,
         object_storage,
         configuration,
         format_settings,
         getInMemoryMetadataPtr()->getSampleBlock(),
-        part_log,
-        local_context
-    );
+        local_context);
 }
 
 void StorageObjectStorage::truncate(
