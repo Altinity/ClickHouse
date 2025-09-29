@@ -86,8 +86,7 @@ def check_s3_gets(cluster, node, expected_result, cluster_first, cluster_second,
         "filesystem_cache_name": "'raw_s3_cache'",
         }
 
-    if lock_object_storage_task_distribution_ms > 0:
-        settings["lock_object_storage_task_distribution_ms"] = lock_object_storage_task_distribution_ms
+    settings["lock_object_storage_task_distribution_ms"] = lock_object_storage_task_distribution_ms
 
     query_id_first = str(uuid.uuid4())
     result_first = node.query(
