@@ -148,7 +148,12 @@ DataFileMetaInfo::DataFileMetaInfo(
     {
         auto i_name = name_by_index.find(column.first);
         if (i_name != name_by_index.end())
-            columns_info[i_name->second] = {column.second.rows_count, column.second.nulls_count, column.second.hyperrectangle};
+        {
+            if (column.second.nulls_count.has_value() && column.second.nulls_count.value() >= 0)
+                columns_info[i_name->second] = {column.second.rows_count, column.second.nulls_count, column.second.hyperrectangle};
+            else
+                columns_info[i_name->second] = {column.second.rows_count, std::nullopt, column.second.hyperrectangle};
+        }
     }
 }
 
