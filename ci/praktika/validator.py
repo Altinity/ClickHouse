@@ -160,11 +160,12 @@ class Validator:
                     in Settings.S3_BUCKET_TO_HTTP_ENDPOINT
                 ), f"S3_BUCKET_TO_HTTP_ENDPOINT Setting must include bucket name [{Settings.HTML_S3_PATH}] from HTML_S3_PATH, workflow [{workflow.name}]"
 
-            if workflow.enable_cache:
-                for artifact in workflow.artifacts or []:
-                    assert (
-                        artifact.is_s3_artifact()
-                    ), f"All artifacts must be of S3 type if enable_cache|enable_html=True, artifact [{artifact.name}], type [{artifact.type}], workflow [{workflow.name}]"
+            # NOTE(myrotk): the only GH artifact is build_reports and it is necessary
+            # if workflow.enable_cache:
+            #     for artifact in workflow.artifacts or []:
+            #         assert (
+            #             artifact.is_s3_artifact()
+            #         ), f"All artifacts must be of S3 type if enable_cache|enable_html=True, artifact [{artifact.name}], type [{artifact.type}], workflow [{workflow.name}]"
 
             if workflow.dockers and not workflow.disable_dockers_build:
                 assert (

@@ -23,16 +23,16 @@ query "ALTER TABLE $mt_table EXPORT PART '2020_1_1_0' TO TABLE $s3_table SETTING
 query "ALTER TABLE $mt_table EXPORT PART '2021_2_2_0' TO TABLE $s3_table SETTINGS allow_experimental_export_merge_tree_part = 1"
 
 echo "---- Both data parts should appear"
-query "SELECT DISTINCT ON (id) replaceRegexpAll(_path, '$s3_table', 's3_table_NAME'), id FROM $s3_table ORDER BY id"
+query "SELECT * FROM $s3_table ORDER BY id"
 
 echo "---- Export the same part again, it should be idempotent"
 query "ALTER TABLE $mt_table EXPORT PART '2020_1_1_0' TO TABLE $s3_table SETTINGS allow_experimental_export_merge_tree_part = 1"
 
-query "SELECT DISTINCT ON (id) replaceRegexpAll(_path, '$s3_table', 's3_table_NAME'), id FROM $s3_table ORDER BY id"
+query "SELECT * FROM $s3_table ORDER BY id"
 
 query "CREATE TABLE $mt_table_roundtrip ENGINE = MergeTree() PARTITION BY year ORDER BY tuple() AS SELECT * FROM $s3_table"
 
 echo "---- Data in roundtrip MergeTree table (should match s3_table)"
-query "SELECT DISTINCT ON (id) * FROM $mt_table_roundtrip ORDER BY id"
+query "SELECT * FROM $s3_table ORDER BY id"
 
 query "DROP TABLE IF EXISTS $mt_table, $s3_table, $mt_table_roundtrip"

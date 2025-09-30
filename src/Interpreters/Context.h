@@ -88,6 +88,7 @@ class AsynchronousMetrics;
 class BackgroundSchedulePool;
 class MergeList;
 class MovesList;
+class ExportsList;
 class ReplicatedFetchList;
 class RefreshSet;
 class Cluster;
@@ -1140,6 +1141,9 @@ public:
 
     MovesList & getMovesList();
     const MovesList & getMovesList() const;
+
+    ExportsList & getExportsList();
+    const ExportsList & getExportsList() const;
 
     ReplicatedFetchList & getReplicatedFetchList();
     const ReplicatedFetchList & getReplicatedFetchList() const;
