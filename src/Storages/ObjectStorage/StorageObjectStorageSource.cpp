@@ -340,11 +340,6 @@ Chunk StorageObjectStorageSource::generate()
             {
                 for (const auto & constant_column : reader.constant_columns_with_values)
                 {
-                    LOG_DEBUG(log, "Restore constant column '{}' index {} with value '{}'",
-                        constant_column.second.name_and_type.name,
-                        constant_column.first,
-                        constant_column.second.value
-                    );
                     chunk.addColumn(constant_column.first,
                         constant_column.second.name_and_type.type->createColumnConst(
                             chunk.getNumRows(), constant_column.second.value)->convertToFullColumnIfConst());
