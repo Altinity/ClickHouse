@@ -29,7 +29,7 @@ protected:
         size_t num_rows = std::min(max_block_size, remaining_rows);
         remaining_rows -= num_rows;
         auto chunk = cloneConstWithDefault(Chunk{getPort().getHeader().getColumns(), 0}, num_rows);
-        chunk.getChunkInfos().add(std::make_shared<ChunkInfoRowNumOffset>(generated_rows));
+        chunk.getChunkInfos().add(std::make_shared<ChunkInfoRowNumbers>(generated_rows));
         generated_rows += num_rows;
         return chunk;
     }
