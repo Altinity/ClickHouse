@@ -18,6 +18,20 @@ FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES = [
     )
 ]
 
+PRIORITY_BUILD_JOBS = [
+    job.name
+    for job in JobConfigs.build_jobs
+    if any(
+        substr in job.name
+        for substr in (
+            "debug",
+            "binary",
+            "asan",
+            "release",
+        )
+    )
+]
+
 REGULAR_BUILD_NAMES = [job.name for job in JobConfigs.build_jobs]
 
 workflow = Workflow.Config(
@@ -36,6 +50,11 @@ workflow = Workflow.Config(
                     # JobNames.STYLE_CHECK, # NOTE (strtgbb): we don't run style check
                     # JobNames.FAST_TEST, # NOTE (strtgbb): this takes too long, revisit later
                     # JobConfigs.tidy_build_arm_jobs[0].name, # NOTE (strtgbb): this takes too long, revisit later
+                    *(
+                        PRIORITY_BUILD_JOBS
+                        if job.name not in PRIORITY_BUILD_JOBS
+                        else []
+                    )
                 ]
             )
             for job in JobConfigs.build_jobs
@@ -101,7 +120,7 @@ workflow = Workflow.Config(
             job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
             for job in JobConfigs.buzz_fuzzer_jobs
         ],
-        #*[
+        # *[
         #    job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
         #    for job in JobConfigs.performance_comparison_with_master_head_jobs
         # ], # NOTE (strtgbb): failed previously due to GH secrets not being handled properly, try again later
