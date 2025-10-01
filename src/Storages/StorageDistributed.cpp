@@ -1036,7 +1036,6 @@ void StorageDistributed::read(
 
     SelectQueryInfo modified_query_info = query_info;
 
-    std::vector<Block> all_headers;
     std::vector<SelectQueryInfo> all_query_infos;
 
     const auto & settings = local_context->getSettingsRef();
@@ -1080,16 +1079,10 @@ void StorageDistributed::read(
                     table_function_entry.table_function_ast,
                     table_function_entry.predicate_ast);
 
-                // TODO: somewhere here the DESCRIBE TABLE is triggered, try to avoid it.
-                auto additional_header = InterpreterSelectQueryAnalyzer::getSampleBlock(additional_query_tree, local_context, SelectQueryOptions(processed_stage).analyze());
-
-                for (auto & column : additional_header)
-                    column.column = column.column->convertToFullColumnIfConst();
 
                 additional_query_info.query = queryNodeToDistributedSelectQuery(additional_query_tree);
                 additional_query_info.query_tree = std::move(additional_query_tree);
 
-                all_headers.push_back(additional_header);
                 all_query_infos.push_back(additional_query_info);
             }
         }
@@ -1113,14 +1106,11 @@ void StorageDistributed::read(
             {
                 SelectQueryInfo additional_query_info = query_info;
 
-                auto additional_header = InterpreterSelectQuery(additional_query_info.query, local_context, SelectQueryOptions(processed_stage).analyze()).getSampleBlock();
-
                 additional_query_info.query = ClusterProxy::rewriteSelectQuery(
                     local_context, additional_query_info.query,
                     "", "", table_function_entry.table_function_ast,
                     table_function_entry.predicate_ast);
 
-                all_headers.push_back(additional_header);
                 all_query_infos.push_back(additional_query_info);
             }
         }
@@ -1176,12 +1166,11 @@ void StorageDistributed::read(
     for (size_t i = 0; i < all_query_infos.size(); ++i)
     {
         auto additional_query_info = all_query_infos[i];
-        auto additional_header = all_headers[i];
 
         // This properly handles both analyzer and legacy modes with converting actions
         auto additional_plan_ptr = createLocalPlan(
             additional_query_info.query,
-            additional_header,
+            header,
             local_context,
             processed_stage,
             0, // shard_num - not applicable for local plans
