@@ -120,9 +120,6 @@ public:
     StorageSnapshotPtr getStorageSnapshotForQuery(
         const StorageMetadataPtr & metadata_snapshot, const ASTPtr & query, ContextPtr query_context) const override;
 
-    /// Override for TieredDistributedMerge to merge schemas from all layers
-    StorageInMemoryMetadata getInMemoryMetadata() const override;
-
     QueryProcessingStage::Enum
     getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageSnapshotPtr &, SelectQueryInfo &) const override;
 
@@ -328,12 +325,6 @@ private:
 
     /// Additional table functions for TieredDistributedMerge engine
     std::vector<TableFunctionEntry> additional_table_functions;
-
-private:
-    /// Helper methods for TieredDistributedMerge
-    ColumnsDescription getColumnsDescriptionFromLayers(const ContextPtr & query_context) const;
-    StorageSnapshotPtr getStorageSnapshotForLayer(const TableFunctionEntry & layer, const ContextPtr & query_context) const;
-    VirtualColumnsDescription createVirtualsForTieredDistributedMerge() const;
 };
 
 }
