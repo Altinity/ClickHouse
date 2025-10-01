@@ -2202,6 +2202,11 @@ void StorageDistributed::setAdditionalTableFunctions(std::vector<TableFunctionEn
 {
     additional_table_functions = std::move(additional_table_functions_);
     log = getLogger("TieredDistributedMerge (" + getStorageID().table_name + ")");
+
+    auto virtuals = createVirtuals();
+    // or _layer_index?
+    virtuals.addEphemeral("_table_index", std::make_shared<DataTypeUInt32>(), "Index of the table function in TieredDistributedMerge (0 for main table, 1+ for additional table functions)");
+    setVirtuals(virtuals);
 }
 
 void registerStorageDistributed(StorageFactory & factory)
