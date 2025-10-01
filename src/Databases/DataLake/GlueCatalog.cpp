@@ -427,7 +427,7 @@ bool GlueCatalog::classifyTimestampTZ(const String & column_name, const TableMet
         DB::ASTStorage * storage = table_engine_definition->as<DB::ASTStorage>();
         DB::ASTs args = storage->engine->arguments->children;
 
-        String storage_endpoint = !settings[DB::DatabaseDataLakeSetting::storage_endpoint].empty() ? settings[DB::DatabaseDataLakeSetting::storage_endpoint].value : metadata_uri;
+        String storage_endpoint = !settings[DB::DatabaseDataLakeSetting::storage_endpoint].value.empty() ? settings[DB::DatabaseDataLakeSetting::storage_endpoint].value : metadata_uri;
         
         if (args.empty())
             args.emplace_back(std::make_shared<DB::ASTLiteral>(storage_endpoint));
