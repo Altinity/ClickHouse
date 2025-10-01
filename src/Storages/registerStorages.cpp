@@ -13,6 +13,7 @@ void registerStorageNull(StorageFactory & factory);
 void registerStorageMerge(StorageFactory & factory);
 void registerStorageBuffer(StorageFactory & factory);
 void registerStorageDistributed(StorageFactory & factory);
+void registerStorageTieredDistributedMerge(StorageFactory & factory);
 void registerStorageMemory(StorageFactory & factory);
 void registerStorageFile(StorageFactory & factory);
 void registerStorageURL(StorageFactory & factory);
@@ -115,6 +116,7 @@ void registerStorages()
     registerStorageMerge(factory);
     registerStorageBuffer(factory);
     registerStorageDistributed(factory);
+    registerStorageTieredDistributedMerge(factory);
     registerStorageMemory(factory);
     registerStorageFile(factory);
     registerStorageURL(factory);

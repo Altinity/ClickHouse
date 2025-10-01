@@ -2351,7 +2351,10 @@ void registerStorageDistributed(StorageFactory & factory)
         .source_access_type = AccessType::REMOTE,
         .has_builtin_setting_fn = DistributedSettings::hasBuiltin,
     });
+}
 
+void registerStorageTieredDistributedMerge(StorageFactory & factory)
+{
     // Register TieredDistributedMerge engine
     // TODO: consider moving it to a separate file / subclass of StorageDistributed
     factory.registerStorage("TieredDistributedMerge", [](const StorageFactory::Arguments & args) -> StoragePtr
