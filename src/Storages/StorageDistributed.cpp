@@ -910,6 +910,7 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
     const ASTPtr & remote_table_function,
     const ASTPtr & additional_filter = nullptr)
 {
+    auto dbg_log = getLogger("TieredDistributedMerge/buildQueryTreeDistributed");
     auto & planner_context = query_info.planner_context;
     const auto & query_context = planner_context->getQueryContext();
 
@@ -956,6 +957,18 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
             query_analysis_pass.run(node, query_context);
         }
 
+        // Try to log replacement table expression columns for table function as well
+        try
+        {
+            if (table_function_node->isResolved())
+            {
+                auto snapshot = table_function_node->getStorageSnapshot();
+                auto cols = snapshot->getColumns(GetColumnsOptions(GetColumnsOptions::All).withExtendedObjects().withVirtuals());
+                LOG_TRACE(dbg_log, "Replacement table expression (table function) columns: {}", ColumnsDescription{cols}.toString());
+            }
+        }
+        catch (...) {}
+
         replacement_table_expression = std::move(table_function_node);
     }
     else
@@ -963,6 +976,11 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
         auto get_column_options = GetColumnsOptions(GetColumnsOptions::All).withExtendedObjects().withVirtuals();
 
         auto column_names_and_types = distributed_storage_snapshot->getColumns(get_column_options);
+        try
+        {
+            LOG_TRACE(dbg_log, "Replacement table expression (remote table) columns: {}", ColumnsDescription{column_names_and_types}.toString());
+        }
+        catch (...) {}
 
         auto storage = std::make_shared<StorageDummy>(remote_storage_id, ColumnsDescription{column_names_and_types});
         auto table_node = std::make_shared<TableNode>(std::move(storage), query_context);
@@ -980,11 +998,26 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
 
     if (additional_filter)
     {
-        const auto & context = query_info.planner_context->getQueryContext();
-
+        // Build filter tree in the same query context that is used for the replacement table expression
         filter = buildQueryTree(additional_filter->clone(), query_context);
 
-        QueryAnalysisPass(replacement_table_expression).run(filter, context);
+        // Ensure the replacement table expression is resolved (has storage/snapshot) before analyzing the filter
+        if (auto * tf = replacement_table_expression->as<TableFunctionNode>(); tf && !tf->isResolved())
+        {
+            QueryAnalysisPass analyze_table_expression;
+            QueryTreeNodePtr tmp = replacement_table_expression;
+            analyze_table_expression.run(tmp, query_context);
+            replacement_table_expression = std::move(tmp);
+        }
+
+        // Analyze the filter against the resolved replacement table expression so identifiers/types
+        // are bound to the correct subtable header/snapshot, including virtual/hive columns.
+        QueryAnalysisPass(replacement_table_expression).run(filter, query_context);
+        try
+        {
+            LOG_TRACE(dbg_log, "Additional filter after analysis: {}", filter->formatASTForErrorMessage());
+        }
+        catch (...) {}
     }
 
     auto query_tree_to_modify = query_info.query_tree->cloneAndReplace(query_info.table_expression, std::move(replacement_table_expression));
@@ -997,6 +1030,21 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
             ? mergeConditionNodes({query.getWhere(), filter}, query_context)
             : std::move(filter);
     }
+
+    try
+    {
+        LOG_TRACE(dbg_log, "Query tree after replacement + reanalysis: {}", query_tree_to_modify->formatASTForErrorMessage());
+    }
+    catch (...) {}
+
+    // Also log a sample header after reanalysis (analyze-only) to see resolved types
+    try
+    {
+        SelectQueryOptions opts = SelectQueryOptions().analyze();
+        Block sample = InterpreterSelectQueryAnalyzer::getSampleBlock(query_tree_to_modify, query_context, opts);
+        LOG_TRACE(dbg_log, "Sample header after reanalysis: {}", sample.dumpStructure());
+    }
+    catch (...) {}
 
     ReplaseAliasColumnsVisitor replase_alias_columns_visitor;
     replase_alias_columns_visitor.visit(query_tree_to_modify);
@@ -1065,6 +1113,9 @@ void StorageDistributed::read(
         modified_query_info.query = queryNodeToDistributedSelectQuery(query_tree_distributed);
 
         modified_query_info.query_tree = std::move(query_tree_distributed);
+        // Clear any pre-typed filter DAG from the original query_info to avoid mismatches
+        // after table substitution. Planner will rebuild filters from the re-analyzed tree.
+        modified_query_info.filter_actions_dag.reset();
 
         if (!additional_table_functions.empty())
         {
@@ -1079,14 +1130,10 @@ void StorageDistributed::read(
                     table_function_entry.table_function_ast,
                     table_function_entry.predicate_ast);
 
-                // TODO: somewhere here the DESCRIBE TABLE is triggered, try to avoid it.
-                auto additional_header = InterpreterSelectQueryAnalyzer::getSampleBlock(additional_query_tree, local_context, SelectQueryOptions(processed_stage).analyze());
-
-                for (auto & column : additional_header)
-                    column.column = column.column->convertToFullColumnIfConst();
-
                 additional_query_info.query = queryNodeToDistributedSelectQuery(additional_query_tree);
                 additional_query_info.query_tree = std::move(additional_query_tree);
+                additional_query_info.filter_actions_dag.reset();
+                LOG_DEBUG(log, "TieredDistributedMerge: additional storage #{} query: {}", i, additional_query_info.query->formatForLogging());
 
                 all_headers.push_back(additional_header);
                 all_query_infos.push_back(additional_query_info);
@@ -1112,14 +1159,13 @@ void StorageDistributed::read(
             {
                 SelectQueryInfo additional_query_info = query_info;
 
-                auto additional_header = InterpreterSelectQuery(additional_query_info.query, local_context, SelectQueryOptions(processed_stage).analyze()).getSampleBlock();
-
                 additional_query_info.query = ClusterProxy::rewriteSelectQuery(
                     local_context, additional_query_info.query,
                     "", "", table_function_entry.table_function_ast,
                     table_function_entry.predicate_ast);
 
-                all_headers.push_back(additional_header);
+                LOG_DEBUG(log, "TieredDistributedMerge: additional storage #{} query: {}", i, additional_query_info.query->formatForLogging());
+
                 all_query_infos.push_back(additional_query_info);
             }
         }
@@ -1135,6 +1181,8 @@ void StorageDistributed::read(
             return;
         }
     }
+
+    // No-op here: filter DAG will be produced by the planner from the re-analyzed query tree.
 
     const auto & snapshot_data = assert_cast<const SnapshotData &>(*storage_snapshot->data);
 
@@ -1174,22 +1222,36 @@ void StorageDistributed::read(
     std::vector<QueryPlan> additional_plans;
     for (size_t i = 0; i < all_query_infos.size(); ++i)
     {
+        // Use the rewritten additional query info built above for this storage
         auto additional_query_info = all_query_infos[i];
-        const auto & storage = additional_table_functions[i].storage;
-        auto additional_header = all_headers[i];
 
         // Create a new query plan for this additional storage
         QueryPlan additional_plan;
-        // Execute the query against the additional storage
-        storage->read(
-            additional_plan,
-            {}, // column names
-            storage->getStorageSnapshot(storage->getInMemoryMetadataPtr(), local_context),
-            additional_query_info,
-            local_context,
-            processed_stage,
-            0, // max_block_size
-            0); // num_streams
+
+        // Build a full SELECT plan for the additional storage so that
+        // projection/aggregation (e.g. count()) is represented in the plan output header.
+        const auto & settings_local = local_context->getSettingsRef();
+        if (settings_local[Setting::allow_experimental_analyzer])
+        {
+            // Use the analyzer pipeline
+            // Build plan to the same processing stage as the main path
+            SelectQueryOptions add_opts(processed_stage);
+            InterpreterSelectQueryAnalyzer add_interpreter(
+                additional_query_info.query_tree,
+                local_context,
+                add_opts);
+            additional_plan = std::move(add_interpreter).extractQueryPlan();
+        }
+        else
+        {
+            // Classic pipeline
+            SelectQueryOptions add_opts(processed_stage);
+            InterpreterSelectQuery add_interpreter(
+                additional_query_info.query,
+                local_context,
+                add_opts);
+            add_interpreter.buildQueryPlan(additional_plan);
+        }
 
         additional_plans.push_back(std::move(additional_plan));
     }
@@ -2395,26 +2457,26 @@ void registerStorageDistributed(StorageFactory & factory)
                                 "Argument #{}: additional table function must be a valid table function, got: {}", i, func->name);
             }
 
-            // Additional table functions can be either TableFunctionRemote or ITableFunctionCluster
-            // Check if it's a supported table function type
-            String table_function_name = func->name;
+            // // Additional table functions can be either TableFunctionRemote or ITableFunctionCluster
+            // // Check if it's a supported table function type
+            // String table_function_name = func->name;
 
-                // Check for ITableFunctionCluster types (ending with "Cluster")
-            // Use a whitelist of supported table function names for clarity and safety
-            static const std::unordered_set<std::string> supported_table_functions = {
-                "remote", "remoteSecure", "cluster", "clusterAllReplicas",
-                "s3Cluster", "urlCluster", "fileCluster", "S3Cluster", "AzureCluster", "HDFSCluster",
-                "IcebergS3Cluster", "IcebergAzureCluster", "IcebergHDFSCluster", "DeltaLakeCluster", "HudiCluster"
-            };
+            // // Check for ITableFunctionCluster types (ending with "Cluster")
+            // // Use a whitelist of supported table function names for clarity and safety
+            // static const std::unordered_set<std::string> supported_table_functions = {
+            //     "remote", "remoteSecure", "cluster", "clusterAllReplicas",
+            //     "s3Cluster", "urlCluster", "fileCluster", "S3Cluster", "AzureCluster", "HDFSCluster",
+            //     "IcebergS3Cluster", "IcebergAzureCluster", "IcebergHDFSCluster", "DeltaLakeCluster", "HudiCluster"
+            // };
 
-            if (supported_table_functions.find(table_function_name) == supported_table_functions.end())
-            {
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "Argument #{}: additional table function '{}' is not supported. "
-                    "TieredDistributedMerge engine requires additional table functions to be either ITableFunctionCluster-based "
-                    "(like s3Cluster, urlCluster, DeltaLakeCluster, etc.) or TableFunctionRemote-based "
-                    "(like remote, remoteSecure, cluster, clusterAllReplicas).", i, table_function_name);
-            }
+            // if (supported_table_functions.find(table_function_name) == supported_table_functions.end())
+            // {
+            //     throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            //         "Argument #{}: additional table function '{}' is not supported. "
+            //         "TieredDistributedMerge engine requires additional table functions to be either ITableFunctionCluster-based "
+            //         "(like s3Cluster, urlCluster, DeltaLakeCluster, etc.) or TableFunctionRemote-based "
+            //         "(like remote, remoteSecure, cluster, clusterAllReplicas).", i, table_function_name);
+            // }
 
             // TODO: Validate predicate - must be a SQL expression (just rejecting a string literal for now)
             if (const auto * literal = predicate_ast->as<ASTLiteral>())
