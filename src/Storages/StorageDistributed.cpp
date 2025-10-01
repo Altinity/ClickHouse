@@ -20,6 +20,7 @@
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/ObjectUtils.h>
 #include <DataTypes/NestedUtils.h>
+#include <DataTypes/getLeastSupertype.h>
 
 #include <Disks/IVolume.h>
 
@@ -28,6 +29,7 @@
 #include <Storages/StorageFactory.h>
 #include <Storages/AlterCommands.h>
 #include <Storages/getStructureOfRemoteTable.h>
+#include <TableFunctions/TableFunctionFactory.h>
 #include <Storages/checkAndGetLiteralArgument.h>
 #include <Storages/StorageDummy.h>
 #include <Storages/removeGroupingFunctionSpecializations.h>
@@ -765,11 +767,6 @@ static bool requiresObjectColumns(const ColumnsDescription & all_columns, ASTPtr
     return false;
 }
 
-StorageSnapshotPtr StorageDistributed::getStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context) const
-{
-    /// TODO: support additional table functions
-    return getStorageSnapshotForQuery(metadata_snapshot, nullptr, query_context);
-}
 
 /// TODO: support additional table functions
 StorageSnapshotPtr StorageDistributed::getStorageSnapshotForQuery(
@@ -1188,7 +1185,7 @@ void StorageDistributed::read(
             auto table_function = TableFunctionFactory::instance().get(additional_table_functions[i].table_function_ast, local_context);
             if (!table_function)
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid table function in TieredDistributedMerge engine");
-            
+
             storage = table_function->execute(
                 additional_table_functions[i].table_function_ast,
                 local_context,
@@ -1196,7 +1193,7 @@ void StorageDistributed::read(
                 {}, // columns - will be determined from storage
                 false, // use_global_context = false
                 false); // is_insert_query = false
-            
+
             // Handle StorageTableFunctionProxy if present
             if (auto proxy = std::dynamic_pointer_cast<StorageTableFunctionProxy>(storage))
             {
@@ -2424,7 +2421,7 @@ void registerStorageTieredDistributedMerge(StorageFactory & factory)
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
                                 "Argument #{} must be a valid SQL expression: {}", i + 1, e.message());
             }
-                        
+
             // Validate table function or table identifier
             if (const auto * func = table_function_ast->as<ASTFunction>())
             {
@@ -2545,4 +2542,140 @@ bool StorageDistributed::initializeDiskOnConfigChange(const std::set<String> & n
 
     return true;
 }
+
+StorageInMemoryMetadata StorageDistributed::getInMemoryMetadata() const
+{
+    if (additional_table_functions.empty())
+    {
+        // For regular Distributed engine, use base implementation
+        return IStorage::getInMemoryMetadata();
+    }
+
+    // For TieredDistributedMerge engine, merge schemas from all layers
+    auto metadata = IStorage::getInMemoryMetadata();
+
+    // Get merged columns from all layers
+    auto merged_columns = getColumnsDescriptionFromLayers(getContext());
+    if (!merged_columns.empty())
+    {
+        metadata.setColumns(merged_columns);
+    }
+
+    // Note: Virtual columns for TieredDistributedMerge should be set in constructor
+    // or in a non-const method
+
+    return metadata;
+}
+
+StorageSnapshotPtr StorageDistributed::getStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context) const
+{
+    if (additional_table_functions.empty())
+    {
+        // For regular Distributed engine, use existing implementation
+        return getStorageSnapshotForQuery(metadata_snapshot, nullptr, query_context);
+    }
+
+    // For TieredDistributedMerge engine, create snapshot with virtual columns
+    auto snapshot_data = std::make_unique<SnapshotData>();
+
+    if (!requiresObjectColumns(metadata_snapshot->getColumns(), nullptr))
+        return std::make_shared<StorageSnapshot>(*this, metadata_snapshot, ColumnsDescription{}, std::move(snapshot_data));
+
+    // For Object columns, we need to collect objects from all layers
+    snapshot_data->objects_by_shard = getExtendedObjectsOfRemoteTables(
+        *getCluster(),
+        StorageID{remote_database, remote_table},
+        metadata_snapshot->getColumns(),
+        getContext());
+
+    auto object_columns = DB::getConcreteObjectColumns(
+        snapshot_data->objects_by_shard.begin(),
+        snapshot_data->objects_by_shard.end(),
+        metadata_snapshot->getColumns(),
+        [](const auto & shard_num_and_columns) -> const auto & { return shard_num_and_columns.second; });
+
+    return std::make_shared<StorageSnapshot>(*this, metadata_snapshot, std::move(object_columns), std::move(snapshot_data));
+}
+
+ColumnsDescription StorageDistributed::getColumnsDescriptionFromLayers(const ContextPtr & query_context) const
+{
+    ColumnsDescription result;
+
+    // Start with the main distributed table columns
+    auto main_metadata = IStorage::getInMemoryMetadata();
+    result = main_metadata.getColumns();
+
+    // Add columns from additional table functions
+    for (const auto & layer : additional_table_functions)
+    {
+        try
+        {
+            auto layer_snapshot = getStorageSnapshotForLayer(layer, query_context);
+            if (layer_snapshot)
+            {
+                auto layer_columns = layer_snapshot->getAllColumnsDescription();
+
+                // Merge columns using supertype logic (similar to StorageMerge)
+                for (const auto & column : layer_columns)
+                {
+                    if (!result.has(column.name))
+                    {
+                        result.add(column);
+                    }
+                    else if (column != result.get(column.name))
+                    {
+                        result.modify(column.name, [&column](ColumnDescription & existing)
+                        {
+                            existing.type = getLeastSupertypeOrVariant(DataTypes{existing.type, column.type});
+                            if (existing.default_desc != column.default_desc)
+                                existing.default_desc = {};
+                        });
+                    }
+                }
+            }
+        }
+        catch (const Exception & e)
+        {
+            LOG_WARNING(log, "Failed to get schema from layer {}: {}", layer.table_function_ast->formatForErrorMessage(), e.message());
+        }
+    }
+
+    return result;
+}
+
+StorageSnapshotPtr StorageDistributed::getStorageSnapshotForLayer(const TableFunctionEntry & layer, const ContextPtr & query_context) const
+{
+    try
+    {
+        if (layer.storage_id.has_value())
+        {
+            // It's a table identifier - get storage directly
+            auto storage = DatabaseCatalog::instance().getTable(layer.storage_id.value(), query_context);
+            return storage->getStorageSnapshot(storage->getInMemoryMetadataPtr(), query_context);
+        }
+        else
+        {
+            // It's a table function - execute it to get storage
+            auto table_function = TableFunctionFactory::instance().get(layer.table_function_ast, query_context);
+            auto storage = table_function->execute(layer.table_function_ast, query_context, "");
+            return storage->getStorageSnapshot(storage->getInMemoryMetadataPtr(), query_context);
+        }
+    }
+    catch (const Exception & e)
+    {
+        LOG_WARNING(log, "Failed to get storage snapshot for layer: {}", e.message());
+        return nullptr;
+    }
+}
+
+VirtualColumnsDescription StorageDistributed::createVirtualsForTieredDistributedMerge() const
+{
+    auto desc = createVirtuals(); // Get base virtuals from regular Distributed
+
+    // Add _table_index virtual column for TieredDistributedMerge
+    desc.addEphemeral("_table_index", std::make_shared<DataTypeUInt32>(), "Index of the table layer (0 for main layer, 1+ for additional layers)");
+
+    return desc;
+}
+
 }
