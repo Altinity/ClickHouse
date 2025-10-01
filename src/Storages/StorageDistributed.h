@@ -175,10 +175,7 @@ public:
     void setAdditionalFilter(ASTPtr filter) { additional_filter = std::move(filter); }
 
     /// Set additional table functions for TieredDistributedMerge engine
-    void setAdditionalTableFunctions(std::vector<TableFunctionEntry> additional_table_functions_)
-    {
-        additional_table_functions = std::move(additional_table_functions_);
-    }
+    void setAdditionalTableFunctions(std::vector<TableFunctionEntry> additional_table_functions_);
 
     /// Getter methods for ClusterProxy::executeQuery
     StorageID getRemoteStorageID() const { return remote_storage; }

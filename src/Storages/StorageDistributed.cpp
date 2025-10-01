@@ -1211,6 +1211,7 @@ void StorageDistributed::read(
 
         // Create UnionStep to combine all plans
         auto union_step = std::make_unique<UnionStep>(std::move(headers), 0);
+        union_step->setStepDescription("TieredDistributedMerge");
 
         union_plan.unitePlans(std::move(union_step), std::move(plan_ptrs));
 
@@ -2195,6 +2196,12 @@ void StorageDistributed::delayInsertOrThrowIfNeeded() const
                 formatReadableSizeWithBinarySuffix((*distributed_settings)[DistributedSetting::bytes_to_delay_insert]));
         }
     }
+}
+
+void StorageDistributed::setAdditionalTableFunctions(std::vector<TableFunctionEntry> additional_table_functions_)
+{
+    additional_table_functions = std::move(additional_table_functions_);
+    log = getLogger("TieredDistributedMerge (" + getStorageID().table_name + ")");
 }
 
 void registerStorageDistributed(StorageFactory & factory)
