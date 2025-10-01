@@ -50,17 +50,22 @@ class StorageDistributed final : public IStorage, WithContext
     friend class StorageSystemDistributionQueue;
 
 public:
-    /// Structure to hold storage, its AST, and associated predicate
+    /// Structure to hold table function AST, predicate, and optional StorageID for table identifiers
     struct TableFunctionEntry
     {
-        StoragePtr storage;
         ASTPtr table_function_ast;
         ASTPtr predicate_ast;
+        std::optional<StorageID> storage_id; // For table identifiers instead of table functions
 
-        TableFunctionEntry(StoragePtr storage_, ASTPtr table_function_ast_, ASTPtr predicate_ast_)
-            : storage(std::move(storage_))
-            , table_function_ast(std::move(table_function_ast_))
+        TableFunctionEntry(ASTPtr table_function_ast_, ASTPtr predicate_ast_)
+            : table_function_ast(std::move(table_function_ast_))
             , predicate_ast(std::move(predicate_ast_))
+        {}
+
+        TableFunctionEntry(ASTPtr table_function_ast_, ASTPtr predicate_ast_, StorageID storage_id_)
+            : table_function_ast(std::move(table_function_ast_))
+            , predicate_ast(std::move(predicate_ast_))
+            , storage_id(std::move(storage_id_))
         {}
     };
 

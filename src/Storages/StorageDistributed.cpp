@@ -1175,7 +1175,34 @@ void StorageDistributed::read(
     for (size_t i = 0; i < all_query_infos.size(); ++i)
     {
         auto additional_query_info = all_query_infos[i];
-        const auto & storage = additional_table_functions[i].storage;
+        // Get storage from either table function execution or StorageID resolution
+        StoragePtr storage;
+        if (additional_table_functions[i].storage_id.has_value())
+        {
+            // For table identifiers, resolve the StorageID
+            storage = DatabaseCatalog::instance().getTable(additional_table_functions[i].storage_id.value(), local_context);
+        }
+        else
+        {
+            // For table functions, execute the AST
+            auto table_function = TableFunctionFactory::instance().get(additional_table_functions[i].table_function_ast, local_context);
+            if (!table_function)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid table function in TieredDistributedMerge engine");
+            
+            storage = table_function->execute(
+                additional_table_functions[i].table_function_ast,
+                local_context,
+                getStorageID().table_name, // Use the current table name
+                {}, // columns - will be determined from storage
+                false, // use_global_context = false
+                false); // is_insert_query = false
+            
+            // Handle StorageTableFunctionProxy if present
+            if (auto proxy = std::dynamic_pointer_cast<StorageTableFunctionProxy>(storage))
+            {
+                storage = proxy->getNested();
+            }
+        }
         auto additional_header = all_headers[i];
 
         // Create a new query plan for this additional storage
@@ -2382,40 +2409,6 @@ void registerStorageDistributed(StorageFactory & factory)
             ASTPtr table_function_ast = engine_args[i];
             ASTPtr predicate_ast = engine_args[i + 1];
 
-            // Validate table function
-            const auto * func = table_function_ast->as<ASTFunction>();
-            if (!func)
-            {
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "Additional table function must be a table function, got: {}", table_function_ast->getID());
-            }
-            else if (!TableFunctionFactory::instance().isTableFunctionName(func->name))
-            {
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                                "Argument #{}: additional table function must be a valid table function, got: {}", i, func->name);
-            }
-
-            // Additional table functions can be either TableFunctionRemote or ITableFunctionCluster
-            // Check if it's a supported table function type
-            String table_function_name = func->name;
-
-                // Check for ITableFunctionCluster types (ending with "Cluster")
-            // Use a whitelist of supported table function names for clarity and safety
-            static const std::unordered_set<std::string> supported_table_functions = {
-                "remote", "remoteSecure", "cluster", "clusterAllReplicas",
-                "s3Cluster", "urlCluster", "fileCluster", "S3Cluster", "AzureCluster", "HDFSCluster",
-                "IcebergS3Cluster", "IcebergAzureCluster", "IcebergHDFSCluster", "DeltaLakeCluster", "HudiCluster"
-            };
-
-            if (supported_table_functions.find(table_function_name) == supported_table_functions.end())
-            {
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "Argument #{}: additional table function '{}' is not supported. "
-                    "TieredDistributedMerge engine requires additional table functions to be either ITableFunctionCluster-based "
-                    "(like s3Cluster, urlCluster, DeltaLakeCluster, etc.) or TableFunctionRemote-based "
-                    "(like remote, remoteSecure, cluster, clusterAllReplicas).", i, table_function_name);
-            }
-
             // TODO: Validate predicate - must be a SQL expression (just rejecting a string literal for now)
             if (const auto * literal = predicate_ast->as<ASTLiteral>())
             {
@@ -2425,31 +2418,41 @@ void registerStorageDistributed(StorageFactory & factory)
                                     "Additional predicate must be a SQL expression, got string literal");
                 }
             }
-
-            // Create table function instance and execute it to get StoragePtr
-            auto table_function = TableFunctionFactory::instance().get(table_function_ast, context);
-            if (!table_function)
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid additional table function in TieredDistributedMerge engine");
-
-            // Execute the table function to get the underlying storage
-            StoragePtr additional_storage = table_function->execute(
-                table_function_ast,
-                context,
-                args.table_id.table_name,
-                args.columns, // Use the same columns as the main table function
-                false, // use_global_context = false
-                false); // is_insert_query = false
-
-            // Handle StorageTableFunctionProxy if present
-            if (auto proxy = std::dynamic_pointer_cast<StorageTableFunctionProxy>(additional_storage))
+                        
+            // Validate table function or table identifier
+            if (const auto * func = table_function_ast->as<ASTFunction>())
             {
-                additional_storage = proxy->getNested();
+                // It's a table function - validate it
+                if (!TableFunctionFactory::instance().isTableFunctionName(func->name))
+                {
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                                    "Argument #{}: additional table function must be a valid table function, got: {}", i, func->name);
+                }
+
+                // It's a table function - store the AST for later execution
+                additional_table_functions.emplace_back(table_function_ast, predicate_ast);
+            }
+            else if (const auto * identifier = table_function_ast->as<ASTTableIdentifier>())
+            {
+                // It's a table identifier - validate it can be parsed as StorageID
+                try
+                {
+                    // Parse table identifier to get StorageID
+                    StorageID storage_id(table_function_ast);
+                    additional_table_functions.emplace_back(table_function_ast, predicate_ast, storage_id);
+                }
+                catch (const Exception & e)
+                {
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "Argument #{}: invalid table identifier '{}': {}", i, identifier->name(), e.message());
+                }
+            }
+            else
+            {
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Argument #{}: additional argument must be either a table function or table identifier, got: {}", i, table_function_ast->getID());
             }
 
-           // additional_storage->renameInMemory({args.table_id.database_name, args.table_id.table_name, args.table_id.uuid});
-
-
-            additional_table_functions.emplace_back(std::move(additional_storage), table_function_ast,  predicate_ast);
         }
 
         // Now handle the first table function (which must be a TableFunctionRemote)
