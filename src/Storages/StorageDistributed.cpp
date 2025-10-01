@@ -2386,20 +2386,21 @@ void registerStorageTieredDistributedMerge(StorageFactory & factory)
                             "First argument must be a table function, got: {}", first_arg->getID());
         }
 
-        // TODO: Validate second argument - must be a SQL expression (just rejecting a string literal for now)
-        ASTPtr second_arg = engine_args[1];
-        if (const auto * literal = second_arg->as<ASTLiteral>())
-        {
-            // Check if it's a string literal (which would be invalid for a SQL expression)
-            if (literal->value.getType() == Field::Types::String)
-            {
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                                "Second argument must be a SQL expression, got string literal");
-            }
-        }
-
         // Create the underlying StorageDistributed using the table function
         const ContextPtr & context = args.getContext();
+
+        // Validate second argument - must be a SQL expression
+        ASTPtr second_arg = engine_args[1];
+        try
+        {
+            auto syntax_result = TreeRewriter(context).analyze(second_arg, args.columns.getAllPhysical());
+            ExpressionAnalyzer(second_arg, syntax_result, context).getActions(true);
+        }
+        catch (const Exception & e)
+        {
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                            "Second argument must be a valid SQL expression: {}", e.message());
+        }
 
         // Parse additional table function pairs (if any)
         std::vector<StorageDistributed::TableFunctionEntry> additional_table_functions;
@@ -2412,14 +2413,16 @@ void registerStorageTieredDistributedMerge(StorageFactory & factory)
             ASTPtr table_function_ast = engine_args[i];
             ASTPtr predicate_ast = engine_args[i + 1];
 
-            // TODO: Validate predicate - must be a SQL expression (just rejecting a string literal for now)
-            if (const auto * literal = predicate_ast->as<ASTLiteral>())
+            // Validate predicate - must be a SQL expression
+            try
             {
-                if (literal->value.getType() == Field::Types::String)
-                {
-                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                                    "Additional predicate must be a SQL expression, got string literal");
-                }
+                auto syntax_result = TreeRewriter(context).analyze(predicate_ast, args.columns.getAllPhysical());
+                ExpressionAnalyzer(predicate_ast, syntax_result, context).getActions(true);
+            }
+            catch (const Exception & e)
+            {
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                                "Argument #{} must be a valid SQL expression: {}", i + 1, e.message());
             }
                         
             // Validate table function or table identifier
