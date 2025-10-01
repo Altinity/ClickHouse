@@ -170,6 +170,15 @@ std::optional<String> StorageObjectStorageStableTaskDistributor::getMatchingFile
             file_path = object_info->getPath();
         }
 
+        auto file_meta_info = object_info->getFileMetaInfo();
+        if (file_meta_info.has_value())
+        {
+            RelativePathWithMetadata::CommandInTaskResponse response;
+            response.setFilePath(file_path);
+            response.setFileMetaInfo(file_meta_info.value());
+            file_path = response.toString();
+        }
+
         size_t file_replica_idx = getReplicaForFile(file_path);
         if (file_replica_idx == number_of_current_replica)
         {
@@ -242,8 +251,8 @@ std::optional<String> StorageObjectStorageStableTaskDistributor::getAnyUnprocess
         /// All unprocessed files owned by alive replicas with recenlty activity
         /// Need to retry after (oldest_activity - activity_limit) microseconds
         RelativePathWithMetadata::CommandInTaskResponse response;
-        response.set_retry_after_us(oldest_activity - activity_limit);
-        return response.to_string();
+        response.setRetryAfterUs(oldest_activity - activity_limit);
+        return response.toString();
     }
 
     return std::nullopt;
