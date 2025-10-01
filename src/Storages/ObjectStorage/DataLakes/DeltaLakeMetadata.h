@@ -35,7 +35,7 @@ public:
 
     DeltaLakeMetadata(ObjectStoragePtr object_storage_, ConfigurationObserverPtr configuration_, ContextPtr context_);
 
-    Strings getDataFiles() const override { return data_files; }
+    DataFileInfos getDataFiles() const override { return data_files; }
 
     NamesAndTypesList getTableSchema() const override { return schema; }
 
@@ -67,12 +67,12 @@ protected:
         ContextPtr context) const override;
 
 private:
-    mutable Strings data_files;
+    mutable DataFileInfos data_files;
     NamesAndTypesList schema;
     DeltaLakePartitionColumns partition_columns;
     ObjectStoragePtr object_storage;
 
-    Strings getDataFiles(const ActionsDAG *) const { return data_files; }
+    DataFileInfos getDataFiles(const ActionsDAG *) const { return data_files; }
 };
 
 }

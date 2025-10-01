@@ -104,7 +104,7 @@ public:
             return std::nullopt;
         auto data_files = current_metadata->getDataFiles();
         if (!data_files.empty())
-            return data_files[0];
+            return data_files[0].file_path;
         return std::nullopt;
     }
 

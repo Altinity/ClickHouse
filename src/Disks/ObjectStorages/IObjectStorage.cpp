@@ -8,6 +8,9 @@
 #include <Common/Exception.h>
 #include <Common/ObjectStorageKeyGenerator.h>
 
+/// TODO: move DataFileInfo into separate file
+#include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
+
 #include <Poco/JSON/Object.h>
 #include <Poco/JSON/Parser.h>
 #include <Poco/JSON/JSONException.h>
@@ -101,6 +104,28 @@ WriteSettings IObjectStorage::patchSettings(const WriteSettings & write_settings
     return write_settings;
 }
 
+RelativePathWithMetadata::RelativePathWithMetadata(const String & task_string, std::optional<ObjectMetadata> metadata_)
+    : metadata(std::move(metadata_))
+    , command(task_string)
+{
+    if (!command.isParsed())
+        relative_path = task_string;
+    else
+    {
+        auto file_path = command.getFilePath();
+        if (file_path.has_value())
+            relative_path = file_path.value();
+        file_meta_info = command.getFileMetaInfo();
+    }
+}
+
+RelativePathWithMetadata::RelativePathWithMetadata(const DataFileInfo & info, std::optional<ObjectMetadata> metadata_)
+    : metadata(std::move(metadata_))
+{
+    relative_path = info.file_path;
+    file_meta_info = info.file_meta_info;
+}
+
 void RelativePathWithMetadata::loadMetadata(ObjectStoragePtr object_storage, bool ignore_non_existent_file)
 {
     if (!metadata)
@@ -129,8 +154,12 @@ RelativePathWithMetadata::CommandInTaskResponse::CommandInTaskResponse(const std
 
         successfully_parsed = true;
 
+        if (json->has("file_path"))
+            file_path = json->getValue<std::string>("file_path");
         if (json->has("retry_after_us"))
             retry_after_us = json->getValue<size_t>("retry_after_us");
+        if (json->has("meta_info"))
+            file_meta_info = std::make_shared<DataFileMetaInfo>(json->getObject("meta_info"));
     }
     catch (const Poco::JSON::JSONException &)
     { /// Not a JSON
@@ -138,11 +167,16 @@ RelativePathWithMetadata::CommandInTaskResponse::CommandInTaskResponse(const std
     }
 }
 
-std::string RelativePathWithMetadata::CommandInTaskResponse::to_string() const
+std::string RelativePathWithMetadata::CommandInTaskResponse::toString() const
 {
     Poco::JSON::Object json;
+
+    if (file_path.has_value())
+        json.set("file_path", file_path.value());
     if (retry_after_us.has_value())
         json.set("retry_after_us", retry_after_us.value());
+    if (file_meta_info.has_value())
+        json.set("meta_info", file_meta_info.value()->toJson());
 
     std::ostringstream oss;
     oss.exceptions(std::ios::failbit);

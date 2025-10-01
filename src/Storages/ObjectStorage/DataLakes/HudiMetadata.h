@@ -19,7 +19,7 @@ public:
 
     HudiMetadata(ObjectStoragePtr object_storage_, ConfigurationObserverPtr configuration_, ContextPtr context_);
 
-    Strings getDataFiles() const override;
+    DataFileInfos getDataFiles() const override;
 
     NamesAndTypesList getTableSchema() const override { return {}; }
 
@@ -49,9 +49,9 @@ protected:
 private:
     const ObjectStoragePtr object_storage;
     const ConfigurationObserverPtr configuration;
-    mutable Strings data_files;
+    mutable DataFileInfos data_files;
 
-    Strings getDataFilesImpl() const;
+    DataFileInfos getDataFilesImpl() const;
 };
 
 }

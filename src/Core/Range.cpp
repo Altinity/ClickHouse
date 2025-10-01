@@ -2,12 +2,19 @@
 #include <Core/Range.h>
 #include <IO/Operators.h>
 #include <IO/WriteBufferFromString.h>
+#include <IO/ReadBufferFromString.h>
 #include <Common/FieldVisitorToString.h>
 #include <Common/FieldAccurateComparison.h>
 
 
 namespace DB
 {
+
+namespace ErrorCodes
+{
+extern const int INCORRECT_DATA;
+};
+
 
 FieldRef::FieldRef(ColumnsWithTypeAndName * columns_, size_t row_idx_, size_t column_idx_)
     : Field((*(*columns_)[column_idx_].column)[row_idx_]), columns(columns_), row_idx(row_idx_), column_idx(column_idx_)
@@ -149,6 +156,13 @@ bool Range::fullBounded() const
 bool Range::isInfinite() const
 {
     return left.isNegativeInfinity() && right.isPositiveInfinity();
+}
+
+/// [x, x]
+bool Range::isPoint() const
+{
+    return fullBounded() && left_included && right_included && equals(left, right)
+        && !left.isNegativeInfinity() && !left.isPositiveInfinity();
 }
 
 bool Range::intersectsRange(const Range & r) const
@@ -330,6 +344,29 @@ String Range::toString() const
     str << applyVisitor(FieldVisitorToString(), right) << (right_included ? ']' : ')');
 
     return str.str();
+}
+
+String Range::serialize() const
+{
+    WriteBufferFromOwnString str;
+
+    str << left_included << right_included;
+    writeFieldBinary(left, str);
+    writeFieldBinary(right, str);
+
+    return str.str();
+}
+
+void Range::deserialize(const String & range)
+{
+    if (range.empty())
+        throw Exception(ErrorCodes::INCORRECT_DATA, "Empty range dump");
+
+    ReadBufferFromOwnString str(range);
+
+    str >> left_included >> right_included;
+    left = readFieldBinary(str);
+    right = readFieldBinary(str);
 }
 
 Hyperrectangle intersect(const Hyperrectangle & a, const Hyperrectangle & b)

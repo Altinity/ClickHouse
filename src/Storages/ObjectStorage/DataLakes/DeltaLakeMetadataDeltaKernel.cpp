@@ -35,7 +35,7 @@ bool DeltaLakeMetadataDeltaKernel::update(const ContextPtr &)
     return table_snapshot->update();
 }
 
-Strings DeltaLakeMetadataDeltaKernel::getDataFiles() const
+DataFileInfos DeltaLakeMetadataDeltaKernel::getDataFiles() const
 {
     throwNotImplemented("getDataFiles()");
 }
