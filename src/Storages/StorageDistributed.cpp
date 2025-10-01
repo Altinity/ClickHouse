@@ -9,6 +9,7 @@
 #include <Processors/QueryPlan/QueryPlan.h>
 #include <Processors/QueryPlan/SourceStepWithFilter.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
+#include <Processors/QueryPlan/DistributedCreateLocalPlan.h>
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
 #include <Interpreters/InterpreterSelectWithUnionQuery.h>
 #include <IO/WriteBufferFromString.h>
@@ -1175,50 +1176,21 @@ void StorageDistributed::read(
     for (size_t i = 0; i < all_query_infos.size(); ++i)
     {
         auto additional_query_info = all_query_infos[i];
-        // Get storage from either table function execution or StorageID resolution
-        StoragePtr storage;
-        if (additional_table_functions[i].storage_id.has_value())
-        {
-            // For table identifiers, resolve the StorageID
-            storage = DatabaseCatalog::instance().getTable(additional_table_functions[i].storage_id.value(), local_context);
-        }
-        else
-        {
-            // For table functions, execute the AST
-            auto table_function = TableFunctionFactory::instance().get(additional_table_functions[i].table_function_ast, local_context);
-            if (!table_function)
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid table function in TieredDistributedMerge engine");
-            
-            storage = table_function->execute(
-                additional_table_functions[i].table_function_ast,
-                local_context,
-                getStorageID().table_name, // Use the current table name
-                {}, // columns - will be determined from storage
-                false, // use_global_context = false
-                false); // is_insert_query = false
-            
-            // Handle StorageTableFunctionProxy if present
-            if (auto proxy = std::dynamic_pointer_cast<StorageTableFunctionProxy>(storage))
-            {
-                storage = proxy->getNested();
-            }
-        }
         auto additional_header = all_headers[i];
 
-        // Create a new query plan for this additional storage
-        QueryPlan additional_plan;
-        // Execute the query against the additional storage
-        storage->read(
-            additional_plan,
-            {}, // column names
-            storage->getStorageSnapshot(storage->getInMemoryMetadataPtr(), local_context),
-            additional_query_info,
+        // This properly handles both analyzer and legacy modes with converting actions
+        auto additional_plan_ptr = createLocalPlan(
+            additional_query_info.query,
+            additional_header,
             local_context,
             processed_stage,
-            0, // max_block_size
-            0); // num_streams
+            0, // shard_num - not applicable for local plans
+            1, // shard_count - not applicable for local plans
+            false, // has_missing_objects
+            false, // build_logical_plan
+            ""); // default_database
 
-        additional_plans.push_back(std::move(additional_plan));
+        additional_plans.push_back(std::move(*additional_plan_ptr));
     }
 
     // Combine all plans using UnionStep
