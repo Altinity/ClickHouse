@@ -1199,10 +1199,11 @@ void StorageDistributed::read(
     {
         // Convert QueryPlan objects to QueryPlanPtr
         std::vector<QueryPlanPtr> plan_ptrs;
-        plan_ptrs.reserve(additional_plans.size() + 1);
+        plan_ptrs.reserve(additional_plans.size() + query_plan.isInitialized() ? 1 : 0);
 
         // Add the main plan to the list
-        plan_ptrs.push_back(std::make_unique<QueryPlan>(std::move(query_plan)));
+        if (query_plan.isInitialized())
+            plan_ptrs.push_back(std::make_unique<QueryPlan>(std::move(query_plan)));
 
         // Add additional plans
         for (auto & plan : additional_plans)
