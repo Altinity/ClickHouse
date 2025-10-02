@@ -1042,6 +1042,17 @@ void StorageDistributed::read(
 
     const auto & settings = local_context->getSettingsRef();
 
+    // Disable memory_bound settings when additional table functions are present
+    // to avoid UNKNOWN_AGGREGATED_DATA_VARIANT when mixing different aggregation variants
+    // from remote shards (with memory_bound) and local layers (without memory_bound)
+    // FIXME: we can push additional_query_info into ClusterProxy::executeQuery to avoid this hack
+    // TODO: test is needed
+    if (!additional_table_functions.empty())
+    {
+        const_cast<Context *>(local_context.get())->setSetting("enable_memory_bound_merging_of_aggregation_results", false);
+        const_cast<Context *>(local_context.get())->setSetting("distributed_aggregation_memory_efficient", false);
+    }
+
     if (settings[Setting::allow_experimental_analyzer])
     {
         StorageID remote_storage_id = StorageID::createEmpty();
@@ -1199,7 +1210,7 @@ void StorageDistributed::read(
     {
         // Convert QueryPlan objects to QueryPlanPtr
         std::vector<QueryPlanPtr> plan_ptrs;
-        plan_ptrs.reserve(additional_plans.size() + query_plan.isInitialized() ? 1 : 0);
+        plan_ptrs.reserve(additional_plans.size() + (query_plan.isInitialized() ? 1 : 0));
 
         // Add the main plan to the list
         if (query_plan.isInitialized())
