@@ -35,7 +35,7 @@ class AltinityWorkflowTemplates:
           echo "Workflow Run Report: [View Report]($REPORT_LINK)" >> $GITHUB_STEP_SUMMARY
 """
     # Additional jobs
-    REGRESSION_HASH = "eadf0647501a547d57c49b71ca256e10c6c304f6"
+    REGRESSION_HASH = "bf856e2a535d5bb7a010cc2c2992c75d14df3c0e"
     ADDITIONAL_JOBS = r"""
 ##########################################################################################
 ##################################### ALTINITY JOBS ######################################
