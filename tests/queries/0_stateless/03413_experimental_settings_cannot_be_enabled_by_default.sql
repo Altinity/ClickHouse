@@ -9,6 +9,7 @@ SELECT name, value FROM system.settings WHERE tier = 'Experimental' AND type = '
 -- turned ON for Altinity Antalya builds specifically
     'allow_experimental_database_iceberg',
     'allow_experimental_database_unity_catalog',
-    'allow_experimental_database_glue_catalog'
+    'allow_experimental_database_glue_catalog',
+    'allow_experimental_iceberg_read_optimization'
 );
 SELECT name, value FROM system.merge_tree_settings WHERE tier = 'Experimental' AND type = 'Bool' AND value != '0' AND name NOT IN ('remove_rolled_back_parts_immediately');
