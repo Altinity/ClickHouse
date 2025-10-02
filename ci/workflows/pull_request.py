@@ -85,7 +85,7 @@ workflow = Workflow.Config(
         # "python3 ./ci/jobs/scripts/workflow_hooks/pr_description.py", # NOTE (strtgbb): relies on labels we don't use
         "python3 ./ci/jobs/scripts/workflow_hooks/version_log.py",
         # "python3 ./ci/jobs/scripts/workflow_hooks/quick_sync.py", # NOTE (strtgbb): we don't do this
-        "python3 ./ci/jobs/scripts/workflow_hooks/new_tests_check.py",
+        # "python3 ./ci/jobs/scripts/workflow_hooks/new_tests_check.py", # NOTE (strtgbb): we don't use this
     ],
     workflow_filter_hooks=[should_skip_job],
     post_hooks=[
