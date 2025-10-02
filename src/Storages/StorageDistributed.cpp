@@ -205,6 +205,8 @@ namespace ErrorCodes
     extern const int NOT_IMPLEMENTED;
     extern const int STORAGE_REQUIRES_PARAMETER;
     extern const int BAD_ARGUMENTS;
+    extern const int UNKNOWN_DATABASE;
+    extern const int UNKNOWN_TABLE;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
     extern const int INCORRECT_NUMBER_OF_COLUMNS;
     extern const int INFINITE_LOOP;
@@ -1075,10 +1077,9 @@ void StorageDistributed::read(
 
                 auto additional_query_tree = buildQueryTreeDistributed(additional_query_info,
                     query_info.initial_storage_snapshot ? query_info.initial_storage_snapshot : storage_snapshot,
-                    StorageID::createEmpty(),
-                    table_function_entry.table_function_ast,
+                    table_function_entry.storage_id ? *table_function_entry.storage_id : StorageID::createEmpty(),
+                    table_function_entry.storage_id ? nullptr :  table_function_entry.table_function_ast,
                     table_function_entry.predicate_ast);
-
 
                 additional_query_info.query = queryNodeToDistributedSelectQuery(additional_query_tree);
                 additional_query_info.query_tree = std::move(additional_query_tree);
@@ -1106,10 +1107,21 @@ void StorageDistributed::read(
             {
                 SelectQueryInfo additional_query_info = query_info;
 
-                additional_query_info.query = ClusterProxy::rewriteSelectQuery(
-                    local_context, additional_query_info.query,
-                    "", "", table_function_entry.table_function_ast,
-                    table_function_entry.predicate_ast);
+                if (table_function_entry.storage_id)
+                {
+                    additional_query_info.query = ClusterProxy::rewriteSelectQuery(
+                        local_context, additional_query_info.query,
+                        table_function_entry.storage_id->database_name, table_function_entry.storage_id->table_name,
+                        nullptr,
+                        table_function_entry.predicate_ast);
+                }
+                else
+                {
+                    additional_query_info.query = ClusterProxy::rewriteSelectQuery(
+                        local_context, additional_query_info.query,
+                        "", "", table_function_entry.table_function_ast,
+                        table_function_entry.predicate_ast);
+                }
 
                 all_query_infos.push_back(additional_query_info);
             }
@@ -2397,7 +2409,7 @@ void registerStorageTieredDistributedMerge(StorageFactory & factory)
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
                                 "Argument #{} must be a valid SQL expression: {}", i + 1, e.message());
             }
-                        
+
             // Validate table function or table identifier
             if (const auto * func = table_function_ast->as<ASTFunction>())
             {
@@ -2411,19 +2423,57 @@ void registerStorageTieredDistributedMerge(StorageFactory & factory)
                 // It's a table function - store the AST for later execution
                 additional_table_functions.emplace_back(table_function_ast, predicate_ast);
             }
-            else if (const auto * identifier = table_function_ast->as<ASTTableIdentifier>())
+            else if (const auto * ast_identifier = table_function_ast->as<ASTIdentifier>())
             {
-                // It's a table identifier - validate it can be parsed as StorageID
+                // It's an identifier - try to convert it to a table identifier
+                auto table_identifier = ast_identifier->createTable();
+                if (!table_identifier)
+                {
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "Argument #{}: identifier '{}' cannot be converted to table identifier", i, ast_identifier->name());
+                }
+
                 try
                 {
                     // Parse table identifier to get StorageID
-                    StorageID storage_id(table_function_ast);
+                    StorageID storage_id(table_identifier);
+
+                    // Sanity check: ensure the table identifier is fully qualified (has database name)
+                    if (storage_id.database_name.empty())
+                    {
+                        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                            "Argument #{}: table identifier '{}' must be fully qualified (database.table)", i, ast_identifier->name());
+                    }
+
+                    // Sanity check: verify the table exists
+                    try
+                    {
+                        auto database = DatabaseCatalog::instance().getDatabase(storage_id.database_name, context);
+                        if (!database)
+                        {
+                            throw Exception(ErrorCodes::UNKNOWN_DATABASE,
+                                "Database '{}' does not exist", storage_id.database_name);
+                        }
+
+                        auto table = database->tryGetTable(storage_id.table_name, context);
+                        if (!table)
+                        {
+                            throw Exception(ErrorCodes::UNKNOWN_TABLE,
+                                "Table '{}.{}' does not exist", storage_id.database_name, storage_id.table_name);
+                        }
+                    }
+                    catch (const Exception & e)
+                    {
+                        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                            "Argument #{}: table '{}' validation failed: {}", i, ast_identifier->name(), e.message());
+                    }
+
                     additional_table_functions.emplace_back(table_function_ast, predicate_ast, storage_id);
                 }
                 catch (const Exception & e)
                 {
                     throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                        "Argument #{}: invalid table identifier '{}': {}", i, identifier->name(), e.message());
+                        "Argument #{}: invalid table identifier '{}': {}", i, ast_identifier->name(), e.message());
                 }
             }
             else
