@@ -20,9 +20,7 @@ from env_helper import (
     S3_URL,
 )
 
-sensitive_var_pattern = re.compile(
-    r"\b[A-Z_]*(?<!WRONG_)(SECRET|PASSWORD|ACCESS_KEY|TOKEN)[A-Z_]*\b(?!%)(?!=clickhouse$)(?!=minio)(?!: \*{3}$)(?! '\[HIDDEN\]')"
-)
+sensitive_var_pattern = re.compile(r"[A-Z_]*(SECRET|PASSWORD|KEY|TOKEN|AZURE)[A-Z_]*")
 sensitive_strings = {
     var: value for var, value in os.environ.items() if sensitive_var_pattern.match(var)
 }
@@ -41,8 +39,6 @@ def scan_file_for_sensitive_data(file_content, file_name):
 
     matches = []
     for line_number, line in enumerate(file_content.splitlines(), start=1):
-        for match in sensitive_var_pattern.finditer(line):
-            matches.append((file_name, line_number, clean_line(line)))
         for name, value in sensitive_strings.items():
             if value in line:
                 matches.append((file_name, line_number, clean_line(line)))

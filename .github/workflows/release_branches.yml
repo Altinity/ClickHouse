@@ -492,7 +492,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Integration tests (aarch64)
-      runner_type: altinity-on-demand, altinity-type-cax41, altinity-image-arm-snapshot-22.04-arm, altinity-startup-snapshot, altinity-setup-none
+      runner_type: altinity-on-demand, altinity-func-tester-aarch64
       data: ${{ needs.RunConfig.outputs.data }}
 #############################################################################################
 ####################################### AST FUZZERS #########################################
@@ -504,7 +504,7 @@ jobs:
     secrets: inherit
     with:
       test_name: AST fuzzer (asan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
+      runner_type: altinity-on-demand, altinity-func-tester
       data: ${{ needs.RunConfig.outputs.data }}
   ASTFuzzerTsan:
     needs: [RunConfig, BuilderDebTsan]
@@ -513,7 +513,7 @@ jobs:
     secrets: inherit
     with:
       test_name: AST fuzzer (tsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
+      runner_type: altinity-on-demand, altinity-func-tester
       data: ${{ needs.RunConfig.outputs.data }}
   ASTFuzzerMsan:
     needs: [RunConfig, BuilderDebMsan]
@@ -522,7 +522,7 @@ jobs:
     secrets: inherit
     with:
       test_name: AST fuzzer (msan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
+      runner_type: altinity-on-demand, altinity-func-tester
       data: ${{ needs.RunConfig.outputs.data }}
   ASTFuzzerUBsan:
     needs: [RunConfig, BuilderDebUBsan]
@@ -531,7 +531,7 @@ jobs:
     secrets: inherit
     with:
       test_name: AST fuzzer (ubsan)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
+      runner_type: altinity-on-demand, altinity-func-tester
       data: ${{ needs.RunConfig.outputs.data }}
   ASTFuzzerDebug:
     needs: [RunConfig, BuilderDebDebug]
@@ -540,7 +540,7 @@ jobs:
     secrets: inherit
     with:
       test_name: AST fuzzer (debug)
-      runner_type: altinity-on-demand, altinity-type-cpx51, altinity-image-x86-snapshot-22.04-amd, altinity-startup-snapshot, altinity-setup-none
+      runner_type: altinity-on-demand, altinity-func-tester
       data: ${{ needs.RunConfig.outputs.data }}
 #############################################################################################
 ##################################### REGRESSION TESTS ######################################
@@ -552,7 +552,7 @@ jobs:
     secrets: inherit
     with:
       runner_type: altinity-on-demand, altinity-regression-tester
-      commit: e3c00be97a045aa04e9d1a6ec50cc64f4c387b70
+      commit: fd33d9e73ebd14392d601d87902ddf0e7c90709c
       arch: release
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout_minutes: 300
@@ -563,7 +563,7 @@ jobs:
     secrets: inherit
     with:
       runner_type: altinity-on-demand, altinity-regression-tester-aarch64
-      commit: e3c00be97a045aa04e9d1a6ec50cc64f4c387b70
+      commit: fd33d9e73ebd14392d601d87902ddf0e7c90709c
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout_minutes: 300
