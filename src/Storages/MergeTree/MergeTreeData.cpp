@@ -6206,10 +6206,20 @@ void MergeTreeData::exportPartToTable(const PartitionCommand & command, ContextP
             "Exporting merge tree part is experimental. Set `allow_experimental_export_merge_tree_part` to enable it");
     }
 
-    String dest_database = query_context->resolveDatabase(command.to_database);
-    auto dest_storage = DatabaseCatalog::instance().getTable({dest_database, command.to_table}, query_context);
+    auto part_name = command.partition->as<ASTLiteral &>().value.safeGet<String>();
 
-    if (dest_storage->getStorageID() == this->getStorageID())
+    exportPartToTable(part_name, StorageID{command.to_database, command.to_table}, query_context);
+}
+
+void MergeTreeData::exportPartToTable(
+    const std::string & part_name,
+    const StorageID & destination_storage_id,
+    ContextPtr query_context,
+    std::function<void(MergeTreeExportManifest::CompletionCallbackResult)> completion_callback)
+{
+    auto dest_storage = DatabaseCatalog::instance().getTable(destination_storage_id, query_context);
+
+    if (destination_storage_id == this->getStorageID())
     {
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Exporting to the same table is not allowed");
     }
@@ -6231,8 +6241,6 @@ void MergeTreeData::exportPartToTable(const PartitionCommand & command, ContextP
     if (query_to_string(src_snapshot->getPartitionKeyAST()) != query_to_string(destination_snapshot->getPartitionKeyAST()))
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
 
-    auto part_name = command.partition->as<ASTLiteral &>().value.safeGet<String>();
-
     auto part = getPartIfExists(part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
 
     if (!part)
@@ -6244,7 +6252,8 @@ void MergeTreeData::exportPartToTable(const PartitionCommand & command, ContextP
             dest_storage->getStorageID(),
             part,
             query_context->getSettingsRef()[Setting::export_merge_tree_part_overwrite_file_if_exists],
-            query_context->getSettingsRef()[Setting::output_format_parallel_formatting]);
+            query_context->getSettingsRef()[Setting::output_format_parallel_formatting],
+            completion_callback);
 
         std::lock_guard lock(export_manifests_mutex);
 
@@ -6311,6 +6320,9 @@ void MergeTreeData::exportPartToTableImpl(
 
         std::lock_guard inner_lock(export_manifests_mutex);
         export_manifests.erase(manifest);
+
+        if (manifest.completion_callback)
+            manifest.completion_callback({});
         return;
     }
 
@@ -6400,6 +6412,9 @@ void MergeTreeData::exportPartToTableImpl(
 
         ProfileEvents::increment(ProfileEvents::PartsExports);
         ProfileEvents::increment(ProfileEvents::PartsExportTotalMilliseconds, static_cast<UInt64>((*exports_list_entry)->elapsed * 1000));
+
+        if (manifest.completion_callback)
+            manifest.completion_callback({true, destination_file_path});
     }
     catch (...)
     {
@@ -6420,6 +6435,9 @@ void MergeTreeData::exportPartToTableImpl(
             exports_list_entry.get());
 
         export_manifests.erase(manifest);
+
+        if (manifest.completion_callback)
+            manifest.completion_callback({});
 
         throw;
     }
@@ -6479,6 +6497,12 @@ Pipe MergeTreeData::alterPartition(
             case PartitionCommand::EXPORT_PART:
             {
                 exportPartToTable(command, query_context);
+                break;
+            }
+
+            case PartitionCommand::EXPORT_PARTITION:
+            {
+                exportPartitionToTable(command, query_context);
                 break;
             }
 

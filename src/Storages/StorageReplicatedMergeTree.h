@@ -510,6 +510,8 @@ private:
     /// A task that marks finished mutations as done.
     BackgroundSchedulePoolTaskHolder mutations_finalizing_task;
 
+    BackgroundSchedulePoolTaskHolder export_merge_tree_partition_select_task;
+
     /// A thread that removes old parts, log entries, and blocks.
     ReplicatedMergeTreeCleanupThread cleanup_thread;
 
@@ -737,6 +739,8 @@ private:
     /// Checks if some mutations are done and marks them as done.
     void mutationsFinalizingTask();
 
+    void selectPartsToExport();
+
     /** Write the selected parts to merge into the log,
       * Call when merge_selecting_mutex is locked.
       * Returns false if any part is not in ZK.
@@ -923,7 +927,8 @@ private:
         bool fetch_part,
         ContextPtr query_context) override;
     void forgetPartition(const ASTPtr & partition, ContextPtr query_context) override;
-
+    
+    void exportPartitionToTable(const PartitionCommand &, ContextPtr) override;
 
     /// NOTE: there are no guarantees for concurrent merges. Dropping part can
     /// be concurrently merged into some covering part and dropPart will do

@@ -984,6 +984,16 @@ public:
 
     void exportPartToTable(const PartitionCommand & command, ContextPtr query_context);
 
+    void exportPartToTable(
+        const std::string & part_name,
+        const StorageID & destination_storage_id, ContextPtr query_context,
+        std::function<void(MergeTreeExportManifest::CompletionCallbackResult)> completion_callback = {});
+
+    virtual void exportPartitionToTable(const PartitionCommand &, ContextPtr)
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "EXPORT PARTITION is not implemented");
+    }
+
     void exportPartToTableImpl(
         const MergeTreeExportManifest & manifest,
         ContextPtr local_context);

@@ -116,6 +116,9 @@
 #include <Backups/RestorerFromBackup.h>
 
 #include <Common/scope_guard_safe.h>
+#include <Functions/generateSnowflakeID.h>
+#include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/MergeTree/ReplicatedMergeTreeLogEntry.h>
 #include <IO/SharedThreadPools.h>
 
 #include <boost/algorithm/string/join.hpp>
@@ -183,6 +186,7 @@ namespace Setting
     extern const SettingsInt64 replication_wait_for_inactive_replica_timeout;
     extern const SettingsUInt64 select_sequential_consistency;
     extern const SettingsBool update_sequential_consistency;
+    extern const SettingsBool allow_experimental_export_merge_tree_part;
 }
 
 namespace MergeTreeSetting
@@ -454,6 +458,11 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
 
     mutations_finalizing_task = getContext()->getSchedulePool().createTask(
         getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::mutationsFinalizingTask)", [this] { mutationsFinalizingTask(); });
+
+    export_merge_tree_partition_select_task = getContext()->getSchedulePool().createTask(
+        getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_select_task)", [this] { selectPartsToExport(); });
+
+    export_merge_tree_partition_select_task->deactivate();
 
     /// This task can be scheduled by different parts of code even when storage is readonly.
     /// This can lead to redundant exceptions during startup.
@@ -4354,6 +4363,197 @@ void StorageReplicatedMergeTree::mutationsFinalizingTask()
     }
 }
 
+// static void exportPartitionCallback(
+//     MergeTreeExportManifest::CompletionCallbackResult result,
+//     zkutil::ZooKeeperPtr & zookeeper,
+//     const String & partition_export,
+//     const String & part_name)
+// {
+//     if (!result.success)
+//     {
+//         LOG_INFO(log, "Failed to export partition {} part {}, releasing lock", partition_export, part_name);
+//         zookeeper->remove(owner_path);
+//         return;
+//     }
+
+//     zookeeper->create(part_path / "path", result.relative_path_in_destination_storage, zkutil::CreateMode::Persistent);
+//     LOG_INFO(log, "Exported partition {} part {} to {}", partition_export, part_name, result.relative_path_in_destination_storage);
+
+//     /// loop over all parts again and check if they all have the path set, if so, mark the export as done
+//     bool completed = true;
+//     Strings exported_paths;
+//     for (const auto & possibly_commited_part : part_names)
+//     {
+//         /// todo arthur is this a case of "try to write as opposed to try to read because it might be stale?"
+//         const auto possibly_commited_part_path = parts_path / possibly_commited_part;
+//         if (!zookeeper->exists(possibly_commited_part_path / "path"))
+//         {
+//             completed = false;
+//             break;
+//         }
+//         exported_paths.push_back(zookeeper->get(possibly_commited_part_path / "path"));
+//     }
+
+//     if (completed)
+//     {
+        
+//         const auto destination_storage = DatabaseCatalog::instance().tryGetTable(
+//             StorageID(QualifiedTableName::parseFromString(destination_storage_id)),
+//             getContext());
+//         const auto transaction_id = zookeeper->get(partition_export_path / "transaction_id");
+//         /// possibly need to add a check here to see if the table still exists
+//         destination_storage->commitExportPartitionTransaction(transaction_id, partition_export, exported_paths, getContext());
+//         zookeeper->set(partition_export_path / "status", "COMPLETED");
+//     }
+// }
+
+void StorageReplicatedMergeTree::selectPartsToExport()
+{
+    auto zookeeper = getZooKeeper();
+    auto exports_path = fs::path(zookeeper_path) / "exports";
+
+    /// grab all exports/<partition_id>
+    Strings partition_exports;
+    zookeeper->tryGetChildren(exports_path, partition_exports);
+
+    for (const auto & partition_export : partition_exports)
+    {
+        const auto partition_export_path = fs::path(exports_path) / partition_export;
+        const auto destination_storage_id = zookeeper->get(partition_export_path / "destination_storage_id");
+
+        if (destination_storage_id.empty())
+        {
+            LOG_WARNING(log, "Failed to grab destination storage id for partition {} export", partition_export);
+            continue;
+        }
+
+        const auto time_to_live_seconds = std::stoi(zookeeper->get(partition_export_path / "time_to_live_seconds"));
+        const auto create_time = std::stoi(zookeeper->get(partition_export_path / "create_time"));
+
+        if (time(nullptr) - create_time > time_to_live_seconds)
+        {
+            LOG_INFO(log, "Partition {} export has expired, removing zk entry", partition_export);
+            zookeeper->tryRemoveRecursive(partition_export_path);
+            continue;
+        }
+
+        if (zookeeper->get(partition_export_path / "status") != "IN_PROGRESS")
+        {
+            LOG_INFO(log, "Partition {} export is not in progress, skipping", partition_export);
+            continue;
+        }
+
+        /// grab all part names, if it already has an owner, skip
+        /// otherwise, try to atomically claim it
+        const auto parts_path = partition_export_path / "parts";
+        auto part_names = zookeeper->getChildren(parts_path);
+
+        for (const auto & part_name : part_names)
+        {
+            /// The check if this replica contains the part is also performed in `exportPartToTable`.
+            /// Doing it here so that we don't even bother claiming the part export if we don't have it.
+            auto part = getPartIfExists(part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
+            if (!part)
+            {
+                LOG_INFO(log, "Part {} not found in the replica, skipping export", part_name);
+                continue;
+            }
+
+            auto part_path = parts_path / part_name;
+            auto owner_path = part_path / "owner";
+
+            /// Ephemeral because it acts like a lock. AFAIK, if this node crashes, the lock will be released and another replica can claim it.
+            if (Coordination::Error::ZOK != zookeeper->tryCreate(owner_path, replica_name, zkutil::CreateMode::Ephemeral))
+            {
+                LOG_INFO(log, "Export partition {} part {} already has an owner or failed to claim it, skipping", partition_export, part_name);
+                continue;
+            }
+
+            LOG_INFO(log, "Claimed export partition {} part {}", partition_export, part_name);
+
+            /// Two failure paths: catch block and the lambda function. The try-catch is for the case where it fails to schedule the export.
+            /// The lambda is for the case the export itself fails.
+            try
+            {
+                std::function<void(MergeTreeExportManifest::CompletionCallbackResult)> callback = [this, partition_export, part_name, owner_path, part_path, parts_path, part_names, destination_storage_id, partition_export_path]
+                (MergeTreeExportManifest::CompletionCallbackResult result)
+                {
+                    auto zk = getZooKeeper();
+                    if (!result.success)
+                    {
+                        LOG_INFO(log, "Failed to export part {}, releasing lock", part_name);
+
+                        const auto retry_count = std::stoi(zk->get(part_path / "retry_count")) + 1;
+                        const auto max_retry_count = std::stoi(zk->get(part_path / "max_retry_count"));
+
+                        if (retry_count >= max_retry_count)
+                        {
+                            LOG_INFO(log, "Failed to export part {} after {} retries, setting status to FAILED", part_name, retry_count);
+                            zk->set(partition_export_path / "status", "FAILED");
+                        }
+                        else
+                        {
+                            zk->set(part_path / "retry_count", std::to_string(retry_count));
+                        }
+
+                        zk->remove(owner_path);
+                        return;
+                    }
+                
+                    zk->create(part_path / "path", result.relative_path_in_destination_storage, zkutil::CreateMode::Persistent);
+                    LOG_INFO(log, "Exported partition {} part {} to {}", partition_export, part_name, result.relative_path_in_destination_storage);
+                
+                    /// loop over all parts again and check if they all have the path set, if so, mark the export as done
+                    Strings exported_paths;
+                    for (const auto & possibly_commited_part : part_names)
+                    {
+                        /// todo arthur is this a case of "try to write as opposed to try to read because it might be stale?"
+                        const auto possibly_commited_part_path = parts_path / possibly_commited_part;
+                        if (!zk->exists(possibly_commited_part_path / "path"))
+                        {
+                            break;
+                        }
+                        exported_paths.push_back(zk->get(possibly_commited_part_path / "path"));
+                    }
+                
+                    bool exported_all_parts = exported_paths.size() == part_names.size();
+                    if (!exported_all_parts)
+                    {
+                        return;
+                    }
+
+                    const auto destination_storage = DatabaseCatalog::instance().tryGetTable(
+                        StorageID(QualifiedTableName::parseFromString(destination_storage_id)),
+                        getContext());
+                    const auto transaction_id = zk->get(partition_export_path / "transaction_id");
+                    /// possibly need to add a check here to see if the table still exists
+                    destination_storage->commitExportPartitionTransaction(transaction_id, partition_export, exported_paths, getContext());
+                    zk->tryCreate(partition_export_path / "status", "COMPLETED", zkutil::CreateMode::Persistent);
+                };
+
+                exportPartToTable(
+                    part_name, 
+                    StorageID(QualifiedTableName::parseFromString(destination_storage_id)),
+                    getContext(),
+                    callback);
+
+                /// for now, export only one part at a time
+                break;
+            }
+            catch (...)
+            {
+                tryLogCurrentException(log, __PRETTY_FUNCTION__);
+
+                zookeeper->remove(owner_path);
+                /// for now, export only one part at a time
+                break;
+            }
+        }
+    }
+
+    export_merge_tree_partition_select_task->scheduleAfter(1000 * 5);
+}
+
 
 StorageReplicatedMergeTree::CreateMergeEntryResult StorageReplicatedMergeTree::createLogEntryToMergeParts(
     zkutil::ZooKeeperPtr & zookeeper,
@@ -7875,6 +8075,156 @@ void StorageReplicatedMergeTree::fetchPartition(
     } while (!missing_parts.empty());
 
     LOG_TRACE(log, "Fetch took {} sec. ({} tries)", watch.elapsedSeconds(), try_no);
+}
+
+void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand & command, ContextPtr query_context)
+{
+    if (!query_context->getSettingsRef()[Setting::allow_experimental_export_merge_tree_part])
+    {
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+            "Exporting merge tree part is experimental. Set `allow_experimental_export_merge_tree_part` to enable it");
+    }
+
+    String dest_database = query_context->resolveDatabase(command.to_database);
+    auto dest_storage = DatabaseCatalog::instance().getTable({dest_database, command.to_table}, query_context);
+
+    if (dest_storage->getStorageID() == this->getStorageID())
+    {
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Exporting to the same table is not allowed");
+    }
+
+    if (!dest_storage->supportsImport())
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Destination storage {} does not support MergeTree parts or uses unsupported partitioning", dest_storage->getName());
+
+    auto query_to_string = [] (const ASTPtr & ast)
+    {
+        return ast ? ast->formatWithSecretsOneLine() : "";
+    };
+
+    auto src_snapshot = getInMemoryMetadataPtr();
+    auto destination_snapshot = dest_storage->getInMemoryMetadataPtr();
+
+    if (destination_snapshot->getColumns().getAllPhysical().sizeOfDifference(src_snapshot->getColumns().getAllPhysical()))
+        throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS, "Tables have different structure");
+
+    if (query_to_string(src_snapshot->getPartitionKeyAST()) != query_to_string(destination_snapshot->getPartitionKeyAST()))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
+
+    zkutil::ZooKeeperPtr zookeeper = getZooKeeperAndAssertNotReadonly();
+
+    const String partition_id = getPartitionIDFromQuery(command.partition, query_context);
+    
+    const auto exports_path = fs::path(zookeeper_path) / "exports";
+    Coordination::Requests ops;
+
+    /// maybe this should go in initialization somewhere else
+    if (!zookeeper->exists(exports_path))
+    {
+        ops.emplace_back(zkutil::makeCreateRequest(exports_path, "", zkutil::CreateMode::Persistent));
+    }
+
+    const auto partition_exports_path = exports_path / partition_id;
+
+    /// check if entry already exists
+    if (zookeeper->exists(partition_exports_path))
+    {
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Partition {} already exported or it is being exported", partition_id);
+    }
+
+    ops.emplace_back(zkutil::makeCreateRequest(partition_exports_path, "", zkutil::CreateMode::Persistent));
+
+    const Strings parts = zookeeper->getChildren(fs::path(replica_path) / "parts");
+    const ActiveDataPartSet active_parts_set(format_version, parts);
+    const auto part_infos = active_parts_set.getPartInfos();
+    std::vector<String> parts_to_export;
+    for (const auto & part_info : part_infos)
+    {
+        if (part_info.getPartitionId() == partition_id)
+        {
+            parts_to_export.push_back(part_info.getPartNameV1());
+        }
+    }
+
+    if (parts_to_export.empty())
+    {
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Partition {} doesn't exist", partition_id);
+    }
+
+    /// somehow check if the list of parts is updated "enough"
+
+    /*
+        table_path/exports/partition_id
+            table_path/exports/partition_id/transaction_id
+            table_path/exports/partition_id/destination_storage_id
+            table_path/exports/partition_id/status
+            table_path/exports/partition_id/create_time
+            table_path/exports/partition_id/time_to_live_seconds
+            table_path/exports/partition_id/part_name_1
+                table_path/exports/partition_id/part_name_1/status
+                table_path/exports/partition_id/part_name_1/owner
+                table_path/exports/partition_id/part_name_1/retry_count
+                table_path/exports/partition_id/part_name_1/max_retry_count
+                table_path/exports/partition_id/part_name_1/path
+            table_path/exports/partition_id/part_name_n
+                ...
+    */
+
+    const auto transaction_id = std::to_string(generateSnowflakeID());
+
+    const auto parts_path = fs::path(partition_exports_path) / "parts";
+    ops.emplace_back(zkutil::makeCreateRequest(
+        parts_path, "",
+        zkutil::CreateMode::Persistent));
+
+    ops.emplace_back(zkutil::makeCreateRequest(
+        fs::path(partition_exports_path) / "transaction_id", 
+        transaction_id, 
+        zkutil::CreateMode::Persistent));
+
+    ops.emplace_back(zkutil::makeCreateRequest(
+        fs::path(partition_exports_path) / "destination_storage_id", 
+        dest_storage->getStorageID().getFullTableName(), 
+        zkutil::CreateMode::Persistent));
+
+    /// status: IN_PROGRESS, COMPLETED, FAILED
+    ops.emplace_back(zkutil::makeCreateRequest(
+        fs::path(partition_exports_path) / "status", 
+        "IN_PROGRESS", 
+        zkutil::CreateMode::Persistent));
+
+    ops.emplace_back(zkutil::makeCreateRequest(
+        fs::path(partition_exports_path) / "create_time", 
+        std::to_string(time(nullptr)), 
+        zkutil::CreateMode::Persistent));
+
+
+    ops.emplace_back(zkutil::makeCreateRequest(
+        fs::path(partition_exports_path) / "time_to_live_seconds", 
+        std::to_string(3600),
+        zkutil::CreateMode::Persistent));
+
+    for (const String & part_name : parts_to_export)
+    {
+        const String part_path = fs::path(parts_path) / part_name;
+        
+        ops.emplace_back(zkutil::makeCreateRequest(part_path, "", zkutil::CreateMode::Persistent));
+
+        ops.emplace_back(zkutil::makeCreateRequest(
+            fs::path(part_path) / "retry_count", 
+            "0", 
+            zkutil::CreateMode::Persistent));
+
+        ops.emplace_back(zkutil::makeCreateRequest(
+            fs::path(part_path) / "max_retry_count", 
+            "3", 
+            zkutil::CreateMode::Persistent));
+    }
+
+    Coordination::Responses responses;
+    Coordination::Error code = zookeeper->tryMulti(ops, responses);
+
+    if (code != Coordination::Error::ZOK)
+        throw zkutil::KeeperException::fromPath(code, partition_exports_path);
 }
 
 

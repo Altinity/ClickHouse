@@ -905,4 +905,15 @@ bool StorageObjectStorageCluster::prefersLargeBlocks() const
     return IStorageCluster::prefersLargeBlocks();
 }
 
+void StorageObjectStorageCluster::commitExportPartitionTransaction(
+    const String & transaction_id,
+    const String & partition_id,
+    const Strings & exported_paths,
+    ContextPtr local_context)
+{
+    if (pure_storage)
+        return pure_storage->commitExportPartitionTransaction(transaction_id, partition_id, exported_paths, local_context);
+    return IStorageCluster::commitExportPartitionTransaction(transaction_id, partition_id, exported_paths, local_context);
+}
+
 }

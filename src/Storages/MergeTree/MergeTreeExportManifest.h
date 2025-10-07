@@ -8,22 +8,33 @@ struct MergeTreeExportManifest
 {
     using DataPartPtr = std::shared_ptr<const IMergeTreeDataPart>;
 
+    struct CompletionCallbackResult
+    {
+        bool success = false;
+        String relative_path_in_destination_storage;
+    };
+
 
     MergeTreeExportManifest(
         const StorageID & destination_storage_id_,
         const DataPartPtr & data_part_,
         bool overwrite_file_if_exists_,
-        bool parallel_formatting_)
+        bool parallel_formatting_,
+        std::function<void(CompletionCallbackResult)> completion_callback_ = {})
         : destination_storage_id(destination_storage_id_),
           data_part(data_part_),
           overwrite_file_if_exists(overwrite_file_if_exists_),
           parallel_formatting(parallel_formatting_),
+          completion_callback(completion_callback_),
           create_time(time(nullptr)) {}
 
     StorageID destination_storage_id;
     DataPartPtr data_part;
     bool overwrite_file_if_exists;
     bool parallel_formatting;
+
+
+    std::function<void(CompletionCallbackResult)> completion_callback;
 
     time_t create_time;
     mutable bool in_progress = false;

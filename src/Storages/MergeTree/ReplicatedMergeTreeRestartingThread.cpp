@@ -174,6 +174,7 @@ bool ReplicatedMergeTreeRestartingThread::runImpl()
     storage.cleanup_thread.start();
     storage.async_block_ids_cache.start();
     storage.part_check_thread.start();
+    storage.export_merge_tree_partition_select_task->activateAndSchedule();
 
     LOG_DEBUG(log, "Table started successfully");
     return true;
