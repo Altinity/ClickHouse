@@ -378,6 +378,17 @@ void ASTAlterCommand::formatImpl(WriteBuffer & ostr, const FormatSettings & sett
         }
 
     }
+    else if (type == ASTAlterCommand::EXPORT_PARTITION)
+    {
+        ostr << (settings.hilite ? hilite_keyword : "") << "EXPORT PARTITION " << (settings.hilite ? hilite_none : "");
+        partition->format(ostr, settings, state, frame);
+        ostr << " TO TABLE ";
+        if (!to_database.empty())
+        {
+            ostr << (settings.hilite ? hilite_identifier : "") << backQuoteIfNeed(to_database) << (settings.hilite ? hilite_none : "") << ".";
+        }
+        ostr << (settings.hilite ? hilite_identifier : "") << backQuoteIfNeed(to_table) << (settings.hilite ? hilite_none : "");
+    }
     else if (type == ASTAlterCommand::REPLACE_PARTITION)
     {
         ostr << (settings.hilite ? hilite_keyword : "") << (replace ? "REPLACE" : "ATTACH") << " PARTITION "

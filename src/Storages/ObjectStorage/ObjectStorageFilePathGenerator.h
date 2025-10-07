@@ -51,7 +51,7 @@ namespace DB
 
             result += raw_path;
 
-            if (raw_path.back() != '/')
+            if (!result.empty() && result.back() != '/')
             {
                 result += "/";
             }
