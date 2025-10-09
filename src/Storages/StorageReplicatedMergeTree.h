@@ -13,6 +13,7 @@
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include <Common/ZooKeeper/ZooKeeperRetries.h>
 #include <Common/randomSeed.h>
+#include <Storages/ExportReplicatedMergeTreePartitionTaskEntry.h>
 #include <Core/BackgroundSchedulePool.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Interpreters/Cluster.h>
@@ -506,8 +507,16 @@ private:
     /// A task that marks finished mutations as done.
     BackgroundSchedulePoolTaskHolder mutations_finalizing_task;
 
+    BackgroundSchedulePoolTaskHolder export_merge_tree_partition_updating_task;
+
+    Coordination::WatchCallbackPtr export_merge_tree_partition_watch_callback;
+
+    std::mutex export_merge_tree_partition_mutex;
+
     BackgroundSchedulePoolTaskHolder export_merge_tree_partition_select_task;
 
+    
+    std::unordered_map<std::string, ExportReplicatedMergeTreePartitionTaskEntry> export_merge_tree_partition_task_entries;
     /// A thread that removes old parts, log entries, and blocks.
     ReplicatedMergeTreeCleanupThread cleanup_thread;
 
@@ -738,6 +747,9 @@ private:
     void mutationsFinalizingTask();
 
     void selectPartsToExport();
+
+    /// update in-memory list of partition exports
+    void exportMergeTreePartitionUpdatingTask();
 
     /** Write the selected parts to merge into the log,
       * Call when merge_selecting_mutex is locked.
