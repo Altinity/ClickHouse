@@ -152,6 +152,7 @@ ManifestFileContent::ManifestFileContent(
     Int64 inherited_sequence_number,
     Int64 inherited_snapshot_id,
     const String & table_location,
+    const String & common_namespace,
     DB::ContextPtr context,
     const String & path_to_manifest_file_)
     : path_to_manifest_file(path_to_manifest_file_)
@@ -291,7 +292,11 @@ ManifestFileContent::ManifestFileContent(
 
         const auto file_path_key
             = manifest_file_deserializer.getValueFromRowByName(i, c_data_file_file_path, TypeIndex::String).safeGet<String>();
-        const auto file_path = getProperFilePathFromMetadataInfo(manifest_file_deserializer.getValueFromRowByName(i, c_data_file_file_path, TypeIndex::String).safeGet<String>(), common_path, table_location);
+        const auto file_path = getProperFilePathFromMetadataInfo(
+            manifest_file_deserializer.getValueFromRowByName(i, c_data_file_file_path, TypeIndex::String).safeGet<String>(),
+            common_path,
+            table_location,
+            common_namespace);
 
         /// NOTE: This is weird, because in manifest file partition looks like this:
         /// {

@@ -177,6 +177,7 @@ Iceberg::PersistentTableComponents IcebergMetadata::initializePersistentTableCom
         .metadata_compression_method = compression_method,
         .table_path = configuration->getPathForRead().path,
         .table_uuid = table_uuid,
+        .common_namespace = configuration->getNamespace(),
     };
 }
 
@@ -320,7 +321,10 @@ IcebergDataSnapshotPtr IcebergMetadata::createIcebergDataSnapshotFromSnapshotJSO
             persistent_components,
             local_context,
             getProperFilePathFromMetadataInfo(
-                manifest_list_file_path, persistent_components.table_path, persistent_components.table_location),
+                manifest_list_file_path,
+                persistent_components.table_path,
+                persistent_components.table_location,
+                persistent_components.common_namespace),
             log),
         snapshot_id,
         schema_id,

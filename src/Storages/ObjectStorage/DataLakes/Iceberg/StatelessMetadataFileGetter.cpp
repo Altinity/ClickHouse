@@ -100,6 +100,7 @@ Iceberg::ManifestFilePtr getManifestFile(
             inherited_sequence_number,
             inherited_snapshot_id,
             persistent_table_components.table_location,
+            persistent_table_components.common_namespace,
             local_context,
             filename);
     };
@@ -153,7 +154,10 @@ ManifestFileCacheKeys getManifestList(
             const std::string file_path
                 = manifest_list_deserializer.getValueFromRowByName(i, f_manifest_path, TypeIndex::String).safeGet<std::string>();
             const auto manifest_file_name = getProperFilePathFromMetadataInfo(
-                file_path, persistent_table_components.table_path, persistent_table_components.table_location);
+                file_path,
+                persistent_table_components.table_path,
+                persistent_table_components.table_location,
+                persistent_table_components.common_namespace);
             Int64 added_sequence_number = 0;
             auto added_snapshot_id = manifest_list_deserializer.getValueFromRowByName(i, f_added_snapshot_id);
             if (added_snapshot_id.isNull())

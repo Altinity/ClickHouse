@@ -158,6 +158,7 @@ public:
         Int64 inherited_sequence_number,
         Int64 inherited_snapshot_id,
         const std::string & table_location,
+        const std::string & common_namespace,
         DB::ContextPtr context,
         const String & path_to_manifest_file_);
 
