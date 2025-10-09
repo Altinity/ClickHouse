@@ -202,7 +202,7 @@ IcebergMetadata::IcebergMetadata(
     , object_storage(std::move(object_storage_))
     , persistent_components(initializePersistentTableComponents(configuration_, cache_ptr, context_))
     , data_lake_settings(configuration_->getDataLakeSettings())
-    , write_format(configuration_->format)
+    , write_format(configuration_->getFormat())
 {
 }
 

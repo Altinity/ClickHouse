@@ -179,6 +179,8 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
         return distributed_iterator;
     }
 
+    configuration->update(object_storage, local_context, true);
+
     std::unique_ptr<IObjectIterator> iterator;
     const auto & reading_path = configuration->getPathForRead();
     if (reading_path.hasGlobs() && hasExactlyOneBracketsExpansion(reading_path.path))
@@ -471,7 +473,7 @@ void StorageObjectStorageSource::addNumRowsToCache(const ObjectInfo & object_inf
 {
     const auto cache_key = getKeyForSchemaCache(
         getUniqueStoragePathIdentifier(*configuration, object_info),
-        object_info.getFileFormat().value_or(configuration->format),
+        object_info.getFileFormat().value_or(configuration->getFormat()),
         format_settings,
         read_context);
     schema_cache.addNumRows(cache_key, num_rows);
@@ -549,7 +551,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
         const auto cache_key = getKeyForSchemaCache(
             getUniqueStoragePathIdentifier(*configuration, *object_info),
-            object_info->getFileFormat().value_or(configuration->format),
+            object_info->getFileFormat().value_or(configuration->getFormat()),
             format_settings,
             context_);
 
@@ -584,13 +586,13 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         CompressionMethod compression_method;
         if (const auto * object_info_in_archive = dynamic_cast<const ArchiveIterator::ObjectInfoInArchive *>(object_info.get()))
         {
-            compression_method = chooseCompressionMethod(configuration->getPathInArchive(), configuration->compression_method);
+            compression_method = chooseCompressionMethod(configuration->getPathInArchive(), configuration->getCompressionMethod());
             const auto & archive_reader = object_info_in_archive->archive_reader;
             read_buf = archive_reader->readFile(object_info_in_archive->path_in_archive, /*throw_on_not_found=*/true);
         }
         else
         {
-            compression_method = chooseCompressionMethod(object_info->getFileName(), configuration->compression_method);
+            compression_method = chooseCompressionMethod(object_info->getFileName(), configuration->getCompressionMethod());
             read_buf = createReadBuffer(object_info->relative_path_with_metadata, object_storage, context_, log);
         }
 
@@ -622,10 +624,10 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             "Reading object '{}', size: {} bytes, with format: {}",
             object_info->getPath(),
             object_info->getObjectMetadata()->size_bytes,
-            object_info->getFileFormat().value_or(configuration->format));
+            object_info->getFileFormat().value_or(configuration->getFormat()));
 
         auto input_format = FormatFactory::instance().getInput(
-            object_info->getFileFormat().value_or(configuration->format),
+            object_info->getFileFormat().value_or(configuration->getFormat()),
             *read_buf,
             initial_header,
             context_,

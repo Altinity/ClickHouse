@@ -39,6 +39,11 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         /// controls new feature and it's 'true' by default, use 'false' as previous_value).
         /// It's used to implement `compatibility` setting (see https://github.com/ClickHouse/ClickHouse/issues/35972)
         /// Note: please check if the key already exists to prevent duplicate entries.
+        addSettingsChanges(settings_changes_history, "26.1.1.2000",
+        {
+            {"object_storage_cluster", "", "", "Antalya: New setting"},
+            {"object_storage_max_nodes", 0, 0, "Antalya: New setting"},
+        });
         addSettingsChanges(settings_changes_history, "26.1",
         {
             {"parallel_replicas_filter_pushdown", false, false, "New setting"},
@@ -311,6 +316,15 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"distributed_plan_force_shuffle_aggregation", 0, 0, "New experimental setting"},
             {"allow_experimental_insert_into_iceberg", false, false, "New setting."},
             /// RELEASE CLOSED
+        });
+        addSettingsChanges(settings_changes_history, "25.6.5.2000",
+        {
+            {"allow_experimental_database_iceberg", false, true, "Turned ON by default for Antalya"},
+            {"allow_experimental_database_unity_catalog", false, true, "Turned ON by default for Antalya"},
+            {"allow_experimental_database_glue_catalog", false, true, "Turned ON by default for Antalya"},
+            {"output_format_parquet_enum_as_byte_array", true, true, "Enable writing Enum as byte array in Parquet by default"},
+            {"object_storage_cluster", "", "", "New setting"},
+            {"object_storage_max_nodes", 0, 0, "New setting"},
         });
         addSettingsChanges(settings_changes_history, "25.6",
         {
