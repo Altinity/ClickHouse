@@ -115,6 +115,7 @@
 
 #include <Common/scope_guard_safe.h>
 #include "Interpreters/StorageID.h"
+#include "QueryPipeline/QueryPlanResourceHolder.h"
 #include "Storages/ExportReplicatedMergeTreePartitionManifest.h"
 #include "Storages/ExportReplicatedMergeTreePartitionTaskEntry.h"
 #include <Functions/generateSnowflakeID.h>
@@ -4465,11 +4466,16 @@ void StorageReplicatedMergeTree::selectPartsToExport()
 
     auto complete_part_export = [&](
         const std::string & export_partition_path,
+        const std::string & part_path,
         const std::string & part_status_path,
         const std::string & parts_to_do_path,
         const std::string & lock_path,
         const std::string & next_idx_path,
         const std::size_t next_idx_local,
+        const std::string & path_in_destination_storage_path,
+        const StoragePtr & destination_storage,
+        const std::string & transaction_id,
+        const std::string & partition_id,
         const ZooKeeperPtr & zk) -> bool
     {
         /// todo arthur is it possible to grab stats using a multi-op?
@@ -4529,9 +4535,38 @@ void StorageReplicatedMergeTree::selectPartsToExport()
             ops.emplace_back(zkutil::makeSetRequest(part_status_path, "COMPLETED", -1));
             ops.emplace_back(zkutil::makeRemoveRequest(lock_path, lock_stat.version));
             ops.emplace_back(zkutil::makeSetRequest(parts_to_do_path, std::to_string(parts_to_do), parts_to_do_stat.version));
+            ops.emplace_back(zkutil::makeCreateRequest(fs::path(part_path) / "finished_by", replica_name, zkutil::CreateMode::Persistent));
+            ops.emplace_back(zkutil::makeCreateRequest(fs::path(part_path) / "path_in_destination_storage", path_in_destination_storage_path, zkutil::CreateMode::Persistent));
 
             if (parts_to_do == 0)
             {
+                /// loop over all parts under `/parts` and grab all paths in destination storage
+                Strings exported_paths;
+                const auto parts_path = fs::path(export_partition_path) / "parts";
+                Strings parts = zk->getChildren(parts_path);
+                
+                for (const auto & part : parts)
+                {
+                    std::string path_in_destination_storage;
+                    const auto path_in_destination_storage_zk_path = fs::path(parts_path) / part / "path_in_destination_storage";
+                    
+                    if (zk->tryGet(path_in_destination_storage_zk_path, path_in_destination_storage))
+                    {
+                        exported_paths.push_back(path_in_destination_storage);
+                    }
+                    else
+                    {
+                        /// todo arthur what should I do here?
+                        LOG_WARNING(log, "Failed to get path_in_destination_storage for part {} in export", part);
+                    }
+                }
+                
+                LOG_INFO(log, "Collected {} exported paths for export", exported_paths.size());
+
+                /// manually add the export we just finished because it is not zk yet
+                exported_paths.push_back(path_in_destination_storage_path);
+
+                destination_storage->commitExportPartitionTransaction(transaction_id, partition_id, exported_paths, getContext());
                 ops.emplace_back(zkutil::makeSetRequest(fs::path(export_partition_path) / "status", "COMPLETED", -1));
             }
 
@@ -4669,14 +4704,30 @@ void StorageReplicatedMergeTree::selectPartsToExport()
 
     std::lock_guard lock(export_merge_tree_partition_mutex);
 
-    for (const auto & [key, task_entry] : export_merge_tree_partition_task_entries)
+    for (auto & [key, task_entry] : export_merge_tree_partition_task_entries)
     {
         /// this sounds impossible, but just in case
         if (task_entry.parts_to_do == 0)
         {
             LOG_INFO(log, "Already completed, skipping");
             continue;
-        }        
+        }
+
+        std::string parts_to_do_string;
+        if (!zk->tryGet(fs::path(exports_path) / key / "parts_to_do", parts_to_do_string))
+        {
+            LOG_INFO(log, "Failed to get parts_to_do, skipping");
+            continue;
+        }
+        
+        const auto parts_to_do = std::stoull(parts_to_do_string.c_str());
+        task_entry.parts_to_do = parts_to_do;
+
+        if (task_entry.parts_to_do == 0)
+        {
+            LOG_INFO(log, "Already completed, skipping");
+            continue;
+        }
 
         const auto & manifest = task_entry.manifest;
         const auto & database = getContext()->resolveDatabase(manifest.destination_database);
@@ -4705,6 +4756,9 @@ void StorageReplicatedMergeTree::selectPartsToExport()
 
         const auto part_to_export = try_to_acquire_a_part(manifest, partition_path, next_idx, zk);
 
+        const auto partition_id = manifest.partition_id;
+        const auto transaction_id = manifest.transaction_id;
+
         if (part_to_export.has_value())
         {
             try
@@ -4713,20 +4767,26 @@ void StorageReplicatedMergeTree::selectPartsToExport()
                     part_to_export.value(),
                     destination_storage_id,
                     getContext(),
-                    [this, exports_path, key, part_to_export, complete_part_export, partition_path, next_idx_path, next_idx]
+                    [this, partition_id, transaction_id, exports_path, key, part_to_export, complete_part_export, partition_path, next_idx_path, next_idx, destination_storage]
                     (MergeTreeExportManifest::CompletionCallbackResult result)
                 {
                     
                     const auto zk_client = getZooKeeper();
                     if (result.success)
                     {
+
                         complete_part_export(
                             partition_path,
+                            fs::path(exports_path) / key / "parts" / part_to_export.value(),
                             fs::path(exports_path) / key / "parts" / part_to_export.value() / "status",
                             fs::path(exports_path) / key / "parts_to_do",
                             fs::path(exports_path) / key / "parts" / part_to_export.value() / "lock",
                             next_idx_path,
                             next_idx,
+                            result.relative_path_in_destination_storage,
+                            destination_storage,
+                            transaction_id,
+                            partition_id,
                             zk_client);
 
                         /// maybe get up to date from complete_parts_export?
@@ -4734,7 +4794,7 @@ void StorageReplicatedMergeTree::selectPartsToExport()
                         export_merge_tree_partition_task_entries[key].parts_to_do--;
 
                         if (export_merge_tree_partition_task_entries[key].parts_to_do == 0)
-                        {
+                        {                            
                             export_merge_tree_partition_task_entries.erase(key);
                         }
                     }
@@ -4744,7 +4804,6 @@ void StorageReplicatedMergeTree::selectPartsToExport()
                         /// if above threshhold, fail the entire export - hopefully it is safe to do so :D
                         /// I could also leave this for the cleanup thread, but will do it here for now.
 
-                        bool erase_entry = false;
                         Coordination::Requests ops;
 
                         std::string retry_count_string;
@@ -4755,8 +4814,7 @@ void StorageReplicatedMergeTree::selectPartsToExport()
                             //// todo arthur unhardcode this
                             if (retry_count > 3)
                             {
-                                ops.emplace_back(zkutil::makeRemoveRequest(partition_path, -1));
-                                erase_entry = true;
+                                ops.emplace_back(zkutil::makeRemoveRecursiveRequest(partition_path, 1000));
                             }
                             else
                             {
@@ -4775,13 +4833,6 @@ void StorageReplicatedMergeTree::selectPartsToExport()
                         if (zk_client->tryMulti(ops, responses) != Coordination::Error::ZOK)
                         {
                             LOG_INFO(log, "All failure mechanism failed, will not try to update it");
-                            return;
-                        }
-
-                        if (erase_entry)
-                        {
-                            std::lock_guard inner_lock(export_merge_tree_partition_mutex);
-                            export_merge_tree_partition_task_entries.erase(key);
                             return;
                         }
 
