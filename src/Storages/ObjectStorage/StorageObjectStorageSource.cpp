@@ -30,6 +30,7 @@
 #include <Storages/ObjectStorage/DataLakes/DeletionVectorTransform.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSource.h>
+#include <Storages/ObjectStorage/StorageObjectStorageStableTaskDistributor.h>
 #include <Storages/ObjectStorage/Utils.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <boost/operators.hpp>
@@ -513,11 +514,31 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
     ObjectInfoPtr object_info;
     auto query_settings = configuration->getQuerySettings(context_);
 
+    bool not_a_path = false;
+
     do
     {
+        not_a_path = false;
         object_info = file_iterator->next(processor);
 
-        if (!object_info || object_info->getPath().empty())
+        if (!object_info)
+            return {};
+
+        if (object_info->relative_path_with_metadata.getCommand().is_parsed())
+        {
+            auto retry_after_us = object_info->relative_path_with_metadata.getCommand().get_retry_after_us();
+            if (retry_after_us.has_value())
+            {
+                not_a_path = true;
+                /// TODO: Make asyncronous waiting without sleep in thread
+                /// Now this sleep is on executor node in worker thread
+                /// Does not block query initiator
+                sleepForMicroseconds(std::min(Poco::Timestamp::TimeDiff(100000ul), retry_after_us.value()));
+                continue;
+            }
+        }
+
+        if (object_info->getPath().empty())
             return {};
 
         if (!object_info->getObjectMetadata())
@@ -536,7 +557,8 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             else
                 object_info->setObjectMetadata(object_storage->getObjectMetadata(path, with_tags));
         }
-    } while (query_settings.skip_empty_files && object_info->getObjectMetadata()->size_bytes == 0);
+    }
+    while (not_a_path || (query_settings.skip_empty_files && object_info->getObjectMetadata()->size_bytes == 0));
 
     QueryPipelineBuilder builder;
     std::shared_ptr<ISource> source;
@@ -1141,6 +1163,12 @@ StorageObjectStorageSource::ReadTaskIterator::ReadTaskIterator(
     , is_archive(is_archive_)
     , object_storage(object_storage_)
 {
+    if (!getContext()->isSwarmModeEnabled())
+    {
+        LOG_DEBUG(getLogger("StorageObjectStorageSource"), "STOP SWARM MODE called, stop getting new tasks");
+        return;
+    }
+
     ThreadPool pool(
         CurrentMetrics::StorageObjectStorageThreads,
         CurrentMetrics::StorageObjectStorageThreadsActive,
@@ -1176,6 +1204,12 @@ ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator::next(size_t)
     ObjectInfoPtr object_info;
     if (current_index >= buffer.size())
     {
+        if (!getContext()->isSwarmModeEnabled())
+        {
+            LOG_DEBUG(getLogger("StorageObjectStorageSource"), "STOP SWARM MODE called, stop getting new tasks");
+            return nullptr;
+        }
+
         auto task = callback();
         if (!task || task->isEmpty())
             return nullptr;

@@ -113,16 +113,39 @@ struct DataLakeObjectMetadata;
 
 struct RelativePathWithMetadata
 {
+    class CommandInTaskResponse
+    {
+    public:
+        CommandInTaskResponse() = default;
+        explicit CommandInTaskResponse(const std::string & task);
+
+        bool is_parsed() const { return successfully_parsed; }
+        void set_retry_after_us(Poco::Timestamp::TimeDiff time_us) { retry_after_us = time_us; }
+
+        std::string to_string() const;
+
+        std::optional<Poco::Timestamp::TimeDiff> get_retry_after_us() const { return retry_after_us; }
+
+    private:
+        bool successfully_parsed = false;
+        std::optional<Poco::Timestamp::TimeDiff> retry_after_us;
+    };
+
     String relative_path;
     /// Object metadata: size, modification time, etc.
     std::optional<ObjectMetadata> metadata;
+    /// Retry request after short pause
+    CommandInTaskResponse command;
 
     RelativePathWithMetadata() = default;
 
-    explicit RelativePathWithMetadata(String relative_path_, std::optional<ObjectMetadata> metadata_ = std::nullopt)
-        : relative_path(std::move(relative_path_))
-        , metadata(std::move(metadata_))
-    {}
+    explicit RelativePathWithMetadata(const String & task_string, std::optional<ObjectMetadata> metadata_ = std::nullopt)
+        : metadata(std::move(metadata_))
+        , command(task_string)
+    {
+        if (!command.is_parsed())
+            relative_path = task_string;
+    }
 
     RelativePathWithMetadata(const RelativePathWithMetadata & other) = default;
 
@@ -130,6 +153,8 @@ struct RelativePathWithMetadata
 
     std::string getFileName() const { return std::filesystem::path(relative_path).filename(); }
     std::string getPath() const { return relative_path; }
+
+    const CommandInTaskResponse & getCommand() const { return command; }
 };
 
 struct ObjectKeyWithMetadata
