@@ -195,6 +195,7 @@ struct Settings;
     M(Bool, disable_fetch_partition_for_zero_copy_replication, true, "Disable FETCH PARTITION query for zero copy replication.", 0) \
     M(Bool, enable_block_number_column, false, "Enable persisting column _block_number for each row.", 0) ALIAS(allow_experimental_block_number_column) \
     M(Bool, enable_block_offset_column, false, "Enable persisting column _block_offset for each row.", 0) \
+    M(SearchOrphanedPartsDisks, search_orphaned_parts_disks, SearchOrphanedPartsDisks::ANY, "ClickHouse scans all disks for orphaned parts upon any ATTACH or CREATE table in order to not allow to miss data parts at undefined (not included in policy) disks. Orphaned parts originates from potentially unsafe storage reconfiguration, e.g. if a disk was excluded from storage policy. This setting limits scope of disks to search by traits of the disks. Possible values: - any - scope is not limited, - local - scope is limited by local disks, - none - empty scope, do not search", 0) \
     \
     /** Experimental/work in progress feature. Unsafe for production. */ \
     M(UInt64, part_moves_between_shards_enable, 0, "Experimental/Incomplete feature to move parts between shards. Does not take into account sharding expressions.", 0) \
