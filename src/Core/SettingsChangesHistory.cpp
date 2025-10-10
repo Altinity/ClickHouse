@@ -220,6 +220,11 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"os_threads_nice_value_query", 0, 0, "New setting."},
             {"os_threads_nice_value_materialized_view", 0, 0, "New setting."},
             {"os_thread_priority", 0, 0, "Alias for os_threads_nice_value_query."},
+            {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
+            {"lock_object_storage_task_distribution_ms", 500, 500, "Raised the value to 500 to avoid hoping tasks between executors."},
+            {"object_storage_cluster", "", "", "Antalya: New setting"},
+            {"object_storage_max_nodes", 0, 0, "Antalya: New setting"},
+            {"allow_retries_in_cluster_requests", false, false, "Antalya: New setting"},
         });
         addSettingsChanges(settings_changes_history, "25.8",
         {
