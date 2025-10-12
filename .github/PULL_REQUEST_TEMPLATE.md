@@ -24,6 +24,7 @@ tests/ci/cancel_and_rerun_workflow_lambda/app.py
 ### Documentation entry for user-facing changes
 ...
 
+### CI/CD Options
 #### Exclude tests:
 - [ ] <!---ci_exclude_fast--> Fast test
 - [ ] <!---ci_exclude_integration--> Integration Tests
@@ -34,7 +35,21 @@ tests/ci/cancel_and_rerun_workflow_lambda/app.py
 - [x] <!---ci_exclude_tsan--> All with TSAN
 - [x] <!---ci_exclude_msan--> All with MSAN
 - [x] <!---ci_exclude_ubsan--> All with UBSAN
-- [ ] <!---ci_exclude_coverage--> All with Coverage
+- [x] <!---ci_exclude_coverage--> All with Coverage
 - [ ] <!---ci_exclude_aarch64|arm--> All with Aarch64
 - [x] <!---ci_exclude_regression--> All Regression
 - [ ] <!---no_ci_cache--> Disable CI Cache
+
+#### Regression jobs to run:
+- [ ] <!---ci_regression_common--> Fast suites (mostly <1h)
+- [ ] <!---ci_regression_aggregate_functions--> Aggregate Functions (2h)
+- [ ] <!---ci_regression_alter--> Alter (1.5h)
+- [ ] <!---ci_regression_benchmark--> Benchmark (30m)
+- [ ] <!---ci_regression_clickhouse_keeper--> ClickHouse Keeper (1h)
+- [ ] <!---ci_regression_iceberg--> Iceberg (2h)
+- [ ] <!---ci_regression_ldap--> LDAP (1h)
+- [ ] <!---ci_regression_parquet--> Parquet (1.5h)
+- [ ] <!---ci_regression_rbac--> RBAC (1.5h)
+- [ ] <!---ci_regression_ssl_server--> SSL Server (1h)
+- [ ] <!---ci_regression_s3--> S3 (2h)
+- [ ] <!---ci_regression_tiered_storage--> Tiered Storage (2h)
