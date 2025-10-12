@@ -110,6 +110,7 @@ def started_cluster():
             user_configs=[
                 "configs/users.d/users.xml",
                 "configs/users.d/enable_writes.xml",
+                "configs/users.d/disable_parquet_metadata_caching.xml",
             ],
             env_variables={
                 "RUST_BACKTRACE": "1",
@@ -131,6 +132,7 @@ def started_cluster():
             user_configs=[
                 "configs/users.d/users.xml",
                 "configs/users.d/enable_writes.xml",
+                "configs/users.d/disable_parquet_metadata_caching.xml",
             ],
             with_minio=True,
             stay_alive=True,
@@ -181,6 +183,7 @@ def started_cluster():
             user_configs=[
                 "configs/users.d/users.xml",
                 "configs/users.d/disabled_delta_kernel.xml",
+                "configs/users.d/disable_parquet_metadata_caching.xml",
             ],
             with_minio=True,
             with_azurite=True,
@@ -1383,7 +1386,7 @@ def test_session_token(started_cluster):
     parquet_data_path = create_initial_data_file(
         started_cluster,
         instance,
-        "SELECT toUInt64(number), toString(number) FROM numbers(100)",
+        "SELECT toUInt64(number), toString(number) FROM numbers(100) SETTINGS input_format_parquet_use_metadata_cache=0",
         TABLE_NAME,
         node_name=node_name,
     )
@@ -1396,7 +1399,7 @@ def test_session_token(started_cluster):
             f"""
     SELECT count() FROM deltaLake(
         'http://{started_cluster.minio_host}:{started_cluster.minio_port}/{started_cluster.minio_bucket}/{TABLE_NAME}/',
-        SETTINGS allow_experimental_delta_kernel_rs=1)
+        SETTINGS allow_experimental_delta_kernel_rs=1, input_format_parquet_use_metadata_cache=0)
     """
         )
     )
