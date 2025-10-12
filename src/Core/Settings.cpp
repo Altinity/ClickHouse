@@ -7536,6 +7536,9 @@ Rewrite expressions like 'x IN subquery' to JOIN. This might be useful for optim
     DECLARE(Bool, allow_retries_in_cluster_requests, false, R"(
 Allow retries in cluster request, when one node goes offline
 )", EXPERIMENTAL) \
+    DECLARE(Bool, allow_experimental_iceberg_read_optimization, true, R"(
+Allow Iceberg read optimization based on Iceberg metadata.
+)", EXPERIMENTAL) \
     \
     /** Experimental timeSeries* aggregate functions. */ \
     DECLARE_WITH_ALIAS(Bool, allow_experimental_time_series_aggregate_functions, false, R"(

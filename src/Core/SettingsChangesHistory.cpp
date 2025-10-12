@@ -43,6 +43,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         {
             {"lock_object_storage_task_distribution_ms", 500, 500, "New setting."},
             {"allow_retries_in_cluster_requests", false, false, "New setting"},
+            {"allow_experimental_iceberg_read_optimization", true, true, "New setting."},
         });
         addSettingsChanges(settings_changes_history, "26.1",
         {
