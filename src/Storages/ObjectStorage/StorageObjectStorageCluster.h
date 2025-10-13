@@ -129,6 +129,8 @@ public:
 
     bool supportsParallelInsert() const override;
 
+    bool prefersLargeBlocks() const override;
+
 private:
     void updateQueryToSendIfNeeded(
         ASTPtr & query,

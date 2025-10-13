@@ -899,5 +899,11 @@ bool StorageObjectStorageCluster::supportsParallelInsert() const
     return IStorageCluster::supportsParallelInsert();
 }
 
+bool StorageObjectStorageCluster::prefersLargeBlocks() const
+{
+    if (pure_storage)
+        return pure_storage->prefersLargeBlocks();
+    return IStorageCluster::prefersLargeBlocks();
+}
 
 }
