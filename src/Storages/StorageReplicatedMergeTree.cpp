@@ -4490,6 +4490,7 @@ void StorageReplicatedMergeTree::exportMergeTreePartitionUpdatingTask()
     }
 
     export_merge_tree_partition_updating_task->scheduleAfter(30 * 1000);
+    export_merge_tree_partition_select_task->schedule();
 }
 
 void StorageReplicatedMergeTree::selectPartsToExport()
@@ -4870,9 +4871,6 @@ void StorageReplicatedMergeTree::selectPartsToExport()
 
                     }
                 });
-
-                /// managed to schedule a task, re-run immediately to pick up more tasks if possible
-                export_merge_tree_partition_select_task->schedule();
             }
             catch (...)
             {
