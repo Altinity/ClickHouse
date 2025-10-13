@@ -6206,9 +6206,11 @@ void MergeTreeData::exportPartToTable(const PartitionCommand & command, ContextP
             "Exporting merge tree part is experimental. Set `allow_experimental_export_merge_tree_part` to enable it");
     }
 
-    auto part_name = command.partition->as<ASTLiteral &>().value.safeGet<String>();
+    const auto part_name = command.partition->as<ASTLiteral &>().value.safeGet<String>();
 
-    exportPartToTable(part_name, StorageID{command.to_database, command.to_table}, query_context);
+    const auto database_name = query_context->resolveDatabase(command.to_database);
+
+    exportPartToTable(part_name, StorageID{database_name, command.to_table}, query_context);
 }
 
 void MergeTreeData::exportPartToTable(
