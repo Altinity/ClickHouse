@@ -4377,119 +4377,119 @@ void StorageReplicatedMergeTree::mutationsFinalizingTask()
     }
 }
 
-// static void exportPartitionCallback(
-//     MergeTreeExportManifest::CompletionCallbackResult result,
-//     zkutil::ZooKeeperPtr & zookeeper,
-//     const String & partition_export,
-//     const String & part_name)
-// {
-//     if (!result.success)
-//     {
-//         LOG_INFO(log, "Failed to export partition {} part {}, releasing lock", partition_export, part_name);
-//         zookeeper->remove(owner_path);
-//         return;
-//     }
-
-//     zookeeper->create(part_path / "path", result.relative_path_in_destination_storage, zkutil::CreateMode::Persistent);
-//     LOG_INFO(log, "Exported partition {} part {} to {}", partition_export, part_name, result.relative_path_in_destination_storage);
-
-//     /// loop over all parts again and check if they all have the path set, if so, mark the export as done
-//     bool completed = true;
-//     Strings exported_paths;
-//     for (const auto & possibly_commited_part : part_names)
-//     {
-//         /// todo arthur is this a case of "try to write as opposed to try to read because it might be stale?"
-//         const auto possibly_commited_part_path = parts_path / possibly_commited_part;
-//         if (!zookeeper->exists(possibly_commited_part_path / "path"))
-//         {
-//             completed = false;
-//             break;
-//         }
-//         exported_paths.push_back(zookeeper->get(possibly_commited_part_path / "path"));
-//     }
-
-//     if (completed)
-//     {
-        
-//         const auto destination_storage = DatabaseCatalog::instance().tryGetTable(
-//             StorageID(QualifiedTableName::parseFromString(destination_storage_id)),
-//             getContext());
-//         const auto transaction_id = zookeeper->get(partition_export_path / "transaction_id");
-//         /// possibly need to add a check here to see if the table still exists
-//         destination_storage->commitExportPartitionTransaction(transaction_id, partition_export, exported_paths, getContext());
-//         zookeeper->set(partition_export_path / "status", "COMPLETED");
-//     }
-// }
-
 void StorageReplicatedMergeTree::exportMergeTreePartitionUpdatingTask()
 {
     std::lock_guard lock(export_merge_tree_partition_mutex);
 
     auto zk = getZooKeeper();
 
-    const auto exports_path = fs::path(zookeeper_path) / "exports";
-    /// why do I need the stat?
+    const std::string exports_path = fs::path(zookeeper_path) / "exports";
+    const std::string cleanup_lock_path = fs::path(zookeeper_path) / "exports_cleanup_lock";
+
+    bool cleanup_lock_acquired = zk->tryCreate(cleanup_lock_path, "", zkutil::CreateMode::Ephemeral) == Coordination::Error::ZOK;
+
+    if (cleanup_lock_acquired)
+    {
+        LOG_INFO(log, "Cleanup lock acquired, will remove stale entries");
+    }
+
     Coordination::Stat stat;
-    const auto partition_exports_in_zk = zk->getChildrenWatch(exports_path, &stat, export_merge_tree_partition_watch_callback);
-    const auto partition_exports_in_zk_set = std::unordered_set(partition_exports_in_zk.begin(), partition_exports_in_zk.end());
+    const auto children = zk->getChildrenWatch(exports_path, &stat, export_merge_tree_partition_watch_callback);
+    const std::unordered_set<std::string> zk_children(children.begin(), children.end());
 
-    std::unordered_set<std::string> local_export_partition_entries;
-    for (const auto & entry : export_merge_tree_partition_task_entries)
-        local_export_partition_entries.insert(entry.first);
+    const auto now = time(nullptr);
 
-    std::unordered_set<std::string> new_entries;
-    std::unordered_set<std::string> removed_entries;
-
-    for (const auto & partition_export_task_entry : local_export_partition_entries)
+    /// Load new entries
+    /// If we have the cleanup lock, also remove stale entries from zk and local
+    for (const auto & key : zk_children)
     {
-        if (!partition_exports_in_zk_set.contains(partition_export_task_entry))
-            removed_entries.insert(partition_export_task_entry);
-    }
-
-    for (const auto & partition_export : partition_exports_in_zk_set)
-    {
-        if (!local_export_partition_entries.contains(partition_export))
-            new_entries.insert(partition_export);
-    }
-
-    /// remove the removed entries from the local set
-    for (const auto & entry : removed_entries)
-        export_merge_tree_partition_task_entries.erase(entry);
-
-    // add the new entries to the local set
-    for (const auto & entry_key : new_entries)
-    {
-        // get entry from zk
-        const auto entry_path = fs::path(exports_path) / entry_key;
-        const auto metadata_entry_path = fs::path(entry_path) / "metadata.json";
-        const auto parts_to_do_path = fs::path(entry_path) / "parts_to_do";
-
-        std::string parts_to_do_string;
-        if (!zk->tryGet(parts_to_do_path, parts_to_do_string))
-        {
-            LOG_INFO(log, "Skipping...");
+        if (!cleanup_lock_acquired && export_merge_tree_partition_task_entries.contains(key))
             continue;
-        }
 
-        const auto parts_to_do = std::stoull(parts_to_do_string.c_str());
-
-        if (parts_to_do == 0)
-        {
-            LOG_INFO(log, "Skipping... Parts to do is 0, will not load it");
-            continue;
-        }
+        const std::string entry_path = fs::path(exports_path) / key;
 
         std::string metadata_json;
-        if (!zk->tryGet(metadata_entry_path, metadata_json))
+        if (!zk->tryGet(fs::path(entry_path) / "metadata.json", metadata_json))
         {
-            LOG_INFO(log, "Skipping...");
+            LOG_INFO(log, "Skipping {}: missing metadata.json", key);
             continue;
         }
+
+        std::string status;
+        if (!zk->tryGet(fs::path(entry_path) / "status", status))
+        {
+            LOG_INFO(log, "Skipping {}: missing status", key);
+            continue;
+        }
+
+        bool is_not_pending = status != "PENDING";
 
         const auto metadata = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
 
-        export_merge_tree_partition_task_entries[entry_key] = ExportReplicatedMergeTreePartitionTaskEntry {metadata, parts_to_do};
+        if (cleanup_lock_acquired)
+        {
+            bool has_expired = metadata.create_time < now - 45;
+
+            if (has_expired && is_not_pending)
+            {
+                zk->tryRemoveRecursive(fs::path(entry_path));
+                export_merge_tree_partition_task_entries.erase(key);
+                LOG_INFO(log, "Removed {}: expired", key);
+                continue;
+            }
+        }
+
+        if (is_not_pending)
+        {
+            LOG_INFO(log, "Skipping {}: status is not PENDING", key);
+            continue;
+        }
+
+        if (export_merge_tree_partition_task_entries.contains(key))
+        {
+            LOG_INFO(log, "Skipping {}: already exists", key);
+            continue;
+        }
+
+        std::string parts_to_do_str;
+        if (!zk->tryGet(fs::path(entry_path) / "parts_to_do", parts_to_do_str))
+        {
+            LOG_INFO(log, "Skipping {}: no parts_to_do", key);
+            continue;
+        }
+
+        uint64_t parts_to_do = 0;
+        try
+        {
+            parts_to_do = std::stoull(parts_to_do_str);
+        }
+        catch (...)
+        {
+            LOG_WARNING(log, "Skipping {}: invalid parts_to_do='{}'", key, parts_to_do_str);
+            continue;
+        }
+
+        if (parts_to_do == 0)
+        {
+            LOG_INFO(log, "Skipping {}: parts_to_do is 0", key);
+            continue;
+        }
+
+        export_merge_tree_partition_task_entries.emplace(
+            key,
+            ExportReplicatedMergeTreePartitionTaskEntry{std::move(metadata), parts_to_do});
     }
+
+    /// Remove entries that were deleted by someone else
+    std::erase_if(export_merge_tree_partition_task_entries,
+        [&](auto const & kv) { return !zk_children.contains(kv.first); });
+
+    if (cleanup_lock_acquired)
+    {
+        zk->tryRemove(cleanup_lock_path);
+    }
+
+    export_merge_tree_partition_updating_task->scheduleAfter(30 * 1000);
 }
 
 void StorageReplicatedMergeTree::selectPartsToExport()
