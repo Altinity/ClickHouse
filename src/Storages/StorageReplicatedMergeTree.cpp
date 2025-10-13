@@ -4443,9 +4443,19 @@ void StorageReplicatedMergeTree::exportMergeTreePartitionUpdatingTask()
             continue;
         }
 
+        std::vector<DataPartPtr> part_references;
+
+        for (const auto & part_name : metadata.parts)
+        {
+            if (const auto part = getPartIfExists(part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated}))
+            {
+                part_references.push_back(part);
+            }
+        }
+
         export_merge_tree_partition_task_entries.emplace(
             key,
-            ExportReplicatedMergeTreePartitionTaskEntry{std::move(metadata), parts_to_do});
+            ExportReplicatedMergeTreePartitionTaskEntry {metadata, parts_to_do, std::move(part_references)});
     }
 
     /// Remove entries that were deleted by someone else
