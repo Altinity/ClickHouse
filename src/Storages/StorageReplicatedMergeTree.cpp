@@ -4870,6 +4870,9 @@ void StorageReplicatedMergeTree::selectPartsToExport()
 
                     }
                 });
+
+                /// managed to schedule a task, re-run immediately to pick up more tasks if possible
+                export_merge_tree_partition_select_task->schedule();
             }
             catch (...)
             {
@@ -4878,12 +4881,15 @@ void StorageReplicatedMergeTree::selectPartsToExport()
 
                 /// best-effort to remove the lock (actually, we should make sure the lock is released..)
                 zk->tryRemove(fs::path(partition_path) / "parts" / part_to_export.value() / "lock");
+
+                /// re-run after some time
+                export_merge_tree_partition_select_task->scheduleAfter(1000 * 5);
             }
             
         }
     }
 
-    export_merge_tree_partition_select_task->scheduleAfter(1000 * 5);
+    // export_merge_tree_partition_select_task->scheduleAfter(1000 * 5);
 }
 
 
@@ -8419,8 +8425,9 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
             "Exporting merge tree part is experimental. Set `allow_experimental_export_merge_tree_part` to enable it");
     }
 
-    String dest_database = query_context->resolveDatabase(command.to_database);
-    auto dest_storage = DatabaseCatalog::instance().getTable({dest_database, command.to_table}, query_context);
+    const auto dest_database = query_context->resolveDatabase(command.to_database);
+    const auto dest_table = command.to_table;
+    auto dest_storage = DatabaseCatalog::instance().getTable({dest_database, dest_table}, query_context);
 
     if (dest_storage->getStorageID() == this->getStorageID())
     {
@@ -8526,8 +8533,8 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 
     manifest.transaction_id = std::to_string(generateSnowflakeID());
     manifest.partition_id = partition_id;
-    manifest.destination_database = command.to_database;
-    manifest.destination_table = command.to_table;
+    manifest.destination_database = dest_database;
+    manifest.destination_table = dest_table;
     manifest.source_replica = replica_name;
     manifest.number_of_parts = part_names.size();
     manifest.parts = part_names;
