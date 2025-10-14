@@ -10,10 +10,25 @@ struct MergeTreeExportManifest
 
     struct CompletionCallbackResult
     {
+    private:
+        CompletionCallbackResult(bool success_, const String & relative_path_in_destination_storage_, const String & exception_)
+            : success(success_), relative_path_in_destination_storage(relative_path_in_destination_storage_), exception(exception_) {}
+    public:
+
+        static CompletionCallbackResult createSuccess(const String & relative_path_in_destination_storage_)
+        {
+            return CompletionCallbackResult(true, relative_path_in_destination_storage_, "");
+        }
+
+        static CompletionCallbackResult createFailure(const String & exception_)
+        {
+            return CompletionCallbackResult(false, "", exception_);
+        }
+
         bool success = false;
         String relative_path_in_destination_storage;
+        String exception;
     };
-
 
     MergeTreeExportManifest(
         const StorageID & destination_storage_id_,
