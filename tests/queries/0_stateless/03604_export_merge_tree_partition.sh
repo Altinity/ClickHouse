@@ -24,6 +24,9 @@ query "INSERT INTO $rmt_table VALUES (3, 2020), (5, 2021)"
 
 query "INSERT INTO $rmt_table VALUES (6, 2022), (7, 2022)"
 
+# sync replicas
+query "SYSTEM SYNC REPLICA $rmt_table"s
+
 query "ALTER TABLE $rmt_table EXPORT PARTITION ID '2020' TO TABLE $s3_table SETTINGS allow_experimental_export_merge_tree_part = 1"
 
 query "ALTER TABLE $rmt_table EXPORT PARTITION ID '2021' TO TABLE $s3_table SETTINGS allow_experimental_export_merge_tree_part = 1"
