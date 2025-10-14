@@ -141,9 +141,9 @@ void DataFileMetaInfo::serialize(WriteBuffer & out) const
         size_t field_mask = 0;
         if (column.second.rows_count.has_value())
             field_mask |= FIELD_MASK_ROWS;
-        if (column.second.rows_count.has_value())
+        if (column.second.nulls_count.has_value())
             field_mask |= FIELD_MASK_NULLS;
-        if (column.second.rows_count.has_value())
+        if (column.second.hyperrectangle.has_value())
             field_mask |= FIELD_MASK_RECT;
         writeIntBinary(field_mask, out);
 
