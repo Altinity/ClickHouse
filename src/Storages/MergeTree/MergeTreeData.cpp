@@ -6324,7 +6324,7 @@ void MergeTreeData::exportPartToTableImpl(
         export_manifests.erase(manifest);
 
         if (manifest.completion_callback)
-            manifest.completion_callback({});
+            manifest.completion_callback(MergeTreeExportManifest::CompletionCallbackResult::createFailure(e.message()));
         return;
     }
 
@@ -6398,6 +6398,13 @@ void MergeTreeData::exportPartToTableImpl(
         CompletedPipelineExecutor exec(pipeline);
         exec.execute();
 
+        volatile bool x = true;
+
+        if (x)
+        {
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Some issue");
+        }
+
         std::lock_guard inner_lock(export_manifests_mutex);
         writePartLog(
             PartLogElement::Type::EXPORT_PART,
@@ -6416,9 +6423,9 @@ void MergeTreeData::exportPartToTableImpl(
         ProfileEvents::increment(ProfileEvents::PartsExportTotalMilliseconds, static_cast<UInt64>((*exports_list_entry)->elapsed * 1000));
 
         if (manifest.completion_callback)
-            manifest.completion_callback({true, destination_file_path});
+            manifest.completion_callback(MergeTreeExportManifest::CompletionCallbackResult::createSuccess(destination_file_path));
     }
-    catch (...)
+    catch (const Exception & e)
     {
         tryLogCurrentException(__PRETTY_FUNCTION__, fmt::format("while exporting the part {}. User should retry.", manifest.data_part->name));
 
@@ -6439,7 +6446,7 @@ void MergeTreeData::exportPartToTableImpl(
         export_manifests.erase(manifest);
 
         if (manifest.completion_callback)
-            manifest.completion_callback({});
+            manifest.completion_callback(MergeTreeExportManifest::CompletionCallbackResult::createFailure(e.message()));
 
         throw;
     }
