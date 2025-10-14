@@ -107,7 +107,8 @@ StorageObjectStorage::StorageObjectStorage(
     ASTPtr partition_by_,
     ASTPtr /*order_by_*/,
     bool is_table_function,
-    bool lazy_init)
+    bool lazy_init,
+    std::optional<std::string> sample_path_)
     : IStorage(table_id_)
     , configuration(configuration_)
     , object_storage(object_storage_)
@@ -168,7 +169,7 @@ StorageObjectStorage::StorageObjectStorage(
     /// (e.g. read always follows constructor immediately).
     update_configuration_on_read_write = !is_table_function || !updated_configuration;
 
-    std::string sample_path;
+    std::string sample_path = sample_path_.value_or("");
 
     ColumnsDescription columns{columns_in_table_or_function_definition};
     if (need_resolve_columns_or_format)

@@ -21,6 +21,7 @@
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
+#include <Parsers/ASTSetQuery.h>
 #include <Disks/DiskType.h>
 
 #include <memory>
@@ -53,19 +54,20 @@ namespace ErrorCodes
 
 namespace DataLakeStorageSetting
 {
-    extern DataLakeStorageSettingsDatabaseDataLakeCatalogType storage_catalog_type;
-    extern DataLakeStorageSettingsString object_storage_endpoint;
-    extern DataLakeStorageSettingsString storage_aws_access_key_id;
-    extern DataLakeStorageSettingsString storage_aws_secret_access_key;
-    extern DataLakeStorageSettingsString storage_region;
-    extern DataLakeStorageSettingsString storage_catalog_url;
-    extern DataLakeStorageSettingsString storage_warehouse;
-    extern DataLakeStorageSettingsString storage_catalog_credential;
+    extern const DataLakeStorageSettingsDatabaseDataLakeCatalogType storage_catalog_type;
+    extern const DataLakeStorageSettingsString object_storage_endpoint;
+    extern const DataLakeStorageSettingsString storage_aws_access_key_id;
+    extern const DataLakeStorageSettingsString storage_aws_secret_access_key;
+    extern const DataLakeStorageSettingsString storage_region;
+    extern const DataLakeStorageSettingsString storage_catalog_url;
+    extern const DataLakeStorageSettingsString storage_warehouse;
+    extern const DataLakeStorageSettingsString storage_catalog_credential;
 
-    extern DataLakeStorageSettingsString storage_auth_scope;
-    extern DataLakeStorageSettingsString storage_auth_header;
-    extern DataLakeStorageSettingsString storage_oauth_server_uri;
-    extern DataLakeStorageSettingsBool storage_oauth_server_use_request_body;
+    extern const DataLakeStorageSettingsString storage_auth_scope;
+    extern const DataLakeStorageSettingsString storage_auth_header;
+    extern const DataLakeStorageSettingsString storage_oauth_server_uri;
+    extern const DataLakeStorageSettingsBool storage_oauth_server_use_request_body;
+    extern const DataLakeStorageSettingsString iceberg_metadata_file_path;
 }
 
 template <typename T>
@@ -375,6 +377,42 @@ public:
     }
 
     bool isClusterSupported() const override { return is_cluster_supported; }
+
+    ASTPtr createArgsWithAccessData() const override
+    {
+        auto res = BaseStorageConfiguration::createArgsWithAccessData();
+
+        auto iceberg_metadata_file_path = (*settings)[DataLakeStorageSetting::iceberg_metadata_file_path];
+
+        if (iceberg_metadata_file_path.changed)
+        {
+            auto * arguments = res->template as<ASTExpressionList>();
+            if (!arguments)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Arguments are not an expression list");
+
+            bool has_settings = false;
+
+            for (auto & arg : arguments->children)
+            {
+                if (auto * settings_ast = arg->template as<ASTSetQuery>())
+                {
+                    has_settings = true;
+                    settings_ast->changes.setSetting("iceberg_metadata_file_path", iceberg_metadata_file_path.value);
+                    break;
+                }
+            }
+
+            if (!has_settings)
+            {
+                boost::intrusive_ptr<ASTSetQuery> settings_ast = make_intrusive<ASTSetQuery>();
+                settings_ast->is_standalone = false;
+                settings_ast->changes.setSetting("iceberg_metadata_file_path", iceberg_metadata_file_path.value);
+                arguments->children.push_back(settings_ast);
+            }
+        }
+
+        return res;
+    }
 
 private:
     DataLakeMetadataPtr current_metadata;

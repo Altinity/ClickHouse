@@ -53,7 +53,8 @@ public:
         ASTPtr partition_by_ = nullptr,
         ASTPtr order_by_ = nullptr,
         bool is_table_function_ = false,
-        bool lazy_init = false);
+        bool lazy_init = false,
+        std::optional<std::string> sample_path_ = std::nullopt);
 
     String getName() const override;
 

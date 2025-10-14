@@ -221,7 +221,8 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         partition_by,
         order_by,
         /* is_table_function */is_table_function,
-        /* lazy_init */lazy_init);
+        /* lazy_init */lazy_init,
+        sample_path);
 
     auto virtuals_ = getVirtualsPtr();
     if (virtuals_)
