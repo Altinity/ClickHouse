@@ -26,6 +26,12 @@ ASTPtr extractTableFunctionASTPtrFromSelectQuery(ASTPtr & query)
     return table_expression ? table_expression->table_function : nullptr;
 }
 
+ASTPtr extractTableASTPtrFromSelectQuery(ASTPtr & query)
+{
+    auto table_expression = extractTableExpressionASTPtrFromSelectQuery(query);
+    return table_expression ? table_expression->database_and_table_name : nullptr;
+}
+
 ASTFunction * extractTableFunctionFromSelectQuery(ASTPtr & query)
 {
     auto table_function_ast = extractTableFunctionASTPtrFromSelectQuery(query);
