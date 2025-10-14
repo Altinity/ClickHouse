@@ -6101,13 +6101,6 @@ void MergeTreeData::exportPartToTableImpl(
         CompletedPipelineExecutor exec(pipeline);
         exec.execute();
 
-        volatile bool x = true;
-
-        if (x)
-        {
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Some issue");
-        }
-
         std::lock_guard inner_lock(export_manifests_mutex);
         writePartLog(
             PartLogElement::Type::EXPORT_PART,
