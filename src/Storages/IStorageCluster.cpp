@@ -32,6 +32,7 @@
 #include <Analyzer/ColumnNode.h>
 #include <Analyzer/JoinNode.h>
 #include <Analyzer/InDepthQueryTreeVisitor.h>
+#include <Analyzer/Utils.h>
 #include <Storages/StorageDistributed.h>
 #include <TableFunctions/TableFunctionFactory.h>
 #include <Storages/extractTableFunctionFromSelectQuery.h>
@@ -218,37 +219,40 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
     {
     case ObjectStorageClusterJoinMode::LOCAL:
     {
-        auto modified_query_tree = query_tree->clone();
-        bool need_modify = false;
-
-        SearcherVisitor table_function_searcher({QueryTreeNodeType::TABLE, QueryTreeNodeType::TABLE_FUNCTION}, context);
-        table_function_searcher.visit(query_tree);
-        auto table_function_node = table_function_searcher.getNode();
-        if (!table_function_node)
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find table function node");
-
-        if (has_join)
+        if (has_join || has_local_columns_in_where)
         {
+            auto modified_query_tree = query_tree->clone();
+
+            SearcherVisitor table_function_searcher({QueryTreeNodeType::TABLE, QueryTreeNodeType::TABLE_FUNCTION}, context);
+            table_function_searcher.visit(modified_query_tree);
+            auto table_function_node = table_function_searcher.getNode();
+            if (!table_function_node)
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find table function node");
+
             QueryTreeNodePtr query_tree_distributed;
 
             auto & query_node = modified_query_tree->as<QueryNode &>();
 
-            if (table_function_searcher.getType().value() == QueryTreeNodeType::TABLE_FUNCTION)
+            if (has_join)
             {
-                auto table_function = extractTableFunctionASTPtrFromSelectQuery(query_to_send);
-                query_tree_distributed = buildTableFunctionQueryTree(table_function, context);
-                auto & table_function_ast = table_function->as<ASTFunction &>();
-                query_tree_distributed->setAlias(table_function_ast.alias);
-            }
-            else
-            {
-                auto join_node = query_node.getJoinTree();
-                query_tree_distributed = join_node->as<JoinNode>()->getLeftTableExpression()->clone();
+                if (table_function_searcher.getType().value() == QueryTreeNodeType::TABLE_FUNCTION)
+                {
+                    auto table_function = extractTableFunctionASTPtrFromSelectQuery(query_to_send);
+                    query_tree_distributed = buildTableFunctionQueryTree(table_function, context);
+                    auto & table_function_ast = table_function->as<ASTFunction &>();
+                    query_tree_distributed->setAlias(table_function_ast.alias);
+                }
+                else
+                {
+                    auto join_node = query_node.getJoinTree();
+                    query_tree_distributed = join_node->as<JoinNode>()->getLeftTableExpression()->clone();
+                }
             }
 
             // Find add used columns from table function to make proper projection list
+            // Need to do before changing WHERE condition
             CollectUsedColumnsForSourceVisitor collector(table_function_node, context);
-            collector.visit(query_tree);
+            collector.visit(modified_query_tree);
             const auto & columns = collector.getColumns();
 
             query_node.resolveProjectionColumns(columns);
@@ -258,20 +262,26 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
                 column_nodes_to_select->getNodes().emplace_back(std::make_shared<ColumnNode>(column, table_function_node));
             query_node.getProjectionNode() = column_nodes_to_select;
 
-            // Left only table function to send on cluster nodes
-            modified_query_tree = modified_query_tree->cloneAndReplace(query_node.getJoinTree(), query_tree_distributed);
+            if (has_local_columns_in_where)
+            {
+                if (query_node.getPrewhere())
+                    removeExpressionsThatDoNotDependOnTableIdentifiers(query_node.getPrewhere(), table_function_node, context);
+                if (query_node.getWhere())
+                    removeExpressionsThatDoNotDependOnTableIdentifiers(query_node.getWhere(), table_function_node, context);
+            }
 
-            need_modify = true;
-        }
+            query_node.getOrderByNode() = std::make_shared<ListNode>();
+            query_node.getGroupByNode() = std::make_shared<ListNode>();
 
-        if (has_local_columns_in_where)
-        {
-            auto & query_node = modified_query_tree->as<QueryNode &>();
-            query_node.getWhere() = {};
-        }
+            if (query_tree_distributed)
+            {
+                // Left only table function to send on cluster nodes
+                modified_query_tree = modified_query_tree->cloneAndReplace(query_node.getJoinTree(), query_tree_distributed);
+            }
 
-        if (need_modify)
             query_to_send = queryNodeToDistributedSelectQuery(modified_query_tree);
+        }
+
         return;
     }
     case ObjectStorageClusterJoinMode::GLOBAL:
@@ -526,12 +536,16 @@ QueryProcessingStage::Enum IStorageCluster::getQueryProcessingStage(
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find table or table function node");
 
         auto & query_node = query_info.query_tree->as<QueryNode &>();
-        if (query_node.hasWhere())
+        if (query_node.hasWhere() || query_node.hasPrewhere())
         {
             CollectUsedColumnsForSourceVisitor collector_where(table_function_node, context, true);
-            collector_where.visit(query_node.getWhere());
+            if (query_node.hasPrewhere())
+                collector_where.visit(query_node.getPrewhere());
+            if (query_node.hasWhere())
+                collector_where.visit(query_node.getWhere());
 
-            // Can't use 'WHERE' on remote node if it contains columns from other sources
+            // SELECT x FROM datalake.table WHERE x IN local.table
+            // Need to modify 'WHERE' on remote node if it contains columns from other sources
             if (!collector_where.getColumns().empty())
                 has_local_columns_in_where = true;
         }
