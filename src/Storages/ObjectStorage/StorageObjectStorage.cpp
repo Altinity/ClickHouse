@@ -1,4 +1,5 @@
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
+#include <Storages/MergeTree/MergeTreePartInfo.h>
 
 #include <Common/Exception.h>
 #include <Common/Logger.h>
@@ -28,6 +29,8 @@
 #include <Storages/ObjectStorage/DataLakes/DeltaLake/TableSnapshot.h>
 #include <Storages/ObjectStorage/DataLakes/DeltaLakeMetadataDeltaKernel.h>
 #include <Interpreters/StorageID.h>
+#include <Common/parseGlobs.h>
+#include <Storages/ObjectStorage/MergeTree/StorageObjectStorageImporterSink.h>
 #include <Databases/LoadingStrictnessLevel.h>
 #include <Databases/DataLake/Common.h>
 #include <Storages/ColumnsDescription.h>
@@ -514,7 +517,8 @@ SinkToStoragePtr StorageObjectStorage::write(
 
     if (configuration->partition_strategy)
     {
-        return std::make_shared<PartitionedStorageObjectStorageSink>(object_storage, configuration, format_settings, sample_block, local_context);
+        auto sink_creator = std::make_shared<PartitionedStorageObjectStorageSink>(object_storage, configuration, format_settings, sample_block, local_context);
+        return std::make_shared<PartitionedSink>(configuration->partition_strategy, sink_creator, local_context, sample_block);
     }
 
     auto paths = configuration->getPaths();
@@ -545,6 +549,48 @@ bool StorageObjectStorage::optimize(
     [[maybe_unused]] ContextPtr context)
 {
     return configuration->optimize(metadata_snapshot, context, format_settings);
+}
+
+bool StorageObjectStorage::supportsImport() const
+{
+    return configuration->partition_strategy != nullptr && configuration->partition_strategy_type == PartitionStrategyFactory::StrategyType::HIVE;
+}
+
+SinkToStoragePtr StorageObjectStorage::import(
+    const std::string & file_name,
+    Block & block_with_partition_values,
+    ContextPtr local_context,
+    std::function<void(ImportStats)> part_log)
+{
+    std::string partition_key;
+
+    if (configuration->partition_strategy)
+    {
+        const auto column_with_partition_key = configuration->partition_strategy->computePartitionKey(block_with_partition_values);
+
+        if (!column_with_partition_key->empty())
+        {
+            partition_key = column_with_partition_key->getDataAt(0).toString();
+        }
+    }
+
+    const auto file_path = configuration->getPathForWrite(partition_key, file_name).path;
+
+    if (object_storage->exists(StoredObject(file_path)))
+    {
+        LOG_INFO(getLogger("StorageObjectStorage"), "File {} already exists, skipping import", file_path);
+        return nullptr;
+    }
+    
+    return std::make_shared<StorageObjectStorageImporterSink>(
+        file_path,
+        object_storage,
+        configuration,
+        format_settings,
+        getInMemoryMetadataPtr()->getSampleBlock(),
+        part_log,
+        local_context
+    );
 }
 
 void StorageObjectStorage::truncate(
@@ -729,5 +775,9 @@ void StorageObjectStorage::checkAlterIsPossible(const AlterCommands & commands, 
     configuration->checkAlterIsPossible(commands);
 }
 
+StorageObjectStorage::Configuration::Path StorageObjectStorage::Configuration::getPathForWrite(const std::string & partition_id, const std::string & filename_override) const
+{
+    return Path {file_path_generator->getPathForWrite(partition_id, filename_override)};
+}
 
 }

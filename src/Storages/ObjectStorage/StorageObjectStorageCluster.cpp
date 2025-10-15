@@ -110,6 +110,11 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
     metadata.setColumns(columns);
     metadata.setConstraints(constraints_);
 
+    if (configuration->getPartitionStrategy())
+    {
+        metadata.partition_key = configuration->getPartitionStrategy()->getPartitionKeyDescription();
+    }
+
     setVirtuals(VirtualColumnUtils::getVirtualsForFileLikeStorage(
         metadata.columns,
         context_,

@@ -169,6 +169,9 @@ MergeTreeSequentialSource::MergeTreeSequentialSource(
             addThrottler(read_settings.remote_throttler, context->getMergesThrottler());
             addThrottler(read_settings.local_throttler, context->getMergesThrottler());
             break;
+        case Export:
+            read_settings.local_throttler = context->getExportsThrottler();
+            break;
     }
 
     MergeTreeReadTask::Extras extras =

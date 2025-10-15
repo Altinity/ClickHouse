@@ -29,8 +29,12 @@ struct IPartitionStrategy
 
     virtual ColumnPtr computePartitionKey(const Chunk & chunk) = 0;
 
-    virtual std::string getPathForRead(const std::string & prefix) = 0;
-    virtual std::string getPathForWrite(const std::string & prefix, const std::string & partition_key) = 0;
+    ColumnPtr computePartitionKey(Block & block) const
+    {
+        actions_with_column_name.actions->execute(block);
+
+        return block.getByName(actions_with_column_name.column_name).column;
+    }
 
     virtual ColumnRawPtrs getFormatChunkColumns(const Chunk & chunk)
     {
@@ -93,8 +97,6 @@ struct WildcardPartitionStrategy : IPartitionStrategy
     WildcardPartitionStrategy(KeyDescription partition_key_description_, const Block & sample_block_, ContextPtr context_);
 
     ColumnPtr computePartitionKey(const Chunk & chunk) override;
-    std::string getPathForRead(const std::string & prefix) override;
-    std::string getPathForWrite(const std::string & prefix, const std::string & partition_key) override;
 };
 
 /*
@@ -112,8 +114,6 @@ struct HiveStylePartitionStrategy : IPartitionStrategy
         bool partition_columns_in_data_file_);
 
     ColumnPtr computePartitionKey(const Chunk & chunk) override;
-    std::string getPathForRead(const std::string & prefix) override;
-    std::string getPathForWrite(const std::string & prefix, const std::string & partition_key) override;
 
     ColumnRawPtrs getFormatChunkColumns(const Chunk & chunk) override;
     Block getFormatHeader() override;

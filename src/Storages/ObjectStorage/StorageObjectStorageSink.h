@@ -8,6 +8,8 @@ namespace DB
 {
 class StorageObjectStorageSink : public SinkToStorage
 {
+friend class StorageObjectStorageImporterSink;
+
 public:
     StorageObjectStorageSink(
         const std::string & path_,
@@ -42,7 +44,7 @@ private:
     void cancelBuffers();
 };
 
-class PartitionedStorageObjectStorageSink : public PartitionedSink
+class PartitionedStorageObjectStorageSink : public PartitionedSink::SinkCreator
 {
 public:
     PartitionedStorageObjectStorageSink(

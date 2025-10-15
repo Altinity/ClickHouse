@@ -274,19 +274,6 @@ ColumnPtr WildcardPartitionStrategy::computePartitionKey(const Chunk & chunk)
     return block_with_partition_by_expr.getByName(actions_with_column.column_name).column;
 }
 
-std::string WildcardPartitionStrategy::getPathForRead(
-    const std::string & prefix)
-{
-    return prefix;
-}
-
-std::string WildcardPartitionStrategy::getPathForWrite(
-    const std::string & prefix,
-    const std::string & partition_key)
-{
-    return PartitionedSink::replaceWildcards(prefix, partition_key);
-}
-
 HiveStylePartitionStrategy::HiveStylePartitionStrategy(
     KeyDescription partition_key_description_,
     const Block & sample_block_,
@@ -304,41 +291,6 @@ HiveStylePartitionStrategy::HiveStylePartitionStrategy(
     }
 
     block_without_partition_columns = buildBlockWithoutPartitionColumns(sample_block, partition_columns_name_set);
-}
-
-std::string HiveStylePartitionStrategy::getPathForRead(const std::string & prefix)
-{
-    return prefix + "**." + Poco::toLower(file_format);
-}
-
-std::string HiveStylePartitionStrategy::getPathForWrite(
-    const std::string & prefix,
-    const std::string & partition_key)
-{
-    std::string path;
-
-    if (!prefix.empty())
-    {
-        path += prefix;
-        if (path.back() != '/')
-        {
-            path += '/';
-        }
-    }
-
-    /// Not adding '/' because buildExpressionHive() always adds a trailing '/'
-    path += partition_key;
-
-    /*
-     * File extension is toLower(format)
-     * This isn't ideal, but I guess multiple formats can be specified and introduced.
-     * So I think it is simpler to keep it this way.
-     *
-     * Or perhaps implement something like `IInputFormat::getFileExtension()`
-     */
-    path += std::to_string(generateSnowflakeID()) + "." + Poco::toLower(file_format);
-
-    return path;
 }
 
 ColumnPtr HiveStylePartitionStrategy::computePartitionKey(const Chunk & chunk)
