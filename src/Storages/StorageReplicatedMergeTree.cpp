@@ -4430,7 +4430,7 @@ void StorageReplicatedMergeTree::exportMergeTreePartitionUpdatingTask()
     
             if (cleanup_lock_acquired)
             {
-                bool has_expired = metadata.create_time < now - 45;
+                bool has_expired = metadata.create_time < now - 90;
     
                 if (has_expired && is_not_pending)
                 {
@@ -4751,7 +4751,8 @@ void StorageReplicatedMergeTree::selectPartsToExport()
         return std::nullopt;
     };
 
-    try {
+    try
+    {
         const auto zk = getZooKeeper();
 
         std::lock_guard lock(export_merge_tree_partition_mutex);
@@ -8490,6 +8491,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 
     const auto dest_database = query_context->resolveDatabase(command.to_database);
     const auto dest_table = command.to_table;
+    const auto dest_storage_id = StorageID(dest_database, dest_table);
     auto dest_storage = DatabaseCatalog::instance().getTable({dest_database, dest_table}, query_context);
 
     if (dest_storage->getStorageID() == this->getStorageID())
@@ -8553,7 +8555,9 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
         ops.emplace_back(zkutil::makeCreateRequest(exports_path, "", zkutil::CreateMode::Persistent));
     }
 
-    const auto partition_exports_path = exports_path / partition_id;
+    const auto export_key = partition_id + "_" + dest_storage_id.getNameForLogs();
+
+    const auto partition_exports_path = fs::path(exports_path) / export_key;
 
     /// check if entry already exists
     if (zookeeper->exists(partition_exports_path))
