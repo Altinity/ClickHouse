@@ -68,6 +68,7 @@
 #include <Storages/MergeTree/ZeroCopyLock.h>
 #include <Storages/PartitionCommands.h>
 #include <Storages/StorageReplicatedMergeTree.h>
+#include <Storages/System/StorageSystemReplicatedPartitionExports.h>
 #include <Storages/VirtualColumnUtils.h>
 
 #include <Databases/DatabaseOnDisk.h>
@@ -4922,6 +4923,60 @@ void StorageReplicatedMergeTree::selectPartsToExport()
         export_merge_tree_partition_select_task->scheduleAfter(1000 * 5);
     }
     // export_merge_tree_partition_select_task->scheduleAfter(1000 * 5);
+}
+
+std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartitionExportsInfo() const
+{
+    std::vector<ReplicatedPartitionExportInfo> infos;
+
+    const auto zk = getZooKeeper();
+    const auto exports_path = fs::path(zookeeper_path) / "exports";
+    const auto children = zk->getChildren(exports_path);
+
+    for (const auto & child : children)
+    {
+        ReplicatedPartitionExportInfo info;
+
+        const auto export_partition_path = fs::path(exports_path) / child;
+        std::string metadata_json;
+        if (!zk->tryGet(export_partition_path / "metadata.json", metadata_json))
+        {
+            LOG_INFO(log, "Skipping {}: missing metadata.json", child);
+            continue;
+        }
+
+        std::string parts_to_do_string;
+        if (!zk->tryGet(export_partition_path / "parts_to_do", parts_to_do_string))
+        {
+            LOG_INFO(log, "Skipping {}: missing parts_to_do", child);
+            continue;
+        }
+
+        std::string status;
+        if (!zk->tryGet(export_partition_path / "status", status))
+        {
+            LOG_INFO(log, "Skipping {}: missing status", child);
+            continue;
+        }
+
+        const auto parts_to_do = std::stoull(parts_to_do_string.c_str());
+        const auto metadata = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
+
+        info.destination_database = metadata.destination_database;
+        info.destination_table = metadata.destination_table;
+        info.partition_id = metadata.partition_id;
+        info.transaction_id = metadata.transaction_id;
+        info.create_time = metadata.create_time;
+        info.source_replica = metadata.source_replica;
+        info.parts_count = metadata.number_of_parts;
+        info.parts_to_do = parts_to_do;
+        info.parts = metadata.parts;
+        info.status = status;
+
+        infos.emplace_back(std::move(info));
+    }
+
+    return infos;
 }
 
 
