@@ -553,7 +553,13 @@ bool StorageObjectStorage::optimize(
 
 bool StorageObjectStorage::supportsImport() const
 {
-    return configuration->partition_strategy != nullptr && configuration->partition_strategy_type == PartitionStrategyFactory::StrategyType::HIVE;
+    if (!configuration->partition_strategy)
+        return false;
+
+    if (configuration->partition_strategy_type == PartitionStrategyFactory::StrategyType::WILDCARD)
+        return configuration->getRawPath().hasExportFilenameWildcard();
+
+    return configuration->partition_strategy_type == PartitionStrategyFactory::StrategyType::HIVE;
 }
 
 SinkToStoragePtr StorageObjectStorage::import(

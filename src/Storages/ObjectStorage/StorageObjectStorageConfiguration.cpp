@@ -183,6 +183,12 @@ bool StorageObjectStorageConfiguration::Path::hasPartitionWildcard() const
     return path.find(PARTITION_ID_WILDCARD) != String::npos;
 }
 
+bool StorageObjectStorageConfiguration::Path::hasExportFilenameWildcard() const
+{
+    return path.find(ObjectStorageWildcardFilePathGenerator::FILE_WILDCARD) != String::npos;
+}
+
+
 bool StorageObjectStorageConfiguration::Path::hasGlobsIgnorePartitionWildcard() const
 {
     if (!hasPartitionWildcard())
