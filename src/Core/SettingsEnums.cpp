@@ -249,4 +249,11 @@ IMPLEMENT_SETTING_ENUM(
     GroupArrayActionWhenLimitReached,
     ErrorCodes::BAD_ARGUMENTS,
     {{"throw", GroupArrayActionWhenLimitReached::THROW}, {"discard", GroupArrayActionWhenLimitReached::DISCARD}})
+
+IMPLEMENT_SETTING_ENUM(
+    SearchOrphanedPartsDisks,
+    ErrorCodes::BAD_ARGUMENTS,
+    {{"any", SearchOrphanedPartsDisks::ANY},
+     {"local", SearchOrphanedPartsDisks::LOCAL},
+     {"none", SearchOrphanedPartsDisks::NONE}})
 }
