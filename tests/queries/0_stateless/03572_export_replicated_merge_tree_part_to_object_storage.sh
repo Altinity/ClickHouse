@@ -35,7 +35,8 @@ query "ALTER TABLE $rmt_table EXPORT PART '$part_2020' TO TABLE $s3_table SETTIN
 
 query "SELECT * FROM $s3_table ORDER BY id"
 
-query "CREATE TABLE $rmt_table_roundtrip ENGINE = ReplicatedMergeTree('/clickhouse/tables/{database}/$rmt_table_roundtrip', 'replica1') PARTITION BY year ORDER BY tuple() AS SELECT * FROM $s3_table"
+query "CREATE TABLE $rmt_table_roundtrip (id UInt64, year UInt16) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{database}/$rmt_table_roundtrip', 'replica1') PARTITION BY year ORDER BY tuple()"
+query "INSERT INTO $rmt_table_roundtrip SELECT * FROM $s3_table"
 
 echo "---- Data in roundtrip ReplicatedMergeTree table (should match s3_table)"
 query "SELECT * FROM $rmt_table_roundtrip ORDER BY id"
