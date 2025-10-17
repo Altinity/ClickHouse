@@ -71,7 +71,6 @@ jobs:
           echo "docker_version: ${DOCKER_VERSION}"
           echo "folder_time: ${FOLDER_TIME}"
           echo "needs_binary_processing: ${NEEDS_BINARY_PROCESSING}"
-          echo "package_version: ${PACKAGE_VERSION}"
           echo "repo_prefix: ${REPO_PREFIX}"
           echo "src_bucket: ${SRC_BUCKET}"
           echo "test_results_src: ${TEST_RESULTS_SRC}"
@@ -240,7 +239,7 @@ jobs:
       REPO_DNS_NAME: ${{ inputs.release_environment == 'production' && 'builds.altinity.cloud' || 'builds.staging.altinity.cloud' }}
       REPO_NAME: ${{ inputs.release_environment == 'production' && 'altinity' || 'altinity-staging' }}
       REPO_SUBTITLE: ${{ inputs.release_environment == 'production' && 'Stable Builds' || 'Staging Builds' }}
-      PACKAGE_VERSION: ${{ needs.extract-package-info.outputs.package_version }}
+      PACKAGE_VERSION: ${{ inputs.package_version }}
       FOLDER_TIME: ${{ needs.extract-package-info.outputs.folder_time }}
       REPO_PREFIX: ${{ needs.extract-package-info.outputs.repo_prefix }}
       NEEDS_BINARY_PROCESSING: ${{ needs.extract-package-info.outputs.needs_binary_processing }}
@@ -369,7 +368,7 @@ jobs:
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      PACKAGE_VERSION: ${{ needs.extract-package-info.outputs.package_version }}
+      PACKAGE_VERSION: ${{ inputs.package_version }}
       DEST_URL: ${{ needs.extract-package-info.outputs.dest_url }}
     steps:
       - name: Install aws cli
