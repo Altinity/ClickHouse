@@ -378,8 +378,8 @@ public:
                              Coordination::ListRequestType list_request_type = Coordination::ListRequestType::ALL);
 
     using MultiGetChildrenResponse = MultiReadResponses<Coordination::ListResponse, false>;
+    
     using MultiTryGetChildrenResponse = MultiReadResponses<Coordination::ListResponse, true>;
-
     template <typename TIter>
     MultiGetChildrenResponse
     getChildren(TIter start, TIter end, Coordination::ListRequestType list_request_type = Coordination::ListRequestType::ALL)

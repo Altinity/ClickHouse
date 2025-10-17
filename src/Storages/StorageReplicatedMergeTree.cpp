@@ -188,6 +188,7 @@ namespace Setting
     extern const SettingsInt64 replication_wait_for_inactive_replica_timeout;
     extern const SettingsUInt64 select_sequential_consistency;
     extern const SettingsBool allow_experimental_export_merge_tree_part;
+    extern const SettingsBool export_merge_tree_partition_force_export;
 }
 
 namespace MergeTreeSetting
@@ -4374,9 +4375,6 @@ void StorageReplicatedMergeTree::exportMergeTreePartitionUpdatingTask()
         /// If we have the cleanup lock, also remove stale entries from zk and local
         for (const auto & key : zk_children)
         {
-            if (!cleanup_lock_acquired && export_merge_tree_partition_task_entries.contains(key))
-                continue;
-    
             const std::string entry_path = fs::path(exports_path) / key;
     
             std::string metadata_json;
@@ -4385,6 +4383,19 @@ void StorageReplicatedMergeTree::exportMergeTreePartitionUpdatingTask()
                 LOG_INFO(log, "Skipping {}: missing metadata.json", key);
                 continue;
             }
+
+            const auto metadata = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
+
+            const auto local_entry = export_merge_tree_partition_task_entries.find(key);
+
+            /// If the zk entry has been replaced with export_merge_tree_partition_force_export, checking only for the export key is not enough
+            /// we need to make sure it is the same transaction id. If it is not, it needs to be replaced.
+            bool has_local_entry_and_is_up_to_date = local_entry != export_merge_tree_partition_task_entries.end()
+                && local_entry->second.manifest.transaction_id == metadata.transaction_id;
+
+            /// If the entry is up to date and we don't have the cleanup lock, early exit, nothing to be done.
+            if (!cleanup_lock_acquired && has_local_entry_and_is_up_to_date)
+                continue;
     
             std::string status;
             if (!zk->tryGet(fs::path(entry_path) / "status", status))
@@ -4394,8 +4405,6 @@ void StorageReplicatedMergeTree::exportMergeTreePartitionUpdatingTask()
             }
     
             bool is_not_pending = status != "PENDING";
-    
-            const auto metadata = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
     
             if (cleanup_lock_acquired)
             {
@@ -4416,7 +4425,7 @@ void StorageReplicatedMergeTree::exportMergeTreePartitionUpdatingTask()
                 continue;
             }
     
-            if (export_merge_tree_partition_task_entries.contains(key))
+            if (has_local_entry_and_is_up_to_date)
             {
                 LOG_INFO(log, "Skipping {}: already exists", key);
                 continue;
@@ -4456,9 +4465,8 @@ void StorageReplicatedMergeTree::exportMergeTreePartitionUpdatingTask()
                 }
             }
     
-            export_merge_tree_partition_task_entries.emplace(
-                key,
-                ExportReplicatedMergeTreePartitionTaskEntry {metadata, parts_to_do, std::move(part_references)});
+            /// It is important to use the operator[] because it updates the existing entry if it already exists.
+            export_merge_tree_partition_task_entries[key] = ExportReplicatedMergeTreePartitionTaskEntry {metadata, parts_to_do, std::move(part_references)};
         }
     
         /// Remove entries that were deleted by someone else
@@ -8694,12 +8702,6 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
                    start_time: 123445
     */
 
-    /// maybe this should go in initialization somewhere else
-    if (!zookeeper->exists(exports_path))
-    {
-        ops.emplace_back(zkutil::makeCreateRequest(exports_path, "", zkutil::CreateMode::Persistent));
-    }
-
     const auto export_key = partition_id + "_" + dest_storage_id.getNameForLogs();
 
     const auto partition_exports_path = fs::path(exports_path) / export_key;
@@ -8707,7 +8709,13 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     /// check if entry already exists
     if (zookeeper->exists(partition_exports_path))
     {
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Partition {} already exported or it is being exported", partition_id);
+        if (!query_context->getSettingsRef()[Setting::export_merge_tree_partition_force_export])
+        {
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Partition {} already exported or it is being exported", partition_id);
+        }
+
+        /// The check for existence and entry removal are not atomic, so this actually might fail.
+        ops.emplace_back(zkutil::makeRemoveRecursiveRequest(partition_exports_path, -1));
     }
 
     ops.emplace_back(zkutil::makeCreateRequest(partition_exports_path, "", zkutil::CreateMode::Persistent));
