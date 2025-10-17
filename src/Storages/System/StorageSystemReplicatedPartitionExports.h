@@ -19,6 +19,9 @@ struct ReplicatedPartitionExportInfo
     size_t parts_to_do;
     std::vector<String> parts;
     String status;
+    std::string last_exception;
+    std::string exception_part;
+    size_t exception_count;
 };
 
 class StorageSystemReplicatedPartitionExports final : public IStorageSystemOneBlock
