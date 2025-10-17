@@ -6874,6 +6874,9 @@ Use roaring bitmap for iceberg positional deletes.
     DECLARE(Bool, export_merge_tree_part_overwrite_file_if_exists, false, R"(
 Overwrite file if it already exists when exporting a merge tree part
 )", 0) \
+    DECLARE(Bool, export_merge_tree_partition_force_export, false, R"(
+Ignore existing partition export and overwrite the zookeeper entry
+)", 0) \
     \
     /* ####################################################### */ \
     /* ########### START OF EXPERIMENTAL FEATURES ############ */ \
