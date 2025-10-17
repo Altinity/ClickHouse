@@ -121,7 +121,6 @@ def main():
 
     args = parser.parse_args()
 
-    s3_base_url = f"s3://{args.artifact_src_bucket}"
     folder_time = generate_time(args.folder_time)
 
     run_details = get_run_details(args.workflow_url)
@@ -139,13 +138,13 @@ def main():
     repo_prefix = get_repo_prefix(altinity_build_feature)
 
     if pr_number != 0:
-        artifact_url = f"{s3_base_url}/PRs/{pr_number}/{commit_sha}"
+        artifact_url = f"PRs/{pr_number}/{commit_sha}"
         test_results_url = f"PRs/{pr_number}" if package_version >= version.parse("25.6") else pr_number
     elif package_version >= version.parse("25.6"):
-        artifact_url = f"{s3_base_url}/REFs/{branch_name}/{commit_sha}"
-        test_results_url = artifact_url
+        artifact_url = f"REFs/{branch_name}/{commit_sha}"
+        test_results_url = f"REFs/{branch_name}/{commit_sha}"
     else:
-        artifact_url = f"{s3_base_url}/{package_version.major}.{package_version.minor}/{commit_sha}"
+        artifact_url = f"{package_version.major}.{package_version.minor}/{commit_sha}"
         test_results_url = 0
     print(f"Artifact URL: {artifact_url}")
 
@@ -157,15 +156,15 @@ def main():
     set_env_variable("NEEDS_BINARY_PROCESSING", package_version >= version.parse("24"))
     set_env_variable("PR_NUMBER", str(pr_number))
     set_env_variable("REPO_PREFIX", repo_prefix)
-    set_env_variable("SRC_URL", artifact_url)
+    set_env_variable("SRC_URL", f"s3://{args.artifact_src_bucket}/{artifact_url}")
     set_env_variable("TEST_RESULTS_SRC", str(test_results_url))
 
     # Validate clickhouse-server amd64 deb file with correct version exists
     if package_version >= version.parse("25.6"):
-        deb_exists = file_exists(f"{artifact_url}/build_amd_release/clickhouse-server_{args.package_version}_amd64.deb")
+        deb_exists = file_exists(f"https://s3.amazonaws.com/{args.artifact_src_bucket}/{artifact_url}/build_amd_release/clickhouse-server_{args.package_version}_amd64.deb")
         set_env_variable("BUILD_DIR", "build_amd_release")
     else:
-        deb_exists = file_exists(f"{artifact_url}/package_release/clickhouse-server_{args.package_version}_amd64.deb")
+        deb_exists = file_exists(f"https://s3.amazonaws.com/{args.artifact_src_bucket}/{artifact_url}/package_release/clickhouse-server_{args.package_version}_amd64.deb")
         set_env_variable("BUILD_DIR", "package_release")
 
     if not deb_exists:
