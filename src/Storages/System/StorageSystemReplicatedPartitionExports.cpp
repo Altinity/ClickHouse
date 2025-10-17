@@ -31,6 +31,9 @@ ColumnsDescription StorageSystemReplicatedPartitionExports::getColumnsDescriptio
         {"parts_count", std::make_shared<DataTypeUInt64>(), "Number of parts in the export."},
         {"parts_to_do", std::make_shared<DataTypeUInt64>(), "Number of parts pending to be exported."},
         {"status", std::make_shared<DataTypeString>(), "Status of the export."},
+        {"last_exception", std::make_shared<DataTypeString>(), "Last exception message of any part (not necessarily the last global exception)"},
+        {"exception_part", std::make_shared<DataTypeString>(), "Part that caused the last exception"},
+        {"exception_count", std::make_shared<DataTypeUInt64>(), "Number of global exceptions"},
     };
 }
 
@@ -128,6 +131,9 @@ void StorageSystemReplicatedPartitionExports::fillData(MutableColumns & res_colu
             res_columns[i++]->insert(info.parts_count);
             res_columns[i++]->insert(info.parts_to_do);
             res_columns[i++]->insert(info.status);
+            res_columns[i++]->insert(info.last_exception);
+            res_columns[i++]->insert(info.exception_part);
+            res_columns[i++]->insert(info.exception_count);
         }
     }
 }
