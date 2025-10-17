@@ -121,7 +121,7 @@ def main():
 
     args = parser.parse_args()
 
-    s3_base_url = f"https://s3.amazonaws.com/{args.artifact_src_bucket}"
+    s3_base_url = f"s3://{args.artifact_src_bucket}"
     folder_time = generate_time(args.folder_time)
 
     run_details = get_run_details(args.workflow_url)
