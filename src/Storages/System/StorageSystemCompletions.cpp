@@ -32,6 +32,7 @@ namespace Setting
 {
     extern const SettingsUInt64 readonly;
     extern const SettingsSeconds lock_acquire_timeout;
+    extern const SettingsBool show_data_lake_catalogs_in_system_tables;
 }
 
 static constexpr const char * DATABASE_CONTEXT = "database";
@@ -96,7 +97,8 @@ void fillDataWithTableColumns(const String & database_name, const String & table
 void fillDataWithDatabasesTablesColumns(MutableColumns & res_columns, const ContextPtr & context)
 {
     const auto & access = context->getAccess();
-    const auto & databases = DatabaseCatalog::instance().getDatabases();
+    const auto & settings = context->getSettingsRef();
+    const auto & databases = DatabaseCatalog::instance().getDatabases(GetDatabasesOptions{.with_datalake_catalogs = settings[Setting::show_data_lake_catalogs_in_system_tables]});
     for (const auto & [database_name, database_ptr] : databases)
     {
         if (!access->isGranted(AccessType::SHOW_DATABASES) || !access->isGranted(AccessType::SHOW_DATABASES, database_name))
