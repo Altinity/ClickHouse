@@ -7558,9 +7558,9 @@ Rewrite expressions like 'x IN subquery' to JOIN. This might be useful for optim
     DECLARE_WITH_ALIAS(Bool, allow_experimental_time_series_aggregate_functions, false, R"(
 Experimental timeSeries* aggregate functions for Prometheus-like timeseries resampling, rate, delta calculation.
 )", EXPERIMENTAL, allow_experimental_ts_to_grid_aggregate_function) \
-    DECLARE_WITH_ALIAS(Bool, allow_experimental_export_merge_tree_part, false, R"(
+    DECLARE(Bool, allow_experimental_export_merge_tree_part, true, R"(
 Experimental export merge tree part.
-)", EXPERIMENTAL, allow_experimental_export_merge_tree_part) \
+)", EXPERIMENTAL) \
     \
     DECLARE(String, promql_database, "", R"(
 Specifies the database name used by the 'promql' dialect. Empty string means the current database.
