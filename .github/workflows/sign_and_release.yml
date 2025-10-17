@@ -43,7 +43,7 @@ jobs:
       FOLDER_TIME: ${{ inputs.folder_time }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     outputs:
-      docker_version: ${{ env.DOCKER_VERSION }}-${{ env.PACKAGE_VERSION }}
+      docker_version: ${{ env.DOCKER_VERSION }}
       commit_hash: ${{ env.COMMIT_HASH }}
       folder_time: ${{ env.FOLDER_TIME }}
       needs_binary_processing: ${{ env.NEEDS_BINARY_PROCESSING }}
