@@ -4993,34 +4993,44 @@ std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartit
 
         const auto parts_to_do = std::stoull(parts_to_do_string.c_str());
 
+        std::string exception_replica;
         std::string last_exception;
         std::string exception_part;
         std::size_t exception_count = 0;
 
         const auto exceptions_per_replica_path = export_partition_path / "exceptions_per_replica";
 
-        const auto exception_children = zk->getChildren(exceptions_per_replica_path);
-        for (const auto & exception_child : exception_children)
+        const auto exception_replicas = zk->getChildren(exceptions_per_replica_path);
+        for (const auto & replica : exception_replicas)
         {
             std::string exception_count_string;
-            if (!zk->tryGet(exceptions_per_replica_path / exception_child / "count", exception_count_string))
+            if (!zk->tryGet(exceptions_per_replica_path / replica / "count", exception_count_string))
             {
-                LOG_INFO(log, "Skipping {}: missing count", exception_child);
+                LOG_INFO(log, "Skipping {}: missing count", replica);
                 continue;
             }
             exception_count += std::stoull(exception_count_string.c_str());
 
             if (last_exception.empty())
             {
-                const auto last_exception_path = exceptions_per_replica_path / exception_child / "last_exception";
+                const auto last_exception_path = exceptions_per_replica_path / replica / "last_exception";
                 std::string last_exception_string;
                 if (!zk->tryGet(last_exception_path / "exception", last_exception_string))
                 {
                     LOG_INFO(log, "Skipping {}: missing last_exception/exception", last_exception_path);
                     continue;
                 }
+
+                std::string exception_part_zk;
+                if (!zk->tryGet(last_exception_path / "part", exception_part_zk))
+                {
+                    LOG_INFO(log, "Skipping {}: missing exception part", last_exception_path);
+                    continue;
+                }
+
+                exception_replica = replica;
                 last_exception = last_exception_string;
-                exception_part = last_exception_path / "part";
+                exception_part = exception_part_zk;
             }
         }
 
@@ -5036,6 +5046,7 @@ std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartit
         info.parts_to_do = parts_to_do;
         info.parts = metadata.parts;
         info.status = status;
+        info.exception_replica = exception_replica;
         info.last_exception = last_exception;
         info.exception_part = exception_part;
         info.exception_count = exception_count;
