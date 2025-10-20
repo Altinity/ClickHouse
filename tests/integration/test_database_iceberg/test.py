@@ -188,10 +188,11 @@ def started_cluster():
         cluster = ClickHouseCluster(__file__)
         cluster.add_instance(
             "node1",
-            main_configs=["configs/backups.xml"],
+            main_configs=["configs/backups.xml", "configs/cluster.xml"],
             user_configs=[],
             stay_alive=True,
             with_iceberg_catalog=True,
+            with_zookeeper=True,
         )
 
         logging.info("Starting cluster...")
@@ -619,6 +620,7 @@ def test_cluster_joins(started_cluster):
     test_ref = f"test_join_tables_{uuid.uuid4()}"
     table_name = f"{test_ref}_table"
     table_name_2 = f"{test_ref}_table_2"
+    table_name_local = f"{test_ref}_table_local"
 
     root_namespace = f"{test_ref}_namespace"
 
@@ -665,6 +667,9 @@ def test_cluster_joins(started_cluster):
     df = pa.Table.from_pylist(data)
     table2.append(df)
 
+    node.query(f"CREATE TABLE `{table_name_local}` (id Int64, second_name String) ENGINE = Memory()")
+    node.query(f"INSERT INTO `{table_name_local}` VALUES (1, 'Silver'), (2, 'Black')")
+
     create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
 
     res = node.query(
@@ -674,7 +679,9 @@ def test_cluster_joins(started_cluster):
                 JOIN {CATALOG_NAME}.`{root_namespace}.{table_name_2}` AS t2
                 ON t1.tag=t2.id
             ORDER BY ALL
-            SETTINGS object_storage_cluster_join_mode='local'
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
         """
     )
 
@@ -689,7 +696,41 @@ def test_cluster_joins(started_cluster):
                 FROM {CATALOG_NAME}.`{root_namespace}.{table_name_2}`
             )
             ORDER BY ALL
-            SETTINGS object_storage_cluster_join_mode='local'
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
+        """
+    )
+
+    assert res == "Jack\nJohn\n"
+
+    res = node.query(
+        f"""
+            SELECT t1.name,t2.second_name
+            FROM {CATALOG_NAME}.`{root_namespace}.{table_name}` AS t1
+                JOIN `{table_name_local}` AS t2
+                ON t1.tag=t2.id
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
+        """
+    )
+
+    assert res == "Jack\tBlack\nJohn\tSilver\n"
+
+    res = node.query(
+        f"""
+            SELECT name
+            FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`
+            WHERE tag in (
+                SELECT id
+                FROM `{table_name_local}`
+            )
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
         """
     )
 
