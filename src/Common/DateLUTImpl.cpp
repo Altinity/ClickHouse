@@ -214,6 +214,7 @@ DateLUTImpl::DateLUTImpl(const std::string & time_zone_)
     }
 }
 
+// Useless change in code to trigger CI
 unsigned int DateLUTImpl::toMillisecond(const DB::DateTime64 & datetime, Int64 scale_multiplier) const
 {
     constexpr Int64 millisecond_multiplier = 1'000;
