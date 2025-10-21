@@ -591,6 +591,9 @@ It is currently only implemented in StorageObjectStorage.
 
     virtual void setMutationCSN(const String & /*mutation_id*/, UInt64 /*csn*/);
 
+    /// Cancel a replicated partition export by transaction id.
+    virtual CancellationCode killExportPartition(const String & /*transaction_id*/);
+
     /// Cancel a part move to shard.
     virtual CancellationCode killPartMoveToShard(const UUID & /*task_uuid*/);
 
