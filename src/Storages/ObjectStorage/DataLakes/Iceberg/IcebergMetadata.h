@@ -128,6 +128,8 @@ public:
         ContextPtr local_context) const override;
 
     void drop(ContextPtr context) override;
+    std::optional<String> partitionKey(ContextPtr) const override;
+    std::optional<String> sortingKey(ContextPtr) const override;
 
 private:
     Iceberg::PersistentTableComponents initializePersistentTableComponents(
