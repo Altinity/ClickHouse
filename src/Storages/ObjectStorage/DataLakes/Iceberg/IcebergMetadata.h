@@ -129,6 +129,9 @@ public:
 
     void drop(ContextPtr context) override;
 
+    std::optional<String> partitionKey(ContextPtr) const override;
+    std::optional<String> sortingKey(ContextPtr) const override;
+
 private:
     Iceberg::PersistentTableComponents initializePersistentTableComponents(
         StorageObjectStorageConfigurationPtr configuration, IcebergMetadataFilesCachePtr cache_ptr, ContextPtr context_);
