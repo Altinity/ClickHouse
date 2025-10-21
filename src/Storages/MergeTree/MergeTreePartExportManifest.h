@@ -1,10 +1,11 @@
 #include <Interpreters/StorageID.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
+#include "QueryPipeline/QueryPipeline.h"
 
 namespace DB
 {
 
-struct MergeTreeExportManifest
+struct MergeTreePartExportManifest
 {
     using DataPartPtr = std::shared_ptr<const IMergeTreeDataPart>;
 
@@ -30,14 +31,16 @@ struct MergeTreeExportManifest
         String exception;
     };
 
-    MergeTreeExportManifest(
+    MergeTreePartExportManifest(
         const StorageID & destination_storage_id_,
         const DataPartPtr & data_part_,
+        const String & query_id_,
         bool overwrite_file_if_exists_,
         bool parallel_formatting_,
         std::function<void(CompletionCallbackResult)> completion_callback_ = {})
         : destination_storage_id(destination_storage_id_),
           data_part(data_part_),
+          query_id(query_id_),
           overwrite_file_if_exists(overwrite_file_if_exists_),
           parallel_formatting(parallel_formatting_),
           completion_callback(completion_callback_),
@@ -45,6 +48,8 @@ struct MergeTreeExportManifest
 
     StorageID destination_storage_id;
     DataPartPtr data_part;
+    /// Used for killing the export.
+    String query_id;
     bool overwrite_file_if_exists;
     bool parallel_formatting;
 
@@ -53,8 +58,10 @@ struct MergeTreeExportManifest
 
     time_t create_time;
     mutable bool in_progress = false;
+    /// Used for killing the export
+    mutable QueryPipeline * pipeline = nullptr;
 
-    bool operator<(const MergeTreeExportManifest & rhs) const 
+    bool operator<(const MergeTreePartExportManifest & rhs) const 
     {
         // Lexicographic comparison: first compare destination storage, then part name
         auto lhs_storage = destination_storage_id.getQualifiedName();
@@ -66,7 +73,7 @@ struct MergeTreeExportManifest
         return data_part->name < rhs.data_part->name;
     }
 
-    bool operator==(const MergeTreeExportManifest & rhs) const 
+    bool operator==(const MergeTreePartExportManifest & rhs) const 
     {
         return destination_storage_id.getQualifiedName() == rhs.destination_storage_id.getQualifiedName()
             && data_part->name == rhs.data_part->name;

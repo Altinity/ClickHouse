@@ -35,8 +35,8 @@
 #include <Interpreters/PartLog.h>
 #include <Poco/Timestamp.h>
 #include <Common/threadPoolCallbackRunner.h>
-#include <Storages/MergeTree/MergeTreeExportStatus.h>
-#include <Storages/MergeTree/MergeTreeExportManifest.h>
+#include <Storages/MergeTree/MergeTreePartExportStatus.h>
+#include <Storages/MergeTree/MergeTreePartExportManifest.h>
 
 #include <boost/multi_index_container.hpp>
 #include <boost/multi_index/ordered_index.hpp>
@@ -908,8 +908,12 @@ public:
 
     void exportPartToTable(
         const std::string & part_name,
-        const StorageID & destination_storage_id, ContextPtr query_context,
-        std::function<void(MergeTreeExportManifest::CompletionCallbackResult)> completion_callback = {});
+        const StorageID & destination_storage_id,
+        const String & transaction_id,
+        ContextPtr query_context,
+        std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback = {});
+
+    void killExportPart(const String & query_id);
 
     virtual void exportPartitionToTable(const PartitionCommand &, ContextPtr)
     {
@@ -917,7 +921,7 @@ public:
     }
 
     void exportPartToTableImpl(
-        const MergeTreeExportManifest & manifest,
+        const MergeTreePartExportManifest & manifest,
         ContextPtr local_context);
 
     /// Checks that Partition could be dropped right now
@@ -1166,7 +1170,7 @@ public:
 
     mutable std::mutex export_manifests_mutex;
 
-    std::set<MergeTreeExportManifest> export_manifests;
+    std::set<MergeTreePartExportManifest> export_manifests;
 
     PinnedPartUUIDsPtr getPinnedPartUUIDs() const;
 

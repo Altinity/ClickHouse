@@ -5910,14 +5910,15 @@ void MergeTreeData::exportPartToTable(const PartitionCommand & command, ContextP
 
     const auto database_name = query_context->resolveDatabase(command.to_database);
 
-    exportPartToTable(part_name, StorageID{database_name, command.to_table}, query_context);
+    exportPartToTable(part_name, StorageID{database_name, command.to_table}, query_context->getCurrentQueryId(), query_context);
 }
 
 void MergeTreeData::exportPartToTable(
     const std::string & part_name,
     const StorageID & destination_storage_id,
+    const String & transaction_id,
     ContextPtr query_context,
-    std::function<void(MergeTreeExportManifest::CompletionCallbackResult)> completion_callback)
+    std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback)
 {
     auto dest_storage = DatabaseCatalog::instance().getTable(destination_storage_id, query_context);
 
@@ -5950,9 +5951,10 @@ void MergeTreeData::exportPartToTable(
                         part_name, getStorageID().getFullTableName());
 
     {
-        MergeTreeExportManifest manifest(
+        MergeTreePartExportManifest manifest(
             dest_storage->getStorageID(),
             part,
+            transaction_id,
             query_context->getSettingsRef()[Setting::export_merge_tree_part_overwrite_file_if_exists],
             query_context->getSettingsRef()[Setting::output_format_parallel_formatting],
             completion_callback);
@@ -5970,7 +5972,7 @@ void MergeTreeData::exportPartToTable(
 }
 
 void MergeTreeData::exportPartToTableImpl(
-    const MergeTreeExportManifest & manifest,
+    const MergeTreePartExportManifest & manifest,
     ContextPtr local_context)
 {
     auto metadata_snapshot = getInMemoryMetadataPtr();
@@ -6027,7 +6029,7 @@ void MergeTreeData::exportPartToTableImpl(
         export_manifests.erase(manifest);
 
         if (manifest.completion_callback)
-            manifest.completion_callback(MergeTreeExportManifest::CompletionCallbackResult::createFailure(e.message()));
+            manifest.completion_callback(MergeTreePartExportManifest::CompletionCallbackResult::createFailure(e.message()));
         return;
     }
 
@@ -6096,6 +6098,9 @@ void MergeTreeData::exportPartToTableImpl(
 
     pipeline.complete(sink);
 
+    /// oh boy, is there another way?
+    manifest.pipeline = &pipeline;
+
     try
     {
         CompletedPipelineExecutor exec(pipeline);
@@ -6119,7 +6124,7 @@ void MergeTreeData::exportPartToTableImpl(
         ProfileEvents::increment(ProfileEvents::PartsExportTotalMilliseconds, static_cast<UInt64>((*exports_list_entry)->elapsed * 1000));
 
         if (manifest.completion_callback)
-            manifest.completion_callback(MergeTreeExportManifest::CompletionCallbackResult::createSuccess(destination_file_path));
+            manifest.completion_callback(MergeTreePartExportManifest::CompletionCallbackResult::createSuccess(destination_file_path));
     }
     catch (const Exception & e)
     {
@@ -6142,10 +6147,28 @@ void MergeTreeData::exportPartToTableImpl(
         export_manifests.erase(manifest);
 
         if (manifest.completion_callback)
-            manifest.completion_callback(MergeTreeExportManifest::CompletionCallbackResult::createFailure(e.message()));
+            manifest.completion_callback(MergeTreePartExportManifest::CompletionCallbackResult::createFailure(e.message()));
 
         throw;
     }
+}
+
+void MergeTreeData::killExportPart(const String & query_id)
+{
+    std::lock_guard lock(export_manifests_mutex);
+
+    const auto it = std::find_if(export_manifests.begin(), export_manifests.end(), [&](const auto & manifest)
+    {
+        return manifest.query_id == query_id;
+    });
+
+    if (it == export_manifests.end())
+        return;
+
+    if (it->pipeline)
+        it->pipeline->cancel();
+
+    export_manifests.erase(it);
 }
 
 void MergeTreeData::movePartitionToShard(const ASTPtr & /*partition*/, bool /*move_part*/, const String & /*to*/, ContextPtr /*query_context*/)
@@ -8881,7 +8904,9 @@ bool MergeTreeData::scheduleDataMovingJob(BackgroundJobsAssignee & assignee)
         }
 
         manifest.in_progress = assignee.scheduleMoveTask(std::make_shared<ExecutableLambdaAdapter>(
-            [this, manifest] () mutable {
+            [this, &manifest] () mutable {
+                /// TODO arthur fix this: I need to be able to modify the real manifest
+                /// but grabbing it by reference is causing problems
                 exportPartToTableImpl(manifest, getContext());
                 return true;
             },

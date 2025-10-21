@@ -13,6 +13,7 @@
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include <Common/ZooKeeper/ZooKeeperRetries.h>
 #include <Common/randomSeed.h>
+#include "Interpreters/CancellationCode.h"
 #include <Storages/ExportReplicatedMergeTreePartitionTaskEntry.h>
 #include <Core/BackgroundSchedulePool.h>
 #include <DataTypes/DataTypesNumber.h>
@@ -934,6 +935,7 @@ private:
     void movePartitionToTable(const StoragePtr & dest_table, const ASTPtr & partition, ContextPtr query_context) override;
     void movePartitionToShard(const ASTPtr & partition, bool move_part, const String & to, ContextPtr query_context) override;
     CancellationCode killPartMoveToShard(const UUID & task_uuid) override;
+    CancellationCode killExportPartition(const String & transaction_id) override;
     void fetchPartition(
         const ASTPtr & partition,
         const StorageMetadataPtr & metadata_snapshot,

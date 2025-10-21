@@ -119,7 +119,6 @@
 #include "QueryPipeline/QueryPlanResourceHolder.h"
 #include "Storages/ExportReplicatedMergeTreePartitionManifest.h"
 #include "Storages/ExportReplicatedMergeTreePartitionTaskEntry.h"
-#include <Functions/generateSnowflakeID.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeLogEntry.h>
 #include <IO/SharedThreadPools.h>
@@ -4471,7 +4470,27 @@ void StorageReplicatedMergeTree::exportMergeTreePartitionUpdatingTask()
     
         /// Remove entries that were deleted by someone else
         std::erase_if(export_merge_tree_partition_task_entries,
-            [&](auto const & kv) { return !zk_children.contains(kv.first); });
+            [&](auto const & kv)
+            {
+                if (zk_children.contains(kv.first))
+                {
+                    return false;
+                }
+
+                const auto & transaction_id = kv.second.manifest.transaction_id;
+                LOG_INFO(log, "Export task {} was deleted, calling killExportPartition for transaction {}", kv.first, transaction_id);
+                
+                try
+                {
+                    killExportPart(transaction_id);
+                }
+                catch (...)
+                {
+                    tryLogCurrentException(log, __PRETTY_FUNCTION__);
+                }
+
+                return true;
+            });
     
         if (cleanup_lock_acquired)
         {
@@ -4809,9 +4828,10 @@ void StorageReplicatedMergeTree::selectPartsToExport()
                     exportPartToTable(
                         part_to_export.value(),
                         destination_storage_id,
+                        transaction_id,
                         getContext(),
                         [this, partition_id, transaction_id, exports_path, key, part_to_export, complete_part_export, partition_path, next_idx_path, next_idx, destination_storage]
-                        (MergeTreeExportManifest::CompletionCallbackResult result)
+                        (MergeTreePartExportManifest::CompletionCallbackResult result)
                     {
                         const auto zk_client = getZooKeeper();
                         if (result.success)
@@ -8724,18 +8744,6 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 
     const auto parts = getDataPartsVectorInPartitionForInternalUsage(MergeTreeDataPartState::Active, partition_id, &data_parts_lock);
 
-    // const Strings parts = zookeeper->getChildren(fs::path(replica_path) / "parts");
-    // const ActiveDataPartSet active_parts_set(format_version, parts);
-    // const auto part_infos = active_parts_set.getPartInfos();
-    // std::vector<String> parts_to_export;
-    // for (const auto & part : parts)
-    // {
-    //     if (part_info.getPartitionId() == partition_id)
-    //     {
-    //         parts_to_export.push_back(part_info.getPartNameV1());
-    //     }
-    // }
-
     if (parts.empty())
     {
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Partition {} doesn't exist", partition_id);
@@ -8751,7 +8759,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 
     ExportReplicatedMergeTreePartitionManifest manifest;
 
-    manifest.transaction_id = std::to_string(generateSnowflakeID());
+    manifest.transaction_id = query_context->getCurrentQueryId();
     manifest.partition_id = partition_id;
     manifest.destination_database = dest_database;
     manifest.destination_table = dest_table;
@@ -10064,6 +10072,49 @@ void StorageReplicatedMergeTree::movePartitionToShard(
 CancellationCode StorageReplicatedMergeTree::killPartMoveToShard(const UUID & task_uuid)
 {
     return part_moves_between_shards_orchestrator.killPartMoveToShard(task_uuid);
+}
+
+CancellationCode StorageReplicatedMergeTree::killExportPartition(const String & transaction_id)
+{
+    auto zk = getZooKeeper();
+    const auto exports_path = fs::path(zookeeper_path) / "exports";
+
+    const auto export_keys = zk->getChildren(exports_path);
+    String export_key_to_be_cancelled;
+    for (const auto & export_key : export_keys)
+    {
+        std::string status;
+        if (!zk->tryGet(fs::path(exports_path) / export_key / "status", status))
+            continue;
+        if (status != "PENDING")
+            continue;
+
+        std::string metadata_json;
+        if (!zk->tryGet(fs::path(exports_path) / export_key / "metadata.json", metadata_json))
+            continue;
+        const auto manifest = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
+        if (manifest.transaction_id == transaction_id)
+        {
+            export_key_to_be_cancelled = export_key;
+            break;
+        }
+    }
+
+    if (export_key_to_be_cancelled.empty())
+        return CancellationCode::NotFound;
+
+    try
+    {
+        /// Once the entry is removed from zk, the update task will be triggered in all replicas
+        /// The logic for cancelling individual part exports will be triggered in the update task.
+        zk->removeRecursive(fs::path(exports_path) / export_key_to_be_cancelled);
+        return CancellationCode::CancelSent;
+    }
+    catch (...)
+    {
+        tryLogCurrentException(log, __PRETTY_FUNCTION__);
+        return CancellationCode::CancelCannotBeSent;
+    }
 }
 
 void StorageReplicatedMergeTree::getCommitPartOps(
