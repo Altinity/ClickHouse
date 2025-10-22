@@ -4688,21 +4688,6 @@ void StorageReplicatedMergeTree::selectPartsToExport()
                     return false;
                 }
 
-                // std::string parts_to_do_zk;
-                // if (!zk->tryGet(fs::path(export_partition_path) / "parts_to_do", parts_to_do_zk))
-                // {
-                //     LOG_INFO(log, "Failed to get parts_to_do, skipping");
-                //     return false;
-                // }
-
-                // const auto parts_to_do = std::stoull(parts_to_do_zk.c_str());
-
-                // if (parts_to_do == 0)
-                // {
-                //     LOG_INFO(log, "Skipping... Parts to do is 0, maybe someone else already completed it?");
-                //     return false;
-                // }
-
                 /// only try to lock it if the status is still PENDING
                 /// if we did not check for status = pending, chances are some other replica completed and released the lock in the meantime
                 ops.emplace_back(zkutil::makeCheckRequest(status_path, stat.version));
@@ -4733,9 +4718,31 @@ void StorageReplicatedMergeTree::selectPartsToExport()
     auto try_to_acquire_a_part = [&](
         const ExportReplicatedMergeTreePartitionManifest & manifest,
         const std::string & partition_export_path,
-        const std::size_t next_idx,
+        std::size_t & next_idx,
         const ZooKeeperPtr & zk) -> std::optional<std::string>
     {
+        const auto try_to_update_next_idx = [&](std::size_t local_next_idx)
+        {
+            /// Update next_idx - best effort, if it fails, that is ok
+            Coordination::Stat next_idx_stat;
+            std::string next_idx_string;
+            const auto next_idx_path = fs::path(partition_export_path) / "next_idx";
+
+            if (zk->tryGet(next_idx_path, next_idx_string, &next_idx_stat))
+            {
+                const std::size_t next_idx_zk = std::stoul(next_idx_string.c_str());
+                const std::size_t new_next_idx = std::max(next_idx_zk, local_next_idx + 1);
+                Coordination::Requests ops;
+                ops.emplace_back(zkutil::makeCheckRequest(next_idx_path, next_idx_stat.version));
+                ops.emplace_back(zkutil::makeSetRequest(next_idx_path, std::to_string(new_next_idx), next_idx_stat.version));
+                Coordination::Responses responses;
+                if (zk->tryMulti(ops, responses) != Coordination::Error::ZOK)
+                {
+                    LOG_INFO(log, "Updated next_idx to {}", new_next_idx);
+                }
+            }
+        };
+
         for (auto i = next_idx; i < manifest.number_of_parts; i++)
         {
             const auto part_path = fs::path(partition_export_path) / "parts" / manifest.parts[i];
@@ -4751,6 +4758,8 @@ void StorageReplicatedMergeTree::selectPartsToExport()
 
             if (lock_part(part_path, status_path, lock_path, replica_name, zk))
             {
+                next_idx = i;
+                try_to_update_next_idx(i);
                 return manifest.parts[i];
             }
         }
@@ -4772,6 +4781,8 @@ void StorageReplicatedMergeTree::selectPartsToExport()
 
             if (lock_part(part_path, status_path, lock_path, replica_name, zk))
             {
+                next_idx = i;
+                try_to_update_next_idx(i);
                 return manifest.parts[i];
             }
         }
@@ -4822,21 +4833,21 @@ void StorageReplicatedMergeTree::selectPartsToExport()
                 LOG_INFO(log, "Skipping... Status is not PENDING");
                 continue;
             }
-    
+
             const auto & manifest = task_entry.manifest;
             const auto & database = getContext()->resolveDatabase(manifest.destination_database);
             const auto & table = manifest.destination_table;
-    
+
             const auto destination_storage_id = StorageID(QualifiedTableName {database, table});
-    
+
             const auto destination_storage = DatabaseCatalog::instance().tryGetTable(destination_storage_id, getContext());
-        
+
             if (!destination_storage)
             {
                 LOG_INFO(log, "Failed to reconstruct destination storage: {}, skipping", destination_storage_id.getNameForLogs());
                 continue;
             }
-    
+
             const auto partition_path = fs::path(exports_path) / key;
             const auto next_idx_path = fs::path(partition_path) / "next_idx";
             std::string next_idx_string;
@@ -4845,16 +4856,13 @@ void StorageReplicatedMergeTree::selectPartsToExport()
                 LOG_INFO(log, "Failed to get next_idx, skipping");
                 continue;
             }
-    
-            const auto next_idx = std::stoull(next_idx_string.c_str());
-    
-            const auto part_to_export = try_to_acquire_a_part(manifest, partition_path, next_idx, zk);
-    
-            const auto partition_id = manifest.partition_id;
-            const auto transaction_id = manifest.transaction_id;
-    
-            if (part_to_export.has_value())
+
+            std::size_t next_idx = std::stoull(next_idx_string.c_str());
+            while (const auto part_to_export = try_to_acquire_a_part(manifest, partition_path, next_idx, zk))
             {
+                const auto partition_id = manifest.partition_id;
+                const auto transaction_id = manifest.transaction_id;
+
                 try
                 {
                     exportPartToTable(
@@ -4969,11 +4977,14 @@ void StorageReplicatedMergeTree::selectPartsToExport()
     
                     /// best-effort to remove the lock (actually, we should make sure the lock is released..)
                     zk->tryRemove(fs::path(partition_path) / "parts" / part_to_export.value() / "lock");
+
+                    /// todo arthur should I try to rewind the next_idx?
     
                     /// re-run after some time
                     export_merge_tree_partition_select_task->scheduleAfter(1000 * 5);
+
+                    break;
                 }
-                
             }
         }
     }
@@ -4982,7 +4993,6 @@ void StorageReplicatedMergeTree::selectPartsToExport()
         tryLogCurrentException(log, __PRETTY_FUNCTION__);
         export_merge_tree_partition_select_task->scheduleAfter(1000 * 5);
     }
-    // export_merge_tree_partition_select_task->scheduleAfter(1000 * 5);
 }
 
 std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartitionExportsInfo() const

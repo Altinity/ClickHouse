@@ -1362,6 +1362,7 @@ protected:
     friend class MergeTask;
     friend class IPartMetadataManager;
     friend class IMergedBlockOutputStream; // for access to log
+    friend class ExportPartTask;
 
     bool require_part_metadata;
 
