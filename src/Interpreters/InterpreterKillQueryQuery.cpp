@@ -255,7 +255,7 @@ BlockIO InterpreterKillQueryQuery::execute()
         Block exports_block = getSelectResult(
             "source_database, source_table, transaction_id, destination_database, destination_table, partition_id",
             "system.replicated_partition_exports");
-        if (!exports_block)
+        if (exports_block.empty())
             return res_io;
 
         const ColumnString & src_db_col = typeid_cast<const ColumnString &>(*exports_block.getByName("source_database").column);
@@ -317,7 +317,7 @@ BlockIO InterpreterKillQueryQuery::execute()
             throw Exception(ErrorCodes::ACCESS_DENIED, "Not allowed to kill export partition. "
                 "To execute this query, it's necessary to have the grant {}", required_access_rights.toString());
 
-        res_io.pipeline = QueryPipeline(Pipe(std::make_shared<SourceFromSingleChunk>(header.cloneWithColumns(std::move(res_columns)))));
+        res_io.pipeline = QueryPipeline(Pipe(std::make_shared<SourceFromSingleChunk>(std::make_shared<const Block>(header.cloneWithColumns(std::move(res_columns))))));
 
         break;
     }

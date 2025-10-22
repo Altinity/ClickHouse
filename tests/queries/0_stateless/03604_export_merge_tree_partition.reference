@@ -11,6 +11,7 @@ Select from destination table
 2	2020
 3	2020
 4	2021
+5	2021
 Export partition 2022
 Select from destination table again
 1	2020

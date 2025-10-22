@@ -8701,7 +8701,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
         }
 
         /// The check for existence and entry removal are not atomic, so this actually might fail.
-        ops.emplace_back(zkutil::makeRemoveRecursiveRequest(partition_exports_path, -1));
+        ops.emplace_back(zkutil::makeRemoveRecursiveRequest(*zookeeper, partition_exports_path, -1));
     }
 
     ops.emplace_back(zkutil::makeCreateRequest(partition_exports_path, "", zkutil::CreateMode::Persistent));
