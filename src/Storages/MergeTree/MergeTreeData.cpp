@@ -24,6 +24,7 @@
 #include <Common/scope_guard_safe.h>
 #include <Common/typeid_cast.h>
 #include <Common/thread_local_rng.h>
+#include "Storages/MergeTree/ExportPartTask.h"
 #include <Processors/Executors/CompletedPipelineExecutor.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
 #include <Storages/MergeTree/MergeTreeSequentialSource.h>
@@ -6098,9 +6099,6 @@ void MergeTreeData::exportPartToTableImpl(
 
     pipeline.complete(sink);
 
-    /// oh boy, is there another way?
-    manifest.pipeline = &pipeline;
-
     try
     {
         CompletedPipelineExecutor exec(pipeline);
@@ -6157,18 +6155,16 @@ void MergeTreeData::killExportPart(const String & query_id)
 {
     std::lock_guard lock(export_manifests_mutex);
 
-    const auto it = std::find_if(export_manifests.begin(), export_manifests.end(), [&](const auto & manifest)
+    std::erase_if(export_manifests, [&](const auto & manifest)
     {
-        return manifest.query_id == query_id;
+        if (manifest.query_id == query_id)
+        {
+            if (manifest.task)
+                manifest.task->cancel();
+            return true;
+        }
+        return false;
     });
-
-    if (it == export_manifests.end())
-        return;
-
-    if (it->pipeline)
-        it->pipeline->cancel();
-
-    export_manifests.erase(it);
 }
 
 void MergeTreeData::movePartitionToShard(const ASTPtr & /*partition*/, bool /*move_part*/, const String & /*to*/, ContextPtr /*query_context*/)
@@ -8903,17 +8899,18 @@ bool MergeTreeData::scheduleDataMovingJob(BackgroundJobsAssignee & assignee)
             continue;
         }
 
-        manifest.in_progress = assignee.scheduleMoveTask(std::make_shared<ExecutableLambdaAdapter>(
-            [this, &manifest] () mutable {
-                /// TODO arthur fix this: I need to be able to modify the real manifest
-                /// but grabbing it by reference is causing problems
-                exportPartToTableImpl(manifest, getContext());
-                return true;
-            },
-            moves_assignee_trigger,
-            getStorageID()));
+        auto task = std::make_shared<ExportPartTask>(*this, manifest, getContext());
 
-        return manifest.in_progress;
+        manifest.in_progress = assignee.scheduleMoveTask(task);
+
+        if (!manifest.in_progress)
+        {
+            continue;
+        }
+
+        manifest.task = task;
+
+        return true;
     }
 
     return false;

@@ -1,9 +1,13 @@
+#pragma once
+
 #include <Interpreters/StorageID.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
-#include "QueryPipeline/QueryPipeline.h"
+#include <QueryPipeline/QueryPipeline.h>
 
 namespace DB
 {
+
+class ExportPartTask;
 
 struct MergeTreePartExportManifest
 {
@@ -58,8 +62,7 @@ struct MergeTreePartExportManifest
 
     time_t create_time;
     mutable bool in_progress = false;
-    /// Used for killing the export
-    mutable QueryPipeline * pipeline = nullptr;
+    mutable std::shared_ptr<ExportPartTask> task = nullptr;
 
     bool operator<(const MergeTreePartExportManifest & rhs) const 
     {
