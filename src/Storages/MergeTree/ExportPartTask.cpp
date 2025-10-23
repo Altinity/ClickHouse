@@ -50,15 +50,12 @@ bool ExportPartTask::executeStep()
 
     MergeTreeSequentialSourceType read_type = MergeTreeSequentialSourceType::Export;
 
-    NamesAndTypesList partition_columns;
+    Block block_with_partition_values;
     if (metadata_snapshot->hasPartitionKey())
     {
-        const auto & partition_key = metadata_snapshot->getPartitionKey();
-        if (!partition_key.column_names.empty())
-            partition_columns = partition_key.expression->getRequiredColumnsWithTypes();
+        /// todo arthur do I need to init minmax_idx?
+        block_with_partition_values = manifest.data_part->minmax_idx->getBlock(storage);
     }
-
-    auto block_with_partition_values = manifest.data_part->partition.getBlockWithPartitionValues(partition_columns);
 
     auto destination_storage = DatabaseCatalog::instance().tryGetTable(manifest.destination_storage_id, local_context);
     if (!destination_storage)
@@ -92,7 +89,7 @@ bool ExportPartTask::executeStep()
             ProfileEvents::increment(ProfileEvents::PartsExportDuplicated);
         }
 
-        ProfileEvents::incrementNoTrace(ProfileEvents::PartsExportFailures);
+        ProfileEvents::increment(ProfileEvents::PartsExportFailures);
 
         std::lock_guard inner_lock(storage.export_manifests_mutex);
         storage.export_manifests.erase(manifest);

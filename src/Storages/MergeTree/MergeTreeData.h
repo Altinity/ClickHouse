@@ -998,10 +998,6 @@ public:
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "EXPORT PARTITION is not implemented");
     }
 
-    void exportPartToTableImpl(
-        const MergeTreePartExportManifest & manifest,
-        ContextPtr local_context);
-
     /// Checks that Partition could be dropped right now
     /// Otherwise - throws an exception with detailed information.
     /// We do not use mutex because it is not very important that the size could change during the operation.
