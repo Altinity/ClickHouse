@@ -6458,6 +6458,8 @@ void MergeTreeData::killExportPart(const String & query_id)
         {
             if (manifest.task)
                 manifest.task->cancel();
+
+            getContext()->getExportsList().remove(getStorageID(), manifest.destination_storage_id, manifest.data_part->name);
             return true;
         }
         return false;

@@ -83,6 +83,8 @@ public:
     ExportsList()
         : Parent(CurrentMetrics::Export)
     {}
+
+    void remove(const StorageID & source_table_id, const StorageID & destination_table_id, const String & part_name);
 };
 
 using ExportsListEntry = BackgroundProcessListEntry<ExportsListElement, ExportInfo>;

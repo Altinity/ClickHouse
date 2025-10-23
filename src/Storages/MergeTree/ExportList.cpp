@@ -63,4 +63,12 @@ UInt64 ExportsListElement::getPeakMemoryUsage() const
     return thread_group->memory_tracker.getPeak();
 }
 
+void ExportsList::remove(const StorageID & source_table_id, const StorageID & destination_table_id, const String & part_name)
+{
+    std::erase_if(entries, [source_table_id, destination_table_id, part_name](const auto & entry)
+    {
+        return entry.source_table_id == source_table_id && entry.destination_table_id == destination_table_id && entry.part_name == part_name;
+    });
+}
+
 }
