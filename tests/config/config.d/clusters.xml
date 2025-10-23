@@ -162,6 +162,19 @@
                 </replica>
             </shard>
         </parallel_replicas>
+        <test_three_replicas>
+            <shard>
+                <internal_replication>false</internal_replication>
+                <replica>
+                    <host>127.0.0.1</host>
+                    <port>9000</port>
+                </replica>
+                <replica>
+                    <host>127.0.0.1</host>
+                    <port>9100</port>
+                </replica>
+            </shard>
+        </test_three_replicas>
         <test_cluster_1_shard_3_replicas_1_unavailable>
             <shard>
                 <internal_replication>false</internal_replication>
