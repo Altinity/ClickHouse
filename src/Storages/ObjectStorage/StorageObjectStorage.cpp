@@ -477,6 +477,7 @@ bool StorageObjectStorage::supportsImport() const
     return configuration->partition_strategy_type == PartitionStrategyFactory::StrategyType::HIVE;
 }
 
+
 SinkToStoragePtr StorageObjectStorage::import(
     const std::string & file_name,
     Block & block_with_partition_values,
