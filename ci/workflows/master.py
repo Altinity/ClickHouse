@@ -40,7 +40,7 @@ workflow = Workflow.Config(
         # *JobConfigs.sqlancer_master_jobs,
         JobConfigs.sqltest_master_job,
     ],
-    additional_jobs=["GrypeScan", "Regression", "SignRelease", "CIReport"],
+    additional_jobs=["GrypeScan", "Regression", "SignRelease", "CIReport", "SourceUpload"],
     artifacts=[
         *ArtifactConfigs.unittests_binaries,
         *ArtifactConfigs.clickhouse_binaries,

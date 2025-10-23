@@ -174,6 +174,8 @@ struct RelativePathWithMetadata
     std::optional<DataFileMetaInfoPtr> getFileMetaInfo() const { return file_meta_info; }
 
     const CommandInTaskResponse & getCommand() const { return command; }
+
+    void loadMetadata(ObjectStoragePtr object_storage, bool ignore_non_existent_file = true);
 };
 
 struct ObjectKeyWithMetadata

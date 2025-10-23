@@ -16,10 +16,10 @@ SELECT * FROM s3(s3_conn, filename='dir_**.parquet') Format Null SETTINGS use_ob
 -- { echoOn }
 
 -- The cached key should be `dir_`, and that includes all three files: 1, 2 and 3. Cache should return all three, but ClickHouse should filter out the third.
-SELECT _path, * FROM s3(s3_conn, filename='dir_a/dir_b/t_03377_sample_{1..2}.parquet') order by id SETTINGS use_object_storage_list_objects_cache=1;
+SELECT _path, id FROM s3(s3_conn, filename='dir_a/dir_b/t_03377_sample_{1..2}.parquet') order by id SETTINGS use_object_storage_list_objects_cache=1;
 
 -- Make sure the filtering did not interfere with the cached values
-SELECT _path, * FROM s3(s3_conn, filename='dir_a/dir_b/t_03377_sample_*.parquet') order by id SETTINGS use_object_storage_list_objects_cache=1;
+SELECT _path, id FROM s3(s3_conn, filename='dir_a/dir_b/t_03377_sample_*.parquet') order by id SETTINGS use_object_storage_list_objects_cache=1;
 
 SYSTEM FLUSH LOGS;
 

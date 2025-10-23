@@ -499,7 +499,7 @@ def test_cluster_table_function(started_cluster, format_version, storage_type):
     # Cluster Query with node1 as coordinator and storage type as arg
     select_cluster_with_type_arg, query_id_cluster_with_type_arg = make_query_from_function(
         run_on_cluster=True,
-        storage_type_as_arg=True,        
+        storage_type_as_arg=True,
     )
 
     # Cluster Query with node1 as coordinator and storage type in named collection
@@ -1042,7 +1042,7 @@ def test_metadata_file_selection_from_version_hint(started_cluster, format_versi
         spark.sql(
             f"INSERT INTO {TABLE_NAME} select id, char(id + ascii('a')) from range(10)"
         )
-        
+
     # test the case where version_hint.text file contains just the version number
     with open(f"/iceberg_data/default/{TABLE_NAME}/metadata/version-hint.text", "w") as f:
         f.write('5')
@@ -2645,7 +2645,7 @@ def test_writes_create_table(started_cluster, format_version, storage_type):
     with pytest.raises(Exception):
         create_iceberg_table(storage_type, instance, TABLE_NAME, started_cluster, "(x String)", format_version)
 
-    create_iceberg_table(storage_type, instance, TABLE_NAME, started_cluster, "(x String)", format_version, "", True)    
+    create_iceberg_table(storage_type, instance, TABLE_NAME, started_cluster, "(x String)", format_version, "", True)
 
     assert '`x` String' in instance.query(f"SHOW CREATE TABLE {TABLE_NAME}")
 
@@ -2710,7 +2710,7 @@ def test_relevant_iceberg_schema_chosen(started_cluster, storage_type):
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
     TABLE_NAME = "test_relevant_iceberg_schema_chosen_" + storage_type + "_" + get_uuid_str()
-    
+
     spark.sql(
         f"""
         CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
@@ -3211,7 +3211,7 @@ def test_system_iceberg_metadata(started_cluster, format_version, storage_type):
             result[name] = list(filter(lambda x: len(x) > 0, result[name]))
         result['row_in_file'] = list(map(lambda x : int(x) if x.isdigit() else None, result['row_in_file']))
         return result
-    
+
     def verify_result_dictionary(diction : dict, allowed_content_types : set):
         # Expected content_type and only it is present
         if set(diction['content_type']) != allowed_content_types:
@@ -3254,7 +3254,7 @@ def test_system_iceberg_metadata(started_cluster, format_version, storage_type):
                             raise ValueError("Row should be specified for an entry {}, file_path: {}".format(diction['content_type'][i], file_path))
 
                         number_of_missing_row_values += 1
-                    
+
             # We have exactly one metadata file
             if number_of_missing_row_values != 1:
                 raise ValueError("Not a one row value (corresponding to metadata file) is missing for file path: {}".format(file_path))
@@ -3623,3 +3623,49 @@ def test_cluster_joins(started_cluster, storage_type):
     )
 
     assert res == "jack\njohn\n"
+
+
+@pytest.mark.parametrize("storage_type", ["s3"])
+def test_system_tables_partition_sorting_keys(started_cluster, storage_type):
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
+
+    table_name = f"test_sys_tables_keys_{storage_type}_{uuid.uuid4().hex[:8]}"
+    fq_table = f"spark_catalog.default.{table_name}"
+
+    spark.sql(f"DROP TABLE IF EXISTS {fq_table}")
+    spark.sql(f"""
+        CREATE TABLE {fq_table} (
+            id INT,
+            ts TIMESTAMP,
+            payload STRING
+        )
+        USING iceberg
+        PARTITIONED BY (bucket(16, id), day(ts))
+        TBLPROPERTIES ('format-version' = '2')
+    """)
+    spark.sql(f"ALTER TABLE {fq_table} WRITE ORDERED BY (id DESC NULLS LAST, hour(ts))")
+    spark.sql(f"""
+        INSERT INTO {fq_table} VALUES
+        (1, timestamp'2024-01-01 10:00:00', 'a'),
+        (2, timestamp'2024-01-02 11:00:00', 'b'),
+        (NULL, timestamp'2024-01-03 12:00:00', 'c')
+    """)
+
+    time.sleep(2)
+    default_upload_directory(
+        started_cluster,
+        storage_type,
+        f"/iceberg_data/default/{table_name}/",
+        f"/iceberg_data/default/{table_name}/",
+    )
+
+    create_iceberg_table(storage_type, instance, table_name, started_cluster)
+
+    res = instance.query(f"""
+        SELECT partition_key, sorting_key
+        FROM system.tables
+        WHERE name = '{table_name}' FORMAT csv
+    """).strip().lower()
+
+    assert res == '"bucket(16, id), day(ts)","id desc, hour(ts) asc"'

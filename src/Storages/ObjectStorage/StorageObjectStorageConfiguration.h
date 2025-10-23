@@ -62,6 +62,7 @@ public:
         std::string path;
 
         bool hasPartitionWildcard() const;
+        bool hasExportFilenameWildcard() const;
         bool hasGlobsIgnorePartitionWildcard() const;
         bool hasGlobs() const;
         std::string cutGlobs(bool supports_partial_prefix) const;

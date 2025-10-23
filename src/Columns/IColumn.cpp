@@ -5,6 +5,7 @@
 #include <Columns/ColumnBLOB.h>
 #include <Columns/ColumnCompressed.h>
 #include <Columns/ColumnConst.h>
+#include <Columns/ColumnConstable.h>
 #include <Columns/ColumnDecimal.h>
 #include <Columns/ColumnDynamic.h>
 #include <Columns/ColumnFixedString.h>
@@ -827,6 +828,7 @@ template class IColumnHelper<ColumnString, IColumn>;
 template class IColumnHelper<ColumnLowCardinality, IColumn>;
 template class IColumnHelper<ColumnNullable, IColumn>;
 template class IColumnHelper<ColumnConst, IColumn>;
+template class IColumnHelper<ColumnConstable, IColumn>;
 template class IColumnHelper<ColumnArray, IColumn>;
 template class IColumnHelper<ColumnTuple, IColumn>;
 template class IColumnHelper<ColumnMap, IColumn>;

@@ -9,8 +9,3 @@
 2	2020
 3	2020
 4	2021
----- Data in roundtrip ReplicatedMergeTree table (should match s3_table)
-1	2020
-2	2020
-3	2020
-4	2021

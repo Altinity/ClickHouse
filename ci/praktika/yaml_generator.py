@@ -519,6 +519,9 @@ class PullRequestPushYamlGen:
             res += AltinityWorkflowTemplates.ALTINITY_JOBS["CIReport"].replace(
                 "{ALL_JOBS}", ALL_JOBS
             )
+        if "SourceUpload" in self.workflow_config.additional_jobs:
+            res += AltinityWorkflowTemplates.ALTINITY_JOBS["SourceUpload"]
+            ALL_JOBS += "\n      - SourceUpload"
 
         return res
 

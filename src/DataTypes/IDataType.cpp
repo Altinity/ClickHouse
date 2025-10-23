@@ -1,6 +1,7 @@
 #include <cstddef>
 #include <Columns/IColumn.h>
 #include <Columns/ColumnConst.h>
+#include <Columns/ColumnConstable.h>
 #include <Columns/ColumnSparse.h>
 
 #include <Common/Exception.h>
@@ -91,10 +92,21 @@ ColumnPtr IDataType::createColumnConst(size_t size, const Field & field) const
     return ColumnConst::create(std::move(column), size);
 }
 
-
 ColumnPtr IDataType::createColumnConstWithDefaultValue(size_t size) const
 {
     return createColumnConst(size, getDefault());
+}
+
+ColumnPtr IDataType::createColumnConstable(size_t size, const Field & field) const
+{
+    auto column = createColumn();
+    column->insert(field);
+    return ColumnConstable::create(std::move(column), size);
+}
+
+ColumnPtr IDataType::createColumnConstableWithDefaultValue(size_t size) const
+{
+    return createColumnConstable(size, getDefault());
 }
 
 DataTypePtr IDataType::promoteNumericType() const

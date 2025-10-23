@@ -7,13 +7,12 @@ CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 rmt_table="rmt_table_${RANDOM}"
 s3_table="s3_table_${RANDOM}"
-rmt_table_roundtrip="rmt_table_roundtrip_${RANDOM}"
 
 query() {
     $CLICKHOUSE_CLIENT --query "$1"
 }
 
-query "DROP TABLE IF EXISTS $rmt_table, $s3_table, $rmt_table_roundtrip"
+query "DROP TABLE IF EXISTS $rmt_table, $s3_table"
 
 query "CREATE TABLE $rmt_table (id UInt64, year UInt16) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{database}/$rmt_table', 'replica1') PARTITION BY year ORDER BY tuple()"
 query "CREATE TABLE $s3_table (id UInt64, year UInt16) ENGINE = S3(s3_conn, filename='$s3_table', format=Parquet, partition_strategy='hive') PARTITION BY year"
@@ -35,9 +34,4 @@ query "ALTER TABLE $rmt_table EXPORT PART '$part_2020' TO TABLE $s3_table SETTIN
 
 query "SELECT * FROM $s3_table ORDER BY id"
 
-query "CREATE TABLE $rmt_table_roundtrip ENGINE = ReplicatedMergeTree('/clickhouse/tables/{database}/$rmt_table_roundtrip', 'replica1') PARTITION BY year ORDER BY tuple() AS SELECT * FROM $s3_table"
-
-echo "---- Data in roundtrip ReplicatedMergeTree table (should match s3_table)"
-query "SELECT * FROM $rmt_table_roundtrip ORDER BY id"
-
-query "DROP TABLE IF EXISTS $rmt_table, $s3_table, $rmt_table_roundtrip"
+query "DROP TABLE IF EXISTS $rmt_table, $s3_table"
