@@ -1,7 +1,7 @@
 version: '2.3'
 services:
     openldap:
-        image: bitnami/openldap:2.6.6
+        image: bitnamilegacy/openldap:2.6.6
         restart: always
         environment:
             LDAP_ROOT: dc=example,dc=org
