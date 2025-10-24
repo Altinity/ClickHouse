@@ -535,6 +535,37 @@ def test_timestamps(started_cluster):
     assert node.query(f"SHOW CREATE TABLE {CATALOG_NAME}.`{root_namespace}.{table_name}`") == f"CREATE TABLE {CATALOG_NAME}.`{root_namespace}.{table_name}`\\n(\\n    `timestamp` Nullable(DateTime64(6)),\\n    `timestamptz` Nullable(DateTime64(6, \\'UTC\\'))\\n)\\nENGINE = Iceberg(\\'http://minio:9000/warehouse-rest/data/\\', \\'minio\\', \\'[HIDDEN]\\')\n"
     assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`") == "2024-01-01 12:00:00.000000\t2024-01-01 12:00:00.000000\n"
 
+    # Berlin - UTC+1 at winter
+    # Istanbul - UTC+3 at winter
+    assert node.query(f"""
+                      SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`
+                      SETTINGS timezone_for_iceberg_timestamptz='UTC'
+                      """) == "2024-01-01 12:00:00.000000\t2024-01-01 12:00:00.000000\n"
+    assert node.query(f"""
+                      SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`
+                      SETTINGS timezone_for_iceberg_timestamptz='Europe/Berlin'
+                      """) == "2024-01-01 12:00:00.000000\t2024-01-01 13:00:00.000000\n"
+    assert node.query(f"""
+                      SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`
+                      SETTINGS timezone_for_iceberg_timestamptz=''
+                      """) == "2024-01-01 12:00:00.000000\t2024-01-01 12:00:00.000000\n"
+    assert node.query(f"""
+                      SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`
+                      SETTINGS session_timezone='Asia/Istanbul'
+                      """) == "2024-01-01 15:00:00.000000\t2024-01-01 12:00:00.000000\n"
+    assert node.query(f"""
+                      SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`
+                      SETTINGS session_timezone='Asia/Istanbul', timezone_for_iceberg_timestamptz='Europe/Berlin'
+                      """) == "2024-01-01 15:00:00.000000\t2024-01-01 13:00:00.000000\n"
+    assert node.query(f"""
+                      SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`
+                      SETTINGS session_timezone='Asia/Istanbul', timezone_for_iceberg_timestamptz=''
+                      """) == "2024-01-01 15:00:00.000000\t2024-01-01 15:00:00.000000\n"
+    assert "Invalid time zone: Foo/Bar" in node.query_and_get_error(f"""
+                      SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`
+                      SETTINGS timezone_for_iceberg_timestamptz='Foo/Bar'
+                      """)
+
 
 def test_insert(started_cluster):
     node = started_cluster.instances["node1"]
