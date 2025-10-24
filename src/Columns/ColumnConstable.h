@@ -139,11 +139,7 @@ public:
         {
             convertDataToFullColumn();
             auto src_full = src.convertToFullColumnIfConst();
-#if !defined(DEBUG_OR_SANITIZER_BUILD)
             data->insertRangeFrom(*src_full, start, length);
-#else
-            data->doInsertRangeFrom(*src_full, start, length);
-#endif
         }
         s += length;
     }
@@ -178,11 +174,7 @@ public:
 #endif
     {
         convertDataToFullColumn();
-#if !defined(DEBUG_OR_SANITIZER_BUILD)
         data->insertFrom(src, position);
-#else
-        data->doInsertFrom(src, position);
-#endif
         ++s;
     }
 
@@ -193,11 +185,7 @@ public:
 #endif
     {
         convertDataToFullColumn();
-#if !defined(DEBUG_OR_SANITIZER_BUILD)
         data->insertManyFrom(src, position, length);
-#else
-        data->doInsertManyFrom(src, position, length);
-#endif
         s += length;
     }
 
