@@ -75,13 +75,15 @@ ColumnMapperPtr createColumnMapper(Poco::JSON::Object::Ptr schema_object);
  *     }
  * }
  */
-class IcebergSchemaProcessor
+class IcebergSchemaProcessor : private WithContext
 {
     static std::string default_link;
 
     using Node = ActionsDAG::Node;
 
 public:
+    IcebergSchemaProcessor(ContextPtr context_) : WithContext(context_) {}
+
     void addIcebergTableSchema(Poco::JSON::Object::Ptr schema_ptr);
     std::shared_ptr<NamesAndTypesList> getClickhouseTableSchemaById(Int32 id);
     std::shared_ptr<const ActionsDAG> getSchemaTransformationDagByIds(Int32 old_id, Int32 new_id);
@@ -92,7 +94,7 @@ public:
     Poco::JSON::Object::Ptr getIcebergTableSchemaById(Int32 id) const;
     bool hasClickhouseTableSchemaById(Int32 id) const;
 
-    static DataTypePtr getSimpleType(const String & type_name);
+    static DataTypePtr getSimpleType(const String & type_name, ContextPtr context_);
 
     static std::unordered_map<String, Int64> traverseSchema(Poco::JSON::Array::Ptr schema);
 

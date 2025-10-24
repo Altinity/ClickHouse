@@ -135,7 +135,7 @@ IcebergMetadata::IcebergMetadata(
     : object_storage(std::move(object_storage_))
     , configuration(std::move(configuration_))
     , persistent_components(PersistentTableComponents{
-          .schema_processor = std::make_shared<IcebergSchemaProcessor>(),
+          .schema_processor = std::make_shared<IcebergSchemaProcessor>(context_),
           .metadata_cache = cache_ptr,
           .format_version = format_version_,
           .table_location = metadata_object_->getValue<String>(f_location)

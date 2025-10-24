@@ -130,7 +130,7 @@ bool HiveCatalog::tryGetTableMetadata(const std::string & namespace_name, const 
         auto columns = table.sd.cols;
         for (const auto & column : columns)
         {
-            schema.push_back({column.name, getType(column.type, true)});
+            schema.push_back({column.name, getType(column.type, true, getContext())});
         }
         result.setSchema(schema);
     }

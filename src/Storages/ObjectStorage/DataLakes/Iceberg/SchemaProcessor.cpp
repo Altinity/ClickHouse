@@ -17,6 +17,7 @@
 #include <base/types.h>
 #include <Common/SharedLockGuard.h>
 #include <base/scope_guard.h>
+#include <Core/Settings.h>
 
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeDate.h>
@@ -32,6 +33,8 @@
 #include <DataTypes/NestedUtils.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <Formats/FormatFactory.h>
+#include <Interpreters/Context_fwd.h>
+#include <Interpreters/Context.h>
 
 #include <IO/ReadHelpers.h>
 
@@ -46,6 +49,10 @@ extern const int LOGICAL_ERROR;
 extern const int BAD_ARGUMENTS;
 }
 
+namespace Setting
+{
+extern const SettingsTimezone timezone_for_iceberg_timestamptz;
+}
 
 namespace
 {
@@ -221,7 +228,7 @@ NamesAndTypesList IcebergSchemaProcessor::tryGetFieldsCharacteristics(Int32 sche
     return fields;
 }
 
-DataTypePtr IcebergSchemaProcessor::getSimpleType(const String & type_name)
+DataTypePtr IcebergSchemaProcessor::getSimpleType(const String & type_name, ContextPtr context_)
 {
     if (type_name == f_boolean)
         return DataTypeFactory::instance().get("Bool");
@@ -240,7 +247,10 @@ DataTypePtr IcebergSchemaProcessor::getSimpleType(const String & type_name)
     if (type_name == f_timestamp)
         return std::make_shared<DataTypeDateTime64>(6);
     if (type_name == f_timestamptz)
-        return std::make_shared<DataTypeDateTime64>(6, "UTC");
+    {
+        std::string timezone = context_->getSettingsRef()[Setting::timezone_for_iceberg_timestamptz];
+        return std::make_shared<DataTypeDateTime64>(6, timezone);
+    }
     if (type_name == f_string || type_name == f_binary)
         return std::make_shared<DataTypeString>();
     if (type_name == f_uuid)
@@ -323,7 +333,11 @@ IcebergSchemaProcessor::getComplexTypeFromObject(const Poco::JSON::Object::Ptr &
 }
 
 DataTypePtr IcebergSchemaProcessor::getFieldType(
-    const Poco::JSON::Object::Ptr & field, const String & type_key, bool required, String & current_full_name, bool is_subfield_of_root)
+    const Poco::JSON::Object::Ptr & field,
+    const String & type_key,
+    bool required,
+    String & current_full_name,
+    bool is_subfield_of_root)
 {
     if (field->isObject(type_key))
         return getComplexTypeFromObject(field->getObject(type_key), current_full_name, is_subfield_of_root);
@@ -332,7 +346,7 @@ DataTypePtr IcebergSchemaProcessor::getFieldType(
     if (type.isString())
     {
         const String & type_name = type.extract<String>();
-        auto data_type = getSimpleType(type_name);
+        auto data_type = getSimpleType(type_name, getContext());
         return required ? data_type : makeNullable(data_type);
     }
 

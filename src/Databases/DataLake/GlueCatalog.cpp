@@ -372,7 +372,7 @@ bool GlueCatalog::tryGetTableMetadata(
                         column_type = "timestamptz";
                 }
 
-                schema.push_back({column.GetName(), getType(column_type, can_be_nullable)});
+                schema.push_back({column.GetName(), getType(column_type, can_be_nullable, getContext())});
             }
             result.setSchema(schema);
         }
