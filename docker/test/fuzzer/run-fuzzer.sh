@@ -24,7 +24,10 @@ BASE_REF=${BASE_REF:="master"}
 function git_clone_with_retry
 {
     for _ in 1 2 3 4; do
-        if git clone --depth 1 https://github.com/Altinity/ClickHouse.git -b "${BASE_REF}" -- "$1" 2>&1 | ts '%Y-%m-%d %H:%M:%S';then
+        # Strip refs/tags/ prefix if present, as --branch expects just the tag/branch name
+        local ref_name="${BASE_REF#refs/tags/}"
+        
+        if git clone --depth 1 https://github.com/Altinity/ClickHouse.git --branch "${ref_name}" -- "$1" 2>&1 | ts '%Y-%m-%d %H:%M:%S';then
             return 0
         else
             sleep 0.5
