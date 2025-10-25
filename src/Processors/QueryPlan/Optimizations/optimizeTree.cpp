@@ -120,6 +120,31 @@ void optimizeTreeFirstPass(const QueryPlanOptimizationSettings & optimization_se
     }
 }
 
+template <typename Func>
+void traverseQueryPlan(Stack & stack, QueryPlan::Node & root, Func && on_enter)
+{
+    stack.clear();
+    stack.push_back({.node = &root});
+
+    while (!stack.empty())
+    {
+        auto & frame = stack.back();
+
+        if (frame.next_child == 0)
+            on_enter(*frame.node);
+
+        if (frame.next_child < frame.node->children.size())
+        {
+            auto next_frame = Frame{.node = frame.node->children[frame.next_child]};
+            ++frame.next_child;
+            stack.push_back(next_frame);
+            continue;
+        }
+
+        stack.pop_back();
+    }
+}
+
 void optimizeTreeSecondPass(
     const QueryPlanOptimizationSettings & optimization_settings, QueryPlan::Node & root, QueryPlan::Nodes & nodes, QueryPlan & query_plan)
 {
@@ -162,6 +187,18 @@ void optimizeTreeSecondPass(
 
         stack.pop_back();
     }
+
+    /// Materialize subplan references before other optimizations.
+    traverseQueryPlan(stack, root, [&](auto & frame_node)
+    {
+        materializeQueryPlanReferences(frame_node, nodes);
+    });
+
+    /// Remove CommonSubplanSteps (they must be not used at that point).
+    traverseQueryPlan(stack, root, [&](auto & frame_node)
+    {
+        optimizeUnusedCommonSubplans(frame_node);
+    });
 
     calculateHashTableCacheKeys(root);
 
