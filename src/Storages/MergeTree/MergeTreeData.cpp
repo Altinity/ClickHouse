@@ -212,8 +212,6 @@ namespace Setting
     extern const SettingsBool allow_experimental_export_merge_tree_part;
     extern const SettingsUInt64 min_bytes_to_use_direct_io;
     extern const SettingsBool export_merge_tree_part_overwrite_file_if_exists;
-    extern const SettingsBool output_format_parallel_formatting;
-    extern const SettingsBool output_format_parallel_formatting_parquet;
 }
 
 namespace MergeTreeSetting
@@ -6295,7 +6293,7 @@ void MergeTreeData::exportPartToTableImpl(
             manifest.data_part->name + "_" + manifest.data_part->checksums.getTotalChecksumHex(),
             block_with_partition_values,
             destination_file_path,
-            manifest.overwrite_file_if_exists,
+            local_context->getSettingsRef()[Setting::export_merge_tree_part_overwrite_file_if_exists],
             local_context);
     }
     catch (const Exception & e)
