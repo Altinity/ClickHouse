@@ -4588,15 +4588,6 @@ void StorageReplicatedMergeTree::selectPartsToExport()
                 return false;
             }
 
-            std::string next_idx_string;
-            if (!zk->tryGet(next_idx_path, next_idx_string, &next_idx_stat))
-            {
-                LOG_INFO(log, "Failed to get next_idx, skipping");
-                return false;
-            }
-
-            const std::size_t next_idx_zk = std::stoull(next_idx_string.c_str());
-
             std::size_t parts_to_do = std::stoull(parts_to_do_string.c_str());
 
             if (parts_to_do == 0)
@@ -4610,8 +4601,6 @@ void StorageReplicatedMergeTree::selectPartsToExport()
             Coordination::Requests ops;
             ops.emplace_back(zkutil::makeCheckRequest(lock_path, lock_stat.version));
             ops.emplace_back(zkutil::makeCheckRequest(parts_to_do_path, parts_to_do_stat.version));
-            ops.emplace_back(zkutil::makeCheckRequest(next_idx_path, next_idx_stat.version));
-            ops.emplace_back(zkutil::makeSetRequest(next_idx_path, std::to_string(std::max(next_idx_zk, next_idx_local + 1)), next_idx_stat.version));
             ops.emplace_back(zkutil::makeSetRequest(part_status_path, "COMPLETED", -1));
             ops.emplace_back(zkutil::makeRemoveRequest(lock_path, lock_stat.version));
             ops.emplace_back(zkutil::makeSetRequest(parts_to_do_path, std::to_string(parts_to_do), parts_to_do_stat.version));
