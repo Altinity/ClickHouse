@@ -52,6 +52,7 @@ class Result(MetaClasses.Serializable):
         OK = "OK"
         FAIL = "FAIL"
         SKIPPED = "SKIPPED"
+        BROKEN = "BROKEN"
 
     class Label:
         REQUIRED = "required"
@@ -176,6 +177,7 @@ class Result(MetaClasses.Serializable):
             Result.Status.SUCCESS,
             Result.StatusExtended.OK,
             Result.StatusExtended.SKIPPED,
+            Result.StatusExtended.BROKEN,
         )
 
     def is_error(self):

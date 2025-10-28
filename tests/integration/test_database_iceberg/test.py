@@ -72,6 +72,8 @@ DEFAULT_PARTITION_SPEC = PartitionSpec(
 
 DEFAULT_SORT_ORDER = SortOrder(SortField(source_id=2, transform=IdentityTransform()))
 
+AVAILABLE_ENGINES = ["DataLakeCatalog", "Iceberg"]
+
 
 def list_namespaces():
     response = requests.get(f"{BASE_URL_LOCAL}/namespaces")
@@ -122,7 +124,7 @@ def generate_record():
 
 
 def create_clickhouse_iceberg_database(
-    started_cluster, node, name, additional_settings={}
+    started_cluster, node, name, additional_settings={}, engine='DataLakeCatalog'
 ):
     settings = {
         "catalog_type": "rest",
@@ -137,7 +139,7 @@ def create_clickhouse_iceberg_database(
 DROP DATABASE IF EXISTS {name};
 SET allow_database_iceberg=true;
 SET write_full_path_in_iceberg_metadata=1;
-CREATE DATABASE {name} ENGINE = DataLakeCatalog('{BASE_URL}', 'minio', '{minio_secret_key}')
+CREATE DATABASE {name} ENGINE = {engine}('{BASE_URL}', 'minio', '{minio_secret_key}')
 SETTINGS {",".join((k+"="+repr(v) for k, v in settings.items()))}
     """
     )
@@ -202,7 +204,8 @@ def started_cluster():
         cluster.shutdown()
 
 
-def test_list_tables(started_cluster):
+@pytest.mark.parametrize("engine", AVAILABLE_ENGINES)
+def test_list_tables(started_cluster, engine):
     node = started_cluster.instances["node1"]
 
     root_namespace = f"clickhouse_{uuid.uuid4()}"
@@ -233,7 +236,7 @@ def test_list_tables(started_cluster):
     for namespace in [namespace_1, namespace_2]:
         assert len(catalog.list_tables(namespace)) == 0
 
-    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME, engine=engine)
 
     tables_list = ""
     for table in namespace_1_tables:
@@ -268,7 +271,8 @@ def test_list_tables(started_cluster):
     )
 
 
-def test_many_namespaces(started_cluster):
+@pytest.mark.parametrize("engine", AVAILABLE_ENGINES)
+def test_many_namespaces(started_cluster, engine):
     node = started_cluster.instances["node1"]
     root_namespace_1 = f"A_{uuid.uuid4()}"
     root_namespace_2 = f"B_{uuid.uuid4()}"
@@ -289,7 +293,7 @@ def test_many_namespaces(started_cluster):
         for table in tables:
             create_table(catalog, namespace, table)
 
-    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME, engine=engine)
 
     for namespace in namespaces:
         for table in tables:
@@ -301,7 +305,8 @@ def test_many_namespaces(started_cluster):
             )
 
 
-def test_select(started_cluster):
+@pytest.mark.parametrize("engine", AVAILABLE_ENGINES)
+def test_select(started_cluster, engine):
     node = started_cluster.instances["node1"]
 
     test_ref = f"test_list_tables_{uuid.uuid4()}"
@@ -329,7 +334,7 @@ def test_select(started_cluster):
     df = pa.Table.from_pylist(data)
     table.append(df)
 
-    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME, engine=engine)
 
     expected = DEFAULT_CREATE_TABLE.format(CATALOG_NAME, namespace, table_name)
     assert expected == node.query(
@@ -343,7 +348,8 @@ def test_select(started_cluster):
     assert int(node.query(f"SELECT count() FROM system.iceberg_history WHERE table = '{namespace}.{table_name}' and database = '{CATALOG_NAME}'").strip()) == 1
 
 
-def test_hide_sensitive_info(started_cluster):
+@pytest.mark.parametrize("engine", AVAILABLE_ENGINES)
+def test_hide_sensitive_info(started_cluster, engine):
     node = started_cluster.instances["node1"]
 
     test_ref = f"test_hide_sensitive_info_{uuid.uuid4()}"
@@ -361,6 +367,7 @@ def test_hide_sensitive_info(started_cluster):
         node,
         CATALOG_NAME,
         additional_settings={"catalog_credential": "SECRET_1"},
+        engine=engine,
     )
     assert "SECRET_1" not in node.query(f"SHOW CREATE DATABASE {CATALOG_NAME}")
 
@@ -369,11 +376,13 @@ def test_hide_sensitive_info(started_cluster):
         node,
         CATALOG_NAME,
         additional_settings={"auth_header": "SECRET_2"},
+        engine=engine,
     )
     assert "SECRET_2" not in node.query(f"SHOW CREATE DATABASE {CATALOG_NAME}")
 
 
-def test_tables_with_same_location(started_cluster):
+@pytest.mark.parametrize("engine", AVAILABLE_ENGINES)
+def test_tables_with_same_location(started_cluster, engine):
     node = started_cluster.instances["node1"]
 
     test_ref = f"test_tables_with_same_location_{uuid.uuid4()}"
@@ -404,7 +413,7 @@ def test_tables_with_same_location(started_cluster):
     df = pa.Table.from_pylist(data)
     table_2.append(df)
 
-    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME, engine=engine)
 
     assert 'aaa\naaa\naaa' == node.query(f"SELECT symbol FROM {CATALOG_NAME}.`{namespace}.{table_name}`").strip()
     assert 'bbb\nbbb\nbbb' == node.query(f"SELECT symbol FROM {CATALOG_NAME}.`{namespace}.{table_name_2}`").strip()
@@ -560,6 +569,7 @@ def test_create(started_cluster):
     node.query(f"INSERT INTO {CATALOG_NAME}.`{root_namespace}.{table_name}` VALUES ('AAPL');", settings={"allow_experimental_insert_into_iceberg": 1, 'write_full_path_in_iceberg_metadata': 1})
     assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`") == "AAPL\n"
 
+
 def test_drop_table(started_cluster):
     node = started_cluster.instances["node1"]
 
@@ -575,3 +585,27 @@ def test_drop_table(started_cluster):
 
     drop_clickhouse_iceberg_table(node, root_namespace, table_name)
     assert len(catalog.list_tables(root_namespace)) == 0
+
+
+def test_table_with_slash(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    # pyiceberg at current moment (version 0.9.1) has a bug with table names with slashes
+    # see https://github.com/apache/iceberg-python/issues/2462
+    # so we need to encode it manually
+    table_raw_suffix = "table/foo"
+    table_encoded_suffix = "table%2Ffoo"
+
+    test_ref = f"test_list_tables_{uuid.uuid4()}"
+    table_name = f"{test_ref}_{table_raw_suffix}"
+    table_encoded_name = f"{test_ref}_{table_encoded_suffix}"
+    root_namespace = f"{test_ref}_namespace"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(root_namespace)
+
+    create_table(catalog, root_namespace, table_name, DEFAULT_SCHEMA, PartitionSpec(), DEFAULT_SORT_ORDER)
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+    node.query(f"INSERT INTO {CATALOG_NAME}.`{root_namespace}.{table_encoded_name}` VALUES (NULL, 'AAPL', 193.24, 193.31, tuple('bot'));", settings={"allow_experimental_insert_into_iceberg": 1, 'write_full_path_in_iceberg_metadata': 1})
+    assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_encoded_name}`") == "\\N\tAAPL\t193.24\t193.31\t('bot')\n"

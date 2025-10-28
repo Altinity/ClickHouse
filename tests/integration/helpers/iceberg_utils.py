@@ -192,7 +192,10 @@ def get_creation_expression(
     allow_dynamic_metadata_for_data_lakes=True,
     use_version_hint=False,
     run_on_cluster=False,
+    object_storage_cluster=False,
     explicit_metadata_path="",
+    storage_type_as_arg=False,
+    storage_type_in_named_collection=False,
     **kwargs,
 ):
     settings_array = []
@@ -203,6 +206,9 @@ def get_creation_expression(
 
     if use_version_hint:
         settings_array.append("iceberg_use_version_hint = true")
+
+    if object_storage_cluster:
+        settings_array.append(f"object_storage_cluster = '{object_storage_cluster}'")
 
     if partition_by:
         partition_by = "PARTITION BY " + partition_by
@@ -216,6 +222,22 @@ def get_creation_expression(
     else:
         settings_expression = ""
 
+    storage_arg = storage_type
+    engine_part = ""
+    if (storage_type_in_named_collection):
+        storage_arg += "_with_type"
+    elif (storage_type_as_arg):
+        storage_arg += f", storage_type='{storage_type}'"
+    else:
+        if (storage_type == "s3"):
+            engine_part = "S3"
+        elif (storage_type == "azure"):
+            engine_part = "Azure"
+        elif (storage_type == "hdfs"):
+            engine_part = "HDFS"
+        elif (storage_type == "local"):
+            engine_part = "Local"
+
     if_not_exists_prefix = ""
     if if_not_exists:
         if_not_exists_prefix = "IF NOT EXISTS"        
@@ -228,16 +250,16 @@ def get_creation_expression(
 
         if run_on_cluster:
             assert table_function
-            return f"icebergS3Cluster('cluster_simple', s3, filename = 'iceberg_data/default/{table_name}/', format={format}, url = 'http://minio1:9001/{bucket}/')"
+            return f"iceberg{engine_part}Cluster('cluster_simple', {storage_arg}, filename = 'iceberg_data/default/{table_name}/', format={format}, url = 'http://minio1:9001/{bucket}/')"
         else:
             if table_function:
-                return f"icebergS3(s3, filename = 'iceberg_data/default/{table_name}/', format={format}, url = 'http://minio1:9001/{bucket}/')"
+                return f"iceberg{engine_part}({storage_arg}, filename = 'iceberg_data/default/{table_name}/', format={format}, url = 'http://minio1:9001/{bucket}/')"
             else:
                 return (
                     f"""
                     DROP TABLE IF EXISTS {table_name};
                     CREATE TABLE {if_not_exists_prefix} {table_name} {schema}
-                    ENGINE=IcebergS3(s3, filename = 'iceberg_data/default/{table_name}/', format={format}, url = 'http://minio1:9001/{bucket}/')
+                    ENGINE=Iceberg{engine_part}({storage_arg}, filename = 'iceberg_data/default/{table_name}/', format={format}, url = 'http://minio1:9001/{bucket}/')
                     {partition_by}
                     {settings_expression}
                     """
@@ -247,19 +269,19 @@ def get_creation_expression(
         if run_on_cluster:
             assert table_function
             return f"""
-                icebergAzureCluster('cluster_simple', azure, container = '{cluster.azure_container_name}', storage_account_url = '{cluster.env_variables["AZURITE_STORAGE_ACCOUNT_URL"]}', blob_path = '/iceberg_data/default/{table_name}/', format={format})
+                iceberg{engine_part}Cluster('cluster_simple', {storage_arg}, container = '{cluster.azure_container_name}', storage_account_url = '{cluster.env_variables["AZURITE_STORAGE_ACCOUNT_URL"]}', blob_path = '/iceberg_data/default/{table_name}/', format={format})
             """
         else:
             if table_function:
                 return f"""
-                    icebergAzure(azure, container = '{cluster.azure_container_name}', storage_account_url = '{cluster.env_variables["AZURITE_STORAGE_ACCOUNT_URL"]}', blob_path = '/iceberg_data/default/{table_name}/', format={format})
+                    iceberg{engine_part}({storage_arg}, container = '{cluster.azure_container_name}', storage_account_url = '{cluster.env_variables["AZURITE_STORAGE_ACCOUNT_URL"]}', blob_path = '/iceberg_data/default/{table_name}/', format={format})
                 """
             else:
                 return (
                     f"""
                     DROP TABLE IF EXISTS {table_name};
                     CREATE TABLE {if_not_exists_prefix} {table_name} {schema}
-                    ENGINE=IcebergAzure(azure, container = {cluster.azure_container_name}, storage_account_url = '{cluster.env_variables["AZURITE_STORAGE_ACCOUNT_URL"]}', blob_path = '/iceberg_data/default/{table_name}/', format={format})
+                    ENGINE=Iceberg{engine_part}({storage_arg}, container = {cluster.azure_container_name}, storage_account_url = '{cluster.env_variables["AZURITE_STORAGE_ACCOUNT_URL"]}', blob_path = '/iceberg_data/default/{table_name}/', format={format})
                     {partition_by}
                     {settings_expression}
                     """
@@ -270,14 +292,14 @@ def get_creation_expression(
 
         if table_function:
             return f"""
-                icebergLocal(local, path = '/iceberg_data/default/{table_name}/', format={format})
+                iceberg{engine_part}({storage_arg}, path = '/iceberg_data/default/{table_name}/', format={format})
             """
         else:
             return (
                 f"""
                 DROP TABLE IF EXISTS {table_name};
                 CREATE TABLE {if_not_exists_prefix} {table_name} {schema}
-                ENGINE=IcebergLocal(local, path = '/iceberg_data/default/{table_name}/', format={format})
+                ENGINE=Iceberg{engine_part}({storage_arg}, path = '/iceberg_data/default/{table_name}/', format={format})
                 {partition_by}
                 {settings_expression}
                 """
@@ -365,16 +387,39 @@ def create_iceberg_table(
     if_not_exists=False,
     compression_method=None,
     format="Parquet",
+    object_storage_cluster=False,
     **kwargs,
 ):
     if 'output_format_parquet_use_custom_encoder' in kwargs:
         node.query(
-            get_creation_expression(storage_type, table_name, cluster, schema, format_version, partition_by, if_not_exists, compression_method, format, **kwargs),
+            get_creation_expression(
+                storage_type,
+                table_name,
+                cluster,
+                schema,
+                format_version,
+                partition_by,
+                if_not_exists,
+                compression_method,
+                format,
+                object_storage_cluster=object_storage_cluster,
+                **kwargs),
             settings={"output_format_parquet_use_custom_encoder" : 0, "output_format_parquet_parallel_encoding" : 0}
         )
     else:
         node.query(
-            get_creation_expression(storage_type, table_name, cluster, schema, format_version, partition_by, if_not_exists, compression_method, format, **kwargs),
+            get_creation_expression(
+                storage_type,
+                table_name,
+                cluster,
+                schema,
+                format_version,
+                partition_by,
+                if_not_exists,
+                compression_method,
+                format,
+                object_storage_cluster=object_storage_cluster,
+                **kwargs),
         )
 
 

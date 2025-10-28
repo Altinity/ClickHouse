@@ -116,6 +116,13 @@ class Runner:
 
         print("Read GH Environment")
         env = _Environment.from_env()
+        try:
+            version_string = Info().get_kv_data("version")['string']
+            os.environ["CLICKHOUSE_VERSION_STRING"] = version_string
+            env.CLICKHOUSE_VERSION_STRING = version_string
+        except Exception as e:
+            print(e)
+
         env.JOB_NAME = job.name
         os.environ["JOB_NAME"] = job.name
         os.environ["CHECK_NAME"] = job.name
@@ -502,6 +509,11 @@ class Runner:
             print(f"Run html report hook")
             HtmlRunnerHooks.post_run(workflow, job, info_errors)
             workflow_result = Result.from_fs(workflow.name)
+
+            # Altinity workflow report
+            cmd = f"PR_NUMBER={env.PR_NUMBER} ./.github/actions/create_workflow_report/workflow_report_hook.sh"
+            workflow_report_url = Shell.get_output(cmd).splitlines()[-1]
+            print(f"::notice ::Workflow report: {workflow_report_url}")
 
             if job.name == Settings.FINISH_WORKFLOW_JOB_NAME and ci_db:
                 # run after HtmlRunnerHooks.post_run(), when Workflow Result has up-to-date storage_usage data

@@ -1,4 +1,6 @@
 import dataclasses
+import json
+import os
 import traceback
 from typing import List
 
@@ -28,6 +30,16 @@ RETRIES_SIGN = "Some tests were restarted"
 #         out.writerow(status)
 
 
+def get_broken_tests_list() -> dict:
+    file_path = "tests/broken_tests.json"
+    if not os.path.isfile(file_path) or os.path.getsize(file_path) == 0:
+        return {}
+
+    with open(file_path, "r", encoding="utf-8") as skip_list_file:
+        skip_list_tests = json.load(skip_list_file)
+    return skip_list_tests
+
+
 class FTResultsProcessor:
     @dataclasses.dataclass
     class Summary:
@@ -36,6 +48,7 @@ class FTResultsProcessor:
         unknown: int
         failed: int
         success: int
+        broken: int
         test_results: List[Result]
         hung: bool = False
         server_died: bool = False
@@ -43,9 +56,10 @@ class FTResultsProcessor:
         success_finish: bool = False
         test_end: bool = True
 
-    def __init__(self, wd):
+    def __init__(self, wd, test_options):
         self.tests_output_file = f"{wd}/test_result.txt"
         self.debug_files = []
+        self.test_options = test_options
 
     def _process_test_output(self):
         total = 0
@@ -53,12 +67,15 @@ class FTResultsProcessor:
         unknown = 0
         failed = 0
         success = 0
+        broken = 0
         hung = False
         server_died = False
         retries = False
         success_finish = False
         test_results = []
         test_end = True
+
+        known_broken_tests = get_broken_tests_list()
 
         with open(self.tests_output_file, "r", encoding="utf-8") as test_file:
             for line in test_file:
@@ -128,6 +145,8 @@ class FTResultsProcessor:
                 if DATABASE_SIGN in line:
                     test_end = True
 
+        test_options_string = ", ".join(self.test_options)
+
         test_results_ = []
         for test in test_results:
             try:
@@ -140,6 +159,37 @@ class FTResultsProcessor:
                         info="".join(test[3])[:16384],
                     )
                 )
+
+                if test[1] == "FAIL":
+                    broken_message = None
+                    if test[0] in known_broken_tests.keys():
+                        message = known_broken_tests[test[0]].get("message")
+                        check_types = known_broken_tests[test[0]].get("check_types")
+                        if check_types and not any(
+                            check_type in test_options_string
+                            for check_type in check_types
+                        ):
+                            broken_message = None
+                        elif message:
+                            if message in test_results_[-1].info:
+                                broken_message = (
+                                    f"\nMarked as broken, matched message: '{message}'"
+                                )
+                        else:
+                            broken_message = f"\nMarked as broken, no message specified"
+
+                        if broken_message and check_types:
+                            broken_message += (
+                                f", matched one or more check types {check_types}"
+                            )
+
+                    if broken_message:
+                        broken += 1
+                        failed -= 1
+                        test_results_[-1].set_status(Result.StatusExtended.BROKEN)
+                        test_results_[-1].set_label(Result.Label.BROKEN)
+                        test_results_[-1].info += broken_message
+
             except Exception as e:
                 print(f"ERROR: Failed to parse test results: {test}")
                 traceback.print_exc()
@@ -165,6 +215,7 @@ class FTResultsProcessor:
             unknown=unknown,
             failed=failed,
             success=success,
+            broken=broken,
             test_results=test_results,
             hung=hung,
             server_died=server_died,
