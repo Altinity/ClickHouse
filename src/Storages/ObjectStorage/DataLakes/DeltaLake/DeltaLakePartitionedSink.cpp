@@ -180,7 +180,7 @@ DeltaLakePartitionedSink::createSinkForPartition(StringRef partition_key)
 {
     auto data_prefix = std::filesystem::path(delta_transaction->getDataPath()) / partition_key.toString();
     return std::make_unique<StorageObjectStorageSink>(
-        DeltaLake::generateWritePath(std::move(data_prefix), configuration->format),
+        DeltaLake::generateWritePath(std::move(data_prefix), configuration->getFormat()),
         object_storage,
         configuration,
         format_settings,

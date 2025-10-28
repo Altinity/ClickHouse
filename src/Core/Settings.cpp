@@ -1760,6 +1760,22 @@ Possible values:
 - `global` — Replaces the `IN`/`JOIN` query with `GLOBAL IN`/`GLOBAL JOIN.`
 - `allow` — Allows the use of these types of subqueries.
 )", IMPORTANT) \
+    DECLARE(ObjectStorageClusterJoinMode, object_storage_cluster_join_mode, ObjectStorageClusterJoinMode::ALLOW, R"(
+Changes the behaviour of object storage cluster function or table.
+
+ClickHouse applies this setting when the query contains the product of object storage cluster function ot table, i.e. when the query for a object storage cluster function ot table contains a non-GLOBAL subquery for the object storage cluster function ot table.
+
+Restrictions:
+
+- Only applied for JOIN subqueries.
+- Only if the FROM section uses a object storage cluster function ot table.
+
+Possible values:
+
+- `local` — Replaces the database and table in the subquery with local ones for the destination server (shard), leaving the normal `IN`/`JOIN.`
+- `global` — Unsupported for now. Replaces the `IN`/`JOIN` query with `GLOBAL IN`/`GLOBAL JOIN.`
+- `allow` — Default value. Allows the use of these types of subqueries.
+)", 0) \
     \
     DECLARE(UInt64, max_concurrent_queries_for_all_users, 0, R"(
 Throw exception if the value of this setting is less or equal than the current number of simultaneously processed queries.
@@ -6629,13 +6645,13 @@ The timeout in milliseconds for connecting to a remote replica during query exec
     DECLARE(Bool, parallel_replicas_for_cluster_engines, true, R"(
 Replace table function engines with their -Cluster alternatives
 )", 0) \
-    DECLARE_WITH_ALIAS(Bool, allow_experimental_database_iceberg, false, R"(
+    DECLARE_WITH_ALIAS(Bool, allow_experimental_database_iceberg, true, R"(
 Allow experimental database engine DataLakeCatalog with catalog_type = 'iceberg'
 )", BETA, allow_database_iceberg) \
-    DECLARE_WITH_ALIAS(Bool, allow_experimental_database_unity_catalog, false, R"(
+    DECLARE_WITH_ALIAS(Bool, allow_experimental_database_unity_catalog, true, R"(
 Allow experimental database engine DataLakeCatalog with catalog_type = 'unity'
 )", BETA, allow_database_unity_catalog) \
-    DECLARE_WITH_ALIAS(Bool, allow_experimental_database_glue_catalog, false, R"(
+    DECLARE_WITH_ALIAS(Bool, allow_experimental_database_glue_catalog, true, R"(
 Allow experimental database engine DataLakeCatalog with catalog_type = 'glue'
 )", BETA, allow_database_glue_catalog) \
     DECLARE_WITH_ALIAS(Bool, allow_experimental_analyzer, true, R"(
@@ -6855,6 +6871,9 @@ Possible values:
     DECLARE(Bool, use_roaring_bitmap_iceberg_positional_deletes, false, R"(
 Use roaring bitmap for iceberg positional deletes.
 )", 0) \
+    DECLARE(Bool, export_merge_tree_part_overwrite_file_if_exists, false, R"(
+Overwrite file if it already exists when exporting a merge tree part
+)", 0) \
     \
     /* ####################################################### */ \
     /* ########### START OF EXPERIMENTAL FEATURES ############ */ \
@@ -6971,6 +6990,15 @@ Enable PRQL - an alternative to SQL.
     DECLARE(Bool, enable_adaptive_memory_spill_scheduler, false, R"(
 Trigger processor to spill data into external storage adpatively. grace join is supported at present.
 )", EXPERIMENTAL) \
+    DECLARE(String, object_storage_cluster, "", R"(
+Cluster to make distributed requests to object storages with alternative syntax.
+)", EXPERIMENTAL) \
+    DECLARE(UInt64, object_storage_max_nodes, 0, R"(
+Limit for hosts used for request in object storage cluster table functions - azureBlobStorageCluster, s3Cluster, hdfsCluster, etc.
+Possible values:
+- Positive integer.
+- 0 — All hosts in cluster.
+)", EXPERIMENTAL) \
     DECLARE(Bool, allow_experimental_delta_kernel_rs, true, R"(
 Allow experimental delta-kernel-rs implementation.
 )", BETA) \
@@ -6985,6 +7013,9 @@ Write full paths (including s3://) into iceberg metadata files.
 )", EXPERIMENTAL) \
     DECLARE(String, iceberg_metadata_compression_method, "", R"(
 Method to compress `.metadata.json` file.
+)", EXPERIMENTAL) \
+    DECLARE(Bool, use_object_storage_list_objects_cache, false, R"(
+Cache the list of objects returned by list objects calls in object storage
 )", EXPERIMENTAL) \
     DECLARE(Bool, make_distributed_plan, false, R"(
 Make distributed query plan.
@@ -7001,6 +7032,19 @@ Default number of tasks for parallel reading in distributed query. Tasks are spr
     DECLARE(Bool, distributed_plan_optimize_exchanges, true, R"(
 Removes unnecessary exchanges in distributed query plan. Disable it for debugging.
 )", 0) \
+    DECLARE(UInt64, lock_object_storage_task_distribution_ms, 500, R"(
+In object storage distribution queries do not distribute tasks on non-prefetched nodes until prefetched node is active.
+Determines how long the free executor node (one that finished processing all of it assigned tasks) should wait before "stealing" tasks from queue of currently busy executor nodes.
+
+Possible values:
+
+- 0  - steal tasks immediately after freeing up.
+- >0 - wait for specified period of time before stealing tasks.
+
+Having this `>0` helps with cache reuse and might improve overall query time.
+Because busy node might have warmed-up caches for this specific task, while free node needs to fetch lots of data from S3.
+Which might take longer than just waiting for the busy node and generate extra traffic.
+)", EXPERIMENTAL) \
     DECLARE(String, distributed_plan_force_exchange_kind, "", R"(
 Force specified kind of Exchange operators between distributed query stages.
 
@@ -7025,11 +7069,23 @@ DECLARE(Bool, allow_experimental_ytsaurus_dictionary_source, false, R"(
     DECLARE(Bool, distributed_plan_force_shuffle_aggregation, false, R"(
 Use Shuffle aggregation strategy instead of PartialAggregation + Merge in distributed query plan.
 )", EXPERIMENTAL) \
+    DECLARE(Bool, allow_experimental_iceberg_read_optimization, true, R"(
+Allow Iceberg read optimization based on Iceberg metadata.
+)", EXPERIMENTAL) \
+    DECLARE(Bool, allow_retries_in_cluster_requests, false, R"(
+Allow retries in cluster request, when one node goes offline
+)", EXPERIMENTAL) \
+    DECLARE(Bool, object_storage_remote_initiator, false, R"(
+Execute request to object storage as remote on one of object_storage_cluster nodes.
+)", EXPERIMENTAL) \
     \
     /** Experimental timeSeries* aggregate functions. */ \
     DECLARE_WITH_ALIAS(Bool, allow_experimental_time_series_aggregate_functions, false, R"(
 Experimental timeSeries* aggregate functions for Prometheus-like timeseries resampling, rate, delta calculation.
 )", EXPERIMENTAL, allow_experimental_ts_to_grid_aggregate_function) \
+    DECLARE(Bool, allow_experimental_export_merge_tree_part, true, R"(
+Experimental export merge tree part.
+)", EXPERIMENTAL) \
     \
     DECLARE(String, promql_database, "", R"(
 Specifies the database name used by the 'promql' dialect. Empty string means the current database.

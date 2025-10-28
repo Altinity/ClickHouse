@@ -68,6 +68,9 @@ class RestorerFromBackup;
 
 class ConditionSelectivityEstimator;
 
+class IObjectStorage;
+using ObjectStoragePtr = std::shared_ptr<IObjectStorage>;
+
 class ActionsDAG;
 
 /** Storage. Describes the table. Responsible for
@@ -449,6 +452,27 @@ public:
         const StorageMetadataPtr & /*metadata_snapshot*/,
         ContextPtr /*context*/,
         bool /*async_insert*/);
+
+    virtual bool supportsImport() const
+    {
+      return false;
+    }
+
+    /*
+It is currently only implemented in StorageObjectStorage.
+      It is meant to be used to import merge tree data parts into object storage. It is similar to the write API,
+      but it won't re-partition the data and should allow the filename to be set by the caller.
+    */
+    virtual SinkToStoragePtr import(
+        const std::string & /* file_name */,
+        Block & /* block_with_partition_values */,
+        std::string & /* destination_file_path */,
+        bool /* overwrite_if_exists */,
+        ContextPtr /* context */)
+    {
+      throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Import is not implemented for storage {}", getName());
+    }
+    
 
     /** Writes the data to a table in distributed manner.
       * It is supposed that implementation looks into SELECT part of the query and executes distributed

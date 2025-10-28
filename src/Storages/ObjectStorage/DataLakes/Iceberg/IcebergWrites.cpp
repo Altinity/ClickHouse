@@ -1249,7 +1249,7 @@ void IcebergStorageSink::consume(Chunk & chunk)
                 format_settings->parquet.filter_push_down = true;
             }
             writers[partition_key] = FormatFactory::instance().getOutputFormatParallelIfPossible(
-                configuration->format, *write_buffers[partition_key], *sample_block, context, format_settings);
+                configuration->getFormat(), *write_buffers[partition_key], *sample_block, context, format_settings);
         }
 
         writers[partition_key]->write(getHeader().cloneWithColumns(part_chunk.getColumns()));
@@ -1368,7 +1368,7 @@ bool IcebergStorageSink::initializeMetadata()
                     statistics.at(partition_key),
                     sample_block,
                     new_snapshot,
-                    configuration->format,
+                    configuration->getFormat(),
                     partititon_spec,
                     partition_spec_id,
                     *buffer_manifest_entry,

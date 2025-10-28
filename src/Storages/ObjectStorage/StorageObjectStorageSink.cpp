@@ -62,7 +62,7 @@ StorageObjectStorageSink::StorageObjectStorageSink(
     , sample_block(sample_block_)
 {
     const auto & settings = context->getSettingsRef();
-    const auto chosen_compression_method = chooseCompressionMethod(path, configuration->compression_method);
+    const auto chosen_compression_method = chooseCompressionMethod(path, configuration->getCompressionMethod());
 
     auto buffer = object_storage->writeObject(
         StoredObject(path), WriteMode::Rewrite, std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());
@@ -74,7 +74,7 @@ StorageObjectStorageSink::StorageObjectStorageSink(
         static_cast<int>(settings[Setting::output_format_compression_zstd_window_log]));
 
     writer = FormatFactory::instance().getOutputFormatParallelIfPossible(
-        configuration->format, *write_buf, *sample_block, context, format_settings_);
+        configuration->getFormat(), *write_buf, *sample_block, context, format_settings_);
 }
 
 void StorageObjectStorageSink::consume(Chunk & chunk)
@@ -142,8 +142,7 @@ PartitionedStorageObjectStorageSink::PartitionedStorageObjectStorageSink(
     std::optional<FormatSettings> format_settings_,
     SharedHeader sample_block_,
     ContextPtr context_)
-    : PartitionedSink(configuration_->partition_strategy, context_, sample_block_)
-    , object_storage(object_storage_)
+    : object_storage(object_storage_)
     , configuration(configuration_)
     , query_settings(configuration_->getQuerySettings(context_))
     , format_settings(format_settings_)
@@ -176,7 +175,7 @@ SinkPtr PartitionedStorageObjectStorageSink::createSinkForPartition(const String
         object_storage,
         configuration,
         format_settings,
-        std::make_shared<Block>(partition_strategy->getFormatHeader()),
+        std::make_shared<Block>(configuration->partition_strategy->getFormatHeader()),
         context
     );
 }

@@ -7,6 +7,11 @@
 #include <Interpreters/Context.h>
 #include <Common/Exception.h>
 #include <Common/ObjectStorageKeyGenerator.h>
+#include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
+
+#include <Poco/JSON/Object.h>
+#include <Poco/JSON/Parser.h>
+#include <Poco/JSON/JSONException.h>
 
 
 namespace DB
@@ -97,11 +102,64 @@ WriteSettings IObjectStorage::patchSettings(const WriteSettings & write_settings
     return write_settings;
 }
 
+RelativePathWithMetadata::RelativePathWithMetadata(const DataFileInfo & info, std::optional<ObjectMetadata> metadata_)
+    : metadata(std::move(metadata_))
+{
+    relative_path = info.file_path;
+    file_meta_info = info.file_meta_info;
+}
+
 std::string RelativePathWithMetadata::getPathOrPathToArchiveIfArchive() const
 {
     if (isArchive())
         return getPathToArchive();
     return getPath();
+}
+
+RelativePathWithMetadata::CommandInTaskResponse::CommandInTaskResponse(const std::string & task)
+{
+    Poco::JSON::Parser parser;
+    try
+    {
+        auto json = parser.parse(task).extract<Poco::JSON::Object::Ptr>();
+        if (!json)
+            return;
+
+        successfully_parsed = true;
+
+        if (json->has("retry_after_us"))
+            retry_after_us = json->getValue<size_t>("retry_after_us");
+    }
+    catch (const Poco::JSON::JSONException &)
+    { /// Not a JSON
+        return;
+    }
+}
+
+std::string RelativePathWithMetadata::CommandInTaskResponse::to_string() const
+{
+    Poco::JSON::Object json;
+    if (retry_after_us.has_value())
+        json.set("retry_after_us", retry_after_us.value());
+
+    std::ostringstream oss;
+    oss.exceptions(std::ios::failbit);
+    Poco::JSON::Stringifier::stringify(json, oss);
+    return oss.str();
+}
+
+
+void RelativePathWithMetadata::loadMetadata(ObjectStoragePtr object_storage, bool ignore_non_existent_file)
+{
+    if (!metadata)
+    {
+        const auto & path = isArchive() ? getPathToArchive() : getPath();
+
+        if (ignore_non_existent_file)
+            metadata = object_storage->tryGetObjectMetadata(path);
+        else
+            metadata = object_storage->getObjectMetadata(path);
+    }
 }
 
 }

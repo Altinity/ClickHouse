@@ -29,6 +29,8 @@ ClusterFunctionReadTaskResponse::ClusterFunctionReadTaskResponse(ObjectInfoPtr o
     if (object->data_lake_metadata.has_value())
         data_lake_metadata = object->data_lake_metadata.value();
 
+    file_meta_info = object->file_meta_info;
+
     const bool send_over_whole_archive = !context->getSettingsRef()[Setting::cluster_function_process_archive_on_multiple_nodes];
     path = send_over_whole_archive ? object->getPathOrPathToArchiveIfArchive() : object->getPath();
 }
@@ -45,6 +47,7 @@ ObjectInfoPtr ClusterFunctionReadTaskResponse::getObjectInfo() const
 
     auto object = std::make_shared<ObjectInfo>(path);
     object->data_lake_metadata = data_lake_metadata;
+    object->file_meta_info = file_meta_info;
     return object;
 }
 
@@ -60,6 +63,14 @@ void ClusterFunctionReadTaskResponse::serialize(WriteBuffer & out, size_t protoc
             data_lake_metadata.transform->serialize(out, registry);
         else
             ActionsDAG().serialize(out, registry);
+    }
+
+    if (protocol_version >= DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_DATA_LAKE_COLUMNS_METADATA)
+    {
+        if (file_meta_info.has_value())
+            file_meta_info.value()->serialize(out);
+        else
+            DataFileMetaInfo().serialize(out);
     }
 }
 
@@ -86,6 +97,14 @@ void ClusterFunctionReadTaskResponse::deserialize(ReadBuffer & in)
         {
             data_lake_metadata.transform = std::move(transform);
         }
+    }
+
+    if (protocol_version >= DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_DATA_LAKE_COLUMNS_METADATA)
+    {
+        auto info = std::make_shared<DataFileMetaInfo>(DataFileMetaInfo::deserialize(in));
+
+        if (!path.empty() && !info->empty())
+            file_meta_info = info;
     }
 }
 

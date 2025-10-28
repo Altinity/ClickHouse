@@ -107,33 +107,75 @@ struct ObjectMetadata
     ObjectAttributes attributes;
 };
 
+
+struct DataFileInfo;
+class DataFileMetaInfo;
+using DataFileMetaInfoPtr = std::shared_ptr<DataFileMetaInfo>;
+
 struct DataLakeObjectMetadata;
 
 struct RelativePathWithMetadata
 {
+    class CommandInTaskResponse
+    {
+    public:
+        CommandInTaskResponse() = default;
+        explicit CommandInTaskResponse(const std::string & task);
+
+        bool is_parsed() const { return successfully_parsed; }
+        void set_retry_after_us(Poco::Timestamp::TimeDiff time_us) { retry_after_us = time_us; }
+
+        std::string to_string() const;
+
+        std::optional<Poco::Timestamp::TimeDiff> get_retry_after_us() const { return retry_after_us; }
+
+    private:
+        bool successfully_parsed = false;
+        std::optional<Poco::Timestamp::TimeDiff> retry_after_us;
+    };
+
     String relative_path;
     /// Object metadata: size, modification time, etc.
     std::optional<ObjectMetadata> metadata;
     /// Delta lake related object metadata.
     std::optional<DataLakeObjectMetadata> data_lake_metadata;
+    /// Information about columns
+    std::optional<DataFileMetaInfoPtr> file_meta_info;
+    /// Retry request after short pause
+    CommandInTaskResponse command;
 
     RelativePathWithMetadata() = default;
 
-    explicit RelativePathWithMetadata(String relative_path_, std::optional<ObjectMetadata> metadata_ = std::nullopt)
-        : relative_path(std::move(relative_path_))
+    explicit RelativePathWithMetadata(String command_or_path, std::optional<ObjectMetadata> metadata_ = std::nullopt)
+        : relative_path(std::move(command_or_path))
         , metadata(std::move(metadata_))
-    {}
+        , command(relative_path)
+    {
+        if (command.is_parsed())
+            relative_path = "";
+    }
+
+    explicit RelativePathWithMetadata(const DataFileInfo & info, std::optional<ObjectMetadata> metadata_ = std::nullopt);
 
     RelativePathWithMetadata(const RelativePathWithMetadata & other) = default;
 
     virtual ~RelativePathWithMetadata() = default;
 
     virtual std::string getFileName() const { return std::filesystem::path(relative_path).filename(); }
+    virtual std::string getFileNameWithoutExtension() const { return std::filesystem::path(relative_path).stem(); }
+
     virtual std::string getPath() const { return relative_path; }
     virtual bool isArchive() const { return false; }
     virtual std::string getPathToArchive() const { throw Exception(ErrorCodes::LOGICAL_ERROR, "Not an archive"); }
     virtual size_t fileSizeInArchive() const { throw Exception(ErrorCodes::LOGICAL_ERROR, "Not an archive"); }
     virtual std::string getPathOrPathToArchiveIfArchive() const;
+
+    void setFileMetaInfo(std::optional<DataFileMetaInfoPtr> file_meta_info_ ) { file_meta_info = file_meta_info_; }
+    std::optional<DataFileMetaInfoPtr> getFileMetaInfo() const { return file_meta_info; }
+
+    const CommandInTaskResponse & getCommand() const { return command; }
+
+    void loadMetadata(ObjectStoragePtr object_storage, bool ignore_non_existent_file = true);
 };
 
 struct ObjectKeyWithMetadata
@@ -327,6 +369,14 @@ public:
     }
     virtual std::shared_ptr<const S3::Client> tryGetS3StorageClient() { return nullptr; }
 #endif
+
+
+    virtual bool supportsListObjectsCache() { return false; }
+
+private:
+    mutable std::mutex throttlers_mutex;
+    ThrottlerPtr remote_read_throttler;
+    ThrottlerPtr remote_write_throttler;
 };
 
 using ObjectStoragePtr = std::shared_ptr<IObjectStorage>;

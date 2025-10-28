@@ -7,6 +7,7 @@
 #include <Storages/ObjectStorage/IObjectIterator.h>
 #include <Storages/prepareReadingFromFormat.h>
 #include <Common/threadPoolCallbackRunner.h>
+#include "Storages/ObjectStorage/ObjectStorageFilePathGenerator.h"
 #include <Interpreters/ActionsDAG.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
@@ -56,7 +57,8 @@ public:
         bool distributed_processing_ = false,
         ASTPtr partition_by_ = nullptr,
         bool is_table_function_ = false,
-        bool lazy_init = false);
+        bool lazy_init = false,
+        std::optional<std::string> sample_path_ = std::nullopt);
 
     String getName() const override;
 
@@ -75,6 +77,16 @@ public:
         const StorageMetadataPtr & metadata_snapshot,
         ContextPtr context,
         bool async_insert) override;
+
+
+    bool supportsImport() const override;
+
+    SinkToStoragePtr import(
+        const std::string & /* file_name */,
+        Block & /* block_with_partition_values */,
+        std::string & /* destination_file_path */,
+        bool /* overwrite_if_exists */,
+        ContextPtr /* context */) override;
 
     void truncate(
         const ASTPtr & query,
@@ -122,7 +134,7 @@ public:
 
     static std::pair<ColumnsDescription, std::string> resolveSchemaAndFormatFromData(
         const ObjectStoragePtr & object_storage,
-        const StorageObjectStorageConfigurationPtr & configuration,
+        StorageObjectStorageConfigurationPtr & configuration,
         const std::optional<FormatSettings> & format_settings,
         std::string & sample_path,
         const ContextPtr & context);

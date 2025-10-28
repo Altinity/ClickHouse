@@ -26,7 +26,10 @@ class RemoteQueryExecutorReadContext : public AsyncTaskExecutor
 {
 public:
     explicit RemoteQueryExecutorReadContext(
-        RemoteQueryExecutor & executor_, bool suspend_when_query_sent_, bool read_packet_type_separately_);
+        RemoteQueryExecutor & executor_,
+        bool suspend_when_query_sent_,
+        bool read_packet_type_separately_,
+        bool allow_retries_in_cluster_requests_);
 
     ~RemoteQueryExecutorReadContext() override;
 
@@ -85,6 +88,7 @@ private:
     /// None -> Type -> Body -> None
     /// None -> Body -> None
     std::atomic<PacketPart> has_read_packet_part = PacketPart::None;
+    std::atomic_bool has_data_packets = false;
     Packet packet;
 
     RemoteQueryExecutor & executor;
@@ -108,6 +112,7 @@ private:
     bool suspend_when_query_sent = false;
     bool is_query_sent = false;
     const bool read_packet_type_separately = false;
+    const bool allow_retries_in_cluster_requests = false;
 };
 
 }

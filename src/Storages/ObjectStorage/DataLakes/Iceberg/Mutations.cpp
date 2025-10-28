@@ -152,7 +152,7 @@ std::optional<DeleteFileWriteResultWithStats> writeDataFiles(
                     column_mapper->setStorageColumnEncoding(std::move(field_ids));
                     FormatFilterInfoPtr format_filter_info = std::make_shared<FormatFilterInfo>(nullptr, context, column_mapper);
                     auto output_format = FormatFactory::instance().getOutputFormat(
-                        configuration->format, *write_buffer, delete_file_sample_block, context, format_settings, format_filter_info);
+                        configuration->getFormat(), *write_buffer, delete_file_sample_block, context, format_settings, format_filter_info);
 
                     write_buffers[partition_key] = std::move(write_buffer);
                     writers[partition_key] = std::move(output_format);
@@ -285,7 +285,7 @@ bool writeMetadataFiles(
                     delete_filenames.statistic.at(partition_key),
                     std::make_shared<const Block>(getPositionDeleteFileSampleBlock()),
                     new_snapshot,
-                    configuration->format,
+                    configuration->getFormat(),
                     partititon_spec,
                     partition_spec_id,
                     *buffer_manifest_entry,

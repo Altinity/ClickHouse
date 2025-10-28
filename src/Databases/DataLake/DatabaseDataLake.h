@@ -88,7 +88,7 @@ private:
     void validateSettings();
     std::shared_ptr<DataLake::ICatalog> getCatalog() const;
 
-    std::shared_ptr<StorageObjectStorageConfiguration> getConfiguration(
+    StorageObjectStorageConfigurationPtr getConfiguration(
         DatabaseDataLakeStorageType type,
         DataLakeStorageSettingsPtr storage_settings) const;
 

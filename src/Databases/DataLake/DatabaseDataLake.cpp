@@ -22,6 +22,7 @@
 #include <Storages/ConstraintsDescription.h>
 #include <Storages/StorageNull.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeConfiguration.h>
+#include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
 
 #include <Interpreters/evaluateConstantExpression.h>
 #include <Interpreters/Context.h>
@@ -47,6 +48,7 @@ namespace DatabaseDataLakeSetting
     extern const DatabaseDataLakeSettingsString oauth_server_uri;
     extern const DatabaseDataLakeSettingsBool oauth_server_use_request_body;
     extern const DatabaseDataLakeSettingsBool vended_credentials;
+    extern const DatabaseDataLakeSettingsString object_storage_cluster;
     extern const DatabaseDataLakeSettingsString aws_access_key_id;
     extern const DatabaseDataLakeSettingsString aws_secret_access_key;
     extern const DatabaseDataLakeSettingsString region;
@@ -176,7 +178,7 @@ std::shared_ptr<DataLake::ICatalog> DatabaseDataLake::getCatalog() const
     return catalog_impl;
 }
 
-std::shared_ptr<StorageObjectStorageConfiguration> DatabaseDataLake::getConfiguration(
+StorageObjectStorageConfigurationPtr DatabaseDataLake::getConfiguration(
     DatabaseDataLakeStorageType type,
     DataLakeStorageSettingsPtr storage_settings) const
 {
@@ -423,24 +425,25 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
 
     /// with_table_structure = false: because there will be
     /// no table structure in table definition AST.
-    StorageObjectStorageConfiguration::initialize(*configuration, args, context_copy, /* with_table_structure */false);
+    configuration->initialize(args, context_copy, /* with_table_structure */false);
 
-    return std::make_shared<StorageObjectStorage>(
+    auto cluster_name = settings[DatabaseDataLakeSetting::object_storage_cluster].value;
+    
+    return std::make_shared<StorageObjectStorageCluster>(
+        cluster_name,
         configuration,
         configuration->createObjectStorage(context_copy, /* is_readonly */ false),
-        context_copy,
         StorageID(getDatabaseName(), name),
         /* columns */columns,
         /* constraints */ConstraintsDescription{},
+        /* partition_by */nullptr,
+        context_copy,
         /* comment */"",
         getFormatSettings(context_copy),
         LoadingStrictnessLevel::CREATE,
         getCatalog(),
         /* if_not_exists*/true,
         /* is_datalake_query*/true,
-        /* distributed_processing */false,
-        /* partition_by */nullptr,
-        /* is_table_function */false,
         /* lazy_init */true);
 }
 
@@ -729,6 +732,11 @@ void registerDatabaseDataLake(DatabaseFactory & factory)
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "Engine `{}` must have arguments", database_engine_name);
         }
 
+        if (database_engine_name == "Iceberg" && catalog_type != DatabaseDataLakeCatalogType::ICEBERG_REST)
+        {
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Engine `Iceberg` must have `rest` catalog type only");
+        }
+
         for (auto & engine_arg : engine_args)
             engine_arg = evaluateConstantExpressionOrIdentifierAsLiteral(engine_arg, args.context);
 
@@ -810,6 +818,7 @@ void registerDatabaseDataLake(DatabaseFactory & factory)
             args.uuid);
     };
     factory.registerDatabase("DataLakeCatalog", create_fn, { .supports_arguments = true, .supports_settings = true });
+    factory.registerDatabase("Iceberg", create_fn, { .supports_arguments = true, .supports_settings = true });
 }
 
 }

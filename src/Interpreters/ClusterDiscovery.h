@@ -38,6 +38,9 @@ public:
 
     ~ClusterDiscovery();
 
+    void registerAll();
+    void unregisterAll();
+
 private:
     struct NodeInfo
     {
@@ -125,6 +128,7 @@ private:
     void initialUpdate();
 
     void registerInZk(zkutil::ZooKeeperPtr & zk, ClusterInfo & info);
+    void unregisterFromZk(zkutil::ZooKeeperPtr & zk, ClusterInfo & info);
 
     Strings getNodeNames(zkutil::ZooKeeperPtr & zk,
                          const String & zk_root,
@@ -207,6 +211,15 @@ private:
     std::shared_ptr<std::vector<std::shared_ptr<MulticlusterDiscovery>>> multicluster_discovery_paths;
 
     MultiVersion<Macros>::Version macros;
+
+    enum RegisterChangeFlag
+    {
+        RCF_NONE,
+        RCF_REGISTER_ALL,
+        RCF_UNREGISTER_ALL,
+    };
+
+    std::atomic<RegisterChangeFlag> register_change_flag = RegisterChangeFlag::RCF_NONE;
 };
 
 }

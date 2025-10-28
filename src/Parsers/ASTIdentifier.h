@@ -52,6 +52,7 @@ public:
     void updateTreeHashImpl(SipHash & hash_state, bool ignore_alias) const override;
 
     void restoreTable();  // TODO(ilezhankin): get rid of this
+    void resetSemanticTable();  // Reset semantic to empty string (see ResetSemanticTableVisitor)
     std::shared_ptr<ASTTableIdentifier> createTable() const;  // returns |nullptr| if identifier is not table.
 
     String full_name;

@@ -20,6 +20,8 @@ struct ClusterFunctionReadTaskResponse
     String path;
     /// Object metadata path, in case of data lake object.
     DataLakeObjectMetadata data_lake_metadata;
+    /// File's columns info
+    std::optional<DataFileMetaInfoPtr> file_meta_info;
 
     /// Convert received response into ObjectInfo.
     ObjectInfoPtr getObjectInfo() const;

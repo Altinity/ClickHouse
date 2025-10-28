@@ -779,6 +779,9 @@ InterpreterInsertQuery::distributedWriteIntoReplicatedMergeTreeFromClusterStorag
     if (!src_storage_cluster)
         return {};
 
+    if (src_storage_cluster->getOriginalClusterName().empty())
+        return {};
+
     if (!isInsertSelectTrivialEnoughForDistributedExecution(query))
         return {};
 

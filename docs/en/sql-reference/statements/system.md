@@ -206,6 +206,12 @@ SYSTEM RELOAD USERS [ON CLUSTER cluster_name]
 
 Normally shuts down ClickHouse (like `service clickhouse-server stop` / `kill {$pid_clickhouse-server}`)
 
+## PRESHUTDOWN {#preshutdown}
+
+<CloudNotSupportedBadge/>
+
+Prepare node for graceful shutdown. Unregister in autodiscovered clusters, stop accepting distributed requests to object storages (s3Cluster, icebergCluster, etc.).
+
 ## KILL {#kill}
 
 Aborts ClickHouse process (like `kill -9 {$ pid_clickhouse-server}`)

@@ -240,7 +240,7 @@ void writeDataFiles(
             /*num_streams_=*/1);
 
         auto input_format = FormatFactory::instance().getInput(
-            configuration->format,
+            configuration->getFormat(),
             *read_buffer,
             *sample_block,
             context,
@@ -249,7 +249,7 @@ void writeDataFiles(
             parser_shared_resources,
             std::make_shared<FormatFilterInfo>(nullptr, context, nullptr),
             true /* is_remote_fs */,
-            chooseCompressionMethod(data_file->data_object_info->getPath(), configuration->compression_method),
+            chooseCompressionMethod(data_file->data_object_info->getPath(), configuration->getCompressionMethod()),
             false);
 
         auto write_buffer = object_storage->writeObject(
@@ -260,7 +260,7 @@ void writeDataFiles(
             context->getWriteSettings());
 
         auto output_format
-            = FormatFactory::instance().getOutputFormat(configuration->format, *write_buffer, *sample_block, context, format_settings);
+            = FormatFactory::instance().getOutputFormat(configuration->getFormat(), *write_buffer, *sample_block, context, format_settings);
 
         while (true)
         {
@@ -411,7 +411,7 @@ void writeMetadataFiles(
                 manifest_entry->statistics,
                 sample_block_,
                 snapshot,
-                configuration->format,
+                configuration->getFormat(),
                 partititon_spec,
                 partition_spec_id,
                 *buffer_manifest_entry,
