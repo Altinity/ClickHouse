@@ -4439,7 +4439,7 @@ void StorageReplicatedMergeTree::exportMergeTreePartitionUpdatingTask()
     
             if (cleanup_lock_acquired)
             {
-                bool has_expired = metadata.create_time < now - 90;
+                bool has_expired = metadata.create_time < now - 180;
     
                 if (has_expired && is_not_pending)
                 {
@@ -4550,8 +4550,6 @@ void StorageReplicatedMergeTree::selectPartsToExport()
         const std::string & part_status_path,
         const std::string & parts_to_do_path,
         const std::string & lock_path,
-        const std::string & next_idx_path,
-        const std::size_t next_idx_local,
         const std::string & path_in_destination_storage_path,
         const StoragePtr & destination_storage,
         const std::string & transaction_id,
@@ -4561,7 +4559,6 @@ void StorageReplicatedMergeTree::selectPartsToExport()
         /// todo arthur is it possible to grab stats using a multi-op?
         Coordination::Stat parts_to_do_stat;
         Coordination::Stat lock_stat;
-        Coordination::Stat next_idx_stat;
         std::string parts_to_do_string;
 
         int retries = 0;
@@ -4600,6 +4597,8 @@ void StorageReplicatedMergeTree::selectPartsToExport()
 
             Coordination::Requests ops;
             ops.emplace_back(zkutil::makeCheckRequest(lock_path, lock_stat.version));
+
+            /// there is a problem here: if someone else completed a part export before, this thing will fail..
             ops.emplace_back(zkutil::makeCheckRequest(parts_to_do_path, parts_to_do_stat.version));
             ops.emplace_back(zkutil::makeSetRequest(part_status_path, "COMPLETED", -1));
             ops.emplace_back(zkutil::makeRemoveRequest(lock_path, lock_stat.version));
@@ -4854,12 +4853,15 @@ void StorageReplicatedMergeTree::selectPartsToExport()
 
                 try
                 {
+                    /// todo arthur temporary for hackathon
+                    auto context_copy = Context::createCopy(getContext());
+                    context_copy->setSetting("export_merge_tree_part_overwrite_file_if_exists", true);
                     exportPartToTable(
                         part_to_export.value(),
                         destination_storage_id,
                         transaction_id,
-                        getContext(),
-                        [this, partition_id, transaction_id, exports_path, key, part_to_export, complete_part_export, partition_path, next_idx_path, next_idx, destination_storage]
+                        context_copy,
+                        [this, partition_id, transaction_id, exports_path, key, part_to_export, complete_part_export, partition_path, destination_storage]
                         (MergeTreePartExportManifest::CompletionCallbackResult result)
                     {
                         const auto zk_client = getZooKeeper();
@@ -4871,8 +4873,6 @@ void StorageReplicatedMergeTree::selectPartsToExport()
                                 fs::path(partition_path) / "parts" / part_to_export.value() / "status",
                                 fs::path(partition_path) / "parts_to_do",
                                 fs::path(partition_path) / "parts" / part_to_export.value() / "lock",
-                                next_idx_path,
-                                next_idx,
                                 result.relative_path_in_destination_storage,
                                 destination_storage,
                                 transaction_id,
