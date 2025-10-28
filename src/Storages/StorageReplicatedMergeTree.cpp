@@ -4598,7 +4598,19 @@ void StorageReplicatedMergeTree::selectPartsToExport()
             Coordination::Requests ops;
             ops.emplace_back(zkutil::makeCheckRequest(lock_path, lock_stat.version));
 
-            /// there is a problem here: if someone else completed a part export before, this thing will fail..
+            /*
+            todo arthur:
+                Taking a note here so we can eventually discuss:
+
+                Marking an individual part export as completed should ideally not depend on race conditions. Right now it depends. For instance:
+
+                replica1 finished part1, and it is about to mark it as completed. It queries parts_to_do and creates the request that updates parts_to_do and the status. Before it sends that query, replica2 does the same and is able to update parts_to_do and its part2 status.
+
+                At this point, replica1 will faill the entire request, which includes status=completed. There are a few ways around it:
+
+                Upon failure, release the lock and let someoe else (or the same replica in the future) retry that part even tho it had already succeeded.
+                Implement retry logic that detects if the failure was because of the parts_to_do version and keeps retrying for a while until it eventually release the lock
+            */
             ops.emplace_back(zkutil::makeCheckRequest(parts_to_do_path, parts_to_do_stat.version));
             ops.emplace_back(zkutil::makeSetRequest(part_status_path, "COMPLETED", -1));
             ops.emplace_back(zkutil::makeRemoveRequest(lock_path, lock_stat.version));
