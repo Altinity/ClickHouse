@@ -213,7 +213,7 @@ namespace Setting
     extern const SettingsUInt64 min_bytes_to_use_direct_io;
     extern const SettingsBool export_merge_tree_part_overwrite_file_if_exists;
     extern const SettingsBool output_format_parallel_formatting;
-    extern const SettingsBool output_format_parallel_formatting_parquet;
+    extern const SettingsBool output_format_parquet_parallel_encoding;
 }
 
 namespace MergeTreeSetting
@@ -6246,7 +6246,7 @@ void MergeTreeData::exportPartToTable(const PartitionCommand & command, ContextP
             part,
             query_context->getSettingsRef()[Setting::export_merge_tree_part_overwrite_file_if_exists],
             query_context->getSettingsRef()[Setting::output_format_parallel_formatting],
-            query_context->getSettingsRef()[Setting::output_format_parallel_formatting_parquet]);
+            query_context->getSettingsRef()[Setting::output_format_parquet_parallel_encoding]);
 
         std::lock_guard lock(export_manifests_mutex);
 
