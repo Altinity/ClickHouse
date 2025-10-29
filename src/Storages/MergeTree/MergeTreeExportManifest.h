@@ -12,15 +12,23 @@ struct MergeTreeExportManifest
     MergeTreeExportManifest(
         const StorageID & destination_storage_id_,
         const DataPartPtr & data_part_,
-        ContextPtr context_)
+        bool overwrite_file_if_exists_,
+        bool parallel_formatting_,
+        bool parallel_formatting_parquet_)
         : destination_storage_id(destination_storage_id_),
           data_part(data_part_),
-          context(context_),
+          overwrite_file_if_exists(overwrite_file_if_exists_),
+          parallel_formatting(parallel_formatting_),
+          parallel_formatting_parquet(parallel_formatting_parquet_),
           create_time(time(nullptr)) {}
 
     StorageID destination_storage_id;
     DataPartPtr data_part;
-    ContextPtr context;
+    bool overwrite_file_if_exists;
+    bool parallel_formatting;
+    /// parquet has a different setting for parallel formatting
+    bool parallel_formatting_parquet;
+
     time_t create_time;
     mutable bool in_progress = false;
 
