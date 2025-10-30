@@ -1114,12 +1114,30 @@ MergeMutateSelectedEntryPtr StorageMergeTree::selectPartsToMerge(
             out_disable_reason.text += ". ";
         out_disable_reason.text += "Cannot select parts for optimization";
 
+<<<<<<< HEAD
         return {};
     }
 
     /// Account TTL merge here to avoid exceeding the max_number_of_merges_with_ttl_in_pool limit
     if (isTTLMergeType(future_part->merge_type))
         getContext()->getMergeList().bookMergeWithTTL();
+=======
+        try
+        {
+            uint64_t needed_disk_space = CompactionStatistics::estimateNeededDiskSpace(future_part->parts, true);
+            auto tagger = std::make_unique<CurrentlyMergingPartsTagger>(future_part, needed_disk_space, *this, metadata_snapshot, false);
+
+            return std::make_shared<MergeMutateSelectedEntry>(future_part, std::move(tagger), std::make_shared<MutationCommands>());
+        }
+        catch (...)
+        {
+            if (isTTLMergeType(future_part->merge_type))
+                getContext()->getMergeList().cancelMergeWithTTL();
+
+            throw;
+        }
+    };
+>>>>>>> 32c356c9c68e (Merge pull request #89127 from save-my-heart/fix_ttl_merge)
 
     merging_tagger = std::make_unique<CurrentlyMergingPartsTagger>(future_part, MergeTreeDataMergerMutator::estimateNeededDiskSpace(future_part->parts, true), *this, metadata_snapshot, false);
     return std::make_shared<MergeMutateSelectedEntry>(future_part, std::move(merging_tagger), std::make_shared<MutationCommands>());
