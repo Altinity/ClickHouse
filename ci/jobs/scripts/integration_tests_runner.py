@@ -13,6 +13,7 @@ import shutil
 import signal
 import subprocess
 import time
+from functools import lru_cache
 from collections import OrderedDict, defaultdict
 from itertools import chain
 from statistics import median
@@ -92,6 +93,31 @@ def filter_existing_tests(tests_to_run, repo_path):
                 "Skipping test %s, seems like it was removed", relative_test_path
             )
     return result
+
+
+@lru_cache(maxsize=None)
+def extract_fail_logs(log_path: str) -> dict[str, str]:
+    with open(log_path, "r", encoding="utf-8") as log_file:
+        text = log_file.read()
+
+    # Regex matches:
+    #  - a line like "_____ test_something [param] _____"
+    #  - captures the test name (with params)
+    #  - captures everything up to the next header or end of file
+    pattern = re.compile(
+        r"_{5,}\s+([^\s].*?)\s+_{5,}(.*?)(?=_{5,}\s+[^\s].*?\s+_{5,}|\Z)",
+        re.S,
+    )
+
+    results = {}
+    for match in pattern.finditer(text):
+        test_name, body = match.groups()
+
+        # Keep only sections that include a failure or captured log
+        if "Captured log" in body or "FAILED" in body:
+            results[test_name.strip()] = body.strip()
+
+    return results
 
 
 def _get_deselect_option(tests):
@@ -438,8 +464,8 @@ class ClickhouseIntegrationTestsRunner:
         def get_log_paths(test_name):
             """Could be a list of logs for all tests or a dict with test name as a key"""
             if isinstance(log_paths, dict):
-                return log_paths[test_name]
-            return log_paths
+                return sorted(log_paths[test_name], reverse=True)
+            return sorted(log_paths, reverse=True)
 
         broken_tests_log = os.path.join(self.result_path, "broken_tests_handler.log")
 
@@ -478,11 +504,13 @@ class ClickhouseIntegrationTestsRunner:
                         for log_path in get_log_paths(failed_test):
                             if log_path.endswith(".log"):
                                 log_file.write(f"Checking log file: {log_path}\n")
-                                with open(log_path) as test_log:
-                                    if fail_message in test_log.read():
-                                        log_file.write("Found fail message in logs\n")
-                                        mark_as_broken = True
-                                        break
+                                fail_logs = extract_fail_logs(log_path).get(
+                                    failed_test.split("::")[-1]
+                                )
+                                if fail_logs and fail_message in fail_logs:
+                                    log_file.write("Found fail message in logs\n")
+                                    mark_as_broken = True
+                                    break
 
                     if mark_as_broken:
                         log_file.write(f"Moving test to BROKEN state\n")
