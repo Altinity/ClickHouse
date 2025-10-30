@@ -44,7 +44,8 @@ jobs:
       fail-fast: false
       matrix:
         branch:
-          - customizations/24.8.18
+          - customizations/24.3.18
+          - customizations/24.8.14
           - releases/25.3.7
     name: ${{ matrix.branch }}
     if: github.event.schedule != '0 0 * * *'
