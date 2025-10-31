@@ -456,8 +456,6 @@ private:
             response_stream = nullptr;
             Session::setSendDataHooks();
             Session::setReceiveDataHooks();
-            Session::setSendThrottler();
-            Session::setReceiveThrottler();
 
             group->atConnectionDestroy();
 
