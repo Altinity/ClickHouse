@@ -119,7 +119,6 @@ def get_pr_info_from_number(pr_number: str) -> dict:
     return response.json()
 
 
-@lru_cache
 def get_run_details(run_url: str) -> dict:
     """
     Fetch run details for a given run URL.
@@ -659,15 +658,6 @@ def create_workflow_report(
     check_cves: bool = False,
     mark_preview: bool = False,
 ) -> str:
-    if pr_number is None or commit_sha is None:
-        run_details = get_run_details(actions_run_url)
-        if pr_number is None:
-            if len(run_details["pull_requests"]) > 0:
-                pr_number = run_details["pull_requests"][0]["number"]
-            else:
-                pr_number = 0
-        if commit_sha is None:
-            commit_sha = run_details["head_commit"]["id"]
 
     host = os.getenv(DATABASE_HOST_VAR)
     if not host:
@@ -683,6 +673,17 @@ def create_workflow_report(
     if not all([host, user, password, GITHUB_TOKEN]):
         raise Exception("Required environment variables are not set")
 
+    run_details = get_run_details(actions_run_url)
+    branch_name = run_details.get("head_branch", "unknown branch")
+    if pr_number is None or commit_sha is None:
+        if pr_number is None:
+            if len(run_details["pull_requests"]) > 0:
+                pr_number = run_details["pull_requests"][0]["number"]
+            else:
+                pr_number = 0
+        if commit_sha is None:
+            commit_sha = run_details["head_commit"]["id"]
+
     db_client = Client(
         host=host,
         user=user,
@@ -692,9 +693,6 @@ def create_workflow_report(
         verify=False,
         settings={"use_numpy": True},
     )
-
-    run_details = get_run_details(actions_run_url)
-    branch_name = run_details.get("head_branch", "unknown branch")
 
     fail_results = {
         "job_statuses": get_commit_statuses(commit_sha),
@@ -755,13 +753,10 @@ def create_workflow_report(
             .sum()
         )
 
-    # Set up the Jinja2 environment
-    template_dir = os.path.dirname(__file__)
-
     # Load the template
-    template = Environment(loader=FileSystemLoader(template_dir)).get_template(
-        "ci_run_report.html.jinja"
-    )
+    template = Environment(
+        loader=FileSystemLoader(os.path.dirname(__file__))
+    ).get_template("ci_run_report.html.jinja")
 
     # Define the context for rendering
     context = {
