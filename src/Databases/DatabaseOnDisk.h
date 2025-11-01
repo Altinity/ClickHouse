@@ -12,6 +12,8 @@ namespace DB
 {
 
 class Context;
+struct AlterCommand;
+
 std::pair<String, StoragePtr> createTableFromAST(
     ASTCreateQuery ast_create_query,
     const String & database_name,
@@ -81,6 +83,8 @@ public:
     static void checkTableNameLengthUnlocked(const String & database_name_, const String & table_name, ContextPtr context_);
 
     void modifySettingsMetadata(const SettingsChanges & settings_changes, ContextPtr query_context);
+
+    void alterDatabaseComment(const AlterCommand & alter_command) override;
 
 protected:
     static constexpr const char * create_suffix = ".tmp";
