@@ -6874,7 +6874,7 @@ Use roaring bitmap for iceberg positional deletes.
     DECLARE(Bool, export_merge_tree_part_overwrite_file_if_exists, false, R"(
 Overwrite file if it already exists when exporting a merge tree part
 )", 0) \
-    DECLARE(Timezone, timezone_for_iceberg_timestamptz, "UTC", R"(
+    DECLARE(Timezone, iceberg_timezone_for_timestamptz, "UTC", R"(
 Timezone for Iceberg timestamptz field.
 
 Possible values:

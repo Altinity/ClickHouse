@@ -82,7 +82,7 @@ class IcebergSchemaProcessor : private WithContext
     using Node = ActionsDAG::Node;
 
 public:
-    IcebergSchemaProcessor(ContextPtr context_) : WithContext(context_) {}
+    explicit IcebergSchemaProcessor(ContextPtr context_) : WithContext(context_) {}
 
     void addIcebergTableSchema(Poco::JSON::Object::Ptr schema_ptr);
     std::shared_ptr<NamesAndTypesList> getClickhouseTableSchemaById(Int32 id);

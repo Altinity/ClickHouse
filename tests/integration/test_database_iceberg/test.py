@@ -537,33 +537,41 @@ def test_timestamps(started_cluster):
 
     # Berlin - UTC+1 at winter
     # Istanbul - UTC+3 at winter
+
+    # 'UTC' is default value, responce is equal to query above
     assert node.query(f"""
                       SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`
-                      SETTINGS timezone_for_iceberg_timestamptz='UTC'
+                      SETTINGS iceberg_timezone_for_timestamptz='UTC'
                       """) == "2024-01-01 12:00:00.000000\t2024-01-01 12:00:00.000000\n"
+    # Timezone from setting
     assert node.query(f"""
                       SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`
-                      SETTINGS timezone_for_iceberg_timestamptz='Europe/Berlin'
+                      SETTINGS iceberg_timezone_for_timestamptz='Europe/Berlin'
                       """) == "2024-01-01 12:00:00.000000\t2024-01-01 13:00:00.000000\n"
+    # Empty value means session timezone, by default it is 'UTC' too
     assert node.query(f"""
                       SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`
-                      SETTINGS timezone_for_iceberg_timestamptz=''
+                      SETTINGS iceberg_timezone_for_timestamptz=''
                       """) == "2024-01-01 12:00:00.000000\t2024-01-01 12:00:00.000000\n"
+    # If session timezone is used, `timestamptz` does not changed, 'UTC' by default
     assert node.query(f"""
                       SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`
                       SETTINGS session_timezone='Asia/Istanbul'
                       """) == "2024-01-01 15:00:00.000000\t2024-01-01 12:00:00.000000\n"
+    # Setiing `iceberg_timezone_for_timestamptz` does not affect `timestamp` column
     assert node.query(f"""
                       SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`
-                      SETTINGS session_timezone='Asia/Istanbul', timezone_for_iceberg_timestamptz='Europe/Berlin'
+                      SETTINGS session_timezone='Asia/Istanbul', iceberg_timezone_for_timestamptz='Europe/Berlin'
                       """) == "2024-01-01 15:00:00.000000\t2024-01-01 13:00:00.000000\n"
+    # Empty value, used non-default session timezone
     assert node.query(f"""
                       SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`
-                      SETTINGS session_timezone='Asia/Istanbul', timezone_for_iceberg_timestamptz=''
+                      SETTINGS session_timezone='Asia/Istanbul', iceberg_timezone_for_timestamptz=''
                       """) == "2024-01-01 15:00:00.000000\t2024-01-01 15:00:00.000000\n"
+    # Invalid timezone
     assert "Invalid time zone: Foo/Bar" in node.query_and_get_error(f"""
                       SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`
-                      SETTINGS timezone_for_iceberg_timestamptz='Foo/Bar'
+                      SETTINGS iceberg_timezone_for_timestamptz='Foo/Bar'
                       """)
 
 

@@ -51,7 +51,7 @@ extern const int BAD_ARGUMENTS;
 
 namespace Setting
 {
-extern const SettingsTimezone timezone_for_iceberg_timestamptz;
+extern const SettingsTimezone iceberg_timezone_for_timestamptz;
 }
 
 namespace
@@ -248,7 +248,7 @@ DataTypePtr IcebergSchemaProcessor::getSimpleType(const String & type_name, Cont
         return std::make_shared<DataTypeDateTime64>(6);
     if (type_name == f_timestamptz)
     {
-        std::string timezone = context_->getSettingsRef()[Setting::timezone_for_iceberg_timestamptz];
+        std::string timezone = context_->getSettingsRef()[Setting::iceberg_timezone_for_timestamptz];
         return std::make_shared<DataTypeDateTime64>(6, timezone);
     }
     if (type_name == f_string || type_name == f_binary)
