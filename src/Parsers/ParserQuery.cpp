@@ -35,6 +35,7 @@
 #include <Parsers/Access/ParserCheckGrantQuery.h>
 #include <Parsers/Access/ParserMoveAccessEntityQuery.h>
 #include <Parsers/Access/ParserSetRoleQuery.h>
+#include <Parsers/Access/ParserExecuteAsQuery.h>
 
 
 namespace DB
@@ -103,6 +104,14 @@ bool ParserQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
         || external_ddl_p.parse(pos, node, expected)
         || transaction_control_p.parse(pos, node, expected)
         || delete_p.parse(pos, node, expected);
+
+    if (!res && allow_execute_as)
+    {
+        ParserQuery subquery_p{end, allow_settings_after_format_in_insert, implicit_select};
+        subquery_p.allow_execute_as = false;
+        ParserExecuteAsQuery execute_as_p{subquery_p};
+        res = execute_as_p.parse(pos, node, expected);
+    }
 
     if (res && allow_in_parallel_with)
     {
