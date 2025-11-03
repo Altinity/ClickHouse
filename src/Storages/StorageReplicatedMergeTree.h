@@ -14,6 +14,8 @@
 #include <Common/ZooKeeper/ZooKeeperRetries.h>
 #include <Common/randomSeed.h>
 #include "Interpreters/CancellationCode.h"
+#include "Storages/MergeTree/ExportPartitionManifestUpdatingTask.h"
+#include "Storages/MergeTree/ExportPartitionTaskScheduler.h"
 #include <Storages/ExportReplicatedMergeTreePartitionTaskEntry.h>
 #include <Core/BackgroundSchedulePool.h>
 #include <DataTypes/DataTypesNumber.h>
@@ -402,6 +404,8 @@ private:
     friend class MergeFromLogEntryTask;
     friend class MutateFromLogEntryTask;
     friend class ReplicatedMergeMutateTaskBase;
+    friend class ExportPartitionManifestUpdatingTask;
+    friend class ExportPartitionTaskScheduler;
 
     using MergeStrategyPicker = ReplicatedMergeTreeMergeStrategyPicker;
     using LogEntry = ReplicatedMergeTreeLogEntry;
@@ -517,6 +521,9 @@ private:
     BackgroundSchedulePoolTaskHolder mutations_finalizing_task;
 
     BackgroundSchedulePoolTaskHolder export_merge_tree_partition_updating_task;
+    std::shared_ptr<ExportPartitionManifestUpdatingTask> export_merge_tree_partition_manifest_updater;
+
+    std::shared_ptr<ExportPartitionTaskScheduler> export_merge_tree_partition_task_scheduler;
 
     Coordination::WatchCallbackPtr export_merge_tree_partition_watch_callback;
 

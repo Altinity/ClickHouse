@@ -74,6 +74,7 @@ bool ExportPartTask::executeStep()
     {
         auto context_copy = Context::createCopy(local_context);
         context_copy->setSetting("output_format_parallel_formatting", manifest.parallel_formatting);
+        context_copy->setSetting("output_format_parquet_parallel_encoding", manifest.parquet_parallel_formatting);
 
         sink = destination_storage->import(
             manifest.data_part->name + "_" + manifest.data_part->checksums.getTotalChecksumHex(),
@@ -228,7 +229,7 @@ void ExportPartTask::onCompleted()
 
 StorageID ExportPartTask::getStorageID() const
 {
-    return manifest.destination_storage_id;
+    return storage.getStorageID();
 }
 
 Priority ExportPartTask::getPriority() const

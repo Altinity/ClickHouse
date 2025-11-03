@@ -470,6 +470,10 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
     /// Will be activated by restarting thread.
     mutations_finalizing_task->deactivate();
 
+    export_merge_tree_partition_manifest_updater = std::make_shared<ExportPartitionManifestUpdatingTask>(*this);
+
+    export_merge_tree_partition_task_scheduler = std::make_shared<ExportPartitionTaskScheduler>(*this);
+
     export_merge_tree_partition_updating_task = getContext()->getSchedulePool().createTask(
         getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_updating_task)", [this] { exportMergeTreePartitionUpdatingTask(); });
 
@@ -4379,621 +4383,32 @@ void StorageReplicatedMergeTree::mutationsFinalizingTask()
 }
 
 void StorageReplicatedMergeTree::exportMergeTreePartitionUpdatingTask()
-{
+{   
     try
     {
-        std::lock_guard lock(export_merge_tree_partition_mutex);
-
-        auto zk = getZooKeeper();
-    
-        const std::string exports_path = fs::path(zookeeper_path) / "exports";
-        const std::string cleanup_lock_path = fs::path(zookeeper_path) / "exports_cleanup_lock";
-    
-        bool cleanup_lock_acquired = zk->tryCreate(cleanup_lock_path, "", zkutil::CreateMode::Ephemeral) == Coordination::Error::ZOK;
-    
-        if (cleanup_lock_acquired)
-        {
-            LOG_INFO(log, "Cleanup lock acquired, will remove stale entries");
-        }
-    
-        Coordination::Stat stat;
-        const auto children = zk->getChildrenWatch(exports_path, &stat, export_merge_tree_partition_watch_callback);
-        const std::unordered_set<std::string> zk_children(children.begin(), children.end());
-    
-        const auto now = time(nullptr);
-    
-        /// Load new entries
-        /// If we have the cleanup lock, also remove stale entries from zk and local
-        for (const auto & key : zk_children)
-        {
-            const std::string entry_path = fs::path(exports_path) / key;
-    
-            std::string metadata_json;
-            if (!zk->tryGet(fs::path(entry_path) / "metadata.json", metadata_json))
-            {
-                LOG_INFO(log, "Skipping {}: missing metadata.json", key);
-                continue;
-            }
-
-            const auto metadata = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
-
-            const auto local_entry = export_merge_tree_partition_task_entries.find(key);
-
-            /// If the zk entry has been replaced with export_merge_tree_partition_force_export, checking only for the export key is not enough
-            /// we need to make sure it is the same transaction id. If it is not, it needs to be replaced.
-            bool has_local_entry_and_is_up_to_date = local_entry != export_merge_tree_partition_task_entries.end()
-                && local_entry->second.manifest.transaction_id == metadata.transaction_id;
-
-            /// If the entry is up to date and we don't have the cleanup lock, early exit, nothing to be done.
-            if (!cleanup_lock_acquired && has_local_entry_and_is_up_to_date)
-                continue;
-    
-            std::string status;
-            if (!zk->tryGet(fs::path(entry_path) / "status", status))
-            {
-                LOG_INFO(log, "Skipping {}: missing status", key);
-                continue;
-            }
-    
-            bool is_not_pending = status != "PENDING";
-    
-            if (cleanup_lock_acquired)
-            {
-                bool has_expired = metadata.create_time < now - 180;
-    
-                if (has_expired && is_not_pending)
-                {
-                    zk->tryRemoveRecursive(fs::path(entry_path));
-                    export_merge_tree_partition_task_entries.erase(key);
-                    LOG_INFO(log, "Removed {}: expired", key);
-                    continue;
-                }
-            }
-    
-            if (is_not_pending)
-            {
-                LOG_INFO(log, "Skipping {}: status is not PENDING", key);
-                continue;
-            }
-    
-            if (has_local_entry_and_is_up_to_date)
-            {
-                LOG_INFO(log, "Skipping {}: already exists", key);
-                continue;
-            }
-    
-            std::string parts_to_do_str;
-            if (!zk->tryGet(fs::path(entry_path) / "parts_to_do", parts_to_do_str))
-            {
-                LOG_INFO(log, "Skipping {}: no parts_to_do", key);
-                continue;
-            }
-    
-            uint64_t parts_to_do = 0;
-            try
-            {
-                parts_to_do = std::stoull(parts_to_do_str);
-            }
-            catch (...)
-            {
-                LOG_WARNING(log, "Skipping {}: invalid parts_to_do='{}'", key, parts_to_do_str);
-                continue;
-            }
-    
-            if (parts_to_do == 0)
-            {
-                LOG_INFO(log, "Skipping {}: parts_to_do is 0", key);
-                continue;
-            }
-    
-            std::vector<DataPartPtr> part_references;
-    
-            for (const auto & part_name : metadata.parts)
-            {
-                if (const auto part = getPartIfExists(part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated}))
-                {
-                    part_references.push_back(part);
-                }
-            }
-    
-            /// It is important to use the operator[] because it updates the existing entry if it already exists.
-            export_merge_tree_partition_task_entries[key] = ExportReplicatedMergeTreePartitionTaskEntry {metadata, parts_to_do, std::move(part_references)};
-        }
-    
-        /// Remove entries that were deleted by someone else
-        std::erase_if(export_merge_tree_partition_task_entries,
-            [&](auto const & kv)
-            {
-                if (zk_children.contains(kv.first))
-                {
-                    return false;
-                }
-
-                const auto & transaction_id = kv.second.manifest.transaction_id;
-                LOG_INFO(log, "Export task {} was deleted, calling killExportPartition for transaction {}", kv.first, transaction_id);
-                
-                try
-                {
-                    killExportPart(transaction_id);
-                }
-                catch (...)
-                {
-                    tryLogCurrentException(log, __PRETTY_FUNCTION__);
-                }
-
-                return true;
-            });
-    
-        if (cleanup_lock_acquired)
-        {
-            zk->tryRemove(cleanup_lock_path);
-        }
-
-        export_merge_tree_partition_select_task->schedule();
+        export_merge_tree_partition_manifest_updater->run();
     }
     catch (...)
     {
         tryLogCurrentException(log, __PRETTY_FUNCTION__);
     }
-    
+
 
     export_merge_tree_partition_updating_task->scheduleAfter(30 * 1000);
 }
 
 void StorageReplicatedMergeTree::selectPartsToExport()
 {
-    const auto exports_path = fs::path(zookeeper_path) / "exports";
-
-    auto complete_part_export = [&](
-        const std::string & export_partition_path,
-        const std::string & part_path,
-        const std::string & part_status_path,
-        const std::string & parts_to_do_path,
-        const std::string & lock_path,
-        const std::string & path_in_destination_storage_path,
-        const StoragePtr & destination_storage,
-        const std::string & transaction_id,
-        const std::string & partition_id,
-        const ZooKeeperPtr & zk) -> bool
-    {
-        /// todo arthur is it possible to grab stats using a multi-op?
-        Coordination::Stat parts_to_do_stat;
-        Coordination::Stat lock_stat;
-        std::string parts_to_do_string;
-
-        int retries = 0;
-        const int max_retries = 3;
-        while (retries < max_retries)
-        {
-            if (!zk->tryGet(parts_to_do_path, parts_to_do_string, &parts_to_do_stat))
-            {
-                LOG_INFO(log, "Failed to get parts_to_do, skipping");
-                return false;
-            }
-
-            std::string locked_by;
-
-            if (!zk->tryGet(lock_path, locked_by, &lock_stat))
-            {
-                LOG_INFO(log, "Failed to get locked_by, skipping");
-                return false;
-            }
-
-            if (locked_by != replica_name)
-            {
-                LOG_INFO(log, "Skipping... Locked by {}, not by {}", locked_by, replica_name);
-                return false;
-            }
-
-            std::size_t parts_to_do = std::stoull(parts_to_do_string.c_str());
-
-            if (parts_to_do == 0)
-            {
-                LOG_INFO(log, "Skipping... Parts to do is 0, maybe someone else already completed it? that sounds weird");
-                return false;
-            }
-
-            parts_to_do--;
-
-            Coordination::Requests ops;
-            ops.emplace_back(zkutil::makeCheckRequest(lock_path, lock_stat.version));
-
-            /*
-            todo arthur:
-                Taking a note here so we can eventually discuss:
-
-                Marking an individual part export as completed should ideally not depend on race conditions. Right now it depends. For instance:
-
-                replica1 finished part1, and it is about to mark it as completed. It queries parts_to_do and creates the request that updates parts_to_do and the status. Before it sends that query, replica2 does the same and is able to update parts_to_do and its part2 status.
-
-                At this point, replica1 will faill the entire request, which includes status=completed. There are a few ways around it:
-
-                Upon failure, release the lock and let someoe else (or the same replica in the future) retry that part even tho it had already succeeded.
-                Implement retry logic that detects if the failure was because of the parts_to_do version and keeps retrying for a while until it eventually release the lock
-            */
-            ops.emplace_back(zkutil::makeCheckRequest(parts_to_do_path, parts_to_do_stat.version));
-            ops.emplace_back(zkutil::makeSetRequest(part_status_path, "COMPLETED", -1));
-            ops.emplace_back(zkutil::makeRemoveRequest(lock_path, lock_stat.version));
-            ops.emplace_back(zkutil::makeSetRequest(parts_to_do_path, std::to_string(parts_to_do), parts_to_do_stat.version));
-            ops.emplace_back(zkutil::makeCreateRequest(fs::path(part_path) / "finished_by", replica_name, zkutil::CreateMode::Persistent));
-            ops.emplace_back(zkutil::makeCreateRequest(fs::path(part_path) / "path_in_destination_storage", path_in_destination_storage_path, zkutil::CreateMode::Persistent));
-
-            if (parts_to_do == 0)
-            {
-                /// loop over all parts under `/parts` and grab all paths in destination storage
-                Strings exported_paths;
-                const auto parts_path = fs::path(export_partition_path) / "parts";
-                Strings parts = zk->getChildren(parts_path);
-                
-                for (const auto & part : parts)
-                {
-                    std::string path_in_destination_storage;
-                    const auto path_in_destination_storage_zk_path = fs::path(parts_path) / part / "path_in_destination_storage";
-                    
-                    if (zk->tryGet(path_in_destination_storage_zk_path, path_in_destination_storage))
-                    {
-                        exported_paths.push_back(path_in_destination_storage);
-                    }
-                    else
-                    {
-                        /// todo arthur what should I do here?
-                        LOG_WARNING(log, "Failed to get path_in_destination_storage for part {} in export", part);
-                    }
-                }
-                
-                LOG_INFO(log, "Collected {} exported paths for export", exported_paths.size());
-
-                /// manually add the export we just finished because it is not zk yet
-                exported_paths.push_back(path_in_destination_storage_path);
-
-                destination_storage->commitExportPartitionTransaction(transaction_id, partition_id, exported_paths, getContext());
-                ops.emplace_back(zkutil::makeSetRequest(fs::path(export_partition_path) / "status", "COMPLETED", -1));
-            }
-
-            Coordination::Responses responses;
-            if (zk->tryMulti(ops, responses) == Coordination::Error::ZOK)
-            {
-                return true;
-            }
-
-            retries++;
-        }
-
-        return false;
-    };
-
-    auto lock_part = [&](
-        const std::string & part_path,
-        const std::string & status_path,
-        const std::string & lock_path,
-        const std::string & node_name,
-        const ZooKeeperPtr & zk) -> bool
-    {
-        Coordination::Requests ops;
-
-        /// if the part path exists, it can be one of the following:
-        /// 1. PENDING and Locked - Some replica is working on it - we should skip
-        /// 2. PENDING and unlocked - Whoever was working on it died - we should acquire the lock
-        /// 3. COMPLETED and unlocked - We should skip
-        if (zk->exists(part_path))
-        {
-            Coordination::Stat stat;
-            std::string status;
-
-            if (zk->tryGet(status_path, status, &stat))
-            {
-                if (status != "PENDING")
-                {
-                    LOG_INFO(log, "Skipping... Status is not PENDING");
-                    return false;
-                }
-
-                /// only try to lock it if the status is still PENDING
-                /// if we did not check for status = pending, chances are some other replica completed and released the lock in the meantime
-                ops.emplace_back(zkutil::makeCheckRequest(status_path, stat.version));
-                /// todo do I need to "re-set" the status to PENDING? I don't think so.
-                ops.emplace_back(zkutil::makeCreateRequest(lock_path, node_name, zkutil::CreateMode::Ephemeral));
-                /// no need to update retry count here.
-            }
-            else
-            {
-                LOG_INFO(log, "Skipping... Failed to get status, probably killed");
-                return false;
-            }
-        }
-        else
-        {
-            /// if the node does not exist, just create everything from scratch.
-            ops.emplace_back(zkutil::makeCreateRequest(part_path, "", zkutil::CreateMode::Persistent));
-            ops.emplace_back(zkutil::makeCreateRequest(status_path, "PENDING", zkutil::CreateMode::Persistent));
-            ops.emplace_back(zkutil::makeCreateRequest(lock_path, node_name, zkutil::CreateMode::Ephemeral));
-            ops.emplace_back(zkutil::makeCreateRequest(fs::path(part_path) / "retry_count", "0", zkutil::CreateMode::Persistent));
-        }
-
-        Coordination::Responses responses;
-
-        return zk->tryMulti(ops, responses) == Coordination::Error::ZOK;
-    };
-
-    auto try_to_acquire_a_part = [&](
-        const ExportReplicatedMergeTreePartitionManifest & manifest,
-        const std::string & partition_export_path,
-        std::size_t & next_idx,
-        const ZooKeeperPtr & zk) -> std::optional<std::string>
-    {
-        const auto try_to_update_next_idx = [&](std::size_t local_next_idx)
-        {
-            /// Update next_idx - best effort, if it fails, that is ok
-            Coordination::Stat next_idx_stat;
-            std::string next_idx_string;
-            const auto next_idx_path = fs::path(partition_export_path) / "next_idx";
-
-            if (zk->tryGet(next_idx_path, next_idx_string, &next_idx_stat))
-            {
-                const std::size_t next_idx_zk = std::stoul(next_idx_string.c_str());
-                const std::size_t new_next_idx = std::max(next_idx_zk, local_next_idx + 1);
-                Coordination::Requests ops;
-                ops.emplace_back(zkutil::makeCheckRequest(next_idx_path, next_idx_stat.version));
-                ops.emplace_back(zkutil::makeSetRequest(next_idx_path, std::to_string(new_next_idx), next_idx_stat.version));
-                Coordination::Responses responses;
-                if (zk->tryMulti(ops, responses) != Coordination::Error::ZOK)
-                {
-                    LOG_INFO(log, "Updated next_idx to {}", new_next_idx);
-                }
-            }
-        };
-
-        for (auto i = next_idx; i < manifest.number_of_parts; i++)
-        {
-            const auto part_path = fs::path(partition_export_path) / "parts" / manifest.parts[i];
-            const auto lock_path = fs::path(part_path) / "lock";
-            const auto status_path = fs::path(part_path) / "status";
-
-            const auto part = getPartIfExists(manifest.parts[i], {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
-            if (!part)
-            {
-                LOG_INFO(log, "Skipping... Part {} not found locally", manifest.parts[i]);
-                continue;
-            }
-
-            if (lock_part(part_path, status_path, lock_path, replica_name, zk))
-            {
-                next_idx = i;
-                try_to_update_next_idx(i);
-                return manifest.parts[i];
-            }
-        }
-
-        /// failed to lock a part in the range of `next_idx...number_of_parts`
-        /// now try the full scan `0...next_idx`
-        for (auto i = 0u; i < next_idx; i++)
-        {
-            const auto part_path = fs::path(partition_export_path) / "parts" / manifest.parts[i];
-            const auto lock_path = fs::path(part_path) / "lock";
-            const auto status_path = fs::path(part_path) / "status";
-
-            const auto part = getPartIfExists(manifest.parts[i], {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
-            if (!part)
-            {
-                LOG_INFO(log, "Skipping... Part {} not found locally", manifest.parts[i]);
-                continue;
-            }
-
-            if (lock_part(part_path, status_path, lock_path, replica_name, zk))
-            {
-                next_idx = i;
-                try_to_update_next_idx(i);
-                return manifest.parts[i];
-            }
-        }
-
-        return std::nullopt;
-    };
-
     try
     {
-        const auto zk = getZooKeeper();
-
-        std::lock_guard lock(export_merge_tree_partition_mutex);
-    
-        for (auto & [key, task_entry] : export_merge_tree_partition_task_entries)
-        {
-            /// this sounds impossible, but just in case
-            if (task_entry.parts_to_do == 0)
-            {
-                LOG_INFO(log, "Already completed, skipping");
-                continue;
-            }
-    
-            std::string parts_to_do_string;
-            if (!zk->tryGet(fs::path(exports_path) / key / "parts_to_do", parts_to_do_string))
-            {
-                LOG_INFO(log, "Failed to get parts_to_do, skipping");
-                continue;
-            }
-            
-            const auto parts_to_do = std::stoull(parts_to_do_string.c_str());
-            task_entry.parts_to_do = parts_to_do;
-    
-            if (task_entry.parts_to_do == 0)
-            {
-                LOG_INFO(log, "Already completed, skipping");
-                continue;
-            }
-    
-            std::string status;
-            if (!zk->tryGet(fs::path(exports_path) / key / "status", status))
-            {
-                LOG_INFO(log, "Failed to get status, skipping");
-                continue;
-            }
-    
-            if (status != "PENDING")
-            {
-                LOG_INFO(log, "Skipping... Status is not PENDING");
-                continue;
-            }
-
-            const auto & manifest = task_entry.manifest;
-            const auto & database = getContext()->resolveDatabase(manifest.destination_database);
-            const auto & table = manifest.destination_table;
-
-            const auto destination_storage_id = StorageID(QualifiedTableName {database, table});
-
-            const auto destination_storage = DatabaseCatalog::instance().tryGetTable(destination_storage_id, getContext());
-
-            if (!destination_storage)
-            {
-                LOG_INFO(log, "Failed to reconstruct destination storage: {}, skipping", destination_storage_id.getNameForLogs());
-                continue;
-            }
-
-            const auto partition_path = fs::path(exports_path) / key;
-            const auto next_idx_path = fs::path(partition_path) / "next_idx";
-            std::string next_idx_string;
-            if (!zk->tryGet(next_idx_path, next_idx_string))
-            {
-                LOG_INFO(log, "Failed to get next_idx, skipping");
-                continue;
-            }
-
-            std::size_t next_idx = std::stoull(next_idx_string.c_str());
-            while (const auto part_to_export = try_to_acquire_a_part(manifest, partition_path, next_idx, zk))
-            {
-                const auto partition_id = manifest.partition_id;
-                const auto transaction_id = manifest.transaction_id;
-
-                try
-                {
-                    /// todo arthur temporary for hackathon
-                    auto context_copy = Context::createCopy(getContext());
-                    context_copy->setSetting("export_merge_tree_part_overwrite_file_if_exists", true);
-                    exportPartToTable(
-                        part_to_export.value(),
-                        destination_storage_id,
-                        transaction_id,
-                        context_copy,
-                        [this, partition_id, transaction_id, exports_path, key, part_to_export, complete_part_export, partition_path, destination_storage]
-                        (MergeTreePartExportManifest::CompletionCallbackResult result)
-                    {
-                        const auto zk_client = getZooKeeper();
-                        if (result.success)
-                        {
-                            complete_part_export(
-                                partition_path,
-                                fs::path(partition_path) / "parts" / part_to_export.value(),
-                                fs::path(partition_path) / "parts" / part_to_export.value() / "status",
-                                fs::path(partition_path) / "parts_to_do",
-                                fs::path(partition_path) / "parts" / part_to_export.value() / "lock",
-                                result.relative_path_in_destination_storage,
-                                destination_storage,
-                                transaction_id,
-                                partition_id,
-                                zk_client);
-    
-                            /// maybe get up to date from complete_parts_export?
-                            std::lock_guard inner_lock(export_merge_tree_partition_mutex);
-                            export_merge_tree_partition_task_entries[key].parts_to_do--;
-    
-                            if (export_merge_tree_partition_task_entries[key].parts_to_do == 0)
-                            {                            
-                                export_merge_tree_partition_task_entries.erase(key);
-                            }
-                        }
-                        else
-                        {
-                            /// increment retry_count
-                            /// if above threshhold, fail the entire export - hopefully it is safe to do so :D
-                            /// I could also leave this for the cleanup thread, but will do it here for now.
-    
-                            Coordination::Requests ops;
-    
-                            std::string retry_count_string;
-                            if (zk_client->tryGet(fs::path(partition_path) / "parts" / part_to_export.value() / "retry_count", retry_count_string))
-                            {
-                                std::size_t retry_count = std::stoull(retry_count_string.c_str()) + 1;
-    
-                                //// todo arthur unhardcode this
-                                if (retry_count >= 3)
-                                {
-                                    /// instead of removing the entire partition, just mark the status as failed
-                                    ops.emplace_back(zkutil::makeSetRequest(fs::path(partition_path) / "status", "FAILED", -1));
-                                    /// mark the part as failed as well
-                                    ops.emplace_back(zkutil::makeSetRequest(fs::path(partition_path) / "parts" / part_to_export.value() / "status", "FAILED", -1));
-                                }
-                                else
-                                {
-                                    ops.emplace_back(zkutil::makeSetRequest(fs::path(partition_path) / "parts" / part_to_export.value() / "retry_count", std::to_string(retry_count), -1));
-                                }
-    
-                                ops.emplace_back(zkutil::makeRemoveRequest(fs::path(partition_path) / "parts" / part_to_export.value() / "lock", -1));
-                            }
-                            else
-                            {
-                                LOG_INFO(log, "Failed to get retry_count, will not try to update it");
-                                ops.emplace_back(zkutil::makeRemoveRequest(fs::path(partition_path) / "parts" / part_to_export.value() / "lock", -1));
-                            }
-    
-                            std::size_t num_exceptions = 0;
-    
-                            const auto exceptions_per_replica_path = fs::path(partition_path) / "exceptions_per_replica" / replica_name;
-                            const auto count_path = exceptions_per_replica_path / "count";
-                            const auto last_exception_path = exceptions_per_replica_path / "last_exception";
-    
-                            if (zk_client->exists(exceptions_per_replica_path))
-                            {
-                                std::string num_exceptions_string;
-                                zk_client->tryGet(count_path, num_exceptions_string);
-                                num_exceptions = std::stoull(num_exceptions_string.c_str());
-    
-                                ops.emplace_back(zkutil::makeSetRequest(last_exception_path / "part", part_to_export.value(), -1));
-                                ops.emplace_back(zkutil::makeSetRequest(last_exception_path / "exception", result.exception, -1));
-                            }
-                            else
-                            {
-                                ops.emplace_back(zkutil::makeCreateRequest(exceptions_per_replica_path, "", zkutil::CreateMode::Persistent));
-                                ops.emplace_back(zkutil::makeCreateRequest(count_path, "0", zkutil::CreateMode::Persistent));
-                                ops.emplace_back(zkutil::makeCreateRequest(last_exception_path, "", zkutil::CreateMode::Persistent));
-                                ops.emplace_back(zkutil::makeCreateRequest(last_exception_path / "part", part_to_export.value(), zkutil::CreateMode::Persistent));
-                                ops.emplace_back(zkutil::makeCreateRequest(last_exception_path / "exception", result.exception, zkutil::CreateMode::Persistent));
-                            }
-    
-                            num_exceptions++;
-                            ops.emplace_back(zkutil::makeSetRequest(count_path, std::to_string(num_exceptions), -1));
-    
-                            Coordination::Responses responses;
-                            if (zk_client->tryMulti(ops, responses) != Coordination::Error::ZOK)
-                            {
-                                LOG_INFO(log, "All failure mechanism failed, will not try to update it");
-                                return;
-                            }
-    
-                        }
-                    });
-                }
-                catch (...)
-                {
-                    /// failed to schedule the part export
-                    tryLogCurrentException(log, __PRETTY_FUNCTION__);
-    
-                    /// best-effort to remove the lock (actually, we should make sure the lock is released..)
-                    zk->tryRemove(fs::path(partition_path) / "parts" / part_to_export.value() / "lock");
-
-                    /// todo arthur should I try to rewind the next_idx?
-    
-                    /// re-run after some time
-                    export_merge_tree_partition_select_task->scheduleAfter(1000 * 5);
-
-                    break;
-                }
-            }
-        }
+        export_merge_tree_partition_task_scheduler->run();
     }
     catch (...)
     {
         tryLogCurrentException(log, __PRETTY_FUNCTION__);
-        export_merge_tree_partition_select_task->scheduleAfter(1000 * 5);
     }
+
+    export_merge_tree_partition_select_task->scheduleAfter(1000 * 5);
 }
 
 std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartitionExportsInfo() const
@@ -5016,13 +4431,6 @@ std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartit
             continue;
         }
 
-        std::string parts_to_do_string;
-        if (!zk->tryGet(export_partition_path / "parts_to_do", parts_to_do_string))
-        {
-            LOG_INFO(log, "Skipping {}: missing parts_to_do", child);
-            continue;
-        }
-
         std::string status;
         if (!zk->tryGet(export_partition_path / "status", status))
         {
@@ -5030,7 +4438,14 @@ std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartit
             continue;
         }
 
-        const auto parts_to_do = std::stoull(parts_to_do_string.c_str());
+        std::vector<std::string> processing_parts;
+        if (Coordination::Error::ZOK != zk->tryGetChildren(export_partition_path / "processing", processing_parts))
+        {
+            LOG_INFO(log, "Skipping {}: missing processing parts", child);
+            continue;
+        }
+
+        const auto parts_to_do = processing_parts.size();
 
         std::string exception_replica;
         std::string last_exception;
@@ -5048,6 +4463,7 @@ std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartit
                 LOG_INFO(log, "Skipping {}: missing count", replica);
                 continue;
             }
+
             exception_count += std::stoull(exception_count_string.c_str());
 
             if (last_exception.empty())
@@ -8663,32 +8079,6 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     const auto exports_path = fs::path(zookeeper_path) / "exports";
     Coordination::Requests ops;
 
-    /*
-    exports
-    partition_id + target storage id: (or may be hash is safer?)
-        metadata (znode) <- immutable, every replica read it once to get full meta, znode mtime - is a timestamp
-            parition id
-            destination id
-            source replica
-            number of parts: 100
-            list of parts: <- processed in strict order
-                2020_0_0_1
-                2020_1_1_1
-                ...
-          parts_to_do: 100 (znode)
-          exceptions_per_replica (znode)
-            replica1:
-               num_exceptions: 1
-                last_exception (znode, znode mtime - is a timestamp of last exception)
-                    part:
-                    exception
-        parts/
-            part_name/  <-- the value of that znode is pending initially, and finished later.
-                lock = ephemeral, when processing
-                   replica: r1
-                   start_time: 123445
-    */
-
     const auto export_key = partition_id + "_" + dest_storage_id.getNameForLogs();
 
     const auto partition_exports_path = fs::path(exports_path) / export_key;
@@ -8741,22 +8131,45 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
         zkutil::CreateMode::Persistent));
 
     ops.emplace_back(zkutil::makeCreateRequest(
-        fs::path(partition_exports_path) / "parts_to_do", 
-        std::to_string(part_names.size()), 
-        zkutil::CreateMode::Persistent));
-    
-    ops.emplace_back(zkutil::makeCreateRequest(
-        fs::path(partition_exports_path) / "next_idx", 
-        "0", 
-        zkutil::CreateMode::Persistent));
-
-    ops.emplace_back(zkutil::makeCreateRequest(
         fs::path(partition_exports_path) / "exceptions_per_replica", 
         "", 
         zkutil::CreateMode::Persistent));
 
     ops.emplace_back(zkutil::makeCreateRequest(
-        fs::path(partition_exports_path) / "parts", 
+        fs::path(partition_exports_path) / "processing", 
+        "", 
+        zkutil::CreateMode::Persistent));
+
+    for (const auto & part : part_names)
+    {
+        ops.emplace_back(zkutil::makeCreateRequest(
+            fs::path(partition_exports_path) / "processing" / part, 
+            "", 
+            zkutil::CreateMode::Persistent));
+
+        ops.emplace_back(zkutil::makeCreateRequest(
+            fs::path(partition_exports_path) / "processing" / part / "max_retry", 
+            "3",
+            zkutil::CreateMode::Persistent));
+
+        ops.emplace_back(zkutil::makeCreateRequest(
+            fs::path(partition_exports_path) / "processing" / part / "status", 
+            "PENDING", 
+            zkutil::CreateMode::Persistent));
+
+        ops.emplace_back(zkutil::makeCreateRequest(
+            fs::path(partition_exports_path) / "processing" / part / "retry_count", 
+            "0",
+            zkutil::CreateMode::Persistent));
+    }
+    
+    ops.emplace_back(zkutil::makeCreateRequest(
+        fs::path(partition_exports_path) / "processed", 
+        "", 
+        zkutil::CreateMode::Persistent));
+
+    ops.emplace_back(zkutil::makeCreateRequest(
+        fs::path(partition_exports_path) / "locks", 
         "", 
         zkutil::CreateMode::Persistent));
 

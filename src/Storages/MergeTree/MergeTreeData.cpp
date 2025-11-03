@@ -214,6 +214,7 @@ namespace Setting
     extern const SettingsUInt64 min_bytes_to_use_direct_io;
     extern const SettingsBool export_merge_tree_part_overwrite_file_if_exists;
     extern const SettingsBool output_format_parallel_formatting;
+    extern const SettingsBool output_format_parquet_parallel_encoding;
 }
 
 namespace MergeTreeSetting
@@ -6258,6 +6259,7 @@ void MergeTreeData::exportPartToTable(
             transaction_id,
             query_context->getSettingsRef()[Setting::export_merge_tree_part_overwrite_file_if_exists],
             query_context->getSettingsRef()[Setting::output_format_parallel_formatting],
+            query_context->getSettingsRef()[Setting::output_format_parquet_parallel_encoding],
             completion_callback);
 
         std::lock_guard lock(export_manifests_mutex);
@@ -6283,7 +6285,6 @@ void MergeTreeData::killExportPart(const String & query_id)
             if (manifest.task)
                 manifest.task->cancel();
 
-            getContext()->getExportsList().remove(getStorageID(), manifest.destination_storage_id, manifest.data_part->name);
             return true;
         }
         return false;
