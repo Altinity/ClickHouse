@@ -25,7 +25,8 @@ public:
         std::shared_ptr<DataLake::ICatalog> catalog,
         bool if_not_exists,
         bool is_datalake_query,
-        bool lazy_init = false);
+        bool is_table_function,
+        bool lazy_init);
 
     std::string getName() const override;
 
@@ -154,6 +155,8 @@ private:
         ContextPtr context,
         bool async_insert) override;
 
+    void updateConfigurationIfNeeded(ContextPtr context) override;
+
     /*
     In case the table was created with `object_storage_cluster` setting,
     modify the AST query object so that it uses the table function implementation
@@ -176,6 +179,7 @@ private:
 
     /// non-clustered storage to fall back on pure realisation if needed
     std::shared_ptr<StorageObjectStorage> pure_storage;
+    bool update_configuration_on_read_write;
 };
 
 }

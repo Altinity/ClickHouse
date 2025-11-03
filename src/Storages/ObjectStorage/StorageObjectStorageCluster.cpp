@@ -91,6 +91,7 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
     std::shared_ptr<DataLake::ICatalog> catalog,
     bool if_not_exists,
     bool is_datalake_query,
+    bool is_table_function,
     bool lazy_init)
     : IStorageCluster(
         cluster_name_, table_id_, getLogger(fmt::format("{}({})", configuration_->getEngineName(), table_id_.table_name)))
@@ -144,6 +145,10 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         }
         tryLogCurrentException(log_);
     }
+
+    // For tables need to update configuration on each read
+    // because data can be changed after previous update
+    update_configuration_on_read_write = !is_table_function;
 
     ColumnsDescription columns{columns_in_table_or_function_definition};
     std::string sample_path;
@@ -741,6 +746,18 @@ IDataLakeMetadata * StorageObjectStorageCluster::getExternalMetadata(ContextPtr 
         /* check_consistent_with_previous_metadata */false);
 
     return configuration->getExternalMetadata();
+}
+
+void StorageObjectStorageCluster::updateConfigurationIfNeeded(ContextPtr context)
+{
+    if (update_configuration_on_read_write)
+    {
+        configuration->update(
+            object_storage,
+            context,
+            /* if_not_updated_before */false,
+            /* check_consistent_with_previous_metadata */false);
+    }
 }
 
 void StorageObjectStorageCluster::checkAlterIsPossible(const AlterCommands & commands, ContextPtr context) const

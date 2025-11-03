@@ -288,22 +288,26 @@ def get_creation_expression(
                 )
 
     elif storage_type == "local":
-        assert not run_on_cluster
-
-        if table_function:
+        if run_on_cluster:
+            assert table_function
             return f"""
-                iceberg{engine_part}({storage_arg}, path = '/iceberg_data/default/{table_name}/', format={format})
+                iceberg{engine_part}Cluster('cluster_single_node', {storage_arg}, path = '/iceberg_data/default/{table_name}/', format={format})
             """
         else:
-            return (
-                f"""
-                DROP TABLE IF EXISTS {table_name};
-                CREATE TABLE {if_not_exists_prefix} {table_name} {schema}
-                ENGINE=Iceberg{engine_part}({storage_arg}, path = '/iceberg_data/default/{table_name}/', format={format})
-                {partition_by}
-                {settings_expression}
+            if table_function:
+                return f"""
+                    iceberg{engine_part}({storage_arg}, path = '/iceberg_data/default/{table_name}/', format={format})
                 """
-            )
+            else:
+                return (
+                    f"""
+                    DROP TABLE IF EXISTS {table_name};
+                    CREATE TABLE {if_not_exists_prefix} {table_name} {schema}
+                    ENGINE=Iceberg{engine_part}({storage_arg}, path = '/iceberg_data/default/{table_name}/', format={format})
+                    {partition_by}
+                    {settings_expression}
+                    """
+                )
 
     else:
         raise Exception(f"Unknown iceberg storage type: {storage_type}")

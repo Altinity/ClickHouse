@@ -97,6 +97,8 @@ protected:
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method writeFallBackToPure is not supported by storage {}", getName());
     }
 
+    virtual void updateConfigurationIfNeeded(ContextPtr /* context */) {}
+
 private:
     static ClusterPtr getClusterImpl(ContextPtr context, const String & cluster_name_, size_t max_hosts = 0);
 
