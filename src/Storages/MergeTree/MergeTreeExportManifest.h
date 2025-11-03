@@ -20,7 +20,7 @@ struct MergeTreeExportManifest
           data_part(data_part_),
           overwrite_file_if_exists(overwrite_file_if_exists_),
           parallel_formatting(parallel_formatting_),
-          parallel_formatting_parquet(parallel_formatting_parquet_),
+          parquet_parallel_encoding(parallel_formatting_parquet_),
           max_threads(max_threads_),
           create_time(time(nullptr)) {}
 
@@ -29,7 +29,7 @@ struct MergeTreeExportManifest
     bool overwrite_file_if_exists;
     bool parallel_formatting;
     /// parquet has a different setting for parallel formatting
-    bool parallel_formatting_parquet;
+    bool parquet_parallel_encoding;
     std::size_t max_threads;
 
     time_t create_time;

@@ -6295,7 +6295,7 @@ void MergeTreeData::exportPartToTableImpl(
     {
         auto context_copy = Context::createCopy(local_context);
         context_copy->setSetting("output_format_parallel_formatting", manifest.parallel_formatting);
-        context_copy->setSetting("output_format_parquet_parallel_encoding", manifest.parallel_formatting_parquet);
+        context_copy->setSetting("output_format_parquet_parallel_encoding", manifest.parquet_parallel_encoding);
         context_copy->setSetting("max_threads", manifest.max_threads);
 
         sink = destination_storage->import(
