@@ -97,8 +97,16 @@ def filter_existing_tests(tests_to_run, repo_path):
 
 @lru_cache(maxsize=None)
 def extract_fail_logs(log_path: str) -> dict[str, str]:
-    with open(log_path, "r", encoding="utf-8") as log_file:
-        text = log_file.read()
+    try:
+        with open(log_path, "r", encoding="utf-8") as log_file:
+            text = log_file.read()
+    except UnicodeDecodeError:
+        logging.warning(
+            "Failed to read log file %s as UTF-8, using errors='replace'",
+            log_path,
+        )
+        with open(log_path, "r", encoding="utf-8", errors="replace") as log_file:
+            text = log_file.read()
 
     # Regex matches:
     #  - a line like "_____ test_something [param] _____"
@@ -406,17 +414,50 @@ class ClickhouseIntegrationTestsRunner:
         return list(sorted(skip_list_tests))
 
     @staticmethod
-    def _get_broken_tests_list(repo_path: str) -> dict:
-        skip_list_file_path = f"{repo_path}/tests/broken_tests.json"
+    def _get_broken_tests_rules(repo_path: str) -> dict:
+        broken_tests_file_path = f"{repo_path}/tests/broken_tests.yaml"
         if (
-            not os.path.isfile(skip_list_file_path)
-            or os.path.getsize(skip_list_file_path) == 0
+            not os.path.isfile(broken_tests_file_path)
+            or os.path.getsize(broken_tests_file_path) == 0
         ):
-            return {}
+            raise ValueError(
+                "There is something wrong with getting broken tests rules: "
+                f"file '{broken_tests_file_path}' is empty or does not exist."
+            )
 
-        with open(skip_list_file_path, "r", encoding="utf-8") as skip_list_file:
-            skip_list_tests = json.load(skip_list_file)
-        return skip_list_tests
+        with open(broken_tests_file_path, "r", encoding="utf-8") as broken_tests_file:
+            broken_tests = yaml.safe_load(broken_tests_file)
+
+        compiled_rules = {"exact": {}, "pattern": {}}
+
+        for test in broken_tests:
+            regex = test.get("regex") is True
+            rule = {
+                "reason": test["reason"],
+            }
+            if test.get("message"):
+                rule["message"] = re.compile(test["message"]) if regex else test["message"]
+
+            if test.get("not_message"):
+                rule["not_message"] = (
+                    re.compile(test["not_message"]) if regex else test["not_message"]
+                )
+            if test.get("check_types"):
+                rule["check_types"] = test["check_types"]
+
+            if regex:
+                rule["regex"] = True
+                compiled_rules["pattern"][re.compile(test["name"])] = rule
+            else:
+                compiled_rules["exact"][test["name"]] = rule
+
+        logging.info(
+            "Compiled %s exact rules and %s pattern rules",
+            len(compiled_rules["exact"]),
+            len(compiled_rules["pattern"]),
+        )
+
+        return compiled_rules
 
     @staticmethod
     def group_test_by_file(tests):
@@ -463,14 +504,71 @@ class ClickhouseIntegrationTestsRunner:
 
         def get_log_paths(test_name):
             """Could be a list of logs for all tests or a dict with test name as a key"""
-            if isinstance(log_paths, dict):
-                return sorted(log_paths[test_name], reverse=True)
-            return sorted(log_paths, reverse=True)
+            log_paths_list = (
+                log_paths[test_name] if isinstance(log_paths, dict) else log_paths
+            )
+            return sorted(
+                [x for x in log_paths_list if x.endswith(".log")], reverse=True
+            )
 
         broken_tests_log = os.path.join(self.result_path, "broken_tests_handler.log")
 
+        def test_is_known_fail(test_name, test_logs, debug_log_file):
+            if test_logs is None:
+                debug_log_file.write(
+                    f"WARNING: Test '{test_name}' has no logs - cannot match message patterns\n"
+                )
+
+            matching_rules = []
+
+            debug_log_file.write("Potential matching rules:\n")
+            exact_rule = known_broken_tests["exact"].get(test_name)
+            if exact_rule:
+                debug_log_file.write(f"{test_name} - {exact_rule}\n")
+                matching_rules.append(exact_rule)
+
+            for name_re, data in known_broken_tests["pattern"].items():
+                if name_re.fullmatch(test_name):
+                    debug_log_file.write(f"{name_re} - {data}\n")
+                    matching_rules.append(data)
+
+            if not matching_rules:
+                return False
+
+            def matches_substring(substring, log, is_regex):
+                if log is None:
+                    # Cannot match a message pattern if we have no logs
+                    return False
+                if is_regex:
+                    return bool(substring.search(log))
+                return substring in log
+
+            for rule_data in matching_rules:
+                if rule_data.get("check_types") and not any(
+                    ct in context_name for ct in rule_data["check_types"]
+                ):
+                    debug_log_file.write(f"Check types didn't match: '{rule_data['check_types']}' not in '{context_name}'\n")
+                    continue
+
+                is_regex = rule_data.get("regex", False)
+                not_message = rule_data.get("not_message")
+                if not_message and matches_substring(not_message, test_logs, is_regex):
+                    debug_log_file.write(f"Skip rule: Not message matched: '{not_message}'\n")
+                    continue
+                message = rule_data.get("message")
+                if message and not matches_substring(message, test_logs, is_regex):
+                    debug_log_file.write(f"Skip rule: Message didn't match: '{message}'\n")
+                    continue
+
+                debug_log_file.write(f"Test {test_name} matched rule: {rule_data}\n")
+                return rule_data["reason"]
+
+            return False
+
         with open(broken_tests_log, "a") as log_file:
-            log_file.write(f"{len(known_broken_tests)} Known broken tests\n")
+            log_file.write(
+                f"{len(known_broken_tests['exact']) + len(known_broken_tests['pattern'])} Known broken tests\n"
+            )
             for status, tests in counters.items():
                 log_file.write(f"Total tests in {status} state: {len(tests)}\n")
 
@@ -479,45 +577,26 @@ class ClickhouseIntegrationTestsRunner:
                     log_file.write(
                         f"Checking test {failed_test} (status: {fail_status})\n"
                     )
-                    if failed_test not in known_broken_tests.keys():
+
+                    # Should only care about the most recent log file
+                    log_path = get_log_paths(failed_test)[0]
+                    test_logs = extract_fail_logs(log_path)
+                    test_log = test_logs.get(failed_test.split("::")[-1])
+                    if test_log is None:
                         log_file.write(
-                            f"Test {failed_test} is not in known broken tests\n"
+                            f"WARNING: Test '{failed_test}' has no logs among {test_logs.keys()}\n"
                         )
-                        continue
-
-                    check_types = known_broken_tests[failed_test].get("check_types")
-                    fail_message = known_broken_tests[failed_test].get("message")
-
-                    if check_types and not any(
-                        check_type in context_name for check_type in check_types
-                    ):
+                    known_fail_reason = test_is_known_fail(
+                        failed_test, test_log, log_file
+                    )
+                    if known_fail_reason is not False:
                         log_file.write(
-                            f"Test {context_name} {failed_test} is only known to be broken for check types {check_types}\n"
+                            f"Test {failed_test} is known to fail: {known_fail_reason}\n"
                         )
-                        mark_as_broken = False
-                    elif not fail_message:
-                        log_file.write("No fail message specified, marking as broken\n")
-                        mark_as_broken = True
-                    else:
-                        log_file.write(f"Looking for fail message: {fail_message}\n")
-                        mark_as_broken = False
-                        for log_path in get_log_paths(failed_test):
-                            if log_path.endswith(".log"):
-                                log_file.write(f"Checking log file: {log_path}\n")
-                                fail_logs = extract_fail_logs(log_path).get(
-                                    failed_test.split("::")[-1]
-                                )
-                                if fail_logs and fail_message in fail_logs:
-                                    log_file.write("Found fail message in logs\n")
-                                    mark_as_broken = True
-                                    break
-
-                    if mark_as_broken:
-                        log_file.write(f"Moving test to BROKEN state\n")
                         counters[fail_status].remove(failed_test)
                         counters["BROKEN"].append(failed_test)
                     else:
-                        log_file.write("Test not marked as broken\n")
+                        log_file.write(f"Test {failed_test} is not known to fail\n")
 
             for status, tests in counters.items():
                 log_file.write(f"Total tests in {status} state: {len(tests)}\n")
@@ -796,7 +875,7 @@ class ClickhouseIntegrationTestsRunner:
         }  # type: Dict
         tests_times = defaultdict(float)  # type: Dict
         tests_log_paths = defaultdict(list)
-        known_broken_tests = self._get_broken_tests_list(self.repo_path)
+        known_broken_tests = self._get_broken_tests_rules(self.repo_path)
         id_counter = 0
         for test_to_run in tests_to_run:
             tries_num = 1 if should_fail else FLAKY_TRIES_COUNT
@@ -1234,7 +1313,7 @@ class ClickhouseIntegrationTestsRunner:
         tests_times = defaultdict(float)
         tests_log_paths = defaultdict(list)
         items_to_run = list(grouped_tests.items())
-        known_broken_tests = self._get_broken_tests_list(self.repo_path)
+        known_broken_tests = self._get_broken_tests_rules(self.repo_path)
         logging.info("Total test groups %s", len(items_to_run))
         if self.shuffle_test_groups():
             logging.info("Shuffling test groups")

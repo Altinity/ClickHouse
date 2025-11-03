@@ -8,6 +8,7 @@ from datetime import datetime
 from functools import lru_cache
 from glob import glob
 import urllib.parse
+import re
 
 import pandas as pd
 from jinja2 import Environment, FileSystemLoader
@@ -15,6 +16,8 @@ import requests
 from clickhouse_driver import Client
 import boto3
 from botocore.exceptions import NoCredentialsError
+import yaml
+
 
 DATABASE_HOST_VAR = "CHECKS_DATABASE_HOST"
 DATABASE_USER_VAR = "CLICKHOUSE_TEST_STAT_LOGIN"
@@ -166,6 +169,59 @@ def get_checks_fails(client: Client, commit_sha: str, branch_name: str):
     return client.query_dataframe(query)
 
 
+def get_broken_tests_rules(broken_tests_file_path):
+    with open(broken_tests_file_path, "r", encoding="utf-8") as broken_tests_file:
+        broken_tests = yaml.safe_load(broken_tests_file)
+
+    compiled_rules = {"exact": {}, "pattern": {}}
+
+    for test in broken_tests:
+        regex = test.get("regex") is True
+        rule = {
+            "reason": test["reason"],
+        }
+
+        if test.get("check_types"):
+            rule["check_types"] = test["check_types"]
+
+        if regex:
+            rule["regex"] = True
+            compiled_rules["pattern"][re.compile(test["name"])] = rule
+        else:
+            compiled_rules["exact"][test["name"]] = rule
+
+    return compiled_rules
+
+
+def get_known_fail_reason(test_name: str, check_name: str, known_fails: dict):
+    """
+    Returns the reason why a test is known to fail based on its name and build context.
+
+    - Exact-name rules are checked first.
+    - Pattern-name rules are checked next (first match wins).
+    - Message/not_message conditions are ignored.
+    """
+    # 1. Exact-name rules
+    rule_data = known_fails["exact"].get(test_name)
+    if rule_data:
+        check_types = rule_data.get("check_types", [])
+        if not check_types or any(
+            check_type in check_name for check_type in check_types
+        ):
+            return rule_data["reason"]
+
+    # 2. Pattern-name rules
+    for name_re, rule_data in known_fails["pattern"].items():
+        if name_re.fullmatch(test_name):
+            check_types = rule_data.get("check_types", [])
+            if not check_types or any(
+                check_type in check_name for check_type in check_types
+            ):
+                return rule_data["reason"]
+
+    return "No reason given"
+
+
 def get_checks_known_fails(
     client: Client, commit_sha: str, branch_name: str, known_fails: dict
 ):
@@ -189,19 +245,22 @@ def get_checks_known_fails(
             GROUP BY check_name, test_name, report_url, task_url
         )
         WHERE test_status='BROKEN'
-        AND test_name IN ({','.join(f"'{test}'" for test in known_fails.keys())})
         ORDER BY job_name, test_name
         """
 
     df = client.query_dataframe(query)
 
+    if df.shape[0] == 0:
+        return df
+
     df.insert(
         len(df.columns) - 1,
         "reason",
-        df["test_name"]
-        .astype(str)
-        .apply(
-            lambda test_name: known_fails[test_name].get("reason", "No reason given")
+        df.apply(
+            lambda row: get_known_fail_reason(
+                row["test_name"], row["job_name"], known_fails
+            ),
+            axis=1,
         ),
     )
 
@@ -654,7 +713,7 @@ def create_workflow_report(
     pr_number: int = None,
     commit_sha: str = None,
     no_upload: bool = False,
-    known_fails: str = None,
+    known_fails_file_path: str = None,
     check_cves: bool = False,
     mark_preview: bool = False,
 ) -> str:
@@ -710,15 +769,12 @@ def create_workflow_report(
     # This might occur when run in preview mode.
     cves_not_checked = not check_cves or fail_results["docker_images_cves"] is ...
 
-    if known_fails:
-        if not os.path.exists(known_fails):
-            print(f"Known fails file {known_fails} not found.")
-            exit(1)
+    if known_fails_file_path:
+        if not os.path.exists(known_fails_file_path):
+            print(f"WARNING:Known fails file {known_fails_file_path} not found.")
+        else:
+            known_fails = get_broken_tests_rules(known_fails_file_path)
 
-        with open(known_fails) as f:
-            known_fails = json.load(f)
-
-        if known_fails:
             fail_results["checks_known_fails"] = get_checks_known_fails(
                 db_client, commit_sha, branch_name, known_fails
             )
