@@ -291,7 +291,7 @@ def get_creation_expression(
         if run_on_cluster:
             assert table_function
             return f"""
-                iceberg{engine_part}Cluster('cluster_single_node', {storage_arg}, path = '/iceberg_data/default/{table_name}/', format={format})
+                iceberg{engine_part}Cluster('cluster_simple', {storage_arg}, path = '/iceberg_data/default/{table_name}/', format={format})
             """
         else:
             if table_function:
@@ -477,6 +477,17 @@ def default_upload_directory(
         raise Exception(f"Unknown iceberg storage type: {storage_type}")
 
 
+def additional_upload_directory(
+    started_cluster, node, storage_type, local_path, remote_path, **kwargs
+):
+    if storage_type == "local":
+        return LocalUploader(started_cluster.instances[node]).upload_directory(
+            local_path, remote_path, **kwargs
+        )
+    else:
+        raise Exception(f"Unknown iceberg storage type for additional uploading: {storage_type}")
+
+
 def default_download_directory(
     started_cluster, storage_type, remote_path, local_path, **kwargs
 ):
@@ -499,6 +510,7 @@ def execute_spark_query_general(
         f"/iceberg_data/default/{table_name}/",
     )
     return
+
 
 def get_last_snapshot(path_to_table):
     import json
