@@ -22,7 +22,6 @@ void ExportPartitionTaskScheduler::run()
 
     for (const auto & [key, entry] : storage.export_merge_tree_partition_task_entries)
     {
-
         const auto & manifest = entry.manifest;
         const auto & database = storage.getContext()->resolveDatabase(manifest.destination_database);
         const auto & table = manifest.destination_table;
@@ -112,11 +111,13 @@ void ExportPartitionTaskScheduler::run()
             {
                 tryLogCurrentException(__PRETTY_FUNCTION__);
                 zk->tryRemove(fs::path(storage.zookeeper_path) / "exports" / key / "locks" / zk_part_name);
-                /// todo arthur re-schedule this so we can try later
                 /// we should not increment retry_count because the node might just be full
             }
         }
     }
+
+    /// maybe we failed to schedule or failed to export, need to retry eventually
+    storage.export_merge_tree_partition_select_task->scheduleAfter(1000 * 5);
 }
 
 void ExportPartitionTaskScheduler::handlePartExportCompletion(
@@ -137,7 +138,7 @@ void ExportPartitionTaskScheduler::handlePartExportCompletion(
     }
     else
     {
-        handlePartExportFailure(processing_parts_path, processed_part_path, part_name, export_path, zk, result.exception);
+        handlePartExportFailure(processing_parts_path, part_name, export_path, zk, result.exception, manifest.max_retries);
     }
 }
 
@@ -182,7 +183,6 @@ void ExportPartitionTaskScheduler::handlePartExportSuccess(
         // Remove children before parent (order matters for multi operations)
         // Maybe a ls + multi rm..
         requests.emplace_back(zkutil::makeRemoveRequest(processing_parts_path / part_name / "retry_count", -1));
-        requests.emplace_back(zkutil::makeRemoveRequest(processing_parts_path / part_name / "max_retry", -1));
         requests.emplace_back(zkutil::makeRemoveRequest(processing_parts_path / part_name / "status", -1));
         requests.emplace_back(zkutil::makeRemoveRequest(processing_parts_path / part_name, -1));
     }
@@ -223,14 +223,29 @@ void ExportPartitionTaskScheduler::handlePartExportSuccess(
 
 void ExportPartitionTaskScheduler::handlePartExportFailure(
     const std::filesystem::path & processing_parts_path,
-    const std::filesystem::path & processed_part_path,
     const std::string & part_name,
     const std::filesystem::path & export_path,
     const zkutil::ZooKeeperPtr & zk,
-    const String & exception
+    const String & exception,
+    size_t max_retries
 )
 {
     tryLogCurrentException(__PRETTY_FUNCTION__);
+
+    Coordination::Stat locked_by_stat;
+    std::string locked_by;
+
+    if (!zk->tryGet(export_path / "locks" / part_name, locked_by, &locked_by_stat))
+    {
+        LOG_INFO(storage.log, "ExportPartition: Part {} is not locked by any replica, will not increment error counts", part_name);
+        return;
+    }
+
+    if (locked_by != storage.replica_name)
+    {
+        LOG_INFO(storage.log, "ExportPartition: Part {} is locked by another replica, will not increment error counts", part_name);
+        return;
+    }
 
     Coordination::Requests ops;
 
@@ -240,21 +255,17 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
     {
         std::size_t retry_count = std::stoull(retry_count_string.c_str()) + 1;
 
-
         ops.emplace_back(zkutil::makeSetRequest(processing_part_path / "retry_count", std::to_string(retry_count), -1));
-        ops.emplace_back(zkutil::makeRemoveRequest(export_path / "locks" / part_name, -1));
+        ops.emplace_back(zkutil::makeRemoveRequest(export_path / "locks" / part_name, locked_by_stat.version));
 
-        if (retry_count >= 3)
+        if (retry_count >= max_retries)
         {
-            /// remove from processing and create in processed with status FAILED
-
-            ops.emplace_back(zkutil::makeRemoveRequest(processing_parts_path / part_name, -1));
-            ops.emplace_back(zkutil::makeCreateRequest(processed_part_path, "", zkutil::CreateMode::Persistent));
-            ops.emplace_back(zkutil::makeCreateRequest(processed_part_path / "status", "FAILED", zkutil::CreateMode::Persistent));
-            ops.emplace_back(zkutil::makeCreateRequest(processed_part_path / "finished_by", storage.replica_name, zkutil::CreateMode::Persistent));
+            /// just set status in processing_part_path and finished_by
+            ops.emplace_back(zkutil::makeSetRequest(processing_part_path / "status", "FAILED", -1));
+            ops.emplace_back(zkutil::makeCreateRequest(processing_part_path / "finished_by", storage.replica_name, zkutil::CreateMode::Persistent));
             ops.emplace_back(zkutil::makeSetRequest(export_path / "status", "FAILED", -1));
 
-            LOG_INFO(storage.log, "ExportPartition: Marked part export {} as failed", part_name);
+            LOG_INFO(storage.log, "ExportPartition: Retry count limit exceeded for part {}, will try to fail the entire task", part_name);
         }
 
         std::size_t num_exceptions = 0;

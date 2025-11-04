@@ -41,11 +41,11 @@ private:
 
     void handlePartExportFailure(
         const std::filesystem::path & processing_parts_path,
-        const std::filesystem::path & processed_part_path,
         const std::string & part_name,
         const std::filesystem::path & export_path,
         const zkutil::ZooKeeperPtr & zk,
-        const String & exception);
+        const String & exception,
+        size_t max_retries);
 };
 
 }

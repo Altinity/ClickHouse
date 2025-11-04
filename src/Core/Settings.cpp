@@ -6877,6 +6877,9 @@ Overwrite file if it already exists when exporting a merge tree part
     DECLARE(Bool, export_merge_tree_partition_force_export, false, R"(
 Ignore existing partition export and overwrite the zookeeper entry
 )", 0) \
+    DECLARE(UInt64, export_merge_tree_partition_max_retries, 3, R"(
+Maximum number of retries for exporting a merge tree part in an export partition task
+)", 0) \
     \
     /* ####################################################### */ \
     /* ########### START OF EXPERIMENTAL FEATURES ############ */ \
