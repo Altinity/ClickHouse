@@ -110,16 +110,6 @@ extern const SettingsBool allow_experimental_insert_into_iceberg;
 extern const SettingsBool allow_experimental_iceberg_compaction;
 }
 
-namespace
-{
-String dumpMetadataObjectToString(const Poco::JSON::Object::Ptr & metadata_object)
-{
-    std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-    Poco::JSON::Stringifier::stringify(metadata_object, oss);
-    return removeEscapedSlashes(oss.str());
-}
-}
-
 
 using namespace Iceberg;
 
@@ -245,7 +235,7 @@ bool IcebergMetadata::update(const ContextPtr & local_context)
 
     insertRowToLogTable(
         local_context,
-        dumpMetadataObjectToString(metadata_object),
+        metadata_object,
         DB::IcebergMetadataLogLevel::Metadata,
         configuration_ptr->getRawPath().path,
         metadata_file_path,
@@ -775,7 +765,7 @@ DataLakeMetadataPtr IcebergMetadata::create(
 
     insertRowToLogTable(
         local_context,
-        dumpMetadataObjectToString(object),
+        object,
         DB::IcebergMetadataLogLevel::Metadata,
         configuration_ptr->getRawPath().path,
         metadata_file_path,

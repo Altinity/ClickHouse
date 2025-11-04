@@ -30,11 +30,13 @@
 #include <Common/logger_useful.h>
 #include <Common/MultiVersion.h>
 #include <Common/Macros.h>
+#include <Common/ElapsedTimeProfileEventIncrement.h>
 
 
 namespace ProfileEvents
 {
     extern const Event S3ListObjects;
+    extern const Event S3ListObjectsMicroseconds;
     extern const Event DiskS3DeleteObjects;
     extern const Event DiskS3ListObjects;
 }
@@ -136,6 +138,7 @@ private:
     {
         ProfileEvents::increment(ProfileEvents::S3ListObjects);
         ProfileEvents::increment(ProfileEvents::DiskS3ListObjects);
+        ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::S3ListObjectsMicroseconds);
 
         auto outcome = client->ListObjectsV2(*request);
 
@@ -263,6 +266,7 @@ void S3ObjectStorage::listObjects(const std::string & path, RelativePathsWithMet
     {
         ProfileEvents::increment(ProfileEvents::S3ListObjects);
         ProfileEvents::increment(ProfileEvents::DiskS3ListObjects);
+        ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::S3ListObjectsMicroseconds);
 
         outcome = client.get()->ListObjectsV2(request);
         throwIfError(outcome);

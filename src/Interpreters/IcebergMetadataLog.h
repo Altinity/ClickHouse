@@ -2,6 +2,7 @@
 
 #include <Interpreters/SystemLog.h>
 #include <Storages/ColumnsDescription.h>
+#include <Poco/JSON/Object.h>
 
 namespace DB
 {
@@ -26,6 +27,14 @@ struct IcebergMetadataLogElement
 void insertRowToLogTable(
     const ContextPtr & local_context,
     String row,
+    IcebergMetadataLogLevel row_log_level,
+    const String & table_path,
+    const String & file_path,
+    std::optional<UInt64> row_in_file);
+
+void insertRowToLogTable(
+    const ContextPtr & local_context,
+    const Poco::JSON::Object::Ptr metadata_object,
     IcebergMetadataLogLevel row_log_level,
     const String & table_path,
     const String & file_path,

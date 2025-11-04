@@ -20,6 +20,7 @@
 #include <Processors/QueryPlan/ReadFromSystemNumbersStep.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeConfiguration.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergWrites.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/SelectQueryInfo.h>
 #include <base/Decimal.h>
@@ -104,6 +105,39 @@ void insertRowToLogTable(
             .table_path = table_path,
             .file_path = file_path,
             .metadata_content = row,
+            .row_in_file = row_in_file});
+}
+
+String dumpMetadataObjectToString(const Poco::JSON::Object::Ptr & metadata_object)
+{
+    std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+    Poco::JSON::Stringifier::stringify(metadata_object, oss);
+    return removeEscapedSlashes(oss.str());
+}
+
+void insertRowToLogTable(
+    const ContextPtr & local_context,
+    const Poco::JSON::Object::Ptr metadata_object,
+    IcebergMetadataLogLevel row_log_level,
+    const String & table_path,
+    const String & file_path,
+    std::optional<UInt64> row_in_file)
+{
+    IcebergMetadataLogLevel set_log_level = local_context->getSettingsRef()[Setting::iceberg_metadata_log_level].value;
+    if (set_log_level < row_log_level)
+        return;
+    timespec spec{};
+    if (clock_gettime(CLOCK_REALTIME, &spec))
+        throw ErrnoException(ErrorCodes::CANNOT_CLOCK_GETTIME, "Cannot clock_gettime");
+
+    Context::getGlobalContextInstance()->getIcebergMetadataLog()->add(
+        DB::IcebergMetadataLogElement{
+            .current_time = spec.tv_sec,
+            .query_id = local_context->getCurrentQueryId(),
+            .content_type = row_log_level,
+            .table_path = table_path,
+            .file_path = file_path,
+            .metadata_content = dumpMetadataObjectToString(metadata_object),
             .row_in_file = row_in_file});
 }
 }
