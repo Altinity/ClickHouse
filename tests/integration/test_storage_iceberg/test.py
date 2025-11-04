@@ -1242,6 +1242,7 @@ def test_partition_pruning(started_cluster, storage_type, run_on_cluster):
             storage_type,
             TABLE_NAME,
             query,
+            additional_nodes=["node2", "node3"] if storage_type=="local" else [],
         )
 
     execute_spark_query(
@@ -2078,6 +2079,7 @@ def test_minmax_pruning_with_null(started_cluster, storage_type, run_on_cluster)
             storage_type,
             TABLE_NAME,
             query,
+            additional_nodes=["node2", "node3"] if storage_type=="local" else [],
         )
 
     execute_spark_query(

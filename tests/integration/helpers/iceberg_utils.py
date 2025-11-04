@@ -500,7 +500,7 @@ def default_download_directory(
 
         
 def execute_spark_query_general(
-    spark, started_cluster, storage_type: str, table_name: str, query: str
+    spark, started_cluster, storage_type: str, table_name: str, query: str, additional_nodes=[]
 ):
     spark.sql(query)
     default_upload_directory(
@@ -509,6 +509,14 @@ def execute_spark_query_general(
         f"/iceberg_data/default/{table_name}/",
         f"/iceberg_data/default/{table_name}/",
     )
+    for node in additional_nodes:
+        additional_upload_directory(
+            started_cluster,
+            node,
+            storage_type,
+            f"/iceberg_data/default/{table_name}/",
+            f"/iceberg_data/default/{table_name}/",
+        )
     return
 
 
