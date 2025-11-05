@@ -4,7 +4,6 @@
 namespace DB
 {
 
-// Test fixture that uses the shared container definition
 class ExportPartitionOrderingTest : public ::testing::Test
 {
 protected:
@@ -21,7 +20,6 @@ protected:
 
 TEST_F(ExportPartitionOrderingTest, IterationOrderMatchesCreateTime)
 {
-    // Create entries with different create_times (in reverse order)
     time_t base_time = 1000;
     
     ExportReplicatedMergeTreePartitionManifest manifest1;

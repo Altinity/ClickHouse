@@ -65,23 +65,51 @@ def test_restart_nodes_during_export(cluster):
     create_tables_and_insert_data(node2, mt_table, s3_table, "replica2")
     create_s3_table(watcher_node, s3_table)
 
-    # Add network delays so we can kill the node during the export
+    # Block S3/MinIO requests to keep exports alive via retry mechanism
+    # This allows ZooKeeper operations to proceed quickly
+    minio_ip = cluster.minio_ip
+    minio_port = cluster.minio_port
+
     with PartitionManager() as pm:
-        pm.add_network_delay(node, delay_ms=5000)
+        # Block responses from MinIO (source_port matches MinIO service)
+        pm_rule_reject_responses_node1 = {
+            "destination": node.ip_address,
+            "source_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm._add_rule(pm_rule_reject_responses_node1)
+
+        pm_rule_reject_responses_node2 = {
+            "destination": node2.ip_address,
+            "source_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm._add_rule(pm_rule_reject_responses_node2)
+
+        # Block requests to MinIO (destination: MinIO, destination_port: minio_port)
+        pm_rule_reject_requests = {
+            "destination": minio_ip,
+            "destination_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm._add_rule(pm_rule_reject_requests)
         
         export_queries = f"""
             ALTER TABLE {mt_table}
             EXPORT PARTITION ID '2020' TO TABLE {s3_table}
-            SETTINGS allow_experimental_export_merge_tree_part=1;
+            SETTINGS allow_experimental_export_merge_tree_part=1, export_merge_tree_partition_max_retries = 50;
             ALTER TABLE {mt_table}
             EXPORT PARTITION ID '2021' TO TABLE {s3_table}
-            SETTINGS allow_experimental_export_merge_tree_part=1;
+            SETTINGS allow_experimental_export_merge_tree_part=1, export_merge_tree_partition_max_retries = 50;
         """
 
         node.query(export_queries)
-    
-    node.stop_clickhouse(kill=True)
-    node2.stop_clickhouse(kill=True)
+
+        # wait for the exports to start
+        time.sleep(3)
+
+        node.stop_clickhouse(kill=True)
+        node2.stop_clickhouse(kill=True)
 
     assert watcher_node.query(f"SELECT count() FROM {s3_table} where year = 2020") == '0\n', "Partition 2020 was written to S3 during network delay crash"
 
@@ -109,22 +137,42 @@ def test_kill_export(cluster):
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
     create_tables_and_insert_data(node2, mt_table, s3_table, "replica2")
 
+    # Block S3/MinIO requests to keep exports alive via retry mechanism
+    # This allows ZooKeeper operations (KILL) to proceed quickly
+    minio_ip = cluster.minio_ip
+    minio_port = cluster.minio_port
+
     with PartitionManager() as pm:
-        pm.add_network_delay(node, delay_ms=5000)
+        # Block responses from MinIO (source_port matches MinIO service)
+        pm_rule_reject_responses = {
+            "destination": node.ip_address,
+            "source_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm._add_rule(pm_rule_reject_responses)
+
+        # Block requests to MinIO (destination: MinIO, destination_port: minio_port)
+        pm_rule_reject_requests = {
+            "destination": minio_ip,
+            "destination_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm._add_rule(pm_rule_reject_requests)
         
         export_queries = f"""
             ALTER TABLE {mt_table}
             EXPORT PARTITION ID '2020' TO TABLE {s3_table}
-            SETTINGS allow_experimental_export_merge_tree_part=1;
+            SETTINGS allow_experimental_export_merge_tree_part=1, export_merge_tree_partition_max_retries = 50;
             ALTER TABLE {mt_table}
             EXPORT PARTITION ID '2021' TO TABLE {s3_table}
-            SETTINGS allow_experimental_export_merge_tree_part=1;
+            SETTINGS allow_experimental_export_merge_tree_part=1, export_merge_tree_partition_max_retries = 50;
         """
 
         node.query(export_queries)
     
-    # kill only 2020, 2021 should still finish
-    node.query(f"KILL EXPORT PARTITION WHERE partition_id = '2020'")
+        # Kill only 2020 while S3 is blocked - retry mechanism keeps exports alive
+        # ZooKeeper operations (KILL) proceed quickly since only S3 is blocked
+        node.query(f"KILL EXPORT PARTITION WHERE partition_id = '2020'")
 
     # wait for 2021 to finish
     time.sleep(5)
@@ -160,10 +208,10 @@ def test_drop_table_during_export(cluster):
 
         node.query(export_queries)
 
-    # I think this will actually wait until background operations are finished
-    node.query(f"DROP TABLE {mt_table} SYNC")
-    # this will not wait, but the pointer the background task holds is still valid, so the write will finish
-    node.query(f"DROP TABLE {s3_table}")
+        # I think this will actually wait until background operations are finished
+        node.query(f"DROP TABLE {mt_table} SYNC")
+        # this will not wait, but the pointer the background task holds is still valid, so the write will finish
+        node.query(f"DROP TABLE {s3_table}")
 
     time.sleep(5)
 
@@ -181,19 +229,40 @@ def test_kill_export_by_table(cluster):
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
     create_tables_and_insert_data(node, alt_mt_table, alt_s3_table, "replica1")
 
-    # Slow down network so we can issue KILL mid-flight
+    # Block S3/MinIO requests to keep exports alive via retry mechanism
+    # This allows ZooKeeper operations (KILL) to proceed quickly
+    minio_ip = cluster.minio_ip
+    minio_port = cluster.minio_port
+
     with PartitionManager() as pm:
-        pm.add_network_delay(node, delay_ms=5000)
+        # Block responses from MinIO (source_port matches MinIO service)
+        pm_rule_reject_responses = {
+            "destination": node.ip_address,
+            "source_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm._add_rule(pm_rule_reject_responses)
+
+        # Block requests to MinIO (destination: MinIO, destination_port: minio_port)
+        pm_rule_reject_requests = {
+            "destination": minio_ip,
+            "destination_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm._add_rule(pm_rule_reject_requests)
 
         # Start two exports for the same table and one export for another table concurrently
         node.query(
-            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS allow_experimental_export_merge_tree_part=1;
-            ALTER TABLE {mt_table} EXPORT PARTITION ID '2021' TO TABLE {s3_table} SETTINGS allow_experimental_export_merge_tree_part=1;
-            ALTER TABLE {alt_mt_table} EXPORT PARTITION ID '2020' TO TABLE {alt_s3_table} SETTINGS allow_experimental_export_merge_tree_part=1;"
+            f"""
+            ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS allow_experimental_export_merge_tree_part=1, export_merge_tree_partition_max_retries = 50;
+            ALTER TABLE {mt_table} EXPORT PARTITION ID '2021' TO TABLE {s3_table} SETTINGS allow_experimental_export_merge_tree_part=1, export_merge_tree_partition_max_retries = 50;
+            ALTER TABLE {alt_mt_table} EXPORT PARTITION ID '2020' TO TABLE {alt_s3_table} SETTINGS allow_experimental_export_merge_tree_part=1, export_merge_tree_partition_max_retries = 50;
+            """
         )
 
-    # Kill all exports for the first table only
-    node.query(f"KILL EXPORT PARTITION WHERE source_table = '{mt_table}'")
+        # Kill all exports for the first table only while S3 is blocked
+        # Retry mechanism keeps exports alive, ZooKeeper operations proceed quickly
+        node.query(f"KILL EXPORT PARTITION WHERE source_table = '{mt_table}'")
 
     # Give some time for effects to propagate
     time.sleep(5)

@@ -194,6 +194,7 @@ namespace Setting
     extern const SettingsBool allow_experimental_export_merge_tree_part;
     extern const SettingsBool export_merge_tree_partition_force_export;
     extern const SettingsUInt64 export_merge_tree_partition_max_retries;
+    extern const SettingsUInt64 export_merge_tree_partition_manifest_ttl;
 }
 
 namespace MergeTreeSetting
@@ -8128,6 +8129,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     manifest.parts = part_names;
     manifest.create_time = time(nullptr);
     manifest.max_retries = query_context->getSettingsRef()[Setting::export_merge_tree_partition_max_retries];
+    manifest.ttl_seconds = query_context->getSettingsRef()[Setting::export_merge_tree_partition_manifest_ttl];
 
     ops.emplace_back(zkutil::makeCreateRequest(
         fs::path(partition_exports_path) / "metadata.json", 

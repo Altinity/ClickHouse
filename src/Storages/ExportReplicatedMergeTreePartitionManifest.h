@@ -20,6 +20,7 @@ struct ExportReplicatedMergeTreePartitionManifest
     std::vector<String> parts;
     time_t create_time;
     size_t max_retries;
+    size_t ttl_seconds;
 
     std::string toJsonString() const
     {
@@ -38,6 +39,7 @@ struct ExportReplicatedMergeTreePartitionManifest
         
         json.set("create_time", create_time);
         json.set("max_retries", max_retries);
+        json.set("ttl_seconds", ttl_seconds);
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
         Poco::JSON::Stringifier::stringify(json, oss);
@@ -63,6 +65,7 @@ struct ExportReplicatedMergeTreePartitionManifest
             manifest.parts.push_back(parts_array->getElement<String>(static_cast<unsigned int>(i)));
         
         manifest.create_time = json->getValue<time_t>("create_time");
+        manifest.ttl_seconds = json->getValue<size_t>("ttl_seconds");
         return manifest;
     }
 };

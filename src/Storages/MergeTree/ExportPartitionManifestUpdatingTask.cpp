@@ -55,6 +55,35 @@ table_path/
     This is the overall idea, but please read the code to get a better understanding
 */
 
+struct CleanupLockRAII
+{
+    CleanupLockRAII(const zkutil::ZooKeeperPtr & zk_, const std::string & cleanup_lock_path_, const std::string & replica_name_, const LoggerPtr & log_)
+    : cleanup_lock_path(cleanup_lock_path_), zk(zk_), replica_name(replica_name_), log(log_)
+    {
+        is_locked = zk->tryCreate(cleanup_lock_path, replica_name, ::zkutil::CreateMode::Ephemeral) == Coordination::Error::ZOK;
+
+        if (is_locked)
+        {
+            LOG_INFO(log, "ExportPartition Manifest Updating Task: Cleanup lock acquired, will remove stale entries");
+        }
+    }
+
+    ~CleanupLockRAII()
+    {
+        if (is_locked)
+        {
+            LOG_INFO(log, "ExportPartition Manifest Updating Task: Releasing cleanup lock");
+            zk->tryRemove(cleanup_lock_path);
+        }
+    }
+
+    bool is_locked;
+    std::string cleanup_lock_path;
+    zkutil::ZooKeeperPtr zk;
+    std::string replica_name;
+    LoggerPtr log;
+};
+
 ExportPartitionManifestUpdatingTask::ExportPartitionManifestUpdatingTask(StorageReplicatedMergeTree & storage_)
     : storage(storage_)
 {
@@ -69,12 +98,7 @@ void ExportPartitionManifestUpdatingTask::run()
     const std::string exports_path = fs::path(storage.zookeeper_path) / "exports";
     const std::string cleanup_lock_path = fs::path(storage.zookeeper_path) / "exports_cleanup_lock";
 
-    bool cleanup_lock_acquired = zk->tryCreate(cleanup_lock_path, "", ::zkutil::CreateMode::Ephemeral) == Coordination::Error::ZOK;
-
-    if (cleanup_lock_acquired)
-    {
-        LOG_INFO(storage.log, "ExportPartition: Cleanup lock acquired, will remove stale entries");
-    }
+    CleanupLockRAII cleanup_lock(zk, cleanup_lock_path, storage.replica_name, storage.log.load());
 
     Coordination::Stat stat;
     const auto children = zk->getChildrenWatch(exports_path, &stat, storage.export_merge_tree_partition_watch_callback);
@@ -92,7 +116,7 @@ void ExportPartitionManifestUpdatingTask::run()
         std::string metadata_json;
         if (!zk->tryGet(fs::path(entry_path) / "metadata.json", metadata_json))
         {
-            LOG_INFO(storage.log, "ExportPartition: Skipping {}: missing metadata.json", key);
+            LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Skipping {}: missing metadata.json", key);
             continue;
         }
 
@@ -107,21 +131,21 @@ void ExportPartitionManifestUpdatingTask::run()
             && local_entry->manifest.transaction_id == metadata.transaction_id;
 
         /// If the entry is up to date and we don't have the cleanup lock, early exit, nothing to be done.
-        if (!cleanup_lock_acquired && has_local_entry_and_is_up_to_date)
+        if (!cleanup_lock.is_locked && has_local_entry_and_is_up_to_date)
             continue;
 
         std::string status;
         if (!zk->tryGet(fs::path(entry_path) / "status", status))
         {
-            LOG_INFO(storage.log, "ExportPartition: Skipping {}: missing status", key);
+            LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Skipping {}: missing status", key);
             continue;
         }
 
         bool is_not_pending = status != "PENDING";
 
-        if (cleanup_lock_acquired)
+        if (cleanup_lock.is_locked)
         {
-            bool has_expired = metadata.create_time < now - 180;
+            bool has_expired = metadata.create_time < now - static_cast<time_t>(metadata.ttl_seconds);
 
             if (has_expired && is_not_pending)
             {
@@ -129,36 +153,36 @@ void ExportPartitionManifestUpdatingTask::run()
                 auto it = entries_by_key.find(key);
                 if (it != entries_by_key.end())
                     entries_by_key.erase(it);
-                LOG_INFO(storage.log, "ExportPartition: Removed {}: expired", key);
+                LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Removed {}: expired", key);
                 continue;
             }
         }
 
         if (is_not_pending)
         {
-            LOG_INFO(storage.log, "ExportPartition: Skipping {}: status is not PENDING", key);
+            LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Skipping {}: status is not PENDING", key);
             continue;
         }
 
 
-        if (cleanup_lock_acquired)
+        if (cleanup_lock.is_locked)
         {
             std::vector<std::string> parts_in_processing_or_pending;
             if (Coordination::Error::ZOK != zk->tryGetChildren(fs::path(entry_path) / "processing", parts_in_processing_or_pending))
             {
-                LOG_INFO(storage.log, "ExportPartition: Failed to get parts in processing or pending, skipping");
+                LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Failed to get parts in processing or pending, skipping");
                 continue;
             }
     
             if (parts_in_processing_or_pending.empty())
             {
-                LOG_INFO(storage.log, "ExportPartition: Cleanup found PENDING for {} with all parts exported, try to fix it by committing the export", entry_path);
+                LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Cleanup found PENDING for {} with all parts exported, try to fix it by committing the export", entry_path);
 
                 const auto destination_storage_id = StorageID(QualifiedTableName {metadata.destination_database, metadata.destination_table});
                 const auto destination_storage = DatabaseCatalog::instance().tryGetTable(destination_storage_id, storage.getContext());
                 if (!destination_storage)
                 {
-                    LOG_INFO(storage.log, "ExportPartition: Failed to reconstruct destination storage: {}, skipping", destination_storage_id.getNameForLogs());
+                    LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Failed to reconstruct destination storage: {}, skipping", destination_storage_id.getNameForLogs());
                     continue;
                 }
 
@@ -169,7 +193,7 @@ void ExportPartitionManifestUpdatingTask::run()
 
         if (has_local_entry_and_is_up_to_date)
         {
-            LOG_INFO(storage.log, "ExportPartition: Skipping {}: already exists", key);
+            LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Skipping {}: already exists", key);
             continue;
         }
 
@@ -204,7 +228,7 @@ void ExportPartitionManifestUpdatingTask::run()
         }
 
         const auto & transaction_id = it->manifest.transaction_id;
-        LOG_INFO(storage.log, "ExportPartition: Export task {} was deleted, calling killExportPartition for transaction {}", key, transaction_id);
+        LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Export task {} was deleted, calling killExportPartition for transaction {}", key, transaction_id);
         
         try
         {
@@ -218,7 +242,7 @@ void ExportPartitionManifestUpdatingTask::run()
         it = entries_by_key.erase(it);
     }
 
-    if (cleanup_lock_acquired)
+    if (cleanup_lock.is_locked)
     {
         zk->tryRemove(cleanup_lock_path);
     }
