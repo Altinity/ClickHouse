@@ -363,7 +363,7 @@ Chunk StorageObjectStorageSource::generate()
             for (const auto & constant_column : reader.constant_columns_with_values)
             {
                 chunk.addColumn(constant_column.first,
-                    constant_column.second.name_and_type.type->createColumnConst(
+                    constant_column.second.name_and_type.type->createColumnConstable(
                         chunk.getNumRows(), constant_column.second.value));
             }
 
