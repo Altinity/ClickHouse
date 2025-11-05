@@ -67,7 +67,7 @@ def test_restart_nodes_during_export(cluster):
 
     # Add network delays so we can kill the node during the export
     with PartitionManager() as pm:
-        pm.add_network_delay(node, delay_ms=1000)
+        pm.add_network_delay(node, delay_ms=5000)
         
         export_queries = f"""
             ALTER TABLE {mt_table}
@@ -110,7 +110,7 @@ def test_kill_export(cluster):
     create_tables_and_insert_data(node2, mt_table, s3_table, "replica2")
 
     with PartitionManager() as pm:
-        pm.add_network_delay(node, delay_ms=1000)
+        pm.add_network_delay(node, delay_ms=5000)
         
         export_queries = f"""
             ALTER TABLE {mt_table}
@@ -183,17 +183,13 @@ def test_kill_export_by_table(cluster):
 
     # Slow down network so we can issue KILL mid-flight
     with PartitionManager() as pm:
-        pm.add_network_delay(node, delay_ms=3000)
+        pm.add_network_delay(node, delay_ms=5000)
 
         # Start two exports for the same table and one export for another table concurrently
         node.query(
-            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS allow_experimental_export_merge_tree_part=1;"
-        )
-        node.query(
-            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2021' TO TABLE {s3_table} SETTINGS allow_experimental_export_merge_tree_part=1;"
-        )
-        node.query(
-            f"ALTER TABLE {alt_mt_table} EXPORT PARTITION ID '2020' TO TABLE {alt_s3_table} SETTINGS allow_experimental_export_merge_tree_part=1;"
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS allow_experimental_export_merge_tree_part=1;
+            ALTER TABLE {mt_table} EXPORT PARTITION ID '2021' TO TABLE {s3_table} SETTINGS allow_experimental_export_merge_tree_part=1;
+            ALTER TABLE {alt_mt_table} EXPORT PARTITION ID '2020' TO TABLE {alt_s3_table} SETTINGS allow_experimental_export_merge_tree_part=1;"
         )
 
     # Kill all exports for the first table only
