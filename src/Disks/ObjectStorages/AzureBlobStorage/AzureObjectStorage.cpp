@@ -185,9 +185,12 @@ void AzureObjectStorage::listObjects(const std::string & path, RelativePathsWith
         ProfileEvents::increment(ProfileEvents::AzureListObjects);
         if (client_ptr->IsClientForDisk())
             ProfileEvents::increment(ProfileEvents::DiskAzureListObjects);
-        ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::AzureListObjectsMicroseconds);
 
-        blob_list_response = client_ptr->ListBlobs(options);
+        {
+            ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::AzureListObjectsMicroseconds);
+            blob_list_response = client_ptr->ListBlobs(options);
+        }
+
         const auto & blobs_list = blob_list_response.Blobs;
 
         for (const auto & blob : blobs_list)

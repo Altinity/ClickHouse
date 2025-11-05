@@ -138,9 +138,13 @@ private:
     {
         ProfileEvents::increment(ProfileEvents::S3ListObjects);
         ProfileEvents::increment(ProfileEvents::DiskS3ListObjects);
-        ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::S3ListObjectsMicroseconds);
 
-        auto outcome = client->ListObjectsV2(*request);
+        Aws::S3::Model::ListObjectsV2Outcome outcome;
+
+        {
+            ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::S3ListObjectsMicroseconds);
+            outcome = client->ListObjectsV2(*request);
+        }
 
         /// Outcome failure will be handled on the caller side.
         if (outcome.IsSuccess())
@@ -266,9 +270,12 @@ void S3ObjectStorage::listObjects(const std::string & path, RelativePathsWithMet
     {
         ProfileEvents::increment(ProfileEvents::S3ListObjects);
         ProfileEvents::increment(ProfileEvents::DiskS3ListObjects);
-        ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::S3ListObjectsMicroseconds);
 
-        outcome = client.get()->ListObjectsV2(request);
+        {
+            ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::S3ListObjectsMicroseconds);
+            outcome = client.get()->ListObjectsV2(request);
+        }
+
         throwIfError(outcome);
 
         auto result = outcome.GetResult();
