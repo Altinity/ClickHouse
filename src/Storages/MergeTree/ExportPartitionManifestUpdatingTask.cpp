@@ -84,6 +84,71 @@ struct CleanupLockRAII
     LoggerPtr log;
 };
 
+namespace
+{
+    /*
+        Remove expired entries and fix non-committed exports that have already exported all parts.
+
+        Return values:
+        - true: the cleanup was successful, the entry is removed from the entries_by_key container and the function returns true. Proceed to the next entry.
+        - false: the cleanup was not successful, the entry is not removed from the entries_by_key container and the function returns false.
+    */
+    bool tryCleanup(
+        const zkutil::ZooKeeperPtr & zk,
+        const std::string & entry_path,
+        const LoggerPtr & log,
+        const ContextPtr & context,
+        const std::string & key,
+        const ExportReplicatedMergeTreePartitionManifest & metadata,
+        const time_t now,
+        const bool is_pending,
+        auto & entries_by_key
+    )
+    {
+        bool has_expired = metadata.create_time < now - static_cast<time_t>(metadata.ttl_seconds);
+
+        if (has_expired && !is_pending)
+        {
+            zk->tryRemoveRecursive(fs::path(entry_path));
+            auto it = entries_by_key.find(key);
+            if (it != entries_by_key.end())
+                entries_by_key.erase(it);
+            LOG_INFO(log, "ExportPartition Manifest Updating Task: Removed {}: expired", key);
+
+            return true;
+        }
+        else if (is_pending)
+        {
+            std::vector<std::string> parts_in_processing_or_pending;
+            if (Coordination::Error::ZOK != zk->tryGetChildren(fs::path(entry_path) / "processing", parts_in_processing_or_pending))
+            {
+                LOG_INFO(log, "ExportPartition Manifest Updating Task: Failed to get parts in processing or pending, skipping");
+                return false;
+            }
+
+            if (parts_in_processing_or_pending.empty())
+            {
+                LOG_INFO(log, "ExportPartition Manifest Updating Task: Cleanup found PENDING for {} with all parts exported, try to fix it by committing the export", entry_path);
+    
+                const auto destination_storage_id = StorageID(QualifiedTableName {metadata.destination_database, metadata.destination_table});
+                const auto destination_storage = DatabaseCatalog::instance().tryGetTable(destination_storage_id, context);
+                if (!destination_storage)
+                {
+                    LOG_INFO(log, "ExportPartition Manifest Updating Task: Failed to reconstruct destination storage: {}, skipping", destination_storage_id.getNameForLogs());
+                    return false;
+                }
+
+                /// it sounds like a replica exported the last part, but was not able to commit the export. Try to fix it
+                ExportPartitionUtils::commit(metadata, destination_storage, zk, log, entry_path, context);
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+}
+
 ExportPartitionManifestUpdatingTask::ExportPartitionManifestUpdatingTask(StorageReplicatedMergeTree & storage_)
     : storage(storage_)
 {
@@ -106,6 +171,8 @@ void ExportPartitionManifestUpdatingTask::run()
 
     const auto now = time(nullptr);
 
+    auto & entries_by_key = storage.export_merge_tree_partition_task_entries_by_key;
+
     /// Load new entries
     /// If we have the cleanup lock, also remove stale entries from zk and local
     /// Upload dangling commit files if any
@@ -122,7 +189,6 @@ void ExportPartitionManifestUpdatingTask::run()
 
         const auto metadata = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
 
-        auto & entries_by_key = storage.export_merge_tree_partition_task_entries_by_key;
         const auto local_entry = entries_by_key.find(key);
 
         /// If the zk entry has been replaced with export_merge_tree_partition_force_export, checking only for the export key is not enough
@@ -141,54 +207,30 @@ void ExportPartitionManifestUpdatingTask::run()
             continue;
         }
 
-        bool is_not_pending = status != "PENDING";
+        bool is_pending = status == "PENDING";
 
+        /// if we have the cleanup lock, try to cleanup
+        /// if we successfully cleaned it up, early exit
         if (cleanup_lock.is_locked)
         {
-            bool has_expired = metadata.create_time < now - static_cast<time_t>(metadata.ttl_seconds);
+            bool cleanup_successful = tryCleanup(
+                zk,
+                entry_path,
+                storage.log.load(),
+                storage.getContext(),
+                key,
+                metadata,
+                now,
+                is_pending, entries_by_key);
 
-            if (has_expired && is_not_pending)
-            {
-                zk->tryRemoveRecursive(fs::path(entry_path));
-                auto it = entries_by_key.find(key);
-                if (it != entries_by_key.end())
-                    entries_by_key.erase(it);
-                LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Removed {}: expired", key);
+            if (cleanup_successful)
                 continue;
-            }
         }
 
-        if (is_not_pending)
+        if (!is_pending)
         {
             LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Skipping {}: status is not PENDING", key);
             continue;
-        }
-
-
-        if (cleanup_lock.is_locked)
-        {
-            std::vector<std::string> parts_in_processing_or_pending;
-            if (Coordination::Error::ZOK != zk->tryGetChildren(fs::path(entry_path) / "processing", parts_in_processing_or_pending))
-            {
-                LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Failed to get parts in processing or pending, skipping");
-                continue;
-            }
-    
-            if (parts_in_processing_or_pending.empty())
-            {
-                LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Cleanup found PENDING for {} with all parts exported, try to fix it by committing the export", entry_path);
-
-                const auto destination_storage_id = StorageID(QualifiedTableName {metadata.destination_database, metadata.destination_table});
-                const auto destination_storage = DatabaseCatalog::instance().tryGetTable(destination_storage_id, storage.getContext());
-                if (!destination_storage)
-                {
-                    LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Failed to reconstruct destination storage: {}, skipping", destination_storage_id.getNameForLogs());
-                    continue;
-                }
-
-                /// it sounds like a replica exported the last part, but was not able to commit the export. Try to fix it
-                ExportPartitionUtils::commit(metadata, destination_storage, zk, storage.log.load(), entry_path, storage.getContext());
-            }
         }
 
         if (has_local_entry_and_is_up_to_date)
@@ -197,27 +239,45 @@ void ExportPartitionManifestUpdatingTask::run()
             continue;
         }
 
-        std::vector<DataPartPtr> part_references;
-
-        for (const auto & part_name : metadata.parts)
-        {
-            if (const auto part = storage.getPartIfExists(part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated}))
-            {
-                part_references.push_back(part);
-            }
-        }
-
-        /// Insert or update entry. The multi_index container automatically maintains both indexes.
-        auto entry = ExportReplicatedMergeTreePartitionTaskEntry {metadata, std::move(part_references)};
-        auto it = entries_by_key.find(key);
-        if (it != entries_by_key.end())
-            entries_by_key.replace(it, entry);
-        else
-            entries_by_key.insert(entry);
+        addTask(metadata, key, entries_by_key);
     }
 
     /// Remove entries that were deleted by someone else
-    auto & entries_by_key = storage.export_merge_tree_partition_task_entries_by_key;
+    removeStaleEntries(zk_children, entries_by_key);
+
+    storage.export_merge_tree_partition_select_task->schedule();
+}
+
+void ExportPartitionManifestUpdatingTask::addTask(
+    const ExportReplicatedMergeTreePartitionManifest & metadata,
+    const std::string & key,
+    auto & entries_by_key
+)
+{
+    std::vector<DataPartPtr> part_references;
+
+    for (const auto & part_name : metadata.parts)
+    {
+        if (const auto part = storage.getPartIfExists(part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated}))
+        {
+            part_references.push_back(part);
+        }
+    }
+
+    /// Insert or update entry. The multi_index container automatically maintains both indexes.
+    auto entry = ExportReplicatedMergeTreePartitionTaskEntry {metadata, std::move(part_references)};
+    auto it = entries_by_key.find(key);
+    if (it != entries_by_key.end())
+        entries_by_key.replace(it, entry);
+    else
+        entries_by_key.insert(entry);
+}
+
+void ExportPartitionManifestUpdatingTask::removeStaleEntries(
+    const std::unordered_set<std::string> & zk_children,
+    auto & entries_by_key
+)
+{
     for (auto it = entries_by_key.begin(); it != entries_by_key.end();)
     {
         const auto & key = it->getCompositeKey();
@@ -241,13 +301,6 @@ void ExportPartitionManifestUpdatingTask::run()
 
         it = entries_by_key.erase(it);
     }
-
-    if (cleanup_lock.is_locked)
-    {
-        zk->tryRemove(cleanup_lock_path);
-    }
-
-    storage.export_merge_tree_partition_select_task->schedule();
 }
 
 }
