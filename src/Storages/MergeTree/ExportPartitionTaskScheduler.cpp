@@ -20,9 +20,11 @@ void ExportPartitionTaskScheduler::run()
 
     auto zk = storage.getZooKeeper();
 
-    for (const auto & [key, entry] : storage.export_merge_tree_partition_task_entries)
+    // Iterate sorted by create_time
+    for (const auto & entry : storage.export_merge_tree_partition_task_entries_by_create_time)
     {
         const auto & manifest = entry.manifest;
+        const auto key = entry.getCompositeKey();
         const auto & database = storage.getContext()->resolveDatabase(manifest.destination_database);
         const auto & table = manifest.destination_table;
 

@@ -425,6 +425,8 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
     , merge_strategy_picker(*this)
     , queue(*this, merge_strategy_picker)
     , fetcher(*this)
+    , export_merge_tree_partition_task_entries_by_key(export_merge_tree_partition_task_entries.get<ExportPartitionTaskEntryTagByCompositeKey>())
+    , export_merge_tree_partition_task_entries_by_create_time(export_merge_tree_partition_task_entries.get<ExportPartitionTaskEntryTagByCreateTime>())
     , cleanup_thread(*this)
     , async_block_ids_cache(*this)
     , part_check_thread(*this)
@@ -8080,7 +8082,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     const auto exports_path = fs::path(zookeeper_path) / "exports";
     Coordination::Requests ops;
 
-    const auto export_key = partition_id + "_" + dest_storage_id.getNameForLogs();
+    const auto export_key = partition_id + "_" + dest_storage_id.getQualifiedName().getFullName();
 
     const auto partition_exports_path = fs::path(exports_path) / export_key;
 

@@ -2,6 +2,11 @@
 
 #include <Storages/ExportReplicatedMergeTreePartitionManifest.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
+#include "Core/QualifiedTableName.h"
+#include <boost/multi_index_container.hpp>
+#include <boost/multi_index/hashed_index.hpp>
+#include <boost/multi_index/ordered_index.hpp>
+#include <boost/multi_index/mem_fun.hpp>
 
 namespace DB
 {
@@ -15,6 +20,38 @@ struct ExportReplicatedMergeTreePartitionTaskEntry
     /// It does not mean this replica will export all the parts
     /// There is also a chance this replica does not contain a given part and it is totally ok.
     std::vector<DataPartPtr> part_references;
+
+    std::string getCompositeKey() const
+    {
+        const auto qualified_table_name = QualifiedTableName {manifest.destination_database, manifest.destination_table};
+        return manifest.partition_id + "_" + qualified_table_name.getFullName();
+    }
+
+    /// Get create_time for sorted iteration
+    time_t getCreateTime() const
+    {
+        return manifest.create_time;
+    }
 };
+
+struct ExportPartitionTaskEntryTagByCompositeKey {};
+struct ExportPartitionTaskEntryTagByCreateTime {};
+
+// Multi-index container for export partition task entries
+// - Index 0 (TagByCompositeKey): hashed_unique on composite key for O(1) lookup
+// - Index 1 (TagByCreateTime): ordered_non_unique on create_time for sorted iteration
+using ExportPartitionTaskEntriesContainer = boost::multi_index_container<
+    ExportReplicatedMergeTreePartitionTaskEntry,
+    boost::multi_index::indexed_by<
+        boost::multi_index::hashed_unique<
+            boost::multi_index::tag<ExportPartitionTaskEntryTagByCompositeKey>,
+            boost::multi_index::const_mem_fun<ExportReplicatedMergeTreePartitionTaskEntry, std::string, &ExportReplicatedMergeTreePartitionTaskEntry::getCompositeKey>
+        >,
+        boost::multi_index::ordered_non_unique<
+            boost::multi_index::tag<ExportPartitionTaskEntryTagByCreateTime>,
+            boost::multi_index::const_mem_fun<ExportReplicatedMergeTreePartitionTaskEntry, time_t, &ExportReplicatedMergeTreePartitionTaskEntry::getCreateTime>
+        >
+    >
+>;
 
 }

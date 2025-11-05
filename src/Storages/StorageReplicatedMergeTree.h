@@ -531,8 +531,11 @@ private:
 
     BackgroundSchedulePoolTaskHolder export_merge_tree_partition_select_task;
 
+    ExportPartitionTaskEntriesContainer export_merge_tree_partition_task_entries;
     
-    std::unordered_map<std::string, ExportReplicatedMergeTreePartitionTaskEntry> export_merge_tree_partition_task_entries;
+    // Convenience references to indexes
+    ExportPartitionTaskEntriesContainer::index<ExportPartitionTaskEntryTagByCompositeKey>::type & export_merge_tree_partition_task_entries_by_key;
+    ExportPartitionTaskEntriesContainer::index<ExportPartitionTaskEntryTagByCreateTime>::type & export_merge_tree_partition_task_entries_by_create_time;
     /// A thread that removes old parts, log entries, and blocks.
     ReplicatedMergeTreeCleanupThread cleanup_thread;
 

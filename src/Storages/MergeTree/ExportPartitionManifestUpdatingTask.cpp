@@ -98,12 +98,13 @@ void ExportPartitionManifestUpdatingTask::run()
 
         const auto metadata = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
 
-        const auto local_entry = storage.export_merge_tree_partition_task_entries.find(key);
+        auto & entries_by_key = storage.export_merge_tree_partition_task_entries_by_key;
+        const auto local_entry = entries_by_key.find(key);
 
         /// If the zk entry has been replaced with export_merge_tree_partition_force_export, checking only for the export key is not enough
         /// we need to make sure it is the same transaction id. If it is not, it needs to be replaced.
-        bool has_local_entry_and_is_up_to_date = local_entry != storage.export_merge_tree_partition_task_entries.end()
-            && local_entry->second.manifest.transaction_id == metadata.transaction_id;
+        bool has_local_entry_and_is_up_to_date = local_entry != entries_by_key.end()
+            && local_entry->manifest.transaction_id == metadata.transaction_id;
 
         /// If the entry is up to date and we don't have the cleanup lock, early exit, nothing to be done.
         if (!cleanup_lock_acquired && has_local_entry_and_is_up_to_date)
@@ -125,7 +126,9 @@ void ExportPartitionManifestUpdatingTask::run()
             if (has_expired && is_not_pending)
             {
                 zk->tryRemoveRecursive(fs::path(entry_path));
-                storage.export_merge_tree_partition_task_entries.erase(key);
+                auto it = entries_by_key.find(key);
+                if (it != entries_by_key.end())
+                    entries_by_key.erase(it);
                 LOG_INFO(storage.log, "ExportPartition: Removed {}: expired", key);
                 continue;
             }
@@ -180,45 +183,45 @@ void ExportPartitionManifestUpdatingTask::run()
             }
         }
 
-        /// It is important to use the operator[] because it updates the existing entry if it already exists.
-        storage.export_merge_tree_partition_task_entries[key] = ExportReplicatedMergeTreePartitionTaskEntry {metadata, std::move(part_references)};
+        /// Insert or update entry. The multi_index container automatically maintains both indexes.
+        auto entry = ExportReplicatedMergeTreePartitionTaskEntry {metadata, std::move(part_references)};
+        auto it = entries_by_key.find(key);
+        if (it != entries_by_key.end())
+            entries_by_key.replace(it, entry);
+        else
+            entries_by_key.insert(entry);
     }
 
     /// Remove entries that were deleted by someone else
-    std::erase_if(storage.export_merge_tree_partition_task_entries,
-        [&](auto const & kv)
+    auto & entries_by_key = storage.export_merge_tree_partition_task_entries_by_key;
+    for (auto it = entries_by_key.begin(); it != entries_by_key.end();)
+    {
+        const auto & key = it->getCompositeKey();
+        if (zk_children.contains(key))
         {
-            if (zk_children.contains(kv.first))
-            {
-                return false;
-            }
+            ++it;
+            continue;
+        }
 
-            const auto & transaction_id = kv.second.manifest.transaction_id;
-            LOG_INFO(storage.log, "ExportPartition: Export task {} was deleted, calling killExportPartition for transaction {}", kv.first, transaction_id);
-            
-            try
-            {
-                storage.killExportPart(transaction_id);
-            }
-            catch (...)
-            {
-                tryLogCurrentException(storage.log, __PRETTY_FUNCTION__);
-            }
+        const auto & transaction_id = it->manifest.transaction_id;
+        LOG_INFO(storage.log, "ExportPartition: Export task {} was deleted, calling killExportPartition for transaction {}", key, transaction_id);
+        
+        try
+        {
+            storage.killExportPart(transaction_id);
+        }
+        catch (...)
+        {
+            tryLogCurrentException(storage.log, __PRETTY_FUNCTION__);
+        }
 
-            return true;
-        });
+        it = entries_by_key.erase(it);
+    }
 
     if (cleanup_lock_acquired)
     {
         zk->tryRemove(cleanup_lock_path);
     }
-
-    /// todo arthur remember to sort the entries by create_time
-    // std::sort(storage.export_merge_tree_partition_task_entries.begin(), storage.export_merge_tree_partition_task_entries.end(),
-    //     [](const auto & a, const auto & b)
-    //     {
-    //         return a.second.manifest.create_time < b.second.manifest.create_time;
-    //     });
 
     storage.export_merge_tree_partition_select_task->schedule();
 }
