@@ -995,7 +995,7 @@ public:
 
     virtual void exportPartitionToTable(const PartitionCommand &, ContextPtr)
     {
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "EXPORT PARTITION is not implemented");
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "EXPORT PARTITION is not implemented for engine {}", getName());
     }
 
     /// Checks that Partition could be dropped right now

@@ -49,6 +49,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"allow_experimental_export_merge_tree_part", false, true, "Turned ON by default for Antalya."},
             {"export_merge_tree_partition_force_export", false, false, "New setting."},
             {"export_merge_tree_partition_max_retries", 3, 3, "New setting."},
+            {"export_merge_tree_partition_manifest_ttl", 180, 180, "New setting."},
         });
         addSettingsChanges(settings_changes_history, "25.8",
         {

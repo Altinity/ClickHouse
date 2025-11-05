@@ -8081,7 +8081,6 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     const String partition_id = getPartitionIDFromQuery(command.partition, query_context);
     
     const auto exports_path = fs::path(zookeeper_path) / "exports";
-    Coordination::Requests ops;
 
     const auto export_key = partition_id + "_" + dest_storage_id.getQualifiedName().getFullName();
 
@@ -8090,14 +8089,37 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     /// check if entry already exists
     if (zookeeper->exists(partition_exports_path))
     {
-        if (!query_context->getSettingsRef()[Setting::export_merge_tree_partition_force_export])
+        LOG_INFO(log, "Export with key {} is already exported or it is being exported. Checking if it has expired so that we can overwrite it.", export_key);
+
+        bool has_expired = false;
+
+        if (zookeeper->exists(fs::path(partition_exports_path) / "metadata.json"))
         {
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Partition {} already exported or it is being exported", partition_id);
+            std::string metadata_json;
+            if (zookeeper->tryGet(fs::path(partition_exports_path) / "metadata.json", metadata_json))
+            {
+                const auto manifest = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
+                if (static_cast<time_t>(manifest.create_time + manifest.ttl_seconds) < time(nullptr))
+                {
+                    has_expired = true;
+                }
+            }
         }
 
-        /// The check for existence and entry removal are not atomic, so this actually might fail.
-        ops.emplace_back(zkutil::makeRemoveRecursiveRequest(*zookeeper, partition_exports_path, -1));
+        if (!has_expired && !query_context->getSettingsRef()[Setting::export_merge_tree_partition_force_export])
+        {
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Export with key {} already exported or it is being exported, and it has not expired. Set `export_merge_tree_partition_force_export` to overwrite it.", export_key);
+        }
+
+        LOG_INFO(log, "Overwriting export with key {}", export_key);
+
+        /// Not putting in ops (same transaction) because we can't construct a "tryRemoveRecursive" request.
+        /// It is possible that the zk being used does not support RemoveRecursive requests.
+        /// It is ok for this to be non transactional. Worst case scenario an on-going export is going to be killed and a new task won't be scheduled.
+        zookeeper->tryRemoveRecursive(partition_exports_path);
     }
+
+    Coordination::Requests ops;
 
     ops.emplace_back(zkutil::makeCreateRequest(partition_exports_path, "", zkutil::CreateMode::Persistent));
 
