@@ -510,11 +510,6 @@ class Runner:
             HtmlRunnerHooks.post_run(workflow, job, info_errors)
             workflow_result = Result.from_fs(workflow.name)
 
-            # Altinity workflow report
-            cmd = f"PR_NUMBER={env.PR_NUMBER} ./.github/actions/create_workflow_report/workflow_report_hook.sh"
-            workflow_report_url = Shell.get_output(cmd).splitlines()[-1]
-            print(f"::notice ::Workflow report: {workflow_report_url}")
-
             if job.name == Settings.FINISH_WORKFLOW_JOB_NAME and ci_db:
                 # run after HtmlRunnerHooks.post_run(), when Workflow Result has up-to-date storage_usage data
                 workflow_storage_usage = StorageUsage.from_dict(
@@ -567,6 +562,11 @@ class Runner:
                 print(f"ERROR: Failed to post commit status for the job")
 
         if workflow.enable_report:
+            # Altinity workflow report
+            cmd = f"PR_NUMBER={env.PR_NUMBER} ./.github/actions/create_workflow_report/workflow_report_hook.sh"
+            workflow_report_url = Shell.get_output(cmd).splitlines()[-1]
+            print(f"::notice ::Workflow report: {workflow_report_url}")
+
             # to make it visible in GH Actions annotations
             print(f"::notice ::Job report: {report_url}")
 
