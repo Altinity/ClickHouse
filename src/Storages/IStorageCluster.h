@@ -104,6 +104,7 @@ private:
     String cluster_name;
 
     mutable bool has_join = false;
+    mutable bool has_cross_join = false;
     mutable bool has_local_columns_in_where = false;
 };
 

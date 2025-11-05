@@ -223,7 +223,7 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
     {
     case ObjectStorageClusterJoinMode::LOCAL:
     {
-        if (has_join || has_local_columns_in_where)
+        if (has_join || has_cross_join || has_local_columns_in_where)
         {
             auto modified_query_tree = query_tree->clone();
 
@@ -237,7 +237,7 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
 
             auto & query_node = modified_query_tree->as<QueryNode &>();
 
-            if (has_join)
+            if (has_join || has_cross_join)
             {
                 if (table_function_searcher.getType().value() == QueryTreeNodeType::TABLE_FUNCTION)
                 {
@@ -246,10 +246,19 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
                     auto & table_function_ast = table_function->as<ASTFunction &>();
                     query_tree_distributed->setAlias(table_function_ast.alias);
                 }
-                else
+                else if (has_join)
                 {
                     auto join_node = query_node.getJoinTree();
                     query_tree_distributed = join_node->as<JoinNode>()->getLeftTableExpression()->clone();
+                }
+                else
+                {
+                    SearcherVisitor join_searcher({QueryTreeNodeType::CROSS_JOIN}, context);
+                    join_searcher.visit(modified_query_tree);
+                    auto cross_join_node = join_searcher.getNode();
+                    if (!cross_join_node)
+                        throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find CROSS JOIN node");
+                    query_tree_distributed = cross_join_node->as<CrossJoinNode>()->getTableExpressions()[0]->clone();
                 }
             }
 
@@ -528,10 +537,15 @@ QueryProcessingStage::Enum IStorageCluster::getQueryProcessingStage(
             throw Exception(ErrorCodes::NOT_IMPLEMENTED,
                 "object_storage_cluster_join_mode!='allow' is not supported without allow_experimental_analyzer=true");
 
-        SearcherVisitor join_searcher({QueryTreeNodeType::JOIN}, context);
+        SearcherVisitor join_searcher({QueryTreeNodeType::JOIN, QueryTreeNodeType::CROSS_JOIN}, context);
         join_searcher.visit(query_info.query_tree);
         if (join_searcher.getNode())
-            has_join = true;
+        {
+            if (join_searcher.getType() == QueryTreeNodeType::JOIN)
+                has_join = true;
+            else
+                has_cross_join = true;
+        }
 
         SearcherVisitor table_function_searcher({QueryTreeNodeType::TABLE, QueryTreeNodeType::TABLE_FUNCTION}, context);
         table_function_searcher.visit(query_info.query_tree);
@@ -554,7 +568,7 @@ QueryProcessingStage::Enum IStorageCluster::getQueryProcessingStage(
                 has_local_columns_in_where = true;
         }
 
-        if (has_join || has_local_columns_in_where)
+        if (has_join || has_cross_join || has_local_columns_in_where)
             return QueryProcessingStage::Enum::FetchColumns;
     }
 
