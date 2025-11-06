@@ -232,8 +232,6 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
     size_t max_retries
 )
 {
-    tryLogCurrentException(__PRETTY_FUNCTION__);
-
     Coordination::Stat locked_by_stat;
     std::string locked_by;
 

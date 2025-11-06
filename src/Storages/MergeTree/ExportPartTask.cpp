@@ -10,6 +10,7 @@
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
 #include <Processors/QueryPlan/QueryPlan.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
+#include "Common/Exception.h"
 #include <Common/ProfileEventsScope.h>
 
 namespace ProfileEvents
@@ -86,6 +87,7 @@ bool ExportPartTask::executeStep()
     }
     catch (const Exception & e)
     {
+        tryLogCurrentException(__PRETTY_FUNCTION__);
         if (e.code() == ErrorCodes::FILE_ALREADY_EXISTS)
         {
             ProfileEvents::increment(ProfileEvents::PartsExportDuplicated);
