@@ -31,7 +31,7 @@ class AltinityWorkflowTemplates:
           else
             PREFIX="PRs/$PR_NUMBER/$COMMIT_SHA"
           fi
-          REPORT_LINK=https://s3.amazonaws.com/altinity-build-artifacts/$PREFIX/ci_run_report.html
+          REPORT_LINK=https://s3.amazonaws.com/altinity-build-artifacts/$PREFIX/$GITHUB_RUN_ID/ci_run_report.html
           echo "Workflow Run Report: [View Report]($REPORT_LINK)" >> $GITHUB_STEP_SUMMARY
 """
     # Additional jobs

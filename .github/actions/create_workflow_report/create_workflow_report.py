@@ -122,12 +122,10 @@ def get_pr_info_from_number(pr_number: str) -> dict:
     return response.json()
 
 
-def get_run_details(run_url: str) -> dict:
+def get_run_details(run_id: str) -> dict:
     """
     Fetch run details for a given run URL.
     """
-    run_id = run_url.split("/")[-1]
-
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
@@ -732,7 +730,9 @@ def create_workflow_report(
     if not all([host, user, password, GITHUB_TOKEN]):
         raise Exception("Required environment variables are not set")
 
-    run_details = get_run_details(actions_run_url)
+    run_id = actions_run_url.split("/")[-1]
+
+    run_details = get_run_details(run_id)
     branch_name = run_details.get("head_branch", "unknown branch")
     if pr_number is None or commit_sha is None:
         if pr_number is None:
@@ -821,7 +821,7 @@ def create_workflow_report(
         "s3_bucket": S3_BUCKET,
         "pr_info_html": pr_info_html,
         "pr_number": pr_number,
-        "workflow_id": actions_run_url.split("/")[-1],
+        "workflow_id": run_id,
         "commit_sha": commit_sha,
         "base_sha": "" if pr_number == 0 else pr_info.get("base", {}).get("sha"),
         "date": f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC",
@@ -875,9 +875,11 @@ def create_workflow_report(
         exit(0)
 
     if pr_number == 0:
-        report_destination_key = f"REFs/{branch_name}/{commit_sha}/{report_name}"
+        report_destination_key = f"REFs/{branch_name}/{commit_sha}"
     else:
-        report_destination_key = f"PRs/{pr_number}/{commit_sha}/{report_name}"
+        report_destination_key = f"PRs/{pr_number}/{commit_sha}"
+
+    report_destination_key += f"/{run_id}/{report_name}"
 
     # Upload the report to S3
     s3_client = boto3.client("s3", endpoint_url=os.getenv("S3_URL"))
