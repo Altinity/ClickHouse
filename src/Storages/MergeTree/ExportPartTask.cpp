@@ -168,8 +168,15 @@ bool ExportPartTask::executeStep()
     try
     {
         CompletedPipelineExecutor exec(pipeline);
-        exec.execute();
 
+        auto is_cancelled_callback = [this]()
+        {
+            return storage.parts_mover.moves_blocker.isCancelled();
+        };
+
+        exec.setCancelCallback(is_cancelled_callback, 100);
+
+        exec.execute();
         std::lock_guard inner_lock(storage.export_manifests_mutex);
         storage.writePartLog(
             PartLogElement::Type::EXPORT_PART,
