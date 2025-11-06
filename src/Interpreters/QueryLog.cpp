@@ -103,6 +103,7 @@ ColumnsDescription QueryLogElement::getColumnsDescription()
         {"initial_port", std::make_shared<DataTypeUInt16>(), "The client port that was used to make the parent query."},
         {"initial_query_start_time", std::make_shared<DataTypeDateTime>(), "Initial query starting time (for distributed query execution)."},
         {"initial_query_start_time_microseconds", std::make_shared<DataTypeDateTime64>(6), "Initial query starting time with microseconds precision (for distributed query execution)."},
+        {"authenticated_user", low_cardinality_string, "Name of the user who was authenticated in the session."},
         {"interface", std::make_shared<DataTypeUInt8>(), "Interface that the query was initiated from. Possible values: 1 — TCP, 2 — HTTP."},
         {"is_secure", std::make_shared<DataTypeUInt8>(), "The flag whether a query was executed over a secure interface"},
         {"os_user", low_cardinality_string, "Operating system username who runs clickhouse-client."},
@@ -330,6 +331,8 @@ void QueryLogElement::appendClientInfo(const ClientInfo & client_info, MutableCo
     columns[i++]->insert(client_info.initial_address->port());
     columns[i++]->insert(client_info.initial_query_start_time);
     columns[i++]->insert(client_info.initial_query_start_time_microseconds);
+
+    columns[i++]->insertData(client_info.authenticated_user.data(), client_info.authenticated_user.size());
 
     columns[i++]->insert(static_cast<UInt64>(client_info.interface));
     columns[i++]->insert(static_cast<UInt64>(client_info.is_secure));
