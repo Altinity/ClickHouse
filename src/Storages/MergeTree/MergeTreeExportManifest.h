@@ -13,17 +13,24 @@ struct MergeTreeExportManifest
         const StorageID & destination_storage_id_,
         const DataPartPtr & data_part_,
         bool overwrite_file_if_exists_,
-        bool parallel_formatting_)
+        bool parallel_formatting_,
+        bool parallel_formatting_parquet_,
+        std::size_t max_threads_)
         : destination_storage_id(destination_storage_id_),
           data_part(data_part_),
           overwrite_file_if_exists(overwrite_file_if_exists_),
           parallel_formatting(parallel_formatting_),
+          parquet_parallel_encoding(parallel_formatting_parquet_),
+          max_threads(max_threads_),
           create_time(time(nullptr)) {}
 
     StorageID destination_storage_id;
     DataPartPtr data_part;
     bool overwrite_file_if_exists;
     bool parallel_formatting;
+    /// parquet has a different setting for parallel formatting
+    bool parquet_parallel_encoding;
+    std::size_t max_threads;
 
     time_t create_time;
     mutable bool in_progress = false;

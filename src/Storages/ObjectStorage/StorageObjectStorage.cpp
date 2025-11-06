@@ -591,7 +591,7 @@ SinkToStoragePtr StorageObjectStorage::import(
     return std::make_shared<StorageObjectStorageSink>(
         destination_file_path,
         object_storage,
-        format_settings,
+        std::nullopt, /// passing nullopt to force rebuild for format_settings based on query context
         std::make_shared<const Block>(getInMemoryMetadataPtr()->getSampleBlock()),
         local_context,
         configuration->format,
