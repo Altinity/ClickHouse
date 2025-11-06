@@ -404,7 +404,18 @@ def test_table_with_slash(started_cluster):
     catalog.create_namespace(root_namespace)
 
     create_table(catalog, root_namespace, table_name, DEFAULT_SCHEMA, PartitionSpec(), DEFAULT_SORT_ORDER)
+    table = catalog.load_table(f"{root_namespace}.{table_encoded_name}")
+    data = [
+        {
+            "datetime": datetime.strptime("2025-01-01 12:00:00", "%Y-%m-%d %H:%M:%S"),
+            "symbol": "AAPL",
+            "bid": 193.24,
+            "ask": 193.31,
+            "details": {"created_by": "bot"},
+        }
+    ]
+    df = pa.Table.from_pylist(data)
+    table.append(df)
 
     create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
-    node.query(f"INSERT INTO {CATALOG_NAME}.`{root_namespace}.{table_encoded_name}` VALUES (NULL, 'AAPL', 193.24, 193.31, tuple('bot'));", settings={"allow_experimental_insert_into_iceberg": 1, 'write_full_path_in_iceberg_metadata': 1})
-    assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_encoded_name}`") == "\\N\tAAPL\t193.24\t193.31\t('bot')\n"
+    assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_encoded_name}`") == "2025-01-01 12:00:00.000000\tAAPL\t193.24\t193.31\t('bot')\n"
