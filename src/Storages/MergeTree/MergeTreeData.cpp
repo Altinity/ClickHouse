@@ -6260,6 +6260,7 @@ void MergeTreeData::exportPartToTable(
             query_context->getSettingsRef()[Setting::export_merge_tree_part_overwrite_file_if_exists],
             query_context->getSettingsRef()[Setting::output_format_parallel_formatting],
             query_context->getSettingsRef()[Setting::output_format_parquet_parallel_encoding],
+            query_context->getSettingsRef()[Setting::max_threads],
             completion_callback);
 
         std::lock_guard lock(export_manifests_mutex);

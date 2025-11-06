@@ -41,14 +41,16 @@ struct MergeTreePartExportManifest
         const String & query_id_,
         bool overwrite_file_if_exists_,
         bool parallel_formatting_,
-        bool parquet_parallel_formatting_,
+        bool parquet_parallel_encoding_,
+        std::size_t max_threads_,
         std::function<void(CompletionCallbackResult)> completion_callback_ = {})
         : destination_storage_id(destination_storage_id_),
           data_part(data_part_),
           query_id(query_id_),
           overwrite_file_if_exists(overwrite_file_if_exists_),
           parallel_formatting(parallel_formatting_),
-          parquet_parallel_formatting(parquet_parallel_formatting_),
+          parquet_parallel_encoding(parquet_parallel_encoding_),
+          max_threads(max_threads_),
           completion_callback(completion_callback_),
           create_time(time(nullptr)) {}
 
@@ -59,8 +61,8 @@ struct MergeTreePartExportManifest
     bool overwrite_file_if_exists;
     bool parallel_formatting;
     /// parquet has a different setting for parallel formatting
-    bool parquet_parallel_formatting;
-
+    bool parquet_parallel_encoding;
+    std::size_t max_threads;
 
     std::function<void(CompletionCallbackResult)> completion_callback;
 

@@ -1,3 +1,4 @@
+#include <optional>
 #include <thread>
 #include <Core/ColumnWithTypeAndName.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
@@ -508,7 +509,7 @@ SinkToStoragePtr StorageObjectStorage::import(
         destination_file_path,
         object_storage,
         configuration,
-        std::nullopt, /// passing nullopt here so we can rebuild it based on the context received in the import function
+        std::nullopt, /// passing nullopt to force rebuild for format_settings based on query context
         std::make_shared<const Block>(getInMemoryMetadataPtr()->getSampleBlock()),
         local_context);
 }
