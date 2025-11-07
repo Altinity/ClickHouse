@@ -109,7 +109,7 @@ void HiveCatalog::getTableMetadata(
 bool HiveCatalog::tryGetTableMetadata(
     const std::string & namespace_name,
     const std::string & table_name,
-    DB::ContextPtr /* context_ */,
+    DB::ContextPtr context_,
     TableMetadata & result) const
 {
     Apache::Hadoop::Hive::Table table;
@@ -138,7 +138,7 @@ bool HiveCatalog::tryGetTableMetadata(
         auto columns = table.sd.cols;
         for (const auto & column : columns)
         {
-            schema.push_back({column.name, getType(column.type, true, getContext())});
+            schema.push_back({column.name, getType(column.type, true, context_)});
         }
         result.setSchema(schema);
     }
