@@ -627,7 +627,7 @@ bool RestCatalog::getTableMetadataImpl(
     {
         // int format_version = metadata_object->getValue<int>("format-version");
         auto schema_processor = DB::Iceberg::IcebergSchemaProcessor(context_);
-        auto id = DB::IcebergMetadata::parseTableSchema(metadata_object, schema_processor, log);
+        auto id = DB::IcebergMetadata::parseTableSchema(metadata_object, schema_processor, context_, log);
         auto schema = schema_processor.getClickhouseTableSchemaById(id);
         result.setSchema(*schema);
     }
