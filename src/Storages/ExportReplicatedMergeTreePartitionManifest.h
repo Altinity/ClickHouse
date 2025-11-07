@@ -21,6 +21,9 @@ struct ExportReplicatedMergeTreePartitionManifest
     time_t create_time;
     size_t max_retries;
     size_t ttl_seconds;
+    size_t max_threads;
+    bool parallel_formatting;
+    bool parquet_parallel_encoding;
 
     std::string toJsonString() const
     {
@@ -36,7 +39,9 @@ struct ExportReplicatedMergeTreePartitionManifest
         for (const auto & part : parts)
             parts_array->add(part);
         json.set("parts", parts_array);
-        
+        json.set("parallel_formatting", parallel_formatting);
+        json.set("max_threads", max_threads);
+        json.set("parquet_parallel_encoding", parquet_parallel_encoding);
         json.set("create_time", create_time);
         json.set("max_retries", max_retries);
         json.set("ttl_seconds", ttl_seconds);
@@ -66,6 +71,9 @@ struct ExportReplicatedMergeTreePartitionManifest
         
         manifest.create_time = json->getValue<time_t>("create_time");
         manifest.ttl_seconds = json->getValue<size_t>("ttl_seconds");
+        manifest.max_threads = json->getValue<size_t>("max_threads");
+        manifest.parallel_formatting = json->getValue<bool>("parallel_formatting");
+        manifest.parquet_parallel_encoding = json->getValue<bool>("parquet_parallel_encoding");
         return manifest;
     }
 };

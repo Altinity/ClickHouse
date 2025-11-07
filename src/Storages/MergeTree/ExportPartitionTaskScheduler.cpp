@@ -9,6 +9,18 @@
 namespace DB
 {
 
+namespace
+{
+    ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ExportReplicatedMergeTreePartitionManifest & manifest)
+    {
+        auto context_copy = Context::createCopy(context);
+        context_copy->setSetting("output_format_parallel_formatting", manifest.parallel_formatting);
+        context_copy->setSetting("output_format_parquet_parallel_encoding", manifest.parquet_parallel_encoding);
+        context_copy->setSetting("max_threads", manifest.max_threads);
+        return context_copy;
+    }
+}
+
 ExportPartitionTaskScheduler::ExportPartitionTaskScheduler(StorageReplicatedMergeTree & storage_)
     : storage(storage_)
 {
@@ -102,7 +114,7 @@ void ExportPartitionTaskScheduler::run()
                     part->name,
                     destination_storage_id,
                     manifest.transaction_id,
-                    storage.getContext(),
+                    getContextCopyWithTaskSettings(storage.getContext(), manifest),
                     [this, key, zk_part_name, manifest, destination_storage]
                     (MergeTreePartExportManifest::CompletionCallbackResult result)
                     {
