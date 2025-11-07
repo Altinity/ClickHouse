@@ -23,6 +23,7 @@ namespace Setting
 }
 
 ClusterFunctionReadTaskResponse::ClusterFunctionReadTaskResponse(ObjectInfoPtr object, const ContextPtr & context)
+    : iceberg_read_optimization_enabled(context->getSettingsRef()[Setting::allow_experimental_iceberg_read_optimization])
 {
     if (!object)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "`object` cannot be null");
@@ -31,8 +32,6 @@ ClusterFunctionReadTaskResponse::ClusterFunctionReadTaskResponse(ObjectInfoPtr o
         data_lake_metadata = object->data_lake_metadata.value();
 
     file_meta_info = object->file_meta_info;
-
-    iceberg_read_optimization_enabled = context->getSettingsRef()[Setting::allow_experimental_iceberg_read_optimization];
 
     const bool send_over_whole_archive = !context->getSettingsRef()[Setting::cluster_function_process_archive_on_multiple_nodes];
     path = send_over_whole_archive ? object->getPathOrPathToArchiveIfArchive() : object->getPath();
