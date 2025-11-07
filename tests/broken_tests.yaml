@@ -33,23 +33,20 @@
   reason: INVESTIGATE - Memory limit exceeded
   message: 'DB::Exception: (total) memory limit exceeded:'
 - name: 02700_s3_part_INT_MAX
-  reason: INVESTIGATE - Memory limit exceeded
+  reason: KNOWN - Memory limit exceeded
   message: 'DB::Exception: (total) memory limit exceeded:'
 - name: 03572_export_merge_tree_part_to_object_storage
-  reason: INVESTIGATE - Unstable on asan, tsan
+  reason: INVESTIGATE - Unstable on asan, tsan, msan
   message: result differs with reference
   check_types:
   - asan
   - tsan
+  - msan
 - name: 03321_clickhouse_local_initialization_not_too_slow_even_under_sanitizers
   reason: INVESTIGATE - Unstable on msan
+  message: result differs with reference
   check_types:
   - msan
-- name: 03262_column_sizes_with_dynamic_structure
-  reason: INVESTIGATE - Unstable on tsan
-  message: 'DB::Exception: Estimated query execution time'
-  check_types:
-  - tsan
 - name: 02676_optimize_old_parts_replicated
   reason: INVESTIGATE - Unstable on tsan
   message: result differs with reference
@@ -86,13 +83,13 @@
 - name: test_storage_delta/test.py::test_concurrent_queries[False]
   reason: INVESTIGATE - Unstable test
 - name: test_storage_s3_queue/test_0.py::test_streaming_to_many_views[unordered]
-  reason: 'INVESTIGATE: Broken test?'
+  reason: 'KNOWN - Unstable upstream'
 - name: test_storage_s3_queue/test_0.py::test_streaming_to_many_views[ordered]
-  reason: 'INVESTIGATE: Broken test?'
+  reason: 'KNOWN - Unstable upstream'
 - name: test_storage_s3_queue/test_2.py::test_shards_distributed[unordered-1]
-  reason: 'INVESTIGATE: Unstable test'
+  reason: 'KNOWN - Unstable upstream'
 - name: test_storage_s3_queue/test_4.py::test_list_and_delete_race
-  reason: 'KNOWN: Unstable test'
+  reason: 'KNOWN - Unstable upstream'
   message: AssertionError
 - name: test_storage_s3_queue/test_5.py::test_failed_startup
   reason: 'INVESTIGATE: Unstable on tsan'
@@ -157,13 +154,15 @@
 # regex: true applies to name, message, and not_message fields, but not to reason or check_types fields.
 
 # Match all sanitizer related timeouts in stateless tests
+# Note that this style of multiline string is inserting a space before each |.
+# Make sure to include final punctuation marks as each sub-pattern has a space appended.
 - name: \d{5}_.*
   reason: 'KNOWN: Random timeout with sanitizer'
   message: 'Timeout! Processes left in process group
-    |DB::Exception: Timeout exceeded
-    |Timeout exceeded while receiving data from server
-    |DB::Exception: Estimated query execution time \((\d+\.\d+) seconds\) is too long
-    |curl: \(28\) Operation timed out'
+     |DB::Exception: Timeout exceeded:?
+     |Timeout exceeded while receiving data from server\.
+     |DB::Exception: Estimated query execution time \((\d+\.\d+) seconds\) is too long\.
+     |curl: \(28\) Operation timed out'
   not_message: 'Sanitizer trap'
   regex: true
   check_types:

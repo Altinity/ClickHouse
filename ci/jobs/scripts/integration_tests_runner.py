@@ -1436,7 +1436,7 @@ def run():
 
 
 timeout_expired = False
-runner_subprocess = None  # type:Optional[TeePopen]
+runner_subprocess = None
 
 
 def handle_sigterm(signum, _frame):
