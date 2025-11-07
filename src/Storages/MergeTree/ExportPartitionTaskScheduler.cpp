@@ -169,64 +169,16 @@ void ExportPartitionTaskScheduler::handlePartExportSuccess(
 {
     LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} exported successfully", relative_path_in_destination_storage);
 
-    Coordination::Stat locked_by_stat;
-    std::string locked_by;
-
-    if (!zk->tryGet(export_path / "locks" / part_name, locked_by, &locked_by_stat))
+    if (!tryToMovePartToProcessed(export_path, processing_parts_path, processed_part_path, part_name, relative_path_in_destination_storage, zk))
     {
-        LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} is not locked by any replica, will not commit or set it as completed", part_name);
-        return;
-    }
-
-    /// Is this a good idea? what if the file we just pushed to s3 ends up triggering an exception in the replica that actually locks the part and it does not commit?
-    /// I guess we should not throw if file already exists for export partition, hard coded.
-    if (locked_by != storage.replica_name)
-    {
-        LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} is locked by another replica, will not commit or set it as completed", part_name);
-        return;
-    }
-
-    Coordination::Requests requests;
-
-    if (zk->isFeatureEnabled(DB::KeeperFeatureFlag::REMOVE_RECURSIVE))
-    {
-        requests.emplace_back(zkutil::makeRemoveRecursiveRequest(*zk, processing_parts_path / part_name, -1));
-    }
-    else
-    {
-        // Remove children before parent (order matters for multi operations)
-        // Maybe a ls + multi rm..
-        requests.emplace_back(zkutil::makeRemoveRequest(processing_parts_path / part_name / "retry_count", -1));
-        requests.emplace_back(zkutil::makeRemoveRequest(processing_parts_path / part_name / "status", -1));
-        requests.emplace_back(zkutil::makeRemoveRequest(processing_parts_path / part_name, -1));
-    }
-
-    requests.emplace_back(zkutil::makeCreateRequest(processed_part_path, "", zkutil::CreateMode::Persistent));
-    requests.emplace_back(zkutil::makeCreateRequest(processed_part_path / "path", relative_path_in_destination_storage, zkutil::CreateMode::Persistent));
-    requests.emplace_back(zkutil::makeCreateRequest(processed_part_path / "status", "COMPLETED", zkutil::CreateMode::Persistent));
-    requests.emplace_back(zkutil::makeCreateRequest(processed_part_path / "finished_by", storage.replica_name, zkutil::CreateMode::Persistent));
-    requests.emplace_back(zkutil::makeRemoveRequest(export_path / "locks" / part_name, locked_by_stat.version));
-
-    Coordination::Responses responses;
-    if (Coordination::Error::ZOK != zk->tryMulti(requests, responses))
-    {
-        /// todo  arthur remember what to do here
-        LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to update export path, skipping");
+        LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to move part to processed, will not commit export partition");
         return;
     }
 
     LOG_INFO(storage.log, "ExportPartition scheduler task: Marked part export {} as completed", part_name);
-    
-    Strings parts_in_processing_or_pending;
-    if (Coordination::Error::ZOK != zk->tryGetChildren(export_path / "processing", parts_in_processing_or_pending))
-    {
-        LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to get parts in processing or pending, will not try to commit export partition");
-        return;
-    }
 
-    if (!parts_in_processing_or_pending.empty())
+    if (!areAllPartsProcessed(export_path, zk))
     {
-        LOG_INFO(storage.log, "ExportPartition scheduler task: There are still parts in processing or pending, will not try to commit export partition");
         return;
     }
 
@@ -262,21 +214,32 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
     Coordination::Requests ops;
 
     const auto processing_part_path = processing_parts_path / part_name;
-    std::string retry_count_string;
-    if (zk->tryGet(processing_part_path / "retry_count", retry_count_string))
+
+    std::string processing_part_string;
+
+    if (!zk->tryGet(processing_part_path, processing_part_string))
     {
-        std::size_t retry_count = std::stoull(retry_count_string.c_str()) + 1;
+        LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to get processing part, will not increment error counts");
+        return;
+    }
 
-        ops.emplace_back(zkutil::makeSetRequest(processing_part_path / "retry_count", std::to_string(retry_count), -1));
+    /// todo arthur could this have been cached?
+    auto processing_part_entry = ExportReplicatedMergeTreePartitionProcessingPartEntry::fromJsonString(processing_part_string);
+
+    processing_part_entry.retry_count++;
+
+    if (processing_part_entry.retry_count)
+    {
         ops.emplace_back(zkutil::makeRemoveRequest(export_path / "locks" / part_name, locked_by_stat.version));
+        ops.emplace_back(zkutil::makeSetRequest(processing_part_path, processing_part_entry.toJsonString(), -1));
 
-        if (retry_count >= max_retries)
+        if (processing_part_entry.retry_count >= max_retries)
         {
             /// just set status in processing_part_path and finished_by
-            ops.emplace_back(zkutil::makeSetRequest(processing_part_path / "status", "FAILED", -1));
-            ops.emplace_back(zkutil::makeCreateRequest(processing_part_path / "finished_by", storage.replica_name, zkutil::CreateMode::Persistent));
-            ops.emplace_back(zkutil::makeSetRequest(export_path / "status", "FAILED", -1));
+            processing_part_entry.status = "FAILED";
+            processing_part_entry.finished_by = storage.replica_name;
 
+            ops.emplace_back(zkutil::makeSetRequest(export_path / "status", "FAILED", -1));
             LOG_INFO(storage.log, "ExportPartition scheduler task: Retry count limit exceeded for part {}, will try to fail the entire task", part_name);
         }
 
@@ -314,6 +277,75 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
             return;
         }
     }
+}
+
+bool ExportPartitionTaskScheduler::tryToMovePartToProcessed(
+    const std::filesystem::path & export_path,
+    const std::filesystem::path & processing_parts_path,
+    const std::filesystem::path & processed_part_path,
+    const std::string & part_name,
+    const String & relative_path_in_destination_storage,
+    const zkutil::ZooKeeperPtr & zk
+)
+{
+    Coordination::Stat locked_by_stat;
+    std::string locked_by;
+
+    if (!zk->tryGet(export_path / "locks" / part_name, locked_by, &locked_by_stat))
+    {
+        LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} is not locked by any replica, will not commit or set it as completed", part_name);
+        return false;
+    }
+
+    /// Is this a good idea? what if the file we just pushed to s3 ends up triggering an exception in the replica that actually locks the part and it does not commit?
+    /// I guess we should not throw if file already exists for export partition, hard coded.
+    if (locked_by != storage.replica_name)
+    {
+        LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} is locked by another replica, will not commit or set it as completed", part_name);
+        return false;
+    }
+
+    Coordination::Requests requests;
+
+    ExportReplicatedMergeTreePartitionProcessedPartEntry processed_part_entry;
+    processed_part_entry.part_name = part_name;
+    processed_part_entry.path_in_destination = relative_path_in_destination_storage;
+    processed_part_entry.status = "SUCCESS";
+    processed_part_entry.finished_by = storage.replica_name;
+
+    requests.emplace_back(zkutil::makeRemoveRequest(processing_parts_path / part_name, -1));
+    requests.emplace_back(zkutil::makeCreateRequest(processed_part_path, processed_part_entry.toJsonString(), zkutil::CreateMode::Persistent));
+    requests.emplace_back(zkutil::makeRemoveRequest(export_path / "locks" / part_name, locked_by_stat.version));
+
+    Coordination::Responses responses;
+    if (Coordination::Error::ZOK != zk->tryMulti(requests, responses))
+    {
+        /// todo  arthur remember what to do here
+        LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to update export path, skipping");
+        return false;
+    }
+
+    return true;
+}
+
+bool ExportPartitionTaskScheduler::areAllPartsProcessed(
+    const std::filesystem::path & export_path,
+    const zkutil::ZooKeeperPtr & zk)
+{
+    Strings parts_in_processing_or_pending;
+    if (Coordination::Error::ZOK != zk->tryGetChildren(export_path / "processing", parts_in_processing_or_pending))
+    {
+        LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to get parts in processing or pending, will not try to commit export partition");
+        return false;
+    }
+
+    if (!parts_in_processing_or_pending.empty())
+    {
+        LOG_INFO(storage.log, "ExportPartition scheduler task: There are still parts in processing or pending, will not try to commit export partition");
+        return false;
+    }
+
+    return true;
 }
 
 }

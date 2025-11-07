@@ -8176,19 +8176,14 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 
     for (const auto & part : part_names)
     {
-        ops.emplace_back(zkutil::makeCreateRequest(
-            fs::path(partition_exports_path) / "processing" / part, 
-            "", 
-            zkutil::CreateMode::Persistent));
+        ExportReplicatedMergeTreePartitionProcessingPartEntry entry;
+        entry.status = "PENDING";
+        entry.part_name = part;
+        entry.retry_count = 0;
 
         ops.emplace_back(zkutil::makeCreateRequest(
-            fs::path(partition_exports_path) / "processing" / part / "status", 
-            "PENDING", 
-            zkutil::CreateMode::Persistent));
-
-        ops.emplace_back(zkutil::makeCreateRequest(
-            fs::path(partition_exports_path) / "processing" / part / "retry_count", 
-            "0",
+            fs::path(partition_exports_path) / "processing" / part,
+            entry.toJsonString(),
             zkutil::CreateMode::Persistent));
     }
     

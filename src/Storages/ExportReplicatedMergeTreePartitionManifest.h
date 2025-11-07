@@ -9,6 +9,84 @@
 namespace DB
 {
 
+struct ExportReplicatedMergeTreePartitionProcessingPartEntry
+{
+    String part_name;
+    String status;
+    size_t retry_count;
+    String finished_by;
+
+    std::string toJsonString() const
+    {
+        Poco::JSON::Object json;
+
+        json.set("part_name", part_name);
+        json.set("status", status);
+        json.set("retry_count", retry_count);
+        json.set("finished_by", finished_by);
+        std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+        oss.exceptions(std::ios::failbit);
+        Poco::JSON::Stringifier::stringify(json, oss);
+
+        return oss.str();
+    }
+
+    static ExportReplicatedMergeTreePartitionProcessingPartEntry fromJsonString(const std::string & json_string)
+    {
+        Poco::JSON::Parser parser;
+        auto json = parser.parse(json_string).extract<Poco::JSON::Object::Ptr>();
+        chassert(json);
+
+        ExportReplicatedMergeTreePartitionProcessingPartEntry entry;
+
+        entry.part_name = json->getValue<String>("part_name");
+        entry.status = json->getValue<String>("status");
+        entry.retry_count = json->getValue<size_t>("retry_count");
+        if (json->has("finished_by"))
+        {
+            entry.finished_by = json->getValue<String>("finished_by");
+        }
+        return entry;
+    }
+};
+
+struct ExportReplicatedMergeTreePartitionProcessedPartEntry
+{
+    String part_name;
+    String path_in_destination;
+    String status;
+    String finished_by;
+
+    std::string toJsonString() const
+    {
+        Poco::JSON::Object json;
+        json.set("part_name", part_name);
+        json.set("path_in_destination", path_in_destination);
+        json.set("status", status);
+        json.set("finished_by", finished_by);
+        std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+        oss.exceptions(std::ios::failbit);
+        Poco::JSON::Stringifier::stringify(json, oss);
+        return oss.str();
+    }
+
+    static ExportReplicatedMergeTreePartitionProcessedPartEntry fromJsonString(const std::string & json_string)
+    {
+        Poco::JSON::Parser parser;
+        auto json = parser.parse(json_string).extract<Poco::JSON::Object::Ptr>();
+        chassert(json);
+
+        ExportReplicatedMergeTreePartitionProcessedPartEntry entry;
+
+        entry.part_name = json->getValue<String>("part_name");
+        entry.path_in_destination = json->getValue<String>("path_in_destination");
+        entry.status = json->getValue<String>("status");
+        entry.finished_by = json->getValue<String>("finished_by");
+
+        return entry;
+    }
+};
+
 struct ExportReplicatedMergeTreePartitionManifest
 {
     String transaction_id;

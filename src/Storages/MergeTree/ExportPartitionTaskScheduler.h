@@ -46,6 +46,20 @@ private:
         const zkutil::ZooKeeperPtr & zk,
         const String & exception,
         size_t max_retries);
+
+    bool tryToMovePartToProcessed(
+        const std::filesystem::path & export_path,
+        const std::filesystem::path & processing_parts_path,
+        const std::filesystem::path & processed_part_path,
+        const std::string & part_name,
+        const String & relative_path_in_destination_storage,
+        const zkutil::ZooKeeperPtr & zk
+    );
+
+    bool areAllPartsProcessed(
+        const std::filesystem::path & export_path,
+        const zkutil::ZooKeeperPtr & zk
+    );
 };
 
 }
