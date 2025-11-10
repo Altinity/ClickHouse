@@ -243,9 +243,10 @@ bool IcebergMetadata::update(const ContextPtr & local_context)
 
     updateState(local_context, metadata_object);
 
+    auto dump_metadata = [&]()->String { return dumpMetadataObjectToString(metadata_object); };
     insertRowToLogTable(
         local_context,
-        dumpMetadataObjectToString(metadata_object),
+        dump_metadata,
         DB::IcebergMetadataLogLevel::Metadata,
         configuration_ptr->getRawPath().path,
         metadata_file_path,
@@ -773,9 +774,10 @@ DataLakeMetadataPtr IcebergMetadata::create(
 
     auto format_version = object->getValue<int>(f_format_version);
 
+    auto dump_metadata = [&]()->String { return dumpMetadataObjectToString(object); };
     insertRowToLogTable(
         local_context,
-        dumpMetadataObjectToString(object),
+        dump_metadata,
         DB::IcebergMetadataLogLevel::Metadata,
         configuration_ptr->getRawPath().path,
         metadata_file_path,

@@ -40,6 +40,8 @@
 #include <Storages/ObjectStorage/StorageObjectStorageSource.h>
 #include <Storages/ObjectStorage/Utils.h>
 
+#include <Common/ElapsedTimeProfileEventIncrement.h>
+
 using namespace DB;
 
 
@@ -65,6 +67,8 @@ namespace DB::DataLakeStorageSetting
 namespace ProfileEvents
 {
     extern const Event IcebergVersionHintUsed;
+    extern const Event IcebergJsonFileParsing;
+    extern const Event IcebergJsonFileParsingMicroseconds;
 }
 
 namespace DB::Setting
@@ -309,6 +313,9 @@ Poco::JSON::Object::Ptr getMetadataJSONObject(
         readJSONObjectPossiblyInvalid(json_str, *buf);
         return json_str;
     };
+
+    ProfileEvents::increment(ProfileEvents::IcebergJsonFileParsing);
+    ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::IcebergJsonFileParsingMicroseconds);
 
     String metadata_json_str;
     if (cache_ptr)
