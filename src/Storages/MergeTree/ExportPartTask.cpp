@@ -12,6 +12,7 @@
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include "Common/Exception.h"
 #include <Common/ProfileEventsScope.h>
+#include "Storages/MergeTree/ExportList.h"
 
 namespace ProfileEvents
 {
@@ -68,8 +69,19 @@ bool ExportPartTask::executeStep()
         throw Exception(ErrorCodes::UNKNOWN_TABLE, "Failed to reconstruct destination storage: {}", destination_storage_id_name);
     }
 
+    auto exports_list_entry = storage.getContext()->getExportsList().insert(
+        getStorageID(),
+        manifest.destination_storage_id,
+        manifest.data_part->getBytesOnDisk(),
+        manifest.data_part->name,
+        "not_computed_yet",
+        manifest.data_part->rows_count,
+        manifest.data_part->getBytesOnDisk(),
+        manifest.data_part->getBytesUncompressedOnDisk(),
+        manifest.create_time,
+        local_context);
+
     SinkToStoragePtr sink;
-    std::string destination_file_path;
 
     try
     {
@@ -81,17 +93,43 @@ bool ExportPartTask::executeStep()
         sink = destination_storage->import(
             manifest.data_part->name + "_" + manifest.data_part->checksums.getTotalChecksumHex(),
             block_with_partition_values,
-            destination_file_path,
-            manifest.overwrite_file_if_exists,
+            (*exports_list_entry)->destination_file_path,
+            manifest.file_already_exists_policy == MergeTreePartExportManifest::FileAlreadyExistsPolicy::OVERWRITE,
             context_copy);
     }
     catch (const Exception & e)
     {
-        tryLogCurrentException(__PRETTY_FUNCTION__);
         if (e.code() == ErrorCodes::FILE_ALREADY_EXISTS)
         {
             ProfileEvents::increment(ProfileEvents::PartsExportDuplicated);
+
+            /// File already exists and the policy is NO_OP, treat it as success.
+            if (manifest.file_already_exists_policy == MergeTreePartExportManifest::FileAlreadyExistsPolicy::NO_OP)
+            {
+                storage.writePartLog(
+                    PartLogElement::Type::EXPORT_PART,
+                    {},
+                    static_cast<UInt64>((*exports_list_entry)->elapsed * 1000000000),
+                    manifest.data_part->name,
+                    manifest.data_part,
+                    {manifest.data_part},
+                    nullptr,
+                    nullptr,
+                    exports_list_entry.get());
+
+                std::lock_guard inner_lock(storage.export_manifests_mutex);
+                storage.export_manifests.erase(manifest);
+
+                ProfileEvents::increment(ProfileEvents::PartsExports);
+                ProfileEvents::increment(ProfileEvents::PartsExportTotalMilliseconds, static_cast<UInt64>((*exports_list_entry)->elapsed * 1000));
+
+                if (manifest.completion_callback)
+                    manifest.completion_callback(MergeTreePartExportManifest::CompletionCallbackResult::createSuccess((*exports_list_entry)->destination_file_path));
+                return false;
+            }
         }
+
+        tryLogCurrentException(__PRETTY_FUNCTION__);
 
         ProfileEvents::increment(ProfileEvents::PartsExportFailures);
 
@@ -139,17 +177,6 @@ bool ExportPartTask::executeStep()
         local_context,
         getLogger("ExportPartition"));
 
-    auto exports_list_entry = storage.getContext()->getExportsList().insert(
-        getStorageID(),
-        manifest.destination_storage_id,
-        manifest.data_part->getBytesOnDisk(),
-        manifest.data_part->name,
-        destination_file_path,
-        manifest.data_part->rows_count,
-        manifest.data_part->getBytesOnDisk(),
-        manifest.data_part->getBytesUncompressedOnDisk(),
-        manifest.create_time,
-        local_context);
 
     ThreadGroupSwitcher switcher((*exports_list_entry)->thread_group, "");
 
@@ -198,7 +225,7 @@ bool ExportPartTask::executeStep()
         ProfileEvents::increment(ProfileEvents::PartsExportTotalMilliseconds, static_cast<UInt64>((*exports_list_entry)->elapsed * 1000));
 
         if (manifest.completion_callback)
-            manifest.completion_callback(MergeTreePartExportManifest::CompletionCallbackResult::createSuccess(destination_file_path));
+            manifest.completion_callback(MergeTreePartExportManifest::CompletionCallbackResult::createSuccess((*exports_list_entry)->destination_file_path));
     }
     catch (const Exception & e)
     {

@@ -4,6 +4,7 @@ import random
 import string
 import time
 from typing import Optional
+import uuid
 
 from helpers.cluster import ClickHouseCluster
 from helpers.network import PartitionManager
@@ -231,7 +232,7 @@ def test_drop_source_table_during_export(cluster):
         node.query(f"DROP TABLE {mt_table}")
 
     # Sleep some time to let the export finish (assuming it was not properly cancelled)
-    time.sleep(5)
+    time.sleep(10)
 
     assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_*', format=LineAsString)") == '0\n', "Background operations completed even with the table dropped"
 
@@ -284,7 +285,7 @@ def test_drop_destination_table_during_export(cluster):
         node.query(f"DROP TABLE {s3_table}")
 
     # give some time for the export to finish
-    time.sleep(5)
+    time.sleep(10)
 
     # not sure this is the expected behavior, but adding until we make a decision
     assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_*', format=LineAsString)") != '0\n', "Background operations did not complete after dropping the destination table"
@@ -553,6 +554,105 @@ def test_export_ttl(cluster):
 
     # assert that the export succeeded, check the commit file
     assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2020_*', format=LineAsString)") == '1\n', "Export did not succeed"
+
+
+# export an individual part with alter table export part
+# and then try to export the partition. It should not fail because export partition is idempotent.
+def test_export_part_and_partition(cluster):
+    node = cluster.instances["replica1"]
+
+    mt_table = "export_part_and_partition_mt_table"
+    s3_table = "export_part_and_partition_s3_table"
+
+    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
+
+    # stop merges so part names remain stable. it is important for the test.
+    node.query(f"SYSTEM STOP MERGES {mt_table}")
+
+    query_id_1 = uuid.uuid4().hex
+    query_id_2 = uuid.uuid4().hex
+    query_id_3 = uuid.uuid4().hex
+    query_id_4 = uuid.uuid4().hex
+
+    # Export all parts
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS allow_experimental_export_merge_tree_part=1",
+        query_id=query_id_1,
+    )
+
+    # check system.replicated_partition_exports for the export
+    assert node.query(
+        f"""
+        SELECT status FROM system.replicated_partition_exports
+        WHERE source_table = '{mt_table}'
+          AND destination_table = '{s3_table}'
+          AND partition_id = '2020'
+          AND transaction_id = '{query_id_1}'
+        """
+    ) == "COMPLETED\n", "Export should be marked as COMPLETED"
+
+    # wait for the exports to finish
+    time.sleep(3)
+
+    # try to export the partition
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS allow_experimental_export_merge_tree_part=1, export_merge_tree_partition_force_export=1",
+        query_id=query_id_2,
+    )
+
+    time.sleep(3)
+
+    # check system.replicated_partition_exports for the export
+    assert node.query(
+        f"""
+        SELECT status FROM system.replicated_partition_exports
+        WHERE source_table = '{mt_table}'
+          AND destination_table = '{s3_table}'
+          AND partition_id = '2020'
+          AND transaction_id = '{query_id_2}'
+        """
+    ) == "COMPLETED\n", "Export should be marked as COMPLETED"
+
+    # now let's try with a file exists policy that is not NO_OP
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS allow_experimental_export_merge_tree_part=1, export_merge_tree_partition_force_export=1, export_merge_tree_part_file_already_exists_policy='OVERWRITE'",
+        query_id=query_id_3,
+    )
+
+    # wait for the export to finish
+    time.sleep(3)
+
+    # check system.replicated_partition_exports for the export
+    assert node.query(
+        f"""
+        SELECT status FROM system.replicated_partition_exports
+        WHERE source_table = '{mt_table}'
+          AND destination_table = '{s3_table}'
+          AND partition_id = '2020'
+          AND transaction_id = '{query_id_3}'
+        """
+    ) == "COMPLETED\n", "Export should be marked as COMPLETED"
+
+    # last but not least, let's try with the error policy
+    # max retries = 1 so it fails fast
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS allow_experimental_export_merge_tree_part=1, export_merge_tree_partition_force_export=1, export_merge_tree_part_file_already_exists_policy='ERROR', export_merge_tree_partition_max_retries=1",
+        query_id=query_id_4,
+    )
+
+    # wait for the export to finish
+    time.sleep(3)
+
+    # check system.replicated_partition_exports for the export
+    assert node.query(
+        f"""
+        SELECT status FROM system.replicated_partition_exports
+        WHERE source_table = '{mt_table}'
+          AND destination_table = '{s3_table}'
+          AND partition_id = '2020'
+          AND transaction_id = '{query_id_4}'
+        """
+    ) == "FAILED\n", "Export should be marked as FAILED"
 
 
 # def test_source_mutations_during_export_snapshot(cluster):

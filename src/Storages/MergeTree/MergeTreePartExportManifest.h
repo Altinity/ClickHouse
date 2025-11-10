@@ -11,6 +11,13 @@ class ExportPartTask;
 
 struct MergeTreePartExportManifest
 {
+    enum class FileAlreadyExistsPolicy
+    {
+        NO_OP,
+        ERROR,
+        OVERWRITE,
+    };
+
     using DataPartPtr = std::shared_ptr<const IMergeTreeDataPart>;
 
     struct CompletionCallbackResult
@@ -39,7 +46,7 @@ struct MergeTreePartExportManifest
         const StorageID & destination_storage_id_,
         const DataPartPtr & data_part_,
         const String & query_id_,
-        bool overwrite_file_if_exists_,
+        FileAlreadyExistsPolicy file_already_exists_policy_,
         bool parallel_formatting_,
         bool parquet_parallel_encoding_,
         std::size_t max_threads_,
@@ -47,7 +54,7 @@ struct MergeTreePartExportManifest
         : destination_storage_id(destination_storage_id_),
           data_part(data_part_),
           query_id(query_id_),
-          overwrite_file_if_exists(overwrite_file_if_exists_),
+          file_already_exists_policy(file_already_exists_policy_),
           parallel_formatting(parallel_formatting_),
           parquet_parallel_encoding(parquet_parallel_encoding_),
           max_threads(max_threads_),
@@ -58,7 +65,7 @@ struct MergeTreePartExportManifest
     DataPartPtr data_part;
     /// Used for killing the export.
     String query_id;
-    bool overwrite_file_if_exists;
+    FileAlreadyExistsPolicy file_already_exists_policy;
     bool parallel_formatting;
     /// parquet has a different setting for parallel formatting
     bool parquet_parallel_encoding;

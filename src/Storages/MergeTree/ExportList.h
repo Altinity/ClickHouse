@@ -41,7 +41,7 @@ struct ExportsListElement : private boost::noncopyable
     const StorageID destination_table_id;
     const UInt64 part_size;
     const String part_name;
-    const String destination_file_path;
+    String destination_file_path;
     UInt64 rows_read {0};
     UInt64 total_rows_to_read {0};
     UInt64 total_size_bytes_compressed {0};

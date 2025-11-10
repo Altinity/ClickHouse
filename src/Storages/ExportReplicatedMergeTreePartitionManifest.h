@@ -5,6 +5,7 @@
 #include <Poco/JSON/Object.h>
 #include <Poco/JSON/Array.h>
 #include <Poco/JSON/Parser.h>
+#include <Storages/MergeTree/MergeTreePartExportManifest.h>
 
 namespace DB
 {
@@ -102,6 +103,7 @@ struct ExportReplicatedMergeTreePartitionManifest
     size_t max_threads;
     bool parallel_formatting;
     bool parquet_parallel_encoding;
+    MergeTreePartExportManifest::FileAlreadyExistsPolicy file_already_exists_policy;
 
     std::string toJsonString() const
     {
@@ -120,6 +122,7 @@ struct ExportReplicatedMergeTreePartitionManifest
         json.set("parallel_formatting", parallel_formatting);
         json.set("max_threads", max_threads);
         json.set("parquet_parallel_encoding", parquet_parallel_encoding);
+        json.set("file_already_exists_policy", String(magic_enum::enum_name(file_already_exists_policy)));
         json.set("create_time", create_time);
         json.set("max_retries", max_retries);
         json.set("ttl_seconds", ttl_seconds);
@@ -152,6 +155,18 @@ struct ExportReplicatedMergeTreePartitionManifest
         manifest.max_threads = json->getValue<size_t>("max_threads");
         manifest.parallel_formatting = json->getValue<bool>("parallel_formatting");
         manifest.parquet_parallel_encoding = json->getValue<bool>("parquet_parallel_encoding");
+
+        if (json->has("file_already_exists_policy"))
+        {
+            const auto file_already_exists_policy = magic_enum::enum_cast<MergeTreePartExportManifest::FileAlreadyExistsPolicy>(json->getValue<String>("file_already_exists_policy"));
+            if (file_already_exists_policy)
+            {
+                manifest.file_already_exists_policy = file_already_exists_policy.value();
+            }
+
+            /// what to do if it's not a valid value?
+        }
+
         return manifest;
     }
 };

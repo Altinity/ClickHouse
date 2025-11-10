@@ -198,6 +198,7 @@ namespace Setting
     extern const SettingsBool output_format_parallel_formatting;
     extern const SettingsBool output_format_parquet_parallel_encoding;
     extern const SettingsMaxThreads max_threads;
+    extern const SettingsString export_merge_tree_part_file_already_exists_policy;
 }
 
 namespace MergeTreeSetting
@@ -300,6 +301,7 @@ namespace ErrorCodes
     extern const int FAULT_INJECTED;
     extern const int CANNOT_FORGET_PARTITION;
     extern const int TIMEOUT_EXCEEDED;
+    extern const int INVALID_SETTING_VALUE;
 }
 
 namespace ActionLocks
@@ -8158,6 +8160,18 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     manifest.max_threads = query_context->getSettingsRef()[Setting::max_threads];
     manifest.parallel_formatting = query_context->getSettingsRef()[Setting::output_format_parallel_formatting];
     manifest.parquet_parallel_encoding = query_context->getSettingsRef()[Setting::output_format_parquet_parallel_encoding];
+
+    const auto file_already_exists_policy = magic_enum::enum_cast<MergeTreePartExportManifest::FileAlreadyExistsPolicy>(query_context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value);
+
+    if (!file_already_exists_policy)
+    {
+        throw Exception(
+            ErrorCodes::INVALID_SETTING_VALUE,
+            "Invalid value for setting 'export_merge_tree_part_file_already_exists_policy': {}",
+            query_context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value);
+    }
+
+    manifest.file_already_exists_policy = file_already_exists_policy.value();
 
     ops.emplace_back(zkutil::makeCreateRequest(
         fs::path(partition_exports_path) / "metadata.json", 

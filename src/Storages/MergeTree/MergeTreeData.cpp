@@ -212,7 +212,7 @@ namespace Setting
     extern const SettingsBool apply_patch_parts;
     extern const SettingsBool allow_experimental_export_merge_tree_part;
     extern const SettingsUInt64 min_bytes_to_use_direct_io;
-    extern const SettingsBool export_merge_tree_part_overwrite_file_if_exists;
+    extern const SettingsString export_merge_tree_part_file_already_exists_policy;
     extern const SettingsBool output_format_parallel_formatting;
     extern const SettingsBool output_format_parquet_parallel_encoding;
 }
@@ -6253,11 +6253,20 @@ void MergeTreeData::exportPartToTable(
                         part_name, getStorageID().getFullTableName());
 
     {
+        const auto file_already_exists_policy = magic_enum::enum_cast<MergeTreePartExportManifest::FileAlreadyExistsPolicy>(Poco::toUpper(query_context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value));
+        if (!file_already_exists_policy)
+        {
+            throw Exception(
+                ErrorCodes::INVALID_SETTING_VALUE,
+                "Invalid value for setting 'export_merge_tree_part_file_already_exists_policy': {}",
+                query_context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value);
+        }
+
         MergeTreePartExportManifest manifest(
             dest_storage->getStorageID(),
             part,
             transaction_id,
-            query_context->getSettingsRef()[Setting::export_merge_tree_part_overwrite_file_if_exists],
+            *file_already_exists_policy,
             query_context->getSettingsRef()[Setting::output_format_parallel_formatting],
             query_context->getSettingsRef()[Setting::output_format_parquet_parallel_encoding],
             query_context->getSettingsRef()[Setting::max_threads],

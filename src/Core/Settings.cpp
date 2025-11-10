@@ -6884,6 +6884,12 @@ Maximum number of retries for exporting a merge tree part in an export partition
 Determines how long the manifest will live in ZooKeeper. It prevents the same partition from being exported twice to the same destination.
 This setting does not affect / delete in progress tasks. It'll only cleanup the completed ones.
 )", 0) \
+    DECLARE(String, export_merge_tree_part_file_already_exists_policy, "NO_OP", R"(
+Possible values:
+- NO_OP - No-op if the file already exists - Default.
+- ERROR - Throw an error if the file already exists.
+- OVERWRITE - Overwrite the file
+)", 0) \
     \
     /* ####################################################### */ \
     /* ########### START OF EXPERIMENTAL FEATURES ############ */ \
