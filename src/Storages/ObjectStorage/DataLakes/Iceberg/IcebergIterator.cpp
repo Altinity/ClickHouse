@@ -196,9 +196,10 @@ std::optional<ManifestFileEntryPtr> SingleThreadIcebergKeysIterator::next()
                     local_context);
             }
             auto pruning_status = current_pruner ? current_pruner->canBePruned(manifest_file_entry) : PruningReturnStatus::NOT_PRUNED;
+            auto dummy_row_metadata = []()->String { return ""; };
             insertRowToLogTable(
                 local_context,
-                "",
+                dummy_row_metadata,
                 DB::IcebergMetadataLogLevel::ManifestFileEntry,
                 persistent_components.table_path,
                 current_manifest_file_content->getPathToManifestFile(),

@@ -12,6 +12,7 @@
 #include <Interpreters/IcebergMetadataLog.h>
 #include <Interpreters/InterpreterSelectQuery.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeConfiguration.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergWrites.h>
 #include <Common/DateLUTImpl.h>
 
 namespace DB
@@ -79,7 +80,7 @@ void IcebergMetadataLogElement::appendToBlock(MutableColumns & columns) const
 
 void insertRowToLogTable(
     const ContextPtr & local_context,
-    String row,
+    std::function<String()> get_row,
     IcebergMetadataLogLevel row_log_level,
     const String & table_path,
     const String & file_path,
@@ -107,7 +108,7 @@ void insertRowToLogTable(
             .content_type = row_log_level,
             .table_path = table_path,
             .file_path = file_path,
-            .metadata_content = row,
+            .metadata_content = get_row(),
             .row_in_file = row_in_file,
             .pruning_status = pruning_status});
 }
