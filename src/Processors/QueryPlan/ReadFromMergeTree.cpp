@@ -115,7 +115,8 @@ bool restorePrewhereInputs(FilterDAGInfo * row_level_filter, PrewhereInfo * info
     if (row_level_filter)
         added = added || restoreDAGInputs(row_level_filter->actions, inputs);
 
-    added = added || restoreDAGInputs(info->prewhere_actions, inputs);
+    if (info)
+        added = added || restoreDAGInputs(info->prewhere_actions, inputs);
 
     return added;
 }
