@@ -12,8 +12,16 @@ namespace DB
 
 struct ExportReplicatedMergeTreePartitionProcessingPartEntry
 {
+
+    enum class Status
+    {
+        PENDING,
+        COMPLETED,
+        FAILED
+    };
+
     String part_name;
-    String status;
+    Status status;
     size_t retry_count;
     String finished_by;
 
@@ -22,7 +30,7 @@ struct ExportReplicatedMergeTreePartitionProcessingPartEntry
         Poco::JSON::Object json;
 
         json.set("part_name", part_name);
-        json.set("status", status);
+        json.set("status", String(magic_enum::enum_name(status)));
         json.set("retry_count", retry_count);
         json.set("finished_by", finished_by);
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
@@ -41,7 +49,7 @@ struct ExportReplicatedMergeTreePartitionProcessingPartEntry
         ExportReplicatedMergeTreePartitionProcessingPartEntry entry;
 
         entry.part_name = json->getValue<String>("part_name");
-        entry.status = json->getValue<String>("status");
+        entry.status = magic_enum::enum_cast<Status>(json->getValue<String>("status")).value();
         entry.retry_count = json->getValue<size_t>("retry_count");
         if (json->has("finished_by"))
         {
@@ -55,7 +63,6 @@ struct ExportReplicatedMergeTreePartitionProcessedPartEntry
 {
     String part_name;
     String path_in_destination;
-    String status;
     String finished_by;
 
     std::string toJsonString() const
@@ -63,7 +70,6 @@ struct ExportReplicatedMergeTreePartitionProcessedPartEntry
         Poco::JSON::Object json;
         json.set("part_name", part_name);
         json.set("path_in_destination", path_in_destination);
-        json.set("status", status);
         json.set("finished_by", finished_by);
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
@@ -81,7 +87,6 @@ struct ExportReplicatedMergeTreePartitionProcessedPartEntry
 
         entry.part_name = json->getValue<String>("part_name");
         entry.path_in_destination = json->getValue<String>("path_in_destination");
-        entry.status = json->getValue<String>("status");
         entry.finished_by = json->getValue<String>("finished_by");
 
         return entry;

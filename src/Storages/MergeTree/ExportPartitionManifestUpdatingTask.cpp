@@ -265,7 +265,7 @@ void ExportPartitionManifestUpdatingTask::addTask(
     }
 
     /// Insert or update entry. The multi_index container automatically maintains both indexes.
-    auto entry = ExportReplicatedMergeTreePartitionTaskEntry {metadata, std::move(part_references)};
+    auto entry = ExportReplicatedMergeTreePartitionTaskEntry {metadata, ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING, std::move(part_references)};
     auto it = entries_by_key.find(key);
     if (it != entries_by_key.end())
         entries_by_key.replace(it, entry);

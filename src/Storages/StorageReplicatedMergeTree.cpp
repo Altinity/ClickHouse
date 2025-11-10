@@ -8191,7 +8191,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     for (const auto & part : part_names)
     {
         ExportReplicatedMergeTreePartitionProcessingPartEntry entry;
-        entry.status = "PENDING";
+        entry.status = ExportReplicatedMergeTreePartitionProcessingPartEntry::Status::PENDING;
         entry.part_name = part;
         entry.retry_count = 0;
 

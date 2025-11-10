@@ -35,12 +35,19 @@ void ExportPartitionTaskScheduler::run()
     auto zk = storage.getZooKeeper();
 
     // Iterate sorted by create_time
-    for (const auto & entry : storage.export_merge_tree_partition_task_entries_by_create_time)
+    for (auto & entry : storage.export_merge_tree_partition_task_entries_by_create_time)
     {
         const auto & manifest = entry.manifest;
         const auto key = entry.getCompositeKey();
         const auto & database = storage.getContext()->resolveDatabase(manifest.destination_database);
         const auto & table = manifest.destination_table;
+
+        /// No need to query zk for status if the local one is not PENDING
+        if (entry.status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
+        {
+            LOG_INFO(storage.log, "ExportPartition scheduler task: Skipping... Local status is {}", magic_enum::enum_name(entry.status).data());
+            continue;
+        }
 
         const auto destination_storage_id = StorageID(QualifiedTableName {database, table});
 
@@ -52,16 +59,25 @@ void ExportPartitionTaskScheduler::run()
             continue;
         }
 
-        std::string status;
-        if (!zk->tryGet(fs::path(storage.zookeeper_path) / "exports" / key / "status", status))
+        std::string status_in_zk_string;
+        if (!zk->tryGet(fs::path(storage.zookeeper_path) / "exports" / key / "status", status_in_zk_string))
         {
             LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to get status, skipping");
             continue;
         }
 
-        if (status != "PENDING")
+        const auto status_in_zk = magic_enum::enum_cast<ExportReplicatedMergeTreePartitionTaskEntry::Status>(status_in_zk_string);
+
+        if (!status_in_zk)
         {
-            LOG_INFO(storage.log, "ExportPartition scheduler task: Skipping... Status is not PENDING");
+            LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to get status from zk, skipping");
+            continue;
+        }
+
+        if (status_in_zk.value() != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
+        {
+            entry.status = status_in_zk.value();
+            LOG_INFO(storage.log, "ExportPartition scheduler task: Skipping... Status from zk is {}", entry.status);
             continue;
         }
 
@@ -238,10 +254,10 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
         if (processing_part_entry.retry_count >= max_retries)
         {
             /// just set status in processing_part_path and finished_by
-            processing_part_entry.status = "FAILED";
+            processing_part_entry.status = ExportReplicatedMergeTreePartitionProcessingPartEntry::Status::FAILED;
             processing_part_entry.finished_by = storage.replica_name;
 
-            ops.emplace_back(zkutil::makeSetRequest(export_path / "status", "FAILED", -1));
+            ops.emplace_back(zkutil::makeSetRequest(export_path / "status", String(magic_enum::enum_name(ExportReplicatedMergeTreePartitionTaskEntry::Status::FAILED)).data(), -1));
             LOG_INFO(storage.log, "ExportPartition scheduler task: Retry count limit exceeded for part {}, will try to fail the entire task", part_name);
         }
 
@@ -312,7 +328,6 @@ bool ExportPartitionTaskScheduler::tryToMovePartToProcessed(
     ExportReplicatedMergeTreePartitionProcessedPartEntry processed_part_entry;
     processed_part_entry.part_name = part_name;
     processed_part_entry.path_in_destination = relative_path_in_destination_storage;
-    processed_part_entry.status = "SUCCESS";
     processed_part_entry.finished_by = storage.replica_name;
 
     requests.emplace_back(zkutil::makeRemoveRequest(processing_parts_path / part_name, -1));

@@ -553,16 +553,15 @@ def test_export_ttl(cluster):
     time.sleep(expiration_time)
 
     # assert that the export succeeded, check the commit file
-    assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2020_*', format=LineAsString)") == '1\n', "Export did not succeed"
+    # there should be two commit files now, one for the first export and one for the second export
+    assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2020_*', format=LineAsString)") == '2\n', "Export did not succeed"
 
 
-# export an individual part with alter table export part
-# and then try to export the partition. It should not fail because export partition is idempotent.
-def test_export_part_and_partition(cluster):
+def test_export_partition_file_already_exists_policy(cluster):
     node = cluster.instances["replica1"]
 
-    mt_table = "export_part_and_partition_mt_table"
-    s3_table = "export_part_and_partition_s3_table"
+    mt_table = "export_partition_file_already_exists_policy_mt_table"
+    s3_table = "export_partition_file_already_exists_policy_s3_table"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
