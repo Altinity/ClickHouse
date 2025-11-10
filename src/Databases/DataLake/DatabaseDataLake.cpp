@@ -450,7 +450,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
 
     auto [namespace_name, table_name] = DataLake::parseTableName(name);
 
-    if (!catalog->tryGetTableMetadata(namespace_name, table_name, table_metadata))
+    if (!catalog->tryGetTableMetadata(namespace_name, table_name, context_, table_metadata))
         return nullptr;
     if (ignore_if_not_iceberg && !table_metadata.isDefaultReadableTable())
         return nullptr;
@@ -807,7 +807,7 @@ ASTPtr DatabaseDataLake::getCreateDatabaseQueryImpl() const
 
 ASTPtr DatabaseDataLake::getCreateTableQueryImpl(
     const String & name,
-    ContextPtr /* context_ */,
+    ContextPtr context_,
     bool throw_on_error) const
 {
     auto catalog = getCatalog();
@@ -815,7 +815,7 @@ ASTPtr DatabaseDataLake::getCreateTableQueryImpl(
 
     const auto [namespace_name, table_name] = DataLake::parseTableName(name);
 
-    if (!catalog->tryGetTableMetadata(namespace_name, table_name, table_metadata))
+    if (!catalog->tryGetTableMetadata(namespace_name, table_name, context_, table_metadata))
     {
         if (throw_on_error)
             throw Exception(ErrorCodes::CANNOT_GET_CREATE_TABLE_QUERY, "Table `{}` doesn't exist", name);

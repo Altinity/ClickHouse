@@ -232,6 +232,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"object_storage_max_nodes", 0, 0, "New setting"},
             {"allow_retries_in_cluster_requests", false, false, "New setting"},
             {"object_storage_remote_initiator", false, false, "New setting."},
+            {"allow_experimental_export_merge_tree_part", false, true, "Turned ON by default for Antalya."},
+            {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."}
         });
         addSettingsChanges(settings_changes_history, "25.8",
         {
