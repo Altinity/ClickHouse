@@ -51,20 +51,20 @@ class StorageDistributed final : public IStorage, WithContext
 
 public:
     /// Structure to hold table function AST, predicate, optional StorageID, and cached physical columns for the segment
-    struct TableFunctionEntry
+    struct HybridSegment
     {
         ASTPtr table_function_ast;
         ASTPtr predicate_ast;
         std::optional<StorageID> storage_id; // For table identifiers instead of table functions
         ColumnsDescription actual_columns;
 
-        TableFunctionEntry(ASTPtr table_function_ast_, ASTPtr predicate_ast_, ColumnsDescription actual_columns_)
+        HybridSegment(ASTPtr table_function_ast_, ASTPtr predicate_ast_, ColumnsDescription actual_columns_)
             : table_function_ast(std::move(table_function_ast_))
             , predicate_ast(std::move(predicate_ast_))
             , actual_columns(std::move(actual_columns_))
         {}
 
-        TableFunctionEntry(ASTPtr table_function_ast_, ASTPtr predicate_ast_, StorageID storage_id_, ColumnsDescription actual_columns_)
+        HybridSegment(ASTPtr table_function_ast_, ASTPtr predicate_ast_, StorageID storage_id_, ColumnsDescription actual_columns_)
             : table_function_ast(std::move(table_function_ast_))
             , predicate_ast(std::move(predicate_ast_))
             , storage_id(std::move(storage_id_))
@@ -94,7 +94,7 @@ public:
 
     std::string getName() const override
     {
-        return (additional_table_functions.empty() && !additional_filter)
+        return (segments.empty() && !additional_filter)
             ? "Distributed"
             : "Hybrid";
     }
@@ -179,8 +179,8 @@ public:
     /// Set additional filter for Hybrid engine
     void setAdditionalFilter(ASTPtr filter) { additional_filter = std::move(filter); }
 
-    /// Set additional table functions for Hybrid engine along with cached schema info
-    void setHybridLayout(ColumnsDescription base_segment_columns_, std::vector<TableFunctionEntry> additional_table_functions_);
+    /// Set segment definitions for Hybrid engine along with cached schema info
+    void setHybridLayout(ColumnsDescription base_segment_columns_, std::vector<HybridSegment> segments_);
 
     /// Getter methods for ClusterProxy::executeQuery
     StorageID getRemoteStorageID() const { return remote_storage; }
@@ -326,8 +326,8 @@ private:
     /// Additional filter expression for Hybrid engine
     ASTPtr additional_filter;
 
-    /// Additional table functions for Hybrid engine
-    std::vector<TableFunctionEntry> additional_table_functions;
+    /// Additional segments for Hybrid engine
+    std::vector<HybridSegment> segments;
     ColumnsDescription base_segment_columns;
 };
 
