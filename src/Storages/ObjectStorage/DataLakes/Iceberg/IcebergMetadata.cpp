@@ -135,7 +135,7 @@ IcebergMetadata::IcebergMetadata(
     : object_storage(std::move(object_storage_))
     , configuration(std::move(configuration_))
     , persistent_components(PersistentTableComponents{
-          .schema_processor = std::make_shared<IcebergSchemaProcessor>(),
+          .schema_processor = std::make_shared<IcebergSchemaProcessor>(context_),
           .metadata_cache = cache_ptr,
           .format_version = format_version_,
           .table_location = metadata_object_->getValue<String>(f_location)
@@ -148,7 +148,7 @@ IcebergMetadata::IcebergMetadata(
     updateState(context_, metadata_object_);
 }
 
-void IcebergMetadata::addTableSchemaById(Int32 schema_id, Poco::JSON::Object::Ptr metadata_object) const
+void IcebergMetadata::addTableSchemaById(Int32 schema_id, Poco::JSON::Object::Ptr metadata_object, ContextPtr context_) const
 {
     if (persistent_components.schema_processor->hasClickhouseTableSchemaById(schema_id))
         return;
@@ -163,7 +163,7 @@ void IcebergMetadata::addTableSchemaById(Int32 schema_id, Poco::JSON::Object::Pt
         auto current_schema = schemas->getObject(i);
         if (current_schema->has(f_schema_id) && current_schema->getValue<int>(f_schema_id) == schema_id)
         {
-            persistent_components.schema_processor->addIcebergTableSchema(current_schema);
+            persistent_components.schema_processor->addIcebergTableSchema(current_schema, context_);
             return;
         }
     }
@@ -174,13 +174,16 @@ void IcebergMetadata::addTableSchemaById(Int32 schema_id, Poco::JSON::Object::Pt
 }
 
 Int32 IcebergMetadata::parseTableSchema(
-    const Poco::JSON::Object::Ptr & metadata_object, IcebergSchemaProcessor & schema_processor, LoggerPtr metadata_logger)
+    const Poco::JSON::Object::Ptr & metadata_object,
+    IcebergSchemaProcessor & schema_processor,
+    ContextPtr context_,
+    LoggerPtr metadata_logger)
 {
     const auto format_version = metadata_object->getValue<Int32>(f_format_version);
     if (format_version == 2)
     {
         auto [schema, current_schema_id] = parseTableSchemaV2Method(metadata_object);
-        schema_processor.addIcebergTableSchema(schema);
+        schema_processor.addIcebergTableSchema(schema, context_);
         return current_schema_id;
     }
     else
@@ -188,7 +191,7 @@ Int32 IcebergMetadata::parseTableSchema(
         try
         {
             auto [schema, current_schema_id] = parseTableSchemaV1Method(metadata_object);
-            schema_processor.addIcebergTableSchema(schema);
+            schema_processor.addIcebergTableSchema(schema, context_);
             return current_schema_id;
         }
         catch (const Exception & first_error)
@@ -198,7 +201,7 @@ Int32 IcebergMetadata::parseTableSchema(
             try
             {
                 auto [schema, current_schema_id] = parseTableSchemaV2Method(metadata_object);
-                schema_processor.addIcebergTableSchema(schema);
+                schema_processor.addIcebergTableSchema(schema, context_);
                 LOG_WARNING(
                     metadata_logger,
                     "Iceberg table schema was parsed using v2 specification, but it was impossible to parse it using v1 "
@@ -243,9 +246,10 @@ bool IcebergMetadata::update(const ContextPtr & local_context)
 
     updateState(local_context, metadata_object);
 
+    auto dump_metadata = [&]()->String { return dumpMetadataObjectToString(metadata_object); };
     insertRowToLogTable(
         local_context,
-        dumpMetadataObjectToString(metadata_object),
+        dump_metadata,
         DB::IcebergMetadataLogLevel::Metadata,
         configuration_ptr->getRawPath().path,
         metadata_file_path,
@@ -457,7 +461,7 @@ void IcebergMetadata::updateSnapshot(ContextPtr local_context, Poco::JSON::Objec
     for (UInt32 j = 0; j < schemas->size(); ++j)
     {
         auto schema = schemas->getObject(j);
-        persistent_components.schema_processor->addIcebergTableSchema(schema);
+        persistent_components.schema_processor->addIcebergTableSchema(schema, local_context);
     }
     auto snapshots = metadata_object->get(f_snapshots).extract<Poco::JSON::Array::Ptr>();
     bool successfully_found_snapshot = false;
@@ -522,7 +526,7 @@ void IcebergMetadata::updateSnapshot(ContextPtr local_context, Poco::JSON::Objec
                     relevant_snapshot_id,
                     configuration_ptr->getPathForRead().path);
             relevant_snapshot_schema_id = snapshot->getValue<Int32>(f_schema_id);
-            addTableSchemaById(relevant_snapshot_schema_id, metadata_object);
+            addTableSchemaById(relevant_snapshot_schema_id, metadata_object, local_context);
         }
     }
     if (!successfully_found_snapshot)
@@ -609,7 +613,11 @@ void IcebergMetadata::updateState(const ContextPtr & local_context, Poco::JSON::
         {
             updateSnapshot(local_context, metadata_object);
         }
-        relevant_snapshot_schema_id = parseTableSchema(metadata_object, *persistent_components.schema_processor, log);
+        relevant_snapshot_schema_id = parseTableSchema(
+            metadata_object,
+            *persistent_components.schema_processor,
+            local_context,
+            log);
     }
 }
 
@@ -626,14 +634,17 @@ std::shared_ptr<NamesAndTypesList> IcebergMetadata::getInitialSchemaByPath(Conte
         : nullptr;
 }
 
-std::shared_ptr<const ActionsDAG> IcebergMetadata::getSchemaTransformer(ContextPtr, ObjectInfoPtr object_info) const
+std::shared_ptr<const ActionsDAG> IcebergMetadata::getSchemaTransformer(ContextPtr context_, ObjectInfoPtr object_info) const
 {
     IcebergDataObjectInfo * iceberg_object_info = dynamic_cast<IcebergDataObjectInfo *>(object_info.get());
     SharedLockGuard lock(mutex);
     if (!iceberg_object_info)
         return nullptr;
     return (iceberg_object_info->underlying_format_read_schema_id != relevant_snapshot_schema_id)
-        ? persistent_components.schema_processor->getSchemaTransformationDagByIds(iceberg_object_info->underlying_format_read_schema_id, relevant_snapshot_schema_id)
+        ? persistent_components.schema_processor->getSchemaTransformationDagByIds(
+            context_,
+            iceberg_object_info->underlying_format_read_schema_id,
+            relevant_snapshot_schema_id)
         : nullptr;
 }
 
@@ -773,9 +784,10 @@ DataLakeMetadataPtr IcebergMetadata::create(
 
     auto format_version = object->getValue<int>(f_format_version);
 
+    auto dump_metadata = [&]()->String { return dumpMetadataObjectToString(object); };
     insertRowToLogTable(
         local_context,
-        dumpMetadataObjectToString(object),
+        dump_metadata,
         DB::IcebergMetadataLogLevel::Metadata,
         configuration_ptr->getRawPath().path,
         metadata_file_path,

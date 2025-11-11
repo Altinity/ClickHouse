@@ -18,6 +18,7 @@ from .result import Result, ResultInfo, _ResultS3
 from .runtime import RunConfig
 from .settings import Settings
 from .utils import Shell, Utils
+from ci.defs.defs import ArtifactNames
 
 assert Settings.CI_CONFIG_RUNS_ON
 
@@ -403,17 +404,22 @@ def _config_workflow(workflow: Workflow.Config, job_name) -> Result:
             # NOTE (strtgbb): We always want these build artifacts for our report and regression tests.
             # If we make FinishCIReport and regression tests into praktika jobs, we can remove this.
             if "CIReport" in workflow.additional_jobs:
-                all_required_artifacts.update(["CH_AMD_RELEASE", "CH_ARM_RELEASE"])
+                all_required_artifacts.update(
+                    [
+                        ArtifactNames.CH_AMD_RELEASE,
+                        ArtifactNames.CH_ARM_RELEASE,
+                    ]
+                )
             if (
                 "Regression" in workflow.additional_jobs
                 and "regression"
                 not in workflow_config.custom_data.get("ci_exclude_tags", [])
             ):
-                all_required_artifacts.update(["CH_AMD_BINARY"])
+                all_required_artifacts.update([ArtifactNames.CH_AMD_BINARY])
                 if "aarch64" not in workflow_config.custom_data.get(
                     "ci_exclude_tags", []
                 ):
-                    all_required_artifacts.update(["CH_ARM_BINARY"])
+                    all_required_artifacts.update([ArtifactNames.CH_ARM_BINARY])
             print(f"Including artifacts for custom jobs [{all_required_artifacts}]")
 
             for job in workflow.jobs:
