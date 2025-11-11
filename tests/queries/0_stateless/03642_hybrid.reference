@@ -27,7 +27,7 @@ CREATE TABLE default.test_tiered_distributed_numbers_range\n(\n    `number` UInt
 2
 3
 4
-Create Hybrid table with two remote layers as table
+Create Hybrid table with two remote segments as table
 CREATE TABLE default.test_tiered_distributed_numbers_dual\n(\n    `number` UInt64\n)\nENGINE = Hybrid(remote(\'localhost:9000\', \'system.numbers\'), number < 5, remote(\'localhost:9000\', system.numbers), (number >= 10) AND (number <= 15))\nCOMMENT \'Generates all natural numbers, starting from 0 (to 2^64 - 1, and then again) in sorted order.\'
 0
 1
@@ -63,23 +63,23 @@ Create Hybrid table combining remote function and local table
 13
 14
 15
-Verify Hybrid skips layer with always false predicate on the first layer
+Verify Hybrid skips segment with always false predicate on the first segment
 10
 11
 12
 13
 14
 15
-Verify Hybrid skips layer with always false predicate on the second layer
+Verify Hybrid skips segment with always false predicate on the second segment
 0
 1
 2
-Prepare local MergeTree table for multi-layer tests
+Prepare local MergeTree table for multi-segment tests
 Populate local table with sample data
-Create Hybrid table with three layer pairs
-Count rows across all layers
+Create Hybrid table with three segment pairs
+Count rows across all segments
 6
-Count rows from layers with id > 4
+Count rows from segments with id > 4
 1
 Count rows where value > 200
 3
@@ -127,7 +127,7 @@ Verify additional_table_filters works consistently (legacy analyser)
 2	Bob	200.3
 Verify additional_table_filters works consistently (new analyser)
 2	Bob	200.3
-Clean up Hybrid table with three layer pairs
+Clean up Hybrid table with three segment pairs
 Clean up local helper table
 Drop predicate filtering fixtures if they exist
 Create local tables representing before/after watermark partitions
@@ -135,7 +135,7 @@ Create second local table with different value type
 Insert rows before watermark into both tables
 Insert rows after watermark into both tables
 Create Hybrid table with analyzer disabled during reads
-Insert row via Hybrid table (should go to first layer)
+Insert row via Hybrid table (should go to first segment)
 Verify that inserted row landed in first table
 17	John	2025-09-25	400
 Verify that second table did not receive the inserted row

@@ -49,7 +49,7 @@ SHOW CREATE TABLE test_tiered_distributed_numbers_range;
 SELECT * FROM test_tiered_distributed_numbers_range ORDER BY number;
 DROP TABLE IF EXISTS test_tiered_distributed_numbers_range SYNC;
 
-SELECT 'Create Hybrid table with two remote layers as table';
+SELECT 'Create Hybrid table with two remote segments as table';
 DROP TABLE IF EXISTS test_tiered_distributed_numbers_dual SYNC;
 CREATE TABLE test_tiered_distributed_numbers_dual ENGINE = Hybrid(
     remote('localhost:9000', system.numbers), number < 5,
@@ -73,7 +73,7 @@ CREATE TABLE test_tiered_distributed_numbers_mixed
 SELECT * FROM test_tiered_distributed_numbers_mixed ORDER BY number;
 DROP TABLE IF EXISTS test_tiered_distributed_numbers_mixed SYNC;
 
-SELECT 'Verify Hybrid skips layer with always false predicate on the first layer';
+SELECT 'Verify Hybrid skips segment with always false predicate on the first segment';
 DROP TABLE IF EXISTS test_tiered_distributed_numbers_skip_first SYNC;
 CREATE TABLE test_tiered_distributed_numbers_skip_first
 (
@@ -85,7 +85,7 @@ CREATE TABLE test_tiered_distributed_numbers_skip_first
 SELECT * FROM test_tiered_distributed_numbers_skip_first ORDER BY number;
 DROP TABLE IF EXISTS test_tiered_distributed_numbers_skip_first SYNC;
 
-SELECT 'Verify Hybrid skips layer with always false predicate on the second layer';
+SELECT 'Verify Hybrid skips segment with always false predicate on the second segment';
 DROP TABLE IF EXISTS test_tiered_distributed_numbers_skip_second SYNC;
 CREATE TABLE test_tiered_distributed_numbers_skip_second
 (
@@ -99,7 +99,7 @@ DROP TABLE IF EXISTS test_tiered_distributed_numbers_skip_second SYNC;
 
 -----------------------------
 
-SELECT 'Prepare local MergeTree table for multi-layer tests';
+SELECT 'Prepare local MergeTree table for multi-segment tests';
 DROP TABLE IF EXISTS test_tiered_local_data SYNC;
 CREATE TABLE test_tiered_local_data
 (
@@ -119,10 +119,10 @@ INSERT INTO test_tiered_local_data VALUES
     (4, 'David', '2022-01-04 13:00:00', 300.2),
     (5, 'Eve', '2022-01-05 14:00:00', 250.1);
 
-SELECT 'Create Hybrid table with three layer pairs';
-DROP TABLE IF EXISTS test_tiered_multi_layer SYNC;
+SELECT 'Create Hybrid table with three segment pairs';
+DROP TABLE IF EXISTS test_tiered_multi_segment SYNC;
 
-CREATE TABLE test_tiered_multi_layer
+CREATE TABLE test_tiered_multi_segment
 (
     `id` UInt32,
     `name` String,
@@ -138,52 +138,52 @@ ENGINE = Hybrid(
     id > 3
 );
 
-SELECT 'Count rows across all layers';
-SELECT count() FROM test_tiered_multi_layer;
-SELECT 'Count rows from layers with id > 4';
-SELECT count() FROM test_tiered_multi_layer WHERE id > 4;
+SELECT 'Count rows across all segments';
+SELECT count() FROM test_tiered_multi_segment;
+SELECT 'Count rows from segments with id > 4';
+SELECT count() FROM test_tiered_multi_segment WHERE id > 4;
 SELECT 'Count rows where value > 200';
-SELECT count() FROM test_tiered_multi_layer WHERE value > 200;
+SELECT count() FROM test_tiered_multi_segment WHERE value > 200;
 SELECT 'Count rows named Alice';
-SELECT count() AS alice_rows FROM test_tiered_multi_layer WHERE name = 'Alice';
+SELECT count() AS alice_rows FROM test_tiered_multi_segment WHERE name = 'Alice';
 
 SELECT 'Select rows ordered by value descending (id > 2)';
-SELECT id, name, value FROM test_tiered_multi_layer WHERE id > 2 ORDER BY value DESC;
+SELECT id, name, value FROM test_tiered_multi_segment WHERE id > 2 ORDER BY value DESC;
 SELECT 'Limit results ordered by id';
-SELECT * FROM test_tiered_multi_layer ORDER BY id LIMIT 3;
+SELECT * FROM test_tiered_multi_segment ORDER BY id LIMIT 3;
 SELECT 'Explain plan for filter on value';
-EXPLAIN SELECT * FROM test_tiered_multi_layer WHERE value > 150 SETTINGS prefer_localhost_replica=0, enable_analyzer=0;
-EXPLAIN SELECT * FROM test_tiered_multi_layer WHERE value > 150 SETTINGS prefer_localhost_replica=0, enable_analyzer=1;
-EXPLAIN SELECT * FROM test_tiered_multi_layer WHERE value > 150 SETTINGS prefer_localhost_replica=1, enable_analyzer=0;
-EXPLAIN SELECT * FROM test_tiered_multi_layer WHERE value > 150 SETTINGS prefer_localhost_replica=1, enable_analyzer=1;
+EXPLAIN SELECT * FROM test_tiered_multi_segment WHERE value > 150 SETTINGS prefer_localhost_replica=0, enable_analyzer=0;
+EXPLAIN SELECT * FROM test_tiered_multi_segment WHERE value > 150 SETTINGS prefer_localhost_replica=0, enable_analyzer=1;
+EXPLAIN SELECT * FROM test_tiered_multi_segment WHERE value > 150 SETTINGS prefer_localhost_replica=1, enable_analyzer=0;
+EXPLAIN SELECT * FROM test_tiered_multi_segment WHERE value > 150 SETTINGS prefer_localhost_replica=1, enable_analyzer=1;
 
 SELECT 'Aggregate values across name when filtering by event_time';
 SELECT
     name,
     count() AS count,
     avg(value) AS avg_value
-FROM test_tiered_multi_layer
+FROM test_tiered_multi_segment
 WHERE event_time >= '2022-01-02'
 GROUP BY name
 ORDER BY avg_value DESC;
 
 SELECT 'Verify additional_table_filters works consistently (legacy analyser)';
 SELECT id, name, value
-FROM test_tiered_multi_layer
+FROM test_tiered_multi_segment
 WHERE id < 3
 ORDER BY id
-SETTINGS additional_table_filters = {'test_tiered_multi_layer' : 'id > 1'}, allow_experimental_analyzer = 0;
+SETTINGS additional_table_filters = {'test_tiered_multi_segment' : 'id > 1'}, allow_experimental_analyzer = 0;
 
 SELECT 'Verify additional_table_filters works consistently (new analyser)';
 SELECT id, name, value
-FROM test_tiered_multi_layer
+FROM test_tiered_multi_segment
 WHERE id < 3
 ORDER BY id
-SETTINGS additional_table_filters = {'test_tiered_multi_layer' : 'id > 1'}, allow_experimental_analyzer = 1;
+SETTINGS additional_table_filters = {'test_tiered_multi_segment' : 'id > 1'}, allow_experimental_analyzer = 1;
 
 
-SELECT 'Clean up Hybrid table with three layer pairs';
-DROP TABLE IF EXISTS test_tiered_multi_layer SYNC;
+SELECT 'Clean up Hybrid table with three segment pairs';
+DROP TABLE IF EXISTS test_tiered_multi_segment SYNC;
 SELECT 'Clean up local helper table';
 DROP TABLE IF EXISTS test_tiered_local_data SYNC;
 
@@ -254,7 +254,7 @@ ENGINE = Hybrid(
     date < '2025-09-01'
 );
 
-SELECT 'Insert row via Hybrid table (should go to first layer)';
+SELECT 'Insert row via Hybrid table (should go to first segment)';
 INSERT INTO test_tiered_watermark SETTINGS distributed_foreground_insert = 1
 VALUES (17, 'John', '2025-09-25', 400);
 
@@ -326,13 +326,13 @@ DROP TABLE IF EXISTS test_tiered_watermark_before SYNC;
 --   1. Integration tests (similar to tests/queries/0_stateless)
 --   - Base SELECT with date split: part in Distributed, part in S3 -> results should match a manual UNION ALL (with correct ORDER BY/aggregation).
 --   - GROUP BY / ORDER BY / LIMIT: confirm the stage is selected correctly, finalization happens at the top, rows_before_limit_at_least is correct (createLocalPlan already keeps LIMIT).
---   - JOIN: with a small table on the initiator; check GLOBAL JOIN scenarios. Ensure remote layers behave the same as remote shard subqueries created through createLocalPlan.
---   - skipUnusedShards: with analyzer ensure layer conditions are respected (where FILTER DAG is available).
---   - Constants: hostName()/now() in SELECT across several layers -> ensure no discrepancies.
---   - EXPLAIN PLAN/PIPELINE: show child plans for layers and remote plans.
+--   - JOIN: with a small table on the initiator; check GLOBAL JOIN scenarios. Ensure remote segments behave the same as remote shard subqueries created through createLocalPlan.
+--   - skipUnusedShards: with analyzer ensure segment conditions are respected (where FILTER DAG is available).
+--   - Constants: hostName()/now() in SELECT across several segments -> ensure no discrepancies.
+--   - EXPLAIN PLAN/PIPELINE: show child plans for segments and remote plans.
 --   - Subqueries in logs.
 -- - Different column sets/types: supertype in snapshot, converting actions on read.
---   - Object columns: same as Distributed — use ColumnsDescriptionByShardNum for layers if needed (optional for local layers; already implemented for Distributed).
+--   - Object columns: same as Distributed — use ColumnsDescriptionByShardNum for segments if needed (optional for local segments; already implemented for Distributed).
 
 -- Condition with dictGet('a1_watermarks_dict', ...)
 
@@ -342,4 +342,4 @@ DROP TABLE IF EXISTS test_tiered_watermark_before SYNC;
 -- TODO:
 -- test for distributed_aggregation_memory_efficient & enable_memory_bound_merging_of_aggregation_results
 -- to avoid UNKNOWN_AGGREGATED_DATA_VARIANT when mixing different aggregation variants
--- from remote shards (with memory_bound) and local layers (without memory_bound)
+-- from remote shards (with memory_bound) and local segments (without memory_bound)

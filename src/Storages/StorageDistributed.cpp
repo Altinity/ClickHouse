@@ -2196,7 +2196,7 @@ void StorageDistributed::setHybridLayout(std::vector<TableFunctionEntry> additio
     log = getLogger("Hybrid (" + getStorageID().table_name + ")");
 
     auto virtuals = createVirtuals();
-    // or _layer_index?
+    // or _segment_index?
     virtuals.addEphemeral("_table_index", std::make_shared<DataTypeUInt32>(), "Index of the table function in Hybrid (0 for main table, 1+ for additional table functions)");
     setVirtuals(virtuals);
 }
