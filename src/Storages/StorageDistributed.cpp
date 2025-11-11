@@ -2190,8 +2190,9 @@ void StorageDistributed::delayInsertOrThrowIfNeeded() const
     }
 }
 
-void StorageDistributed::setHybridLayout(std::vector<TableFunctionEntry> additional_table_functions_)
+void StorageDistributed::setHybridLayout(ColumnsDescription base_segment_columns_, std::vector<TableFunctionEntry> additional_table_functions_)
 {
+    base_segment_columns = std::move(base_segment_columns_);
     additional_table_functions = std::move(additional_table_functions_);
     log = getLogger("Hybrid (" + getStorageID().table_name + ")");
 
@@ -2348,13 +2349,13 @@ void registerStorageHybrid(StorageFactory & factory)
         if (!table_function)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid table function in Hybrid engine");
 
-        // For schema inference, we need to determine the columns first if they're not provided
+        // Capture the physical columns reported by the first segment (table function)
+        ColumnsDescription first_segment_columns = table_function->getActualTableStructure(local_context, true);
+
+        // For schema inference, prefer user-provided columns, otherwise use the physical ones
         ColumnsDescription columns_to_use = args.columns;
         if (columns_to_use.empty())
-        {
-            // Get the column structure from the table function
-            columns_to_use = table_function->getActualTableStructure(local_context, true);
-        }
+            columns_to_use = first_segment_columns;
 
         // Execute the table function to get the underlying storage
         StoragePtr storage = table_function->execute(
@@ -2429,11 +2430,11 @@ void registerStorageHybrid(StorageFactory & factory)
                 // TableFunctionFactory::get mutates the AST in-place inside TableFunctionRemote::parseArguments.
                 ASTPtr normalized_table_function_ast = table_function_ast->clone();
                 auto additional_table_function = TableFunctionFactory::instance().get(normalized_table_function_ast, local_context);
-                (void)additional_table_function;
+                ColumnsDescription segment_columns = additional_table_function->getActualTableStructure(local_context, true);
                 replaceCurrentDatabaseFunction(normalized_table_function_ast, local_context);
 
-                // It's a table function - store the AST for later execution
-                additional_table_functions.emplace_back(normalized_table_function_ast, predicate_ast);
+                // It's a table function - store the AST and cached schema for later execution
+                additional_table_functions.emplace_back(normalized_table_function_ast, predicate_ast, std::move(segment_columns));
             }
             else if (const auto * ast_identifier = table_function_ast->as<ASTIdentifier>())
             {
@@ -2445,6 +2446,7 @@ void registerStorageHybrid(StorageFactory & factory)
                         "Argument #{}: identifier '{}' cannot be converted to table identifier", i, ast_identifier->name());
                 }
 
+                StoragePtr validated_table;
                 try
                 {
                     // Parse table identifier to get StorageID
@@ -2473,6 +2475,7 @@ void registerStorageHybrid(StorageFactory & factory)
                             throw Exception(ErrorCodes::UNKNOWN_TABLE,
                                 "Table '{}.{}' does not exist", storage_id.database_name, storage_id.table_name);
                         }
+                        validated_table = table;
                     }
                     catch (const Exception & e)
                     {
@@ -2480,7 +2483,11 @@ void registerStorageHybrid(StorageFactory & factory)
                             "Argument #{}: table '{}' validation failed: {}", i, ast_identifier->name(), e.message());
                     }
 
-                    additional_table_functions.emplace_back(table_function_ast, predicate_ast, storage_id);
+                    ColumnsDescription segment_columns;
+                    if (validated_table)
+                        segment_columns = validated_table->getInMemoryMetadataPtr()->getColumns();
+
+                    additional_table_functions.emplace_back(table_function_ast, predicate_ast, storage_id, std::move(segment_columns));
                 }
                 catch (const Exception & e)
                 {
@@ -2502,7 +2509,7 @@ void registerStorageHybrid(StorageFactory & factory)
         distributed_storage->renameInMemory({args.table_id.database_name, args.table_id.table_name, args.table_id.uuid});
 
         // Store additional table functions for later use
-        distributed_storage->setHybridLayout(std::move(additional_table_functions));
+        distributed_storage->setHybridLayout(std::move(first_segment_columns), std::move(additional_table_functions));
 
         return distributed_storage;
     },

@@ -50,22 +50,25 @@ class StorageDistributed final : public IStorage, WithContext
     friend class StorageSystemDistributionQueue;
 
 public:
-    /// Structure to hold table function AST, predicate, and optional StorageID for table identifiers
+    /// Structure to hold table function AST, predicate, optional StorageID, and cached physical columns for the segment
     struct TableFunctionEntry
     {
         ASTPtr table_function_ast;
         ASTPtr predicate_ast;
         std::optional<StorageID> storage_id; // For table identifiers instead of table functions
+        ColumnsDescription actual_columns;
 
-        TableFunctionEntry(ASTPtr table_function_ast_, ASTPtr predicate_ast_)
+        TableFunctionEntry(ASTPtr table_function_ast_, ASTPtr predicate_ast_, ColumnsDescription actual_columns_)
             : table_function_ast(std::move(table_function_ast_))
             , predicate_ast(std::move(predicate_ast_))
+            , actual_columns(std::move(actual_columns_))
         {}
 
-        TableFunctionEntry(ASTPtr table_function_ast_, ASTPtr predicate_ast_, StorageID storage_id_)
+        TableFunctionEntry(ASTPtr table_function_ast_, ASTPtr predicate_ast_, StorageID storage_id_, ColumnsDescription actual_columns_)
             : table_function_ast(std::move(table_function_ast_))
             , predicate_ast(std::move(predicate_ast_))
             , storage_id(std::move(storage_id_))
+            , actual_columns(std::move(actual_columns_))
         {}
     };
 
@@ -176,8 +179,8 @@ public:
     /// Set additional filter for Hybrid engine
     void setAdditionalFilter(ASTPtr filter) { additional_filter = std::move(filter); }
 
-    /// Set additional table functions for Hybrid engine
-    void setHybridLayout(std::vector<TableFunctionEntry> additional_table_functions_);
+    /// Set additional table functions for Hybrid engine along with cached schema info
+    void setHybridLayout(ColumnsDescription base_segment_columns_, std::vector<TableFunctionEntry> additional_table_functions_);
 
     /// Getter methods for ClusterProxy::executeQuery
     StorageID getRemoteStorageID() const { return remote_storage; }
@@ -325,6 +328,7 @@ private:
 
     /// Additional table functions for Hybrid engine
     std::vector<TableFunctionEntry> additional_table_functions;
+    ColumnsDescription base_segment_columns;
 };
 
 }
