@@ -94,7 +94,7 @@ public:
 
     std::string getName() const override
     {
-        return (segments.empty() && !additional_filter)
+        return (segments.empty() && !base_segment_predicate)
             ? "Distributed"
             : "Hybrid";
     }
@@ -176,8 +176,8 @@ public:
 
     size_t getShardCount() const;
 
-    /// Set additional filter for Hybrid engine
-    void setAdditionalFilter(ASTPtr filter) { additional_filter = std::move(filter); }
+    /// Set optional predicate applied to the base segment
+    void setBaseSegmentPredicate(ASTPtr predicate) { base_segment_predicate = std::move(predicate); }
 
     /// Set segment definitions for Hybrid engine along with cached schema info
     void setHybridLayout(ColumnsDescription base_segment_columns_, std::vector<HybridSegment> segments_);
@@ -324,7 +324,7 @@ private:
     bool is_remote_function;
 
     /// Additional filter expression for Hybrid engine
-    ASTPtr additional_filter;
+    ASTPtr base_segment_predicate;
 
     /// Additional segments for Hybrid engine
     std::vector<HybridSegment> segments;

@@ -1087,7 +1087,7 @@ void StorageDistributed::read(
             query_info.initial_storage_snapshot ? query_info.initial_storage_snapshot : storage_snapshot,
             remote_storage_id,
             remote_table_function_ptr,
-            additional_filter);
+            base_segment_predicate);
         Block block = *InterpreterSelectQueryAnalyzer::getSampleBlock(query_tree_distributed, local_context, SelectQueryOptions(processed_stage).analyze());
         /** For distributed tables we do not need constants in header, since we don't send them to remote servers.
           * Moreover, constants can break some functions like `hostName` that are constants only for local queries.
@@ -1105,7 +1105,7 @@ void StorageDistributed::read(
         {
             for (const auto & segment : segments)
             {
-                // Create a modified query info with the additional predicate
+                // Create a modified query info with the segment predicate
                 SelectQueryInfo additional_query_info = query_info;
 
                 auto additional_query_tree = buildQueryTreeDistributed(additional_query_info,
@@ -1132,7 +1132,7 @@ void StorageDistributed::read(
         modified_query_info.query = ClusterProxy::rewriteSelectQuery(
             local_context, modified_query_info.query,
             remote_database, remote_table, remote_table_function_ptr,
-            additional_filter);
+            base_segment_predicate);
 
         if (!segments.empty())
         {
@@ -2401,7 +2401,7 @@ void registerStorageHybrid(StorageFactory & factory)
 
         ASTPtr second_arg = engine_args[1];
         validate_predicate(second_arg, 1);
-        distributed_storage->setAdditionalFilter(second_arg);
+        distributed_storage->setBaseSegmentPredicate(second_arg);
 
         // Parse additional table function pairs (if any)
         std::vector<StorageDistributed::HybridSegment> segment_definitions;
