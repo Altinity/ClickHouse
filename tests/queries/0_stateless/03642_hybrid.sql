@@ -97,6 +97,41 @@ CREATE TABLE test_tiered_distributed_numbers_skip_second
 SELECT * FROM test_tiered_distributed_numbers_skip_second ORDER BY number;
 DROP TABLE IF EXISTS test_tiered_distributed_numbers_skip_second SYNC;
 
+SELECT 'Hybrid raises when a segment is missing a column used by the base schema';
+DROP TABLE IF EXISTS test_hybrid_segment_full SYNC;
+DROP TABLE IF EXISTS test_hybrid_segment_partial SYNC;
+DROP TABLE IF EXISTS test_hybrid_missing_column SYNC;
+
+CREATE TABLE test_hybrid_segment_full
+(
+    `id` UInt32,
+    `value` UInt32
+)
+ENGINE = MergeTree()
+ORDER BY id;
+
+CREATE TABLE test_hybrid_segment_partial
+(
+    `id` UInt32
+)
+ENGINE = MergeTree()
+ORDER BY id;
+
+INSERT INTO test_hybrid_segment_full VALUES (1, 10), (2, 20);
+INSERT INTO test_hybrid_segment_partial VALUES (3), (4);
+
+CREATE TABLE test_hybrid_missing_column ENGINE = Hybrid(
+    remote('localhost:9000', currentDatabase(), 'test_hybrid_segment_full'), id < 3,
+    remote('localhost:9000', currentDatabase(), 'test_hybrid_segment_partial'), id >= 3
+);
+
+SELECT id, value FROM test_hybrid_missing_column ORDER BY id SETTINGS enable_analyzer = 0; -- { serverError UNKNOWN_IDENTIFIER }
+SELECT id, value FROM test_hybrid_missing_column ORDER BY id SETTINGS enable_analyzer = 1; -- { serverError UNKNOWN_IDENTIFIER }
+
+DROP TABLE IF EXISTS test_hybrid_missing_column SYNC;
+DROP TABLE IF EXISTS test_hybrid_segment_partial SYNC;
+DROP TABLE IF EXISTS test_hybrid_segment_full SYNC;
+
 -----------------------------
 
 SELECT 'Prepare local MergeTree table for multi-segment tests';

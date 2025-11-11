@@ -74,6 +74,7 @@ Verify Hybrid skips segment with always false predicate on the second segment
 0
 1
 2
+Hybrid raises when a segment is missing a column used by the base schema
 Prepare local MergeTree table for multi-segment tests
 Populate local table with sample data
 Create Hybrid table with three segment pairs
