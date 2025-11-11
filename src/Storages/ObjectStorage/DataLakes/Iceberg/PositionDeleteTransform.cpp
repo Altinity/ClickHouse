@@ -70,15 +70,19 @@ void IcebergPositionDeleteTransform::initializeDeleteSources()
             && position_deletes_object.reference_data_file_path != iceberg_data_path)
             continue;
 
-        auto object_path = position_deletes_object.file_path;
-        auto object_metadata = object_storage->getObjectMetadata(object_path);
-        auto object_info = std::make_shared<ObjectInfo>(object_path, object_metadata);
+        /// Resolve the position delete file path to get the correct storage and key
+        /// This handles cases where delete files are outside the table location
+        auto [delete_storage_to_use, resolved_delete_key] = resolveObjectStorageForPath(
+            table_location, position_deletes_object.file_path, object_storage, secondary_storages, context);
+        
+        auto object_metadata = delete_storage_to_use->getObjectMetadata(resolved_delete_key);
+        PathWithMetadata delete_file_object(resolved_delete_key, object_metadata, position_deletes_object.file_path, delete_storage_to_use);
 
 
         String format = position_deletes_object.file_format;
         Block initial_header;
         {
-            std::unique_ptr<ReadBuffer> read_buf_schema = createReadBuffer(*object_info, object_storage, context, log);
+            std::unique_ptr<ReadBuffer> read_buf_schema = createReadBuffer(delete_file_object, delete_storage_to_use, context, log);
             auto schema_reader = FormatFactory::instance().getSchemaReader(format, *read_buf_schema, context);
             auto columns_with_names = schema_reader->readSchema();
             ColumnsWithTypeAndName initial_header_data;
@@ -89,9 +93,9 @@ void IcebergPositionDeleteTransform::initializeDeleteSources()
             initial_header = Block(initial_header_data);
         }
 
-        CompressionMethod compression_method = chooseCompressionMethod(object_path, "auto");
+        CompressionMethod compression_method = chooseCompressionMethod(resolved_delete_key, "auto");
 
-        delete_read_buffers.push_back(createReadBuffer(*object_info, object_storage, context, log));
+        delete_read_buffers.push_back(createReadBuffer(delete_file_object, delete_storage_to_use, context, log));
 
         auto syntax_result = TreeRewriter(context).analyze(where_ast, initial_header.getNamesAndTypesList());
         ExpressionAnalyzer analyzer(where_ast, syntax_result, context);

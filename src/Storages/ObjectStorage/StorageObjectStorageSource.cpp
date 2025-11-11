@@ -346,10 +346,14 @@ Chunk StorageObjectStorageSource::generate()
                     path);
             }
 
+            /// For _path column, use absolute_path if available (e.g., file:///home/...)
+            /// Otherwise, fall back to the storage path identifier
+            std::string path_for_virtual_column = object_info->getAbsolutePath().value_or(path);
+
             VirtualColumnUtils::addRequestedFileLikeStorageVirtualsToChunk(
                 chunk,
                 read_from_format_info.requested_virtual_columns,
-                {.path = path,
+                {.path = path_for_virtual_column,
                  .size = object_info->isArchive() ? object_info->fileSizeInArchive() : object_info->metadata->size_bytes,
                  .filename = &filename,
                  .last_modified = object_info->metadata->last_modified,
@@ -484,8 +488,6 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
     ObjectInfoPtr object_info;
     auto query_settings = configuration->getQuerySettings(context_);
 
-    ObjectStoragePtr storage_to_use = object_storage;
-
     bool not_a_path = false;
 
     do
@@ -516,6 +518,8 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         object_info->loadMetadata(object_storage, query_settings.ignore_non_existent_file);
     }
     while (not_a_path || (query_settings.skip_empty_files && object_info->metadata->size_bytes == 0));
+    
+    ObjectStoragePtr storage_to_use = object_info->getObjectStorage().value_or(object_storage);
 
     QueryPipelineBuilder builder;
     std::shared_ptr<ISource> source;

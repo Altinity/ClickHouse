@@ -125,7 +125,6 @@ std::optional<ManifestFileEntry> SingleThreadIcebergKeysIterator::next()
                 ++manifest_file_index;
                 continue;
             }
-            std::map<String, ObjectStoragePtr> empty_secondary_storages;
             current_manifest_file_content = Iceberg::getManifestFile(
                 object_storage,
                 configuration.lock(),
@@ -135,7 +134,7 @@ std::optional<ManifestFileEntry> SingleThreadIcebergKeysIterator::next()
                 data_snapshot->manifest_list_entries[manifest_file_index].manifest_file_absolute_path,
                 data_snapshot->manifest_list_entries[manifest_file_index].added_sequence_number,
                 data_snapshot->manifest_list_entries[manifest_file_index].added_snapshot_id,
-                empty_secondary_storages);
+                secondary_storages);
             internal_data_index = 0;
         }
         auto files = files_generator(current_manifest_file_content);
@@ -202,7 +201,8 @@ SingleThreadIcebergKeysIterator::SingleThreadIcebergKeysIterator(
     const ActionsDAG * filter_dag_,
     Iceberg::IcebergTableStateSnapshotPtr table_snapshot_,
     Iceberg::IcebergDataSnapshotPtr data_snapshot_,
-    PersistentTableComponents persistent_components_)
+    PersistentTableComponents persistent_components_,
+    std::map<String, ObjectStoragePtr> & secondary_storages_)
     : object_storage(object_storage_)
     , filter_dag(filter_dag_ ? std::make_shared<ActionsDAG>(filter_dag_->clone()) : nullptr)
     , local_context(local_context_)
@@ -224,6 +224,7 @@ SingleThreadIcebergKeysIterator::SingleThreadIcebergKeysIterator(
     , persistent_components(persistent_components_)
     , files_generator(files_generator_)
     , log(getLogger("IcebergIterator"))
+    , secondary_storages(secondary_storages_)
     , manifest_file_content_type(manifest_file_content_type_)
 {
 }
@@ -236,7 +237,8 @@ IcebergIterator::IcebergIterator(
     IDataLakeMetadata::FileProgressCallback callback_,
     Iceberg::IcebergTableStateSnapshotPtr table_snapshot_,
     Iceberg::IcebergDataSnapshotPtr data_snapshot_,
-    PersistentTableComponents persistent_components_)
+    PersistentTableComponents persistent_components_,
+    std::map<String, ObjectStoragePtr> & secondary_storages_)
     : filter_dag(filter_dag_ ? std::make_unique<ActionsDAG>(filter_dag_->clone()) : nullptr)
     , object_storage(std::move(object_storage_))
     , local_context(local_context_)
@@ -249,7 +251,8 @@ IcebergIterator::IcebergIterator(
           filter_dag.get(),
           table_snapshot_,
           data_snapshot_,
-          persistent_components_)
+          persistent_components_,
+          secondary_storages_)
     , deletes_iterator(
           object_storage,
           local_context_,
@@ -265,7 +268,8 @@ IcebergIterator::IcebergIterator(
           filter_dag.get(),
           table_snapshot_,
           data_snapshot_,
-          persistent_components_)
+          persistent_components_,
+          secondary_storages_)
     , blocking_queue(100)
     , producer_task(local_context_->getSchedulePool().createTask(
           "IcebergMetaReaderThread",
@@ -305,6 +309,7 @@ IcebergIterator::IcebergIterator(
     , compression_method(configuration_.lock()->getCompressionMethod())
     , persistent_components(persistent_components_)
     , table_schema_id(table_snapshot_->schema_id)
+    , secondary_storages(secondary_storages_)
 {
     auto delete_file = deletes_iterator.next();
     while (delete_file.has_value())
@@ -331,9 +336,8 @@ ObjectInfoPtr IcebergIterator::next(size_t)
     if (blocking_queue.pop(manifest_file_entry))
     {
         // Resolve the data file path to get the correct storage and key
-        std::map<String, ObjectStoragePtr> empty_secondary_storages;
         auto [storage_to_use, resolved_key] = resolveObjectStorageForPath(
-            persistent_components.table_location, manifest_file_entry.file_path, object_storage, empty_secondary_storages, local_context);
+            persistent_components.table_location, manifest_file_entry.file_path, object_storage, secondary_storages, local_context);
         
         // Create IcebergDataObjectInfo with resolved storage
         IcebergDataObjectInfoPtr object_info = std::make_shared<IcebergDataObjectInfo>(manifest_file_entry, storage_to_use, resolved_key);

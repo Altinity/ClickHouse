@@ -1,3 +1,4 @@
+#include <Poco/String.h>
 #include "config.h"
 
 #if USE_AVRO
@@ -42,12 +43,7 @@ IcebergDataObjectInfo::IcebergDataObjectInfo(Iceberg::ManifestFileEntry data_man
     , underlying_format_read_schema_id(data_manifest_file_entry_.schema_id)
     , sequence_number(data_manifest_file_entry_.added_sequence_number)
 {
-    auto toupper = [](String & str)
-    {
-        std::transform(str.begin(), str.end(), str.begin(), ::toupper);
-        return str;
-    };
-    if (!position_deletes_objects.empty() && toupper(data_manifest_file_entry_.file_format) != "PARQUET")
+    if (!position_deletes_objects.empty() && Poco::toUpper(data_manifest_file_entry_.file_format) != "PARQUET")
     {
         throw Exception(
             ErrorCodes::NOT_IMPLEMENTED,
@@ -83,13 +79,15 @@ std::shared_ptr<ISimpleTransform> IcebergDataObjectInfo::getPositionDeleteTransf
     ObjectStoragePtr object_storage,
     const SharedHeader & header,
     const std::optional<FormatSettings> & format_settings,
-    ContextPtr context_)
+    ContextPtr context_,
+    const String & table_location,
+    std::map<String, ObjectStoragePtr> & secondary_storages)
 {
     IcebergDataObjectInfoPtr self = shared_from_this();
     if (!context_->getSettingsRef()[Setting::use_roaring_bitmap_iceberg_positional_deletes].value)
-        return std::make_shared<IcebergStreamingPositionDeleteTransform>(header, self, object_storage, format_settings, context_);
+        return std::make_shared<IcebergStreamingPositionDeleteTransform>(header, self, object_storage, format_settings, context_, table_location, secondary_storages);
     else
-        return std::make_shared<IcebergBitmapPositionDeleteTransform>(header, self, object_storage, format_settings, context_);
+        return std::make_shared<IcebergBitmapPositionDeleteTransform>(header, self, object_storage, format_settings, context_, table_location, secondary_storages);
 }
 }
 

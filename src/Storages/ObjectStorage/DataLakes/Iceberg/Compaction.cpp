@@ -69,6 +69,7 @@ struct Plan
     IcebergHistory history;
     std::unordered_map<String, Int64> manifest_file_to_first_snapshot;
     std::unordered_map<String, std::vector<String>> manifest_list_to_manifest_files;
+    std::unordered_map<String, std::unordered_set<Int64>> manifest_file_to_snapshots;
     std::unordered_map<Int64, std::vector<std::shared_ptr<DataFilePlan>>> snapshot_id_to_data_files;
     std::unordered_map<String, std::shared_ptr<DataFilePlan>> path_to_data_file;
     FileNamesGenerator generator;
@@ -111,7 +112,7 @@ Plan getPlan(
     IcebergHistory snapshots_info,
     const PersistentTableComponents & persistent_table_components,
     ObjectStoragePtr object_storage,
-    std::map<String, DB::ObjectStoragePtr> secondary_storages,
+    std::map<String, DB::ObjectStoragePtr> & secondary_storages,
     StorageObjectStorageConfigurationPtr configuration,
     ContextPtr context,
     CompressionMethod compression_method)
@@ -156,7 +157,9 @@ Plan getPlan(
         {
             plan.manifest_list_to_manifest_files[snapshot.manifest_list_absolute_path].push_back(manifest_file.manifest_file_absolute_path);
             if (!plan.manifest_file_to_first_snapshot.contains(manifest_file.manifest_file_absolute_path))
+            {
                 plan.manifest_file_to_first_snapshot[manifest_file.manifest_file_absolute_path] = snapshot.snapshot_id;
+            }
             auto manifest_file_content = getManifestFile(
                 object_storage,
                 configuration,
@@ -174,6 +177,8 @@ Plan getPlan(
                 manifest_files[manifest_file.manifest_file_absolute_path]->path = manifest_file.manifest_file_absolute_path;
             }
             manifest_files[manifest_file.manifest_file_absolute_path]->manifest_lists_path.push_back(snapshot.manifest_list_path);
+            // Track which snapshots this manifest file belongs to
+            plan.manifest_file_to_snapshots[manifest_file.manifest_file_absolute_path].insert(snapshot.snapshot_id);
             auto data_files = manifest_file_content->getFilesWithoutDeleted(FileContentType::DATA);
             auto positional_delete_files = manifest_file_content->getFilesWithoutDeleted(FileContentType::POSITION_DELETE);
             for (const auto & pos_delete_file : positional_delete_files)
@@ -185,19 +190,24 @@ Plan getPlan(
                 if (plan.partitions.size() <= partition_index)
                     plan.partitions.push_back({});
 
-                IcebergDataObjectInfoPtr data_object_info = std::make_shared<IcebergDataObjectInfo>(data_file);
+                auto [resolved_storage, resolved_key] = resolveObjectStorageForPath(
+                    persistent_table_components.table_location, data_file.file_path, object_storage, secondary_storages, context);
+
+                IcebergDataObjectInfoPtr data_object_info = std::make_shared<IcebergDataObjectInfo>(data_file, resolved_storage, resolved_key);
                 std::shared_ptr<DataFilePlan> data_file_ptr;
-                if (!plan.path_to_data_file.contains(manifest_file.manifest_file_absolute_path))
+                std::string storage_identifier = resolved_storage->getDescription() + ":" + resolved_storage->getObjectsNamespace();
+                std::string composite_key = storage_identifier + "|" + resolved_key;
+                if (!plan.path_to_data_file.contains(composite_key))
                 {
                     data_file_ptr = std::make_shared<DataFilePlan>(DataFilePlan{
                         .data_object_info = data_object_info,
                         .manifest_list = manifest_files[manifest_file.manifest_file_absolute_path],
                         .patched_path = plan.generator.generateDataFileName()});
-                    plan.path_to_data_file[manifest_file.manifest_file_absolute_path] = data_file_ptr;
+                    plan.path_to_data_file[composite_key] = data_file_ptr;
                 }
                 else
                 {
-                    data_file_ptr = plan.path_to_data_file[manifest_file.manifest_file_absolute_path];
+                    data_file_ptr = plan.path_to_data_file[composite_key];
                 }
                 plan.partitions[partition_index].push_back(data_file_ptr);
                 plan.snapshot_id_to_data_files[snapshot.snapshot_id].push_back(plan.partitions[partition_index].back());
@@ -229,15 +239,18 @@ void writeDataFiles(
     ObjectStoragePtr object_storage,
     const std::optional<FormatSettings> & format_settings,
     ContextPtr context,
-    StorageObjectStorageConfigurationPtr configuration)
+    StorageObjectStorageConfigurationPtr configuration,
+    const String & table_location,
+    std::map<String, ObjectStoragePtr> & secondary_storages)
 {
     for (auto & [_, data_file] : initial_plan.path_to_data_file)
     {
         auto delete_file_transform = std::make_shared<IcebergBitmapPositionDeleteTransform>(
-            sample_block, data_file->data_object_info, object_storage, format_settings, context);
+            sample_block, data_file->data_object_info, object_storage, format_settings, context, table_location, secondary_storages);
 
+        ObjectStoragePtr storage_to_use = data_file->data_object_info->getObjectStorage().value_or(object_storage);
         StorageObjectStorage::ObjectInfo object_info(data_file->data_object_info->getPath());
-        auto read_buffer = createReadBuffer(object_info, object_storage, context, getLogger("IcebergCompaction"));
+        auto read_buffer = createReadBuffer(object_info, storage_to_use, context, getLogger("IcebergCompaction"));
 
         const Settings & settings = context->getSettingsRef();
         auto parser_shared_resources = std::make_shared<FormatParserSharedResources>(
@@ -395,6 +408,9 @@ void writeMetadataFiles(
         {
             manifest_entry->patched_path = plan.generator.generateManifestEntryName();
             manifest_file_renamings[manifest_entry->path] = manifest_entry->patched_path.path_in_metadata;
+
+            std::vector<String> unique_data_filenames(data_filenames.begin(), data_filenames.end());
+
             auto buffer_manifest_entry = object_storage->writeObject(
                 StoredObject(manifest_entry->patched_path.path_in_storage),
                 WriteMode::Rewrite,
@@ -412,7 +428,7 @@ void writeMetadataFiles(
                 partition_columns,
                 plan.partition_encoder.getPartitionValue(grouped_by_manifest_files_partitions[manifest_entry]),
                 ChunkPartitioner(fields_from_partition_spec, current_schema, context, sample_block_).getResultTypes(),
-                std::vector(data_filenames.begin(), data_filenames.end()),
+                unique_data_filenames,
                 manifest_entry->statistics,
                 sample_block_,
                 snapshot,
@@ -441,16 +457,25 @@ void writeMetadataFiles(
         if (plan.history[i].added_files == 0)
             continue;
 
-        auto initial_manifest_list_name = plan.history[i].manifest_list_path;
+        auto initial_manifest_list_name = plan.history[i].manifest_list_absolute_path;
         auto initial_manifest_entries = plan.manifest_list_to_manifest_files[initial_manifest_list_name];
-        auto renamed_manifest_list = manifest_list_renamings[initial_manifest_list_name];
+        auto renamed_manifest_list = manifest_list_renamings[plan.history[i].manifest_list_path];
         std::vector<String> renamed_manifest_entries;
+        std::unordered_set<String> seen_manifest_entries; // Deduplicate manifest entries
         Int32 total_manifest_file_sizes = 0;
         for (const auto & initial_manifest_entry : initial_manifest_entries)
         {
             auto renamed_manifest_entry = manifest_file_renamings[initial_manifest_entry];
             if (!renamed_manifest_entry.empty())
             {
+                auto it = plan.manifest_file_to_snapshots.find(initial_manifest_entry);
+                if (it != plan.manifest_file_to_snapshots.end() && !it->second.contains(plan.history[i].snapshot_id))
+                    continue;
+
+                if (seen_manifest_entries.contains(renamed_manifest_entry))
+                    continue;
+
+                seen_manifest_entries.insert(renamed_manifest_entry);
                 renamed_manifest_entries.push_back(renamed_manifest_entry);
                 total_manifest_file_sizes += manifest_file_sizes[renamed_manifest_entry];
             }
@@ -513,7 +538,7 @@ void compactIcebergTable(
     IcebergHistory snapshots_info,
     const PersistentTableComponents & persistent_table_components,
     ObjectStoragePtr object_storage_,
-    std::map<String, DB::ObjectStoragePtr> secondary_storages_,
+    std::map<String, DB::ObjectStoragePtr> & secondary_storages_,
     StorageObjectStorageConfigurationPtr configuration_,
     const std::optional<FormatSettings> & format_settings_,
     SharedHeader sample_block_,
@@ -525,7 +550,7 @@ void compactIcebergTable(
     if (plan.need_optimize)
     {
         auto old_files = getOldFiles(object_storage_, configuration_);
-        writeDataFiles(plan, sample_block_, object_storage_, format_settings_, context_, configuration_);
+        writeDataFiles(plan, sample_block_, object_storage_, format_settings_, context_, configuration_, persistent_table_components.table_location, secondary_storages_);
         writeMetadataFiles(plan, object_storage_, configuration_, context_, sample_block_);
         clearOldFiles(object_storage_, old_files);
     }

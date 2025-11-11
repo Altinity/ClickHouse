@@ -56,6 +56,11 @@ std::string extractStorageType(const std::string & path);
 
 std::string makeAbsolutePath(const std::string & table_location, const std::string & path);
 
+// Normalize a path that may be relative to table location to be relative to storage root
+// Returns the normalized key (not a full URI)
+// Handles cases where the path already includes the table location prefix
+std::string normalizePathToStorageRoot(const std::string & table_location, const std::string & path);
+
 // Resolve object storage for reading a file from
 // * If path is relative -- it must be read from "base" storage
 // * Otherwise, lookup if suitable storage already exists in secondary_storages

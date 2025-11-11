@@ -45,7 +45,8 @@ public:
         const ActionsDAG * filter_dag_,
         IcebergTableStateSnapshotPtr table_snapshot_,
         IcebergDataSnapshotPtr data_snapshot_,
-        PersistentTableComponents persistent_components);
+        PersistentTableComponents persistent_components,
+        std::map<String, ObjectStoragePtr> & secondary_storages_);
 
     std::optional<DB::Iceberg::ManifestFileEntry> next();
 
@@ -62,7 +63,7 @@ private:
     PersistentTableComponents persistent_components;
     FilesGenerator files_generator;
     LoggerPtr log;
-
+    std::map<String, ObjectStoragePtr> & secondary_storages;
 
     // By Iceberg design it is difficult to avoid storing position deletes in memory.
     size_t manifest_file_index = 0;
@@ -90,7 +91,8 @@ public:
         IDataLakeMetadata::FileProgressCallback callback_,
         Iceberg::IcebergTableStateSnapshotPtr table_snapshot_,
         Iceberg::IcebergDataSnapshotPtr data_snapshot_,
-        Iceberg::PersistentTableComponents persistent_components_);
+        Iceberg::PersistentTableComponents persistent_components_,
+        std::map<String, ObjectStoragePtr> & secondary_storages_);
 
     ObjectInfoPtr next(size_t) override;
 
@@ -114,6 +116,7 @@ private:
     std::mutex exception_mutex;
     Iceberg::PersistentTableComponents persistent_components;
     Int32 table_schema_id;
+    std::map<String, ObjectStoragePtr> & secondary_storages;
 };
 }
 

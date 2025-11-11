@@ -148,10 +148,7 @@ void PathWithMetadata::loadMetadata(ObjectStoragePtr object_storage, bool ignore
     {
         const auto & path = isArchive() ? getPathToArchive() : getPath();
 
-        auto storage_to_use = object_storage;
-
-        if (auto storage_for_file = getObjectStorage(); storage_for_file.has_value())
-            storage_to_use = storage_for_file.value();
+        auto storage_to_use = object_storage_to_use.value_or(object_storage);
 
         if (ignore_non_existent_file)
             metadata = storage_to_use->tryGetObjectMetadata(path);

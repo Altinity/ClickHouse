@@ -32,7 +32,9 @@ struct IcebergDataObjectInfo : public PathWithMetadata, std::enable_shared_from_
         ObjectStoragePtr object_storage,
         const SharedHeader & header,
         const std::optional<FormatSettings> & format_settings,
-        ContextPtr context_);
+        ContextPtr context_,
+        const String & table_location,
+        std::map<String, ObjectStoragePtr> & secondary_storages);
 
     void addPositionDeleteObject(Iceberg::ManifestFileEntry position_delete_object)
     {
