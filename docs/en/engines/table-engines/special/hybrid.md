@@ -1,6 +1,6 @@
 ---
 description: 'Hybrid unions multiple data sources behind per-layer predicates so queries behave like a single table while data is migrated or tiered.'
-slug: /engines/table-engines/special/tiered-distributed
+slug: /engines/table-engines/special/hybrid
 title: 'Hybrid Table Engine'
 sidebar_label: 'Hybrid'
 sidebar_position: 11
