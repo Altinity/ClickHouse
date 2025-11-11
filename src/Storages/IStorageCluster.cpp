@@ -223,7 +223,9 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
     {
     case ObjectStorageClusterJoinMode::LOCAL:
     {
-        if (has_join || has_cross_join || has_local_columns_in_where)
+        auto info = getQueryTreeInfo(query_tree, context);
+
+        if (info.has_join || info.has_cross_join || info.has_local_columns_in_where)
         {
             auto modified_query_tree = query_tree->clone();
 
@@ -237,7 +239,7 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
 
             auto & query_node = modified_query_tree->as<QueryNode &>();
 
-            if (has_join || has_cross_join)
+            if (info.has_join || info.has_cross_join)
             {
                 if (table_function_searcher.getType().value() == QueryTreeNodeType::TABLE_FUNCTION)
                 {
@@ -246,7 +248,7 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
                     auto & table_function_ast = table_function->as<ASTFunction &>();
                     query_tree_distributed->setAlias(table_function_ast.alias);
                 }
-                else if (has_join)
+                else if (info.has_join)
                 {
                     auto join_node = query_node.getJoinTree();
                     query_tree_distributed = join_node->as<JoinNode>()->getLeftTableExpression()->clone();
@@ -275,7 +277,7 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
                 column_nodes_to_select->getNodes().emplace_back(std::make_shared<ColumnNode>(column, table_function_node));
             query_node.getProjectionNode() = column_nodes_to_select;
 
-            if (has_local_columns_in_where)
+            if (info.has_local_columns_in_where)
             {
                 if (query_node.getPrewhere())
                     removeExpressionsThatDoNotDependOnTableIdentifiers(query_node.getPrewhere(), table_function_node, context);
@@ -526,6 +528,45 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
     pipeline.init(std::move(pipe));
 }
 
+IStorageCluster::QueryTreeInfo IStorageCluster::getQueryTreeInfo(QueryTreeNodePtr query_tree, ContextPtr context)
+{
+    QueryTreeInfo info;
+
+    SearcherVisitor join_searcher({QueryTreeNodeType::JOIN, QueryTreeNodeType::CROSS_JOIN}, context);
+    join_searcher.visit(query_tree);
+
+    if (join_searcher.getNode())
+    {
+        if (join_searcher.getType() == QueryTreeNodeType::JOIN)
+            info.has_join = true;
+        else
+            info.has_cross_join = true;
+    }
+
+    SearcherVisitor table_function_searcher({QueryTreeNodeType::TABLE, QueryTreeNodeType::TABLE_FUNCTION}, context);
+    table_function_searcher.visit(query_tree);
+    auto table_function_node = table_function_searcher.getNode();
+    if (!table_function_node)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find table or table function node");
+
+    auto & query_node = query_tree->as<QueryNode &>();
+    if (query_node.hasWhere() || query_node.hasPrewhere())
+    {
+        CollectUsedColumnsForSourceVisitor collector_where(table_function_node, context, true);
+        if (query_node.hasPrewhere())
+            collector_where.visit(query_node.getPrewhere());
+        if (query_node.hasWhere())
+            collector_where.visit(query_node.getWhere());
+
+        // SELECT x FROM datalake.table WHERE x IN local.table
+        // Need to modify 'WHERE' on remote node if it contains columns from other sources
+        if (!collector_where.getColumns().empty())
+            info.has_local_columns_in_where = true;
+    }
+
+    return info;
+}
+
 QueryProcessingStage::Enum IStorageCluster::getQueryProcessingStage(
     ContextPtr context, QueryProcessingStage::Enum to_stage, const StorageSnapshotPtr &, SelectQueryInfo & query_info) const
 {
@@ -537,38 +578,8 @@ QueryProcessingStage::Enum IStorageCluster::getQueryProcessingStage(
             throw Exception(ErrorCodes::NOT_IMPLEMENTED,
                 "object_storage_cluster_join_mode!='allow' is not supported without allow_experimental_analyzer=true");
 
-        SearcherVisitor join_searcher({QueryTreeNodeType::JOIN, QueryTreeNodeType::CROSS_JOIN}, context);
-        join_searcher.visit(query_info.query_tree);
-        if (join_searcher.getNode())
-        {
-            if (join_searcher.getType() == QueryTreeNodeType::JOIN)
-                has_join = true;
-            else
-                has_cross_join = true;
-        }
-
-        SearcherVisitor table_function_searcher({QueryTreeNodeType::TABLE, QueryTreeNodeType::TABLE_FUNCTION}, context);
-        table_function_searcher.visit(query_info.query_tree);
-        auto table_function_node = table_function_searcher.getNode();
-        if (!table_function_node)
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find table or table function node");
-
-        auto & query_node = query_info.query_tree->as<QueryNode &>();
-        if (query_node.hasWhere() || query_node.hasPrewhere())
-        {
-            CollectUsedColumnsForSourceVisitor collector_where(table_function_node, context, true);
-            if (query_node.hasPrewhere())
-                collector_where.visit(query_node.getPrewhere());
-            if (query_node.hasWhere())
-                collector_where.visit(query_node.getWhere());
-
-            // SELECT x FROM datalake.table WHERE x IN local.table
-            // Need to modify 'WHERE' on remote node if it contains columns from other sources
-            if (!collector_where.getColumns().empty())
-                has_local_columns_in_where = true;
-        }
-
-        if (has_join || has_cross_join || has_local_columns_in_where)
+        auto info = getQueryTreeInfo(query_info.query_tree, context);
+        if (info.has_join || info.has_cross_join || info.has_local_columns_in_where)
             return QueryProcessingStage::Enum::FetchColumns;
     }
 
