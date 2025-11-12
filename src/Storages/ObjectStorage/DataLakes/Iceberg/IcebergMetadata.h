@@ -80,7 +80,10 @@ public:
     bool supportsSchemaEvolution() const override { return true; }
 
     static Int32 parseTableSchema(
-        const Poco::JSON::Object::Ptr & metadata_object, Iceberg::IcebergSchemaProcessor & schema_processor, LoggerPtr metadata_logger);
+        const Poco::JSON::Object::Ptr & metadata_object,
+        Iceberg::IcebergSchemaProcessor & schema_processor,
+        ContextPtr context_,
+        LoggerPtr metadata_logger);
 
     bool supportsUpdate() const override { return true; }
     bool supportsWrites() const override { return true; }
@@ -150,7 +153,7 @@ private:
 
     void updateState(const ContextPtr & local_context, Poco::JSON::Object::Ptr metadata_object) TSA_REQUIRES(mutex);
     void updateSnapshot(ContextPtr local_context, Poco::JSON::Object::Ptr metadata_object) TSA_REQUIRES(mutex);
-    void addTableSchemaById(Int32 schema_id, Poco::JSON::Object::Ptr metadata_object) const TSA_REQUIRES(mutex);
+    void addTableSchemaById(Int32 schema_id, Poco::JSON::Object::Ptr metadata_object, ContextPtr context_) const TSA_REQUIRES(mutex);
     std::optional<Int32> getSchemaVersionByFileIfOutdated(String data_path) const TSA_REQUIRES_SHARED(mutex);
     void initializeSchemasFromManifestList(ContextPtr local_context, ManifestFileCacheKeys manifest_list_ptr) const TSA_REQUIRES(mutex);
 };

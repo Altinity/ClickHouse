@@ -326,7 +326,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
 
     auto [namespace_name, table_name] = DataLake::parseTableName(name);
 
-    if (!catalog->tryGetTableMetadata(namespace_name, table_name, table_metadata))
+    if (!catalog->tryGetTableMetadata(namespace_name, table_name, context_, table_metadata))
         return nullptr;
 
     if (ignore_if_not_iceberg && !table_metadata.isDefaultReadableTable())
@@ -434,17 +434,18 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
         configuration,
         configuration->createObjectStorage(context_copy, /* is_readonly */ false),
         StorageID(getDatabaseName(), name),
-        /* columns */columns,
-        /* constraints */ConstraintsDescription{},
-        /* partition_by */nullptr,
+        /* columns */ columns,
+        /* constraints */ ConstraintsDescription{},
+        /* partition_by */ nullptr,
         context_copy,
-        /* comment */"",
+        /* comment */ "",
         getFormatSettings(context_copy),
         LoadingStrictnessLevel::CREATE,
         getCatalog(),
-        /* if_not_exists*/true,
-        /* is_datalake_query*/true,
-        /* lazy_init */true);
+        /* if_not_exists */ true,
+        /* is_datalake_query */ true,
+        /* is_table_function */ true,
+        /* lazy_init */ true);
 }
 
 void DatabaseDataLake::dropTable( /// NOLINT
@@ -632,7 +633,7 @@ ASTPtr DatabaseDataLake::getCreateDatabaseQuery() const
 
 ASTPtr DatabaseDataLake::getCreateTableQueryImpl(
     const String & name,
-    ContextPtr /* context_ */,
+    ContextPtr context_,
     bool /* throw_on_error */) const
 {
     auto catalog = getCatalog();
@@ -640,7 +641,7 @@ ASTPtr DatabaseDataLake::getCreateTableQueryImpl(
 
     const auto [namespace_name, table_name] = DataLake::parseTableName(name);
 
-    if (!catalog->tryGetTableMetadata(namespace_name, table_name, table_metadata))
+    if (!catalog->tryGetTableMetadata(namespace_name, table_name, context_, table_metadata))
     {
         throw Exception(
             ErrorCodes::CANNOT_GET_CREATE_TABLE_QUERY, "Table `{}` doesn't exist", name);

@@ -6890,6 +6890,16 @@ Possible values:
 - ERROR - Throw an error if the file already exists.
 - OVERWRITE - Overwrite the file
 )", 0) \
+    DECLARE(Timezone, iceberg_timezone_for_timestamptz, "UTC", R"(
+Timezone for Iceberg timestamptz field.
+
+Possible values:
+
+- Any valid timezone, e.g. `Europe/Berlin`, `UTC` or `Zulu`
+- `` (empty value) - use session timezone
+
+Default value is `UTC`.
+)", 0) \
     \
     /* ####################################################### */ \
     /* ########### START OF EXPERIMENTAL FEATURES ############ */ \
