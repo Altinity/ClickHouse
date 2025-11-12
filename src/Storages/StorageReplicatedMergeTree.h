@@ -521,6 +521,9 @@ private:
     BackgroundSchedulePoolTaskHolder mutations_finalizing_task;
 
     BackgroundSchedulePoolTaskHolder export_merge_tree_partition_updating_task;
+
+    /// mostly handle kill operations
+    BackgroundSchedulePoolTaskHolder export_merge_tree_partition_status_handling_task;
     std::shared_ptr<ExportPartitionManifestUpdatingTask> export_merge_tree_partition_manifest_updater;
 
     std::shared_ptr<ExportPartitionTaskScheduler> export_merge_tree_partition_task_scheduler;
@@ -535,6 +538,7 @@ private:
     
     // Convenience references to indexes
     ExportPartitionTaskEntriesContainer::index<ExportPartitionTaskEntryTagByCompositeKey>::type & export_merge_tree_partition_task_entries_by_key;
+    ExportPartitionTaskEntriesContainer::index<ExportPartitionTaskEntryTagByTransactionId>::type & export_merge_tree_partition_task_entries_by_transaction_id;
     ExportPartitionTaskEntriesContainer::index<ExportPartitionTaskEntryTagByCreateTime>::type & export_merge_tree_partition_task_entries_by_create_time;
     /// A thread that removes old parts, log entries, and blocks.
     ReplicatedMergeTreeCleanupThread cleanup_thread;
@@ -767,6 +771,9 @@ private:
 
     /// update in-memory list of partition exports
     void exportMergeTreePartitionUpdatingTask();
+
+    /// handle status changes for export partition tasks
+    void exportMergeTreePartitionStatusHandlingTask();
 
     /** Write the selected parts to merge into the log,
       * Call when merge_selecting_mutex is locked.

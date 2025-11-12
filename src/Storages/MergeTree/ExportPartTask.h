@@ -27,6 +27,9 @@ private:
     MergeTreePartExportManifest manifest;
     ContextPtr local_context;
     QueryPipeline pipeline;
+    std::atomic<bool> cancel_requested = false;
+
+    bool isCancelled() const;
 };
 
 }

@@ -2,6 +2,7 @@
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/ExportReplicatedMergeTreePartitionTaskEntry.h>
 #include "Storages/MergeTree/ExportPartitionUtils.h"
+#include "Common/logger_useful.h"
 #include <Common/ZooKeeper/Types.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include <Interpreters/DatabaseCatalog.h>
@@ -154,9 +155,11 @@ ExportPartitionManifestUpdatingTask::ExportPartitionManifestUpdatingTask(Storage
 {
 }
 
-void ExportPartitionManifestUpdatingTask::run()
+void ExportPartitionManifestUpdatingTask::poll()
 {
     std::lock_guard lock(storage.export_merge_tree_partition_mutex);
+
+    LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Polling for new entries for table {}. Current number of entries: {}", storage.getStorageID().getNameForLogs(), storage.export_merge_tree_partition_task_entries_by_key.size());
 
     auto zk = storage.getZooKeeper();
     
@@ -200,8 +203,13 @@ void ExportPartitionManifestUpdatingTask::run()
         if (!cleanup_lock.is_locked && has_local_entry_and_is_up_to_date)
             continue;
 
+        auto status_watch_callback = std::make_shared<Coordination::WatchCallback>([this, key](const Coordination::WatchResponse &) {
+            storage.export_merge_tree_partition_manifest_updater->addStatusChange(key);
+            storage.export_merge_tree_partition_status_handling_task->schedule();
+        });
+
         std::string status;
-        if (!zk->tryGet(fs::path(entry_path) / "status", status))
+        if (!zk->tryGetWatch(fs::path(entry_path) / "status", status, nullptr, status_watch_callback))
         {
             LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Skipping {}: missing status", key);
             continue;
@@ -244,6 +252,8 @@ void ExportPartitionManifestUpdatingTask::run()
 
     /// Remove entries that were deleted by someone else
     removeStaleEntries(zk_children, entries_by_key);
+
+    LOG_INFO(storage.log, "ExportPartition Manifest Updating task: finished polling for new entries. Number of entries: {}", entries_by_key.size());
 
     storage.export_merge_tree_partition_select_task->schedule();
 }
@@ -300,6 +310,64 @@ void ExportPartitionManifestUpdatingTask::removeStaleEntries(
         }
 
         it = entries_by_key.erase(it);
+    }
+}
+
+void ExportPartitionManifestUpdatingTask::addStatusChange(const std::string & key)
+{
+    std::lock_guard lock(status_changes_mutex);
+    status_changes.emplace(key);
+}
+
+void ExportPartitionManifestUpdatingTask::handleStatusChanges()
+{
+    std::lock_guard lock(status_changes_mutex);
+    std::lock_guard task_entries_lock(storage.export_merge_tree_partition_mutex);
+    auto zk = storage.getZooKeeper();
+
+    LOG_INFO(storage.log, "ExportPartition Manifest Updating task: handling status changes. Number of status changes: {}", status_changes.size());
+
+    while (!status_changes.empty())
+    {
+        LOG_INFO(storage.log, "ExportPartition Manifest Updating task: handling status change for task {}", status_changes.front());
+        const auto key = status_changes.front();
+        status_changes.pop();
+
+        auto it = storage.export_merge_tree_partition_task_entries_by_key.find(key);
+        if (it == storage.export_merge_tree_partition_task_entries_by_key.end())
+            continue;
+
+        /// get new status from zk
+        std::string new_status_string;
+        if (!zk->tryGet(fs::path(storage.zookeeper_path) / "exports" / key / "status", new_status_string))
+        {
+            LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Failed to get new status for task {}, skipping", key);
+            continue;
+        }
+
+        const auto new_status = magic_enum::enum_cast<ExportReplicatedMergeTreePartitionTaskEntry::Status>(new_status_string);
+        if (!new_status)
+        {
+            LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Invalid status {} for task {}, skipping", new_status_string, key);
+            continue;
+        }
+
+        LOG_INFO(storage.log, "ExportPartition Manifest Updating task: status changed for task {}. New status: {}", key, magic_enum::enum_name(*new_status).data());
+
+        /// If status changed to KILLED, cancel local export operations
+        if (*new_status == ExportReplicatedMergeTreePartitionTaskEntry::Status::KILLED)
+        {
+            try
+            {
+                storage.killExportPart(it->manifest.transaction_id);
+            }
+            catch (...)
+            {
+                tryLogCurrentException(storage.log, __PRETTY_FUNCTION__);
+            }
+        }
+
+        it->status = *new_status;
     }
 }
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <mutex>
+#include <queue>
 #include <string>
 #include <unordered_set>
 namespace DB
@@ -13,7 +15,11 @@ class ExportPartitionManifestUpdatingTask
 public:
     ExportPartitionManifestUpdatingTask(StorageReplicatedMergeTree & storage);
 
-    void run();
+    void poll();
+
+    void handleStatusChanges();
+
+    void addStatusChange(const std::string & key);
 
 private:
     StorageReplicatedMergeTree & storage;
@@ -28,6 +34,9 @@ private:
         const std::unordered_set<std::string> & zk_children,
         auto & entries_by_key
     );
+
+    std::mutex status_changes_mutex;
+    std::queue<std::string> status_changes;
 };
 
 }

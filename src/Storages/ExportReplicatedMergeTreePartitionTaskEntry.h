@@ -19,7 +19,8 @@ struct ExportReplicatedMergeTreePartitionTaskEntry
     {
         PENDING,
         COMPLETED,
-        FAILED
+        FAILED,
+        KILLED
     };
 
     /// Allows us to skip completed / failed entries during scheduling
@@ -37,6 +38,11 @@ struct ExportReplicatedMergeTreePartitionTaskEntry
         return manifest.partition_id + "_" + qualified_table_name.getFullName();
     }
 
+    std::string getTransactionId() const
+    {
+        return manifest.transaction_id;
+    }
+
     /// Get create_time for sorted iteration
     time_t getCreateTime() const
     {
@@ -46,6 +52,7 @@ struct ExportReplicatedMergeTreePartitionTaskEntry
 
 struct ExportPartitionTaskEntryTagByCompositeKey {};
 struct ExportPartitionTaskEntryTagByCreateTime {};
+struct ExportPartitionTaskEntryTagByTransactionId {};
 
 // Multi-index container for export partition task entries
 // - Index 0 (TagByCompositeKey): hashed_unique on composite key for O(1) lookup
@@ -60,6 +67,10 @@ using ExportPartitionTaskEntriesContainer = boost::multi_index_container<
         boost::multi_index::ordered_non_unique<
             boost::multi_index::tag<ExportPartitionTaskEntryTagByCreateTime>,
             boost::multi_index::const_mem_fun<ExportReplicatedMergeTreePartitionTaskEntry, time_t, &ExportReplicatedMergeTreePartitionTaskEntry::getCreateTime>
+        >,
+        boost::multi_index::hashed_unique<
+            boost::multi_index::tag<ExportPartitionTaskEntryTagByTransactionId>,
+            boost::multi_index::const_mem_fun<ExportReplicatedMergeTreePartitionTaskEntry, std::string, &ExportReplicatedMergeTreePartitionTaskEntry::getTransactionId>
         >
     >
 >;

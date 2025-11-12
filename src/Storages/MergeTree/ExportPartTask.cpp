@@ -30,6 +30,7 @@ namespace ErrorCodes
     extern const int UNKNOWN_TABLE;
     extern const int FILE_ALREADY_EXISTS;
     extern const int LOGICAL_ERROR;
+    extern const int QUERY_WAS_CANCELLED;
 }
 
 namespace Setting
@@ -201,12 +202,18 @@ bool ExportPartTask::executeStep()
 
         auto is_cancelled_callback = [this]()
         {
-            return storage.parts_mover.moves_blocker.isCancelled();
+            return isCancelled();
         };
 
         exec.setCancelCallback(is_cancelled_callback, 100);
 
         exec.execute();
+
+        if (isCancelled())
+        {
+            throw Exception(ErrorCodes::QUERY_WAS_CANCELLED, "Export part was cancelled");
+        }
+
         std::lock_guard inner_lock(storage.export_manifests_mutex);
         storage.writePartLog(
             PartLogElement::Type::EXPORT_PART,
@@ -257,7 +264,13 @@ bool ExportPartTask::executeStep()
 
 void ExportPartTask::cancel() noexcept
 {
+    cancel_requested.store(true);
     pipeline.cancel();
+}
+
+bool ExportPartTask::isCancelled() const
+{
+    return cancel_requested.load() || storage.parts_mover.moves_blocker.isCancelled();
 }
 
 void ExportPartTask::onCompleted()

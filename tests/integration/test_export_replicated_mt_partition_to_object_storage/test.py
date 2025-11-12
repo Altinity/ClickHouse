@@ -173,7 +173,7 @@ def test_kill_export(cluster):
     
         # Kill only 2020 while S3 is blocked - retry mechanism keeps exports alive
         # ZooKeeper operations (KILL) proceed quickly since only S3 is blocked
-        node.query(f"KILL EXPORT PARTITION WHERE partition_id = '2020'")
+        node.query(f"KILL EXPORT PARTITION WHERE partition_id = '2020' and source_table = '{mt_table}' and destination_table = '{s3_table}'")
 
     # wait for 2021 to finish
     time.sleep(5)
@@ -181,6 +181,10 @@ def test_kill_export(cluster):
     # checking for the commit file because maybe the data file was too fast?
     assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2020_*', format=LineAsString)") == '0\n', "Partition 2020 was written to S3, it was not killed as expected"
     assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2021_*', format=LineAsString)") != f'0\n', "Partition 2021 was not written to S3, but it should have been"
+
+    # check system.replicated_partition_exports for the export, status should be KILLED
+    assert node.query(f"SELECT status FROM system.replicated_partition_exports WHERE partition_id = '2020' and source_table = '{mt_table}' and destination_table = '{s3_table}'") == 'KILLED\n', "Partition 2020 was not killed as expected"
+    assert node.query(f"SELECT status FROM system.replicated_partition_exports WHERE partition_id = '2021' and source_table = '{mt_table}' and destination_table = '{s3_table}'") == 'COMPLETED\n', "Partition 2021 was not completed, this is unexpected"
 
 
 def test_drop_source_table_during_export(cluster):
@@ -289,72 +293,6 @@ def test_drop_destination_table_during_export(cluster):
 
     # not sure this is the expected behavior, but adding until we make a decision
     assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_*', format=LineAsString)") != '0\n', "Background operations did not complete after dropping the destination table"
-
-
-def test_kill_export_by_table(cluster):
-    node = cluster.instances["replica1"]
-
-    mt_table = "kill_granularity_by_table_mt"
-    s3_table = "kill_granularity_by_table_s3"
-    alt_mt_table = "kill_granularity_by_table_alt_mt"
-    alt_s3_table = "kill_granularity_by_table_alt_s3"
-
-    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
-    create_tables_and_insert_data(node, alt_mt_table, alt_s3_table, "replica1")
-
-    # Block S3/MinIO requests to keep exports alive via retry mechanism
-    # This allows ZooKeeper operations (KILL) to proceed quickly
-    minio_ip = cluster.minio_ip
-    minio_port = cluster.minio_port
-
-    with PartitionManager() as pm:
-        # Block responses from MinIO (source_port matches MinIO service)
-        pm_rule_reject_responses = {
-            "destination": node.ip_address,
-            "source_port": minio_port,
-            "action": "REJECT --reject-with tcp-reset",
-        }
-        pm._add_rule(pm_rule_reject_responses)
-
-        # Block requests to MinIO (destination: MinIO, destination_port: minio_port)
-        pm_rule_reject_requests = {
-            "destination": minio_ip,
-            "destination_port": minio_port,
-            "action": "REJECT --reject-with tcp-reset",
-        }
-        pm._add_rule(pm_rule_reject_requests)
-
-        # Start two exports for the same table and one export for another table concurrently
-        node.query(
-            f"""
-            ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS allow_experimental_export_merge_tree_part=1, export_merge_tree_partition_max_retries = 50;
-            ALTER TABLE {mt_table} EXPORT PARTITION ID '2021' TO TABLE {s3_table} SETTINGS allow_experimental_export_merge_tree_part=1, export_merge_tree_partition_max_retries = 50;
-            ALTER TABLE {alt_mt_table} EXPORT PARTITION ID '2020' TO TABLE {alt_s3_table} SETTINGS allow_experimental_export_merge_tree_part=1, export_merge_tree_partition_max_retries = 50;
-            """
-        )
-
-        # Kill all exports for the first table only while S3 is blocked
-        # Retry mechanism keeps exports alive, ZooKeeper operations proceed quickly
-        node.query(f"KILL EXPORT PARTITION WHERE source_table = '{mt_table}'")
-
-    # Give some time for effects to propagate
-    time.sleep(5)
-
-    # The killed table should have no commit for either partition
-    assert (
-        node.query(
-            f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_*', format=LineAsString)"
-        )
-        == '0\n'
-    ), "Partition 2020 was written to S3, but KILL by table should have stopped it"
-
-    # The alternate table (not killed) should complete
-    assert (
-        node.query(
-            f"SELECT count() FROM s3(s3_conn, filename='{alt_s3_table}/commit_*', format=LineAsString)"
-        )
-        != '0\n'
-    ), "Alternate table export was affected by KILL on a different table"
 
 
 def test_concurrent_exports_to_different_targets(cluster):

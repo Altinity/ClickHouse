@@ -432,6 +432,7 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
     , queue(*this, merge_strategy_picker)
     , fetcher(*this)
     , export_merge_tree_partition_task_entries_by_key(export_merge_tree_partition_task_entries.get<ExportPartitionTaskEntryTagByCompositeKey>())
+    , export_merge_tree_partition_task_entries_by_transaction_id(export_merge_tree_partition_task_entries.get<ExportPartitionTaskEntryTagByTransactionId>())
     , export_merge_tree_partition_task_entries_by_create_time(export_merge_tree_partition_task_entries.get<ExportPartitionTaskEntryTagByCreateTime>())
     , cleanup_thread(*this)
     , async_block_ids_cache(*this)
@@ -487,6 +488,11 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
         getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_updating_task)", [this] { exportMergeTreePartitionUpdatingTask(); });
 
     export_merge_tree_partition_updating_task->deactivate();
+
+    export_merge_tree_partition_status_handling_task = getContext()->getSchedulePool().createTask(
+        getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_status_handling_task)", [this] { exportMergeTreePartitionStatusHandlingTask(); });
+
+    export_merge_tree_partition_status_handling_task->deactivate();
 
     export_merge_tree_partition_watch_callback = std::make_shared<Coordination::WatchCallback>(export_merge_tree_partition_updating_task->getWatchCallback());
         
@@ -4395,7 +4401,7 @@ void StorageReplicatedMergeTree::exportMergeTreePartitionUpdatingTask()
 {   
     try
     {
-        export_merge_tree_partition_manifest_updater->run();
+        export_merge_tree_partition_manifest_updater->poll();
     }
     catch (...)
     {
@@ -4418,6 +4424,18 @@ void StorageReplicatedMergeTree::selectPartsToExport()
     }
 
     export_merge_tree_partition_select_task->scheduleAfter(1000 * 5);
+}
+
+void StorageReplicatedMergeTree::exportMergeTreePartitionStatusHandlingTask()
+{
+    try
+    {
+        export_merge_tree_partition_manifest_updater->handleStatusChanges();
+    }
+    catch (...)
+    {
+        tryLogCurrentException(log, __PRETTY_FUNCTION__);
+    }
 }
 
 std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartitionExportsInfo() const
@@ -5901,6 +5919,7 @@ void StorageReplicatedMergeTree::partialShutdown()
     mutations_finalizing_task->deactivate();
     export_merge_tree_partition_updating_task->deactivate();
     export_merge_tree_partition_select_task->deactivate();
+    export_merge_tree_partition_status_handling_task->deactivate();
 
     cleanup_thread.stop();
     async_block_ids_cache.stop();
@@ -9633,45 +9652,85 @@ CancellationCode StorageReplicatedMergeTree::killPartMoveToShard(const UUID & ta
 
 CancellationCode StorageReplicatedMergeTree::killExportPartition(const String & transaction_id)
 {
-    auto zk = getZooKeeper();
-    const auto exports_path = fs::path(zookeeper_path) / "exports";
-
-    const auto export_keys = zk->getChildren(exports_path);
-    String export_key_to_be_cancelled;
-    for (const auto & export_key : export_keys)
+    auto try_set_status_to_killed = [this](const zkutil::ZooKeeperPtr & zk, const std::string & status_path)
     {
-        std::string status;
-        if (!zk->tryGet(fs::path(exports_path) / export_key / "status", status))
-            continue;
-        if (status != "PENDING")
-            continue;
+        Coordination::Stat stat;
+        std::string status_from_zk_string;
 
-        std::string metadata_json;
-        if (!zk->tryGet(fs::path(exports_path) / export_key / "metadata.json", metadata_json))
-            continue;
-        const auto manifest = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
-        if (manifest.transaction_id == transaction_id)
+        if (!zk->tryGet(status_path, status_from_zk_string, &stat))
         {
-            export_key_to_be_cancelled = export_key;
-            break;
+            /// found entry locally, but not in zk. It might have been deleted by another replica and we did not have time to update the local entry.
+            LOG_INFO(log, "Export partition task not found in zk, can not cancel it");
+            return CancellationCode::CancelCannotBeSent;
+        }
+
+        const auto status_from_zk = magic_enum::enum_cast<ExportReplicatedMergeTreePartitionTaskEntry::Status>(status_from_zk_string);
+
+        if (!status_from_zk)
+        {
+            LOG_INFO(log, "Export partition task status is invalid, can not cancel it");
+            return CancellationCode::CancelCannotBeSent;
+        }
+
+        if (status_from_zk.value() != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
+        {
+            LOG_INFO(log, "Export partition task is {}, can not cancel it", String(magic_enum::enum_name(status_from_zk.value())));
+            return CancellationCode::CancelCannotBeSent;
+        }
+
+        if (zk->trySet(status_path, String(magic_enum::enum_name(ExportReplicatedMergeTreePartitionTaskEntry::Status::KILLED)), stat.version) != Coordination::Error::ZOK)
+        {
+            LOG_INFO(log, "Status has been updated while trying to kill the export partition task, can not cancel it");
+            return CancellationCode::CancelCannotBeSent;
+        }
+
+        return CancellationCode::CancelSent;
+    };
+
+    std::lock_guard lock(export_merge_tree_partition_mutex);
+
+    const auto zk = getZooKeeper();
+
+    /// if we have the entry locally, no need to list from zk. we can save some requests.
+    const auto & entry = export_merge_tree_partition_task_entries_by_transaction_id.find(transaction_id);
+    if (entry != export_merge_tree_partition_task_entries_by_transaction_id.end())
+    {
+        LOG_INFO(log, "Export partition task found locally, trying to cancel it");
+        /// found locally, no need to get children on zk
+        if (entry->status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
+        {
+            LOG_INFO(log, "Export partition task is not pending, can not cancel it");
+            return CancellationCode::CancelCannotBeSent;
+        }
+
+        return try_set_status_to_killed(zk, fs::path(zookeeper_path) / "exports" / entry->getCompositeKey() / "status");
+    }
+    else
+    {
+        LOG_INFO(log, "Export partition task not found locally, trying to find it on zk");
+        /// for some reason, we don't have the entry locally. ls on zk to find the entry
+        const auto exports_path = fs::path(zookeeper_path) / "exports";
+
+        const auto export_keys = zk->getChildren(exports_path);
+        String export_key_to_be_cancelled;
+
+        for (const auto & export_key : export_keys)
+        {
+            std::string metadata_json;
+            if (!zk->tryGet(fs::path(exports_path) / export_key / "metadata.json", metadata_json))
+                continue;
+            const auto manifest = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
+            if (manifest.transaction_id == transaction_id)
+            {
+                LOG_INFO(log, "Export partition task found on zk, trying to cancel it");
+                return try_set_status_to_killed(zk, fs::path(exports_path) / export_key / "status");
+            }
         }
     }
 
-    if (export_key_to_be_cancelled.empty())
-        return CancellationCode::NotFound;
+    LOG_INFO(log, "Export partition task not found, can not cancel it");
 
-    try
-    {
-        /// Once the entry is removed from zk, the update task will be triggered in all replicas
-        /// The logic for cancelling individual part exports will be triggered in the update task.
-        zk->removeRecursive(fs::path(exports_path) / export_key_to_be_cancelled);
-        return CancellationCode::CancelSent;
-    }
-    catch (...)
-    {
-        tryLogCurrentException(log, __PRETTY_FUNCTION__);
-        return CancellationCode::CancelCannotBeSent;
-    }
+    return CancellationCode::NotFound;
 }
 
 void StorageReplicatedMergeTree::getCommitPartOps(
