@@ -96,6 +96,7 @@ env:
   CHECKS_DATABASE_HOST: ${{ secrets.CHECKS_DATABASE_HOST }}
   CHECKS_DATABASE_USER: ${{ secrets.CLICKHOUSE_TEST_STAT_LOGIN }}
   CHECKS_DATABASE_PASSWORD: ${{ secrets.CLICKHOUSE_TEST_STAT_PASSWORD }}
+  LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
   args: --test-to-end
     --no-colors
     --local
