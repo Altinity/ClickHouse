@@ -595,7 +595,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
         /* partition_by */nullptr,
         /* order_by */nullptr,
         context_copy,
-        /* comment */"",
+        /* comment */ "",
         getFormatSettings(context_copy),
         LoadingStrictnessLevel::CREATE,
         getCatalog(),

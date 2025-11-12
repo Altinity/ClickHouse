@@ -274,10 +274,10 @@ StoragePtr TableFunctionObjectStorage<Definition, Configuration, is_data_lake>::
             /* comment */ String{},
             /* format_settings */ std::nullopt, /// No format_settings
             /* mode */ LoadingStrictnessLevel::CREATE,
-            configuration->getCatalog(context, /*attach*/ false),
+            configuration->getCatalog(context, /* attach */ false),
             /* if_not_exists */ false,
             /* is_datalake_query*/ false,
-            /* is_table_function */true);
+            /* is_table_function */ true);
 
         storage->startup();
         return storage;
@@ -427,18 +427,6 @@ template class TableFunctionObjectStorage<DeltaLakeAzureClusterDefinition, Stora
 template class TableFunctionObjectStorage<HudiClusterDefinition, StorageS3HudiConfiguration, true>;
 #endif
 
-#if USE_AVRO
-void registerTableFunctionIceberg(TableFunctionFactory & factory)
-{
-    factory.registerFunction<TableFunctionIcebergLocal>(
-        {.documentation
-         = {.description = R"(The table function can be used to read the Iceberg table stored locally.)",
-            .examples{{IcebergLocalDefinition::name, "SELECT * FROM icebergLocal(filename)", ""}},
-            .category = FunctionDocumentation::Category::TableFunction},
-         .allow_readonly = false});
-}
-#endif
-
 
 #if USE_AVRO
 void registerTableFunctionPaimon(TableFunctionFactory & factory)
@@ -486,9 +474,6 @@ void registerTableFunctionPaimon(TableFunctionFactory & factory)
 void registerDataLakeTableFunctions(TableFunctionFactory & factory)
 {
     UNUSED(factory);
-#if USE_AVRO
-    registerTableFunctionIceberg(factory);
-#endif
 
 #if USE_AVRO
     registerTableFunctionPaimon(factory);

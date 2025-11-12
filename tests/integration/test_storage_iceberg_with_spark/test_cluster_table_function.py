@@ -121,7 +121,7 @@ def test_cluster_table_function(started_cluster_iceberg_with_spark, format_versi
             storage_type_in_named_collection=storage_type_in_named_collection,
         )
         query_id = str(uuid.uuid4())
-        settings = "SETTINGS object_storage_cluster='cluster_simple'" if alt_syntax else ""
+        settings = f"SETTINGS object_storage_cluster='cluster_simple'" if (alt_syntax and not run_on_cluster) else ""
         if remote:
             query = f"SELECT * FROM remote('node2', {expr}) {settings}"
         else:

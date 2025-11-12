@@ -305,7 +305,7 @@ def get_creation_expression(
         if run_on_cluster:
             assert table_function
             return f"""
-                iceberg{engine_part}({storage_arg}, path = '/var/lib/clickhouse/user_files/iceberg_data/default/{table_name}/', format={format})
+                iceberg{engine_part}Cluster('cluster_simple', {storage_arg}, path = '/var/lib/clickhouse/user_files/iceberg_data/default/{table_name}/', format={format})
             """
         else:
             if table_function:

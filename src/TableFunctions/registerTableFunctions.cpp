@@ -70,7 +70,6 @@ void registerTableFunctions()
     registerTableFunctionObjectStorage(factory);
     registerTableFunctionObjectStorageCluster(factory);
     registerTableFunctionObjectStorageClusterFallback(factory);
-    registerDataLakeTableFunctions(factory);
     registerDataLakeClusterTableFunctions(factory);
 
 #if USE_YTSAURUS
