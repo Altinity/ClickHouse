@@ -67,6 +67,13 @@ struct IcebergHDFSClusterFallbackDefinition
     static constexpr auto storage_engine_cluster_name = "IcebergHDFSCluster";
 };
 
+struct IcebergLocalClusterFallbackDefinition
+{
+    static constexpr auto name = "icebergLocal";
+    static constexpr auto storage_engine_name = "Local";
+    static constexpr auto storage_engine_cluster_name = "IcebergLocalCluster";
+};
+
 struct DeltaLakeClusterFallbackDefinition
 {
     static constexpr auto name = "deltaLake";
@@ -163,6 +170,7 @@ using TableFunctionHDFSClusterFallback = TableFunctionObjectStorageClusterFallba
 
 #if USE_AVRO
 using TableFunctionIcebergClusterFallback = TableFunctionObjectStorageClusterFallback<IcebergClusterFallbackDefinition, TableFunctionIcebergCluster>;
+using TableFunctionIcebergLocalClusterFallback = TableFunctionObjectStorageClusterFallback<IcebergLocalClusterFallbackDefinition, TableFunctionIcebergLocalCluster>;
 #endif
 
 #if USE_AVRO && USE_AWS_S3
@@ -279,6 +287,27 @@ void registerTableFunctionObjectStorageClusterFallback(TableFunctionFactory & fa
                 {
                     "iceberg",
                     "SELECT * FROM iceberg(url, storage_type='hdfs') SETTINGS object_storage_cluster='cluster'", ""
+                },
+            },
+            .category = FunctionDocumentation::Category::TableFunction
+        },
+        .allow_readonly = false
+    }
+    );
+
+    factory.registerFunction<TableFunctionIcebergLocalClusterFallback>(
+    {
+        .documentation = {
+            .description=R"(The table function can be used to read the Iceberg table stored on shared disk in parallel for many nodes in a specified cluster or from single node.)",
+            .examples{
+                {
+                    "icebergLocal",
+                    "SELECT * FROM icebergLocal(filename)", ""
+                },
+                {
+                    "icebergLocal",
+                    "SELECT * FROM icebergLocal(filename) "
+                    "SETTINGS object_storage_cluster='cluster'", ""
                 },
             },
             .category = FunctionDocumentation::Category::TableFunction

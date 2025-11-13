@@ -204,9 +204,11 @@ StoragePtr TableFunctionObjectStorage<Definition, Configuration, is_data_lake>::
             /* comment */ String{},
             /* format_settings */ std::nullopt, /// No format_settings
             /* mode */ LoadingStrictnessLevel::CREATE,
-            configuration->getCatalog(context, /*attach*/ false),
+            configuration->getCatalog(context, /* attach */ false),
             /* if_not_exists */ false,
-            /* is_datalake_query*/ false);
+            /* is_datalake_query */ false,
+            /* is_table_function */ true,
+            /* lazy_init */ false);
 
         storage->startup();
         return storage;
@@ -296,6 +298,7 @@ template class TableFunctionObjectStorage<HDFSClusterDefinition, StorageHDFSConf
 
 #if USE_AVRO
 template class TableFunctionObjectStorage<IcebergClusterDefinition, StorageIcebergConfiguration, true>;
+template class TableFunctionObjectStorage<IcebergLocalClusterDefinition, StorageLocalIcebergConfiguration, true>;
 #endif
 
 #if USE_AVRO && USE_AWS_S3
@@ -334,13 +337,4 @@ void registerTableFunctionIceberg(TableFunctionFactory & factory)
          .allow_readonly = false});
 }
 #endif
-
-
-void registerDataLakeTableFunctions(TableFunctionFactory & factory)
-{
-    UNUSED(factory);
-#if USE_AVRO
-    registerTableFunctionIceberg(factory);
-#endif
-}
 }
