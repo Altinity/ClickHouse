@@ -1255,6 +1255,9 @@ bool KeyCondition::tryPrepareSetIndex(
     auto set_columns = prepared_set->getSetElements();
     assert(set_types_size == set_columns.size());
 
+    IColumn::Filter filter(set_columns.front()->size(), 1);
+    bool filter_used = false;
+
     for (size_t indexes_mapping_index = 0; indexes_mapping_index < indexes_mapping_size; ++indexes_mapping_index)
     {
         const auto & key_column_type = data_types[indexes_mapping_index];
@@ -1309,26 +1312,30 @@ bool KeyCondition::tryPrepareSetIndex(
         const auto & nullable_set_column_null_map = nullable_set_column_typed.getNullMapData();
         size_t nullable_set_column_null_map_size = nullable_set_column_null_map.size();
 
-        IColumn::Filter filter(nullable_set_column_null_map_size);
-
         if (set_column_null_map)
         {
             for (size_t i = 0; i < nullable_set_column_null_map_size; ++i)
-                filter[i] = (*set_column_null_map)[i] || !nullable_set_column_null_map[i];
+                filter[i] &= (*set_column_null_map)[i] || !nullable_set_column_null_map[i];
 
-            set_column = nullable_set_column_typed.filter(filter, 0);
+            set_column = nullable_set_column;
         }
         else
         {
             for (size_t i = 0; i < nullable_set_column_null_map_size; ++i)
-                filter[i] = !nullable_set_column_null_map[i];
+                filter[i] &= !nullable_set_column_null_map[i];
 
-            set_column = nullable_set_column_typed.getNestedColumn().filter(filter, 0);
+            set_column = nullable_set_column_typed.getNestedColumnPtr();
         }
+        filter_used = true;
 
         set_columns[set_element_index] = std::move(set_column);
     }
 
+    if (filter_used)
+    {
+        for (size_t set_element_index = 0; set_element_index < set_columns.size(); ++set_element_index)
+            set_columns[set_element_index] = set_columns[set_element_index]->filter(filter, 0);
+    }
     out.set_index = std::make_shared<MergeTreeSetIndex>(set_columns, std::move(indexes_mapping));
 
     /// When not all key columns are used or when there are multiple elements in
