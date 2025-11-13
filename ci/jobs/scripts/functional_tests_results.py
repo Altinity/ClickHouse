@@ -3,6 +3,9 @@ import json
 import os
 import traceback
 from typing import List
+import re
+
+import yaml
 
 from praktika.result import Result
 
@@ -30,14 +33,99 @@ RETRIES_SIGN = "Some tests were restarted"
 #         out.writerow(status)
 
 
-def get_broken_tests_list() -> dict:
-    file_path = "tests/broken_tests.json"
-    if not os.path.isfile(file_path) or os.path.getsize(file_path) == 0:
-        return {}
+def get_broken_tests_rules() -> dict:
+    broken_tests_file_path = "tests/broken_tests.yaml"
+    if (
+        not os.path.isfile(broken_tests_file_path)
+        or os.path.getsize(broken_tests_file_path) == 0
+    ):
+        raise ValueError(
+            "There is something wrong with getting broken tests rules: "
+            f"file '{broken_tests_file_path}' is empty or does not exist."
+        )
 
-    with open(file_path, "r", encoding="utf-8") as skip_list_file:
-        skip_list_tests = json.load(skip_list_file)
-    return skip_list_tests
+    with open(broken_tests_file_path, "r", encoding="utf-8") as broken_tests_file:
+        broken_tests = yaml.safe_load(broken_tests_file)
+
+    compiled_rules = {"exact": {}, "pattern": {}}
+
+    for test in broken_tests:
+        regex = test.get("regex") is True
+        rule = {
+            "reason": test["reason"],
+        }
+
+        if test.get("message"):
+            rule["message"] = re.compile(test["message"]) if regex else test["message"]
+
+        if test.get("not_message"):
+            rule["not_message"] = (
+                re.compile(test["not_message"]) if regex else test["not_message"]
+            )
+        if test.get("check_types"):
+            rule["check_types"] = test["check_types"]
+
+        if regex:
+            rule["regex"] = True
+            compiled_rules["pattern"][re.compile(test["name"])] = rule
+        else:
+            compiled_rules["exact"][test["name"]] = rule
+
+    print(
+        f"INFO: Compiled {len(compiled_rules['exact'])} exact rules and {len(compiled_rules['pattern'])} pattern rules"
+    )
+
+    return compiled_rules
+
+
+def test_is_known_fail(test_name, test_logs, known_broken_tests, test_options_string):
+    matching_rules = []
+
+    print(f"Checking known broken tests for failed test: {test_name}")
+    print("Potential matching rules:")
+    exact_rule = known_broken_tests["exact"].get(test_name)
+    if exact_rule:
+        print(f"{test_name} - {exact_rule}")
+        matching_rules.append(exact_rule)
+
+    for name_re, data in known_broken_tests["pattern"].items():
+        if name_re.fullmatch(test_name):
+            print(f"{name_re} - {data}")
+            matching_rules.append(data)
+
+    if not matching_rules:
+        return False
+
+    def matches_substring(substring, log, is_regex):
+        if log is None:
+            return False
+        if is_regex:
+            return bool(substring.search(log))
+        return substring in log
+
+    for rule_data in matching_rules:
+        if rule_data.get("check_types") and not any(
+            ct in test_options_string for ct in rule_data["check_types"]
+        ):
+            print(
+                f"Check types didn't match: '{rule_data['check_types']}' not in '{test_options_string}'"
+            )
+            continue  # check_types didn't match → skip rule
+
+        is_regex = rule_data.get("regex", False)
+        not_message = rule_data.get("not_message")
+        if not_message and matches_substring(not_message, test_logs, is_regex):
+            print(f"Skip rule: Not message matched: '{rule_data['not_message']}'")
+            continue  # not_message matched → skip rule
+        message = rule_data.get("message")
+        if message and not matches_substring(message, test_logs, is_regex):
+            print(f"Skip rule: Message didn't match: '{rule_data['message']}'")
+            continue
+
+        print(f"Test {test_name} matched rule: {rule_data}")
+        return rule_data["reason"]
+
+    return False
 
 
 class FTResultsProcessor:
@@ -75,7 +163,7 @@ class FTResultsProcessor:
         test_results = []
         test_end = True
 
-        known_broken_tests = get_broken_tests_list()
+        known_broken_tests = get_broken_tests_rules()
 
         with open(self.tests_output_file, "r", encoding="utf-8") as test_file:
             for line in test_file:
@@ -161,34 +249,19 @@ class FTResultsProcessor:
                 )
 
                 if test[1] == "FAIL":
-                    broken_message = None
-                    if test[0] in known_broken_tests.keys():
-                        message = known_broken_tests[test[0]].get("message")
-                        check_types = known_broken_tests[test[0]].get("check_types")
-                        if check_types and not any(
-                            check_type in test_options_string
-                            for check_type in check_types
-                        ):
-                            broken_message = None
-                        elif message:
-                            if message in test_results_[-1].info:
-                                broken_message = (
-                                    f"\nMarked as broken, matched message: '{message}'"
-                                )
-                        else:
-                            broken_message = f"\nMarked as broken, no message specified"
-
-                        if broken_message and check_types:
-                            broken_message += (
-                                f", matched one or more check types {check_types}"
-                            )
+                    broken_message = test_is_known_fail(
+                        test[0],
+                        test_results_[-1].info,
+                        known_broken_tests,
+                        test_options_string,
+                    )
 
                     if broken_message:
                         broken += 1
                         failed -= 1
                         test_results_[-1].set_status(Result.StatusExtended.BROKEN)
                         test_results_[-1].set_label(Result.Label.BROKEN)
-                        test_results_[-1].info += broken_message
+                        test_results_[-1].info += "\nMarked as broken: " + broken_message
 
             except Exception as e:
                 print(f"ERROR: Failed to parse test results: {test}")
