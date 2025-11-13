@@ -8123,7 +8123,13 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
             if (zookeeper->tryGet(fs::path(partition_exports_path) / "metadata.json", metadata_json))
             {
                 const auto manifest = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
-                if (static_cast<time_t>(manifest.create_time + manifest.ttl_seconds) < time(nullptr))
+
+                const auto now = time(nullptr);
+                const auto expiration_time = manifest.create_time + manifest.ttl_seconds;
+
+                LOG_INFO(log, "Export with key {} has expiration time {}, now is {}", export_key, expiration_time, now);
+
+                if (static_cast<time_t>(expiration_time) < now)
                 {
                     has_expired = true;
                 }
