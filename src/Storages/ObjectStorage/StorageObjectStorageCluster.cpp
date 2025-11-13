@@ -906,4 +906,67 @@ bool StorageObjectStorageCluster::prefersLargeBlocks() const
     return IStorageCluster::prefersLargeBlocks();
 }
 
+bool StorageObjectStorageCluster::supportsPartitionBy() const
+{
+    if (pure_storage)
+        return pure_storage->supportsPartitionBy();
+    return IStorageCluster::supportsPartitionBy();
+}
+
+bool StorageObjectStorageCluster::supportsSubcolumns() const
+{
+    if (pure_storage)
+        return pure_storage->supportsSubcolumns();
+    return IStorageCluster::supportsSubcolumns();
+}
+
+bool StorageObjectStorageCluster::supportsDynamicSubcolumns() const
+{
+    if (pure_storage)
+        return pure_storage->supportsDynamicSubcolumns();
+    return IStorageCluster::supportsDynamicSubcolumns();
+}
+
+bool StorageObjectStorageCluster::supportsTrivialCountOptimization(const StorageSnapshotPtr & snapshot, ContextPtr context) const
+{
+    if (pure_storage)
+        return pure_storage->supportsTrivialCountOptimization(snapshot, context);
+    return IStorageCluster::supportsTrivialCountOptimization(snapshot, context);
+}
+
+bool StorageObjectStorageCluster::supportsPrewhere() const
+{
+    if (pure_storage)
+        return pure_storage->supportsPrewhere();
+    return IStorageCluster::supportsPrewhere();
+}
+
+bool StorageObjectStorageCluster::canMoveConditionsToPrewhere() const
+{
+    if (pure_storage)
+        return pure_storage->canMoveConditionsToPrewhere();
+    return IStorageCluster::canMoveConditionsToPrewhere();
+}
+
+std::optional<NameSet> StorageObjectStorageCluster::supportedPrewhereColumns() const
+{
+    if (pure_storage)
+        return pure_storage->supportedPrewhereColumns();
+    return IStorageCluster::supportedPrewhereColumns();
+}
+
+IStorageCluster::ColumnSizeByName StorageObjectStorageCluster::getColumnSizes() const
+{
+    if (pure_storage)
+        return pure_storage->getColumnSizes();
+    return IStorageCluster::getColumnSizes();
+}
+
+bool StorageObjectStorageCluster::parallelizeOutputAfterReading(ContextPtr context) const
+{
+    if (pure_storage)
+        return pure_storage->parallelizeOutputAfterReading(context);
+    return IStorageCluster::parallelizeOutputAfterReading(context);
+}
+
 }

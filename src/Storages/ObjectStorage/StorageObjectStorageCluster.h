@@ -131,6 +131,22 @@ public:
 
     bool prefersLargeBlocks() const override;
 
+    bool supportsPartitionBy() const override;
+
+    bool supportsSubcolumns() const override;
+
+    bool supportsDynamicSubcolumns() const override;
+
+    bool supportsTrivialCountOptimization(const StorageSnapshotPtr &, ContextPtr) const override;
+
+    /// Things required for PREWHERE.
+    bool supportsPrewhere() const override;
+    bool canMoveConditionsToPrewhere() const override;
+    std::optional<NameSet> supportedPrewhereColumns() const override;
+    ColumnSizeByName getColumnSizes() const override;
+
+    bool parallelizeOutputAfterReading(ContextPtr context) const override;
+
 private:
     void updateQueryToSendIfNeeded(
         ASTPtr & query,
