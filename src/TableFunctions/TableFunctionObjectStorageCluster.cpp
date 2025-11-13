@@ -76,7 +76,8 @@ StoragePtr TableFunctionObjectStorageCluster<Definition, Configuration, is_data_
             /* mode */ LoadingStrictnessLevel::CREATE,
             /* catalog*/ nullptr,
             /* if_not_exists */ false,
-            /* is_datalake_query*/ false,
+            /* is_datalake_query */ false,
+            /* is_table_function */ true,
             /* lazy_init */ true);
     }
 
@@ -152,6 +153,13 @@ void registerTableFunctionIcebergCluster(TableFunctionFactory & factory)
                 {"icebergCluster", "SELECT * FROM icebergCluster(cluster, uri, [format], [structure], [compression_method], storage_type='hdfs')", ""},
 #   endif
             },
+            .category = FunctionDocumentation::Category::TableFunction},
+         .allow_readonly = false});
+
+    factory.registerFunction<TableFunctionIcebergLocalCluster>(
+        {.documentation
+         = {.description = R"(The table function can be used to read the Iceberg table stored on shared storage in parallel for many nodes in a specified cluster.)",
+            .examples{{IcebergLocalClusterDefinition::name, "SELECT * FROM icebergLocalCluster(cluster, filename, format, [,compression])", ""}},
             .category = FunctionDocumentation::Category::TableFunction},
          .allow_readonly = false});
 

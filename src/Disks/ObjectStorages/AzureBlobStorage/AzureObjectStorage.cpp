@@ -13,6 +13,7 @@
 #include <Disks/ObjectStorages/AzureBlobStorage/AzureBlobStorageCommon.h>
 #include <Disks/ObjectStorages/ObjectStorageIteratorAsync.h>
 #include <Interpreters/Context.h>
+#include <Common/ElapsedTimeProfileEventIncrement.h>
 
 
 namespace CurrentMetrics
@@ -25,6 +26,7 @@ namespace CurrentMetrics
 namespace ProfileEvents
 {
     extern const Event AzureListObjects;
+    extern const Event AzureListObjectsMicroseconds;
     extern const Event DiskAzureListObjects;
     extern const Event AzureDeleteObjects;
     extern const Event DiskAzureDeleteObjects;
@@ -76,6 +78,7 @@ private:
         ProfileEvents::increment(ProfileEvents::AzureListObjects);
         if (client->IsClientForDisk())
             ProfileEvents::increment(ProfileEvents::DiskAzureListObjects);
+        ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::AzureListObjectsMicroseconds);
 
         chassert(batch.empty());
         auto blob_list_response = client->ListBlobs(options);
@@ -183,7 +186,11 @@ void AzureObjectStorage::listObjects(const std::string & path, RelativePathsWith
         if (client_ptr->IsClientForDisk())
             ProfileEvents::increment(ProfileEvents::DiskAzureListObjects);
 
-        blob_list_response = client_ptr->ListBlobs(options);
+        {
+            ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::AzureListObjectsMicroseconds);
+            blob_list_response = client_ptr->ListBlobs(options);
+        }
+
         const auto & blobs_list = blob_list_response.Blobs;
 
         for (const auto & blob : blobs_list)
