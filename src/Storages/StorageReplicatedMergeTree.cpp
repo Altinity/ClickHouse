@@ -4444,7 +4444,12 @@ std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartit
 
     const auto zk = getZooKeeper();
     const auto exports_path = fs::path(zookeeper_path) / "exports";
-    const auto children = zk->getChildren(exports_path);
+    std::vector<std::string> children;
+    if (Coordination::Error::ZOK != zk->tryGetChildren(exports_path, children))
+    {
+        LOG_INFO(log, "Failed to get children from exports path, returning empty export info list");
+        return infos;
+    }
 
     for (const auto & child : children)
     {

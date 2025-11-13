@@ -10,52 +10,6 @@
 namespace DB
 {
 
-/// v2 of my initial design
-/*
-table_path/
-    exports/
-        <partition_id+destination_storage_id>/
-            metadata.json -> {tid, partition_id, destination_id, create_time, ttl}
-            parts/
-                processing/ <-- not started, in progress
-                    part_1.json -> {retry_count, max_retry_count, path_in_destination}
-                    ...
-                    part_n.json
-                processed/
-                    part_1.json -> {retry_count, max_retry_count, path_in_destination}
-                    ...
-                    part_n.json
-            locks
-                part_1 -> r1
-                part_n -> rN
-    cleanup_lock <--- ephemeral
-
-    One of the ideas behind this design is to reduce the number of required CAS loops.
-    It should work as follows:
-
-    upon request, the structure should be created in zk in case it does not exist.
-
-    once the task is published in zk, replicas are notified there is a new task and will fetch it.
-
-    once they have it loaded locally, eventually the scheduler thread will run and try to lock individual parts in that task to export.
-
-    the lock process is kind of the following:
-
-    try to create an ephemeral node with the aprt name under the `locks` path. If it succeeded, the part is locked and the task will be scheduled within that replica.
-
-    if it fails, it means the part is already locked by another replica. Try the next part.
-
-    Once it completes, moves the part structure that lives under processing to processed with status either of failed or succeeded. If it failed, it'll also fail the entire task.
-
-    Also, once it completes a local part, after moving it to processed (a transaction). It tries to read `processing` to check if it is empty.
-
-    If it is empty, it means all parts have been exported and it is time to commit the export. Note that this is not transactional with the previous operation of moving the part to processed.
-
-    So it means there is a chance the last part will be exported, but the server might die right before checking processing path and will never commit. For this, the cleanup thread also helps
-
-    This is the overall idea, but please read the code to get a better understanding
-*/
-
 struct CleanupLockRAII
 {
     CleanupLockRAII(const zkutil::ZooKeeperPtr & zk_, const std::string & cleanup_lock_path_, const std::string & replica_name_, const LoggerPtr & log_)
