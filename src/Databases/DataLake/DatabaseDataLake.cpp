@@ -434,17 +434,18 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
         configuration,
         configuration->createObjectStorage(context_copy, /* is_readonly */ false),
         StorageID(getDatabaseName(), name),
-        /* columns */columns,
-        /* constraints */ConstraintsDescription{},
-        /* partition_by */nullptr,
+        /* columns */ columns,
+        /* constraints */ ConstraintsDescription{},
+        /* partition_by */ nullptr,
         context_copy,
-        /* comment */"",
+        /* comment */ "",
         getFormatSettings(context_copy),
         LoadingStrictnessLevel::CREATE,
         getCatalog(),
-        /* if_not_exists*/true,
-        /* is_datalake_query*/true,
-        /* lazy_init */true);
+        /* if_not_exists */ true,
+        /* is_datalake_query */ true,
+        /* is_table_function */ true,
+        /* lazy_init */ true);
 }
 
 void DatabaseDataLake::dropTable( /// NOLINT

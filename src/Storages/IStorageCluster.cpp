@@ -288,6 +288,8 @@ void IStorageCluster::read(
         return;
     }
 
+    updateConfigurationIfNeeded(context);
+
     storage_snapshot->check(column_names);
 
     const auto & settings = context->getSettingsRef();

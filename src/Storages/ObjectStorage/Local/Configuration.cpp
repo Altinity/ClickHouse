@@ -81,4 +81,20 @@ StorageObjectStorageQuerySettings StorageLocalConfiguration::getQuerySettings(co
         .ignore_non_existent_file = false};
 }
 
+ASTPtr StorageLocalConfiguration::createArgsWithAccessData() const
+{
+    auto arguments = std::make_shared<ASTExpressionList>();
+
+    arguments->children.push_back(std::make_shared<ASTLiteral>(path.path));
+    if (getFormat() != "auto")
+        arguments->children.push_back(std::make_shared<ASTLiteral>(getFormat()));
+    if (getStructure() != "auto")
+        arguments->children.push_back(std::make_shared<ASTLiteral>(getStructure()));
+    if (getCompressionMethod() != "auto")
+        arguments->children.push_back(std::make_shared<ASTLiteral>(getCompressionMethod()));
+
+    return arguments;
+}
+
+
 }

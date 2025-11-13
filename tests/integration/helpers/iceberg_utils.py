@@ -290,22 +290,26 @@ def get_creation_expression(
                 )
 
     elif storage_type == "local":
-        assert not run_on_cluster
-
-        if table_function:
+        if run_on_cluster:
+            assert table_function
             return f"""
-                iceberg{engine_part}({storage_arg}, path = '/iceberg_data/default/{table_name}/', format={format})
+                iceberg{engine_part}Cluster('cluster_simple', {storage_arg}, path = '/iceberg_data/default/{table_name}/', format={format})
             """
         else:
-            return (
-                f"""
-                DROP TABLE IF EXISTS {table_name};
-                CREATE TABLE {if_not_exists_prefix} {table_name} {schema}
-                ENGINE=Iceberg{engine_part}({storage_arg}, path = '/iceberg_data/default/{table_name}/', format={format})
-                {partition_by}
-                {settings_expression}
+            if table_function:
+                return f"""
+                    iceberg{engine_part}({storage_arg}, path = '/iceberg_data/default/{table_name}/', format={format})
                 """
-            )
+            else:
+                return (
+                    f"""
+                    DROP TABLE IF EXISTS {table_name};
+                    CREATE TABLE {if_not_exists_prefix} {table_name} {schema}
+                    ENGINE=Iceberg{engine_part}({storage_arg}, path = '/iceberg_data/default/{table_name}/', format={format})
+                    {partition_by}
+                    {settings_expression}
+                    """
+                )
 
     else:
         raise Exception(f"Unknown iceberg storage type: {storage_type}")
@@ -475,6 +479,17 @@ def default_upload_directory(
         raise Exception(f"Unknown iceberg storage type: {storage_type}")
 
 
+def additional_upload_directory(
+    started_cluster, node, storage_type, local_path, remote_path, **kwargs
+):
+    if storage_type == "local":
+        return LocalUploader(started_cluster.instances[node]).upload_directory(
+            local_path, remote_path, **kwargs
+        )
+    else:
+        raise Exception(f"Unknown iceberg storage type for additional uploading: {storage_type}")
+
+
 def default_download_directory(
     started_cluster, storage_type, remote_path, local_path, **kwargs
 ):
@@ -487,7 +502,7 @@ def default_download_directory(
 
 
 def execute_spark_query_general(
-    spark, started_cluster, storage_type: str, table_name: str, query: str
+    spark, started_cluster, storage_type: str, table_name: str, query: str, additional_nodes=None
 ):
     spark.sql(query)
     default_upload_directory(
@@ -496,7 +511,17 @@ def execute_spark_query_general(
         f"/iceberg_data/default/{table_name}/",
         f"/iceberg_data/default/{table_name}/",
     )
+    additional_nodes = additional_nodes or []
+    for node in additional_nodes:
+        additional_upload_directory(
+            started_cluster,
+            node,
+            storage_type,
+            f"/iceberg_data/default/{table_name}/",
+            f"/iceberg_data/default/{table_name}/",
+        )
     return
+
 
 def get_last_snapshot(path_to_table):
     import json

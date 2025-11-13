@@ -38,6 +38,7 @@ from helpers.test_tools import TSV
 
 from helpers.iceberg_utils import (
     default_upload_directory,
+    additional_upload_directory,
     default_download_directory,
     execute_spark_query_general,
     get_creation_expression,
@@ -410,7 +411,7 @@ def count_secondary_subqueries(started_cluster, query_id, expected, comment):
 
 
 @pytest.mark.parametrize("format_version", ["1", "2"])
-@pytest.mark.parametrize("storage_type", ["s3", "azure"])
+@pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
 def test_cluster_table_function(started_cluster, format_version, storage_type):
 
     instance = started_cluster.instances["node1"]
@@ -442,6 +443,19 @@ def test_cluster_table_function(started_cluster, format_version, storage_type):
         )
 
         logging.info(f"Adding another dataframe. result files: {files}")
+
+        if storage_type == "local":
+            # For local storage we need to upload data from each node
+            for node_name, replica in started_cluster.instances.items():
+                if node_name == "node1":
+                    continue
+                additional_upload_directory(
+                    started_cluster,
+                    node_name,
+                    storage_type,
+                    f"/iceberg_data/default/{TABLE_NAME}/",
+                    f"/iceberg_data/default/{TABLE_NAME}/",
+                )
 
         return files
 
@@ -480,7 +494,7 @@ def test_cluster_table_function(started_cluster, format_version, storage_type):
             storage_type_in_named_collection=storage_type_in_named_collection,
         )
         query_id = str(uuid.uuid4())
-        settings = "SETTINGS object_storage_cluster='cluster_simple'" if alt_syntax else ""
+        settings = f"SETTINGS object_storage_cluster='cluster_simple'" if (alt_syntax and not run_on_cluster) else ""
         if remote:
             query = f"SELECT * FROM remote('node2', {expr}) {settings}"
         else:
@@ -1257,7 +1271,7 @@ def test_filesystem_cache(started_cluster, storage_type):
 
 @pytest.mark.parametrize(
     "storage_type, run_on_cluster",
-    [("s3", False), ("s3", True), ("azure", False), ("azure", True), ("local", False)],
+    [("s3", False), ("s3", True), ("azure", False), ("azure", True), ("local", False), ("local", True)],
 )
 def test_partition_pruning(started_cluster, storage_type, run_on_cluster):
     instance = started_cluster.instances["node1"]
@@ -1271,6 +1285,7 @@ def test_partition_pruning(started_cluster, storage_type, run_on_cluster):
             storage_type,
             TABLE_NAME,
             query,
+            additional_nodes=["node2", "node3"] if storage_type=="local" else [],
         )
 
     execute_spark_query(
@@ -2096,8 +2111,6 @@ def test_explicit_metadata_file(started_cluster, storage_type):
 @pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
 @pytest.mark.parametrize("run_on_cluster", [False, True])
 def test_minmax_pruning_with_null(started_cluster, storage_type, run_on_cluster):
-    if run_on_cluster and storage_type == "local":
-        pytest.skip("Local storage is not supported on cluster")
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
     TABLE_NAME = "test_minmax_pruning_with_null" + storage_type + "_" + get_uuid_str()
@@ -2109,6 +2122,7 @@ def test_minmax_pruning_with_null(started_cluster, storage_type, run_on_cluster)
             storage_type,
             TABLE_NAME,
             query,
+            additional_nodes=["node2", "node3"] if storage_type=="local" else [],
         )
 
     execute_spark_query(
