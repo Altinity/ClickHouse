@@ -9,36 +9,6 @@
 
 namespace DB
 {
-
-struct CleanupLockRAII
-{
-    CleanupLockRAII(const zkutil::ZooKeeperPtr & zk_, const std::string & cleanup_lock_path_, const std::string & replica_name_, const LoggerPtr & log_)
-    : cleanup_lock_path(cleanup_lock_path_), zk(zk_), replica_name(replica_name_), log(log_)
-    {
-        is_locked = zk->tryCreate(cleanup_lock_path, replica_name, ::zkutil::CreateMode::Ephemeral) == Coordination::Error::ZOK;
-
-        if (is_locked)
-        {
-            LOG_INFO(log, "ExportPartition Manifest Updating Task: Cleanup lock acquired, will remove stale entries");
-        }
-    }
-
-    ~CleanupLockRAII()
-    {
-        if (is_locked)
-        {
-            LOG_INFO(log, "ExportPartition Manifest Updating Task: Releasing cleanup lock");
-            zk->tryRemove(cleanup_lock_path);
-        }
-    }
-
-    bool is_locked;
-    std::string cleanup_lock_path;
-    zkutil::ZooKeeperPtr zk;
-    std::string replica_name;
-    LoggerPtr log;
-};
-
 namespace
 {
     /*
@@ -120,7 +90,11 @@ void ExportPartitionManifestUpdatingTask::poll()
     const std::string exports_path = fs::path(storage.zookeeper_path) / "exports";
     const std::string cleanup_lock_path = fs::path(storage.zookeeper_path) / "exports_cleanup_lock";
 
-    CleanupLockRAII cleanup_lock(zk, cleanup_lock_path, storage.replica_name, storage.log.load());
+    auto cleanup_lock = zkutil::EphemeralNodeHolder::tryCreate(cleanup_lock_path, *zk, storage.replica_name);
+    if (cleanup_lock)
+    {
+        LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Cleanup lock acquired, will remove stale entries");
+    }
 
     Coordination::Stat stat;
     const auto children = zk->getChildrenWatch(exports_path, &stat, storage.export_merge_tree_partition_watch_callback);
@@ -154,7 +128,7 @@ void ExportPartitionManifestUpdatingTask::poll()
             && local_entry->manifest.transaction_id == metadata.transaction_id;
 
         /// If the entry is up to date and we don't have the cleanup lock, early exit, nothing to be done.
-        if (!cleanup_lock.is_locked && has_local_entry_and_is_up_to_date)
+        if (!cleanup_lock && has_local_entry_and_is_up_to_date)
             continue;
 
         auto status_watch_callback = std::make_shared<Coordination::WatchCallback>([this, key](const Coordination::WatchResponse &) {
@@ -173,7 +147,7 @@ void ExportPartitionManifestUpdatingTask::poll()
 
         /// if we have the cleanup lock, try to cleanup
         /// if we successfully cleaned it up, early exit
-        if (cleanup_lock.is_locked)
+        if (cleanup_lock)
         {
             bool cleanup_successful = tryCleanup(
                 zk,

@@ -8119,7 +8119,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     /// check if entry already exists
     if (zookeeper->exists(partition_exports_path))
     {
-        LOG_INFO(log, "Export with key {} is already exported or it is being exported. Checking if it has expired so that we can overwrite it.", export_key);
+        LOG_INFO(log, "Export with key {} is already exported or it is being exported. Checking if it has expired so that we can overwrite it", export_key);
 
         bool has_expired = false;
 
