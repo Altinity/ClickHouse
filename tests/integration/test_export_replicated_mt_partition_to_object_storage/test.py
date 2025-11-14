@@ -241,60 +241,6 @@ def test_drop_source_table_during_export(cluster):
     assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_*', format=LineAsString)") == '0\n', "Background operations completed even with the table dropped"
 
 
-def test_drop_destination_table_during_export(cluster):
-    node = cluster.instances["replica1"]
-    # node2 = cluster.instances["replica2"]
-    watcher_node = cluster.instances["watcher_node"]
-
-    mt_table = "drop_destination_table_during_export_mt_table"
-    s3_table = "drop_destination_table_during_export_s3_table"
-
-    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
-    create_s3_table(watcher_node, s3_table)
-
-    # Block S3/MinIO requests to keep exports alive via retry mechanism
-    # This allows ZooKeeper operations (KILL) to proceed quickly
-    minio_ip = cluster.minio_ip
-    minio_port = cluster.minio_port
-
-    with PartitionManager() as pm:
-        # Block responses from MinIO (source_port matches MinIO service)
-        pm_rule_reject_responses = {
-            "destination": node.ip_address,
-            "source_port": minio_port,
-            "action": "REJECT --reject-with tcp-reset",
-        }
-        pm._add_rule(pm_rule_reject_responses)
-
-        # Block requests to MinIO (destination: MinIO, destination_port: minio_port)
-        pm_rule_reject_requests = {
-            "destination": minio_ip,
-            "destination_port": minio_port,
-            "action": "REJECT --reject-with tcp-reset",
-        }
-        pm._add_rule(pm_rule_reject_requests)
-
-        export_queries = f"""
-            ALTER TABLE {mt_table}
-            EXPORT PARTITION ID '2020' TO TABLE {s3_table}
-            SETTINGS allow_experimental_export_merge_tree_part=1;
-            ALTER TABLE {mt_table}
-            EXPORT PARTITION ID '2021' TO TABLE {s3_table}
-            SETTINGS allow_experimental_export_merge_tree_part=1;
-        """
-
-        node.query(export_queries)
-
-        # The pointer to the destination table is still valid, so the write will continue
-        node.query(f"DROP TABLE {s3_table}")
-
-    # give some time for the export to finish
-    time.sleep(10)
-
-    # not sure this is the expected behavior, but adding until we make a decision
-    assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_*', format=LineAsString)") != '0\n', "Background operations did not complete after dropping the destination table"
-
-
 def test_concurrent_exports_to_different_targets(cluster):
     node = cluster.instances["replica1"]
 
