@@ -229,9 +229,9 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
         {
             auto modified_query_tree = query_tree->clone();
 
-            SearcherVisitor table_function_searcher({QueryTreeNodeType::TABLE, QueryTreeNodeType::TABLE_FUNCTION}, context);
-            table_function_searcher.visit(modified_query_tree);
-            auto table_function_node = table_function_searcher.getNode();
+            SearcherVisitor left_table_expression_searcher({QueryTreeNodeType::TABLE, QueryTreeNodeType::TABLE_FUNCTION}, context);
+            left_table_expression_searcher.visit(modified_query_tree);
+            auto table_function_node = left_table_expression_searcher.getNode();
             if (!table_function_node)
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find table function node");
 
@@ -239,29 +239,19 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
 
             auto & query_node = modified_query_tree->as<QueryNode &>();
 
-            if (info.has_join || info.has_cross_join)
+            if (info.has_join)
             {
-                if (table_function_searcher.getType().value() == QueryTreeNodeType::TABLE_FUNCTION)
-                {
-                    auto table_function = extractTableFunctionASTPtrFromSelectQuery(query_to_send);
-                    query_tree_distributed = buildTableFunctionQueryTree(table_function, context);
-                    auto & table_function_ast = table_function->as<ASTFunction &>();
-                    query_tree_distributed->setAlias(table_function_ast.alias);
-                }
-                else if (info.has_join)
-                {
-                    auto join_node = query_node.getJoinTree();
-                    query_tree_distributed = join_node->as<JoinNode>()->getLeftTableExpression()->clone();
-                }
-                else
-                {
-                    SearcherVisitor join_searcher({QueryTreeNodeType::CROSS_JOIN}, context);
-                    join_searcher.visit(modified_query_tree);
-                    auto cross_join_node = join_searcher.getNode();
-                    if (!cross_join_node)
-                        throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find CROSS JOIN node");
-                    query_tree_distributed = cross_join_node->as<CrossJoinNode>()->getTableExpressions()[0]->clone();
-                }
+                auto join_node = query_node.getJoinTree();
+                query_tree_distributed = join_node->as<JoinNode>()->getLeftTableExpression()->clone();
+            }
+            else if (info.has_cross_join)
+            {
+                SearcherVisitor join_searcher({QueryTreeNodeType::CROSS_JOIN}, context);
+                join_searcher.visit(modified_query_tree);
+                auto cross_join_node = join_searcher.getNode();
+                if (!cross_join_node)
+                    throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find CROSS JOIN node");
+                query_tree_distributed = cross_join_node->as<CrossJoinNode>()->getTableExpressions()[0]->clone();
             }
 
             // Find add used columns from table function to make proper projection list
@@ -545,9 +535,9 @@ IStorageCluster::QueryTreeInfo IStorageCluster::getQueryTreeInfo(QueryTreeNodePt
             info.has_cross_join = true;
     }
 
-    SearcherVisitor table_function_searcher({QueryTreeNodeType::TABLE, QueryTreeNodeType::TABLE_FUNCTION}, context);
-    table_function_searcher.visit(query_tree);
-    auto table_function_node = table_function_searcher.getNode();
+    SearcherVisitor left_table_expression_searcher({QueryTreeNodeType::TABLE, QueryTreeNodeType::TABLE_FUNCTION}, context);
+    left_table_expression_searcher.visit(query_tree);
+    auto table_function_node = left_table_expression_searcher.getNode();
     if (!table_function_node)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find table or table function node");
 
@@ -560,8 +550,9 @@ IStorageCluster::QueryTreeInfo IStorageCluster::getQueryTreeInfo(QueryTreeNodePt
         if (query_node.hasWhere())
             collector_where.visit(query_node.getWhere());
 
-        // SELECT x FROM datalake.table WHERE x IN local.table
+        // SELECT x FROM datalake.table WHERE x IN local.table.
         // Need to modify 'WHERE' on remote node if it contains columns from other sources
+        // because remote node might not have those sources.
         if (!collector_where.getColumns().empty())
             info.has_local_columns_in_where = true;
     }
