@@ -469,6 +469,10 @@ if (ARCH_S390X)
 else ()
     set(ENABLE_OPENSSL_DYNAMIC_DEFAULT OFF)
 endif ()
+
+#TODO (vnemkov): remove this before merging
+set(ENABLE_OPENSSL_DYNAMIC_DEFAULT ON)
+
 option(ENABLE_OPENSSL_DYNAMIC "This option removes SSL from ClickHouse and will link to the OpenSSL version supplied by OS." ${ENABLE_OPENSSL_DYNAMIC_DEFAULT})
 
 # when installing to /usr - place configs to /etc but for /usr/local place to /usr/local/etc
