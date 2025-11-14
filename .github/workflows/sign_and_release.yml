@@ -52,6 +52,7 @@ jobs:
       src_url: ${{ env.SRC_URL }}
       dest_url: ${{ env.DEST_URL }}
       major_version: ${{ env.MAJOR_VERSION }}
+      build_dir: ${{ env.BUILD_DIR }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -88,7 +89,7 @@ jobs:
       - name: Process ARM binary
         if: ${{ env.NEEDS_BINARY_PROCESSING == 'true' }}
         run: |
-          ARM_PATH=$([ "$MAJOR_VERSION" -ge 25 ] && echo "build_arm_release" || echo "package_aarch64")
+          ARM_PATH=$([ "$BUILD_DIR" = "build_amd_release" ] && echo "build_arm_release" || echo "package_aarch64")
 
           echo "Downloading clickhouse binary..."
           if ! aws s3 cp "${SRC_URL}/${ARM_PATH}/clickhouse" clickhouse; then
@@ -124,6 +125,7 @@ jobs:
       DEST_URL: ${{ needs.extract-package-info.outputs.dest_url }}
       NEEDS_BINARY_PROCESSING: ${{ needs.extract-package-info.outputs.needs_binary_processing }}
       MAJOR_VERSION: ${{ needs.extract-package-info.outputs.major_version }}
+      BUILD_DIR: ${{ needs.extract-package-info.outputs.build_dir }}
     steps:
       - name: Install aws cli
         uses: unfor19/install-aws-cli-action@v1
@@ -134,7 +136,7 @@ jobs:
       - name: Move verified packages to destination
         run: |
           # Move ARM packages
-          ARM_PATH=$([ "$MAJOR_VERSION" -ge 25 ] && echo "build_arm_release" || echo "package_aarch64")
+          ARM_PATH=$([ "$BUILD_DIR" = "build_amd_release" ] && echo "build_arm_release" || echo "package_aarch64")
           echo "Moving verified ARM packages to destination..."
           if ! aws s3 sync "${SRC_URL}/${ARM_PATH}/" "${DEST_URL}/packages/ARM_PACKAGES/"; then
             echo "Failed to move ARM packages to destination"
@@ -142,9 +144,8 @@ jobs:
           fi
 
           # Move AMD packages
-          AMD_PATH=$([ "$MAJOR_VERSION" -ge 25 ] && echo "build_amd_release" || echo "package_release")
           echo "Moving verified AMD packages to destination..."
-          if ! aws s3 sync "${SRC_URL}/${AMD_PATH}/" "${DEST_URL}/packages/AMD_PACKAGES/"; then
+          if ! aws s3 sync "${SRC_URL}/${BUILD_DIR}/" "${DEST_URL}/packages/AMD_PACKAGES/"; then
             echo "Failed to move AMD packages to destination"
             exit 1
           fi
