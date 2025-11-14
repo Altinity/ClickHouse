@@ -29,6 +29,7 @@
 #include <Disks/WriteMode.h>
 
 #include <Processors/ISimpleTransform.h>
+#include <Processors/Formats/IInputFormat.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeObjectMetadata.h>
 
 #include <Interpreters/Context_fwd.h>

@@ -1,9 +1,22 @@
 #include <Storages/VirtualColumnUtils.h>
 #include <Storages/ObjectStorage/IObjectIterator.h>
 #include <Interpreters/ExpressionActions.h>
+#include <Formats/FormatFactory.h>
+#include <Interpreters/Context.h>
+#include <Disks/ObjectStorages/IObjectStorage.h>
+#include <IO/ReadBufferFromFileBase.h>
+#include <Core/Settings.h>
+#include <Core/Defines.h>
+#include <Storages/ObjectStorage/Utils.h>
+#include <Processors/Formats/IInputFormat.h>
 
 namespace DB
 {
+
+namespace Setting
+{
+    extern const SettingsUInt64 cluster_table_function_buckets_batch_size;
+}
 
 static ExpressionActionsPtr getExpressionActions(
     const DB::ActionsDAG & filter_,
