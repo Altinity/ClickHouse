@@ -58,8 +58,11 @@ file(COPY ${ClickHouse_SOURCE_DIR}/contrib/openssl/include/ DESTINATION ${DELTA_
 set(DELTA_KERNEL_TARGET_PATH ${DELTA_KERNEL_RS_BINARY_DIR}/include)
 
 set(DELTA_KERNEL_FFI_OPENSSL "OPENSSL_STATIC=1")
+set(DELTA_KERNEL_FFI_OPENSSL_LIB_DIR "${CMAKE_BINARY_DIR}/contrib/openssl-cmake/")
+
 if (ENABLE_OPENSSL_DYNAMIC)
     set(DELTA_KERNEL_FFI_OPENSSL "OPENSSL_DYNAMIC=1")
+    set(DELTA_KERNEL_FFI_OPENSSL_LIB_DIR "${CMAKE_BINARY_DIR}/programs")
 endif()
 
 corrosion_set_env_vars(delta_kernel_ffi
@@ -67,7 +70,7 @@ corrosion_set_env_vars(delta_kernel_ffi
         "CARGO_TARGET_DIR=${DELTA_KERNEL_TARGET_PATH}"
         "OPENSSL_LIBS=ssl:crypto"
         "${DELTA_KERNEL_FFI_OPENSSL}"
-        "OPENSSL_LIB_DIR=${CMAKE_BINARY_DIR}/contrib/openssl-cmake/"
+        "OPENSSL_LIB_DIR=${DELTA_KERNEL_FFI_OPENSSL_LIB_DIR}"
         "OPENSSL_INCLUDE_DIR=${DELTA_KERNEL_RS_BINARY_DIR}/${PLATFORM_DIRECTORY}")
 
 target_include_directories(delta_kernel_ffi INTERFACE "${DELTA_KERNEL_TARGET_PATH}/")
