@@ -10,9 +10,9 @@
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
 #include <Processors/QueryPlan/QueryPlan.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
-#include "Common/Exception.h"
+#include <Common/Exception.h>
 #include <Common/ProfileEventsScope.h>
-#include "Storages/MergeTree/ExportList.h"
+#include <Storages/MergeTree/ExportList.h>
 
 namespace ProfileEvents
 {

@@ -259,16 +259,15 @@ BlockIO InterpreterKillQueryQuery::execute()
             return res_io;
 
         const ColumnString & src_db_col = typeid_cast<const ColumnString &>(*exports_block.getByName("source_database").column);
-        const ColumnString & src_tbl_col = typeid_cast<const ColumnString &>(*exports_block.getByName("source_table").column);
+        const ColumnString & src_table_col = typeid_cast<const ColumnString &>(*exports_block.getByName("source_table").column);
         const ColumnString & dst_db_col = typeid_cast<const ColumnString &>(*exports_block.getByName("destination_database").column);
-        const ColumnString & dst_tbl_col = typeid_cast<const ColumnString &>(*exports_block.getByName("destination_table").column);
+        const ColumnString & dst_table_col = typeid_cast<const ColumnString &>(*exports_block.getByName("destination_table").column);
         const ColumnString & tx_col = typeid_cast<const ColumnString &>(*exports_block.getByName("transaction_id").column);
 
         auto header = exports_block.cloneEmpty();
         header.insert(0, {ColumnString::create(), std::make_shared<DataTypeString>(), "kill_status"});
 
         MutableColumns res_columns = header.cloneEmptyColumns();
-        auto table_id = StorageID::createEmpty();
         AccessRightsElements required_access_rights;
         auto access = getContext()->getAccess();
         bool access_denied = false;
@@ -276,12 +275,12 @@ BlockIO InterpreterKillQueryQuery::execute()
         for (size_t i = 0; i < exports_block.rows(); ++i)
         {
             const auto src_database = src_db_col.getDataAt(i).toString();
-            const auto src_table = src_tbl_col.getDataAt(i).toString();
-            const auto dst_database = dst_db_col.getDataAt(i).toString();
-            const auto dst_table = dst_tbl_col.getDataAt(i).toString();
+            const auto src_table = src_table_col.getDataAt(i).toString();
+            const auto dst_database = dst_db_col.getDataAt(i).toView();
+            const auto dst_table = dst_table_col.getDataAt(i).toView();
 
-            table_id = StorageID{src_database, src_table};
-            auto transaction_id = tx_col.getDataAt(i).toString();
+            const auto table_id = StorageID{src_database, src_table};
+            const auto transaction_id = tx_col.getDataAt(i).toString();
 
             CancellationCode code = CancellationCode::Unknown;
             if (!query.test)
