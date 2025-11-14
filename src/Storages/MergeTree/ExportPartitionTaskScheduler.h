@@ -6,6 +6,7 @@
 namespace DB
 {
 
+class Exception;
 class StorageReplicatedMergeTree;
 
 struct ExportReplicatedMergeTreePartitionManifest;
@@ -44,7 +45,7 @@ private:
         const std::string & part_name,
         const std::filesystem::path & export_path,
         const zkutil::ZooKeeperPtr & zk,
-        const String & exception,
+        const std::optional<Exception> & exception,
         size_t max_retries);
 
     bool tryToMovePartToProcessed(

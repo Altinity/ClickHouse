@@ -2,13 +2,20 @@
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
-#include "Common/ZooKeeper/Types.h"
+#include <Common/Exception.h>
+#include <Common/ZooKeeper/Types.h>
 #include "Storages/MergeTree/ExportPartitionUtils.h"
 #include "Storages/MergeTree/MergeTreePartExportManifest.h"
 
 
 namespace DB
 {
+
+namespace ErrorCodes
+{
+    extern const int QUERY_WAS_CANCELLED;
+    extern const int LOGICAL_ERROR;
+}
 
 namespace
 {
@@ -210,10 +217,22 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
     const std::string & part_name,
     const std::filesystem::path & export_path,
     const zkutil::ZooKeeperPtr & zk,
-    const String & exception,
+    const std::optional<Exception> & exception,
     size_t max_retries
 )
 {
+    if (!exception)
+    {
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "ExportPartition scheduler task: No exception provided for error handling. Sounds like a bug");
+    }
+
+    /// Early exit if the query was cancelled - no need to increment error counts
+    if (exception->code() == ErrorCodes::QUERY_WAS_CANCELLED)
+    {
+        LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} export was cancelled, skipping error handling", part_name);
+        return;
+    }
+
     Coordination::Stat locked_by_stat;
     std::string locked_by;
 
@@ -274,7 +293,7 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
             num_exceptions = std::stoull(num_exceptions_string.c_str());
 
             ops.emplace_back(zkutil::makeSetRequest(last_exception_path / "part", part_name, -1));
-            ops.emplace_back(zkutil::makeSetRequest(last_exception_path / "exception", exception, -1));
+            ops.emplace_back(zkutil::makeSetRequest(last_exception_path / "exception", exception->message(), -1));
         }
         else
         {
@@ -282,7 +301,7 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
             ops.emplace_back(zkutil::makeCreateRequest(count_path, "0", zkutil::CreateMode::Persistent));
             ops.emplace_back(zkutil::makeCreateRequest(last_exception_path, "", zkutil::CreateMode::Persistent));
             ops.emplace_back(zkutil::makeCreateRequest(last_exception_path / "part", part_name, zkutil::CreateMode::Persistent));
-            ops.emplace_back(zkutil::makeCreateRequest(last_exception_path / "exception", exception, zkutil::CreateMode::Persistent));
+            ops.emplace_back(zkutil::makeCreateRequest(last_exception_path / "exception", exception->message(), zkutil::CreateMode::Persistent));
         }
 
         num_exceptions++;

@@ -138,7 +138,7 @@ bool ExportPartTask::executeStep()
         storage.export_manifests.erase(manifest);
 
         if (manifest.completion_callback)
-            manifest.completion_callback(MergeTreePartExportManifest::CompletionCallbackResult::createFailure(e.message()));
+            manifest.completion_callback(MergeTreePartExportManifest::CompletionCallbackResult::createFailure(e));
         return false;
     }
 
@@ -255,7 +255,7 @@ bool ExportPartTask::executeStep()
         storage.export_manifests.erase(manifest);
 
         if (manifest.completion_callback)
-            manifest.completion_callback(MergeTreePartExportManifest::CompletionCallbackResult::createFailure(e.message()));
+            manifest.completion_callback(MergeTreePartExportManifest::CompletionCallbackResult::createFailure(e));
 
         throw;
     }

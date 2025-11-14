@@ -3,9 +3,12 @@
 #include <Interpreters/StorageID.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <QueryPipeline/QueryPipeline.h>
+#include <optional>
 
 namespace DB
 {
+
+class Exception;
 
 class ExportPartTask;
 
@@ -23,23 +26,23 @@ struct MergeTreePartExportManifest
     struct CompletionCallbackResult
     {
     private:
-        CompletionCallbackResult(bool success_, const String & relative_path_in_destination_storage_, const String & exception_)
-            : success(success_), relative_path_in_destination_storage(relative_path_in_destination_storage_), exception(exception_) {}
+        CompletionCallbackResult(bool success_, const String & relative_path_in_destination_storage_, std::optional<Exception> exception_)
+            : success(success_), relative_path_in_destination_storage(relative_path_in_destination_storage_), exception(std::move(exception_)) {}
     public:
 
         static CompletionCallbackResult createSuccess(const String & relative_path_in_destination_storage_)
         {
-            return CompletionCallbackResult(true, relative_path_in_destination_storage_, "");
+            return CompletionCallbackResult(true, relative_path_in_destination_storage_, std::nullopt);
         }
 
-        static CompletionCallbackResult createFailure(const String & exception_)
+        static CompletionCallbackResult createFailure(Exception exception_)
         {
-            return CompletionCallbackResult(false, "", exception_);
+            return CompletionCallbackResult(false, "", std::move(exception_));
         }
 
         bool success = false;
         String relative_path_in_destination_storage;
-        String exception;
+        std::optional<Exception> exception;
     };
 
     MergeTreePartExportManifest(
