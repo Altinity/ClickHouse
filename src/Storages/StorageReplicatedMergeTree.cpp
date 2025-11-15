@@ -304,6 +304,11 @@ namespace ErrorCodes
     extern const int INVALID_SETTING_VALUE;
 }
 
+namespace ServerSetting
+{
+    extern const ServerSettingsBool enable_experimental_export_merge_tree_partition_feature;
+}
+
 namespace ActionLocks
 {
     extern const StorageActionBlockType PartsMerge;
@@ -480,26 +485,30 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
     /// Will be activated by restarting thread.
     mutations_finalizing_task->deactivate();
 
-    export_merge_tree_partition_manifest_updater = std::make_shared<ExportPartitionManifestUpdatingTask>(*this);
+    if (getContext()->getServerSettings()[ServerSetting::enable_experimental_export_merge_tree_partition_feature])
+    {
+        export_merge_tree_partition_manifest_updater = std::make_shared<ExportPartitionManifestUpdatingTask>(*this);
 
-    export_merge_tree_partition_task_scheduler = std::make_shared<ExportPartitionTaskScheduler>(*this);
+        export_merge_tree_partition_task_scheduler = std::make_shared<ExportPartitionTaskScheduler>(*this);
 
-    export_merge_tree_partition_updating_task = getContext()->getSchedulePool().createTask(
-        getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_updating_task)", [this] { exportMergeTreePartitionUpdatingTask(); });
+        export_merge_tree_partition_updating_task = getContext()->getSchedulePool().createTask(
+            getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_updating_task)", [this] { exportMergeTreePartitionUpdatingTask(); });
 
-    export_merge_tree_partition_updating_task->deactivate();
+        export_merge_tree_partition_updating_task->deactivate();
 
-    export_merge_tree_partition_status_handling_task = getContext()->getSchedulePool().createTask(
-        getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_status_handling_task)", [this] { exportMergeTreePartitionStatusHandlingTask(); });
+        export_merge_tree_partition_status_handling_task = getContext()->getSchedulePool().createTask(
+            getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_status_handling_task)", [this] { exportMergeTreePartitionStatusHandlingTask(); });
 
-    export_merge_tree_partition_status_handling_task->deactivate();
+        export_merge_tree_partition_status_handling_task->deactivate();
 
-    export_merge_tree_partition_watch_callback = std::make_shared<Coordination::WatchCallback>(export_merge_tree_partition_updating_task->getWatchCallback());
-        
-    export_merge_tree_partition_select_task = getContext()->getSchedulePool().createTask(
-        getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_select_task)", [this] { selectPartsToExport(); });
+        export_merge_tree_partition_watch_callback = std::make_shared<Coordination::WatchCallback>(export_merge_tree_partition_updating_task->getWatchCallback());
 
-    export_merge_tree_partition_select_task->deactivate();
+        export_merge_tree_partition_select_task = getContext()->getSchedulePool().createTask(
+            getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_select_task)", [this] { selectPartsToExport(); });
+
+        export_merge_tree_partition_select_task->deactivate();
+    }
+
 
     bool has_zookeeper = getContext()->hasZooKeeper() || getContext()->hasAuxiliaryZooKeeper(zookeeper_info.zookeeper_name);
     if (has_zookeeper)
@@ -5923,9 +5932,13 @@ void StorageReplicatedMergeTree::partialShutdown()
     queue_updating_task->deactivate();
     mutations_updating_task->deactivate();
     mutations_finalizing_task->deactivate();
-    export_merge_tree_partition_updating_task->deactivate();
-    export_merge_tree_partition_select_task->deactivate();
-    export_merge_tree_partition_status_handling_task->deactivate();
+
+    if (getContext()->getServerSettings()[ServerSetting::enable_experimental_export_merge_tree_partition_feature])
+    {
+        export_merge_tree_partition_updating_task->deactivate();
+        export_merge_tree_partition_select_task->deactivate();
+        export_merge_tree_partition_status_handling_task->deactivate();
+    }
 
     cleanup_thread.stop();
     async_block_ids_cache.stop();
@@ -8073,10 +8086,10 @@ void StorageReplicatedMergeTree::fetchPartition(
 
 void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand & command, ContextPtr query_context)
 {
-    if (!query_context->getSettingsRef()[Setting::allow_experimental_export_merge_tree_part])
+    if (!query_context->getServerSettings()[ServerSetting::enable_experimental_export_merge_tree_partition_feature])
     {
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
-            "Exporting merge tree part is experimental. Set `allow_experimental_export_merge_tree_part` to enable it");
+            "Exporting merge tree partition is experimental. Set the server setting `enable_experimental_export_merge_tree_partition_feature` to enable it");
     }
 
     const auto dest_database = query_context->resolveDatabase(command.to_database);

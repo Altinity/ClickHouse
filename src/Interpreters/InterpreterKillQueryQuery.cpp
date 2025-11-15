@@ -19,6 +19,7 @@
 #include <DataTypes/DataTypeString.h>
 #include <Columns/ColumnsNumber.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <Core/ServerSettings.h>
 #include <Processors/Sources/SourceFromSingleChunk.h>
 #include <Processors/ISource.h>
 #include <Processors/Executors/PullingPipelineExecutor.h>
@@ -37,11 +38,17 @@ namespace Setting
     extern const SettingsUInt64 max_parser_depth;
 }
 
+namespace ServerSetting
+{
+    extern const ServerSettingsBool enable_experimental_export_merge_tree_partition_feature;
+}
+
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
     extern const int ACCESS_DENIED;
     extern const int NOT_IMPLEMENTED;
+    extern const int SUPPORT_IS_DISABLED;
 }
 
 
@@ -252,6 +259,12 @@ BlockIO InterpreterKillQueryQuery::execute()
     }
     case ASTKillQueryQuery::Type::ExportPartition:
     {
+        if (!getContext()->getServerSettings()[ServerSetting::enable_experimental_export_merge_tree_partition_feature])
+        {
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+                "Exporting merge tree partition is experimental. Set the server setting `enable_experimental_export_merge_tree_partition_feature` to enable it");
+        }
+
         Block exports_block = getSelectResult(
             "source_database, source_table, transaction_id, destination_database, destination_table, partition_id",
             "system.replicated_partition_exports");

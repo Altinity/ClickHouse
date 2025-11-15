@@ -15,7 +15,7 @@ def cluster():
         cluster = ClickHouseCluster(__file__)
         cluster.add_instance(
             "replica1", 
-            main_configs=["configs/named_collections.xml"],
+            main_configs=["configs/named_collections.xml", "configs/allow_experimental_export_partition.xml"],
             user_configs=["configs/users.d/profile.xml"],
             with_minio=True,
             stay_alive=True,
@@ -23,7 +23,7 @@ def cluster():
         )
         cluster.add_instance(
             "replica2", 
-            main_configs=["configs/named_collections.xml"],
+            main_configs=["configs/named_collections.xml", "configs/allow_experimental_export_partition.xml"],
             user_configs=["configs/users.d/profile.xml"],
             with_minio=True,
             stay_alive=True,
@@ -35,6 +35,14 @@ def cluster():
             main_configs=["configs/named_collections.xml"],
             user_configs=[],
             with_minio=True,
+        )
+        cluster.add_instance(
+            "replica_with_export_disabled", 
+            main_configs=["configs/named_collections.xml", "configs/disable_experimental_export_partition.xml"],
+            user_configs=["configs/users.d/profile.xml"],
+            with_minio=True,
+            stay_alive=True,
+            with_zookeeper=True,
         )
         logging.info("Starting cluster...")
         cluster.start()
@@ -537,6 +545,21 @@ def test_export_partition_file_already_exists_policy(cluster):
         """
     ) == "FAILED\n", "Export should be marked as FAILED"
 
+
+def test_export_partition_feature_is_disabled(cluster):
+    replica_with_export_disabled = cluster.instances["replica_with_export_disabled"]
+
+    mt_table = "export_partition_feature_is_disabled_mt_table"
+    s3_table = "export_partition_feature_is_disabled_s3_table"
+
+    create_tables_and_insert_data(replica_with_export_disabled, mt_table, s3_table, "replica1")
+
+    error = replica_with_export_disabled.query_and_get_error(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS allow_experimental_export_merge_tree_part=1;")
+    assert "experimental" in error, "Expected error about disabled feature"
+
+    # make sure kill operation also throws
+    error = replica_with_export_disabled.query_and_get_error(f"KILL EXPORT PARTITION WHERE partition_id = '2020' and source_table = '{mt_table}' and destination_table = '{s3_table}'")
+    assert "experimental" in error, "Expected error about disabled feature"
 
 # def test_source_mutations_during_export_snapshot(cluster):
 #     node = cluster.instances["replica1"]
