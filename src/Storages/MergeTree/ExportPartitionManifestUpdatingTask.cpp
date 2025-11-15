@@ -131,9 +131,17 @@ void ExportPartitionManifestUpdatingTask::poll()
         if (!cleanup_lock && has_local_entry_and_is_up_to_date)
             continue;
 
-        auto status_watch_callback = std::make_shared<Coordination::WatchCallback>([this, key](const Coordination::WatchResponse &) {
-            storage.export_merge_tree_partition_manifest_updater->addStatusChange(key);
-            storage.export_merge_tree_partition_status_handling_task->schedule();
+        std::weak_ptr<ExportPartitionManifestUpdatingTask> weak_manifest_updater = storage.export_merge_tree_partition_manifest_updater;
+
+        auto status_watch_callback = std::make_shared<Coordination::WatchCallback>([weak_manifest_updater, key](const Coordination::WatchResponse &)
+        {
+            /// If the table is dropped but the watch is not removed, we need to prevent use after free
+            /// below code assumes that if manifest updater is still alive, the status handling task is also alive
+            if (auto manifest_updater = weak_manifest_updater.lock())
+            {
+                manifest_updater->addStatusChange(key);
+                manifest_updater->storage.export_merge_tree_partition_status_handling_task->schedule();
+            }
         });
 
         std::string status;
