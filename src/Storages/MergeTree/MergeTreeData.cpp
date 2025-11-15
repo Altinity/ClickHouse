@@ -6298,8 +6298,8 @@ void MergeTreeData::exportPartToTableImpl(
             block_with_partition_values,
             destination_file_path,
             manifest.overwrite_file_if_exists,
-            format_settings,
-            context_copy);
+            manifest.format_settings,
+            local_context);
     }
     catch (const Exception & e)
     {
