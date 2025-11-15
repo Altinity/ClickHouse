@@ -483,7 +483,7 @@ SinkToStoragePtr StorageObjectStorage::import(
     Block & block_with_partition_values,
     std::string & destination_file_path,
     bool overwrite_if_exists,
-    const std::optional<FormatSettings> & format_settings_
+    const std::optional<FormatSettings> & format_settings_,
     ContextPtr local_context)
 {
     std::string partition_key;
