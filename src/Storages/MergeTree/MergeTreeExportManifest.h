@@ -17,7 +17,7 @@ struct MergeTreeExportManifest
         : destination_storage_id(destination_storage_id_),
           data_part(data_part_),
           overwrite_file_if_exists(overwrite_file_if_exists_),
-          format_settings(format_settings_)
+          format_settings(format_settings_),
           create_time(time(nullptr)) {}
 
     StorageID destination_storage_id;
