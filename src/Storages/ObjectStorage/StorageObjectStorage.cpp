@@ -483,6 +483,7 @@ SinkToStoragePtr StorageObjectStorage::import(
     Block & block_with_partition_values,
     std::string & destination_file_path,
     bool overwrite_if_exists,
+    const std::optional<FormatSettings> & format_settings_
     ContextPtr local_context)
 {
     std::string partition_key;
@@ -508,7 +509,7 @@ SinkToStoragePtr StorageObjectStorage::import(
         destination_file_path,
         object_storage,
         configuration,
-        std::nullopt, /// passing nullopt to force rebuild for format_settings based on query context
+        format_settings_ ? format_settings_ : format_settings,
         std::make_shared<const Block>(getInMemoryMetadataPtr()->getSampleBlock()),
         local_context);
 }

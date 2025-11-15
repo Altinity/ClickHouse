@@ -47,6 +47,7 @@
 #include <Disks/SingleDiskVolume.h>
 #include <Disks/TemporaryFileOnDisk.h>
 #include <Disks/createVolume.h>
+#include <Formats/FormatFactory.h>
 #include <IO/Operators.h>
 #include <IO/S3Common.h>
 #include <IO/SharedThreadPools.h>
@@ -6241,13 +6242,12 @@ void MergeTreeData::exportPartToTable(const PartitionCommand & command, ContextP
                         part_name, getStorageID().getFullTableName());
 
     {
+        const auto format_settings = getFormatSettings(query_context);
         MergeTreeExportManifest manifest(
             dest_storage->getStorageID(),
             part,
             query_context->getSettingsRef()[Setting::export_merge_tree_part_overwrite_file_if_exists],
-            query_context->getSettingsRef()[Setting::output_format_parallel_formatting],
-            query_context->getSettingsRef()[Setting::output_format_parquet_parallel_encoding],
-            query_context->getSettingsRef()[Setting::max_threads]);
+            format_settings);
 
         std::lock_guard lock(export_manifests_mutex);
 
@@ -6293,16 +6293,12 @@ void MergeTreeData::exportPartToTableImpl(
 
     try
     {
-        auto context_copy = Context::createCopy(local_context);
-        context_copy->setSetting("output_format_parallel_formatting", manifest.parallel_formatting);
-        context_copy->setSetting("output_format_parquet_parallel_encoding", manifest.parquet_parallel_encoding);
-        context_copy->setSetting("max_threads", manifest.max_threads);
-
         sink = destination_storage->import(
             manifest.data_part->name + "_" + manifest.data_part->checksums.getTotalChecksumHex(),
             block_with_partition_values,
             destination_file_path,
             manifest.overwrite_file_if_exists,
+            format_settings,
             context_copy);
     }
     catch (const Exception & e)
