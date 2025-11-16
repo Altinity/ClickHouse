@@ -506,7 +506,7 @@ def test_export_partition_file_already_exists_policy(cluster):
 
     # now let's try with a file exists policy that is not NO_OP
     node.query(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS allow_experimental_export_merge_tree_part=1, export_merge_tree_partition_force_export=1, export_merge_tree_part_file_already_exists_policy='OVERWRITE'",
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS allow_experimental_export_merge_tree_part=1, export_merge_tree_partition_force_export=1, export_merge_tree_part_file_already_exists_policy='overwrite'",
         query_id=query_id_3,
     )
 
@@ -527,7 +527,7 @@ def test_export_partition_file_already_exists_policy(cluster):
     # last but not least, let's try with the error policy
     # max retries = 1 so it fails fast
     node.query(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS allow_experimental_export_merge_tree_part=1, export_merge_tree_partition_force_export=1, export_merge_tree_part_file_already_exists_policy='ERROR', export_merge_tree_partition_max_retries=1",
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS allow_experimental_export_merge_tree_part=1, export_merge_tree_partition_force_export=1, export_merge_tree_part_file_already_exists_policy='error', export_merge_tree_partition_max_retries=1",
         query_id=query_id_4,
     )
 

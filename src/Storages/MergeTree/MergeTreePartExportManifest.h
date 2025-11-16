@@ -14,12 +14,7 @@ class ExportPartTask;
 
 struct MergeTreePartExportManifest
 {
-    enum class FileAlreadyExistsPolicy
-    {
-        NO_OP,
-        ERROR,
-        OVERWRITE,
-    };
+    using FileAlreadyExistsPolicy = MergeTreePartExportFileAlreadyExistsPolicy;
 
     using DataPartPtr = std::shared_ptr<const IMergeTreeDataPart>;
 

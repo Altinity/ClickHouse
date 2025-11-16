@@ -95,7 +95,7 @@ bool ExportPartTask::executeStep()
             manifest.data_part->name + "_" + manifest.data_part->checksums.getTotalChecksumHex(),
             block_with_partition_values,
             (*exports_list_entry)->destination_file_path,
-            manifest.file_already_exists_policy == MergeTreePartExportManifest::FileAlreadyExistsPolicy::OVERWRITE,
+            manifest.file_already_exists_policy == MergeTreePartExportManifest::FileAlreadyExistsPolicy::overwrite,
             context_copy);
     }
     catch (const Exception & e)
@@ -105,7 +105,7 @@ bool ExportPartTask::executeStep()
             ProfileEvents::increment(ProfileEvents::PartsExportDuplicated);
 
             /// File already exists and the policy is NO_OP, treat it as success.
-            if (manifest.file_already_exists_policy == MergeTreePartExportManifest::FileAlreadyExistsPolicy::NO_OP)
+            if (manifest.file_already_exists_policy == MergeTreePartExportManifest::FileAlreadyExistsPolicy::skip)
             {
                 storage.writePartLog(
                     PartLogElement::Type::EXPORT_PART,

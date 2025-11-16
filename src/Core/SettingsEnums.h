@@ -480,4 +480,14 @@ enum class IcebergMetadataLogLevel : uint8_t
 };
 
 DECLARE_SETTING_ENUM(IcebergMetadataLogLevel)
+
+enum class MergeTreePartExportFileAlreadyExistsPolicy : uint8_t
+{
+    skip,
+    error,
+    overwrite,
+};
+
+DECLARE_SETTING_ENUM(MergeTreePartExportFileAlreadyExistsPolicy)
+
 }
