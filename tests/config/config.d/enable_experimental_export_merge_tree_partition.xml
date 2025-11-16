@@ -1,3 +1,3 @@
 <clickhouse>
-    <enable_export_merge_tree_partition_feature>0</enable_export_merge_tree_partition_feature>
+    <enable_experimental_export_merge_tree_partition>0</enable_experimental_export_merge_tree_partition>
 </clickhouse>
