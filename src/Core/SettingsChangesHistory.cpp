@@ -46,6 +46,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"lock_object_storage_task_distribution_ms", 500, 500, "Raised the value to 500 to avoid hoping tasks between executors."},
             {"allow_retries_in_cluster_requests", false, false, "New setting"},
             {"object_storage_remote_initiator", false, false, "New setting."},
+            {"allow_experimental_export_merge_tree_part", false, false, "New setting."},
+            {"export_merge_tree_part_overwrite_file_if_exists", false, false, "New setting."},
             {"allow_experimental_export_merge_tree_part", false, true, "Turned ON by default for Antalya."},
             {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."}
         });
