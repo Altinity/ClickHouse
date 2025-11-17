@@ -233,8 +233,10 @@ bool isClickhouseApp(std::string_view app_suffix, std::vector<char *> & argv)
 /// We absolutely discourage the ancient technique of loading
 /// 3rd-party uncontrolled dangerous libraries into the process address space,
 /// because it is insane.
+/// However, when using system OpenSSL (ENABLE_OPENSSL_DYNAMIC), we must allow dlopen
+/// because OpenSSL 3.x uses it to load provider modules (e.g., legacy.so).
 
-#if !defined(USE_MUSL)
+#if !defined(USE_MUSL) && !defined(ENABLE_OPENSSL_DYNAMIC)
 extern "C"
 {
     void * dlopen(const char *, int)

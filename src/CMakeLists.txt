@@ -327,6 +327,10 @@ if (TARGET ch_contrib::nuraft)
 endif()
 
 add_library (dbms STATIC ${dbms_headers} ${dbms_sources})
+
+# Suppress Arrow C++ deprecation warnings (std::aligned_storage in C++23)
+target_compile_options(dbms PRIVATE -Wno-deprecated-declarations)
+
 target_link_libraries (dbms PRIVATE ch_contrib::libdivide daemon)
 if (TARGET ch_contrib::jemalloc)
     target_link_libraries (dbms PRIVATE ch_contrib::jemalloc)
@@ -737,6 +741,7 @@ if (ENABLE_TESTS)
     # gtest framework has substandard code
     target_compile_options(unit_tests_dbms PRIVATE
         -Wno-sign-compare
+        -Wno-deprecated-declarations  # Arrow C++ deprecation warnings
     )
 
     target_link_libraries(unit_tests_dbms PRIVATE

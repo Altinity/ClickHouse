@@ -388,7 +388,30 @@ endif ()
 
 include(cmake/dbms_glob_sources.cmake)
 
+if (ARCH_S390X)
+    set(ENABLE_OPENSSL_DYNAMIC_DEFAULT ON)
+else ()
+    set(ENABLE_OPENSSL_DYNAMIC_DEFAULT OFF)
+endif ()
+
+#TODO (vnemkov): remove this before merging
+set(ENABLE_OPENSSL_DYNAMIC_DEFAULT ON)
+
+option(ENABLE_OPENSSL_DYNAMIC "This option removes SSL from ClickHouse and will link to the OpenSSL version supplied by OS." ${ENABLE_OPENSSL_DYNAMIC_DEFAULT})
+
+# Disable glibc-compatibility when using dynamic OpenSSL
+# System OpenSSL may require newer glibc symbols than the compatibility layer provides
+if (ENABLE_OPENSSL_DYNAMIC)
+    set(GLIBC_COMPATIBILITY OFF CACHE BOOL "Disabled due to ENABLE_OPENSSL_DYNAMIC" FORCE)
+    message(STATUS "GLIBC_COMPATIBILITY disabled because ENABLE_OPENSSL_DYNAMIC is ON")
+endif()
+
 add_library(global-group INTERFACE)
+
+# Define ENABLE_OPENSSL_DYNAMIC as a preprocessor macro so it can be used in code
+if (ENABLE_OPENSSL_DYNAMIC)
+    target_compile_definitions(global-group INTERFACE ENABLE_OPENSSL_DYNAMIC)
+endif()
 if (OS_LINUX OR OS_ANDROID)
     include(cmake/linux/default_libs.cmake)
 elseif (OS_DARWIN)
@@ -411,8 +434,14 @@ if (WERROR)
 endif ()
 
 # Make this extra-checks for correct library dependencies.
+# Skip when using dynamic OpenSSL as system OpenSSL may have dependencies on newer glibc
 if (OS_LINUX AND NOT SANITIZE)
-    target_link_options(global-group INTERFACE "LINKER:--no-undefined")
+    if (ENABLE_OPENSSL_DYNAMIC)
+        # Allow undefined symbols in shared libraries (they'll be resolved at runtime)
+        target_link_options(global-group INTERFACE "LINKER:--allow-shlib-undefined")
+    else ()
+        target_link_options(global-group INTERFACE "LINKER:--no-undefined")
+    endif ()
 endif ()
 
 ######################################
@@ -463,17 +492,6 @@ else()
 endif ()
 
 enable_testing() # Enable for tests without binary
-
-if (ARCH_S390X)
-    set(ENABLE_OPENSSL_DYNAMIC_DEFAULT ON)
-else ()
-    set(ENABLE_OPENSSL_DYNAMIC_DEFAULT OFF)
-endif ()
-
-#TODO (vnemkov): remove this before merging
-set(ENABLE_OPENSSL_DYNAMIC_DEFAULT ON)
-
-option(ENABLE_OPENSSL_DYNAMIC "This option removes SSL from ClickHouse and will link to the OpenSSL version supplied by OS." ${ENABLE_OPENSSL_DYNAMIC_DEFAULT})
 
 # when installing to /usr - place configs to /etc but for /usr/local place to /usr/local/etc
 if (CMAKE_INSTALL_PREFIX STREQUAL "/usr")

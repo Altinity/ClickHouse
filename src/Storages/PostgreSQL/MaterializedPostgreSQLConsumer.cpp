@@ -890,7 +890,10 @@ bool MaterializedPostgreSQLConsumer::consume()
                 "'{}', NULL, {}, 'publication_names', '{}', 'proto_version', '1')",
                 replication_slot_name, max_block_size, publication_name);
 
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Wdeprecated-declarations"
         auto stream{pqxx::stream_from::query(*tx, query_str)};
+        #pragma clang diagnostic pop
 
         while (true)
         {

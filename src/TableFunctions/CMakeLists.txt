@@ -21,6 +21,9 @@ extract_into_parent_list(clickhouse_table_functions_headers dbms_headers
 
 add_library(clickhouse_table_functions ${clickhouse_table_functions_headers} ${clickhouse_table_functions_sources})
 
+# Suppress Arrow C++ deprecation warnings (std::aligned_storage in C++23)
+target_compile_options(clickhouse_table_functions PRIVATE -Wno-deprecated-declarations)
+
 target_link_libraries(clickhouse_table_functions PRIVATE clickhouse_parsers clickhouse_storages_system dbms)
 
 if (TARGET ch_contrib::hivemetastore)

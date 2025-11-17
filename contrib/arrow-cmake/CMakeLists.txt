@@ -561,6 +561,10 @@ if (SANITIZE STREQUAL "undefined")
     target_compile_options(_arrow PRIVATE -fno-sanitize=undefined)
 endif ()
 
+# Suppress C++17/20 deprecation warnings for std::aligned_storage
+target_compile_options(_arrow PRIVATE -Wno-deprecated-declarations)
+target_compile_options(_parquet PRIVATE -Wno-deprecated-declarations)
+
 # Define Thrift version for parquet (we use 0.16.0)
 add_definitions(-DPARQUET_THRIFT_VERSION_MAJOR=0)
 add_definitions(-DPARQUET_THRIFT_VERSION_MINOR=16)

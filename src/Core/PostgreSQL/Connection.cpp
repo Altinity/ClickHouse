@@ -63,7 +63,12 @@ void Connection::updateConnection()
     connection = std::make_unique<pqxx::connection>(connection_info.connection_string);
 
     if (replication)
+    {
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Wdeprecated-declarations"
         connection->set_variable("default_transaction_isolation", "'repeatable read'");
+        #pragma clang diagnostic pop
+    }
 
     LOG_DEBUG(getLogger("PostgreSQLConnection"), "New connection to {}", connection_info.host_port);
 }

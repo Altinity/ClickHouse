@@ -1,6 +1,10 @@
 #include <Storages/StorageArrowFlight.h>
 
 #if USE_ARROWFLIGHT
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
 #include <sstream>
 #include <Analyzer/ColumnNode.h>
 #include <Analyzer/ConstantNode.h>
@@ -290,5 +294,7 @@ void registerStorageArrowFlight(StorageFactory & factory)
 }
 
 }
+
+#pragma clang diagnostic pop
 
 #endif

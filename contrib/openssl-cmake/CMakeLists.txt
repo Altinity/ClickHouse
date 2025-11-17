@@ -10,6 +10,59 @@ if(NOT ENABLE_SSL)
   return()
 endif()
 
+# When ENABLE_OPENSSL_DYNAMIC is ON, use system OpenSSL instead of building from source
+if(ENABLE_OPENSSL_DYNAMIC)
+  message(STATUS "Using system OpenSSL (dynamic linking)")
+
+  # OpenSSL is now installed in the sysroot, so we can use it with the sysroot-relative paths
+  # Get OpenSSL paths for Rust builds (from host system)
+  execute_process(
+    COMMAND pkg-config --variable=libdir openssl
+    OUTPUT_VARIABLE OPENSSL_SYSTEM_LIB_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+  execute_process(
+    COMMAND pkg-config --variable=includedir openssl
+    OUTPUT_VARIABLE OPENSSL_SYSTEM_INCLUDE_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+
+  # Export these as cache variables for other CMake files
+  set(SYSTEM_OPENSSL_LIB_DIR "${OPENSSL_SYSTEM_LIB_DIR}" CACHE INTERNAL "System OpenSSL library directory")
+  set(SYSTEM_OPENSSL_INCLUDE_DIR "${OPENSSL_SYSTEM_INCLUDE_DIR}" CACHE INTERNAL "System OpenSSL include directory")
+
+  # Create imported libraries that match the expected names (both with and without OpenSSL:: namespace)
+  # Use full paths to host system OpenSSL libraries to bypass sysroot
+  # Suppress OpenSSL 3.0 deprecation warnings for code that uses older APIs
+  add_library(crypto INTERFACE IMPORTED GLOBAL)
+  set_target_properties(crypto PROPERTIES
+    INTERFACE_LINK_LIBRARIES "${OPENSSL_SYSTEM_LIB_DIR}/libcrypto.so"
+    INTERFACE_COMPILE_DEFINITIONS "OPENSSL_API_COMPAT=0x10100000L"
+  )
+
+  add_library(ssl INTERFACE IMPORTED GLOBAL)
+  set_target_properties(ssl PROPERTIES
+    INTERFACE_LINK_LIBRARIES "${OPENSSL_SYSTEM_LIB_DIR}/libssl.so;${OPENSSL_SYSTEM_LIB_DIR}/libcrypto.so"
+    INTERFACE_COMPILE_DEFINITIONS "OPENSSL_API_COMPAT=0x10100000L"
+  )
+
+  # Create namespaced targets for modules that expect OpenSSL::SSL and OpenSSL::Crypto
+  add_library(OpenSSL::Crypto INTERFACE IMPORTED GLOBAL)
+  set_target_properties(OpenSSL::Crypto PROPERTIES
+    INTERFACE_LINK_LIBRARIES "crypto"
+  )
+
+  add_library(OpenSSL::SSL INTERFACE IMPORTED GLOBAL)
+  set_target_properties(OpenSSL::SSL PROPERTIES
+    INTERFACE_LINK_LIBRARIES "ssl"
+  )
+
+  message(STATUS "Using system OpenSSL from sysroot (dynamic linking)")
+  message(STATUS "OpenSSL paths for Rust: lib=${OPENSSL_SYSTEM_LIB_DIR}, include=${OPENSSL_SYSTEM_INCLUDE_DIR}")
+
+  return()
+endif()
+
 # Below build description was generated from these steps:
 # - Checkout OpenSSL in the desired version (e.g. 3.2)
 # - Take a brief look (but not too long to save your mental sanity) at the supported build options (*)

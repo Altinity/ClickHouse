@@ -182,7 +182,10 @@ PostgreSQLTableStructure::ColumnsInfoPtr readNamesAndTypesList(
     {
         std::set<size_t> recheck_arrays_indexes;
         {
+            #pragma clang diagnostic push
+            #pragma clang diagnostic ignored "-Wdeprecated-declarations"
             auto stream{pqxx::stream_from::query(tx, query)};
+            #pragma clang diagnostic pop
 
             size_t i = 0;
             auto recheck_array = [&]() { recheck_arrays_indexes.insert(i); };

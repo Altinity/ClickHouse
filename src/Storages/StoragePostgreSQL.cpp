@@ -495,7 +495,10 @@ private:
             pqxx::params params;
             params.reserve(row.size());
             params.append_multi(row);
+            #pragma clang diagnostic push
+            #pragma clang diagnostic ignored "-Wdeprecated-declarations"
             tx.exec_prepared(statement_name, params);
+            #pragma clang diagnostic pop
         }
 
         ~PreparedInsert() override

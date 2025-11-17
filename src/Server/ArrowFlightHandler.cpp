@@ -1,6 +1,10 @@
 #include <Server/ArrowFlightHandler.h>
 
 #if USE_ARROWFLIGHT
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+
 #include <memory>
 #include <arrow/compute/api.h>
 #include <arrow/flight/api.h>
@@ -593,5 +597,7 @@ ArrowFlightHandler::ListActions(const arrow::flight::ServerCallContext & /*conte
 }
 
 }
+
+#pragma clang diagnostic pop
 
 #endif

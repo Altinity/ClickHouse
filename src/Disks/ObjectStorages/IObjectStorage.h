@@ -47,6 +47,8 @@ namespace DB::AzureBlobStorage
 class ContainerClientWrapper;
 using ContainerClient = ContainerClientWrapper;
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 class StaticCredential : public Azure::Core::Credentials::TokenCredential
 {
 public:
@@ -65,6 +67,7 @@ private:
     std::string token;
     std::chrono::system_clock::time_point expires_on;
 };
+#pragma clang diagnostic pop
 
 using ConnectionString = StrongTypedef<String, struct ConnectionStringTag>;
 
