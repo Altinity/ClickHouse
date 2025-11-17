@@ -67,7 +67,7 @@ void IcebergPositionDeleteTransform::initializeDeleteSources()
     {
         /// Skip position deletes that do not match the data file path.
         if (position_deletes_object.reference_data_file_path.has_value()
-            && position_deletes_object.reference_data_file_path != iceberg_data_path)
+            && position_deletes_object.reference_data_file_path.value() != iceberg_data_path)
             continue;
 
         /// Resolve the position delete file path to get the correct storage and key
@@ -192,10 +192,8 @@ void IcebergBitmapPositionDeleteTransform::initialize()
         while (auto delete_chunk = delete_source->read())
         {
             int position_index = getColumnIndex(delete_source, IcebergPositionDeleteTransform::positions_column_name);
-            int filename_index = getColumnIndex(delete_source, IcebergPositionDeleteTransform::data_file_path_column_name);
 
             auto position_column = delete_chunk.getColumns()[position_index];
-            auto filename_column = delete_chunk.getColumns()[filename_index];
 
             for (size_t i = 0; i < delete_chunk.getNumRows(); ++i)
             {

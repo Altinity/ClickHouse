@@ -168,15 +168,19 @@ std::optional<DeleteFileWriteResultWithStats> writeDataFiles(
                     Field cur_value;
                     col_data_filename.column->get(i, cur_value);
 
+                    String original_path = cur_value.safeGet<String>();
                     String path_without_namespace;
-                    if (cur_value.safeGet<String>().starts_with(configuration->getNamespace()))
-                        path_without_namespace = cur_value.safeGet<String>().substr(configuration->getNamespace().size());
 
-                    if (!path_without_namespace.starts_with(configuration->getPathForRead().path))
+                    if (original_path.starts_with(configuration->getNamespace()))
+                        path_without_namespace = original_path.substr(configuration->getNamespace().size());
+                    else
+                        path_without_namespace = original_path;
+
+                    if (!path_without_namespace.empty() && !path_without_namespace.starts_with(configuration->getPathForRead().path))
                     {
                         if (path_without_namespace.starts_with('/'))
                             path_without_namespace = path_without_namespace.substr(1);
-                        else
+                        else if (!path_without_namespace.empty())
                             path_without_namespace = "/" + path_without_namespace;
                     }
                     col_data_filename_without_namespaces->insert(path_without_namespace);

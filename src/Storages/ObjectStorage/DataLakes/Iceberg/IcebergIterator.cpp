@@ -137,7 +137,7 @@ std::optional<ManifestFileEntry> SingleThreadIcebergKeysIterator::next()
                 secondary_storages);
             internal_data_index = 0;
         }
-        auto files = files_generator(current_manifest_file_content);
+        const auto & files = files_generator(current_manifest_file_content);
         while (internal_data_index < files.size())
         {
             const auto & manifest_file_entry = files[internal_data_index++];
