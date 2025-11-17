@@ -242,10 +242,10 @@ public:
     }
 #endif
 
-    void modifyFormatSettings(FormatSettings & settings_) const override
+    void modifyFormatSettings(FormatSettings & settings_, const Context & local_context) const override
     {
         assertInitializedDL();
-        current_metadata->modifyFormatSettings(settings_);
+        current_metadata->modifyFormatSettings(settings_, local_context);
     }
 
     ColumnMapperPtr getColumnMapperForObject(ObjectInfoPtr object_info) const override
@@ -449,7 +449,7 @@ class StorageIcebergConfiguration : public StorageObjectStorageConfiguration, pu
 
 public:
     explicit StorageIcebergConfiguration(DataLakeStorageSettingsPtr settings_) : settings(settings_) {}
- 
+
     ObjectStorageType getType() const override { return getImpl().getType(); }
 
     std::string getTypeName() const override { return getImpl().getTypeName(); }
@@ -504,7 +504,7 @@ public:
     std::shared_ptr<const ActionsDAG> getSchemaTransformer(ContextPtr context, ObjectInfoPtr object_info) const override
         { return getImpl().getSchemaTransformer(context, object_info); }
 
-    void modifyFormatSettings(FormatSettings & settings_) const override { getImpl().modifyFormatSettings(settings_); }
+    void modifyFormatSettings(FormatSettings & settings_, const Context & local_context) const override { getImpl().modifyFormatSettings(settings_, local_context); }
 
     void addDeleteTransformers(
         ObjectInfoPtr object_info,
