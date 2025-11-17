@@ -48,6 +48,7 @@
 #include <Disks/SingleDiskVolume.h>
 #include <Disks/TemporaryFileOnDisk.h>
 #include <Disks/createVolume.h>
+#include <Formats/FormatFactory.h>
 #include <IO/Operators.h>
 #include <IO/S3Common.h>
 #include <IO/SharedThreadPools.h>
@@ -6254,14 +6255,13 @@ void MergeTreeData::exportPartToTable(
                         part_name, getStorageID().getFullTableName());
 
     {
+        const auto format_settings = getFormatSettings(query_context);
         MergeTreePartExportManifest manifest(
             dest_storage->getStorageID(),
             part,
             transaction_id,
             query_context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value,
-            query_context->getSettingsRef()[Setting::output_format_parallel_formatting],
-            query_context->getSettingsRef()[Setting::output_format_parquet_parallel_encoding],
-            query_context->getSettingsRef()[Setting::max_threads],
+            format_settings,
             completion_callback);
 
         std::lock_guard lock(export_manifests_mutex);

@@ -86,17 +86,13 @@ bool ExportPartTask::executeStep()
 
     try
     {
-        auto context_copy = Context::createCopy(local_context);
-        context_copy->setSetting("output_format_parallel_formatting", manifest.parallel_formatting);
-        context_copy->setSetting("output_format_parquet_parallel_encoding", manifest.parquet_parallel_encoding);
-        context_copy->setSetting("max_threads", manifest.max_threads);
-
         sink = destination_storage->import(
             manifest.data_part->name + "_" + manifest.data_part->checksums.getTotalChecksumHex(),
             block_with_partition_values,
             (*exports_list_entry)->destination_file_path,
             manifest.file_already_exists_policy == MergeTreePartExportManifest::FileAlreadyExistsPolicy::overwrite,
-            context_copy);
+            manifest.format_settings,
+            local_context);
     }
     catch (const Exception & e)
     {
