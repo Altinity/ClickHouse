@@ -38,6 +38,7 @@ from helpers.test_tools import TSV
 
 from helpers.iceberg_utils import (
     default_upload_directory,
+    additional_upload_directory,
     default_download_directory,
     execute_spark_query_general,
     get_creation_expression,
@@ -410,7 +411,7 @@ def count_secondary_subqueries(started_cluster, query_id, expected, comment):
 
 
 @pytest.mark.parametrize("format_version", ["1", "2"])
-@pytest.mark.parametrize("storage_type", ["s3", "azure"])
+@pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
 def test_cluster_table_function(started_cluster, format_version, storage_type):
 
     instance = started_cluster.instances["node1"]
@@ -442,6 +443,19 @@ def test_cluster_table_function(started_cluster, format_version, storage_type):
         )
 
         logging.info(f"Adding another dataframe. result files: {files}")
+
+        if storage_type == "local":
+            # For local storage we need to upload data from each node
+            for node_name, replica in started_cluster.instances.items():
+                if node_name == "node1":
+                    continue
+                additional_upload_directory(
+                    started_cluster,
+                    node_name,
+                    storage_type,
+                    f"/iceberg_data/default/{TABLE_NAME}/",
+                    f"/iceberg_data/default/{TABLE_NAME}/",
+                )
 
         return files
 
@@ -480,7 +494,7 @@ def test_cluster_table_function(started_cluster, format_version, storage_type):
             storage_type_in_named_collection=storage_type_in_named_collection,
         )
         query_id = str(uuid.uuid4())
-        settings = "SETTINGS object_storage_cluster='cluster_simple'" if alt_syntax else ""
+        settings = f"SETTINGS object_storage_cluster='cluster_simple'" if (alt_syntax and not run_on_cluster) else ""
         if remote:
             query = f"SELECT * FROM remote('node2', {expr}) {settings}"
         else:
@@ -1257,7 +1271,7 @@ def test_filesystem_cache(started_cluster, storage_type):
 
 @pytest.mark.parametrize(
     "storage_type, run_on_cluster",
-    [("s3", False), ("s3", True), ("azure", False), ("azure", True), ("local", False)],
+    [("s3", False), ("s3", True), ("azure", False), ("azure", True), ("local", False), ("local", True)],
 )
 def test_partition_pruning(started_cluster, storage_type, run_on_cluster):
     instance = started_cluster.instances["node1"]
@@ -1271,6 +1285,7 @@ def test_partition_pruning(started_cluster, storage_type, run_on_cluster):
             storage_type,
             TABLE_NAME,
             query,
+            additional_nodes=["node2", "node3"] if storage_type=="local" else [],
         )
 
     execute_spark_query(
@@ -2096,8 +2111,6 @@ def test_explicit_metadata_file(started_cluster, storage_type):
 @pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
 @pytest.mark.parametrize("run_on_cluster", [False, True])
 def test_minmax_pruning_with_null(started_cluster, storage_type, run_on_cluster):
-    if run_on_cluster and storage_type == "local":
-        pytest.skip("Local storage is not supported on cluster")
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
     TABLE_NAME = "test_minmax_pruning_with_null" + storage_type + "_" + get_uuid_str()
@@ -2109,6 +2122,7 @@ def test_minmax_pruning_with_null(started_cluster, storage_type, run_on_cluster)
             storage_type,
             TABLE_NAME,
             query,
+            additional_nodes=["node2", "node3"] if storage_type=="local" else [],
         )
 
     execute_spark_query(
@@ -3535,6 +3549,151 @@ def test_read_constant_columns_optimization(started_cluster, storage_type, run_o
     compare_selects(f"SELECT _path,* FROM {creation_expression} ORDER BY ALL")
     compare_selects(f"SELECT _path,* FROM {creation_expression} WHERE name_old='vasily' ORDER BY ALL")
     compare_selects(f"SELECT _path,* FROM {creation_expression} WHERE ((tag + length(name_old)) % 2 = 1) ORDER BY ALL")
+
+
+@pytest.mark.parametrize("storage_type", ["s3", "azure"])
+def test_cluster_joins(started_cluster, storage_type):
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
+    TABLE_NAME = "test_cluster_joins_" + storage_type + "_" + get_uuid_str()
+    TABLE_NAME_2 = "test_cluster_joins_2_" + storage_type + "_" + get_uuid_str()
+    TABLE_NAME_LOCAL = "test_cluster_joins_local_" + storage_type + "_" + get_uuid_str()
+
+    def execute_spark_query(query: str, table_name):
+        return execute_spark_query_general(
+            spark,
+            started_cluster,
+            storage_type,
+            table_name,
+            query,
+        )
+
+    execute_spark_query(
+        f"""
+            CREATE TABLE {TABLE_NAME} (
+                tag INT,
+                name VARCHAR(50)
+            )
+            USING iceberg
+            OPTIONS('format-version'='2')
+        """, TABLE_NAME
+    )
+
+    execute_spark_query(
+        f"""
+        INSERT INTO {TABLE_NAME} VALUES
+        (1, 'john'),
+        (2, 'jack')
+    """, TABLE_NAME
+    )
+
+    execute_spark_query(
+        f"""
+            CREATE TABLE {TABLE_NAME_2} (
+                id INT,
+                second_name VARCHAR(50)
+            )
+            USING iceberg
+            OPTIONS('format-version'='2')
+        """, TABLE_NAME_2
+    )
+
+    execute_spark_query(
+        f"""
+        INSERT INTO {TABLE_NAME_2} VALUES
+        (1, 'dow'),
+        (2, 'sparrow')
+    """, TABLE_NAME_2
+    )
+
+    creation_expression = get_creation_expression(
+        storage_type, TABLE_NAME, started_cluster, table_function=True, run_on_cluster=True
+    )
+
+    creation_expression_2 = get_creation_expression(
+        storage_type, TABLE_NAME_2, started_cluster, table_function=True, run_on_cluster=True
+    )
+
+    instance.query(f"CREATE TABLE `{TABLE_NAME_LOCAL}` (id Int64, second_name String) ENGINE = Memory()")
+    instance.query(f"INSERT INTO `{TABLE_NAME_LOCAL}` VALUES (1, 'silver'), (2, 'black')")
+
+    res = instance.query(
+        f"""
+            SELECT t1.name,t2.second_name
+            FROM {creation_expression} AS t1
+                JOIN {creation_expression_2} AS t2
+                ON t1.tag=t2.id
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
+        """
+    )
+
+    assert res == "jack\tsparrow\njohn\tdow\n"
+
+    res = instance.query(
+        f"""
+            SELECT name
+            FROM {creation_expression}
+            WHERE tag in (
+                SELECT id
+                FROM {creation_expression_2}
+            )
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
+        """
+    )
+
+    assert res == "jack\njohn\n"
+
+    res = instance.query(
+        f"""
+            SELECT t1.name,t2.second_name
+            FROM {creation_expression} AS t1
+                JOIN `{TABLE_NAME_LOCAL}` AS t2
+                ON t1.tag=t2.id
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
+        """
+    )
+
+    assert res == "jack\tblack\njohn\tsilver\n"
+
+    res = instance.query(
+        f"""
+            SELECT name
+            FROM {creation_expression}
+            WHERE tag in (
+                SELECT id
+                FROM `{TABLE_NAME_LOCAL}`
+            )
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
+        """
+    )
+
+    assert res == "jack\njohn\n"
+
+    res = instance.query(
+        f"""
+            SELECT t1.name,t2.second_name
+            FROM {creation_expression} AS t1
+                CROSS JOIN `{TABLE_NAME_LOCAL}` AS t2
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
+        """
+    )
+
+    assert res == "jack\tblack\njack\tsilver\njohn\tblack\njohn\tsilver\n"
 
 
 @pytest.mark.parametrize("storage_type", ["s3"])

@@ -1,3 +1,4 @@
+#include <optional>
 #include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
 
 #include <Common/Exception.h>
@@ -91,6 +92,7 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
     std::shared_ptr<DataLake::ICatalog> catalog,
     bool if_not_exists,
     bool is_datalake_query,
+    bool is_table_function,
     bool lazy_init)
     : IStorageCluster(
         cluster_name_, table_id_, getLogger(fmt::format("{}({})", configuration_->getEngineName(), table_id_.table_name)))
@@ -144,6 +146,10 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         }
         tryLogCurrentException(log_);
     }
+
+    // For tables need to update configuration on each read
+    // because data can be changed after previous update
+    update_configuration_on_read_write = !is_table_function;
 
     ColumnsDescription columns{columns_in_table_or_function_definition};
     std::string sample_path;
@@ -295,6 +301,7 @@ void StorageObjectStorageCluster::updateQueryForDistributedEngineIfNeeded(ASTPtr
         {"IcebergS3", "icebergS3"},
         {"IcebergAzure", "icebergAzure"},
         {"IcebergHDFS", "icebergHDFS"},
+        {"IcebergLocal", "icebergLocal"},
         {"DeltaLake", "deltaLake"},
         {"DeltaLakeS3", "deltaLakeS3"},
         {"DeltaLakeAzure", "deltaLakeAzure"},
@@ -416,6 +423,7 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
             {"icebergS3", "icebergS3Cluster"},
             {"icebergAzure", "icebergAzureCluster"},
             {"icebergHDFS", "icebergHDFSCluster"},
+            {"icebergLocal", "icebergLocalCluster"},
             {"deltaLake", "deltaLakeCluster"},
             {"deltaLakeS3", "deltaLakeS3Cluster"},
             {"deltaLakeAzure", "deltaLakeAzureCluster"},
@@ -568,12 +576,13 @@ SinkToStoragePtr StorageObjectStorageCluster::import(
     Block & block_with_partition_values,
     std::string & destination_file_path,
     bool overwrite_if_exists,
+    const std::optional<FormatSettings> & format_settings_,
     ContextPtr context)
 {
     if (pure_storage)
-        return pure_storage->import(file_name, block_with_partition_values, destination_file_path, overwrite_if_exists, context);
+        return pure_storage->import(file_name, block_with_partition_values, destination_file_path, overwrite_if_exists, format_settings_, context);
     
-    return IStorageCluster::import(file_name, block_with_partition_values, destination_file_path, overwrite_if_exists, context);
+    return IStorageCluster::import(file_name, block_with_partition_values, destination_file_path, overwrite_if_exists, format_settings_, context);
 }
 
 void StorageObjectStorageCluster::readFallBackToPure(
@@ -741,6 +750,18 @@ IDataLakeMetadata * StorageObjectStorageCluster::getExternalMetadata(ContextPtr 
     return configuration->getExternalMetadata();
 }
 
+void StorageObjectStorageCluster::updateConfigurationIfNeeded(ContextPtr context)
+{
+    if (update_configuration_on_read_write)
+    {
+        configuration->update(
+            object_storage,
+            context,
+            /* if_not_updated_before */false,
+            /* check_consistent_with_previous_metadata */false);
+    }
+}
+
 void StorageObjectStorageCluster::checkAlterIsPossible(const AlterCommands & commands, ContextPtr context) const
 {
     if (getClusterName(context).empty())
@@ -903,6 +924,76 @@ bool StorageObjectStorageCluster::prefersLargeBlocks() const
     if (pure_storage)
         return pure_storage->prefersLargeBlocks();
     return IStorageCluster::prefersLargeBlocks();
+}
+
+bool StorageObjectStorageCluster::supportsPartitionBy() const
+{
+    if (pure_storage)
+        return pure_storage->supportsPartitionBy();
+    return IStorageCluster::supportsPartitionBy();
+}
+
+bool StorageObjectStorageCluster::supportsSubcolumns() const
+{
+    if (pure_storage)
+        return pure_storage->supportsSubcolumns();
+    return IStorageCluster::supportsSubcolumns();
+}
+
+bool StorageObjectStorageCluster::supportsDynamicSubcolumns() const
+{
+    if (pure_storage)
+        return pure_storage->supportsDynamicSubcolumns();
+    return IStorageCluster::supportsDynamicSubcolumns();
+}
+
+bool StorageObjectStorageCluster::supportsTrivialCountOptimization(const StorageSnapshotPtr & snapshot, ContextPtr context) const
+{
+    if (pure_storage)
+        return pure_storage->supportsTrivialCountOptimization(snapshot, context);
+    return IStorageCluster::supportsTrivialCountOptimization(snapshot, context);
+}
+
+bool StorageObjectStorageCluster::supportsPrewhere() const
+{
+    if (pure_storage)
+        return pure_storage->supportsPrewhere();
+    return IStorageCluster::supportsPrewhere();
+}
+
+bool StorageObjectStorageCluster::canMoveConditionsToPrewhere() const
+{
+    if (pure_storage)
+        return pure_storage->canMoveConditionsToPrewhere();
+    return IStorageCluster::canMoveConditionsToPrewhere();
+}
+
+std::optional<NameSet> StorageObjectStorageCluster::supportedPrewhereColumns() const
+{
+    if (pure_storage)
+        return pure_storage->supportedPrewhereColumns();
+    return IStorageCluster::supportedPrewhereColumns();
+}
+
+IStorageCluster::ColumnSizeByName StorageObjectStorageCluster::getColumnSizes() const
+{
+    if (pure_storage)
+        return pure_storage->getColumnSizes();
+    return IStorageCluster::getColumnSizes();
+}
+
+bool StorageObjectStorageCluster::parallelizeOutputAfterReading(ContextPtr context) const
+{
+    if (pure_storage)
+        return pure_storage->parallelizeOutputAfterReading(context);
+    return IStorageCluster::parallelizeOutputAfterReading(context);
+}
+
+bool StorageObjectStorageCluster::supportsDelete() const
+{
+    if (pure_storage)
+        return pure_storage->supportsDelete();
+    return IStorageCluster::supportsDelete();
 }
 
 }

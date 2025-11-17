@@ -97,14 +97,22 @@ protected:
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Method writeFallBackToPure is not supported by storage {}", getName());
     }
 
+    virtual void updateConfigurationIfNeeded(ContextPtr /* context */) {}
+
 private:
     static ClusterPtr getClusterImpl(ContextPtr context, const String & cluster_name_, size_t max_hosts = 0);
 
     LoggerPtr log;
     String cluster_name;
 
-    mutable bool has_join = false;
-    mutable bool has_local_columns_in_where = false;
+    struct QueryTreeInfo
+    {
+        bool has_join = false;
+        bool has_cross_join = false;
+        bool has_local_columns_in_where = false;
+    };
+
+    static QueryTreeInfo getQueryTreeInfo(QueryTreeNodePtr query_tree, ContextPtr context);
 };
 
 

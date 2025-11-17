@@ -364,7 +364,7 @@ Chunk StorageObjectStorageSource::generate()
             {
                 chunk.addColumn(constant_column.first,
                     constant_column.second.name_and_type.type->createColumnConst(
-                        chunk.getNumRows(), constant_column.second.value));
+                        chunk.getNumRows(), constant_column.second.value)->convertToFullColumnIfConst());
             }
 
 #if USE_PARQUET && USE_AWS_S3

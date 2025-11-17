@@ -8,6 +8,7 @@ from datetime import datetime
 from functools import lru_cache
 from glob import glob
 import urllib.parse
+import re
 
 import pandas as pd
 from jinja2 import Environment, FileSystemLoader
@@ -15,6 +16,8 @@ import requests
 from clickhouse_driver import Client
 import boto3
 from botocore.exceptions import NoCredentialsError
+import yaml
+
 
 DATABASE_HOST_VAR = "CHECKS_DATABASE_HOST"
 DATABASE_USER_VAR = "CLICKHOUSE_TEST_STAT_LOGIN"
@@ -119,13 +122,10 @@ def get_pr_info_from_number(pr_number: str) -> dict:
     return response.json()
 
 
-@lru_cache
-def get_run_details(run_url: str) -> dict:
+def get_run_details(run_id: str) -> dict:
     """
     Fetch run details for a given run URL.
     """
-    run_id = run_url.split("/")[-1]
-
     headers = {
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
@@ -167,6 +167,59 @@ def get_checks_fails(client: Client, commit_sha: str, branch_name: str):
     return client.query_dataframe(query)
 
 
+def get_broken_tests_rules(broken_tests_file_path):
+    with open(broken_tests_file_path, "r", encoding="utf-8") as broken_tests_file:
+        broken_tests = yaml.safe_load(broken_tests_file)
+
+    compiled_rules = {"exact": {}, "pattern": {}}
+
+    for test in broken_tests:
+        regex = test.get("regex") is True
+        rule = {
+            "reason": test["reason"],
+        }
+
+        if test.get("check_types"):
+            rule["check_types"] = test["check_types"]
+
+        if regex:
+            rule["regex"] = True
+            compiled_rules["pattern"][re.compile(test["name"])] = rule
+        else:
+            compiled_rules["exact"][test["name"]] = rule
+
+    return compiled_rules
+
+
+def get_known_fail_reason(test_name: str, check_name: str, known_fails: dict):
+    """
+    Returns the reason why a test is known to fail based on its name and build context.
+
+    - Exact-name rules are checked first.
+    - Pattern-name rules are checked next (first match wins).
+    - Message/not_message conditions are ignored.
+    """
+    # 1. Exact-name rules
+    rule_data = known_fails["exact"].get(test_name)
+    if rule_data:
+        check_types = rule_data.get("check_types", [])
+        if not check_types or any(
+            check_type in check_name for check_type in check_types
+        ):
+            return rule_data["reason"]
+
+    # 2. Pattern-name rules
+    for name_re, rule_data in known_fails["pattern"].items():
+        if name_re.fullmatch(test_name):
+            check_types = rule_data.get("check_types", [])
+            if not check_types or any(
+                check_type in check_name for check_type in check_types
+            ):
+                return rule_data["reason"]
+
+    return "No reason given"
+
+
 def get_checks_known_fails(
     client: Client, commit_sha: str, branch_name: str, known_fails: dict
 ):
@@ -190,19 +243,22 @@ def get_checks_known_fails(
             GROUP BY check_name, test_name, report_url, task_url
         )
         WHERE test_status='BROKEN'
-        AND test_name IN ({','.join(f"'{test}'" for test in known_fails.keys())})
         ORDER BY job_name, test_name
         """
 
     df = client.query_dataframe(query)
 
+    if df.shape[0] == 0:
+        return df
+
     df.insert(
         len(df.columns) - 1,
         "reason",
-        df["test_name"]
-        .astype(str)
-        .apply(
-            lambda test_name: known_fails[test_name].get("reason", "No reason given")
+        df.apply(
+            lambda row: get_known_fail_reason(
+                row["test_name"], row["job_name"], known_fails
+            ),
+            axis=1,
         ),
     )
 
@@ -655,19 +711,10 @@ def create_workflow_report(
     pr_number: int = None,
     commit_sha: str = None,
     no_upload: bool = False,
-    known_fails: str = None,
+    known_fails_file_path: str = None,
     check_cves: bool = False,
     mark_preview: bool = False,
 ) -> str:
-    if pr_number is None or commit_sha is None:
-        run_details = get_run_details(actions_run_url)
-        if pr_number is None:
-            if len(run_details["pull_requests"]) > 0:
-                pr_number = run_details["pull_requests"][0]["number"]
-            else:
-                pr_number = 0
-        if commit_sha is None:
-            commit_sha = run_details["head_commit"]["id"]
 
     host = os.getenv(DATABASE_HOST_VAR)
     if not host:
@@ -683,6 +730,19 @@ def create_workflow_report(
     if not all([host, user, password, GITHUB_TOKEN]):
         raise Exception("Required environment variables are not set")
 
+    run_id = actions_run_url.split("/")[-1]
+
+    run_details = get_run_details(run_id)
+    branch_name = run_details.get("head_branch", "unknown branch")
+    if pr_number is None or commit_sha is None:
+        if pr_number is None:
+            if len(run_details["pull_requests"]) > 0:
+                pr_number = run_details["pull_requests"][0]["number"]
+            else:
+                pr_number = 0
+        if commit_sha is None:
+            commit_sha = run_details["head_commit"]["id"]
+
     db_client = Client(
         host=host,
         user=user,
@@ -692,9 +752,6 @@ def create_workflow_report(
         verify=False,
         settings={"use_numpy": True},
     )
-
-    run_details = get_run_details(actions_run_url)
-    branch_name = run_details.get("head_branch", "unknown branch")
 
     fail_results = {
         "job_statuses": get_commit_statuses(commit_sha),
@@ -712,15 +769,12 @@ def create_workflow_report(
     # This might occur when run in preview mode.
     cves_not_checked = not check_cves or fail_results["docker_images_cves"] is ...
 
-    if known_fails:
-        if not os.path.exists(known_fails):
-            print(f"Known fails file {known_fails} not found.")
-            exit(1)
+    if known_fails_file_path:
+        if not os.path.exists(known_fails_file_path):
+            print(f"WARNING:Known fails file {known_fails_file_path} not found.")
+        else:
+            known_fails = get_broken_tests_rules(known_fails_file_path)
 
-        with open(known_fails) as f:
-            known_fails = json.load(f)
-
-        if known_fails:
             fail_results["checks_known_fails"] = get_checks_known_fails(
                 db_client, commit_sha, branch_name, known_fails
             )
@@ -755,13 +809,10 @@ def create_workflow_report(
             .sum()
         )
 
-    # Set up the Jinja2 environment
-    template_dir = os.path.dirname(__file__)
-
     # Load the template
-    template = Environment(loader=FileSystemLoader(template_dir)).get_template(
-        "ci_run_report.html.jinja"
-    )
+    template = Environment(
+        loader=FileSystemLoader(os.path.dirname(__file__))
+    ).get_template("ci_run_report.html.jinja")
 
     # Define the context for rendering
     context = {
@@ -770,7 +821,7 @@ def create_workflow_report(
         "s3_bucket": S3_BUCKET,
         "pr_info_html": pr_info_html,
         "pr_number": pr_number,
-        "workflow_id": actions_run_url.split("/")[-1],
+        "workflow_id": run_id,
         "commit_sha": commit_sha,
         "base_sha": "" if pr_number == 0 else pr_info.get("base", {}).get("sha"),
         "date": f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC",
@@ -824,9 +875,11 @@ def create_workflow_report(
         exit(0)
 
     if pr_number == 0:
-        report_destination_key = f"REFs/{branch_name}/{commit_sha}/{report_name}"
+        report_destination_key = f"REFs/{branch_name}/{commit_sha}"
     else:
-        report_destination_key = f"PRs/{pr_number}/{commit_sha}/{report_name}"
+        report_destination_key = f"PRs/{pr_number}/{commit_sha}"
+
+    report_destination_key += f"/{run_id}/{report_name}"
 
     # Upload the report to S3
     s3_client = boto3.client("s3", endpoint_url=os.getenv("S3_URL"))

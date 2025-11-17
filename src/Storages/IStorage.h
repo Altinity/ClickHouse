@@ -412,6 +412,7 @@ private:
         size_t /*max_block_size*/,
         size_t /*num_streams*/);
 
+public:
     /// Should we process blocks of data returned by the storage in parallel
     /// even when the storage returned only one stream of data for reading?
     /// It is beneficial, for example, when you read from a file quickly,
@@ -422,7 +423,6 @@ private:
     /// useless).
     virtual bool parallelizeOutputAfterReading(ContextPtr) const { return !isSystemStorage(); }
 
-public:
     /// Other version of read which adds reading step to query plan.
     /// Default implementation creates ReadFromStorageStep and uses usual read.
     /// Can be called after `shutdown`, but not after `drop`.
@@ -468,6 +468,7 @@ It is currently only implemented in StorageObjectStorage.
         Block & /* block_with_partition_values */,
         std::string & /* destination_file_path */,
         bool /* overwrite_if_exists */,
+        const std::optional<FormatSettings> & /* format_settings */,
         ContextPtr /* context */)
     {
       throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Import is not implemented for storage {}", getName());

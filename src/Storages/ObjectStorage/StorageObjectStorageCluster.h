@@ -25,7 +25,8 @@ public:
         std::shared_ptr<DataLake::ICatalog> catalog,
         bool if_not_exists,
         bool is_datalake_query,
-        bool lazy_init = false);
+        bool is_table_function,
+        bool lazy_init);
 
     std::string getName() const override;
 
@@ -129,8 +130,27 @@ public:
         Block & /* block_with_partition_values */,
         std::string & /* destination_file_path */,
         bool /* overwrite_if_exists */,
+        const std::optional<FormatSettings> & /* format_settings_ */,
         ContextPtr /* context */) override;
     bool prefersLargeBlocks() const override;
+
+    bool supportsPartitionBy() const override;
+
+    bool supportsSubcolumns() const override;
+
+    bool supportsDynamicSubcolumns() const override;
+
+    bool supportsTrivialCountOptimization(const StorageSnapshotPtr &, ContextPtr) const override;
+
+    /// Things required for PREWHERE.
+    bool supportsPrewhere() const override;
+    bool canMoveConditionsToPrewhere() const override;
+    std::optional<NameSet> supportedPrewhereColumns() const override;
+    ColumnSizeByName getColumnSizes() const override;
+
+    bool parallelizeOutputAfterReading(ContextPtr context) const override;
+
+    bool supportsDelete() const override;
 
 private:
     void updateQueryToSendIfNeeded(
@@ -154,6 +174,8 @@ private:
         ContextPtr context,
         bool async_insert) override;
 
+    void updateConfigurationIfNeeded(ContextPtr context) override;
+
     /*
     In case the table was created with `object_storage_cluster` setting,
     modify the AST query object so that it uses the table function implementation
@@ -176,6 +198,7 @@ private:
 
     /// non-clustered storage to fall back on pure realisation if needed
     std::shared_ptr<StorageObjectStorage> pure_storage;
+    bool update_configuration_on_read_write;
 };
 
 }
