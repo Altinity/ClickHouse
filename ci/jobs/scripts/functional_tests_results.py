@@ -356,7 +356,7 @@ class FTResultsProcessor:
             pass
 
         if not info:
-            info = f"Failed: {s.failed}, Passed: {s.success}, Skipped: {s.skipped}"
+            info = f"Failed: {s.failed}, Passed: {s.success}, Skipped: {s.skipped}, Broken: {s.broken}"
 
         result = Result.create_from(
             name="Tests",
