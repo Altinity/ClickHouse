@@ -1917,12 +1917,12 @@ Possible values:
     DECLARE(ObjectStorageClusterJoinMode, object_storage_cluster_join_mode, ObjectStorageClusterJoinMode::ALLOW, R"(
 Changes the behaviour of object storage cluster function or table.
 
-ClickHouse applies this setting when the query contains the product of object storage cluster function ot table, i.e. when the query for a object storage cluster function ot table contains a non-GLOBAL subquery for the object storage cluster function ot table.
+ClickHouse applies this setting when the query contains the product of object storage cluster function or table, i.e. when the query for a object storage cluster function or table contains a non-GLOBAL subquery for the object storage cluster function or table.
 
 Restrictions:
 
 - Only applied for JOIN subqueries.
-- Only if the FROM section uses a object storage cluster function ot table.
+- Only if the FROM section uses a object storage cluster function or table.
 
 Possible values:
 

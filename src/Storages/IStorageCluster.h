@@ -63,8 +63,14 @@ private:
     LoggerPtr log;
     String cluster_name;
 
-    mutable bool has_join = false;
-    mutable bool has_local_columns_in_where = false;
+    struct QueryTreeInfo
+    {
+        bool has_join = false;
+        bool has_cross_join = false;
+        bool has_local_columns_in_where = false;
+    };
+
+    static QueryTreeInfo getQueryTreeInfo(QueryTreeNodePtr query_tree, ContextPtr context);
 };
 
 
