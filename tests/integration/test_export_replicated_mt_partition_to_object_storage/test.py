@@ -561,6 +561,81 @@ def test_export_partition_feature_is_disabled(cluster):
     error = replica_with_export_disabled.query_and_get_error(f"KILL EXPORT PARTITION WHERE partition_id = '2020' and source_table = '{mt_table}' and destination_table = '{s3_table}'")
     assert "experimental" in error, "Expected error about disabled feature"
 
+
+def test_export_partition_permissions(cluster):
+    """Test that export partition validates permissions correctly:
+    - User needs ALTER permission on source table
+    - User needs INSERT permission on destination table
+    """
+    node = cluster.instances["replica1"]
+
+    mt_table = "permissions_mt_table"
+    s3_table = "permissions_s3_table"
+
+    # Create tables as default user
+    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
+
+    # Create test users with specific permissions
+    node.query("CREATE USER IF NOT EXISTS user_no_alter IDENTIFIED WITH no_password")
+    node.query("CREATE USER IF NOT EXISTS user_no_insert IDENTIFIED WITH no_password")
+    node.query("CREATE USER IF NOT EXISTS user_with_permissions IDENTIFIED WITH no_password")
+
+    # Grant basic access to all users
+    node.query(f"GRANT SELECT ON {mt_table} TO user_no_alter")
+    node.query(f"GRANT SELECT ON {s3_table} TO user_no_alter")
+    
+    # user_no_insert has ALTER on source but no INSERT on destination
+    node.query(f"GRANT ALTER ON {mt_table} TO user_no_insert")
+    node.query(f"GRANT SELECT ON {s3_table} TO user_no_insert")
+    
+    # user_with_permissions has both ALTER and INSERT
+    node.query(f"GRANT ALTER ON {mt_table} TO user_with_permissions")
+    node.query(f"GRANT INSERT ON {s3_table} TO user_with_permissions")
+
+    # Test 1: User without ALTER permission should fail
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
+        f"SETTINGS allow_experimental_export_merge_tree_part=1",
+        user="user_no_alter"
+    )
+    assert "ACCESS_DENIED" in error or "Not enough privileges" in error, \
+        f"Expected ACCESS_DENIED error for user without ALTER, got: {error}"
+
+    # Test 2: User with ALTER but without INSERT permission should fail
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
+        f"SETTINGS allow_experimental_export_merge_tree_part=1",
+        user="user_no_insert"
+    )
+    assert "ACCESS_DENIED" in error or "Not enough privileges" in error, \
+        f"Expected ACCESS_DENIED error for user without INSERT, got: {error}"
+
+    # Test 3: User with both ALTER and INSERT should succeed
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
+        f"SETTINGS allow_experimental_export_merge_tree_part=1",
+        user="user_with_permissions"
+    )
+
+    # Wait for export to complete
+    time.sleep(5)
+
+    # Verify the export succeeded
+    result = node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020")
+    assert result.strip() == "3", f"Expected 3 rows exported, got: {result}"
+
+    # Verify system table shows COMPLETED status
+    status = node.query(
+        f"""
+        SELECT status FROM system.replicated_partition_exports
+        WHERE source_table = '{mt_table}'
+            AND destination_table = '{s3_table}'
+            AND partition_id = '2020'
+        """
+    )
+    assert status.strip() == "COMPLETED", f"Expected COMPLETED status, got: {status}"
+
+
 # def test_source_mutations_during_export_snapshot(cluster):
 #     node = cluster.instances["replica1"]
 
