@@ -781,3 +781,17 @@ def test_cluster_joins(started_cluster):
     )
 
     assert res == "Jack\nJohn\n"
+
+    res = node.query(
+        f"""
+            SELECT t1.name,t2.second_name
+            FROM {CATALOG_NAME}.`{root_namespace}.{table_name}` AS t1
+                CROSS JOIN `{table_name_local}` AS t2
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
+        """
+    )
+
+    assert res == "Jack\tBlack\nJack\tSilver\nJohn\tBlack\nJohn\tSilver\n"

@@ -251,6 +251,7 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
                 auto cross_join_node = join_searcher.getNode();
                 if (!cross_join_node)
                     throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find CROSS JOIN node");
+                // CrossJoinNode contains vector of nodes. 0 is left expression, always exists.
                 query_tree_distributed = cross_join_node->as<CrossJoinNode>()->getTableExpressions()[0]->clone();
             }
 

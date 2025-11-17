@@ -3638,6 +3638,20 @@ def test_cluster_joins(started_cluster, storage_type):
 
     assert res == "jack\njohn\n"
 
+    res = instance.query(
+        f"""
+            SELECT t1.name,t2.second_name
+            FROM {creation_expression} AS t1
+                CROSS JOIN `{TABLE_NAME_LOCAL}` AS t2
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
+        """
+    )
+
+    assert res == "jack\tblack\njack\tsilver\njohn\tblack\njohn\tsilver\n"
+
 
 @pytest.mark.parametrize("storage_type", ["s3"])
 def test_system_tables_partition_sorting_keys(started_cluster, storage_type):
