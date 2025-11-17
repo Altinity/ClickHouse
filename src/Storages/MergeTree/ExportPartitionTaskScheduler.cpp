@@ -46,7 +46,7 @@ void ExportPartitionTaskScheduler::run()
     {
         const auto & manifest = entry.manifest;
         const auto key = entry.getCompositeKey();
-        const auto & database = storage.getContext()->resolveDatabase(manifest.destination_database);
+        const auto database = storage.getContext()->resolveDatabase(manifest.destination_database);
         const auto & table = manifest.destination_table;
 
         /// No need to query zk for status if the local one is not PENDING
