@@ -4497,7 +4497,13 @@ std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartit
 
         const auto exceptions_per_replica_path = export_partition_path / "exceptions_per_replica";
 
-        const auto exception_replicas = zk->getChildren(exceptions_per_replica_path);
+        Strings exception_replicas;
+        if (Coordination::Error::ZOK != zk->tryGetChildren(exceptions_per_replica_path, exception_replicas))
+        {
+            LOG_INFO(log, "Skipping {}: missing exceptions_per_replica", export_partition_path);
+            continue;
+        }
+
         for (const auto & replica : exception_replicas)
         {
             std::string exception_count_string;
