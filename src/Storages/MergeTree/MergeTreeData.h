@@ -991,7 +991,7 @@ public:
         ContextPtr query_context,
         std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback = {});
 
-    void killExportPart(const String & query_id);
+    void killExportPart(const String & transaction_id);
 
     virtual void exportPartitionToTable(const PartitionCommand &, ContextPtr)
     {

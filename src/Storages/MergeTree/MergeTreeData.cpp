@@ -102,6 +102,7 @@
 #include <Storages/MergeTree/LoadedMergeTreeDataPartInfoForReader.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Storages/MergeTree/MergeTreeIndexGranularityAdaptive.h>
+#include <Functions/generateSnowflakeID.h>
 
 #include <boost/algorithm/string/join.hpp>
 
@@ -6212,7 +6213,7 @@ void MergeTreeData::exportPartToTable(const PartitionCommand & command, ContextP
 
     const auto database_name = query_context->resolveDatabase(command.to_database);
 
-    exportPartToTable(part_name, StorageID{database_name, command.to_table}, query_context->getCurrentQueryId(), query_context);
+    exportPartToTable(part_name, StorageID{database_name, command.to_table}, generateSnowflakeIDString(), query_context);
 }
 
 void MergeTreeData::exportPartToTable(
@@ -6275,13 +6276,13 @@ void MergeTreeData::exportPartToTable(
     background_moves_assignee.trigger();
 }
 
-void MergeTreeData::killExportPart(const String & query_id)
+void MergeTreeData::killExportPart(const String & transaction_id)
 {
     std::lock_guard lock(export_manifests_mutex);
 
     std::erase_if(export_manifests, [&](const auto & manifest)
     {
-        if (manifest.query_id == query_id)
+        if (manifest.transaction_id == transaction_id)
         {
             if (manifest.task)
                 manifest.task->cancel();

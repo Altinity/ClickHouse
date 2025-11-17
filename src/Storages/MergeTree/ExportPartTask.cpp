@@ -289,7 +289,7 @@ Priority ExportPartTask::getPriority() const
 
 String ExportPartTask::getQueryId() const
 {
-    return manifest.query_id;
+    return manifest.transaction_id;
 }
 
 }

@@ -43,7 +43,7 @@ struct MergeTreePartExportManifest
     MergeTreePartExportManifest(
         const StorageID & destination_storage_id_,
         const DataPartPtr & data_part_,
-        const String & query_id_,
+        const String & transaction_id_,
         FileAlreadyExistsPolicy file_already_exists_policy_,
         bool parallel_formatting_,
         bool parquet_parallel_encoding_,
@@ -51,7 +51,7 @@ struct MergeTreePartExportManifest
         std::function<void(CompletionCallbackResult)> completion_callback_ = {})
         : destination_storage_id(destination_storage_id_),
           data_part(data_part_),
-          query_id(query_id_),
+          transaction_id(transaction_id_),
           file_already_exists_policy(file_already_exists_policy_),
           parallel_formatting(parallel_formatting_),
           parquet_parallel_encoding(parquet_parallel_encoding_),
@@ -62,7 +62,7 @@ struct MergeTreePartExportManifest
     StorageID destination_storage_id;
     DataPartPtr data_part;
     /// Used for killing the export.
-    String query_id;
+    String transaction_id;
     FileAlreadyExistsPolicy file_already_exists_policy;
     bool parallel_formatting;
     /// parquet has a different setting for parallel formatting

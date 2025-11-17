@@ -118,6 +118,7 @@
 #include <Backups/RestorerFromBackup.h>
 
 #include <Common/scope_guard_safe.h>
+#include "Functions/generateSnowflakeID.h"
 #include "Interpreters/StorageID.h"
 #include "QueryPipeline/QueryPlanResourceHolder.h"
 #include "Storages/ExportReplicatedMergeTreePartitionManifest.h"
@@ -8191,7 +8192,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 
     ExportReplicatedMergeTreePartitionManifest manifest;
 
-    manifest.transaction_id = query_context->getCurrentQueryId();
+    manifest.transaction_id = generateSnowflakeIDString();
     manifest.partition_id = partition_id;
     manifest.destination_database = dest_database;
     manifest.destination_table = dest_table;
