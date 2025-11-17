@@ -496,19 +496,19 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
         export_merge_tree_partition_task_scheduler = std::make_shared<ExportPartitionTaskScheduler>(*this);
 
         export_merge_tree_partition_updating_task = getContext()->getSchedulePool().createTask(
-            getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_updating_task)", [this] { exportMergeTreePartitionUpdatingTask(); });
+            getStorageID(), getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_updating_task)", [this] { exportMergeTreePartitionUpdatingTask(); });
 
         export_merge_tree_partition_updating_task->deactivate();
 
         export_merge_tree_partition_status_handling_task = getContext()->getSchedulePool().createTask(
-            getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_status_handling_task)", [this] { exportMergeTreePartitionStatusHandlingTask(); });
+            getStorageID(), getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_status_handling_task)", [this] { exportMergeTreePartitionStatusHandlingTask(); });
 
         export_merge_tree_partition_status_handling_task->deactivate();
 
-        export_merge_tree_partition_watch_callback = std::make_shared<Coordination::WatchCallback>(export_merge_tree_partition_updating_task->getWatchCallback());
+        export_merge_tree_partition_watch_callback = export_merge_tree_partition_updating_task->getWatchCallback();
 
         export_merge_tree_partition_select_task = getContext()->getSchedulePool().createTask(
-            getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_select_task)", [this] { selectPartsToExport(); });
+            getStorageID(), getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_select_task)", [this] { selectPartsToExport(); });
 
         export_merge_tree_partition_select_task->deactivate();
     }
@@ -8201,9 +8201,9 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 
     ops.emplace_back(zkutil::makeCreateRequest(partition_exports_path, "", zkutil::CreateMode::Persistent));
 
-    auto data_parts_lock = lockParts();
+    auto data_parts_lock = readLockParts();
 
-    const auto parts = getDataPartsVectorInPartitionForInternalUsage(MergeTreeDataPartState::Active, partition_id, &data_parts_lock);
+    const auto parts = getDataPartsVectorInPartitionForInternalUsage(MergeTreeDataPartState::Active, partition_id, data_parts_lock);
 
     if (parts.empty())
     {

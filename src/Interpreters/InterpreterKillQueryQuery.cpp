@@ -287,13 +287,13 @@ BlockIO InterpreterKillQueryQuery::execute()
 
         for (size_t i = 0; i < exports_block.rows(); ++i)
         {
-            const auto src_database = src_db_col.getDataAt(i).toString();
-            const auto src_table = src_table_col.getDataAt(i).toString();
-            const auto dst_database = dst_db_col.getDataAt(i).toView();
-            const auto dst_table = dst_table_col.getDataAt(i).toView();
+            const auto src_database = src_db_col.getDataAt(i);
+            const auto src_table = src_table_col.getDataAt(i);
+            const auto dst_database = dst_db_col.getDataAt(i);
+            const auto dst_table = dst_table_col.getDataAt(i);
 
-            const auto table_id = StorageID{src_database, src_table};
-            const auto transaction_id = tx_col.getDataAt(i).toString();
+            const auto table_id = StorageID{std::string{src_database}, std::string{src_table}};
+            const auto transaction_id = tx_col.getDataAt(i);
 
             CancellationCode code = CancellationCode::Unknown;
             if (!query.test)
@@ -318,7 +318,7 @@ BlockIO InterpreterKillQueryQuery::execute()
                         access_denied = true;
                         continue;
                     }
-                    code = storage->killExportPartition(transaction_id);
+                    code = storage->killExportPartition(std::string{transaction_id});
                 }
             }
 

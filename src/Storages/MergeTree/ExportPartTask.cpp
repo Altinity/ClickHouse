@@ -10,6 +10,7 @@
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
 #include <Processors/QueryPlan/QueryPlan.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
+#include "Common/setThreadName.h"
 #include <Common/Exception.h>
 #include <Common/ProfileEventsScope.h>
 #include <Storages/MergeTree/ExportList.h>
@@ -175,7 +176,7 @@ bool ExportPartTask::executeStep()
         getLogger("ExportPartition"));
 
 
-    ThreadGroupSwitcher switcher((*exports_list_entry)->thread_group, "");
+    ThreadGroupSwitcher switcher((*exports_list_entry)->thread_group, ThreadName::EXPORT_PART);
 
     QueryPlanOptimizationSettings optimization_settings(local_context);
     auto pipeline_settings = BuildQueryPipelineSettings(local_context);

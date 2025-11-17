@@ -488,6 +488,7 @@ It is currently only implemented in StorageObjectStorage.
         Block & /* block_with_partition_values */,
         std::string & /* destination_file_path */,
         bool /* overwrite_if_exists */,
+        const std::optional<FormatSettings> & /* format_settings */,
         ContextPtr /* context */)
     {
       throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Import is not implemented for storage {}", getName());

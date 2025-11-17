@@ -1,3 +1,4 @@
+#include <optional>
 #include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
 
 #include <Common/Exception.h>
