@@ -69,6 +69,7 @@ private:
     size_t manifest_file_index = 0;
     size_t internal_data_index = 0;
     Iceberg::ManifestFilePtr current_manifest_file_content;
+    std::vector<ManifestFileEntry> current_files;
     Int32 previous_entry_schema = -1;
     std::optional<Iceberg::ManifestFilesPruner> current_pruner;
 
