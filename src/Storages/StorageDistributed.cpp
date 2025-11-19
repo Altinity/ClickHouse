@@ -2452,11 +2452,28 @@ void registerStorageHybrid(StorageFactory & factory)
                     // Parse table identifier to get StorageID
                     StorageID storage_id(table_identifier);
 
-                    // Sanity check: ensure the table identifier is fully qualified (has database name)
+                    // Fill database for unqualified identifiers using current database (or the target table database).
                     if (storage_id.database_name.empty())
                     {
-                        throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                            "Argument #{}: table identifier '{}' must be fully qualified (database.table)", i, ast_identifier->name());
+                        String default_database = local_context->getCurrentDatabase();
+                        if (default_database.empty())
+                            default_database = args.table_id.database_name;
+
+                        if (default_database.empty())
+                        {
+                            throw Exception(ErrorCodes::UNKNOWN_DATABASE,
+                                "Argument #{}: table identifier '{}' does not specify database and no default database is selected",
+                                i, ast_identifier->name());
+                        }
+
+                        storage_id.database_name = default_database;
+
+                        // Update AST so the table definition stores a fully qualified name.
+                        auto qualified_identifier = std::make_shared<ASTTableIdentifier>(storage_id.database_name, storage_id.table_name);
+                        qualified_identifier->alias = ast_identifier->alias;
+                        qualified_identifier->prefer_alias_to_column_name = ast_identifier->prefer_alias_to_column_name;
+                        table_function_ast = qualified_identifier;
+                        engine_args[i] = table_function_ast;
                     }
 
                     // Sanity check: verify the table exists
