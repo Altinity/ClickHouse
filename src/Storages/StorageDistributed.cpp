@@ -104,6 +104,7 @@
 #include <Processors/Sources/RemoteSource.h>
 #include <Processors/Sinks/EmptySink.h>
 
+#include <Core/Names.h>
 #include <Core/Settings.h>
 #include <Core/SettingsEnums.h>
 
@@ -117,9 +118,9 @@
 #include <memory>
 #include <filesystem>
 #include <cassert>
-
 #include <boost/algorithm/string/find_iterator.hpp>
 #include <boost/algorithm/string/finder.hpp>
+#include <fmt/ranges.h>
 
 
 namespace fs = std::filesystem;
@@ -169,6 +170,8 @@ void replaceCurrentDatabaseFunction(ASTPtr & ast, const ContextPtr & context)
     for (auto & child : ast->children)
         replaceCurrentDatabaseFunction(child, context);
 }
+
+
 }
 
 namespace Setting
@@ -965,7 +968,6 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
 
     replacement_table_expression->setAlias(query_info.table_expression->getAlias());
 
-
     QueryTreeNodePtr filter;
 
     if (additional_filter)
@@ -977,7 +979,7 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
         QueryAnalysisPass(replacement_table_expression).run(filter, context);
     }
 
-    auto query_tree_to_modify = query_info.query_tree->cloneAndReplace(query_info.table_expression, std::move(replacement_table_expression));
+    auto query_tree_to_modify = query_info.query_tree->cloneAndReplace(query_info.table_expression, replacement_table_expression);
 
     // Apply additional filter if provided
     if (filter)
@@ -1028,6 +1030,38 @@ void StorageDistributed::read(
     std::vector<SelectQueryInfo> additional_query_infos;
 
     const auto & settings = local_context->getSettingsRef();
+    auto metadata_ptr = getInMemoryMetadataPtr();
+
+    auto describe_segment_target = [&](const HybridSegment & segment) -> String
+    {
+        if (segment.storage_id)
+            return segment.storage_id->getNameForLogs();
+        if (segment.table_function_ast)
+            return segment.table_function_ast->formatForLogging();
+        chassert(false, "Hybrid segment is missing both storage_id and table_function_ast");
+        return String{"<unknown_segment>"};
+    };
+
+    auto describe_base_target = [&]() -> String
+    {
+       if (remote_table_function_ptr)
+          return remote_table_function_ptr->formatForLogging();
+       if (!remote_database.empty())
+          return remote_database + "." + remote_table;
+       return remote_table;
+    };
+
+    String base_target = describe_base_target();
+
+    const bool log_hybrid_query_rewrites = (!segments.empty() || base_segment_predicate);
+
+    auto log_rewritten_query = [&](const String & target, const ASTPtr & ast)
+    {
+        if (!log_hybrid_query_rewrites || !ast)
+            return;
+
+        LOG_TRACE(log, "rewriteSelectQuery (target: {}) -> {}", target, ast->formatForLogging());
+    };
 
     if (settings[Setting::allow_experimental_analyzer])
     {
@@ -1052,6 +1086,7 @@ void StorageDistributed::read(
         modified_query_info.query = queryNodeToDistributedSelectQuery(query_tree_distributed);
 
         modified_query_info.query_tree = std::move(query_tree_distributed);
+        log_rewritten_query(base_target, modified_query_info.query);
 
         if (!segments.empty())
         {
@@ -1068,6 +1103,7 @@ void StorageDistributed::read(
 
                 additional_query_info.query = queryNodeToDistributedSelectQuery(additional_query_tree);
                 additional_query_info.query_tree = std::move(additional_query_tree);
+                log_rewritten_query(describe_segment_target(segment), additional_query_info.query);
 
                 additional_query_infos.push_back(std::move(additional_query_info));
             }
@@ -1085,6 +1121,7 @@ void StorageDistributed::read(
             local_context, modified_query_info.query,
             remote_database, remote_table, remote_table_function_ptr,
             base_segment_predicate);
+        log_rewritten_query(base_target, modified_query_info.query);
 
         if (!segments.empty())
         {
@@ -1108,6 +1145,7 @@ void StorageDistributed::read(
                         segment.predicate_ast);
                 }
 
+                log_rewritten_query(describe_segment_target(segment), additional_query_info.query);
                 additional_query_infos.push_back(std::move(additional_query_info));
             }
         }
@@ -1133,7 +1171,7 @@ void StorageDistributed::read(
                 processed_stage);
 
         auto shard_filter_generator = ClusterProxy::getShardFilterGeneratorForCustomKey(
-            *modified_query_info.getCluster(), local_context, getInMemoryMetadataPtr()->columns);
+            *modified_query_info.getCluster(), local_context, metadata_ptr->columns);
 
         ClusterProxy::executeQuery(
             query_plan,
@@ -2142,9 +2180,8 @@ void StorageDistributed::delayInsertOrThrowIfNeeded() const
     }
 }
 
-void StorageDistributed::setHybridLayout(ColumnsDescription base_segment_columns_, std::vector<HybridSegment> segments_)
+void StorageDistributed::setHybridLayout(std::vector<HybridSegment> segments_)
 {
-    base_segment_columns = std::move(base_segment_columns_);
     segments = std::move(segments_);
     log = getLogger("Hybrid (" + getStorageID().table_name + ")");
 
@@ -2153,6 +2190,25 @@ void StorageDistributed::setHybridLayout(ColumnsDescription base_segment_columns
     virtuals.addEphemeral("_table_index", std::make_shared<DataTypeUInt32>(), "Index of the table function in Hybrid (0 for main table, 1+ for additional segments)");
     setVirtuals(virtuals);
 }
+
+void StorageDistributed::setCachedColumnsToCast(ColumnsDescription columns)
+{
+    cached_columns_to_cast = std::move(columns);
+    if (!cached_columns_to_cast.empty() && log)
+    {
+        Names columns_with_types;
+        columns_with_types.reserve(cached_columns_to_cast.getAllPhysical().size());
+        for (const auto & col : cached_columns_to_cast.getAllPhysical())
+            columns_with_types.emplace_back(col.name + " " + col.type->getName());
+        LOG_DEBUG(log, "Hybrid auto-cast will apply to: [{}]", fmt::join(columns_with_types, ", "));
+    }
+}
+
+ColumnsDescription StorageDistributed::getColumnsToCast() const
+{
+    return cached_columns_to_cast;
+}
+
 
 void registerStorageDistributed(StorageFactory & factory)
 {
@@ -2314,6 +2370,27 @@ void registerStorageHybrid(StorageFactory & factory)
         if (columns_to_use.empty())
             columns_to_use = first_segment_columns;
 
+        NameSet columns_to_cast_names;
+        auto validate_segment_schema = [&](const ColumnsDescription & segment_columns, const String & segment_name)
+        {
+            for (const auto & column : columns_to_use.getAllPhysical())
+            {
+                auto found = segment_columns.tryGetPhysical(column.name);
+                if (!found)
+                {
+                    throw Exception(
+                        ErrorCodes::BAD_ARGUMENTS,
+                        "Hybrid segment {} is missing column '{}' required by Hybrid schema",
+                        segment_name, column.name);
+                }
+
+                if (!found->type->equals(*column.type))
+                    columns_to_cast_names.emplace(column.name);
+            }
+        };
+
+        validate_segment_schema(first_segment_columns, engine_args[0]->formatForLogging());
+
         // Execute the table function to get the underlying storage
         StoragePtr storage = table_function->execute(
             first_arg,
@@ -2390,8 +2467,10 @@ void registerStorageHybrid(StorageFactory & factory)
                 ColumnsDescription segment_columns = additional_table_function->getActualTableStructure(local_context, true);
                 replaceCurrentDatabaseFunction(normalized_table_function_ast, local_context);
 
+                validate_segment_schema(segment_columns, normalized_table_function_ast->formatForLogging());
+
                 // It's a table function - store the AST and cached schema for later execution
-                segment_definitions.emplace_back(normalized_table_function_ast, predicate_ast, std::move(segment_columns));
+                segment_definitions.emplace_back(normalized_table_function_ast, predicate_ast);
             }
             else if (const auto * ast_identifier = table_function_ast->as<ASTIdentifier>())
             {
@@ -2426,7 +2505,7 @@ void registerStorageHybrid(StorageFactory & factory)
                         storage_id.database_name = default_database;
 
                         // Update AST so the table definition stores a fully qualified name.
-                        auto qualified_identifier = std::make_shared<ASTTableIdentifier>(storage_id.database_name, storage_id.table_name);
+                        auto qualified_identifier = make_intrusive<ASTTableIdentifier>(storage_id.database_name, storage_id.table_name);
                         qualified_identifier->alias = ast_identifier->alias;
                         qualified_identifier->prefer_alias_to_column_name = ast_identifier->prefer_alias_to_column_name;
                         table_function_ast = qualified_identifier;
@@ -2458,10 +2537,13 @@ void registerStorageHybrid(StorageFactory & factory)
                     }
 
                     ColumnsDescription segment_columns;
-                    if (validated_table)
-                    segment_columns = validated_table->getInMemoryMetadataPtr()->getColumns();
 
-                    segment_definitions.emplace_back(table_function_ast, predicate_ast, storage_id, std::move(segment_columns));
+                    if (validated_table)
+                        segment_columns = validated_table->getInMemoryMetadataPtr()->getColumns();
+
+                    validate_segment_schema(segment_columns, storage_id.getNameForLogs());
+
+                    segment_definitions.emplace_back(table_function_ast, predicate_ast, storage_id);
                 }
                 catch (const Exception & e)
                 {
@@ -2483,7 +2565,17 @@ void registerStorageHybrid(StorageFactory & factory)
         distributed_storage->renameInMemory({args.table_id.database_name, args.table_id.table_name, args.table_id.uuid});
 
         // Store segment definitions for later use
-        distributed_storage->setHybridLayout(std::move(first_segment_columns), std::move(segment_definitions));
+        distributed_storage->setHybridLayout(std::move(segment_definitions));
+        if (!columns_to_cast_names.empty())
+        {
+            NamesAndTypesList cast_cols;
+            for (const auto & col : columns_to_use.getAllPhysical())
+            {
+                if (columns_to_cast_names.contains(col.name))
+                    cast_cols.emplace_back(col.name, col.type);
+            }
+            distributed_storage->setCachedColumnsToCast(ColumnsDescription(cast_cols));
+        }
 
         return distributed_storage;
     },

@@ -1,3 +1,4 @@
+Hybrid creation requires allow_experimental_hybrid_table
 Check Hybrid engine is registered
 Hybrid
 Ensure no leftovers before validation checks
@@ -173,14 +174,14 @@ Read predicate-filtered data with analyzer enabled and prefer localhost replica
 21	Alice	2025-08-15	100
 22	Bob	2025-08-20	200
 23	Charlie	2025-08-25	300
-Check if the subqueries were recorded in query_log
+Check if the subqueries were recorded in query_log (hybrid_table_auto_cast_columns = 0)
 Row 1:
 ──────
 type:              QueryFinish
 is_initial_query2: 1
 tbl:               ['_table_function.remote','db.test_tiered_watermark']
-qry:               SELECT * FROM test_tiered_watermark ORDER BY id DESC SETTINGS enable_analyzer = 1, prefer_localhost_replica = 0, log_queries=1, serialize_query_plan=0, log_comment = 'test_tiered_watermark', max_threads=1 FORMAT Null;
-log_comment:       test_tiered_watermark
+qry:               SELECT * FROM test_tiered_watermark ORDER BY id DESC SETTINGS enable_analyzer = 1,  hybrid_table_auto_cast_columns = 0, prefer_localhost_replica = 0, log_queries=1, serialize_query_plan=0, log_comment = 'test_tiered_watermark1', max_threads=1 FORMAT Null;
+log_comment:       test_tiered_watermark1
 
 Row 2:
 ──────
@@ -188,7 +189,7 @@ type:              QueryFinish
 is_initial_query2: 0
 tbl:               ['db.test_tiered_watermark_after']
 qry:               SELECT `__table1`.`id` AS `id`, `__table1`.`name` AS `name`, `__table1`.`date` AS `date`, `__table1`.`value` AS `value` FROM `db`.`test_tiered_watermark_after` AS `__table1` WHERE `__table1`.`date` >= '2025-09-01' ORDER BY `__table1`.`id` DESC
-log_comment:       test_tiered_watermark
+log_comment:       test_tiered_watermark1
 
 Row 3:
 ──────
@@ -196,5 +197,29 @@ type:              QueryFinish
 is_initial_query2: 0
 tbl:               ['db.test_tiered_watermark_before']
 qry:               SELECT `__table1`.`id` AS `id`, `__table1`.`name` AS `name`, `__table1`.`date` AS `date`, `__table1`.`value` AS `value` FROM `db`.`test_tiered_watermark_before` AS `__table1` WHERE `__table1`.`date` < '2025-09-01' ORDER BY `__table1`.`id` DESC
-log_comment:       test_tiered_watermark
+log_comment:       test_tiered_watermark1
+Check if the subqueries were recorded in query_log (hybrid_table_auto_cast_columns = 1)
+Row 1:
+──────
+type:              QueryFinish
+is_initial_query2: 1
+tbl:               ['_table_function.remote','db.test_tiered_watermark']
+qry:               SELECT * FROM test_tiered_watermark ORDER BY id DESC SETTINGS enable_analyzer = 1, hybrid_table_auto_cast_columns = 1, prefer_localhost_replica = 0, log_queries=1, serialize_query_plan=0, log_comment = 'test_tiered_watermark2', max_threads=1 FORMAT Null;
+log_comment:       test_tiered_watermark2
+
+Row 2:
+──────
+type:              QueryFinish
+is_initial_query2: 0
+tbl:               ['db.test_tiered_watermark_after']
+qry:               SELECT _CAST(`__table1`.`id`, 'UInt32') AS `id`, _CAST(`__table1`.`name`, 'String') AS `name`, `__table1`.`date` AS `date`, _CAST(`__table1`.`value`, 'UInt32') AS `value` FROM `db`.`test_tiered_watermark_after` AS `__table1` WHERE `__table1`.`date` >= '2025-09-01' ORDER BY `id` DESC
+log_comment:       test_tiered_watermark2
+
+Row 3:
+──────
+type:              QueryFinish
+is_initial_query2: 0
+tbl:               ['db.test_tiered_watermark_before']
+qry:               SELECT _CAST(`__table1`.`id`, 'UInt32') AS `id`, _CAST(`__table1`.`name`, 'String') AS `name`, `__table1`.`date` AS `date`, _CAST(`__table1`.`value`, 'UInt32') AS `value` FROM `db`.`test_tiered_watermark_before` AS `__table1` WHERE `__table1`.`date` < '2025-09-01' ORDER BY _CAST(`__table1`.`id`, 'UInt32') DESC
+log_comment:       test_tiered_watermark2
 Clean up predicate filtering tables

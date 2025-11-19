@@ -487,7 +487,6 @@ void executeQuery(
                 0,  /// shard_num is not applicable for local hybrid plans
                 1,  /// shard_count is not applicable for local hybrid plans
                 false,
-                false,
                 "");
 
             plans.emplace_back(std::move(additional_plan));

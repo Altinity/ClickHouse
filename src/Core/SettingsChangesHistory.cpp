@@ -220,6 +220,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"os_threads_nice_value_query", 0, 0, "New setting."},
             {"os_threads_nice_value_materialized_view", 0, 0, "New setting."},
             {"os_thread_priority", 0, 0, "Alias for os_threads_nice_value_query."},
+            {"hybrid_table_auto_cast_columns", true, true, "New setting to automatically cast Hybrid table columns when segments disagree on types. Default enabled."},
+            {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."}
         });
         addSettingsChanges(settings_changes_history, "25.8",
         {
@@ -275,7 +277,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"allow_experimental_ytsaurus_table_engine", false, false, "New setting."},
             {"allow_experimental_ytsaurus_table_function", false, false, "New setting."},
             {"allow_experimental_ytsaurus_dictionary_source", false, false, "New setting."},
-            {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
             {"per_part_index_stats", false, false, "New setting."},
             {"allow_experimental_iceberg_compaction", 0, 0, "New setting"},
             {"delta_lake_snapshot_version", -1, -1, "New setting"},
