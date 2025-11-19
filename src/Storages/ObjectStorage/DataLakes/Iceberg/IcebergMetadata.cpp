@@ -1063,8 +1063,7 @@ void IcebergMetadata::addDeleteTransformers(
         {
             /// get header of delete file
             Block delete_file_header;
-            // Resolve the delete file path to get the correct storage and key
-            // This handles cases where delete files are outside the table location
+
             auto [delete_storage_to_use, resolved_delete_key] = resolveObjectStorageForPath(
                 persistent_components.table_location, delete_file.file_path, object_storage, secondary_storages, local_context);
             

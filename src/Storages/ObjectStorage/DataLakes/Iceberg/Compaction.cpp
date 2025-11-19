@@ -177,7 +177,6 @@ Plan getPlan(
                 manifest_files[manifest_file.manifest_file_absolute_path]->path = manifest_file.manifest_file_absolute_path;
             }
             manifest_files[manifest_file.manifest_file_absolute_path]->manifest_lists_path.push_back(snapshot.manifest_list_path);
-            // Track which snapshots this manifest file belongs to
             plan.manifest_file_to_snapshots[manifest_file.manifest_file_absolute_path].insert(snapshot.snapshot_id);
             auto data_files = manifest_file_content->getFilesWithoutDeleted(FileContentType::DATA);
             auto positional_delete_files = manifest_file_content->getFilesWithoutDeleted(FileContentType::POSITION_DELETE);
@@ -195,19 +194,18 @@ Plan getPlan(
 
                 IcebergDataObjectInfoPtr data_object_info = std::make_shared<IcebergDataObjectInfo>(data_file, resolved_storage, resolved_key);
                 std::shared_ptr<DataFilePlan> data_file_ptr;
-                std::string storage_identifier = resolved_storage->getDescription() + ":" + resolved_storage->getObjectsNamespace();
-                std::string composite_key = storage_identifier + "|" + resolved_key;
-                if (!plan.path_to_data_file.contains(composite_key))
+                std::string path_identifier = resolved_storage->getDescription() + ":" + resolved_storage->getObjectsNamespace() + "|" + resolved_key;
+                if (!plan.path_to_data_file.contains(path_identifier))
                 {
                     data_file_ptr = std::make_shared<DataFilePlan>(DataFilePlan{
                         .data_object_info = data_object_info,
                         .manifest_list = manifest_files[manifest_file.manifest_file_absolute_path],
                         .patched_path = plan.generator.generateDataFileName()});
-                    plan.path_to_data_file[composite_key] = data_file_ptr;
+                    plan.path_to_data_file[path_identifier] = data_file_ptr;
                 }
                 else
                 {
-                    data_file_ptr = plan.path_to_data_file[composite_key];
+                    data_file_ptr = plan.path_to_data_file[path_identifier];
                 }
                 plan.partitions[partition_index].push_back(data_file_ptr);
                 plan.snapshot_id_to_data_files[snapshot.snapshot_id].push_back(plan.partitions[partition_index].back());

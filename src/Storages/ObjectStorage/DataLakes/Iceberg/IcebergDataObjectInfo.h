@@ -22,7 +22,7 @@ struct IcebergDataObjectInfo : public PathWithMetadata, std::enable_shared_from_
     /// It is also used to create a filter for the data object in the position delete transform.
     explicit IcebergDataObjectInfo(Iceberg::ManifestFileEntry data_manifest_file_entry_);
     
-    /// Constructor with resolved storage and key for files that may be outside table location
+    /// Sometimes data files are located outside the table location and even in a different storage.
     explicit IcebergDataObjectInfo(
         Iceberg::ManifestFileEntry data_manifest_file_entry_,
         ObjectStoragePtr resolved_storage,

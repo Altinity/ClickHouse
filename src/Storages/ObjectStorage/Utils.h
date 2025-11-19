@@ -47,24 +47,11 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     const LoggerPtr & log,
     const std::optional<ReadSettings> & read_settings = std::nullopt);
 
-bool isRelativePath(const std::string & path);
-
-bool isSameStorageSchema(const std::string & schema1, const std::string & schema2);
-
-// Returns lowercased and normalized schema / storage type (e.g. s3:// -> "s3")
-std::string extractStorageType(const std::string & path);
-
 std::string makeAbsolutePath(const std::string & table_location, const std::string & path);
 
-// Normalize a path that may be relative to table location to be relative to storage root
-// Returns the normalized key (not a full URI)
-// Handles cases where the path already includes the table location prefix
-std::string normalizePathToStorageRoot(const std::string & table_location, const std::string & path);
-
-// Resolve object storage for reading a file from
-// * If path is relative -- it must be read from "base" storage
-// * Otherwise, lookup if suitable storage already exists in secondary_storages
-// * Also, TODO: come back here and make some comments
+/// Resolve object storage and key for reading from that storage
+/// If path is relative -- it must be read from base_storage
+/// Otherwise, look for a suitable storage in secondary_storages
 std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
     const std::string & table_location,
     const std::string & path,

@@ -37,13 +37,22 @@ namespace Setting
 extern const SettingsBool use_roaring_bitmap_iceberg_positional_deletes;
 };
 
+namespace
+{
+String toupper(String & str)
+{
+    std::transform(str.begin(), str.end(), str.begin(), ::toupper);
+    return str;
+}
+}
+
 IcebergDataObjectInfo::IcebergDataObjectInfo(Iceberg::ManifestFileEntry data_manifest_file_entry_)
     : PathWithMetadata(data_manifest_file_entry_.file_path, std::nullopt, data_manifest_file_entry_.file_path_key)
     , data_object_file_path_key(data_manifest_file_entry_.file_path_key)
     , underlying_format_read_schema_id(data_manifest_file_entry_.schema_id)
     , sequence_number(data_manifest_file_entry_.added_sequence_number)
 {
-    if (!position_deletes_objects.empty() && Poco::toUpper(data_manifest_file_entry_.file_format) != "PARQUET")
+    if (!position_deletes_objects.empty() && toupper(data_manifest_file_entry_.file_format) != "PARQUET")
     {
         throw Exception(
             ErrorCodes::NOT_IMPLEMENTED,

@@ -85,7 +85,6 @@ Iceberg::ManifestFilePtr getManifestFile(
 
     auto create_fn = [&, use_iceberg_metadata_cache]()
     {
-        // Resolve the absolute path to get the correct storage and key_in_storage
         auto [storage_to_use, resolved_key_in_storage] = resolveObjectStorageForPath(
             persistent_table_components.table_location, absolute_path, object_storage, secondary_storages, local_context);
         

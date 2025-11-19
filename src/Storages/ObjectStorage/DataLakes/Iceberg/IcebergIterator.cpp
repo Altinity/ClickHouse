@@ -135,12 +135,12 @@ std::optional<ManifestFileEntry> SingleThreadIcebergKeysIterator::next()
                 data_snapshot->manifest_list_entries[manifest_file_index].added_sequence_number,
                 data_snapshot->manifest_list_entries[manifest_file_index].added_snapshot_id,
                 secondary_storages);
-            current_files = files_generator(current_manifest_file_content);
             internal_data_index = 0;
         }
-        while (internal_data_index < current_files.size())
+        auto files = files_generator(current_manifest_file_content);
+        while (internal_data_index < files.size())
         {
-            const auto & manifest_file_entry = current_files[internal_data_index++];
+            const auto & manifest_file_entry = files[internal_data_index++];
             if ((manifest_file_entry.schema_id != previous_entry_schema) && (use_partition_pruning))
             {
                 previous_entry_schema = manifest_file_entry.schema_id;
@@ -175,7 +175,6 @@ std::optional<ManifestFileEntry> SingleThreadIcebergKeysIterator::next()
             }
         }
         current_manifest_file_content = nullptr;
-        current_files.clear();
         current_pruner = std::nullopt;
         ++manifest_file_index;
         internal_data_index = 0;
@@ -340,16 +339,14 @@ ObjectInfoPtr IcebergIterator::next(size_t)
         auto [storage_to_use, resolved_key] = resolveObjectStorageForPath(
             persistent_components.table_location, manifest_file_entry.file_path, object_storage, secondary_storages, local_context);
         
-        // Create IcebergDataObjectInfo with resolved storage
         IcebergDataObjectInfoPtr object_info = std::make_shared<IcebergDataObjectInfo>(manifest_file_entry, storage_to_use, resolved_key);
+        
         for (const auto & position_delete : defineDeletesSpan(manifest_file_entry, position_deletes_files, false))
-        {
             object_info->addPositionDeleteObject(position_delete);
-        }
+
         for (const auto & equality_delete : defineDeletesSpan(manifest_file_entry, equality_deletes_files, true))
-        {
             object_info->addEqualityDeleteObject(equality_delete);
-        }
+        
         object_info->setFileMetaInfo(std::make_shared<DataFileMetaInfo>(
                                     *persistent_components.schema_processor,
                                     table_schema_id, /// current schema id to use current column names
