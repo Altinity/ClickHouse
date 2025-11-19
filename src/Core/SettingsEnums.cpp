@@ -370,4 +370,6 @@ IMPLEMENT_SETTING_ENUM(
      {"manifest_list_entry", IcebergMetadataLogLevel::ManifestListEntry},
      {"manifest_file_metadata", IcebergMetadataLogLevel::ManifestFileMetadata},
      {"manifest_file_entry", IcebergMetadataLogLevel::ManifestFileEntry}})
+
+IMPLEMENT_SETTING_AUTO_ENUM(MergeTreePartExportFileAlreadyExistsPolicy, ErrorCodes::BAD_ARGUMENTS);
 }
