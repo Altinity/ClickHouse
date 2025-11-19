@@ -1,3 +1,4 @@
+Hybrid creation requires allow_experimental_hybrid_table
 Check Hybrid engine is registered
 Hybrid
 Ensure no leftovers before validation checks

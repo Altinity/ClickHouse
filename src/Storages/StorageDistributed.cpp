@@ -1229,6 +1229,9 @@ void StorageDistributed::read(
     const auto * columns_to_cast_ptr = need_hybrid_casts ? &columns_to_cast_names : nullptr;
     const auto * base_actual_columns_for_cast = !base_segment_columns.empty() ? &base_segment_columns : &metadata_columns;
 
+    if (need_hybrid_casts && !settings[Setting::allow_experimental_analyzer])
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Setting 'hybrid_table_auto_cast_columns' is supported only with allow_experimental_analyzer=1");
+
     auto describe_segment_target = [&](const HybridSegment & segment) -> String
     {
         if (segment.storage_id)
@@ -1319,9 +1322,7 @@ void StorageDistributed::read(
         modified_query_info.query = ClusterProxy::rewriteSelectQuery(
             local_context, modified_query_info.query,
             remote_database, remote_table, remote_table_function_ptr,
-            base_segment_predicate,
-            columns_to_cast_ptr,
-            &metadata_columns);
+            base_segment_predicate);
         log_rewritten_query(base_target, modified_query_info.query);
 
         if (!segments.empty())
@@ -1336,18 +1337,14 @@ void StorageDistributed::read(
                         local_context, additional_query_info.query,
                         segment.storage_id->database_name, segment.storage_id->table_name,
                         nullptr,
-                        segment.predicate_ast,
-                        columns_to_cast_ptr,
-                        &metadata_columns);
+                        segment.predicate_ast);
                 }
                 else
                 {
                     additional_query_info.query = ClusterProxy::rewriteSelectQuery(
                         local_context, additional_query_info.query,
                         "", "", segment.table_function_ast,
-                        segment.predicate_ast,
-                        columns_to_cast_ptr,
-                        &metadata_columns);
+                        segment.predicate_ast);
                 }
 
                 log_rewritten_query(describe_segment_target(segment), additional_query_info.query);

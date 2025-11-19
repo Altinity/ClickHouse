@@ -30,6 +30,10 @@ The Hybrid engine is experimental. Enable it per session (or in the user profile
 SET allow_experimental_hybrid_table = 1;
 ```
 
+### Automatic Type Alignment
+
+Hybrid segments can evolve independently, so the same logical column may use different physical types. When you set the experimental `hybrid_table_auto_cast_columns = 1` (requires `allow_experimental_analyzer = 1`), the engine inserts the necessary `CAST` operations into each rewritten query so every shard receives the schema defined by the Hybrid table. This prevents header mismatches without having to edit each query.
+
 ## Engine definition
 
 ```sql

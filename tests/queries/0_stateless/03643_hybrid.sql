@@ -346,7 +346,7 @@ DROP TABLE IF EXISTS test_tiered_watermark SYNC;
 DROP TABLE IF EXISTS test_tiered_watermark_after SYNC;
 DROP TABLE IF EXISTS test_tiered_watermark_before SYNC;
 
--- TODO:
+-- TODO: - addressed by 03644_hybrid_auto_cast.sql
 -- Code: 70. DB::Exception: Received from localhost:9000. DB::Exception: Conversion from AggregateFunction(sum, Decimal(38, 0)) to AggregateFunction(sum, UInt32) is not supported: while converting source column `sum(__table1.value)` to destination column `sum(__table1.value)`. (CANNOT_CONVERT_TYPE)
 -- SELECT sum(value) FROM test_tiered_watermark;
 
