@@ -54,7 +54,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"export_merge_tree_partition_manifest_ttl", 180, 180, "New setting."},
             {"export_merge_tree_part_file_already_exists_policy", "skip", "skip", "New setting."},
             {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."},
-            {"hybrid_table_auto_cast_columns", false, false, "New setting to automatically cast Hybrid table columns when segments disagree on types."}
+            {"hybrid_table_auto_cast_columns", false, false, "New setting to automatically cast Hybrid table columns when segments disagree on types."},
+            {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."}
         });
         addSettingsChanges(settings_changes_history, "25.8",
         {
@@ -110,7 +111,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"allow_experimental_ytsaurus_table_engine", false, false, "New setting."},
             {"allow_experimental_ytsaurus_table_function", false, false, "New setting."},
             {"allow_experimental_ytsaurus_dictionary_source", false, false, "New setting."},
-            {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
             {"per_part_index_stats", false, false, "New setting."},
             {"allow_experimental_iceberg_compaction", 0, 0, "New setting "},
             {"delta_lake_snapshot_version", -1, -1, "New setting"},
