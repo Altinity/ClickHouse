@@ -49,6 +49,10 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"allow_experimental_export_merge_tree_part", false, false, "New setting."},
             {"export_merge_tree_part_overwrite_file_if_exists", false, false, "New setting."},
             {"allow_experimental_export_merge_tree_part", false, true, "Turned ON by default for Antalya."},
+            {"export_merge_tree_partition_force_export", false, false, "New setting."},
+            {"export_merge_tree_partition_max_retries", 3, 3, "New setting."},
+            {"export_merge_tree_partition_manifest_ttl", 180, 180, "New setting."},
+            {"export_merge_tree_part_file_already_exists_policy", "skip", "skip", "New setting."},
             {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."}
         });
         addSettingsChanges(settings_changes_history, "25.8",

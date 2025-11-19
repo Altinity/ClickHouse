@@ -134,6 +134,12 @@ public:
         ContextPtr /* context */) override;
     bool prefersLargeBlocks() const override;
 
+    void commitExportPartitionTransaction(
+        const String & transaction_id,
+        const String & partition_id,
+        const Strings & exported_paths,
+        ContextPtr local_context) override;
+
     bool supportsPartitionBy() const override;
 
     bool supportsSubcolumns() const override;
