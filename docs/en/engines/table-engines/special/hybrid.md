@@ -22,6 +22,14 @@ Typical use cases include:
 
 By giving mutually exclusive predicates to the segments (for example, `date < watermark` and `date >= watermark`), you ensure that each row is read from exactly one source.
 
+## Enable the engine
+
+The Hybrid engine is experimental. Enable it per session (or in the user profile) before creating tables:
+
+```sql
+SET allow_experimental_hybrid_table = 1;
+```
+
 ## Engine definition
 
 ```sql
