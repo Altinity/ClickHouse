@@ -275,6 +275,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"allow_experimental_ytsaurus_table_engine", false, false, "New setting."},
             {"allow_experimental_ytsaurus_table_function", false, false, "New setting."},
             {"allow_experimental_ytsaurus_dictionary_source", false, false, "New setting."},
+            {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
             {"per_part_index_stats", false, false, "New setting."},
             {"allow_experimental_iceberg_compaction", 0, 0, "New setting"},
             {"delta_lake_snapshot_version", -1, -1, "New setting"},

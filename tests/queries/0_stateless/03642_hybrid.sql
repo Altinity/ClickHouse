@@ -1,4 +1,10 @@
--- Test Hybrid engine registration and basic validation
+SELECT 'Hybrid creation requires allow_experimental_hybrid_table';
+SET allow_experimental_hybrid_table = 0;
+CREATE TABLE test_hybrid_requires_setting (`dummy` UInt8) ENGINE = Hybrid(remote('localhost:9000'), 1); -- { serverError SUPPORT_IS_DISABLED }
+DROP TABLE IF EXISTS test_hybrid_requires_setting SYNC;
+
+SET allow_experimental_hybrid_table = 1;
+
 SELECT 'Check Hybrid engine is registered';
 SELECT name FROM system.table_engines WHERE name = 'Hybrid';
 

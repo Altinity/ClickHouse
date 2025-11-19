@@ -7338,6 +7338,9 @@ Allows creation of tables with the [TimeSeries](../../engines/table-engines/inte
 - 0 — the [TimeSeries](../../engines/table-engines/integrations/time-series.md) table engine is disabled.
 - 1 — the [TimeSeries](../../engines/table-engines/integrations/time-series.md) table engine is enabled.
 )", EXPERIMENTAL) \
+    DECLARE(Bool, allow_experimental_hybrid_table, false, R"(
+Allows creation of tables with the [Hybrid](../../engines/table-engines/special/hybrid.md) table engine.
+)", EXPERIMENTAL) \
     DECLARE(Bool, allow_experimental_codecs, false, R"(
 If it is set to true, allow to specify experimental compression codecs (but we don't have those yet and this option does nothing).
 )", EXPERIMENTAL) \

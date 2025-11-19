@@ -201,6 +201,7 @@ namespace Setting
     extern const SettingsUInt64 allow_experimental_parallel_reading_from_replicas;
     extern const SettingsBool prefer_global_in_and_join;
     extern const SettingsBool enable_global_with_statement;
+    extern const SettingsBool allow_experimental_hybrid_table;
 }
 
 namespace DistributedSetting
@@ -234,6 +235,7 @@ namespace ErrorCodes
     extern const int DISTRIBUTED_TOO_MANY_PENDING_BYTES;
     extern const int ARGUMENT_OUT_OF_BOUND;
     extern const int TOO_LARGE_DISTRIBUTED_DEPTH;
+    extern const int SUPPORT_IS_DISABLED;
 }
 
 namespace ActionLocks
@@ -2258,8 +2260,6 @@ void registerStorageDistributed(StorageFactory & factory)
 
 void registerStorageHybrid(StorageFactory & factory)
 {
-    // Register Hybrid engine
-    // TODO: consider moving it to a separate file / subclass of StorageDistributed
     factory.registerStorage("Hybrid", [](const StorageFactory::Arguments & args) -> StoragePtr
     {
         ASTs & engine_args = args.engine_args;
@@ -2272,6 +2272,13 @@ void registerStorageHybrid(StorageFactory & factory)
         ContextPtr local_context = args.getLocalContext();
         if (!local_context)
             local_context = global_context;
+
+        if (args.mode <= LoadingStrictnessLevel::CREATE
+            && !local_context->getSettingsRef()[Setting::allow_experimental_hybrid_table])
+        {
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+                "Experimental Hybrid table engine is not enabled (the setting 'allow_experimental_hybrid_table')");
+        }
 
         // Validate first argument - must be a table function
         ASTPtr first_arg = engine_args[0];

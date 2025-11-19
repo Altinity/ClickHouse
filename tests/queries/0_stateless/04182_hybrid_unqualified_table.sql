@@ -1,3 +1,5 @@
+SET allow_experimental_hybrid_table = 1;
+
 SELECT 'Hybrid allows unqualified local tables by default';
 
 DROP TABLE IF EXISTS test_hybrid_unqualified_segment SYNC;
