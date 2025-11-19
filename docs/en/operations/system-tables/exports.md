@@ -13,7 +13,7 @@ Columns:
 - `source_table` ([String](/docs/en/sql-reference/data-types/string.md)) — Name of the source table.
 - `destination_database` ([String](/docs/en/sql-reference/data-types/string.md)) — Name of the destination database.
 - `destination_table` ([String](/docs/en/sql-reference/data-types/string.md)) — Name of the destination table.
-- `create_time` ([DateTime](/docs/en/sql-reference/data-types/datetime.md)) — Date and time when the export command was submitted for execution.
+- `create_time` ([DateTime](/docs/en/sql-reference/data-types/datetime.md)) — Date and time when the export command was received in the server.
 - `part_name` ([String](/docs/en/sql-reference/data-types/string.md)) — Name of the part.
 - `destination_file_path` ([String](/docs/en/sql-reference/data-types/string.md)) — File path relative to where the part is being exported to.
 - `elapsed` ([Float64](/docs/en/sql-reference/data-types/float.md)) — The time elapsed (in seconds) since the export started.
