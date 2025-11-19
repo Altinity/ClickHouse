@@ -39,7 +39,7 @@ Source and destination tables must be 100% compatible:
 ### `allow_experimental_export_merge_tree_part` (Required)
 
 - **Type**: `Bool`
-- **Default**: `true`
+- **Default**: `false`
 - **Description**: Must be set to `1` to enable the experimental feature.
 
 ### `export_merge_tree_part_overwrite_file_if_exists` (Optional)
