@@ -492,6 +492,15 @@ It is currently only implemented in StorageObjectStorage.
     {
       throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Import is not implemented for storage {}", getName());
     }
+
+    virtual void commitExportPartitionTransaction(
+      const String & /* transaction_id */,
+      const String & /* partition_id */,
+      const Strings & /* exported_paths */,
+      ContextPtr /* local_context */)
+  {
+      throw Exception(ErrorCodes::NOT_IMPLEMENTED, "commitExportPartitionTransaction is not implemented for storage type {}", getName());
+  }
     
 
     /** Writes the data to a table in distributed manner.
@@ -599,6 +608,9 @@ It is currently only implemented in StorageObjectStorage.
     virtual void waitForMutation(const String & /*mutation_id*/, bool /*wait_for_another_mutation*/);
 
     virtual void setMutationCSN(const String & /*mutation_id*/, UInt64 /*csn*/);
+
+    /// Cancel a replicated partition export by transaction id.
+    virtual CancellationCode killExportPartition(const String & /*transaction_id*/);
 
     /// Cancel a part move to shard.
     virtual CancellationCode killPartMoveToShard(const UUID & /*task_uuid*/);

@@ -84,6 +84,12 @@ public:
         bool /* overwrite_if_exists */,
         ContextPtr /* context */) override;
 
+    void commitExportPartitionTransaction(
+        const String & transaction_id,
+        const String & partition_id,
+        const Strings & exported_paths,
+        ContextPtr local_context) override;
+
     void truncate(
         const ASTPtr & query,
         const StorageMetadataPtr & metadata_snapshot,

@@ -562,6 +562,7 @@ bool StorageObjectStorage::supportsImport() const
     return configuration->partition_strategy_type == PartitionStrategyFactory::StrategyType::HIVE;
 }
 
+
 SinkToStoragePtr StorageObjectStorage::import(
     const std::string & file_name,
     Block & block_with_partition_values,
@@ -596,6 +597,26 @@ SinkToStoragePtr StorageObjectStorage::import(
         local_context,
         configuration->format,
         configuration->compression_method);
+}
+
+void StorageObjectStorage::commitExportPartitionTransaction(const String & transaction_id, const String & partition_id, const Strings & exported_paths, ContextPtr local_context)
+{
+    const String commit_object = configuration->getRawPath().path + "/commit_" + partition_id + "_" + transaction_id;
+
+    /// if file already exists, nothing to be done
+    if (object_storage->exists(StoredObject(commit_object)))
+    {
+        LOG_DEBUG(getLogger("StorageObjectStorage"), "Commit file already exists, nothing to be done: {}", commit_object);
+        return;
+    }
+
+    auto out = object_storage->writeObject(StoredObject(commit_object), WriteMode::Rewrite, /* attributes= */ {}, DBMS_DEFAULT_BUFFER_SIZE, local_context->getWriteSettings());
+    for (const auto & p : exported_paths)
+    {
+        out->write(p.data(), p.size());
+        out->write("\n", 1);
+    }
+    out->finalize();
 }
 
 void StorageObjectStorage::truncate(

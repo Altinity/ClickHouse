@@ -1,0 +1,687 @@
+import logging
+import pytest
+import random
+import string
+import time
+from typing import Optional
+import uuid
+
+from helpers.cluster import ClickHouseCluster
+from helpers.network import PartitionManager
+
+@pytest.fixture(scope="module")
+def cluster():
+    try:
+        cluster = ClickHouseCluster(__file__)
+        cluster.add_instance(
+            "replica1", 
+            main_configs=["configs/named_collections.xml", "configs/allow_experimental_export_partition.xml"],
+            user_configs=["configs/users.d/profile.xml"],
+            with_minio=True,
+            stay_alive=True,
+            with_zookeeper=True,
+        )
+        cluster.add_instance(
+            "replica2", 
+            main_configs=["configs/named_collections.xml", "configs/allow_experimental_export_partition.xml"],
+            user_configs=["configs/users.d/profile.xml"],
+            with_minio=True,
+            stay_alive=True,
+            with_zookeeper=True,
+        )
+        # node that does not participate in the export, but will have visibility over the s3 table
+        cluster.add_instance(
+            "watcher_node", 
+            main_configs=["configs/named_collections.xml"],
+            user_configs=[],
+            with_minio=True,
+        )
+        cluster.add_instance(
+            "replica_with_export_disabled", 
+            main_configs=["configs/named_collections.xml", "configs/disable_experimental_export_partition.xml"],
+            user_configs=["configs/users.d/profile.xml"],
+            with_minio=True,
+            stay_alive=True,
+            with_zookeeper=True,
+        )
+        logging.info("Starting cluster...")
+        cluster.start()
+        yield cluster
+    finally:
+        cluster.shutdown()
+
+
+def create_s3_table(node, s3_table):
+    node.query(f"CREATE TABLE {s3_table} (id UInt64, year UInt16) ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive') PARTITION BY year")
+
+
+def create_tables_and_insert_data(node, mt_table, s3_table, replica_name):
+    node.query(f"CREATE TABLE {mt_table} (id UInt64, year UInt16) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', '{replica_name}') PARTITION BY year ORDER BY tuple()")
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020), (3, 2020), (4, 2021)")
+
+    create_s3_table(node, s3_table)
+
+
+def test_restart_nodes_during_export(cluster):
+    node = cluster.instances["replica1"]
+    node2 = cluster.instances["replica2"]
+    watcher_node = cluster.instances["watcher_node"]
+
+    mt_table = "disaster_mt_table"
+    s3_table = "disaster_s3_table"
+
+    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
+    create_tables_and_insert_data(node2, mt_table, s3_table, "replica2")
+    create_s3_table(watcher_node, s3_table)
+
+    # Block S3/MinIO requests to keep exports alive via retry mechanism
+    # This allows ZooKeeper operations to proceed quickly
+    minio_ip = cluster.minio_ip
+    minio_port = cluster.minio_port
+
+    with PartitionManager() as pm:
+        # Block responses from MinIO (source_port matches MinIO service)
+        pm_rule_reject_responses_node1 = {
+            "destination": node.ip_address,
+            "source_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm._add_rule(pm_rule_reject_responses_node1)
+
+        pm_rule_reject_responses_node2 = {
+            "destination": node2.ip_address,
+            "source_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm._add_rule(pm_rule_reject_responses_node2)
+
+        # Block requests to MinIO (destination: MinIO, destination_port: minio_port)
+        pm_rule_reject_requests = {
+            "destination": minio_ip,
+            "destination_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm._add_rule(pm_rule_reject_requests)
+        
+        export_queries = f"""
+            ALTER TABLE {mt_table}
+            EXPORT PARTITION ID '2020' TO TABLE {s3_table}
+            SETTINGS export_merge_tree_partition_max_retries = 50;
+            ALTER TABLE {mt_table}
+            EXPORT PARTITION ID '2021' TO TABLE {s3_table}
+            SETTINGS export_merge_tree_partition_max_retries = 50;
+        """
+
+        node.query(export_queries)
+
+        # wait for the exports to start
+        time.sleep(3)
+
+        node.stop_clickhouse(kill=True)
+        node2.stop_clickhouse(kill=True)
+
+    assert watcher_node.query(f"SELECT count() FROM {s3_table} where year = 2020") == '0\n', "Partition 2020 was written to S3 during network delay crash"
+
+    assert watcher_node.query(f"SELECT count() FROM {s3_table} where year = 2021") == '0\n', "Partition 2021 was written to S3 during network delay crash"
+
+    # start the nodes, they should finish the export
+    node.start_clickhouse()
+    node2.start_clickhouse()
+
+    time.sleep(5)
+
+    assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") != f'0\n', "Export of partition 2020 did not resume after crash"
+
+    assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2021") != f'0\n', "Export of partition 2021 did not resume after crash"
+
+
+def test_kill_export(cluster):
+    node = cluster.instances["replica1"]
+    node2 = cluster.instances["replica2"]
+    watcher_node = cluster.instances["watcher_node"]
+
+    mt_table = "kill_export_mt_table"
+    s3_table = "kill_export_s3_table"
+
+    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
+    create_tables_and_insert_data(node2, mt_table, s3_table, "replica2")
+
+    # Block S3/MinIO requests to keep exports alive via retry mechanism
+    # This allows ZooKeeper operations (KILL) to proceed quickly
+    minio_ip = cluster.minio_ip
+    minio_port = cluster.minio_port
+
+    with PartitionManager() as pm:
+        # Block responses from MinIO (source_port matches MinIO service)
+        pm_rule_reject_responses = {
+            "destination": node.ip_address,
+            "source_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm._add_rule(pm_rule_reject_responses)
+
+        # Block requests to MinIO (destination: MinIO, destination_port: minio_port)
+        pm_rule_reject_requests = {
+            "destination": minio_ip,
+            "destination_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm._add_rule(pm_rule_reject_requests)
+        
+        export_queries = f"""
+            ALTER TABLE {mt_table}
+            EXPORT PARTITION ID '2020' TO TABLE {s3_table}
+            SETTINGS export_merge_tree_partition_max_retries = 50;
+            ALTER TABLE {mt_table}
+            EXPORT PARTITION ID '2021' TO TABLE {s3_table}
+            SETTINGS export_merge_tree_partition_max_retries = 50;
+        """
+
+        node.query(export_queries)
+    
+        # Kill only 2020 while S3 is blocked - retry mechanism keeps exports alive
+        # ZooKeeper operations (KILL) proceed quickly since only S3 is blocked
+        node.query(f"KILL EXPORT PARTITION WHERE partition_id = '2020' and source_table = '{mt_table}' and destination_table = '{s3_table}'")
+
+    # wait for 2021 to finish
+    time.sleep(5)
+
+    # checking for the commit file because maybe the data file was too fast?
+    assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2020_*', format=LineAsString)") == '0\n', "Partition 2020 was written to S3, it was not killed as expected"
+    assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2021_*', format=LineAsString)") != f'0\n', "Partition 2021 was not written to S3, but it should have been"
+
+    # check system.replicated_partition_exports for the export, status should be KILLED
+    assert node.query(f"SELECT status FROM system.replicated_partition_exports WHERE partition_id = '2020' and source_table = '{mt_table}' and destination_table = '{s3_table}'") == 'KILLED\n', "Partition 2020 was not killed as expected"
+    assert node.query(f"SELECT status FROM system.replicated_partition_exports WHERE partition_id = '2021' and source_table = '{mt_table}' and destination_table = '{s3_table}'") == 'COMPLETED\n', "Partition 2021 was not completed, this is unexpected"
+
+
+def test_drop_source_table_during_export(cluster):
+    node = cluster.instances["replica1"]
+    # node2 = cluster.instances["replica2"]
+    watcher_node = cluster.instances["watcher_node"]
+
+    mt_table = "drop_source_table_during_export_mt_table"
+    s3_table = "drop_source_table_during_export_s3_table"
+
+    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
+    # create_tables_and_insert_data(node2, mt_table, s3_table, "replica2")
+    create_s3_table(watcher_node, s3_table)
+
+    # Block S3/MinIO requests to keep exports alive via retry mechanism
+    # This allows ZooKeeper operations (KILL) to proceed quickly
+    minio_ip = cluster.minio_ip
+    minio_port = cluster.minio_port
+
+    with PartitionManager() as pm:
+        # Block responses from MinIO (source_port matches MinIO service)
+        pm_rule_reject_responses = {
+            "destination": node.ip_address,
+            "source_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm._add_rule(pm_rule_reject_responses)
+
+        # Block requests to MinIO (destination: MinIO, destination_port: minio_port)
+        pm_rule_reject_requests = {
+            "destination": minio_ip,
+            "destination_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm._add_rule(pm_rule_reject_requests)
+        
+        export_queries = f"""
+            ALTER TABLE {mt_table}
+            EXPORT PARTITION ID '2020' TO TABLE {s3_table};
+            ALTER TABLE {mt_table}
+            EXPORT PARTITION ID '2021' TO TABLE {s3_table};
+        """
+
+        node.query(export_queries)
+
+        # This should kill the background operations and drop the table
+        node.query(f"DROP TABLE {mt_table}")
+
+    # Sleep some time to let the export finish (assuming it was not properly cancelled)
+    time.sleep(10)
+
+    assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_*', format=LineAsString)") == '0\n', "Background operations completed even with the table dropped"
+
+
+def test_concurrent_exports_to_different_targets(cluster):
+    node = cluster.instances["replica1"]
+
+    mt_table = "concurrent_diff_targets_mt_table"
+    s3_table_a = "concurrent_diff_targets_s3_a"
+    s3_table_b = "concurrent_diff_targets_s3_b"
+
+    create_tables_and_insert_data(node, mt_table, s3_table_a, "replica1")
+    create_s3_table(node, s3_table_b)
+
+    # Launch two exports of the same partition to two different S3 tables concurrently
+    with PartitionManager() as pm:
+        pm.add_network_delay(node, delay_ms=1000)
+
+        node.query(
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table_a}"
+        )
+        node.query(
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table_b}"
+        )
+
+    time.sleep(5)
+
+    # Both targets should receive the same data independently
+    assert node.query(f"SELECT count() FROM {s3_table_a} WHERE year = 2020") == '3\n', "First target did not receive expected rows"
+    assert node.query(f"SELECT count() FROM {s3_table_b} WHERE year = 2020") == '3\n', "Second target did not receive expected rows"
+
+    # And both should have a commit marker
+    assert node.query(
+        f"SELECT count() FROM s3(s3_conn, filename='{s3_table_a}/commit_2020_*', format=LineAsString)"
+    ) != '0\n', "Commit file missing for first target"
+    assert node.query(
+        f"SELECT count() FROM s3(s3_conn, filename='{s3_table_b}/commit_2020_*', format=LineAsString)"
+    ) != '0\n', "Commit file missing for second target"
+
+
+def test_failure_is_logged_in_system_table(cluster):
+    node = cluster.instances["replica1"]
+
+    mt_table = "failure_is_logged_in_system_table_mt_table"
+    s3_table = "failure_is_logged_in_system_table_s3_table"
+
+    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
+
+    # Block traffic to/from MinIO to force upload errors and retries, following existing S3 tests style
+    minio_ip = cluster.minio_ip
+    minio_port = cluster.minio_port
+
+    with PartitionManager() as pm:
+        # Block responses from MinIO (source_port matches MinIO service)
+        pm_rule_reject_responses = {
+            "destination": node.ip_address,
+            "source_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm._add_rule(pm_rule_reject_responses)
+
+        # Also block requests to MinIO (destination: MinIO, destination_port: 9001) with REJECT to fail fast
+        pm_rule_reject_requests = {
+            "destination": minio_ip,
+            "destination_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm._add_rule(pm_rule_reject_requests)
+
+        node.query(
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS export_merge_tree_partition_max_retries=1;"
+        )
+
+        # Wait so that the export fails
+        time.sleep(5)
+
+    # Network restored; verify the export is marked as FAILED in the system table
+    # Also verify we captured at least one exception and no commit file exists
+    status = node.query(
+        f"""
+        SELECT status FROM system.replicated_partition_exports
+        WHERE source_table = '{mt_table}'
+          AND destination_table = '{s3_table}'
+          AND partition_id = '2020'
+        """
+    )
+
+    assert status.strip() == "FAILED", f"Expected FAILED status, got: {status!r}"
+
+    exception_count = node.query(
+        f"""
+        SELECT any(exception_count) FROM system.replicated_partition_exports
+        WHERE source_table = '{mt_table}'
+          AND destination_table = '{s3_table}'
+          AND partition_id = '2020'
+        """
+    )
+    assert int(exception_count.strip()) > 0, "Expected non-zero exception_count in system.replicated_partition_exports"
+
+    # No commit should have been produced for this partition
+    assert node.query(
+        f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2020_*', format=LineAsString)"
+    ) == '0\n', "Commit file exists despite forced S3 failures"
+
+
+def test_inject_short_living_failures(cluster):
+    node = cluster.instances["replica1"]
+
+    mt_table = "inject_short_living_failures_mt_table"
+    s3_table = "inject_short_living_failures_s3_table"
+
+    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
+
+    # Block traffic to/from MinIO to force upload errors and retries, following existing S3 tests style
+    minio_ip = cluster.minio_ip
+    minio_port = cluster.minio_port
+
+    with PartitionManager() as pm:
+        # Block responses from MinIO (source_port matches MinIO service)
+        pm_rule_reject_responses = {
+            "destination": node.ip_address,
+            "source_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm._add_rule(pm_rule_reject_responses)
+
+        # Also block requests to MinIO (destination: MinIO, destination_port: 9001) with REJECT to fail fast
+        pm_rule_reject_requests = {
+            "destination": minio_ip,
+            "destination_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm._add_rule(pm_rule_reject_requests)
+
+        # set big max_retries so that the export does not fail completely
+        node.query(
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS export_merge_tree_partition_max_retries=100;"
+        )
+
+        # wait only for a second to get at least one failure, but not enough to finish the export
+        time.sleep(5)
+    
+    # wait for the export to finish
+    time.sleep(5)
+
+    # Assert the export succeeded
+    assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == '3\n', "Export did not succeed"
+    assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2020_*', format=LineAsString)") == '1\n', "Export did not succeed"
+
+    # check system.replicated_partition_exports for the export
+    assert node.query(
+        f"""
+        SELECT status FROM system.replicated_partition_exports
+        WHERE source_table = '{mt_table}'
+          AND destination_table = '{s3_table}'
+          AND partition_id = '2020'
+        """
+    ) == "COMPLETED\n", "Export should be marked as COMPLETED"
+
+    exception_count = node.query(
+        f"""
+        SELECT exception_count FROM system.replicated_partition_exports
+        WHERE source_table = '{mt_table}'
+          AND destination_table = '{s3_table}'
+          AND partition_id = '2020'
+        """
+    )
+    assert int(exception_count.strip()) >= 1, "Expected at least one exception"
+
+
+def test_export_ttl(cluster):
+    node = cluster.instances["replica1"]
+
+    mt_table = "export_ttl_mt_table"
+    s3_table = "export_ttl_s3_table"
+
+    expiration_time = 5
+
+    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
+
+    # start export
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS export_merge_tree_partition_manifest_ttl={expiration_time};")
+
+    # assert that I get an error when trying to export the same partition again, query_and_get_error
+    error = node.query_and_get_error(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table};")
+    assert "Export with key" in error, "Expected error about expired export"
+
+    # wait for the export to finish and for the manifest to expire
+    time.sleep(expiration_time)
+
+    # assert that the export succeeded, check the commit file
+    assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2020_*', format=LineAsString)") == '1\n', "Export did not succeed"
+
+    # start export again
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}")
+
+    # wait for the export to finish
+    time.sleep(expiration_time)
+
+    # assert that the export succeeded, check the commit file
+    # there should be two commit files now, one for the first export and one for the second export
+    assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2020_*', format=LineAsString)") == '2\n', "Export did not succeed"
+
+
+def test_export_partition_file_already_exists_policy(cluster):
+    node = cluster.instances["replica1"]
+
+    mt_table = "export_partition_file_already_exists_policy_mt_table"
+    s3_table = "export_partition_file_already_exists_policy_s3_table"
+
+    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
+
+    # stop merges so part names remain stable. it is important for the test.
+    node.query(f"SYSTEM STOP MERGES {mt_table}")
+
+    # Export all parts
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}",
+    )
+
+    # check system.replicated_partition_exports for the export
+    assert node.query(
+        f"""
+        SELECT status FROM system.replicated_partition_exports
+        WHERE source_table = '{mt_table}'
+          AND destination_table = '{s3_table}'
+          AND partition_id = '2020'
+        """
+    ) == "COMPLETED\n", "Export should be marked as COMPLETED"
+
+    # wait for the exports to finish
+    time.sleep(3)
+
+    # try to export the partition
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS export_merge_tree_partition_force_export=1"
+    )
+
+    time.sleep(3)
+
+    assert node.query(
+        f"""
+        SELECT count() FROM system.replicated_partition_exports
+        WHERE source_table = '{mt_table}'
+          AND destination_table = '{s3_table}'
+          AND partition_id = '2020'
+          AND status = 'COMPLETED'
+        """
+    ) == '1\n', "Expected the export to be marked as COMPLETED"
+
+    # overwrite policy
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS export_merge_tree_partition_force_export=1, export_merge_tree_part_file_already_exists_policy='overwrite'"
+    )
+
+    # wait for the export to finish
+    time.sleep(3)
+
+    # check system.replicated_partition_exports for the export
+    # ideally we would make sure the transaction id is different, but I do not have the time to do that now
+    assert node.query(
+        f"""
+        SELECT count() FROM system.replicated_partition_exports
+        WHERE source_table = '{mt_table}'
+          AND destination_table = '{s3_table}'
+          AND partition_id = '2020'
+          AND status = 'COMPLETED'
+        """
+    ) == '1\n', "Expected the export to be marked as COMPLETED"
+
+    # last but not least, let's try with the error policy
+    # max retries = 1 so it fails fast
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS export_merge_tree_partition_force_export=1, export_merge_tree_part_file_already_exists_policy='error', export_merge_tree_partition_max_retries=1",
+    )
+
+    # wait for the export to finish
+    time.sleep(3)
+
+    # check system.replicated_partition_exports for the export
+    assert node.query(
+        f"""
+        SELECT count() FROM system.replicated_partition_exports
+        WHERE source_table = '{mt_table}'
+          AND destination_table = '{s3_table}'
+          AND partition_id = '2020'
+          AND status = 'FAILED'
+        """
+    ) == '1\n', "Expected the export to be marked as FAILED"
+
+
+def test_export_partition_feature_is_disabled(cluster):
+    replica_with_export_disabled = cluster.instances["replica_with_export_disabled"]
+
+    mt_table = "export_partition_feature_is_disabled_mt_table"
+    s3_table = "export_partition_feature_is_disabled_s3_table"
+
+    create_tables_and_insert_data(replica_with_export_disabled, mt_table, s3_table, "replica1")
+
+    error = replica_with_export_disabled.query_and_get_error(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table};")
+    assert "experimental" in error, "Expected error about disabled feature"
+
+    # make sure kill operation also throws
+    error = replica_with_export_disabled.query_and_get_error(f"KILL EXPORT PARTITION WHERE partition_id = '2020' and source_table = '{mt_table}' and destination_table = '{s3_table}'")
+    assert "experimental" in error, "Expected error about disabled feature"
+
+
+def test_export_partition_permissions(cluster):
+    """Test that export partition validates permissions correctly:
+    - User needs ALTER permission on source table
+    - User needs INSERT permission on destination table
+    """
+    node = cluster.instances["replica1"]
+
+    mt_table = "permissions_mt_table"
+    s3_table = "permissions_s3_table"
+
+    # Create tables as default user
+    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
+
+    # Create test users with specific permissions
+    node.query("CREATE USER IF NOT EXISTS user_no_alter IDENTIFIED WITH no_password")
+    node.query("CREATE USER IF NOT EXISTS user_no_insert IDENTIFIED WITH no_password")
+    node.query("CREATE USER IF NOT EXISTS user_with_permissions IDENTIFIED WITH no_password")
+
+    # Grant basic access to all users
+    node.query(f"GRANT SELECT ON {mt_table} TO user_no_alter")
+    node.query(f"GRANT SELECT ON {s3_table} TO user_no_alter")
+    
+    # user_no_insert has ALTER on source but no INSERT on destination
+    node.query(f"GRANT ALTER ON {mt_table} TO user_no_insert")
+    node.query(f"GRANT SELECT ON {s3_table} TO user_no_insert")
+    
+    # user_with_permissions has both ALTER and INSERT
+    node.query(f"GRANT ALTER ON {mt_table} TO user_with_permissions")
+    node.query(f"GRANT INSERT ON {s3_table} TO user_with_permissions")
+
+    # Test 1: User without ALTER permission should fail
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}",
+        user="user_no_alter"
+    )
+    assert "ACCESS_DENIED" in error or "Not enough privileges" in error, \
+        f"Expected ACCESS_DENIED error for user without ALTER, got: {error}"
+
+    # Test 2: User with ALTER but without INSERT permission should fail
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}",
+        user="user_no_insert"
+    )
+    assert "ACCESS_DENIED" in error or "Not enough privileges" in error, \
+        f"Expected ACCESS_DENIED error for user without INSERT, got: {error}"
+
+    # Test 3: User with both ALTER and INSERT should succeed
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}",
+        user="user_with_permissions"
+    )
+
+    # Wait for export to complete
+    time.sleep(5)
+
+    # Verify the export succeeded
+    result = node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020")
+    assert result.strip() == "3", f"Expected 3 rows exported, got: {result}"
+
+    # Verify system table shows COMPLETED status
+    status = node.query(
+        f"""
+        SELECT status FROM system.replicated_partition_exports
+        WHERE source_table = '{mt_table}'
+            AND destination_table = '{s3_table}'
+            AND partition_id = '2020'
+        """
+    )
+    assert status.strip() == "COMPLETED", f"Expected COMPLETED status, got: {status}"
+
+
+# assert multiple exports within a single query are executed. They all share the same query id
+# and previously the transaction id was the query id, which would cause problems
+def test_multiple_exports_within_a_single_query(cluster):
+    node = cluster.instances["replica1"]
+
+    mt_table = "multiple_exports_within_a_single_query_mt_table"
+    s3_table = "multiple_exports_within_a_single_query_s3_table"
+
+    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
+
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}, EXPORT PARTITION ID '2021' TO TABLE {s3_table};")
+
+    time.sleep(5)
+
+    # assert the exports have been executed
+    assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == '3\n', "Export did not succeed"
+    assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2021") == '1\n', "Export did not succeed"
+
+    # check system.replicated_partition_exports for the exports
+    assert node.query(
+        f"""
+        SELECT status FROM system.replicated_partition_exports
+        WHERE source_table = '{mt_table}'
+          AND destination_table = '{s3_table}'
+          AND partition_id = '2020'
+        """
+    ) == "COMPLETED\n", "Export should be marked as COMPLETED"
+
+    assert node.query(
+        f"""
+        SELECT status FROM system.replicated_partition_exports
+        WHERE source_table = '{mt_table}'
+          AND destination_table = '{s3_table}'
+          AND partition_id = '2021'
+        """
+    ) == "COMPLETED\n", "Export should be marked as COMPLETED"
+
+# def test_source_mutations_during_export_snapshot(cluster):
+#     node = cluster.instances["replica1"]
+
+#     mt_table = "mutations_snapshot_mt_table"
+#     s3_table = "mutations_snapshot_s3_table"
+
+#     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
+
+#     # Ensure export sees a consistent snapshot at start time even if we mutate the source later
+#     with PartitionManager() as pm:
+#         pm.add_network_delay(node, delay_ms=5000)
+
+#         # Start export of 2020
+#         node.query(
+#             f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table};"
+#         )
+
+#     # Mutate the source after export started (delete the same partition)
+#     node.query(f"ALTER TABLE {mt_table} DROP COLUMN id")
+
+#     # assert the mutation has been applied AND the data has not been exported yet
+#     assert node.query(f"SELECT count() FROM {mt_table} WHERE year = 2020") == '0\n', "Mutation has not been applied"
+#     assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == '0\n', "Data has been exported"
+
+#     # Wait for export to finish and then verify destination still reflects the original snapshot (3 rows)
+#     time.sleep(5)
+#     assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == '3\n', "Export did not preserve snapshot at start time after source mutation"

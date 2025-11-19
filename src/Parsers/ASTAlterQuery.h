@@ -73,6 +73,7 @@ public:
         UNFREEZE_PARTITION,
         UNFREEZE_ALL,
         EXPORT_PART,
+        EXPORT_PARTITION,
 
         DELETE,
         UPDATE,

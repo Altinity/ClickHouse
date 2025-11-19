@@ -579,6 +579,12 @@ AccessRightsElements InterpreterAlterQuery::getRequiredAccessForCommand(const AS
             required_access.emplace_back(AccessType::INSERT, command.to_database, command.to_table);
             break;
         }
+        case ASTAlterCommand::EXPORT_PARTITION:
+        {
+            required_access.emplace_back(AccessType::ALTER_EXPORT_PARTITION, database, table);
+            required_access.emplace_back(AccessType::INSERT, command.to_database, command.to_table);
+            break;
+        }
         case ASTAlterCommand::FETCH_PARTITION:
         {
             required_access.emplace_back(AccessType::ALTER_FETCH_PARTITION, database, table);

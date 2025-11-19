@@ -39,8 +39,8 @@
 #include <Poco/Timestamp.h>
 #include <Common/threadPoolCallbackRunner.h>
 #include <Storages/MergeTree/PatchParts/PatchPartsUtils.h>
-#include <Storages/MergeTree/MergeTreeExportStatus.h>
-#include <Storages/MergeTree/MergeTreeExportManifest.h>
+#include <Storages/MergeTree/MergeTreePartExportStatus.h>
+#include <Storages/MergeTree/MergeTreePartExportManifest.h>
 
 #include <boost/multi_index_container.hpp>
 #include <boost/multi_index/ordered_index.hpp>
@@ -1025,9 +1025,19 @@ public:
 
     void exportPartToTable(const PartitionCommand & command, ContextPtr query_context);
 
-    void exportPartToTableImpl(
-        const MergeTreeExportManifest & manifest,
-        ContextPtr local_context);
+    void exportPartToTable(
+        const std::string & part_name,
+        const StorageID & destination_storage_id,
+        const String & transaction_id,
+        ContextPtr query_context,
+        std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback = {});
+
+    void killExportPart(const String & transaction_id);
+
+    virtual void exportPartitionToTable(const PartitionCommand &, ContextPtr)
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "EXPORT PARTITION is not implemented for engine {}", getName());
+    }
 
     /// Checks that Partition could be dropped right now
     /// Otherwise - throws an exception with detailed information.
@@ -1288,7 +1298,7 @@ public:
 
     mutable std::mutex export_manifests_mutex;
 
-    std::set<MergeTreeExportManifest> export_manifests;
+    std::set<MergeTreePartExportManifest> export_manifests;
 
     PinnedPartUUIDsPtr getPinnedPartUUIDs() const;
 
@@ -1384,6 +1394,7 @@ protected:
     friend class IPartMetadataManager;
     friend class IMergedBlockOutputStream; // for access to log
     friend struct DataPartsLock; // for access to shared_parts_list/shared_ranges_in_parts
+    friend class ExportPartTask;
 
     bool require_part_metadata;
 

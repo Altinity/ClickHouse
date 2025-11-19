@@ -24,6 +24,7 @@
 #include <Common/quoteString.h>
 #include <Common/typeid_cast.h>
 #include <Common/thread_local_rng.h>
+#include "Storages/MergeTree/ExportPartTask.h"
 #include <Processors/Executors/CompletedPipelineExecutor.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
 #include <Storages/MergeTree/MergeTreeSequentialSource.h>
@@ -91,6 +92,7 @@
 #include <Storages/MergeTree/LoadedMergeTreeDataPartInfoForReader.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Storages/MergeTree/MergeTreeIndexGranularityAdaptive.h>
+#include <Functions/generateSnowflakeID.h>
 
 #include <boost/algorithm/string/join.hpp>
 
@@ -211,7 +213,7 @@ namespace Setting
     extern const SettingsBool use_statistics_cache;
     extern const SettingsBool allow_experimental_export_merge_tree_part;
     extern const SettingsUInt64 min_bytes_to_use_direct_io;
-    extern const SettingsBool export_merge_tree_part_overwrite_file_if_exists;
+    extern const SettingsMergeTreePartExportFileAlreadyExistsPolicy export_merge_tree_part_file_already_exists_policy;
     extern const SettingsBool output_format_parallel_formatting;
     extern const SettingsBool output_format_parquet_parallel_encoding;
 }
@@ -6436,10 +6438,23 @@ void MergeTreeData::exportPartToTable(const PartitionCommand & command, ContextP
             "Exporting merge tree part is experimental. Set `allow_experimental_export_merge_tree_part` to enable it");
     }
 
-    String dest_database = query_context->resolveDatabase(command.to_database);
-    auto dest_storage = DatabaseCatalog::instance().getTable({dest_database, command.to_table}, query_context);
+    const auto part_name = command.partition->as<ASTLiteral &>().value.safeGet<String>();
 
-    if (dest_storage->getStorageID() == this->getStorageID())
+    const auto database_name = query_context->resolveDatabase(command.to_database);
+
+    exportPartToTable(part_name, StorageID{database_name, command.to_table}, generateSnowflakeIDString(), query_context);
+}
+
+void MergeTreeData::exportPartToTable(
+    const std::string & part_name,
+    const StorageID & destination_storage_id,
+    const String & transaction_id,
+    ContextPtr query_context,
+    std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback)
+{
+    auto dest_storage = DatabaseCatalog::instance().getTable(destination_storage_id, query_context);
+
+    if (destination_storage_id == this->getStorageID())
     {
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Exporting to the same table is not allowed");
     }
@@ -6461,8 +6476,6 @@ void MergeTreeData::exportPartToTable(const PartitionCommand & command, ContextP
     if (query_to_string(src_snapshot->getPartitionKeyAST()) != query_to_string(destination_snapshot->getPartitionKeyAST()))
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
 
-    auto part_name = command.partition->as<ASTLiteral &>().value.safeGet<String>();
-
     auto part = getPartIfExists(part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
 
     if (!part)
@@ -6470,13 +6483,14 @@ void MergeTreeData::exportPartToTable(const PartitionCommand & command, ContextP
                         part_name, getStorageID().getFullTableName());
 
     {
-        MergeTreeExportManifest manifest(
+        const auto format_settings = getFormatSettings(query_context);
+        MergeTreePartExportManifest manifest(
             dest_storage->getStorageID(),
             part,
-            query_context->getSettingsRef()[Setting::export_merge_tree_part_overwrite_file_if_exists],
-            query_context->getSettingsRef()[Setting::output_format_parallel_formatting],
-            query_context->getSettingsRef()[Setting::output_format_parquet_parallel_encoding],
-            query_context->getSettingsRef()[Setting::max_threads]);
+            transaction_id,
+            query_context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value,
+            format_settings,
+            completion_callback);
 
         std::lock_guard lock(export_manifests_mutex);
 
@@ -6490,173 +6504,21 @@ void MergeTreeData::exportPartToTable(const PartitionCommand & command, ContextP
     background_moves_assignee.trigger();
 }
 
-void MergeTreeData::exportPartToTableImpl(
-    const MergeTreeExportManifest & manifest,
-    ContextPtr local_context)
+void MergeTreeData::killExportPart(const String & transaction_id)
 {
-    auto metadata_snapshot = getInMemoryMetadataPtr();
-    Names columns_to_read = metadata_snapshot->getColumns().getNamesOfPhysical();
-    StorageSnapshotPtr storage_snapshot = getStorageSnapshot(metadata_snapshot, local_context);
+    std::lock_guard lock(export_manifests_mutex);
 
-    MergeTreeSequentialSourceType read_type = MergeTreeSequentialSourceType::Export;
-
-    Block block_with_partition_values;
-    if (metadata_snapshot->hasPartitionKey())
+    std::erase_if(export_manifests, [&](const auto & manifest)
     {
-        /// todo arthur do I need to init minmax_idx?
-        block_with_partition_values = manifest.data_part->minmax_idx->getBlock(*this);
-    }
-
-    auto destination_storage = DatabaseCatalog::instance().tryGetTable(manifest.destination_storage_id, getContext());
-    if (!destination_storage)
-    {
-        std::lock_guard inner_lock(export_manifests_mutex);
-
-        const auto destination_storage_id_name = manifest.destination_storage_id.getNameForLogs();
-        export_manifests.erase(manifest);
-        throw Exception(ErrorCodes::UNKNOWN_TABLE, "Failed to reconstruct destination storage: {}", destination_storage_id_name);
-    }
-
-    SinkToStoragePtr sink;
-    std::string destination_file_path;
-
-    try
-    {
-        auto context_copy = Context::createCopy(local_context);
-        context_copy->setSetting("output_format_parallel_formatting", manifest.parallel_formatting);
-        context_copy->setSetting("output_format_parquet_parallel_encoding", manifest.parquet_parallel_encoding);
-        context_copy->setSetting("max_threads", manifest.max_threads);
-
-        sink = destination_storage->import(
-            manifest.data_part->name + "_" + manifest.data_part->checksums.getTotalChecksumHex(),
-            block_with_partition_values,
-            destination_file_path,
-            manifest.overwrite_file_if_exists,
-            context_copy);
-    }
-    catch (const Exception & e)
-    {
-        if (e.code() == ErrorCodes::FILE_ALREADY_EXISTS)
+        if (manifest.transaction_id == transaction_id)
         {
-            ProfileEvents::increment(ProfileEvents::PartsExportDuplicated);
+            if (manifest.task)
+                manifest.task->cancel();
+
+            return true;
         }
-
-        ProfileEvents::increment(ProfileEvents::PartsExportFailures);
-
-        std::lock_guard inner_lock(export_manifests_mutex);
-        export_manifests.erase(manifest);
-        return;
-    }
-
-    bool apply_deleted_mask = true;
-    bool read_with_direct_io = local_context->getSettingsRef()[Setting::min_bytes_to_use_direct_io] > manifest.data_part->getBytesOnDisk();
-    bool prefetch = false;
-
-    MergeTreeData::IMutationsSnapshot::Params params
-    {
-        .metadata_version = metadata_snapshot->getMetadataVersion(),
-        .min_part_metadata_version = manifest.data_part->getMetadataVersion(),
-    };
-
-    auto mutations_snapshot = getMutationsSnapshot(params);
-
-    auto alter_conversions = MergeTreeData::getAlterConversionsForPart(
-        manifest.data_part,
-        mutations_snapshot,
-        local_context);
-
-    QueryPlan plan_for_part;
-
-    createReadFromPartStep(
-        read_type,
-        plan_for_part,
-        *this,
-        storage_snapshot,
-        RangesInDataPart(manifest.data_part),
-        alter_conversions,
-        nullptr,
-        columns_to_read,
-        nullptr,
-        apply_deleted_mask,
-        std::nullopt,
-        read_with_direct_io,
-        prefetch,
-        local_context,
-        getLogger("ExportPartition"));
-
-    auto exports_list_entry = getContext()->getExportsList().insert(
-        getStorageID(),
-        manifest.destination_storage_id,
-        manifest.data_part->getBytesOnDisk(),
-        manifest.data_part->name,
-        destination_file_path,
-        manifest.data_part->rows_count,
-        manifest.data_part->getBytesOnDisk(),
-        manifest.data_part->getBytesUncompressedOnDisk(),
-        manifest.create_time,
-        local_context);
-
-    ThreadGroupSwitcher switcher((*exports_list_entry)->thread_group, ThreadName::EXPORT_MT_PART);
-
-    QueryPlanOptimizationSettings optimization_settings(local_context);
-    auto pipeline_settings = BuildQueryPipelineSettings(local_context);
-    auto builder = plan_for_part.buildQueryPipeline(optimization_settings, pipeline_settings);
-
-    builder->setProgressCallback([&exports_list_entry](const Progress & progress)
-    {
-        (*exports_list_entry)->bytes_read_uncompressed += progress.read_bytes;
-        (*exports_list_entry)->rows_read += progress.read_rows;
-        (*exports_list_entry)->elapsed = (*exports_list_entry)->watch.elapsedSeconds();
+        return false;
     });
-
-    auto pipeline = QueryPipelineBuilder::getPipeline(std::move(*builder));
-
-    pipeline.complete(sink);
-
-    try
-    {
-        CompletedPipelineExecutor exec(pipeline);
-        exec.execute();
-
-        std::lock_guard inner_lock(export_manifests_mutex);
-        writePartLog(
-            PartLogElement::Type::EXPORT_PART,
-            {},
-            static_cast<UInt64>((*exports_list_entry)->elapsed * 1000000000),
-            manifest.data_part->name,
-            manifest.data_part,
-            {manifest.data_part},
-            nullptr,
-            nullptr,
-            exports_list_entry.get());
-
-        export_manifests.erase(manifest);
-
-        ProfileEvents::increment(ProfileEvents::PartsExports);
-        ProfileEvents::increment(ProfileEvents::PartsExportTotalMilliseconds, static_cast<UInt64>((*exports_list_entry)->elapsed * 1000));
-    }
-    catch (...)
-    {
-        tryLogCurrentException(__PRETTY_FUNCTION__, fmt::format("while exporting the part {}. User should retry.", manifest.data_part->name));
-
-        ProfileEvents::increment(ProfileEvents::PartsExportFailures);
-
-        std::lock_guard inner_lock(export_manifests_mutex);
-        writePartLog(
-            PartLogElement::Type::EXPORT_PART,
-            ExecutionStatus::fromCurrentException("", true),
-            static_cast<UInt64>((*exports_list_entry)->elapsed * 1000000000),
-            manifest.data_part->name,
-            manifest.data_part,
-            {manifest.data_part},
-            nullptr,
-            nullptr,
-            exports_list_entry.get());
-
-        export_manifests.erase(manifest);
-
-        throw;
-    }
 }
 
 void MergeTreeData::movePartitionToShard(const ASTPtr & /*partition*/, bool /*move_part*/, const String & /*to*/, ContextPtr /*query_context*/)
@@ -6713,6 +6575,12 @@ Pipe MergeTreeData::alterPartition(
             case PartitionCommand::EXPORT_PART:
             {
                 exportPartToTable(command, query_context);
+                break;
+            }
+
+            case PartitionCommand::EXPORT_PARTITION:
+            {
+                exportPartitionToTable(command, query_context);
                 break;
             }
 
@@ -9585,15 +9453,18 @@ bool MergeTreeData::scheduleDataMovingJob(BackgroundJobsAssignee & assignee)
             continue;
         }
 
-        manifest.in_progress = assignee.scheduleMoveTask(std::make_shared<ExecutableLambdaAdapter>(
-            [this, manifest] () mutable {
-                exportPartToTableImpl(manifest, getContext());
-                return true;
-            },
-            moves_assignee_trigger,
-            getStorageID()));
+        auto task = std::make_shared<ExportPartTask>(*this, manifest, getContext());
 
-        return manifest.in_progress;
+        manifest.in_progress = assignee.scheduleMoveTask(task);
+
+        if (!manifest.in_progress)
+        {
+            continue;
+        }
+
+        manifest.task = task;
+
+        return true;
     }
 
     return false;

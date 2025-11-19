@@ -388,6 +388,17 @@ void ASTAlterCommand::formatImpl(WriteBuffer & ostr, const FormatSettings & sett
         }
 
     }
+    else if (type == ASTAlterCommand::EXPORT_PARTITION)
+    {
+        ostr << "EXPORT PARTITION ";
+        partition->format(ostr, settings, state, frame);
+        ostr << " TO TABLE ";
+        if (!to_database.empty())
+        {
+            ostr << backQuoteIfNeed(to_database) << ".";
+        }
+        ostr << backQuoteIfNeed(to_table);
+    }
     else if (type == ASTAlterCommand::REPLACE_PARTITION)
     {
         ostr << (replace ? "REPLACE" : "ATTACH") << " PARTITION "
