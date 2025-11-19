@@ -39,10 +39,9 @@ StringRef foldEncryptionKeyInMySQLCompatitableMode(size_t cipher_key_size, Strin
 
 const EVP_CIPHER * getCipherByName(StringRef cipher_name)
 {
-    // NOTE: cipher obtained not via EVP_CIPHER_fetch() would cause extra work on each context reset
-    // with EVP_CIPHER_CTX_reset() or EVP_EncryptInit_ex(), but using EVP_CIPHER_fetch()
-    // causes data race, so we stick to the slower but safer alternative here.
-    return EVP_get_cipherbyname(cipher_name.data);
+    // OPTIMIZATION: Use cached EVP_CIPHER_fetch() for better performance in OpenSSL 3.x
+    return OpenSSLOptimized::CipherCache::instance().getCipher(
+        std::string_view(cipher_name.data, cipher_name.size));
 }
 
 }

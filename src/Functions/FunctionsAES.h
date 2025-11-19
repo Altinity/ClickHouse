@@ -14,6 +14,7 @@
 #include <Functions/IFunction.h>
 #include <Functions/FunctionFactory.h>
 #include <Functions/FunctionHelpers.h>
+#include <Functions/FunctionsAES_Optimized.h>
 
 #include <fmt/format.h>
 
@@ -261,8 +262,9 @@ private:
     {
         using namespace OpenSSLDetails;
 
-        auto evp_ctx_ptr = std::unique_ptr<EVP_CIPHER_CTX, decltype(&::EVP_CIPHER_CTX_free)>(EVP_CIPHER_CTX_new(), &EVP_CIPHER_CTX_free);
-        auto * evp_ctx = evp_ctx_ptr.get();
+        // OPTIMIZATION: Reuse thread-local context instead of allocating per batch
+        auto & context_wrapper = OpenSSLOptimized::EVPContextPool::getContext();
+        auto * evp_ctx = context_wrapper.ctx;
 
         const auto block_size = static_cast<size_t>(EVP_CIPHER_block_size(evp_cipher));
         const auto key_size = static_cast<size_t>(EVP_CIPHER_key_length(evp_cipher));
@@ -295,6 +297,9 @@ private:
 
         for (size_t row_idx = 0; row_idx < input_rows_count; ++row_idx)
         {
+            // OPTIMIZATION: Reset context for reuse
+            EVP_CIPHER_CTX_reset(evp_ctx);
+            
             const auto key_value = key_holder.setKey(key_size, key_column->getDataAt(row_idx));
             auto iv_value = StringRef{};
             if (iv_column)
@@ -536,8 +541,9 @@ private:
     {
         using namespace OpenSSLDetails;
 
-        auto evp_ctx_ptr = std::unique_ptr<EVP_CIPHER_CTX, decltype(&::EVP_CIPHER_CTX_free)>(EVP_CIPHER_CTX_new(), &EVP_CIPHER_CTX_free);
-        auto * evp_ctx = evp_ctx_ptr.get();
+        // OPTIMIZATION: Reuse thread-local context instead of allocating per batch
+        auto & context_wrapper = OpenSSLOptimized::EVPContextPool::getContext();
+        auto * evp_ctx = context_wrapper.ctx;
 
         [[maybe_unused]] const auto block_size = static_cast<size_t>(EVP_CIPHER_block_size(evp_cipher));
         [[maybe_unused]] const auto iv_size = static_cast<size_t>(EVP_CIPHER_iv_length(evp_cipher));
@@ -577,6 +583,9 @@ private:
         KeyHolder<mode> key_holder;
         for (size_t row_idx = 0; row_idx < input_rows_count; ++row_idx)
         {
+            // OPTIMIZATION: Reset context for reuse
+            EVP_CIPHER_CTX_reset(evp_ctx);
+            
             // 0: prepare key if required
             auto key_value = key_holder.setKey(key_size, key_column->getDataAt(row_idx));
             auto iv_value = StringRef{};
