@@ -104,6 +104,7 @@
 #include <Processors/Sources/RemoteSource.h>
 #include <Processors/Sinks/EmptySink.h>
 
+#include <Core/Names.h>
 #include <Core/Settings.h>
 #include <Core/SettingsEnums.h>
 
@@ -117,7 +118,7 @@
 #include <memory>
 #include <filesystem>
 #include <cassert>
-
+#include <unordered_map>
 #include <boost/algorithm/string/find_iterator.hpp>
 #include <boost/algorithm/string/finder.hpp>
 
@@ -169,6 +170,113 @@ void replaceCurrentDatabaseFunction(ASTPtr & ast, const ContextPtr & context)
     for (auto & child : ast->children)
         replaceCurrentDatabaseFunction(child, context);
 }
+
+NameSet collectColumnsToCast(
+    const ColumnsDescription & metadata_columns,
+    const ColumnsDescription & actual_columns)
+{
+    NameSet names;
+    if (metadata_columns.empty() || actual_columns.empty())
+        return names;
+
+    for (const auto & expected_column : metadata_columns.getAllPhysical())
+    {
+        auto actual_column_opt = actual_columns.tryGetPhysical(expected_column.name);
+        if (!actual_column_opt)
+            continue;
+
+        if (!actual_column_opt->type->equals(*expected_column.type))
+            names.emplace(expected_column.name);
+    }
+
+    return names;
+}
+
+void applyHybridCastsToQueryTree(
+    QueryTreeNodePtr & query_tree,
+    const QueryTreeNodePtr & replacement_table_expression,
+    const ColumnsDescription & metadata_columns,
+    const NameSet & columns_to_cast,
+    const ColumnsDescription & actual_columns,
+    const ContextPtr & context)
+{
+    if (columns_to_cast.empty())
+        return;
+
+    class HybridCastVisitor : public InDepthQueryTreeVisitor<HybridCastVisitor>
+    {
+    public:
+        HybridCastVisitor(
+            const QueryTreeNodePtr & table_expression_,
+            const ColumnsDescription & metadata_columns_,
+            const NameSet & columns_to_cast_,
+            const ColumnsDescription & actual_columns_,
+            ContextPtr context_)
+            : table_expression(table_expression_)
+            , metadata_columns(metadata_columns_)
+            , columns_to_cast(columns_to_cast_)
+            , actual_columns(actual_columns_)
+            , context(std::move(context_))
+        {}
+
+        bool shouldTraverseTopToBottom() const { return false; }
+
+        static bool needChildVisit(QueryTreeNodePtr & /*parent*/, QueryTreeNodePtr & child)
+        {
+            auto child_type = child->getNodeType();
+            return !(child_type == QueryTreeNodeType::QUERY || child_type == QueryTreeNodeType::UNION);
+        }
+
+        void visitImpl(QueryTreeNodePtr & node)
+        {
+            auto * column_node = node->as<ColumnNode>();
+            if (!column_node)
+                return;
+
+            auto column_source = column_node->getColumnSourceOrNull();
+            if (column_source != table_expression)
+                return;
+
+            const auto & column_name = column_node->getColumnName();
+            if (!columns_to_cast.contains(column_name))
+                return;
+
+            auto expected_column_opt = metadata_columns.tryGetPhysical(column_name);
+            if (!expected_column_opt)
+                return;
+
+            auto actual_column_opt = actual_columns.tryGetPhysical(column_name);
+            const auto & source_column = actual_column_opt ? *actual_column_opt : *expected_column_opt;
+
+            auto column_clone = std::static_pointer_cast<ColumnNode>(column_node->clone());
+            column_clone->setColumnType(source_column.type);
+
+            auto cast_node = buildCastFunction(column_clone, expected_column_opt->type, context);
+            const auto & alias = node->getAlias();
+            if (!alias.empty())
+                cast_node->setAlias(alias);
+            else
+                cast_node->setAlias(column_name);
+
+            node = cast_node;
+        }
+
+    private:
+        QueryTreeNodePtr table_expression;
+        const ColumnsDescription & metadata_columns;
+        const NameSet & columns_to_cast;
+        const ColumnsDescription & actual_columns;
+        ContextPtr context;
+    };
+
+    HybridCastVisitor visitor(
+        replacement_table_expression,
+        metadata_columns,
+        columns_to_cast,
+        actual_columns,
+        context);
+    visitor.visit(query_tree);
+}
 }
 
 namespace Setting
@@ -202,6 +310,7 @@ namespace Setting
     extern const SettingsBool prefer_global_in_and_join;
     extern const SettingsBool enable_global_with_statement;
     extern const SettingsBool allow_experimental_hybrid_table;
+    extern const SettingsBool hybrid_table_auto_cast_columns;
 }
 
 namespace DistributedSetting
@@ -948,7 +1057,10 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
     const StorageSnapshotPtr & distributed_storage_snapshot,
     const StorageID & remote_storage_id,
     const ASTPtr & remote_table_function,
-    const ASTPtr & additional_filter = nullptr)
+    const ASTPtr & additional_filter = nullptr,
+    const NameSet * columns_to_cast = nullptr,
+    const ColumnsDescription * metadata_columns = nullptr,
+    const ColumnsDescription * actual_columns_for_cast = nullptr)
 {
     auto & planner_context = query_info.planner_context;
     const auto & query_context = planner_context->getQueryContext();
@@ -1027,6 +1139,7 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
         QueryAnalysisPass(replacement_table_expression).run(filter, context);
     }
 
+    auto replacement_table_expression_ptr = replacement_table_expression;
     auto query_tree_to_modify = query_info.query_tree->cloneAndReplace(query_info.table_expression, std::move(replacement_table_expression));
 
     // Apply additional filter if provided
@@ -1036,6 +1149,18 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
         query.getWhere() = query.hasWhere()
             ? mergeConditionNodes({query.getWhere(), filter}, query_context)
             : std::move(filter);
+    }
+
+    if (columns_to_cast && !columns_to_cast->empty() && metadata_columns)
+    {
+        const ColumnsDescription * source_columns = actual_columns_for_cast ? actual_columns_for_cast : metadata_columns;
+        applyHybridCastsToQueryTree(
+            query_tree_to_modify,
+            replacement_table_expression_ptr,
+            *metadata_columns,
+            *columns_to_cast,
+            *source_columns,
+            query_context);
     }
 
     ReplaseAliasColumnsVisitor replase_alias_columns_visitor;
@@ -1078,6 +1203,57 @@ void StorageDistributed::read(
     std::vector<SelectQueryInfo> additional_query_infos;
 
     const auto & settings = local_context->getSettingsRef();
+    auto metadata_ptr = getInMemoryMetadataPtr();
+    const auto & metadata_columns = metadata_ptr->getColumns();
+
+    const bool enable_hybrid_column_casts = settings[Setting::hybrid_table_auto_cast_columns]
+        && (!base_segment_columns.empty() || !segments.empty());
+
+    NameSet columns_to_cast_names;
+    if (enable_hybrid_column_casts)
+    {
+        if (!base_segment_columns.empty())
+        {
+            auto names = collectColumnsToCast(metadata_columns, base_segment_columns);
+            columns_to_cast_names.insert(names.begin(), names.end());
+        }
+
+        for (const auto & segment : segments)
+        {
+            auto names = collectColumnsToCast(metadata_columns, segment.actual_columns);
+            columns_to_cast_names.insert(names.begin(), names.end());
+        }
+    }
+
+    const bool need_hybrid_casts = !columns_to_cast_names.empty();
+    const auto * columns_to_cast_ptr = need_hybrid_casts ? &columns_to_cast_names : nullptr;
+    const auto * base_actual_columns_for_cast = !base_segment_columns.empty() ? &base_segment_columns : &metadata_columns;
+
+    auto describe_segment_target = [&](const HybridSegment & segment) -> String
+    {
+        if (segment.storage_id)
+            return segment.storage_id->getNameForLogs();
+        if (segment.table_function_ast)
+            return segment.table_function_ast->formatForLogging();
+        return String{"<table_function>"};
+    };
+
+    const bool log_hybrid_casts = need_hybrid_casts && log->is(Poco::Message::PRIO_TRACE);
+    auto log_rewritten_query = [&](const String & target, const ASTPtr & ast)
+    {
+        if (!log_hybrid_casts || !ast)
+            return;
+
+        LOG_TRACE(log, "rewriteSelectQuery (target: {}) -> {}", target, ast->formatForLogging());
+    };
+
+    String base_target;
+    if (remote_table_function_ptr)
+        base_target = remote_table_function_ptr->formatForLogging();
+    else if (!remote_database.empty())
+        base_target = remote_database + "." + remote_table;
+    else
+        base_target = remote_table;
 
     if (settings[Setting::allow_experimental_analyzer])
     {
@@ -1089,7 +1265,10 @@ void StorageDistributed::read(
             query_info.initial_storage_snapshot ? query_info.initial_storage_snapshot : storage_snapshot,
             remote_storage_id,
             remote_table_function_ptr,
-            base_segment_predicate);
+            base_segment_predicate,
+            columns_to_cast_ptr,
+            &metadata_columns,
+            base_actual_columns_for_cast);
         Block block = *InterpreterSelectQueryAnalyzer::getSampleBlock(query_tree_distributed, local_context, SelectQueryOptions(processed_stage).analyze());
         /** For distributed tables we do not need constants in header, since we don't send them to remote servers.
           * Moreover, constants can break some functions like `hostName` that are constants only for local queries.
@@ -1102,6 +1281,7 @@ void StorageDistributed::read(
         modified_query_info.query = queryNodeToDistributedSelectQuery(query_tree_distributed);
 
         modified_query_info.query_tree = std::move(query_tree_distributed);
+        log_rewritten_query(base_target, modified_query_info.query);
 
         if (!segments.empty())
         {
@@ -1109,15 +1289,20 @@ void StorageDistributed::read(
             {
                 // Create a modified query info with the segment predicate
                 SelectQueryInfo additional_query_info = query_info;
+                const auto * segment_actual_columns = !segment.actual_columns.empty() ? &segment.actual_columns : &metadata_columns;
 
                 auto additional_query_tree = buildQueryTreeDistributed(additional_query_info,
                     query_info.initial_storage_snapshot ? query_info.initial_storage_snapshot : storage_snapshot,
                     segment.storage_id ? *segment.storage_id : StorageID::createEmpty(),
                     segment.storage_id ? nullptr :  segment.table_function_ast,
-                    segment.predicate_ast);
+                    segment.predicate_ast,
+                    columns_to_cast_ptr,
+                    &metadata_columns,
+                    segment_actual_columns);
 
                 additional_query_info.query = queryNodeToDistributedSelectQuery(additional_query_tree);
                 additional_query_info.query_tree = std::move(additional_query_tree);
+                log_rewritten_query(describe_segment_target(segment), additional_query_info.query);
 
                 additional_query_infos.push_back(std::move(additional_query_info));
             }
@@ -1134,7 +1319,10 @@ void StorageDistributed::read(
         modified_query_info.query = ClusterProxy::rewriteSelectQuery(
             local_context, modified_query_info.query,
             remote_database, remote_table, remote_table_function_ptr,
-            base_segment_predicate);
+            base_segment_predicate,
+            columns_to_cast_ptr,
+            &metadata_columns);
+        log_rewritten_query(base_target, modified_query_info.query);
 
         if (!segments.empty())
         {
@@ -1148,16 +1336,21 @@ void StorageDistributed::read(
                         local_context, additional_query_info.query,
                         segment.storage_id->database_name, segment.storage_id->table_name,
                         nullptr,
-                        segment.predicate_ast);
+                        segment.predicate_ast,
+                        columns_to_cast_ptr,
+                        &metadata_columns);
                 }
                 else
                 {
                     additional_query_info.query = ClusterProxy::rewriteSelectQuery(
                         local_context, additional_query_info.query,
                         "", "", segment.table_function_ast,
-                        segment.predicate_ast);
+                        segment.predicate_ast,
+                        columns_to_cast_ptr,
+                        &metadata_columns);
                 }
 
+                log_rewritten_query(describe_segment_target(segment), additional_query_info.query);
                 additional_query_infos.push_back(std::move(additional_query_info));
             }
         }
@@ -1186,7 +1379,7 @@ void StorageDistributed::read(
                 processed_stage);
 
         auto shard_filter_generator = ClusterProxy::getShardFilterGeneratorForCustomKey(
-            *modified_query_info.getCluster(), local_context, getInMemoryMetadataPtr()->columns);
+            *modified_query_info.getCluster(), local_context, metadata_ptr->columns);
 
         ClusterProxy::executeQuery(
             query_plan,

@@ -6929,6 +6929,9 @@ Allows creation of tables with the [TimeSeries](../../engines/table-engines/inte
     DECLARE(Bool, allow_experimental_hybrid_table, false, R"(
 Allows creation of tables with the [Hybrid](../../engines/table-engines/special/hybrid.md) table engine.
 )", EXPERIMENTAL) \
+    DECLARE(Bool, hybrid_table_auto_cast_columns, false, R"(
+Automatically cast columns to the schema defined in Hybrid tables when remote segments expose different physical types.
+)", EXPERIMENTAL) \
     DECLARE(Bool, allow_experimental_codecs, false, R"(
 If it is set to true, allow to specify experimental compression codecs (but we don't have those yet and this option does nothing).
 )", EXPERIMENTAL) \

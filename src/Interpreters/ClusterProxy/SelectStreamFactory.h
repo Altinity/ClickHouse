@@ -3,10 +3,12 @@
 #include <Analyzer/IQueryTreeNode.h>
 #include <Client/ConnectionPool.h>
 #include <Core/QueryProcessingStage.h>
+#include <Core/Names.h>
 #include <Interpreters/Cluster.h>
 #include <Interpreters/StorageID.h>
 #include <Parsers/IAST_fwd.h>
 #include <Storages/IStorage_fwd.h>
+#include <Storages/ColumnsDescription.h>
 #include <Storages/StorageSnapshot.h>
 
 namespace DB
@@ -42,7 +44,9 @@ ASTPtr rewriteSelectQuery(
     const std::string & remote_database,
     const std::string & remote_table,
     ASTPtr table_function_ptr = nullptr,
-    ASTPtr additional_filter = nullptr);
+    ASTPtr additional_filter = nullptr,
+    const NameSet * columns_to_cast = nullptr,
+    const ColumnsDescription * metadata_columns = nullptr);
 
 using ColumnsDescriptionByShardNum = std::unordered_map<UInt32, ColumnsDescription>;
 using AdditionalShardFilterGenerator = std::function<ASTPtr(uint64_t)>;

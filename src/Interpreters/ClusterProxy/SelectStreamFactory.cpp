@@ -15,12 +15,14 @@
 #include <Interpreters/Cluster.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/AddDefaultDatabaseVisitor.h>
+#include <Interpreters/addTypeConversionToAST.h>
 #include <Interpreters/RequiredSourceColumnsVisitor.h>
 #include <Interpreters/TranslateQualifiedNamesVisitor.h>
 #include <DataTypes/ObjectUtils.h>
 #include <Client/IConnections.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTSetQuery.h>
+#include <Parsers/ASTIdentifier.h>
 #include <Processors/QueryPlan/QueryPlan.h>
 #include <Processors/QueryPlan/ReadFromRemote.h>
 #include <Processors/QueryPlan/ExpressionStep.h>
@@ -60,6 +62,46 @@ namespace FailPoints
 namespace ClusterProxy
 {
 
+namespace
+{
+void applyHybridCastsToAST(
+    ASTPtr & node,
+    const ColumnsDescription * metadata_columns,
+    const NameSet * columns_to_cast)
+{
+    if (!metadata_columns || !columns_to_cast || columns_to_cast->empty() || !node)
+        return;
+
+    if (auto * func = node->as<ASTFunction>(); func && func->name == "_CAST")
+        return;
+
+    if (auto * identifier = node->as<ASTIdentifier>())
+    {
+        String candidate = identifier->name();
+        String short_name = candidate;
+
+        auto dot_pos = candidate.rfind('.');
+        if (dot_pos != String::npos && dot_pos + 1 < candidate.size())
+            short_name = candidate.substr(dot_pos + 1);
+
+        if (columns_to_cast->contains(short_name))
+        {
+            if (auto expected_column_opt = metadata_columns->tryGetPhysical(short_name))
+            {
+                auto cast_ast = addTypeConversionToAST(node->clone(), expected_column_opt->type->getName());
+                const auto & alias = identifier->alias.empty() ? short_name : identifier->alias;
+                cast_ast->setAlias(alias);
+                node = cast_ast;
+                return;
+            }
+        }
+    }
+
+    for (auto & child : node->children)
+        applyHybridCastsToAST(child, metadata_columns, columns_to_cast);
+}
+}
+
 /// select query has database, table and table function names as AST pointers
 /// Creates a copy of query, changes database, table and table function names.
 ASTPtr rewriteSelectQuery(
@@ -68,7 +110,9 @@ ASTPtr rewriteSelectQuery(
     const std::string & remote_database,
     const std::string & remote_table,
     ASTPtr table_function_ptr,
-    ASTPtr additional_filter)
+    ASTPtr additional_filter,
+    const NameSet * columns_to_cast,
+    const ColumnsDescription * metadata_columns)
 {
     auto modified_query_ast = query->clone();
 
@@ -122,6 +166,9 @@ ASTPtr rewriteSelectQuery(
 
             RestoreQualifiedNamesVisitor(data).visit(modified_query_ast);
         }
+
+        if (columns_to_cast && !columns_to_cast->empty() && metadata_columns)
+            applyHybridCastsToAST(modified_query_ast, metadata_columns, columns_to_cast);
     }
 
     /// To make local JOIN works, default database should be added to table names.
