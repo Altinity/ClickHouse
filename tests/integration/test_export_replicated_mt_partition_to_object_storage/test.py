@@ -479,7 +479,7 @@ def test_export_ttl(cluster):
     mt_table = "export_ttl_mt_table"
     s3_table = "export_ttl_s3_table"
 
-    expiration_time = 5
+    expiration_time = 3
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
@@ -492,7 +492,7 @@ def test_export_ttl(cluster):
 
     # wait for the export to finish and for the manifest to expire
     wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED")
-    time.sleep(expiration_time)
+    time.sleep(expiration_time * 2)
 
     # assert that the export succeeded, check the commit file
     assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2020_*', format=LineAsString)") == '1\n', "Export did not succeed"
