@@ -40,13 +40,13 @@ Source and destination tables must be 100% compatible:
 
 - **Type**: `Bool`
 - **Default**: `false`
-- **Description**: Must be set to `1` to enable the experimental feature.
+- **Description**: Must be set to `true` to enable the experimental feature.
 
 ### `export_merge_tree_part_overwrite_file_if_exists` (Optional)
 
 - **Type**: `Bool`
 - **Default**: `false`
-- **Description**: If set to `1`, it will overwrite the file. Otherwise, fails with exception.
+- **Description**: If set to `true`, it will overwrite the file. Otherwise, fails with exception.
 
 ## Examples
 
