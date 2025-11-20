@@ -1291,6 +1291,10 @@ StorageObjectStorageSource::ReadTaskIterator::ReadTaskIterator(
                     object->relative_path = key;
                 }
             }
+            else
+            {
+                object->object_storage_to_use = object_storage;
+            }
             buffer.push_back(object);
         }
     }
@@ -1315,17 +1319,20 @@ StorageObjectStorage::ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator
 
         object_info = raw->getObjectInfo();
 
-        if (object_info->getObjectStorage().has_value())
-        {
-
-        }
-        else if (raw->absolute_path.has_value())
+        if (raw->absolute_path.has_value())
         {
             auto [storage_to_use, key]
                 = resolveObjectStorageForPath("", raw->absolute_path.value(), object_storage, secondary_storages, getContext());
 
-            if (!key.empty()) /// Not a valid key/path, maybe it is "retry_after_us". Store as is.
+            if (!key.empty()) /// Otherwise not a valid key/path, maybe it is "retry_after_us". Store as is.
+            {
                 object_info->object_storage_to_use = storage_to_use;
+                object_info->relative_path = key;
+            }
+        }
+        else
+        {
+            object_info->object_storage_to_use = object_storage;
         }
     }
     else

@@ -165,7 +165,7 @@ ManifestFileCacheKeys getManifestList(
         {
             const std::string file_path
                 = manifest_list_deserializer.getValueFromRowByName(i, f_manifest_path, TypeIndex::String).safeGet<std::string>();
-            const auto manifest_file_name = makeAbsolutePath(persistent_table_components.table_location, file_path);
+            const auto manifest_absolute_path = makeAbsolutePath(persistent_table_components.table_location, file_path);
             Int64 added_sequence_number = 0;
             auto added_snapshot_id = manifest_list_deserializer.getValueFromRowByName(i, f_added_snapshot_id);
             if (added_snapshot_id.isNull())
@@ -184,7 +184,7 @@ ManifestFileCacheKeys getManifestList(
                     manifest_list_deserializer.getValueFromRowByName(i, f_content, TypeIndex::Int32).safeGet<Int32>());
             }
             manifest_file_cache_keys.emplace_back(
-                file_path, manifest_file_name, added_sequence_number, added_snapshot_id.safeGet<Int64>(), content_type);
+                manifest_absolute_path, added_sequence_number, added_snapshot_id.safeGet<Int64>(), content_type);
 
             auto dump_row_metadata = [&]()->String { return manifest_list_deserializer.getContent(i); };
             insertRowToLogTable(

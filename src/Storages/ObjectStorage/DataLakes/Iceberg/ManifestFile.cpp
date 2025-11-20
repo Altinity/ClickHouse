@@ -285,11 +285,9 @@ ManifestFileContent::ManifestFileContent(
         }
         const auto schema_id = schema_id_opt.has_value() ? schema_id_opt.value() : manifest_schema_id;
 
-        const auto file_path_key
-            = manifest_file_deserializer.getValueFromRowByName(i, c_data_file_file_path, TypeIndex::String).safeGet<String>();
-        const auto file_path = makeAbsolutePath(
-            table_location,
-            manifest_file_deserializer.getValueFromRowByName(i, c_data_file_file_path, TypeIndex::String).safeGet<String>());
+        const auto file_path_key_field = manifest_file_deserializer.getValueFromRowByName(i, c_data_file_file_path, TypeIndex::String);
+        const auto file_path_key = file_path_key_field.safeGet<String>();
+        const auto file_path = makeAbsolutePath(table_location, file_path_key);
 
         /// NOTE: This is weird, because in manifest file partition looks like this:
         /// {
