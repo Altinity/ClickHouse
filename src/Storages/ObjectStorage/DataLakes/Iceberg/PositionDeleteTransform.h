@@ -29,7 +29,7 @@ public:
         const std::optional<FormatSettings> & format_settings_,
         ContextPtr context_,
         const String & table_location_,
-        std::map<String, ObjectStoragePtr> & secondary_storages_)
+        SecondaryStorages & secondary_storages_)
         : ISimpleTransform(header_, header_, false)
         , header(header_)
         , iceberg_object_info(iceberg_object_info_)
@@ -57,7 +57,7 @@ protected:
     const std::optional<FormatSettings> format_settings;
     ContextPtr context;
     const String table_location;
-    std::map<String, ObjectStoragePtr> & secondary_storages;
+    SecondaryStorages & secondary_storages;
 
     /// We need to keep the read buffers alive since the delete_sources depends on them.
     std::vector<std::unique_ptr<ReadBuffer>> delete_read_buffers;
@@ -74,7 +74,7 @@ public:
         const std::optional<FormatSettings> & format_settings_,
         ContextPtr context_,
         const String & table_location_,
-        std::map<String, ObjectStoragePtr> & secondary_storages_)
+        SecondaryStorages & secondary_storages_)
         : IcebergPositionDeleteTransform(header_, iceberg_object_info_, object_storage_, format_settings_, context_, table_location_, secondary_storages_)
     {
         initialize();
@@ -101,7 +101,7 @@ public:
         const std::optional<FormatSettings> & format_settings_,
         ContextPtr context_,
         const String & table_location_,
-        std::map<String, ObjectStoragePtr> & secondary_storages_)
+        SecondaryStorages & secondary_storages_)
         : IcebergPositionDeleteTransform(header_, iceberg_object_info_, object_storage_, format_settings_, context_, table_location_, secondary_storages_)
     {
         initialize();

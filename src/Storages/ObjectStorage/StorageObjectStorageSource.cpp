@@ -39,7 +39,7 @@
 #endif
 
 #include <fmt/ranges.h>
-
+#include <Disks/DiskType.h>
 
 namespace fs = std::filesystem;
 namespace ProfileEvents
@@ -519,7 +519,9 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
     }
     while (not_a_path || (query_settings.skip_empty_files && object_info->metadata->size_bytes == 0));
     
-    ObjectStoragePtr storage_to_use = object_info->getObjectStorage().value_or(object_storage);
+    ObjectStoragePtr storage_to_use = object_info->getObjectStorage();
+    if (!storage_to_use)
+        storage_to_use = object_storage;
 
     QueryPipelineBuilder builder;
     std::shared_ptr<ISource> source;
@@ -830,7 +832,9 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     const auto & settings = context_->getSettingsRef();
     const auto & effective_read_settings = read_settings.has_value() ? read_settings.value() : context_->getReadSettings();
 
-    ObjectStoragePtr storage_to_use = object_info.getObjectStorage().value_or(object_storage);
+    ObjectStoragePtr storage_to_use = object_info.getObjectStorage();
+    if (!storage_to_use)
+        storage_to_use = object_storage;
 
     bool use_distributed_cache = false;
 #if ENABLE_DISTRIBUTED_CACHE
@@ -1319,20 +1323,22 @@ StorageObjectStorage::ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator
 
         object_info = raw->getObjectInfo();
 
+        // The 'path' field from master is already the correctly resolved relative path.
+        // We should use it directly and NOT overwrite relative_path.
+        // Only resolve absolute_path if we need to determine which storage to use (for secondary storages).
+        object_info->object_storage_to_use = object_storage;
+        
         if (raw->absolute_path.has_value())
         {
             auto [storage_to_use, key]
                 = resolveObjectStorageForPath("", raw->absolute_path.value(), object_storage, secondary_storages, getContext());
 
-            if (!key.empty()) /// Otherwise not a valid key/path, maybe it is "retry_after_us". Store as is.
+            if (!key.empty() && storage_to_use != object_storage)
             {
+                // File is in a different storage (secondary storage), use that storage
+                // BUT preserve the original relative_path from master - don't overwrite it!
                 object_info->object_storage_to_use = storage_to_use;
-                object_info->relative_path = key;
             }
-        }
-        else
-        {
-            object_info->object_storage_to_use = object_storage;
         }
     }
     else
@@ -1430,7 +1436,10 @@ StorageObjectStorageSource::ArchiveIterator::createArchiveReader(ObjectInfoPtr o
     return DB::createArchiveReader(
         /* path_to_archive */
         object_info->getPath(),
-        /* archive_read_function */ [=, this]() { return createReadBuffer(*object_info, object_info->getObjectStorage().value_or(object_storage), getContext(), log); },
+        /* archive_read_function */ [=, this]() { 
+            ObjectStoragePtr storage = object_info->getObjectStorage() ? object_info->getObjectStorage() : object_storage;
+            return createReadBuffer(*object_info, storage, getContext(), log); 
+        },
         /* archive_size */ size);
 }
 
@@ -1453,7 +1462,9 @@ ObjectInfoPtr StorageObjectStorageSource::ArchiveIterator::next(size_t processor
 
                 if (!archive_object->metadata)
                 {
-                    ObjectStoragePtr storage_to_use = archive_object->getObjectStorage().value_or(object_storage);
+                    ObjectStoragePtr storage_to_use = archive_object->getObjectStorage();
+                    if (!storage_to_use)
+                        storage_to_use = object_storage;
                     archive_object->metadata = storage_to_use->getObjectMetadata(archive_object->getPath());
                 }
 
@@ -1482,7 +1493,9 @@ ObjectInfoPtr StorageObjectStorageSource::ArchiveIterator::next(size_t processor
 
             if (!archive_object->metadata)
             {
-                ObjectStoragePtr storage_to_use = archive_object->getObjectStorage().value_or(object_storage);
+                ObjectStoragePtr storage_to_use = archive_object->getObjectStorage();
+                if (!storage_to_use)
+                    storage_to_use = object_storage;
                 archive_object->metadata = storage_to_use->getObjectMetadata(archive_object->getPath());
             }
 

@@ -2,11 +2,20 @@
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 
 #include <Disks/ObjectStorages/IObjectStorage_fwd.h>
+#include <mutex>
+#include <map>
 
 namespace DB
 {
 
 class IObjectStorage;
+
+/// Thread-safe wrapper for secondary object storages map
+struct SecondaryStorages
+{
+    mutable std::mutex mutex;
+    std::map<std::string, ObjectStoragePtr> storages;
+};
 
 // A URI splitted into components
 //  s3://bucket/a/b -> scheme="s3", authority="bucket", path="/a/b"
@@ -56,7 +65,7 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
     const std::string & table_location,
     const std::string & path,
     const DB::ObjectStoragePtr & base_storage,
-    std::map<std::string, DB::ObjectStoragePtr> & secondary_storages,
+    SecondaryStorages & secondary_storages,
     const DB::ContextPtr & context);
 
 }

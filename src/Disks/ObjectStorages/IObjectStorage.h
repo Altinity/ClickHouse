@@ -143,7 +143,7 @@ struct PathWithMetadata
     /// Retry request after short pause
     CommandInTaskResponse command;
     std::optional<String> absolute_path;
-    std::optional<ObjectStoragePtr> object_storage_to_use = std::nullopt;
+    ObjectStoragePtr object_storage_to_use = nullptr;
 
     PathWithMetadata() = default;
 
@@ -151,11 +151,11 @@ struct PathWithMetadata
         const String & command_or_path,
         std::optional<ObjectMetadata> metadata_ = std::nullopt,
         std::optional<String> absolute_path_ = std::nullopt,
-        std::optional<ObjectStoragePtr> object_storage_to_use_ = std::nullopt)
+        ObjectStoragePtr object_storage_to_use_ = nullptr)
         : relative_path(std::move(command_or_path))
         , metadata(std::move(metadata_))
         , command(relative_path)
-        , absolute_path(absolute_path_)
+        , absolute_path((absolute_path_.has_value() && !absolute_path_.value().empty()) ? absolute_path_ : std::nullopt)
         , object_storage_to_use(object_storage_to_use_)
     {
         if (command.is_parsed())
@@ -183,7 +183,7 @@ struct PathWithMetadata
 
     void loadMetadata(ObjectStoragePtr object_storage, bool ignore_non_existent_file = true);
 
-    std::optional<ObjectStoragePtr> getObjectStorage() const { return object_storage_to_use; }
+    ObjectStoragePtr getObjectStorage() const { return object_storage_to_use; }
 };
 
 struct ObjectKeyWithMetadata

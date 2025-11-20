@@ -76,7 +76,7 @@ Iceberg::ManifestFilePtr getManifestFile(
     const String & absolute_path,
     Int64 inherited_sequence_number,
     Int64 inherited_snapshot_id,
-    std::map<String, ObjectStoragePtr> & secondary_storages)
+    SecondaryStorages & secondary_storages)
 {
     auto log_level = local_context->getSettingsRef()[Setting::iceberg_metadata_log_level].value;
 

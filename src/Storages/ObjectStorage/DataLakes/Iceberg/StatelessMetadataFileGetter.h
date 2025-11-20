@@ -19,6 +19,7 @@
 
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PersistentTableComponents.h>
+#include <Storages/ObjectStorage/Utils.h>
 
 namespace DB::Iceberg
 {
@@ -32,7 +33,7 @@ Iceberg::ManifestFilePtr getManifestFile(
     const String & absolute_path,
     Int64 inherited_sequence_number,
     Int64 inherited_snapshot_id,
-    std::map<String, ObjectStoragePtr> & secondary_storages);
+    SecondaryStorages & secondary_storages);
 
 
 ManifestFileCacheKeys getManifestList(

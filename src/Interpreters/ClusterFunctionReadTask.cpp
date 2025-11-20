@@ -51,7 +51,9 @@ ObjectInfoPtr ClusterFunctionReadTaskResponse::getObjectInfo() const
     auto object = std::make_shared<ObjectInfo>(path);
     object->data_lake_metadata = data_lake_metadata;
     object->file_meta_info = file_meta_info;
-    object->absolute_path = absolute_path;
+    if (absolute_path.has_value() && !absolute_path.value().empty())
+        object->absolute_path = absolute_path;
+    
     return object;
 }
 

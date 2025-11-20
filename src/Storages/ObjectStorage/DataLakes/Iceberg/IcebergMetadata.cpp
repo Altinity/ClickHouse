@@ -133,6 +133,7 @@ IcebergMetadata::IcebergMetadata(
     IcebergMetadataFilesCachePtr cache_ptr,
     CompressionMethod metadata_compression_method_)
     : object_storage(std::move(object_storage_))
+    , secondary_storages(std::make_shared<SecondaryStorages>())
     , configuration(std::move(configuration_))
     , persistent_components(PersistentTableComponents{
           .schema_processor = std::make_shared<IcebergSchemaProcessor>(context_),
@@ -502,7 +503,7 @@ void IcebergMetadata::updateSnapshot(ContextPtr local_context, Poco::JSON::Objec
             auto [partition_key, sorting_key] = extractIcebergKeys(metadata_object);
 
             String manifest_list_path = snapshot->getValue<String>(f_manifest_list);
-            auto [storage_to_use, key_in_storage] = resolveObjectStorageForPath(persistent_components.table_location, manifest_list_path, object_storage, secondary_storages, local_context);
+            auto [storage_to_use, key_in_storage] = resolveObjectStorageForPath(persistent_components.table_location, manifest_list_path, object_storage, *secondary_storages, local_context);
 
             relevant_snapshot = std::make_shared<IcebergDataSnapshot>(
                 getManifestList(
@@ -549,7 +550,7 @@ bool IcebergMetadata::optimize(const StorageMetadataPtr & metadata_snapshot, Con
             snapshots_info,
             persistent_components,
             object_storage,
-            secondary_storages,
+            *secondary_storages,
             configuration_ptr,
             format_settings,
             sample_block,
@@ -930,7 +931,7 @@ std::optional<size_t> IcebergMetadata::totalRows(ContextPtr local_context) const
             manifest_list_entry.manifest_file_absolute_path,
             manifest_list_entry.added_sequence_number,
             manifest_list_entry.added_snapshot_id,
-            secondary_storages);
+            *secondary_storages);
         auto data_count = manifest_file_ptr->getRowsCountInAllFilesExcludingDeleted(FileContentType::DATA);
         auto position_deletes_count = manifest_file_ptr->getRowsCountInAllFilesExcludingDeleted(FileContentType::POSITION_DELETE);
         if (!data_count.has_value() || !position_deletes_count.has_value())
@@ -971,7 +972,7 @@ std::optional<size_t> IcebergMetadata::totalBytes(ContextPtr local_context) cons
             manifest_list_entry.manifest_file_absolute_path,
             manifest_list_entry.added_sequence_number,
             manifest_list_entry.added_snapshot_id,
-            secondary_storages);
+            *secondary_storages);
         auto count = manifest_file_ptr->getBytesCountInAllDataFilesExcludingDeleted();
         if (!count.has_value())
             return {};
@@ -1052,7 +1053,7 @@ void IcebergMetadata::addDeleteTransformers(
         LOG_DEBUG(log, "Constructing filter transform for position delete, there are {} delete objects", iceberg_object_info->position_deletes_objects.size());
         builder.addSimpleTransform(
             [&](const SharedHeader & header)
-            { return iceberg_object_info->getPositionDeleteTransformer(object_storage, header, format_settings, local_context, persistent_components.table_location, secondary_storages); });
+            { return iceberg_object_info->getPositionDeleteTransformer(object_storage, header, format_settings, local_context, persistent_components.table_location, *secondary_storages); });
     }
     const auto & delete_files = iceberg_object_info->equality_deletes_objects;
     if (!delete_files.empty())
@@ -1065,7 +1066,7 @@ void IcebergMetadata::addDeleteTransformers(
             Block delete_file_header;
 
             auto [delete_storage_to_use, resolved_delete_key] = resolveObjectStorageForPath(
-                persistent_components.table_location, delete_file.file_path, object_storage, secondary_storages, local_context);
+                persistent_components.table_location, delete_file.file_path, object_storage, *secondary_storages, local_context);
             
             PathWithMetadata delete_file_object(resolved_delete_key, std::nullopt, delete_file.file_path, delete_storage_to_use);
             {

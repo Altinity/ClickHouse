@@ -28,6 +28,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergIterator.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PersistentTableComponents.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/StatelessMetadataFileGetter.h>
+#include <Storages/ObjectStorage/Utils.h>
 
 namespace DB
 {
@@ -140,7 +141,7 @@ protected:
 
 private:
     const ObjectStoragePtr object_storage;
-    mutable std::map<String, ObjectStoragePtr> secondary_storages; // Sometimes data or manifests can be located on another storage
+    mutable std::shared_ptr<SecondaryStorages> secondary_storages; // Sometimes data or manifests can be located on another storage
 
     const StorageObjectStorageConfigurationWeakPtr configuration;
 

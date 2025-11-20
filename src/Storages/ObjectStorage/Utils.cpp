@@ -34,16 +34,16 @@ namespace ErrorCodes
 namespace
 {
 
-std::string normalizeSchema(const std::string & schema)
+std::string normalizeScheme(const std::string & scheme)
 {
-    auto schema_lowercase = Poco::toLower(schema);
+    auto scheme_lowercase = Poco::toLower(scheme);
 
-    if (schema_lowercase == "s3a" || schema_lowercase == "s3n")
-        schema_lowercase = "s3";
-    else if (schema_lowercase == "wasb" || schema_lowercase == "wasbs" || schema_lowercase == "abfss")
-        schema_lowercase = "abfs";
+    if (scheme_lowercase == "s3a" || scheme_lowercase == "s3n")
+        scheme_lowercase = "s3";
+    else if (scheme_lowercase == "wasb" || scheme_lowercase == "wasbs" || scheme_lowercase == "abfss")
+        scheme_lowercase = "abfs";
 
-    return schema_lowercase;
+    return scheme_lowercase;
 }
 
 std::string factoryTypeForScheme(const std::string & normalized_scheme)
@@ -63,6 +63,7 @@ bool isAbsolutePath(const std::string & path)
     return false;
 }
 
+/// Normalize a path string by removing redundant components and leading slashes.
 std::string normalizePathString(const std::string & path)
 {
     std::filesystem::path fs_path(path);
@@ -79,11 +80,11 @@ std::string normalizePathString(const std::string & path)
 #if USE_AWS_S3
 /// For s3:// URIs (generic), bucket needs to match.
 /// For explicit http(s):// URIs, both bucket and endpoint must match.
-bool s3URIMatches(const S3::URI & target_uri, const std::string & base_bucket, const std::string & base_endpoint, const std::string & target_schema_normalized)
+bool s3URIMatches(const S3::URI & target_uri, const std::string & base_bucket, const std::string & base_endpoint, const std::string & target_scheme_normalized)
 {
     bool bucket_matches = (target_uri.bucket == base_bucket);
     bool endpoint_matches = (target_uri.endpoint == base_endpoint);
-    bool is_generic_s3_uri = (target_schema_normalized == "s3");
+    bool is_generic_s3_uri = (target_scheme_normalized == "s3");
     return bucket_matches && (endpoint_matches || is_generic_s3_uri);
 }
 #endif
@@ -92,12 +93,15 @@ std::pair<ObjectStoragePtr, std::string> getOrCreateStorageAndKey(
     const std::string & cache_key,
     const std::string & key_to_use,
     const std::string & storage_type,
-    std::map<std::string, ObjectStoragePtr> & secondary_storages,
+    SecondaryStorages & secondary_storages,
     const ContextPtr & context,
     std::function<void(Poco::Util::MapConfiguration &, const std::string &)> configure_fn)
 {
-    if (auto it = secondary_storages.find(cache_key); it != secondary_storages.end())
-        return {it->second, key_to_use};
+    {
+        std::lock_guard lock(secondary_storages.mutex);
+        if (auto it = secondary_storages.storages.find(cache_key); it != secondary_storages.storages.end())
+            return {it->second, key_to_use};
+    }
 
     Poco::AutoPtr<Poco::Util::MapConfiguration> cfg(new Poco::Util::MapConfiguration);
     const std::string config_prefix = "object_storages." + cache_key;
@@ -109,11 +113,17 @@ std::pair<ObjectStoragePtr, std::string> getOrCreateStorageAndKey(
     auto & factory = ObjectStorageFactory::instance();
     ObjectStoragePtr storage = factory.create(cache_key, *cfg, config_prefix, context, /*skip_access_check*/ true);
 
-    secondary_storages.emplace(cache_key, storage);
+    {
+        std::lock_guard lock(secondary_storages.mutex);
+        auto [it, inserted] = secondary_storages.storages.emplace(cache_key, storage);
+        if (!inserted)
+            return {it->second, key_to_use};
+    }
 
     return {storage, key_to_use};
 }
 
+/// Normalize a path (relative to table location ot absolute path) to a key that will be looked up in the object storage.
 std::string normalizePathToStorageRoot(const std::string & table_location, const std::string & path)
 {
     if (table_location.empty())
@@ -306,7 +316,7 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
     const std::string & table_location,
     const std::string & path,
     const DB::ObjectStoragePtr & base_storage,
-    std::map<std::string, DB::ObjectStoragePtr> & secondary_storages,
+    SecondaryStorages & secondary_storages,
     const DB::ContextPtr & context)
 {
     if (!isAbsolutePath(path))
@@ -315,18 +325,12 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
     SchemeAuthorityKey table_location_decomposed{table_location};
     SchemeAuthorityKey target_decomposed{path};
 
-    if (target_decomposed.scheme.empty())
-    {
-        // Path has no scheme but wasn't caught by isRelativePath; treat it as relative and normalize to storage root
-        return {base_storage, normalizePathToStorageRoot(table_location, target_decomposed.key)};
-    }
-
-    const std::string base_schema_normalized = normalizeSchema(table_location_decomposed.scheme);
-    const std::string target_schema_normalized = normalizeSchema(target_decomposed.scheme);
+    const std::string base_scheme_normalized = normalizeScheme(table_location_decomposed.scheme);
+    const std::string target_scheme_normalized = normalizeScheme(target_decomposed.scheme);
 
     // For S3 URIs, use S3::URI to properly handle all kinds of URIs, e.g. https://s3.amazonaws.com/bucket/... == s3://bucket/...
     #if USE_AWS_S3
-    if (target_schema_normalized == "s3" || target_schema_normalized == "https" || target_schema_normalized == "http")
+    if (target_scheme_normalized == "s3" || target_scheme_normalized == "https" || target_scheme_normalized == "http")
     {
         std::string normalized_path = path;
         if (target_decomposed.scheme == "s3a" || target_decomposed.scheme == "s3n")
@@ -345,12 +349,12 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
                 const std::string base_bucket = s3_storage->getObjectsNamespace();
                 const std::string base_endpoint = s3_storage->getDescription();
 
-                if (s3URIMatches(s3_uri, base_bucket, base_endpoint, target_schema_normalized))
+                if (s3URIMatches(s3_uri, base_bucket, base_endpoint, target_scheme_normalized))
                     use_base_storage = true;
             }
         }
         
-        if (!use_base_storage && (base_schema_normalized == "s3" || base_schema_normalized == "https" || base_schema_normalized == "http"))
+        if (!use_base_storage && (base_scheme_normalized == "s3" || base_scheme_normalized == "https" || base_scheme_normalized == "http"))
         {
             std::string normalized_table_location = table_location;
             if (table_location_decomposed.scheme == "s3a" || table_location_decomposed.scheme == "s3n")
@@ -359,7 +363,7 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
             }
             S3::URI base_s3_uri(normalized_table_location);
             
-            if (s3URIMatches(s3_uri, base_s3_uri.bucket, base_s3_uri.endpoint, target_schema_normalized))
+            if (s3URIMatches(s3_uri, base_s3_uri.bucket, base_s3_uri.endpoint, target_scheme_normalized))
                 use_base_storage = true;
         }
         
@@ -411,7 +415,7 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
     #endif
 
     #if USE_HDFS
-    if (target_schema_normalized == "hdfs")
+    if (target_scheme_normalized == "hdfs")
     {
         bool use_base_storage = false;
         
@@ -429,13 +433,13 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
                     base_endpoint = base_url;
                 
                 // For HDFS, compare endpoints (namenode addresses)
-                std::string target_endpoint = target_schema_normalized + "://" + target_decomposed.authority;
+                std::string target_endpoint = target_scheme_normalized + "://" + target_decomposed.authority;
                 
                 if (base_endpoint == target_endpoint)
                     use_base_storage = true;
                 
                 // Also check if table_location matches
-                if (!use_base_storage && base_schema_normalized == "hdfs")
+                if (!use_base_storage && base_scheme_normalized == "hdfs")
                 {
                     if (table_location_decomposed.authority == target_decomposed.authority)
                         use_base_storage = true;
@@ -449,17 +453,17 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
     #endif
 
     /// Fallback for schemes not handled above (e.g., abfs, file)
-    if (base_schema_normalized == target_schema_normalized && table_location_decomposed.authority == target_decomposed.authority)
+    if (base_scheme_normalized == target_scheme_normalized && table_location_decomposed.authority == target_decomposed.authority)
         return {base_storage, target_decomposed.key};
 
-    const std::string cache_key = target_schema_normalized + "://" + target_decomposed.authority;
+    const std::string cache_key = target_scheme_normalized + "://" + target_decomposed.authority;
 
-    const std::string type_for_factory = factoryTypeForScheme(target_schema_normalized);
+    const std::string type_for_factory = factoryTypeForScheme(target_scheme_normalized);
     if (type_for_factory.empty())
-        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "Unsupported storage scheme '{}' in path '{}'", target_schema_normalized, path);
+        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "Unsupported storage scheme '{}' in path '{}'", target_scheme_normalized, path);
 
     std::string key_to_use = target_decomposed.key;
-    if (target_schema_normalized == "file")
+    if (target_scheme_normalized == "file")
         key_to_use = "/" + target_decomposed.key;  // file:///absolute/path/to/file -> key = /absolute/path/to/file (full POSIX path)
 
     /// Handle storage types that need new storage creation
@@ -471,7 +475,7 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
         context,
         [&](Poco::Util::MapConfiguration & cfg, const std::string & config_prefix)
         {
-            if (target_schema_normalized == "file")
+            if (target_scheme_normalized == "file")
             {
                 std::filesystem::path fs_path(key_to_use);
                 std::filesystem::path parent = fs_path.parent_path();
@@ -484,14 +488,14 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
                 
                 cfg.setString(config_prefix + ".path", dir_path);
             }
-            else if (target_schema_normalized == "abfs")
+            else if (target_scheme_normalized == "abfs")
             {
-                cfg.setString(config_prefix + ".endpoint", target_schema_normalized + "://" + target_decomposed.authority);
+                cfg.setString(config_prefix + ".endpoint", target_scheme_normalized + "://" + target_decomposed.authority);
             }
-            else if (target_schema_normalized == "hdfs")
+            else if (target_scheme_normalized == "hdfs")
             {
                 // HDFS endpoint must end with '/'
-                auto endpoint = target_schema_normalized + "://" + target_decomposed.authority;
+                auto endpoint = target_scheme_normalized + "://" + target_decomposed.authority;
                 if (!endpoint.empty() && endpoint.back() != '/')
                     endpoint.push_back('/');
                 cfg.setString(config_prefix + ".endpoint", endpoint);
