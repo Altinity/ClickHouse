@@ -534,7 +534,7 @@ def test_export_partition_file_already_exists_policy(cluster):
         """
     ) == "COMPLETED\n", "Export should be marked as COMPLETED"
 
-    # wait for the exports to finish (already completed, but ensure it's done)
+    # wait for the exports to finish
     wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED")
 
     # try to export the partition
@@ -580,7 +580,7 @@ def test_export_partition_file_already_exists_policy(cluster):
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS export_merge_tree_partition_force_export=1, export_merge_tree_part_file_already_exists_policy='error', export_merge_tree_partition_max_retries=1",
     )
 
-    # wait for the export to finish (should fail)
+    # wait for the export to finish
     wait_for_export_status(node, mt_table, s3_table, "2020", "FAILED")
 
     # check system.replicated_partition_exports for the export
