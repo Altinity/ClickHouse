@@ -33,14 +33,14 @@ TEST_F(ExportPartitionOrderingTest, IterationOrderMatchesCreateTime)
     manifest2.partition_id = "2021";
     manifest2.destination_database = "db1";
     manifest2.destination_table = "table1";
-    manifest1.transaction_id = "tx2";
+    manifest2.transaction_id = "tx2";
     manifest2.create_time = base_time + 100; // Middle
     
     ExportReplicatedMergeTreePartitionManifest manifest3;
     manifest3.partition_id = "2022";
     manifest3.destination_database = "db1";
     manifest3.destination_table = "table1";
-    manifest1.transaction_id = "tx3";
+    manifest3.transaction_id = "tx3";
     manifest3.create_time = base_time; // Oldest
 
     ExportReplicatedMergeTreePartitionTaskEntry entry1{manifest1, ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING, {}};
