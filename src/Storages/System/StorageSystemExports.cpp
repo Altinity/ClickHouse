@@ -20,7 +20,7 @@ ColumnsDescription StorageSystemExports::getColumnsDescription()
         {"source_table", std::make_shared<DataTypeString>(), "Name of the source table."},
         {"destination_database", std::make_shared<DataTypeString>(), "Name of the destination database."},
         {"destination_table", std::make_shared<DataTypeString>(), "Name of the destination table."},
-        {"create_time", std::make_shared<DataTypeDateTime>(), "Date and time when the export command was submitted for execution."},
+        {"create_time", std::make_shared<DataTypeDateTime>(), "Date and time when the export command was received in the server."},
         {"part_name", std::make_shared<DataTypeString>(), "Name of the part"},
         {"destination_file_path", std::make_shared<DataTypeString>(), "File path where the part is being exported."},
         {"elapsed", std::make_shared<DataTypeFloat64>(), "The time elapsed (in seconds) since the export started."},
