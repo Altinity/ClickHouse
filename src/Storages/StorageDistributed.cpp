@@ -2384,6 +2384,9 @@ void StorageDistributed::delayInsertOrThrowIfNeeded() const
 
 void StorageDistributed::setHybridLayout(ColumnsDescription base_segment_columns_, std::vector<HybridSegment> segments_)
 {
+    /// Hybrid keeps a snapshot of segment schemas captured during CREATE/ATTACH to avoid re-reading (possibly remote) headers on every query.
+    /// A TTL-based cache was considered but deemed overkill for this experimental feature.
+    /// Subsequent segment DDL changes are not auto-detected; reattach/recreate the Hybrid table to refresh.
     base_segment_columns = std::move(base_segment_columns_);
     segments = std::move(segments_);
     log = getLogger("Hybrid (" + getStorageID().table_name + ")");

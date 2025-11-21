@@ -50,7 +50,9 @@ class StorageDistributed final : public IStorage, WithContext
     friend class StorageSystemDistributionQueue;
 
 public:
-    /// Structure to hold table function AST, predicate, optional StorageID, and cached physical columns for the segment
+    /// Structure to hold table function AST, predicate, optional StorageID, and cached physical columns for the segment.
+    /// Cached columns let us detect schema mismatches and enable features like hybrid_table_auto_cast_columns without
+    /// re-fetching remote headers on every query.
     struct HybridSegment
     {
         ASTPtr table_function_ast;
