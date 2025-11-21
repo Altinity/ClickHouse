@@ -6468,13 +6468,13 @@ void MergeTreeData::exportPartToTable(
         return ast ? ast->formatWithSecretsOneLine() : "";
     };
 
-    auto src_snapshot = getInMemoryMetadataPtr();
-    auto destination_snapshot = dest_storage->getInMemoryMetadataPtr();
+    auto source_metadata_ptr = getInMemoryMetadataPtr();
+    auto destination_metadata_ptr = dest_storage->getInMemoryMetadataPtr();
 
-    if (destination_snapshot->getColumns().getAllPhysical().sizeOfDifference(src_snapshot->getColumns().getAllPhysical()))
+    if (destination_metadata_ptr->getColumns().getAllPhysical().sizeOfDifference(source_metadata_ptr->getColumns().getAllPhysical()))
         throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS, "Tables have different structure");
 
-    if (query_to_string(src_snapshot->getPartitionKeyAST()) != query_to_string(destination_snapshot->getPartitionKeyAST()))
+    if (query_to_string(source_metadata_ptr->getPartitionKeyAST()) != query_to_string(destination_metadata_ptr->getPartitionKeyAST()))
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
 
     auto part = getPartIfExists(part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
@@ -6491,6 +6491,7 @@ void MergeTreeData::exportPartToTable(
             transaction_id,
             query_context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value,
             format_settings,
+            getStorageSnapshot(source_metadata_ptr, query_context),
             completion_callback);
 
         std::lock_guard lock(export_manifests_mutex);
