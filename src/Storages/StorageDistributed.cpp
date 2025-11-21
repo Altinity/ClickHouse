@@ -2572,6 +2572,22 @@ void registerStorageHybrid(StorageFactory & factory)
         if (columns_to_use.empty())
             columns_to_use = first_segment_columns;
 
+        auto validate_segment_schema = [&](const ColumnsDescription & segment_columns, const String & segment_name)
+        {
+            for (const auto & column : columns_to_use.getAllPhysical())
+            {
+                if (!segment_columns.tryGetPhysical(column.name))
+                {
+                    throw Exception(
+                        ErrorCodes::BAD_ARGUMENTS,
+                        "Hybrid segment '{}' is missing column '{}' required by Hybrid schema",
+                        segment_name, column.name);
+                }
+            }
+        };
+
+        validate_segment_schema(first_segment_columns, engine_args[0]->formatForLogging());
+
         // Execute the table function to get the underlying storage
         StoragePtr storage = table_function->execute(
             first_arg,
@@ -2648,6 +2664,8 @@ void registerStorageHybrid(StorageFactory & factory)
                 ColumnsDescription segment_columns = additional_table_function->getActualTableStructure(local_context, true);
                 replaceCurrentDatabaseFunction(normalized_table_function_ast, local_context);
 
+                validate_segment_schema(segment_columns, normalized_table_function_ast->formatForLogging());
+
                 // It's a table function - store the AST and cached schema for later execution
                 segment_definitions.emplace_back(normalized_table_function_ast, predicate_ast, std::move(segment_columns));
             }
@@ -2719,6 +2737,8 @@ void registerStorageHybrid(StorageFactory & factory)
 
                     if (validated_table)
                         segment_columns = validated_table->getInMemoryMetadataPtr()->getColumns();
+
+                    validate_segment_schema(segment_columns, storage_id.getNameForLogs());
 
                     segment_definitions.emplace_back(table_function_ast, predicate_ast, storage_id, std::move(segment_columns));
                 }
