@@ -1127,7 +1127,6 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
 
     replacement_table_expression->setAlias(query_info.table_expression->getAlias());
 
-
     QueryTreeNodePtr filter;
 
     if (additional_filter)
@@ -1139,8 +1138,7 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
         QueryAnalysisPass(replacement_table_expression).run(filter, context);
     }
 
-    auto replacement_table_expression_ptr = replacement_table_expression;
-    auto query_tree_to_modify = query_info.query_tree->cloneAndReplace(query_info.table_expression, std::move(replacement_table_expression));
+    auto query_tree_to_modify = query_info.query_tree->cloneAndReplace(query_info.table_expression, replacement_table_expression);
 
     // Apply additional filter if provided
     if (filter)
@@ -1155,7 +1153,7 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
     {
         applyHybridCastsToQueryTree(
             query_tree_to_modify,
-            replacement_table_expression_ptr,
+            replacement_table_expression,
             metadata_columns,
             *columns_to_cast,
             actual_columns_for_cast,
