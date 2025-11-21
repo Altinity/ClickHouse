@@ -118,7 +118,6 @@
 #include <memory>
 #include <filesystem>
 #include <cassert>
-#include <unordered_map>
 #include <boost/algorithm/string/find_iterator.hpp>
 #include <boost/algorithm/string/finder.hpp>
 
@@ -171,130 +170,7 @@ void replaceCurrentDatabaseFunction(ASTPtr & ast, const ContextPtr & context)
         replaceCurrentDatabaseFunction(child, context);
 }
 
-NameSet collectColumnsToCast(
-    const ColumnsDescription & metadata_columns,
-    const ColumnsDescription & actual_columns)
-{
-    NameSet names;
-    if (metadata_columns.empty() || actual_columns.empty())
-        return names;
 
-    for (const auto & expected_column : metadata_columns.getAllPhysical())
-    {
-        auto actual_column_opt = actual_columns.tryGetPhysical(expected_column.name);
-        if (!actual_column_opt)
-            continue;
-
-        if (!actual_column_opt->type->equals(*expected_column.type))
-            names.emplace(expected_column.name);
-    }
-
-    return names;
-}
-
-void applyHybridCastsToQueryTree(
-    QueryTreeNodePtr & query_tree,
-    const QueryTreeNodePtr & replacement_table_expression,
-    const ColumnsDescription & metadata_columns,
-    const NameSet & columns_to_cast,
-    const ColumnsDescription & actual_columns,
-    const ContextPtr & context)
-{
-    if (columns_to_cast.empty())
-        return;
-
-    // Visitor replaces all usages of the column with CAST(column, type) in the query tree.
-    //
-    // It normalizes headers coming from different segments when table structure in some segments
-    // differs from the Hybrid table definition. For example column X is UInt32 in the Hybrid table,
-    // but Int64 in an additional segment.
-    //
-    // Without these casts ConvertingActions may fail to reconcile mismatched headers when casts are impossible
-    // (e.g. AggregateFunction states carry hashed data tied to their argument type and cannot be recast), for example:
-    // "Conversion from AggregateFunction(uniq, Decimal(38, 0)) to AggregateFunction(uniq, UInt64) is not supported"
-    // (CANNOT_CONVERT_TYPE).
-    //
-    // Per-segment casts are not reliable because WithMergeState strips aliases, so merged pipelines
-    // from different segments would return different headers (with or without CAST), leading to errors
-    // like "Cannot find column `max(value)` in source stream, there are only columns: [max(_CAST(value, 'UInt64'))]"
-    // (THERE_IS_NO_COLUMN).
-    class HybridCastVisitor : public InDepthQueryTreeVisitor<HybridCastVisitor>
-    {
-    public:
-        HybridCastVisitor(
-            const QueryTreeNodePtr & table_expression_,
-            const ColumnsDescription & metadata_columns_,
-            const NameSet & columns_to_cast_,
-            const ColumnsDescription & actual_columns_,
-            ContextPtr context_)
-            : table_expression(table_expression_)
-            , hybrid_schema(metadata_columns_)
-            , columns_to_cast(columns_to_cast_)
-            , segment_columns(actual_columns_)
-            , context(std::move(context_))
-        {}
-
-        bool shouldTraverseTopToBottom() const { return false; }
-
-        static bool needChildVisit(QueryTreeNodePtr & /*parent*/, QueryTreeNodePtr & child)
-        {
-            auto child_type = child->getNodeType();
-            return !(child_type == QueryTreeNodeType::QUERY || child_type == QueryTreeNodeType::UNION);
-        }
-
-        void visitImpl(QueryTreeNodePtr & node)
-        {
-            auto * column_node = node->as<ColumnNode>();
-            if (!column_node)
-                return;
-
-            auto column_source = column_node->getColumnSourceOrNull();
-            if (column_source != table_expression)
-                return;
-
-            const auto & column_name = column_node->getColumnName();
-            if (!columns_to_cast.contains(column_name))
-                return;
-
-            auto expected_column_opt = hybrid_schema.tryGetPhysical(column_name);
-            if (!expected_column_opt)
-                throw Exception(
-                    ErrorCodes::LOGICAL_ERROR,
-                    "Column '{}' expected in Hybrid schema while applying casts, but it is missing",
-                    column_name);
-
-            auto actual_column_opt = segment_columns.tryGetPhysical(column_name);
-            const auto & source_column = actual_column_opt ? *actual_column_opt : *expected_column_opt;
-
-            auto column_clone = std::static_pointer_cast<ColumnNode>(column_node->clone());
-            column_clone->setColumnType(source_column.type);
-
-            auto cast_node = buildCastFunction(column_clone, expected_column_opt->type, context);
-            const auto & alias = node->getAlias();
-            if (!alias.empty())
-                cast_node->setAlias(alias);
-            else
-                cast_node->setAlias(column_name);
-
-            node = cast_node;
-        }
-
-    private:
-        QueryTreeNodePtr table_expression;
-        const ColumnsDescription & hybrid_schema;
-        const NameSet & columns_to_cast;
-        const ColumnsDescription & segment_columns;
-        ContextPtr context;
-    };
-
-    HybridCastVisitor visitor(
-        replacement_table_expression,
-        metadata_columns,
-        columns_to_cast,
-        actual_columns,
-        context);
-    visitor.visit(query_tree);
-}
 }
 
 namespace Setting
@@ -328,7 +204,6 @@ namespace Setting
     extern const SettingsBool prefer_global_in_and_join;
     extern const SettingsBool enable_global_with_statement;
     extern const SettingsBool allow_experimental_hybrid_table;
-    extern const SettingsBool hybrid_table_auto_cast_columns;
 }
 
 namespace DistributedSetting
@@ -1075,10 +950,7 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
     const StorageSnapshotPtr & distributed_storage_snapshot,
     const StorageID & remote_storage_id,
     const ASTPtr & remote_table_function,
-    const ASTPtr & additional_filter,
-    const NameSet & columns_to_cast,
-    const ColumnsDescription & metadata_columns,
-    const ColumnsDescription & actual_columns_for_cast)
+    const ASTPtr & additional_filter)
 {
     auto & planner_context = query_info.planner_context;
     const auto & query_context = planner_context->getQueryContext();
@@ -1167,17 +1039,6 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
             : std::move(filter);
     }
 
-    if (!columns_to_cast.empty())
-    {
-        applyHybridCastsToQueryTree(
-            query_tree_to_modify,
-            replacement_table_expression,
-            metadata_columns,
-            columns_to_cast,
-            actual_columns_for_cast,
-            query_context);
-    }
-
     ReplaseAliasColumnsVisitor replase_alias_columns_visitor;
     replase_alias_columns_visitor.visit(query_tree_to_modify);
 
@@ -1219,32 +1080,6 @@ void StorageDistributed::read(
 
     const auto & settings = local_context->getSettingsRef();
     auto metadata_ptr = getInMemoryMetadataPtr();
-    const auto & metadata_columns = metadata_ptr->getColumns();
-
-    const bool enable_hybrid_column_casts = settings[Setting::hybrid_table_auto_cast_columns]
-        && (!base_segment_columns.empty() || !segments.empty());
-
-    NameSet columns_to_cast_names; /// Empty when no casts are needed
-    if (enable_hybrid_column_casts)
-    {
-        if (!base_segment_columns.empty())
-        {
-            auto names = collectColumnsToCast(metadata_columns, base_segment_columns);
-            columns_to_cast_names.insert(names.begin(), names.end());
-        }
-
-        for (const auto & segment : segments)
-        {
-            auto names = collectColumnsToCast(metadata_columns, segment.actual_columns);
-            columns_to_cast_names.insert(names.begin(), names.end());
-        }
-    }
-
-    const bool need_hybrid_casts = !columns_to_cast_names.empty();
-    const auto * base_actual_columns_for_cast = !base_segment_columns.empty() ? &base_segment_columns : &metadata_columns;
-
-    if (need_hybrid_casts && !settings[Setting::allow_experimental_analyzer])
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Setting 'hybrid_table_auto_cast_columns' is supported only with allow_experimental_analyzer=1");
 
     auto describe_segment_target = [&](const HybridSegment & segment) -> String
     {
@@ -1256,10 +1091,11 @@ void StorageDistributed::read(
         return String{"<unknown_segment>"};
     };
 
-    const bool log_hybrid_casts = need_hybrid_casts && log->is(Poco::Message::PRIO_TRACE);
+    const bool log_hybrid_query_rewrites = (!segments.empty() || base_segment_predicate);
+
     auto log_rewritten_query = [&](const String & target, const ASTPtr & ast)
     {
-        if (!log_hybrid_casts || !ast)
+        if (!log_hybrid_query_rewrites || !ast)
             return;
 
         LOG_TRACE(log, "rewriteSelectQuery (target: {}) -> {}", target, ast->formatForLogging());
@@ -1283,10 +1119,7 @@ void StorageDistributed::read(
             query_info.initial_storage_snapshot ? query_info.initial_storage_snapshot : storage_snapshot,
             remote_storage_id,
             remote_table_function_ptr,
-            base_segment_predicate,
-            columns_to_cast_names,
-            metadata_columns,
-            *base_actual_columns_for_cast);
+            base_segment_predicate);
         Block block = *InterpreterSelectQueryAnalyzer::getSampleBlock(query_tree_distributed, local_context, SelectQueryOptions(processed_stage).analyze());
         /** For distributed tables we do not need constants in header, since we don't send them to remote servers.
           * Moreover, constants can break some functions like `hostName` that are constants only for local queries.
@@ -1307,16 +1140,12 @@ void StorageDistributed::read(
             {
                 // Create a modified query info with the segment predicate
                 SelectQueryInfo additional_query_info = query_info;
-                const auto * segment_actual_columns = !segment.actual_columns.empty() ? &segment.actual_columns : &metadata_columns;
 
                 auto additional_query_tree = buildQueryTreeDistributed(additional_query_info,
                     query_info.initial_storage_snapshot ? query_info.initial_storage_snapshot : storage_snapshot,
                     segment.storage_id ? *segment.storage_id : StorageID::createEmpty(),
                     segment.storage_id ? nullptr :  segment.table_function_ast,
-                    segment.predicate_ast,
-                    columns_to_cast_names,
-                    metadata_columns,
-                    *segment_actual_columns);
+                    segment.predicate_ast);
 
                 additional_query_info.query = queryNodeToDistributedSelectQuery(additional_query_tree);
                 additional_query_info.query_tree = std::move(additional_query_tree);
@@ -2397,19 +2226,29 @@ void StorageDistributed::delayInsertOrThrowIfNeeded() const
     }
 }
 
-void StorageDistributed::setHybridLayout(ColumnsDescription base_segment_columns_, std::vector<HybridSegment> segments_)
+void StorageDistributed::setHybridLayout(std::vector<HybridSegment> segments_)
 {
-    /// Hybrid keeps a snapshot of segment schemas captured during CREATE/ATTACH to avoid re-reading (possibly remote) headers on every query.
-    /// A TTL-based cache was considered but deemed overkill for this experimental feature.
-    /// Subsequent segment DDL changes are not auto-detected; reattach/recreate the Hybrid table to refresh.
-    base_segment_columns = std::move(base_segment_columns_);
     segments = std::move(segments_);
     log = getLogger("Hybrid (" + getStorageID().table_name + ")");
+
+    cached_columns_to_cast = getColumnsToCast();
+    if (!cached_columns_to_cast.empty() && log->is(Poco::Message::PRIO_DEBUG))
+    {
+        std::vector<String> cols;
+        for (const auto & col : cached_columns_to_cast.getAllPhysical())
+            cols.push_back(col.name + " -> " + col.type->getName());
+        LOG_DEBUG(log, "Hybrid auto-cast will apply to: {}", fmt::join(cols, ", "));
+    }
 
     auto virtuals = createVirtuals();
     // or _segment_index?
     virtuals.addEphemeral("_table_index", std::make_shared<DataTypeUInt32>(), "Index of the table function in Hybrid (0 for main table, 1+ for additional segments)");
     setVirtuals(virtuals);
+}
+
+ColumnsDescription StorageDistributed::getColumnsToCast() const
+{
+    return cached_columns_to_cast;
 }
 
 void registerStorageDistributed(StorageFactory & factory)
@@ -2572,17 +2411,22 @@ void registerStorageHybrid(StorageFactory & factory)
         if (columns_to_use.empty())
             columns_to_use = first_segment_columns;
 
+        NameSet columns_to_cast_names;
         auto validate_segment_schema = [&](const ColumnsDescription & segment_columns, const String & segment_name)
         {
             for (const auto & column : columns_to_use.getAllPhysical())
             {
-                if (!segment_columns.tryGetPhysical(column.name))
+                auto found = segment_columns.tryGetPhysical(column.name);
+                if (!found)
                 {
                     throw Exception(
                         ErrorCodes::BAD_ARGUMENTS,
                         "Hybrid segment '{}' is missing column '{}' required by Hybrid schema",
                         segment_name, column.name);
                 }
+
+                if (!found->type->equals(*column.type))
+                    columns_to_cast_names.emplace(column.name);
             }
         };
 
@@ -2667,7 +2511,7 @@ void registerStorageHybrid(StorageFactory & factory)
                 validate_segment_schema(segment_columns, normalized_table_function_ast->formatForLogging());
 
                 // It's a table function - store the AST and cached schema for later execution
-                segment_definitions.emplace_back(normalized_table_function_ast, predicate_ast, std::move(segment_columns));
+                segment_definitions.emplace_back(normalized_table_function_ast, predicate_ast);
             }
             else if (const auto * ast_identifier = table_function_ast->as<ASTIdentifier>())
             {
@@ -2740,7 +2584,7 @@ void registerStorageHybrid(StorageFactory & factory)
 
                     validate_segment_schema(segment_columns, storage_id.getNameForLogs());
 
-                    segment_definitions.emplace_back(table_function_ast, predicate_ast, storage_id, std::move(segment_columns));
+                    segment_definitions.emplace_back(table_function_ast, predicate_ast, storage_id);
                 }
                 catch (const Exception & e)
                 {
@@ -2762,7 +2606,17 @@ void registerStorageHybrid(StorageFactory & factory)
         distributed_storage->renameInMemory({args.table_id.database_name, args.table_id.table_name, args.table_id.uuid});
 
         // Store segment definitions for later use
-        distributed_storage->setHybridLayout(std::move(first_segment_columns), std::move(segment_definitions));
+        distributed_storage->setHybridLayout(std::move(segment_definitions));
+        if (!columns_to_cast_names.empty())
+        {
+            NamesAndTypesList cast_cols;
+            for (const auto & col : columns_to_use.getAllPhysical())
+            {
+                if (columns_to_cast_names.contains(col.name))
+                    cast_cols.emplace_back(col.name, col.type);
+            }
+            distributed_storage->setCachedColumnsToCast(ColumnsDescription(cast_cols));
+        }
 
         return distributed_storage;
     },

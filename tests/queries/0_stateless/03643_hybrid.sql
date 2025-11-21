@@ -129,10 +129,7 @@ INSERT INTO test_hybrid_segment_partial VALUES (3), (4);
 CREATE TABLE test_hybrid_missing_column ENGINE = Hybrid(
     remote('localhost:9000', currentDatabase(), 'test_hybrid_segment_full'), id < 3,
     remote('localhost:9000', currentDatabase(), 'test_hybrid_segment_partial'), id >= 3
-);
-
-SELECT id, value FROM test_hybrid_missing_column ORDER BY id SETTINGS enable_analyzer = 0; -- { serverError UNKNOWN_IDENTIFIER }
-SELECT id, value FROM test_hybrid_missing_column ORDER BY id SETTINGS enable_analyzer = 1; -- { serverError UNKNOWN_IDENTIFIER }
+); -- { serverError BAD_ARGUMENTS }
 
 DROP TABLE IF EXISTS test_hybrid_missing_column SYNC;
 DROP TABLE IF EXISTS test_hybrid_segment_partial SYNC;
@@ -306,19 +303,19 @@ SELECT count() FROM test_tiered_watermark_before WHERE id = 17;
 
 
 SELECT 'Read predicate-filtered data with analyzer disabled and no localhost preference';
-SELECT * FROM test_tiered_watermark ORDER BY id SETTINGS enable_analyzer = 0, prefer_localhost_replica = 0;
+SELECT * FROM test_tiered_watermark ORDER BY id SETTINGS enable_analyzer = 0, prefer_localhost_replica = 0, hybrid_table_auto_cast_columns = 0;
 SELECT 'Read predicate-filtered data with analyzer enabled and no localhost preference';
-SELECT * FROM test_tiered_watermark ORDER BY id SETTINGS enable_analyzer = 1, prefer_localhost_replica = 0;
+SELECT * FROM test_tiered_watermark ORDER BY id SETTINGS enable_analyzer = 1, prefer_localhost_replica = 0, hybrid_table_auto_cast_columns = 0;
 SELECT 'Read predicate-filtered data with analyzer disabled and prefer localhost replica';
 SELECT * FROM test_tiered_watermark ORDER BY id SETTINGS enable_analyzer = 0, prefer_localhost_replica = 1;
 SELECT 'Read predicate-filtered data with analyzer enabled and prefer localhost replica';
-SELECT * FROM test_tiered_watermark ORDER BY id SETTINGS enable_analyzer = 1, prefer_localhost_replica = 1;
+SELECT * FROM test_tiered_watermark ORDER BY id SETTINGS enable_analyzer = 1, prefer_localhost_replica = 1, hybrid_table_auto_cast_columns = 0;
 
 -- other combinations of settings work, but give a bit different content in the query_log
 -- See the problem around is_initial_query described in https://github.com/Altinity/ClickHouse/issues/1077
 SELECT 'Check if the subqueries were recorded in query_log';
 
-SELECT * FROM test_tiered_watermark ORDER BY id DESC SETTINGS enable_analyzer = 1, prefer_localhost_replica = 0, log_queries=1, serialize_query_plan=0, log_comment = 'test_tiered_watermark', max_threads=1 FORMAT Null;
+SELECT * FROM test_tiered_watermark ORDER BY id DESC SETTINGS enable_analyzer = 1, prefer_localhost_replica = 0, hybrid_table_auto_cast_columns = 0, log_queries=1, serialize_query_plan=0, log_comment = 'test_tiered_watermark', max_threads=1 FORMAT Null;
 SYSTEM FLUSH LOGS;
 SELECT
     type,

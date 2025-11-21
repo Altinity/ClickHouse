@@ -48,6 +48,7 @@
 #include <Analyzer/Passes/SumIfToCountIfPass.h>
 #include <Analyzer/Passes/UniqInjectiveFunctionsEliminationPass.h>
 #include <Analyzer/Passes/UniqToCountPass.h>
+#include <Analyzer/Passes/HybridCastsPass.h>
 #include <Analyzer/Utils.h>
 
 namespace DB
@@ -265,6 +266,8 @@ void addQueryTreePasses(QueryTreePassManager & manager, bool only_analyze)
 
     manager.addPass(std::make_unique<ConvertLogicalExpressionToCNFPass>());
     manager.addPass(std::make_unique<RegexpFunctionRewritePass>());
+
+    manager.addPass(std::make_unique<HybridCastsPass>());
 
     manager.addPass(std::make_unique<RewriteSumFunctionWithSumAndCountPass>());
     manager.addPass(std::make_unique<CountDistinctPass>());
