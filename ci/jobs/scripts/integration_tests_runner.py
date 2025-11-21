@@ -1380,7 +1380,7 @@ class ClickhouseIntegrationTestsRunner:
                 for c in counters[state]
             ]
         failed_sum = len(counters["FAILED"]) + len(counters["ERROR"])
-        status_text = f"fail: {failed_sum}, passed: {len(counters['PASSED'])}"
+        status_text = f"fail: {failed_sum}, passed: {len(counters['PASSED'])}, broken: {len(counters['BROKEN'])}"
 
         if not counters or sum(len(counter) for counter in counters.values()) == 0:
             status_text = "No tests found for some reason! It's a bug"

@@ -229,10 +229,9 @@ def get_checks_known_fails(
     if len(known_fails) == 0:
         return pd.DataFrame()
 
-    query = f"""SELECT job_status, job_name, status as test_status, test_name, results_link
+    query = f"""SELECT job_name, status as test_status, test_name, results_link
         FROM (
             SELECT
-                argMax(check_status, check_start_time) as job_status,
                 check_name as job_name,
                 argMax(test_status, check_start_time) as status,
                 test_name,
