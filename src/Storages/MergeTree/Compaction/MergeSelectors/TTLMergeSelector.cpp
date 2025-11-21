@@ -147,6 +147,9 @@ time_t TTLRowDeleteMergeSelector::getTTLForPart(const PartProperties & part) con
 
 bool TTLRowDeleteMergeSelector::canConsiderPart(const PartProperties & part) const
 {
+    if (part.is_in_volume_where_merges_avoid)
+        return false;
+
     if (!part.general_ttl_info.has_value())
         return false;
 
@@ -165,6 +168,9 @@ time_t TTLRecompressMergeSelector::getTTLForPart(const PartProperties & part) co
 
 bool TTLRecompressMergeSelector::canConsiderPart(const PartProperties & part) const
 {
+    if (part.is_in_volume_where_merges_avoid)
+        return false;
+
     if (!part.recompression_ttl_info.has_value())
         return false;
 
