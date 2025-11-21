@@ -120,6 +120,7 @@
 #include <cassert>
 #include <boost/algorithm/string/find_iterator.hpp>
 #include <boost/algorithm/string/finder.hpp>
+#include <fmt/ranges.h>
 
 
 namespace fs = std::filesystem;

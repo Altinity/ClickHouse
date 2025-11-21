@@ -7,6 +7,7 @@
 #include <Analyzer/Resolve/IdentifierResolver.h>
 #include <Analyzer/QueryNode.h>
 #include <Analyzer/TableNode.h>
+#include <Analyzer/UnionNode.h>
 #include <Analyzer/FunctionNode.h>
 #include <Analyzer/ColumnNode.h>
 #include <Analyzer/InDepthQueryTreeVisitor.h>
@@ -34,10 +35,33 @@ namespace ErrorCodes
 namespace
 {
 
-struct HybridCastTask
+/// Collect Hybrid table expressions that require casts to normalize headers across segments.
+class HybridCastTablesCollector : public InDepthQueryTreeVisitor<HybridCastTablesCollector>
 {
-    QueryTreeNodePtr table_expression;
-    ColumnsDescription cast_schema;
+public:
+    explicit HybridCastTablesCollector(std::unordered_map<const IQueryTreeNode *, ColumnsDescription> & cast_map_)
+        : cast_map(cast_map_)
+    {}
+
+    static bool needChildVisit(QueryTreeNodePtr &, QueryTreeNodePtr &) { return true; }
+
+    void visitImpl(QueryTreeNodePtr & node)
+    {
+        const auto * table = node->as<TableNode>();
+        if (!table)
+            return;
+
+        const auto * storage = table->getStorage().get();
+        if (const auto * distributed = typeid_cast<const StorageDistributed *>(storage))
+        {
+            ColumnsDescription to_cast = distributed->getColumnsToCast();
+            if (!to_cast.empty())
+                cast_map.emplace(node.get(), std::move(to_cast)); // repeated table_expression can overwrite
+        }
+    }
+
+private:
+    std::unordered_map<const IQueryTreeNode *, ColumnsDescription> & cast_map;
 };
 
 // Visitor replaces all usages of the column with CAST(column, type) in the query tree.
@@ -55,8 +79,9 @@ public:
 
     static bool needChildVisit(QueryTreeNodePtr &, QueryTreeNodePtr & child)
     {
-        auto child_type = child->getNodeType();
-        return !(child_type == QueryTreeNodeType::QUERY || child_type == QueryTreeNodeType::UNION);
+        /// Traverse all child nodes so casts also apply inside subqueries and UNION branches.
+        (void)child;
+        return true;
     }
 
     void visitImpl(QueryTreeNodePtr & node)
@@ -79,7 +104,6 @@ public:
             return;
 
         auto column_clone = std::static_pointer_cast<ColumnNode>(column_node->clone());
-        column_clone->setColumnType(expected_column_opt->type);
 
         auto cast_node = buildCastFunction(column_clone, expected_column_opt->type, context);
         const auto & alias = node->getAlias();
@@ -99,38 +123,6 @@ private:
 
 } // namespace
 
-void collectHybridTables(const QueryTreeNodePtr & join_tree, std::unordered_map<const IQueryTreeNode *, ColumnsDescription> & cast_map)
-{
-    if (!join_tree)
-        return;
-    if (const auto * table = join_tree->as<TableNode>())
-    {
-        const auto * storage = table->getStorage().get();
-        if (const auto * distributed = typeid_cast<const StorageDistributed *>(storage))
-        {
-            ColumnsDescription to_cast = distributed->getColumnsToCast();
-            if (!to_cast.empty())
-                cast_map.emplace(join_tree.get(), std::move(to_cast)); // repeated table_expression can overwrite
-        }
-        return;
-    }
-    if (const auto * func = join_tree->as<FunctionNode>())
-    {
-        for (auto & child : func->getArguments().getNodes())
-            collectHybridTables(child, cast_map);
-        return;
-    }
-    if (const auto * query = join_tree->as<QueryNode>())
-    {
-        collectHybridTables(query->getJoinTree(), cast_map);
-    }
-    if (const auto * union_node = join_tree->as<UnionNode>())
-    {
-        for (auto & child : union_node->getQueries().getNodes())
-            collectHybridTables(child, cast_map);
-    }
-}
-
 void HybridCastsPass::run(QueryTreeNodePtr & query_tree_node, ContextPtr context)
 {
     const auto & settings = context->getSettingsRef();
@@ -142,7 +134,8 @@ void HybridCastsPass::run(QueryTreeNodePtr & query_tree_node, ContextPtr context
         return;
 
     std::unordered_map<const IQueryTreeNode *, ColumnsDescription> cast_map;
-    collectHybridTables(query->getJoinTree(), cast_map);
+    HybridCastTablesCollector collector(cast_map);
+    collector.visit(query_tree_node);
     if (cast_map.empty())
         return;
 
