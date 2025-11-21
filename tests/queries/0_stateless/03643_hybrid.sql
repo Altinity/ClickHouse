@@ -303,19 +303,19 @@ SELECT count() FROM test_tiered_watermark_before WHERE id = 17;
 
 
 SELECT 'Read predicate-filtered data with analyzer disabled and no localhost preference';
-SELECT * FROM test_tiered_watermark ORDER BY id SETTINGS enable_analyzer = 0, prefer_localhost_replica = 0, hybrid_table_auto_cast_columns = 0;
+SELECT * FROM test_tiered_watermark ORDER BY id SETTINGS enable_analyzer = 0, prefer_localhost_replica = 0;
 SELECT 'Read predicate-filtered data with analyzer enabled and no localhost preference';
-SELECT * FROM test_tiered_watermark ORDER BY id SETTINGS enable_analyzer = 1, prefer_localhost_replica = 0, hybrid_table_auto_cast_columns = 0;
+SELECT * FROM test_tiered_watermark ORDER BY id SETTINGS enable_analyzer = 1, prefer_localhost_replica = 0;
 SELECT 'Read predicate-filtered data with analyzer disabled and prefer localhost replica';
 SELECT * FROM test_tiered_watermark ORDER BY id SETTINGS enable_analyzer = 0, prefer_localhost_replica = 1;
 SELECT 'Read predicate-filtered data with analyzer enabled and prefer localhost replica';
-SELECT * FROM test_tiered_watermark ORDER BY id SETTINGS enable_analyzer = 1, prefer_localhost_replica = 1, hybrid_table_auto_cast_columns = 0;
+SELECT * FROM test_tiered_watermark ORDER BY id SETTINGS enable_analyzer = 1, prefer_localhost_replica = 1;
 
 -- other combinations of settings work, but give a bit different content in the query_log
 -- See the problem around is_initial_query described in https://github.com/Altinity/ClickHouse/issues/1077
-SELECT 'Check if the subqueries were recorded in query_log';
+SELECT 'Check if the subqueries were recorded in query_log (hybrid_table_auto_cast_columns = 0)';
 
-SELECT * FROM test_tiered_watermark ORDER BY id DESC SETTINGS enable_analyzer = 1, prefer_localhost_replica = 0, hybrid_table_auto_cast_columns = 0, log_queries=1, serialize_query_plan=0, log_comment = 'test_tiered_watermark', max_threads=1 FORMAT Null;
+SELECT * FROM test_tiered_watermark ORDER BY id DESC SETTINGS enable_analyzer = 1,  hybrid_table_auto_cast_columns = 0, prefer_localhost_replica = 0, log_queries=1, serialize_query_plan=0, log_comment = 'test_tiered_watermark1', max_threads=1 FORMAT Null;
 SYSTEM FLUSH LOGS;
 SELECT
     type,
@@ -331,7 +331,31 @@ WHERE
     FROM system.query_log
     WHERE
         event_time > now() - 300
-        and log_comment = 'test_tiered_watermark'
+        and log_comment = 'test_tiered_watermark1'
+        and current_database = currentDatabase()
+        and query_id = initial_query_id )
+ORDER BY tbl, event_time_microseconds
+FORMAT Vertical;
+
+SELECT 'Check if the subqueries were recorded in query_log (hybrid_table_auto_cast_columns = 1)';
+
+SELECT * FROM test_tiered_watermark ORDER BY id DESC SETTINGS enable_analyzer = 1, hybrid_table_auto_cast_columns = 1, prefer_localhost_replica = 0, log_queries=1, serialize_query_plan=0, log_comment = 'test_tiered_watermark2', max_threads=1 FORMAT Null;
+SYSTEM FLUSH LOGS;
+SELECT
+    type,
+    query_id = initial_query_id AS is_initial_query2,
+    arraySort(arrayMap(x -> replaceAll(x, currentDatabase(), 'db'), tables)) as tbl,
+    replaceAll(query, currentDatabase(), 'db') as qry,
+    log_comment
+FROM system.query_log
+WHERE
+ event_time > now() - 300 AND type = 'QueryFinish' AND
+ initial_query_id IN (
+    SELECT initial_query_id
+    FROM system.query_log
+    WHERE
+        event_time > now() - 300
+        and log_comment = 'test_tiered_watermark2'
         and current_database = currentDatabase()
         and query_id = initial_query_id )
 ORDER BY tbl, event_time_microseconds

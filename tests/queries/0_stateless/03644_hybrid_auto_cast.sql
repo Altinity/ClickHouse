@@ -81,5 +81,5 @@ SELECT sum(if(arrayExists(x -> (x IN (10)), categories), 1, 0)) AS x FROM test_t
 
 SELECT 'hybrid_table_auto_cast_columns = 1, enable_analyzer = 0 (analizer required)';
 SET hybrid_table_auto_cast_columns = 1, enable_analyzer = 0;
-SELECT max(value) FROM test_tiered_watermark; -- { serverError NOT_IMPLEMENTED }
-SELECT sum(if(arrayExists(x -> (x IN (10)), categories), 1, 0)) AS x FROM test_tiered_watermark; -- { serverError NOT_IMPLEMENTED }
+SELECT max(value) FROM test_tiered_watermark; -- { serverError CANNOT_CONVERT_TYPE }
+

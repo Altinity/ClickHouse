@@ -950,7 +950,7 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
     const StorageSnapshotPtr & distributed_storage_snapshot,
     const StorageID & remote_storage_id,
     const ASTPtr & remote_table_function,
-    const ASTPtr & additional_filter)
+    const ASTPtr & additional_filter = nullptr)
 {
     auto & planner_context = query_info.planner_context;
     const auto & query_context = planner_context->getQueryContext();
@@ -1091,6 +1091,17 @@ void StorageDistributed::read(
         return String{"<unknown_segment>"};
     };
 
+    auto describe_base_target = [&]() -> String
+    {
+       if (remote_table_function_ptr)
+          return remote_table_function_ptr->formatForLogging();
+       if (!remote_database.empty())
+          return remote_database + "." + remote_table;
+       return remote_table;
+    };
+
+    String base_target = describe_base_target();
+
     const bool log_hybrid_query_rewrites = (!segments.empty() || base_segment_predicate);
 
     auto log_rewritten_query = [&](const String & target, const ASTPtr & ast)
@@ -1100,14 +1111,6 @@ void StorageDistributed::read(
 
         LOG_TRACE(log, "rewriteSelectQuery (target: {}) -> {}", target, ast->formatForLogging());
     };
-
-    String base_target;
-    if (remote_table_function_ptr)
-        base_target = remote_table_function_ptr->formatForLogging();
-    else if (!remote_database.empty())
-        base_target = remote_database + "." + remote_table;
-    else
-        base_target = remote_table;
 
     if (settings[Setting::allow_experimental_analyzer])
     {
@@ -2231,25 +2234,30 @@ void StorageDistributed::setHybridLayout(std::vector<HybridSegment> segments_)
     segments = std::move(segments_);
     log = getLogger("Hybrid (" + getStorageID().table_name + ")");
 
-    cached_columns_to_cast = getColumnsToCast();
-    if (!cached_columns_to_cast.empty() && log->is(Poco::Message::PRIO_DEBUG))
-    {
-        std::vector<String> cols;
-        for (const auto & col : cached_columns_to_cast.getAllPhysical())
-            cols.push_back(col.name + " -> " + col.type->getName());
-        LOG_DEBUG(log, "Hybrid auto-cast will apply to: {}", fmt::join(cols, ", "));
-    }
-
     auto virtuals = createVirtuals();
     // or _segment_index?
     virtuals.addEphemeral("_table_index", std::make_shared<DataTypeUInt32>(), "Index of the table function in Hybrid (0 for main table, 1+ for additional segments)");
     setVirtuals(virtuals);
 }
 
+void StorageDistributed::setCachedColumnsToCast(ColumnsDescription columns)
+{
+    cached_columns_to_cast = std::move(columns);
+    if (!cached_columns_to_cast.empty() && log)
+    {
+        Names columns_with_types;
+        columns_with_types.reserve(cached_columns_to_cast.getAllPhysical().size());
+        for (const auto & col : cached_columns_to_cast.getAllPhysical())
+            columns_with_types.emplace_back(col.name + " " + col.type->getName());
+        LOG_DEBUG(log, "Hybrid auto-cast will apply to: [{}]", fmt::join(columns_with_types, ", "));
+    }
+}
+
 ColumnsDescription StorageDistributed::getColumnsToCast() const
 {
     return cached_columns_to_cast;
 }
+
 
 void registerStorageDistributed(StorageFactory & factory)
 {
@@ -2421,7 +2429,7 @@ void registerStorageHybrid(StorageFactory & factory)
                 {
                     throw Exception(
                         ErrorCodes::BAD_ARGUMENTS,
-                        "Hybrid segment '{}' is missing column '{}' required by Hybrid schema",
+                        "Hybrid segment {} is missing column '{}' required by Hybrid schema",
                         segment_name, column.name);
                 }
 

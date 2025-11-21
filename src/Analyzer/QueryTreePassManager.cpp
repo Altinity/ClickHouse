@@ -267,8 +267,6 @@ void addQueryTreePasses(QueryTreePassManager & manager, bool only_analyze)
     manager.addPass(std::make_unique<ConvertLogicalExpressionToCNFPass>());
     manager.addPass(std::make_unique<RegexpFunctionRewritePass>());
 
-    manager.addPass(std::make_unique<HybridCastsPass>());
-
     manager.addPass(std::make_unique<RewriteSumFunctionWithSumAndCountPass>());
     manager.addPass(std::make_unique<CountDistinctPass>());
     manager.addPass(std::make_unique<UniqToCountPass>());
@@ -312,6 +310,8 @@ void addQueryTreePasses(QueryTreePassManager & manager, bool only_analyze)
     manager.addPass(std::make_unique<ShardNumColumnToFunctionPass>());
 
     manager.addPass(std::make_unique<OptimizeDateOrDateTimeConverterWithPreimagePass>());
+
+    manager.addPass(std::make_unique<HybridCastsPass>());
 }
 
 }

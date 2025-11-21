@@ -58,7 +58,6 @@ public:
         ASTPtr table_function_ast;
         ASTPtr predicate_ast;
         std::optional<StorageID> storage_id; // For table identifiers instead of table functions
-        ColumnsDescription actual_columns;
 
         HybridSegment(ASTPtr table_function_ast_, ASTPtr predicate_ast_)
             : table_function_ast(std::move(table_function_ast_))
