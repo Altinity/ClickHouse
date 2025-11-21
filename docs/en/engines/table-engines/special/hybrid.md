@@ -32,7 +32,7 @@ SET allow_experimental_hybrid_table = 1;
 
 ### Automatic Type Alignment
 
-Hybrid segments can evolve independently, so the same logical column may use different physical types. When you set the experimental `hybrid_table_auto_cast_columns = 1` (requires `allow_experimental_analyzer = 1`), the engine inserts the necessary `CAST` operations into each rewritten query so every shard receives the schema defined by the Hybrid table. This prevents header mismatches without having to edit each query.
+Hybrid segments can evolve independently, so the same logical column may use different physical types. With the experimental `hybrid_table_auto_cast_columns = 1` (default, requires `allow_experimental_analyzer = 1`), the engine inserts the necessary `CAST` operations into each rewritten query so every shard receives the schema defined by the Hybrid table. This prevents header mismatches without having to edit each query, and you can opt out by setting the flag to `0` if it causes issues in your setup.
 
 Segment schemas are cached when you create or attach a Hybrid table. If you alter a segment later (for example change a column type), refresh the Hybrid table (detach/attach or recreate it) so the cached headers stay in sync with the new schema; otherwise the auto-cast feature may miss the change and queries can still fail with header/type errors.
 
