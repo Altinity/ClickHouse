@@ -1057,10 +1057,10 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
     const StorageSnapshotPtr & distributed_storage_snapshot,
     const StorageID & remote_storage_id,
     const ASTPtr & remote_table_function,
-    const ASTPtr & additional_filter = nullptr,
-    const NameSet * columns_to_cast = nullptr,
-    const ColumnsDescription * metadata_columns = nullptr,
-    const ColumnsDescription * actual_columns_for_cast = nullptr)
+    const ASTPtr & additional_filter,
+    const NameSet * columns_to_cast,
+    const ColumnsDescription & metadata_columns,
+    const ColumnsDescription & actual_columns_for_cast)
 {
     auto & planner_context = query_info.planner_context;
     const auto & query_context = planner_context->getQueryContext();
@@ -1151,15 +1151,14 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
             : std::move(filter);
     }
 
-    if (columns_to_cast && !columns_to_cast->empty() && metadata_columns)
+    if (columns_to_cast && !columns_to_cast->empty())
     {
-        const ColumnsDescription * source_columns = actual_columns_for_cast ? actual_columns_for_cast : metadata_columns;
         applyHybridCastsToQueryTree(
             query_tree_to_modify,
             replacement_table_expression_ptr,
-            *metadata_columns,
+            metadata_columns,
             *columns_to_cast,
-            *source_columns,
+            actual_columns_for_cast,
             query_context);
     }
 
@@ -1270,8 +1269,8 @@ void StorageDistributed::read(
             remote_table_function_ptr,
             base_segment_predicate,
             columns_to_cast_ptr,
-            &metadata_columns,
-            base_actual_columns_for_cast);
+            metadata_columns,
+            *base_actual_columns_for_cast);
         Block block = *InterpreterSelectQueryAnalyzer::getSampleBlock(query_tree_distributed, local_context, SelectQueryOptions(processed_stage).analyze());
         /** For distributed tables we do not need constants in header, since we don't send them to remote servers.
           * Moreover, constants can break some functions like `hostName` that are constants only for local queries.
@@ -1300,8 +1299,8 @@ void StorageDistributed::read(
                     segment.storage_id ? nullptr :  segment.table_function_ast,
                     segment.predicate_ast,
                     columns_to_cast_ptr,
-                    &metadata_columns,
-                    segment_actual_columns);
+                    metadata_columns,
+                    *segment_actual_columns);
 
                 additional_query_info.query = queryNodeToDistributedSelectQuery(additional_query_tree);
                 additional_query_info.query_tree = std::move(additional_query_tree);
