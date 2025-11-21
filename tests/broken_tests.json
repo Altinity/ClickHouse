@@ -14,6 +14,9 @@
     "03203_hive_style_partitioning": {
         "reason": "INVESTIGATE - new fail in 24.12"
     },
+    "03315_executable_table_function_threads": {
+        "reason": "INVESTIGATE - unstable, timeout"
+    },
     "00988_expansion_aliases_limit": {
         "reason": "INVESTIGATE - Timeout on TSAN"
     },
