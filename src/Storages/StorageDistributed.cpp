@@ -258,7 +258,10 @@ void applyHybridCastsToQueryTree(
 
             auto expected_column_opt = hybrid_schema.tryGetPhysical(column_name);
             if (!expected_column_opt)
-                return;
+                throw Exception(
+                    ErrorCodes::LOGICAL_ERROR,
+                    "Column '{}' expected in Hybrid schema while applying casts, but it is missing",
+                    column_name);
 
             auto actual_column_opt = segment_columns.tryGetPhysical(column_name);
             const auto & source_column = actual_column_opt ? *actual_column_opt : *expected_column_opt;
@@ -1249,7 +1252,8 @@ void StorageDistributed::read(
             return segment.storage_id->getNameForLogs();
         if (segment.table_function_ast)
             return segment.table_function_ast->formatForLogging();
-        return String{"<table_function>"};
+        chassert(false, "Hybrid segment is missing both storage_id and table_function_ast");
+        return String{"<unknown_segment>"};
     };
 
     const bool log_hybrid_casts = need_hybrid_casts && log->is(Poco::Message::PRIO_TRACE);
@@ -2712,8 +2716,9 @@ void registerStorageHybrid(StorageFactory & factory)
                     }
 
                     ColumnsDescription segment_columns;
+
                     if (validated_table)
-                    segment_columns = validated_table->getInMemoryMetadataPtr()->getColumns();
+                        segment_columns = validated_table->getInMemoryMetadataPtr()->getColumns();
 
                     segment_definitions.emplace_back(table_function_ast, predicate_ast, storage_id, std::move(segment_columns));
                 }
