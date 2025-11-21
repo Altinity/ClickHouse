@@ -228,9 +228,9 @@ void applyHybridCastsToQueryTree(
             const ColumnsDescription & actual_columns_,
             ContextPtr context_)
             : table_expression(table_expression_)
-            , metadata_columns(metadata_columns_)
+            , hybrid_schema(metadata_columns_)
             , columns_to_cast(columns_to_cast_)
-            , actual_columns(actual_columns_)
+            , segment_columns(actual_columns_)
             , context(std::move(context_))
         {}
 
@@ -256,11 +256,11 @@ void applyHybridCastsToQueryTree(
             if (!columns_to_cast.contains(column_name))
                 return;
 
-            auto expected_column_opt = metadata_columns.tryGetPhysical(column_name);
+            auto expected_column_opt = hybrid_schema.tryGetPhysical(column_name);
             if (!expected_column_opt)
                 return;
 
-            auto actual_column_opt = actual_columns.tryGetPhysical(column_name);
+            auto actual_column_opt = segment_columns.tryGetPhysical(column_name);
             const auto & source_column = actual_column_opt ? *actual_column_opt : *expected_column_opt;
 
             auto column_clone = std::static_pointer_cast<ColumnNode>(column_node->clone());
@@ -278,9 +278,9 @@ void applyHybridCastsToQueryTree(
 
     private:
         QueryTreeNodePtr table_expression;
-        const ColumnsDescription & metadata_columns;
+        const ColumnsDescription & hybrid_schema;
         const NameSet & columns_to_cast;
-        const ColumnsDescription & actual_columns;
+        const ColumnsDescription & segment_columns;
         ContextPtr context;
     };
 
@@ -1073,7 +1073,7 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
     const StorageID & remote_storage_id,
     const ASTPtr & remote_table_function,
     const ASTPtr & additional_filter,
-    const NameSet * columns_to_cast,
+    const NameSet & columns_to_cast,
     const ColumnsDescription & metadata_columns,
     const ColumnsDescription & actual_columns_for_cast)
 {
@@ -1164,13 +1164,13 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
             : std::move(filter);
     }
 
-    if (columns_to_cast && !columns_to_cast->empty())
+    if (!columns_to_cast.empty())
     {
         applyHybridCastsToQueryTree(
             query_tree_to_modify,
             replacement_table_expression,
             metadata_columns,
-            *columns_to_cast,
+            columns_to_cast,
             actual_columns_for_cast,
             query_context);
     }
@@ -1221,7 +1221,7 @@ void StorageDistributed::read(
     const bool enable_hybrid_column_casts = settings[Setting::hybrid_table_auto_cast_columns]
         && (!base_segment_columns.empty() || !segments.empty());
 
-    NameSet columns_to_cast_names;
+    NameSet columns_to_cast_names; /// Empty when no casts are needed
     if (enable_hybrid_column_casts)
     {
         if (!base_segment_columns.empty())
@@ -1238,7 +1238,6 @@ void StorageDistributed::read(
     }
 
     const bool need_hybrid_casts = !columns_to_cast_names.empty();
-    const auto * columns_to_cast_ptr = need_hybrid_casts ? &columns_to_cast_names : nullptr;
     const auto * base_actual_columns_for_cast = !base_segment_columns.empty() ? &base_segment_columns : &metadata_columns;
 
     if (need_hybrid_casts && !settings[Setting::allow_experimental_analyzer])
@@ -1281,7 +1280,7 @@ void StorageDistributed::read(
             remote_storage_id,
             remote_table_function_ptr,
             base_segment_predicate,
-            columns_to_cast_ptr,
+            columns_to_cast_names,
             metadata_columns,
             *base_actual_columns_for_cast);
         Block block = *InterpreterSelectQueryAnalyzer::getSampleBlock(query_tree_distributed, local_context, SelectQueryOptions(processed_stage).analyze());
@@ -1311,7 +1310,7 @@ void StorageDistributed::read(
                     segment.storage_id ? *segment.storage_id : StorageID::createEmpty(),
                     segment.storage_id ? nullptr :  segment.table_function_ast,
                     segment.predicate_ast,
-                    columns_to_cast_ptr,
+                    columns_to_cast_names,
                     metadata_columns,
                     *segment_actual_columns);
 
