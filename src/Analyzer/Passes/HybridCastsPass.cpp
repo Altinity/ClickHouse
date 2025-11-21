@@ -36,6 +36,10 @@ namespace
 {
 
 /// Collect Hybrid table expressions that require casts to normalize headers across segments.
+///
+/// Hybrid is currently exposed only as an engine (TableNode). If it ever gets a table function
+/// wrapper, this visitor must also look at TableFunctionNode and unwrap to the underlying
+/// StorageDistributed so cached casts can be picked up there as well.
 class HybridCastTablesCollector : public InDepthQueryTreeVisitor<HybridCastTablesCollector>
 {
 public:
