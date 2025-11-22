@@ -28,6 +28,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergIterator.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PersistentTableComponents.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/StatelessMetadataFileGetter.h>
+#include <Storages/ObjectStorage/Utils.h>
 
 namespace DB
 {
@@ -129,11 +130,19 @@ public:
     std::optional<String> sortingKey(ContextPtr) const override;
 
 protected:
+    ObjectIterator createIcebergKeysIterator(
+        Strings && data_files_,
+        ObjectStoragePtr,
+        IDataLakeMetadata::FileProgressCallback callback_,
+        ContextPtr local_context);
+
     ObjectIterator
     iterate(const ActionsDAG * filter_dag, FileProgressCallback callback, size_t list_batch_size, ContextPtr local_context) const override;
 
 private:
     const ObjectStoragePtr object_storage;
+    mutable std::shared_ptr<SecondaryStorages> secondary_storages; // Sometimes data or manifests can be located on another storage
+
     const StorageObjectStorageConfigurationWeakPtr configuration;
 
     DB::Iceberg::PersistentTableComponents persistent_components;
