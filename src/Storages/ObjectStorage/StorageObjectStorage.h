@@ -37,7 +37,10 @@ struct IPartitionStrategy;
 class StorageObjectStorage : public IStorage
 {
 public:
-    using ObjectInfo = RelativePathWithMetadata;
+    class Configuration;
+    using ConfigurationPtr = std::shared_ptr<Configuration>;
+    using ConfigurationObserverPtr = std::weak_ptr<Configuration>;
+    using ObjectInfo = PathWithMetadata;
     using ObjectInfoPtr = std::shared_ptr<ObjectInfo>;
     using ObjectInfos = std::vector<ObjectInfoPtr>;
 

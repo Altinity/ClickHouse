@@ -14,7 +14,7 @@ std::vector<String> listFiles(
     const String & prefix, const String & suffix)
 {
     auto key = std::filesystem::path(configuration.getPathForRead().path) / prefix;
-    RelativePathsWithMetadata files_with_metadata;
+    PathsWithMetadata files_with_metadata;
     object_storage.listObjects(key, files_with_metadata, 0);
     Strings res;
     for (const auto & file_with_metadata : files_with_metadata)

@@ -500,7 +500,9 @@ public:
     {
         auto task = task_distributor.getNextTask(number_of_current_replica);
         if (task)
+        {
             return std::make_shared<ClusterFunctionReadTaskResponse>(std::move(task), context);
+        }
         return std::make_shared<ClusterFunctionReadTaskResponse>();
     }
 

@@ -594,7 +594,7 @@ String GlueCatalog::resolveMetadataPathFromTableLocation(const String & table_lo
                 return "";
 
             // List all files in metadata directory
-            DB::RelativePathsWithMetadata files;
+            DB::PathsWithMetadata files;
             object_storage->listObjects(metadata_dir_path, files, 0);
 
             // Filter for .metadata.json files and find the most recent one

@@ -133,6 +133,7 @@ IcebergMetadata::IcebergMetadata(
     IcebergMetadataFilesCachePtr cache_ptr,
     CompressionMethod metadata_compression_method_)
     : object_storage(std::move(object_storage_))
+    , secondary_storages(std::make_shared<SecondaryStorages>())
     , configuration(std::move(configuration_))
     , persistent_components(PersistentTableComponents{
           .schema_processor = std::make_shared<IcebergSchemaProcessor>(context_),
@@ -500,17 +501,18 @@ void IcebergMetadata::updateSnapshot(ContextPtr local_context, Poco::JSON::Objec
             }
 
             auto [partition_key, sorting_key] = extractIcebergKeys(metadata_object);
+
+            String manifest_list_path = snapshot->getValue<String>(f_manifest_list);
+            auto [storage_to_use, key_in_storage] = resolveObjectStorageForPath(persistent_components.table_location, manifest_list_path, object_storage, *secondary_storages, local_context);
+
             relevant_snapshot = std::make_shared<IcebergDataSnapshot>(
                 getManifestList(
-                object_storage,
+                    storage_to_use,
                 configuration_ptr,
                 persistent_components,
-                local_context,
-                getProperFilePathFromMetadataInfo(
-                    snapshot->getValue<String>(f_manifest_list),
-                    configuration_ptr->getPathForRead().path,
-                    persistent_components.table_location,
-                    configuration_ptr->getNamespace()),
+                    local_context,
+                    key_in_storage,
+                    makeAbsolutePath(persistent_components.table_location, manifest_list_path),
                 log),
                 relevant_snapshot_id,
                 total_rows,
@@ -548,6 +550,7 @@ bool IcebergMetadata::optimize(const StorageMetadataPtr & metadata_snapshot, Con
             snapshots_info,
             persistent_components,
             object_storage,
+            *secondary_storages,
             configuration_ptr,
             format_settings,
             sample_block,
@@ -634,7 +637,7 @@ std::shared_ptr<NamesAndTypesList> IcebergMetadata::getInitialSchemaByPath(Conte
         : nullptr;
 }
 
-std::shared_ptr<const ActionsDAG> IcebergMetadata::getSchemaTransformer(ContextPtr context_, ObjectInfoPtr object_info) const
+std::shared_ptr<const ActionsDAG> IcebergMetadata::getSchemaTransformer(ContextPtr local_context, ObjectInfoPtr object_info) const
 {
     IcebergDataObjectInfo * iceberg_object_info = dynamic_cast<IcebergDataObjectInfo *>(object_info.get());
     SharedLockGuard lock(mutex);
@@ -642,7 +645,7 @@ std::shared_ptr<const ActionsDAG> IcebergMetadata::getSchemaTransformer(ContextP
         return nullptr;
     return (iceberg_object_info->underlying_format_read_schema_id != relevant_snapshot_schema_id)
         ? persistent_components.schema_processor->getSchemaTransformationDagByIds(
-            context_,
+            local_context,
             iceberg_object_info->underlying_format_read_schema_id,
             relevant_snapshot_schema_id)
         : nullptr;
@@ -925,9 +928,10 @@ std::optional<size_t> IcebergMetadata::totalRows(ContextPtr local_context) const
             persistent_components,
             local_context,
             log,
-            manifest_list_entry.manifest_file_path,
+            manifest_list_entry.manifest_file_absolute_path,
             manifest_list_entry.added_sequence_number,
-            manifest_list_entry.added_snapshot_id);
+            manifest_list_entry.added_snapshot_id,
+            *secondary_storages);
         auto data_count = manifest_file_ptr->getRowsCountInAllFilesExcludingDeleted(FileContentType::DATA);
         auto position_deletes_count = manifest_file_ptr->getRowsCountInAllFilesExcludingDeleted(FileContentType::POSITION_DELETE);
         if (!data_count.has_value() || !position_deletes_count.has_value())
@@ -965,9 +969,10 @@ std::optional<size_t> IcebergMetadata::totalBytes(ContextPtr local_context) cons
             persistent_components,
             local_context,
             log,
-            manifest_list_entry.manifest_file_path,
+            manifest_list_entry.manifest_file_absolute_path,
             manifest_list_entry.added_sequence_number,
-            manifest_list_entry.added_snapshot_id);
+            manifest_list_entry.added_snapshot_id,
+            *secondary_storages);
         auto count = manifest_file_ptr->getBytesCountInAllDataFilesExcludingDeleted();
         if (!count.has_value())
             return {};
@@ -1009,7 +1014,8 @@ ObjectIterator IcebergMetadata::iterate(
         callback,
         table_snapshot,
         relevant_snapshot,
-        persistent_components);
+        persistent_components,
+        secondary_storages);
 }
 
 NamesAndTypesList IcebergMetadata::getTableSchema() const
@@ -1047,7 +1053,7 @@ void IcebergMetadata::addDeleteTransformers(
         LOG_DEBUG(log, "Constructing filter transform for position delete, there are {} delete objects", iceberg_object_info->position_deletes_objects.size());
         builder.addSimpleTransform(
             [&](const SharedHeader & header)
-            { return iceberg_object_info->getPositionDeleteTransformer(object_storage, header, format_settings, local_context); });
+            { return iceberg_object_info->getPositionDeleteTransformer(object_storage, header, format_settings, local_context, persistent_components.table_location, *secondary_storages); });
     }
     const auto & delete_files = iceberg_object_info->equality_deletes_objects;
     if (!delete_files.empty())
@@ -1058,9 +1064,13 @@ void IcebergMetadata::addDeleteTransformers(
         {
             /// get header of delete file
             Block delete_file_header;
-            ObjectInfo delete_file_object(delete_file.file_path);
+
+            auto [delete_storage_to_use, resolved_delete_key] = resolveObjectStorageForPath(
+                persistent_components.table_location, delete_file.file_path, object_storage, *secondary_storages, local_context);
+            
+            PathWithMetadata delete_file_object(resolved_delete_key, std::nullopt, delete_file.file_path, delete_storage_to_use);
             {
-                auto schema_read_buffer = createReadBuffer(delete_file_object, object_storage, local_context, log);
+                auto schema_read_buffer = createReadBuffer(delete_file_object, delete_storage_to_use, local_context, log);
                 auto schema_reader = FormatFactory::instance().getSchemaReader(delete_file.file_format, *schema_read_buffer, local_context);
                 auto columns_with_names = schema_reader->readSchema();
                 ColumnsWithTypeAndName initial_header_data;
@@ -1083,7 +1093,7 @@ void IcebergMetadata::addDeleteTransformers(
             }
             /// Then we read the content of the delete file.
             auto mutable_columns_for_set = block_for_set.cloneEmptyColumns();
-            std::unique_ptr<ReadBuffer> data_read_buffer = createReadBuffer(delete_file_object, object_storage, local_context, log);
+            std::unique_ptr<ReadBuffer> data_read_buffer = createReadBuffer(delete_file_object, delete_storage_to_use, local_context, log);
             CompressionMethod compression_method = chooseCompressionMethod(delete_file.file_path, "auto");
             auto delete_format = FormatFactory::instance().getInput(
                 delete_file.file_format,
