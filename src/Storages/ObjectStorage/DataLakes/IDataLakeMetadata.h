@@ -70,6 +70,7 @@ struct DataFileInfo
 {
     std::string file_path;
     std::optional<DataFileMetaInfoPtr> file_meta_info;
+    std::optional<std::string> absolute_uri;
 
     explicit DataFileInfo(const std::string & file_path_)
         : file_path(file_path_) {}
