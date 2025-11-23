@@ -111,7 +111,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getPreQueuedFile(size_t
         auto next_file = files.back();
         files.pop_back();
 
-        auto file_path = send_over_whole_archive ? next_file->getPathOrPathToArchiveIfArchive() : next_file->getPath();
+        auto file_path = send_over_whole_archive ? next_file->getPathOrPathToArchiveIfArchive() : next_file->getAbsolutePath().value_or(next_file->getPath());
         auto it = unprocessed_files.find(file_path);
         if (it == unprocessed_files.end())
             continue;
@@ -221,7 +221,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(s
                 auto next_file = it->second.first;
                 unprocessed_files.erase(it);
 
-                auto file_path = send_over_whole_archive ? next_file->getPathOrPathToArchiveIfArchive() : next_file->getPath();
+                auto file_path = send_over_whole_archive ? next_file->getPathOrPathToArchiveIfArchive() : next_file->getAbsolutePath().value_or(next_file->getPath());
                 LOG_TRACE(
                     log,
                     "Iterator exhausted. Assigning unprocessed file {} to replica {}",
@@ -282,8 +282,8 @@ void StorageObjectStorageStableTaskDistributor::rescheduleTasksFromReplica(size_
     replica_to_files_to_be_processed.erase(number_of_current_replica);
     for (const auto & file : processed_file_list_ptr->second)
     {
-        auto file_replica_idx = getReplicaForFile(file->getPath());
-        unprocessed_files.emplace(file->getPath(), std::make_pair(file, file_replica_idx));
+        auto file_replica_idx = getReplicaForFile(file->getAbsolutePath().value_or(file->getPath()));
+        unprocessed_files.emplace(file->getAbsolutePath().value_or(file->getPath()), std::make_pair(file, file_replica_idx));
         connection_to_files[file_replica_idx].push_back(file);
     }
 }
