@@ -110,8 +110,7 @@ std::pair<ObjectStoragePtr, std::string> getOrCreateStorageAndKey(
 
     configure_fn(*cfg, config_prefix);
 
-    auto & factory = ObjectStorageFactory::instance();
-    ObjectStoragePtr storage = factory.create(cache_key, *cfg, config_prefix, context, /*skip_access_check*/ true);
+    ObjectStoragePtr storage = ObjectStorageFactory::instance().create(cache_key, *cfg, config_prefix, context, /*skip_access_check*/ true);
 
     {
         std::lock_guard lock(secondary_storages.mutex);
