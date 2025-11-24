@@ -57,7 +57,7 @@ See [azureBlobStorage](/sql-reference/table-functions/azureBlobStorage#using-sha
 
 ### `object_storage_cluster` setting.
 
-Only in Altinity Antalya branch alternative syntax for `azureBlobStorageCluster` table function is `azureBlobStorage` function with non-empty setting `object_storage_cluster` with cluster name.
+Only in the Altinity Antalya branch, the alternative syntax for the `azureBlobStorageCluster` table function is avilable. This allows the `azureBlobStorage` function to be used with the non-empty `object_storage_cluster` setting, specifying a cluster name. This enables distributed queries over Azure Blob Storage across a ClickHouse cluster.
 
 ```sql
 SELECT count(*) FROM azureBlobStorage(

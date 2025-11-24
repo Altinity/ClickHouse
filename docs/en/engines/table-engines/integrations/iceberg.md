@@ -300,9 +300,7 @@ CREATE TABLE example_table ENGINE = Iceberg(
 
 ### Specify storage type in arguments
 
-Only in Altinity Antalya branch table engine `Iceberg` can work with all storages.
-In this case storage may be specified with named argument `storage_type`.
-Possible values are `s3`, `azure`, `hdfs`, `local`:
+Only in the Altinity Antalya branch does `Iceberg` table engine support all storage types. The storage type can be specified using the named argument `storage_type`. Supported values are `s3`, `azure`, `hdfs`, and `local`.
 
 ```sql
 CREATE TABLE iceberg_table_s3
@@ -320,7 +318,7 @@ CREATE TABLE iceberg_table_local
 
 ### Specify storage type in named collection
 
-Only in Altinity Antalya branch `storage_type` may be part of named collection.
+Only in Altinity Antalya branch `storage_type` can be included as part of a named collection. This allows for centralized configuration of storage settings.
 
 ```xml
 <clickhouse>
@@ -341,11 +339,11 @@ Only in Altinity Antalya branch `storage_type` may be part of named collection.
 CREATE TABLE iceberg_table ENGINE=Iceberg(iceberg_conf, filename = 'test_table')
 ```
 
-Default value for `storage_type` is `s3`.
+The default value for `storage_type` is `s3`.
 
-### `object_storage_cluster` setting.
+### The `object_storage_cluster` setting.
 
-Only in Altinity Antalya branch alternative syntax for `Iceberg` table engine can be executed on cluster with non-empty setting `object_storage_cluster` with cluster name.
+Only in the Altinity Antalya branch is an alternative syntax for the `Iceberg` table engine available. This syntax allows execution on a cluster when the `object_storage_cluster` setting is non-empty and contains the cluster name.
 
 ```sql
 CREATE TABLE iceberg_table_s3

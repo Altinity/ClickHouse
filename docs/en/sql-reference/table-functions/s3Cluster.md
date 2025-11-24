@@ -94,7 +94,7 @@ For details on optimizing the performance of the s3 function see [our detailed g
 
 ### `object_storage_cluster` setting.
 
-Only in Altinity Antalya branch alternative syntax for `s3Cluster` table function is `s3` function with non-empty setting `object_storage_cluster` with cluster name.
+Only in the Altinity Antalya branch alternative syntax for `s3Cluster` table function is available. This allows the `s3` function to be used with the non-empty `object_storage_cluster` setting, specifying a cluster name. This enables distributed queries over S3 Storage across a ClickHouse cluster.
 
 ```sql
 SELECT * FROM s3(

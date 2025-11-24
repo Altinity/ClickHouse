@@ -46,7 +46,7 @@ A table with the specified structure for reading data from cluster in the specif
 
 ### `object_storage_cluster` setting.
 
-Only in Altinity Antalya branch alternative syntax for `hudiCluster` table function is `hudi` function with non-empty setting `object_storage_cluster` with cluster name.
+Only in the Altinity Antalya branch alternative syntax for `hudiCluster` table function is available. This allows the `hudi` function to be used with the non-empty `object_storage_cluster` setting, specifying a cluster name. This enables distributed queries over Hudi Storage across a ClickHouse cluster.
 
 ```sql
 SELECT *

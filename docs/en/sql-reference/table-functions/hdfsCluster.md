@@ -63,7 +63,7 @@ If your listing of files contains number ranges with leading zeros, use the cons
 
 ### `object_storage_cluster` setting.
 
-Only in Altinity Antalya branch alternative syntax for `hdfsCluster` table function is `hdfs` function with non-empty setting `object_storage_cluster` with cluster name.
+Only in the Altinity Antalya branch alternative syntax for `hdfsCluster` table function is available. This allows the `hdfs` function to be used with the non-empty `object_storage_cluster` setting, specifying a cluster name. This enables distributed queries over HDFS Storage across a ClickHouse cluster.
 
 ```sql
 SELECT count(*)

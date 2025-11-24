@@ -306,9 +306,7 @@ Table function `iceberg` is an alias to `icebergS3` now.
 
 ### Specify storage type in arguments
 
-Only in Altinity Antalya branch table function `iceberg` can work with all storages.
-In this case storage may be specified with named argument `storage_type`.
-Possible values are `s3`, `azure`, `hdfs`, `local`:
+Only in the Altinity Antalya branch does the `iceberg` table function support all storage types. The storage type can be specified using the named argument `storage_type`. Supported values are `s3`, `azure`, `hdfs`, and `local`.
 
 ```sql
 iceberg(storage_type='s3', url [, NOSIGN | access_key_id, secret_access_key, [session_token]] [,format] [,compression_method])
@@ -322,7 +320,7 @@ iceberg(storage_type='local', path_to_table, [,format] [,compression_method])
 
 ### Specify storage type in named collection
 
-Only in Altinity Antalya branch `storage_type` may be part of named collection.
+Only in the Altinity Antalya branch can storage_type be included as part of a named collection. This allows for centralized configuration of storage settings.
 
 ```xml
 <clickhouse>
@@ -343,7 +341,7 @@ Only in Altinity Antalya branch `storage_type` may be part of named collection.
 iceberg(named_collection[, option=value [,..]])
 ```
 
-Default value for `storage_type` is `s3`.
+The default value for `storage_type` is `s3`.
 
 ## See Also {#see-also}
 
