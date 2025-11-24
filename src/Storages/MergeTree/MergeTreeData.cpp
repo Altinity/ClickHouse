@@ -6262,7 +6262,7 @@ void MergeTreeData::exportPartToTable(
             transaction_id,
             query_context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value,
             format_settings,
-            getStorageSnapshot(source_metadata_ptr, query_context),
+            source_metadata_ptr,
             completion_callback);
 
         std::lock_guard lock(export_manifests_mutex);
