@@ -26,6 +26,7 @@ struct ColumnInfo
 #include <Storages/KeyDescription.h>
 #include <Storages/MergeTree/KeyCondition.h>
 #include <Core/Field.h>
+#include <Disks/ObjectStorages/IObjectStorage_fwd.h>
 
 #include <cstdint>
 
@@ -84,6 +85,10 @@ struct ManifestFileEntry
     String file_format;
     std::optional<String> reference_data_file_path; // For position delete files only.
     std::optional<std::vector<Int32>> equality_ids;
+
+    // Resolved storage and key (set by SingleThreadIcebergKeysIterator)
+    ObjectStoragePtr storage_to_use;
+    String resolved_key;
 };
 
 /**
