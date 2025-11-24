@@ -90,6 +90,23 @@ Users can use the same approaches as document for the s3 function [here](/sql-re
 
 For details on optimizing the performance of the s3 function see [our detailed guide](/integrations/s3/performance).
 
+## Altinity Antalya branch
+
+### `object_storage_cluster` setting.
+
+Only in Altinity Antalya branch alternative syntax for `s3Cluster` table function is `s3` function with non-empty setting `object_storage_cluster` with cluster name.
+
+```sql
+SELECT * FROM s3(
+    'http://minio1:9001/root/data/{clickhouse,database}/*',
+    'minio',
+    'ClickHouse_Minio_P@ssw0rd',
+    'CSV',
+    'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))'
+) ORDER BY (name, value, polygon)
+SETTINGS object_storage_cluster='cluster_simple'
+```
+
 ## Related {#related}
 
 - [S3 engine](../../engines/table-engines/integrations/s3.md)

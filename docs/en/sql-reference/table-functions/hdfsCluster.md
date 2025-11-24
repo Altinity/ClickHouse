@@ -59,6 +59,18 @@ FROM hdfsCluster('cluster_simple', 'hdfs://hdfs1:9000/{some,another}_dir/*', 'TS
 If your listing of files contains number ranges with leading zeros, use the construction with braces for each digit separately or use `?`.
 :::
 
+## Altinity Antalya branch
+
+### `object_storage_cluster` setting.
+
+Only in Altinity Antalya branch alternative syntax for `hdfsCluster` table function is `hdfs` function with non-empty setting `object_storage_cluster` with cluster name.
+
+```sql
+SELECT count(*)
+FROM hdfs('hdfs://hdfs1:9000/{some,another}_dir/*', 'TSV', 'name String, value UInt32')
+SETTINGS object_storage_cluster='cluster_simple'
+```
+
 ## Related {#related}
 
 - [HDFS engine](../../engines/table-engines/integrations/hdfs.md)

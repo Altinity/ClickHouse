@@ -296,6 +296,64 @@ CREATE TABLE example_table ENGINE = Iceberg(
 
 `Iceberg` table engine and table function support metadata cache storing the information of manifest files, manifest list and metadata json. The cache is stored in memory. This feature is controlled by setting `use_iceberg_metadata_files_cache`, which is enabled by default.
 
+## Altinity Antalya branch
+
+### Specify storage type in arguments
+
+Only in Altinity Antalya branch table engine `Iceberg` can work with all storages.
+In this case storage may be specified with named argument `storage_type`.
+Possible values are `s3`, `azure`, `hdfs`, `local`:
+
+```sql
+CREATE TABLE iceberg_table_s3
+    ENGINE = Iceberg(storage_type='s3', url,  [, NOSIGN | access_key_id, secret_access_key, [session_token]], format, [,compression])
+
+CREATE TABLE iceberg_table_azure
+    ENGINE = Iceberg(storage_type='azure', connection_string|storage_account_url, container_name, blobpath, [account_name, account_key, format, compression])
+
+CREATE TABLE iceberg_table_hdfs
+    ENGINE = Iceberg(storage_type='hdfs', path_to_table, [,format] [,compression_method])
+
+CREATE TABLE iceberg_table_local
+    ENGINE = Iceberg(storage_type='local', path_to_table, [,format] [,compression_method])
+```
+
+### Specify storage type in named collection
+
+Only in Altinity Antalya branch `storage_type` may be part of named collection.
+
+```xml
+<clickhouse>
+    <named_collections>
+        <iceberg_conf>
+            <url>http://test.s3.amazonaws.com/clickhouse-bucket/</url>
+            <access_key_id>test<access_key_id>
+            <secret_access_key>test</secret_access_key>
+            <format>auto</format>
+            <structure>auto</structure>
+            <storage_type>s3</storage_type>
+        </iceberg_conf>
+    </named_collections>
+</clickhouse>
+```
+
+```sql
+CREATE TABLE iceberg_table ENGINE=Iceberg(iceberg_conf, filename = 'test_table')
+```
+
+Default value for `storage_type` is `s3`.
+
+### `object_storage_cluster` setting.
+
+Only in Altinity Antalya branch alternative syntax for `Iceberg` table engine can be executed on cluster with non-empty setting `object_storage_cluster` with cluster name.
+
+```sql
+CREATE TABLE iceberg_table_s3
+    ENGINE = Iceberg(storage_type='s3', url,  [, NOSIGN | access_key_id, secret_access_key, [session_token]], format, [,compression]);
+
+SELECT * FROM iceberg_table_s3 SETTINGS object_storage_cluster='cluster_simple';
+```
+
 ## See also {#see-also}
 
 - [iceberg table function](/sql-reference/table-functions/iceberg.md)

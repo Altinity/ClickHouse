@@ -49,6 +49,84 @@ SELECT * FROM icebergS3Cluster('cluster_simple', 'http://test.s3.amazonaws.com/c
 - `_time` — Last modified time of the file. Type: `Nullable(DateTime)`. If the time is unknown, the value is `NULL`.
 - `_etag` — The etag of the file. Type: `LowCardinality(String)`. If the etag is unknown, the value is `NULL`.
 
+## Altinity Antalya branch
+
+### `icebergLocalCluster` table function
+
+Only in Altinity Antalya branch `icebergLocalCluster` is a function to make distributed cluster request when iceberg data is storend on shared network storage, mounted with local path.
+Path must be the same on all replicas.
+
+```sql
+icebergLocalCluster(cluster_name, path_to_table, [,format] [,compression_method])
+```
+
+### Specify storage type in arguments
+
+Only in Altinity Antalya branch table function `iceberg` can work with all storages.
+In this case storage may be specified with named argument `storage_type`.
+Possible values are `s3`, `azure`, `hdfs`, `local`:
+
+```sql
+icebergCluster(storage_type='s3', cluster_name, url [, NOSIGN | access_key_id, secret_access_key, [session_token]] [,format] [,compression_method])
+
+icebergCluster(storage_type='azure', cluster_name, connection_string|storage_account_url, container_name, blobpath, [,account_name], [,account_key] [,format] [,compression_method])
+
+icebergCluster(storage_type='hdfs', cluster_name, path_to_table, [,format] [,compression_method])
+
+icebergCluster(storage_type='local', cluster_name, path_to_table, [,format] [,compression_method])
+```
+
+### Specify storage type in named collection
+
+Only in Altinity Antalya branch `storage_type` may be part of named collection.
+
+```xml
+<clickhouse>
+    <named_collections>
+        <iceberg_conf>
+            <url>http://test.s3.amazonaws.com/clickhouse-bucket/</url>
+            <access_key_id>test<access_key_id>
+            <secret_access_key>test</secret_access_key>
+            <format>auto</format>
+            <structure>auto</structure>
+            <storage_type>s3</storage_type>
+        </iceberg_conf>
+    </named_collections>
+</clickhouse>
+```
+
+```sql
+icebergCluster(iceberg_conf[, option=value [,..]])
+```
+
+Default value for `storage_type` is `s3`.
+
+### `object_storage_cluster` setting.
+
+Only in Altinity Antalya branch alternative syntax for `icebergCluster` table function is `iceberg` function with non-empty setting `object_storage_cluster` with cluster name.
+
+```sql
+icebergS3(url [, NOSIGN | access_key_id, secret_access_key, [session_token]] [,format] [,compression_method]) SETTINGS object_storage_cluster='cluster_name'
+
+icebergAzure(connection_string|storage_account_url, container_name, blobpath, [,account_name], [,account_key] [,format] [,compression_method]) SETTINGS object_storage_cluster='cluster_name'
+
+icebergHDSF(path_to_table, [,format] [,compression_method]) SETTINGS object_storage_cluster='cluster_name'
+
+icebergLocal(path_to_table, [,format] [,compression_method]) SETTINGS object_storage_cluster='cluster_name'
+
+icebergS3(option=value [,..]]) SETTINGS object_storage_cluster='cluster_name'
+
+iceberg(storage_type='s3', url [, NOSIGN | access_key_id, secret_access_key, [session_token]] [,format] [,compression_method]) SETTINGS object_storage_cluster='cluster_name'
+
+iceberg(storage_type='azure', connection_string|storage_account_url, container_name, blobpath, [,account_name], [,account_key] [,format] [,compression_method]) SETTINGS object_storage_cluster='cluster_name'
+
+iceberg(storage_type='hdfs', path_to_table, [,format] [,compression_method]) SETTINGS object_storage_cluster='cluster_name'
+
+iceberg(storage_type='local', path_to_table, [,format] [,compression_method]) SETTINGS object_storage_cluster='cluster_name'
+
+iceberg(iceberg_conf[, option=value [,..]]) SETTINGS object_storage_cluster='cluster_name'
+```
+
 **See Also**
 
 - [Iceberg engine](/engines/table-engines/integrations/iceberg.md)
