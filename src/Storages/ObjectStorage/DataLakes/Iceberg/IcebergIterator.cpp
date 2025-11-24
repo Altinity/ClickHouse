@@ -141,7 +141,7 @@ std::optional<ManifestFileEntry> SingleThreadIcebergKeysIterator::next()
         auto files = files_generator(current_manifest_file_content);
         while (internal_data_index < files.size())
         {
-            const auto & manifest_file_entry = files[internal_data_index++];
+            auto & manifest_file_entry = files[internal_data_index++];
             if ((manifest_file_entry.schema_id != previous_entry_schema) && (use_partition_pruning))
             {
                 previous_entry_schema = manifest_file_entry.schema_id;
@@ -164,7 +164,13 @@ std::optional<ManifestFileEntry> SingleThreadIcebergKeysIterator::next()
             switch (pruning_status)
             {
                 case PruningReturnStatus::NOT_PRUNED:
+                {
+                    auto [storage_to_use, resolved_key] = resolveObjectStorageForPath(
+                        persistent_components.table_location, manifest_file_entry.file_path, object_storage, *secondary_storages, local_context);
+                    manifest_file_entry.storage_to_use = storage_to_use;
+                    manifest_file_entry.resolved_key = resolved_key;
                     return manifest_file_entry;
+                }
                 case PruningReturnStatus::MIN_MAX_INDEX_PRUNED: {
                     ++min_max_index_pruned_files;
                     break;
@@ -242,7 +248,6 @@ IcebergIterator::IcebergIterator(
     std::shared_ptr<SecondaryStorages> secondary_storages_)
     : filter_dag(filter_dag_ ? std::make_unique<ActionsDAG>(filter_dag_->clone()) : nullptr)
     , object_storage(std::move(object_storage_))
-    , local_context(local_context_)
     , data_files_iterator(
           object_storage,
           local_context_,
@@ -336,11 +341,8 @@ ObjectInfoPtr IcebergIterator::next(size_t)
     Iceberg::ManifestFileEntry manifest_file_entry;
     if (blocking_queue.pop(manifest_file_entry))
     {
-        // Resolve the data file path to get the correct storage and key
-        auto [storage_to_use, resolved_key] = resolveObjectStorageForPath(
-            persistent_components.table_location, manifest_file_entry.file_path, object_storage, *secondary_storages, local_context);
-        
-        IcebergDataObjectInfoPtr object_info = std::make_shared<IcebergDataObjectInfo>(manifest_file_entry, storage_to_use, resolved_key);
+        IcebergDataObjectInfoPtr object_info = std::make_shared<IcebergDataObjectInfo>(
+            manifest_file_entry, manifest_file_entry.storage_to_use, manifest_file_entry.resolved_key);
         
         for (const auto & position_delete : defineDeletesSpan(manifest_file_entry, position_deletes_files, false))
             object_info->addPositionDeleteObject(position_delete);

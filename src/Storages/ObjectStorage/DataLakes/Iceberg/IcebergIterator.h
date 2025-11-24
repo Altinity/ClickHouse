@@ -103,7 +103,6 @@ public:
 private:
     std::unique_ptr<ActionsDAG> filter_dag;
     ObjectStoragePtr object_storage;
-    ContextPtr local_context;
     Iceberg::SingleThreadIcebergKeysIterator data_files_iterator;
     Iceberg::SingleThreadIcebergKeysIterator deletes_iterator;
     ConcurrentBoundedQueue<Iceberg::ManifestFileEntry> blocking_queue;
