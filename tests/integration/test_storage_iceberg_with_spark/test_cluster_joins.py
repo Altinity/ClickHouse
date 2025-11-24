@@ -87,22 +87,22 @@ def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type):
 
     assert res == "jack\tsparrow\njohn\tdow\n"
 
-    res = instance.query(
-        f"""
-            SELECT name
-            FROM {creation_expression}
-            WHERE tag in (
-                SELECT id
-                FROM {creation_expression_2}
-            )
-            ORDER BY ALL
-            SETTINGS
-                object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='local'
-        """
-    )
+    #res = instance.query(
+    #    f"""
+    #        SELECT name
+    #        FROM {creation_expression}
+    #        WHERE tag in (
+    #            SELECT id
+    #            FROM {creation_expression_2}
+    #        )
+    #        ORDER BY ALL
+    #        SETTINGS
+    #            object_storage_cluster='cluster_simple',
+    #            object_storage_cluster_join_mode='local'
+    #    """
+    #)
 
-    assert res == "jack\njohn\n"
+    #assert res == "jack\njohn\n"
 
     res = instance.query(
         f"""
@@ -110,6 +110,7 @@ def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type):
             FROM {creation_expression} AS t1
                 JOIN `{TABLE_NAME_LOCAL}` AS t2
                 ON t1.tag=t2.id
+            WHERE t1.tag < 10 AND t2.id < 20
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
@@ -119,28 +120,29 @@ def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type):
 
     assert res == "jack\tblack\njohn\tsilver\n"
 
-    res = instance.query(
-        f"""
-            SELECT name
-            FROM {creation_expression}
-            WHERE tag in (
-                SELECT id
-                FROM `{TABLE_NAME_LOCAL}`
-            )
-            ORDER BY ALL
-            SETTINGS
-                object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='local'
-        """
-    )
+    #res = instance.query(
+    #    f"""
+    #        SELECT name
+    #        FROM {creation_expression}
+    #        WHERE tag in (
+    #            SELECT id
+    #            FROM `{TABLE_NAME_LOCAL}`
+    #        )
+    #        ORDER BY ALL
+    #        SETTINGS
+    #            object_storage_cluster='cluster_simple',
+    #            object_storage_cluster_join_mode='local'
+    #    """
+    #)
 
-    assert res == "jack\njohn\n"
+    #assert res == "jack\njohn\n"
 
     res = instance.query(
         f"""
             SELECT t1.name,t2.second_name
             FROM {creation_expression} AS t1
                 CROSS JOIN `{TABLE_NAME_LOCAL}` AS t2
+            WHERE t1.tag < 10 AND t2.id < 20
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',

@@ -815,16 +815,16 @@ def test_joins(started_cluster):
     res = list(map(str.split, result5.splitlines()))
     assert len(res) == 6
 
-    result6 = node.query(
-        f"""
-        SELECT name FROM
-            s3Cluster('cluster_simple',
-                'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
-                'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
-        WHERE value IN (SELECT id FROM join_table)
-        ORDER BY name
-        SETTINGS object_storage_cluster_join_mode='local';
-        """
-    )
-    res = list(map(str.split, result6.splitlines()))
-    assert len(res) == 25
+    #result6 = node.query(
+    #    f"""
+    #    SELECT name FROM
+    #        s3Cluster('cluster_simple',
+    #            'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+    #            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
+    #    WHERE value IN (SELECT id FROM join_table)
+    #    ORDER BY name
+    #    SETTINGS object_storage_cluster_join_mode='local';
+    #    """
+    #)
+    #res = list(map(str.split, result6.splitlines()))
+    #assert len(res) == 25

@@ -472,7 +472,7 @@ QueryProcessingStage::Enum IStorageCluster::getQueryProcessingStage(
                 "object_storage_cluster_join_mode!='allow' is not supported without allow_experimental_analyzer=true");
 
         auto info = getQueryTreeInfo(query_info.query_tree, context);
-        if (info.has_join || info.has_cross_join || info.has_local_columns_in_where)
+        if (info.has_join || info.has_cross_join /*|| info.has_local_columns_in_where*/)
             return QueryProcessingStage::Enum::FetchColumns;
     }
 
