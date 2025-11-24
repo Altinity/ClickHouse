@@ -30,12 +30,12 @@ const MetadataStorageMetrics & IObjectStorage::getMetadataStorageMetrics() const
 
 bool IObjectStorage::existsOrHasAnyChild(const std::string & path) const
 {
-    RelativePathsWithMetadata files;
+    PathsWithMetadata files;
     listObjects(path, files, 1);
     return !files.empty();
 }
 
-void IObjectStorage::listObjects(const std::string &, RelativePathsWithMetadata &, size_t) const
+void IObjectStorage::listObjects(const std::string &, PathsWithMetadata &, size_t) const
 {
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "listObjects() is not supported");
 }
@@ -43,7 +43,7 @@ void IObjectStorage::listObjects(const std::string &, RelativePathsWithMetadata 
 
 ObjectStorageIteratorPtr IObjectStorage::iterate(const std::string & path_prefix, size_t max_keys) const
 {
-    RelativePathsWithMetadata files;
+    PathsWithMetadata files;
     listObjects(path_prefix, files, max_keys);
 
     return std::make_shared<ObjectStorageIteratorFromList>(std::move(files));
@@ -102,21 +102,14 @@ WriteSettings IObjectStorage::patchSettings(const WriteSettings & write_settings
     return write_settings;
 }
 
-RelativePathWithMetadata::RelativePathWithMetadata(const DataFileInfo & info, std::optional<ObjectMetadata> metadata_)
-    : metadata(std::move(metadata_))
-{
-    relative_path = info.file_path;
-    file_meta_info = info.file_meta_info;
-}
-
-std::string RelativePathWithMetadata::getPathOrPathToArchiveIfArchive() const
+std::string PathWithMetadata::getPathOrPathToArchiveIfArchive() const
 {
     if (isArchive())
         return getPathToArchive();
     return getPath();
 }
 
-RelativePathWithMetadata::CommandInTaskResponse::CommandInTaskResponse(const std::string & task)
+PathWithMetadata::CommandInTaskResponse::CommandInTaskResponse(const std::string & task)
 {
     Poco::JSON::Parser parser;
     try
@@ -136,7 +129,7 @@ RelativePathWithMetadata::CommandInTaskResponse::CommandInTaskResponse(const std
     }
 }
 
-std::string RelativePathWithMetadata::CommandInTaskResponse::to_string() const
+std::string PathWithMetadata::CommandInTaskResponse::to_string() const
 {
     Poco::JSON::Object json;
     if (retry_after_us.has_value())
@@ -149,16 +142,18 @@ std::string RelativePathWithMetadata::CommandInTaskResponse::to_string() const
 }
 
 
-void RelativePathWithMetadata::loadMetadata(ObjectStoragePtr object_storage, bool ignore_non_existent_file)
+void PathWithMetadata::loadMetadata(ObjectStoragePtr object_storage, bool ignore_non_existent_file)
 {
     if (!metadata)
     {
         const auto & path = isArchive() ? getPathToArchive() : getPath();
 
+        auto storage_to_use = object_storage_to_use ? object_storage_to_use : object_storage;
+
         if (ignore_non_existent_file)
-            metadata = object_storage->tryGetObjectMetadata(path);
+            metadata = storage_to_use->tryGetObjectMetadata(path);
         else
-            metadata = object_storage->getObjectMetadata(path);
+            metadata = storage_to_use->getObjectMetadata(path);
     }
 }
 

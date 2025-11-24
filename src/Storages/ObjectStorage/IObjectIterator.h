@@ -5,8 +5,8 @@
 namespace DB
 {
 
-using ObjectInfo = RelativePathWithMetadata;
-using ObjectInfoPtr = std::shared_ptr<RelativePathWithMetadata>;
+using ObjectInfo = PathWithMetadata;
+using ObjectInfoPtr = std::shared_ptr<PathWithMetadata>;
 class ExpressionActions;
 
 struct IObjectIterator

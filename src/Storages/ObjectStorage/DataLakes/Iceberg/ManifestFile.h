@@ -26,6 +26,7 @@ struct ColumnInfo
 #include <Storages/KeyDescription.h>
 #include <Storages/MergeTree/KeyCondition.h>
 #include <Core/Field.h>
+#include <Disks/ObjectStorages/IObjectStorage_fwd.h>
 
 #include <cstdint>
 
@@ -84,6 +85,10 @@ struct ManifestFileEntry
     String file_format;
     std::optional<String> reference_data_file_path; // For position delete files only.
     std::optional<std::vector<Int32>> equality_ids;
+
+    // Resolved storage and key (set by SingleThreadIcebergKeysIterator)
+    ObjectStoragePtr storage_to_use;
+    String resolved_key;
 };
 
 /**
@@ -124,7 +129,6 @@ public:
         Int64 inherited_sequence_number,
         Int64 inherited_snapshot_id,
         const std::string & table_location,
-        const std::string & common_namespace,
         DB::ContextPtr context,
         const String & path_to_manifest_file_);
 

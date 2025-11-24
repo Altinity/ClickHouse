@@ -39,7 +39,7 @@
 #endif
 
 #include <fmt/ranges.h>
-
+#include <Disks/DiskType.h>
 
 namespace fs = std::filesystem;
 namespace ProfileEvents
@@ -346,10 +346,14 @@ Chunk StorageObjectStorageSource::generate()
                     path);
             }
 
+            /// For _path column, use absolute_path if available (e.g., file:///home/...)
+            /// Otherwise, fall back to the storage path identifier
+            std::string path_for_virtual_column = object_info->getAbsolutePath().value_or(path);
+
             VirtualColumnUtils::addRequestedFileLikeStorageVirtualsToChunk(
                 chunk,
                 read_from_format_info.requested_virtual_columns,
-                {.path = path,
+                {.path = path_for_virtual_column,
                  .size = object_info->isArchive() ? object_info->fileSizeInArchive() : object_info->metadata->size_bytes,
                  .filename = &filename,
                  .last_modified = object_info->metadata->last_modified,
@@ -514,6 +518,10 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         object_info->loadMetadata(object_storage, query_settings.ignore_non_existent_file);
     }
     while (not_a_path || (query_settings.skip_empty_files && object_info->metadata->size_bytes == 0));
+    
+    ObjectStoragePtr storage_to_use = object_info->getObjectStorage();
+    if (!storage_to_use)
+        storage_to_use = object_storage;
 
     QueryPipelineBuilder builder;
     std::shared_ptr<ISource> source;
@@ -701,7 +709,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         else
         {
             compression_method = chooseCompressionMethod(object_info->getFileName(), configuration->getCompressionMethod());
-            read_buf = createReadBuffer(*object_info, object_storage, context_, log);
+            read_buf = createReadBuffer(*object_info, storage_to_use, context_, log);
         }
 
         Block initial_header = read_from_format_info.format_header;
@@ -824,6 +832,10 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     const auto & settings = context_->getSettingsRef();
     const auto & effective_read_settings = read_settings.has_value() ? read_settings.value() : context_->getReadSettings();
 
+    ObjectStoragePtr storage_to_use = object_info.getObjectStorage();
+    if (!storage_to_use)
+        storage_to_use = object_storage;
+
     bool use_distributed_cache = false;
 #if ENABLE_DISTRIBUTED_CACHE
     ObjectStorageConnectionInfoPtr connection_info;
@@ -831,7 +843,7 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
         && DistributedCache::Registry::instance().isReady(
             effective_read_settings.distributed_cache_settings.read_only_from_current_az))
     {
-        connection_info = object_storage->getConnectionInfo();
+        connection_info = storage_to_use->getConnectionInfo();
         if (connection_info)
             use_distributed_cache = true;
     }
@@ -844,15 +856,15 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
         filesystem_cache_name = settings[Setting::filesystem_cache_name].value;
         use_filesystem_cache = effective_read_settings.enable_filesystem_cache
             && !filesystem_cache_name.empty()
-            && (object_storage->getType() == ObjectStorageType::Azure
-                || object_storage->getType() == ObjectStorageType::S3);
+            && (storage_to_use->getType() == ObjectStorageType::Azure
+                || storage_to_use->getType() == ObjectStorageType::S3);
     }
 
     /// We need object metadata for two cases:
     /// 1. object size suggests whether we need to use prefetch
     /// 2. object etag suggests a cache key in case we use filesystem cache
     if (!object_info.metadata)
-        object_info.metadata = object_storage->getObjectMetadata(object_info.getPath());
+        object_info.metadata = storage_to_use->getObjectMetadata(object_info.getPath());
 
     const auto & object_size = object_info.metadata->size_bytes;
 
@@ -888,9 +900,9 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     {
         const std::string path = object_info.getPath();
         StoredObject object(path, "", object_size);
-        auto read_buffer_creator = [object, nested_buffer_read_settings, object_storage]()
+        auto read_buffer_creator = [object, nested_buffer_read_settings, storage_to_use]()
         {
-            return object_storage->readObject(object, nested_buffer_read_settings);
+            return storage_to_use->readObject(object, nested_buffer_read_settings);
         };
 
         impl = std::make_unique<ReadBufferFromDistributedCache>(
@@ -923,9 +935,9 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
             const auto cache_key = FileCacheKey::fromKey(hash.get128());
             auto cache = FileCacheFactory::instance().get(filesystem_cache_name);
 
-            auto read_buffer_creator = [path = object_info.getPath(), object_size, nested_buffer_read_settings, object_storage]()
+            auto read_buffer_creator = [path = object_info.getPath(), object_size, nested_buffer_read_settings, object_storage, storage_to_use]()
             {
-                return object_storage->readObject(StoredObject(path, "", object_size), nested_buffer_read_settings);
+                return storage_to_use->readObject(StoredObject(path, "", object_size), nested_buffer_read_settings);
             };
 
             impl = std::make_unique<CachedOnDiskReadBufferFromFile>(
@@ -953,7 +965,7 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     }
 
     if (!impl)
-        impl = object_storage->readObject(StoredObject(object_info.getPath(), "", object_size), nested_buffer_read_settings);
+        impl = storage_to_use->readObject(StoredObject(object_info.getPath(), "", object_size), nested_buffer_read_settings);
 
     if (!use_async_buffer)
         return impl;
@@ -1273,7 +1285,22 @@ StorageObjectStorageSource::ReadTaskIterator::ReadTaskIterator(
     {
         auto object = object_future.get();
         if (object)
+        {
+            if (object->getAbsolutePath().has_value())
+            {
+                auto [storage_to_use, key] = resolveObjectStorageForPath("", object->getAbsolutePath().value(), object_storage, secondary_storages, getContext());
+                if (!key.empty())
+                {
+                    object->object_storage_to_use = storage_to_use;
+                    object->relative_path = key;
+                }
+            }
+            else
+            {
+                object->object_storage_to_use = object_storage;
+            }
             buffer.push_back(object);
+        }
     }
 }
 
@@ -1290,10 +1317,29 @@ StorageObjectStorage::ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator
             return nullptr;
         }
 
-        auto task = callback();
-        if (!task || task->isEmpty())
+        auto raw = callback();
+        if (!raw || raw->isEmpty())
             return nullptr;
-        object_info = task->getObjectInfo();
+
+        object_info = raw->getObjectInfo();
+
+        // The 'path' field from master is already the correctly resolved relative path.
+        // We should use it directly and NOT overwrite relative_path.
+        // Only resolve absolute_path if we need to determine which storage to use (for secondary storages).
+        object_info->object_storage_to_use = object_storage;
+        
+        if (raw->absolute_path.has_value())
+        {
+            auto [storage_to_use, key]
+                = resolveObjectStorageForPath("", raw->absolute_path.value(), object_storage, secondary_storages, getContext());
+
+            if (!key.empty() && storage_to_use != object_storage)
+            {
+                // File is in a different storage (secondary storage), use that storage
+                // BUT preserve the original relative_path from master - don't overwrite it!
+                object_info->object_storage_to_use = storage_to_use;
+            }
+        }
     }
     else
     {
@@ -1390,7 +1436,10 @@ StorageObjectStorageSource::ArchiveIterator::createArchiveReader(ObjectInfoPtr o
     return DB::createArchiveReader(
         /* path_to_archive */
         object_info->getPath(),
-        /* archive_read_function */ [=, this]() { return createReadBuffer(*object_info, object_storage, getContext(), log); },
+        /* archive_read_function */ [=, this]() { 
+            ObjectStoragePtr storage = object_info->getObjectStorage() ? object_info->getObjectStorage() : object_storage;
+            return createReadBuffer(*object_info, storage, getContext(), log); 
+        },
         /* archive_size */ size);
 }
 
@@ -1412,7 +1461,12 @@ ObjectInfoPtr StorageObjectStorageSource::ArchiveIterator::next(size_t processor
                 }
 
                 if (!archive_object->metadata)
-                    archive_object->metadata = object_storage->getObjectMetadata(archive_object->getPath());
+                {
+                    ObjectStoragePtr storage_to_use = archive_object->getObjectStorage();
+                    if (!storage_to_use)
+                        storage_to_use = object_storage;
+                    archive_object->metadata = storage_to_use->getObjectMetadata(archive_object->getPath());
+                }
 
                 archive_reader = createArchiveReader(archive_object);
                 file_enumerator = archive_reader->firstFile();
@@ -1438,7 +1492,12 @@ ObjectInfoPtr StorageObjectStorageSource::ArchiveIterator::next(size_t processor
                 return {};
 
             if (!archive_object->metadata)
-                archive_object->metadata = object_storage->getObjectMetadata(archive_object->getPath());
+            {
+                ObjectStoragePtr storage_to_use = archive_object->getObjectStorage();
+                if (!storage_to_use)
+                    storage_to_use = object_storage;
+                archive_object->metadata = storage_to_use->getObjectMetadata(archive_object->getPath());
+            }
 
             archive_reader = createArchiveReader(archive_object);
             if (!archive_reader->fileExists(path_in_archive))

@@ -8,6 +8,7 @@
 #include <Processors/Formats/IInputFormat.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/ObjectStorage/IObjectIterator.h>
+#include <Storages/ObjectStorage/Utils.h>
 #include <Formats/FormatParserSharedResources.h>
 #include <Formats/FormatFilterInfo.h>
 #include <Storages/Cache/ObjectStorageListObjectsCache.h>
@@ -179,6 +180,7 @@ private:
     std::atomic_size_t index = 0;
     bool is_archive;
     ObjectStoragePtr object_storage;
+    SecondaryStorages secondary_storages; // Sometimes data can be located on a different storage
     /// path_to_archive -> archive reader.
     std::unordered_map<std::string, std::shared_ptr<IArchiveReader>> archive_readers;
     std::mutex archive_readers_mutex;

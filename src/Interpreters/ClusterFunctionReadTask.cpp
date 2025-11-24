@@ -35,6 +35,7 @@ ClusterFunctionReadTaskResponse::ClusterFunctionReadTaskResponse(ObjectInfoPtr o
 
     const bool send_over_whole_archive = !context->getSettingsRef()[Setting::cluster_function_process_archive_on_multiple_nodes];
     path = send_over_whole_archive ? object->getPathOrPathToArchiveIfArchive() : object->getPath();
+    absolute_path = object->getAbsolutePath();
 }
 
 ClusterFunctionReadTaskResponse::ClusterFunctionReadTaskResponse(const std::string & path_)
@@ -50,6 +51,9 @@ ObjectInfoPtr ClusterFunctionReadTaskResponse::getObjectInfo() const
     auto object = std::make_shared<ObjectInfo>(path);
     object->data_lake_metadata = data_lake_metadata;
     object->file_meta_info = file_meta_info;
+    if (absolute_path.has_value() && !absolute_path.value().empty())
+        object->absolute_path = absolute_path;
+    
     return object;
 }
 
