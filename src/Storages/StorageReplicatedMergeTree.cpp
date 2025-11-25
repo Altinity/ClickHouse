@@ -6026,6 +6026,17 @@ void StorageReplicatedMergeTree::shutdown(bool)
         /// Wait for all of them
         std::lock_guard lock(data_parts_exchange_ptr->rwlock);
     }
+
+    {
+        std::lock_guard lock(export_merge_tree_partition_mutex);
+        export_merge_tree_partition_task_entries.clear();
+    }
+
+    {
+        std::lock_guard lock(export_manifests_mutex);
+        export_manifests.clear();
+    }
+
     LOG_TRACE(log, "Shutdown finished");
 }
 
