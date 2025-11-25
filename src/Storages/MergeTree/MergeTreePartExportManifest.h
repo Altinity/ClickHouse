@@ -73,7 +73,6 @@ struct MergeTreePartExportManifest
 
     time_t create_time;
     mutable bool in_progress = false;
-    mutable std::shared_ptr<ExportPartTask> task = nullptr;
 
     bool operator<(const MergeTreePartExportManifest & rhs) const 
     {
