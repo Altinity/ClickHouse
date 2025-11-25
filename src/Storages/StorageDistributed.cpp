@@ -104,6 +104,7 @@
 #include <Processors/Sources/RemoteSource.h>
 #include <Processors/Sinks/EmptySink.h>
 
+#include <Core/Names.h>
 #include <Core/Settings.h>
 #include <Core/SettingsEnums.h>
 
@@ -117,9 +118,9 @@
 #include <memory>
 #include <filesystem>
 #include <cassert>
-
 #include <boost/algorithm/string/find_iterator.hpp>
 #include <boost/algorithm/string/finder.hpp>
+#include <fmt/ranges.h>
 
 
 namespace fs = std::filesystem;
@@ -169,6 +170,8 @@ void replaceCurrentDatabaseFunction(ASTPtr & ast, const ContextPtr & context)
     for (auto & child : ast->children)
         replaceCurrentDatabaseFunction(child, context);
 }
+
+
 }
 
 namespace Setting
@@ -201,6 +204,7 @@ namespace Setting
     extern const SettingsUInt64 allow_experimental_parallel_reading_from_replicas;
     extern const SettingsBool prefer_global_in_and_join;
     extern const SettingsBool enable_global_with_statement;
+    extern const SettingsBool allow_experimental_hybrid_table;
 }
 
 namespace DistributedSetting
@@ -234,6 +238,7 @@ namespace ErrorCodes
     extern const int DISTRIBUTED_TOO_MANY_PENDING_BYTES;
     extern const int ARGUMENT_OUT_OF_BOUND;
     extern const int TOO_LARGE_DISTRIBUTED_DEPTH;
+    extern const int SUPPORT_IS_DISABLED;
 }
 
 namespace ActionLocks
@@ -548,8 +553,8 @@ QueryProcessingStage::Enum StorageDistributed::getQueryProcessingStage(
         return QueryProcessingStage::WithMergeableState;
 
     // TODO: check logic
-    if (!additional_table_functions.empty())
-        nodes += additional_table_functions.size();
+    if (!segments.empty())
+        nodes += segments.size();
 
     /// If there is only one node, the query can be fully processed by the
     /// shard, initiator will work as a proxy only.
@@ -593,7 +598,7 @@ QueryProcessingStage::Enum StorageDistributed::getQueryProcessingStage(
 bool StorageDistributed::isShardingKeySuitsQueryTreeNodeExpression(
     const QueryTreeNodePtr & expr, const SelectQueryInfo & query_info) const
 {
-    if (!additional_table_functions.empty())
+    if (!segments.empty())
         return false;
 
     ColumnsWithTypeAndName empty_input_columns;
@@ -636,7 +641,7 @@ bool StorageDistributed::isShardingKeySuitsQueryTreeNodeExpression(
     return allOutputsDependsOnlyOnAllowedNodes(sharding_key_dag, irreducibe_nodes, matches);
 }
 
-// TODO: support additional table functions
+// TODO: support additional segments
 std::optional<QueryProcessingStage::Enum> StorageDistributed::getOptimizedQueryProcessingStageAnalyzer(const SelectQueryInfo & query_info, const Settings & settings) const
 {
     bool optimize_sharding_key_aggregation = settings[Setting::optimize_skip_unused_shards] && settings[Setting::optimize_distributed_group_by_sharding_key]
@@ -695,7 +700,7 @@ std::optional<QueryProcessingStage::Enum> StorageDistributed::getOptimizedQueryP
     return QueryProcessingStage::Complete;
 }
 
-// TODO: support additional table functions
+// TODO: support additional segments
 std::optional<QueryProcessingStage::Enum> StorageDistributed::getOptimizedQueryProcessingStage(const SelectQueryInfo & query_info, const Settings & settings) const
 {
     bool optimize_sharding_key_aggregation = settings[Setting::optimize_skip_unused_shards] && settings[Setting::optimize_distributed_group_by_sharding_key]
@@ -805,11 +810,11 @@ static bool requiresObjectColumns(const ColumnsDescription & all_columns, ASTPtr
 
 StorageSnapshotPtr StorageDistributed::getStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr query_context) const
 {
-    /// TODO: support additional table functions
+    /// TODO: support additional segments
     return getStorageSnapshotForQuery(metadata_snapshot, nullptr, query_context);
 }
 
-/// TODO: support additional table functions
+/// TODO: support additional segments
 StorageSnapshotPtr StorageDistributed::getStorageSnapshotForQuery(
     const StorageMetadataPtr & metadata_snapshot, const ASTPtr & query, ContextPtr /*query_context*/) const
 {
@@ -1013,7 +1018,6 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
 
     replacement_table_expression->setAlias(query_info.table_expression->getAlias());
 
-
     QueryTreeNodePtr filter;
 
     if (additional_filter)
@@ -1025,7 +1029,7 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
         QueryAnalysisPass(replacement_table_expression).run(filter, context);
     }
 
-    auto query_tree_to_modify = query_info.query_tree->cloneAndReplace(query_info.table_expression, std::move(replacement_table_expression));
+    auto query_tree_to_modify = query_info.query_tree->cloneAndReplace(query_info.table_expression, replacement_table_expression);
 
     // Apply additional filter if provided
     if (filter)
@@ -1076,6 +1080,38 @@ void StorageDistributed::read(
     std::vector<SelectQueryInfo> additional_query_infos;
 
     const auto & settings = local_context->getSettingsRef();
+    auto metadata_ptr = getInMemoryMetadataPtr();
+
+    auto describe_segment_target = [&](const HybridSegment & segment) -> String
+    {
+        if (segment.storage_id)
+            return segment.storage_id->getNameForLogs();
+        if (segment.table_function_ast)
+            return segment.table_function_ast->formatForLogging();
+        chassert(false, "Hybrid segment is missing both storage_id and table_function_ast");
+        return String{"<unknown_segment>"};
+    };
+
+    auto describe_base_target = [&]() -> String
+    {
+       if (remote_table_function_ptr)
+          return remote_table_function_ptr->formatForLogging();
+       if (!remote_database.empty())
+          return remote_database + "." + remote_table;
+       return remote_table;
+    };
+
+    String base_target = describe_base_target();
+
+    const bool log_hybrid_query_rewrites = (!segments.empty() || base_segment_predicate);
+
+    auto log_rewritten_query = [&](const String & target, const ASTPtr & ast)
+    {
+        if (!log_hybrid_query_rewrites || !ast)
+            return;
+
+        LOG_TRACE(log, "rewriteSelectQuery (target: {}) -> {}", target, ast->formatForLogging());
+    };
 
     if (settings[Setting::allow_experimental_analyzer])
     {
@@ -1087,7 +1123,7 @@ void StorageDistributed::read(
             query_info.initial_storage_snapshot ? query_info.initial_storage_snapshot : storage_snapshot,
             remote_storage_id,
             remote_table_function_ptr,
-            additional_filter);
+            base_segment_predicate);
         Block block = *InterpreterSelectQueryAnalyzer::getSampleBlock(query_tree_distributed, local_context, SelectQueryOptions(processed_stage).analyze());
         /** For distributed tables we do not need constants in header, since we don't send them to remote servers.
           * Moreover, constants can break some functions like `hostName` that are constants only for local queries.
@@ -1100,29 +1136,31 @@ void StorageDistributed::read(
         modified_query_info.query = queryNodeToDistributedSelectQuery(query_tree_distributed);
 
         modified_query_info.query_tree = std::move(query_tree_distributed);
+        log_rewritten_query(base_target, modified_query_info.query);
 
-        if (!additional_table_functions.empty())
+        if (!segments.empty())
         {
-            for (const auto & table_function_entry : additional_table_functions)
+            for (const auto & segment : segments)
             {
-                // Create a modified query info with the additional predicate
+                // Create a modified query info with the segment predicate
                 SelectQueryInfo additional_query_info = query_info;
 
                 auto additional_query_tree = buildQueryTreeDistributed(additional_query_info,
                     query_info.initial_storage_snapshot ? query_info.initial_storage_snapshot : storage_snapshot,
-                    table_function_entry.storage_id ? *table_function_entry.storage_id : StorageID::createEmpty(),
-                    table_function_entry.storage_id ? nullptr :  table_function_entry.table_function_ast,
-                    table_function_entry.predicate_ast);
+                    segment.storage_id ? *segment.storage_id : StorageID::createEmpty(),
+                    segment.storage_id ? nullptr :  segment.table_function_ast,
+                    segment.predicate_ast);
 
                 additional_query_info.query = queryNodeToDistributedSelectQuery(additional_query_tree);
                 additional_query_info.query_tree = std::move(additional_query_tree);
+                log_rewritten_query(describe_segment_target(segment), additional_query_info.query);
 
                 additional_query_infos.push_back(std::move(additional_query_info));
             }
         }
 
-        // For empty shards - avoid early return if we have additional table functions
-        if (modified_query_info.getCluster()->getShardsInfo().empty() && additional_table_functions.empty())
+        // For empty shards - avoid early return if we have additional segments
+        if (modified_query_info.getCluster()->getShardsInfo().empty() && segments.empty())
             return;
     }
     else
@@ -1132,36 +1170,38 @@ void StorageDistributed::read(
         modified_query_info.query = ClusterProxy::rewriteSelectQuery(
             local_context, modified_query_info.query,
             remote_database, remote_table, remote_table_function_ptr,
-            additional_filter);
+            base_segment_predicate);
+        log_rewritten_query(base_target, modified_query_info.query);
 
-        if (!additional_table_functions.empty())
+        if (!segments.empty())
         {
-            for (const auto & table_function_entry : additional_table_functions)
+            for (const auto & segment : segments)
             {
                 SelectQueryInfo additional_query_info = query_info;
 
-                if (table_function_entry.storage_id)
+                if (segment.storage_id)
                 {
                     additional_query_info.query = ClusterProxy::rewriteSelectQuery(
                         local_context, additional_query_info.query,
-                        table_function_entry.storage_id->database_name, table_function_entry.storage_id->table_name,
+                        segment.storage_id->database_name, segment.storage_id->table_name,
                         nullptr,
-                        table_function_entry.predicate_ast);
+                        segment.predicate_ast);
                 }
                 else
                 {
                     additional_query_info.query = ClusterProxy::rewriteSelectQuery(
                         local_context, additional_query_info.query,
-                        "", "", table_function_entry.table_function_ast,
-                        table_function_entry.predicate_ast);
+                        "", "", segment.table_function_ast,
+                        segment.predicate_ast);
                 }
 
+                log_rewritten_query(describe_segment_target(segment), additional_query_info.query);
                 additional_query_infos.push_back(std::move(additional_query_info));
             }
         }
 
-        // For empty shards - avoid early return if we have additional table functions
-        if (modified_query_info.getCluster()->getShardsInfo().empty() && additional_table_functions.empty())
+        // For empty shards - avoid early return if we have additional segments
+        if (modified_query_info.getCluster()->getShardsInfo().empty() && segments.empty())
         {
             Pipe pipe(std::make_shared<NullSource>(header));
             auto read_from_pipe = std::make_unique<ReadFromPreparedSource>(std::move(pipe));
@@ -1184,7 +1224,7 @@ void StorageDistributed::read(
                 processed_stage);
 
         auto shard_filter_generator = ClusterProxy::getShardFilterGeneratorForCustomKey(
-            *modified_query_info.getCluster(), local_context, getInMemoryMetadataPtr()->columns);
+            *modified_query_info.getCluster(), local_context, metadata_ptr->columns);
 
         ClusterProxy::executeQuery(
             query_plan,
@@ -2190,16 +2230,35 @@ void StorageDistributed::delayInsertOrThrowIfNeeded() const
     }
 }
 
-void StorageDistributed::setHybridLayout(std::vector<TableFunctionEntry> additional_table_functions_)
+void StorageDistributed::setHybridLayout(std::vector<HybridSegment> segments_)
 {
-    additional_table_functions = std::move(additional_table_functions_);
+    segments = std::move(segments_);
     log = getLogger("Hybrid (" + getStorageID().table_name + ")");
 
     auto virtuals = createVirtuals();
-    // or _layer_index?
-    virtuals.addEphemeral("_table_index", std::make_shared<DataTypeUInt32>(), "Index of the table function in Hybrid (0 for main table, 1+ for additional table functions)");
+    // or _segment_index?
+    virtuals.addEphemeral("_table_index", std::make_shared<DataTypeUInt32>(), "Index of the table function in Hybrid (0 for main table, 1+ for additional segments)");
     setVirtuals(virtuals);
 }
+
+void StorageDistributed::setCachedColumnsToCast(ColumnsDescription columns)
+{
+    cached_columns_to_cast = std::move(columns);
+    if (!cached_columns_to_cast.empty() && log)
+    {
+        Names columns_with_types;
+        columns_with_types.reserve(cached_columns_to_cast.getAllPhysical().size());
+        for (const auto & col : cached_columns_to_cast.getAllPhysical())
+            columns_with_types.emplace_back(col.name + " " + col.type->getName());
+        LOG_DEBUG(log, "Hybrid auto-cast will apply to: [{}]", fmt::join(columns_with_types, ", "));
+    }
+}
+
+ColumnsDescription StorageDistributed::getColumnsToCast() const
+{
+    return cached_columns_to_cast;
+}
+
 
 void registerStorageDistributed(StorageFactory & factory)
 {
@@ -2307,8 +2366,6 @@ void registerStorageDistributed(StorageFactory & factory)
 
 void registerStorageHybrid(StorageFactory & factory)
 {
-    // Register Hybrid engine
-    // TODO: consider moving it to a separate file / subclass of StorageDistributed
     factory.registerStorage("Hybrid", [](const StorageFactory::Arguments & args) -> StoragePtr
     {
         ASTs & engine_args = args.engine_args;
@@ -2321,6 +2378,13 @@ void registerStorageHybrid(StorageFactory & factory)
         ContextPtr local_context = args.getLocalContext();
         if (!local_context)
             local_context = global_context;
+
+        if (args.mode <= LoadingStrictnessLevel::CREATE
+            && !local_context->getSettingsRef()[Setting::allow_experimental_hybrid_table])
+        {
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+                "Experimental Hybrid table engine is not enabled (the setting 'allow_experimental_hybrid_table')");
+        }
 
         // Validate first argument - must be a table function
         ASTPtr first_arg = engine_args[0];
@@ -2348,13 +2412,34 @@ void registerStorageHybrid(StorageFactory & factory)
         if (!table_function)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid table function in Hybrid engine");
 
-        // For schema inference, we need to determine the columns first if they're not provided
+        // Capture the physical columns reported by the first segment (table function)
+        ColumnsDescription first_segment_columns = table_function->getActualTableStructure(local_context, true);
+
+        // For schema inference, prefer user-provided columns, otherwise use the physical ones
         ColumnsDescription columns_to_use = args.columns;
         if (columns_to_use.empty())
+            columns_to_use = first_segment_columns;
+
+        NameSet columns_to_cast_names;
+        auto validate_segment_schema = [&](const ColumnsDescription & segment_columns, const String & segment_name)
         {
-            // Get the column structure from the table function
-            columns_to_use = table_function->getActualTableStructure(local_context, true);
-        }
+            for (const auto & column : columns_to_use.getAllPhysical())
+            {
+                auto found = segment_columns.tryGetPhysical(column.name);
+                if (!found)
+                {
+                    throw Exception(
+                        ErrorCodes::BAD_ARGUMENTS,
+                        "Hybrid segment {} is missing column '{}' required by Hybrid schema",
+                        segment_name, column.name);
+                }
+
+                if (!found->type->equals(*column.type))
+                    columns_to_cast_names.emplace(column.name);
+            }
+        };
+
+        validate_segment_schema(first_segment_columns, engine_args[0]->formatForLogging());
 
         // Execute the table function to get the underlying storage
         StoragePtr storage = table_function->execute(
@@ -2400,10 +2485,10 @@ void registerStorageHybrid(StorageFactory & factory)
 
         ASTPtr second_arg = engine_args[1];
         validate_predicate(second_arg, 1);
-        distributed_storage->setAdditionalFilter(second_arg);
+        distributed_storage->setBaseSegmentPredicate(second_arg);
 
         // Parse additional table function pairs (if any)
-        std::vector<StorageDistributed::TableFunctionEntry> additional_table_functions;
+        std::vector<StorageDistributed::HybridSegment> segment_definitions;
         for (size_t i = 2; i < engine_args.size(); i += 2)
         {
             if (i + 1 >= engine_args.size())
@@ -2429,11 +2514,13 @@ void registerStorageHybrid(StorageFactory & factory)
                 // TableFunctionFactory::get mutates the AST in-place inside TableFunctionRemote::parseArguments.
                 ASTPtr normalized_table_function_ast = table_function_ast->clone();
                 auto additional_table_function = TableFunctionFactory::instance().get(normalized_table_function_ast, local_context);
-                (void)additional_table_function;
+                ColumnsDescription segment_columns = additional_table_function->getActualTableStructure(local_context, true);
                 replaceCurrentDatabaseFunction(normalized_table_function_ast, local_context);
 
-                // It's a table function - store the AST for later execution
-                additional_table_functions.emplace_back(normalized_table_function_ast, predicate_ast);
+                validate_segment_schema(segment_columns, normalized_table_function_ast->formatForLogging());
+
+                // It's a table function - store the AST and cached schema for later execution
+                segment_definitions.emplace_back(normalized_table_function_ast, predicate_ast);
             }
             else if (const auto * ast_identifier = table_function_ast->as<ASTIdentifier>())
             {
@@ -2445,16 +2532,34 @@ void registerStorageHybrid(StorageFactory & factory)
                         "Argument #{}: identifier '{}' cannot be converted to table identifier", i, ast_identifier->name());
                 }
 
+                StoragePtr validated_table;
                 try
                 {
                     // Parse table identifier to get StorageID
                     StorageID storage_id(table_identifier);
 
-                    // Sanity check: ensure the table identifier is fully qualified (has database name)
+                    // Fill database for unqualified identifiers using current database (or the target table database).
                     if (storage_id.database_name.empty())
                     {
-                        throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                            "Argument #{}: table identifier '{}' must be fully qualified (database.table)", i, ast_identifier->name());
+                        String default_database = local_context->getCurrentDatabase();
+                        if (default_database.empty())
+                            default_database = args.table_id.database_name;
+
+                        if (default_database.empty())
+                        {
+                            throw Exception(ErrorCodes::UNKNOWN_DATABASE,
+                                "Argument #{}: table identifier '{}' does not specify database and no default database is selected",
+                                i, ast_identifier->name());
+                        }
+
+                        storage_id.database_name = default_database;
+
+                        // Update AST so the table definition stores a fully qualified name.
+                        auto qualified_identifier = std::make_shared<ASTTableIdentifier>(storage_id.database_name, storage_id.table_name);
+                        qualified_identifier->alias = ast_identifier->alias;
+                        qualified_identifier->prefer_alias_to_column_name = ast_identifier->prefer_alias_to_column_name;
+                        table_function_ast = qualified_identifier;
+                        engine_args[i] = table_function_ast;
                     }
 
                     // Sanity check: verify the table exists
@@ -2473,6 +2578,7 @@ void registerStorageHybrid(StorageFactory & factory)
                             throw Exception(ErrorCodes::UNKNOWN_TABLE,
                                 "Table '{}.{}' does not exist", storage_id.database_name, storage_id.table_name);
                         }
+                        validated_table = table;
                     }
                     catch (const Exception & e)
                     {
@@ -2480,7 +2586,14 @@ void registerStorageHybrid(StorageFactory & factory)
                             "Argument #{}: table '{}' validation failed: {}", i, ast_identifier->name(), e.message());
                     }
 
-                    additional_table_functions.emplace_back(table_function_ast, predicate_ast, storage_id);
+                    ColumnsDescription segment_columns;
+
+                    if (validated_table)
+                        segment_columns = validated_table->getInMemoryMetadataPtr()->getColumns();
+
+                    validate_segment_schema(segment_columns, storage_id.getNameForLogs());
+
+                    segment_definitions.emplace_back(table_function_ast, predicate_ast, storage_id);
                 }
                 catch (const Exception & e)
                 {
@@ -2501,8 +2614,18 @@ void registerStorageHybrid(StorageFactory & factory)
         // but we need to rename it to the correct database and table names
         distributed_storage->renameInMemory({args.table_id.database_name, args.table_id.table_name, args.table_id.uuid});
 
-        // Store additional table functions for later use
-        distributed_storage->setHybridLayout(std::move(additional_table_functions));
+        // Store segment definitions for later use
+        distributed_storage->setHybridLayout(std::move(segment_definitions));
+        if (!columns_to_cast_names.empty())
+        {
+            NamesAndTypesList cast_cols;
+            for (const auto & col : columns_to_use.getAllPhysical())
+            {
+                if (columns_to_cast_names.contains(col.name))
+                    cast_cols.emplace_back(col.name, col.type);
+            }
+            distributed_storage->setCachedColumnsToCast(ColumnsDescription(cast_cols));
+        }
 
         return distributed_storage;
     },
