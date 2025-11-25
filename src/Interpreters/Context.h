@@ -1183,6 +1183,7 @@ public:
     void makeQueryContext();
     void makeQueryContextForMerge(const MergeTreeSettings & merge_tree_settings);
     void makeQueryContextForMutate(const MergeTreeSettings & merge_tree_settings);
+    void makeQueryContextForExportPart();
     void makeSessionContext();
     void makeGlobalContext();
 

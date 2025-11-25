@@ -6491,7 +6491,7 @@ void MergeTreeData::exportPartToTable(
             transaction_id,
             query_context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value,
             format_settings,
-            getStorageSnapshot(source_metadata_ptr, query_context),
+            source_metadata_ptr,
             completion_callback);
 
         std::lock_guard lock(export_manifests_mutex);
@@ -9455,7 +9455,12 @@ bool MergeTreeData::scheduleDataMovingJob(BackgroundJobsAssignee & assignee)
             continue;
         }
 
-        auto task = std::make_shared<ExportPartTask>(*this, manifest, getContext());
+        auto context_copy = Context::createCopy(getContext());
+        context_copy->makeQueryContextForExportPart();
+        context_copy->setCurrentQueryId(manifest.transaction_id);
+        context_copy->setBackgroundOperationTypeForContext(ClientInfo::BackgroundOperationType::EXPORT_PART);
+
+        auto task = std::make_shared<ExportPartTask>(*this, manifest, context_copy);
 
         manifest.in_progress = assignee.scheduleMoveTask(task);
 

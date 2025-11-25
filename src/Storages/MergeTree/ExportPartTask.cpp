@@ -48,7 +48,7 @@ ExportPartTask::ExportPartTask(MergeTreeData & storage_, const MergeTreePartExpo
 
 bool ExportPartTask::executeStep()
 {
-    const auto & metadata_snapshot = manifest.storage_snapshot->metadata;
+    const auto & metadata_snapshot = manifest.metadata_snapshot;
 
     Names columns_to_read = metadata_snapshot->getColumns().getNamesOfPhysical();
 
@@ -143,9 +143,13 @@ bool ExportPartTask::executeStep()
     bool read_with_direct_io = local_context->getSettingsRef()[Setting::min_bytes_to_use_direct_io] > manifest.data_part->getBytesOnDisk();
     bool prefetch = false;
 
-    const auto & snapshot_data = assert_cast<const MergeTreeData::SnapshotData &>(*manifest.storage_snapshot->data);
-    auto mutations_snapshot = snapshot_data.mutations_snapshot;
+    MergeTreeData::IMutationsSnapshot::Params mutations_snapshot_params
+    {
+        .metadata_version = metadata_snapshot->getMetadataVersion(),
+        .min_part_metadata_version = manifest.data_part->getMetadataVersion()
+    };
 
+    auto mutations_snapshot = storage.getMutationsSnapshot(mutations_snapshot_params);
     auto alter_conversions = MergeTreeData::getAlterConversionsForPart(
         manifest.data_part,
         mutations_snapshot,
@@ -157,7 +161,7 @@ bool ExportPartTask::executeStep()
         read_type,
         plan_for_part,
         storage,
-        manifest.storage_snapshot,
+        storage.getStorageSnapshot(metadata_snapshot, local_context),
         RangesInDataPart(manifest.data_part),
         alter_conversions,
         nullptr,
