@@ -6283,7 +6283,14 @@ void MergeTreeData::killExportPart(const String & transaction_id)
 
     std::erase_if(export_manifests, [&](const auto & manifest)
     {
-        return manifest.transaction_id == transaction_id;
+        if (manifest.transaction_id == transaction_id)
+        {
+            if (manifest.task)
+                manifest.task->cancel();
+
+            return true;
+        }
+        return false;
     });
 }
 
@@ -9130,12 +9137,16 @@ bool MergeTreeData::scheduleDataMovingJob(BackgroundJobsAssignee & assignee)
         context_copy->setCurrentQueryId(manifest.transaction_id);
         context_copy->setBackgroundOperationTypeForContext(ClientInfo::BackgroundOperationType::EXPORT_PART);
 
-        manifest.in_progress = assignee.scheduleMoveTask(std::make_shared<ExportPartTask>(*this, manifest, context_copy));
+        auto task = std::make_shared<ExportPartTask>(*this, manifest, context_copy);
+
+        manifest.in_progress = assignee.scheduleMoveTask(task);
 
         if (!manifest.in_progress)
         {
             continue;
         }
+
+        manifest.task = task;
 
         return true;
     }
