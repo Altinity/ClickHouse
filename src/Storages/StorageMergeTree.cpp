@@ -256,6 +256,11 @@ void StorageMergeTree::shutdown(bool)
 
     if (deduplication_log)
         deduplication_log->shutdown();
+
+    {
+        std::lock_guard lock(export_manifests_mutex);
+        export_manifests.clear();
+    }
 }
 
 
