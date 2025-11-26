@@ -45,6 +45,8 @@ namespace fs = std::filesystem;
 namespace ProfileEvents
 {
     extern const Event EngineFileLikeReadFiles;
+    extern const Event ObjectStorageClusterProcessedTasks;
+    extern const Event ObjectStorageClusterWaitingMicroseconds;
 }
 
 namespace CurrentMetrics
@@ -507,6 +509,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                 /// TODO: Make asyncronous waiting without sleep in thread
                 /// Now this sleep is on executor node in worker thread
                 /// Does not block query initiator
+                ProfileEvents::increment(ProfileEvents::ObjectStorageClusterWaitingMicroseconds, retry_after_us.value());
                 sleepForMicroseconds(std::min(Poco::Timestamp::TimeDiff(100000ul), retry_after_us.value()));
                 continue;
             }
@@ -519,6 +522,8 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
     }
     while (not_a_path || (query_settings.skip_empty_files && object_info->metadata->size_bytes == 0));
     
+    ProfileEvents::increment(ProfileEvents::ObjectStorageClusterProcessedTasks);
+
     ObjectStoragePtr storage_to_use = object_info->getObjectStorage();
     if (!storage_to_use)
         storage_to_use = object_storage;
