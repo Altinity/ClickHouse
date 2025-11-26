@@ -3,6 +3,7 @@
 #include <Access/ExternalAuthenticators.h>
 #include <Access/User.h>
 #include <Access/Role.h>
+#include <Access/SettingsProfile.h>
 #include <Access/Credentials.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
@@ -160,6 +161,9 @@ TokenAccessStorage::TokenAccessStorage(const String & storage_name_, AccessContr
         common_roles_cfg.insert(role_names.begin(), role_names.end());
     }
     common_role_names.swap(common_roles_cfg);
+
+    if (config.has(prefix_str + "default_profile"))
+        default_profile_name = config.getString(prefix_str + "default_profile");
 
     user_external_roles.clear();
     users_per_roles.clear();
@@ -426,6 +430,42 @@ void TokenAccessStorage::assignRolesNoLock(User & user, const std::set<String> &
     user_external_roles[user_name] = external_roles;
 }
 
+void TokenAccessStorage::assignProfileNoLock(User & user) const
+{
+    if (default_profile_name.empty())
+        return;
+
+    const auto & user_name = user.getName();
+    auto & settings = user.settings;
+
+    // Look up the profile ID once
+    const auto profile_id = access_control.find<SettingsProfile>(default_profile_name);
+    if (!profile_id)
+    {
+        LOG_TRACE(getLogger(), "Did not assign profile '{}' to user '{}': profile not found", default_profile_name, user_name);
+        return;
+    }
+
+    // Check if profile is already assigned
+    bool profile_already_assigned = false;
+    for (const auto & element : settings)
+    {
+        if (element.parent_profile.has_value() && element.parent_profile == *profile_id)
+        {
+            profile_already_assigned = true;
+            break;
+        }
+    }
+
+    if (!profile_already_assigned)
+    {
+        SettingsProfileElement profile_element;
+        profile_element.parent_profile = *profile_id;
+        settings.push_back(std::move(profile_element));
+        LOG_TRACE(getLogger(), "Assigned profile '{}' to user '{}'", default_profile_name, user_name);
+    }
+}
+
 void TokenAccessStorage::updateAssignedRolesNoLock(const UUID & id, const String & user_name, const std::set<String> & external_roles) const
 {
     // Map and grant the roles from scratch only if the list of external role has changed.
@@ -521,12 +561,25 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
     if (new_user)
     {
         assignRolesNoLock(*new_user, external_roles);
+        assignProfileNoLock(*new_user);
         id = memory_storage.insert(new_user);
     }
     else
     {
         // Just in case external_roles are changed.
         updateAssignedRolesNoLock(*id, user->getName(), external_roles);
+
+        // Also update profile if needed
+        memory_storage.update(*id, [this] (const AccessEntityPtr & entity_, const UUID &) -> AccessEntityPtr
+        {
+            if (auto user_entity = typeid_cast<std::shared_ptr<const User>>(entity_))
+            {
+                auto changed_user = typeid_cast<std::shared_ptr<User>>(user_entity->clone());
+                assignProfileNoLock(*changed_user);
+                return changed_user;
+            }
+            return entity_;
+        });
     }
 
     if (id)

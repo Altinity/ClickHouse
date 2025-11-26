@@ -2,6 +2,7 @@
 
 #include <Access/MemoryAccessStorage.h>
 #include <Access/Credentials.h>
+#include <Access/SettingsProfile.h>
 #include <Common/re2.h>
 #include <base/types.h>
 #include <base/scope_guard.h>
@@ -53,6 +54,7 @@ private:
     bool roles_transform_global = false;
 
     std::set<String> common_role_names;                         // role name that should be granted to all users at all times
+    String default_profile_name;                                // settings profile name that should be assigned to all users
     mutable std::map<String, std::set<String>> user_external_roles;
     mutable std::map<String, std::set<String>> users_per_roles; // role name -> user names (...it should be granted to; may but don't have to exist for common roles)
     mutable std::map<String, std::set<String>> roles_per_users; // user name -> role names (...that should be granted to it; may but don't have to include common roles)
@@ -67,6 +69,7 @@ private:
 
     void applyRoleChangeNoLock(bool grant, const UUID & role_id, const String & role_name);
     void assignRolesNoLock(User & user, const std::set<String> & external_roles) const;
+    void assignProfileNoLock(User & user) const;
     void updateAssignedRolesNoLock(const UUID & id, const String & user_name, const std::set<String> & external_roles) const;
 
 protected:
