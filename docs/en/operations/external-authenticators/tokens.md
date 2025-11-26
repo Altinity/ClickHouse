@@ -237,6 +237,7 @@ All this implies that the SQL-driven [Access Control and Account Management](/do
             <roles_filter>
                 \bclickhouse-[a-zA-Z0-9]+\b
             </roles_filter>
+            <roles_transform>s/-/_/g</roles_transform>
         </token>
     </user_directories>
 </clickhouse>
@@ -251,3 +252,4 @@ For now, no more than one `token` section can be defined inside `user_directorie
 - `processor` — Name of one of processors defined in `token_processors` config section described above. This parameter is mandatory and cannot be empty.
 - `common_roles` — Section with a list of locally defined roles that will be assigned to each user retrieved from the IdP. Optional.
 - `roles_filter` — Regex string for groups filtering. Only groups matching this regex will be mapped to roles. Optional.
+- `roles_transform` — Sed-style transform pattern to apply to group names before mapping to roles. Format: `s/pattern/replacement/flags`. The `g` flag applies the replacement globally (all occurrences). Example: `s/-/_/g` converts `clickhouse-grp-dba` to `clickhouse_grp_dba`. Optional.

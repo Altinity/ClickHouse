@@ -48,6 +48,9 @@ private:
 
     String provider_name;
     std::optional<re2::RE2> roles_filter = std::nullopt;
+    std::optional<String> roles_transform_pattern = std::nullopt;
+    std::optional<String> roles_transform_replacement = std::nullopt;
+    bool roles_transform_global = false;
 
     std::set<String> common_role_names;                         // role name that should be granted to all users at all times
     mutable std::map<String, std::set<String>> user_external_roles;

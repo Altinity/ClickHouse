@@ -18,6 +18,115 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
 }
 
+namespace
+{
+    struct ParsedTransform
+    {
+        String pattern;
+        String replacement;
+        bool global;
+    };
+
+    /// Unescape a string segment
+    String unescapeSegment(const String & str, size_t start, size_t end)
+    {
+        String result;
+        result.reserve(end - start);
+        bool escaped = false;
+
+        for (size_t i = start; i < end; ++i)
+        {
+            if (escaped)
+            {
+                result += str[i];
+                escaped = false;
+            }
+            else if (str[i] == '\\')
+                escaped = true;
+            else
+                result += str[i];
+        }
+
+        return result;
+    }
+
+    /// Parse sed-style transform pattern: s/pattern/replacement/flags
+    ParsedTransform parseSedTransform(const String & transform)
+    {
+        if (transform.size() < 4 || transform[0] != 's' || transform[1] != '/')
+        {
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid roles_transform format. Expected sed-style pattern like 's/pattern/replacement/g'");
+        }
+
+        bool escaped = false;
+        size_t first_slash = 1;
+        size_t second_slash = String::npos;
+        size_t third_slash = String::npos;
+
+        // Find delimiters using simple state machine
+        for (size_t i = first_slash + 1; i < transform.size(); ++i)
+        {
+            if (escaped)
+            {
+                escaped = false;
+                continue;
+            }
+
+            if (transform[i] == '\\')
+            {
+                escaped = true;
+                continue;
+            }
+
+            if (transform[i] == '/')
+            {
+                if (second_slash == String::npos)
+                    second_slash = i;
+                else if (third_slash == String::npos)
+                    third_slash = i;
+                else
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid roles_transform format. Too many unescaped slashes. Expected sed-style pattern like 's/pattern/replacement/g'");
+            }
+        }
+
+        if (second_slash == String::npos || third_slash == String::npos)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid roles_transform format. Expected sed-style pattern like 's/pattern/replacement/g'");
+
+        ParsedTransform result;
+
+        result.pattern = unescapeSegment(transform, first_slash + 1, second_slash);
+
+        size_t replacement_end = (third_slash != String::npos) ? third_slash : transform.size();
+        result.replacement = unescapeSegment(transform, second_slash + 1, replacement_end);
+
+        String flags = transform.substr(third_slash + 1);
+        result.global = (flags.find('g') != String::npos);
+
+        return result;
+    }
+
+    String applyTransform(const String & input, const String & pattern, const String & replacement, bool global)
+    {
+        if (pattern.empty())
+            return input;
+
+        re2::RE2 re(pattern);
+        if (!re.ok())
+            return input;
+
+        String result = input;
+        if (global)
+        {
+            RE2::GlobalReplace(&result, re, replacement);
+        }
+        else
+        {
+            RE2::Replace(&result, re, replacement);
+        }
+        return result;
+    }
+}
+
 TokenAccessStorage::TokenAccessStorage(const String & storage_name_, AccessControl & access_control_, const Poco::Util::AbstractConfiguration & config_, const String & prefix_)
         : IAccessStorage(storage_name_), access_control(access_control_), config(config_), prefix(prefix_),
         memory_storage(storage_name_, access_control.getChangesNotifier(), false)
@@ -28,6 +137,15 @@ TokenAccessStorage::TokenAccessStorage(const String & storage_name_, AccessContr
 
     if (config.has(prefix_str + "roles_filter"))
         roles_filter.emplace(config.getString(prefix_str + "roles_filter"));
+
+    if (config.has(prefix_str + "roles_transform"))
+    {
+        String transform = config.getString(prefix_str + "roles_transform");
+        ParsedTransform parsed = parseSedTransform(transform);
+        roles_transform_pattern = parsed.pattern;
+        roles_transform_replacement = parsed.replacement;
+        roles_transform_global = parsed.global;
+    }
 
     provider_name = config.getString(prefix_str + "processor");
     if (provider_name.empty())
@@ -374,15 +492,30 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
         for (const auto & group: token_credentials.getGroups()) {
             if (RE2::FullMatch(group, roles_filter.value()))
             {
-                external_roles.insert(group);
-                LOG_TRACE(getLogger(), "{}: Granted role (group) {} to user", getStorageName(), user->getName());
+                String transformed_group = group;
+                if (roles_transform_pattern.has_value() && roles_transform_replacement.has_value())
+                {
+                    transformed_group = applyTransform(group, roles_transform_pattern.value(), roles_transform_replacement.value(), roles_transform_global);
+                    LOG_TRACE(getLogger(), "{}: Transformed group '{}' to '{}'", getStorageName(), group, transformed_group);
+                }
+                external_roles.insert(transformed_group);
+                LOG_TRACE(getLogger(), "{}: Granted role (group) {} to user", getStorageName(), transformed_group);
             }
         }
     }
     else
     {
         LOG_TRACE(getLogger(), "{}: No external role filtering set, applying all available groups", getStorageName());
-        external_roles = token_credentials.getGroups();
+        for (const auto & group: token_credentials.getGroups())
+        {
+            String transformed_group = group;
+            if (roles_transform_pattern.has_value() && roles_transform_replacement.has_value())
+            {
+                transformed_group = applyTransform(group, roles_transform_pattern.value(), roles_transform_replacement.value(), roles_transform_global);
+                LOG_TRACE(getLogger(), "{}: Transformed group '{}' to '{}'", getStorageName(), group, transformed_group);
+            }
+            external_roles.insert(transformed_group);
+        }
     }
 
     if (new_user)
