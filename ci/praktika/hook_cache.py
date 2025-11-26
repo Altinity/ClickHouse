@@ -66,7 +66,7 @@ class CacheRunnerHooks:
         # implement algorithm to skip dependee jobs if dependency is not in the cache
         # Step 1: Fetch records concurrently
         fetched_records = []
-        if os.environ.get("DISABLE_CI_CACHE", "0") == "1":
+        if os.environ.get("DISABLE_CI_CACHE", "0") in ("1", "true"):
             print("NOTE: CI Cache disabled via GH Variable DISABLE_CI_CACHE=1")
         else:
             with ThreadPoolExecutor(max_workers=200) as executor:

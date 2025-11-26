@@ -192,17 +192,25 @@ def get_creation_expression(
     allow_dynamic_metadata_for_data_lakes=True,
     use_version_hint=False,
     run_on_cluster=False,
+    object_storage_cluster=False,
     explicit_metadata_path="",
+    storage_type_as_arg=False,
+    storage_type_in_named_collection=False,
+    additional_settings = [],
     **kwargs,
 ):
-    settings_array = []
+    settings_array = list(additional_settings)
     settings_array.append(f"allow_dynamic_metadata_for_data_lakes = {1 if allow_dynamic_metadata_for_data_lakes else 0}")
+
 
     if explicit_metadata_path:
         settings_array.append(f"iceberg_metadata_file_path = '{explicit_metadata_path}'")
 
     if use_version_hint:
         settings_array.append("iceberg_use_version_hint = true")
+
+    if object_storage_cluster:
+        settings_array.append(f"object_storage_cluster = '{object_storage_cluster}'")
 
     if partition_by:
         partition_by = "PARTITION BY " + partition_by
@@ -216,9 +224,25 @@ def get_creation_expression(
     else:
         settings_expression = ""
 
+    storage_arg = storage_type
+    engine_part = ""
+    if (storage_type_in_named_collection):
+        storage_arg += "_with_type"
+    elif (storage_type_as_arg):
+        storage_arg += f", storage_type='{storage_type}'"
+    else:
+        if (storage_type == "s3"):
+            engine_part = "S3"
+        elif (storage_type == "azure"):
+            engine_part = "Azure"
+        elif (storage_type == "hdfs"):
+            engine_part = "HDFS"
+        elif (storage_type == "local"):
+            engine_part = "Local"
+
     if_not_exists_prefix = ""
     if if_not_exists:
-        if_not_exists_prefix = "IF NOT EXISTS"        
+        if_not_exists_prefix = "IF NOT EXISTS"
 
     if storage_type == "s3":
         if "bucket" in kwargs:
@@ -228,16 +252,16 @@ def get_creation_expression(
 
         if run_on_cluster:
             assert table_function
-            return f"icebergS3Cluster('cluster_simple', s3, filename = 'iceberg_data/default/{table_name}/', format={format}, url = 'http://minio1:9001/{bucket}/')"
+            return f"iceberg{engine_part}Cluster('cluster_simple', {storage_arg}, filename = 'iceberg_data/default/{table_name}/', format={format}, url = 'http://minio1:9001/{bucket}/')"
         else:
             if table_function:
-                return f"icebergS3(s3, filename = 'iceberg_data/default/{table_name}/', format={format}, url = 'http://minio1:9001/{bucket}/')"
+                return f"iceberg{engine_part}({storage_arg}, filename = 'iceberg_data/default/{table_name}/', format={format}, url = 'http://minio1:9001/{bucket}/')"
             else:
                 return (
                     f"""
                     DROP TABLE IF EXISTS {table_name};
                     CREATE TABLE {if_not_exists_prefix} {table_name} {schema}
-                    ENGINE=IcebergS3(s3, filename = 'iceberg_data/default/{table_name}/', format={format}, url = 'http://minio1:9001/{bucket}/')
+                    ENGINE=Iceberg{engine_part}({storage_arg}, filename = 'iceberg_data/default/{table_name}/', format={format}, url = 'http://minio1:9001/{bucket}/')
                     {partition_by}
                     {settings_expression}
                     """
@@ -247,41 +271,45 @@ def get_creation_expression(
         if run_on_cluster:
             assert table_function
             return f"""
-                icebergAzureCluster('cluster_simple', azure, container = '{cluster.azure_container_name}', storage_account_url = '{cluster.env_variables["AZURITE_STORAGE_ACCOUNT_URL"]}', blob_path = '/iceberg_data/default/{table_name}/', format={format})
+                iceberg{engine_part}Cluster('cluster_simple', {storage_arg}, container = '{cluster.azure_container_name}', storage_account_url = '{cluster.env_variables["AZURITE_STORAGE_ACCOUNT_URL"]}', blob_path = '/iceberg_data/default/{table_name}/', format={format})
             """
         else:
             if table_function:
                 return f"""
-                    icebergAzure(azure, container = '{cluster.azure_container_name}', storage_account_url = '{cluster.env_variables["AZURITE_STORAGE_ACCOUNT_URL"]}', blob_path = '/iceberg_data/default/{table_name}/', format={format})
+                    iceberg{engine_part}({storage_arg}, container = '{cluster.azure_container_name}', storage_account_url = '{cluster.env_variables["AZURITE_STORAGE_ACCOUNT_URL"]}', blob_path = '/iceberg_data/default/{table_name}/', format={format})
                 """
             else:
                 return (
                     f"""
                     DROP TABLE IF EXISTS {table_name};
                     CREATE TABLE {if_not_exists_prefix} {table_name} {schema}
-                    ENGINE=IcebergAzure(azure, container = {cluster.azure_container_name}, storage_account_url = '{cluster.env_variables["AZURITE_STORAGE_ACCOUNT_URL"]}', blob_path = '/iceberg_data/default/{table_name}/', format={format})
+                    ENGINE=Iceberg{engine_part}({storage_arg}, container = {cluster.azure_container_name}, storage_account_url = '{cluster.env_variables["AZURITE_STORAGE_ACCOUNT_URL"]}', blob_path = '/iceberg_data/default/{table_name}/', format={format})
                     {partition_by}
                     {settings_expression}
                     """
                 )
 
     elif storage_type == "local":
-        assert not run_on_cluster
-
-        if table_function:
+        if run_on_cluster:
+            assert table_function
             return f"""
-                icebergLocal(local, path = '/iceberg_data/default/{table_name}/', format={format})
+                iceberg{engine_part}Cluster('cluster_simple', {storage_arg}, path = '/iceberg_data/default/{table_name}/', format={format})
             """
         else:
-            return (
-                f"""
-                DROP TABLE IF EXISTS {table_name};
-                CREATE TABLE {if_not_exists_prefix} {table_name} {schema}
-                ENGINE=IcebergLocal(local, path = '/iceberg_data/default/{table_name}/', format={format})
-                {partition_by}
-                {settings_expression}
+            if table_function:
+                return f"""
+                    iceberg{engine_part}({storage_arg}, path = '/iceberg_data/default/{table_name}/', format={format})
                 """
-            )
+            else:
+                return (
+                    f"""
+                    DROP TABLE IF EXISTS {table_name};
+                    CREATE TABLE {if_not_exists_prefix} {table_name} {schema}
+                    ENGINE=Iceberg{engine_part}({storage_arg}, path = '/iceberg_data/default/{table_name}/', format={format})
+                    {partition_by}
+                    {settings_expression}
+                    """
+                )
 
     else:
         raise Exception(f"Unknown iceberg storage type: {storage_type}")
@@ -314,7 +342,7 @@ def convert_schema_and_data_to_pandas_df(schema_raw, data_raw):
     pandas_types = [clickhouse_to_pandas_types[t]for t in types]
 
     schema_df = pd.DataFrame([types], columns=column_names)
-    
+
     # Convert data to DataFrame
     data_rows = list(
         map(
@@ -322,13 +350,13 @@ def convert_schema_and_data_to_pandas_df(schema_raw, data_raw):
             filter(lambda x: len(x) > 0, data_raw.strip().split("\n")),
         )
     )
-    
+
     if data_rows:
         data_df = pd.DataFrame(data_rows, columns=column_names, dtype='object')
     else:
         # Create empty DataFrame with correct columns
         data_df = pd.DataFrame(columns=column_names, dtype='object')
-    
+
     data_df = data_df.astype(dict(zip(column_names, pandas_types)))
     return schema_df, data_df
 
@@ -365,16 +393,39 @@ def create_iceberg_table(
     if_not_exists=False,
     compression_method=None,
     format="Parquet",
+    object_storage_cluster=False,
     **kwargs,
 ):
     if 'output_format_parquet_use_custom_encoder' in kwargs:
         node.query(
-            get_creation_expression(storage_type, table_name, cluster, schema, format_version, partition_by, if_not_exists, compression_method, format, **kwargs),
+            get_creation_expression(
+                storage_type,
+                table_name,
+                cluster,
+                schema,
+                format_version,
+                partition_by,
+                if_not_exists,
+                compression_method,
+                format,
+                object_storage_cluster=object_storage_cluster,
+                **kwargs),
             settings={"output_format_parquet_use_custom_encoder" : 0, "output_format_parquet_parallel_encoding" : 0}
         )
     else:
         node.query(
-            get_creation_expression(storage_type, table_name, cluster, schema, format_version, partition_by, if_not_exists, compression_method, format, **kwargs),
+            get_creation_expression(
+                storage_type,
+                table_name,
+                cluster,
+                schema,
+                format_version,
+                partition_by,
+                if_not_exists,
+                compression_method,
+                format,
+                object_storage_cluster=object_storage_cluster,
+                **kwargs),
         )
 
 
@@ -428,6 +479,17 @@ def default_upload_directory(
         raise Exception(f"Unknown iceberg storage type: {storage_type}")
 
 
+def additional_upload_directory(
+    started_cluster, node, storage_type, local_path, remote_path, **kwargs
+):
+    if storage_type == "local":
+        return LocalUploader(started_cluster.instances[node]).upload_directory(
+            local_path, remote_path, **kwargs
+        )
+    else:
+        raise Exception(f"Unknown iceberg storage type for additional uploading: {storage_type}")
+
+
 def default_download_directory(
     started_cluster, storage_type, remote_path, local_path, **kwargs
 ):
@@ -438,9 +500,9 @@ def default_download_directory(
     else:
         raise Exception(f"Unknown iceberg storage type for downloading: {storage_type}")
 
-        
+
 def execute_spark_query_general(
-    spark, started_cluster, storage_type: str, table_name: str, query: str
+    spark, started_cluster, storage_type: str, table_name: str, query: str, additional_nodes=None
 ):
     spark.sql(query)
     default_upload_directory(
@@ -449,7 +511,17 @@ def execute_spark_query_general(
         f"/iceberg_data/default/{table_name}/",
         f"/iceberg_data/default/{table_name}/",
     )
+    additional_nodes = additional_nodes or []
+    for node in additional_nodes:
+        additional_upload_directory(
+            started_cluster,
+            node,
+            storage_type,
+            f"/iceberg_data/default/{table_name}/",
+            f"/iceberg_data/default/{table_name}/",
+        )
     return
+
 
 def get_last_snapshot(path_to_table):
     import json

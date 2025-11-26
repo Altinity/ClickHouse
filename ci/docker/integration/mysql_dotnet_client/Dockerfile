@@ -1,4 +1,4 @@
-# docker build -t clickhouse/mysql_dotnet_client .
+# docker build -t altinityinfra/mysql_dotnet_client .
 
 FROM ubuntu:22.04
 

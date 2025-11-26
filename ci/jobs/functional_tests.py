@@ -121,6 +121,7 @@ OPTIONS_TO_TEST_RUNNER_ARGUMENTS = {
     "azure": " --azure-blob-storage --no-random-settings --no-random-merge-tree-settings",  # azurite is slow, with randomization it can be super slow
     "parallel": "--no-sequential",
     "sequential": "--no-parallel",
+    "amd_tsan": " --timeout 1200",  # NOTE (strtgbb): tsan is slow, increase the timeout to avoid timeout errors
 }
 
 
@@ -191,10 +192,12 @@ def main():
 
     if not info.is_local_run:
         # TODO: find a way to work with Azure secret so it's ok for local tests as well, for now keep azure disabled
-        os.environ["AZURE_CONNECTION_STRING"] = Shell.get_output(
-            f"aws ssm get-parameter --region us-east-1 --name azure_connection_string --with-decryption --output text --query Parameter.Value",
-            verbose=True,
-        )
+        # os.environ["AZURE_CONNECTION_STRING"] = Shell.get_output(
+        #     f"aws ssm get-parameter --region us-east-1 --name azure_connection_string --with-decryption --output text --query Parameter.Value",
+        #     verbose=True,
+        # )
+        # NOTE(strtgbb): We pass azure credentials through the docker command, not SSM.
+        pass
     else:
         print("Disable azure for a local run")
         config_installs_args += " --no-azure"
@@ -247,12 +250,13 @@ def main():
 
     if res and JobStages.INSTALL_CLICKHOUSE in stages:
 
-        def configure_log_export():
-            if not info.is_local_run:
-                print("prepare log export config")
-                return CH.create_log_export_config()
-            else:
-                print("skip log export config for local run")
+        # NOTE (strtgbb): Disable log export throughout this file, it depends on aws ssm, which we don't have configured
+        # def configure_log_export():
+        #     if not info.is_local_run:
+        #         print("prepare log export config")
+        #         return CH.create_log_export_config()
+        #     else:
+        #         print("skip log export config for local run")
 
         commands = [
             f"chmod +x {ch_path}/clickhouse",
@@ -298,7 +302,7 @@ def main():
             f"prof_active:true,prof_prefix:{temp_dir}/jemalloc_profiles/clickhouse.jemalloc"
         )
 
-        commands.append(configure_log_export)
+        # commands.append(configure_log_export)
 
         results.append(
             Result.from_commands_run(name="Install ClickHouse", command=commands)
@@ -367,9 +371,9 @@ def main():
                 tests=tests, runs=50 if is_flaky_check else 1, extra_args=runner_options
             )
 
-        if not info.is_local_run:
-            CH.stop_log_exports()
-        ft_res_processor = FTResultsProcessor(wd=temp_dir)
+        # if not info.is_local_run:
+        #     CH.stop_log_exports()
+        ft_res_processor = FTResultsProcessor(wd=temp_dir, test_options=test_options)
         results.append(ft_res_processor.run())
         debug_files += ft_res_processor.debug_files
         test_result = results[-1]

@@ -25,6 +25,7 @@ class Workflow:
         name: str
         event: str
         jobs: List[Job.Config]
+        additional_jobs: List[str] = field(default_factory=list)
         branches: List[str] = field(default_factory=list)
         base_branches: List[str] = field(default_factory=list)
         artifacts: List[Artifact.Config] = field(default_factory=list)

@@ -8,8 +8,8 @@ echo '{
     "ip-forward": true,
     "log-level": "debug",
     "storage-driver": "overlay2",
-    "insecure-registries" : ["dockerhub-proxy.dockerhub-proxy-zone:5000"],
-    "registry-mirrors" : ["http://dockerhub-proxy.dockerhub-proxy-zone:5000"]
+    "insecure-registries" : ["65.108.242.32:5000"],
+    "registry-mirrors" : ["http://65.108.242.32:5000"]
 }' | dd of=/etc/docker/daemon.json 2>/dev/null
 
 if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
