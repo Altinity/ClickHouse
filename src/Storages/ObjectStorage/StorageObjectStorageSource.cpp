@@ -509,8 +509,9 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                 /// TODO: Make asyncronous waiting without sleep in thread
                 /// Now this sleep is on executor node in worker thread
                 /// Does not block query initiator
-                ProfileEvents::increment(ProfileEvents::ObjectStorageClusterWaitingMicroseconds, retry_after_us.value());
-                sleepForMicroseconds(std::min(Poco::Timestamp::TimeDiff(100000ul), retry_after_us.value()));
+                auto wait_time = std::min(Poco::Timestamp::TimeDiff(100000ul), retry_after_us.value());
+                ProfileEvents::increment(ProfileEvents::ObjectStorageClusterWaitingMicroseconds, wait_time);
+                sleepForMicroseconds(wait_time);
                 continue;
             }
         }
