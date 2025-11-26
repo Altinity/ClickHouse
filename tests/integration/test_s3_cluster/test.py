@@ -1049,6 +1049,7 @@ def test_joins(started_cluster):
     node = started_cluster.instances["s0_0_0"]
 
     # Table join_table only exists on the node 's0_0_0'.
+    node.query("DROP TABLE IF EXISTS join_table SYNC")
     node.query(
         """
         CREATE TABLE IF NOT EXISTS join_table (

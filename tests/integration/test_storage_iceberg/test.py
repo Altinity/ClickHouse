@@ -3446,6 +3446,10 @@ def test_read_constant_columns_optimization(started_cluster, storage_type, run_o
 
     # Warm up metadata cache
     for replica in started_cluster.instances.values():
+        replica.query("SYSTEM DROP UNCOMPRESSED CACHE")
+        replica.query("SYSTEM DROP QUERY CACHE")
+        replica.query("SYSTEM DROP FILESYSTEM CACHE")
+        replica.query("SYSTEM DROP ICEBERG METADATA CACHE")
         replica.query(f"SELECT * FROM {creation_expression} ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=0")
 
     all_data_expected_query_id = str(uuid.uuid4())
