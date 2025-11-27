@@ -4470,106 +4470,319 @@ void StorageReplicatedMergeTree::exportMergeTreePartitionStatusHandlingTask()
 std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartitionExportsInfo() const
 {
     std::vector<ReplicatedPartitionExportInfo> infos;
-
     const auto zk = getZooKeeper();
     const auto exports_path = fs::path(zookeeper_path) / "exports";
-    std::vector<std::string> children;
+
     ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
     ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildren);
+
+    std::vector<std::string> children;
     if (Coordination::Error::ZOK != zk->tryGetChildren(exports_path, children))
     {
         LOG_INFO(log, "Failed to get children from exports path, returning empty export info list");
         return infos;
     }
 
+    if (children.empty())
+        return infos;
+
+    /// Batch all metadata.json, status gets, and getChildren operations in a single multi request
+    Coordination::Requests requests;
+    requests.reserve(children.size() * 4); // metadata, status, processing, exceptions_per_replica
+
+    // Track response indices for each child
+    struct ChildResponseIndices
+    {
+        size_t metadata_idx;
+        size_t status_idx;
+        size_t processing_idx;
+        size_t exceptions_per_replica_idx;
+    };
+    std::vector<ChildResponseIndices> response_indices;
+    response_indices.reserve(children.size());
+
     for (const auto & child : children)
     {
-        ReplicatedPartitionExportInfo info;
-
         const auto export_partition_path = fs::path(exports_path) / child;
-        std::string metadata_json;
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
-        if (!zk->tryGet(export_partition_path / "metadata.json", metadata_json))
+        
+        ChildResponseIndices indices;
+        indices.metadata_idx = requests.size();
+        requests.push_back(zkutil::makeGetRequest(export_partition_path / "metadata.json"));
+        
+        indices.status_idx = requests.size();
+        requests.push_back(zkutil::makeGetRequest(export_partition_path / "status"));
+        
+        indices.processing_idx = requests.size();
+        requests.push_back(zkutil::makeListRequest(export_partition_path / "processing"));
+        
+        indices.exceptions_per_replica_idx = requests.size();
+        requests.push_back(zkutil::makeListRequest(export_partition_path / "exceptions_per_replica"));
+        
+        response_indices.push_back(indices);
+    }
+
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperMulti);
+
+    Coordination::Responses responses;
+    Coordination::Error code = zk->tryMulti(requests, responses);
+
+    if (code != Coordination::Error::ZOK)
+    {
+        LOG_INFO(log, "Failed to execute multi request for export partition info, error: {}", code);
+        return infos;
+    }
+
+    // Helper to extract GetResponse data
+    auto getGetResponseData = [&responses](size_t idx) -> std::pair<Coordination::Error, std::string>
+    {
+        if (idx >= responses.size())
+            return {Coordination::Error::ZRUNTIMEINCONSISTENCY, ""};
+        
+        const auto * get_response = dynamic_cast<const Coordination::GetResponse *>(responses[idx].get());
+        if (!get_response)
+            return {Coordination::Error::ZRUNTIMEINCONSISTENCY, ""};
+        
+        return {get_response->error, get_response->data};
+    };
+
+    // Helper to extract ListResponse data
+    auto getListResponseData = [&responses](size_t idx) -> std::pair<Coordination::Error, Strings>
+    {
+        if (idx >= responses.size())
+            return {Coordination::Error::ZRUNTIMEINCONSISTENCY, Strings{}};
+        
+        const auto * list_response = dynamic_cast<const Coordination::ListResponse *>(responses[idx].get());
+        if (!list_response)
+            return {Coordination::Error::ZRUNTIMEINCONSISTENCY, Strings{}};
+        
+        return {list_response->error, list_response->names};
+    };
+
+    // Create response wrappers matching the MultiTryGetResponse/MultiTryGetChildrenResponse interface
+    struct ResponseWrapper
+    {
+        Coordination::Error error;
+        std::string data;
+        Strings names;
+        
+        ResponseWrapper(Coordination::Error err, const std::string & d, const Strings & n) 
+            : error(err), data(d), names(n) {}
+    };
+
+    std::vector<ResponseWrapper> metadata_responses_wrapper;
+    std::vector<ResponseWrapper> status_responses_wrapper;
+    std::vector<ResponseWrapper> processing_responses_wrapper;
+    std::vector<ResponseWrapper> exceptions_per_replica_responses_wrapper;
+
+    metadata_responses_wrapper.reserve(children.size());
+    status_responses_wrapper.reserve(children.size());
+    processing_responses_wrapper.reserve(children.size());
+    exceptions_per_replica_responses_wrapper.reserve(children.size());
+
+    for (size_t child_idx = 0; child_idx < children.size(); ++child_idx)
+    {
+        const auto & indices = response_indices[child_idx];
+        
+        // Extract metadata response
+        auto [metadata_error, metadata_data] = getGetResponseData(indices.metadata_idx);
+        metadata_responses_wrapper.emplace_back(metadata_error, metadata_data, Strings{});
+        
+        // Extract status response
+        auto [status_error, status_data] = getGetResponseData(indices.status_idx);
+        status_responses_wrapper.emplace_back(status_error, status_data, Strings{});
+        
+        // Extract processing response
+        auto [processing_error, processing_names] = getListResponseData(indices.processing_idx);
+        processing_responses_wrapper.emplace_back(processing_error, "", processing_names);
+        
+        // Extract exceptions_per_replica response
+        auto [exceptions_error, exceptions_names] = getListResponseData(indices.exceptions_per_replica_idx);
+        exceptions_per_replica_responses_wrapper.emplace_back(exceptions_error, "", exceptions_names);
+    }
+
+    // Use wrapper vectors directly - they match the interface expected by the code below
+    auto & metadata_responses = metadata_responses_wrapper;
+    auto & status_responses = status_responses_wrapper;
+    auto & processing_responses = processing_responses_wrapper;
+    auto & exceptions_per_replica_responses = exceptions_per_replica_responses_wrapper;
+
+    /// Collect all exception replica paths for batching
+    struct ExceptionReplicaPath
+    {
+        size_t child_idx;
+        std::string replica;
+        std::string count_path;
+        std::string exception_path;
+        std::string part_path;
+    };
+
+    std::vector<ExceptionReplicaPath> exception_replica_paths;
+    for (size_t child_idx = 0; child_idx < children.size(); ++child_idx)
+    {
+        const auto & child = children[child_idx];
+        const auto export_partition_path = fs::path(exports_path) / child;
+        /// Check if we got valid responses
+        if (metadata_responses[child_idx].error != Coordination::Error::ZOK)
         {
             LOG_INFO(log, "Skipping {}: missing metadata.json", child);
             continue;
         }
-
-        std::string status;
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
-        if (!zk->tryGet(export_partition_path / "status", status))
+        if (status_responses[child_idx].error != Coordination::Error::ZOK)
         {
             LOG_INFO(log, "Skipping {}: missing status", child);
             continue;
         }
-
-        std::vector<std::string> processing_parts;
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildren);
-        if (Coordination::Error::ZOK != zk->tryGetChildren(export_partition_path / "processing", processing_parts))
+        if (processing_responses[child_idx].error != Coordination::Error::ZOK)
         {
             LOG_INFO(log, "Skipping {}: missing processing parts", child);
             continue;
         }
-
-        const auto parts_to_do = processing_parts.size();
-
-        std::string exception_replica;
-        std::string last_exception;
-        std::string exception_part;
-        std::size_t exception_count = 0;
-
-        const auto exceptions_per_replica_path = export_partition_path / "exceptions_per_replica";
-
-        Strings exception_replicas;
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildren);
-        if (Coordination::Error::ZOK != zk->tryGetChildren(exceptions_per_replica_path, exception_replicas))
+        if (exceptions_per_replica_responses[child_idx].error != Coordination::Error::ZOK)
         {
             LOG_INFO(log, "Skipping {}: missing exceptions_per_replica", export_partition_path);
             continue;
         }
-
+        const auto exceptions_per_replica_path = export_partition_path / "exceptions_per_replica";
+        const auto & exception_replicas = exceptions_per_replica_responses[child_idx].names;
         for (const auto & replica : exception_replicas)
         {
-            std::string exception_count_string;
-            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
-            if (!zk->tryGet(exceptions_per_replica_path / replica / "count", exception_count_string))
+            const auto last_exception_path = exceptions_per_replica_path / replica / "last_exception";
+            exception_replica_paths.push_back({
+                child_idx,
+                replica,
+                (exceptions_per_replica_path / replica / "count").string(),
+                (last_exception_path / "exception").string(),
+                (last_exception_path / "part").string()
+            });
+        }
+    }
+    /// Batch get all exception data in a single multi request
+    std::map<size_t, std::vector<std::tuple<std::string, std::string, std::string, std::string>>> exception_data_by_child;
+
+    if (!exception_replica_paths.empty())
+    {
+        Coordination::Requests exception_requests;
+        exception_requests.reserve(exception_replica_paths.size() * 3); // count, exception, part for each
+        
+        // Track response indices for each exception replica path
+        struct ExceptionResponseIndices
+        {
+            size_t count_idx;
+            size_t exception_idx;
+            size_t part_idx;
+        };
+        std::vector<ExceptionResponseIndices> exception_response_indices;
+        exception_response_indices.reserve(exception_replica_paths.size());
+        
+        for (const auto & erp : exception_replica_paths)
+        {
+            ExceptionResponseIndices indices;
+            indices.count_idx = exception_requests.size();
+            exception_requests.push_back(zkutil::makeGetRequest(erp.count_path));
+            
+            indices.exception_idx = exception_requests.size();
+            exception_requests.push_back(zkutil::makeGetRequest(erp.exception_path));
+            
+            indices.part_idx = exception_requests.size();
+            exception_requests.push_back(zkutil::makeGetRequest(erp.part_path));
+            
+            exception_response_indices.push_back(indices);
+        }
+
+        // Execute single multi request for all exception data
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperMulti);
+        
+        Coordination::Responses exception_responses;
+        Coordination::Error exception_code = zk->tryMulti(exception_requests, exception_responses);
+
+        if (exception_code != Coordination::Error::ZOK)
+        {
+            LOG_INFO(log, "Failed to execute multi request for exception data, error: {}", exception_code);
+        }
+        else
+        {
+            // Parse exception responses
+            for (size_t exception_path_idx = 0; exception_path_idx < exception_replica_paths.size(); ++exception_path_idx)
             {
-                LOG_INFO(log, "Skipping {}: missing count", replica);
-                continue;
+                const auto & erp = exception_replica_paths[exception_path_idx];
+                const auto & indices = exception_response_indices[exception_path_idx];
+
+                std::string count_str;
+                std::string exception_str;
+                std::string part_str;
+
+                // Extract count response
+                if (indices.count_idx < exception_responses.size())
+                {
+                    const auto * count_response = dynamic_cast<const Coordination::GetResponse *>(exception_responses[indices.count_idx].get());
+                    if (count_response && count_response->error == Coordination::Error::ZOK)
+                        count_str = count_response->data;
+                }
+
+                // Extract exception response
+                if (indices.exception_idx < exception_responses.size())
+                {
+                    const auto * exception_response = dynamic_cast<const Coordination::GetResponse *>(exception_responses[indices.exception_idx].get());
+                    if (exception_response && exception_response->error == Coordination::Error::ZOK)
+                        exception_str = exception_response->data;
+                }
+
+                // Extract part response
+                if (indices.part_idx < exception_responses.size())
+                {
+                    const auto * part_response = dynamic_cast<const Coordination::GetResponse *>(exception_responses[indices.part_idx].get());
+                    if (part_response && part_response->error == Coordination::Error::ZOK)
+                        part_str = part_response->data;
+                }
+
+                exception_data_by_child[erp.child_idx].emplace_back(erp.replica, count_str, exception_str, part_str);
             }
+        }
+    }
 
-            exception_count += std::stoull(exception_count_string.c_str());
+    /// Build the result
+    for (size_t child_idx = 0; child_idx < children.size(); ++child_idx)
+    {
+        /// Skip if we already determined this child is invalid
+        if (metadata_responses[child_idx].error != Coordination::Error::ZOK
+            || status_responses[child_idx].error != Coordination::Error::ZOK
+            || processing_responses[child_idx].error != Coordination::Error::ZOK
+            || exceptions_per_replica_responses[child_idx].error != Coordination::Error::ZOK)
+        {
+            continue;
+        }
 
-            if (last_exception.empty())
+        ReplicatedPartitionExportInfo info;
+        const auto metadata_json = metadata_responses[child_idx].data;
+        const auto status = status_responses[child_idx].data;
+        const auto processing_parts = processing_responses[child_idx].names;
+        const auto parts_to_do = processing_parts.size();
+        std::string exception_replica;
+        std::string last_exception;
+        std::string exception_part;
+        std::size_t exception_count = 0;
+        /// Process exception data
+        auto exception_data_it = exception_data_by_child.find(child_idx);
+        if (exception_data_it != exception_data_by_child.end())
+        {
+            for (const auto & [replica, count_str, exception_str, part_str] : exception_data_it->second)
             {
-                const auto last_exception_path = exceptions_per_replica_path / replica / "last_exception";
-                std::string last_exception_string;
-                if (!zk->tryGet(last_exception_path / "exception", last_exception_string))
+                if (!count_str.empty())
                 {
-                    LOG_INFO(log, "Skipping {}: missing last_exception/exception", last_exception_path);
-                    continue;
+                    exception_count += std::stoull(count_str);
                 }
-
-                std::string exception_part_zk;
-                if (!zk->tryGet(last_exception_path / "part", exception_part_zk))
+                if (last_exception.empty() && !exception_str.empty() && !part_str.empty())
                 {
-                    LOG_INFO(log, "Skipping {}: missing exception part", last_exception_path);
-                    continue;
+                    exception_replica = replica;
+                    last_exception = exception_str;
+                    exception_part = part_str;
                 }
-
-                exception_replica = replica;
-                last_exception = last_exception_string;
-                exception_part = exception_part_zk;
             }
         }
 
         const auto metadata = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
-
         info.destination_database = metadata.destination_database;
         info.destination_table = metadata.destination_table;
         info.partition_id = metadata.partition_id;
@@ -4585,13 +4798,10 @@ std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartit
         info.last_exception = last_exception;
         info.exception_part = exception_part;
         info.exception_count = exception_count;
-
         infos.emplace_back(std::move(info));
     }
-
     return infos;
 }
-
 
 StorageReplicatedMergeTree::CreateMergeEntryResult StorageReplicatedMergeTree::createLogEntryToMergeParts(
     zkutil::ZooKeeperPtr & zookeeper,
