@@ -4,6 +4,7 @@
 #include <queue>
 #include <string>
 #include <unordered_set>
+#include <Storages/System/StorageSystemReplicatedPartitionExports.h>
 namespace DB
 {
 
@@ -20,6 +21,8 @@ public:
     void handleStatusChanges();
 
     void addStatusChange(const std::string & key);
+
+    std::vector<ReplicatedPartitionExportInfo> getPartitionExportsInfo() const;
 
 private:
     StorageReplicatedMergeTree & storage;
