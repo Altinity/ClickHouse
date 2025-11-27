@@ -5,7 +5,18 @@
 #include "Common/logger_useful.h"
 #include <Common/ZooKeeper/Types.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
+#include <Common/ProfileEvents.h>
 #include <Interpreters/DatabaseCatalog.h>
+
+namespace ProfileEvents
+{
+    extern const Event ExportPartitionZooKeeperRequests;
+    extern const Event ExportPartitionZooKeeperGet;
+    extern const Event ExportPartitionZooKeeperGetChildren;
+    extern const Event ExportPartitionZooKeeperGetChildrenWatch;
+    extern const Event ExportPartitionZooKeeperGetWatch;
+    extern const Event ExportPartitionZooKeeperRemoveRecursive;
+}
 
 namespace DB
 {
@@ -35,6 +46,8 @@ namespace
         if (has_expired && !is_pending)
         {
             zk->tryRemoveRecursive(fs::path(entry_path));
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRemoveRecursive);
             auto it = entries_by_key.find(key);
             if (it != entries_by_key.end())
                 entries_by_key.erase(it);
@@ -44,9 +57,12 @@ namespace
         }
         else if (is_pending)
         {
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildren);
             std::vector<std::string> parts_in_processing_or_pending;
             if (Coordination::Error::ZOK != zk->tryGetChildren(fs::path(entry_path) / "processing", parts_in_processing_or_pending))
             {
+
                 LOG_INFO(log, "ExportPartition Manifest Updating Task: Failed to get parts in processing or pending, skipping");
                 return false;
             }
@@ -98,6 +114,8 @@ void ExportPartitionManifestUpdatingTask::poll()
 
     Coordination::Stat stat;
     const auto children = zk->getChildrenWatch(exports_path, &stat, storage.export_merge_tree_partition_watch_callback);
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildrenWatch);
     const std::unordered_set<std::string> zk_children(children.begin(), children.end());
 
     const auto now = time(nullptr);
@@ -111,6 +129,8 @@ void ExportPartitionManifestUpdatingTask::poll()
     {
         const std::string entry_path = fs::path(exports_path) / key;
 
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
         std::string metadata_json;
         if (!zk->tryGet(fs::path(entry_path) / "metadata.json", metadata_json))
         {
@@ -144,6 +164,8 @@ void ExportPartitionManifestUpdatingTask::poll()
             }
         });
 
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetWatch);
         std::string status;
         if (!zk->tryGetWatch(fs::path(entry_path) / "status", status, nullptr, status_watch_callback))
         {
@@ -273,6 +295,8 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
         if (it == storage.export_merge_tree_partition_task_entries_by_key.end())
             continue;
 
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
         /// get new status from zk
         std::string new_status_string;
         if (!zk->tryGet(fs::path(storage.zookeeper_path) / "exports" / key / "status", new_status_string))
