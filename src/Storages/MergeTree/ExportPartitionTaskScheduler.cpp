@@ -4,8 +4,21 @@
 #include <Interpreters/DatabaseCatalog.h>
 #include <Common/Exception.h>
 #include <Common/ZooKeeper/Types.h>
+#include <Common/ProfileEvents.h>
 #include "Storages/MergeTree/ExportPartitionUtils.h"
 #include "Storages/MergeTree/MergeTreePartExportManifest.h"
+
+namespace ProfileEvents
+{
+    extern const Event ExportPartitionZooKeeperRequests;
+    extern const Event ExportPartitionZooKeeperGet;
+    extern const Event ExportPartitionZooKeeperGetChildren;
+    extern const Event ExportPartitionZooKeeperCreate;
+    extern const Event ExportPartitionZooKeeperSet;
+    extern const Event ExportPartitionZooKeeperRemove;
+    extern const Event ExportPartitionZooKeeperMulti;
+    extern const Event ExportPartitionZooKeeperExists;
+}
 
 
 namespace DB
@@ -75,12 +88,17 @@ void ExportPartitionTaskScheduler::run()
             continue;
         }
 
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
         std::string status_in_zk_string;
         if (!zk->tryGet(fs::path(storage.zookeeper_path) / "exports" / key / "status", status_in_zk_string))
         {
             LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to get status, skipping");
             continue;
         }
+
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
 
         const auto status_in_zk = magic_enum::enum_cast<ExportReplicatedMergeTreePartitionTaskEntry::Status>(status_in_zk_string);
 
@@ -97,6 +115,8 @@ void ExportPartitionTaskScheduler::run()
             continue;
         }
 
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildren);
         std::vector<std::string> parts_in_processing_or_pending;
         
         if (Coordination::Error::ZOK != zk->tryGetChildren(fs::path(storage.zookeeper_path) / "exports" / key / "processing", parts_in_processing_or_pending))
@@ -105,12 +125,15 @@ void ExportPartitionTaskScheduler::run()
             continue;
         }
 
+
         if (parts_in_processing_or_pending.empty())
         {
             LOG_INFO(storage.log, "ExportPartition scheduler task: No parts in processing or pending, skipping");
             continue;
         }
 
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildren);
         std::vector<std::string> locked_parts;
 
         if (Coordination::Error::ZOK != zk->tryGetChildren(fs::path(storage.zookeeper_path) / "exports" / key / "locks", locked_parts))
@@ -136,6 +159,8 @@ void ExportPartitionTaskScheduler::run()
                 continue;
             }
 
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperCreate);
             if (Coordination::Error::ZOK != zk->tryCreate(fs::path(storage.zookeeper_path) / "exports" / key / "locks" / zk_part_name, storage.replica_name, zkutil::CreateMode::Ephemeral))
             {
                 LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to lock part {}, skipping", zk_part_name);
@@ -160,6 +185,8 @@ void ExportPartitionTaskScheduler::run()
             {
                 tryLogCurrentException(__PRETTY_FUNCTION__);
                 zk->tryRemove(fs::path(storage.zookeeper_path) / "exports" / key / "locks" / zk_part_name);
+                ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+                ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRemove);
                 /// we should not increment retry_count because the node might just be full
             }
         }
@@ -251,6 +278,8 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
     Coordination::Stat locked_by_stat;
     std::string locked_by;
 
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
     if (!zk->tryGet(export_path / "locks" / part_name, locked_by, &locked_by_stat))
     {
         LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} is not locked by any replica, will not increment error counts", part_name);
@@ -267,6 +296,8 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
 
     const auto processing_part_path = processing_parts_path / part_name;
 
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
     std::string processing_part_string;
 
     if (!zk->tryGet(processing_part_path, processing_part_string))
@@ -301,10 +332,14 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
         const auto count_path = exceptions_per_replica_path / "count";
         const auto last_exception_path = exceptions_per_replica_path / "last_exception";
 
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperExists);
         if (zk->exists(exceptions_per_replica_path))
         {
             std::string num_exceptions_string;
             zk->tryGet(count_path, num_exceptions_string);
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
             num_exceptions = std::stoull(num_exceptions_string.c_str());
 
             ops.emplace_back(zkutil::makeSetRequest(last_exception_path / "part", part_name, -1));
@@ -322,6 +357,8 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
         num_exceptions++;
         ops.emplace_back(zkutil::makeSetRequest(count_path, std::to_string(num_exceptions), -1));
 
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperMulti);
         Coordination::Responses responses;
         if (Coordination::Error::ZOK != zk->tryMulti(ops, responses))
         {
@@ -343,6 +380,8 @@ bool ExportPartitionTaskScheduler::tryToMovePartToProcessed(
     Coordination::Stat locked_by_stat;
     std::string locked_by;
 
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
     if (!zk->tryGet(export_path / "locks" / part_name, locked_by, &locked_by_stat))
     {
         LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} is not locked by any replica, will not commit or set it as completed", part_name);
@@ -368,9 +407,12 @@ bool ExportPartitionTaskScheduler::tryToMovePartToProcessed(
     requests.emplace_back(zkutil::makeCreateRequest(processed_part_path, processed_part_entry.toJsonString(), zkutil::CreateMode::Persistent));
     requests.emplace_back(zkutil::makeRemoveRequest(export_path / "locks" / part_name, locked_by_stat.version));
 
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperMulti);
     Coordination::Responses responses;
     if (Coordination::Error::ZOK != zk->tryMulti(requests, responses))
     {
+
         /// todo  arthur remember what to do here
         LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to update export path, skipping");
         return false;
@@ -383,6 +425,8 @@ bool ExportPartitionTaskScheduler::areAllPartsProcessed(
     const std::filesystem::path & export_path,
     const zkutil::ZooKeeperPtr & zk)
 {
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildren);
     Strings parts_in_processing_or_pending;
     if (Coordination::Error::ZOK != zk->tryGetChildren(export_path / "processing", parts_in_processing_or_pending))
     {

@@ -157,6 +157,15 @@ namespace ProfileEvents
     extern const Event ReplicaPartialShutdown;
     extern const Event ReplicatedCoveredPartsInZooKeeperOnStart;
     extern const Event MergesRejectedByMemoryLimit;
+    extern const Event ExportPartitionZooKeeperRequests;
+    extern const Event ExportPartitionZooKeeperGet;
+    extern const Event ExportPartitionZooKeeperGetChildren;
+    extern const Event ExportPartitionZooKeeperCreate;
+    extern const Event ExportPartitionZooKeeperSet;
+    extern const Event ExportPartitionZooKeeperRemove;
+    extern const Event ExportPartitionZooKeeperRemoveRecursive;
+    extern const Event ExportPartitionZooKeeperMulti;
+    extern const Event ExportPartitionZooKeeperExists;
 }
 
 namespace CurrentMetrics
@@ -4465,6 +4474,8 @@ std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartit
     const auto zk = getZooKeeper();
     const auto exports_path = fs::path(zookeeper_path) / "exports";
     std::vector<std::string> children;
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildren);
     if (Coordination::Error::ZOK != zk->tryGetChildren(exports_path, children))
     {
         LOG_INFO(log, "Failed to get children from exports path, returning empty export info list");
@@ -4477,6 +4488,8 @@ std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartit
 
         const auto export_partition_path = fs::path(exports_path) / child;
         std::string metadata_json;
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
         if (!zk->tryGet(export_partition_path / "metadata.json", metadata_json))
         {
             LOG_INFO(log, "Skipping {}: missing metadata.json", child);
@@ -4484,6 +4497,8 @@ std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartit
         }
 
         std::string status;
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
         if (!zk->tryGet(export_partition_path / "status", status))
         {
             LOG_INFO(log, "Skipping {}: missing status", child);
@@ -4491,6 +4506,8 @@ std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartit
         }
 
         std::vector<std::string> processing_parts;
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildren);
         if (Coordination::Error::ZOK != zk->tryGetChildren(export_partition_path / "processing", processing_parts))
         {
             LOG_INFO(log, "Skipping {}: missing processing parts", child);
@@ -4507,6 +4524,8 @@ std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartit
         const auto exceptions_per_replica_path = export_partition_path / "exceptions_per_replica";
 
         Strings exception_replicas;
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildren);
         if (Coordination::Error::ZOK != zk->tryGetChildren(exceptions_per_replica_path, exception_replicas))
         {
             LOG_INFO(log, "Skipping {}: missing exceptions_per_replica", export_partition_path);
@@ -4516,6 +4535,8 @@ std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartit
         for (const auto & replica : exception_replicas)
         {
             std::string exception_count_string;
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
             if (!zk->tryGet(exceptions_per_replica_path / replica / "count", exception_count_string))
             {
                 LOG_INFO(log, "Skipping {}: missing count", replica);
@@ -8178,15 +8199,21 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     const auto partition_exports_path = fs::path(exports_path) / export_key;
 
     /// check if entry already exists
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperExists);
     if (zookeeper->exists(partition_exports_path))
     {
         LOG_INFO(log, "Export with key {} is already exported or it is being exported. Checking if it has expired so that we can overwrite it", export_key);
 
         bool has_expired = false;
 
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperExists);
         if (zookeeper->exists(fs::path(partition_exports_path) / "metadata.json"))
         {
             std::string metadata_json;
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
             if (zookeeper->tryGet(fs::path(partition_exports_path) / "metadata.json", metadata_json))
             {
                 const auto manifest = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
@@ -8213,6 +8240,8 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
         /// Not putting in ops (same transaction) because we can't construct a "tryRemoveRecursive" request.
         /// It is possible that the zk being used does not support RemoveRecursive requests.
         /// It is ok for this to be non transactional. Worst case scenario an on-going export is going to be killed and a new task won't be scheduled.
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRemoveRecursive);
         zookeeper->tryRemoveRecursive(partition_exports_path);
     }
 
@@ -8338,6 +8367,8 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
         "PENDING", 
         zkutil::CreateMode::Persistent));
 
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperMulti);
     Coordination::Responses responses;
     Coordination::Error code = zookeeper->tryMulti(ops, responses);
 
