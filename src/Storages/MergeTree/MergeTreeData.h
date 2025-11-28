@@ -1359,6 +1359,7 @@ protected:
     friend class IPartMetadataManager;
     friend class IMergedBlockOutputStream; // for access to log
     friend class ExportPartTask;
+    friend class ExportPartFromPartitionExportTask;
 
     bool require_part_metadata;
 
