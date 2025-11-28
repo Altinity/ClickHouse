@@ -1,0 +1,67 @@
+#include <Storages/MergeTree/ExportPartFromPartitionExportTask.h>
+#include <Common/ProfileEvents.h>
+
+namespace ProfileEvents
+{
+    extern const Event ExportPartitionZooKeeperRequests;
+    extern const Event ExportPartitionZooKeeperGetChildren;
+    extern const Event ExportPartitionZooKeeperCreate;
+}
+namespace DB
+{
+
+ExportPartFromPartitionExportTask::ExportPartFromPartitionExportTask(
+    StorageReplicatedMergeTree & storage_,
+    const std::string & key_,
+    const MergeTreePartExportManifest & manifest_,
+    ContextPtr context_)
+    : storage(storage_),
+    key(key_),
+    manifest(manifest_),
+    local_context(context_)
+{
+    export_part_task = std::make_shared<ExportPartTask>(storage, manifest, local_context);
+}
+
+bool ExportPartFromPartitionExportTask::executeStep()
+{
+    const auto zk = storage.getZooKeeper();
+    const auto part_name = manifest.data_part->name;
+    
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperCreate);
+    if (Coordination::Error::ZOK == zk->tryCreate(fs::path(storage.zookeeper_path) / "exports" / key / "locks" / part_name, storage.replica_name, zkutil::CreateMode::Ephemeral))
+    {
+        export_part_task->executeStep();
+        return false;
+    }
+
+    LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to lock part {}, skipping", part_name);
+    return false;
+}
+
+void ExportPartFromPartitionExportTask::cancel() noexcept
+{
+    export_part_task->cancel();
+}
+
+void ExportPartFromPartitionExportTask::onCompleted()
+{
+    export_part_task->onCompleted();
+}
+
+StorageID ExportPartFromPartitionExportTask::getStorageID() const
+{
+    return export_part_task->getStorageID();
+}
+
+Priority ExportPartFromPartitionExportTask::getPriority() const
+{
+    return export_part_task->getPriority();
+}
+
+String ExportPartFromPartitionExportTask::getQueryId() const
+{
+    return export_part_task->getQueryId();
+}
+}

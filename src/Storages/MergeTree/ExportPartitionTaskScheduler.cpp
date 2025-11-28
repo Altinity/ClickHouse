@@ -7,6 +7,9 @@
 #include <Common/ProfileEvents.h>
 #include "Storages/MergeTree/ExportPartitionUtils.h"
 #include "Storages/MergeTree/MergeTreePartExportManifest.h"
+#include "Storages/MergeTree/ExportPartFromPartitionExportTask.h"
+#include "Formats/FormatFactory.h"
+#include <Core/Settings.h>
 
 namespace ProfileEvents
 {
@@ -23,6 +26,11 @@ namespace ProfileEvents
 
 namespace DB
 {
+
+namespace Setting
+{
+    extern const SettingsMergeTreePartExportFileAlreadyExistsPolicy export_merge_tree_part_file_already_exists_policy;
+}
 
 namespace ErrorCodes
 {
@@ -156,41 +164,29 @@ void ExportPartitionTaskScheduler::run()
                 continue;
             }
 
-            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperCreate);
-            if (Coordination::Error::ZOK != zk->tryCreate(fs::path(storage.zookeeper_path) / "exports" / key / "locks" / zk_part_name, storage.replica_name, zkutil::CreateMode::Ephemeral))
-            {
-                LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to lock part {}, skipping", zk_part_name);
-                continue;
-            }
+            std::lock_guard part_export_lock(storage.export_manifests_mutex);
 
-            try
-            {
-                storage.exportPartToTable(
-                    part->name,
-                    destination_storage_id,
-                    manifest.transaction_id,
-                    getContextCopyWithTaskSettings(storage.getContext(), manifest),
-                    /*allow_outdated_parts*/ true,
-                    [this, key, zk_part_name, manifest, destination_storage]
-                    (MergeTreePartExportManifest::CompletionCallbackResult result)
-                    {
-                        handlePartExportCompletion(key, zk_part_name, manifest, destination_storage, result);
-                    });
-            }
-            catch (const Exception &)
-            {
-                tryLogCurrentException(__PRETTY_FUNCTION__);
-                zk->tryRemove(fs::path(storage.zookeeper_path) / "exports" / key / "locks" / zk_part_name);
-                ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-                ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRemove);
-                /// we should not increment retry_count because the node might just be full
-            }
+            auto context = getContextCopyWithTaskSettings(storage.getContext(), manifest);
+
+            const auto format_settings = getFormatSettings(context);
+
+            MergeTreePartExportManifest part_export_manifest(
+                destination_storage->getStorageID(),
+                part,
+                manifest.transaction_id,
+                context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value,
+                format_settings,
+                storage.getInMemoryMetadataPtr(),
+                [this, key, zk_part_name, manifest, destination_storage]
+                (MergeTreePartExportManifest::CompletionCallbackResult result)
+                {
+                    handlePartExportCompletion(key, zk_part_name, manifest, destination_storage, result);
+                });
+
+            storage.background_moves_assignee.scheduleMoveTask(
+                std::make_shared<ExportPartFromPartitionExportTask>(storage, key, part_export_manifest, getContextCopyWithTaskSettings(storage.getContext(), manifest)));
         }
     }
-
-    /// maybe we failed to schedule or failed to export, need to retry eventually
-    storage.export_merge_tree_partition_select_task->scheduleAfter(1000 * 5);
 }
 
 void ExportPartitionTaskScheduler::handlePartExportCompletion(

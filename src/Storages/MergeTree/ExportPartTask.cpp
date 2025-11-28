@@ -101,6 +101,11 @@ ExportPartTask::ExportPartTask(MergeTreeData & storage_, const MergeTreePartExpo
 {
 }
 
+const MergeTreePartExportManifest & ExportPartTask::getManifest() const
+{
+    return manifest;
+}
+
 bool ExportPartTask::executeStep()
 {
     auto local_context = Context::createCopy(storage.getContext());

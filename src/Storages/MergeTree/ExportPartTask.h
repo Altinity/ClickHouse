@@ -18,6 +18,7 @@ public:
     StorageID getStorageID() const override;
     Priority getPriority() const override;
     String getQueryId() const override;
+    const MergeTreePartExportManifest & getManifest() const;
 
     void cancel() noexcept override;
 
