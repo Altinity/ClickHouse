@@ -97,9 +97,6 @@ void ExportPartitionTaskScheduler::run()
             continue;
         }
 
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
-
         const auto status_in_zk = magic_enum::enum_cast<ExportReplicatedMergeTreePartitionTaskEntry::Status>(status_in_zk_string);
 
         if (!status_in_zk)
