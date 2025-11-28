@@ -24,9 +24,13 @@ StorageObjectStorageStableTaskDistributor::StorageObjectStorageStableTaskDistrib
     , lock_object_storage_task_distribution_us(lock_object_storage_task_distribution_ms_ * 1000)
     , iterator_exhausted(false)
 {
+    Poco::Timestamp now;
     size_t nodes = ids_of_nodes.size();
     for (size_t i = 0; i < nodes; ++i)
+    {
         replica_to_files_to_be_processed[i] = std::list<ObjectInfoPtr>{};
+        last_node_activity[i] = now;
+    }
 }
 
 ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getNextTask(size_t number_of_current_replica)
