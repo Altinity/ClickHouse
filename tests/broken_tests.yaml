@@ -57,6 +57,21 @@
   message: result differs with reference
   check_types:
   - msan
+- name: 00024_random_counters
+  reason: INVESTIGATE - random timeout
+  message: Timeout! Killing process group
+- name: test_storage_s3_queue/test_5.py::test_migration[1-s3queue_]
+  reason: KNOWN - Sometimes fails due to test order
+  message: 'Failed: Timeout >900.0s'
+- name: test_storage_s3_queue/test_5.py::test_migration[3-s3queue_]
+  reason: KNOWN - Sometimes fails due to test order
+  message: 'Failed: Timeout >900.0s'
+- name: test_storage_s3_queue/test_5.py::test_migration[1-]
+  reason: KNOWN - Sometimes fails due to test order
+  message: 'Failed: Timeout >900.0s'
+- name: test_storage_s3_queue/test_5.py::test_migration[3-]
+  reason: KNOWN - Sometimes fails due to test order
+  message: 'Failed: Timeout >900.0s'
 - name: test_scheduler_cpu_preemptive/test.py::test_downscaling[cpu-slot-preemption-timeout-1ms]
   reason: INVESTIGATE - Unstable on tsan, asan
   message: 'Failed: Timeout >900.0s'
@@ -87,6 +102,12 @@
 - name: test_storage_s3_queue/test_0.py::test_streaming_to_many_views[ordered]
   reason: 'KNOWN - Unstable upstream'
 - name: test_storage_s3_queue/test_2.py::test_shards_distributed[unordered-1]
+  reason: 'KNOWN - Unstable upstream'
+- name: test_storage_s3_queue/test_2.py::test_shards_distributed[unordered-8]
+  reason: 'KNOWN - Unstable upstream'
+- name: test_storage_s3_queue/test_2.py::test_shards_distributed[ordered-1]
+  reason: 'KNOWN - Unstable upstream'
+- name: test_storage_s3_queue/test_2.py::test_shards_distributed[ordered-2]
   reason: 'KNOWN - Unstable upstream'
 - name: test_storage_s3_queue/test_4.py::test_list_and_delete_race
   reason: 'KNOWN - Unstable upstream'
@@ -163,7 +184,7 @@
      |Timeout exceeded while receiving data from server\.
      |DB::Exception: Estimated query execution time \((\d+\.\d+) seconds\) is too long\.
      |curl: \(28\) Operation timed out'
-  not_message: 'Sanitizer trap'
+  not_message: 'Sanitizer trap|Sanitizer assert'
   regex: true
   check_types:
   - tsan
