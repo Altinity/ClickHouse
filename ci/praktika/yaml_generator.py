@@ -342,6 +342,14 @@ class PullRequestPushYamlGen:
                     YamlGenerator.Templates.TEMPLATE_IF_EXPRESSION_NOT_CANCELLED
                 )
 
+            # TODO: replace this hack with a proper configuration
+            if (
+                job_name == Settings.CI_CONFIG_JOB_NAME
+                and self.workflow_config.name == "Community PR"
+            ):
+                if_expression = "\n    if: ${{ github.actor == 'strtgbb' }}"
+                job_addons.append("\n      - name: Dump env\n        run: env | sort\n")
+
             secrets_envs = []
             # note(strtgbb): This adds github secrets to praktika_setup_env.sh
             # This makes the workflow very verbose and we don't need it
@@ -486,7 +494,12 @@ class PullRequestPushYamlGen:
                     VAR_NAME=secret.name
                 )
         format_kwargs["ENV_SECRETS"] = GH_VAR_ENVS + SECRET_ENVS
-        format_kwargs["ENV_SECRETS"] += AltinityWorkflowTemplates.ADDITIONAL_GLOBAL_ENV
+
+        if self.parser.config.secrets:
+            # Only add global env if there are secrets in workflow config
+            format_kwargs[
+                "ENV_SECRETS"
+            ] += AltinityWorkflowTemplates.ADDITIONAL_GLOBAL_ENV
 
         template_1 = base_template.strip().format(
             NAME=self.workflow_config.name,
