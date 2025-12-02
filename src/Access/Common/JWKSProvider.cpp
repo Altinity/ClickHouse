@@ -25,11 +25,8 @@ JWKSType JWKSClient::getJWKS()
     auto now = std::chrono::high_resolution_clock::now();
     auto diff = std::chrono::duration<double>(now - last_request_send).count();
 
-    if (diff < refresh_timeout)
-    {
-        jwt::jwks <jwt::traits::kazuho_picojson> result(cached_jwks);
-        return result;
-    }
+    if (diff < refresh_timeout && cached_jwks.has_value())
+        return cached_jwks.value();
 
     Poco::Net::HTTPResponse response;
     std::string response_string;
@@ -70,7 +67,7 @@ JWKSType JWKSClient::getJWKS()
     }
 
     cached_jwks = std::move(parsed_jwks);
-    return cached_jwks;
+    return cached_jwks.value();
 }
 
 StaticJWKSParams::StaticJWKSParams(const std::string & static_jwks_, const std::string & static_jwks_file_)

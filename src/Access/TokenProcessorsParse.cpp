@@ -45,7 +45,7 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
         if (externally_configured && ! locally_configured)
         {
             return std::make_unique<OpenIdTokenProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim,
-                                                          config.getString(prefix + ".openid_config_endpoint"),
+                                                          config.getString(prefix + ".configuration_endpoint"),
                                                           verifier_leeway,
                                                           jwks_cache_lifetime);
         }

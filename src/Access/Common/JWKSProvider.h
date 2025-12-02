@@ -43,7 +43,7 @@ private:
     Poco::URI jwks_uri;
 
     std::shared_mutex mutex;
-    JWKSType cached_jwks;
+    std::optional<JWKSType> cached_jwks;
     std::chrono::time_point<std::chrono::high_resolution_clock> last_request_send;
 };
 

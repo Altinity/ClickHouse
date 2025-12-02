@@ -334,6 +334,9 @@ bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
         return false;
     }
 
+    if (!provider->getJWKS().has_jwk(decoded_jwt.get_key_id()))
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWKS error: no JWK found for JWT");
+
     auto jwk = provider->getJWKS().get_jwk(decoded_jwt.get_key_id());
     auto username = decoded_jwt.get_payload_claim(username_claim).as_string();
 
