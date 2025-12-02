@@ -583,9 +583,13 @@ class ClickhouseIntegrationTestsRunner:
                     test_logs = extract_fail_logs(log_path)
                     test_log = test_logs.get(failed_test.split("::")[-1])
                     if test_log is None:
+                        # Log extraction can fail if the fail was in the teardown
                         log_file.write(
-                            f"WARNING: Test '{failed_test}' has no logs among {test_logs.keys()}\n"
+                            f"WARNING: Test '{failed_test}' has no logs among {list(test_logs.keys())}, assuming log extraction failed, proceeding with full log\n"
                         )
+                        with open(log_path, "r", encoding="utf-8") as f:
+                            test_log = f.read()
+
                     known_fail_reason = test_is_known_fail(
                         failed_test, test_log, log_file
                     )
