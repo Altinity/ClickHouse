@@ -250,8 +250,8 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(s
         /// All unprocessed files owned by alive replicas with recenlty activity
         /// Need to retry after (oldest_activity - activity_limit) microseconds
         PathWithMetadata::CommandInTaskResponse response;
-        response.set_retry_after_us(oldest_activity - activity_limit);
-        return std::make_shared<ObjectInfo>(response.to_string());
+        response.setRetryAfterUs(oldest_activity - activity_limit);
+        return std::make_shared<ObjectInfo>(response.toString());
     }
 
     return {};
