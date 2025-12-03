@@ -55,10 +55,8 @@ env:
 jobs:
 {JOBS}\
 """
-        TEMPLATE_GH_TOKEN_PERMISSIONS = """\
-# Allow updating GH commit statuses and PR comments to post an actual job reports link
-permissions: write-all\
-"""
+        # NOTE (strtgbb): This is dangerous to set for untrusted workflows, and for trusted workflows it should already be the default
+        TEMPLATE_GH_TOKEN_PERMISSIONS = ""
         TEMPLATE_ENV_CHECKOUT_REF_PR = """\
   GH_TOKEN: ${{{{ github.token }}}}
   DISABLE_CI_MERGE_COMMIT: ${{{{ vars.DISABLE_CI_MERGE_COMMIT || '0' }}}}
