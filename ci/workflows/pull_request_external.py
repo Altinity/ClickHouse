@@ -92,7 +92,7 @@ workflow = Workflow.Config(
     disable_dockers_build=True,
     enable_dockers_manifest_merge=False,
     secrets=[],
-    enable_job_filtering_by_changes=True,
+    enable_job_filtering_by_changes=False,  # TODO: Change this back?
     enable_cache=False,
     enable_report=False,
     enable_cidb=False,
@@ -106,6 +106,9 @@ workflow = Workflow.Config(
     workflow_filter_hooks=[should_skip_job],
     post_hooks=[],
 )
+
+for job in workflow.jobs:
+    job.enable_commit_status = False
 
 WORKFLOWS = [
     workflow,
