@@ -227,8 +227,8 @@ def test_cache_locality(started_cluster, lock_object_storage_task_distribution_m
     assert s3_get_second <= s3_get_first * (0.189 + dispersion)
 
     # New replica and old replica, different replicas order
-    # All files form removed replica changed replica
-    # Some files form existed replicas changed replica on the new replica
+    # All files from removed replica changed replica
+    # Some files from existed replicas changed replica on the new replica
     (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_1234', 'cluster_4523', 1, lock_object_storage_task_distribution_ms)
     assert s3_get_second <= s3_get_first * (0.368 + dispersion) # actual value - 368 of 1000 changed replica
 
