@@ -217,7 +217,8 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(s
 
         while (it != unprocessed_files.end())
         {
-            auto last_activity = last_node_activity.find(it->second.second);
+            auto number_of_matched_replica = it->second.second;
+            auto last_activity = last_node_activity.find(number_of_matched_replica);
             if (lock_object_storage_task_distribution_us <= 0 // file deferring is turned off
                 || it->second.second == number_of_current_replica // file is matching with current replica
                 || last_activity == last_node_activity.end() // msut never be happen, last_activity is filled for each replica on start
@@ -229,10 +230,10 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(s
                 auto file_path = send_over_whole_archive ? next_file->getPathOrPathToArchiveIfArchive() : next_file->getAbsolutePath().value_or(next_file->getPath());
                 LOG_TRACE(
                     log,
-                    "Iterator exhausted. Assigning unprocessed file {} to replica {}, original matching replica {}",
+                    "Iterator exhausted. Assigning unprocessed file {} to replica {} from matched replica {}",
                     file_path,
                     number_of_current_replica,
-                    it->second.second
+                    number_of_matched_replica
                 );
 
                 return next_file;
