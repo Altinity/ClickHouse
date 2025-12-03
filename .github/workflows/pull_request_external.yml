@@ -1,0 +1,17 @@
+name: Community PR
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - antalya-*
+
+jobs:
+  dummy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print PR info
+        run: |
+          echo "PR #${{ github.event.pull_request.number }}"
+          echo "Source repo: ${{ github.repository }}"
+          echo "Base repo: ${{ github.event.pull_request.base.repo.full_name }}"
+          echo "Actor: ${{ github.actor }}"
