@@ -67,6 +67,17 @@ ExportPartitionTaskScheduler::ExportPartitionTaskScheduler(StorageReplicatedMerg
 
 void ExportPartitionTaskScheduler::run()
 {
+    const auto available_move_executors = storage.background_moves_assignee.getAvailableMoveExecutors();
+    if (available_move_executors == 0)
+    {
+        LOG_INFO(storage.log, "ExportPartition scheduler task: No available move executors, skipping");
+        return;
+    }
+
+    LOG_INFO(storage.log, "ExportPartition scheduler task: Available move executors: {}", available_move_executors);
+
+    std::size_t scheduled_exports_count = 0;
+
     std::lock_guard lock(storage.export_merge_tree_partition_mutex);
 
     auto zk = storage.getZooKeeper();
@@ -74,6 +85,12 @@ void ExportPartitionTaskScheduler::run()
     // Iterate sorted by create_time
     for (auto & entry : storage.export_merge_tree_partition_task_entries_by_create_time)
     {
+        if (scheduled_exports_count >= available_move_executors)
+        {
+            LOG_INFO(storage.log, "ExportPartition scheduler task: Scheduled exports count is greater than available move executors, skipping");
+            break;
+        }
+
         const auto & manifest = entry.manifest;
         const auto key = entry.getCompositeKey();
         const auto database = storage.getContext()->resolveDatabase(manifest.destination_database);
@@ -151,6 +168,12 @@ void ExportPartitionTaskScheduler::run()
 
         for (const auto & zk_part_name : parts_in_processing_or_pending)
         {
+            if (scheduled_exports_count >= available_move_executors)
+            {
+                LOG_INFO(storage.log, "ExportPartition scheduler task: Scheduled exports count is greater than available move executors, skipping");
+                break;
+            }
+
             if (locked_parts_set.contains(zk_part_name))
             {
                 LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} is locked, skipping", zk_part_name);
@@ -163,6 +186,8 @@ void ExportPartitionTaskScheduler::run()
                 LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} not found locally, skipping", zk_part_name);
                 continue;
             }
+
+            LOG_INFO(storage.log, "ExportPartition scheduler task: Scheduling part export: {}", zk_part_name);
 
             std::lock_guard part_export_lock(storage.export_manifests_mutex);
 
