@@ -27,11 +27,14 @@ bool ExportPartFromPartitionExportTask::executeStep()
 {
     const auto zk = storage.getZooKeeper();
     const auto part_name = manifest.data_part->name;
-    
+
+    LOG_INFO(storage.log, "ExportPartition scheduler task: Attempting to lock part: {}", part_name);
+
     ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
     ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperCreate);
     if (Coordination::Error::ZOK == zk->tryCreate(fs::path(storage.zookeeper_path) / "exports" / key / "locks" / part_name, storage.replica_name, zkutil::CreateMode::Ephemeral))
     {
+        LOG_INFO(storage.log, "ExportPartition scheduler task: Locked part: {}", part_name);
         export_part_task->executeStep();
         return false;
     }
