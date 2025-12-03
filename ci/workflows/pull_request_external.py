@@ -1,4 +1,5 @@
-from praktika import Workflow
+import copy
+from praktika import Workflow, Artifact
 
 from ci.defs.defs import BASE_BRANCH, DOCKERS, SECRETS, ArtifactConfigs, JobNames
 from ci.defs.job_configs import JobConfigs
@@ -107,8 +108,14 @@ workflow = Workflow.Config(
     post_hooks=[],
 )
 
-for job in workflow.jobs:
-    job.enable_commit_status = False
+# NOTE (strtgbb): use deepcopy to avoid modifying workflows generated after this one
+for i, job in enumerate(workflow.jobs):
+    workflow.jobs[i] = copy.deepcopy(job)
+    workflow.jobs[i].enable_commit_status = False
+
+for i, artifact in enumerate(workflow.artifacts):
+    workflow.artifacts[i] = copy.deepcopy(artifact)
+    workflow.artifacts[i].type = Artifact.Type.GH
 
 WORKFLOWS = [
     workflow,

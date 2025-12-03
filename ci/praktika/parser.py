@@ -236,7 +236,8 @@ class WorkflowConfigParser:
                     assert (
                         False
                     ), f"Artifact [{artifact_name}] has unsupported type [{artifact.type}]"
-            if artifact.type == Artifact.Type.GH:
+            # NOTE (strtgbb): Added a check that provided_by is not empty, which is the case for artifacts that are defined in defs.py but not used in a workflow
+            if artifact.type == Artifact.Type.GH and artifact.provided_by != "":
                 self.workflow_yaml_config.job_to_config[
                     artifact.provided_by
                 ].artifacts_gh_provides.append(artifact)

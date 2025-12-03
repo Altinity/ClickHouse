@@ -1,5 +1,6 @@
 import dataclasses
 from typing import List
+import os
 
 from . import Artifact, Job, Workflow
 from .mangle import _get_workflows
@@ -314,7 +315,8 @@ class PullRequestPushYamlGen:
             for artifact in job.artifacts_gh_provides:
                 uploads_github.append(
                     YamlGenerator.Templates.TEMPLATE_GH_UPLOAD.format(
-                        NAME=artifact.name, PATH=artifact.path
+                        NAME=artifact.name,
+                        PATH=os.path.relpath(artifact.path, os.getcwd()),
                     )
                 )
             downloads_github = []
