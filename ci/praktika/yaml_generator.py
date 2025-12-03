@@ -351,7 +351,6 @@ class PullRequestPushYamlGen:
                 and self.workflow_config.name == "Community PR"
             ):
                 if_expression = "\n    if: ${{ github.actor == 'strtgbb' }}"
-                job_addons.append("\n      - name: Dump env\n        run: env | sort\n")
 
             secrets_envs = []
             # note(strtgbb): This adds github secrets to praktika_setup_env.sh
