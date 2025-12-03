@@ -94,6 +94,10 @@ class Info:
         return self.env.FORK_NAME
 
     @property
+    def is_community_pr(self):
+        return "Community" in self.env.WORKFLOW_NAME
+
+    @property
     def user_name(self):
         return self.env.USER_LOGIN
 
