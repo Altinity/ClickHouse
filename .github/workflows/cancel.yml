@@ -6,7 +6,14 @@ env:
 
 on: # yamllint disable-line rule:truthy
   workflow_run:
-    workflows: ["PR", "PullRequestCI", "ReleaseBranchCI", "MasterCI", "DocsCheck", "BackportPR"]
+    workflows:
+      - "PR"
+      - "Community PR"
+      - "PullRequestCI"
+      - "ReleaseBranchCI"
+      - "MasterCI"
+      - "DocsCheck"
+      - "BackportPR"
     types:
       - requested
 jobs:
