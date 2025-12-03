@@ -97,9 +97,8 @@ workflow = Workflow.Config(
     enable_report=False,
     enable_cidb=False,
     enable_merge_ready_status=False,
-    enable_commit_status_on_failure=True,
+    enable_commit_status_on_failure=False,
     pre_hooks=[
-        # "python3 ./ci/jobs/scripts/workflow_hooks/is_external_pr.py", TODO: implement
         "python3 ./ci/jobs/scripts/workflow_hooks/store_data.py",
         "python3 ./ci/jobs/scripts/workflow_hooks/version_log.py",
         "python3 ./ci/jobs/scripts/workflow_hooks/parse_ci_tags.py",

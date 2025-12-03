@@ -7,6 +7,7 @@ on:
 
 env:
   PYTHONUNBUFFERED: 1
+  GH_TOKEN: ${{ github.token }}
   CHECKOUT_REF: ""
   DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
   CLICKHOUSE_TEST_STAT_URL: ${{ secrets.CLICKHOUSE_TEST_STAT_URL }}
@@ -21,7 +22,6 @@ env:
   AZURE_CONTAINER_NAME: ${{ secrets.AZURE_CONTAINER_NAME }}
   AZURE_STORAGE_ACCOUNT_URL: "https://${{ secrets.AZURE_ACCOUNT_NAME }}.blob.core.windows.net/"
   ROBOT_TOKEN: ${{ secrets.ROBOT_TOKEN }}
-  GH_TOKEN: ${{ github.token }}
 
 
 jobs:
