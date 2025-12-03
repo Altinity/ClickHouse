@@ -332,25 +332,25 @@ class PullRequestPushYamlGen:
             )
 
             if_expression = ""
+            # NOTE (strtgbb): We still want the cache logic, we use it for skipping based on PR config
             if (
-                self.workflow_config.config.enable_cache
-                and job_name_normalized != config_job_name_normalized
+                # self.workflow_config.config.enable_cache
+                # and 
+                job_name_normalized != config_job_name_normalized
             ):
                 if_expression = YamlGenerator.Templates.TEMPLATE_IF_EXPRESSION.format(
                     WORKFLOW_CONFIG_JOB_NAME=config_job_name_normalized,
                     JOB_NAME_BASE64=Utils.to_base64(job_name),
                 )
+            elif self.workflow_config.name == "Community PR":
+                # TODO: replace this hack with a proper configuration
+                if_expression = "\n    if: ${{ github.actor == 'strtgbb' }}"
+
             if job.run_unless_cancelled:
                 if_expression = (
                     YamlGenerator.Templates.TEMPLATE_IF_EXPRESSION_NOT_CANCELLED
                 )
 
-            # TODO: replace this hack with a proper configuration
-            if (
-                job_name == Settings.CI_CONFIG_JOB_NAME
-                and self.workflow_config.name == "Community PR"
-            ):
-                if_expression = "\n    if: ${{ github.actor == 'strtgbb' }}"
 
             secrets_envs = []
             # note(strtgbb): This adds github secrets to praktika_setup_env.sh

@@ -86,6 +86,7 @@ jobs:
   fast_test:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RmFzdCB0ZXN0') }}
     name: "Fast test"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -130,6 +131,7 @@ jobs:
   build_amd_debug:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, fast_test]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFtZF9kZWJ1Zyk=') }}
     name: "Build (amd_debug)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -187,6 +189,7 @@ jobs:
   build_amd_release:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, fast_test]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFtZF9yZWxlYXNlKQ==') }}
     name: "Build (amd_release)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -265,6 +268,7 @@ jobs:
   build_amd_asan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, fast_test]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFtZF9hc2FuKQ==') }}
     name: "Build (amd_asan)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -329,6 +333,7 @@ jobs:
   build_amd_tsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, fast_test]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFtZF90c2FuKQ==') }}
     name: "Build (amd_tsan)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -393,6 +398,7 @@ jobs:
   build_amd_msan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, fast_test]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFtZF9tc2FuKQ==') }}
     name: "Build (amd_msan)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -457,6 +463,7 @@ jobs:
   build_amd_ubsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, fast_test]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFtZF91YnNhbik=') }}
     name: "Build (amd_ubsan)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -521,6 +528,7 @@ jobs:
   build_amd_binary:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, fast_test]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFtZF9iaW5hcnkp') }}
     name: "Build (amd_binary)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -571,6 +579,7 @@ jobs:
   build_arm_release:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, fast_test]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFybV9yZWxlYXNlKQ==') }}
     name: "Build (arm_release)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -649,6 +658,7 @@ jobs:
   build_arm_coverage:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, fast_test]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFybV9jb3ZlcmFnZSk=') }}
     name: "Build (arm_coverage)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -706,6 +716,7 @@ jobs:
   build_arm_binary:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, fast_test]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFybV9iaW5hcnkp') }}
     name: "Build (arm_binary)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -756,6 +767,7 @@ jobs:
   unit_tests_asan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, build_amd_asan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'VW5pdCB0ZXN0cyAoYXNhbik=') }}
     name: "Unit tests (asan)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -806,6 +818,7 @@ jobs:
   unit_tests_tsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, build_amd_tsan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'VW5pdCB0ZXN0cyAodHNhbik=') }}
     name: "Unit tests (tsan)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -856,6 +869,7 @@ jobs:
   unit_tests_msan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, build_amd_msan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'VW5pdCB0ZXN0cyAobXNhbik=') }}
     name: "Unit tests (msan)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -906,6 +920,7 @@ jobs:
   unit_tests_ubsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, build_amd_ubsan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'VW5pdCB0ZXN0cyAodWJzYW4p') }}
     name: "Unit tests (ubsan)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -956,6 +971,7 @@ jobs:
   stateless_tests_amd_asan_distributed_plan_parallel_1_2:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, build_amd_asan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfYXNhbiwgZGlzdHJpYnV0ZWQgcGxhbiwgcGFyYWxsZWwsIDEvMik=') }}
     name: "Stateless tests (amd_asan, distributed plan, parallel, 1/2)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -1006,6 +1022,7 @@ jobs:
   stateless_tests_amd_asan_distributed_plan_parallel_2_2:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, build_amd_asan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfYXNhbiwgZGlzdHJpYnV0ZWQgcGxhbiwgcGFyYWxsZWwsIDIvMik=') }}
     name: "Stateless tests (amd_asan, distributed plan, parallel, 2/2)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -1056,6 +1073,7 @@ jobs:
   stateless_tests_amd_asan_distributed_plan_sequential:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_asan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfYXNhbiwgZGlzdHJpYnV0ZWQgcGxhbiwgc2VxdWVudGlhbCk=') }}
     name: "Stateless tests (amd_asan, distributed plan, sequential)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -1106,6 +1124,7 @@ jobs:
   stateless_tests_amd_binary_old_analyzer_s3_storage_databasereplicated_parallel:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_binary]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfYmluYXJ5LCBvbGQgYW5hbHl6ZXIsIHMzIHN0b3JhZ2UsIERhdGFiYXNlUmVwbGljYXRlZCwgcGFyYWxsZWwp') }}
     name: "Stateless tests (amd_binary, old analyzer, s3 storage, DatabaseReplicated, parallel)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -1156,6 +1175,7 @@ jobs:
   stateless_tests_amd_binary_old_analyzer_s3_storage_databasereplicated_sequential:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_binary]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfYmluYXJ5LCBvbGQgYW5hbHl6ZXIsIHMzIHN0b3JhZ2UsIERhdGFiYXNlUmVwbGljYXRlZCwgc2VxdWVudGlhbCk=') }}
     name: "Stateless tests (amd_binary, old analyzer, s3 storage, DatabaseReplicated, sequential)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -1206,6 +1226,7 @@ jobs:
   stateless_tests_amd_binary_parallelreplicas_s3_storage_parallel:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_binary]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfYmluYXJ5LCBQYXJhbGxlbFJlcGxpY2FzLCBzMyBzdG9yYWdlLCBwYXJhbGxlbCk=') }}
     name: "Stateless tests (amd_binary, ParallelReplicas, s3 storage, parallel)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -1256,6 +1277,7 @@ jobs:
   stateless_tests_amd_binary_parallelreplicas_s3_storage_sequential:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_binary]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfYmluYXJ5LCBQYXJhbGxlbFJlcGxpY2FzLCBzMyBzdG9yYWdlLCBzZXF1ZW50aWFsKQ==') }}
     name: "Stateless tests (amd_binary, ParallelReplicas, s3 storage, sequential)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -1306,6 +1328,7 @@ jobs:
   stateless_tests_amd_debug_asyncinsert_s3_storage_parallel:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_debug]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfZGVidWcsIEFzeW5jSW5zZXJ0LCBzMyBzdG9yYWdlLCBwYXJhbGxlbCk=') }}
     name: "Stateless tests (amd_debug, AsyncInsert, s3 storage, parallel)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -1356,6 +1379,7 @@ jobs:
   stateless_tests_amd_debug_asyncinsert_s3_storage_sequential:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_debug]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfZGVidWcsIEFzeW5jSW5zZXJ0LCBzMyBzdG9yYWdlLCBzZXF1ZW50aWFsKQ==') }}
     name: "Stateless tests (amd_debug, AsyncInsert, s3 storage, sequential)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -1406,6 +1430,7 @@ jobs:
   stateless_tests_amd_debug_parallel:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, build_amd_debug]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfZGVidWcsIHBhcmFsbGVsKQ==') }}
     name: "Stateless tests (amd_debug, parallel)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -1456,6 +1481,7 @@ jobs:
   stateless_tests_amd_debug_sequential:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_debug]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfZGVidWcsIHNlcXVlbnRpYWwp') }}
     name: "Stateless tests (amd_debug, sequential)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -1506,6 +1532,7 @@ jobs:
   stateless_tests_amd_tsan_parallel_1_2:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_tsan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfdHNhbiwgcGFyYWxsZWwsIDEvMik=') }}
     name: "Stateless tests (amd_tsan, parallel, 1/2)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -1556,6 +1583,7 @@ jobs:
   stateless_tests_amd_tsan_parallel_2_2:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_tsan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfdHNhbiwgcGFyYWxsZWwsIDIvMik=') }}
     name: "Stateless tests (amd_tsan, parallel, 2/2)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -1606,6 +1634,7 @@ jobs:
   stateless_tests_amd_tsan_sequential_1_2:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_tsan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfdHNhbiwgc2VxdWVudGlhbCwgMS8yKQ==') }}
     name: "Stateless tests (amd_tsan, sequential, 1/2)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -1656,6 +1685,7 @@ jobs:
   stateless_tests_amd_tsan_sequential_2_2:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_tsan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfdHNhbiwgc2VxdWVudGlhbCwgMi8yKQ==') }}
     name: "Stateless tests (amd_tsan, sequential, 2/2)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -1706,6 +1736,7 @@ jobs:
   stateless_tests_amd_msan_parallel_1_2:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_msan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgcGFyYWxsZWwsIDEvMik=') }}
     name: "Stateless tests (amd_msan, parallel, 1/2)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -1756,6 +1787,7 @@ jobs:
   stateless_tests_amd_msan_parallel_2_2:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_msan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgcGFyYWxsZWwsIDIvMik=') }}
     name: "Stateless tests (amd_msan, parallel, 2/2)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -1806,6 +1838,7 @@ jobs:
   stateless_tests_amd_msan_sequential_1_2:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_msan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgc2VxdWVudGlhbCwgMS8yKQ==') }}
     name: "Stateless tests (amd_msan, sequential, 1/2)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -1856,6 +1889,7 @@ jobs:
   stateless_tests_amd_msan_sequential_2_2:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_msan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgc2VxdWVudGlhbCwgMi8yKQ==') }}
     name: "Stateless tests (amd_msan, sequential, 2/2)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -1906,6 +1940,7 @@ jobs:
   stateless_tests_amd_ubsan_parallel:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_ubsan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfdWJzYW4sIHBhcmFsbGVsKQ==') }}
     name: "Stateless tests (amd_ubsan, parallel)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -1956,6 +1991,7 @@ jobs:
   stateless_tests_amd_ubsan_sequential:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_ubsan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfdWJzYW4sIHNlcXVlbnRpYWwp') }}
     name: "Stateless tests (amd_ubsan, sequential)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -2006,6 +2042,7 @@ jobs:
   stateless_tests_amd_debug_distributed_plan_s3_storage_parallel:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_debug]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfZGVidWcsIGRpc3RyaWJ1dGVkIHBsYW4sIHMzIHN0b3JhZ2UsIHBhcmFsbGVsKQ==') }}
     name: "Stateless tests (amd_debug, distributed plan, s3 storage, parallel)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -2056,6 +2093,7 @@ jobs:
   stateless_tests_amd_debug_distributed_plan_s3_storage_sequential:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_debug]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfZGVidWcsIGRpc3RyaWJ1dGVkIHBsYW4sIHMzIHN0b3JhZ2UsIHNlcXVlbnRpYWwp') }}
     name: "Stateless tests (amd_debug, distributed plan, s3 storage, sequential)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -2106,6 +2144,7 @@ jobs:
   stateless_tests_amd_tsan_s3_storage_parallel:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_tsan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfdHNhbiwgczMgc3RvcmFnZSwgcGFyYWxsZWwp') }}
     name: "Stateless tests (amd_tsan, s3 storage, parallel)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -2156,6 +2195,7 @@ jobs:
   stateless_tests_amd_tsan_s3_storage_sequential_1_2:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_tsan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfdHNhbiwgczMgc3RvcmFnZSwgc2VxdWVudGlhbCwgMS8yKQ==') }}
     name: "Stateless tests (amd_tsan, s3 storage, sequential, 1/2)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -2206,6 +2246,7 @@ jobs:
   stateless_tests_amd_tsan_s3_storage_sequential_2_2:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_tsan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfdHNhbiwgczMgc3RvcmFnZSwgc2VxdWVudGlhbCwgMi8yKQ==') }}
     name: "Stateless tests (amd_tsan, s3 storage, sequential, 2/2)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -2256,6 +2297,7 @@ jobs:
   stateless_tests_arm_binary_parallel:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
     needs: [config_workflow, build_arm_binary]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhcm1fYmluYXJ5LCBwYXJhbGxlbCk=') }}
     name: "Stateless tests (arm_binary, parallel)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -2306,6 +2348,7 @@ jobs:
   stateless_tests_arm_binary_sequential:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_arm_binary]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhcm1fYmluYXJ5LCBzZXF1ZW50aWFsKQ==') }}
     name: "Stateless tests (arm_binary, sequential)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -2356,6 +2399,7 @@ jobs:
   bugfix_validation_integration_tests:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, fast_test]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVnZml4IHZhbGlkYXRpb24gKGludGVncmF0aW9uIHRlc3RzKQ==') }}
     name: "Bugfix validation (integration tests)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -2400,6 +2444,7 @@ jobs:
   bugfix_validation_functional_tests:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
     needs: [config_workflow]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVnZml4IHZhbGlkYXRpb24gKGZ1bmN0aW9uYWwgdGVzdHMp') }}
     name: "Bugfix validation (functional tests)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -2444,6 +2489,7 @@ jobs:
   stateless_tests_amd_asan_flaky_check:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
     needs: [config_workflow, build_amd_asan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfYXNhbiwgZmxha3kgY2hlY2sp') }}
     name: "Stateless tests (amd_asan, flaky check)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -2494,6 +2540,7 @@ jobs:
   integration_tests_amd_asan_old_analyzer_1_6:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_asan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBvbGQgYW5hbHl6ZXIsIDEvNik=') }}
     name: "Integration tests (amd_asan, old analyzer, 1/6)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -2544,6 +2591,7 @@ jobs:
   integration_tests_amd_asan_old_analyzer_2_6:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_asan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBvbGQgYW5hbHl6ZXIsIDIvNik=') }}
     name: "Integration tests (amd_asan, old analyzer, 2/6)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -2594,6 +2642,7 @@ jobs:
   integration_tests_amd_asan_old_analyzer_3_6:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_asan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBvbGQgYW5hbHl6ZXIsIDMvNik=') }}
     name: "Integration tests (amd_asan, old analyzer, 3/6)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -2644,6 +2693,7 @@ jobs:
   integration_tests_amd_asan_old_analyzer_4_6:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_asan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBvbGQgYW5hbHl6ZXIsIDQvNik=') }}
     name: "Integration tests (amd_asan, old analyzer, 4/6)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -2694,6 +2744,7 @@ jobs:
   integration_tests_amd_asan_old_analyzer_5_6:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_asan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBvbGQgYW5hbHl6ZXIsIDUvNik=') }}
     name: "Integration tests (amd_asan, old analyzer, 5/6)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -2744,6 +2795,7 @@ jobs:
   integration_tests_amd_asan_old_analyzer_6_6:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_asan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBvbGQgYW5hbHl6ZXIsIDYvNik=') }}
     name: "Integration tests (amd_asan, old analyzer, 6/6)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -2794,6 +2846,7 @@ jobs:
   integration_tests_amd_binary_1_5:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_binary]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9iaW5hcnksIDEvNSk=') }}
     name: "Integration tests (amd_binary, 1/5)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -2844,6 +2897,7 @@ jobs:
   integration_tests_amd_binary_2_5:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_binary]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9iaW5hcnksIDIvNSk=') }}
     name: "Integration tests (amd_binary, 2/5)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -2894,6 +2948,7 @@ jobs:
   integration_tests_amd_binary_3_5:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_binary]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9iaW5hcnksIDMvNSk=') }}
     name: "Integration tests (amd_binary, 3/5)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -2944,6 +2999,7 @@ jobs:
   integration_tests_amd_binary_4_5:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_binary]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9iaW5hcnksIDQvNSk=') }}
     name: "Integration tests (amd_binary, 4/5)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -2994,6 +3050,7 @@ jobs:
   integration_tests_amd_binary_5_5:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_binary]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9iaW5hcnksIDUvNSk=') }}
     name: "Integration tests (amd_binary, 5/5)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -3044,6 +3101,7 @@ jobs:
   integration_tests_arm_binary_distributed_plan_1_4:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_arm_binary]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFybV9iaW5hcnksIGRpc3RyaWJ1dGVkIHBsYW4sIDEvNCk=') }}
     name: "Integration tests (arm_binary, distributed plan, 1/4)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -3094,6 +3152,7 @@ jobs:
   integration_tests_arm_binary_distributed_plan_2_4:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_arm_binary]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFybV9iaW5hcnksIGRpc3RyaWJ1dGVkIHBsYW4sIDIvNCk=') }}
     name: "Integration tests (arm_binary, distributed plan, 2/4)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -3144,6 +3203,7 @@ jobs:
   integration_tests_arm_binary_distributed_plan_3_4:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_arm_binary]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFybV9iaW5hcnksIGRpc3RyaWJ1dGVkIHBsYW4sIDMvNCk=') }}
     name: "Integration tests (arm_binary, distributed plan, 3/4)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -3194,6 +3254,7 @@ jobs:
   integration_tests_arm_binary_distributed_plan_4_4:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_arm_binary]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFybV9iaW5hcnksIGRpc3RyaWJ1dGVkIHBsYW4sIDQvNCk=') }}
     name: "Integration tests (arm_binary, distributed plan, 4/4)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -3244,6 +3305,7 @@ jobs:
   integration_tests_amd_tsan_1_6:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_tsan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF90c2FuLCAxLzYp') }}
     name: "Integration tests (amd_tsan, 1/6)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -3294,6 +3356,7 @@ jobs:
   integration_tests_amd_tsan_2_6:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_tsan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF90c2FuLCAyLzYp') }}
     name: "Integration tests (amd_tsan, 2/6)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -3344,6 +3407,7 @@ jobs:
   integration_tests_amd_tsan_3_6:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_tsan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF90c2FuLCAzLzYp') }}
     name: "Integration tests (amd_tsan, 3/6)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -3394,6 +3458,7 @@ jobs:
   integration_tests_amd_tsan_4_6:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_tsan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF90c2FuLCA0LzYp') }}
     name: "Integration tests (amd_tsan, 4/6)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -3444,6 +3509,7 @@ jobs:
   integration_tests_amd_tsan_5_6:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_tsan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF90c2FuLCA1LzYp') }}
     name: "Integration tests (amd_tsan, 5/6)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -3494,6 +3560,7 @@ jobs:
   integration_tests_amd_tsan_6_6:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_tsan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF90c2FuLCA2LzYp') }}
     name: "Integration tests (amd_tsan, 6/6)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -3544,6 +3611,7 @@ jobs:
   integration_tests_amd_asan_flaky_check:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, build_amd_asan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBmbGFreSBjaGVjayk=') }}
     name: "Integration tests (amd_asan, flaky check)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -3594,6 +3662,7 @@ jobs:
   docker_server_image:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
     needs: [config_workflow, build_amd_release, build_arm_release, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VyIHNlcnZlciBpbWFnZQ==') }}
     name: "Docker server image"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -3638,6 +3707,7 @@ jobs:
   docker_keeper_image:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
     needs: [config_workflow, build_amd_release, build_arm_release, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VyIGtlZXBlciBpbWFnZQ==') }}
     name: "Docker keeper image"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -3682,6 +3752,7 @@ jobs:
   install_packages_amd_debug:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_debug]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW5zdGFsbCBwYWNrYWdlcyAoYW1kX2RlYnVnKQ==') }}
     name: "Install packages (amd_debug)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -3739,6 +3810,7 @@ jobs:
   compatibility_check_release:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
     needs: [config_workflow, build_amd_release, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'Q29tcGF0aWJpbGl0eSBjaGVjayAocmVsZWFzZSk=') }}
     name: "Compatibility check (release)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -3783,6 +3855,7 @@ jobs:
   compatibility_check_aarch64:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: [config_workflow, build_arm_release, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'Q29tcGF0aWJpbGl0eSBjaGVjayAoYWFyY2g2NCk=') }}
     name: "Compatibility check (aarch64)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -3827,6 +3900,7 @@ jobs:
   stress_test_amd_debug:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, build_amd_debug, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RyZXNzIHRlc3QgKGFtZF9kZWJ1Zyk=') }}
     name: "Stress test (amd_debug)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -3871,6 +3945,7 @@ jobs:
   stress_test_amd_tsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, build_amd_tsan, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RyZXNzIHRlc3QgKGFtZF90c2FuKQ==') }}
     name: "Stress test (amd_tsan)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -3915,6 +3990,7 @@ jobs:
   stress_test_amd_ubsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, build_amd_ubsan, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RyZXNzIHRlc3QgKGFtZF91YnNhbik=') }}
     name: "Stress test (amd_ubsan)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -3959,6 +4035,7 @@ jobs:
   stress_test_amd_msan:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, build_amd_msan, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RyZXNzIHRlc3QgKGFtZF9tc2FuKQ==') }}
     name: "Stress test (amd_msan)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -4003,6 +4080,7 @@ jobs:
   ast_fuzzer_amd_debug:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_debug]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QVNUIGZ1enplciAoYW1kX2RlYnVnKQ==') }}
     name: "AST fuzzer (amd_debug)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -4053,6 +4131,7 @@ jobs:
   ast_fuzzer_amd_tsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_tsan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QVNUIGZ1enplciAoYW1kX3RzYW4p') }}
     name: "AST fuzzer (amd_tsan)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -4103,6 +4182,7 @@ jobs:
   ast_fuzzer_amd_msan:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_msan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QVNUIGZ1enplciAoYW1kX21zYW4p') }}
     name: "AST fuzzer (amd_msan)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -4153,6 +4233,7 @@ jobs:
   ast_fuzzer_amd_ubsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_ubsan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QVNUIGZ1enplciAoYW1kX3Vic2FuKQ==') }}
     name: "AST fuzzer (amd_ubsan)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -4203,6 +4284,7 @@ jobs:
   buzzhouse_amd_debug:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_debug]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnV6ekhvdXNlIChhbWRfZGVidWcp') }}
     name: "BuzzHouse (amd_debug)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -4253,6 +4335,7 @@ jobs:
   buzzhouse_amd_tsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_tsan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnV6ekhvdXNlIChhbWRfdHNhbik=') }}
     name: "BuzzHouse (amd_tsan)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -4303,6 +4386,7 @@ jobs:
   buzzhouse_amd_msan:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_msan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnV6ekhvdXNlIChhbWRfbXNhbik=') }}
     name: "BuzzHouse (amd_msan)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -4353,6 +4437,7 @@ jobs:
   buzzhouse_amd_ubsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel, build_amd_ubsan]
+    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnV6ekhvdXNlIChhbWRfdWJzYW4p') }}
     name: "BuzzHouse (amd_ubsan)"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
