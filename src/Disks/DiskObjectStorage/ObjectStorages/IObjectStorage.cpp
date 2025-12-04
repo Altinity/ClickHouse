@@ -119,7 +119,7 @@ RelativePathWithMetadata::CommandInTaskResponse::CommandInTaskResponse(const std
         if (!json)
             return;
 
-        successfully_parsed = true;
+        is_valid = true;
 
         if (json->has("retry_after_us"))
             retry_after_us = json->getValue<size_t>("retry_after_us");
@@ -130,7 +130,7 @@ RelativePathWithMetadata::CommandInTaskResponse::CommandInTaskResponse(const std
     }
 }
 
-std::string RelativePathWithMetadata::CommandInTaskResponse::to_string() const
+std::string RelativePathWithMetadata::CommandInTaskResponse::toString() const
 {
     Poco::JSON::Object json;
     if (retry_after_us.has_value())

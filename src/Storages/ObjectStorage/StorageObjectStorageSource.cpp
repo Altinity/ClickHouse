@@ -537,9 +537,9 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         if (!object_info)
             return {};
 
-        if (object_info->relative_path_with_metadata.getCommand().is_parsed())
+        if (object_info->relative_path_with_metadata.getCommand().isValid())
         {
-            auto retry_after_us = object_info->relative_path_with_metadata.getCommand().get_retry_after_us();
+            auto retry_after_us = object_info->relative_path_with_metadata.getCommand().getRetryAfterUs();
             if (retry_after_us.has_value())
             {
                 not_a_path = true;

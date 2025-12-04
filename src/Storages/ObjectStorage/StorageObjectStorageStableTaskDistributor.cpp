@@ -30,9 +30,13 @@ StorageObjectStorageStableTaskDistributor::StorageObjectStorageStableTaskDistrib
     , lock_object_storage_task_distribution_us(lock_object_storage_task_distribution_ms_ * 1000)
     , iterator_exhausted(false)
 {
+    Poco::Timestamp now;
     size_t nodes = ids_of_nodes.size();
     for (size_t i = 0; i < nodes; ++i)
+    {
         replica_to_files_to_be_processed[i] = std::list<ObjectInfoPtr>{};
+        last_node_activity[i] = now;
+    }
 }
 
 ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getNextTask(size_t number_of_current_replica)
@@ -221,10 +225,12 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(s
 
         while (it != unprocessed_files.end())
         {
-            auto last_activity = last_node_activity.find(it->second.second);
-            if (lock_object_storage_task_distribution_us <= 0
-                || last_activity == last_node_activity.end()
-                || activity_limit > last_activity->second)
+            auto number_of_matched_replica = it->second.second;
+            auto last_activity = last_node_activity.find(number_of_matched_replica);
+            if (lock_object_storage_task_distribution_us <= 0 // file deferring is turned off
+                || it->second.second == number_of_current_replica // file is matching with current replica
+                || last_activity == last_node_activity.end() // msut never be happen, last_activity is filled for each replica on start
+                || activity_limit > last_activity->second) // matched replica did not ask for a new files for a while
             {
                 auto next_file = it->second.first;
                 unprocessed_files.erase(it);
@@ -232,9 +238,10 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(s
                 auto file_path = send_over_whole_archive ? next_file->getPathOrPathToArchiveIfArchive() : next_file->getPath();
                 LOG_TRACE(
                     log,
-                    "Iterator exhausted. Assigning unprocessed file {} to replica {}",
+                    "Iterator exhausted. Assigning unprocessed file {} to replica {} from matched replica {}",
                     file_path,
-                    number_of_current_replica
+                    number_of_current_replica,
+                    number_of_matched_replica
                 );
 
                 ProfileEvents::increment(ProfileEvents::ObjectStorageClusterSentToNonMatchedReplica);
@@ -255,8 +262,8 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(s
         /// All unprocessed files owned by alive replicas with recenlty activity
         /// Need to retry after (oldest_activity - activity_limit) microseconds
         RelativePathWithMetadata::CommandInTaskResponse response;
-        response.set_retry_after_us(oldest_activity - activity_limit);
-        return std::make_shared<ObjectInfo>(response.to_string());
+        response.setRetryAfterUs(oldest_activity - activity_limit);
+        return std::make_shared<ObjectInfo>(response.toString());
     }
 
     return {};

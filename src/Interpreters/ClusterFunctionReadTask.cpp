@@ -45,8 +45,14 @@ ClusterFunctionReadTaskResponse::ClusterFunctionReadTaskResponse(ObjectInfoPtr o
 
     file_meta_info = object->relative_path_with_metadata.file_meta_info;
 
-    const bool send_over_whole_archive = !context->getSettingsRef()[Setting::cluster_function_process_archive_on_multiple_nodes];
-    path = send_over_whole_archive ? object->getPathOrPathToArchiveIfArchive() : object->getPath();
+    if (object->relative_path_with_metadata.getCommand().isValid())
+        path = object->relative_path_with_metadata.getCommand().toString();
+    else
+    {
+        const bool send_over_whole_archive = !context->getSettingsRef()[Setting::cluster_function_process_archive_on_multiple_nodes];
+        path = send_over_whole_archive ? object->getPathOrPathToArchiveIfArchive() : object->getPath();
+    }
+
     file_bucket_info = object->file_bucket_info;
 }
 

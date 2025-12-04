@@ -22,8 +22,8 @@ def create_buckets_s3(cluster, files=1000):
     s3_data = []
 
     for file_number in range(files):
-        file_name = f"data/generated/file_{file_number}.csv"
-        os.makedirs(os.path.join(SCRIPT_DIR, "data/generated/"), exist_ok=True)
+        file_name = f"data/generated_{files}/file_{file_number}.csv"
+        os.makedirs(os.path.join(SCRIPT_DIR, f"data/generated_{files}/"), exist_ok=True)
         s3_data.append(file_name)
         with open(os.path.join(SCRIPT_DIR, file_name), "w+", encoding="utf-8") as f:
             # a String, b UInt64
@@ -69,15 +69,17 @@ def started_cluster():
         logging.info("Cluster started")
 
         create_buckets_s3(cluster)
+        create_buckets_s3(cluster, files=3)
 
         yield cluster
     finally:
-        shutil.rmtree(os.path.join(SCRIPT_DIR, "data/generated/"), ignore_errors=True)
+        shutil.rmtree(os.path.join(SCRIPT_DIR, "data/generated_1000/"), ignore_errors=True)
+        shutil.rmtree(os.path.join(SCRIPT_DIR, "data/generated_3/"), ignore_errors=True)
         cluster.shutdown()
 
 
 def check_s3_gets(cluster, node, expected_result, cluster_first, cluster_second, enable_filesystem_cache,
-                  lock_object_storage_task_distribution_ms):
+                  lock_object_storage_task_distribution_ms, files=1000):
     for host in list(cluster.instances.values()):
         host.query("SYSTEM DROP FILESYSTEM CACHE 'raw_s3_cache'", ignore_error=True)
 
@@ -92,7 +94,7 @@ def check_s3_gets(cluster, node, expected_result, cluster_first, cluster_second,
     result_first = node.query(
         f"""
         SELECT count(*)
-          FROM s3Cluster('{cluster_first}', 'http://minio1:9001/root/data/generated/*', 'minio', '{minio_secret_key}', 'CSV', 'a String, b UInt64')
+          FROM s3Cluster('{cluster_first}', 'http://minio1:9001/root/data/generated_{files}/*', 'minio', '{minio_secret_key}', 'CSV', 'a String, b UInt64')
           WHERE b=42
         SETTINGS {",".join(f"{k}={v}" for k, v in settings.items())}
         """,
@@ -103,7 +105,7 @@ def check_s3_gets(cluster, node, expected_result, cluster_first, cluster_second,
     result_second = node.query(
         f"""
         SELECT count(*)
-          FROM s3Cluster('{cluster_second}', 'http://minio1:9001/root/data/generated/*', 'minio', '{minio_secret_key}', 'CSV', 'a String, b UInt64')
+          FROM s3Cluster('{cluster_second}', 'http://minio1:9001/root/data/generated_{files}/*', 'minio', '{minio_secret_key}', 'CSV', 'a String, b UInt64')
           WHERE b=42
         SETTINGS {",".join(f"{k}={v}" for k, v in settings.items())}
         """,
@@ -134,6 +136,40 @@ def check_s3_gets(cluster, node, expected_result, cluster_first, cluster_second,
     return int(s3_get_first), int(s3_get_second)
 
 
+def check_s3_gets_by_hosts(cluster, node, expected_result,
+                  lock_object_storage_task_distribution_ms, files=1000):
+    settings = {
+        "enable_filesystem_cache": False,
+        }
+
+    settings["lock_object_storage_task_distribution_ms"] = lock_object_storage_task_distribution_ms
+    query_id = str(uuid.uuid4())
+    result = node.query(
+        f"""
+        SELECT count(*)
+          FROM s3Cluster('{cluster}', 'http://minio1:9001/root/data/generated_{files}/*', 'minio', '{minio_secret_key}', 'CSV', 'a String, b UInt64')
+          WHERE b=42
+        SETTINGS {",".join(f"{k}={v}" for k, v in settings.items())}
+        """,
+        query_id=query_id,
+    )
+    assert result == expected_result
+
+    node.query(f"SYSTEM FLUSH LOGS ON CLUSTER {cluster}")
+
+    s3_get = node.query(
+        f"""
+        SELECT ProfileEvents['S3GetObject']
+          FROM clusterAllReplicas('{cluster}', system.query_log)
+          WHERE type='QueryFinish'
+            AND initial_query_id='{query_id}'
+          ORDER BY hostname
+        """,
+    )
+
+    return [int(events) for events in s3_get.strip().split("\n")]
+
+
 def check_s3_gets_repeat(cluster, node, expected_result, cluster_first, cluster_second, enable_filesystem_cache,
                          lock_object_storage_task_distribution_ms):
     # Repeat test several times to get average result
@@ -154,7 +190,7 @@ def test_cache_locality(started_cluster, lock_object_storage_task_distribution_m
     expected_result = node.query(
         f"""
         SELECT count(*)
-          FROM s3('http://minio1:9001/root/data/generated/*', 'minio', '{minio_secret_key}', 'CSV', 'a String, b UInt64')
+          FROM s3('http://minio1:9001/root/data/generated_1000/*', 'minio', '{minio_secret_key}', 'CSV', 'a String, b UInt64')
           WHERE b=42
         """
     )
@@ -170,26 +206,57 @@ def test_cache_locality(started_cluster, lock_object_storage_task_distribution_m
     (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_12345', 'cluster_12345', 1, lock_object_storage_task_distribution_ms)
     assert s3_get_second <= s3_get_first * dispersion
 
-    # Different nodes order
+    # Different replicas order
     (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_12345', 'cluster_34512', 1, lock_object_storage_task_distribution_ms)
     assert s3_get_second <= s3_get_first * dispersion
 
-    # No last node
+    # No last replica
     (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_12345', 'cluster_1234', 1, lock_object_storage_task_distribution_ms)
-    assert s3_get_second <= s3_get_first * (0.211 + dispersion) # actual value - 24 for 100 files, 211 for 1000
+    assert s3_get_second <= s3_get_first * (0.179 + dispersion) # actual value - 179 of 1000 files changed replica
 
-    # No first node
+    # No first replica
     (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_12345', 'cluster_2345', 1, lock_object_storage_task_distribution_ms)
-    assert s3_get_second <= s3_get_first * (0.189 + dispersion) # actual value - 12 for 100 files, 189 for 1000
+    assert s3_get_second <= s3_get_first * (0.189 + dispersion) # actual value - 189 of 1000 files changed replica
 
-    # No first node, different nodes order
+    # No first replica, different replicas order
     (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_12345', 'cluster_4523', 1, lock_object_storage_task_distribution_ms)
     assert s3_get_second <= s3_get_first * (0.189 + dispersion)
 
-    # Add new node, different nodes order
+    # Add new replica, different replicas order
     (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_4523', 'cluster_12345', 1, lock_object_storage_task_distribution_ms)
     assert s3_get_second <= s3_get_first * (0.189 + dispersion)
 
-    # New node and old node, different nodes order
+    # New replica and old replica, different replicas order
+    # All files from removed replica changed replica
+    # Some files from existed replicas changed replica on the new replica
     (s3_get_first, s3_get_second) = check_s3_gets_repeat(started_cluster, node, expected_result, 'cluster_1234', 'cluster_4523', 1, lock_object_storage_task_distribution_ms)
-    assert s3_get_second <= s3_get_first * (0.400 + dispersion) # actual value - 36 for 100 files, 400 for 1000
+    assert s3_get_second <= s3_get_first * (0.368 + dispersion) # actual value - 368 of 1000 changed replica
+
+    if (lock_object_storage_task_distribution_ms > 0):
+        s3_get = check_s3_gets_by_hosts('cluster_12345', node, expected_result, lock_object_storage_task_distribution_ms, files=1000)
+        assert s3_get == [189,210,220,202,179]
+        s3_get = check_s3_gets_by_hosts('cluster_1234', node, expected_result, lock_object_storage_task_distribution_ms, files=1000)
+        assert s3_get == [247,243,264,246]
+        s3_get = check_s3_gets_by_hosts('cluster_2345', node, expected_result, lock_object_storage_task_distribution_ms, files=1000)
+        assert s3_get == [251,280,248,221]
+
+
+def test_cache_locality_few_files(started_cluster):
+    node = started_cluster.instances["clickhouse0"]
+
+    expected_result = node.query(
+        f"""
+        SELECT count(*)
+          FROM s3('http://minio1:9001/root/data/generated_3/*', 'minio', '{minio_secret_key}', 'CSV', 'a String, b UInt64')
+          WHERE b=42
+        """
+    )
+
+    # Rendezvous hash makes the next distribution:
+    # file_0 - clickhouse1
+    # file_1 - clickhouse4
+    # file_2 - clickhouse3
+    # The same distribution must be in each query
+    for _ in range(10):
+        s3_get = check_s3_gets_by_hosts('cluster_12345', node, expected_result, lock_object_storage_task_distribution_ms=30000, files=3)
+        assert s3_get == [1,0,1,1,0]
