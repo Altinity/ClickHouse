@@ -3,6 +3,7 @@ class AltinityWorkflowTemplates:
     # Braces must be escaped
     ADDITIONAL_GLOBAL_ENV = r"""  AWS_DEFAULT_REGION: ${{{{ secrets.AWS_DEFAULT_REGION }}}}
   CHECKS_DATABASE_HOST: ${{{{ secrets.CHECKS_DATABASE_HOST }}}}
+  CLICKHOUSE_PLAY_DB: gh-data
   AZURE_STORAGE_KEY: ${{{{ secrets.AZURE_STORAGE_KEY }}}}
   AZURE_ACCOUNT_NAME: ${{{{ secrets.AZURE_ACCOUNT_NAME }}}}
   AZURE_CONTAINER_NAME: ${{{{ secrets.AZURE_CONTAINER_NAME }}}}

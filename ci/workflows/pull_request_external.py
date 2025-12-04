@@ -60,10 +60,6 @@ workflow = Workflow.Config(
         ],
         *[
             job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
-            for job in JobConfigs.compatibility_test_jobs
-        ],
-        *[
-            job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
             for job in JobConfigs.stress_test_jobs
         ],
         # *[
