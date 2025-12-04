@@ -33,9 +33,14 @@ ClusterFunctionReadTaskResponse::ClusterFunctionReadTaskResponse(ObjectInfoPtr o
 
     file_meta_info = object->file_meta_info;
 
-    const bool send_over_whole_archive = !context->getSettingsRef()[Setting::cluster_function_process_archive_on_multiple_nodes];
-    path = send_over_whole_archive ? object->getPathOrPathToArchiveIfArchive() : object->getPath();
-    absolute_path = object->getAbsolutePath();
+    if (object->getCommand().isValid())
+        path = object->getCommand().toString();
+    else
+    {
+        const bool send_over_whole_archive = !context->getSettingsRef()[Setting::cluster_function_process_archive_on_multiple_nodes];
+        path = send_over_whole_archive ? object->getPathOrPathToArchiveIfArchive() : object->getPath();
+        absolute_path = object->getAbsolutePath();
+    }
 }
 
 ClusterFunctionReadTaskResponse::ClusterFunctionReadTaskResponse(const std::string & path_)
