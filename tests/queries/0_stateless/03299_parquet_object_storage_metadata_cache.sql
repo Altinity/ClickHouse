@@ -1,5 +1,7 @@
 -- Tags: no-parallel, no-fasttest, no-parallel-replicas
 
+SET input_format_parquet_use_native_reader_v3=0;
+
 DROP TABLE IF EXISTS t_parquet_03262;
 
 CREATE TABLE t_parquet_03262 (a UInt64)
