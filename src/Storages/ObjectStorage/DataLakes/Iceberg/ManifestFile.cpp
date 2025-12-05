@@ -161,6 +161,7 @@ ManifestFileContent::ManifestFileContent(
         DB::IcebergMetadataLogLevel::ManifestFileMetadata,
         common_path,
         path_to_manifest_file,
+        std::nullopt,
         std::nullopt);
 
     for (const auto & column_name : {f_status, f_data_file})
@@ -237,7 +238,8 @@ ManifestFileContent::ManifestFileContent(
             DB::IcebergMetadataLogLevel::ManifestFileEntry,
             common_path,
             path_to_manifest_file,
-            i);
+            i,
+            std::nullopt);
         FileContentType content_type = FileContentType::DATA;
         if (format_version_ > 1)
             content_type = FileContentType(manifest_file_deserializer.getValueFromRowByName(i, c_data_file_content, TypeIndex::Int32).safeGet<UInt64>());
@@ -419,6 +421,7 @@ ManifestFileContent::ManifestFileContent(
                 this->data_files_without_deleted.emplace_back(
                     file_path_key,
                     file_path,
+                    i,
                     status,
                     added_sequence_number,
                     snapshot_id,
@@ -445,6 +448,7 @@ ManifestFileContent::ManifestFileContent(
                 this->position_deletes_files_without_deleted.emplace_back(
                     file_path_key,
                     file_path,
+                    i,
                     status,
                     added_sequence_number,
                     snapshot_id,
@@ -473,6 +477,7 @@ ManifestFileContent::ManifestFileContent(
                 this->equality_deletes_files.emplace_back(
                     file_path_key,
                     file_path,
+                    i,
                     status,
                     added_sequence_number,
                     snapshot_id,
