@@ -204,6 +204,9 @@ def main():
                 "NOTE: No azure credentials provided for community PR - disable azure storage"
             )
             config_installs_args += " --no-azure"
+
+            # NOTE(strtgbb): With the above, some tests are still trying to use azure, try this:
+            os.environ["USE_AZURE_STORAGE_FOR_MERGE_TREE"] = "0"
     else:
         print("Disable azure for a local run")
         config_installs_args += " --no-azure"
