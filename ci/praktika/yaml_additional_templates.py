@@ -22,6 +22,7 @@ class AltinityWorkflowTemplates:
     # Additional pre steps for config workflow job
     ADDITIONAL_CI_CONFIG_STEPS = r"""
       - name: Note report location to summary
+        if: ${{ !failure() && env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY }}
         env:
           PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
           COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
