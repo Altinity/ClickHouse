@@ -170,7 +170,7 @@ std::optional<ManifestFileEntry> SingleThreadIcebergKeysIterator::next()
             auto pruning_status = current_pruner ? current_pruner->canBePruned(manifest_file_entry) : PruningReturnStatus::NOT_PRUNED;
             insertRowToLogTable(
                 local_context,
-                "",
+                [&]()->String { return ""; },
                 DB::IcebergMetadataLogLevel::ManifestFileEntry,
                 configuration.lock()->getRawPath().path,
                 current_manifest_file_content->getPathToManifestFile(),
