@@ -68,7 +68,9 @@
 
 namespace ProfileEvents
 {
-    extern const Event IcebergTrivialCountOptimizationApplied;
+extern const Event IcebergIteratorInitializationMicroseconds;
+extern const Event IcebergMetadataUpdateMicroseconds;
+extern const Event IcebergTrivialCountOptimizationApplied;
 }
 
 namespace DB
@@ -254,6 +256,7 @@ bool IcebergMetadata::update(const ContextPtr & local_context)
         DB::IcebergMetadataLogLevel::Metadata,
         configuration_ptr->getRawPath().path,
         metadata_file_path,
+        std::nullopt,
         std::nullopt);
 
     if (previous_snapshot_id != relevant_snapshot_id)
@@ -794,6 +797,7 @@ DataLakeMetadataPtr IcebergMetadata::create(
         DB::IcebergMetadataLogLevel::Metadata,
         configuration_ptr->getRawPath().path,
         metadata_file_path,
+        std::nullopt,
         std::nullopt);
     return std::make_unique<IcebergMetadata>(object_storage, configuration_ptr, local_context, metadata_version, format_version, object, cache_ptr, compression_method);
 }
@@ -1003,6 +1007,8 @@ ObjectIterator IcebergMetadata::iterate(
      ContextPtr local_context) const
 {
     SharedLockGuard lock(mutex);
+
+    ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::IcebergIteratorInitializationMicroseconds);
 
     auto table_snapshot
         = std::make_shared<IcebergTableStateSnapshot>(last_metadata_version, relevant_snapshot_schema_id, relevant_snapshot_id);
