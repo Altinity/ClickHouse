@@ -3,6 +3,7 @@
 
 #include <Core/NamesAndTypes.h>
 #include <Core/Types.h>
+#include <Core/Range.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Processors/ISimpleTransform.h>
 #include <Storages/ObjectStorage/IObjectIterator.h>
@@ -14,6 +15,8 @@
 #include <Databases/DataLake/ICatalog.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Storages/AlterCommands.h>
+
+#include <Storages/ObjectStorage/DataLakes/Iceberg/SchemaProcessor.h>
 
 
 namespace DataLake
@@ -27,7 +30,59 @@ namespace DB
 namespace ErrorCodes
 {
 extern const int UNSUPPORTED_METHOD;
-}
+};
+
+namespace Iceberg
+{
+struct ColumnInfo;
+};
+
+class DataFileMetaInfo
+{
+public:
+    DataFileMetaInfo() = default;
+
+    // subset of Iceberg::ColumnInfo now
+    struct ColumnInfo
+    {
+        std::optional<Int64> rows_count;
+        std::optional<Int64> nulls_count;
+        std::optional<DB::Range> hyperrectangle;
+    };
+
+    // Extract metadata from Iceberg structure
+    explicit DataFileMetaInfo(
+        const Iceberg::IcebergSchemaProcessor & schema_processor,
+        Int32 schema_id,
+        const std::unordered_map<Int32, Iceberg::ColumnInfo> & columns_info_);
+
+    void serialize(WriteBuffer & out) const;
+    static DataFileMetaInfo deserialize(ReadBuffer & in);
+
+    bool empty() const { return columns_info.empty(); }
+
+    std::unordered_map<std::string, ColumnInfo> columns_info;
+};
+
+using DataFileMetaInfoPtr = std::shared_ptr<DataFileMetaInfo>;
+
+struct DataFileInfo
+{
+    std::string file_path;
+    std::optional<DataFileMetaInfoPtr> file_meta_info;
+    std::optional<std::string> absolute_uri;
+
+    explicit DataFileInfo(const std::string & file_path_)
+        : file_path(file_path_) {}
+
+    explicit DataFileInfo(std::string && file_path_)
+        : file_path(std::move(file_path_)) {}
+
+    bool operator==(const DataFileInfo & rhs) const
+    {
+        return file_path == rhs.file_path;
+    }
+};
 
 class SinkToStorage;
 using SinkToStoragePtr = std::shared_ptr<SinkToStorage>;
@@ -74,7 +129,7 @@ public:
     virtual bool supportsSchemaEvolution() const { return false; }
     virtual bool supportsWrites() const { return false; }
 
-    virtual void modifyFormatSettings(FormatSettings &) const {}
+    virtual void modifyFormatSettings(FormatSettings &, const Context &) const {}
 
     virtual std::optional<size_t> totalRows(ContextPtr) const { return {}; }
     virtual std::optional<size_t> totalBytes(ContextPtr) const { return {}; }
@@ -111,6 +166,9 @@ public:
     virtual void addDeleteTransformers(ObjectInfoPtr, QueryPipelineBuilder &, const std::optional<FormatSettings> &, ContextPtr) const {}
     virtual void checkAlterIsPossible(const AlterCommands & /*commands*/) { throwNotImplemented("alter"); }
     virtual void alter(const AlterCommands & /*params*/, ContextPtr /*context*/) { throwNotImplemented("alter"); }
+
+    virtual std::optional<String> partitionKey(ContextPtr) const { return {}; }
+    virtual std::optional<String> sortingKey(ContextPtr) const { return {}; }
 
 protected:
     virtual ObjectIterator createKeysIterator(

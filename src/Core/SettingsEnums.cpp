@@ -90,6 +90,11 @@ IMPLEMENT_SETTING_ENUM(DistributedProductMode, ErrorCodes::UNKNOWN_DISTRIBUTED_P
      {"global", DistributedProductMode::GLOBAL},
      {"allow",  DistributedProductMode::ALLOW}})
 
+IMPLEMENT_SETTING_ENUM(ObjectStorageClusterJoinMode, ErrorCodes::BAD_ARGUMENTS,
+    {{"local",  ObjectStorageClusterJoinMode::LOCAL},
+     {"global", ObjectStorageClusterJoinMode::GLOBAL},
+     {"allow",  ObjectStorageClusterJoinMode::ALLOW}})
+
 
 IMPLEMENT_SETTING_ENUM(QueryResultCacheNondeterministicFunctionHandling, ErrorCodes::BAD_ARGUMENTS,
     {{"throw",  QueryResultCacheNondeterministicFunctionHandling::Throw},
@@ -365,4 +370,6 @@ IMPLEMENT_SETTING_ENUM(
      {"manifest_list_entry", IcebergMetadataLogLevel::ManifestListEntry},
      {"manifest_file_metadata", IcebergMetadataLogLevel::ManifestFileMetadata},
      {"manifest_file_entry", IcebergMetadataLogLevel::ManifestFileEntry}})
+
+IMPLEMENT_SETTING_AUTO_ENUM(MergeTreePartExportFileAlreadyExistsPolicy, ErrorCodes::BAD_ARGUMENTS);
 }

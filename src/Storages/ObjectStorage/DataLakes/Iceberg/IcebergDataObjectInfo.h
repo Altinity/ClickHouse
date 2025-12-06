@@ -8,12 +8,13 @@
 
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PositionDeleteObject.h>
+#include <Storages/ObjectStorage/Utils.h>
 #include <base/defines.h>
 
 
 namespace DB
 {
-struct IcebergDataObjectInfo : public RelativePathWithMetadata, std::enable_shared_from_this<IcebergDataObjectInfo>
+struct IcebergDataObjectInfo : public PathWithMetadata, std::enable_shared_from_this<IcebergDataObjectInfo>
 {
     using IcebergDataObjectInfoPtr = std::shared_ptr<IcebergDataObjectInfo>;
 
@@ -21,12 +22,20 @@ struct IcebergDataObjectInfo : public RelativePathWithMetadata, std::enable_shar
     /// It is used to filter position deletes objects by data file path.
     /// It is also used to create a filter for the data object in the position delete transform.
     explicit IcebergDataObjectInfo(Iceberg::ManifestFileEntry data_manifest_file_entry_);
+    
+    /// Sometimes data files are located outside the table location and even in a different storage.
+    explicit IcebergDataObjectInfo(
+        Iceberg::ManifestFileEntry data_manifest_file_entry_,
+        ObjectStoragePtr resolved_storage,
+        const String & resolved_key);
 
     std::shared_ptr<ISimpleTransform> getPositionDeleteTransformer(
         ObjectStoragePtr object_storage,
         const SharedHeader & header,
         const std::optional<FormatSettings> & format_settings,
-        ContextPtr context_);
+        ContextPtr context_,
+        const String & table_location,
+        SecondaryStorages & secondary_storages);
 
     void addPositionDeleteObject(Iceberg::ManifestFileEntry position_delete_object)
     {

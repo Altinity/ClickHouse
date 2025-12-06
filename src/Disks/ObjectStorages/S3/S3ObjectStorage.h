@@ -61,6 +61,8 @@ public:
 
     ObjectStorageType getType() const override { return ObjectStorageType::S3; }
 
+    bool supportsListObjectsCache() override { return true; }
+
     bool exists(const StoredObject & object) const override;
 
     std::unique_ptr<ReadBufferFromFileBase> readObject( /// NOLINT
@@ -77,7 +79,7 @@ public:
         size_t buf_size = DBMS_DEFAULT_BUFFER_SIZE,
         const WriteSettings & write_settings = {}) override;
 
-    void listObjects(const std::string & path, RelativePathsWithMetadata & children, size_t max_keys) const override;
+    void listObjects(const std::string & path, PathsWithMetadata & children, size_t max_keys) const override;
 
     ObjectStorageIteratorPtr iterate(const std::string & path_prefix, size_t max_keys) const override;
 

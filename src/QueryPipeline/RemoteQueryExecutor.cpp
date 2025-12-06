@@ -52,6 +52,7 @@ namespace Setting
     extern const SettingsBool use_hedged_requests;
     extern const SettingsBool push_external_roles_in_interserver_queries;
     extern const SettingsMilliseconds parallel_replicas_connect_timeout_ms;
+    extern const SettingsBool allow_retries_in_cluster_requests;
 }
 
 namespace ErrorCodes
@@ -82,6 +83,7 @@ RemoteQueryExecutor::RemoteQueryExecutor(
     , extension(extension_)
     , priority_func(priority_func_)
     , read_packet_type_separately(context->canUseParallelReplicasOnInitiator() && !context->getSettingsRef()[Setting::use_hedged_requests])
+    , allow_retries_in_cluster_requests(context->getSettingsRef()[Setting::allow_retries_in_cluster_requests])
 {
     if (stage == QueryProcessingStage::QueryPlan && !query_plan)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Query plan is not passed for QueryPlan processing stage");
@@ -406,7 +408,16 @@ void RemoteQueryExecutor::sendQueryUnlocked(ClientInfo::QueryKind query_kind, As
 
     auto timeouts = ConnectionTimeouts::getTCPTimeoutsWithFailover(settings);
     ClientInfo modified_client_info = context->getClientInfo();
-    modified_client_info.query_kind = query_kind;
+
+    /// Doesn't support now "remote('1.1.1.{1,2}')""
+    if (is_remote_function && (shard_count == 1))
+    {
+        modified_client_info.setInitialQuery();
+        modified_client_info.client_name = "ClickHouse server";
+        modified_client_info.interface = ClientInfo::Interface::TCP;
+    }
+    else
+        modified_client_info.query_kind = query_kind;
 
     if (extension)
         modified_client_info.collaborate_with_initiator = true;
@@ -458,7 +469,8 @@ int RemoteQueryExecutor::sendQueryAsync()
         read_context = std::make_unique<ReadContext>(
             *this,
             /*suspend_when_query_sent*/ true,
-            read_packet_type_separately);
+            read_packet_type_separately,
+            allow_retries_in_cluster_requests);
 
     /// If query already sent, do nothing. Note that we cannot use sent_query flag here,
     /// because we can still be in process of sending scalars or external tables.
@@ -531,7 +543,8 @@ RemoteQueryExecutor::ReadResult RemoteQueryExecutor::readAsync()
         read_context = std::make_unique<ReadContext>(
             *this,
             /*suspend_when_query_sent*/ false,
-            read_packet_type_separately);
+            read_packet_type_separately,
+            allow_retries_in_cluster_requests);
         recreate_read_context = false;
     }
 
@@ -655,7 +668,11 @@ RemoteQueryExecutor::ReadResult RemoteQueryExecutor::processPacket(Packet packet
             /// We can actually return it, and the first call to RemoteQueryExecutor::read
             /// will return earlier. We should consider doing it.
             if (!packet.block.empty() && (packet.block.rows() > 0))
+            {
+                if (extension && extension->replica_info)
+                    replica_has_processed_data.insert(extension->replica_info->number_of_current_replica);
                 return ReadResult(adaptBlockStructure(packet.block, *header));
+            }
             break;  /// If the block is empty - we will receive other packets before EndOfStream.
 
         case Protocol::Server::Exception:
@@ -715,6 +732,22 @@ RemoteQueryExecutor::ReadResult RemoteQueryExecutor::processPacket(Packet packet
             break;
 
         case Protocol::Server::TimezoneUpdate:
+            break;
+
+        case Protocol::Server::ConnectionLost:
+            if (allow_retries_in_cluster_requests)
+            {
+                if (extension && extension->task_iterator && extension->task_iterator->supportRerunTask() && extension->replica_info)
+                {
+                    if (!replica_has_processed_data.contains(extension->replica_info->number_of_current_replica))
+                    {
+                        finished = true;
+                        extension->task_iterator->rescheduleTasksFromReplica(extension->replica_info->number_of_current_replica);
+                        return ReadResult(Block{});
+                    }
+                }
+            }
+            packet.exception->rethrow();
             break;
 
         default:
@@ -982,6 +1015,11 @@ void RemoteQueryExecutor::setProfileInfoCallback(ProfileInfoCallback callback)
 {
     LockAndBlocker guard(was_cancelled_mutex);
     profile_info_callback = std::move(callback);
+}
+
+bool RemoteQueryExecutor::skipUnavailableShards() const
+{
+    return context->getSettingsRef()[Setting::skip_unavailable_shards];
 }
 
 bool RemoteQueryExecutor::needToSkipUnavailableShard() const

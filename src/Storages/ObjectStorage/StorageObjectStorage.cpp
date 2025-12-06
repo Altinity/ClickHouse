@@ -1,6 +1,8 @@
+#include <optional>
 #include <thread>
 #include <Core/ColumnWithTypeAndName.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
+#include <Storages/MergeTree/MergeTreePartInfo.h>
 
 #include <Common/Exception.h>
 #include <Common/Logger.h>
@@ -32,7 +34,6 @@
 #include <Common/parseGlobs.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Mutations.h>
 #include <Interpreters/StorageID.h>
-#include <Processors/Formats/Impl/ParquetBlockInputFormat.h>
 #include <Databases/LoadingStrictnessLevel.h>
 #include <Databases/DataLake/Common.h>
 #include <Storages/ColumnsDescription.h>
@@ -55,6 +56,7 @@ namespace ErrorCodes
     extern const int NOT_IMPLEMENTED;
     extern const int LOGICAL_ERROR;
     extern const int INCORRECT_DATA;
+    extern const int FILE_ALREADY_EXISTS;
 }
 
 String StorageObjectStorage::getPathSample(ContextPtr context)
@@ -67,6 +69,11 @@ String StorageObjectStorage::getPathSample(ContextPtr context)
     bool local_distributed_processing = distributed_processing;
     if (context->getSettingsRef()[Setting::use_hive_partitioning])
         local_distributed_processing = false;
+
+    const auto path = configuration->getRawPath();
+
+    if (!configuration->isArchive() && !path.hasGlobs() && !local_distributed_processing)
+        return path.path;
 
     auto file_iterator = StorageObjectStorageSource::createFileIterator(
         configuration,
@@ -81,11 +88,6 @@ String StorageObjectStorage::getPathSample(ContextPtr context)
         nullptr, // read_keys
         {} // file_progress_callback
     );
-
-    const auto path = configuration->getRawPath();
-
-    if (!configuration->isArchive() && !path.hasGlobs() && !local_distributed_processing)
-        return path.path;
 
     if (auto file = file_iterator->next(0))
         return file->getPath();
@@ -103,12 +105,13 @@ StorageObjectStorage::StorageObjectStorage(
     std::optional<FormatSettings> format_settings_,
     LoadingStrictnessLevel mode,
     std::shared_ptr<DataLake::ICatalog> catalog_,
-    bool if_not_exists_,
-    bool is_datalake_query,
+    bool /*if_not_exists_*/,
+    bool /*is_datalake_query*/,
     bool distributed_processing_,
     ASTPtr partition_by_,
     bool is_table_function,
-    bool lazy_init)
+    bool lazy_init,
+    std::optional<std::string> sample_path_)
     : IStorage(table_id_)
     , configuration(configuration_)
     , object_storage(object_storage_)
@@ -120,24 +123,11 @@ StorageObjectStorage::StorageObjectStorage(
 {
     configuration->initPartitionStrategy(partition_by_, columns_in_table_or_function_definition, context);
 
-    const bool need_resolve_columns_or_format = columns_in_table_or_function_definition.empty() || (configuration->format == "auto");
+    const bool need_resolve_columns_or_format = columns_in_table_or_function_definition.empty() || (configuration->getFormat() == "auto");
     const bool need_resolve_sample_path = context->getSettingsRef()[Setting::use_hive_partitioning]
-        && !configuration->partition_strategy
+        && !configuration->getPartitionStrategy()
         && !configuration->isDataLakeConfiguration();
     const bool do_lazy_init = lazy_init && !need_resolve_columns_or_format && !need_resolve_sample_path;
-
-    if (!is_table_function && !columns_in_table_or_function_definition.empty() && !is_datalake_query && mode == LoadingStrictnessLevel::CREATE)
-    {
-        configuration->create(
-            object_storage,
-            context,
-            columns_in_table_or_function_definition,
-            partition_by_,
-            if_not_exists_,
-            catalog,
-            storage_id
-        );
-    }
 
     bool updated_configuration = false;
     try
@@ -169,11 +159,11 @@ StorageObjectStorage::StorageObjectStorage(
     /// (e.g. read always follows constructor immediately).
     update_configuration_on_read_write = !is_table_function || !updated_configuration;
 
-    std::string sample_path;
+    std::string sample_path = sample_path_.value_or("");
 
     ColumnsDescription columns{columns_in_table_or_function_definition};
     if (need_resolve_columns_or_format)
-        resolveSchemaAndFormat(columns, configuration->format, object_storage, configuration, format_settings, sample_path, context);
+        resolveSchemaAndFormat(columns, object_storage, configuration, format_settings, sample_path, context);
     else
         validateSupportedColumns(columns, *configuration);
 
@@ -181,7 +171,7 @@ StorageObjectStorage::StorageObjectStorage(
 
     /// FIXME: We need to call getPathSample() lazily on select
     /// in case it failed to be initialized in constructor.
-    if (updated_configuration && sample_path.empty() && need_resolve_sample_path && !configuration->partition_strategy)
+    if (updated_configuration && sample_path.empty() && need_resolve_sample_path && !configuration->getPartitionStrategy())
     {
         try
         {
@@ -213,7 +203,26 @@ StorageObjectStorage::StorageObjectStorage(
             sample_path);
     }
 
-    supports_prewhere = FormatFactory::instance().checkIfFormatSupportsPrewhere(configuration->format, context, format_settings);
+    /// TODO: Known problems with datalake prewhere:
+    ///  * If the iceberg table went through schema evolution, columns read from file may need to
+    ///    be renamed or typecast before applying prewhere. There's already a mechanism for
+    ///    telling parquet reader to rename columns: ColumnMapper. And parquet reader already
+    ///    automatically does type casts to requested types. But weirdly the iceberg reader uses
+    ///    those mechanism to request the *old* name and type of the column, then has additional
+    ///    code to do the renaming and casting as a separate step outside parquet reader.
+    ///    We should probably change this and delete that additional code?
+    ///  * Delta Lake can have "partition columns", which are columns with constant value specified
+    ///    in the metadata, not present in parquet file. Like hive partitioning, but in metadata
+    ///    files instead of path. Currently these columns are added to the block outside parquet
+    ///    reader. If they appear in prewhere expression, parquet reader gets a "no column in block"
+    ///    error. Unlike hive partitioning, we can't (?) just return these columns from
+    ///    supportedPrewhereColumns() because at the time of the call the delta lake metadata hasn't
+    ///    been read yet. So we should probably pass these columns to the parquet reader instead of
+    ///    adding them outside.
+    ///  * There's a bug in StorageObjectStorageSource::createReader: it makes a copy of
+    ///    FormatFilterInfo, but for some reason unsets prewhere_info and row_level_filter_info.
+    ///    There's probably no reason for this, and it should just copy those fields like the others.
+    supports_prewhere = !configuration->isDataLakeConfiguration() && FormatFactory::instance().checkIfFormatSupportsPrewhere(configuration->getFormat(), context, format_settings);
 
     StorageInMemoryMetadata metadata;
     metadata.setColumns(columns);
@@ -221,9 +230,9 @@ StorageObjectStorage::StorageObjectStorage(
     metadata.setComment(comment);
 
     /// I am not sure this is actually required, but just in case
-    if (configuration->partition_strategy)
+    if (configuration->getPartitionStrategy())
     {
-        metadata.partition_key = configuration->partition_strategy->getPartitionKeyDescription();
+        metadata.partition_key = configuration->getPartitionStrategy()->getPartitionKeyDescription();
     }
 
     setVirtuals(VirtualColumnUtils::getVirtualsForFileLikeStorage(metadata.columns));
@@ -237,17 +246,17 @@ String StorageObjectStorage::getName() const
 
 bool StorageObjectStorage::prefersLargeBlocks() const
 {
-    return FormatFactory::instance().checkIfOutputFormatPrefersLargeBlocks(configuration->format);
+    return FormatFactory::instance().checkIfOutputFormatPrefersLargeBlocks(configuration->getFormat());
 }
 
 bool StorageObjectStorage::parallelizeOutputAfterReading(ContextPtr context) const
 {
-    return FormatFactory::instance().checkParallelizeOutputAfterReading(configuration->format, context);
+    return FormatFactory::instance().checkParallelizeOutputAfterReading(configuration->getFormat(), context);
 }
 
 bool StorageObjectStorage::supportsSubsetOfColumns(const ContextPtr & context) const
 {
-    return FormatFactory::instance().checkIfFormatSupportsSubsetOfColumns(configuration->format, context, format_settings);
+    return FormatFactory::instance().checkIfFormatSupportsSubsetOfColumns(configuration->getFormat(), context, format_settings);
 }
 
 bool StorageObjectStorage::supportsPrewhere() const
@@ -262,7 +271,7 @@ bool StorageObjectStorage::canMoveConditionsToPrewhere() const
 
 std::optional<NameSet> StorageObjectStorage::supportedPrewhereColumns() const
 {
-    return getInMemoryMetadataPtr()->getColumnsWithoutDefaultExpressions();
+    return getInMemoryMetadataPtr()->getColumnsWithoutDefaultExpressions(/*exclude=*/ hive_partition_columns_to_read_from_file_path);
 }
 
 IStorage::ColumnSizeByName StorageObjectStorage::getColumnSizes() const
@@ -355,7 +364,7 @@ void StorageObjectStorage::read(
             /* check_consistent_with_previous_metadata */true);
     }
 
-    if (configuration->partition_strategy && configuration->partition_strategy_type != PartitionStrategyFactory::StrategyType::HIVE)
+    if (configuration->getPartitionStrategy() && configuration->getPartitionStrategyType() != PartitionStrategyFactory::StrategyType::HIVE)
     {
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
                         "Reading from a partitioned {} storage is not implemented yet",
@@ -380,7 +389,7 @@ void StorageObjectStorage::read(
     if (!modified_format_settings.has_value())
         modified_format_settings.emplace(getFormatSettings(local_context));
 
-    configuration->modifyFormatSettings(modified_format_settings.value());
+    configuration->modifyFormatSettings(modified_format_settings.value(), *local_context);
 
     auto read_step = std::make_unique<ReadFromObjectStorageStep>(
         object_storage,
@@ -442,9 +451,10 @@ SinkToStoragePtr StorageObjectStorage::write(
 
     /// Not a data lake, just raw object storage
 
-    if (configuration->partition_strategy)
+    if (configuration->getPartitionStrategy())
     {
-        return std::make_shared<PartitionedStorageObjectStorageSink>(object_storage, configuration, format_settings, sample_block, local_context);
+        auto sink_creator = std::make_shared<PartitionedStorageObjectStorageSink>(object_storage, configuration, format_settings, sample_block, local_context);
+        return std::make_shared<PartitionedSink>(configuration->partition_strategy, sink_creator, local_context, sample_block);
     }
 
     auto paths = configuration->getPaths();
@@ -474,6 +484,74 @@ bool StorageObjectStorage::optimize(
     [[maybe_unused]] ContextPtr context)
 {
     return configuration->optimize(metadata_snapshot, context, format_settings);
+}
+
+bool StorageObjectStorage::supportsImport() const
+{
+    if (!configuration->partition_strategy)
+        return false;
+
+    if (configuration->partition_strategy_type == PartitionStrategyFactory::StrategyType::WILDCARD)
+        return configuration->getRawPath().hasExportFilenameWildcard();
+
+    return configuration->partition_strategy_type == PartitionStrategyFactory::StrategyType::HIVE;
+}
+
+
+SinkToStoragePtr StorageObjectStorage::import(
+    const std::string & file_name,
+    Block & block_with_partition_values,
+    std::string & destination_file_path,
+    bool overwrite_if_exists,
+    const std::optional<FormatSettings> & format_settings_,
+    ContextPtr local_context)
+{
+    std::string partition_key;
+
+    if (configuration->partition_strategy)
+    {
+        const auto column_with_partition_key = configuration->partition_strategy->computePartitionKey(block_with_partition_values);
+
+        if (!column_with_partition_key->empty())
+        {
+            partition_key = column_with_partition_key->getDataAt(0).toString();
+        }
+    }
+
+    destination_file_path = configuration->getPathForWrite(partition_key, file_name).path;
+
+    if (!overwrite_if_exists && object_storage->exists(StoredObject(destination_file_path)))
+    {
+        throw Exception(ErrorCodes::FILE_ALREADY_EXISTS, "File {} already exists", destination_file_path);
+    }
+
+    return std::make_shared<StorageObjectStorageSink>(
+        destination_file_path,
+        object_storage,
+        configuration,
+        format_settings_ ? format_settings_ : format_settings,
+        std::make_shared<const Block>(getInMemoryMetadataPtr()->getSampleBlock()),
+        local_context);
+}
+
+void StorageObjectStorage::commitExportPartitionTransaction(const String & transaction_id, const String & partition_id, const Strings & exported_paths, ContextPtr local_context)
+{
+    const String commit_object = configuration->getRawPath().path + "/commit_" + partition_id + "_" + transaction_id;
+
+    /// if file already exists, nothing to be done
+    if (object_storage->exists(StoredObject(commit_object)))
+    {
+        LOG_DEBUG(getLogger("StorageObjectStorage"), "Commit file already exists, nothing to be done: {}", commit_object);
+        return;
+    }
+
+    auto out = object_storage->writeObject(StoredObject(commit_object), WriteMode::Rewrite, /* attributes= */ {}, DBMS_DEFAULT_BUFFER_SIZE, local_context->getWriteSettings());
+    for (const auto & p : exported_paths)
+    {
+        out->write(p.data(), p.size());
+        out->write("\n", 1);
+    }
+    out->finalize();
 }
 
 void StorageObjectStorage::truncate(
@@ -549,7 +627,7 @@ ColumnsDescription StorageObjectStorage::resolveSchemaFromData(
 {
     ObjectInfos read_keys;
     auto iterator = createReadBufferIterator(object_storage, configuration, format_settings, read_keys, context);
-    auto schema = readSchemaFromFormat(configuration->format, format_settings, *iterator, context);
+    auto schema = readSchemaFromFormat(configuration->getFormat(), format_settings, *iterator, context);
     sample_path = iterator->getLastFilePath();
     return schema;
 }
@@ -570,7 +648,7 @@ std::string StorageObjectStorage::resolveFormatFromData(
 
 std::pair<ColumnsDescription, std::string> StorageObjectStorage::resolveSchemaAndFormatFromData(
     const ObjectStoragePtr & object_storage,
-    const StorageObjectStorageConfigurationPtr & configuration,
+    StorageObjectStorageConfigurationPtr & configuration,
     const std::optional<FormatSettings> & format_settings,
     std::string & sample_path,
     const ContextPtr & context)
@@ -579,13 +657,13 @@ std::pair<ColumnsDescription, std::string> StorageObjectStorage::resolveSchemaAn
     auto iterator = createReadBufferIterator(object_storage, configuration, format_settings, read_keys, context);
     auto [columns, format] = detectFormatAndReadSchema(format_settings, *iterator, context);
     sample_path = iterator->getLastFilePath();
-    configuration->format = format;
+    configuration->setFormat(format);
     return std::pair(columns, format);
 }
 
 void StorageObjectStorage::addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const
 {
-    configuration->addStructureAndFormatToArgsIfNeeded(args, "", configuration->format, context, /*with_structure=*/false);
+    configuration->addStructureAndFormatToArgsIfNeeded(args, "", configuration->getFormat(), context, /*with_structure=*/false);
 }
 
 SchemaCache & StorageObjectStorage::getSchemaCache(const ContextPtr & context, const std::string & storage_engine_name)
@@ -646,6 +724,5 @@ void StorageObjectStorage::checkAlterIsPossible(const AlterCommands & commands, 
 {
     configuration->checkAlterIsPossible(commands);
 }
-
 
 }

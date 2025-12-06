@@ -1029,8 +1029,9 @@ bool StorageFile::canMoveConditionsToPrewhere() const
 
 std::optional<NameSet> StorageFile::supportedPrewhereColumns() const
 {
-    /// Currently don't support prewhere for virtual columns and columns with default expressions.
-    return getInMemoryMetadataPtr()->getColumnsWithoutDefaultExpressions();
+    /// Currently don't support prewhere for virtual columns, columns with default expressions,
+    /// and columns taken from file path (hive partitioning).
+    return getInMemoryMetadataPtr()->getColumnsWithoutDefaultExpressions(/*exclude=*/ hive_partition_columns_to_read_from_file_path);
 }
 
 IStorage::ColumnSizeByName StorageFile::getColumnSizes() const
@@ -1989,7 +1990,7 @@ private:
     std::unique_lock<std::shared_timed_mutex> lock;
 };
 
-class PartitionedStorageFileSink : public PartitionedSink
+class PartitionedStorageFileSink : public PartitionedSink::SinkCreator
 {
 public:
     PartitionedStorageFileSink(
@@ -2004,7 +2005,7 @@ public:
         const String format_name_,
         ContextPtr context_,
         int flags_)
-        : PartitionedSink(partition_strategy_, context_, std::make_shared<const Block>(metadata_snapshot_->getSampleBlock()))
+        : partition_strategy(partition_strategy_)
         , path(path_)
         , metadata_snapshot(metadata_snapshot_)
         , table_name_for_log(table_name_for_log_)
@@ -2020,11 +2021,12 @@ public:
 
     SinkPtr createSinkForPartition(const String & partition_id) override
     {
-        std::string filepath = partition_strategy->getPathForWrite(path, partition_id);
+        const auto file_path_generator = std::make_shared<ObjectStorageWildcardFilePathGenerator>(path);
+        std::string filepath = file_path_generator->getPathForWrite(partition_id);
 
         fs::create_directories(fs::path(filepath).parent_path());
 
-        validatePartitionKey(filepath, true);
+        PartitionedSink::validatePartitionKey(filepath, true);
         checkCreationIsAllowed(context, context->getUserFilesPath(), filepath, /*can_be_directory=*/ true);
         return std::make_shared<StorageFileSink>(
             metadata_snapshot,
@@ -2041,6 +2043,7 @@ public:
     }
 
 private:
+    std::shared_ptr<IPartitionStrategy> partition_strategy;
     const String path;
     StorageMetadataPtr metadata_snapshot;
     String table_name_for_log;
@@ -2092,7 +2095,7 @@ SinkToStoragePtr StorageFile::write(
             has_wildcards,
             /* partition_columns_in_data_file */true);
 
-        return std::make_shared<PartitionedStorageFileSink>(
+        auto sink_creator = std::make_shared<PartitionedStorageFileSink>(
             partition_strategy,
             metadata_snapshot,
             getStorageID().getNameForLogs(),
@@ -2104,6 +2107,13 @@ SinkToStoragePtr StorageFile::write(
             format_name,
             context,
             flags);
+
+        return std::make_shared<PartitionedSink>(
+            partition_strategy,
+            sink_creator,
+            context,
+            std::make_shared<const Block>(metadata_snapshot->getSampleBlock())
+        );
     }
 
     String path;
@@ -2129,6 +2139,7 @@ SinkToStoragePtr StorageFile::write(
                 String new_path;
                 do
                 {
+
                     new_path = path.substr(0, pos) + "." + std::to_string(index) + (pos == std::string::npos ? "" : path.substr(pos));
                     ++index;
                 }

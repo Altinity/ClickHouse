@@ -7,6 +7,11 @@
 #include <Interpreters/Context.h>
 #include <Common/Exception.h>
 #include <Common/ObjectStorageKeyGenerator.h>
+#include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
+
+#include <Poco/JSON/Object.h>
+#include <Poco/JSON/Parser.h>
+#include <Poco/JSON/JSONException.h>
 
 
 namespace DB
@@ -25,12 +30,12 @@ const MetadataStorageMetrics & IObjectStorage::getMetadataStorageMetrics() const
 
 bool IObjectStorage::existsOrHasAnyChild(const std::string & path) const
 {
-    RelativePathsWithMetadata files;
+    PathsWithMetadata files;
     listObjects(path, files, 1);
     return !files.empty();
 }
 
-void IObjectStorage::listObjects(const std::string &, RelativePathsWithMetadata &, size_t) const
+void IObjectStorage::listObjects(const std::string &, PathsWithMetadata &, size_t) const
 {
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "listObjects() is not supported");
 }
@@ -38,7 +43,7 @@ void IObjectStorage::listObjects(const std::string &, RelativePathsWithMetadata 
 
 ObjectStorageIteratorPtr IObjectStorage::iterate(const std::string & path_prefix, size_t max_keys) const
 {
-    RelativePathsWithMetadata files;
+    PathsWithMetadata files;
     listObjects(path_prefix, files, max_keys);
 
     return std::make_shared<ObjectStorageIteratorFromList>(std::move(files));
@@ -97,11 +102,59 @@ WriteSettings IObjectStorage::patchSettings(const WriteSettings & write_settings
     return write_settings;
 }
 
-std::string RelativePathWithMetadata::getPathOrPathToArchiveIfArchive() const
+std::string PathWithMetadata::getPathOrPathToArchiveIfArchive() const
 {
     if (isArchive())
         return getPathToArchive();
     return getPath();
+}
+
+PathWithMetadata::CommandInTaskResponse::CommandInTaskResponse(const std::string & task)
+{
+    Poco::JSON::Parser parser;
+    try
+    {
+        auto json = parser.parse(task).extract<Poco::JSON::Object::Ptr>();
+        if (!json)
+            return;
+
+        is_valid = true;
+
+        if (json->has("retry_after_us"))
+            retry_after_us = json->getValue<size_t>("retry_after_us");
+    }
+    catch (const Poco::JSON::JSONException &)
+    { /// Not a JSON
+        return;
+    }
+}
+
+std::string PathWithMetadata::CommandInTaskResponse::toString() const
+{
+    Poco::JSON::Object json;
+    if (retry_after_us.has_value())
+        json.set("retry_after_us", retry_after_us.value());
+
+    std::ostringstream oss;
+    oss.exceptions(std::ios::failbit);
+    Poco::JSON::Stringifier::stringify(json, oss);
+    return oss.str();
+}
+
+
+void PathWithMetadata::loadMetadata(ObjectStoragePtr object_storage, bool ignore_non_existent_file)
+{
+    if (!metadata)
+    {
+        const auto & path = isArchive() ? getPathToArchive() : getPath();
+
+        auto storage_to_use = object_storage_to_use ? object_storage_to_use : object_storage;
+
+        if (ignore_non_existent_file)
+            metadata = storage_to_use->tryGetObjectMetadata(path);
+        else
+            metadata = storage_to_use->getObjectMetadata(path);
+    }
 }
 
 }

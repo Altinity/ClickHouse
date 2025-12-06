@@ -454,7 +454,7 @@ Model::HeadObjectOutcome Client::HeadObject(HeadObjectRequest & request) const
     auto bucket_uri = getURIForBucket(bucket);
     if (!bucket_uri)
     {
-        if (auto maybe_error = updateURIForBucketForHead(bucket); maybe_error.has_value())
+        if (auto maybe_error = updateURIForBucketForHead(bucket, request.GetKey()); maybe_error.has_value())
             return *maybe_error;
 
         if (auto region = getRegionForBucket(bucket); !region.empty())
@@ -659,7 +659,6 @@ Client::doRequest(RequestType & request, RequestFn request_fn) const
     if (auto uri = getURIForBucket(bucket); uri.has_value())
         request.overrideURI(std::move(*uri));
 
-
     bool found_new_endpoint = false;
     // if we found correct endpoint after 301 responses, update the cache for future requests
     SCOPE_EXIT(
@@ -693,17 +692,33 @@ Client::doRequest(RequestType & request, RequestFn request_fn) const
             continue;
         }
 
-        if (error.GetResponseCode() != Aws::Http::HttpResponseCode::MOVED_PERMANENTLY)
+        /// IllegalLocationConstraintException may indicate that we are working with an opt-in region (e.g. me-south-1)
+        /// In that case, we need to update the region and try again
+        bool is_illegal_constraint_exception = error.GetExceptionName() == "IllegalLocationConstraintException";
+        if (error.GetResponseCode() != Aws::Http::HttpResponseCode::MOVED_PERMANENTLY && !is_illegal_constraint_exception)
             return result;
 
         // maybe we detect a correct region
-        if (!detect_region)
+        bool new_region_detected = false;
+        if (!detect_region || is_illegal_constraint_exception)
         {
             if (auto region = GetErrorMarshaller()->ExtractRegion(error); !region.empty() && region != explicit_region)
             {
+                LOG_INFO(log, "Detected new region: {}", region);
                 request.overrideRegion(region);
                 insertRegionOverride(bucket, region);
+                new_region_detected = true;
             }
+        }
+
+        /// special handling for opt-in regions
+        if (new_region_detected && is_illegal_constraint_exception && initial_endpoint.substr(11) == "amazonaws.com")
+        {
+            S3::URI new_uri(initial_endpoint);
+            new_uri.addRegionToURI(request.getRegionOverride());
+            found_new_endpoint = true;
+            request.overrideURI(new_uri);
+            continue;
         }
 
         // we possibly got new location, need to try with that one
@@ -1006,12 +1021,15 @@ std::optional<S3::URI> Client::getURIFromError(const Aws::S3::S3Error & error) c
 }
 
 // Do a list request because head requests don't have body in response
-std::optional<Aws::S3::S3Error> Client::updateURIForBucketForHead(const std::string & bucket) const
+// S3 Tables don't support ListObjects, so made dirty workaroung - changed on GetObject
+std::optional<Aws::S3::S3Error> Client::updateURIForBucketForHead(const std::string & bucket, const std::string & key) const
 {
-    ListObjectsV2Request req;
+    GetObjectRequest req;
     req.SetBucket(bucket);
-    req.SetMaxKeys(1);
-    auto result = ListObjectsV2(req);
+    req.SetKey(key);
+    req.SetRange("bytes=0-1");
+    auto result = GetObject(req);
+
     if (result.IsSuccess())
         return std::nullopt;
     return result.GetError();

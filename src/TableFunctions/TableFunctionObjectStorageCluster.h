@@ -12,8 +12,6 @@ namespace DB
 
 class Context;
 
-class StorageS3Settings;
-class StorageAzureBlobSettings;
 class StorageS3Configuration;
 class StorageAzureConfiguration;
 
@@ -45,21 +43,26 @@ protected:
 
     const char * getStorageEngineName() const override { return Definition::storage_engine_name; }
     const char * getNonClusteredStorageEngineName() const override { return Definition::non_clustered_storage_engine_name; }
-    bool hasStaticStructure() const override { return Base::getConfiguration()->structure != "auto"; }
-    bool needStructureHint() const override { return Base::getConfiguration()->structure == "auto"; }
+    bool hasStaticStructure() const override { return Base::getConfiguration()->getStructure() != "auto"; }
+    bool needStructureHint() const override { return Base::getConfiguration()->getStructure() == "auto"; }
     void setStructureHint(const ColumnsDescription & structure_hint_) override { Base::structure_hint = structure_hint_; }
 };
 
 #if USE_AWS_S3
-using TableFunctionS3Cluster = TableFunctionObjectStorageCluster<S3ClusterDefinition, StorageS3Configuration>;
+using TableFunctionS3Cluster = TableFunctionObjectStorageCluster<S3ClusterDefinition, StorageS3Configuration, false>;
 #endif
 
 #if USE_AZURE_BLOB_STORAGE
-using TableFunctionAzureBlobCluster = TableFunctionObjectStorageCluster<AzureClusterDefinition, StorageAzureConfiguration>;
+using TableFunctionAzureBlobCluster = TableFunctionObjectStorageCluster<AzureClusterDefinition, StorageAzureConfiguration, false>;
 #endif
 
 #if USE_HDFS
-using TableFunctionHDFSCluster = TableFunctionObjectStorageCluster<HDFSClusterDefinition, StorageHDFSConfiguration>;
+using TableFunctionHDFSCluster = TableFunctionObjectStorageCluster<HDFSClusterDefinition, StorageHDFSConfiguration, false>;
+#endif
+
+#if USE_AVRO
+using TableFunctionIcebergCluster = TableFunctionObjectStorageCluster<IcebergClusterDefinition, StorageIcebergConfiguration, true>;
+using TableFunctionIcebergLocalCluster = TableFunctionObjectStorageCluster<IcebergLocalClusterDefinition, StorageLocalIcebergConfiguration, true>;
 #endif
 
 #if USE_AVRO && USE_AWS_S3
@@ -76,6 +79,11 @@ using TableFunctionIcebergHDFSCluster = TableFunctionObjectStorageCluster<Iceber
 
 #if USE_AWS_S3 && USE_PARQUET && USE_DELTA_KERNEL_RS
 using TableFunctionDeltaLakeCluster = TableFunctionObjectStorageCluster<DeltaLakeClusterDefinition, StorageS3DeltaLakeConfiguration, true>;
+using TableFunctionDeltaLakeS3Cluster = TableFunctionObjectStorageCluster<DeltaLakeS3ClusterDefinition, StorageS3DeltaLakeConfiguration, true>;
+#endif
+
+#if USE_AZURE_BLOB_STORAGE && USE_PARQUET && USE_DELTA_KERNEL_RS
+using TableFunctionDeltaLakeAzureCluster = TableFunctionObjectStorageCluster<DeltaLakeAzureClusterDefinition, StorageAzureDeltaLakeConfiguration, true>;
 #endif
 
 #if USE_AWS_S3

@@ -19,9 +19,11 @@ namespace ErrorCodes
 namespace Setting
 {
     extern const SettingsBool cluster_function_process_archive_on_multiple_nodes;
+    extern const SettingsBool allow_experimental_iceberg_read_optimization;
 }
 
 ClusterFunctionReadTaskResponse::ClusterFunctionReadTaskResponse(ObjectInfoPtr object, const ContextPtr & context)
+    : iceberg_read_optimization_enabled(context->getSettingsRef()[Setting::allow_experimental_iceberg_read_optimization])
 {
     if (!object)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "`object` cannot be null");
@@ -29,8 +31,16 @@ ClusterFunctionReadTaskResponse::ClusterFunctionReadTaskResponse(ObjectInfoPtr o
     if (object->data_lake_metadata.has_value())
         data_lake_metadata = object->data_lake_metadata.value();
 
-    const bool send_over_whole_archive = !context->getSettingsRef()[Setting::cluster_function_process_archive_on_multiple_nodes];
-    path = send_over_whole_archive ? object->getPathOrPathToArchiveIfArchive() : object->getPath();
+    file_meta_info = object->file_meta_info;
+
+    if (object->getCommand().isValid())
+        path = object->getCommand().toString();
+    else
+    {
+        const bool send_over_whole_archive = !context->getSettingsRef()[Setting::cluster_function_process_archive_on_multiple_nodes];
+        path = send_over_whole_archive ? object->getPathOrPathToArchiveIfArchive() : object->getPath();
+        absolute_path = object->getAbsolutePath();
+    }
 }
 
 ClusterFunctionReadTaskResponse::ClusterFunctionReadTaskResponse(const std::string & path_)
@@ -45,6 +55,10 @@ ObjectInfoPtr ClusterFunctionReadTaskResponse::getObjectInfo() const
 
     auto object = std::make_shared<ObjectInfo>(path);
     object->data_lake_metadata = data_lake_metadata;
+    object->file_meta_info = file_meta_info;
+    if (absolute_path.has_value() && !absolute_path.value().empty())
+        object->absolute_path = absolute_path;
+    
     return object;
 }
 
@@ -60,6 +74,15 @@ void ClusterFunctionReadTaskResponse::serialize(WriteBuffer & out, size_t protoc
             data_lake_metadata.transform->serialize(out, registry);
         else
             ActionsDAG().serialize(out, registry);
+    }
+
+    if (protocol_version >= DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_DATA_LAKE_COLUMNS_METADATA)
+    {
+        /// This info is not used when optimization is disabled, so there is no need to send it.
+        if (iceberg_read_optimization_enabled && file_meta_info.has_value())
+            file_meta_info.value()->serialize(out);
+        else
+            DataFileMetaInfo().serialize(out);
     }
 }
 
@@ -86,6 +109,14 @@ void ClusterFunctionReadTaskResponse::deserialize(ReadBuffer & in)
         {
             data_lake_metadata.transform = std::move(transform);
         }
+    }
+
+    if (protocol_version >= DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_DATA_LAKE_COLUMNS_METADATA)
+    {
+        auto info = std::make_shared<DataFileMetaInfo>(DataFileMetaInfo::deserialize(in));
+
+        if (!path.empty() && !info->empty())
+            file_meta_info = info;
     }
 }
 

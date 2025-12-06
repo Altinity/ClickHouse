@@ -60,7 +60,7 @@ private:
     mutable Strings data_files;
 
     Strings getDataFilesImpl() const;
-    Strings getDataFiles(const ActionsDAG * filter_dag) const;
+    Strings getDataFiles() const;
 };
 
 }

@@ -1,7 +1,10 @@
 #pragma once
 
+
+#include <Interpreters/Context_fwd.h>
 #include "config.h"
 
+#include <map>
 #include <string>
 #include <string_view>
 
@@ -30,8 +33,6 @@ void writeMessageToFile(
     DB::ContextPtr context,
     std::function<void()> cleanup,
     DB::CompressionMethod compression_method = DB::CompressionMethod::None);
-
-std::string getProperFilePathFromMetadataInfo(std::string_view data_path, std::string_view common_path, std::string_view table_location);
 
 struct TransformAndArgument
 {

@@ -24,9 +24,9 @@ extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
 void StorageLocalConfiguration::fromNamedCollection(const NamedCollection & collection, ContextPtr)
 {
     path = collection.get<String>("path");
-    format = collection.getOrDefault<String>("format", "auto");
-    compression_method = collection.getOrDefault<String>("compression_method", collection.getOrDefault<String>("compression", "auto"));
-    structure = collection.getOrDefault<String>("structure", "auto");
+    setFormat(collection.getOrDefault<String>("format", "auto"));
+    setCompressionMethod(collection.getOrDefault<String>("compression_method", collection.getOrDefault<String>("compression", "auto")));
+    setStructure(collection.getOrDefault<String>("structure", "auto"));
     paths = {path};
 }
 
@@ -46,23 +46,23 @@ void StorageLocalConfiguration::fromAST(ASTs & args, ContextPtr context, bool wi
 
     if (args.size() > 1)
     {
-        format = checkAndGetLiteralArgument<String>(args[1], "format_name");
+        setFormat(checkAndGetLiteralArgument<String>(args[1], "format_name"));
     }
 
     if (with_structure)
     {
         if (args.size() > 2)
         {
-            structure = checkAndGetLiteralArgument<String>(args[2], "structure");
+            setStructure(checkAndGetLiteralArgument<String>(args[2], "structure"));
         }
         if (args.size() > 3)
         {
-            compression_method = checkAndGetLiteralArgument<String>(args[3], "compression_method");
+            setCompressionMethod(checkAndGetLiteralArgument<String>(args[3], "compression_method"));
         }
     }
     else if (args.size() > 2)
     {
-        compression_method = checkAndGetLiteralArgument<String>(args[2], "compression_method");
+        setCompressionMethod(checkAndGetLiteralArgument<String>(args[2], "compression_method"));
     }
     paths = {path};
 }
@@ -80,5 +80,21 @@ StorageObjectStorageQuerySettings StorageLocalConfiguration::getQuerySettings(co
         .throw_on_zero_files_match = false,
         .ignore_non_existent_file = false};
 }
+
+ASTPtr StorageLocalConfiguration::createArgsWithAccessData() const
+{
+    auto arguments = std::make_shared<ASTExpressionList>();
+
+    arguments->children.push_back(std::make_shared<ASTLiteral>(path.path));
+    if (getFormat() != "auto")
+        arguments->children.push_back(std::make_shared<ASTLiteral>(getFormat()));
+    if (getStructure() != "auto")
+        arguments->children.push_back(std::make_shared<ASTLiteral>(getStructure()));
+    if (getCompressionMethod() != "auto")
+        arguments->children.push_back(std::make_shared<ASTLiteral>(getCompressionMethod()));
+
+    return arguments;
+}
+
 
 }
