@@ -3452,24 +3452,12 @@ def test_system_iceberg_metadata(started_cluster, format_version, storage_type):
             raise
 
 
-<<<<<<< HEAD
 @pytest.mark.parametrize("storage_type", ["s3", "azure"])
 @pytest.mark.parametrize("run_on_cluster", [False, True])
 def test_read_constant_columns_optimization(started_cluster, storage_type, run_on_cluster):
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
     TABLE_NAME = "test_read_constant_columns_optimization_" + storage_type + "_" + get_uuid_str()
-=======
-@pytest.mark.parametrize(
-    "storage_type",
-    ["s3", "azure", "local"],
-)
-def test_partition_pruning_with_subquery_set(started_cluster, storage_type):
-    instance = started_cluster.instances["node1"]
-    spark = started_cluster.spark_session
-    TABLE_NAME = "test_partition_pruning_" + storage_type + "_" + get_uuid_str()
-    IN_MEMORY_TABLE = "in_memory_table_" + get_uuid_str()
->>>>>>> v25.8.12.129-lts
 
     def execute_spark_query(query: str):
         return execute_spark_query_general(
@@ -3483,7 +3471,6 @@ def test_partition_pruning_with_subquery_set(started_cluster, storage_type):
     execute_spark_query(
         f"""
             CREATE TABLE {TABLE_NAME} (
-<<<<<<< HEAD
                 tag INT,
                 date DATE,
                 date2 DATE,
@@ -3714,20 +3701,10 @@ def test_cluster_joins(started_cluster, storage_type):
             USING iceberg
             OPTIONS('format-version'='2')
         """, TABLE_NAME_2
-=======
-                id INT,
-                data STRING
-            )
-            USING iceberg
-            PARTITIONED BY (identity(id))
-            OPTIONS('format-version'='2')
-        """
->>>>>>> v25.8.12.129-lts
     )
 
     execute_spark_query(
         f"""
-<<<<<<< HEAD
         INSERT INTO {TABLE_NAME_2} VALUES
         (1, 'dow'),
         (2, 'sparrow')
@@ -3871,7 +3848,41 @@ def test_system_tables_partition_sorting_keys(started_cluster, storage_type):
     """).strip().lower()
 
     assert res == '"bucket(16, id), day(ts)","id desc, hour(ts) asc"'
-=======
+
+
+@pytest.mark.parametrize(
+    "storage_type",
+    ["s3", "azure", "local"],
+)
+def test_partition_pruning_with_subquery_set(started_cluster, storage_type):
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
+    TABLE_NAME = "test_partition_pruning_" + storage_type + "_" + get_uuid_str()
+    IN_MEMORY_TABLE = "in_memory_table_" + get_uuid_str()
+
+    def execute_spark_query(query: str):
+        return execute_spark_query_general(
+            spark,
+            started_cluster,
+            storage_type,
+            TABLE_NAME,
+            query,
+        )
+
+    execute_spark_query(
+        f"""
+            CREATE TABLE {TABLE_NAME} (
+                id INT,
+                data STRING
+            )
+            USING iceberg
+            PARTITIONED BY (identity(id))
+            OPTIONS('format-version'='2')
+        """
+    )
+
+    execute_spark_query(
+        f"""
         INSERT INTO {TABLE_NAME} VALUES
         (1, 'a'),
         (2, 'b'),
@@ -3881,14 +3892,12 @@ def test_system_tables_partition_sorting_keys(started_cluster, storage_type):
     """
     )
 
-
     creation_expression = get_creation_expression(
         storage_type, TABLE_NAME, started_cluster, table_function=True
     )
 
     instance.query(f"CREATE TABLE {IN_MEMORY_TABLE} (id INT) ENGINE = Memory")
     instance.query(f"INSERT INTO {IN_MEMORY_TABLE} VALUES (2), (4)")
-
 
     def check_validity_and_get_prunned_files(select_expression):
         settings1 = {
@@ -3907,4 +3916,3 @@ def test_system_tables_partition_sorting_keys(started_cluster, storage_type):
         )
         == 3
     )
->>>>>>> v25.8.12.129-lts
