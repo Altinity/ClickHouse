@@ -8,9 +8,9 @@
 #include <Interpreters/IcebergMetadataLog.h>
 
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
-#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.h>
+#include <Storages/ObjectStorage/Utils.h>
 
 #include <Core/TypeId.h>
 #include <DataTypes/DataTypesDecimal.h>
@@ -154,9 +154,10 @@ ManifestFileContent::ManifestFileContent(
     const String & path_to_manifest_file_)
     : path_to_manifest_file(path_to_manifest_file_)
 {
+    auto dump_metadata = [&]()->String { return manifest_file_deserializer.getMetadataContent(); };
     insertRowToLogTable(
         context,
-        manifest_file_deserializer.getMetadataContent(),
+        dump_metadata,
         DB::IcebergMetadataLogLevel::ManifestFileMetadata,
         common_path,
         path_to_manifest_file,
@@ -200,7 +201,7 @@ ManifestFileContent::ManifestFileContent(
     const Poco::JSON::Object::Ptr & schema_object = json.extract<Poco::JSON::Object::Ptr>();
     Int32 manifest_schema_id = schema_object->getValue<int>(f_schema_id);
 
-    schema_processor.addIcebergTableSchema(schema_object);
+    schema_processor.addIcebergTableSchema(schema_object, context);
 
     for (size_t i = 0; i != partition_specification->size(); ++i)
     {
@@ -230,9 +231,10 @@ ManifestFileContent::ManifestFileContent(
 
     for (size_t i = 0; i < manifest_file_deserializer.rows(); ++i)
     {
+        auto dump_row_metadata = [&]()->String { return manifest_file_deserializer.getContent(i); };
         insertRowToLogTable(
             context,
-            manifest_file_deserializer.getContent(i),
+            dump_row_metadata,
             DB::IcebergMetadataLogLevel::ManifestFileEntry,
             common_path,
             path_to_manifest_file,
@@ -242,7 +244,6 @@ ManifestFileContent::ManifestFileContent(
         if (format_version_ > 1)
             content_type = FileContentType(manifest_file_deserializer.getValueFromRowByName(i, c_data_file_content, TypeIndex::Int32).safeGet<UInt64>());
         const auto status = ManifestEntryStatus(manifest_file_deserializer.getValueFromRowByName(i, f_status, TypeIndex::Int32).safeGet<UInt64>());
-
 
         if (status == ManifestEntryStatus::DELETED)
             continue;
@@ -286,9 +287,9 @@ ManifestFileContent::ManifestFileContent(
         }
         const auto schema_id = schema_id_opt.has_value() ? schema_id_opt.value() : manifest_schema_id;
 
-        const auto file_path_key
-            = manifest_file_deserializer.getValueFromRowByName(i, c_data_file_file_path, TypeIndex::String).safeGet<String>();
-        const auto file_path = getProperFilePathFromMetadataInfo(manifest_file_deserializer.getValueFromRowByName(i, c_data_file_file_path, TypeIndex::String).safeGet<String>(), common_path, table_location);
+        const auto file_path_key_field = manifest_file_deserializer.getValueFromRowByName(i, c_data_file_file_path, TypeIndex::String);
+        const auto file_path_key = file_path_key_field.safeGet<String>();
+        const auto file_path = makeAbsolutePath(table_location, file_path_key);
 
         /// NOTE: This is weird, because in manifest file partition looks like this:
         /// {

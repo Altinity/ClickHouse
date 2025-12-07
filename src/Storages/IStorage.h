@@ -68,6 +68,9 @@ class RestorerFromBackup;
 
 class ConditionSelectivityEstimator;
 
+class IObjectStorage;
+using ObjectStoragePtr = std::shared_ptr<IObjectStorage>;
+
 class ActionsDAG;
 
 /** Storage. Describes the table. Responsible for
@@ -409,6 +412,7 @@ private:
         size_t /*max_block_size*/,
         size_t /*num_streams*/);
 
+public:
     /// Should we process blocks of data returned by the storage in parallel
     /// even when the storage returned only one stream of data for reading?
     /// It is beneficial, for example, when you read from a file quickly,
@@ -419,7 +423,6 @@ private:
     /// useless).
     virtual bool parallelizeOutputAfterReading(ContextPtr) const { return !isSystemStorage(); }
 
-public:
     /// Other version of read which adds reading step to query plan.
     /// Default implementation creates ReadFromStorageStep and uses usual read.
     /// Can be called after `shutdown`, but not after `drop`.
@@ -449,6 +452,37 @@ public:
         const StorageMetadataPtr & /*metadata_snapshot*/,
         ContextPtr /*context*/,
         bool /*async_insert*/);
+
+    virtual bool supportsImport() const
+    {
+      return false;
+    }
+
+    /*
+It is currently only implemented in StorageObjectStorage.
+      It is meant to be used to import merge tree data parts into object storage. It is similar to the write API,
+      but it won't re-partition the data and should allow the filename to be set by the caller.
+    */
+    virtual SinkToStoragePtr import(
+        const std::string & /* file_name */,
+        Block & /* block_with_partition_values */,
+        std::string & /* destination_file_path */,
+        bool /* overwrite_if_exists */,
+        const std::optional<FormatSettings> & /* format_settings */,
+        ContextPtr /* context */)
+    {
+      throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Import is not implemented for storage {}", getName());
+    }
+
+    virtual void commitExportPartitionTransaction(
+      const String & /* transaction_id */,
+      const String & /* partition_id */,
+      const Strings & /* exported_paths */,
+      ContextPtr /* local_context */)
+  {
+      throw Exception(ErrorCodes::NOT_IMPLEMENTED, "commitExportPartitionTransaction is not implemented for storage type {}", getName());
+  }
+    
 
     /** Writes the data to a table in distributed manner.
       * It is supposed that implementation looks into SELECT part of the query and executes distributed
@@ -557,6 +591,9 @@ public:
     virtual void waitForMutation(const String & /*mutation_id*/, bool /*wait_for_another_mutation*/);
 
     virtual void setMutationCSN(const String & /*mutation_id*/, UInt64 /*csn*/);
+
+    /// Cancel a replicated partition export by transaction id.
+    virtual CancellationCode killExportPartition(const String & /*transaction_id*/);
 
     /// Cancel a part move to shard.
     virtual CancellationCode killPartMoveToShard(const UUID & /*task_uuid*/);

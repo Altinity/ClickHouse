@@ -1,6 +1,23 @@
 #pragma once
 
 #include "config.h"
+#include <Core/Range.h>
+#include <Core/Types.h>
+
+#include <optional>
+
+namespace DB::Iceberg
+{
+
+struct ColumnInfo
+{
+    std::optional<Int64> rows_count;
+    std::optional<Int64> bytes_size;
+    std::optional<Int64> nulls_count;
+    std::optional<DB::Range> hyperrectangle;
+};
+
+}
 
 #if USE_AVRO
 
@@ -9,6 +26,7 @@
 #include <Storages/KeyDescription.h>
 #include <Storages/MergeTree/KeyCondition.h>
 #include <Core/Field.h>
+#include <Disks/ObjectStorages/IObjectStorage_fwd.h>
 
 #include <cstdint>
 
@@ -37,14 +55,6 @@ enum class ManifestFileContentType
 };
 
 String FileContentTypeToString(FileContentType type);
-
-struct ColumnInfo
-{
-    std::optional<Int64> rows_count;
-    std::optional<Int64> bytes_size;
-    std::optional<Int64> nulls_count;
-    std::optional<DB::Range> hyperrectangle;
-};
 
 struct PartitionSpecsEntry
 {
@@ -76,6 +86,10 @@ struct ManifestFileEntry
     String file_format;
     std::optional<String> reference_data_file_path; // For position delete files only.
     std::optional<std::vector<Int32>> equality_ids;
+
+    // Resolved storage and key (set by SingleThreadIcebergKeysIterator)
+    ObjectStoragePtr storage_to_use;
+    String resolved_key;
 };
 
 /**

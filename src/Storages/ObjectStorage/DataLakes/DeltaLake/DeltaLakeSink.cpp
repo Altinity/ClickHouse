@@ -42,7 +42,7 @@ DeltaLakeSink::StorageSinkPtr DeltaLakeSink::createStorageSink() const
     return std::make_unique<StorageObjectStorageSink>(
         DeltaLake::generateWritePath(
             delta_transaction->getDataPath(),
-            configuration->format),
+            configuration->getFormat()),
         object_storage,
         configuration,
         format_settings,

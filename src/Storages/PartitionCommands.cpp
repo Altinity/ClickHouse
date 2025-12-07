@@ -130,6 +130,25 @@ std::optional<PartitionCommand> PartitionCommand::parse(const ASTAlterCommand * 
         res.with_name = command_ast->with_name;
         return res;
     }
+    if (command_ast->type == ASTAlterCommand::EXPORT_PART)
+    {
+        PartitionCommand res;
+        res.type = EXPORT_PART;
+        res.partition = command_ast->partition->clone();
+        res.part = command_ast->part;
+        res.to_database = command_ast->to_database;
+        res.to_table = command_ast->to_table;
+        return res;
+    }
+    if (command_ast->type == ASTAlterCommand::EXPORT_PARTITION)
+    {
+        PartitionCommand res;
+        res.type = EXPORT_PARTITION;
+        res.partition = command_ast->partition->clone();
+        res.to_database = command_ast->to_database;
+        res.to_table = command_ast->to_table;
+        return res;
+    }
     return {};
 }
 
@@ -171,6 +190,10 @@ std::string PartitionCommand::typeToString() const
         return "UNFREEZE ALL";
     case PartitionCommand::Type::REPLACE_PARTITION:
         return "REPLACE PARTITION";
+    case PartitionCommand::Type::EXPORT_PART:
+        return "EXPORT PART";
+    case PartitionCommand::Type::EXPORT_PARTITION:
+        return "EXPORT PARTITION";
     default:
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Uninitialized partition command");
     }

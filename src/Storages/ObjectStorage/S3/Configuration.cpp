@@ -92,6 +92,7 @@ static const std::unordered_set<std::string_view> optional_configuration_keys =
     "no_sign_request",
     "partition_strategy",
     "partition_columns_in_data_file",
+    "storage_type",
     /// Private configuration options
     "role_arn", /// for extra_credentials
     "role_session_name", /// for extra_credentials
@@ -205,10 +206,10 @@ void StorageS3Configuration::fromNamedCollection(const NamedCollection & collect
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Partition strategy {} is not supported", partition_strategy_name);
         }
 
-        partition_strategy_type = partition_strategy_type_opt.value();
+        setPartitionStrategyType(partition_strategy_type_opt.value());
     }
 
-    partition_columns_in_data_file = collection.getOrDefault<bool>("partition_columns_in_data_file", partition_strategy_type != PartitionStrategyFactory::StrategyType::HIVE);
+    setPartitionColumnsInDataFile(collection.getOrDefault<bool>("partition_columns_in_data_file", getPartitionStrategyType() != PartitionStrategyFactory::StrategyType::HIVE));
     s3_settings->auth_settings[S3AuthSetting::role_arn] = collection.getOrDefault<String>("role_arn", "");
     s3_settings->auth_settings[S3AuthSetting::role_session_name] = collection.getOrDefault<String>("role_session_name", "");
 
@@ -217,9 +218,9 @@ void StorageS3Configuration::fromNamedCollection(const NamedCollection & collect
     s3_settings->auth_settings[S3AuthSetting::metadata_service] = collection.getOrDefault<String>("metadata_service", "");
     s3_settings->auth_settings[S3AuthSetting::request_token_path] = collection.getOrDefault<String>("request_token_path", "");
 
-    format = collection.getOrDefault<String>("format", format);
-    compression_method = collection.getOrDefault<String>("compression_method", collection.getOrDefault<String>("compression", "auto"));
-    structure = collection.getOrDefault<String>("structure", "auto");
+    setFormat(collection.getOrDefault<String>("format", getFormat()));
+    setCompressionMethod(collection.getOrDefault<String>("compression_method", collection.getOrDefault<String>("compression", "auto")));
+    setStructure(collection.getOrDefault<String>("structure", "auto"));
 
     s3_settings->request_settings = S3::S3RequestSettings(collection, settings, /* validate_settings */true);
 
@@ -619,24 +620,25 @@ void StorageS3Configuration::fromAST(ASTs & args, ContextPtr context, bool with_
     if (auto format_value = getFromPositionOrKeyValue<String>("format", args, engine_args_to_idx, key_value_args);
         format_value.has_value())
     {
-        format = format_value.value();
+        auto format_ = format_value.value();
         /// Set format to configuration only of it's not 'auto',
         /// because we can have default format set in configuration.
-        if (format != "auto")
-            format = format;
+        if (format_ != "auto")
+            setFormat(format_);
     }
 
     if (auto structure_value = getFromPositionOrKeyValue<String>("structure", args, engine_args_to_idx, key_value_args);
         structure_value.has_value())
     {
-        structure = structure_value.value();
+        setStructure(structure_value.value());
     }
 
     if (auto compression_method_value = getFromPositionOrKeyValue<String>("compression_method", args, engine_args_to_idx, key_value_args);
         compression_method_value.has_value())
     {
-        compression_method = compression_method_value.value();
+        setCompressionMethod(compression_method_value.value());
     }
+
 
     if (auto partition_strategy_value = getFromPositionOrKeyValue<String>("partition_strategy", args, engine_args_to_idx, key_value_args);
         partition_strategy_value.has_value())
@@ -649,16 +651,16 @@ void StorageS3Configuration::fromAST(ASTs & args, ContextPtr context, bool with_
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Partition strategy {} is not supported", partition_strategy_name);
         }
 
-        partition_strategy_type = partition_strategy_type_opt.value();
+        setPartitionStrategyType(partition_strategy_type_opt.value());
     }
 
     if (auto partition_columns_in_data_file_value = getFromPositionOrKeyValue<bool>("partition_columns_in_data_file", args, engine_args_to_idx, key_value_args);
         partition_columns_in_data_file_value.has_value())
     {
-        partition_columns_in_data_file = partition_columns_in_data_file_value.value();
+        setPartitionColumnsInDataFile(partition_columns_in_data_file_value.value());
     }
     else
-        partition_columns_in_data_file = partition_strategy_type != PartitionStrategyFactory::StrategyType::HIVE;
+        setPartitionColumnsInDataFile(getPartitionStrategyType() != PartitionStrategyFactory::StrategyType::HIVE);
 
     if (auto access_key_id_value = getFromPositionOrKeyValue<String>("access_key_id", args, engine_args_to_idx, key_value_args);
         access_key_id_value.has_value())
@@ -967,6 +969,30 @@ void StorageS3Configuration::addStructureAndFormatToArgsIfNeeded(
         if (extra_credentials)
             args.push_back(extra_credentials);
     }
+}
+
+ASTPtr StorageS3Configuration::createArgsWithAccessData() const
+{
+    auto arguments = std::make_shared<ASTExpressionList>();
+
+    arguments->children.push_back(std::make_shared<ASTLiteral>(url.uri_str));
+    if (s3_settings->auth_settings[S3AuthSetting::no_sign_request])
+    {
+        arguments->children.push_back(std::make_shared<ASTLiteral>("NOSIGN"));
+    }
+    else
+    {
+        arguments->children.push_back(std::make_shared<ASTLiteral>(s3_settings->auth_settings[S3AuthSetting::access_key_id].value));
+        arguments->children.push_back(std::make_shared<ASTLiteral>(s3_settings->auth_settings[S3AuthSetting::secret_access_key].value));
+        if (!s3_settings->auth_settings[S3AuthSetting::session_token].value.empty())
+            arguments->children.push_back(std::make_shared<ASTLiteral>(s3_settings->auth_settings[S3AuthSetting::session_token].value));
+        if (getFormat() != "auto")
+            arguments->children.push_back(std::make_shared<ASTLiteral>(getFormat()));
+        if (!getCompressionMethod().empty())
+            arguments->children.push_back(std::make_shared<ASTLiteral>(getCompressionMethod()));
+    }
+
+    return arguments;
 }
 
 }

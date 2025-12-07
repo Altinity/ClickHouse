@@ -39,6 +39,24 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         /// controls new feature and it's 'true' by default, use 'false' as previous_value).
         /// It's used to implement `compatibility` setting (see https://github.com/ClickHouse/ClickHouse/issues/35972)
         /// Note: please check if the key already exists to prevent duplicate entries.
+        addSettingsChanges(settings_changes_history, "25.8.9.2000",
+        {
+            {"allow_experimental_iceberg_read_optimization", true, true, "New setting."},
+            {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
+            {"lock_object_storage_task_distribution_ms", 500, 500, "Raised the value to 500 to avoid hoping tasks between executors."},
+            {"allow_retries_in_cluster_requests", false, false, "New setting"},
+            {"object_storage_remote_initiator", false, false, "New setting."},
+            {"allow_experimental_export_merge_tree_part", false, false, "New setting."},
+            {"export_merge_tree_part_overwrite_file_if_exists", false, false, "New setting."},
+            {"allow_experimental_export_merge_tree_part", false, true, "Turned ON by default for Antalya."},
+            {"export_merge_tree_partition_force_export", false, false, "New setting."},
+            {"export_merge_tree_partition_max_retries", 3, 3, "New setting."},
+            {"export_merge_tree_partition_manifest_ttl", 180, 180, "New setting."},
+            {"export_merge_tree_part_file_already_exists_policy", "skip", "skip", "New setting."},
+            {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."},
+            {"hybrid_table_auto_cast_columns", true, true, "New setting to automatically cast Hybrid table columns when segments disagree on types. Default enabled."},
+            {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."}
+        });
         addSettingsChanges(settings_changes_history, "25.8",
         {
             {"output_format_json_quote_64bit_integers", true, false, "Disable quoting of the 64 bit integers in JSON by default"},
@@ -110,6 +128,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"allow_experimental_lightweight_update", false, true, "Lightweight updates were moved to Beta."},
             {"s3_slow_all_threads_after_retryable_error", false, false, "Added an alias for setting `backup_slow_all_threads_after_retryable_s3_error`"},
             {"iceberg_metadata_log_level", "none", "none", "New setting."},
+            {"use_object_storage_list_objects_cache", false, false, "New setting."},
         });
         addSettingsChanges(settings_changes_history, "25.7",
         {
@@ -132,6 +151,18 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"distributed_plan_force_shuffle_aggregation", 0, 0, "New experimental setting"},
             {"allow_experimental_insert_into_iceberg", false, false, "New setting."},
             /// RELEASE CLOSED
+        });
+        addSettingsChanges(settings_changes_history, "25.6.5.2000",
+        {
+            {"allow_experimental_database_iceberg", false, true, "Turned ON by default for Antalya"},
+            {"allow_experimental_database_unity_catalog", false, true, "Turned ON by default for Antalya"},
+            {"allow_experimental_database_glue_catalog", false, true, "Turned ON by default for Antalya"},
+            {"output_format_parquet_enum_as_byte_array", true, true, "Enable writing Enum as byte array in Parquet by default"},
+            {"object_storage_cluster", "", "", "New setting"},
+            {"object_storage_max_nodes", 0, 0, "New setting"},
+            {"allow_experimental_export_merge_tree_part", false, false, "New setting."},
+            {"export_merge_tree_part_overwrite_file_if_exists", false, false, "New setting."},
+            {"lock_object_storage_task_distribution_ms", 0, 0, "New setting."},
         });
         addSettingsChanges(settings_changes_history, "25.6",
         {
@@ -253,6 +284,11 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"parallel_replicas_for_cluster_engines", false, true, "New setting."},
             {"parallel_hash_join_threshold", 0, 0, "New setting"},
             /// Release closed. Please use 25.4
+        });
+        addSettingsChanges(settings_changes_history, "24.12.2.20000",
+        {
+            // Altinity Antalya modifications atop of 24.12
+            {"input_format_parquet_use_metadata_cache", true, true, "New setting, turned ON by default"}, // https://github.com/Altinity/ClickHouse/pull/586
         });
         addSettingsChanges(settings_changes_history, "25.2",
         {

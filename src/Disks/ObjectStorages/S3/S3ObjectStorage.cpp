@@ -30,11 +30,13 @@
 #include <Common/logger_useful.h>
 #include <Common/MultiVersion.h>
 #include <Common/Macros.h>
+#include <Common/ElapsedTimeProfileEventIncrement.h>
 
 
 namespace ProfileEvents
 {
     extern const Event S3ListObjects;
+    extern const Event S3ListObjectsMicroseconds;
     extern const Event DiskS3DeleteObjects;
     extern const Event DiskS3ListObjects;
 }
@@ -132,12 +134,17 @@ public:
     }
 
 private:
-    bool getBatchAndCheckNext(RelativePathsWithMetadata & batch) override
+    bool getBatchAndCheckNext(PathsWithMetadata & batch) override
     {
         ProfileEvents::increment(ProfileEvents::S3ListObjects);
         ProfileEvents::increment(ProfileEvents::DiskS3ListObjects);
 
-        auto outcome = client->ListObjectsV2(*request);
+        Aws::S3::Model::ListObjectsV2Outcome outcome;
+
+        {
+            ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::S3ListObjectsMicroseconds);
+            outcome = client->ListObjectsV2(*request);
+        }
 
         /// Outcome failure will be handled on the caller side.
         if (outcome.IsSuccess())
@@ -148,7 +155,7 @@ private:
             for (const auto & object : objects)
             {
                 ObjectMetadata metadata{static_cast<uint64_t>(object.GetSize()), Poco::Timestamp::fromEpochTime(object.GetLastModified().Seconds()), object.GetETag(), {}};
-                batch.emplace_back(std::make_shared<RelativePathWithMetadata>(object.GetKey(), std::move(metadata)));
+                batch.emplace_back(std::make_shared<PathWithMetadata>(object.GetKey(), std::move(metadata)));
             }
 
             /// It returns false when all objects were returned
@@ -246,7 +253,7 @@ ObjectStorageIteratorPtr S3ObjectStorage::iterate(const std::string & path_prefi
     return std::make_shared<S3IteratorAsync>(uri.bucket, path_prefix, client.get(), max_keys);
 }
 
-void S3ObjectStorage::listObjects(const std::string & path, RelativePathsWithMetadata & children, size_t max_keys) const
+void S3ObjectStorage::listObjects(const std::string & path, PathsWithMetadata & children, size_t max_keys) const
 {
     auto settings_ptr = s3_settings.get();
 
@@ -264,7 +271,11 @@ void S3ObjectStorage::listObjects(const std::string & path, RelativePathsWithMet
         ProfileEvents::increment(ProfileEvents::S3ListObjects);
         ProfileEvents::increment(ProfileEvents::DiskS3ListObjects);
 
-        outcome = client.get()->ListObjectsV2(request);
+        {
+            ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::S3ListObjectsMicroseconds);
+            outcome = client.get()->ListObjectsV2(request);
+        }
+
         throwIfError(outcome);
 
         auto result = outcome.GetResult();
@@ -274,7 +285,7 @@ void S3ObjectStorage::listObjects(const std::string & path, RelativePathsWithMet
             break;
 
         for (const auto & object : objects)
-            children.emplace_back(std::make_shared<RelativePathWithMetadata>(
+            children.emplace_back(std::make_shared<PathWithMetadata>(
                 object.GetKey(),
                 ObjectMetadata{
                     static_cast<uint64_t>(object.GetSize()),

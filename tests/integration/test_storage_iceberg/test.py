@@ -1,21 +1,19 @@
-import glob
-import json
 import logging
+import json
 import os
 import subprocess
 import time
 import uuid
+import time
 from datetime import datetime, timezone
 
 import pyspark
 import pytest
-from azure.storage.blob import BlobServiceClient
 from minio.deleteobjects import DeleteObject
 from pyspark.sql.functions import (
     monotonically_increasing_id,
     row_number,
 )
-from pyspark.sql.readwriter import DataFrameWriter, DataFrameWriterV2
 from pyspark.sql.types import (
     ArrayType,
     BooleanType,
@@ -40,6 +38,7 @@ from helpers.test_tools import TSV
 
 from helpers.iceberg_utils import (
     default_upload_directory,
+    additional_upload_directory,
     default_download_directory,
     execute_spark_query_general,
     get_creation_expression,
@@ -343,9 +342,76 @@ def test_types(started_cluster, format_version, storage_type):
         ]
     )
 
+    # Test storage type as function argument
+    table_function_expr = get_creation_expression(
+        storage_type,
+        TABLE_NAME,
+        started_cluster,
+        table_function=True,
+        storage_type_as_arg=True,
+    )
+    assert (
+        instance.query(f"SELECT a, b, c, d, e FROM {table_function_expr}").strip()
+        == "123\tstring\t2000-01-01\t['str1','str2']\ttrue"
+    )
+
+    assert instance.query(f"DESCRIBE {table_function_expr} FORMAT TSV") == TSV(
+        [
+            ["a", "Nullable(Int32)"],
+            ["b", "Nullable(String)"],
+            ["c", "Nullable(Date)"],
+            ["d", "Array(Nullable(String))"],
+            ["e", "Nullable(Bool)"],
+        ]
+    )
+
+    # Test storage type as field in named collection
+    table_function_expr = get_creation_expression(
+        storage_type,
+        TABLE_NAME,
+        started_cluster,
+        table_function=True,
+        storage_type_in_named_collection=True,
+    )
+    assert (
+        instance.query(f"SELECT a, b, c, d, e FROM {table_function_expr}").strip()
+        == "123\tstring\t2000-01-01\t['str1','str2']\ttrue"
+    )
+
+    assert instance.query(f"DESCRIBE {table_function_expr} FORMAT TSV") == TSV(
+        [
+            ["a", "Nullable(Int32)"],
+            ["b", "Nullable(String)"],
+            ["c", "Nullable(Date)"],
+            ["d", "Array(Nullable(String))"],
+            ["e", "Nullable(Bool)"],
+        ]
+    )
+
+
+def count_secondary_subqueries(started_cluster, query_id, expected, comment):
+    for node_name, replica in started_cluster.instances.items():
+        cluster_secondary_queries = (
+            replica.query(
+                f"""
+                SELECT count(*) FROM system.query_log
+                WHERE
+                    type = 'QueryFinish'
+                    AND NOT is_initial_query
+                    AND initial_query_id='{query_id}'
+            """
+            )
+            .strip()
+        )
+
+        logging.info(
+            f"[{node_name}] cluster_secondary_queries {comment}: {cluster_secondary_queries}"
+        )
+        assert int(cluster_secondary_queries) == expected
+
 
 @pytest.mark.parametrize("format_version", ["1", "2"])
-@pytest.mark.parametrize("storage_type", ["s3", "azure"])
+@pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
 def test_cluster_table_function(started_cluster, format_version, storage_type):
 
     instance = started_cluster.instances["node1"]
@@ -378,6 +444,19 @@ def test_cluster_table_function(started_cluster, format_version, storage_type):
 
         logging.info(f"Adding another dataframe. result files: {files}")
 
+        if storage_type == "local":
+            # For local storage we need to upload data from each node
+            for node_name, replica in started_cluster.instances.items():
+                if node_name == "node1":
+                    continue
+                additional_upload_directory(
+                    started_cluster,
+                    node_name,
+                    storage_type,
+                    f"/iceberg_data/default/{TABLE_NAME}/",
+                    f"/iceberg_data/default/{TABLE_NAME}/",
+                )
+
         return files
 
     files = add_df(mode="overwrite")
@@ -398,6 +477,153 @@ def test_cluster_table_function(started_cluster, format_version, storage_type):
         instance.query(f"SELECT * FROM {table_function_expr}").strip().split()
     )
 
+    def make_query_from_function(
+            run_on_cluster=False,
+            alt_syntax=False,
+            remote=False,
+            storage_type_as_arg=False,
+            storage_type_in_named_collection=False,
+            ):
+        expr = get_creation_expression(
+            storage_type,
+            TABLE_NAME,
+            started_cluster,
+            table_function=True,
+            run_on_cluster=run_on_cluster,
+            storage_type_as_arg=storage_type_as_arg,
+            storage_type_in_named_collection=storage_type_in_named_collection,
+        )
+        query_id = str(uuid.uuid4())
+        settings = f"SETTINGS object_storage_cluster='cluster_simple'" if (alt_syntax and not run_on_cluster) else ""
+        if remote:
+            query = f"SELECT * FROM remote('node2', {expr}) {settings}"
+        else:
+            query = f"SELECT * FROM {expr} {settings}"
+        responce = instance.query(query, query_id=query_id).strip().split()
+        return responce, query_id
+
+    # Cluster Query with node1 as coordinator
+    select_cluster, query_id_cluster = make_query_from_function(run_on_cluster=True)
+
+    # Cluster Query with node1 as coordinator with alternative syntax
+    select_cluster_alt_syntax, query_id_cluster_alt_syntax = make_query_from_function(
+        run_on_cluster=True,
+        alt_syntax=True)
+
+    # Cluster Query with node1 as coordinator and storage type as arg
+    select_cluster_with_type_arg, query_id_cluster_with_type_arg = make_query_from_function(
+        run_on_cluster=True,
+        storage_type_as_arg=True,
+    )
+
+    # Cluster Query with node1 as coordinator and storage type in named collection
+    select_cluster_with_type_in_nc, query_id_cluster_with_type_in_nc = make_query_from_function(
+        run_on_cluster=True,
+        storage_type_in_named_collection=True,
+    )
+
+    # Cluster Query with node1 as coordinator and storage type as arg, alternative syntax
+    select_cluster_with_type_arg_alt_syntax, query_id_cluster_with_type_arg_alt_syntax = make_query_from_function(
+        storage_type_as_arg=True,
+        alt_syntax=True,
+    )
+
+    # Cluster Query with node1 as coordinator and storage type in named collection, alternative syntax
+    select_cluster_with_type_in_nc_alt_syntax, query_id_cluster_with_type_in_nc_alt_syntax = make_query_from_function(
+        storage_type_in_named_collection=True,
+        alt_syntax=True,
+    )
+
+    #select_remote_cluster, _ = make_query_from_function(run_on_cluster=True, remote=True)
+
+    def make_query_from_table(alt_syntax=False):
+        query_id = str(uuid.uuid4())
+        settings = "SETTINGS object_storage_cluster='cluster_simple'" if alt_syntax else ""
+        responce = (
+            instance.query(
+                f"SELECT * FROM {TABLE_NAME} {settings}",
+                query_id=query_id,
+            )
+            .strip()
+            .split()
+        )
+        return responce, query_id
+
+    create_iceberg_table(storage_type, instance, TABLE_NAME, started_cluster, object_storage_cluster='cluster_simple')
+    select_cluster_table_engine, query_id_cluster_table_engine = make_query_from_table()
+
+    #select_remote_cluster = (
+    #    instance.query(f"SELECT * FROM remote('node2',{table_function_expr_cluster})")
+    #    .strip()
+    #    .split()
+    #)
+
+    instance.query(f"DROP TABLE IF EXISTS `{TABLE_NAME}` SYNC")
+
+    create_iceberg_table(storage_type, instance, TABLE_NAME, started_cluster)
+    select_pure_table_engine, query_id_pure_table_engine = make_query_from_table()
+    select_pure_table_engine_cluster, query_id_pure_table_engine_cluster = make_query_from_table(alt_syntax=True)
+
+    create_iceberg_table(storage_type, instance, TABLE_NAME, started_cluster, storage_type_as_arg=True)
+    select_pure_table_engine_with_type_arg, query_id_pure_table_engine_with_type_arg = make_query_from_table()
+    select_pure_table_engine_cluster_with_type_arg, query_id_pure_table_engine_cluster_with_type_arg = make_query_from_table(alt_syntax=True)
+
+    create_iceberg_table(storage_type, instance, TABLE_NAME, started_cluster, storage_type_in_named_collection=True)
+    select_pure_table_engine_with_type_in_nc, query_id_pure_table_engine_with_type_in_nc = make_query_from_table()
+    select_pure_table_engine_cluster_with_type_in_nc, query_id_pure_table_engine_cluster_with_type_in_nc = make_query_from_table(alt_syntax=True)
+
+    # Simple size check
+    assert len(select_regular) == 600
+    assert len(select_cluster) == 600
+    assert len(select_cluster_alt_syntax) == 600
+    assert len(select_cluster_table_engine) == 600
+    #assert len(select_remote_cluster) == 600
+    assert len(select_cluster_with_type_arg) == 600
+    assert len(select_cluster_with_type_in_nc) == 600
+    assert len(select_cluster_with_type_arg_alt_syntax) == 600
+    assert len(select_cluster_with_type_in_nc_alt_syntax) == 600
+    assert len(select_pure_table_engine) == 600
+    assert len(select_pure_table_engine_cluster) == 600
+    assert len(select_pure_table_engine_with_type_arg) == 600
+    assert len(select_pure_table_engine_cluster_with_type_arg) == 600
+    assert len(select_pure_table_engine_with_type_in_nc) == 600
+    assert len(select_pure_table_engine_cluster_with_type_in_nc) == 600
+
+    # Actual check
+    assert select_cluster == select_regular
+    assert select_cluster_alt_syntax == select_regular
+    assert select_cluster_table_engine == select_regular
+    #assert select_remote_cluster == select_regular
+    assert select_cluster_with_type_arg == select_regular
+    assert select_cluster_with_type_in_nc == select_regular
+    assert select_cluster_with_type_arg_alt_syntax == select_regular
+    assert select_cluster_with_type_in_nc_alt_syntax == select_regular
+    assert select_pure_table_engine == select_regular
+    assert select_pure_table_engine_cluster == select_regular
+    assert select_pure_table_engine_with_type_arg == select_regular
+    assert select_pure_table_engine_cluster_with_type_arg == select_regular
+    assert select_pure_table_engine_with_type_in_nc == select_regular
+    assert select_pure_table_engine_cluster_with_type_in_nc == select_regular
+
+    # Check query_log
+    for replica in started_cluster.instances.values():
+        replica.query("SYSTEM FLUSH LOGS")
+
+    count_secondary_subqueries(started_cluster, query_id_cluster, 1, "table function")
+    count_secondary_subqueries(started_cluster, query_id_cluster_alt_syntax, 1, "table function alt syntax")
+    count_secondary_subqueries(started_cluster, query_id_cluster_table_engine, 1, "cluster table engine")
+    count_secondary_subqueries(started_cluster, query_id_cluster_with_type_arg, 1, "table function with storage type in args")
+    count_secondary_subqueries(started_cluster, query_id_cluster_with_type_in_nc, 1, "table function with storage type in named collection")
+    count_secondary_subqueries(started_cluster, query_id_cluster_with_type_arg_alt_syntax, 1, "table function with storage type in args alt syntax")
+    count_secondary_subqueries(started_cluster, query_id_cluster_with_type_in_nc_alt_syntax, 1, "table function with storage type in named collection alt syntax")
+    count_secondary_subqueries(started_cluster, query_id_pure_table_engine, 0, "table engine")
+    count_secondary_subqueries(started_cluster, query_id_pure_table_engine_cluster, 1, "table engine with cluster setting")
+    count_secondary_subqueries(started_cluster, query_id_pure_table_engine_with_type_arg, 0, "table engine with storage type in args")
+    count_secondary_subqueries(started_cluster, query_id_pure_table_engine_cluster_with_type_arg, 1, "table engine with cluster setting with storage type in args")
+    count_secondary_subqueries(started_cluster, query_id_pure_table_engine_with_type_in_nc, 0, "table engine with storage type in named collection")
+    count_secondary_subqueries(started_cluster, query_id_pure_table_engine_cluster_with_type_in_nc, 1, "table engine with cluster setting with storage type in named collection")
+
+
     # Cluster Query with node1 as coordinator
     table_function_expr_cluster = get_creation_expression(
         storage_type,
@@ -406,45 +632,21 @@ def test_cluster_table_function(started_cluster, format_version, storage_type):
         table_function=True,
         run_on_cluster=True,
     )
-    select_cluster = (
-        instance.query(f"SELECT * FROM {table_function_expr_cluster}").strip().split()
+    select_remote_cluster = (
+        instance.query(f"SELECT * FROM remote('node2',{table_function_expr_cluster})")
+        .strip()
+        .split()
     )
+    assert len(select_remote_cluster) == 600
+    assert select_remote_cluster == select_regular
 
-    # Simple size check
-    assert len(select_regular) == 600
-    assert len(select_cluster) == 600
-
-    # Actual check
-    assert select_cluster == select_regular
-
-    # Check query_log
-    for replica in started_cluster.instances.values():
-        replica.query("SYSTEM FLUSH LOGS")
-
-    for node_name, replica in started_cluster.instances.items():
-        cluster_secondary_queries = (
-            replica.query(
-                f"""
-                SELECT query, type, is_initial_query, read_rows, read_bytes FROM system.query_log
-                WHERE
-                    type = 'QueryStart' AND
-                    positionCaseInsensitive(query, '{storage_type}Cluster') != 0 AND
-                    position(query, '{TABLE_NAME}') != 0 AND
-                    position(query, 'system.query_log') = 0 AND
-                    NOT is_initial_query
-            """
-            )
-            .strip()
-            .split("\n")
-        )
-
-        logging.info(
-            f"[{node_name}] cluster_secondary_queries: {cluster_secondary_queries}"
-        )
-        assert len(cluster_secondary_queries) == 1
-
-    # write 3 times
-    assert int(instance.query(f"SELECT count() FROM {table_function_expr_cluster}")) == 100 * 3
+    select_remote_cluster = (
+        instance.query(f"SELECT * FROM remote('node2',{table_function_expr_cluster})")
+        .strip()
+        .split()
+    )
+    assert len(select_remote_cluster) == 600
+    assert select_remote_cluster == select_regular
 
 
 @pytest.mark.parametrize("format_version", ["1", "2"])
@@ -533,6 +735,12 @@ def test_delete_files(started_cluster, format_version, storage_type):
     assert instance.query(f"SELECT ProfileEvents['IcebergTrivialCountOptimizationApplied'] FROM system.query_log where query_id = '{query_id}' and type = 'QueryFinish'") == "1\n"
 
 
+def get_array(query_result: str):
+    arr = sorted([int(x) for x in query_result.strip().split("\n")])
+    print(arr)
+    return arr
+
+
 @pytest.mark.parametrize("use_roaring_bitmaps", [0, 1])
 @pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
 def test_position_deletes(started_cluster, use_roaring_bitmaps,  storage_type):
@@ -548,11 +756,6 @@ def test_position_deletes(started_cluster, use_roaring_bitmaps,  storage_type):
         """
     )
     spark.sql(f"INSERT INTO {TABLE_NAME} select id, char(id + ascii('a')) from range(10, 100)")
-
-    def get_array(query_result: str):
-        arr = sorted([int(x) for x in query_result.strip().split("\n")])
-        print(arr)
-        return arr
 
     default_upload_directory(
         started_cluster,
@@ -633,6 +836,49 @@ def test_position_deletes(started_cluster, use_roaring_bitmaps,  storage_type):
     # Clean up
     instance.query(f"DROP TABLE {TABLE_NAME}")
 
+
+@pytest.mark.parametrize("use_roaring_bitmaps", [0, 1])
+def test_position_deletes_out_of_order(started_cluster, use_roaring_bitmaps):
+    storage_type = "local"
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
+    TABLE_NAME = "test_position_deletes_out_of_order_" + get_uuid_str()
+    instance.query(f"SET use_roaring_bitmap_iceberg_positional_deletes={use_roaring_bitmaps};")
+    instance.query(f"SET input_format_parquet_use_native_reader_v3=1;")
+
+    # There are a few flaky hacks chained together here.
+    # We want the parquet reader to produce chunks corresponding to row groups out of order if
+    # `format_settings.parquet.preserve_order` wasn't enabled. For that we:
+    #  * Use `PREWHERE NOT sleepEachRow(...)` to make the reader take longer for bigger row groups.
+    #  * Set spark row group size limit to 1 byte. Rely on current spark implementation detail:
+    #    it'll check this limit every 100 rows. So effectively we've set row group size to 100 rows.
+    #  * Insert 105 rows. So the first row group will have 100 rows, the second 5 rows.
+    # If one of these steps breaks in future, this test will be less effective but won't fail.
+
+    spark.sql(
+        f"""
+        CREATE TABLE {TABLE_NAME} (id bigint, data string) USING iceberg TBLPROPERTIES ('format-version' = '2', 'write.update.mode'='merge-on-read', 'write.delete.mode'='merge-on-read', 'write.merge.mode'='merge-on-read', 'write.parquet.row-group-size-bytes'='1')
+        """
+    )
+    spark.sql(f"INSERT INTO {TABLE_NAME} select /*+ COALESCE(1) */ id, char(id + ascii('a')) from range(0, 105)")
+    # (Fun fact: if you replace these two queries with one query with `WHERE id < 10 OR id = 103`,
+    #  spark either quetly fails to delete row 103 or outright crashes with segfault in jre.)
+    spark.sql(f"DELETE FROM {TABLE_NAME} WHERE id < 10")
+    spark.sql(f"DELETE FROM {TABLE_NAME} WHERE id = 103")
+
+    default_upload_directory(
+        started_cluster,
+        storage_type,
+        f"/iceberg_data/default/{TABLE_NAME}/",
+        f"/iceberg_data/default/{TABLE_NAME}/",
+    )
+
+    create_iceberg_table(storage_type, instance, TABLE_NAME, started_cluster, additional_settings=["input_format_parquet_use_native_reader_v3=1", f"use_roaring_bitmap_iceberg_positional_deletes={use_roaring_bitmaps}"])
+
+    # TODO: Replace WHERE with PREWHERE when we add prewhere support for datalakes.
+    assert get_array(instance.query(f"SELECT id FROM {TABLE_NAME} WHERE NOT sleepEachRow(1/100) order by id")) == list(range(10, 103)) + [104]
+
+    instance.query(f"DROP TABLE {TABLE_NAME}")
 
 @pytest.mark.parametrize("format_version", ["1", "2"])
 @pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
@@ -854,7 +1100,7 @@ def test_metadata_file_selection_from_version_hint(started_cluster, format_versi
         spark.sql(
             f"INSERT INTO {TABLE_NAME} select id, char(id + ascii('a')) from range(10)"
         )
-        
+
     # test the case where version_hint.text file contains just the version number
     with open(f"/iceberg_data/default/{TABLE_NAME}/metadata/version-hint.text", "w") as f:
         f.write('5')
@@ -1026,7 +1272,7 @@ def test_filesystem_cache(started_cluster, storage_type):
 
 @pytest.mark.parametrize(
     "storage_type, run_on_cluster",
-    [("s3", False), ("s3", True), ("azure", False), ("local", False)],
+    [("s3", False), ("s3", True), ("azure", False), ("azure", True), ("local", False), ("local", True)],
 )
 def test_partition_pruning(started_cluster, storage_type, run_on_cluster):
     instance = started_cluster.instances["node1"]
@@ -1040,6 +1286,7 @@ def test_partition_pruning(started_cluster, storage_type, run_on_cluster):
             storage_type,
             TABLE_NAME,
             query,
+            additional_nodes=["node2", "node3"] if storage_type=="local" else [],
         )
 
     execute_spark_query(
@@ -1816,6 +2063,7 @@ def test_minmax_pruning(started_cluster, storage_type, is_table_function):
         == 1
     )
 
+
 @pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
 def test_explicit_metadata_file(started_cluster, storage_type):
     instance = started_cluster.instances["node1"]
@@ -1860,8 +2108,10 @@ def test_explicit_metadata_file(started_cluster, storage_type):
     with pytest.raises(Exception):
         create_iceberg_table(storage_type, instance, TABLE_NAME, started_cluster, explicit_metadata_path="../metadata/v11.metadata.json")
 
+
 @pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
-def test_minmax_pruning_with_null(started_cluster, storage_type):
+@pytest.mark.parametrize("run_on_cluster", [False, True])
+def test_minmax_pruning_with_null(started_cluster, storage_type, run_on_cluster):
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
     TABLE_NAME = "test_minmax_pruning_with_null" + storage_type + "_" + get_uuid_str()
@@ -1873,6 +2123,7 @@ def test_minmax_pruning_with_null(started_cluster, storage_type):
             storage_type,
             TABLE_NAME,
             query,
+            additional_nodes=["node2", "node3"] if storage_type=="local" else [],
         )
 
     execute_spark_query(
@@ -1931,7 +2182,7 @@ def test_minmax_pruning_with_null(started_cluster, storage_type):
     )
 
     creation_expression = get_creation_expression(
-        storage_type, TABLE_NAME, started_cluster, table_function=True
+        storage_type, TABLE_NAME, started_cluster, table_function=True, run_on_cluster=run_on_cluster
     )
 
     def check_validity_and_get_prunned_files(select_expression):
@@ -2452,7 +2703,7 @@ def test_writes_create_table(started_cluster, format_version, storage_type):
     with pytest.raises(Exception):
         create_iceberg_table(storage_type, instance, TABLE_NAME, started_cluster, "(x String)", format_version)
 
-    create_iceberg_table(storage_type, instance, TABLE_NAME, started_cluster, "(x String)", format_version, "", True)    
+    create_iceberg_table(storage_type, instance, TABLE_NAME, started_cluster, "(x String)", format_version, "", True)
 
     assert '`x` String' in instance.query(f"SHOW CREATE TABLE {TABLE_NAME}")
 
@@ -2517,7 +2768,7 @@ def test_relevant_iceberg_schema_chosen(started_cluster, storage_type):
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
     TABLE_NAME = "test_relevant_iceberg_schema_chosen_" + storage_type + "_" + get_uuid_str()
-    
+
     spark.sql(
         f"""
         CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
@@ -2992,7 +3243,7 @@ class PrunedInfo:
 
     def __repr__(self):
         return "PrunedInfo(not_pruned={}, partition_pruned={}, min_max_index_pruned={})".format(self.not_pruned, self.partition_pruned, self.min_max_index_pruned)
-    
+
     def __eq__(self, other):
         return (self.not_pruned == other.not_pruned and
                 self.partition_pruned == other.partition_pruned and
@@ -3088,7 +3339,7 @@ def verify_result_dictionary(diction : dict, allowed_content_types : set):
                     number_of_missing_row_values += 1
         if partitioned_rows != not_deleted_files:
             raise ValueError("Partitioned rows are not consistent with not deleted files for file path: {}, partitioned rows: {}, not deleted files: {}".format(file_path, partitioned_rows, not_deleted_files))
-                
+
         # We have exactly one metadata file
         if number_of_missing_row_values != 1:
             raise ValueError("Not a one row value (corresponding to metadata file) is missing for file path: {}".format(file_path))
@@ -3201,6 +3452,404 @@ def test_system_iceberg_metadata(started_cluster, format_version, storage_type):
             raise
 
 
+@pytest.mark.parametrize("storage_type", ["s3", "azure"])
+@pytest.mark.parametrize("run_on_cluster", [False, True])
+def test_read_constant_columns_optimization(started_cluster, storage_type, run_on_cluster):
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
+    TABLE_NAME = "test_read_constant_columns_optimization_" + storage_type + "_" + get_uuid_str()
+
+    def execute_spark_query(query: str):
+        return execute_spark_query_general(
+            spark,
+            started_cluster,
+            storage_type,
+            TABLE_NAME,
+            query,
+        )
+
+    execute_spark_query(
+        f"""
+            CREATE TABLE {TABLE_NAME} (
+                tag INT,
+                date DATE,
+                date2 DATE,
+                name VARCHAR(50),
+                number BIGINT
+            )
+            USING iceberg
+            PARTITIONED BY (identity(tag), years(date))
+            OPTIONS('format-version'='2')
+        """
+    )
+
+    execute_spark_query(
+        f"""
+        INSERT INTO {TABLE_NAME} VALUES
+        (1, DATE '2024-01-20', DATE '2024-01-20', 'vasya', 5),
+        (1, DATE '2024-01-20', DATE '2024-01-20', 'vasilisa', 5),
+        (1, DATE '2025-01-20', DATE '2025-01-20', 'vasya', 5),
+        (1, DATE '2025-01-20', DATE '2025-01-20', 'vasya', 5),
+        (2, DATE '2025-01-20', DATE '2025-01-20', 'vasilisa', 5),
+        (2, DATE '2025-01-21', DATE '2025-01-20', 'vasilisa', 5)
+    """
+    )
+
+    execute_spark_query(
+        f"""
+            ALTER TABLE {TABLE_NAME} ALTER COLUMN number FIRST;
+        """
+    )
+
+    execute_spark_query(
+        f"""
+        INSERT INTO {TABLE_NAME} VALUES
+        (5, 3, DATE '2025-01-20', DATE '2024-01-20', 'vasilisa'),
+        (5, 3, DATE '2025-01-20', DATE '2025-01-20', 'vasilisa')
+    """
+    )
+
+    execute_spark_query(
+        f"""
+            ALTER TABLE {TABLE_NAME} RENAME COLUMN name TO name_old;
+        """
+    )
+
+    execute_spark_query(
+        f"""
+            ALTER TABLE {TABLE_NAME}
+            ADD COLUMNS (
+                name string
+            );
+        """
+    )
+
+    execute_spark_query(
+        f"""
+        INSERT INTO {TABLE_NAME} VALUES
+        (5, 4, DATE '2025-01-20', DATE '2024-01-20', 'vasya', 'iceberg'),
+        (5, 4, DATE '2025-01-20', DATE '2025-01-20', 'vasilisa', 'iceberg'),
+        (5, 5, DATE '2025-01-20', DATE '2024-01-20', 'vasya', 'iceberg'),
+        (5, 5, DATE '2025-01-20', DATE '2024-01-20', 'vasilisa', 'icebreaker'),
+        (5, 6, DATE '2025-01-20', DATE '2024-01-20', 'vasya', 'iceberg'),
+        (5, 6, DATE '2025-01-20', DATE '2024-01-20', 'vasya', 'iceberg')
+    """
+    )
+
+    # Totally must be 7 files
+    # Partitioned column 'tag' is constant in each file
+    # Column 'date' is constant in 6 files, has different values in (2-2025)
+    # Column 'date2' is constant in 4 files (1-2024, 2-2025, 5-2025, 6-2025)
+    # Column 'name_old' is constant in 3 files (1-2025, 2-2025 as 'name', 6-2025 as 'name_old')
+    # Column 'number' is globally constant
+    # New column 'name2' is present only in 3 files (4-2025, 5-2025, 6-2025), constant in two (4-2025, 6-2025)
+    # Files 1-2025 and 6-2025 have only constant columns
+
+    creation_expression = get_creation_expression(
+        storage_type, TABLE_NAME, started_cluster, table_function=True, run_on_cluster=run_on_cluster
+    )
+
+    # Warm up metadata cache
+    for replica in started_cluster.instances.values():
+        replica.query(f"SELECT * FROM {creation_expression} ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=0")
+
+    all_data_expected_query_id = str(uuid.uuid4())
+    all_data_expected = instance.query(
+        f"SELECT * FROM {creation_expression} ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=0",
+        query_id=all_data_expected_query_id,
+        )
+    const_only_expected_query_id = str(uuid.uuid4())
+    const_only_expected = instance.query(
+        f"SELECT tag, number FROM {creation_expression} ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=0",
+        query_id=const_only_expected_query_id,
+        )
+    const_partial_expected_query_id = str(uuid.uuid4())
+    const_partial_expected = instance.query(
+        f"SELECT tag, date2, number, name_old FROM {creation_expression} ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=0",
+        query_id=const_partial_expected_query_id,
+        )
+    const_partial2_expected_query_id = str(uuid.uuid4())
+    const_partial2_expected = instance.query(
+        f"SELECT tag, date2, number, name FROM {creation_expression} ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=0",
+        query_id=const_partial2_expected_query_id,
+        )
+    count_expected_query_id = str(uuid.uuid4())
+    count_expected = instance.query(
+        f"SELECT count(),tag FROM {creation_expression} GROUP BY ALL ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=0",
+        query_id=count_expected_query_id,
+        )
+
+    all_data_query_id = str(uuid.uuid4())
+    all_data_optimized = instance.query(
+        f"SELECT * FROM {creation_expression} ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=1",
+        query_id=all_data_query_id,
+        )
+    const_only_query_id = str(uuid.uuid4())
+    const_only_optimized = instance.query(
+        f"SELECT tag, number FROM {creation_expression} ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=1",
+        query_id=const_only_query_id,
+        )
+    const_partial_query_id = str(uuid.uuid4())
+    const_partial_optimized = instance.query(
+        f"SELECT tag, date2, number, name_old FROM {creation_expression} ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=1",
+        query_id=const_partial_query_id,
+        )
+    const_partial2_query_id = str(uuid.uuid4())
+    const_partial2_optimized = instance.query(
+        f"SELECT tag, date2, number, name FROM {creation_expression} ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=1",
+        query_id=const_partial2_query_id,
+        )
+    count_query_id = str(uuid.uuid4())
+    count_optimized = instance.query(
+        f"SELECT count(),tag FROM {creation_expression} GROUP BY ALL ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=1",
+        query_id=count_query_id,
+        )
+
+    assert all_data_expected == all_data_optimized
+    assert const_only_expected == const_only_optimized
+    assert const_partial_expected == const_partial_optimized
+    assert const_partial2_expected == const_partial2_optimized
+    assert count_expected == count_optimized
+
+    for replica in started_cluster.instances.values():
+        replica.query("SYSTEM FLUSH LOGS")
+
+    def check_events(query_id, event, expected):
+        res = instance.query(
+            f"""
+            SELECT
+                sum(tupleElement(arrayJoin(ProfileEvents),2)) as value
+            FROM
+                clusterAllReplicas('cluster_simple', system.query_log)
+            WHERE
+                type='QueryFinish'
+                AND tupleElement(arrayJoin(ProfileEvents),1)='{event}'
+                AND initial_query_id='{query_id}'
+            GROUP BY ALL
+            FORMAT CSV
+            """)
+        assert int(res) == expected
+
+    event = "S3GetObject" if storage_type == "s3" else "AzureGetObject"
+
+    # Without optimization clickhouse reads all 7 files
+    check_events(all_data_expected_query_id, event, 7)
+    check_events(const_only_expected_query_id, event, 7)
+    check_events(const_partial_expected_query_id, event, 7)
+    check_events(const_partial2_expected_query_id, event, 7)
+    check_events(count_expected_query_id, event, 7)
+
+    # If file has only constant columns it is not read
+    check_events(all_data_query_id, event, 5) # 1-2025, 6-2025 must not be read
+    check_events(const_only_query_id, event, 0) # All must not be read
+    check_events(const_partial_query_id, event, 4) # 1-2025, 6-2025 and 2-2025 must not be read
+    check_events(const_partial2_query_id, event, 3) # 6-2025 must not be read, 1-2024, 1-2025, 2-2025 don't have new column 'name'
+    check_events(count_query_id, event, 0) # All must not be read
+
+    def compare_selects(query):
+        result_expected = instance.query(f"{query} SETTINGS allow_experimental_iceberg_read_optimization=0")
+        result_optimized = instance.query(f"{query} SETTINGS allow_experimental_iceberg_read_optimization=1")
+        assert result_expected == result_optimized
+
+    compare_selects(f"SELECT _path,* FROM {creation_expression} ORDER BY ALL")
+    compare_selects(f"SELECT _path,* FROM {creation_expression} WHERE name_old='vasily' ORDER BY ALL")
+    compare_selects(f"SELECT _path,* FROM {creation_expression} WHERE ((tag + length(name_old)) % 2 = 1) ORDER BY ALL")
+
+
+@pytest.mark.parametrize("storage_type", ["s3", "azure"])
+def test_cluster_joins(started_cluster, storage_type):
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
+    TABLE_NAME = "test_cluster_joins_" + storage_type + "_" + get_uuid_str()
+    TABLE_NAME_2 = "test_cluster_joins_2_" + storage_type + "_" + get_uuid_str()
+    TABLE_NAME_LOCAL = "test_cluster_joins_local_" + storage_type + "_" + get_uuid_str()
+
+    def execute_spark_query(query: str, table_name):
+        return execute_spark_query_general(
+            spark,
+            started_cluster,
+            storage_type,
+            table_name,
+            query,
+        )
+
+    execute_spark_query(
+        f"""
+            CREATE TABLE {TABLE_NAME} (
+                tag INT,
+                name VARCHAR(50)
+            )
+            USING iceberg
+            OPTIONS('format-version'='2')
+        """, TABLE_NAME
+    )
+
+    execute_spark_query(
+        f"""
+        INSERT INTO {TABLE_NAME} VALUES
+        (1, 'john'),
+        (2, 'jack')
+    """, TABLE_NAME
+    )
+
+    execute_spark_query(
+        f"""
+            CREATE TABLE {TABLE_NAME_2} (
+                id INT,
+                second_name VARCHAR(50)
+            )
+            USING iceberg
+            OPTIONS('format-version'='2')
+        """, TABLE_NAME_2
+    )
+
+    execute_spark_query(
+        f"""
+        INSERT INTO {TABLE_NAME_2} VALUES
+        (1, 'dow'),
+        (2, 'sparrow')
+    """, TABLE_NAME_2
+    )
+
+    creation_expression = get_creation_expression(
+        storage_type, TABLE_NAME, started_cluster, table_function=True, run_on_cluster=True
+    )
+
+    creation_expression_2 = get_creation_expression(
+        storage_type, TABLE_NAME_2, started_cluster, table_function=True, run_on_cluster=True
+    )
+
+    instance.query(f"CREATE TABLE `{TABLE_NAME_LOCAL}` (id Int64, second_name String) ENGINE = Memory()")
+    instance.query(f"INSERT INTO `{TABLE_NAME_LOCAL}` VALUES (1, 'silver'), (2, 'black')")
+
+    res = instance.query(
+        f"""
+            SELECT t1.name,t2.second_name
+            FROM {creation_expression} AS t1
+                JOIN {creation_expression_2} AS t2
+                ON t1.tag=t2.id
+            WHERE t1.tag < 10 AND t2.id < 20
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
+        """
+    )
+
+    assert res == "jack\tsparrow\njohn\tdow\n"
+
+    #res = instance.query(
+    #    f"""
+    #        SELECT name
+    #        FROM {creation_expression}
+    #        WHERE tag in (
+    #            SELECT id
+    #            FROM {creation_expression_2}
+    #        )
+    #        ORDER BY ALL
+    #        SETTINGS
+    #            object_storage_cluster='cluster_simple',
+    #            object_storage_cluster_join_mode='local'
+    #    """
+    #)
+
+    #assert res == "jack\njohn\n"
+
+    res = instance.query(
+        f"""
+            SELECT t1.name,t2.second_name
+            FROM {creation_expression} AS t1
+                JOIN `{TABLE_NAME_LOCAL}` AS t2
+                ON t1.tag=t2.id
+            WHERE t1.tag < 10 AND t2.id < 20
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
+        """
+    )
+
+    assert res == "jack\tblack\njohn\tsilver\n"
+
+    #res = instance.query(
+    #    f"""
+    #        SELECT name
+    #        FROM {creation_expression}
+    #        WHERE tag in (
+    #            SELECT id
+    #            FROM `{TABLE_NAME_LOCAL}`
+    #        )
+    #        ORDER BY ALL
+    #        SETTINGS
+    #            object_storage_cluster='cluster_simple',
+    #            object_storage_cluster_join_mode='local'
+    #    """
+    #)
+
+    #assert res == "jack\njohn\n"
+
+    res = instance.query(
+        f"""
+            SELECT t1.name,t2.second_name
+            FROM {creation_expression} AS t1
+                CROSS JOIN `{TABLE_NAME_LOCAL}` AS t2
+            WHERE t1.tag < 10 AND t2.id < 20
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
+        """
+    )
+
+    assert res == "jack\tblack\njack\tsilver\njohn\tblack\njohn\tsilver\n"
+
+
+@pytest.mark.parametrize("storage_type", ["s3"])
+def test_system_tables_partition_sorting_keys(started_cluster, storage_type):
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
+
+    table_name = f"test_sys_tables_keys_{storage_type}_{uuid.uuid4().hex[:8]}"
+    fq_table = f"spark_catalog.default.{table_name}"
+
+    spark.sql(f"DROP TABLE IF EXISTS {fq_table}")
+    spark.sql(f"""
+        CREATE TABLE {fq_table} (
+            id INT,
+            ts TIMESTAMP,
+            payload STRING
+        )
+        USING iceberg
+        PARTITIONED BY (bucket(16, id), day(ts))
+        TBLPROPERTIES ('format-version' = '2')
+    """)
+    spark.sql(f"ALTER TABLE {fq_table} WRITE ORDERED BY (id DESC NULLS LAST, hour(ts))")
+    spark.sql(f"""
+        INSERT INTO {fq_table} VALUES
+        (1, timestamp'2024-01-01 10:00:00', 'a'),
+        (2, timestamp'2024-01-02 11:00:00', 'b'),
+        (NULL, timestamp'2024-01-03 12:00:00', 'c')
+    """)
+
+    time.sleep(2)
+    default_upload_directory(
+        started_cluster,
+        storage_type,
+        f"/iceberg_data/default/{table_name}/",
+        f"/iceberg_data/default/{table_name}/",
+    )
+
+    create_iceberg_table(storage_type, instance, table_name, started_cluster)
+
+    res = instance.query(f"""
+        SELECT partition_key, sorting_key
+        FROM system.tables
+        WHERE name = '{table_name}' FORMAT csv
+    """).strip().lower()
+
+    assert res == '"bucket(16, id), day(ts)","id desc, hour(ts) asc"'
+
+
 @pytest.mark.parametrize(
     "storage_type",
     ["s3", "azure", "local"],
@@ -3243,14 +3892,12 @@ def test_partition_pruning_with_subquery_set(started_cluster, storage_type):
     """
     )
 
-
     creation_expression = get_creation_expression(
         storage_type, TABLE_NAME, started_cluster, table_function=True
     )
 
     instance.query(f"CREATE TABLE {IN_MEMORY_TABLE} (id INT) ENGINE = Memory")
     instance.query(f"INSERT INTO {IN_MEMORY_TABLE} VALUES (2), (4)")
-
 
     def check_validity_and_get_prunned_files(select_expression):
         settings1 = {

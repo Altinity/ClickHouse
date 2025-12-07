@@ -1,0 +1,7 @@
+<clickhouse>
+    <profiles>
+        <default>
+            <input_format_parquet_use_metadata_cache>0</input_format_parquet_use_metadata_cache>
+        </default>
+    </profiles>
+</clickhouse>

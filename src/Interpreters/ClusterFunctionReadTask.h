@@ -18,8 +18,14 @@ struct ClusterFunctionReadTaskResponse
 
     /// Data path (object path, in case of object storage).
     String path;
+    /// Absolute path (including storage type prefix).
+    std::optional<String> absolute_path;
     /// Object metadata path, in case of data lake object.
     DataLakeObjectMetadata data_lake_metadata;
+    /// File's columns info
+    std::optional<DataFileMetaInfoPtr> file_meta_info;
+
+    const bool iceberg_read_optimization_enabled = false;
 
     /// Convert received response into ObjectInfo.
     ObjectInfoPtr getObjectInfo() const;

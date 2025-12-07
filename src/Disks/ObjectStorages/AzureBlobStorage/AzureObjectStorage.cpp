@@ -14,6 +14,7 @@
 #include <Disks/ObjectStorages/AzureBlobStorage/AzureBlobStorageCommon.h>
 #include <Disks/ObjectStorages/ObjectStorageIteratorAsync.h>
 #include <Interpreters/Context.h>
+#include <Common/ElapsedTimeProfileEventIncrement.h>
 
 
 namespace CurrentMetrics
@@ -26,6 +27,7 @@ namespace CurrentMetrics
 namespace ProfileEvents
 {
     extern const Event AzureListObjects;
+    extern const Event AzureListObjectsMicroseconds;
     extern const Event DiskAzureListObjects;
     extern const Event AzureDeleteObjects;
     extern const Event DiskAzureDeleteObjects;
@@ -72,11 +74,12 @@ public:
     }
 
 private:
-    bool getBatchAndCheckNext(RelativePathsWithMetadata & batch) override
+    bool getBatchAndCheckNext(PathsWithMetadata & batch) override
     {
         ProfileEvents::increment(ProfileEvents::AzureListObjects);
         if (client->IsClientForDisk())
             ProfileEvents::increment(ProfileEvents::DiskAzureListObjects);
+        ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::AzureListObjectsMicroseconds);
 
         chassert(batch.empty());
         auto blob_list_response = client->ListBlobs(options);
@@ -85,7 +88,7 @@ private:
 
         for (const auto & blob : blobs_list)
         {
-            batch.emplace_back(std::make_shared<RelativePathWithMetadata>(
+            batch.emplace_back(std::make_shared<PathWithMetadata>(
                 blob.Name,
                 ObjectMetadata{
                     static_cast<uint64_t>(blob.BlobSize),
@@ -167,7 +170,7 @@ ObjectStorageIteratorPtr AzureObjectStorage::iterate(const std::string & path_pr
     return std::make_shared<AzureIteratorAsync>(path_prefix, client_ptr, max_keys ? max_keys : settings_ptr->list_object_keys_size);
 }
 
-void AzureObjectStorage::listObjects(const std::string & path, RelativePathsWithMetadata & children, size_t max_keys) const
+void AzureObjectStorage::listObjects(const std::string & path, PathsWithMetadata & children, size_t max_keys) const
 {
     auto client_ptr = client.get();
 
@@ -184,12 +187,16 @@ void AzureObjectStorage::listObjects(const std::string & path, RelativePathsWith
         if (client_ptr->IsClientForDisk())
             ProfileEvents::increment(ProfileEvents::DiskAzureListObjects);
 
-        blob_list_response = client_ptr->ListBlobs(options);
+        {
+            ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::AzureListObjectsMicroseconds);
+            blob_list_response = client_ptr->ListBlobs(options);
+        }
+
         const auto & blobs_list = blob_list_response.Blobs;
 
         for (const auto & blob : blobs_list)
         {
-            children.emplace_back(std::make_shared<RelativePathWithMetadata>(
+            children.emplace_back(std::make_shared<PathWithMetadata>(
                 blob.Name,
                 ObjectMetadata{
                     static_cast<uint64_t>(blob.BlobSize),

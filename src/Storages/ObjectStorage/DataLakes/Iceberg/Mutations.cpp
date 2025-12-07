@@ -1,4 +1,5 @@
 #include <Columns/ColumnString.h>
+#include <Columns/ColumnNullable.h>
 #include <Core/ColumnsWithTypeAndName.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
@@ -114,18 +115,10 @@ std::optional<DeleteFileWriteResultWithStats> writeDataFiles(
             Chunk chunk(block.getColumns(), block.rows());
             auto partition_result = chunk_partitioner.partitionChunk(chunk);
 
-            auto col_data_filename = block.getByName(block_datafile_path);
-            auto col_position = block.getByName(block_row_number);
-
-            size_t col_data_filename_index = 0;
-            size_t col_position_index = 0;
-            for (size_t i = 0; i < block.columns(); ++i)
-            {
-                if (block.getNames()[i] == block_datafile_path)
-                    col_data_filename_index = i;
-                if (block.getNames()[i] == block_row_number)
-                    col_position_index = i;
-            }
+            size_t col_data_filename_index = block.getPositionByName(block_datafile_path);
+            size_t col_position_index = block.getPositionByName(block_row_number);
+            ColumnWithTypeAndName col_data_filename = block.getByPosition(col_data_filename_index);
+            ColumnWithTypeAndName col_position = block.getByPosition(col_position_index);
 
             for (const auto & [partition_key, partition_chunk] : partition_result)
             {
@@ -152,7 +145,7 @@ std::optional<DeleteFileWriteResultWithStats> writeDataFiles(
                     column_mapper->setStorageColumnEncoding(std::move(field_ids));
                     FormatFilterInfoPtr format_filter_info = std::make_shared<FormatFilterInfo>(nullptr, context, column_mapper);
                     auto output_format = FormatFactory::instance().getOutputFormat(
-                        configuration->format, *write_buffer, delete_file_sample_block, context, format_settings, format_filter_info);
+                        configuration->getFormat(), *write_buffer, delete_file_sample_block, context, format_settings, format_filter_info);
 
                     write_buffers[partition_key] = std::move(write_buffer);
                     writers[partition_key] = std::move(output_format);
@@ -161,21 +154,33 @@ std::optional<DeleteFileWriteResultWithStats> writeDataFiles(
                 col_data_filename.column = partition_chunk.getColumns()[col_data_filename_index];
                 col_position.column = partition_chunk.getColumns()[col_position_index];
 
+                if (const ColumnNullable * nullable = typeid_cast<const ColumnNullable *>(col_position.column.get()))
+                {
+                    const auto & null_map = nullable->getNullMapData();
+                    if (std::any_of(null_map.begin(), null_map.end(), [](UInt8 x) { return x != 0; }))
+                        throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected null _row_number");
+                    col_position.column = nullable->getNestedColumnPtr();
+                }
+
                 auto col_data_filename_without_namespaces = ColumnString::create();
                 for (size_t i = 0; i < col_data_filename.column->size(); ++i)
                 {
                     Field cur_value;
                     col_data_filename.column->get(i, cur_value);
 
+                    String original_path = cur_value.safeGet<String>();
                     String path_without_namespace;
-                    if (cur_value.safeGet<String>().starts_with(configuration->getNamespace()))
-                        path_without_namespace = cur_value.safeGet<String>().substr(configuration->getNamespace().size());
 
-                    if (!path_without_namespace.starts_with(configuration->getPathForRead().path))
+                    if (original_path.starts_with(configuration->getNamespace()))
+                        path_without_namespace = original_path.substr(configuration->getNamespace().size());
+                    else
+                        path_without_namespace = original_path;
+
+                    if (!path_without_namespace.empty() && !path_without_namespace.starts_with(configuration->getPathForRead().path))
                     {
                         if (path_without_namespace.starts_with('/'))
                             path_without_namespace = path_without_namespace.substr(1);
-                        else
+                        else if (!path_without_namespace.empty())
                             path_without_namespace = "/" + path_without_namespace;
                     }
                     col_data_filename_without_namespaces->insert(path_without_namespace);
@@ -285,7 +290,7 @@ bool writeMetadataFiles(
                     delete_filenames.statistic.at(partition_key),
                     std::make_shared<const Block>(getPositionDeleteFileSampleBlock()),
                     new_snapshot,
-                    configuration->format,
+                    configuration->getFormat(),
                     partititon_spec,
                     partition_spec_id,
                     *buffer_manifest_entry,
