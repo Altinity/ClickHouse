@@ -82,7 +82,7 @@ Only in the Altinity Antalya branch, `storage_type` can be part of a named colle
     <named_collections>
         <iceberg_conf>
             <url>http://test.s3.amazonaws.com/clickhouse-bucket/</url>
-            <access_key_id>test<access_key_id>
+            <access_key_id>test</access_key_id>
             <secret_access_key>test</secret_access_key>
             <format>auto</format>
             <structure>auto</structure>
@@ -107,11 +107,11 @@ icebergS3(url [, NOSIGN | access_key_id, secret_access_key, [session_token]] [,f
 
 icebergAzure(connection_string|storage_account_url, container_name, blobpath, [,account_name], [,account_key] [,format] [,compression_method]) SETTINGS object_storage_cluster='cluster_name'
 
-icebergHDSF(path_to_table, [,format] [,compression_method]) SETTINGS object_storage_cluster='cluster_name'
+icebergHDFS(path_to_table, [,format] [,compression_method]) SETTINGS object_storage_cluster='cluster_name'
 
 icebergLocal(path_to_table, [,format] [,compression_method]) SETTINGS object_storage_cluster='cluster_name'
 
-icebergS3(option=value [,..]]) SETTINGS object_storage_cluster='cluster_name'
+icebergS3(option=value [,..]) SETTINGS object_storage_cluster='cluster_name'
 
 iceberg(storage_type='s3', url [, NOSIGN | access_key_id, secret_access_key, [session_token]] [,format] [,compression_method]) SETTINGS object_storage_cluster='cluster_name'
 
