@@ -3,6 +3,12 @@
 #include <consistent_hashing.h>
 #include <optional>
 
+namespace ProfileEvents
+{
+    extern const Event ObjectStorageClusterSentToMatchedReplica;
+    extern const Event ObjectStorageClusterSentToNonMatchedReplica;
+};
+
 namespace DB
 {
 
@@ -125,6 +131,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getPreQueuedFile(size_t
             number_of_current_replica
         );
 
+        ProfileEvents::increment(ProfileEvents::ObjectStorageClusterSentToMatchedReplica);
         return next_file;
     }
 
@@ -176,6 +183,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getMatchingFileFromIter
                 file_identifier, number_of_current_replica
             );
 
+            ProfileEvents::increment(ProfileEvents::ObjectStorageClusterSentToMatchedReplica);
             return object_info;
         }
         LOG_TEST(
@@ -229,6 +237,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(s
                     number_of_current_replica
                 );
 
+                ProfileEvents::increment(ProfileEvents::ObjectStorageClusterSentToNonMatchedReplica);
                 return next_file;
             }
 

@@ -51,6 +51,8 @@ namespace fs = std::filesystem;
 namespace ProfileEvents
 {
     extern const Event EngineFileLikeReadFiles;
+    extern const Event ObjectStorageClusterProcessedTasks;
+    extern const Event ObjectStorageClusterWaitingMicroseconds;
 }
 
 namespace CurrentMetrics
@@ -544,7 +546,9 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                 /// TODO: Make asyncronous waiting without sleep in thread
                 /// Now this sleep is on executor node in worker thread
                 /// Does not block query initiator
-                sleepForMicroseconds(std::min(Poco::Timestamp::TimeDiff(100000ul), retry_after_us.value()));
+                auto wait_time = std::min(Poco::Timestamp::TimeDiff(100000ul), retry_after_us.value());
+                ProfileEvents::increment(ProfileEvents::ObjectStorageClusterWaitingMicroseconds, wait_time);
+                sleepForMicroseconds(wait_time);
                 continue;
             }
         }
@@ -570,6 +574,8 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         }
     }
     while (not_a_path || (query_settings.skip_empty_files && object_info->getObjectMetadata()->size_bytes == 0));
+
+    ProfileEvents::increment(ProfileEvents::ObjectStorageClusterProcessedTasks);
 
     QueryPipelineBuilder builder;
     std::shared_ptr<ISource> source;
