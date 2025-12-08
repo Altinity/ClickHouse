@@ -87,7 +87,7 @@ Iceberg::ManifestFilePtr getManifestFile(
     {
         auto [storage_to_use, resolved_key_in_storage] = resolveObjectStorageForPath(
             persistent_table_components.table_location, absolute_path, object_storage, secondary_storages, local_context);
-        
+
         PathWithMetadata manifest_object_info(resolved_key_in_storage, std::nullopt, absolute_path, storage_to_use);
 
         auto read_settings = local_context->getReadSettings();
@@ -159,6 +159,7 @@ ManifestFileCacheKeys getManifestList(
             DB::IcebergMetadataLogLevel::ManifestListMetadata,
             configuration_ptr->getRawPath().path,
             key_in_storage,
+            std::nullopt,
             std::nullopt);
 
         for (size_t i = 0; i < manifest_list_deserializer.rows(); ++i)
@@ -193,7 +194,8 @@ ManifestFileCacheKeys getManifestList(
                 DB::IcebergMetadataLogLevel::ManifestListEntry,
                 configuration_ptr->getRawPath().path,
                 absolute_path,
-                i);
+                i,
+                std::nullopt);
         }
         /// We only return the list of {file name, seq number} for cache.
         /// Because ManifestList holds a list of ManifestFilePtr which consume much memory space.
@@ -254,7 +256,6 @@ std::pair<Poco::JSON::Object::Ptr, Int32> parseTableSchemaV1Method(const Poco::J
     auto current_schema_id = schema->getValue<int>(f_schema_id);
     return {schema, current_schema_id};
 }
-
 }
 }
 

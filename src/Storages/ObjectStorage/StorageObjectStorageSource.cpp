@@ -500,9 +500,9 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         if (!object_info)
             return {};
 
-        if (object_info->getCommand().is_parsed())
+        if (object_info->getCommand().isValid())
         {
-            auto retry_after_us = object_info->getCommand().get_retry_after_us();
+            auto retry_after_us = object_info->getCommand().getRetryAfterUs();
             if (retry_after_us.has_value())
             {
                 not_a_path = true;

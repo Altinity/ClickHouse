@@ -121,15 +121,19 @@ struct PathWithMetadata
         CommandInTaskResponse() = default;
         explicit CommandInTaskResponse(const std::string & task);
 
-        bool is_parsed() const { return successfully_parsed; }
-        void set_retry_after_us(Poco::Timestamp::TimeDiff time_us) { retry_after_us = time_us; }
+        bool isValid() const { return is_valid; }
+        void setRetryAfterUs(Poco::Timestamp::TimeDiff time_us)
+        {
+            retry_after_us = time_us;
+            is_valid = true;
+        }
 
-        std::string to_string() const;
+        std::string toString() const;
 
-        std::optional<Poco::Timestamp::TimeDiff> get_retry_after_us() const { return retry_after_us; }
+        std::optional<Poco::Timestamp::TimeDiff> getRetryAfterUs() const { return retry_after_us; }
 
     private:
-        bool successfully_parsed = false;
+        bool is_valid = false;
         std::optional<Poco::Timestamp::TimeDiff> retry_after_us;
     };
 
@@ -158,7 +162,7 @@ struct PathWithMetadata
         , absolute_path((absolute_path_.has_value() && !absolute_path_.value().empty()) ? absolute_path_ : std::nullopt)
         , object_storage_to_use(object_storage_to_use_)
     {
-        if (command.is_parsed())
+        if (command.isValid())
             relative_path = "";
     }
 
