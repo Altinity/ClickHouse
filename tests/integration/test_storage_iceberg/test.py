@@ -3850,6 +3850,7 @@ def test_system_tables_partition_sorting_keys(started_cluster, storage_type):
     assert res == '"bucket(16, id), day(ts)","id desc, hour(ts) asc"'
 
 
+
 @pytest.mark.parametrize(
     "storage_type",
     ["s3", "azure", "local"],
@@ -3916,3 +3917,19 @@ def test_partition_pruning_with_subquery_set(started_cluster, storage_type):
         )
         == 3
     )
+
+
+    
+def test_iceberg_write_minmax(started_cluster):
+    instance = started_cluster.instances["node1"]
+    TABLE_NAME = "test_iceberg_write_minmax_" + get_uuid_str()
+
+    create_iceberg_table("local", instance, TABLE_NAME, started_cluster, "(x Int32, y Int32)", partition_by="identity(x)")
+
+    instance.query(f"INSERT INTO {TABLE_NAME} VALUES (1, 1), (1, 2)", settings={"allow_experimental_insert_into_iceberg": 1})
+
+    res = instance.query(f"SELECT x,y FROM {TABLE_NAME} WHERE y=1 ORDER BY ALL").strip()
+    assert res == "1\t1"
+
+    res = instance.query(f"SELECT x,y FROM {TABLE_NAME} WHERE y=2 ORDER BY ALL").strip()
+    assert res == "1\t2"
