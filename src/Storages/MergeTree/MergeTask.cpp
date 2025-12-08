@@ -1376,16 +1376,6 @@ bool MergeTask::MergeProjectionsStage::mergeMinMaxIndexAndPrepareProjections() c
             projection_parts.front()->name,
             projection_parts.back()->name);
 
-        /// Skip parts with empty parent parts.
-        chassert(global_ctx->future_part->parts.size() == projection_parts.size());
-        std::erase_if(
-            projection_parts,
-            [&](const auto & part)
-            {
-                size_t index = &part - projection_parts.data();
-                return global_ctx->future_part->parts[index]->isEmpty();
-            });
-
         auto projection_future_part = std::make_shared<FutureMergedMutatedPart>();
         projection_future_part->assign(std::move(projection_parts), /*patch_parts_=*/ {});
         projection_future_part->name = projection->name;
@@ -1471,7 +1461,7 @@ bool MergeTask::MergeProjectionsStage::finalizeProjectionsAndWholeMerge() const
         global_ctx->cached_marks.emplace(name, std::move(marks));
 
     global_ctx->new_data_part->getDataPartStorage().precommitTransaction();
-    global_ctx->promise.set_value(global_ctx->new_data_part);
+    global_ctx->promise.set_value(std::exchange(global_ctx->new_data_part, nullptr));
 
     return false;
 }
@@ -1632,6 +1622,9 @@ void MergeTask::cancel() noexcept
 
     if (global_ctx->to)
         global_ctx->to->cancel();
+
+    if (global_ctx->new_data_part)
+        global_ctx->new_data_part->removeIfNeeded();
 }
 
 

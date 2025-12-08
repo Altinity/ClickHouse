@@ -91,6 +91,10 @@
     M(IcebergMetadataFilesCacheHits, "Number of times iceberg metadata files have been found in the cache.", ValueType::Number) \
     M(IcebergMetadataFilesCacheMisses, "Number of times iceberg metadata files have not been found in the iceberg metadata cache and had to be read from (remote) disk.", ValueType::Number) \
     M(IcebergMetadataFilesCacheWeightLost, "Approximate number of bytes evicted from the iceberg metadata cache.", ValueType::Number) \
+    M(IcebergMetadataReadWaitTimeMicroseconds, "Total time data readers spend waiting for iceberg metadata files to be read and parsed, summed across all reader threads.", ValueType::Microseconds) \
+    M(IcebergIteratorInitializationMicroseconds, "Total time spent on synchronous initialization of iceberg data iterators.", ValueType::Microseconds) \
+    M(IcebergMetadataUpdateMicroseconds, "Total time spent on synchronous initialization of iceberg data iterators.", ValueType::Microseconds) \
+    M(IcebergMetadataReturnedObjectInfos, "Total number of returned object infos from iceberg iterator.", ValueType::Number) \
     M(VectorSimilarityIndexCacheHits, "Number of times an index granule has been found in the vector index cache.", ValueType::Number) \
     M(VectorSimilarityIndexCacheMisses, "Number of times an index granule has not been found in the vector index cache and had to be read from disk.", ValueType::Number) \
     M(VectorSimilarityIndexCacheWeightLost, "Approximate number of bytes evicted from the vector index cache.", ValueType::Number) \
@@ -385,6 +389,27 @@
     M(MergeTreeDataWriterCompressedBytes, "Bytes written to filesystem for data INSERTed to MergeTree tables.", ValueType::Bytes) \
     M(MergeTreeDataWriterBlocks, "Number of blocks INSERTed to MergeTree tables. Each block forms a data part of level zero.", ValueType::Number) \
     M(MergeTreeDataWriterBlocksAlreadySorted, "Number of blocks INSERTed to MergeTree tables that appeared to be already sorted.", ValueType::Number) \
+    \
+    /* Per-executor background executor task timings */ \
+    M(MergeMutateBackgroundExecutorTaskExecuteStepMicroseconds, "Time spent in executeStep() for MergeMutate executor tasks.", ValueType::Microseconds) \
+    M(MergeMutateBackgroundExecutorTaskCancelMicroseconds, "Time spent in cancel() for MergeMutate executor tasks.", ValueType::Microseconds) \
+    M(MergeMutateBackgroundExecutorTaskResetMicroseconds, "Time spent resetting task for MergeMutate executor.", ValueType::Microseconds) \
+    M(MergeMutateBackgroundExecutorWaitMicroseconds, "Time spent waiting for completion in MergeMutate executor.", ValueType::Microseconds) \
+    \
+    M(MoveBackgroundExecutorTaskExecuteStepMicroseconds, "Time spent in executeStep() for Move executor tasks.", ValueType::Microseconds) \
+    M(MoveBackgroundExecutorTaskCancelMicroseconds, "Time spent in cancel() for Move executor tasks.", ValueType::Microseconds) \
+    M(MoveBackgroundExecutorTaskResetMicroseconds, "Time spent resetting task for Move executor.", ValueType::Microseconds) \
+    M(MoveBackgroundExecutorWaitMicroseconds, "Time spent waiting for completion in Move executor.", ValueType::Microseconds) \
+    \
+    M(FetchBackgroundExecutorTaskExecuteStepMicroseconds, "Time spent in executeStep() for Fetch executor tasks.", ValueType::Microseconds) \
+    M(FetchBackgroundExecutorTaskCancelMicroseconds, "Time spent in cancel() for Fetch executor tasks.", ValueType::Microseconds) \
+    M(FetchBackgroundExecutorTaskResetMicroseconds, "Time spent resetting task for Fetch executor.", ValueType::Microseconds) \
+    M(FetchBackgroundExecutorWaitMicroseconds, "Time spent waiting for completion in Fetch executor.", ValueType::Microseconds) \
+    \
+    M(CommonBackgroundExecutorTaskExecuteStepMicroseconds, "Time spent in executeStep() for Common executor tasks.", ValueType::Microseconds) \
+    M(CommonBackgroundExecutorTaskCancelMicroseconds, "Time spent in cancel() for Common executor tasks.", ValueType::Microseconds) \
+    M(CommonBackgroundExecutorTaskResetMicroseconds, "Time spent resetting task for Common executor.", ValueType::Microseconds) \
+    M(CommonBackgroundExecutorWaitMicroseconds, "Time spent waiting for completion in Common executor.", ValueType::Microseconds) \
     \
     M(MergeTreeDataWriterSkipIndicesCalculationMicroseconds, "Time spent calculating skip indices", ValueType::Microseconds) \
     M(MergeTreeDataWriterStatisticsCalculationMicroseconds, "Time spent calculating statistics", ValueType::Microseconds) \
@@ -1159,6 +1184,11 @@ The server successfully detected this situation and will download merged part fr
     M(ObjectStorageListObjectsCachePrefixMatchHits, "Number of times object storage list objects operation miss the cache using prefix matching.", ValueType::Number) \
     M(ParquetMetaDataCacheHits, "Number of times the read from filesystem cache hit the cache.", ValueType::Number) \
     M(ParquetMetaDataCacheMisses, "Number of times the read from filesystem cache miss the cache.", ValueType::Number) \
+    \
+    M(ObjectStorageClusterSentToMatchedReplica, "Number of tasks in ObjectStorageCluster request sent to matched replica.", ValueType::Number) \
+    M(ObjectStorageClusterSentToNonMatchedReplica, "Number of tasks in ObjectStorageCluster request sent to non-matched replica.", ValueType::Number) \
+    M(ObjectStorageClusterProcessedTasks, "Number of processed tasks in ObjectStorageCluster request.", ValueType::Number) \
+    M(ObjectStorageClusterWaitingMicroseconds, "Time of waiting for tasks in ObjectStorageCluster request.", ValueType::Microseconds) \
 
 #ifdef APPLY_FOR_EXTERNAL_EVENTS
     #define APPLY_FOR_EVENTS(M) APPLY_FOR_BUILTIN_EVENTS(M) APPLY_FOR_EXTERNAL_EVENTS(M)
