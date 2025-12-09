@@ -233,8 +233,6 @@ public:
 
     IConnections & getConnections() { return *connections; }
 
-    bool skipUnavailableShards() const;
-
     bool needToSkipUnavailableShard() const;
 
     bool isReplicaUnavailable() const { return extension && extension->parallel_reading_coordinator && connections->size() == 0; }
@@ -338,8 +336,6 @@ private:
     GetPriorityForLoadBalancing::Func priority_func;
 
     const bool read_packet_type_separately = false;
-
-    const bool allow_retries_in_cluster_requests = false;
 
     std::unordered_set<size_t> replica_has_processed_data;
 
