@@ -181,6 +181,12 @@ FutureSetFromSubquery::~FutureSetFromSubquery() = default;
 
 SetPtr FutureSetFromSubquery::get() const
 {
+    std::lock_guard lock(mutex);
+    return get_unsafe();
+}
+
+SetPtr FutureSetFromSubquery::get_unsafe() const
+{
     if (set_and_key->set != nullptr && set_and_key->set->isCreated())
         return set_and_key->set;
 
@@ -189,12 +195,15 @@ SetPtr FutureSetFromSubquery::get() const
 
 void FutureSetFromSubquery::setQueryPlan(std::unique_ptr<QueryPlan> source_)
 {
+    std::lock_guard lock(mutex);
     source = std::move(source_);
     set_and_key->set->setHeader(source->getCurrentHeader()->getColumnsWithTypeAndName());
 }
 
 void FutureSetFromSubquery::buildExternalTableFromInplaceSet(StoragePtr external_table_)
 {
+    std::lock_guard lock(mutex);
+
     const auto & set = *set_and_key->set;
 
     LOG_TRACE(getLogger("FutureSetFromSubquery"), "Building external table from set of {} elements", set.getTotalRowCount());
@@ -240,6 +249,8 @@ void FutureSetFromSubquery::buildExternalTableFromInplaceSet(StoragePtr external
 
 void FutureSetFromSubquery::setExternalTable(StoragePtr external_table_)
 {
+    std::lock_guard lock(mutex);
+
     if (set_and_key->set->isCreated())
     {
         if (!set_and_key->set->hasExplicitSetElements())
@@ -253,12 +264,19 @@ void FutureSetFromSubquery::setExternalTable(StoragePtr external_table_)
 
 DataTypes FutureSetFromSubquery::getTypes() const
 {
+    std::lock_guard lock(mutex);
     return set_and_key->set->getElementsTypes();
 }
 
 FutureSet::Hash FutureSetFromSubquery::getHash() const { return hash; }
 
 std::unique_ptr<QueryPlan> FutureSetFromSubquery::build(const SizeLimits & network_transfer_limits, const PreparedSetsCachePtr & prepared_sets_cache)
+{
+    std::lock_guard lock(mutex);
+    return build_unsafe(network_transfer_limits, prepared_sets_cache);
+}
+
+std::unique_ptr<QueryPlan> FutureSetFromSubquery::build_unsafe(const SizeLimits & network_transfer_limits, const PreparedSetsCachePtr & prepared_sets_cache)
 {
     if (set_and_key->set->isCreated())
         return nullptr;
@@ -280,6 +298,8 @@ std::unique_ptr<QueryPlan> FutureSetFromSubquery::build(const SizeLimits & netwo
 
 void FutureSetFromSubquery::buildSetInplace(const ContextPtr & context)
 {
+    std::lock_guard lock(mutex);
+
     if (external_table_set)
         external_table_set->buildSetInplace(context);
 
@@ -287,7 +307,7 @@ void FutureSetFromSubquery::buildSetInplace(const ContextPtr & context)
     SizeLimits network_transfer_limits(settings[Setting::max_rows_to_transfer], settings[Setting::max_bytes_to_transfer], settings[Setting::transfer_overflow_mode]);
     auto prepared_sets_cache = context->getPreparedSetsCache();
 
-    auto plan = build(network_transfer_limits, prepared_sets_cache);
+    auto plan = build_unsafe(network_transfer_limits, prepared_sets_cache);
 
     if (!plan)
         return;
@@ -305,7 +325,9 @@ SetPtr FutureSetFromSubquery::buildOrderedSetInplace(const ContextPtr & context)
     if (!context->getSettingsRef()[Setting::use_index_for_in_with_subqueries])
         return nullptr;
 
-    if (auto set = get())
+    std::lock_guard lock(mutex);
+
+    if (auto set = get_unsafe())
     {
         if (set->hasExplicitSetElements())
             return set;
@@ -327,7 +349,7 @@ SetPtr FutureSetFromSubquery::buildOrderedSetInplace(const ContextPtr & context)
     SizeLimits network_transfer_limits(settings[Setting::max_rows_to_transfer], settings[Setting::max_bytes_to_transfer], settings[Setting::transfer_overflow_mode]);
     auto prepared_sets_cache = context->getPreparedSetsCache();
 
-    auto plan = build(network_transfer_limits, prepared_sets_cache);
+    auto plan = build_unsafe(network_transfer_limits, prepared_sets_cache);
     if (!plan)
         return nullptr;
 

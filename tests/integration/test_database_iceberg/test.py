@@ -783,22 +783,22 @@ def test_cluster_joins(started_cluster):
 
     assert res == "Jack\tSparrow\nJohn\tDow\n"
 
-    #res = node.query(
-    #    f"""
-    #        SELECT name
-    #        FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`
-    #        WHERE tag in (
-    #            SELECT id
-    #            FROM {CATALOG_NAME}.`{root_namespace}.{table_name_2}`
-    #        )
-    #        ORDER BY ALL
-    #        SETTINGS
-    #            object_storage_cluster='cluster_simple',
-    #            object_storage_cluster_join_mode='local'
-    #    """
-    #)
+    res = node.query(
+        f"""
+            SELECT name
+            FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`
+            WHERE tag in (
+                SELECT id
+                FROM {CATALOG_NAME}.`{root_namespace}.{table_name_2}`
+            )
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
+        """
+    )
 
-    #assert res == "Jack\nJohn\n"
+    assert res == "Jack\nJohn\n"
 
     res = node.query(
         f"""
@@ -816,22 +816,22 @@ def test_cluster_joins(started_cluster):
 
     assert res == "Jack\tBlack\nJohn\tSilver\n"
 
-    #res = node.query(
-    #    f"""
-    #        SELECT name
-    #        FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`
-    #        WHERE tag in (
-    #            SELECT id
-    #            FROM `{table_name_local}`
-    #        )
-    #        ORDER BY ALL
-    #        SETTINGS
-    #            object_storage_cluster='cluster_simple',
-    #            object_storage_cluster_join_mode='local'
-    #    """
-    #)
+    res = node.query(
+        f"""
+            SELECT name
+            FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`
+            WHERE tag in (
+                SELECT id
+                FROM `{table_name_local}`
+            )
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
+        """
+    )
 
-    #assert res == "Jack\nJohn\n"
+    assert res == "Jack\nJohn\n"
 
     res = node.query(
         f"""

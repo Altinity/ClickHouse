@@ -87,22 +87,22 @@ def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type):
 
     assert res == "jack\tsparrow\njohn\tdow\n"
 
-    #res = instance.query(
-    #    f"""
-    #        SELECT name
-    #        FROM {creation_expression}
-    #        WHERE tag in (
-    #            SELECT id
-    #            FROM {creation_expression_2}
-    #        )
-    #        ORDER BY ALL
-    #        SETTINGS
-    #            object_storage_cluster='cluster_simple',
-    #            object_storage_cluster_join_mode='local'
-    #    """
-    #)
+    res = instance.query(
+        f"""
+            SELECT name
+            FROM {creation_expression}
+            WHERE tag in (
+                SELECT id
+                FROM {creation_expression_2}
+            )
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
+        """
+    )
 
-    #assert res == "jack\njohn\n"
+    assert res == "jack\njohn\n"
 
     res = instance.query(
         f"""
@@ -120,22 +120,22 @@ def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type):
 
     assert res == "jack\tblack\njohn\tsilver\n"
 
-    #res = instance.query(
-    #    f"""
-    #        SELECT name
-    #        FROM {creation_expression}
-    #        WHERE tag in (
-    #            SELECT id
-    #            FROM `{TABLE_NAME_LOCAL}`
-    #        )
-    #        ORDER BY ALL
-    #        SETTINGS
-    #            object_storage_cluster='cluster_simple',
-    #            object_storage_cluster_join_mode='local'
-    #    """
-    #)
+    res = instance.query(
+        f"""
+            SELECT name
+            FROM {creation_expression}
+            WHERE tag in (
+                SELECT id
+                FROM `{TABLE_NAME_LOCAL}`
+            )
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
+        """
+    )
 
-    #assert res == "jack\njohn\n"
+    assert res == "jack\njohn\n"
 
     res = instance.query(
         f"""
