@@ -286,6 +286,8 @@ void ExternalAuthenticators::resetImpl()
     ldap_caches.clear();
     kerberos_params.reset();
     token_processors.clear();
+    access_token_to_username_cache.clear();
+    username_to_access_token_cache.clear();
 }
 
 void ExternalAuthenticators::reset()
@@ -318,10 +320,17 @@ void parseTokenProcessors(std::unordered_map<String, std::unique_ptr<ITokenProce
     }
 }
 
-void ExternalAuthenticators::setConfiguration(const Poco::Util::AbstractConfiguration & config, LoggerPtr log)
+bool ExternalAuthenticators::isTokenAuthEnabled() const
+{
+    std::lock_guard lock(mutex);
+    return token_auth_enabled;
+}
+
+void ExternalAuthenticators::setConfiguration(const Poco::Util::AbstractConfiguration & config, LoggerPtr log, bool token_auth_enabled_)
 {
     std::lock_guard lock(mutex);
     resetImpl();
+    token_auth_enabled = token_auth_enabled_;
 
     Poco::Util::AbstractConfiguration::Keys all_keys;
     config.keys("", all_keys);
@@ -421,7 +430,10 @@ void ExternalAuthenticators::setConfiguration(const Poco::Util::AbstractConfigur
         tryLogCurrentException(log, "Could not parse Kerberos section");
     }
 
-    parseTokenProcessors(token_processors, config, token_processors_config, log);
+    if (token_auth_enabled)
+        parseTokenProcessors(token_processors, config, token_processors_config, log);
+    else
+        LOG_INFO(log, "Token authentication is disabled, skipping token processors configuration");
 }
 
 static UInt128 computeParamsHash(const LDAPClient::Params & params, const LDAPClient::RoleSearchParamsList * role_search_params)
@@ -649,6 +661,9 @@ bool ExternalAuthenticators::checkCredentialsAgainstProcessor(const ITokenProces
 bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & credentials, const String & processor_name) const
 {
     std::lock_guard lock{mutex};
+
+    if (!token_auth_enabled)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Token authentication is disabled");
 
     if (token_processors.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Token authentication is not configured");

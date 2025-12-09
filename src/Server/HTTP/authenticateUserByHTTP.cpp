@@ -222,8 +222,12 @@ bool authenticateUserByHTTP(
 #endif
     else if (!bearer_token.empty())
     {
+        const auto & access_control = global_context->getAccessControl();
+        if (!access_control.isTokenAuthEnabled())
+            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Token authentication is disabled");
+
         const auto token_credentials = TokenCredentials(bearer_token);
-        const auto & external_authenticators = global_context->getAccessControl().getExternalAuthenticators();
+        const auto & external_authenticators = access_control.getExternalAuthenticators();
 
         if (!external_authenticators.checkTokenCredentials(token_credentials))
             throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Invalid authentication: Token could not be verified.");

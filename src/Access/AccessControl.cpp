@@ -297,6 +297,8 @@ void AccessControl::setupFromMainConfig(const Poco::Util::AbstractConfiguration 
     setDefaultPasswordTypeFromConfig(config_.getString("default_password_type", "sha256_password"));
     setPasswordComplexityRulesFromConfig(config_);
 
+    setTokenAuthEnabled(config_.getBool("enable_token_auth", true));
+
     setBcryptWorkfactor(config_.getInt("bcrypt_workfactor", 12));
 
     /// Optional improvements in access control system.
@@ -494,6 +496,12 @@ void AccessControl::addStoragesFromUserDirectoriesConfig(
         }
         else if (type == TokenAccessStorage::STORAGE_TYPE)
         {
+            if (!isTokenAuthEnabled())
+            {
+                LOG_INFO(getLogger(), "Token authentication is disabled, skipping token user directory '{}'", name);
+                continue;
+            }
+
             if (has_token_storage)
                 throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "Only one `token` section can be defined.");
 
@@ -677,7 +685,7 @@ void AccessControl::restoreFromBackup(RestorerFromBackup & restorer, const Strin
 
 void AccessControl::setExternalAuthenticatorsConfig(const Poco::Util::AbstractConfiguration & config)
 {
-    external_authenticators->setConfiguration(config, getLogger());
+    external_authenticators->setConfiguration(config, getLogger(), isTokenAuthEnabled());
 }
 
 
@@ -955,5 +963,15 @@ bool AccessControl::getAllowExperimentalTierSettings() const
 bool AccessControl::getAllowBetaTierSettings() const
 {
     return allow_beta_tier_settings;
+}
+
+void AccessControl::setTokenAuthEnabled(bool enable)
+{
+    enable_token_auth = enable;
+}
+
+bool AccessControl::isTokenAuthEnabled() const
+{
+    return enable_token_auth;
 }
 }

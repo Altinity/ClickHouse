@@ -261,6 +261,10 @@ public:
     bool getAllowExperimentalTierSettings() const;
     bool getAllowBetaTierSettings() const;
 
+    /// Controls whether token-based auth is enabled.
+    void setTokenAuthEnabled(bool enable);
+    bool isTokenAuthEnabled() const;
+
 private:
     class ContextAccessCache;
     class CustomSettingsPrefixes;
@@ -294,6 +298,7 @@ private:
     std::atomic_bool allow_beta_tier_settings = true;
     std::atomic_bool enable_user_name_access_type = true;
     std::atomic_bool enable_read_write_grants = false;
+    std::atomic_bool enable_token_auth = true;
 };
 
 }

@@ -16,6 +16,15 @@ Although not all tokens are JWTs, under the hood both ways are treated as the sa
 # Token Processors
 
 ## Configuration
+
+Token-based authentication is enabled by default. To disable it, set `enable_token_auth` to `0` in `config.xml`:
+
+```xml
+<enable_token_auth>0</enable_token_auth>
+```
+
+When disabled, token processors are not parsed, TokenAccessStorage is not available, and authentication via tokens (`--jwt` option or `Authorization: Bearer` header) is rejected.
+
 To use token-based authentication, add `token_processors` section to `config.xml` and define at least one token processor in it.
 Its contents are different for different token processor types.
 

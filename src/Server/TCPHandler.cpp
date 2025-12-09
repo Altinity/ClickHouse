@@ -1876,9 +1876,13 @@ void TCPHandler::receiveHello()
 
     if (is_jwt_based_auth)
     {
+        const auto & access_control = server.context()->getAccessControl();
+        if (!access_control.isTokenAuthEnabled())
+            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Token authentication is disabled");
+
         auto credentials = TokenCredentials(password);
 
-        const auto & external_authenticators = server.context()->getAccessControl().getExternalAuthenticators();
+        const auto & external_authenticators = access_control.getExternalAuthenticators();
 
         if (!external_authenticators.checkTokenCredentials(credentials))
             throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Token is invalid");

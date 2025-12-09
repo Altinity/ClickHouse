@@ -39,7 +39,9 @@ class ExternalAuthenticators
 {
 public:
     void reset();
-    void setConfiguration(const Poco::Util::AbstractConfiguration & config, LoggerPtr log);
+    void setConfiguration(const Poco::Util::AbstractConfiguration & config, LoggerPtr log, bool token_auth_enabled = true);
+
+    bool isTokenAuthEnabled() const;
 
     // The name and readiness of the credentials must be verified before calling these.
     bool checkLDAPCredentials(const String & server, const BasicCredentials & credentials,
@@ -85,6 +87,8 @@ private:
 
     mutable TokenToUsernameCache access_token_to_username_cache TSA_GUARDED_BY(mutex) ;
     mutable UsernameToTokenCache username_to_access_token_cache TSA_GUARDED_BY(mutex) ;
+
+    bool token_auth_enabled TSA_GUARDED_BY(mutex) = true;
 
     bool checkCredentialsAgainstProcessor(const ITokenProcessor & processor,
                                           TokenCredentials & credentials) const TSA_REQUIRES(mutex);
