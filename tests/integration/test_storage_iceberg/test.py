@@ -3551,6 +3551,10 @@ def test_read_constant_columns_optimization(started_cluster, storage_type, run_o
 
     # Warm up metadata cache
     for replica in started_cluster.instances.values():
+        replica.query("SYSTEM DROP UNCOMPRESSED CACHE")
+        replica.query("SYSTEM DROP QUERY CACHE")
+        replica.query("SYSTEM DROP FILESYSTEM CACHE")
+        replica.query("SYSTEM DROP ICEBERG METADATA CACHE")
         replica.query(f"SELECT * FROM {creation_expression} ORDER BY ALL SETTINGS allow_experimental_iceberg_read_optimization=0")
 
     all_data_expected_query_id = str(uuid.uuid4())
@@ -3738,22 +3742,22 @@ def test_cluster_joins(started_cluster, storage_type):
 
     assert res == "jack\tsparrow\njohn\tdow\n"
 
-    #res = instance.query(
-    #    f"""
-    #        SELECT name
-    #        FROM {creation_expression}
-    #        WHERE tag in (
-    #            SELECT id
-    #            FROM {creation_expression_2}
-    #        )
-    #        ORDER BY ALL
-    #        SETTINGS
-    #            object_storage_cluster='cluster_simple',
-    #            object_storage_cluster_join_mode='local'
-    #    """
-    #)
+    res = instance.query(
+        f"""
+            SELECT name
+            FROM {creation_expression}
+            WHERE tag in (
+                SELECT id
+                FROM {creation_expression_2}
+            )
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
+        """
+    )
 
-    #assert res == "jack\njohn\n"
+    assert res == "jack\njohn\n"
 
     res = instance.query(
         f"""
@@ -3771,22 +3775,22 @@ def test_cluster_joins(started_cluster, storage_type):
 
     assert res == "jack\tblack\njohn\tsilver\n"
 
-    #res = instance.query(
-    #    f"""
-    #        SELECT name
-    #        FROM {creation_expression}
-    #        WHERE tag in (
-    #            SELECT id
-    #            FROM `{TABLE_NAME_LOCAL}`
-    #        )
-    #        ORDER BY ALL
-    #        SETTINGS
-    #            object_storage_cluster='cluster_simple',
-    #            object_storage_cluster_join_mode='local'
-    #    """
-    #)
+    res = instance.query(
+        f"""
+            SELECT name
+            FROM {creation_expression}
+            WHERE tag in (
+                SELECT id
+                FROM `{TABLE_NAME_LOCAL}`
+            )
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
+        """
+    )
 
-    #assert res == "jack\njohn\n"
+    assert res == "jack\njohn\n"
 
     res = instance.query(
         f"""
