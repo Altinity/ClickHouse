@@ -68,6 +68,8 @@ ExportPartitionTaskScheduler::ExportPartitionTaskScheduler(StorageReplicatedMerg
 void ExportPartitionTaskScheduler::run()
 {
     const auto available_move_executors = storage.background_moves_assignee.getAvailableMoveExecutors();
+
+    /// this is subject to TOCTOU - but for now we choose to live with it.
     if (available_move_executors == 0)
     {
         LOG_INFO(storage.log, "ExportPartition scheduler task: No available move executors, skipping");
@@ -77,6 +79,9 @@ void ExportPartitionTaskScheduler::run()
     LOG_INFO(storage.log, "ExportPartition scheduler task: Available move executors: {}", available_move_executors);
 
     std::size_t scheduled_exports_count = 0;
+
+    const uint32_t seed = uint32_t(std::hash<std::string>{}(storage.replica_name)) ^ uint32_t(scheduled_exports_count);
+    std::mt19937 rng(seed);
 
     std::lock_guard lock(storage.export_merge_tree_partition_mutex);
 
@@ -154,6 +159,9 @@ void ExportPartitionTaskScheduler::run()
             continue;
         }
 
+        /// shuffle the parts to reduce the risk of lock collisions
+        std::shuffle(parts_in_processing_or_pending.begin(), parts_in_processing_or_pending.end(), rng);
+
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildren);
         std::vector<std::string> locked_parts;
@@ -207,9 +215,11 @@ void ExportPartitionTaskScheduler::run()
                 {
                     handlePartExportCompletion(key, zk_part_name, manifest, destination_storage, result);
                 });
+            
+            scheduled_exports_count++;
 
-            storage.background_moves_assignee.scheduleMoveTask(
-                std::make_shared<ExportPartFromPartitionExportTask>(storage, key, part_export_manifest, getContextCopyWithTaskSettings(storage.getContext(), manifest)));
+            part_export_manifest.task = std::make_shared<ExportPartFromPartitionExportTask>(storage, key, part_export_manifest, getContextCopyWithTaskSettings(storage.getContext(), manifest));
+            storage.background_moves_assignee.scheduleMoveTask(part_export_manifest.task);
         }
     }
 }

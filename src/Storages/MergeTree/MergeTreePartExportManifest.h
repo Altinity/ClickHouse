@@ -13,7 +13,7 @@ namespace DB
 
 class Exception;
 
-class ExportPartTask;
+class IExecutableTask;
 
 struct MergeTreePartExportManifest
 {
@@ -78,7 +78,7 @@ struct MergeTreePartExportManifest
 
     time_t create_time;
     mutable bool in_progress = false;
-    mutable std::shared_ptr<ExportPartTask> task = nullptr;
+    mutable std::shared_ptr<IExecutableTask> task = nullptr;
 
     bool operator<(const MergeTreePartExportManifest & rhs) const 
     {
