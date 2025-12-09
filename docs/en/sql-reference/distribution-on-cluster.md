@@ -1,6 +1,6 @@
 # Task distribution in *Cluster family functions
 
-## Task distribution algorythm
+## Task distribution algorithm
 
 Table functions such as `s3Cluster`, `azureBlobStorageCluster`, `hdsfCluster`, `icebergCluster`, and table engines like `S3`, `Azure`, `HDFS`, `Iceberg` with the setting `object_storage_cluster` distribute tasks across all cluster nodes or a subset limited by the `object_storage_max_nodes` setting. This setting limits the number of nodes involved in processing a distributed query, randomly selecting nodes for each query.
 
