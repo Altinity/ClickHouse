@@ -1037,8 +1037,10 @@ if __name__ == "__main__":
             # FIXME: the start_time must be preserved globally in ENV or something like that
             # to get the same values in different DBs
             # As a wild idea, it could be stored in a Info.check_start_timestamp
+            exit(0) # Note (strtgbb): We don't use log exports
             res = ch.start_log_exports(check_start_time=Utils.timestamp())
         elif command == "logs_export_stop":
+            exit(0) # Note (strtgbb): We don't use log exports
             res = ch.stop_log_exports()
         elif command == "start_minio":
             param = sys.argv[2]
