@@ -323,6 +323,7 @@ bool ExportPartTask::executeStep()
 
 void ExportPartTask::cancel() noexcept
 {
+    LOG_INFO(getLogger("ExportPartTask"), "Export part {} task cancel() method called", manifest.data_part->name);
     cancel_requested.store(true);
     pipeline.cancel();
 }

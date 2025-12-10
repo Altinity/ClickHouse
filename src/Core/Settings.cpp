@@ -7348,6 +7348,10 @@ Throw an error if there are pending mutations when exporting a merge tree part.
     DECLARE(Bool, export_merge_tree_part_throw_on_pending_patch_parts, true, R"(
 Throw an error if there are pending patch parts when exporting a merge tree part.
 )", 0) \
+    DECLARE(Bool, export_merge_tree_partition_lock_inside_the_task, false, R"(
+Only lock a part when the task is already running. This might help with busy waiting where the scheduler locks a part, but the task ends in the pending list.
+On the other hand, there is a chance once the task executes that part has already been locked by another replica and the task will simply early exit.
+)", 0) \
     \
     /* ####################################################### */ \
     /* ########### START OF EXPERIMENTAL FEATURES ############ */ \

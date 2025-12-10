@@ -13,14 +13,12 @@ namespace DB
 ExportPartFromPartitionExportTask::ExportPartFromPartitionExportTask(
     StorageReplicatedMergeTree & storage_,
     const std::string & key_,
-    const MergeTreePartExportManifest & manifest_,
-    ContextPtr context_)
+    const MergeTreePartExportManifest & manifest_)
     : storage(storage_),
     key(key_),
-    manifest(manifest_),
-    local_context(context_)
+    manifest(manifest_)
 {
-    export_part_task = std::make_shared<ExportPartTask>(storage, manifest, local_context);
+    export_part_task = std::make_shared<ExportPartTask>(storage, manifest);
 }
 
 bool ExportPartFromPartitionExportTask::executeStep()
@@ -28,18 +26,18 @@ bool ExportPartFromPartitionExportTask::executeStep()
     const auto zk = storage.getZooKeeper();
     const auto part_name = manifest.data_part->name;
 
-    LOG_INFO(storage.log, "ExportPartition scheduler task: Attempting to lock part: {}", part_name);
+    LOG_INFO(storage.log, "ExportPartFromPartitionExportTask: Attempting to lock part: {}", part_name);
 
     ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
     ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperCreate);
     if (Coordination::Error::ZOK == zk->tryCreate(fs::path(storage.zookeeper_path) / "exports" / key / "locks" / part_name, storage.replica_name, zkutil::CreateMode::Ephemeral))
     {
-        LOG_INFO(storage.log, "ExportPartition scheduler task: Locked part: {}", part_name);
+        LOG_INFO(storage.log, "ExportPartFromPartitionExportTask: Locked part: {}", part_name);
         export_part_task->executeStep();
         return false;
     }
 
-    LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to lock part {}, skipping", part_name);
+    LOG_INFO(storage.log, "ExportPartFromPartitionExportTask: Failed to lock part {}, skipping", part_name);
     return false;
 }
 

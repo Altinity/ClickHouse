@@ -30,6 +30,7 @@ namespace DB
 namespace Setting
 {
     extern const SettingsMergeTreePartExportFileAlreadyExistsPolicy export_merge_tree_part_file_already_exists_policy;
+    extern const SettingsBool export_merge_tree_partition_lock_inside_the_task;
 }
 
 namespace ErrorCodes
@@ -197,29 +198,83 @@ void ExportPartitionTaskScheduler::run()
 
             LOG_INFO(storage.log, "ExportPartition scheduler task: Scheduling part export: {}", zk_part_name);
 
-            std::lock_guard part_export_lock(storage.export_manifests_mutex);
-
             auto context = getContextCopyWithTaskSettings(storage.getContext(), manifest);
 
-            const auto format_settings = getFormatSettings(context);
+            /// todo arthur this code path does not perform all the validations a simple part export does because we are not calling exportPartToTable directly.
+            /// the schema and everything else has been validated when the export partition task was created, but nothing prevents the destination table from being
+            /// recreated with a new schema before the export task is scheduled.
+            if (context->getSettingsRef()[Setting::export_merge_tree_partition_lock_inside_the_task])
+            {
+                LOG_INFO(storage.log, "ExportPartition scheduler task: Locking part export inside the task");
+                std::lock_guard part_export_lock(storage.export_manifests_mutex);
 
-            MergeTreePartExportManifest part_export_manifest(
-                destination_storage->getStorageID(),
-                part,
-                manifest.transaction_id,
-                context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value,
-                format_settings,
-                storage.getInMemoryMetadataPtr(),
-                [this, key, zk_part_name, manifest, destination_storage]
-                (MergeTreePartExportManifest::CompletionCallbackResult result)
+                MergeTreePartExportManifest part_export_manifest(
+                    destination_storage->getStorageID(),
+                    part,
+                    manifest.transaction_id,
+                    context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value,
+                    context->getSettingsCopy(),
+                    storage.getInMemoryMetadataPtr(),
+                    [this, key, zk_part_name, manifest, destination_storage]
+                    (MergeTreePartExportManifest::CompletionCallbackResult result)
+                    {
+                        handlePartExportCompletion(key, zk_part_name, manifest, destination_storage, result);
+                    });
+
+                part_export_manifest.task = std::make_shared<ExportPartFromPartitionExportTask>(storage, key, part_export_manifest);
+
+                /// todo arthur this might conflict with the standalone export part. what to do in this case?
+                if (!storage.export_manifests.emplace(part_export_manifest).second)
                 {
-                    handlePartExportCompletion(key, zk_part_name, manifest, destination_storage, result);
-                });
-            
-            scheduled_exports_count++;
+                    LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} is already being exported, skipping", zk_part_name);
+                    continue;
+                }
 
-            part_export_manifest.task = std::make_shared<ExportPartFromPartitionExportTask>(storage, key, part_export_manifest, getContextCopyWithTaskSettings(storage.getContext(), manifest));
-            storage.background_moves_assignee.scheduleMoveTask(part_export_manifest.task);
+                if (!storage.background_moves_assignee.scheduleMoveTask(part_export_manifest.task))
+                {
+                    storage.export_manifests.erase(part_export_manifest);
+                    LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to schedule export part task, skipping");
+                    return;
+                }
+            }
+            else
+            {
+                try
+                {
+                    LOG_INFO(storage.log, "ExportPartition scheduler task: Exporting part to table");
+
+                    LOG_INFO(storage.log, "ExportPartition scheduler task: Attempting to lock part: {}", zk_part_name);
+
+                    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+                    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperCreate);
+                    if (Coordination::Error::ZOK != zk->tryCreate(fs::path(storage.zookeeper_path) / "exports" / key / "locks" / zk_part_name, storage.replica_name, zkutil::CreateMode::Ephemeral))
+                    {
+                        LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to lock part {}, skipping", zk_part_name);
+                        continue;
+                    }
+
+                    LOG_INFO(storage.log, "ExportPartition scheduler task: Locked part: {}", zk_part_name);
+
+                    storage.exportPartToTable(
+                        part->name,
+                        destination_storage_id,
+                        manifest.transaction_id,
+                        getContextCopyWithTaskSettings(storage.getContext(), manifest),
+                        [this, key, zk_part_name, manifest, destination_storage]
+                        (MergeTreePartExportManifest::CompletionCallbackResult result)
+                        {
+                            handlePartExportCompletion(key, zk_part_name, manifest, destination_storage, result);
+                        });
+                }
+                catch (const Exception &)
+                {
+                    tryLogCurrentException(__PRETTY_FUNCTION__);
+                    zk->tryRemove(fs::path(storage.zookeeper_path) / "exports" / key / "locks" / zk_part_name);
+                    /// we should not increment retry_count because the node might just be full
+                }
+            }
+
+            scheduled_exports_count++;
         }
     }
 }
@@ -291,6 +346,8 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
     size_t max_retries
 )
 {
+    LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} export failed, will now increment counters", part_name);
+
     if (!exception)
     {
         throw Exception(ErrorCodes::LOGICAL_ERROR, "ExportPartition scheduler task: No exception provided for error handling. Sounds like a bug");
@@ -339,61 +396,68 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
 
     processing_part_entry.retry_count++;
 
-    if (processing_part_entry.retry_count)
+    ops.emplace_back(zkutil::makeRemoveRequest(export_path / "locks" / part_name, locked_by_stat.version));
+    ops.emplace_back(zkutil::makeSetRequest(processing_part_path, processing_part_entry.toJsonString(), -1));
+
+    LOG_INFO(storage.log, "ExportPartition scheduler task: Updating processing part entry for part {}, retry count: {}, max retries: {}", part_name, processing_part_entry.retry_count, max_retries);
+
+    if (processing_part_entry.retry_count >= max_retries)
     {
-        ops.emplace_back(zkutil::makeRemoveRequest(export_path / "locks" / part_name, locked_by_stat.version));
-        ops.emplace_back(zkutil::makeSetRequest(processing_part_path, processing_part_entry.toJsonString(), -1));
+        /// just set status in processing_part_path and finished_by
+        processing_part_entry.status = ExportReplicatedMergeTreePartitionProcessingPartEntry::Status::FAILED;
+        processing_part_entry.finished_by = storage.replica_name;
 
-        if (processing_part_entry.retry_count >= max_retries)
-        {
-            /// just set status in processing_part_path and finished_by
-            processing_part_entry.status = ExportReplicatedMergeTreePartitionProcessingPartEntry::Status::FAILED;
-            processing_part_entry.finished_by = storage.replica_name;
-
-            ops.emplace_back(zkutil::makeSetRequest(export_path / "status", String(magic_enum::enum_name(ExportReplicatedMergeTreePartitionTaskEntry::Status::FAILED)).data(), -1));
-            LOG_INFO(storage.log, "ExportPartition scheduler task: Retry count limit exceeded for part {}, will try to fail the entire task", part_name);
-        }
-
-        std::size_t num_exceptions = 0;
-    
-        const auto exceptions_per_replica_path = export_path / "exceptions_per_replica" / storage.replica_name;
-        const auto count_path = exceptions_per_replica_path / "count";
-        const auto last_exception_path = exceptions_per_replica_path / "last_exception";
-
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperExists);
-        if (zk->exists(exceptions_per_replica_path))
-        {
-            std::string num_exceptions_string;
-            zk->tryGet(count_path, num_exceptions_string);
-            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
-            num_exceptions = std::stoull(num_exceptions_string.c_str());
-
-            ops.emplace_back(zkutil::makeSetRequest(last_exception_path / "part", part_name, -1));
-            ops.emplace_back(zkutil::makeSetRequest(last_exception_path / "exception", exception->message(), -1));
-        }
-        else
-        {
-            ops.emplace_back(zkutil::makeCreateRequest(exceptions_per_replica_path, "", zkutil::CreateMode::Persistent));
-            ops.emplace_back(zkutil::makeCreateRequest(count_path, "0", zkutil::CreateMode::Persistent));
-            ops.emplace_back(zkutil::makeCreateRequest(last_exception_path, "", zkutil::CreateMode::Persistent));
-            ops.emplace_back(zkutil::makeCreateRequest(last_exception_path / "part", part_name, zkutil::CreateMode::Persistent));
-            ops.emplace_back(zkutil::makeCreateRequest(last_exception_path / "exception", exception->message(), zkutil::CreateMode::Persistent));
-        }
-
-        num_exceptions++;
-        ops.emplace_back(zkutil::makeSetRequest(count_path, std::to_string(num_exceptions), -1));
-
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperMulti);
-        Coordination::Responses responses;
-        if (Coordination::Error::ZOK != zk->tryMulti(ops, responses))
-        {
-            LOG_INFO(storage.log, "ExportPartition scheduler task: All failure mechanism failed, will not try to update it");
-            return;
-        }
+        ops.emplace_back(zkutil::makeSetRequest(export_path / "status", String(magic_enum::enum_name(ExportReplicatedMergeTreePartitionTaskEntry::Status::FAILED)).data(), -1));
+        LOG_INFO(storage.log, "ExportPartition scheduler task: Retry count limit exceeded for part {}, will try to fail the entire task", part_name);
     }
+    else
+    {
+        LOG_INFO(storage.log, "ExportPartition scheduler task: Retry count limit not exceeded for part {}, will increment retry count", part_name);
+    }
+
+    std::size_t num_exceptions = 0;
+
+    const auto exceptions_per_replica_path = export_path / "exceptions_per_replica" / storage.replica_name;
+    const auto count_path = exceptions_per_replica_path / "count";
+    const auto last_exception_path = exceptions_per_replica_path / "last_exception";
+
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperExists);
+    if (zk->exists(exceptions_per_replica_path))
+    {
+        LOG_INFO(storage.log, "ExportPartition scheduler task: Exceptions per replica path exists, no need to create it");
+        std::string num_exceptions_string;
+        zk->tryGet(count_path, num_exceptions_string);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
+        num_exceptions = std::stoull(num_exceptions_string.c_str());
+
+        ops.emplace_back(zkutil::makeSetRequest(last_exception_path / "part", part_name, -1));
+        ops.emplace_back(zkutil::makeSetRequest(last_exception_path / "exception", exception->message(), -1));
+    }
+    else
+    {
+        LOG_INFO(storage.log, "ExportPartition scheduler task: Exceptions per replica path does not exist, will create it");
+        ops.emplace_back(zkutil::makeCreateRequest(exceptions_per_replica_path, "", zkutil::CreateMode::Persistent));
+        ops.emplace_back(zkutil::makeCreateRequest(count_path, "0", zkutil::CreateMode::Persistent));
+        ops.emplace_back(zkutil::makeCreateRequest(last_exception_path, "", zkutil::CreateMode::Persistent));
+        ops.emplace_back(zkutil::makeCreateRequest(last_exception_path / "part", part_name, zkutil::CreateMode::Persistent));
+        ops.emplace_back(zkutil::makeCreateRequest(last_exception_path / "exception", exception->message(), zkutil::CreateMode::Persistent));
+    }
+
+    num_exceptions++;
+    ops.emplace_back(zkutil::makeSetRequest(count_path, std::to_string(num_exceptions), -1));
+
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperMulti);
+    Coordination::Responses responses;
+    if (Coordination::Error::ZOK != zk->tryMulti(ops, responses))
+    {
+        LOG_INFO(storage.log, "ExportPartition scheduler task: All failure mechanism failed, will not try to update it");
+        return;
+    }
+
+    LOG_INFO(storage.log, "ExportPartition scheduler task: Successfully updated exception counters for part {}", part_name);
 }
 
 bool ExportPartitionTaskScheduler::tryToMovePartToProcessed(

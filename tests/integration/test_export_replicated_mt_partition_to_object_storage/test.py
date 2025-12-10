@@ -80,6 +80,7 @@ def cluster():
             with_minio=True,
             stay_alive=True,
             with_zookeeper=True,
+            keeper_required_feature_flags=["multi_read"],
         )
         cluster.add_instance(
             "replica2", 
@@ -88,6 +89,7 @@ def cluster():
             with_minio=True,
             stay_alive=True,
             with_zookeeper=True,
+            keeper_required_feature_flags=["multi_read"],
         )
         # node that does not participate in the export, but will have visibility over the s3 table
         cluster.add_instance(
@@ -103,6 +105,7 @@ def cluster():
             with_minio=True,
             stay_alive=True,
             with_zookeeper=True,
+            keeper_required_feature_flags=["multi_read"],
         )
         logging.info("Starting cluster...")
         cluster.start()
@@ -294,6 +297,9 @@ def test_kill_export(cluster):
     # check system.replicated_partition_exports for the export, status should be KILLED
     assert node.query(f"SELECT status FROM system.replicated_partition_exports WHERE partition_id = '2020' and source_table = '{mt_table}' and destination_table = '{s3_table}'") == 'KILLED\n', "Partition 2020 was not killed as expected"
     assert node.query(f"SELECT status FROM system.replicated_partition_exports WHERE partition_id = '2021' and source_table = '{mt_table}' and destination_table = '{s3_table}'") == 'COMPLETED\n', "Partition 2021 was not completed, this is unexpected"
+
+    # check the data did not land on s3
+    assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == '0\n', "Partition 2020 was written to S3, it was not killed as expected"
 
 
 def test_drop_source_table_during_export(cluster):
