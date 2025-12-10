@@ -13,6 +13,7 @@
 #include <Common/Exception.h>
 #include <Common/ProfileEventsScope.h>
 #include <Storages/MergeTree/ExportList.h>
+#include <Formats/FormatFactory.h>
 
 namespace ProfileEvents
 {
@@ -38,10 +39,9 @@ namespace Setting
     extern const SettingsUInt64 min_bytes_to_use_direct_io;
 }
 
-ExportPartTask::ExportPartTask(MergeTreeData & storage_, const MergeTreePartExportManifest & manifest_, ContextPtr context_)
+ExportPartTask::ExportPartTask(MergeTreeData & storage_, const MergeTreePartExportManifest & manifest_)
     : storage(storage_),
-    manifest(manifest_),
-    local_context(context_)
+    manifest(manifest_)
 {
 }
 
@@ -52,6 +52,12 @@ const MergeTreePartExportManifest & ExportPartTask::getManifest() const
 
 bool ExportPartTask::executeStep()
 {
+    auto local_context = Context::createCopy(storage.getContext());
+    local_context->makeQueryContextForExportPart();
+    local_context->setCurrentQueryId(manifest.transaction_id);
+    local_context->setBackgroundOperationTypeForContext(ClientInfo::BackgroundOperationType::EXPORT_PART);
+    local_context->setSettings(manifest.settings);
+
     const auto & metadata_snapshot = manifest.metadata_snapshot;
 
     Names columns_to_read = metadata_snapshot->getColumns().getNamesOfPhysical();
@@ -96,7 +102,7 @@ bool ExportPartTask::executeStep()
             block_with_partition_values,
             (*exports_list_entry)->destination_file_path,
             manifest.file_already_exists_policy == MergeTreePartExportManifest::FileAlreadyExistsPolicy::overwrite,
-            manifest.format_settings,
+            getFormatSettings(local_context),
             local_context);
     }
     catch (const Exception & e)
@@ -131,9 +137,20 @@ bool ExportPartTask::executeStep()
             }
         }
 
-        tryLogCurrentException(__PRETTY_FUNCTION__);
+        LOG_INFO(getLogger("ExportPartTask"), "Export part {} failed: {}", manifest.data_part->name, e.message());
 
         ProfileEvents::increment(ProfileEvents::PartsExportFailures);
+
+        storage.writePartLog(
+            PartLogElement::Type::EXPORT_PART,
+            ExecutionStatus::fromCurrentException("", true),
+            static_cast<UInt64>((*exports_list_entry)->elapsed * 1000000000),
+            manifest.data_part->name,
+            manifest.data_part,
+            {manifest.data_part},
+            nullptr,
+            nullptr,
+            exports_list_entry.get());
 
         std::lock_guard inner_lock(storage.export_manifests_mutex);
         storage.export_manifests.erase(manifest);
@@ -264,6 +281,7 @@ bool ExportPartTask::executeStep()
 
 void ExportPartTask::cancel() noexcept
 {
+    LOG_INFO(getLogger("ExportPartTask"), "Export part {} task cancel() method called", manifest.data_part->name);
     cancel_requested.store(true);
     pipeline.cancel();
 }

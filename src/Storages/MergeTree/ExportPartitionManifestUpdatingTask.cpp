@@ -100,6 +100,12 @@ std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::
 {
     std::vector<ReplicatedPartitionExportInfo> infos;
     const auto zk = storage.getZooKeeper();
+
+    if (!zk->isFeatureEnabled(DB::KeeperFeatureFlag::MULTI_READ))
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "MULTI_READ feature flag is not enabled");
+    }
+
     const auto exports_path = fs::path(storage.zookeeper_path) / "exports";
 
     ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
@@ -657,6 +663,7 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
         {
             try
             {
+                LOG_INFO(storage.log, "ExportPartition Manifest Updating task: killing export partition for task {}", key);
                 storage.killExportPart(it->manifest.transaction_id);
             }
             catch (...)
