@@ -428,7 +428,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
     configuration->initialize(args, context_copy, /* with_table_structure */false);
 
     auto cluster_name = settings[DatabaseDataLakeSetting::object_storage_cluster].value;
-    
+
     return std::make_shared<StorageObjectStorageCluster>(
         cluster_name,
         configuration,
@@ -504,7 +504,6 @@ DatabaseTablesIteratorPtr DatabaseDataLake::getTablesIterator(
                     }
                     catch (...)
                     {
-                        tryLogCurrentException(log, fmt::format("Ignoring table {}", table_name));
                         promise->set_exception(std::current_exception());
                     }
                 });
@@ -591,7 +590,7 @@ DatabaseTablesIteratorPtr DatabaseDataLake::getLightweightTablesIterator(
                     }
                     catch (...)
                     {
-                        tryLogCurrentException(log, fmt::format("ignoring table {}", table_name));
+                        tryLogCurrentException(log, fmt::format("Ignoring table {}", table_name));
                     }
                     promise->set_value(storage);
                 });
@@ -634,7 +633,7 @@ ASTPtr DatabaseDataLake::getCreateDatabaseQuery() const
 ASTPtr DatabaseDataLake::getCreateTableQueryImpl(
     const String & name,
     ContextPtr context_,
-    bool /* throw_on_error */) const
+    bool throw_on_error) const
 {
     auto catalog = getCatalog();
     auto table_metadata = DataLake::TableMetadata().withLocation().withSchema();
@@ -643,8 +642,9 @@ ASTPtr DatabaseDataLake::getCreateTableQueryImpl(
 
     if (!catalog->tryGetTableMetadata(namespace_name, table_name, context_, table_metadata))
     {
-        throw Exception(
-            ErrorCodes::CANNOT_GET_CREATE_TABLE_QUERY, "Table `{}` doesn't exist", name);
+        if (throw_on_error)
+            throw Exception(ErrorCodes::CANNOT_GET_CREATE_TABLE_QUERY, "Table `{}` doesn't exist", name);
+        return {};
     }
 
     auto create_table_query = std::make_shared<ASTCreateQuery>();
