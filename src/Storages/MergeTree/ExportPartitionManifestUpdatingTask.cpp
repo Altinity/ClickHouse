@@ -673,6 +673,12 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
         }
 
         it->status = *new_status;
+
+        if (it->status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
+        {
+            /// we no longer need to keep the data parts alive
+            it->part_references.clear();
+        }
     }
 }
 

@@ -109,6 +109,7 @@ struct ExportReplicatedMergeTreePartitionManifest
     bool parallel_formatting;
     bool parquet_parallel_encoding;
     MergeTreePartExportManifest::FileAlreadyExistsPolicy file_already_exists_policy;
+    bool lock_inside_the_task; /// todo temporary
 
     std::string toJsonString() const
     {
@@ -131,6 +132,7 @@ struct ExportReplicatedMergeTreePartitionManifest
         json.set("create_time", create_time);
         json.set("max_retries", max_retries);
         json.set("ttl_seconds", ttl_seconds);
+        json.set("lock_inside_the_task", lock_inside_the_task);
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
         Poco::JSON::Stringifier::stringify(json, oss);
@@ -170,6 +172,11 @@ struct ExportReplicatedMergeTreePartitionManifest
             }
 
             /// what to do if it's not a valid value?
+        }
+
+        if (json->has("lock_inside_the_task"))
+        {
+            manifest.lock_inside_the_task = json->getValue<bool>("lock_inside_the_task");
         }
 
         return manifest;
