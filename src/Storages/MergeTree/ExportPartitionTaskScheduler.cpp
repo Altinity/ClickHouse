@@ -30,7 +30,6 @@ namespace DB
 namespace Setting
 {
     extern const SettingsMergeTreePartExportFileAlreadyExistsPolicy export_merge_tree_part_file_already_exists_policy;
-    extern const SettingsBool export_merge_tree_partition_lock_inside_the_task;
 }
 
 namespace ErrorCodes
@@ -203,7 +202,7 @@ void ExportPartitionTaskScheduler::run()
             /// todo arthur this code path does not perform all the validations a simple part export does because we are not calling exportPartToTable directly.
             /// the schema and everything else has been validated when the export partition task was created, but nothing prevents the destination table from being
             /// recreated with a new schema before the export task is scheduled.
-            if (context->getSettingsRef()[Setting::export_merge_tree_partition_lock_inside_the_task])
+            if (manifest.lock_inside_the_task)
             {
                 LOG_INFO(storage.log, "ExportPartition scheduler task: Locking part export inside the task");
                 std::lock_guard part_export_lock(storage.export_manifests_mutex);
