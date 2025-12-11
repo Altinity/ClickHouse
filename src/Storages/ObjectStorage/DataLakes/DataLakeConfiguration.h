@@ -66,7 +66,7 @@ public:
             {
                 throw Exception(
                     ErrorCodes::FORMAT_VERSION_TOO_OLD,
-                    "Metadata is not consinsent with the one which was used to infer table schema. Please, retry the query.");
+                    "Metadata is not consistent with the one which was used to infer table schema. Please, retry the query.");
             }
         }
     }
