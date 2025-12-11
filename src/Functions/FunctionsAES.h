@@ -305,10 +305,12 @@ private:
         const bool iv_is_constant = iv_column && isColumnConst(*iv_column);
         /// Avoid re-initializing cipher with the same key/IV on every row (expensive with OpenSSL 3).
         const bool can_reuse_context = (mode != CipherMode::RFC5116_AEAD_AES_GCM) && key_is_constant && (!iv_column || iv_is_constant);
+        /// Reuse only key schedule even if IV changes per row (still cheaper than full init).
+        const bool can_reuse_key_schedule = (mode != CipherMode::RFC5116_AEAD_AES_GCM) && key_is_constant;
 
         StringRef const_key_value{};
         StringRef const_iv_value{};
-        if (can_reuse_context)
+        if (can_reuse_key_schedule)
         {
             const_key_value = key_holder.setKey(key_size, key_column->getDataAt(0));
             if constexpr (mode != CipherMode::MySQLCompatibility)
@@ -317,7 +319,7 @@ private:
                     throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid key size {} != expected size {}", const_key_value.size, key_size);
             }
 
-            if (iv_column)
+            if (iv_column && iv_is_constant)
             {
                 const_iv_value = iv_column->getDataAt(0);
                 if (const_iv_value.size == 0)
@@ -344,6 +346,22 @@ private:
 
                 /// Reset context to the fresh state but keep the already prepared key schedule.
                 if (row_idx != 0 && EVP_EncryptInit_ex(evp_ctx, nullptr, nullptr, nullptr,
+                        reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
+                    onError("EVP_EncryptInit_ex");
+            }
+            else if (can_reuse_key_schedule)
+            {
+                key_value = const_key_value;
+                if (iv_column)
+                {
+                    iv_value = iv_column->getDataAt(row_idx);
+                    if (iv_value.size == 0)
+                        iv_value.data = nullptr;
+                }
+
+                validateIV<mode>(iv_value, iv_size);
+
+                if (EVP_EncryptInit_ex(evp_ctx, nullptr, nullptr, nullptr,
                         reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
                     onError("EVP_EncryptInit_ex");
             }
@@ -379,7 +397,7 @@ private:
             // Avoid extra work on empty ciphertext/plaintext for some ciphers
             if (!(input_value.size == 0 && block_size == 1 && mode != CipherMode::RFC5116_AEAD_AES_GCM))
             {
-                if (!can_reuse_context)
+                if (!can_reuse_context && !can_reuse_key_schedule)
                 {
                     // 1: Init CTX
                     if constexpr (mode == CipherMode::RFC5116_AEAD_AES_GCM)
@@ -636,10 +654,12 @@ private:
         const bool iv_is_constant = iv_column && isColumnConst(*iv_column);
         /// Avoid re-initializing cipher with the same key/IV on every row (expensive with OpenSSL 3).
         const bool can_reuse_context = (mode != CipherMode::RFC5116_AEAD_AES_GCM) && key_is_constant && (!iv_column || iv_is_constant);
+        /// Reuse only key schedule even if IV changes per row.
+        const bool can_reuse_key_schedule = (mode != CipherMode::RFC5116_AEAD_AES_GCM) && key_is_constant;
 
         StringRef const_key_value{};
         StringRef const_iv_value{};
-        if (can_reuse_context)
+        if (can_reuse_key_schedule)
         {
             const_key_value = key_holder.setKey(key_size, key_column->getDataAt(0));
             if constexpr (mode != CipherMode::MySQLCompatibility)
@@ -648,7 +668,7 @@ private:
                     throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid key size {} != expected size {}", const_key_value.size, key_size);
             }
 
-            if (iv_column)
+            if (iv_column && iv_is_constant)
             {
                 const_iv_value = iv_column->getDataAt(0);
 
@@ -678,6 +698,24 @@ private:
 
                 /// Reset context but keep already computed key schedule.
                 if (row_idx != 0 && EVP_DecryptInit_ex(evp_ctx, nullptr, nullptr, nullptr,
+                        reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
+                    onError("EVP_DecryptInit_ex");
+            }
+            else if (can_reuse_key_schedule)
+            {
+                key_value = const_key_value;
+                if (iv_column)
+                {
+                    iv_value = iv_column->getDataAt(row_idx);
+
+                    /// If the length is zero (empty string is passed) it should be treat as no IV.
+                    if (iv_value.size == 0)
+                        iv_value.data = nullptr;
+                }
+
+                validateIV<mode>(iv_value, iv_size);
+
+                if (EVP_DecryptInit_ex(evp_ctx, nullptr, nullptr, nullptr,
                         reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
                     onError("EVP_DecryptInit_ex");
             }
@@ -729,7 +767,7 @@ private:
             /// This makes sense for default implementation for NULLs.
             if (input_value.size > 0)
             {
-                if (!can_reuse_context)
+                if (!can_reuse_context && !can_reuse_key_schedule)
                 {
                     // 1: Init CTX
                     if constexpr (mode == CipherMode::RFC5116_AEAD_AES_GCM)
