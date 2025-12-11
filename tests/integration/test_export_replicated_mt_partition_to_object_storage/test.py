@@ -287,6 +287,9 @@ def test_kill_export(cluster):
         # ZooKeeper operations (KILL) proceed quickly since only S3 is blocked
         node.query(f"KILL EXPORT PARTITION WHERE partition_id = '2020' and source_table = '{mt_table}' and destination_table = '{s3_table}'")
 
+        # sleep for a while to let the kill to be processed
+        time.sleep(2)
+
     # wait for 2021 to finish
     wait_for_export_status(node, mt_table, s3_table, "2021", "COMPLETED")
 

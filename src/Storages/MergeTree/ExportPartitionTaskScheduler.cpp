@@ -138,7 +138,7 @@ void ExportPartitionTaskScheduler::run()
         if (status_in_zk.value() != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
         {
             entry.status = status_in_zk.value();
-            LOG_INFO(storage.log, "ExportPartition scheduler task: Skipping... Status from zk is {}", entry.status);
+            LOG_INFO(storage.log, "ExportPartition scheduler task: Skipping {}... Status from zk is {}", key, magic_enum::enum_name(entry.status).data());
             continue;
         }
 

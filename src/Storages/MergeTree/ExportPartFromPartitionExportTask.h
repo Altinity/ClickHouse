@@ -8,6 +8,9 @@
 namespace DB
 {
 
+/*
+    Decorator around the ExportPartTask to lock the part inside the task
+*/
 class ExportPartFromPartitionExportTask : public IExecutableTask
 {
 public:

@@ -175,6 +175,7 @@ struct ExportReplicatedMergeTreePartitionManifest
         manifest.parquet_parallel_encoding = json->getValue<bool>("parquet_parallel_encoding");
         manifest.max_bytes_per_file = json->getValue<size_t>("max_bytes_per_file");
         manifest.max_rows_per_file = json->getValue<size_t>("max_rows_per_file");
+
         if (json->has("file_already_exists_policy"))
         {
             const auto file_already_exists_policy = magic_enum::enum_cast<MergeTreePartExportManifest::FileAlreadyExistsPolicy>(json->getValue<String>("file_already_exists_policy"));
@@ -186,10 +187,7 @@ struct ExportReplicatedMergeTreePartitionManifest
             /// what to do if it's not a valid value?
         }
 
-        if (json->has("lock_inside_the_task"))
-        {
-            manifest.lock_inside_the_task = json->getValue<bool>("lock_inside_the_task");
-        }
+        manifest.lock_inside_the_task = json->getValue<bool>("lock_inside_the_task");
 
         return manifest;
     }

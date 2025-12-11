@@ -77,6 +77,7 @@ struct MergeTreePartExportManifest
     std::function<void(CompletionCallbackResult)> completion_callback;
 
     time_t create_time;
+    /// Required to cancel export tasks
     mutable std::shared_ptr<IExecutableTask> task = nullptr;
 
     bool operator<(const MergeTreePartExportManifest & rhs) const 
