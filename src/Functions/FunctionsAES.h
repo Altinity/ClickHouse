@@ -307,10 +307,12 @@ private:
         const bool can_reuse_context = (mode != CipherMode::RFC5116_AEAD_AES_GCM) && key_is_constant && (!iv_column || iv_is_constant);
         /// Reuse only key schedule even if IV changes per row (still cheaper than full init).
         const bool can_reuse_key_schedule = (mode != CipherMode::RFC5116_AEAD_AES_GCM) && key_is_constant;
+        /// GCM: reuse key schedule, still re-set IVLEN/IV per row.
+        const bool can_reuse_gcm_key = (mode == CipherMode::RFC5116_AEAD_AES_GCM) && key_is_constant;
 
         StringRef const_key_value{};
         StringRef const_iv_value{};
-        if (can_reuse_key_schedule)
+        if (can_reuse_key_schedule || can_reuse_gcm_key)
         {
             const_key_value = key_holder.setKey(key_size, key_column->getDataAt(0));
             if constexpr (mode != CipherMode::MySQLCompatibility)
@@ -328,10 +330,20 @@ private:
                 validateIV<mode>(const_iv_value, iv_size);
             }
 
-            if (EVP_EncryptInit_ex(evp_ctx, evp_cipher, nullptr,
-                    reinterpret_cast<const unsigned char*>(const_key_value.data),
-                    reinterpret_cast<const unsigned char*>(const_iv_value.data)) != 1)
-                onError("EVP_EncryptInit_ex");
+            if constexpr (mode == CipherMode::RFC5116_AEAD_AES_GCM)
+            {
+                if (EVP_EncryptInit_ex(evp_ctx, evp_cipher, nullptr,
+                        reinterpret_cast<const unsigned char*>(const_key_value.data),
+                        nullptr) != 1)
+                    onError("EVP_EncryptInit_ex");
+            }
+            else
+            {
+                if (EVP_EncryptInit_ex(evp_ctx, evp_cipher, nullptr,
+                        reinterpret_cast<const unsigned char*>(const_key_value.data),
+                        reinterpret_cast<const unsigned char*>(const_iv_value.data)) != 1)
+                    onError("EVP_EncryptInit_ex");
+            }
         }
 
         for (size_t row_idx = 0; row_idx < input_rows_count; ++row_idx)
@@ -346,6 +358,27 @@ private:
 
                 /// Reset context to the fresh state but keep the already prepared key schedule.
                 if (row_idx != 0 && EVP_EncryptInit_ex(evp_ctx, nullptr, nullptr, nullptr,
+                        reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
+                    onError("EVP_EncryptInit_ex");
+            }
+            else if (can_reuse_gcm_key)
+            {
+                key_value = const_key_value;
+                if (iv_column)
+                {
+                    iv_value = iv_column->getDataAt(row_idx);
+                    if (iv_value.size == 0)
+                        iv_value.data = nullptr;
+                }
+
+                if (iv_value.size == 0)
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid IV size {} != expected size {}", iv_value.size, iv_size);
+
+                if (EVP_CIPHER_CTX_ctrl(evp_ctx, EVP_CTRL_AEAD_SET_IVLEN, safe_cast<int>(iv_value.size), nullptr) != 1)
+                    onError("EVP_CIPHER_CTX_ctrl");
+
+                if (EVP_EncryptInit_ex(evp_ctx, nullptr, nullptr,
+                        nullptr,
                         reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
                     onError("EVP_EncryptInit_ex");
             }
@@ -397,32 +430,22 @@ private:
             // Avoid extra work on empty ciphertext/plaintext for some ciphers
             if (!(input_value.size == 0 && block_size == 1 && mode != CipherMode::RFC5116_AEAD_AES_GCM))
             {
-                if (!can_reuse_context && !can_reuse_key_schedule)
+                if (!can_reuse_context && !can_reuse_key_schedule && !can_reuse_gcm_key)
                 {
                     // 1: Init CTX
                     if constexpr (mode == CipherMode::RFC5116_AEAD_AES_GCM)
                     {
-                        // 1.a.1: Init CTX with custom IV length and optionally with AAD
-                        if (EVP_EncryptInit_ex(evp_ctx, evp_cipher, nullptr, nullptr, nullptr) != 1)
-                            onError("EVP_EncryptInit_ex");
+                    // 1.a.1: Init CTX with custom IV length
+                    if (EVP_EncryptInit_ex(evp_ctx, evp_cipher, nullptr, nullptr, nullptr) != 1)
+                        onError("EVP_EncryptInit_ex");
 
-                        if (EVP_CIPHER_CTX_ctrl(evp_ctx, EVP_CTRL_AEAD_SET_IVLEN, safe_cast<int>(iv_value.size), nullptr) != 1)
-                            onError("EVP_CIPHER_CTX_ctrl");
+                    if (EVP_CIPHER_CTX_ctrl(evp_ctx, EVP_CTRL_AEAD_SET_IVLEN, safe_cast<int>(iv_value.size), nullptr) != 1)
+                        onError("EVP_CIPHER_CTX_ctrl");
 
-                        if (EVP_EncryptInit_ex(evp_ctx, nullptr, nullptr,
-                                reinterpret_cast<const unsigned char*>(key_value.data),
-                                reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
-                            onError("EVP_EncryptInit_ex");
-
-                        // 1.a.2 Set AAD
-                        if (aad_column)
-                        {
-                            const auto aad_data = aad_column->getDataAt(row_idx);
-                            int tmp_len = 0;
-                            if (aad_data.size != 0 && EVP_EncryptUpdate(evp_ctx, nullptr, &tmp_len,
-                                    reinterpret_cast<const unsigned char *>(aad_data.data), safe_cast<int>(aad_data.size)) != 1)
-                                onError("EVP_EncryptUpdate");
-                        }
+                    if (EVP_EncryptInit_ex(evp_ctx, nullptr, nullptr,
+                            reinterpret_cast<const unsigned char*>(key_value.data),
+                            reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
+                        onError("EVP_EncryptInit_ex");
                     }
                     else
                     {
@@ -433,6 +456,18 @@ private:
                                 reinterpret_cast<const unsigned char*>(key_value.data),
                                 reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
                             onError("EVP_EncryptInit_ex");
+                    }
+                }
+
+                if constexpr (mode == CipherMode::RFC5116_AEAD_AES_GCM)
+                {
+                    if (aad_column)
+                    {
+                        const auto aad_data = aad_column->getDataAt(row_idx);
+                        int tmp_len = 0;
+                        if (aad_data.size != 0 && EVP_EncryptUpdate(evp_ctx, nullptr, &tmp_len,
+                                reinterpret_cast<const unsigned char *>(aad_data.data), safe_cast<int>(aad_data.size)) != 1)
+                            onError("EVP_EncryptUpdate");
                     }
                 }
 
@@ -656,10 +691,11 @@ private:
         const bool can_reuse_context = (mode != CipherMode::RFC5116_AEAD_AES_GCM) && key_is_constant && (!iv_column || iv_is_constant);
         /// Reuse only key schedule even if IV changes per row.
         const bool can_reuse_key_schedule = (mode != CipherMode::RFC5116_AEAD_AES_GCM) && key_is_constant;
+        const bool can_reuse_gcm_key = (mode == CipherMode::RFC5116_AEAD_AES_GCM) && key_is_constant;
 
         StringRef const_key_value{};
         StringRef const_iv_value{};
-        if (can_reuse_key_schedule)
+        if (can_reuse_key_schedule || can_reuse_gcm_key)
         {
             const_key_value = key_holder.setKey(key_size, key_column->getDataAt(0));
             if constexpr (mode != CipherMode::MySQLCompatibility)
@@ -679,10 +715,20 @@ private:
                 validateIV<mode>(const_iv_value, iv_size);
             }
 
-            if (EVP_DecryptInit_ex(evp_ctx, evp_cipher, nullptr,
-                    reinterpret_cast<const unsigned char*>(const_key_value.data),
-                    reinterpret_cast<const unsigned char*>(const_iv_value.data)) != 1)
-                onError("EVP_DecryptInit_ex");
+            if constexpr (mode == CipherMode::RFC5116_AEAD_AES_GCM)
+            {
+                if (EVP_DecryptInit_ex(evp_ctx, evp_cipher, nullptr,
+                        reinterpret_cast<const unsigned char*>(const_key_value.data),
+                        nullptr) != 1)
+                    onError("EVP_DecryptInit_ex");
+            }
+            else
+            {
+                if (EVP_DecryptInit_ex(evp_ctx, evp_cipher, nullptr,
+                        reinterpret_cast<const unsigned char*>(const_key_value.data),
+                        reinterpret_cast<const unsigned char*>(const_iv_value.data)) != 1)
+                    onError("EVP_DecryptInit_ex");
+            }
         }
 
         for (size_t row_idx = 0; row_idx < input_rows_count; ++row_idx)
@@ -698,6 +744,28 @@ private:
 
                 /// Reset context but keep already computed key schedule.
                 if (row_idx != 0 && EVP_DecryptInit_ex(evp_ctx, nullptr, nullptr, nullptr,
+                        reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
+                    onError("EVP_DecryptInit_ex");
+            }
+            else if (can_reuse_gcm_key)
+            {
+                key_value = const_key_value;
+                if (iv_column)
+                {
+                    iv_value = iv_column->getDataAt(row_idx);
+
+                    /// If the length is zero (empty string is passed) it should be treat as no IV.
+                    if (iv_value.size == 0)
+                        iv_value.data = nullptr;
+                }
+
+                if (iv_value.size == 0)
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid IV size {} != expected size {}", iv_value.size, iv_size);
+
+                if (EVP_CIPHER_CTX_ctrl(evp_ctx, EVP_CTRL_AEAD_SET_IVLEN, safe_cast<int>(iv_value.size), nullptr) != 1)
+                    onError("EVP_CIPHER_CTX_ctrl");
+
+                if (EVP_DecryptInit_ex(evp_ctx, nullptr, nullptr, nullptr,
                         reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
                     onError("EVP_DecryptInit_ex");
             }
@@ -767,7 +835,7 @@ private:
             /// This makes sense for default implementation for NULLs.
             if (input_value.size > 0)
             {
-                if (!can_reuse_context && !can_reuse_key_schedule)
+                if (!can_reuse_context && !can_reuse_key_schedule && !can_reuse_gcm_key)
                 {
                     // 1: Init CTX
                     if constexpr (mode == CipherMode::RFC5116_AEAD_AES_GCM)
@@ -784,16 +852,6 @@ private:
                                 reinterpret_cast<const unsigned char*>(key_value.data),
                                 reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
                             onError("EVP_DecryptInit_ex");
-
-                        // 1.a.2: Set AAD if present
-                        if (aad_column)
-                        {
-                            StringRef aad_data = aad_column->getDataAt(row_idx);
-                            int tmp_len = 0;
-                            if (aad_data.size != 0 && EVP_DecryptUpdate(evp_ctx, nullptr, &tmp_len,
-                                    reinterpret_cast<const unsigned char *>(aad_data.data), safe_cast<int>(aad_data.size)) != 1)
-                            onError("EVP_DecryptUpdate");
-                        }
                     }
                     else
                     {
@@ -808,6 +866,18 @@ private:
                 }
 
                 // 2: Feed the data to the cipher
+                if constexpr (mode == CipherMode::RFC5116_AEAD_AES_GCM)
+                {
+                    if (aad_column)
+                    {
+                        StringRef aad_data = aad_column->getDataAt(row_idx);
+                        int tmp_len = 0;
+                        if (aad_data.size != 0 && EVP_DecryptUpdate(evp_ctx, nullptr, &tmp_len,
+                                reinterpret_cast<const unsigned char *>(aad_data.data), safe_cast<int>(aad_data.size)) != 1)
+                        onError("EVP_DecryptUpdate");
+                    }
+                }
+
                 int output_len = 0;
                 if (EVP_DecryptUpdate(evp_ctx,
                         reinterpret_cast<unsigned char*>(decrypted), &output_len,
