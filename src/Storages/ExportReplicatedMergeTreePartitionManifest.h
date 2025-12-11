@@ -162,22 +162,14 @@ struct ExportReplicatedMergeTreePartitionManifest
         manifest.max_threads = json->getValue<size_t>("max_threads");
         manifest.parallel_formatting = json->getValue<bool>("parallel_formatting");
         manifest.parquet_parallel_encoding = json->getValue<bool>("parquet_parallel_encoding");
-
-        if (json->has("file_already_exists_policy"))
+        const auto file_already_exists_policy = magic_enum::enum_cast<MergeTreePartExportManifest::FileAlreadyExistsPolicy>(json->getValue<String>("file_already_exists_policy"));
+        /// todo what to do if it's not a valid value?
+        if (file_already_exists_policy)
         {
-            const auto file_already_exists_policy = magic_enum::enum_cast<MergeTreePartExportManifest::FileAlreadyExistsPolicy>(json->getValue<String>("file_already_exists_policy"));
-            if (file_already_exists_policy)
-            {
-                manifest.file_already_exists_policy = file_already_exists_policy.value();
-            }
-
-            /// what to do if it's not a valid value?
+            manifest.file_already_exists_policy = file_already_exists_policy.value();
         }
 
-        if (json->has("lock_inside_the_task"))
-        {
-            manifest.lock_inside_the_task = json->getValue<bool>("lock_inside_the_task");
-        }
+        manifest.lock_inside_the_task = json->getValue<bool>("lock_inside_the_task");
 
         return manifest;
     }
