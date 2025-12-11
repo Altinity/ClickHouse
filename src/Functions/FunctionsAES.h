@@ -275,6 +275,17 @@ private:
         const auto block_size = static_cast<size_t>(EVP_CIPHER_block_size(evp_cipher));
         const auto key_size = static_cast<size_t>(EVP_CIPHER_key_length(evp_cipher));
         [[maybe_unused]] const auto iv_size = static_cast<size_t>(EVP_CIPHER_iv_length(evp_cipher));
+        std::string zero_iv_buffer;
+        auto getIVPtr = [&](const StringRef & iv_value) -> const unsigned char *
+        {
+            if (iv_size > 0 && iv_value.size == 0)
+            {
+                if (zero_iv_buffer.size() != iv_size)
+                    zero_iv_buffer.assign(iv_size, '\0');
+                return reinterpret_cast<const unsigned char *>(zero_iv_buffer.data());
+            }
+            return reinterpret_cast<const unsigned char *>(iv_value.data);
+        };
         const auto tag_size = 16; // https://tools.ietf.org/html/rfc5116#section-5.1
 
         auto encrypted_result_column = ColumnString::create();
@@ -341,7 +352,7 @@ private:
             {
                 if (EVP_EncryptInit_ex(evp_ctx, evp_cipher, nullptr,
                         reinterpret_cast<const unsigned char*>(const_key_value.data),
-                        reinterpret_cast<const unsigned char*>(const_iv_value.data)) != 1)
+                        getIVPtr(const_iv_value)) != 1)
                     onError("EVP_EncryptInit_ex");
             }
         }
@@ -358,7 +369,7 @@ private:
 
                 /// Reset context to the fresh state but keep the already prepared key schedule.
                 if (row_idx != 0 && EVP_EncryptInit_ex(evp_ctx, nullptr, nullptr, nullptr,
-                        reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
+                        getIVPtr(iv_value)) != 1)
                     onError("EVP_EncryptInit_ex");
             }
             else if (can_reuse_gcm_key)
@@ -395,7 +406,7 @@ private:
                 validateIV<mode>(iv_value, iv_size);
 
                 if (EVP_EncryptInit_ex(evp_ctx, nullptr, nullptr, nullptr,
-                        reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
+                        getIVPtr(iv_value)) != 1)
                     onError("EVP_EncryptInit_ex");
             }
             else
@@ -435,17 +446,17 @@ private:
                     // 1: Init CTX
                     if constexpr (mode == CipherMode::RFC5116_AEAD_AES_GCM)
                     {
-                    // 1.a.1: Init CTX with custom IV length
-                    if (EVP_EncryptInit_ex(evp_ctx, evp_cipher, nullptr, nullptr, nullptr) != 1)
-                        onError("EVP_EncryptInit_ex");
+                        // 1.a.1: Init CTX with custom IV length
+                        if (EVP_EncryptInit_ex(evp_ctx, evp_cipher, nullptr, nullptr, nullptr) != 1)
+                            onError("EVP_EncryptInit_ex");
 
-                    if (EVP_CIPHER_CTX_ctrl(evp_ctx, EVP_CTRL_AEAD_SET_IVLEN, safe_cast<int>(iv_value.size), nullptr) != 1)
-                        onError("EVP_CIPHER_CTX_ctrl");
+                        if (EVP_CIPHER_CTX_ctrl(evp_ctx, EVP_CTRL_AEAD_SET_IVLEN, safe_cast<int>(iv_value.size), nullptr) != 1)
+                            onError("EVP_CIPHER_CTX_ctrl");
 
-                    if (EVP_EncryptInit_ex(evp_ctx, nullptr, nullptr,
-                            reinterpret_cast<const unsigned char*>(key_value.data),
-                            reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
-                        onError("EVP_EncryptInit_ex");
+                        if (EVP_EncryptInit_ex(evp_ctx, nullptr, nullptr,
+                                reinterpret_cast<const unsigned char*>(key_value.data),
+                                getIVPtr(iv_value)) != 1)
+                            onError("EVP_EncryptInit_ex");
                     }
                     else
                     {
@@ -454,7 +465,7 @@ private:
 
                         if (EVP_EncryptInit_ex(evp_ctx, evp_cipher, nullptr,
                                 reinterpret_cast<const unsigned char*>(key_value.data),
-                                reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
+                                getIVPtr(iv_value)) != 1)
                             onError("EVP_EncryptInit_ex");
                     }
                 }
@@ -651,6 +662,17 @@ private:
 
         [[maybe_unused]] const auto block_size = static_cast<size_t>(EVP_CIPHER_block_size(evp_cipher));
         [[maybe_unused]] const auto iv_size = static_cast<size_t>(EVP_CIPHER_iv_length(evp_cipher));
+        std::string zero_iv_buffer;
+        auto getIVPtr = [&](const StringRef & iv_value) -> const unsigned char *
+        {
+            if (iv_size > 0 && iv_value.size == 0)
+            {
+                if (zero_iv_buffer.size() != iv_size)
+                    zero_iv_buffer.assign(iv_size, '\0');
+                return reinterpret_cast<const unsigned char *>(zero_iv_buffer.data());
+            }
+            return reinterpret_cast<const unsigned char *>(iv_value.data);
+        };
 
         const size_t key_size = static_cast<size_t>(EVP_CIPHER_key_length(evp_cipher));
         static constexpr size_t tag_size = 16; // https://tools.ietf.org/html/rfc5116#section-5.1
@@ -726,7 +748,7 @@ private:
             {
                 if (EVP_DecryptInit_ex(evp_ctx, evp_cipher, nullptr,
                         reinterpret_cast<const unsigned char*>(const_key_value.data),
-                        reinterpret_cast<const unsigned char*>(const_iv_value.data)) != 1)
+                        getIVPtr(const_iv_value)) != 1)
                     onError("EVP_DecryptInit_ex");
             }
         }
@@ -744,7 +766,7 @@ private:
 
                 /// Reset context but keep already computed key schedule.
                 if (row_idx != 0 && EVP_DecryptInit_ex(evp_ctx, nullptr, nullptr, nullptr,
-                        reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
+                        getIVPtr(iv_value)) != 1)
                     onError("EVP_DecryptInit_ex");
             }
             else if (can_reuse_gcm_key)
@@ -766,7 +788,7 @@ private:
                     onError("EVP_CIPHER_CTX_ctrl");
 
                 if (EVP_DecryptInit_ex(evp_ctx, nullptr, nullptr, nullptr,
-                        reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
+                        getIVPtr(iv_value)) != 1)
                     onError("EVP_DecryptInit_ex");
             }
             else if (can_reuse_key_schedule)
@@ -784,7 +806,7 @@ private:
                 validateIV<mode>(iv_value, iv_size);
 
                 if (EVP_DecryptInit_ex(evp_ctx, nullptr, nullptr, nullptr,
-                        reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
+                        getIVPtr(iv_value)) != 1)
                     onError("EVP_DecryptInit_ex");
             }
             else
@@ -850,7 +872,7 @@ private:
                         // 1.a.1 : Init CTX with key and IV
                         if (EVP_DecryptInit_ex(evp_ctx, nullptr, nullptr,
                                 reinterpret_cast<const unsigned char*>(key_value.data),
-                                reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
+                                getIVPtr(iv_value)) != 1)
                             onError("EVP_DecryptInit_ex");
                     }
                     else
@@ -860,7 +882,7 @@ private:
 
                         if (EVP_DecryptInit_ex(evp_ctx, evp_cipher, nullptr,
                                 reinterpret_cast<const unsigned char*>(key_value.data),
-                                reinterpret_cast<const unsigned char*>(iv_value.data)) != 1)
+                                getIVPtr(iv_value)) != 1)
                             onError("EVP_DecryptInit_ex");
                     }
                 }
