@@ -24,6 +24,8 @@ public:
 
     std::vector<ReplicatedPartitionExportInfo> getPartitionExportsInfo() const;
 
+    std::vector<ReplicatedPartitionExportInfo> getPartitionExportsInfoLocal() const;
+
 private:
     StorageReplicatedMergeTree & storage;
 

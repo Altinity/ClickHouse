@@ -215,13 +215,16 @@ def test_restart_nodes_during_export(cluster):
     assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2021") != f'0\n', "Export of partition 2021 did not resume after crash"
 
 
-def test_kill_export(cluster):
+@pytest.mark.parametrize(
+    "system_table_prefer_remote_information", ['0', '1']
+)
+def test_kill_export(cluster, system_table_prefer_remote_information):
     node = cluster.instances["replica1"]
     node2 = cluster.instances["replica2"]
     watcher_node = cluster.instances["watcher_node"]
 
-    mt_table = "kill_export_mt_table"
-    s3_table = "kill_export_s3_table"
+    mt_table = f"kill_export_mt_table_{system_table_prefer_remote_information}"
+    s3_table = f"kill_export_s3_table_{system_table_prefer_remote_information}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
     create_tables_and_insert_data(node2, mt_table, s3_table, "replica2")
@@ -298,8 +301,8 @@ def test_kill_export(cluster):
     assert node.query(f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/commit_2021_*', format=LineAsString)") != f'0\n', "Partition 2021 was not written to S3, but it should have been"
 
     # check system.replicated_partition_exports for the export, status should be KILLED
-    assert node.query(f"SELECT status FROM system.replicated_partition_exports WHERE partition_id = '2020' and source_table = '{mt_table}' and destination_table = '{s3_table}'") == 'KILLED\n', "Partition 2020 was not killed as expected"
-    assert node.query(f"SELECT status FROM system.replicated_partition_exports WHERE partition_id = '2021' and source_table = '{mt_table}' and destination_table = '{s3_table}'") == 'COMPLETED\n', "Partition 2021 was not completed, this is unexpected"
+    assert node.query(f"SELECT status FROM system.replicated_partition_exports WHERE partition_id = '2020' and source_table = '{mt_table}' and destination_table = '{s3_table}' SETTINGS export_merge_tree_partition_system_table_prefer_remote_information = {system_table_prefer_remote_information}") == 'KILLED\n', "Partition 2020 was not killed as expected"
+    assert node.query(f"SELECT status FROM system.replicated_partition_exports WHERE partition_id = '2021' and source_table = '{mt_table}' and destination_table = '{s3_table}' SETTINGS export_merge_tree_partition_system_table_prefer_remote_information = {system_table_prefer_remote_information}") == 'COMPLETED\n', "Partition 2021 was not completed, this is unexpected"
 
     # check the data did not land on s3
     assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == '0\n', "Partition 2020 was written to S3, it was not killed as expected"
@@ -446,6 +449,7 @@ def test_failure_is_logged_in_system_table(cluster):
         WHERE source_table = '{mt_table}'
           AND destination_table = '{s3_table}'
           AND partition_id = '2020'
+          SETTINGS export_merge_tree_partition_system_table_prefer_remote_information = 1
         """
     )
 
@@ -457,6 +461,7 @@ def test_failure_is_logged_in_system_table(cluster):
         WHERE source_table = '{mt_table}'
           AND destination_table = '{s3_table}'
           AND partition_id = '2020'
+          SETTINGS export_merge_tree_partition_system_table_prefer_remote_information = 1
         """
     )
     assert int(exception_count.strip()) > 0, "Expected non-zero exception_count in system.replicated_partition_exports"

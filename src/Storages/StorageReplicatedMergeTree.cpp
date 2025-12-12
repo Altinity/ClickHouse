@@ -4468,9 +4468,14 @@ void StorageReplicatedMergeTree::exportMergeTreePartitionStatusHandlingTask()
     }
 }
 
-std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartitionExportsInfo() const
+std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartitionExportsInfo(bool prefer_remote_information) const
 {
-    return export_merge_tree_partition_manifest_updater->getPartitionExportsInfo();
+    if (prefer_remote_information && getZooKeeper()->isFeatureEnabled(DB::KeeperFeatureFlag::MULTI_READ))
+    {
+        return export_merge_tree_partition_manifest_updater->getPartitionExportsInfo();
+    }
+
+    return export_merge_tree_partition_manifest_updater->getPartitionExportsInfoLocal();
 }
 
 StorageReplicatedMergeTree::CreateMergeEntryResult StorageReplicatedMergeTree::createLogEntryToMergeParts(
