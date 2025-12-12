@@ -101,11 +101,6 @@ std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::
     std::vector<ReplicatedPartitionExportInfo> infos;
     const auto zk = storage.getZooKeeper();
 
-    if (!zk->isFeatureEnabled(DB::KeeperFeatureFlag::MULTI_READ))
-    {
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "MULTI_READ feature flag is not enabled");
-    }
-
     const auto exports_path = fs::path(storage.zookeeper_path) / "exports";
 
     ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
@@ -433,6 +428,33 @@ std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::
         info.last_exception = last_exception;
         info.exception_part = exception_part;
         info.exception_count = exception_count;
+        infos.emplace_back(std::move(info));
+    }
+
+    return infos;
+}
+
+std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::getPartitionExportsInfoLocal() const
+{
+    std::lock_guard lock(storage.export_merge_tree_partition_mutex);
+
+    std::vector<ReplicatedPartitionExportInfo> infos;
+
+    for (const auto & entry : storage.export_merge_tree_partition_task_entries_by_key)
+    {
+        ReplicatedPartitionExportInfo info;
+
+        info.destination_database = entry.manifest.destination_database;
+        info.destination_table = entry.manifest.destination_table;
+        info.partition_id = entry.manifest.partition_id;
+        info.transaction_id = entry.manifest.transaction_id;
+        info.create_time = entry.manifest.create_time;
+        info.source_replica = entry.manifest.source_replica;
+        info.parts_count = entry.manifest.number_of_parts;
+        info.parts_to_do = entry.manifest.parts.size();
+        info.parts = entry.manifest.parts;
+        info.status = magic_enum::enum_name(entry.status);
+
         infos.emplace_back(std::move(info));
     }
 
