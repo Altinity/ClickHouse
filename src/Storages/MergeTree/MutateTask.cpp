@@ -120,6 +120,11 @@ static void splitAndModifyMutationCommands(
     {
         NameSet mutated_columns;
         NameSet dropped_columns;
+<<<<<<< HEAD
+=======
+        NameSet ignored_columns;
+        NameSet extra_columns_for_indices_and_projections;
+>>>>>>> 1a6de6f7d4f5 (Merge pull request #91980 from ClickHouse/fix_bug_with_ttl)
 
         for (const auto & command : commands)
         {
@@ -145,6 +150,52 @@ static void splitAndModifyMutationCommands(
                 for_interpreter.push_back(command);
                 for (const auto & [column_name, expr] : command.column_to_update_expression)
                     mutated_columns.emplace(column_name);
+<<<<<<< HEAD
+=======
+
+                if (command.type == MutationCommand::Type::MATERIALIZE_TTL && suitable_for_ttl_optimization)
+                {
+                    for (const auto & col : part_columns)
+                    {
+                        if (!mutated_columns.contains(col.name))
+                            ignored_columns.emplace(col.name);
+                    }
+                }
+                if (command.type == MutationCommand::Type::MATERIALIZE_INDEX)
+                {
+                    const auto & all_indices = metadata_snapshot->getSecondaryIndices();
+                    for (const auto & index : all_indices)
+                    {
+                        if (index.name == command.index_name)
+                        {
+                            auto required_columns = index.expression->getRequiredColumns();
+                            for (const auto & column : required_columns)
+                            {
+                                if (!part_columns.has(column))
+                                    extra_columns_for_indices_and_projections.insert(column);
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                if (command.type == MutationCommand::Type::MATERIALIZE_PROJECTION)
+                {
+                    const auto & all_projections = metadata_snapshot->getProjections();
+                    for (const auto & projection : all_projections)
+                    {
+                        if (projection.name == command.projection_name)
+                        {
+                            for (const auto & column : projection.required_columns)
+                            {
+                                if (!part_columns.has(column))
+                                    extra_columns_for_indices_and_projections.insert(column);
+                            }
+                            break;
+                        }
+                    }
+                }
+>>>>>>> 1a6de6f7d4f5 (Merge pull request #91980 from ClickHouse/fix_bug_with_ttl)
             }
             else if (command.type == MutationCommand::Type::DROP_INDEX
                      || command.type == MutationCommand::Type::DROP_PROJECTION
@@ -251,6 +302,27 @@ static void splitAndModifyMutationCommands(
                      .column_name = column.name,
                 });
             }
+        }
+        for (const auto & column_name : extra_columns_for_indices_and_projections)
+        {
+            if (mutated_columns.contains(column_name))
+                continue;
+
+            if (column_name == "_part_offset")
+                continue;
+
+            auto data_type = metadata_snapshot->getColumns().getColumn(
+                GetColumnsOptions::AllPhysical,
+                column_name).type;
+
+            for_interpreter.push_back(
+                MutationCommand
+                {
+                    .type = MutationCommand::Type::READ_COLUMN,
+                    .column_name = column_name,
+                    .data_type = std::move(data_type),
+                }
+            );
         }
     }
     else
@@ -1529,7 +1601,8 @@ private:
                 renamed_stats[STATS_FILE_PREFIX + command.column_name + STATS_FILE_SUFFIX] = STATS_FILE_PREFIX + command.rename_to + STATS_FILE_SUFFIX;
         }
 
-        bool is_full_part_storage = isFullPartStorage(ctx->new_data_part->getDataPartStorage());
+        bool is_full_part_storage = isFullPartStorage(ctx->source_part->getDataPartStorage());
+        bool is_full_wide_part = is_full_part_storage && isWidePart(ctx->new_data_part);
         const auto & indices = ctx->metadata_snapshot->getSecondaryIndices();
 
         MergeTreeIndices skip_indices;
@@ -1538,9 +1611,18 @@ private:
             if (removed_indices.contains(idx.name))
                 continue;
 
+<<<<<<< HEAD
+=======
+            if (ctx->indices_to_drop_names.contains(idx.name))
+                continue;
+
+            /// For packed part we need to recalculate all indices because they are stored inside packed parts format
+            /// For compact parts we need to recalculate indices because rewrite of compact part may produce a little bit different data part
+            /// with different number of marks.
+>>>>>>> 1a6de6f7d4f5 (Merge pull request #91980 from ClickHouse/fix_bug_with_ttl)
             bool need_recalculate =
                 ctx->materialized_indices.contains(idx.name)
-                || (!is_full_part_storage && ctx->source_part->hasSecondaryIndex(idx.name));
+                || (!is_full_wide_part && ctx->source_part->hasSecondaryIndex(idx.name));
 
             if (need_recalculate)
             {
