@@ -14,6 +14,7 @@
 #include <Common/Exception.h>
 #include <Common/ProfileEventsScope.h>
 #include <Storages/MergeTree/ExportList.h>
+#include <Formats/FormatFactory.h>
 
 namespace ProfileEvents
 {
