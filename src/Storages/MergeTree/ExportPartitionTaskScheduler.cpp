@@ -28,6 +28,8 @@ namespace
         context_copy->setSetting("output_format_parquet_parallel_encoding", manifest.parquet_parallel_encoding);
         context_copy->setSetting("max_threads", manifest.max_threads);
         context_copy->setSetting("export_merge_tree_part_file_already_exists_policy", String(magic_enum::enum_name(manifest.file_already_exists_policy)));
+        context_copy->setSetting("export_merge_tree_part_max_bytes_per_file", manifest.max_bytes_per_file);
+        context_copy->setSetting("export_merge_tree_part_max_rows_per_file", manifest.max_rows_per_file);
         return context_copy;
     }
 }

@@ -112,6 +112,8 @@ struct ExportReplicatedMergeTreePartitionManifest
     size_t max_threads;
     bool parallel_formatting;
     bool parquet_parallel_encoding;
+    size_t max_bytes_per_file;
+    size_t max_rows_per_file;
     MergeTreePartExportManifest::FileAlreadyExistsPolicy file_already_exists_policy;
 
     std::string toJsonString() const
@@ -131,6 +133,8 @@ struct ExportReplicatedMergeTreePartitionManifest
         json.set("parallel_formatting", parallel_formatting);
         json.set("max_threads", max_threads);
         json.set("parquet_parallel_encoding", parquet_parallel_encoding);
+        json.set("max_bytes_per_file", max_bytes_per_file);
+        json.set("max_rows_per_file", max_rows_per_file);
         json.set("file_already_exists_policy", String(magic_enum::enum_name(file_already_exists_policy)));
         json.set("create_time", create_time);
         json.set("max_retries", max_retries);
@@ -164,7 +168,8 @@ struct ExportReplicatedMergeTreePartitionManifest
         manifest.max_threads = json->getValue<size_t>("max_threads");
         manifest.parallel_formatting = json->getValue<bool>("parallel_formatting");
         manifest.parquet_parallel_encoding = json->getValue<bool>("parquet_parallel_encoding");
-
+        manifest.max_bytes_per_file = json->getValue<size_t>("max_bytes_per_file");
+        manifest.max_rows_per_file = json->getValue<size_t>("max_rows_per_file");
         if (json->has("file_already_exists_policy"))
         {
             const auto file_already_exists_policy = magic_enum::enum_cast<MergeTreePartExportManifest::FileAlreadyExistsPolicy>(json->getValue<String>("file_already_exists_policy"));
