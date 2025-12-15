@@ -5,6 +5,7 @@
 #include <Storages/StorageSnapshot.h>
 #include <QueryPipeline/QueryPipeline.h>
 #include <optional>
+#include <Core/Settings.h>
 
 namespace DB
 {
@@ -46,14 +47,14 @@ struct MergeTreePartExportManifest
         const DataPartPtr & data_part_,
         const String & transaction_id_,
         FileAlreadyExistsPolicy file_already_exists_policy_,
-        const FormatSettings & format_settings_,
+        const Settings & settings_,
         const StorageMetadataPtr & metadata_snapshot_,
         std::function<void(CompletionCallbackResult)> completion_callback_ = {})
         : destination_storage_id(destination_storage_id_),
           data_part(data_part_),
           transaction_id(transaction_id_),
           file_already_exists_policy(file_already_exists_policy_),
-          format_settings(format_settings_),
+          settings(settings_),
           metadata_snapshot(metadata_snapshot_),
           completion_callback(completion_callback_),
           create_time(time(nullptr)) {}
@@ -63,7 +64,7 @@ struct MergeTreePartExportManifest
     /// Used for killing the export.
     String transaction_id;
     FileAlreadyExistsPolicy file_already_exists_policy;
-    FormatSettings format_settings;
+    Settings settings;
 
     /// Metadata snapshot captured at the time of query validation to prevent race conditions with mutations
     /// Otherwise the export could fail if the schema changes between validation and execution

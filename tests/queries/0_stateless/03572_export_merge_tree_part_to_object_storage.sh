@@ -15,6 +15,9 @@ s3_table="s3_table_${RANDOM}"
 s3_table_wildcard="s3_table_wildcard_${RANDOM}"
 s3_table_wildcard_partition_expression_with_function="s3_table_wildcard_partition_expression_with_function_${RANDOM}"
 mt_table_roundtrip="mt_table_roundtrip_${RANDOM}"
+big_table="big_table_${RANDOM}"
+big_destination_max_bytes="big_destination_max_bytes_${RANDOM}"
+big_destination_max_rows="big_destination_max_rows_${RANDOM}"
 
 query() {
     $CLICKHOUSE_CLIENT --query "$1"
@@ -73,4 +76,42 @@ sleep 1
 echo "---- Both data parts should appear"
 query "SELECT * FROM s3(s3_conn, filename='$s3_table_wildcard_partition_expression_with_function/**.parquet') ORDER BY id"
 
-query "DROP TABLE IF EXISTS $mt_table, $s3_table, $mt_table_roundtrip, $s3_table_wildcard, $s3_table_wildcard_partition_expression_with_function, $mt_table_partition_expression_with_function"
+echo "---- Test max_bytes per file"
+
+query "CREATE TABLE $big_table (id UInt64, data String, year UInt16) Engine=MergeTree() order by id partition by year"
+
+query "CREATE TABLE $big_destination_max_bytes(id UInt64, data String, year UInt16) engine=S3(s3_conn, filename='$big_destination_max_bytes', partition_strategy='hive', format=Parquet) partition by year"
+
+# we need to set min_insert_block_size_rows = 10485760, min_insert_block_size_bytes = 0 to make sure a single part is generated
+query "INSERT INTO $big_table SELECT number + 10_485_760_0 AS id, repeat('x', 1000) AS data, 2025 AS year FROM numbers(10_485_760) SETTINGS min_insert_block_size_rows = 10485760, min_insert_block_size_bytes = 0, max_insert_threads=1"
+
+# this should generate ~4 files
+query "ALTER TABLE $big_table EXPORT PART '2025_1_1_0' TO TABLE $big_destination_max_bytes SETTINGS allow_experimental_export_merge_tree_part = 1, export_merge_tree_part_max_bytes_per_file=10000000, output_format_parquet_row_group_size_bytes=5000000"
+
+# sleeping a little longer because it will write multiple files
+sleep 20
+
+echo "---- Count files in big_destination_max_bytes, should be 5 (4 parquet, 1 commit)"
+query "SELECT count(_file) FROM s3(s3_conn, filename='$big_destination_max_bytes/**', format='One')"
+
+echo "---- Count rows in big_table and big_destination_max_bytes"
+query "SELECT COUNT() from $big_table"
+query "SELECT COUNT() from $big_destination_max_bytes"
+
+query "CREATE TABLE $big_destination_max_rows(id UInt64, data String, year UInt16) engine=S3(s3_conn, filename='$big_destination_max_rows', partition_strategy='hive', format=Parquet) partition by year"
+
+echo "---- Test max_rows per file"
+# export_merge_tree_part_max_rows_per_file = 2621440 is select count()/4 from big_table
+query "ALTER TABLE $big_table EXPORT PART '2025_1_1_0' TO TABLE $big_destination_max_rows SETTINGS allow_experimental_export_merge_tree_part = 1, export_merge_tree_part_max_rows_per_file=2621440"
+
+# sleeping a little longer because it will write multiple files
+sleep 20
+
+echo "---- Count files in big_destination_max_rows, should be 5 (4 parquet, 1 commit)"
+query "SELECT count(_file) FROM s3(s3_conn, filename='$big_destination_max_rows/**', format='One')"
+
+echo "---- Count rows in big_table and big_destination_max_rows"
+query "SELECT COUNT() from $big_table"
+query "SELECT COUNT() from $big_destination_max_rows"
+
+query "DROP TABLE IF EXISTS $mt_table, $s3_table, $mt_table_roundtrip, $s3_table_wildcard, $s3_table_wildcard_partition_expression_with_function, $mt_table_partition_expression_with_function, $big_table, $big_destination_max_bytes, $big_destination_max_rows"
