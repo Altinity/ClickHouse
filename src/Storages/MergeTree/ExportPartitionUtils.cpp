@@ -55,7 +55,10 @@ namespace ExportPartitionUtils
 
             const auto processed_part_entry = ExportReplicatedMergeTreePartitionProcessedPartEntry::fromJsonString(responses[i].data);
 
-            exported_paths.emplace_back(processed_part_entry.path_in_destination);
+            for (const auto & path_in_destination : processed_part_entry.paths_in_destination)
+            {
+                exported_paths.emplace_back(path_in_destination);
+            }
         }
 
         return exported_paths;

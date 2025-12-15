@@ -23,22 +23,22 @@ struct MergeTreePartExportManifest
     struct CompletionCallbackResult
     {
     private:
-        CompletionCallbackResult(bool success_, const String & relative_path_in_destination_storage_, std::optional<Exception> exception_)
-            : success(success_), relative_path_in_destination_storage(relative_path_in_destination_storage_), exception(std::move(exception_)) {}
+        CompletionCallbackResult(bool success_, const std::vector<String> & relative_paths_in_destination_storage_, std::optional<Exception> exception_)
+            : success(success_), relative_paths_in_destination_storage(relative_paths_in_destination_storage_), exception(std::move(exception_)) {}
     public:
 
-        static CompletionCallbackResult createSuccess(const String & relative_path_in_destination_storage_)
+        static CompletionCallbackResult createSuccess(const std::vector<String> & relative_paths_in_destination_storage_)
         {
-            return CompletionCallbackResult(true, relative_path_in_destination_storage_, std::nullopt);
+            return CompletionCallbackResult(true, relative_paths_in_destination_storage_, std::nullopt);
         }
 
         static CompletionCallbackResult createFailure(Exception exception_)
         {
-            return CompletionCallbackResult(false, "", std::move(exception_));
+            return CompletionCallbackResult(false, {}, std::move(exception_));
         }
 
         bool success = false;
-        String relative_path_in_destination_storage;
+        std::vector<String> relative_paths_in_destination_storage;
         std::optional<Exception> exception;
     };
 

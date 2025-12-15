@@ -196,7 +196,7 @@ bool ExportPartTask::executeStep()
         ProfileEvents::increment(ProfileEvents::PartsExportTotalMilliseconds, (*exports_list_entry)->watch.elapsedMilliseconds());
 
         if (manifest.completion_callback)
-            manifest.completion_callback(MergeTreePartExportManifest::CompletionCallbackResult::createSuccess((*exports_list_entry)->destination_file_paths.front()));
+            manifest.completion_callback(MergeTreePartExportManifest::CompletionCallbackResult::createSuccess((*exports_list_entry)->destination_file_paths));
     }
     catch (const Exception & e)
     {
@@ -226,12 +226,7 @@ bool ExportPartTask::executeStep()
 
                 if (manifest.completion_callback)
                 {
-                    if ((*exports_list_entry)->destination_file_paths.empty())
-                    {
-                        throw Exception(ErrorCodes::LOGICAL_ERROR, "No destination file paths found for part {}", manifest.data_part->name);
-                    }
-
-                    manifest.completion_callback(MergeTreePartExportManifest::CompletionCallbackResult::createSuccess((*exports_list_entry)->destination_file_paths.front()));
+                    manifest.completion_callback(MergeTreePartExportManifest::CompletionCallbackResult::createSuccess((*exports_list_entry)->destination_file_paths));
                 }
                     
                 return false;

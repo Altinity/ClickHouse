@@ -62,14 +62,14 @@ struct ExportReplicatedMergeTreePartitionProcessingPartEntry
 struct ExportReplicatedMergeTreePartitionProcessedPartEntry
 {
     String part_name;
-    String path_in_destination;
+    std::vector<String> paths_in_destination;
     String finished_by;
 
     std::string toJsonString() const
     {
         Poco::JSON::Object json;
         json.set("part_name", part_name);
-        json.set("path_in_destination", path_in_destination);
+        json.set("paths_in_destination", paths_in_destination);
         json.set("finished_by", finished_by);
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
@@ -86,7 +86,11 @@ struct ExportReplicatedMergeTreePartitionProcessedPartEntry
         ExportReplicatedMergeTreePartitionProcessedPartEntry entry;
 
         entry.part_name = json->getValue<String>("part_name");
-        entry.path_in_destination = json->getValue<String>("path_in_destination");
+
+        const auto paths_in_destination_array = json->getArray("paths_in_destination");
+        for (size_t i = 0; i < paths_in_destination_array->size(); ++i)
+            entry.paths_in_destination.emplace_back(paths_in_destination_array->getElement<String>(static_cast<unsigned int>(i)));
+
         entry.finished_by = json->getValue<String>("finished_by");
 
         return entry;
