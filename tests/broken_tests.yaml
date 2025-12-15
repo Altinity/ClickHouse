@@ -57,6 +57,24 @@
   message: result differs with reference
   check_types:
   - msan
+- name: 02313_filesystem_cache_seeks
+  reason: fails when azure storage is not set up
+  message: 'DB::Exception: Unknown storage policy `azure_cache`'
+- name: 02286_drop_filesystem_cache
+  reason: fails when azure storage is not set up
+  message: 'DB::Exception: Unknown storage policy `azure_cache`'
+- name: 02242_system_filesystem_cache_log_table
+  reason: fails when azure storage is not set up
+  message: 'DB::Exception: Unknown storage policy `azure_cache`'
+- name: 02241_filesystem_cache_on_write_operations
+  reason: fails when azure storage is not set up
+  message: 'DB::Exception: Unknown storage policy `azure_cache`'
+- name: 02240_system_filesystem_cache_table
+  reason: fails when azure storage is not set up
+  message: 'DB::Exception: Unknown storage policy `azure_cache`'
+- name: 02226_filesystem_cache_profile_events
+  reason: fails when azure storage is not set up
+  message: 'DB::Exception: Unknown storage policy `azure_cache`'
 - name: 00024_random_counters
   reason: INVESTIGATE - random timeout
   message: Timeout! Killing process group
