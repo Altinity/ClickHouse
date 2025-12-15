@@ -182,7 +182,7 @@ bool ExportPartTask::executeStep()
         storage.writePartLog(
             PartLogElement::Type::EXPORT_PART,
             {},
-            static_cast<UInt64>((*exports_list_entry)->elapsed * 1000000000),
+            (*exports_list_entry)->watch.elapsed(),
             manifest.data_part->name,
             manifest.data_part,
             {manifest.data_part},
@@ -193,7 +193,7 @@ bool ExportPartTask::executeStep()
         storage.export_manifests.erase(manifest);
 
         ProfileEvents::increment(ProfileEvents::PartsExports);
-        ProfileEvents::increment(ProfileEvents::PartsExportTotalMilliseconds, static_cast<UInt64>((*exports_list_entry)->elapsed * 1000));
+        ProfileEvents::increment(ProfileEvents::PartsExportTotalMilliseconds, (*exports_list_entry)->watch.elapsedMilliseconds());
 
         if (manifest.completion_callback)
             manifest.completion_callback(MergeTreePartExportManifest::CompletionCallbackResult::createSuccess((*exports_list_entry)->destination_file_paths.front()));
@@ -210,7 +210,7 @@ bool ExportPartTask::executeStep()
                 storage.writePartLog(
                     PartLogElement::Type::EXPORT_PART,
                     {},
-                    static_cast<UInt64>((*exports_list_entry)->elapsed * 1000000000),
+                    (*exports_list_entry)->watch.elapsed(),
                     manifest.data_part->name,
                     manifest.data_part,
                     {manifest.data_part},
@@ -222,7 +222,7 @@ bool ExportPartTask::executeStep()
                 storage.export_manifests.erase(manifest);
 
                 ProfileEvents::increment(ProfileEvents::PartsExports);
-                ProfileEvents::increment(ProfileEvents::PartsExportTotalMilliseconds, static_cast<UInt64>((*exports_list_entry)->elapsed * 1000));
+                ProfileEvents::increment(ProfileEvents::PartsExportTotalMilliseconds, (*exports_list_entry)->watch.elapsedMilliseconds());
 
                 if (manifest.completion_callback)
                 {
@@ -243,7 +243,7 @@ bool ExportPartTask::executeStep()
         storage.writePartLog(
             PartLogElement::Type::EXPORT_PART,
             ExecutionStatus::fromCurrentException("", true),
-            static_cast<UInt64>((*exports_list_entry)->elapsed * 1000000000),
+            (*exports_list_entry)->watch.elapsed(),
             manifest.data_part->name,
             manifest.data_part,
             {manifest.data_part},
