@@ -354,6 +354,8 @@ def main():
         )
         res = results[-1].is_ok()
 
+    runner_options += f" --known-fails-file-path tests/broken_tests.yaml"
+
     test_result = None
     if res and JobStages.TEST in stages:
         stop_watch_ = Utils.Stopwatch()

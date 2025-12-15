@@ -88,8 +88,7 @@ TEST_MAX_RUN_TIME_IN_SECONDS = 180
 
 
 @lru_cache(maxsize=1)
-def get_broken_tests_rules() -> dict:
-    broken_tests_file_path = "tests/broken_tests.yaml"
+def get_broken_tests_rules(broken_tests_file_path: str) -> dict:
     if (
         not os.path.isfile(broken_tests_file_path)
         or os.path.getsize(broken_tests_file_path) == 0
@@ -129,10 +128,10 @@ def get_broken_tests_rules() -> dict:
     return compiled_rules
 
 
-def test_is_known_fail(test_name, test_logs, build_flags):
+def test_is_known_fail(test_name, test_logs, build_flags, broken_tests_file_path):
     matching_rules = []
 
-    known_broken_tests = get_broken_tests_rules()
+    known_broken_tests = get_broken_tests_rules(broken_tests_file_path)
 
     # print(f"Checking known broken tests for failed test: {test_name}")
     # print("Potential matching rules:")
@@ -2321,13 +2320,17 @@ class TestCase:
             if result.status == TestStatus.FAIL:
                 result.description = self.add_info_about_settings(result.description)
 
-                # Check if the test is known to fail
-                known_fail_reason = test_is_known_fail(
-                    self.name, result.description, args.build_flags
-                )
-                if known_fail_reason:
-                    result.status = TestStatus.BROKEN
-                    result.description += f"Marked as broken: {known_fail_reason}"
+                if args.known_fails_file_path:
+                    # Check if the test is known to fail
+                    known_fail_reason = test_is_known_fail(
+                        self.name,
+                        result.description,
+                        args.build_flags,
+                        args.known_fails_file_path,
+                    )
+                    if known_fail_reason:
+                        result.status = TestStatus.BROKEN
+                        result.description += f"Marked as broken: {known_fail_reason}"
 
             if self.name in suite.blacklist_check:
                 if result.status == TestStatus.OK:
@@ -3817,6 +3820,8 @@ def parse_args():
     parser = ArgumentParser(description="ClickHouse functional tests")
     parser.add_argument("-q", "--queries", help="Path to queries dir")
     parser.add_argument("--tmp", help="Path to tmp dir")
+
+    parser.add_argument("--known-fails-file-path", help="Path to known fails file")
 
     parser.add_argument(
         "-b",
