@@ -42,15 +42,20 @@ namespace Setting
     extern const SettingsUInt64 export_merge_tree_part_max_rows_per_file;
 }
 
-ExportPartTask::ExportPartTask(MergeTreeData & storage_, const MergeTreePartExportManifest & manifest_, ContextPtr context_)
+ExportPartTask::ExportPartTask(MergeTreeData & storage_, const MergeTreePartExportManifest & manifest_)
     : storage(storage_),
-    manifest(manifest_),
-    local_context(context_)
+    manifest(manifest_)
 {
 }
 
 bool ExportPartTask::executeStep()
 {
+    auto local_context = Context::createCopy(storage.getContext());
+    local_context->makeQueryContextForExportPart();
+    local_context->setCurrentQueryId(manifest.transaction_id);
+    local_context->setBackgroundOperationTypeForContext(ClientInfo::BackgroundOperationType::EXPORT_PART);
+    local_context->setSettings(manifest.settings);
+
     const auto & metadata_snapshot = manifest.metadata_snapshot;
 
     Names columns_to_read = metadata_snapshot->getColumns().getNamesOfPhysical();
