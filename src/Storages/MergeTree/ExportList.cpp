@@ -46,15 +46,15 @@ ExportInfo ExportsListElement::getInfo() const
         res.destination_file_paths = destination_file_paths;
     }
 
-    res.rows_read = rows_read;
+    res.rows_read = rows_read.load(std::memory_order_relaxed);
     res.total_rows_to_read = total_rows_to_read;
     res.total_size_bytes_compressed = total_size_bytes_compressed;
     res.total_size_bytes_uncompressed = total_size_bytes_uncompressed;
-    res.bytes_read_uncompressed = bytes_read_uncompressed;
+    res.bytes_read_uncompressed = bytes_read_uncompressed.load(std::memory_order_relaxed);
     res.memory_usage = getMemoryUsage();
     res.peak_memory_usage = getPeakMemoryUsage();
     res.create_time = create_time;
-    res.elapsed = elapsed;
+    res.elapsed = watch.elapsedSeconds();
     return res;
 }
 

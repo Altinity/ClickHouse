@@ -42,14 +42,15 @@ struct ExportsListElement : private boost::noncopyable
     const StorageID destination_table_id;
     const UInt64 part_size;
     const String part_name;
+
+    /// see destination_file_paths_mutex
     std::vector<String> destination_file_paths;
-    UInt64 rows_read {0};
+    std::atomic<UInt64> rows_read {0};
     UInt64 total_rows_to_read {0};
     UInt64 total_size_bytes_compressed {0};
     UInt64 total_size_bytes_uncompressed {0};
-    UInt64 bytes_read_uncompressed {0};
+    std::atomic<UInt64> bytes_read_uncompressed {0};
     time_t create_time {0};
-    Float64 elapsed {0};
 
     Stopwatch watch;
     ThreadGroupPtr thread_group;

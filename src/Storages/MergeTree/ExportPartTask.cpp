@@ -156,7 +156,6 @@ bool ExportPartTask::executeStep()
         {
             (*exports_list_entry)->bytes_read_uncompressed += progress.read_bytes;
             (*exports_list_entry)->rows_read += progress.read_rows;
-            (*exports_list_entry)->elapsed = (*exports_list_entry)->watch.elapsedSeconds();
         });
 
         pipeline = QueryPipelineBuilder::getPipeline(std::move(*builder));
