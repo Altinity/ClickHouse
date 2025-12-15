@@ -89,7 +89,7 @@ query "INSERT INTO $big_table SELECT number + 10_485_760_0 AS id, repeat('x', 10
 query "ALTER TABLE $big_table EXPORT PART '2025_1_1_0' TO TABLE $big_destination_max_bytes SETTINGS allow_experimental_export_merge_tree_part = 1, export_merge_tree_part_max_bytes_per_file=10000000, output_format_parquet_row_group_size_bytes=5000000"
 
 # sleeping a little longer because it will write multiple files
-sleep 20
+sleep 50
 
 echo "---- Count files in big_destination_max_bytes, should be 5 (4 parquet, 1 commit)"
 query "SELECT count(_file) FROM s3(s3_conn, filename='$big_destination_max_bytes/**', format='One')"
@@ -105,7 +105,7 @@ echo "---- Test max_rows per file"
 query "ALTER TABLE $big_table EXPORT PART '2025_1_1_0' TO TABLE $big_destination_max_rows SETTINGS allow_experimental_export_merge_tree_part = 1, export_merge_tree_part_max_rows_per_file=2621440"
 
 # sleeping a little longer because it will write multiple files
-sleep 20
+sleep 50
 
 echo "---- Count files in big_destination_max_rows, should be 5 (4 parquet, 1 commit)"
 query "SELECT count(_file) FROM s3(s3_conn, filename='$big_destination_max_rows/**', format='One')"
