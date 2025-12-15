@@ -52,13 +52,13 @@ Source and destination tables must be 100% compatible:
 
 - **Type**: `UInt64`
 - **Default**: `0`
-- **Description**: Maximum number of bytes to write to a single file when exporting a merge tree part. 0 means no limit. This is not a hard limit, and it highly depends on the output format granularity and input source chunk size.
+- **Description**: Maximum number of bytes to write to a single file when exporting a merge tree part. 0 means no limit. This is not a hard limit, and it highly depends on the output format granularity and input source chunk size. Using this might break idempotency, use it with care.
 
 ### `export_merge_tree_part_max_rows_per_file` (Optional)
 
 - **Type**: `UInt64`
 - **Default**: `0`
-- **Description**: Maximum number of rows to write to a single file when exporting a merge tree part. 0 means no limit. This is not a hard limit, and it highly depends on the output format granularity and input source chunk size.
+- **Description**: Maximum number of rows to write to a single file when exporting a merge tree part. 0 means no limit. This is not a hard limit, and it highly depends on the output format granularity and input source chunk size. Using this might break idempotency, use it with care.
 
 ## Examples
 
