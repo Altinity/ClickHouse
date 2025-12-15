@@ -9136,11 +9136,6 @@ bool MergeTreeData::scheduleDataMovingJob(BackgroundJobsAssignee & assignee)
             continue;
         }
 
-        auto context_copy = Context::createCopy(getContext());
-        context_copy->makeQueryContextForExportPart();
-        context_copy->setCurrentQueryId(manifest.transaction_id);
-        context_copy->setBackgroundOperationTypeForContext(ClientInfo::BackgroundOperationType::EXPORT_PART);
-
         auto task = std::make_shared<ExportPartTask>(*this, manifest);
 
         manifest.in_progress = assignee.scheduleMoveTask(task);
