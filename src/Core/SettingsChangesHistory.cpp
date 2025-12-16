@@ -55,7 +55,9 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"export_merge_tree_part_file_already_exists_policy", "skip", "skip", "New setting."},
             {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."},
             {"hybrid_table_auto_cast_columns", true, true, "New setting to automatically cast Hybrid table columns when segments disagree on types. Default enabled."},
-            {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."}
+            {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
+            {"input_format_parquet_verify_checksums", true, true, "New setting."},
+            {"output_format_parquet_write_checksums", false, true, "New setting."},
         });
         addSettingsChanges(settings_changes_history, "25.8",
         {
