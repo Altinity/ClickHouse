@@ -74,6 +74,12 @@ namespace ExportPartitionUtils
     {
         const auto exported_paths = ExportPartitionUtils::getExportedPaths(log, zk, entry_path);
 
+        if (exported_paths.empty())
+        {
+            LOG_INFO(log, "ExportPartition: No exported paths found, will not commit export. This might be a bug");
+            return;
+        }
+
         destination_storage->commitExportPartitionTransaction(manifest.transaction_id, manifest.partition_id, exported_paths, context);
 
         LOG_INFO(log, "ExportPartition: Committed export, mark as completed");
