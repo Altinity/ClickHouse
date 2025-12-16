@@ -80,6 +80,12 @@ namespace ExportPartitionUtils
             return;
         }
 
+        if (exported_paths.size() < manifest.parts.size())
+        {
+            LOG_INFO(log, "ExportPartition: Reached the commit phase, but exported paths size is less than the number of parts, will not commit export. This might be a bug");
+            return;
+        }
+
         destination_storage->commitExportPartitionTransaction(manifest.transaction_id, manifest.partition_id, exported_paths, context);
 
         LOG_INFO(log, "ExportPartition: Committed export, mark as completed");
