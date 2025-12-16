@@ -137,7 +137,7 @@ bool ExportPartTask::executeStep()
             }
         }
 
-        LOG_INFO(getLogger("ExportPartTask"), "Export part {} failed: {}", manifest.data_part->name, e.message());
+        LOG_WARNING(getLogger("ExportPartTask"), "Export part {} failed: {}", manifest.data_part->name, e.message());
 
         ProfileEvents::increment(ProfileEvents::PartsExportFailures);
 

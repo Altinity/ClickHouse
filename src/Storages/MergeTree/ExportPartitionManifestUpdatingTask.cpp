@@ -401,7 +401,7 @@ std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::
             {
                 if (!count_str.empty())
                 {
-                    exception_count += std::stoull(count_str);
+                    exception_count += parse<size_t>(count_str);
                 }
                 if (last_exception.empty() && !exception_str.empty() && !part_str.empty())
                 {
@@ -478,10 +478,11 @@ void ExportPartitionManifestUpdatingTask::poll()
         LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Cleanup lock acquired, will remove stale entries");
     }
 
-    Coordination::Stat stat;
-    const auto children = zk->getChildrenWatch(exports_path, &stat, storage.export_merge_tree_partition_watch_callback);
     ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
     ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildrenWatch);
+
+    Coordination::Stat stat;
+    const auto children = zk->getChildrenWatch(exports_path, &stat, storage.export_merge_tree_partition_watch_callback);
     const std::unordered_set<std::string> zk_children(children.begin(), children.end());
 
     const auto now = time(nullptr);
