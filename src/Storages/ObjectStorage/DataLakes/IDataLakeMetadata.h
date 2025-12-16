@@ -6,7 +6,7 @@
 #include <Core/Range.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Processors/ISimpleTransform.h>
-#include <Storages/ObjectStorage/IObjectIterator.h>
+#include <Disks/ObjectStorages/IObjectStorage.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Storages/AlterCommands.h>
 #include <Storages/MutationCommands.h>
@@ -94,10 +94,9 @@ struct StorageID;
 struct IObjectIterator;
 struct RelativePathWithMetadata;
 class IObjectStorage;
-struct ObjectInfo;
-using ObjectInfoPtr = std::shared_ptr<ObjectInfo>;
 using ObjectIterator = std::shared_ptr<IObjectIterator>;
 using ObjectStoragePtr = std::shared_ptr<IObjectStorage>;
+using ObjectInfoPtr = std::shared_ptr<PathWithMetadata>;
 
 class IDataLakeMetadata : boost::noncopyable
 {

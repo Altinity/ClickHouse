@@ -150,6 +150,8 @@ struct PathWithMetadata
     std::optional<String> absolute_path;
     ObjectStoragePtr object_storage_to_use = nullptr;
 
+    FileBucketInfoPtr file_bucket_info;
+
     PathWithMetadata() = default;
 
     explicit PathWithMetadata(
@@ -189,6 +191,14 @@ struct PathWithMetadata
     void loadMetadata(ObjectStoragePtr object_storage, bool ignore_non_existent_file = true);
 
     ObjectStoragePtr getObjectStorage() const { return object_storage_to_use; }
+
+    String getIdentifier() const
+    {
+        String result = absolute_path.value_or(relative_path);
+        if (file_bucket_info)
+            result += file_bucket_info->getIdentifier();
+        return result;
+    }
 };
 
 struct ObjectKeyWithMetadata

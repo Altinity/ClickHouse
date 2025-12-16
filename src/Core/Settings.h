@@ -110,8 +110,7 @@ class WriteBuffer;
     M(CLASS_NAME, URI) \
     M(CLASS_NAME, VectorSearchFilterStrategy) \
     M(CLASS_NAME, GeoToH3ArgumentOrder) \
-    M(CLASS_NAME, ObjectStorageGranularityLevel) \
-    M(CLASS_NAME, DecorrelationJoinKind)
+    M(CLASS_NAME, ObjectStorageGranularityLevel)
 
 
 COMMON_SETTINGS_SUPPORTED_TYPES(Settings, DECLARE_SETTING_TRAIT)

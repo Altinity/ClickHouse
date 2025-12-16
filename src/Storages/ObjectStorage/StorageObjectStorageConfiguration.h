@@ -27,6 +27,7 @@ class IDataLakeMetadata;
 struct IObjectIterator;
 using SinkToStoragePtr = std::shared_ptr<SinkToStorage>;
 using ObjectIterator = std::shared_ptr<IObjectIterator>;
+using ObjectInfoPtr = std::shared_ptr<PathWithMetadata>;
 
 namespace ErrorCodes
 {
@@ -281,16 +282,15 @@ public:
         return false;
     }
 
+    String format = "auto";
+    String compression_method = "auto";
+    String structure = "auto";
+
     PartitionStrategyFactory::StrategyType partition_strategy_type = PartitionStrategyFactory::StrategyType::NONE;
     std::shared_ptr<IPartitionStrategy> partition_strategy;
     /// Whether partition column values are contained in the actual data.
     /// And alternative is with hive partitioning, when they are contained in file path.
     bool partition_columns_in_data_file = true;
-
-private:
-    String format = "auto";
-    String compression_method = "auto";
-    String structure = "auto";
 
 protected:
     bool initialized = false;

@@ -1,11 +1,8 @@
 #pragma once
 #include <Core/Types.h>
-<<<<<<< HEAD
-=======
 #include <Storages/ObjectStorage/DataLakes/DataLakeObjectMetadata.h>
 #include <Processors/Formats/IInputFormat.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataObjectInfo.h>
->>>>>>> 4bed2ad0c69 (Merge pull request #87508 from scanhex12/distributed_execution_better_spread)
 #include <Storages/ObjectStorage/IObjectIterator.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeObjectMetadata.h>
 
