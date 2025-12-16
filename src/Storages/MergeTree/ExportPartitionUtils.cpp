@@ -74,13 +74,6 @@ namespace ExportPartitionUtils
     {
         const auto exported_paths = ExportPartitionUtils::getExportedPaths(log, zk, entry_path);
 
-        if (exported_paths.size() != manifest.parts.size())
-        {
-            LOG_INFO(log, "ExportPartition: Skipping {}: exported paths size does not match parts size, this is a BUG", entry_path);
-            return;
-        }
-
-        LOG_INFO(log, "ExportPartition: Exported paths size matches parts size, commit the export");
         destination_storage->commitExportPartitionTransaction(manifest.transaction_id, manifest.partition_id, exported_paths, context);
 
         LOG_INFO(log, "ExportPartition: Committed export, mark as completed");
