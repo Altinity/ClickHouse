@@ -875,8 +875,7 @@ def test_position_deletes_out_of_order(started_cluster, use_roaring_bitmaps):
 
     create_iceberg_table(storage_type, instance, TABLE_NAME, started_cluster, additional_settings=["input_format_parquet_use_native_reader_v3=1", f"use_roaring_bitmap_iceberg_positional_deletes={use_roaring_bitmaps}"])
 
-    # TODO: Replace WHERE with PREWHERE when we add prewhere support for datalakes.
-    assert get_array(instance.query(f"SELECT id FROM {TABLE_NAME} WHERE NOT sleepEachRow(1/100) order by id")) == list(range(10, 103)) + [104]
+    assert get_array(instance.query(f"SELECT id FROM {TABLE_NAME} PREWHERE NOT sleepEachRow(1/100) order by id")) == list(range(10, 103)) + [104]
 
     instance.query(f"DROP TABLE {TABLE_NAME}")
 
