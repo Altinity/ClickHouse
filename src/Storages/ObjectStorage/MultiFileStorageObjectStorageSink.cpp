@@ -41,7 +41,6 @@ MultiFileStorageObjectStorageSink::MultiFileStorageObjectStorageSink(
 
 MultiFileStorageObjectStorageSink::~MultiFileStorageObjectStorageSink()
 {
-    /// todo arthur think about the need for checking if current sink exists
     if (isCancelled())
         current_sink->cancel();
 }
