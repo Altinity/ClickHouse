@@ -80,6 +80,7 @@ namespace ExportPartitionUtils
             return;
         }
 
+        //// not checking for an exact match because a single part might generate multiple files
         if (exported_paths.size() < manifest.parts.size())
         {
             LOG_INFO(log, "ExportPartition: Reached the commit phase, but exported paths size is less than the number of parts, will not commit export. This might be a bug");
