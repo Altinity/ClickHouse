@@ -81,7 +81,7 @@ void ExportPartitionTaskScheduler::run()
     std::size_t scheduled_exports_count = 0;
 
     const uint32_t seed = uint32_t(std::hash<std::string>{}(storage.replica_name)) ^ uint32_t(scheduled_exports_count);
-    std::mt19937 rng(seed);
+    pcg64_fast rng(seed);
 
     std::lock_guard lock(storage.export_merge_tree_partition_mutex);
 
@@ -268,6 +268,8 @@ void ExportPartitionTaskScheduler::run()
                 catch (const Exception &)
                 {
                     tryLogCurrentException(__PRETTY_FUNCTION__);
+                    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+                    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRemove);
                     zk->tryRemove(fs::path(storage.zookeeper_path) / "exports" / key / "locks" / zk_part_name);
                     /// we should not increment retry_count because the node might just be full
                 }
@@ -429,7 +431,7 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
         zk->tryGet(count_path, num_exceptions_string);
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
-        num_exceptions = std::stoull(num_exceptions_string.c_str());
+        num_exceptions = parse<size_t>(num_exceptions_string);
 
         ops.emplace_back(zkutil::makeSetRequest(last_exception_path / "part", part_name, -1));
         ops.emplace_back(zkutil::makeSetRequest(last_exception_path / "exception", exception->message(), -1));
