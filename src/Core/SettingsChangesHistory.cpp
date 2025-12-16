@@ -245,7 +245,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"hybrid_table_auto_cast_columns", true, true, "New setting to automatically cast Hybrid table columns when segments disagree on types. Default enabled."},
             {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
             {"export_merge_tree_partition_lock_inside_the_task", false, false, "New setting."},
-            {"export_merge_tree_partition_system_table_use_local_information", false, false, "New setting."},
+            {"export_merge_tree_partition_system_table_prefer_remote_information", true, true, "New setting."},
         });
         addSettingsChanges(settings_changes_history, "25.8",
         {
