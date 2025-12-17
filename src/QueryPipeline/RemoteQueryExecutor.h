@@ -334,8 +334,6 @@ private:
 
     const bool read_packet_type_separately = false;
 
-    const bool allow_retries_in_cluster_requests = false;
-
     std::unordered_set<size_t> replica_has_processed_data;
 
     /// Send all scalars to remote servers

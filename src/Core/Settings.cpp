@@ -7533,9 +7533,6 @@ If the number of set bits in a runtime bloom filter exceeds this ratio the filte
     DECLARE(Bool, rewrite_in_to_join, false, R"(
 Rewrite expressions like 'x IN subquery' to JOIN. This might be useful for optimizing the whole query with join reordering.
 )", EXPERIMENTAL) \
-    DECLARE(Bool, allow_retries_in_cluster_requests, false, R"(
-Allow retries in cluster request, when one node goes offline
-)", EXPERIMENTAL) \
     DECLARE(Bool, allow_experimental_iceberg_read_optimization, true, R"(
 Allow Iceberg read optimization based on Iceberg metadata.
 )", EXPERIMENTAL) \
@@ -7687,7 +7684,8 @@ Allow experimental database engine DataLakeCatalog with catalog_type = 'paimon_r
     MAKE_OBSOLETE(M, Bool, use_json_alias_for_old_object_type, false) \
     MAKE_OBSOLETE(M, Bool, describe_extend_object_types, false) \
     MAKE_OBSOLETE(M, Bool, allow_experimental_object_type, false) \
-    MAKE_OBSOLETE(M, BoolAuto, insert_select_deduplicate, Field{"auto"})
+    MAKE_OBSOLETE(M, BoolAuto, insert_select_deduplicate, Field{"auto"}) \
+    MAKE_OBSOLETE(M, Bool, allow_retries_in_cluster_requests, false) \
     /** The section above is for obsolete settings. Do not add anything there. */
 #endif /// __CLION_IDE__
 
