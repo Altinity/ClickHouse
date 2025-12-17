@@ -205,6 +205,7 @@ def get_creation_expression(
     additional_settings = [],
     storage_type_as_arg=False,
     storage_type_in_named_collection=False,
+    cluster_name_as_literal=True,
     **kwargs,
 ):
     settings_array = list(additional_settings)
@@ -234,6 +235,8 @@ def get_creation_expression(
     else:
         settings_expression = ""
 
+    cluster_name = "'cluster_simple'" if cluster_name_as_literal else "cluster_simple"
+
     storage_arg = storage_type
     engine_part = ""
     if (storage_type_in_named_collection):
@@ -262,7 +265,7 @@ def get_creation_expression(
 
         if run_on_cluster:
             assert table_function
-            return f"iceberg{engine_part}Cluster('cluster_simple', {storage_arg}, filename = 'var/lib/clickhouse/user_files/iceberg_data/default/{table_name}/', format={format}, url = 'http://minio1:9001/{bucket}/')"
+            return f"iceberg{engine_part}Cluster({cluster_name}, {storage_arg}, filename = 'var/lib/clickhouse/user_files/iceberg_data/default/{table_name}/', format={format}, url = 'http://minio1:9001/{bucket}/')"
         else:
             if table_function:
                 return f"iceberg{engine_part}({storage_arg}, filename = 'var/lib/clickhouse/user_files/iceberg_data/default/{table_name}/', format={format}, url = 'http://minio1:9001/{bucket}/')"
@@ -282,7 +285,7 @@ def get_creation_expression(
         if run_on_cluster:
             assert table_function
             return f"""
-                iceberg{engine_part}Cluster('cluster_simple', {storage_arg}, container = '{cluster.azure_container_name}', storage_account_url = '{cluster.env_variables["AZURITE_STORAGE_ACCOUNT_URL"]}', blob_path = '/var/lib/clickhouse/user_files/iceberg_data/default/{table_name}/', format={format})
+                iceberg{engine_part}Cluster({cluster_name}, {storage_arg}, container = '{cluster.azure_container_name}', storage_account_url = '{cluster.env_variables["AZURITE_STORAGE_ACCOUNT_URL"]}', blob_path = '/var/lib/clickhouse/user_files/iceberg_data/default/{table_name}/', format={format})
             """
         else:
             if table_function:
@@ -305,7 +308,7 @@ def get_creation_expression(
         if run_on_cluster:
             assert table_function
             return f"""
-                iceberg{engine_part}Cluster('cluster_simple', {storage_arg}, path = '/var/lib/clickhouse/user_files/iceberg_data/default/{table_name}/', format={format})
+                iceberg{engine_part}Cluster({cluster_name}, {storage_arg}, path = '/var/lib/clickhouse/user_files/iceberg_data/default/{table_name}/', format={format})
             """
         else:
             if table_function:

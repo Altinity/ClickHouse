@@ -40,7 +40,8 @@ def count_secondary_subqueries(started_cluster, query_id, expected, comment):
 
 @pytest.mark.parametrize("format_version", ["1", "2"])
 @pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
-def test_cluster_table_function(started_cluster_iceberg_with_spark, format_version, storage_type):
+@pytest.mark.parametrize("cluster_name_as_literal", [True, False])
+def test_cluster_table_function(started_cluster_iceberg_with_spark, format_version, storage_type, cluster_name_as_literal):
     instance = started_cluster_iceberg_with_spark.instances["node1"]
     spark = started_cluster_iceberg_with_spark.spark_session
 
@@ -98,7 +99,7 @@ def test_cluster_table_function(started_cluster_iceberg_with_spark, format_versi
 
     # Regular Query only node1
     table_function_expr = get_creation_expression(
-        storage_type, TABLE_NAME, started_cluster_iceberg_with_spark, table_function=True
+        storage_type, TABLE_NAME, started_cluster_iceberg_with_spark, table_function=True, cluster_name_as_literal=cluster_name_as_literal
     )
     select_regular = (
         instance.query(f"SELECT * FROM {table_function_expr}").strip().split()
@@ -119,6 +120,7 @@ def test_cluster_table_function(started_cluster_iceberg_with_spark, format_versi
             run_on_cluster=run_on_cluster,
             storage_type_as_arg=storage_type_as_arg,
             storage_type_in_named_collection=storage_type_in_named_collection,
+            cluster_name_as_literal=cluster_name_as_literal,
         )
         query_id = str(uuid.uuid4())
         settings = f"SETTINGS object_storage_cluster='cluster_simple'" if (alt_syntax and not run_on_cluster) else ""
