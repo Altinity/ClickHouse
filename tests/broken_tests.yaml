@@ -77,7 +77,7 @@
   message: 'DB::Exception: Unknown storage policy `azure_cache`'
 - name: 00024_random_counters
   reason: INVESTIGATE - random timeout
-  message: Timeout! Killing process group
+  message: Timeout! Processes left in process group
 - name: test_storage_s3_queue/test_5.py::test_migration[1-s3queue_]
   reason: KNOWN - Sometimes fails due to test order
   message: 'Failed: Timeout >900.0s'
