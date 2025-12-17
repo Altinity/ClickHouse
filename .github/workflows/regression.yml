@@ -1026,7 +1026,7 @@ jobs:
         run: |
           cat >> "$GITHUB_ENV" << 'EOF'
           REPORTS_PATH=${{ runner.temp }}/reports_dir
-          SUITE=s3_export
+          SUITE=s3
           PART=${{ matrix.PART }}
           EOF
       - name: Setup
@@ -1051,7 +1051,7 @@ jobs:
               --clickhouse-binary-path ${{ env.clickhouse_path }}
               --storage minio
               --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name="$GITHUB_JOB (${{ matrix.PART }})" job.retry=$GITHUB_RUN_ATTEMPT job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
-              --only ":/try*" "minio/export ${{ matrix.PART }}/*"
+              --only ":/try*" "minio/export tests/export ${{ matrix.PART }}/*"
               ${{ env.args }} || EXITCODE=$?;
               .github/add_link_to_logs.sh;
               exit $EXITCODE
@@ -1072,7 +1072,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ${{ env.SUITE }}-${{ matrix.PART }}-${{ inputs.arch }}-artifacts
+          name: ${{ env.SUITE }}-export-${{ matrix.PART }}-${{ inputs.arch }}-artifacts
           path: ${{ env.artifact_paths}}
 
   TieredStorage:
