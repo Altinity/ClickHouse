@@ -167,7 +167,7 @@ def test_is_known_fail(test_name, test_logs, build_flags, broken_tests_file_path
                 ct in build_flags for ct in rule_data["check_types"]
             ):
                 log_file.write(
-                    f"Check types didn't match: '{rule_data['check_types']}' not in '{build_flags}'\n"
+                    f"Skip rule: Check types didn't match: '{rule_data['check_types']}' not in '{build_flags}'\n"
                 )
                 continue  # check_types didn't match → skip rule
 
@@ -185,7 +185,7 @@ def test_is_known_fail(test_name, test_logs, build_flags, broken_tests_file_path
                 )
                 continue
 
-            log_file.write(f"Test {test_name} matched rule: {rule_data}\n")
+            log_file.write(f"Matched rule: {rule_data}\n")
             return rule_data["reason"]
 
         return False
