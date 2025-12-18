@@ -2330,15 +2330,11 @@ class TestCase:
                     )
                     if known_fail_reason:
                         result.status = TestStatus.BROKEN
-                        if "Database: " in result.description.splitlines()[-1]:
-                            result.description = result.description.replace(
-                                "Database: ",
-                                f"Marked as broken: {known_fail_reason}\nDatabase: ",
-                            )
-                        else:
-                            result.description += (
-                                f"\nMarked as broken: {known_fail_reason}"
-                            )
+
+                        # Place the message on the second line
+                        result.description.replace(
+                            "\n", f"\nMarked as broken: {known_fail_reason}\n", count=1
+                        )
 
             if self.name in suite.blacklist_check:
                 if result.status == TestStatus.OK:
