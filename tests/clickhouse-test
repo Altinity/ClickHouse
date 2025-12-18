@@ -2335,7 +2335,7 @@ class TestCase:
                     # Check if the test is known to fail
                     known_fail_reason = test_is_known_fail(
                         self.name,
-                        result.description,
+                        result.reason.value + result.description,
                         args.build_flags,
                         args.known_fails_file_path,
                     )
