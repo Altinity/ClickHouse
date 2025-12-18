@@ -29,6 +29,8 @@ public:
 
     const String & getPath() const { return path; }
 
+    size_t getWrittenBytes() const;
+
     size_t getFileSize() const;
 
 private:

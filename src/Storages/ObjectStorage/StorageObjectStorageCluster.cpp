@@ -584,15 +584,17 @@ bool StorageObjectStorageCluster::supportsImport() const
 SinkToStoragePtr StorageObjectStorageCluster::import(
     const std::string & file_name,
     Block & block_with_partition_values,
-    std::string & destination_file_path,
+    const std::function<void(const std::string &)> & new_file_path_callback,
     bool overwrite_if_exists,
+    std::size_t max_bytes_per_file,
+    std::size_t max_rows_per_file,
     const std::optional<FormatSettings> & format_settings_,
     ContextPtr context)
 {
     if (pure_storage)
-        return pure_storage->import(file_name, block_with_partition_values, destination_file_path, overwrite_if_exists, format_settings_, context);
+        return pure_storage->import(file_name, block_with_partition_values, new_file_path_callback, overwrite_if_exists, max_bytes_per_file, max_rows_per_file, format_settings_, context);
     
-    return IStorageCluster::import(file_name, block_with_partition_values, destination_file_path, overwrite_if_exists, format_settings_, context);
+    return IStorageCluster::import(file_name, block_with_partition_values, new_file_path_callback, overwrite_if_exists, max_bytes_per_file, max_rows_per_file, format_settings_, context);
 }
 
 void StorageObjectStorageCluster::readFallBackToPure(

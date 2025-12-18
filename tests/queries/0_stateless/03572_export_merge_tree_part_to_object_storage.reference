@@ -31,3 +31,14 @@
 2	2020
 3	2020
 4	2021
+---- Test max_bytes and max_rows per file
+---- Count files in big_destination_max_bytes, should be 5 (4 parquet, 1 commit)
+5
+---- Count rows in big_table and big_destination_max_bytes
+4194304
+4194304
+---- Count files in big_destination_max_rows, should be 5 (4 parquet, 1 commit)
+5
+---- Count rows in big_table and big_destination_max_rows
+4194304
+4194304
