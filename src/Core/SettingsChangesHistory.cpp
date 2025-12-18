@@ -233,6 +233,11 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"export_merge_tree_partition_manifest_ttl", 180, 180, "New setting."},
             {"export_merge_tree_part_file_already_exists_policy", "skip", "skip", "New setting."},
             {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."}
+            {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."},
+            {"hybrid_table_auto_cast_columns", true, true, "New setting to automatically cast Hybrid table columns when segments disagree on types. Default enabled."},
+            {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
+            {"export_merge_tree_part_max_bytes_per_file", 0, 0, "New setting."},
+            {"export_merge_tree_part_max_rows_per_file", 0, 0, "New setting."},
         });
         addSettingsChanges(settings_changes_history, "25.8",
         {

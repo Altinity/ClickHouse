@@ -28,6 +28,8 @@ namespace
         context_copy->setSetting("output_format_parquet_parallel_encoding", manifest.parquet_parallel_encoding);
         context_copy->setSetting("max_threads", manifest.max_threads);
         context_copy->setSetting("export_merge_tree_part_file_already_exists_policy", String(magic_enum::enum_name(manifest.file_already_exists_policy)));
+        context_copy->setSetting("export_merge_tree_part_max_bytes_per_file", manifest.max_bytes_per_file);
+        context_copy->setSetting("export_merge_tree_part_max_rows_per_file", manifest.max_rows_per_file);
         return context_copy;
     }
 }
@@ -175,7 +177,7 @@ void ExportPartitionTaskScheduler::handlePartExportCompletion(
 
     if (result.success)
     {
-        handlePartExportSuccess(manifest, destination_storage, processing_parts_path, processed_part_path, part_name, export_path, zk, result.relative_path_in_destination_storage);
+        handlePartExportSuccess(manifest, destination_storage, processing_parts_path, processed_part_path, part_name, export_path, zk, result.relative_paths_in_destination_storage);
     }
     else
     {
@@ -191,12 +193,17 @@ void ExportPartitionTaskScheduler::handlePartExportSuccess(
     const std::string & part_name,
     const std::filesystem::path & export_path,
     const zkutil::ZooKeeperPtr & zk,
-    const String & relative_path_in_destination_storage
+    const std::vector<String> & relative_paths_in_destination_storage
 )
 {
-    LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} exported successfully", relative_path_in_destination_storage);
+    LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} exported successfully, paths size: {}", part_name, relative_paths_in_destination_storage.size());
 
-    if (!tryToMovePartToProcessed(export_path, processing_parts_path, processed_part_path, part_name, relative_path_in_destination_storage, zk))
+    for (const auto & relative_path_in_destination_storage : relative_paths_in_destination_storage)
+    {
+        LOG_INFO(storage.log, "ExportPartition scheduler task: {}", relative_path_in_destination_storage);
+    }
+
+    if (!tryToMovePartToProcessed(export_path, processing_parts_path, processed_part_path, part_name, relative_paths_in_destination_storage, zk))
     {
         LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to move part to processed, will not commit export partition");
         return;
@@ -323,7 +330,7 @@ bool ExportPartitionTaskScheduler::tryToMovePartToProcessed(
     const std::filesystem::path & processing_parts_path,
     const std::filesystem::path & processed_part_path,
     const std::string & part_name,
-    const String & relative_path_in_destination_storage,
+    const std::vector<String> & relative_paths_in_destination_storage,
     const zkutil::ZooKeeperPtr & zk
 )
 {
@@ -348,7 +355,7 @@ bool ExportPartitionTaskScheduler::tryToMovePartToProcessed(
 
     ExportReplicatedMergeTreePartitionProcessedPartEntry processed_part_entry;
     processed_part_entry.part_name = part_name;
-    processed_part_entry.path_in_destination = relative_path_in_destination_storage;
+    processed_part_entry.paths_in_destination = relative_paths_in_destination_storage;
     processed_part_entry.finished_by = storage.replica_name;
 
     requests.emplace_back(zkutil::makeRemoveRequest(processing_parts_path / part_name, -1));

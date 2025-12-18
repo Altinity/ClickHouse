@@ -1,3 +1,4 @@
+#include <mutex>
 #include <Storages/MergeTree/ExportPartTask.h>
 #include <Storages/MergeTree/MergeTreeSequentialSource.h>
 #include <Storages/MergeTree/MergeTreeData.h>
@@ -14,6 +15,7 @@
 #include <Common/Exception.h>
 #include <Common/ProfileEventsScope.h>
 #include <Storages/MergeTree/ExportList.h>
+#include <Formats/FormatFactory.h>
 
 namespace ProfileEvents
 {
@@ -37,17 +39,24 @@ namespace ErrorCodes
 namespace Setting
 {
     extern const SettingsUInt64 min_bytes_to_use_direct_io;
+    extern const SettingsUInt64 export_merge_tree_part_max_bytes_per_file;
+    extern const SettingsUInt64 export_merge_tree_part_max_rows_per_file;
 }
 
-ExportPartTask::ExportPartTask(MergeTreeData & storage_, const MergeTreePartExportManifest & manifest_, ContextPtr context_)
+ExportPartTask::ExportPartTask(MergeTreeData & storage_, const MergeTreePartExportManifest & manifest_)
     : storage(storage_),
-    manifest(manifest_),
-    local_context(context_)
+    manifest(manifest_)
 {
 }
 
 bool ExportPartTask::executeStep()
 {
+    auto local_context = Context::createCopy(storage.getContext());
+    local_context->makeQueryContextForExportPart();
+    local_context->setCurrentQueryId(manifest.transaction_id);
+    local_context->setBackgroundOperationTypeForContext(ClientInfo::BackgroundOperationType::EXPORT_PART);
+    local_context->setSettings(manifest.settings);
+
     const auto & metadata_snapshot = manifest.metadata_snapshot;
 
     Names columns_to_read = metadata_snapshot->getColumns().getNamesOfPhysical();
@@ -76,7 +85,7 @@ bool ExportPartTask::executeStep()
         manifest.destination_storage_id,
         manifest.data_part->getBytesOnDisk(),
         manifest.data_part->name,
-        "not_computed_yet",
+        std::vector<std::string>{},
         manifest.data_part->rows_count,
         manifest.data_part->getBytesOnDisk(),
         manifest.data_part->getBytesUncompressedOnDisk(),
@@ -85,115 +94,75 @@ bool ExportPartTask::executeStep()
 
     SinkToStoragePtr sink;
 
+    const auto new_file_path_callback = [&exports_list_entry](const std::string & file_path)
+    {
+        std::unique_lock lock((*exports_list_entry)->destination_file_paths_mutex);
+        (*exports_list_entry)->destination_file_paths.push_back(file_path);
+    };
+
     try
     {
         sink = destination_storage->import(
             manifest.data_part->name + "_" + manifest.data_part->checksums.getTotalChecksumHex(),
             block_with_partition_values,
-            (*exports_list_entry)->destination_file_path,
+            new_file_path_callback,
             manifest.file_already_exists_policy == MergeTreePartExportManifest::FileAlreadyExistsPolicy::overwrite,
-            manifest.format_settings,
+            manifest.settings[Setting::export_merge_tree_part_max_bytes_per_file],
+            manifest.settings[Setting::export_merge_tree_part_max_rows_per_file],
+            getFormatSettings(local_context),
             local_context);
-    }
-    catch (const Exception & e)
-    {
-        if (e.code() == ErrorCodes::FILE_ALREADY_EXISTS)
+
+        bool apply_deleted_mask = true;
+        bool read_with_direct_io = local_context->getSettingsRef()[Setting::min_bytes_to_use_direct_io] > manifest.data_part->getBytesOnDisk();
+        bool prefetch = false;
+
+        MergeTreeData::IMutationsSnapshot::Params mutations_snapshot_params
         {
-            ProfileEvents::increment(ProfileEvents::PartsExportDuplicated);
+            .metadata_version = metadata_snapshot->getMetadataVersion(),
+            .min_part_metadata_version = manifest.data_part->getMetadataVersion()
+        };
 
-            /// File already exists and the policy is NO_OP, treat it as success.
-            if (manifest.file_already_exists_policy == MergeTreePartExportManifest::FileAlreadyExistsPolicy::skip)
-            {
-                storage.writePartLog(
-                    PartLogElement::Type::EXPORT_PART,
-                    {},
-                    static_cast<UInt64>((*exports_list_entry)->elapsed * 1000000000),
-                    manifest.data_part->name,
-                    manifest.data_part,
-                    {manifest.data_part},
-                    nullptr,
-                    nullptr,
-                    exports_list_entry.get());
+        auto mutations_snapshot = storage.getMutationsSnapshot(mutations_snapshot_params);
+        auto alter_conversions = MergeTreeData::getAlterConversionsForPart(
+            manifest.data_part,
+            mutations_snapshot,
+            local_context);
 
-                std::lock_guard inner_lock(storage.export_manifests_mutex);
-                storage.export_manifests.erase(manifest);
+        QueryPlan plan_for_part;
 
-                ProfileEvents::increment(ProfileEvents::PartsExports);
-                ProfileEvents::increment(ProfileEvents::PartsExportTotalMilliseconds, static_cast<UInt64>((*exports_list_entry)->elapsed * 1000));
+        createReadFromPartStep(
+            read_type,
+            plan_for_part,
+            storage,
+            storage.getStorageSnapshot(metadata_snapshot, local_context),
+            RangesInDataPart(manifest.data_part),
+            alter_conversions,
+            nullptr,
+            columns_to_read,
+            nullptr,
+            apply_deleted_mask,
+            std::nullopt,
+            read_with_direct_io,
+            prefetch,
+            local_context,
+            getLogger("ExportPartition"));
 
-                if (manifest.completion_callback)
-                    manifest.completion_callback(MergeTreePartExportManifest::CompletionCallbackResult::createSuccess((*exports_list_entry)->destination_file_path));
-                return false;
-            }
-        }
+        ThreadGroupSwitcher switcher((*exports_list_entry)->thread_group, ThreadName::EXPORT_PART);
 
-        tryLogCurrentException(__PRETTY_FUNCTION__);
+        QueryPlanOptimizationSettings optimization_settings(local_context);
+        auto pipeline_settings = BuildQueryPipelineSettings(local_context);
+        auto builder = plan_for_part.buildQueryPipeline(optimization_settings, pipeline_settings);
 
-        ProfileEvents::increment(ProfileEvents::PartsExportFailures);
+        builder->setProgressCallback([&exports_list_entry](const Progress & progress)
+        {
+            (*exports_list_entry)->bytes_read_uncompressed += progress.read_bytes;
+            (*exports_list_entry)->rows_read += progress.read_rows;
+        });
 
-        std::lock_guard inner_lock(storage.export_manifests_mutex);
-        storage.export_manifests.erase(manifest);
+        pipeline = QueryPipelineBuilder::getPipeline(std::move(*builder));
 
-        if (manifest.completion_callback)
-            manifest.completion_callback(MergeTreePartExportManifest::CompletionCallbackResult::createFailure(e));
-        return false;
-    }
+        pipeline.complete(sink);
 
-    bool apply_deleted_mask = true;
-    bool read_with_direct_io = local_context->getSettingsRef()[Setting::min_bytes_to_use_direct_io] > manifest.data_part->getBytesOnDisk();
-    bool prefetch = false;
-
-    MergeTreeData::IMutationsSnapshot::Params mutations_snapshot_params
-    {
-        .metadata_version = metadata_snapshot->getMetadataVersion(),
-        .min_part_metadata_version = manifest.data_part->getMetadataVersion()
-    };
-
-    auto mutations_snapshot = storage.getMutationsSnapshot(mutations_snapshot_params);
-    auto alter_conversions = MergeTreeData::getAlterConversionsForPart(
-        manifest.data_part,
-        mutations_snapshot,
-        local_context);
-
-    QueryPlan plan_for_part;
-
-    createReadFromPartStep(
-        read_type,
-        plan_for_part,
-        storage,
-        storage.getStorageSnapshot(metadata_snapshot, local_context),
-        RangesInDataPart(manifest.data_part),
-        alter_conversions,
-        nullptr,
-        columns_to_read,
-        nullptr,
-        apply_deleted_mask,
-        std::nullopt,
-        read_with_direct_io,
-        prefetch,
-        local_context,
-        getLogger("ExportPartition"));
-
-
-    ThreadGroupSwitcher switcher((*exports_list_entry)->thread_group, ThreadName::EXPORT_PART);
-
-    QueryPlanOptimizationSettings optimization_settings(local_context);
-    auto pipeline_settings = BuildQueryPipelineSettings(local_context);
-    auto builder = plan_for_part.buildQueryPipeline(optimization_settings, pipeline_settings);
-
-    builder->setProgressCallback([&exports_list_entry](const Progress & progress)
-    {
-        (*exports_list_entry)->bytes_read_uncompressed += progress.read_bytes;
-        (*exports_list_entry)->rows_read += progress.read_rows;
-        (*exports_list_entry)->elapsed = (*exports_list_entry)->watch.elapsedSeconds();
-    });
-
-    pipeline = QueryPipelineBuilder::getPipeline(std::move(*builder));
-
-    pipeline.complete(sink);
-
-    try
-    {
         CompletedPipelineExecutor exec(pipeline);
 
         auto is_cancelled_callback = [this]()
@@ -214,7 +183,7 @@ bool ExportPartTask::executeStep()
         storage.writePartLog(
             PartLogElement::Type::EXPORT_PART,
             {},
-            static_cast<UInt64>((*exports_list_entry)->elapsed * 1000000000),
+            (*exports_list_entry)->watch.elapsed(),
             manifest.data_part->name,
             manifest.data_part,
             {manifest.data_part},
@@ -225,22 +194,52 @@ bool ExportPartTask::executeStep()
         storage.export_manifests.erase(manifest);
 
         ProfileEvents::increment(ProfileEvents::PartsExports);
-        ProfileEvents::increment(ProfileEvents::PartsExportTotalMilliseconds, static_cast<UInt64>((*exports_list_entry)->elapsed * 1000));
+        ProfileEvents::increment(ProfileEvents::PartsExportTotalMilliseconds, (*exports_list_entry)->watch.elapsedMilliseconds());
 
         if (manifest.completion_callback)
-            manifest.completion_callback(MergeTreePartExportManifest::CompletionCallbackResult::createSuccess((*exports_list_entry)->destination_file_path));
+            manifest.completion_callback(MergeTreePartExportManifest::CompletionCallbackResult::createSuccess((*exports_list_entry)->destination_file_paths));
     }
     catch (const Exception & e)
     {
-        tryLogCurrentException(__PRETTY_FUNCTION__, fmt::format("while exporting the part {}. User should retry.", manifest.data_part->name));
+        if (e.code() == ErrorCodes::FILE_ALREADY_EXISTS)
+        {
+            ProfileEvents::increment(ProfileEvents::PartsExportDuplicated);
+
+            /// File already exists and the policy is NO_OP, treat it as success.
+            if (manifest.file_already_exists_policy == MergeTreePartExportManifest::FileAlreadyExistsPolicy::skip)
+            {
+                storage.writePartLog(
+                    PartLogElement::Type::EXPORT_PART,
+                    {},
+                    (*exports_list_entry)->watch.elapsed(),
+                    manifest.data_part->name,
+                    manifest.data_part,
+                    {manifest.data_part},
+                    nullptr,
+                    nullptr,
+                    exports_list_entry.get());
+
+                std::lock_guard inner_lock(storage.export_manifests_mutex);
+                storage.export_manifests.erase(manifest);
+
+                ProfileEvents::increment(ProfileEvents::PartsExports);
+                ProfileEvents::increment(ProfileEvents::PartsExportTotalMilliseconds, (*exports_list_entry)->watch.elapsedMilliseconds());
+
+                if (manifest.completion_callback)
+                {
+                    manifest.completion_callback(MergeTreePartExportManifest::CompletionCallbackResult::createSuccess((*exports_list_entry)->destination_file_paths));
+                }
+                    
+                return false;
+            }
+        }
 
         ProfileEvents::increment(ProfileEvents::PartsExportFailures);
 
-        std::lock_guard inner_lock(storage.export_manifests_mutex);
         storage.writePartLog(
             PartLogElement::Type::EXPORT_PART,
             ExecutionStatus::fromCurrentException("", true),
-            static_cast<UInt64>((*exports_list_entry)->elapsed * 1000000000),
+            (*exports_list_entry)->watch.elapsed(),
             manifest.data_part->name,
             manifest.data_part,
             {manifest.data_part},
@@ -248,13 +247,14 @@ bool ExportPartTask::executeStep()
             nullptr,
             exports_list_entry.get());
 
+        std::lock_guard inner_lock(storage.export_manifests_mutex);
         storage.export_manifests.erase(manifest);
 
         if (manifest.completion_callback)
             manifest.completion_callback(MergeTreePartExportManifest::CompletionCallbackResult::createFailure(e));
-
-        throw;
+        return false;
     }
+
     return false;
 }
 

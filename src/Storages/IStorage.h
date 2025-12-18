@@ -486,8 +486,10 @@ It is currently only implemented in StorageObjectStorage.
     virtual SinkToStoragePtr import(
         const std::string & /* file_name */,
         Block & /* block_with_partition_values */,
-        std::string & /* destination_file_path */,
+        const std::function<void(const std::string &)> & /* new_file_path_callback */,
         bool /* overwrite_if_exists */,
+        std::size_t /* max_bytes_per_file */,
+        std::size_t /* max_rows_per_file */,
         const std::optional<FormatSettings> & /* format_settings */,
         ContextPtr /* context */)
     {

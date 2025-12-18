@@ -35,6 +35,7 @@
 #include <Storages/ColumnsDescription.h>
 #include <Storages/HivePartitioningUtils.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSettings.h>
+#include <Storages/ObjectStorage/MultiFileStorageObjectStorageSink.h>
 
 
 namespace DB
@@ -566,8 +567,10 @@ bool StorageObjectStorage::supportsImport() const
 SinkToStoragePtr StorageObjectStorage::import(
     const std::string & file_name,
     Block & block_with_partition_values,
-    std::string & destination_file_path,
+    const std::function<void(const std::string &)> & new_file_path_callback,
     bool overwrite_if_exists,
+    std::size_t max_bytes_per_file,
+    std::size_t max_rows_per_file,
     const std::optional<FormatSettings> & format_settings_,
     ContextPtr local_context)
 {
@@ -583,16 +586,20 @@ SinkToStoragePtr StorageObjectStorage::import(
         }
     }
 
-    destination_file_path = configuration->getPathForWrite(partition_key, file_name).path;
+    const auto base_path = configuration->getPathForWrite(partition_key, file_name).path;
 
-    if (!overwrite_if_exists && object_storage->exists(StoredObject(destination_file_path)))
-    {
-        throw Exception(ErrorCodes::FILE_ALREADY_EXISTS, "File {} already exists", destination_file_path);
-    }
-
-    return std::make_shared<StorageObjectStorageSink>(
-        destination_file_path,
+    return std::make_shared<MultiFileStorageObjectStorageSink>(
+        base_path,
+        /* transaction_id= */ file_name, /// not pretty, but the sink needs some sort of id to generate the commit file name. Using the source part name should be enough
         object_storage,
+<<<<<<< HEAD
+=======
+        configuration,
+        max_bytes_per_file,
+        max_rows_per_file,
+        overwrite_if_exists,
+        new_file_path_callback,
+>>>>>>> c24224bdc1e (Merge pull request #1229 from Altinity/max_bytes_rows_per_file)
         format_settings_ ? format_settings_ : format_settings,
         std::make_shared<const Block>(getInMemoryMetadataPtr()->getSampleBlock()),
         local_context,

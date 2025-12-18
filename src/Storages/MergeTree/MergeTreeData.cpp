@@ -6490,7 +6490,7 @@ void MergeTreeData::exportPartToTable(
             part,
             transaction_id,
             query_context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value,
-            format_settings,
+            query_context->getSettingsCopy(),
             source_metadata_ptr,
             completion_callback);
 
@@ -9387,7 +9387,9 @@ try
         part_log_elem.rows_read = (*exports_entry)->rows_read;
         part_log_elem.bytes_read_uncompressed = (*exports_entry)->bytes_read_uncompressed;
         part_log_elem.peak_memory_usage = (*exports_entry)->getPeakMemoryUsage();
-        part_log_elem.path_on_disk = (*exports_entry)->destination_file_path;
+
+        /// no need to lock because at this point no one is writing to the destination file paths
+        part_log_elem.remote_file_paths = (*exports_entry)->destination_file_paths;
     }
 
     if (profile_counters)
@@ -9455,12 +9457,7 @@ bool MergeTreeData::scheduleDataMovingJob(BackgroundJobsAssignee & assignee)
             continue;
         }
 
-        auto context_copy = Context::createCopy(getContext());
-        context_copy->makeQueryContextForExportPart();
-        context_copy->setCurrentQueryId(manifest.transaction_id);
-        context_copy->setBackgroundOperationTypeForContext(ClientInfo::BackgroundOperationType::EXPORT_PART);
-
-        auto task = std::make_shared<ExportPartTask>(*this, manifest, context_copy);
+        auto task = std::make_shared<ExportPartTask>(*this, manifest);
 
         manifest.in_progress = assignee.scheduleMoveTask(task);
 

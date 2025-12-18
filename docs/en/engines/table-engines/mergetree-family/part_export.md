@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `ALTER TABLE EXPORT PART` command exports individual MergeTree data parts to object storage (S3, Azure Blob Storage, etc.), typically in Parquet format.
+The `ALTER TABLE EXPORT PART` command exports individual MergeTree data parts to object storage (S3, Azure Blob Storage, etc.), typically in Parquet format. A commit file is shipped to the same destination directory containing all data files exported within that transaction.
 
 **Key Characteristics:**
 - **Experimental feature** - must be enabled via `allow_experimental_export_merge_tree_part` setting
@@ -47,6 +47,18 @@ Source and destination tables must be 100% compatible:
 - **Type**: `Bool`
 - **Default**: `false`
 - **Description**: If set to `true`, it will overwrite the file. Otherwise, fails with exception.
+
+### `export_merge_tree_part_max_bytes_per_file` (Optional)
+
+- **Type**: `UInt64`
+- **Default**: `0`
+- **Description**: Maximum number of bytes to write to a single file when exporting a merge tree part. 0 means no limit. This is not a hard limit, and it highly depends on the output format granularity and input source chunk size. Using this might break idempotency, use it with care.
+
+### `export_merge_tree_part_max_rows_per_file` (Optional)
+
+- **Type**: `UInt64`
+- **Default**: `0`
+- **Description**: Maximum number of rows to write to a single file when exporting a merge tree part. 0 means no limit. This is not a hard limit, and it highly depends on the output format granularity and input source chunk size. Using this might break idempotency, use it with care.
 
 ## Examples
 
@@ -93,7 +105,7 @@ destination_database:          default
 destination_table:             destination_table
 create_time:                   2025-11-19 09:09:11
 part_name:                     20251016-365_1_1_0
-destination_file_path:         table_root/eventDate=2025-10-16/retention=365/20251016-365_1_1_0_17B2F6CD5D3C18E787C07AE3DAF16EB1.parquet
+destination_file_paths:        ['table_root/eventDate=2025-10-16/retention=365/20251016-365_1_1_0_17B2F6CD5D3C18E787C07AE3DAF16EB1.1.parquet']
 elapsed:                       2.04845441
 rows_read:                     1138688 -- 1.14 million
 total_rows_to_read:            550961374 -- 550.96 million
@@ -138,7 +150,8 @@ partition_id:            2021
 partition:               2021
 part_type:               Compact
 disk_name:               default
-path_on_disk:            year=2021/2021_0_0_0_78C704B133D41CB0EF64DD2A9ED3B6BA.parquet
+path_on_disk:            
+remote_file_paths        ['year=2021/2021_0_0_0_78C704B133D41CB0EF64DD2A9ED3B6BA.1.parquet']
 rows:                    1
 size_in_bytes:           272
 merged_from:             ['2021_0_0_0']
@@ -158,3 +171,99 @@ ProfileEvents:           {}
 - `PartsExportDuplicated` - Number of part exports that failed because target already exists.
 - `PartsExportTotalMilliseconds` - Total time
 
+### Split large files
+
+```sql
+alter table big_table export part '2025_0_32_3' to table replicated_big_destination SETTINGS export_merge_tree_part_max_bytes_per_file=10000000, output_format_parquet_row_group_size_bytes=5000000;
+
+arthur :) select * from system.exports;
+
+SELECT *
+FROM system.exports
+
+Query id: d78d9ce5-cfbc-4957-b7dd-bc8129811634
+
+Row 1:
+──────
+source_database:               default
+source_table:                  big_table
+destination_database:          default
+destination_table:             replicated_big_destination
+create_time:                   2025-12-15 13:12:48
+part_name:                     2025_0_32_3
+destination_file_paths:        ['replicated_big/year=2025/2025_0_32_3_E439C23833C39C6E5104F6F4D1048BE7.1.parquet','replicated_big/year=2025/2025_0_32_3_E439C23833C39C6E5104F6F4D1048BE7.2.parquet','replicated_big/year=2025/2025_0_32_3_E439C23833C39C6E5104F6F4D1048BE7.3.parquet','replicated_big/year=2025/2025_0_32_3_E439C23833C39C6E5104F6F4D1048BE7.4.parquet']
+elapsed:                       14.360427274
+rows_read:                     10256384 -- 10.26 million
+total_rows_to_read:            10485760 -- 10.49 million
+total_size_bytes_compressed:   83779395 -- 83.78 million
+total_size_bytes_uncompressed: 10611691600 -- 10.61 billion
+bytes_read_uncompressed:       10440998912 -- 10.44 billion
+memory_usage:                  89795477 -- 89.80 million
+peak_memory_usage:             107362133 -- 107.36 million
+
+1 row in set. Elapsed: 0.014 sec. 
+
+arthur :) select * from system.part_log where event_type = 'ExportPart' order by event_time desc limit 1 format Vertical;
+
+SELECT *
+FROM system.part_log
+WHERE event_type = 'ExportPart'
+ORDER BY event_time DESC
+LIMIT 1
+FORMAT Vertical
+
+Query id: 95128b01-b751-4726-8e3e-320728ac6af7
+
+Row 1:
+──────
+hostname:                arthur
+query_id:                
+event_type:              ExportPart
+merge_reason:            NotAMerge
+merge_algorithm:         Undecided
+event_date:              2025-12-15
+event_time:              2025-12-15 13:13:03
+event_time_microseconds: 2025-12-15 13:13:03.197492
+duration_ms:             14673
+database:                default
+table:                   big_table
+table_uuid:              a3eeeea0-295c-41a3-84ef-6b5463dbbe8c
+part_name:               2025_0_32_3
+partition_id:            2025
+partition:               2025
+part_type:               Wide
+disk_name:               default
+path_on_disk:            ./store/a3e/a3eeeea0-295c-41a3-84ef-6b5463dbbe8c/2025_0_32_3/
+remote_file_paths:       ['replicated_big/year=2025/2025_0_32_3_E439C23833C39C6E5104F6F4D1048BE7.1.parquet','replicated_big/year=2025/2025_0_32_3_E439C23833C39C6E5104F6F4D1048BE7.2.parquet','replicated_big/year=2025/2025_0_32_3_E439C23833C39C6E5104F6F4D1048BE7.3.parquet','replicated_big/year=2025/2025_0_32_3_E439C23833C39C6E5104F6F4D1048BE7.4.parquet']
+rows:                    10485760 -- 10.49 million
+size_in_bytes:           83779395 -- 83.78 million
+merged_from:             ['2025_0_32_3']
+bytes_uncompressed:      10611691600 -- 10.61 billion
+read_rows:               10485760 -- 10.49 million
+read_bytes:              10674503680 -- 10.67 billion
+peak_memory_usage:       107362133 -- 107.36 million
+error:                   0
+exception:               
+ProfileEvents:           {}
+
+1 row in set. Elapsed: 0.044 sec.
+
+arthur :) select _path, formatReadableSize(_size) as _size from s3(s3_conn, filename='**', format=One);
+
+SELECT
+    _path,
+    formatReadableSize(_size) AS _size
+FROM s3(s3_conn, filename = '**', format = One)
+
+Query id: c48ae709-f590-4d1b-8158-191f8d628966
+
+   ┌─_path────────────────────────────────────────────────────────────────────────────────┬─_size─────┐
+1. │ test/replicated_big/year=2025/2025_0_32_3_E439C23833C39C6E5104F6F4D1048BE7.1.parquet │ 17.36 MiB │
+2. │ test/replicated_big/year=2025/2025_0_32_3_E439C23833C39C6E5104F6F4D1048BE7.2.parquet │ 17.32 MiB │
+3. │ test/replicated_big/year=2025/2025_0_32_3_E439C23833C39C6E5104F6F4D1048BE7.4.parquet │ 5.04 MiB  │
+4. │ test/replicated_big/year=2025/2025_0_32_3_E439C23833C39C6E5104F6F4D1048BE7.3.parquet │ 17.40 MiB │
+5. │ test/replicated_big/year=2025/commit_2025_0_32_3_E439C23833C39C6E5104F6F4D1048BE7    │ 320.00 B  │
+   └──────────────────────────────────────────────────────────────────────────────────────┴───────────┘
+
+5 rows in set. Elapsed: 0.072 sec. 
+```

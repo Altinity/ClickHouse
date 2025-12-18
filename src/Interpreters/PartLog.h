@@ -74,6 +74,7 @@ struct PartLogElement
     String disk_name;
     String path_on_disk;
     Strings deduplication_block_ids;
+    std::vector<String> remote_file_paths;
 
     MergeTreeDataPartType part_type;
 

@@ -55,7 +55,10 @@ namespace ExportPartitionUtils
 
             const auto processed_part_entry = ExportReplicatedMergeTreePartitionProcessedPartEntry::fromJsonString(responses[i].data);
 
-            exported_paths.emplace_back(processed_part_entry.path_in_destination);
+            for (const auto & path_in_destination : processed_part_entry.paths_in_destination)
+            {
+                exported_paths.emplace_back(path_in_destination);
+            }
         }
 
         return exported_paths;
@@ -71,13 +74,19 @@ namespace ExportPartitionUtils
     {
         const auto exported_paths = ExportPartitionUtils::getExportedPaths(log, zk, entry_path);
 
-        if (exported_paths.size() != manifest.parts.size())
+        if (exported_paths.empty())
         {
-            LOG_INFO(log, "ExportPartition: Skipping {}: exported paths size does not match parts size, this is a BUG", entry_path);
+            LOG_WARNING(log, "ExportPartition: No exported paths found, will not commit export. This might be a bug");
             return;
         }
 
-        LOG_INFO(log, "ExportPartition: Exported paths size matches parts size, commit the export");
+        //// not checking for an exact match because a single part might generate multiple files
+        if (exported_paths.size() < manifest.parts.size())
+        {
+            LOG_WARNING(log, "ExportPartition: Reached the commit phase, but exported paths size is less than the number of parts, will not commit export. This might be a bug");
+            return;
+        }
+
         destination_storage->commitExportPartitionTransaction(manifest.transaction_id, manifest.partition_id, exported_paths, context);
 
         LOG_INFO(log, "ExportPartition: Committed export, mark as completed");

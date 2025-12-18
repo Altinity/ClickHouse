@@ -138,6 +138,7 @@ ColumnsDescription PartLogElement::getColumnsDescription()
         {"part_type", std::make_shared<DataTypeString>(), "The type of the part. Possible values: Wide and Compact."},
         {"disk_name", std::make_shared<DataTypeString>(), "The disk name data part lies on."},
         {"path_on_disk", std::make_shared<DataTypeString>(), "Absolute path to the folder with data part files."},
+        {"remote_file_paths", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>()), "In case of an export operation to remote storages, the file paths a given export generated"},
 
         {"rows", std::make_shared<DataTypeUInt64>(), "The number of rows in the data part."},
         {"size_in_bytes", std::make_shared<DataTypeUInt64>(), "Size of the data part on disk in bytes."},
@@ -191,6 +192,12 @@ void PartLogElement::appendToBlock(MutableColumns & columns) const
     columns[i++]->insert(part_type.toString());
     columns[i++]->insert(disk_name);
     columns[i++]->insert(path_on_disk);
+
+    Array remote_file_paths_array;
+    remote_file_paths_array.reserve(remote_file_paths.size());
+    for (const auto & remote_file_path : remote_file_paths)
+        remote_file_paths_array.push_back(remote_file_path);
+    columns[i++]->insert(remote_file_paths_array);
 
     columns[i++]->insert(rows);
     columns[i++]->insert(bytes_compressed_on_disk);

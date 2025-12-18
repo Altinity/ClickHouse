@@ -136,6 +136,13 @@ size_t StorageObjectStorageSink::getFileSize() const
     return *result_file_size;
 }
 
+size_t StorageObjectStorageSink::getWrittenBytes() const
+{
+    if (!write_buf)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Buffer must be initialized before requesting written bytes");
+    return write_buf->count();
+}
+
 PartitionedStorageObjectStorageSink::PartitionedStorageObjectStorageSink(
     ObjectStoragePtr object_storage_,
     StorageObjectStorageConfigurationPtr configuration_,

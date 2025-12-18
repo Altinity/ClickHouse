@@ -7334,6 +7334,14 @@ Possible values:
 - error - Throw an error if the file already exists.
 - overwrite - Overwrite the file.
 )", 0) \
+    DECLARE(UInt64, export_merge_tree_part_max_bytes_per_file, 0, R"(
+Maximum number of bytes to write to a single file when exporting a merge tree part. 0 means no limit.
+This is not a hard limit, and it highly depends on the output format granularity and input source chunk size.
+)", 0) \
+    DECLARE(UInt64, export_merge_tree_part_max_rows_per_file, 0, R"(
+Maximum number of rows to write to a single file when exporting a merge tree part. 0 means no limit.
+This is not a hard limit, and it highly depends on the output format granularity and input source chunk size.
+)", 0) \
     \
     /* ####################################################### */ \
     /* ########### START OF EXPERIMENTAL FEATURES ############ */ \

@@ -203,6 +203,8 @@ namespace Setting
     extern const SettingsBool output_format_parquet_parallel_encoding;
     extern const SettingsMaxThreads max_threads;
     extern const SettingsMergeTreePartExportFileAlreadyExistsPolicy export_merge_tree_part_file_already_exists_policy;
+    extern const SettingsUInt64 export_merge_tree_part_max_bytes_per_file;
+    extern const SettingsUInt64 export_merge_tree_part_max_rows_per_file;
 }
 
 namespace MergeTreeSetting
@@ -8244,6 +8246,8 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     manifest.max_threads = query_context->getSettingsRef()[Setting::max_threads];
     manifest.parallel_formatting = query_context->getSettingsRef()[Setting::output_format_parallel_formatting];
     manifest.parquet_parallel_encoding = query_context->getSettingsRef()[Setting::output_format_parquet_parallel_encoding];
+    manifest.max_bytes_per_file = query_context->getSettingsRef()[Setting::export_merge_tree_part_max_bytes_per_file];
+    manifest.max_rows_per_file = query_context->getSettingsRef()[Setting::export_merge_tree_part_max_rows_per_file];
 
     manifest.file_already_exists_policy = query_context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value;
 
