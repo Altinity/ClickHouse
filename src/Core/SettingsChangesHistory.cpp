@@ -55,8 +55,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"export_merge_tree_part_file_already_exists_policy", "skip", "skip", "New setting."},
             {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."},
             {"hybrid_table_auto_cast_columns", true, true, "New setting to automatically cast Hybrid table columns when segments disagree on types. Default enabled."},
-            {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."}
-            {"show_data_lake_catalogs_in_system_tables", true, false, "Disable catalogs in system tables by default"},
+            {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
             {"optimize_rewrite_like_perfect_affix", false, true, "New setting"},
             {"allow_dynamic_type_in_join_keys", true, false, "Disallow using Dynamic type in JOIN keys by default"},
             {"use_skip_indexes_on_data_read", false, true, "Enabled skip index usage in read phase by default"},
