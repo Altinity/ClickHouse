@@ -19,7 +19,7 @@ public:
         std::size_t max_bytes_per_file_,
         std::size_t max_rows_per_file_,
         bool overwrite_if_exists_,
-        std::function<void(const std::string &)> new_file_path_callback_,
+        const std::function<void(const std::string &)> & new_file_path_callback_,
         const std::optional<FormatSettings> & format_settings_,
         SharedHeader sample_block_,
         ContextPtr context_);

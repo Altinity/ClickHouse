@@ -87,7 +87,7 @@ public:
     SinkToStoragePtr import(
         const std::string & /* file_name */,
         Block & /* block_with_partition_values */,
-        std::function<void(const std::string &)> new_file_path_callback,
+        const std::function<void(const std::string &)> & new_file_path_callback,
         bool /* overwrite_if_exists */,
         std::size_t /* max_bytes_per_file */,
         std::size_t /* max_rows_per_file */,

@@ -105,7 +105,7 @@ destination_database:          default
 destination_table:             destination_table
 create_time:                   2025-11-19 09:09:11
 part_name:                     20251016-365_1_1_0
-destination_file_paths:        ['table_root/eventDate=2025-10-16/retention=365/20251016-365_1_1_0_17B2F6CD5D3C18E787C07AE3DAF16EB1.parquet']
+destination_file_paths:        ['table_root/eventDate=2025-10-16/retention=365/20251016-365_1_1_0_17B2F6CD5D3C18E787C07AE3DAF16EB1.1.parquet']
 elapsed:                       2.04845441
 rows_read:                     1138688 -- 1.14 million
 total_rows_to_read:            550961374 -- 550.96 million
@@ -151,7 +151,7 @@ partition:               2021
 part_type:               Compact
 disk_name:               default
 path_on_disk:            
-remote_file_paths        ['year=2021/2021_0_0_0_78C704B133D41CB0EF64DD2A9ED3B6BA.parquet']
+remote_file_paths        ['year=2021/2021_0_0_0_78C704B133D41CB0EF64DD2A9ED3B6BA.1.parquet']
 rows:                    1
 size_in_bytes:           272
 merged_from:             ['2021_0_0_0']
