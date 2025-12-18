@@ -131,23 +131,6 @@ def get_broken_tests_rules(broken_tests_file_path: str) -> dict:
 def test_is_known_fail(test_name, test_logs, build_flags, broken_tests_file_path):
     matching_rules = []
 
-    known_broken_tests = get_broken_tests_rules(broken_tests_file_path)
-
-    # print(f"Checking known broken tests for failed test: {test_name}")
-    # print("Potential matching rules:")
-    exact_rule = known_broken_tests["exact"].get(test_name)
-    if exact_rule:
-        # print(f"{test_name} - {exact_rule}")
-        matching_rules.append(exact_rule)
-
-    for name_re, data in known_broken_tests["pattern"].items():
-        if name_re.fullmatch(test_name):
-            # print(f"{name_re} - {data}")
-            matching_rules.append(data)
-
-    if not matching_rules:
-        return False
-
     def matches_substring(substring, log, is_regex):
         if log is None:
             return False
@@ -155,29 +138,57 @@ def test_is_known_fail(test_name, test_logs, build_flags, broken_tests_file_path
             return bool(substring.search(log))
         return substring in log
 
-    for rule_data in matching_rules:
-        if rule_data.get("check_types") and not any(
-            ct in build_flags for ct in rule_data["check_types"]
-        ):
-            # print(
-            #     f"Check types didn't match: '{rule_data['check_types']}' not in '{build_flags}'"
-            # )
-            continue  # check_types didn't match → skip rule
+    broken_tests_log = "ci/tmp/broken_tests_handler.log"
 
-        is_regex = rule_data.get("regex", False)
-        not_message = rule_data.get("not_message")
-        if not_message and matches_substring(not_message, test_logs, is_regex):
-            # print(f"Skip rule: Not message matched: '{rule_data['not_message']}'")
-            continue  # not_message matched → skip rule
-        message = rule_data.get("message")
-        if message and not matches_substring(message, test_logs, is_regex):
-            # print(f"Skip rule: Message didn't match: '{rule_data['message']}'")
-            continue
+    with open(broken_tests_log, "a") as log_file:
+        try:
+            known_broken_tests = get_broken_tests_rules(broken_tests_file_path)
+        except Exception as e:
+            log_file.write(f"Error getting broken tests rules: {e}\n")
+            return False
 
-        # print(f"Test {test_name} matched rule: {rule_data}")
-        return rule_data["reason"]
+        log_file.write(f"Checking known broken tests for failed test: {test_name}\n")
+        log_file.write("Potential matching rules:\n")
+        exact_rule = known_broken_tests["exact"].get(test_name)
+        if exact_rule:
+            log_file.write(f"{test_name} - {exact_rule}\n")
+            matching_rules.append(exact_rule)
 
-    return False
+        for name_re, data in known_broken_tests["pattern"].items():
+            if name_re.fullmatch(test_name):
+                log_file.write(f"{name_re} - {data}\n")
+                matching_rules.append(data)
+
+        if not matching_rules:
+            return False
+
+        for rule_data in matching_rules:
+            if rule_data.get("check_types") and not any(
+                ct in build_flags for ct in rule_data["check_types"]
+            ):
+                log_file.write(
+                    f"Check types didn't match: '{rule_data['check_types']}' not in '{build_flags}'\n"
+                )
+                continue  # check_types didn't match → skip rule
+
+            is_regex = rule_data.get("regex", False)
+            not_message = rule_data.get("not_message")
+            if not_message and matches_substring(not_message, test_logs, is_regex):
+                log_file.write(
+                    f"Skip rule: Not message matched: '{rule_data['not_message']}'\n"
+                )
+                continue  # not_message matched → skip rule
+            message = rule_data.get("message")
+            if message and not matches_substring(message, test_logs, is_regex):
+                log_file.write(
+                    f"Skip rule: Message didn't match: '{rule_data['message']}'\n"
+                )
+                continue
+
+            log_file.write(f"Test {test_name} matched rule: {rule_data}\n")
+            return rule_data["reason"]
+
+        return False
 
 
 class SharedEngineReplacer:
@@ -2332,8 +2343,8 @@ class TestCase:
                         result.status = TestStatus.BROKEN
 
                         # Place the message on the second line
-                        result.description.replace(
-                            "\n", f"\nMarked as broken: {known_fail_reason}\n", count=1
+                        result.description = result.description.replace(
+                            "\n", f"\nMarked as broken: {known_fail_reason}\n", 1
                         )
 
             if self.name in suite.blacklist_check:

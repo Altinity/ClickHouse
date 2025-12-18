@@ -449,6 +449,10 @@ def main():
             )
             force_ok_exit = True
 
+    broken_tests_handler_log = os.path.join(temp_dir, "broken_tests_handler.log")
+    if os.path.exists(broken_tests_handler_log):
+        debug_files.append(broken_tests_handler_log)
+
     Result.create_from(
         results=results,
         stopwatch=stop_watch,
