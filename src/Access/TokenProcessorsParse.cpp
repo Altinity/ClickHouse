@@ -25,6 +25,8 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
     auto token_cache_lifetime = config.getUInt64(prefix + ".token_cache_lifetime", 3600);
     auto username_claim = config.getString(prefix + ".username_claim", "sub");
     auto groups_claim = config.getString(prefix + ".groups_claim", "groups");
+    auto expected_issuer = config.getString(prefix + ".expected_issuer", "");
+    auto expected_audience = config.getString(prefix + ".expected_audience", "");
 
     if (provider_type == "google")
     {
@@ -45,6 +47,7 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
         if (externally_configured && ! locally_configured)
         {
             return std::make_unique<OpenIdTokenProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim,
+                                                          expected_issuer, expected_audience,
                                                           config.getString(prefix + ".configuration_endpoint"),
                                                           verifier_leeway,
                                                           jwks_cache_lifetime);
@@ -52,6 +55,7 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
         else if (locally_configured && !externally_configured)
         {
             return std::make_unique<OpenIdTokenProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim,
+                                                          expected_issuer, expected_audience,
                                                           config.getString(prefix + ".userinfo_endpoint"),
                                                           config.getString(prefix + ".token_introspection_endpoint"),
                                                           verifier_leeway,
@@ -77,7 +81,7 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
                                      config.getString(prefix + ".public_key_password", ""),
                                      config.getString(prefix + ".private_key_password", ""),
                                      config.getString(prefix + ".claims", "")};
-        return std::make_unique<StaticKeyJwtProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim, params);
+        return std::make_unique<StaticKeyJwtProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim, expected_issuer, expected_audience, params);
     }
     else if (provider_type == "jwt_static_jwks")
     {
@@ -96,6 +100,7 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
             config.getString(prefix + ".static_jwks_file", "")
         };
         return std::make_unique<JwksJwtProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim,
+                                                  expected_issuer, expected_audience,
                                                   config.getString(prefix + ".claims", ""),
                                                   config.getUInt64(prefix + ".verifier_leeway", 0),
                                                   std::make_shared<StaticJWKS>(params));
@@ -108,6 +113,7 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
             throw DB::Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "'jwks_uri' must be specified for 'jwt_dynamic_jwks' processor");
 
         return std::make_unique<JwksJwtProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim,
+                                                  expected_issuer, expected_audience,
                                                   config.getString(prefix + ".claims", ""),
                                                   config.getUInt64(prefix + ".verifier_leeway", 0),
                                                   config.getString(prefix + ".jwks_uri"),

@@ -64,13 +64,15 @@ It is decoded locally and its integrity is verified using either a local static 
   | HS512 | RS512 | ES512  | PS512 |         |
   |       |       | ES256K |       |         |
   Also supports None (though not recommended).
-`claims` - A string containing a JSON object that should be contained in the token payload. If this parameter is defined, token without corresponding payload will be considered invalid. Optional.
+- `claims` - A string containing a JSON object that should be contained in the token payload. If this parameter is defined, token without corresponding payload will be considered invalid. Optional.
 - `static_key` - key for symmetric algorithms. Mandatory for `HS*` family algorithms.
 - `static_key_in_base64` - indicates if the `static_key` key is base64-encoded. Optional, default: `False`.
 - `public_key` - public key for asymmetric algorithms. Mandatory except for `HS*` family algorithms and `None`.
 - `private_key` - private key for asymmetric algorithms. Optional.
 - `public_key_password` - public key password. Optional.
 - `private_key_password` - private key password. Optional.
+- `expected_issuer` - Expected value of the `iss` (issuer) claim in the JWT. If specified, tokens with a different issuer will be rejected. Optional.
+- `expected_audience` - Expected value of the `aud` (audience) claim in the JWT. If specified, tokens with a different audience will be rejected. Optional.
 
 ### JWT with static JWKS
 ```xml
@@ -90,6 +92,8 @@ It is decoded locally and its integrity is verified using either a local static 
 - `static_jwks_file` - path to a file with JWKS
 - `claims` - A string containing a JSON object that should be contained in the token payload. If this parameter is defined, token without corresponding payload will be considered invalid. Optional.
 - `verifier_leeway` - Clock skew tolerance (seconds). Useful for handling small differences in system clocks between ClickHouse and the token issuer. Optional.
+- `expected_issuer` - Expected value of the `iss` (issuer) claim in the JWT. If specified, tokens with a different issuer will be rejected. Optional.
+- `expected_audience` - Expected value of the `aud` (audience) claim in the JWT. If specified, tokens with a different audience will be rejected. Optional.
 
 :::note
 Only one of `static_jwks` or `static_jwks_file` keys must be present in one verifier
@@ -118,6 +122,8 @@ Only RS* family algorithms are supported!
 - `jwks_cache_lifetime` - Period for resend request for refreshing JWKS. Optional, default: 3600.
 - `claims` - A string containing a JSON object that should be contained in the token payload. If this parameter is defined, token without corresponding payload will be considered invalid. Optional.
 - `verifier_leeway` - Clock skew tolerance (seconds). Useful for handling small differences in system clocks between ClickHouse and the token issuer. Optional.
+- `expected_issuer` - Expected value of the `iss` (issuer) claim in the JWT. If specified, tokens with a different issuer will be rejected. Optional.
+- `expected_audience` - Expected value of the `aud` (audience) claim in the JWT. If specified, tokens with a different audience will be rejected. Optional.
 
 
 ## Processors with external providers
@@ -171,6 +177,8 @@ Either `configuration_endpoint` or both `userinfo_endpoint` and `token_introspec
 - `jwks_uri` - URI of OpenID configuration (often ends with `.well-known/jwks.json`)
 - `jwks_cache_lifetime` - Period for resend request for refreshing JWKS. Optional, default: 3600.
 - `verifier_leeway` - Clock skew tolerance (seconds). Useful for handling small differences in system clocks between ClickHouse and the token issuer. Optional, default: 60
+- `expected_issuer` - Expected value of the `iss` (issuer) claim in the JWT. If specified, tokens with a different issuer will be rejected. Optional.
+- `expected_audience` - Expected value of the `aud` (audience) claim in the JWT. If specified, tokens with a different audience will be rejected. Optional.
 
 Sometimes a token is a valid JWT. In that case token will be decoded and validated locally if configuration endpoint returns JWKS URI (or `jwks_uri` is specified alongside `userinfo_endpoint` and `token_introspection_endpoint`).
 

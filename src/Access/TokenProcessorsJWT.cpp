@@ -178,9 +178,11 @@ StaticKeyJwtProcessor::StaticKeyJwtProcessor(const String & processor_name_,
                                              UInt64 token_cache_lifetime_,
                                              const String & username_claim_,
                                              const String & groups_claim_,
+                                             const String & expected_issuer_,
+                                             const String & expected_audience_,
                                              const StaticKeyJwtParams & params)
                                              : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_),
-                                             claims(params.claims)
+                                             claims(params.claims), expected_issuer(expected_issuer_), expected_audience(expected_audience_)
 {
     const String & algo = params.algo;
     const String & static_key = params.static_key;
@@ -259,6 +261,11 @@ StaticKeyJwtProcessor::StaticKeyJwtProcessor(const String & processor_name_,
     else
         throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "{}: Invalid token processor definition, unknown algorithm {}", processor_name, algo);
 
+    if (!expected_issuer.empty())
+        verifier = verifier.with_issuer(expected_issuer);
+
+    if (!expected_audience.empty())
+        verifier = verifier.with_audience(expected_audience);
 }
 
 namespace
@@ -352,10 +359,9 @@ bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
 
     try
     {
-        auto issuer = decoded_jwt.get_issuer();
         auto x5c = jwk.get_x5c_key_value();
 
-        if (!x5c.empty() && !issuer.empty())
+        if (!x5c.empty())
         {
             LOG_TRACE(getLogger("TokenAuthentication"), "{}: Verifying {} with 'x5c' key", processor_name, username);
             public_key = jwt::helper::convert_base64_der_to_pem(x5c);
@@ -363,7 +369,7 @@ bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
     }
     catch (const jwt::error::claim_not_present_exception &)
     {
-        LOG_TRACE(getLogger("TokenAuthentication"), "{}: issuer or x5c was not specified, skip verification against them", processor_name);
+        LOG_TRACE(getLogger("TokenAuthentication"), "{}: x5c was not specified in JWK, will try RSA components", processor_name);
     }
     catch (const std::bad_cast &)
     {
@@ -393,6 +399,13 @@ bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
         throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: unknown algorithm {}", algo);
 
     verifier = verifier.leeway(verifier_leeway);
+
+    if (!expected_issuer.empty())
+        verifier = verifier.with_issuer(expected_issuer);
+
+    if (!expected_audience.empty())
+        verifier = verifier.with_audience(expected_audience);
+
     verifier.verify(decoded_jwt);
 
     if (!claims.empty() && !check_claims(claims, decoded_jwt.get_payload_json()))
