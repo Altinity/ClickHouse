@@ -63,7 +63,7 @@ It is decoded locally and its integrity is verified using either a local static 
   | HS384 | RS384 | ES384  | PS384 | Ed448   |
   | HS512 | RS512 | ES512  | PS512 |         |
   |       |       | ES256K |       |         |
-  Also supports None (though not recommended).
+  Also supports None (not recommended and must *NEVER* be used in production).
 - `claims` - A string containing a JSON object that should be contained in the token payload. If this parameter is defined, token without corresponding payload will be considered invalid. Optional.
 - `static_key` - key for symmetric algorithms. Mandatory for `HS*` family algorithms.
 - `static_key_in_base64` - indicates if the `static_key` key is base64-encoded. Optional, default: `False`.
