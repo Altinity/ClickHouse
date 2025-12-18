@@ -846,6 +846,12 @@ namespace ErrorCodes
     DECLARE(UInt64, adaptive_write_buffer_initial_size, 16 * 1024, R"(
     Initial size of an adaptive write buffer
     )", 0) \
+    DECLARE(UInt64, min_columns_to_activate_adaptive_write_buffer, 500, R"(
+    Allow to reduce memory usage for tables with lots of columns by using adaptive writer buffers.
+    Possible values:
+    - 0 - unlimited
+    - 1 - always enabled
+    )", 0) \
     DECLARE(UInt64, min_free_disk_bytes_to_perform_insert, 0, R"(
     The minimum number of bytes that should be free in disk space in order to
     insert data. If the number of available free bytes is less than
