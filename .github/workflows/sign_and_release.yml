@@ -9,23 +9,14 @@ jobs:
           version: 2
           arch: arm64
 
-      # - name: Download packages from s3
-      #   run: |
-      #     aws s3 cp s3://altinity-test-reports/builds/stable/v25.3.6.10034.altinitystable/2025-07-28T21-08-35.335/packages/ARM_PACKAGES/clickhouse-with-symtable.sha512 /home/runner/.cache/bin-repo/arm64/v25.3.6.10034.altinitystable/non-self-extracting/clickhouse-with-symtable.sha512
-      #     aws s3 cp s3://altinity-test-reports/builds/stable/v25.3.6.10034.altinitystable/2025-07-28T21-08-35.335/packages/ARM_PACKAGES/clickhouse-with-symtable /home/runner/.cache/bin-repo/arm64/v25.3.6.10034.altinitystable/non-self-extracting/clickhouse-with-symtable
-      #     aws s3 cp s3://altinity-test-reports/builds/stable/v25.3.6.10034.altinitystable/2025-07-28T21-08-35.335/packages/AMD_PACKAGES/clickhouse-with-symtable.sha512 /home/runner/.cache/bin-repo/amd64/v25.3.6.10034.altinitystable/non-self-extracting/clickhouse-with-symtable.sha512
-      #     aws s3 cp s3://altinity-test-reports/builds/stable/v25.3.6.10034.altinitystable/2025-07-28T21-08-35.335/packages/AMD_PACKAGES/clickhouse-with-symtable /home/runner/.cache/bin-repo/amd64/v25.3.6.10034.altinitystable/non-self-extracting/clickhouse-with-symtable
-      #   env:
-      #     AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      #     AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - name: Remove packages from s3
+        run: |
+          aws s3 rm s3://builds.altinity.cloud/Blue/bin-repo/amd64/v25.3.6.10034.altinitystable/non-self-extracting/clickhouse-with-symtable
+          aws s3 rm s3://builds.altinity.cloud/Blue/bin-repo/amd64/v25.3.6.10034.altinitystable/non-self-extracting/clickhouse-with-symtable.sha512
+          aws s3 rm s3://builds.altinity.cloud/Green/bin-repo/amd64/v25.3.6.10034.altinitystable/non-self-extracting/clickhouse-with-symtable
+          aws s3 rm s3://builds.altinity.cloud/Green/bin-repo/amd64/v25.3.6.10034.altinitystable/non-self-extracting/clickhouse-with-symtable.sha512
 
-      # - name: Upload to prod
-      #   run: |
-      #     aws s3 sync /home/runner/.cache/bin-repo/ s3://builds.altinity.cloud/Blue/bin-repo
-      #     aws s3 sync s3://builds.altinity.cloud/Blue/bin-repo s3://builds.altinity.cloud/Green/bin-repo
-
-      - name: Sanity check
-        run: sha512sum /home/runner/.cache/bin-repo/amd64/v25.3.6.10034.altinitystable/non-self-extracting/clickhouse-with-symtable
-
-      - name: check 2
-        run: cat /home/runner/.cache/bin-repo/amd64/v25.3.6.10034.altinitystable/non-self-extracting/clickhouse-with-symtable.sha512
+      - name: Reupload to prod
+        run: |
+          aws s3 sync /home/runner/.cache/bin-repo/ s3://builds.altinity.cloud/Blue/bin-repo
+          aws s3 sync s3://builds.altinity.cloud/Blue/bin-repo s3://builds.altinity.cloud/Green/bin-repo
