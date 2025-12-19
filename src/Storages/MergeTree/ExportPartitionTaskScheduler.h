@@ -37,7 +37,7 @@ private:
         const std::string & part_name,
         const std::filesystem::path & export_path,
         const zkutil::ZooKeeperPtr & zk,
-        const String & relative_path_in_destination_storage
+        const std::vector<String> & relative_paths_in_destination_storage
     );
 
     void handlePartExportFailure(
@@ -53,7 +53,7 @@ private:
         const std::filesystem::path & processing_parts_path,
         const std::filesystem::path & processed_part_path,
         const std::string & part_name,
-        const String & relative_path_in_destination_storage,
+        const std::vector<String> & relative_paths_in_destination_storage,
         const zkutil::ZooKeeperPtr & zk
     );
 
