@@ -3945,9 +3945,9 @@ def test_iceberg_write_minmax(started_cluster):
 @pytest.mark.parametrize("storage_type", ["s3", "azure"])
 @pytest.mark.parametrize("cluster_table_function_buckets_batch_size", [0, 100, 1000])
 @pytest.mark.parametrize("input_format_parquet_use_native_reader_v3", [0, 1])
-def test_cluster_table_function_split_by_row_groups(started_cluster_iceberg_with_spark, format_version, storage_type, cluster_table_function_buckets_batch_size,input_format_parquet_use_native_reader_v3):
-    instance = started_cluster_iceberg_with_spark.instances["node1"]
-    spark = started_cluster_iceberg_with_spark.spark_session
+def test_cluster_table_function_split_by_row_groups(started_cluster, format_version, storage_type, cluster_table_function_buckets_batch_size,input_format_parquet_use_native_reader_v3):
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
 
     TABLE_NAME = (
         "test_iceberg_cluster_"
@@ -3968,7 +3968,7 @@ def test_cluster_table_function_split_by_row_groups(started_cluster_iceberg_with
         )
 
         files = default_upload_directory(
-            started_cluster_iceberg_with_spark,
+            started_cluster,
             storage_type,
             f"/iceberg_data/default/{TABLE_NAME}/",
             f"/iceberg_data/default/{TABLE_NAME}/",
@@ -3979,7 +3979,7 @@ def test_cluster_table_function_split_by_row_groups(started_cluster_iceberg_with
         return files
 
     files = add_df(mode="overwrite")
-    for i in range(1, 5 * len(started_cluster_iceberg_with_spark.instances)):
+    for i in range(1, 5 * len(started_cluster.instances)):
         files = add_df(mode="append")
 
     clusters = instance.query(f"SELECT * FROM system.clusters")
@@ -3987,7 +3987,7 @@ def test_cluster_table_function_split_by_row_groups(started_cluster_iceberg_with
 
     # Regular Query only node1
     table_function_expr = get_creation_expression(
-        storage_type, TABLE_NAME, started_cluster_iceberg_with_spark, table_function=True
+        storage_type, TABLE_NAME, started_cluster, table_function=True
     )
     select_regular = (
         instance.query(f"SELECT * FROM {table_function_expr} ORDER BY ALL").strip().split()
@@ -3997,7 +3997,7 @@ def test_cluster_table_function_split_by_row_groups(started_cluster_iceberg_with
     table_function_expr_cluster = get_creation_expression(
         storage_type,
         TABLE_NAME,
-        started_cluster_iceberg_with_spark,
+        started_cluster,
         table_function=True,
         run_on_cluster=True,
     )
