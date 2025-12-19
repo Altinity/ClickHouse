@@ -180,9 +180,11 @@ StaticKeyJwtProcessor::StaticKeyJwtProcessor(const String & processor_name_,
                                              const String & groups_claim_,
                                              const String & expected_issuer_,
                                              const String & expected_audience_,
+                                             bool allow_no_expiration_,
                                              const StaticKeyJwtParams & params)
                                              : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_),
-                                             claims(params.claims), expected_issuer(expected_issuer_), expected_audience(expected_audience_)
+                                             claims(params.claims), expected_issuer(expected_issuer_), expected_audience(expected_audience_),
+                                             allow_no_expiration(allow_no_expiration_)
 {
     const String & algo = params.algo;
     const String & static_key = params.static_key;
@@ -300,6 +302,12 @@ bool StaticKeyJwtProcessor::resolveAndValidate(TokenCredentials & credentials) c
         auto decoded_jwt = jwt::decode(credentials.getToken());
         verifier.verify(decoded_jwt);
 
+        if (!allow_no_expiration && !decoded_jwt.has_expires_at())
+        {
+            LOG_TRACE(getLogger("TokenAuthentication"), "{}: Token missing 'exp' claim, rejecting", processor_name);
+            return false;
+        }
+
         if (!check_claims(claims, decoded_jwt.get_payload_json()))
             return false;
 
@@ -328,6 +336,12 @@ bool StaticKeyJwtProcessor::resolveAndValidate(TokenCredentials & credentials) c
 bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
 {
     auto decoded_jwt = jwt::decode(credentials.getToken());
+
+    if (!allow_no_expiration && !decoded_jwt.has_expires_at())
+    {
+        LOG_TRACE(getLogger("TokenAuthentication"), "{}: Token missing 'exp' claim, rejecting", processor_name);
+        return false;
+    }
 
     if (!decoded_jwt.has_payload_claim(username_claim))
     {

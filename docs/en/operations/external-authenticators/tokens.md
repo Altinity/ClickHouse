@@ -73,6 +73,7 @@ It is decoded locally and its integrity is verified using either a local static 
 - `private_key_password` - private key password. Optional.
 - `expected_issuer` - Expected value of the `iss` (issuer) claim in the JWT. If specified, tokens with a different issuer will be rejected. Optional.
 - `expected_audience` - Expected value of the `aud` (audience) claim in the JWT. If specified, tokens with a different audience will be rejected. Optional.
+- `allow_no_expiration` - If `true`, tokens without the `exp` (expiration) claim are accepted. Otherwise they are rejected. Optional, default: `false`.
 
 ### JWT with static JWKS
 ```xml
@@ -94,6 +95,7 @@ It is decoded locally and its integrity is verified using either a local static 
 - `verifier_leeway` - Clock skew tolerance (seconds). Useful for handling small differences in system clocks between ClickHouse and the token issuer. Optional.
 - `expected_issuer` - Expected value of the `iss` (issuer) claim in the JWT. If specified, tokens with a different issuer will be rejected. Optional.
 - `expected_audience` - Expected value of the `aud` (audience) claim in the JWT. If specified, tokens with a different audience will be rejected. Optional.
+- `allow_no_expiration` - If `true`, tokens without the `exp` (expiration) claim are accepted. Otherwise they are rejected. Optional, default: `false`.
 
 :::note
 Only one of `static_jwks` or `static_jwks_file` keys must be present in one verifier
@@ -124,6 +126,7 @@ Only RS* family algorithms are supported!
 - `verifier_leeway` - Clock skew tolerance (seconds). Useful for handling small differences in system clocks between ClickHouse and the token issuer. Optional.
 - `expected_issuer` - Expected value of the `iss` (issuer) claim in the JWT. If specified, tokens with a different issuer will be rejected. Optional.
 - `expected_audience` - Expected value of the `aud` (audience) claim in the JWT. If specified, tokens with a different audience will be rejected. Optional.
+- `allow_no_expiration` - If `true`, tokens without the `exp` (expiration) claim are accepted. Otherwise they are rejected. Optional, default: `false`.
 
 
 ## Processors with external providers
@@ -179,6 +182,7 @@ Either `configuration_endpoint` or both `userinfo_endpoint` and `token_introspec
 - `verifier_leeway` - Clock skew tolerance (seconds). Useful for handling small differences in system clocks between ClickHouse and the token issuer. Optional, default: 60
 - `expected_issuer` - Expected value of the `iss` (issuer) claim in the JWT. If specified, tokens with a different issuer will be rejected. Optional.
 - `expected_audience` - Expected value of the `aud` (audience) claim in the JWT. If specified, tokens with a different audience will be rejected. Optional.
+- `allow_no_expiration` - If `true`, tokens without the `exp` (expiration) claim are accepted. Otherwise they are rejected. Optional, default: `false`.
 
 Sometimes a token is a valid JWT. In that case token will be decoded and validated locally if configuration endpoint returns JWKS URI (or `jwks_uri` is specified alongside `userinfo_endpoint` and `token_introspection_endpoint`).
 

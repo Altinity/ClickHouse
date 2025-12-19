@@ -89,6 +89,7 @@ public:
                                    const String & groups_claim_,
                                    const String & expected_issuer_,
                                    const String & expected_audience_,
+                                   bool allow_no_expiration_,
                                    const StaticKeyJwtParams & params);
 
     bool resolveAndValidate(TokenCredentials & credentials) const override;
@@ -98,6 +99,7 @@ private:
     const String claims;
     const String expected_issuer;
     const String expected_audience;
+    const bool allow_no_expiration;
     jwt::verifier<jwt::default_clock, jwt::traits::kazuho_picojson> verifier = jwt::verify();
 };
 
@@ -111,12 +113,13 @@ public:
                               const String & groups_claim_,
                               const String & expected_issuer_,
                               const String & expected_audience_,
+                              bool allow_no_expiration_,
                               const String & claims_,
                               size_t verifier_leeway_,
                               std::shared_ptr<IJWKSProvider> provider_)
                               : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_),
                                 claims(claims_), expected_issuer(expected_issuer_), expected_audience(expected_audience_),
-                                provider(provider_), verifier_leeway(verifier_leeway_) {}
+                                allow_no_expiration(allow_no_expiration_), provider(provider_), verifier_leeway(verifier_leeway_) {}
 
     explicit JwksJwtProcessor(const String & processor_name_,
                               UInt64 token_cache_lifetime_,
@@ -124,6 +127,7 @@ public:
                               const String & groups_claim_,
                               const String & expected_issuer_,
                               const String & expected_audience_,
+                              bool allow_no_expiration_,
                               const String & claims_,
                               size_t verifier_leeway_,
                               const String & jwks_uri_,
@@ -134,6 +138,7 @@ public:
                                                  groups_claim_,
                                                  expected_issuer_,
                                                  expected_audience_,
+                                                 allow_no_expiration_,
                                                  claims_,
                                                  verifier_leeway_,
                                                  std::make_shared<JWKSClient>(jwks_uri_, jwks_cache_lifetime_)) {}
@@ -145,6 +150,7 @@ private:
     const String claims;
     const String expected_issuer;
     const String expected_audience;
+    const bool allow_no_expiration;
     mutable jwt::verifier<jwt::default_clock, jwt::traits::kazuho_picojson> verifier = jwt::verify();
     std::shared_ptr<IJWKSProvider> provider;
     const size_t verifier_leeway;
@@ -186,6 +192,7 @@ public:
                          const String & groups_claim_,
                          const String & expected_issuer_,
                          const String & expected_audience_,
+                         bool allow_no_expiration_,
                          const String & userinfo_endpoint_,
                          const String & token_introspection_endpoint_,
                          UInt64 verifier_leeway_,
@@ -199,6 +206,7 @@ public:
                          const String & groups_claim_,
                          const String & expected_issuer_,
                          const String & expected_audience_,
+                         bool allow_no_expiration_,
                          const String & openid_config_endpoint_,
                          UInt64 verifier_leeway_,
                          UInt64 jwks_cache_lifetime_);
@@ -207,6 +215,7 @@ public:
 private:
     const String expected_issuer;
     const String expected_audience;
+    const bool allow_no_expiration;
     Poco::URI userinfo_endpoint;
     Poco::URI token_introspection_endpoint;
 
