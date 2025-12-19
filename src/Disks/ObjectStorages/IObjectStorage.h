@@ -194,7 +194,7 @@ struct PathWithMetadata
 
     String getIdentifier() const
     {
-        String result = absolute_path.value_or(relative_path);
+        String result = getAbsolutePath().value_or(getPath());
         if (file_bucket_info)
             result += file_bucket_info->getIdentifier();
         return result;

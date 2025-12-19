@@ -101,20 +101,23 @@ ObjectInfoPtr ObjectIteratorSplitByBuckets::next(size_t id)
     if (!last_object_info)
         return {};
 
-    auto buffer = createReadBuffer(*last_object_info, object_storage, getContext(), log);
-
     auto splitter = FormatFactory::instance().getSplitter(format);
-    if (splitter)
+    /// If there's no splitter for this format (e.g., CSV in archives), return the object as-is
+    if (!splitter)
+        return last_object_info;
+
+    auto buffer = createReadBuffer(*last_object_info, object_storage, getContext(), log);
+    size_t bucket_size = getContext()->getSettingsRef()[Setting::cluster_table_function_buckets_batch_size];
+    auto file_bucket_info = splitter->splitToBuckets(bucket_size, *buffer, format_settings);
+    for (const auto & file_bucket : file_bucket_info)
     {
-        size_t bucket_size = getContext()->getSettingsRef()[Setting::cluster_table_function_buckets_batch_size];
-        auto file_bucket_info = splitter->splitToBuckets(bucket_size, *buffer, format_settings);
-        for (const auto & file_bucket : file_bucket_info)
-        {
-            auto copy_object_info = *last_object_info;
-            copy_object_info.file_bucket_info = file_bucket;
-            pending_objects_info.push(std::make_shared<ObjectInfo>(copy_object_info));
-        }
+        auto copy_object_info = *last_object_info;
+        copy_object_info.file_bucket_info = file_bucket;
+        pending_objects_info.push(std::make_shared<ObjectInfo>(copy_object_info));
     }
+
+    if (pending_objects_info.empty())
+        return last_object_info;
 
     auto result = pending_objects_info.front();
     pending_objects_info.pop();
