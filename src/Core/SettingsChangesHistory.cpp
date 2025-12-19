@@ -58,7 +58,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
             {"export_merge_tree_part_max_bytes_per_file", 0, 0, "New setting."},
             {"export_merge_tree_part_max_rows_per_file", 0, 0, "New setting."},
-            {"show_data_lake_catalogs_in_system_tables", true, false, "Disable catalogs in system tables by default"},
         });
         addSettingsChanges(settings_changes_history, "25.8",
         {
