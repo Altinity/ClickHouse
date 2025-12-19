@@ -162,6 +162,8 @@ def test_is_known_fail(test_name, test_logs, build_flags, broken_tests_file_path
         if not matching_rules:
             return False
 
+        log_file.write(f"First line of test logs: {test_logs.splitlines()[0]}\n")
+
         for rule_data in matching_rules:
             if rule_data.get("check_types") and not any(
                 ct in build_flags for ct in rule_data["check_types"]
