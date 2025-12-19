@@ -6900,6 +6900,14 @@ Possible values:
 
 Default value is `UTC`.
 )", 0) \
+    DECLARE(UInt64, export_merge_tree_part_max_bytes_per_file, 0, R"(
+Maximum number of bytes to write to a single file when exporting a merge tree part. 0 means no limit.
+This is not a hard limit, and it highly depends on the output format granularity and input source chunk size.
+)", 0) \
+    DECLARE(UInt64, export_merge_tree_part_max_rows_per_file, 0, R"(
+Maximum number of rows to write to a single file when exporting a merge tree part. 0 means no limit.
+This is not a hard limit, and it highly depends on the output format granularity and input source chunk size.
+)", 0) \
     \
     /* ####################################################### */ \
     /* ########### START OF EXPERIMENTAL FEATURES ############ */ \
@@ -7104,9 +7112,6 @@ Use Shuffle aggregation strategy instead of PartialAggregation + Merge in distri
     DECLARE(Bool, allow_experimental_iceberg_read_optimization, true, R"(
 Allow Iceberg read optimization based on Iceberg metadata.
 )", EXPERIMENTAL) \
-    DECLARE(Bool, allow_retries_in_cluster_requests, false, R"(
-Allow retries in cluster request, when one node goes offline
-)", EXPERIMENTAL) \
     DECLARE(Bool, object_storage_remote_initiator, false, R"(
 Execute request to object storage as remote on one of object_storage_cluster nodes.
 )", EXPERIMENTAL) \
@@ -7228,6 +7233,7 @@ Sets the evaluation time to be used with promql dialect. 'auto' means the curren
     MAKE_OBSOLETE(M, Bool, allow_experimental_shared_set_join, true) \
     MAKE_OBSOLETE(M, UInt64, min_external_sort_block_bytes, 100_MiB) \
     MAKE_OBSOLETE(M, UInt64, distributed_cache_read_alignment, 0) \
+    MAKE_OBSOLETE(M, Bool, allow_retries_in_cluster_requests, false) \
     /** The section above is for obsolete settings. Do not add anything there. */
 #endif /// __CLION_IDE__
 

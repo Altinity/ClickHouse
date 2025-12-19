@@ -59,6 +59,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"input_format_parquet_use_native_reader_v3", false, true, "Seems stable"},
             {"input_format_parquet_verify_checksums", true, true, "New setting."},
             {"output_format_parquet_write_checksums", false, true, "New setting."},
+            {"export_merge_tree_part_max_bytes_per_file", 0, 0, "New setting."},
+            {"export_merge_tree_part_max_rows_per_file", 0, 0, "New setting."},
         });
         addSettingsChanges(settings_changes_history, "25.8",
         {
