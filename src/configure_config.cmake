@@ -235,5 +235,11 @@ if (TARGET ch_rust::wasmtime)
 endif()
 
 set (USE_YTSAURUS 1)
+<<<<<<< HEAD
+=======
+if (TARGET ch_contrib::jwt-cpp)
+    set(USE_JWT_CPP 1)
+endif()
+>>>>>>> 58b404dc6a5 (Merge pull request #1078 from Altinity/oauth-antalya-25.8)
 
 set(SOURCE_DIR ${PROJECT_SOURCE_DIR})
