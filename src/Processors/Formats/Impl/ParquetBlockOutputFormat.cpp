@@ -111,6 +111,7 @@ ParquetBlockOutputFormat::ParquetBlockOutputFormat(WriteBuffer & out_, SharedHea
         options.write_batch_size = format_settings.parquet.write_batch_size;
         options.write_page_index = format_settings.parquet.write_page_index;
         options.write_bloom_filter = format_settings.parquet.write_bloom_filter;
+        options.write_checksums = format_settings.parquet.write_checksums;
         options.bloom_filter_bits_per_value = format_settings.parquet.bloom_filter_bits_per_value;
         options.bloom_filter_flush_threshold_bytes = format_settings.parquet.bloom_filter_flush_threshold_bytes;
         options.write_geometadata = format_settings.parquet.write_geometadata;
@@ -353,6 +354,10 @@ void ParquetBlockOutputFormat::writeUsingArrow(std::vector<Chunk> chunks)
         builder.version(getParquetVersion(format_settings));
         auto compression_codec = getParquetCompression(format_settings.parquet.output_compression_method);
         builder.compression(compression_codec);
+        if (format_settings.parquet.max_dictionary_size == 0)
+            builder.disable_dictionary();
+        else
+            builder.dictionary_pagesize_limit(format_settings.parquet.max_dictionary_size);
 
         if (arrow::util::Codec::SupportsCompressionLevel(compression_codec))
         {

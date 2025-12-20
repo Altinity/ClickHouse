@@ -25,7 +25,8 @@ namespace DB::Parquet
 
 // TODO [parquet]:
 //  * either multistage PREWHERE or make query optimizer selectively move parts of the condition to prewhere instead of the whole condition
-//  * test on files from https://github.com/apache/parquet-testing
+//  * test on files from https://github.com/apache/parquet-testing and https://www.timestored.com/data/sample/parquet
+//  * look at issues in 00900_long_parquet_load.sh
 //  * check fields for false sharing, add cacheline padding as needed
 //  * make sure userspace page cache read buffer supports readBigAt
 //  * support newer parquet versions: https://github.com/apache/parquet-format/blob/master/CHANGES.md
@@ -60,7 +61,7 @@ namespace DB::Parquet
 //     - no columns to read outside prewhere
 //     - no columns to read, but not trivial count either
 //     - ROW POLICY, with and without prewhere, with old and new reader
-//     - prewhere with defaults (it probably doesn't fill them correctly, see MergeTreeRangeReader::executeActionsBeforePrewhere)
+//     - prewhere and other skipping with defaults (it probably doesn't fill them correctly, see MergeTreeRangeReader::executeActionsBeforePrewhere)
 //     - prewhere on virtual columns (do they end up in additional_columns?)
 //     - prewhere with weird filter type (LowCardinality(UInt8), Nullable(UInt8), const UInt8)
 //     - prewhere involving arrays and tuples
@@ -522,7 +523,8 @@ private:
     double estimateAverageStringLengthPerRow(const ColumnChunk & column, const RowGroup & row_group) const;
     void decodeDictionaryPageImpl(const parq::PageHeader & header, std::span<const char> data, ColumnChunk & column, const PrimitiveColumnInfo & column_info);
     void skipToRow(size_t row_idx, ColumnChunk & column, const PrimitiveColumnInfo & column_info);
-    bool initializePage(const char * & data_ptr, const char * data_end, size_t next_row_idx, std::optional<size_t> end_row_idx, size_t target_row_idx, ColumnChunk & column, const PrimitiveColumnInfo & column_info);
+    std::tuple<parq::PageHeader, std::span<const char>> decodeAndCheckPageHeader(const char * & data_ptr, const char * data_end) const;
+    bool initializeDataPage(const char * & data_ptr, const char * data_end, size_t next_row_idx, std::optional<size_t> end_row_idx, size_t target_row_idx, ColumnChunk & column, const PrimitiveColumnInfo & column_info);
     void decompressPageIfCompressed(PageState & page);
     void createPageDecoder(PageState & page, ColumnChunk & column, const PrimitiveColumnInfo & column_info);
     bool skipRowsInPage(size_t target_row_idx, PageState & page, ColumnChunk & column, const PrimitiveColumnInfo & column_info);
