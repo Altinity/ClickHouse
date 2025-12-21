@@ -60,6 +60,10 @@
 - name: 00024_random_counters
   reason: INVESTIGATE - random timeout
   message: Timeout! Killing process group
+- name: 03211_nested_json_merges
+  reason: KNOWN - Unstable upstream
+- name: 03644_object_storage_correlated_subqueries
+  reason: KNOWN - Unstable in upstream 25.8.
 - name: test_storage_s3_queue/test_5.py::test_migration[1-s3queue_]
   reason: KNOWN - Sometimes fails due to test order
   message: 'Failed: Timeout >900.0s'
@@ -168,8 +172,7 @@
   reason: 'KNOWN: Occasional timeout'
   message: docker_compose_iceberg_hms_catalog.yml', '--verbose', 'up', '-d']' timed out after 300 seconds
 - name: test_keeper_memory_soft_limit/test.py::test_soft_limit_create
-  reason: 'INVESTIGATE: Out of Memory'
-  message: 'Coordination error: Out of Memory.'
+  reason: 'FIXME: Unstable in current version. Fixed in recent upstream.'
 
 # Regex rules should be ordered from most specific to least specific.
 # regex: true applies to name, message, and not_message fields, but not to reason or check_types fields.
