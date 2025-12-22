@@ -1,5 +1,8 @@
 #pragma once
 #include <Core/Types.h>
+#include <Storages/ObjectStorage/DataLakes/DataLakeObjectMetadata.h>
+#include <Processors/Formats/IInputFormat.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataObjectInfo.h>
 #include <Storages/ObjectStorage/IObjectIterator.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeObjectMetadata.h>
 
@@ -18,8 +21,12 @@ struct ClusterFunctionReadTaskResponse
 
     /// Data path (object path, in case of object storage).
     String path;
+
     /// Absolute path (including storage type prefix).
     std::optional<String> absolute_path;
+
+    FileBucketInfoPtr file_bucket_info;
+
     /// Object metadata path, in case of data lake object.
     DataLakeObjectMetadata data_lake_metadata;
     /// File's columns info

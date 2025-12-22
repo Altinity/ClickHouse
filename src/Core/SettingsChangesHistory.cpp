@@ -61,6 +61,9 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"output_format_parquet_write_checksums", false, true, "New setting."},
             {"export_merge_tree_part_max_bytes_per_file", 0, 0, "New setting."},
             {"export_merge_tree_part_max_rows_per_file", 0, 0, "New setting."},
+            {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
+            {"cluster_table_function_split_granularity", "file", "file", "New setting."},
+            {"cluster_table_function_buckets_batch_size", 0, 0, "New setting."},
         });
         addSettingsChanges(settings_changes_history, "25.8",
         {

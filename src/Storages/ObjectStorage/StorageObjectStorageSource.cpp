@@ -30,8 +30,10 @@
 #include <Storages/ObjectStorage/StorageObjectStorageStableTaskDistributor.h>
 #include <Storages/ObjectStorage/Utils.h>
 #include <Storages/VirtualColumnUtils.h>
+#include <boost/operators.hpp>
 #include <Common/SipHash.h>
 #include <Common/parseGlobs.h>
+#include <Storages/ObjectStorage/IObjectIterator.h>
 #if ENABLE_DISTRIBUTED_CACHE
 #include <DistributedCache/DistributedCacheRegistry.h>
 #include <Disks/IO/ReadBufferFromDistributedCache.h>
@@ -40,6 +42,8 @@
 
 #include <fmt/ranges.h>
 #include <Disks/DiskType.h>
+#include <Common/ProfileEvents.h>
+#include <Core/SettingsEnums.h>
 
 namespace fs = std::filesystem;
 namespace ProfileEvents
@@ -70,6 +74,7 @@ namespace Setting
     extern const SettingsBool table_engine_read_through_distributed_cache;
     extern const SettingsBool use_object_storage_list_objects_cache;
     extern const SettingsBool allow_experimental_iceberg_read_optimization;
+    extern const SettingsObjectStorageGranularityLevel cluster_table_function_split_granularity;
 }
 
 namespace ErrorCodes
@@ -230,13 +235,22 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
 
         if (filter_actions_dag)
         {
-            return std::make_shared<ObjectIteratorWithPathAndFileFilter>(
+            iter = std::make_shared<ObjectIteratorWithPathAndFileFilter>(
                 std::move(iter),
                 *filter_actions_dag,
                 virtual_columns,
                 hive_columns,
                 configuration->getNamespace(),
                 local_context);
+        }
+        if (local_context->getSettingsRef()[Setting::cluster_table_function_split_granularity] == ObjectStorageGranularityLevel::BUCKET)
+        {
+            iter = std::make_shared<ObjectIteratorSplitByBuckets>(
+                std::move(iter),
+                configuration->format,
+                object_storage,
+                local_context
+            );
         }
         return iter;
     }
@@ -522,7 +536,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         object_info->loadMetadata(object_storage, query_settings.ignore_non_existent_file);
     }
     while (not_a_path || (query_settings.skip_empty_files && object_info->metadata->size_bytes == 0));
-    
+
     ProfileEvents::increment(ProfileEvents::ObjectStorageClusterProcessedTasks);
 
     ObjectStoragePtr storage_to_use = object_info->getObjectStorage();
@@ -754,6 +768,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             compression_method,
             need_only_count);
 
+        input_format->setBucketsToRead(object_info->file_bucket_info);
         input_format->setSerializationHints(read_from_format_info.serialization_hints);
 
         if (need_only_count)
@@ -1333,7 +1348,7 @@ StorageObjectStorage::ObjectInfoPtr StorageObjectStorageSource::ReadTaskIterator
         // We should use it directly and NOT overwrite relative_path.
         // Only resolve absolute_path if we need to determine which storage to use (for secondary storages).
         object_info->object_storage_to_use = object_storage;
-        
+
         if (raw->absolute_path.has_value())
         {
             auto [storage_to_use, key]
@@ -1442,9 +1457,9 @@ StorageObjectStorageSource::ArchiveIterator::createArchiveReader(ObjectInfoPtr o
     return DB::createArchiveReader(
         /* path_to_archive */
         object_info->getPath(),
-        /* archive_read_function */ [=, this]() { 
+        /* archive_read_function */ [=, this]() {
             ObjectStoragePtr storage = object_info->getObjectStorage() ? object_info->getObjectStorage() : object_storage;
-            return createReadBuffer(*object_info, storage, getContext(), log); 
+            return createReadBuffer(*object_info, storage, getContext(), log);
         },
         /* archive_size */ size);
 }
