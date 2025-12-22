@@ -470,6 +470,8 @@ def main():
         )
         res = results[-1].is_ok()
 
+    runner_options += f" --known-fails-file-path tests/broken_tests.yaml"
+
     test_result = None
     if res and JobStages.TEST in stages:
         stop_watch_ = Utils.Stopwatch()
@@ -694,6 +696,10 @@ def main():
 
     if test_result:
         test_result.sort()
+
+    broken_tests_handler_log = os.path.join(temp_dir, "broken_tests_handler.log")
+    if os.path.exists(broken_tests_handler_log):
+        debug_files.append(broken_tests_handler_log)
 
     R = Result.create_from(
         results=results,
