@@ -12,7 +12,7 @@ from stopwatch import Stopwatch
 from tee_popen import TeePopen
 from pr_info import PRInfo
 
-IMAGE_NAME = "clickhouse/fuzzer"
+IMAGE_NAME = "altinityinfra/fuzzer"
 
 
 def get_run_command(
@@ -25,6 +25,7 @@ def get_run_command(
     )
     envs = [
         f"-e FUZZER_TO_RUN='{fuzzer_name}'",
+        f"-e BASE_BRANCH='{PRInfo().base_ref}'",
     ]
 
     env_str = " ".join(envs)

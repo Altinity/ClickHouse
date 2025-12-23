@@ -167,4 +167,9 @@ def should_skip_job(job_name):
             return False, ""
         return True, "Skipped, not labeled with 'pr-performance'"
 
+    ci_exclude_tags = _info_cache.get_kv_data("ci_exclude_tags") or []
+    for tag in ci_exclude_tags:
+        if tag in job_name:
+            return True, f"Skipped, job name includes excluded tag '{tag}'"
+
     return False, ""
