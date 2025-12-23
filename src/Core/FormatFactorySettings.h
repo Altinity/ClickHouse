@@ -182,9 +182,9 @@ When reading Parquet files, parse JSON columns as ClickHouse JSON Column.
     DECLARE(Bool, input_format_parquet_use_native_reader, false, R"(
 Use native parquet reader v1. It's relatively fast but unfinished. Deprecated.
 )", 0) \
-    DECLARE(Bool, input_format_parquet_use_native_reader_v3, false, R"(
-Use Parquet reader v3. Experimental.
-)", EXPERIMENTAL) \
+    DECLARE(Bool, input_format_parquet_use_native_reader_v3, true, R"(
+Use Parquet reader v3.
+)", 0) \
     DECLARE(UInt64, input_format_parquet_memory_low_watermark, 2ul << 20, R"(
 Schedule prefetches more aggressively if memory usage is below than threshold. Potentially useful e.g. if there are many small bloom filters to read over network.
 )", 0) \
@@ -196,6 +196,9 @@ Skip pages using min/max values from column index.
 )", 0) \
     DECLARE(Bool, input_format_parquet_use_offset_index, true, R"(
 Minor tweak to how pages are read from parquet file when no page filtering is used.
+)", 0) \
+    DECLARE(Bool, input_format_parquet_verify_checksums, true, R"(
+Verify page checksums when reading parquet files.
 )", 0) \
     DECLARE(Bool, input_format_allow_seeks, true, R"(
 Allow seeks while reading in ORC/Parquet/Arrow input formats.
@@ -1127,6 +1130,9 @@ If dictionary size grows bigger than this many bytes, switch to encoding without
 )", 0) \
     DECLARE(Bool, output_format_parquet_enum_as_byte_array, true, R"(
 Write enum using parquet physical type: BYTE_ARRAY and logical type: ENUM
+)", 0) \
+    DECLARE(Bool, output_format_parquet_write_checksums, true, R"(
+Put crc32 checksums in parquet page headers.
 )", 0) \
     DECLARE(String, output_format_avro_codec, "", R"(
 Compression codec used for output. Possible values: 'null', 'deflate', 'snappy', 'zstd'.

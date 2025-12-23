@@ -12,8 +12,7 @@ class ExportPartTask : public IExecutableTask
 public:
     explicit ExportPartTask(
         MergeTreeData & storage_,
-        const MergeTreePartExportManifest & manifest_,
-        ContextPtr context_);
+        const MergeTreePartExportManifest & manifest_);
     bool executeStep() override;
     void onCompleted() override;
     StorageID getStorageID() const override;
@@ -25,7 +24,6 @@ public:
 private:
     MergeTreeData & storage;
     MergeTreePartExportManifest manifest;
-    ContextPtr local_context;
     QueryPipeline pipeline;
     std::atomic<bool> cancel_requested = false;
 

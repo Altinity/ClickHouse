@@ -372,4 +372,10 @@ IMPLEMENT_SETTING_ENUM(
      {"manifest_file_entry", IcebergMetadataLogLevel::ManifestFileEntry}})
 
 IMPLEMENT_SETTING_AUTO_ENUM(MergeTreePartExportFileAlreadyExistsPolicy, ErrorCodes::BAD_ARGUMENTS);
+
+IMPLEMENT_SETTING_ENUM(
+    ObjectStorageGranularityLevel,
+    ErrorCodes::BAD_ARGUMENTS,
+    {{"file", ObjectStorageGranularityLevel::FILE},
+    {"bucket", ObjectStorageGranularityLevel::BUCKET}})
 }
