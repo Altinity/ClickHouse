@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
+<<<<<<< HEAD
 # Tags: no-fasttest
 # no-fasttest: Too slow for fast test (~30s), covered by regular stateless runs.
+=======
+>>>>>>> 693a0659a13 (Merge pull request #92588 from ClickHouse/arsenmuk/i90695_double_free_on_shrinkToFit)
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
