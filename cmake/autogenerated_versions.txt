@@ -11,7 +11,5 @@ SET(VERSION_DESCRIBE v25.8.12.20001.altinityantalya)
 SET(VERSION_STRING 25.8.12.20001.altinityantalya)
 # end of autochange
 
-# This is the 'base' tweak of the version, build scripts will
-# increment this by number of commits since previous tag.
 SET(VERSION_TWEAK 20001)
 SET(VERSION_FLAVOUR altinityantalya)
