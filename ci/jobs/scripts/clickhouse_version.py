@@ -38,7 +38,6 @@ SET(VERSION_STRING {string})
 
     @classmethod
     def get_current_version_as_dict(cls):
-        # Return version as-is from the cmake file, without any git-based modifications
         version = get_version_from_repo()
         version = version.with_description(version.flavour)
         return version.as_dict()
