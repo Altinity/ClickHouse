@@ -116,9 +116,20 @@ namespace
                 return std::nullopt;
             }
         }
+        else if (DB::isBool(non_nullable_type))
+        {
+            /// Boolean type needs special handling:
+            /// When UInt8 is extracted from column to Field, it becomes Field(Types::UInt64).
+            /// But query conditions like WHERE bool_col = true create Field(Types::Bool).
+            /// While accurateLess/accurateEquals handle type differences correctly,
+            /// we create a Bool-typed Field for consistency.
+            if (str.empty())
+                return std::nullopt;
+            return static_cast<bool>(static_cast<unsigned char>(str[0]) != 0);
+        }
         else
         {
-            /// For all other types except decimal binary representation
+            /// For all other types except decimal and boolean, binary representation
             /// matches our internal representation
             column->insertData(str.data(), str.length());
             DB::Field result;

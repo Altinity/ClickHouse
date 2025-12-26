@@ -116,6 +116,7 @@ bool canDumpIcebergStats(const Field & field, DataTypePtr type)
         case TypeIndex::Int64:
         case TypeIndex::DateTime64:
         case TypeIndex::String:
+        case TypeIndex::UInt8: /// Boolean
             return true;
         default:
             return false;
@@ -156,6 +157,14 @@ std::vector<uint8_t> dumpFieldToBytes(const Field & field, DataTypePtr type)
             return dumpValue(field.safeGet<Float64>());
         case TypeIndex::Float32:
             return dumpValue(field.safeGet<Float32>());
+        case TypeIndex::UInt8: /// Boolean - stored as single byte in Iceberg
+        {
+            /// Field can be Bool or UInt64 type depending on source
+            UInt8 value = (field.getType() == Field::Types::Bool)
+                ? static_cast<UInt8>(field.safeGet<bool>())
+                : static_cast<UInt8>(field.safeGet<UInt64>());
+            return dumpValue(value);
+        }
         default:
         {
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Can not dump such stats");
