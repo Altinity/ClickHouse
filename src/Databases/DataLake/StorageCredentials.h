@@ -48,4 +48,17 @@ private:
     std::string session_token;
 };
 
+/// Credentials for public buckets that don't require signing (e.g., GCS with no-auth)
+class NoSignCredentials final : public IStorageCredentials
+{
+public:
+    void addCredentialsToEngineArgs(DB::ASTs & engine_args) const override
+    {
+        if (engine_args.size() != 1)
+            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "Storage credentials specified in AST already");
+
+        engine_args.push_back(std::make_shared<DB::ASTLiteral>("NOSIGN"));
+    }
+};
+
 }

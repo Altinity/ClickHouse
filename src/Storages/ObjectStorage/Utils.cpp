@@ -38,7 +38,7 @@ std::string normalizeScheme(const std::string & scheme)
 {
     auto scheme_lowercase = Poco::toLower(scheme);
 
-    if (scheme_lowercase == "s3a" || scheme_lowercase == "s3n")
+    if (scheme_lowercase == "s3a" || scheme_lowercase == "s3n" || scheme_lowercase == "gs")
         scheme_lowercase = "s3";
     else if (scheme_lowercase == "wasb" || scheme_lowercase == "wasbs" || scheme_lowercase == "abfss")
         scheme_lowercase = "abfs";

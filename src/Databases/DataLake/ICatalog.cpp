@@ -53,6 +53,9 @@ StorageType parseStorageTypeFromString(const std::string & type)
     if (capitalize_first_letter(storage_type_str) == "S3a")
         storage_type_str = "S3";
 
+    if (capitalize_first_letter(storage_type_str) == "Gs")
+        storage_type_str = "S3";
+
     auto storage_type = magic_enum::enum_cast<StorageType>(capitalize_first_letter(storage_type_str));
 
     if (!storage_type)

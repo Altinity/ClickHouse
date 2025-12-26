@@ -660,26 +660,52 @@ bool RestCatalog::getTableMetadataImpl(
         {
             case StorageType::S3:
             {
-                static constexpr auto access_key_id_str = "s3.access-key-id";
-                static constexpr auto secret_access_key_str = "s3.secret-access-key";
-                static constexpr auto session_token_str = "s3.session-token";
-                static constexpr auto storage_endpoint_str = "s3.endpoint";
+                /// S3 config keys
+                static constexpr auto s3_access_key_id_str = "s3.access-key-id";
+                static constexpr auto s3_secret_access_key_str = "s3.secret-access-key";
+                static constexpr auto s3_session_token_str = "s3.session-token";
+                static constexpr auto s3_endpoint_str = "s3.endpoint";
+
+                /// GCS config keys (for gs:// URLs accessed via S3-compatible API)
+                static constexpr auto gcs_no_auth_str = "gcs.no-auth";
+                static constexpr auto gcs_access_key_id_str = "gcs.access-key-id";
+                static constexpr auto gcs_secret_access_key_str = "gcs.secret-access-key";
+                static constexpr auto gcs_endpoint_str = "gcs.endpoint";
 
                 std::string access_key_id;
                 std::string secret_access_key;
                 std::string session_token;
                 std::string storage_endpoint;
-                if (config_object->has(access_key_id_str))
-                    access_key_id = config_object->get(access_key_id_str).extract<String>();
-                if (config_object->has(secret_access_key_str))
-                    secret_access_key = config_object->get(secret_access_key_str).extract<String>();
-                if (config_object->has(session_token_str))
-                    session_token = config_object->get(session_token_str).extract<String>();
-                if (config_object->has(storage_endpoint_str))
-                    storage_endpoint = config_object->get(storage_endpoint_str).extract<String>();
+                bool no_auth = false;
 
-                result.setStorageCredentials(
-                    std::make_shared<S3Credentials>(access_key_id, secret_access_key, session_token));
+                /// Check GCS config first (for gs:// URLs)
+                if (config_object->has(gcs_no_auth_str))
+                {
+                    auto no_auth_value = config_object->get(gcs_no_auth_str).toString();
+                    no_auth = (no_auth_value == "true" || no_auth_value == "1");
+                }
+                if (config_object->has(gcs_access_key_id_str))
+                    access_key_id = config_object->get(gcs_access_key_id_str).extract<String>();
+                if (config_object->has(gcs_secret_access_key_str))
+                    secret_access_key = config_object->get(gcs_secret_access_key_str).extract<String>();
+                if (config_object->has(gcs_endpoint_str))
+                    storage_endpoint = config_object->get(gcs_endpoint_str).extract<String>();
+
+                /// Fall back to S3 config keys
+                if (config_object->has(s3_access_key_id_str))
+                    access_key_id = config_object->get(s3_access_key_id_str).extract<String>();
+                if (config_object->has(s3_secret_access_key_str))
+                    secret_access_key = config_object->get(s3_secret_access_key_str).extract<String>();
+                if (config_object->has(s3_session_token_str))
+                    session_token = config_object->get(s3_session_token_str).extract<String>();
+                if (config_object->has(s3_endpoint_str))
+                    storage_endpoint = config_object->get(s3_endpoint_str).extract<String>();
+
+                if (no_auth)
+                    result.setStorageCredentials(std::make_shared<NoSignCredentials>());
+                else
+                    result.setStorageCredentials(
+                        std::make_shared<S3Credentials>(access_key_id, secret_access_key, session_token));
 
                 result.setEndpoint(storage_endpoint);
                 break;
