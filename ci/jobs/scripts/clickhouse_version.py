@@ -38,29 +38,11 @@ SET(VERSION_STRING {string})
 
     @classmethod
     def get_current_version_as_dict(cls):
-        version_from_file = read_versions()
-        try:
-            version = version_from_file
-            tweak = int(
-                Shell.get_output(
-                    f"git rev-list --count {version['githash']}..HEAD", verbose=True
-                )
-            )
-        except ValueError:
-            # Shallow checkout
-            tweak = 0
-
         version = get_version_from_repo()
-        version.tweak += tweak
-
         # relying on ClickHouseVersion to generate proper `description` and `string` with updated `tweak`` value.
         version = version.with_description(version.flavour)
-        version_dict = version.as_dict()
+        return version.as_dict()
 
-        # preserve githash, not sure if that is goign to be usefull, but mimics original implementation
-        version_dict['githash'] = version_from_file['githash']
-
-        return version_dict
 
     @classmethod
     def get_version(cls):
