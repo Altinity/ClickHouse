@@ -6,7 +6,7 @@
 | <   **PERFORMANCE**   >||||
 |Distributed execution: better split tasks by row groups IDs|https://github.com/Altinity/ClickHouse/pull/1237|25.8.12|https://github.com/ClickHouse/ClickHouse/pull/87508|25.11.1|| Support writing parquet enum as byte array|https://github.com/Altinity/ClickHouse/pull/989|25.6.5|https://github.com/ClickHouse/ClickHouse/pull/81090|25.7.1
 |Enable parquet reader v3 by default|https://github.com/Altinity/ClickHouse/pull/1232|25.8.12|https://github.com/ClickHouse/ClickHouse/pull/88827|25.11.1|
-|Set max message size on parquet v3 reader|https://github.com/Altinity/ClickHouse/pull/1198|25.8.12||
+|Set max message size on parquet v3 reader|https://github.com/Altinity/ClickHouse/pull/1198|25.8.12|https://github.com/ClickHouse/ClickHouse/pull/91737|25.12.1
 | AWS S3 authentication with an explicitly provided IAM role|https://github.com/Altinity/ClickHouse/pull/986|25.6.5|https://github.com/ClickHouse/ClickHouse/pull/84011|25.8.1
 | Iceberg table pruning in cluster requests|https://github.com/Altinity/ClickHouse/pull/770|25.2.2||
 | ListObjectsV2 cache|https://github.com/Altinity/ClickHouse/pull/743|25.2.2||
