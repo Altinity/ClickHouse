@@ -316,6 +316,27 @@ def get_version_from_repo(
         flavour=versions.get("flavour", None)
     )
 
+    # If this commit is tagged, use tag's version instead of something stored in cmake
+    if git is not None and git.latest_tag:
+        version_from_tag = get_version_from_tag(git.latest_tag)
+        logging.debug(f'Git latest tag: {git.latest_tag} ({git.commits_since_latest} commits ago)\n'
+            f'"new" tag: {git.new_tag} ({git.commits_since_new})\n'
+            f'current commit: {git.sha}\n'
+            f'current brach: {git.branch}'
+        )
+        if git.latest_tag and git.commits_since_latest == 0:
+            # Tag has a priority over the version written in CMake.
+            # Version must match (except tweak, flavour, description, etc.) to avoid accidental mess.
+            if not (version_from_tag.major == cmake_version.major \
+                    and version_from_tag.minor == cmake_version.minor \
+                    and version_from_tag.patch == cmake_version.patch \
+                    and version_from_tag.tweak == cmake_version.tweak):
+                raise RuntimeError(f"Version generated from tag ({version_from_tag}) should have same major, minor, patch, and tweak values as version generated from cmake ({cmake_version})")
+
+            # Don't need to reset version completely, mostly because revision part is not set in tag, but must be preserved
+            logging.debug(f"Resetting FLAVOUR of version from cmake {cmake_version} to values from tag: {version_from_tag._flavour}")
+            cmake_version._flavour = version_from_tag._flavour
+
     return cmake_version
 
 
