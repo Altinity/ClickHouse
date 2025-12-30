@@ -89,14 +89,16 @@ jobs:
       LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
       # Python encoding
       PYTHONIOENCODING: utf-8
+      build_sha: ${{ inputs.build_sha }}
+      pr_number: ${{ github.event.number }}
+      artifacts: builds
       # Args
       args: --test-to-end
         --no-colors
         --local
         --collect-service-logs
         --output ${{ inputs.output_format }}
-        --parallel ${{ vars.PARALLEL }}
-        --attr project="${GITHUB_REPOSITORY}" project.id="${GITHUB_REPOSITORY_ID}" user.name="${GITHUB_ACTOR}" version="${{ fromJson(inputs.workflow_config).custom_data.version.string }}" package="${clickhouse_path}" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name=$GITHUB_JOB job.retry=$GITHUB_RUN_ATTEMPT job.url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" arch="$(uname -i)"
+        --attr project="${GITHUB_REPOSITORY}" project.id="${GITHUB_REPOSITORY_ID}" user.name="${GITHUB_ACTOR}" version="${{ fromJson(inputs.workflow_config).custom_data.version.string }}" package="$clickhouse_path" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name=$GITHUB_JOB job.retry=$GITHUB_RUN_ATTEMPT job.url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" arch="$(uname -i)"
         --cicd
         --log raw.log
         ${{ inputs.flags != 'none' && inputs.flags || ''}}
@@ -157,22 +159,21 @@ jobs:
 
       - name: 🧪 Run ${{ env.SUITE }} suite
         id: run_suite
-        run: |
-          EXITCODE=0
-          python3 -u ${{ env.SUITE }}/${{ env.SUITE_EXECUTABLE }}
-          --clickhouse ${clickhouse_path}
+        run: python3 
+          -u ${{ env.SUITE }}/${{ env.SUITE_EXECUTABLE }}
+          --clickhouse ${{ env.clickhouse_path }}
           ${{ env.REGRESSION_ARGS }}
           ${{ env.args }} || EXITCODE=$?;
           .github/add_link_to_logs.sh
           exit $EXITCODE
 
       - name: 📊 Set Commit Status
-        if: always() && inputs.set_commit_status
-        run: python3 .github/set_builds_status.py
+        if: always() && inputs.set_commit_status       
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           JOB_OUTCOME: ${{ steps.run_suite.outcome }}
           SUITE_NAME: ${{ format('Regression {0} {1}{2}', inputs.runner_arch, inputs.job_name != '' && inputs.job_name || inputs.suite_name, inputs.part != '' && format('-{0}', inputs.part) || '') }}
+        run: python3 .github/set_builds_status.py
 
       - name: 📝 Create and upload logs
         if: always()
