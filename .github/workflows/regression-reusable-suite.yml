@@ -115,7 +115,8 @@ jobs:
       - name: ⤵️ Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          repository: Altinity/clickhouse-regression
+          ref: ${{ inputs.ref }}
 
       - name: ♻️ Cache setup
         uses: ./.github/actions/cache-setup
