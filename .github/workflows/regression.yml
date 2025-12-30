@@ -3,7 +3,7 @@ name: Regression test workflow - Release
   workflow_call:
     inputs:
       runner_type:
-        description: the label of runner to use, can be a simple string or a comma-separated list
+        description: the (meta-)label of runner to use
         required: true
         type: string
       commit:

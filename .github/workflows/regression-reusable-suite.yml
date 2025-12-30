@@ -44,10 +44,6 @@ on:
         required: false
         type: string
         default: "x86"
-      runner_location:
-        required: false
-        type: string
-        default: "in-hel1-fsn1-nbg1"
       job_name:
         required: false
         type: string
@@ -69,10 +65,8 @@ jobs:
     name: ${{ format('{0}{1}', inputs.job_name != '' && inputs.job_name || inputs.suite_name, inputs.part != '' && format('_{0}', inputs.part) || '') }}
     runs-on: [
       "self-hosted",
-      "${{ inputs.runner_arch }}",
-      "${{ inputs.runner_type != '' && inputs.runner_type || (inputs.runner_arch == 'x86' && 'type-cx42-cpx41' || (inputs.runner_arch == 'arm' || inputs.runner_arch == 'arm64' || inputs.runner_arch == 'aarch64') && 'type-cax31-cax41' || 'type-cx42-cpx41') }}",
-      "${{ inputs.runner_location }}",
-      "image-${{ inputs.runner_arch }}-app-docker-ce",
+      "altinity-on-demand",
+      "${{ inputs.runner_type }}",
     ]
     timeout-minutes: ${{ inputs.timeout_minutes }}
     env:

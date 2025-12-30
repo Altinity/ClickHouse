@@ -67,9 +67,9 @@ class AltinityWorkflowTemplates:
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
-      runner_type: altinity-on-demand, altinity-regression-tester
+      runner_type: altinity-regression-tester
       commit: {REGRESSION_HASH}
-      arch: release
+      arch: x86
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout_minutes: 300
       workflow_config: ${{ needs.config_workflow.outputs.data }}
@@ -79,7 +79,7 @@ class AltinityWorkflowTemplates:
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
-      runner_type: altinity-on-demand, altinity-regression-tester-aarch64
+      runner_type: altinity-regression-tester-aarch64
       commit: {REGRESSION_HASH}
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
