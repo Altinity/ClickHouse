@@ -196,7 +196,7 @@ jobs:
       part: ${{ matrix.PART }}
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
-      job_name: alter-${{ matrix.ONLY }}${{ matrix.PART && format('-{0}', matrix.PART) || '' }}
+      job_name: alter_${{ matrix.ONLY }}
       extra_args: --only "/alter/${{ matrix.ONLY }} partition/${{ matrix.PART && format('part {0}/', matrix.PART) || '' }}*"
     secrets: inherit
 
@@ -222,7 +222,7 @@ jobs:
       storage_path: /${{ matrix.STORAGE }}
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
-      job_name: benchmark-${{ matrix.STORAGE }}
+      job_name: benchmark_${{ matrix.STORAGE }}
       regression_args: --storage ${{ matrix.STORAGE }} --gcs-uri {{GCS_URI}} --gcs-key-id {{GCS_KEY_ID}} --gcs-key-secret {{GCS_KEY_SECRET}} --aws-s3-bucket {{AWS_BUCKET}} --aws-s3-region {{AWS_REGION}} --aws-s3-key-id {{AWS_KEY_ID}} --aws-s3-access-key {{AWS_ACCESS_KEY}}
     secrets: inherit
 
@@ -250,7 +250,7 @@ jobs:
       part: ${{ matrix.PART }}
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
-      job_name: clickhouse_keeper-${{ matrix.PART }}-${{ matrix.SSL }}
+      job_name: clickhouse_keeper_${{ matrix.SSL }}
       extra_args: ${{ matrix.SSL == 'ssl' && '--ssl' || '' }} --only "part ${{ matrix.PART }}/*"
     secrets: inherit
 
@@ -276,7 +276,7 @@ jobs:
       part: ${{ matrix.PART }}
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
-      job_name: iceberg-${{ matrix.PART }}
+      job_name: iceberg
       extra_args: --only ${{ matrix.PART == 1 && '"/iceberg/iceberg engine/rest catalog/*" "/iceberg/s3 table function/*" "/iceberg/icebergS3 table function/*" "/iceberg/iceberg cache"' || '"/iceberg/iceberg engine/glue catalog/*" "/iceberg/iceberg table engine/*"' }}
     secrets: inherit
   LDAP:
@@ -300,7 +300,7 @@ jobs:
       runner_type: ${{ inputs.runner_type }}
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
-      job_name: ldap-${{ matrix.SUITE }}
+      job_name: ldap_${{ matrix.SUITE }}
     secrets: inherit
 
   Parquet:
@@ -345,7 +345,7 @@ jobs:
       storage_path: ${{ matrix.STORAGE }}
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
-      job_name: parquet-${{ matrix.STORAGE }}
+      job_name: parquet_${{ matrix.STORAGE }}
       regression_args: --storage ${{ matrix.STORAGE }} --aws-s3-bucket {{AWS_BUCKET}} --aws-s3-region {{AWS_REGION}} --aws-s3-key-id {{AWS_KEY_ID}} --aws-s3-access-key {{AWS_ACCESS_KEY}}
     secrets: inherit
 
@@ -371,7 +371,7 @@ jobs:
       part: ${{ matrix.PART }}
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
-      job_name: rbac-${{ matrix.PART }}
+      job_name: rbac
       extra_args: --only "/rbac/part ${{ matrix.PART }}/*"
     secrets: inherit
   SSLServer:
@@ -396,7 +396,7 @@ jobs:
       part: ${{ matrix.PART }}
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
-      job_name: ssl_server-${{ matrix.PART }}
+      job_name: ssl_server
       extra_args: --only "part ${{ matrix.PART }}/*"
     secrets: inherit
 
@@ -427,7 +427,7 @@ jobs:
       part: ${{ matrix.PART }}
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
-      job_name: s3-${{ matrix.STORAGE }}-${{ matrix.PART }}
+      job_name: s3_${{ matrix.STORAGE }}
       regression_args: --storage ${{ matrix.STORAGE }} --gcs-uri {{GCS_URI}} --gcs-key-id {{GCS_KEY_ID}} --gcs-key-secret {{GCS_KEY_SECRET}} --aws-s3-bucket {{AWS_BUCKET}} --aws-s3-region {{AWS_REGION}} --aws-s3-key-id {{AWS_KEY_ID}} --aws-s3-access-key {{AWS_ACCESS_KEY}} --azure-account-name {{AZURE_ACCOUNT_NAME}} --azure-storage-key {{AZURE_STORAGE_KEY}} --azure-container {{AZURE_CONTAINER_NAME}}
       extra_args: --only ":/try*" ":/part ${{ matrix.PART }}/*"
     secrets: inherit
@@ -454,7 +454,7 @@ jobs:
       storage_path: /${{ matrix.STORAGE }}
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
-      job_name: tiered_storage-${{ matrix.STORAGE }}
+      job_name: tiered_storage_${{ matrix.STORAGE }}
       regression_args: --aws-s3-access-key {{AWS_ACCESS_KEY}} --aws-s3-key-id {{AWS_KEY_ID}} --aws-s3-uri https://s3.{{AWS_REGION}}.amazonaws.com/{{AWS_BUCKET}}/data/ --gcs-key-id {{GCS_KEY_ID}} --gcs-key-secret {{GCS_KEY_SECRET}} --gcs-uri {{GCS_URI}}
       extra_args: ${{ matrix.STORAGE != 'local' && format('--with-{0}', matrix.STORAGE) || '' }}
     secrets: inherit

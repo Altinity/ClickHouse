@@ -172,7 +172,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           JOB_OUTCOME: ${{ steps.run_suite.outcome }}
-          SUITE_NAME: ${{ format('Regression {0} {1}{2}', inputs.runner_arch, inputs.job_name != '' && inputs.job_name || inputs.suite_name, inputs.part != '' && format('-{0}', inputs.part) || '') }}
+          SUITE_NAME: ${{ format('Regression {0} {1}{2}', inputs.runner_arch, inputs.job_name != '' && inputs.job_name || inputs.suite_name, inputs.part != '' && format('_{0}', inputs.part) || '') }}
         run: python3 .github/set_builds_status.py
 
       - name: 📝 Create and upload logs
