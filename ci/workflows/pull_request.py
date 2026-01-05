@@ -53,14 +53,14 @@ workflow = Workflow.Config(
             )
             for j in JobConfigs.functional_tests_jobs
         ],
-        JobConfigs.bugfix_validation_it_job.set_dependency(
-            [
-                # JobNames.STYLE_CHECK, # NOTE (strtgbb): we don't run style check
-                # JobNames.FAST_TEST, # NOTE (strtgbb): we don't run fast tests
-                # JobConfigs.tidy_build_arm_jobs[0].name, # NOTE (strtgbb): we don't run tidy build jobs
-            ]
-        ),
-        JobConfigs.bugfix_validation_ft_pr_job,
+        # JobConfigs.bugfix_validation_it_job.set_dependency( # NOTE (strtgbb): depends on upstream build
+        #     [
+        #         # JobNames.STYLE_CHECK, # NOTE (strtgbb): we don't run style check
+        #         # JobNames.FAST_TEST, # NOTE (strtgbb): we don't run fast tests
+        #         # JobConfigs.tidy_build_arm_jobs[0].name, # NOTE (strtgbb): we don't run tidy build jobs
+        #     ]
+        # ),
+        # JobConfigs.bugfix_validation_ft_pr_job,
         *JobConfigs.stateless_tests_flaky_pr_jobs,
         *[
             job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)

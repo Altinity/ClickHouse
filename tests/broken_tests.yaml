@@ -59,7 +59,7 @@
   - msan
 - name: 00024_random_counters
   reason: INVESTIGATE - random timeout
-  message: Timeout! Killing process group
+  message: Timeout! Processes left in process group
 - name: 03211_nested_json_merges
   reason: KNOWN - Unstable upstream
 - name: 03644_object_storage_correlated_subqueries
