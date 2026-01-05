@@ -12,6 +12,7 @@ on:
         default: false
   push:
     branches: ['antalya', 'releases/*', 'antalya-*']
+    tags: ['*']
 
 env:
   # Force the stdout and stderr streams to be unbuffered

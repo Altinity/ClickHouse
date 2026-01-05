@@ -9,6 +9,7 @@ workflow = Workflow.Config(
     name="MasterCI",
     event=Workflow.Event.PUSH,
     branches=[BASE_BRANCH, "releases/*", "antalya-*"],
+    tags=["*"],
     jobs=[
         # *JobConfigs.tidy_build_arm_jobs,
         *JobConfigs.build_jobs,
