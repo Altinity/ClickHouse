@@ -58,6 +58,14 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
             {"export_merge_tree_partition_lock_inside_the_task", false, false, "New setting."},
             {"export_merge_tree_partition_system_table_prefer_remote_information", true, true, "New setting."},
+            {"input_format_parquet_use_native_reader_v3", false, true, "Seems stable"},
+            {"input_format_parquet_verify_checksums", true, true, "New setting."},
+            {"output_format_parquet_write_checksums", false, true, "New setting."},
+            {"export_merge_tree_part_max_bytes_per_file", 0, 0, "New setting."},
+            {"export_merge_tree_part_max_rows_per_file", 0, 0, "New setting."},
+            {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
+            {"cluster_table_function_split_granularity", "file", "file", "New setting."},
+            {"cluster_table_function_buckets_batch_size", 0, 0, "New setting."},
         });
         addSettingsChanges(settings_changes_history, "25.8",
         {
@@ -82,7 +90,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"distributed_cache_connect_max_tries", 20, 5, "Changed setting value"},
             {"opentelemetry_trace_cpu_scheduling", false, false, "New setting to trace `cpu_slot_preemption` feature."},
             {"output_format_parquet_max_dictionary_size", 1024 * 1024, 1024 * 1024, "New setting"},
-            {"input_format_parquet_use_native_reader_v3", false, true, "New setting"},
+            {"input_format_parquet_use_native_reader_v3", false, false, "New setting"},
             {"input_format_parquet_memory_low_watermark", 2ul << 20, 2ul << 20, "New setting"},
             {"input_format_parquet_memory_high_watermark", 4ul << 30, 4ul << 30, "New setting"},
             {"input_format_parquet_page_filter_push_down", true, true, "New setting (no effect when input_format_parquet_use_native_reader_v3 is disabled)"},

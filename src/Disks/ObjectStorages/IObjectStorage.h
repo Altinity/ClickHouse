@@ -29,6 +29,7 @@
 #include <Disks/WriteMode.h>
 
 #include <Processors/ISimpleTransform.h>
+#include <Processors/Formats/IInputFormat.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeObjectMetadata.h>
 
 #include <Interpreters/Context_fwd.h>
@@ -149,6 +150,8 @@ struct PathWithMetadata
     std::optional<String> absolute_path;
     ObjectStoragePtr object_storage_to_use = nullptr;
 
+    FileBucketInfoPtr file_bucket_info;
+
     PathWithMetadata() = default;
 
     explicit PathWithMetadata(
@@ -188,6 +191,14 @@ struct PathWithMetadata
     void loadMetadata(ObjectStoragePtr object_storage, bool ignore_non_existent_file = true);
 
     ObjectStoragePtr getObjectStorage() const { return object_storage_to_use; }
+
+    String getIdentifier() const
+    {
+        String result = getAbsolutePath().value_or(getPath());
+        if (file_bucket_info)
+            result += file_bucket_info->getIdentifier();
+        return result;
+    }
 };
 
 struct ObjectKeyWithMetadata

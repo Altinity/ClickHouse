@@ -182,7 +182,12 @@ SchemeAuthorityKey::SchemeAuthorityKey(const std::string & uri)
             return;
         }
         authority = std::string(rest.substr(0, slash));
-        key = std::string(rest.substr(++slash)); // do not keep leading '/'
+        /// For file:// URIs, the path is absolute, so we need to keep the leading '/'
+        /// e.g. file:///home/user/data -> scheme="file", authority="", key="/home/user/data"
+        if (scheme == "file")
+            key = std::string(rest.substr(slash));
+        else
+            key = std::string(rest.substr(++slash));
         return;
     }
 
@@ -352,7 +357,7 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
                     use_base_storage = true;
             }
         }
-        
+
         if (!use_base_storage && (base_scheme_normalized == "s3" || base_scheme_normalized == "https" || base_scheme_normalized == "http"))
         {
             std::string normalized_table_location = table_location;
@@ -361,11 +366,11 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
                 normalized_table_location = "s3://" + table_location_decomposed.authority + "/" + table_location_decomposed.key;
             }
             S3::URI base_s3_uri(normalized_table_location);
-            
+
             if (s3URIMatches(s3_uri, base_s3_uri.bucket, base_s3_uri.endpoint, target_scheme_normalized))
                 use_base_storage = true;
         }
-        
+
         if (use_base_storage)
             return {base_storage, key_to_use};
 
@@ -417,7 +422,7 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
     if (target_scheme_normalized == "hdfs")
     {
         bool use_base_storage = false;
-        
+
         // Check if base_storage matches (only if it's HDFS)
         if (base_storage->getType() == ObjectStorageType::HDFS)
         {
@@ -430,13 +435,13 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
                     base_endpoint = base_url.substr(0, pos);
                 else
                     base_endpoint = base_url;
-                
+
                 // For HDFS, compare endpoints (namenode addresses)
                 std::string target_endpoint = target_scheme_normalized + "://" + target_decomposed.authority;
-                
+
                 if (base_endpoint == target_endpoint)
                     use_base_storage = true;
-                
+
                 // Also check if table_location matches
                 if (!use_base_storage && base_scheme_normalized == "hdfs")
                 {
@@ -445,7 +450,7 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
                 }
             }
         }
-        
+
         if (use_base_storage)
             return {base_storage, target_decomposed.key};
     }
@@ -461,14 +466,10 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
     if (type_for_factory.empty())
         throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "Unsupported storage scheme '{}' in path '{}'", target_scheme_normalized, path);
 
-    std::string key_to_use = target_decomposed.key;
-    if (target_scheme_normalized == "file")
-        key_to_use = "/" + target_decomposed.key;  // file:///absolute/path/to/file -> key = /absolute/path/to/file (full POSIX path)
-
     /// Handle storage types that need new storage creation
     return getOrCreateStorageAndKey(
         cache_key,
-        key_to_use,
+        target_decomposed.key,
         type_for_factory,
         secondary_storages,
         context,
@@ -476,15 +477,15 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
         {
             if (target_scheme_normalized == "file")
             {
-                std::filesystem::path fs_path(key_to_use);
+                std::filesystem::path fs_path(target_decomposed.key);
                 std::filesystem::path parent = fs_path.parent_path();
                 std::string dir_path = parent.string();
-                
+
                 if (dir_path.empty() || dir_path == "/")
                     dir_path = "/";
                 else if (dir_path.back() != '/')
                     dir_path += '/';
-                
+
                 cfg.setString(config_prefix + ".path", dir_path);
             }
             else if (target_scheme_normalized == "abfs")

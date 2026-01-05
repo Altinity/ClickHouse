@@ -62,14 +62,14 @@ struct ExportReplicatedMergeTreePartitionProcessingPartEntry
 struct ExportReplicatedMergeTreePartitionProcessedPartEntry
 {
     String part_name;
-    String path_in_destination;
+    std::vector<String> paths_in_destination;
     String finished_by;
 
     std::string toJsonString() const
     {
         Poco::JSON::Object json;
         json.set("part_name", part_name);
-        json.set("path_in_destination", path_in_destination);
+        json.set("paths_in_destination", paths_in_destination);
         json.set("finished_by", finished_by);
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
@@ -86,7 +86,11 @@ struct ExportReplicatedMergeTreePartitionProcessedPartEntry
         ExportReplicatedMergeTreePartitionProcessedPartEntry entry;
 
         entry.part_name = json->getValue<String>("part_name");
-        entry.path_in_destination = json->getValue<String>("path_in_destination");
+
+        const auto paths_in_destination_array = json->getArray("paths_in_destination");
+        for (size_t i = 0; i < paths_in_destination_array->size(); ++i)
+            entry.paths_in_destination.emplace_back(paths_in_destination_array->getElement<String>(static_cast<unsigned int>(i)));
+
         entry.finished_by = json->getValue<String>("finished_by");
 
         return entry;
@@ -108,6 +112,8 @@ struct ExportReplicatedMergeTreePartitionManifest
     size_t max_threads;
     bool parallel_formatting;
     bool parquet_parallel_encoding;
+    size_t max_bytes_per_file;
+    size_t max_rows_per_file;
     MergeTreePartExportManifest::FileAlreadyExistsPolicy file_already_exists_policy;
     bool lock_inside_the_task; /// todo temporary
 
@@ -128,6 +134,8 @@ struct ExportReplicatedMergeTreePartitionManifest
         json.set("parallel_formatting", parallel_formatting);
         json.set("max_threads", max_threads);
         json.set("parquet_parallel_encoding", parquet_parallel_encoding);
+        json.set("max_bytes_per_file", max_bytes_per_file);
+        json.set("max_rows_per_file", max_rows_per_file);
         json.set("file_already_exists_policy", String(magic_enum::enum_name(file_already_exists_policy)));
         json.set("create_time", create_time);
         json.set("max_retries", max_retries);
@@ -168,6 +176,9 @@ struct ExportReplicatedMergeTreePartitionManifest
         {
             manifest.file_already_exists_policy = file_already_exists_policy.value();
         }
+
+        manifest.max_bytes_per_file = json->getValue<size_t>("max_bytes_per_file");
+        manifest.max_rows_per_file = json->getValue<size_t>("max_rows_per_file");
 
         manifest.lock_inside_the_task = json->getValue<bool>("lock_inside_the_task");
 

@@ -9072,7 +9072,9 @@ try
         part_log_elem.rows_read = (*exports_entry)->rows_read;
         part_log_elem.bytes_read_uncompressed = (*exports_entry)->bytes_read_uncompressed;
         part_log_elem.peak_memory_usage = (*exports_entry)->getPeakMemoryUsage();
-        part_log_elem.path_on_disk = (*exports_entry)->destination_file_path;
+
+        /// no need to lock because at this point no one is writing to the destination file paths
+        part_log_elem.remote_file_paths = (*exports_entry)->destination_file_paths;
     }
 
     if (profile_counters)
