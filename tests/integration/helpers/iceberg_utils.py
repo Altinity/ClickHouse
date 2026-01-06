@@ -153,10 +153,14 @@ def write_iceberg_from_df(
         if partition_by is None:
             df.writeTo(table_name).tableProperty(
                 "format-version", format_version
+            ).tableProperty(
+                "write.parquet.row-group-size-bytes", "104850"  # 1MB
             ).using("iceberg").create()
         else:
             df.writeTo(table_name).tableProperty(
                 "format-version", format_version
+            ).tableProperty(
+                "write.parquet.row-group-size-bytes", "104850"  # 1MB
             ).partitionedBy(partition_by).using("iceberg").create()
     else:
         df.writeTo(table_name).append()
@@ -196,6 +200,7 @@ def get_creation_expression(
     explicit_metadata_path="",
     storage_type_as_arg=False,
     storage_type_in_named_collection=False,
+    cluster_name_as_literal=True,
     additional_settings = [],
     **kwargs,
 ):
@@ -223,6 +228,8 @@ def get_creation_expression(
         settings_expression = " SETTINGS " + ",".join(settings_array)
     else:
         settings_expression = ""
+
+    cluster_name = "'cluster_simple'" if cluster_name_as_literal else "cluster_simple"
 
     storage_arg = storage_type
     engine_part = ""
@@ -252,7 +259,7 @@ def get_creation_expression(
 
         if run_on_cluster:
             assert table_function
-            return f"iceberg{engine_part}Cluster('cluster_simple', {storage_arg}, filename = 'iceberg_data/default/{table_name}/', format={format}, url = 'http://minio1:9001/{bucket}/')"
+            return f"iceberg{engine_part}Cluster({cluster_name}, {storage_arg}, filename = 'iceberg_data/default/{table_name}/', format={format}, url = 'http://minio1:9001/{bucket}/')"
         else:
             if table_function:
                 return f"iceberg{engine_part}({storage_arg}, filename = 'iceberg_data/default/{table_name}/', format={format}, url = 'http://minio1:9001/{bucket}/')"
@@ -271,7 +278,7 @@ def get_creation_expression(
         if run_on_cluster:
             assert table_function
             return f"""
-                iceberg{engine_part}Cluster('cluster_simple', {storage_arg}, container = '{cluster.azure_container_name}', storage_account_url = '{cluster.env_variables["AZURITE_STORAGE_ACCOUNT_URL"]}', blob_path = '/iceberg_data/default/{table_name}/', format={format})
+                iceberg{engine_part}Cluster({cluster_name}, {storage_arg}, container = '{cluster.azure_container_name}', storage_account_url = '{cluster.env_variables["AZURITE_STORAGE_ACCOUNT_URL"]}', blob_path = '/iceberg_data/default/{table_name}/', format={format})
             """
         else:
             if table_function:
@@ -293,7 +300,7 @@ def get_creation_expression(
         if run_on_cluster:
             assert table_function
             return f"""
-                iceberg{engine_part}Cluster('cluster_simple', {storage_arg}, path = '/iceberg_data/default/{table_name}/', format={format})
+                iceberg{engine_part}Cluster({cluster_name}, {storage_arg}, path = '/iceberg_data/default/{table_name}/', format={format})
             """
         else:
             if table_function:

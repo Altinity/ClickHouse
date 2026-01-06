@@ -28,8 +28,7 @@ public:
     explicit RemoteQueryExecutorReadContext(
         RemoteQueryExecutor & executor_,
         bool suspend_when_query_sent_,
-        bool read_packet_type_separately_,
-        bool allow_retries_in_cluster_requests_);
+        bool read_packet_type_separately_);
 
     ~RemoteQueryExecutorReadContext() override;
 
@@ -112,7 +111,6 @@ private:
     bool suspend_when_query_sent = false;
     bool is_query_sent = false;
     const bool read_packet_type_separately = false;
-    const bool allow_retries_in_cluster_requests = false;
 };
 
 }

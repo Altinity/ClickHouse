@@ -990,12 +990,16 @@ std::optional<size_t> IcebergMetadata::totalBytes(ContextPtr local_context) cons
 std::optional<String> IcebergMetadata::partitionKey(ContextPtr) const
 {
     SharedLockGuard lock(mutex);
+    if (!relevant_snapshot)
+        return {};
     return relevant_snapshot->partition_key;
 }
 
 std::optional<String> IcebergMetadata::sortingKey(ContextPtr) const
 {
     SharedLockGuard lock(mutex);
+    if (!relevant_snapshot)
+        return {};
     return relevant_snapshot->sorting_key;
 }
 

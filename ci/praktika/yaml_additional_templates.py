@@ -36,7 +36,7 @@ class AltinityWorkflowTemplates:
           echo "Workflow Run Report: [View Report]($REPORT_LINK)" >> $GITHUB_STEP_SUMMARY
 """
     # Additional jobs
-    REGRESSION_HASH = "00a50b5b8f12c9c603b9a3fa17dd2c5ea2012cac"
+    REGRESSION_HASH = "bd9d71b4ccc80bb5b1a316b43b60f59c0c592898"
     ALTINITY_JOBS = {
         "GrypeScan": r"""
   GrypeScanServer:
@@ -68,9 +68,9 @@ class AltinityWorkflowTemplates:
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
-      runner_type: altinity-on-demand, altinity-regression-tester
+      runner_type: altinity-regression-tester
       commit: {REGRESSION_HASH}
-      arch: release
+      arch: x86
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout_minutes: 300
       workflow_config: ${{ needs.config_workflow.outputs.data }}
@@ -80,7 +80,7 @@ class AltinityWorkflowTemplates:
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
-      runner_type: altinity-on-demand, altinity-regression-tester-aarch64
+      runner_type: altinity-regression-tester-aarch64
       commit: {REGRESSION_HASH}
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}

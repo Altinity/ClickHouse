@@ -375,7 +375,8 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
                 LOG_DEBUG(log, "Has no credentials");
             }
         }
-        else if (!lightweight && table_metadata.requiresCredentials())
+        else if (!lightweight && table_metadata.requiresCredentials()
+            && table_metadata.getStorageType() != DatabaseDataLakeStorageType::Local)
         {
             throw Exception(
                ErrorCodes::BAD_ARGUMENTS,
@@ -536,13 +537,9 @@ DatabaseTablesIteratorPtr DatabaseDataLake::getTablesIterator(
 DatabaseTablesIteratorPtr DatabaseDataLake::getLightweightTablesIterator(
     ContextPtr context_,
     const FilterByNameFunction & filter_by_table_name,
-    bool skip_not_loaded,
-    bool skip_data_lake_catalog) const
+    bool skip_not_loaded) const
 {
     Tables tables;
-
-    if (skip_data_lake_catalog)
-        return std::make_unique<DatabaseTablesSnapshotIterator>(tables, getDatabaseName());
 
     auto catalog = getCatalog();
     DB::Names iceberg_tables;

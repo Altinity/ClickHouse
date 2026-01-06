@@ -6,7 +6,6 @@
 #include <Storages/prepareReadingFromFormat.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Disks/ObjectStorages/IObjectStorage.h>
-#include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeStorageSettings.h>
 #include <Interpreters/StorageID.h>
 #include <Databases/DataLake/ICatalog.h>
@@ -14,13 +13,21 @@
 #include <Storages/AlterCommands.h>
 #include <Storages/IStorage.h>
 #include <Storages/ObjectStorage/ObjectStorageFilePathGenerator.h>
+#include <Common/Exception.h>
+#include <Storages/StorageFactory.h>
+#include <Formats/FormatFilterInfo.h>
+#include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
 
 namespace DB
 {
 
 class NamedCollection;
 class SinkToStorage;
+class IDataLakeMetadata;
+struct IObjectIterator;
 using SinkToStoragePtr = std::shared_ptr<SinkToStorage>;
+using ObjectIterator = std::shared_ptr<IObjectIterator>;
+using ObjectInfoPtr = std::shared_ptr<PathWithMetadata>;
 
 namespace ErrorCodes
 {
@@ -275,16 +282,15 @@ public:
         return false;
     }
 
+    String format = "auto";
+    String compression_method = "auto";
+    String structure = "auto";
+
     PartitionStrategyFactory::StrategyType partition_strategy_type = PartitionStrategyFactory::StrategyType::NONE;
     std::shared_ptr<IPartitionStrategy> partition_strategy;
     /// Whether partition column values are contained in the actual data.
     /// And alternative is with hive partitioning, when they are contained in file path.
     bool partition_columns_in_data_file = true;
-
-private:
-    String format = "auto";
-    String compression_method = "auto";
-    String structure = "auto";
 
 protected:
     bool initialized = false;
