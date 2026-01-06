@@ -1005,6 +1005,76 @@ jobs:
           name: ${{ env.SUITE }}-${{ matrix.STORAGE }}-${{ matrix.PART }}-${{ inputs.arch }}-artifacts
           path: ${{ env.artifact_paths}}
 
+  S3Export:
+    if: |
+      fromJson(inputs.workflow_config).custom_data.ci_regression_jobs[0] == null ||
+      contains(fromJson(inputs.workflow_config).custom_data.ci_regression_jobs, 's3')
+    strategy:
+      fail-fast: false
+      matrix:
+        PART: [part, partition]
+    needs: [runner_labels_setup]
+    runs-on: ${{ fromJson(needs.runner_labels_setup.outputs.runner_labels) }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    steps:
+      - name: Checkout regression repo
+        uses: actions/checkout@v4
+        with:
+          repository: Altinity/clickhouse-regression
+          ref: ${{ inputs.commit }}
+      - name: Set envs
+        run: |
+          cat >> "$GITHUB_ENV" << 'EOF'
+          REPORTS_PATH=${{ runner.temp }}/reports_dir
+          SUITE=s3
+          PART=${{ matrix.PART }}
+          EOF
+      - name: Setup
+        run: .github/setup.sh
+      - name: Get deb url
+        env:
+          S3_BASE_URL: https://altinity-build-artifacts.s3.amazonaws.com/
+          PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
+        run: |
+          mkdir -p $REPORTS_PATH
+          cat > $REPORTS_PATH/workflow_config.json << 'EOF'
+          ${{ inputs.workflow_config }}
+          EOF
+          
+          python3 .github/get-deb-url.py --github-env $GITHUB_ENV --workflow-config $REPORTS_PATH/workflow_config.json --s3-base-url $S3_BASE_URL --pr-number $PR_NUMBER --branch-name ${{ github.ref_name }} --commit-hash ${{ inputs.build_sha }} --binary
+
+      - name: Run ${{ env.SUITE }} suite
+        id: run_suite
+        run:  EXITCODE=0;
+              python3
+              -u ${{ env.SUITE }}/regression.py
+              --clickhouse-binary-path ${{ env.clickhouse_path }}
+              --storage minio
+              --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name="$GITHUB_JOB (${{ matrix.PART }})" job.retry=$GITHUB_RUN_ATTEMPT job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
+              --only ":/try*" "minio/export tests/export ${{ matrix.PART }}/*"
+              ${{ env.args }} || EXITCODE=$?;
+              .github/add_link_to_logs.sh;
+              exit $EXITCODE
+      - name: Set Commit Status
+        if: always()
+        run: python3 .github/set_builds_status.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JOB_OUTCOME: ${{ steps.run_suite.outcome }}
+          SUITE_NAME: "Regression ${{ inputs.arch }} S3 Export ${{ matrix.PART }}"
+      - name: Create and upload logs
+        if: always()
+        run: .github/create_and_upload_logs.sh 1
+      - name: Upload logs to regression results database
+        if: always()
+        timeout-minutes: 20
+        run: .github/upload_results_to_database.sh 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ env.SUITE }}-export-${{ matrix.PART }}-${{ inputs.arch }}-artifacts
+          path: ${{ env.artifact_paths}}
+
   TieredStorage:
     if: |
       fromJson(inputs.workflow_config).custom_data.ci_regression_jobs[0] == null ||
