@@ -13,7 +13,8 @@ import tests.ci
 sys.path.append(os.path.abspath(tests.ci.__path__._path[0]))
 from tests.ci.version_helper import (
     read_versions,
-    get_version_from_repo
+    get_version_from_repo,
+    get_version_from_tag
 )
 
 class CHVersion:
@@ -39,19 +40,17 @@ SET(VERSION_STRING {string})
     @classmethod
     def get_current_version_as_dict(cls):
         version_from_file = read_versions()
-        try:
-            version = version_from_file
-            tweak = int(
-                Shell.get_output(
-                    f"git rev-list --count {version['githash']}..HEAD", verbose=True
-                )
-            )
-        except ValueError:
-            # Shallow checkout
-            tweak = 0
+        # Check if this is a tag push - if so, use the version from the tag
+        ref_type = os.getenv("GITHUB_REF_TYPE", "")
+        ref_name = os.getenv("GITHUB_REF_NAME", "")
 
-        version = get_version_from_repo()
-        version.tweak += tweak
+        if ref_type == "tag" and ref_name.startswith("v"):
+            print(f"Tag push detected: {ref_name}, extracting version from tag")
+            version = get_version_from_tag(ref_name)
+            # Get revision from cmake file since it's not in the tag
+            version._revision = version_from_file.get("revision", version._revision)
+        else:
+            version = get_version_from_repo()
 
         # relying on ClickHouseVersion to generate proper `description` and `string` with updated `tweak`` value.
         version = version.with_description(version.flavour)

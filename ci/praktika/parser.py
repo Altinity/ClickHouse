@@ -45,6 +45,7 @@ class WorkflowYaml:
     name: str
     event: str
     branches: List[str]
+    tags: List[str]
     jobs: List[JobYaml]
     additional_jobs: List[str]
     job_to_config: Dict[str, JobYaml]
@@ -74,6 +75,7 @@ class WorkflowConfigParser:
             name=self.workflow_name,
             event=config.event,
             branches=[],
+            tags=config.tags,
             jobs=[],
             additional_jobs=[],
             secret_names_gh=[],

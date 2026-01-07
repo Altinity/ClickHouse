@@ -43,7 +43,7 @@ on:
         type: boolean
         default: false
   {EVENT}:
-    branches: [{BRANCHES}]
+    branches: [{BRANCHES}]{TAGS}
 
 env:
   # Force the stdout and stderr streams to be unbuffered
@@ -428,6 +428,9 @@ class PullRequestPushYamlGen:
             Workflow.Event.PUSH,
         ):
             base_template = YamlGenerator.Templates.TEMPLATE_PULL_REQUEST_0
+            tags_formatted = ", ".join(
+                [f"'{tag}'" for tag in self.workflow_config.tags]
+            ) if self.workflow_config.tags else ""
             format_kwargs = {
                 "BRANCHES": ", ".join(
                     [f"'{branch}'" for branch in self.workflow_config.branches]
@@ -438,6 +441,7 @@ class PullRequestPushYamlGen:
                     # if not Settings.USE_CUSTOM_GH_AUTH
                     # else ""
                 ),
+                "TAGS": f"\n    tags: [{tags_formatted}]" if tags_formatted else "",
             }
             if self.workflow_config.event in (Workflow.Event.PULL_REQUEST,):
                 ENV_CHECKOUT_REFERENCE = (
