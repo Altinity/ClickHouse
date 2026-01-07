@@ -175,14 +175,14 @@ jobs:
           fi
 
       - name: Upload artifact CH_AMD_DEBUG
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: CH_AMD_DEBUG
           path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact DEB_AMD_DEBUG
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: DEB_AMD_DEBUG
           path: ci/tmp/*.deb
@@ -233,35 +233,35 @@ jobs:
           fi
 
       - name: Upload artifact CH_AMD_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: CH_AMD_RELEASE
           path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact CH_AMD_RELEASE_STRIPPED
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: CH_AMD_RELEASE_STRIPPED
           path: ci/tmp/build/programs/self-extracting/clickhouse-stripped
 
 
       - name: Upload artifact DEB_AMD_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: DEB_AMD_RELEASE
           path: ci/tmp/*.deb
 
 
       - name: Upload artifact RPM_AMD_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: RPM_AMD_RELEASE
           path: ci/tmp/*.rpm
 
 
       - name: Upload artifact TGZ_AMD_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: TGZ_AMD_RELEASE
           path: ci/tmp/*64.tgz*
@@ -312,21 +312,21 @@ jobs:
           fi
 
       - name: Upload artifact UNITTEST_AMD_ASAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: UNITTEST_AMD_ASAN
           path: ci/tmp/build/src/unit_tests_dbms
 
 
       - name: Upload artifact CH_AMD_ASAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: CH_AMD_ASAN
           path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact DEB_AMD_ASAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: DEB_AMD_ASAN
           path: ci/tmp/*.deb
@@ -377,21 +377,21 @@ jobs:
           fi
 
       - name: Upload artifact UNITTEST_AMD_TSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: UNITTEST_AMD_TSAN
           path: ci/tmp/build/src/unit_tests_dbms
 
 
       - name: Upload artifact CH_AMD_TSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: CH_AMD_TSAN
           path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact DEB_AMD_TSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: DEB_AMD_TSAN
           path: ci/tmp/*.deb
@@ -442,21 +442,21 @@ jobs:
           fi
 
       - name: Upload artifact UNITTEST_AMD_MSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: UNITTEST_AMD_MSAN
           path: ci/tmp/build/src/unit_tests_dbms
 
 
       - name: Upload artifact CH_AMD_MSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: CH_AMD_MSAN
           path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact DEB_AMD_MSAM
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: DEB_AMD_MSAM
           path: ci/tmp/*.deb
@@ -507,21 +507,21 @@ jobs:
           fi
 
       - name: Upload artifact UNITTEST_AMD_UBSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: UNITTEST_AMD_UBSAN
           path: ci/tmp/build/src/unit_tests_dbms
 
 
       - name: Upload artifact CH_AMD_UBSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: CH_AMD_UBSAN
           path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact DEB_AMD_UBSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: DEB_AMD_UBSAN
           path: ci/tmp/*.deb
@@ -572,7 +572,7 @@ jobs:
           fi
 
       - name: Upload artifact CH_AMD_BINARY
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: CH_AMD_BINARY
           path: ci/tmp/build/programs/self-extracting/clickhouse
@@ -623,35 +623,35 @@ jobs:
           fi
 
       - name: Upload artifact CH_ARM_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: CH_ARM_RELEASE
           path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact CH_ARM_RELEASE_STRIPPED
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: CH_ARM_RELEASE_STRIPPED
           path: ci/tmp/build/programs/self-extracting/clickhouse-stripped
 
 
       - name: Upload artifact DEB_ARM_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: DEB_ARM_RELEASE
           path: ci/tmp/*.deb
 
 
       - name: Upload artifact RPM_ARM_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: RPM_ARM_RELEASE
           path: ci/tmp/*.rpm
 
 
       - name: Upload artifact TGZ_ARM_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: TGZ_ARM_RELEASE
           path: ci/tmp/*64.tgz*
@@ -702,14 +702,14 @@ jobs:
           fi
 
       - name: Upload artifact CH_COV_BIN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: CH_COV_BIN
           path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact DEB_COV
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: DEB_COV
           path: ci/tmp/*.deb
@@ -760,7 +760,7 @@ jobs:
           fi
 
       - name: Upload artifact CH_ARM_BIN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: CH_ARM_BIN
           path: ci/tmp/build/programs/self-extracting/clickhouse
@@ -800,7 +800,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact UNITTEST_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: UNITTEST_AMD_ASAN
           path: ./ci/tmp
@@ -851,7 +851,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact UNITTEST_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: UNITTEST_AMD_TSAN
           path: ./ci/tmp
@@ -902,7 +902,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact UNITTEST_AMD_MSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: UNITTEST_AMD_MSAN
           path: ./ci/tmp
@@ -953,7 +953,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact UNITTEST_AMD_UBSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: UNITTEST_AMD_UBSAN
           path: ./ci/tmp
@@ -1004,7 +1004,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -1055,7 +1055,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -1106,7 +1106,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -1157,7 +1157,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -1208,7 +1208,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -1259,7 +1259,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -1310,7 +1310,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -1361,7 +1361,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_DEBUG
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_DEBUG
           path: ./ci/tmp
@@ -1412,7 +1412,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_DEBUG
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_DEBUG
           path: ./ci/tmp
@@ -1463,7 +1463,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_DEBUG
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_DEBUG
           path: ./ci/tmp
@@ -1514,7 +1514,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_DEBUG
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_DEBUG
           path: ./ci/tmp
@@ -1565,7 +1565,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -1616,7 +1616,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -1667,7 +1667,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -1718,7 +1718,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -1769,7 +1769,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_MSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_MSAN
           path: ./ci/tmp
@@ -1820,7 +1820,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_MSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_MSAN
           path: ./ci/tmp
@@ -1871,7 +1871,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_MSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_MSAN
           path: ./ci/tmp
@@ -1922,7 +1922,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_MSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_MSAN
           path: ./ci/tmp
@@ -1973,7 +1973,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_UBSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_UBSAN
           path: ./ci/tmp
@@ -2024,7 +2024,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_UBSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_UBSAN
           path: ./ci/tmp
@@ -2075,7 +2075,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_DEBUG
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_DEBUG
           path: ./ci/tmp
@@ -2126,7 +2126,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_DEBUG
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_DEBUG
           path: ./ci/tmp
@@ -2177,7 +2177,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -2228,7 +2228,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -2279,7 +2279,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -2330,7 +2330,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_ARM_BIN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_ARM_BIN
           path: ./ci/tmp
@@ -2381,7 +2381,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_ARM_BIN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_ARM_BIN
           path: ./ci/tmp
@@ -2432,7 +2432,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -2483,7 +2483,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -2534,7 +2534,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -2585,7 +2585,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -2636,7 +2636,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -2687,7 +2687,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -2738,7 +2738,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -2789,7 +2789,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -2840,7 +2840,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -2891,7 +2891,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -2942,7 +2942,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -2993,7 +2993,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -3044,7 +3044,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_ARM_BIN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_ARM_BIN
           path: ./ci/tmp
@@ -3095,7 +3095,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_ARM_BIN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_ARM_BIN
           path: ./ci/tmp
@@ -3146,7 +3146,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_ARM_BIN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_ARM_BIN
           path: ./ci/tmp
@@ -3197,7 +3197,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_ARM_BIN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_ARM_BIN
           path: ./ci/tmp
@@ -3248,7 +3248,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -3299,7 +3299,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -3350,7 +3350,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -3401,7 +3401,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -3452,7 +3452,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -3503,7 +3503,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_TSAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -3554,7 +3554,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_ASAN
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -3605,14 +3605,14 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_DEBUG
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: CH_AMD_DEBUG
           path: ./ci/tmp
 
 
       - name: Download artifact DEB_AMD_DEBUG
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: DEB_AMD_DEBUG
           path: ./ci/tmp
