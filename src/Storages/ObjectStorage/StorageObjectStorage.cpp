@@ -39,6 +39,7 @@
 #include <Storages/ColumnsDescription.h>
 #include <Storages/HivePartitioningUtils.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSettings.h>
+#include <Storages/ObjectStorage/MultiFileStorageObjectStorageSink.h>
 
 #include <Poco/Logger.h>
 
@@ -203,6 +204,8 @@ StorageObjectStorage::StorageObjectStorage(
             sample_path);
     }
 
+    bool format_supports_prewhere = FormatFactory::instance().checkIfFormatSupportsPrewhere(configuration->getFormat(), context, format_settings);
+
     /// TODO: Known problems with datalake prewhere:
     ///  * If the iceberg table went through schema evolution, columns read from file may need to
     ///    be renamed or typecast before applying prewhere. There's already a mechanism for
@@ -222,7 +225,10 @@ StorageObjectStorage::StorageObjectStorage(
     ///  * There's a bug in StorageObjectStorageSource::createReader: it makes a copy of
     ///    FormatFilterInfo, but for some reason unsets prewhere_info and row_level_filter_info.
     ///    There's probably no reason for this, and it should just copy those fields like the others.
-    supports_prewhere = !configuration->isDataLakeConfiguration() && FormatFactory::instance().checkIfFormatSupportsPrewhere(configuration->getFormat(), context, format_settings);
+    ///  * If the table contains files in different formats, with only some of them supporting
+    ///    prewhere, things break.
+    supports_prewhere = !configuration->isDataLakeConfiguration() && format_supports_prewhere;
+    supports_tuple_elements = format_supports_prewhere;
 
     StorageInMemoryMetadata metadata;
     metadata.setColumns(columns);
@@ -376,7 +382,7 @@ void StorageObjectStorage::read(
         column_names,
         storage_snapshot,
         supportsSubsetOfColumns(local_context),
-        /*supports_tuple_elements=*/ supports_prewhere,
+        supports_tuple_elements,
         local_context,
         PrepareReadingFromFormatHiveParams { file_columns, hive_partition_columns_to_read_from_file_path.getNameToTypeMap() });
     if (query_info.prewhere_info)
@@ -501,8 +507,10 @@ bool StorageObjectStorage::supportsImport() const
 SinkToStoragePtr StorageObjectStorage::import(
     const std::string & file_name,
     Block & block_with_partition_values,
-    std::string & destination_file_path,
+    const std::function<void(const std::string &)> & new_file_path_callback,
     bool overwrite_if_exists,
+    std::size_t max_bytes_per_file,
+    std::size_t max_rows_per_file,
     const std::optional<FormatSettings> & format_settings_,
     ContextPtr local_context)
 {
@@ -518,17 +526,17 @@ SinkToStoragePtr StorageObjectStorage::import(
         }
     }
 
-    destination_file_path = configuration->getPathForWrite(partition_key, file_name).path;
+    const auto base_path = configuration->getPathForWrite(partition_key, file_name).path;
 
-    if (!overwrite_if_exists && object_storage->exists(StoredObject(destination_file_path)))
-    {
-        throw Exception(ErrorCodes::FILE_ALREADY_EXISTS, "File {} already exists", destination_file_path);
-    }
-
-    return std::make_shared<StorageObjectStorageSink>(
-        destination_file_path,
+    return std::make_shared<MultiFileStorageObjectStorageSink>(
+        base_path,
+        /* transaction_id= */ file_name, /// not pretty, but the sink needs some sort of id to generate the commit file name. Using the source part name should be enough
         object_storage,
         configuration,
+        max_bytes_per_file,
+        max_rows_per_file,
+        overwrite_if_exists,
+        new_file_path_callback,
         format_settings_ ? format_settings_ : format_settings,
         std::make_shared<const Block>(getInMemoryMetadataPtr()->getSampleBlock()),
         local_context);

@@ -1140,7 +1140,6 @@ bool DDLWorker::initializeMainThread()
             auto zookeeper = getAndSetZooKeeper();
             zookeeper->createAncestors(fs::path(queue_dir) / "");
             initializeReplication();
-            markReplicasActive(true);
             initialized = true;
             return true;
         }
@@ -1213,6 +1212,14 @@ void DDLWorker::runMainThread()
             }
 
             cleanup_event->set();
+            try
+            {
+                markReplicasActive(reinitialized);
+            }
+            catch (...)
+            {
+                tryLogCurrentException(log, "An error occurred when markReplicasActive: ");
+            }
             scheduleTasks(reinitialized);
             subsequent_errors_count = 0;
 
@@ -1291,20 +1298,23 @@ void DDLWorker::createReplicaDirs(const ZooKeeperPtr & zookeeper, const NameSet 
         zookeeper->createAncestors(fs::path(replicas_dir) / host_id / "");
 }
 
-void DDLWorker::markReplicasActive(bool /*reinitialized*/)
+void DDLWorker::markReplicasActive(bool reinitialized)
 {
     auto zookeeper = getZooKeeper();
 
-    // Reset all active_node_holders
-    for (auto & it : active_node_holders)
+    if (reinitialized)
     {
-        auto & active_node_holder = it.second.second;
-        if (active_node_holder)
-            active_node_holder->setAlreadyRemoved();
-        active_node_holder.reset();
-    }
+        // Reset all active_node_holders
+        for (auto & it : active_node_holders)
+        {
+            auto & active_node_holder = it.second.second;
+            if (active_node_holder)
+                active_node_holder->setAlreadyRemoved();
+            active_node_holder.reset();
+        }
 
-    active_node_holders.clear();
+        active_node_holders.clear();
+    }
 
     for (auto it = active_node_holders.begin(); it != active_node_holders.end();)
     {
@@ -1385,12 +1395,7 @@ void DDLWorker::markReplicasActive(bool /*reinitialized*/)
         {
             zookeeper->deleteEphemeralNodeIfContentMatches(active_path, active_id);
         }
-        Coordination::Requests ops;
-        ops.emplace_back(zkutil::makeCreateRequest(active_path, active_id, zkutil::CreateMode::Ephemeral));
-        /// To bump node mtime
-        ops.emplace_back(zkutil::makeSetRequest(fs::path(replicas_dir) / host_id, "", -1));
-        zookeeper->multi(ops);
-
+        zookeeper->create(active_path, active_id, zkutil::CreateMode::Ephemeral);
         auto active_node_holder_zookeeper = zookeeper;
         auto active_node_holder = zkutil::EphemeralNodeHolder::existing(active_path, *active_node_holder_zookeeper);
         active_node_holders[host_id] = {active_node_holder_zookeeper, active_node_holder};

@@ -71,6 +71,7 @@ struct PartLogElement
     String partition;
     String disk_name;
     String path_on_disk;
+    std::vector<String> remote_file_paths;
 
     MergeTreeDataPartType part_type;
 

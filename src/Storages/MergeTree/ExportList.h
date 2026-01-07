@@ -7,6 +7,7 @@
 #include <Common/ThreadStatus.h>
 #include <Poco/URI.h>
 #include <boost/noncopyable.hpp>
+#include <shared_mutex>
 
 namespace CurrentMetrics
 {
@@ -23,7 +24,7 @@ struct ExportInfo
     String destination_database;
     String destination_table;
     String part_name;
-    String destination_file_path;
+    std::vector<String> destination_file_paths;
     UInt64 rows_read;
     UInt64 total_rows_to_read;
     UInt64 total_size_bytes_compressed;
@@ -41,24 +42,26 @@ struct ExportsListElement : private boost::noncopyable
     const StorageID destination_table_id;
     const UInt64 part_size;
     const String part_name;
-    String destination_file_path;
-    UInt64 rows_read {0};
+
+    /// see destination_file_paths_mutex
+    std::vector<String> destination_file_paths;
+    std::atomic<UInt64> rows_read {0};
     UInt64 total_rows_to_read {0};
     UInt64 total_size_bytes_compressed {0};
     UInt64 total_size_bytes_uncompressed {0};
-    UInt64 bytes_read_uncompressed {0};
+    std::atomic<UInt64> bytes_read_uncompressed {0};
     time_t create_time {0};
-    Float64 elapsed {0};
 
     Stopwatch watch;
     ThreadGroupPtr thread_group;
+    mutable std::shared_mutex destination_file_paths_mutex;
 
     ExportsListElement(
         const StorageID & source_table_id_,
         const StorageID & destination_table_id_,
         UInt64 part_size_,
         const String & part_name_,
-        const String & destination_file_path_,
+        const std::vector<String> & destination_file_paths_,
         UInt64 total_rows_to_read_,
         UInt64 total_size_bytes_compressed_,
         UInt64 total_size_bytes_uncompressed_,

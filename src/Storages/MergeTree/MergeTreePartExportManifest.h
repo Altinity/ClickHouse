@@ -5,6 +5,7 @@
 #include <Storages/StorageSnapshot.h>
 #include <QueryPipeline/QueryPipeline.h>
 #include <optional>
+#include <Core/Settings.h>
 
 namespace DB
 {
@@ -22,22 +23,22 @@ struct MergeTreePartExportManifest
     struct CompletionCallbackResult
     {
     private:
-        CompletionCallbackResult(bool success_, const String & relative_path_in_destination_storage_, std::optional<Exception> exception_)
-            : success(success_), relative_path_in_destination_storage(relative_path_in_destination_storage_), exception(std::move(exception_)) {}
+        CompletionCallbackResult(bool success_, const std::vector<String> & relative_paths_in_destination_storage_, std::optional<Exception> exception_)
+            : success(success_), relative_paths_in_destination_storage(relative_paths_in_destination_storage_), exception(std::move(exception_)) {}
     public:
 
-        static CompletionCallbackResult createSuccess(const String & relative_path_in_destination_storage_)
+        static CompletionCallbackResult createSuccess(const std::vector<String> & relative_paths_in_destination_storage_)
         {
-            return CompletionCallbackResult(true, relative_path_in_destination_storage_, std::nullopt);
+            return CompletionCallbackResult(true, relative_paths_in_destination_storage_, std::nullopt);
         }
 
         static CompletionCallbackResult createFailure(Exception exception_)
         {
-            return CompletionCallbackResult(false, "", std::move(exception_));
+            return CompletionCallbackResult(false, {}, std::move(exception_));
         }
 
         bool success = false;
-        String relative_path_in_destination_storage;
+        std::vector<String> relative_paths_in_destination_storage;
         std::optional<Exception> exception;
     };
 
@@ -46,14 +47,14 @@ struct MergeTreePartExportManifest
         const DataPartPtr & data_part_,
         const String & transaction_id_,
         FileAlreadyExistsPolicy file_already_exists_policy_,
-        const FormatSettings & format_settings_,
+        const Settings & settings_,
         const StorageMetadataPtr & metadata_snapshot_,
         std::function<void(CompletionCallbackResult)> completion_callback_ = {})
         : destination_storage_id(destination_storage_id_),
           data_part(data_part_),
           transaction_id(transaction_id_),
           file_already_exists_policy(file_already_exists_policy_),
-          format_settings(format_settings_),
+          settings(settings_),
           metadata_snapshot(metadata_snapshot_),
           completion_callback(completion_callback_),
           create_time(time(nullptr)) {}
@@ -63,7 +64,7 @@ struct MergeTreePartExportManifest
     /// Used for killing the export.
     String transaction_id;
     FileAlreadyExistsPolicy file_already_exists_policy;
-    FormatSettings format_settings;
+    Settings settings;
 
     /// Metadata snapshot captured at the time of query validation to prevent race conditions with mutations
     /// Otherwise the export could fail if the schema changes between validation and execution

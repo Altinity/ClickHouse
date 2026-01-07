@@ -6,7 +6,10 @@
 #include <Core/Range.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Processors/ISimpleTransform.h>
-#include <Storages/ObjectStorage/IObjectIterator.h>
+#include <Disks/ObjectStorages/IObjectStorage.h>
+#include <QueryPipeline/QueryPipelineBuilder.h>
+#include <Storages/AlterCommands.h>
+#include <Storages/MutationCommands.h>
 #include <Storages/prepareReadingFromFormat.h>
 #include <Formats/FormatFilterInfo.h>
 #include <Formats/FormatParserSharedResources.h>
@@ -17,7 +20,6 @@
 #include <Storages/AlterCommands.h>
 
 #include <Storages/ObjectStorage/DataLakes/Iceberg/SchemaProcessor.h>
-
 
 namespace DataLake
 {
@@ -89,6 +91,12 @@ using SinkToStoragePtr = std::shared_ptr<SinkToStorage>;
 class StorageObjectStorageConfiguration;
 using StorageObjectStorageConfigurationPtr = std::shared_ptr<StorageObjectStorageConfiguration>;
 struct StorageID;
+struct IObjectIterator;
+struct RelativePathWithMetadata;
+class IObjectStorage;
+using ObjectIterator = std::shared_ptr<IObjectIterator>;
+using ObjectStoragePtr = std::shared_ptr<IObjectStorage>;
+using ObjectInfoPtr = std::shared_ptr<PathWithMetadata>;
 
 class IDataLakeMetadata : boost::noncopyable
 {
