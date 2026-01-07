@@ -2247,8 +2247,9 @@ void StorageDistributed::setCachedColumnsToCast(ColumnsDescription columns)
     if (!cached_columns_to_cast.empty() && log)
     {
         Names columns_with_types;
-        columns_with_types.reserve(cached_columns_to_cast.getAllPhysical().size());
-        for (const auto & col : cached_columns_to_cast.getAllPhysical())
+        const auto cached_columns = cached_columns_to_cast.getAllPhysical();
+        columns_with_types.reserve(cached_columns.size());
+        for (const auto & col : cached_columns)
             columns_with_types.emplace_back(col.name + " " + col.type->getName());
         LOG_DEBUG(log, "Hybrid auto-cast will apply to: [{}]", fmt::join(columns_with_types, ", "));
     }
@@ -2420,12 +2421,15 @@ void registerStorageHybrid(StorageFactory & factory)
         if (columns_to_use.empty())
             columns_to_use = first_segment_columns;
 
+        const auto physical_columns = columns_to_use.getAllPhysical();
+
         NameSet columns_to_cast_names;
         auto validate_segment_schema = [&](const ColumnsDescription & segment_columns, const String & segment_name)
         {
-            for (const auto & column : columns_to_use.getAllPhysical())
+            for (const auto & column : physical_columns)
             {
-                auto found = segment_columns.tryGetPhysical(column.name);
+                // all columns defined as physical in hybrid should exists in segments (but can be aliases there)
+                auto found = segment_columns.tryGetColumn(GetColumnsOptions(GetColumnsOptions::AllPhysicalAndAliases), column.name);
                 if (!found)
                 {
                     throw Exception(
@@ -2434,6 +2438,7 @@ void registerStorageHybrid(StorageFactory & factory)
                         segment_name, column.name);
                 }
 
+                // if the type of the column is the segment differs - we need to add it to the list of columns which require casts
                 if (!found->type->equals(*column.type))
                     columns_to_cast_names.emplace(column.name);
             }
@@ -2466,8 +2471,6 @@ void registerStorageHybrid(StorageFactory & factory)
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                             "TableFunctionRemote did not return a StorageDistributed or StorageProxy, got: {}", actual_type);
         }
-
-        const auto physical_columns = columns_to_use.getAllPhysical();
 
         auto validate_predicate = [&](ASTPtr & predicate, size_t argument_index)
         {
@@ -2619,7 +2622,9 @@ void registerStorageHybrid(StorageFactory & factory)
         if (!columns_to_cast_names.empty())
         {
             NamesAndTypesList cast_cols;
-            for (const auto & col : columns_to_use.getAllPhysical())
+
+            // 'physical' columns of Hybrid will be read from segments, and may need CASTS
+            for (const auto & col : physical_columns)
             {
                 if (columns_to_cast_names.contains(col.name))
                     cast_cols.emplace_back(col.name, col.type);
