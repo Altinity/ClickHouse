@@ -47,6 +47,7 @@ class WorkflowYaml:
     branches: List[str]
     jobs: List[JobYaml]
     additional_jobs: List[str]
+    if_condition: str
     job_to_config: Dict[str, JobYaml]
     artifact_to_config: Dict[str, ArtifactYaml]
     secret_names_gh: List[str]
@@ -76,6 +77,7 @@ class WorkflowConfigParser:
             branches=[],
             jobs=[],
             additional_jobs=[],
+            if_condition=config.if_condition,
             secret_names_gh=[],
             variable_names_gh=[],
             job_to_config={},

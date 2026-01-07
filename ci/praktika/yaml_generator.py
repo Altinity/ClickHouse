@@ -56,7 +56,7 @@ env:
 jobs:
 {JOBS}\
 """
-        # NOTE (strtgbb): This is dangerous to set for untrusted workflows, and for trusted workflows it should already be the default
+        # NOTE (strtgbb): permissions: write is dangerous to set for untrusted workflows, and for trusted workflows it should already be the default
         TEMPLATE_GH_TOKEN_PERMISSIONS = ""
         TEMPLATE_ENV_CHECKOUT_REF_PR = """\
   GH_TOKEN: ${{{{ github.token }}}}
@@ -342,15 +342,15 @@ class PullRequestPushYamlGen:
                     WORKFLOW_CONFIG_JOB_NAME=config_job_name_normalized,
                     JOB_NAME_BASE64=Utils.to_base64(job_name),
                 )
-            elif self.workflow_config.name == "Community PR":
-                # TODO: replace this hack with a proper configuration
-                if_expression = "\n    if: ${{ github.actor == 'strtgbb' }}"
+            elif self.workflow_config.if_condition:
+                if_expression = (
+                    f"\n    if: ${{{{ {self.workflow_config.if_condition} }}}}"
+                )
 
             if job.run_unless_cancelled:
                 if_expression = (
                     YamlGenerator.Templates.TEMPLATE_IF_EXPRESSION_NOT_CANCELLED
                 )
-
 
             secrets_envs = []
             # note(strtgbb): This adds github secrets to praktika_setup_env.sh

@@ -24,6 +24,7 @@ workflow = Workflow.Config(
     name="Community PR",
     event=Workflow.Event.PULL_REQUEST,
     base_branches=[BASE_BRANCH, "releases/*", "antalya-*"],
+    if_condition="github.repository != github.event.pull_request.head.repo.full_name",
     jobs=[
         JobConfigs.fast_test,
         *[job.set_dependency([JobNames.FAST_TEST]) for job in JobConfigs.build_jobs],
