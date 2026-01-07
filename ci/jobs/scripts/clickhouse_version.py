@@ -39,6 +39,7 @@ SET(VERSION_STRING {string})
 
     @classmethod
     def get_current_version_as_dict(cls):
+        version_from_file = read_versions()
         # Check if this is a tag push - if so, use the version from the tag
         ref_type = os.getenv("GITHUB_REF_TYPE", "")
         ref_name = os.getenv("GITHUB_REF_NAME", "")
@@ -47,15 +48,18 @@ SET(VERSION_STRING {string})
             print(f"Tag push detected: {ref_name}, extracting version from tag")
             version = get_version_from_tag(ref_name)
             # Get revision from cmake file since it's not in the tag
-            cmake_versions = read_versions()
-            version._revision = cmake_versions.get("revision", version._revision)
+            version._revision = version_from_file.get("revision", version._revision)
         else:
             version = get_version_from_repo()
 
         # relying on ClickHouseVersion to generate proper `description` and `string` with updated `tweak`` value.
         version = version.with_description(version.flavour)
-        return version.as_dict()
+        version_dict = version.as_dict()
 
+        # preserve githash, not sure if that is goign to be usefull, but mimics original implementation
+        version_dict['githash'] = version_from_file['githash']
+
+        return version_dict
 
     @classmethod
     def get_version(cls):
