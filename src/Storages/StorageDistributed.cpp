@@ -819,6 +819,99 @@ public:
     }
 };
 
+using ColumnNameToColumnNodeMap = std::unordered_map<std::string, ColumnNodePtr>;
+
+ColumnNameToColumnNodeMap buildColumnNodesForTableExpression(const QueryTreeNodePtr & table_expression_node, const ContextPtr & context)
+{
+    const TableNode * table_node = table_expression_node->as<TableNode>();
+    const TableFunctionNode * table_function_node = table_expression_node->as<TableFunctionNode>();
+    if (!table_node && !table_function_node)
+        return {};
+
+    // Rebuild per-column nodes (including ALIAS expressions) for the replacement table expression.
+    const auto & storage_snapshot = table_node ? table_node->getStorageSnapshot() : table_function_node->getStorageSnapshot();
+    auto get_column_options = GetColumnsOptions(GetColumnsOptions::All).withExtendedObjects().withVirtuals();
+    if (storage_snapshot->storage.supportsSubcolumns())
+        get_column_options.withSubcolumns();
+
+    auto column_names_and_types = storage_snapshot->getColumns(get_column_options);
+    const auto & columns_description = storage_snapshot->metadata->getColumns();
+
+    ColumnNameToColumnNodeMap column_name_to_node;
+    column_name_to_node.reserve(column_names_and_types.size());
+
+    for (const auto & column_name_and_type : column_names_and_types)
+    {
+        const auto & column_default = columns_description.getDefault(column_name_and_type.name);
+        if (column_default && column_default->kind == ColumnDefaultKind::Alias)
+        {
+            auto alias_expression = buildQueryTree(column_default->expression, context);
+            QueryAnalysisPass(table_expression_node).run(alias_expression, context);
+            if (!alias_expression->getResultType()->equals(*column_name_and_type.type))
+                alias_expression = buildCastFunction(alias_expression, column_name_and_type.type, context, true);
+
+            auto column_node = std::make_shared<ColumnNode>(column_name_and_type, std::move(alias_expression), table_expression_node);
+            column_name_to_node.emplace(column_name_and_type.name, std::move(column_node));
+        }
+        else
+        {
+            auto column_node = std::make_shared<ColumnNode>(column_name_and_type, table_expression_node);
+            column_name_to_node.emplace(column_name_and_type.name, std::move(column_node));
+        }
+    }
+
+    return column_name_to_node;
+}
+
+class ReplaceColumnNodesForTableExpressionVisitor : public InDepthQueryTreeVisitor<ReplaceColumnNodesForTableExpressionVisitor>
+{
+public:
+    ReplaceColumnNodesForTableExpressionVisitor(
+        const QueryTreeNodePtr & from_,
+        const QueryTreeNodePtr & to_,
+        const ColumnNameToColumnNodeMap & column_name_to_node_)
+        : from(from_), to(to_), column_name_to_node(column_name_to_node_)
+    {}
+
+    void visitImpl(QueryTreeNodePtr & node)
+    {
+        auto * column_node = node->as<ColumnNode>();
+        if (!column_node)
+            return;
+
+        auto column_source = column_node->getColumnSourceOrNull();
+        if (!column_source)
+            return;
+
+        if (column_source.get() != from.get())
+            return;
+
+        auto it = column_name_to_node.find(column_node->getColumnName());
+        if (it != column_name_to_node.end())
+        {
+            auto replacement = it->second->clone();
+            replacement->setAlias(column_node->getAlias());
+            node = std::move(replacement);
+        }
+        else
+        {
+            // Preserve the column name but rebind its source to the replacement table expression.
+            column_node->setColumnSource(to);
+        }
+    }
+
+    static bool needChildVisit(const QueryTreeNodePtr &, const QueryTreeNodePtr & child_node)
+    {
+        auto child_node_type = child_node->getNodeType();
+        return !(child_node_type == QueryTreeNodeType::QUERY || child_node_type == QueryTreeNodeType::UNION);
+    }
+
+private:
+    QueryTreeNodePtr from;
+    QueryTreeNodePtr to;
+    const ColumnNameToColumnNodeMap & column_name_to_node;
+};
+
 class RewriteInToGlobalInVisitor : public InDepthQueryTreeVisitorWithContext<RewriteInToGlobalInVisitor>
 {
 public:
@@ -969,13 +1062,12 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
     replacement_table_expression->setAlias(query_info.table_expression->getAlias());
 
     QueryTreeNodePtr filter;
-
     if (additional_filter)
     {
         const auto & context = query_info.planner_context->getQueryContext();
 
         filter = buildQueryTree(additional_filter->clone(), query_context);
-
+        // Resolve now; alias expressions are normalized later for the merged query.
         QueryAnalysisPass(replacement_table_expression).run(filter, context);
     }
 
@@ -988,6 +1080,33 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
         query.getWhere() = query.hasWhere()
             ? mergeConditionNodes({query.getWhere(), filter}, query_context)
             : std::move(filter);
+    }
+
+    if (additional_filter)
+    {
+        auto replacement_columns = buildColumnNodesForTableExpression(replacement_table_expression, query_context);
+
+        /**
+         * When Hybrid injects a segment predicate, the query tree may end up mixing
+         * two different column interpretations for the same name:
+         * - SELECT list columns are resolved against the Hybrid schema (physical columns).
+         * - WHERE predicate columns are resolved against the segment schema (ALIAS columns).
+         *
+         * If we later expand alias columns only in one place, the analyzer can see
+         * two different expressions with the same alias (e.g. `computed` as a column
+         * vs `value * 2 AS computed`), which triggers MULTIPLE_EXPRESSIONS_FOR_ALIAS.
+         *
+         * To prevent this, we rebuild ColumnNodes from the replacement table expression
+         * (including fully-resolved ALIAS expressions) and rewrite the whole query tree
+         * so all references to the replaced table share the same column source and
+         * the same alias semantics. This keeps SELECT and WHERE consistent before
+         * ReplaseAliasColumnsVisitor performs final alias expansion.
+         */
+        ReplaceColumnNodesForTableExpressionVisitor replace_query_columns_visitor(
+            replacement_table_expression,
+            replacement_table_expression,
+            replacement_columns);
+        replace_query_columns_visitor.visit(query_tree_to_modify);
     }
 
     ReplaseAliasColumnsVisitor replace_alias_columns_visitor;
@@ -2197,8 +2316,9 @@ void StorageDistributed::setCachedColumnsToCast(ColumnsDescription columns)
     if (!cached_columns_to_cast.empty() && log)
     {
         Names columns_with_types;
-        columns_with_types.reserve(cached_columns_to_cast.getAllPhysical().size());
-        for (const auto & col : cached_columns_to_cast.getAllPhysical())
+        const auto cached_columns = cached_columns_to_cast.getAllPhysical();
+        columns_with_types.reserve(cached_columns.size());
+        for (const auto & col : cached_columns)
             columns_with_types.emplace_back(col.name + " " + col.type->getName());
         LOG_DEBUG(log, "Hybrid auto-cast will apply to: [{}]", fmt::join(columns_with_types, ", "));
     }
@@ -2370,12 +2490,15 @@ void registerStorageHybrid(StorageFactory & factory)
         if (columns_to_use.empty())
             columns_to_use = first_segment_columns;
 
+        const auto physical_columns = columns_to_use.getAllPhysical();
+
         NameSet columns_to_cast_names;
         auto validate_segment_schema = [&](const ColumnsDescription & segment_columns, const String & segment_name)
         {
-            for (const auto & column : columns_to_use.getAllPhysical())
+            for (const auto & column : physical_columns)
             {
-                auto found = segment_columns.tryGetPhysical(column.name);
+                // all columns defined as physical in hybrid should exists in segments (but can be aliases there)
+                auto found = segment_columns.tryGetColumn(GetColumnsOptions(GetColumnsOptions::AllPhysicalAndAliases), column.name);
                 if (!found)
                 {
                     throw Exception(
@@ -2384,6 +2507,7 @@ void registerStorageHybrid(StorageFactory & factory)
                         segment_name, column.name);
                 }
 
+                // if the type of the column is the segment differs - we need to add it to the list of columns which require casts
                 if (!found->type->equals(*column.type))
                     columns_to_cast_names.emplace(column.name);
             }
@@ -2416,8 +2540,6 @@ void registerStorageHybrid(StorageFactory & factory)
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                             "TableFunctionRemote did not return a StorageDistributed or StorageProxy, got: {}", actual_type);
         }
-
-        const auto physical_columns = columns_to_use.getAllPhysical();
 
         auto validate_predicate = [&](ASTPtr & predicate, size_t argument_index)
         {
@@ -2569,7 +2691,9 @@ void registerStorageHybrid(StorageFactory & factory)
         if (!columns_to_cast_names.empty())
         {
             NamesAndTypesList cast_cols;
-            for (const auto & col : columns_to_use.getAllPhysical())
+
+            // 'physical' columns of Hybrid will be read from segments, and may need CASTS
+            for (const auto & col : physical_columns)
             {
                 if (columns_to_cast_names.contains(col.name))
                     cast_cols.emplace_back(col.name, col.type);
