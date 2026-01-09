@@ -1731,6 +1731,9 @@ class TestCase:
                 self.base_client_options + client_options + " "
             )
 
+        current_value = os.environ.get("CLICKHOUSE_CLIENT_OPT", "")
+        os.environ["CLICKHOUSE_CLIENT_OPT"] = f"{current_value} --allow_repeated_settings".strip()
+
         return client_options + new_options
 
     def remove_settings_from_env(self):
