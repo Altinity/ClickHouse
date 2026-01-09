@@ -5,7 +5,7 @@ from ci.defs.defs import BASE_BRANCH, DOCKERS, SECRETS, RunnerLabels
 vector_search_stress_job = Job.Config(
     name="Vector Search Stress",
     runs_on=RunnerLabels.ARM_SMALL,
-    # run_in_docker="clickhouse/stateless-test+--shm-size=16g+--network=host",  # remove if run in docker is not required
+    # run_in_docker="altinityinfra/stateless-test+--shm-size=16g+--network=host",  # remove if run in docker is not required
     command="python3 ./ci/jobs/vector_search_stress_job.py",
 )
 
