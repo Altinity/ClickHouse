@@ -55,7 +55,13 @@ bool NgramTokenExtractor::nextInString(const char * data, size_t length, size_t 
         size_t sz = UTF8::seqLength(static_cast<UInt8>(data[*token_start + *token_length]));
         *token_length += sz;
     }
+<<<<<<< HEAD
     *pos += UTF8::seqLength(static_cast<UInt8>(data[*pos]));
+=======
+    /// The sequence length is determined by the first character, but we should always check it does not go beyond the buffer length.
+    token_length = std::min(token_length, length - token_start);
+    pos += UTF8::seqLength(static_cast<UInt8>(data[pos]));
+>>>>>>> f9fc3b2322d (Merge pull request #93663 from ClickHouse/fix-msan-tokeniterator)
     return code_points == n;
 }
 
@@ -80,7 +86,12 @@ bool NgramTokenExtractor::nextInStringLike(const char * data, size_t length, siz
             token.clear();
             code_points = 0;
             escaped = false;
+<<<<<<< HEAD
             *pos = ++i;
+=======
+            ++i;
+            pos = i;
+>>>>>>> f9fc3b2322d (Merge pull request #93663 from ClickHouse/fix-msan-tokeniterator)
         }
         else if (!escaped && data[i] == '\\')
         {
@@ -90,7 +101,8 @@ bool NgramTokenExtractor::nextInStringLike(const char * data, size_t length, siz
         else
         {
             const size_t sz = UTF8::seqLength(static_cast<UInt8>(data[i]));
-            for (size_t j = 0; j < sz; ++j)
+            /// The sequence length is determined by the first character, but we should always check it does not go beyond the buffer length.
+            for (size_t j = 0; j < sz && i + j < length; ++j)
                 token += data[i + j];
             i += sz;
             ++code_points;
@@ -253,8 +265,14 @@ bool DefaultTokenExtractor::nextInStringLike(const char * data, size_t length, s
         }
         else
         {
+<<<<<<< HEAD
             const size_t sz = UTF8::seqLength(static_cast<UInt8>(data[*pos]));
             for (size_t j = 0; j < sz; ++j)
+=======
+            const size_t sz = UTF8::seqLength(static_cast<UInt8>(data[pos]));
+            /// The sequence length is determined by the first character, but we should always check it does not go beyond the buffer length.
+            for (size_t j = 0; j < sz && pos < length; ++j)
+>>>>>>> f9fc3b2322d (Merge pull request #93663 from ClickHouse/fix-msan-tokeniterator)
             {
                 token += data[*pos];
                 ++*pos;
@@ -374,7 +392,91 @@ bool NoOpTokenExtractor::nextInString(const char * /*data*/, size_t length, size
 
 bool NoOpTokenExtractor::nextInStringLike(const char * /*data*/, size_t /*length*/, size_t * /*token_start*/, String & /*token_length*/) const
 {
+<<<<<<< HEAD
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "NoOpTokenExtractor::nextInStringLike is not implemented");
+=======
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "ArrayTokenExtractor::nextInStringLike is not implemented");
+}
+
+SparseGramsTokenExtractor::SparseGramsTokenExtractor(size_t min_length, size_t max_length, std::optional<size_t> min_cutoff_length_)
+    : ITokenExtractorHelper(Type::SparseGrams)
+    , sparse_grams_iterator(min_length, max_length, min_cutoff_length_)
+{
+}
+
+bool SparseGramsTokenExtractor::nextInString(const char * data, size_t length, size_t & __restrict pos, size_t & __restrict token_start, size_t & __restrict token_length) const
+{
+    if (std::tie(data, length) != std::tie(previous_data, previous_len))
+    {
+        previous_data = data;
+        previous_len = length;
+        sparse_grams_iterator.set(data, data + length);
+    }
+
+    Pos next_begin;
+    Pos next_end;
+    if (!sparse_grams_iterator.get(next_begin, next_end))
+    {
+        previous_data = nullptr;
+        previous_len = 0;
+        return false;
+    }
+    token_start = next_begin - data;
+    token_length = next_end - next_begin;
+    pos = token_start;
+
+    return true;
+}
+
+bool SparseGramsTokenExtractor::nextInStringLike(const char * data, size_t length, size_t & pos, String & token) const
+{
+    if (std::tie(data, length) != std::tie(previous_data, previous_len))
+    {
+        previous_data = data;
+        previous_len = length;
+        sparse_grams_iterator.set(data, data + length);
+    }
+
+    token.clear();
+
+    while (true)
+    {
+        Pos next_begin;
+        Pos next_end;
+        if (!sparse_grams_iterator.get(next_begin, next_end))
+        {
+            previous_data = nullptr;
+            previous_len = 0;
+            return false;
+        }
+        bool match_substring = true;
+        for (size_t i = next_begin - data; i < static_cast<size_t>(next_end - data);)
+        {
+            /// Escaped sequences are not supported by sparse grams tokenizers.
+            /// It requires pushing down this logic into sparse grams implementation,
+            /// because it changes the split into sparse grams. We don't want to do that now.
+            if (data[i] == '%' || data[i] == '_' || data[i] == '\\')
+            {
+                token.clear();
+                match_substring = false;
+                break;
+            }
+            else
+            {
+                const size_t sz = UTF8::seqLength(static_cast<UInt8>(data[i]));
+                /// The sequence length is determined by the first character, but we should always check it does not go beyond the buffer length.
+                for (size_t j = 0; j < sz && i + j < length; ++j)
+                    token.push_back(data[i + j]);
+                i += sz;
+            }
+        }
+        if (match_substring)
+        {
+            pos = next_begin - data;
+            return true;
+        }
+    }
+>>>>>>> f9fc3b2322d (Merge pull request #93663 from ClickHouse/fix-msan-tokeniterator)
 }
 
 }
