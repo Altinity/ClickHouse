@@ -164,7 +164,7 @@ jobs:
           --clickhouse ${{ env.clickhouse_path }}
           ${{ env.REGRESSION_ARGS }}
           ${{ env.args }} || EXITCODE=$?;
-          .github/add_link_to_logs.sh
+          .github/add_link_to_logs.sh;
           exit $EXITCODE
 
       - name: 📊 Set Commit Status
