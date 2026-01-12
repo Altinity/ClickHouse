@@ -277,7 +277,7 @@ jobs:
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
       job_name: iceberg
-      extra_args: --only ${{ matrix.PART == 1 && '"/iceberg/iceberg engine/rest catalog/*" "/iceberg/s3 table function/*" "/iceberg/icebergS3 table function/*" "/iceberg/iceberg cache"' || '"/iceberg/iceberg engine/glue catalog/*" "/iceberg/iceberg table engine/*"' }}
+      extra_args: --only ${{ matrix.PART == 1 && '"/iceberg/iceberg engine/rest catalog/*" "/iceberg/s3 table function/*" "/iceberg/icebergS3 table function/*" "/iceberg/iceberg cache/*"' || '"/iceberg/iceberg engine/glue catalog/*" "/iceberg/iceberg table engine/*"' }}
     secrets: inherit
   LDAP:
     if: |
@@ -430,6 +430,34 @@ jobs:
       job_name: s3_${{ matrix.STORAGE }}
       regression_args: --storage ${{ matrix.STORAGE }} --gcs-uri {{GCS_URI}} --gcs-key-id {{GCS_KEY_ID}} --gcs-key-secret {{GCS_KEY_SECRET}} --aws-s3-bucket {{AWS_BUCKET}} --aws-s3-region {{AWS_REGION}} --aws-s3-key-id {{AWS_KEY_ID}} --aws-s3-access-key {{AWS_ACCESS_KEY}} --azure-account-name {{AZURE_ACCOUNT_NAME}} --azure-storage-key {{AZURE_STORAGE_KEY}} --azure-container {{AZURE_CONTAINER_NAME}}
       extra_args: --only ":/try*" ":/part ${{ matrix.PART }}/*"
+    secrets: inherit
+
+  S3Export:
+    if: |
+      fromJson(inputs.workflow_config).custom_data.ci_regression_jobs[0] == null ||
+      contains(fromJson(inputs.workflow_config).custom_data.ci_regression_jobs, 's3')
+    strategy:
+      fail-fast: false
+      matrix:
+        PART: [part, partition]
+    uses: ./.github/workflows/regression-reusable-suite.yml
+    with:
+      ref: ${{ inputs.commit }}
+      workflow_config: ${{ inputs.workflow_config }}
+      suite_name: s3
+      suite_executable: regression.py
+      output_format: new-fails
+      flags: --with-analyzer
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+      runner_arch: ${{ inputs.arch }}
+      runner_type: ${{ inputs.runner_type }}
+      storage_path: /minio
+      part: ${{ matrix.PART }}
+      build_sha: ${{ inputs.build_sha }}
+      set_commit_status: true
+      job_name: s3_export
+      regression_args: --storage minio
+      extra_args: --only ":/try*" "minio/export tests/export ${{ matrix.PART }}/*"
     secrets: inherit
 
   TieredStorage:
