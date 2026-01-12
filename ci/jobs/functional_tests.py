@@ -332,12 +332,13 @@ def main():
             res = res and CH.start()
             res = res and CH.wait_ready()
             if res:
-                if not Info().is_local_run:
-                    if not CH.start_log_exports(stop_watch.start_time):
-                        info.add_workflow_report_message(
-                            "WARNING: Failed to start log export"
-                        )
-                        print("Failed to start log export")
+                # Note (strtgbb): We don't use this
+                # if not Info().is_local_run:
+                #     if not CH.start_log_exports(stop_watch.start_time):
+                #         info.add_workflow_report_message(
+                #             "WARNING: Failed to start log export"
+                #         )
+                #         print("Failed to start log export")
                 if not CH.create_minio_log_tables():
                     info.add_workflow_report_message(
                         "WARNING: Failed to create minio log tables"
