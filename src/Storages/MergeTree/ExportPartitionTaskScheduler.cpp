@@ -30,6 +30,14 @@ namespace
         context_copy->setSetting("export_merge_tree_part_file_already_exists_policy", String(magic_enum::enum_name(manifest.file_already_exists_policy)));
         context_copy->setSetting("export_merge_tree_part_max_bytes_per_file", manifest.max_bytes_per_file);
         context_copy->setSetting("export_merge_tree_part_max_rows_per_file", manifest.max_rows_per_file);
+
+        /// always allow exporting outdated parts because the parts have been validated when the query was processed
+        context_copy->setSetting("export_merge_tree_part_allow_outdated_parts", true);
+
+        /// always skip pending mutations and patch parts because we already validated the parts during query processing
+        context_copy->setSetting("export_merge_tree_part_throw_on_pending_mutations", false);
+        context_copy->setSetting("export_merge_tree_part_throw_on_pending_patch_parts", false);
+
         return context_copy;
     }
 }
