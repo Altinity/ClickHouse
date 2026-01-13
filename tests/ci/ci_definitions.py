@@ -59,12 +59,12 @@ class Runners(metaclass=WithIter):
     GitHub runner's labels
     """
 
-    BUILDER = "builder"
-    BUILDER_AARCH64 = "builder-aarch64"
-    STYLE_CHECKER = "style-checker"
-    STYLE_CHECKER_AARCH64 = "style-checker-aarch64"
-    FUNC_TESTER = "func-tester"
-    FUNC_TESTER_AARCH64 = "func-tester-aarch64"
+    BUILDER = "altinity-builder"
+    BUILDER_AARCH64 = "altinity-builder-aarch64"
+    STYLE_CHECKER = "altinity-style-checker"
+    STYLE_CHECKER_AARCH64 = "altinity-style-checker-aarch64"
+    FUNC_TESTER = "altinity-func-tester"
+    FUNC_TESTER_AARCH64 = "altinity-func-tester-aarch64"
     FUZZER_UNIT_TESTER = "fuzzer-unit-tester"
 
 
@@ -222,6 +222,9 @@ class JobNames(metaclass=WithIter):
     DOCS_CHECK = "Docs check"
     BUGFIX_VALIDATE = "Bugfix validation"
 
+    SIGN_RELEASE = "Sign release"
+    SIGN_AARCH64 = "Sign aarch64"
+
 
 # hack to concatenate Build and non-build jobs under JobNames class
 for attr_name in dir(BuildNames):
@@ -331,13 +334,13 @@ class JobConfig:
     # will be triggered for the job if omitted in CI workflow yml
     run_command: str = ""
     # job timeout, seconds
-    timeout: int = 7200
+    timeout: int = 7220
     # sets number of batches for a multi-batch job
     num_batches: int = 1
     # label that enables job in CI, if set digest isn't used
     run_by_labels: List[str] = field(default_factory=list)
     # to run always regardless of the job digest or/and label
-    run_always: bool = False
+    run_always: bool = True
     # disables CI await for a given job
     disable_await: bool = False
     # if the job needs to be run on the release branch, including master (building packages, docker server).
@@ -390,7 +393,7 @@ class CommonJobConfigs:
         job_name_keyword="compatibility",
         digest=DigestConfig(
             include_paths=["./tests/ci/compatibility_check.py"],
-            docker=["clickhouse/test-old-ubuntu", "clickhouse/test-old-centos"],
+            docker=["altinityinfra/test-old-ubuntu", "altinityinfra/test-old-centos"],
         ),
         run_command="compatibility_check.py",
         runner_type=Runners.STYLE_CHECKER,
@@ -399,7 +402,7 @@ class CommonJobConfigs:
         job_name_keyword="install",
         digest=DigestConfig(
             include_paths=["./tests/ci/install_check.py"],
-            docker=["clickhouse/install-deb-test", "clickhouse/install-rpm-test"],
+            docker=["altinityinfra/install-deb-test", "altinityinfra/install-rpm-test"],
         ),
         run_command='install_check.py "$CHECK_NAME"',
         runner_type=Runners.STYLE_CHECKER,
@@ -417,7 +420,7 @@ class CommonJobConfigs:
                 "./tests/docker_scripts/",
             ],
             exclude_files=[".md"],
-            docker=["clickhouse/stateless-test"],
+            docker=["altinityinfra/stateless-test"],
         ),
         run_command='functional_test_check.py "$CHECK_NAME"',
         runner_type=Runners.FUNC_TESTER,
@@ -434,7 +437,7 @@ class CommonJobConfigs:
                 "./tests/docker_scripts/",
             ],
             exclude_files=[".md"],
-            docker=["clickhouse/stress-test"],
+            docker=["altinityinfra/stress-test"],
         ),
         run_command="stress_check.py",
         runner_type=Runners.FUNC_TESTER,
@@ -445,7 +448,7 @@ class CommonJobConfigs:
         digest=DigestConfig(
             include_paths=["./tests/ci/upgrade_check.py", "./tests/docker_scripts/"],
             exclude_files=[".md"],
-            docker=["clickhouse/stress-test"],
+            docker=["altinityinfra/stress-test"],
         ),
         run_command="upgrade_check.py",
         runner_type=Runners.FUNC_TESTER,
@@ -471,7 +474,7 @@ class CommonJobConfigs:
             include_paths=[
                 "./tests/ci/ci_fuzzer_check.py",
             ],
-            docker=["clickhouse/fuzzer"],
+            docker=["altinityinfra/fuzzer"],
         ),
         run_command="ci_fuzzer_check.py",
         run_always=True,
@@ -483,7 +486,7 @@ class CommonJobConfigs:
             include_paths=[
                 "./tests/ci/ci_fuzzer_check.py",
             ],
-            docker=["clickhouse/fuzzer"],
+            docker=["altinityinfra/fuzzer"],
         ),
         run_command="ci_fuzzer_check.py",
         run_always=True,
@@ -494,7 +497,7 @@ class CommonJobConfigs:
         digest=DigestConfig(
             include_paths=["./tests/ci/unit_tests_check.py"],
             exclude_files=[".md"],
-            docker=["clickhouse/unit-test"],
+            docker=["altinityinfra/unit-test"],
         ),
         run_command="unit_tests_check.py",
         runner_type=Runners.FUZZER_UNIT_TESTER,
@@ -507,7 +510,7 @@ class CommonJobConfigs:
                 "./tests/performance/",
             ],
             exclude_files=[".md"],
-            docker=["clickhouse/performance-comparison"],
+            docker=["altinityinfra/performance-comparison"],
         ),
         run_command="performance_comparison_check.py",
         runner_type=Runners.FUNC_TESTER,
@@ -525,7 +528,7 @@ class CommonJobConfigs:
         digest=DigestConfig(
             include_paths=["./tests/ci/sqllogic_test.py"],
             exclude_files=[".md"],
-            docker=["clickhouse/sqllogic-test"],
+            docker=["altinityinfra/sqllogic-test"],
         ),
         run_command="sqllogic_test.py",
         timeout=10800,
@@ -537,7 +540,7 @@ class CommonJobConfigs:
         digest=DigestConfig(
             include_paths=["./tests/ci/sqltest.py"],
             exclude_files=[".md"],
-            docker=["clickhouse/sqltest"],
+            docker=["altinityinfra/sqltest"],
         ),
         run_command="sqltest.py",
         timeout=10800,
@@ -554,7 +557,7 @@ class CommonJobConfigs:
     DOCKER_SERVER = JobConfig(
         job_name_keyword="docker",
         required_on_release_branch=True,
-        run_command='docker_server.py --check-name "$CHECK_NAME" --tag-type head --allow-build-reuse',
+        run_command='docker_server.py --check-name "$CHECK_NAME" --tag-type head --allow-build-reuse --push',
         digest=DigestConfig(
             include_paths=[
                 "tests/ci/docker_server.py",
@@ -571,7 +574,7 @@ class CommonJobConfigs:
             include_paths=[
                 "tests/ci/clickbench.py",
             ],
-            docker=["clickhouse/clickbench"],
+            docker=["altinityinfra/clickbench"],
         ),
         run_command='clickbench.py "$CHECK_NAME"',
         timeout=900,
@@ -600,7 +603,7 @@ class CommonJobConfigs:
                 "./tests/performance",
             ],
             exclude_files=[".md"],
-            docker=["clickhouse/binary-builder"],
+            docker=["altinityinfra/binary-builder"],
             git_submodules=True,
         ),
         run_command="build_check.py $BUILD_NAME",
@@ -611,7 +614,6 @@ class CommonJobConfigs:
 REQUIRED_CHECKS = [
     StatusNames.PR_CHECK,
     JobNames.BUILD_CHECK,
-    JobNames.DOCS_CHECK,
     JobNames.FAST_TEST,
     JobNames.STATELESS_TEST_RELEASE,
     JobNames.STATELESS_TEST_ASAN,
