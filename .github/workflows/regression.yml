@@ -432,6 +432,34 @@ jobs:
       extra_args: --only ":/try*" ":/part ${{ matrix.PART }}/*"
     secrets: inherit
 
+  S3Export:
+    if: |
+      fromJson(inputs.workflow_config).custom_data.ci_regression_jobs[0] == null ||
+      contains(fromJson(inputs.workflow_config).custom_data.ci_regression_jobs, 's3')
+    strategy:
+      fail-fast: false
+      matrix:
+        PART: [part, partition]
+    uses: ./.github/workflows/regression-reusable-suite.yml
+    with:
+      ref: ${{ inputs.commit }}
+      workflow_config: ${{ inputs.workflow_config }}
+      suite_name: s3
+      suite_executable: regression.py
+      output_format: new-fails
+      flags: --with-analyzer
+      timeout_minutes: ${{ inputs.timeout_minutes }}
+      runner_arch: ${{ inputs.arch }}
+      runner_type: ${{ inputs.runner_type }}
+      storage_path: /minio
+      part: ${{ matrix.PART }}
+      build_sha: ${{ inputs.build_sha }}
+      set_commit_status: true
+      job_name: s3_export
+      regression_args: --storage minio
+      extra_args: --only ":/try*" "minio/export tests/export ${{ matrix.PART }}/*"
+    secrets: inherit
+
   TieredStorage:
     if: |
       fromJson(inputs.workflow_config).custom_data.ci_regression_jobs[0] == null ||
