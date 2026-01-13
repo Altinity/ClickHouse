@@ -217,6 +217,8 @@ namespace Setting
     extern const SettingsMergeTreePartExportFileAlreadyExistsPolicy export_merge_tree_part_file_already_exists_policy;
     extern const SettingsBool output_format_parallel_formatting;
     extern const SettingsBool output_format_parquet_parallel_encoding;
+    extern const SettingsBool export_merge_tree_part_throw_on_pending_mutations;
+    extern const SettingsBool export_merge_tree_part_throw_on_pending_patch_parts;
 }
 
 namespace MergeTreeSetting
@@ -336,6 +338,7 @@ namespace ErrorCodes
     extern const int TOO_LARGE_LIGHTWEIGHT_UPDATES;
     extern const int UNKNOWN_TABLE;
     extern const int FILE_ALREADY_EXISTS;
+    extern const int PENDING_MUTATIONS_NOT_ALLOWED;
 }
 
 static void checkSuspiciousIndices(const ASTFunction * index_function)
@@ -6253,6 +6256,37 @@ void MergeTreeData::exportPartToTable(
     if (!part)
         throw Exception(ErrorCodes::NO_SUCH_DATA_PART, "No such data part '{}' to export in table '{}'",
                         part_name, getStorageID().getFullTableName());
+
+    const bool need_mutations = query_context->getSettingsRef()[Setting::export_merge_tree_part_throw_on_pending_mutations];
+    const bool need_patch_parts = query_context->getSettingsRef()[Setting::export_merge_tree_part_throw_on_pending_patch_parts];
+
+    MergeTreeData::IMutationsSnapshot::Params mutations_snapshot_params
+    {
+        .metadata_version = source_metadata_ptr->getMetadataVersion(),
+        .min_part_metadata_version = part->getMetadataVersion(),
+        .need_data_mutations = need_mutations,
+        .need_alter_mutations = need_mutations || need_patch_parts,
+        .need_patch_parts = need_patch_parts,
+    };
+
+    const auto mutations_snapshot = getMutationsSnapshot(mutations_snapshot_params);
+
+    const auto pending_mutations = mutations_snapshot->getOnFlyMutationCommandsForPart(part);
+    const auto pending_patch_parts = mutations_snapshot->getPatchesForPart(part);
+
+    if (!pending_mutations.empty())
+    {
+        throw Exception(ErrorCodes::PENDING_MUTATIONS_NOT_ALLOWED,
+            "Part {} can not be exported because there are pending mutations. Either wait for the mutations to be applied or set `export_merge_tree_part_throw_on_pending_mutations` to false",
+            part_name);
+    }
+
+    if (!pending_patch_parts.empty())
+    {
+        throw Exception(ErrorCodes::PENDING_MUTATIONS_NOT_ALLOWED,
+            "Part {} can not be exported because there are pending patch parts. Either wait for the patch parts to be applied or set `export_merge_tree_part_throw_on_pending_patch_parts` to false",
+            part_name);
+    }
 
     {
         const auto format_settings = getFormatSettings(query_context);
