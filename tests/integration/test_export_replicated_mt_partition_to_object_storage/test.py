@@ -912,3 +912,43 @@ def test_patch_parts_after_export_partition_started(cluster):
     assert "101" not in result, "Export should not contain patched data"
 
     node.query(f"DROP TABLE {mt_table}")
+
+
+def test_mutation_in_partition_clause(cluster):
+    """Test that mutations limited to specific partitions using IN PARTITION clause
+    allow exports of unaffected partitions to succeed."""
+    node = cluster.instances["replica1"]
+
+    mt_table = "mutation_in_partition_clause_mt_table"
+    s3_table = "mutation_in_partition_clause_s3_table"
+
+    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
+
+    node.query(f"SYSTEM STOP MERGES {mt_table}")
+
+    # Issue a mutation that uses IN PARTITION to limit it to partition 2020
+    node.query(f"ALTER TABLE {mt_table} UPDATE id = id + 100 IN PARTITION '2020' WHERE year = 2020")
+
+    # Verify mutation is pending for 2020
+    mutations = node.query(
+        f"SELECT count() FROM system.mutations WHERE table = '{mt_table}' AND is_done = 0"
+    )
+    assert mutations.strip() != '0', "Mutation should be pending"
+
+    # Export of 2020 should fail (it has pending mutations)
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
+        f"SETTINGS export_merge_tree_part_throw_on_pending_mutations=true"
+    )
+    assert "PENDING_MUTATIONS_NOT_ALLOWED" in error, f"Expected error about pending mutations for partition 2020, got: {error}"
+
+    # Export of 2021 should succeed (no mutations affecting it)
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2021' TO TABLE {s3_table} "
+        f"SETTINGS export_merge_tree_part_throw_on_pending_mutations=true"
+    )
+
+    wait_for_export_status(node, mt_table, s3_table, "2021", "COMPLETED")
+
+    result = node.query(f"SELECT id FROM {s3_table} WHERE year = 2021 ORDER BY id")
+    assert "4" in result, "Export of partition 2021 should contain original data"
