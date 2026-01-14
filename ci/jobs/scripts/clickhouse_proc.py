@@ -131,14 +131,16 @@ class ClickHouseProc:
             )
         print(f"Started setup_minio.sh asynchronously with PID {self.minio_proc.pid}")
 
-        for _ in range(20):
+        print("Waiting for minio to start...")
+        for _ in range(10):
             res = Shell.check(
                 "/mc ls clickminio/test | grep -q .",
                 verbose=True,
             )
             if res:
+                print("Minio started successfully")
                 return True
-            time.sleep(1)
+            time.sleep(3)
         print("Failed to start minio")
         return False
 
@@ -621,16 +623,17 @@ clickhouse-client --query "SELECT count() FROM test.visits"
         return exit_code == 0
 
     def terminate(self):
-        if self.minio_proc:
-            # remove the webhook so it doesn't spam with errors once we stop ClickHouse
-            Shell.check(
-                "/mc admin config reset clickminio logger_webhook:ch_server_webhook",
-                verbose=True,
-            )
-            Shell.check(
-                "/mc admin config reset clickminio audit_webhook:ch_audit_webhook",
-                verbose=True,
-            )
+        # NOTE (strtgbb): Log tables are disabled, we don't use them
+        # if self.minio_proc:
+        #     # remove the webhook so it doesn't spam with errors once we stop ClickHouse
+        #     Shell.check(
+        #         "/mc admin config reset clickminio logger_webhook:ch_server_webhook",
+        #         verbose=True,
+        #     )
+        #     Shell.check(
+        #         "/mc admin config reset clickminio audit_webhook:ch_audit_webhook",
+        #         verbose=True,
+        #     )
 
         self._flush_system_logs()
         print("Terminate ClickHouse processes")
@@ -938,8 +941,8 @@ quit
             "error_log",
             "query_metric_log",
             "part_log",
-            "minio_audit_logs",
-            "minio_server_logs",
+            # "minio_audit_logs", # NOTE (strtgbb): we do not use these logs
+            # "minio_server_logs",
         ]
 
         command_args = self.LOGS_SAVER_CLIENT_OPTIONS
@@ -1036,8 +1039,10 @@ if __name__ == "__main__":
             # FIXME: the start_time must be preserved globally in ENV or something like that
             # to get the same values in different DBs
             # As a wild idea, it could be stored in a Info.check_start_timestamp
+            exit(0) # Note (strtgbb): We don't use log exports
             res = ch.start_log_exports(check_start_time=Utils.timestamp())
         elif command == "logs_export_stop":
+            exit(0) # Note (strtgbb): We don't use log exports
             res = ch.stop_log_exports()
         elif command == "start_minio":
             param = sys.argv[2]

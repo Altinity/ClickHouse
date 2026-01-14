@@ -246,7 +246,9 @@ def main():
         print(step_name)
         res = res and CH.run_fast_test(test=args.test or "")
         if res:
-            results.append(FTResultsProcessor(wd=Settings.OUTPUT_DIR).run())
+            results.append(
+                FTResultsProcessor(wd=Settings.OUTPUT_DIR, test_options=["fast"]).run()
+            )
             results[-1].set_timing(stopwatch=stop_watch_)
         else:
             results.append(
