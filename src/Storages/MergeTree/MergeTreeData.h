@@ -551,7 +551,6 @@ public:
         virtual bool hasDataMutations() const = 0;
         virtual bool hasAlterMutations() const = 0;
         virtual bool hasMetadataMutations() const = 0;
-        bool hasAnyMutations() const { return hasDataMutations() || hasAlterMutations() || hasMetadataMutations(); }
     };
 
     struct MutationsSnapshotBase : public IMutationsSnapshot
@@ -571,6 +570,7 @@ public:
         bool hasDataMutations() const final { return counters.num_data > 0; }
         bool hasAlterMutations() const final { return counters.num_alter > 0; }
         bool hasMetadataMutations() const final { return counters.num_metadata > 0; }
+        bool hasAnyMutations() const { return hasDataMutations() || hasAlterMutations() || hasMetadataMutations(); }
 
     protected:
         NameSet getColumnsUpdatedInPatches() const;
