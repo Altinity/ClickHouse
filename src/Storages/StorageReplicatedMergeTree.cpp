@@ -8213,7 +8213,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     MergeTreeData::IMutationsSnapshot::Params mutations_snapshot_params
     {
         .metadata_version = getInMemoryMetadataPtr()->getMetadataVersion(),
-        .max_mutation_versions = query_context->getPartitionIdToMaxBlock(getStorageID().uuid),
+        .min_part_metadata_version = MergeTreeData::getMinMetadataVersion(parts),
         .need_data_mutations = throw_on_pending_mutations,
         .need_alter_mutations = throw_on_pending_mutations || throw_on_pending_patch_parts,
         .need_patch_parts = throw_on_pending_patch_parts,
