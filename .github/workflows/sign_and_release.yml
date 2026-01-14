@@ -257,7 +257,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: Altinity/ClickHouse
-          ref: antalya
           path: ClickHouse
 
       - name: Download packages
@@ -360,7 +359,7 @@ jobs:
 
   repo-sanity-check:
     needs: sign-and-publish
-    uses: Altinity/ClickHouse/.github/workflows/repo-sanity-checks.yml@antalya
+    uses: ./.github/workflows/repo-sanity-checks.yml
 
   copy-to-released:
     needs: [extract-package-info, sign-and-publish]
