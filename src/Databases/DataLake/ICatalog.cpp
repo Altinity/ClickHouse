@@ -221,7 +221,11 @@ std::string TableMetadata::getMetadataLocation(const std::string & iceberg_metad
         if (data_location.starts_with(storage_type_str))
             data_location = data_location.substr(storage_type_str.size());
         else if (!endpoint.empty() && data_location.starts_with(endpoint))
+        {
             data_location = data_location.substr(endpoint.size());
+            if (!data_location.empty() && data_location.front() == '/')
+                data_location = data_location.substr(1);
+        }
 
         if (metadata_location.starts_with(data_location))
         {
