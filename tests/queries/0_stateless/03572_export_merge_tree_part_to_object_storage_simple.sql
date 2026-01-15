@@ -17,12 +17,11 @@ DROP TABLE 03572_invalid_schema_table;
 -- The only partition strategy that supports exports is hive. Wildcard should throw
 CREATE TABLE 03572_invalid_schema_table (id UInt64, year UInt16) ENGINE = S3(s3_conn, filename='03572_invalid_schema_table/{_partition_id}', format='Parquet', partition_strategy='wildcard') PARTITION BY (id, year);
 
-ALTER TABLE 03572_outdated_mt_table EXPORT PART '2020_1_1_0' TO TABLE 03572_invalid_schema_table SETTINGS allow_experimental_export_merge_tree_part = 1; -- {serverError NOT_IMPLEMENTED}
+ALTER TABLE 03572_mt_table EXPORT PART '2020_1_1_0' TO TABLE 03572_invalid_schema_table SETTINGS allow_experimental_export_merge_tree_part = 1; -- {serverError NOT_IMPLEMENTED}
 
 -- Test export_merge_tree_part_allow_outdated_parts setting
+CREATE TABLE 03572_outdated_mt_table (id UInt64, year UInt16) ENGINE = MergeTree() PARTITION BY year ORDER BY tuple();
 CREATE TABLE 03572_s3_outdated_table (id UInt64, year UInt16) ENGINE = S3(s3_conn, filename='03572_s3_outdated_table', format='Parquet', partition_strategy='hive') PARTITION BY year;
-
-SYSTEM STOP MERGES 03572_outdated_mt_table;
 
 INSERT INTO 03572_outdated_mt_table VALUES (2, 2020);
 INSERT INTO 03572_outdated_mt_table VALUES (3, 2020);
