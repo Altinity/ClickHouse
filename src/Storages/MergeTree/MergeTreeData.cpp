@@ -6283,7 +6283,7 @@ void MergeTreeData::exportPartToTable(
     const auto alter_conversions = getAlterConversionsForPart(part, mutations_snapshot, query_context);
 
     /// re-check `throw_on_pending_mutations` because `pending_mutations` might have been filled due to `throw_on_pending_patch_parts`
-    if (alter_conversions->hasMutations() && throw_on_pending_mutations)
+    if (throw_on_pending_mutations && alter_conversions->hasMutations())
     {
         throw Exception(ErrorCodes::PENDING_MUTATIONS_NOT_ALLOWED,
             "Part {} can not be exported because there are pending mutations. Either wait for the mutations to be applied or set `export_merge_tree_part_throw_on_pending_mutations` to false",
