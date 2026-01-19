@@ -158,34 +158,24 @@ void ColumnSparse::insertData(const char * pos, size_t length)
     insertSingleValue([&](IColumn & column) { column.insertData(pos, length); });
 }
 
-StringRef ColumnSparse::serializeValueIntoArena(size_t n, Arena & arena, char const *& begin) const
+StringRef ColumnSparse::serializeValueIntoArena(size_t n, Arena & arena, char const *& begin, const IColumn::SerializationSettings * settings) const
 {
-    return values->serializeValueIntoArena(getValueIndex(n), arena, begin);
+    return values->serializeValueIntoArena(getValueIndex(n), arena, begin, settings);
 }
 
-StringRef ColumnSparse::serializeAggregationStateValueIntoArena(size_t n, Arena & arena, char const *& begin) const
+char * ColumnSparse::serializeValueIntoMemory(size_t n, char * memory, const IColumn::SerializationSettings * settings) const
 {
-    return values->serializeAggregationStateValueIntoArena(getValueIndex(n), arena, begin);
+    return values->serializeValueIntoMemory(getValueIndex(n), memory, settings);
 }
 
-char * ColumnSparse::serializeValueIntoMemory(size_t n, char * memory) const
+std::optional<size_t> ColumnSparse::getSerializedValueSize(size_t n, const IColumn::SerializationSettings * settings) const
 {
-    return values->serializeValueIntoMemory(getValueIndex(n), memory);
+    return values->getSerializedValueSize(getValueIndex(n), settings);
 }
 
-std::optional<size_t> ColumnSparse::getSerializedValueSize(size_t n) const
+void ColumnSparse::deserializeAndInsertFromArena(ReadBuffer & in, const IColumn::SerializationSettings * settings)
 {
-    return values->getSerializedValueSize(getValueIndex(n));
-}
-
-void ColumnSparse::deserializeAndInsertFromArena(ReadBuffer & in)
-{
-    insertSingleValue([&](IColumn & column) { column.deserializeAndInsertFromArena(in); });
-}
-
-void ColumnSparse::deserializeAndInsertAggregationStateValueFromArena(ReadBuffer & in)
-{
-    insertSingleValue([&](IColumn & column) { column.deserializeAndInsertAggregationStateValueFromArena(in); });
+    insertSingleValue([&](IColumn & column) { column.deserializeAndInsertFromArena(in, settings); });
 }
 
 void ColumnSparse::skipSerializedInArena(ReadBuffer & in) const
@@ -886,13 +876,18 @@ ColumnSparse::Iterator ColumnSparse::getIterator(size_t n) const
     return Iterator(offsets_data, _size, current_offset, n);
 }
 
-void ColumnSparse::takeDynamicStructureFromSourceColumns(const Columns & source_columns)
+void ColumnSparse::takeDynamicStructureFromSourceColumns(const Columns & source_columns, std::optional<size_t> max_dynamic_subcolumns)
 {
     Columns values_source_columns;
     values_source_columns.reserve(source_columns.size());
     for (const auto & source_column : source_columns)
         values_source_columns.push_back(assert_cast<const ColumnSparse &>(*source_column).getValuesPtr());
-    values->takeDynamicStructureFromSourceColumns(values_source_columns);
+    values->takeDynamicStructureFromSourceColumns(values_source_columns, max_dynamic_subcolumns);
+}
+
+void ColumnSparse::takeDynamicStructureFromColumn(const ColumnPtr & source_column)
+{
+    values->takeDynamicStructureFromColumn(assert_cast<const ColumnSparse &>(*source_column).getValuesPtr());
 }
 
 ColumnPtr recursiveRemoveSparse(const ColumnPtr & column)

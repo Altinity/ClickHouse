@@ -198,6 +198,7 @@ namespace Setting
     extern const SettingsOverflowMode transfer_overflow_mode;
     extern const SettingsString implicit_table_at_top_level;
     extern const SettingsBool use_hive_partitioning;
+    extern const SettingsBool serialize_string_in_memory_with_zero_byte;
 }
 
 namespace ServerSetting
@@ -2200,7 +2201,8 @@ static void executeMergeAggregatedImpl(
         overflow_row,
         settings[Setting::max_threads],
         settings[Setting::max_block_size],
-        settings[Setting::min_hit_rate_to_use_consecutive_keys_optimization]);
+        settings[Setting::min_hit_rate_to_use_consecutive_keys_optimization],
+        settings[Setting::serialize_string_in_memory_with_zero_byte]);
     auto grouping_sets_params = getAggregatorGroupingSetsParams(aggregation_keys_list, keys);
 
     auto merging_aggregated = std::make_unique<MergingAggregatedStep>(
@@ -2824,8 +2826,8 @@ static Aggregator::Params getAggregatorParams(
         /* only_merge */ false,
         settings[Setting::optimize_group_by_constant_keys],
         settings[Setting::min_hit_rate_to_use_consecutive_keys_optimization],
-        stats_collecting_params
-    };
+        stats_collecting_params,
+        settings[Setting::serialize_string_in_memory_with_zero_byte]};
 }
 
 void InterpreterSelectQuery::executeAggregation(
