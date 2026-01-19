@@ -79,24 +79,12 @@ struct MergeTreePartExportManifest
 
     bool operator<(const MergeTreePartExportManifest & rhs) const 
     {
-        const auto lhs_storage_id = destination_storage_ptr->getStorageID();
-        const auto rhs_storage_id = rhs.destination_storage_ptr->getStorageID();
-        // Lexicographic comparison: first compare destination storage, then part name
-        const auto lhs_storage = lhs_storage_id.getQualifiedName();
-        const auto rhs_storage = rhs_storage_id.getQualifiedName();
-        
-        if (lhs_storage != rhs_storage)
-            return lhs_storage < rhs_storage;
-            
         return data_part->name < rhs.data_part->name;
     }
 
     bool operator==(const MergeTreePartExportManifest & rhs) const 
     {
-        const auto lhs_storage_id = destination_storage_ptr->getStorageID();
-        const auto rhs_storage_id = rhs.destination_storage_ptr->getStorageID();
-        return lhs_storage_id.getQualifiedName() == rhs_storage_id.getQualifiedName()
-            && data_part->name == rhs.data_part->name;
+        return data_part->name == rhs.data_part->name;
     }
 };
 

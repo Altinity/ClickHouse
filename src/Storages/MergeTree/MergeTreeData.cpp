@@ -6315,8 +6315,7 @@ void MergeTreeData::exportPartToTable(
 
         if (!export_manifests.emplace(std::move(manifest)).second)
         {
-            throw Exception(ErrorCodes::ABORTED, "Data part '{}' is already being exported to table '{}'",
-                            part_name, dest_storage->getStorageID().getFullTableName());
+            throw Exception(ErrorCodes::ABORTED, "Data part '{}' is already being exported", part_name);
         }
     }
 
