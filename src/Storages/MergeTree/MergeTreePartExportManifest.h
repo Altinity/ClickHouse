@@ -6,6 +6,7 @@
 #include <QueryPipeline/QueryPipeline.h>
 #include <optional>
 #include <Core/Settings.h>
+#include <Storages/IStorage.h>
 
 namespace DB
 {
@@ -43,14 +44,14 @@ struct MergeTreePartExportManifest
     };
 
     MergeTreePartExportManifest(
-        const StorageID & destination_storage_id_,
+        const StoragePtr destination_storage_ptr_,
         const DataPartPtr & data_part_,
         const String & transaction_id_,
         FileAlreadyExistsPolicy file_already_exists_policy_,
         const Settings & settings_,
         const StorageMetadataPtr & metadata_snapshot_,
         std::function<void(CompletionCallbackResult)> completion_callback_ = {})
-        : destination_storage_id(destination_storage_id_),
+        : destination_storage_ptr(destination_storage_ptr_),
           data_part(data_part_),
           transaction_id(transaction_id_),
           file_already_exists_policy(file_already_exists_policy_),
@@ -59,7 +60,7 @@ struct MergeTreePartExportManifest
           completion_callback(completion_callback_),
           create_time(time(nullptr)) {}
 
-    StorageID destination_storage_id;
+    StoragePtr destination_storage_ptr;
     DataPartPtr data_part;
     /// Used for killing the export.
     String transaction_id;
@@ -78,9 +79,11 @@ struct MergeTreePartExportManifest
 
     bool operator<(const MergeTreePartExportManifest & rhs) const 
     {
+        const auto lhs_storage_id = destination_storage_ptr->getStorageID();
+        const auto rhs_storage_id = rhs.destination_storage_ptr->getStorageID();
         // Lexicographic comparison: first compare destination storage, then part name
-        auto lhs_storage = destination_storage_id.getQualifiedName();
-        auto rhs_storage = rhs.destination_storage_id.getQualifiedName();
+        const auto lhs_storage = lhs_storage_id.getQualifiedName();
+        const auto rhs_storage = rhs_storage_id.getQualifiedName();
         
         if (lhs_storage != rhs_storage)
             return lhs_storage < rhs_storage;
@@ -90,7 +93,9 @@ struct MergeTreePartExportManifest
 
     bool operator==(const MergeTreePartExportManifest & rhs) const 
     {
-        return destination_storage_id.getQualifiedName() == rhs.destination_storage_id.getQualifiedName()
+        const auto lhs_storage_id = destination_storage_ptr->getStorageID();
+        const auto rhs_storage_id = rhs.destination_storage_ptr->getStorageID();
+        return lhs_storage_id.getQualifiedName() == rhs_storage_id.getQualifiedName()
             && data_part->name == rhs.data_part->name;
     }
 };

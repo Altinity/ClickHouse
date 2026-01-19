@@ -18,6 +18,9 @@ mt_table_roundtrip="mt_table_roundtrip_${RANDOM}"
 big_table="big_table_${RANDOM}"
 big_destination_max_bytes="big_destination_max_bytes_${RANDOM}"
 big_destination_max_rows="big_destination_max_rows_${RANDOM}"
+tf_schema_inherit="tf_schema_inherit_${RANDOM}"
+tf_schema_explicit="tf_schema_explicit_${RANDOM}"
+mt_table_tf="mt_table_tf_${RANDOM}"
 
 query() {
     $CLICKHOUSE_CLIENT --query "$1"
@@ -114,4 +117,23 @@ echo "---- Count rows in big_table and big_destination_max_rows"
 query "SELECT COUNT() from $big_table"
 query "SELECT COUNT() from $big_destination_max_rows"
 
-query "DROP TABLE IF EXISTS $mt_table, $s3_table, $mt_table_roundtrip, $s3_table_wildcard, $s3_table_wildcard_partition_expression_with_function, $mt_table_partition_expression_with_function, $big_table, $big_destination_max_bytes, $big_destination_max_rows"
+echo "---- Table function with schema inheritance (no schema specified)"
+query "CREATE TABLE $mt_table_tf (id UInt64, value String, year UInt16) ENGINE = MergeTree() PARTITION BY year ORDER BY tuple()"
+query "INSERT INTO $mt_table_tf VALUES (100, 'test1', 2022), (101, 'test2', 2022), (102, 'test3', 2023)"
+
+query "ALTER TABLE $mt_table_tf EXPORT PART '2022_1_1_0' TO TABLE FUNCTION s3(s3_conn, filename='$tf_schema_inherit', format='Parquet', partition_strategy='hive') PARTITION BY year SETTINGS allow_experimental_export_merge_tree_part = 1"
+
+sleep 3
+
+echo "---- Data should be exported with inherited schema"
+query "SELECT * FROM s3(s3_conn, filename='$tf_schema_inherit/**.parquet') ORDER BY id"
+
+echo "---- Table function with explicit compatible schema"
+query "ALTER TABLE $mt_table_tf EXPORT PART '2023_2_2_0' TO TABLE FUNCTION s3(s3_conn, filename='$tf_schema_explicit', format='Parquet', structure='id UInt64, value String, year UInt16', partition_strategy='hive') PARTITION BY year SETTINGS allow_experimental_export_merge_tree_part = 1"
+
+sleep 3
+
+echo "---- Data should be exported with explicit schema"
+query "SELECT * FROM s3(s3_conn, filename='$tf_schema_explicit/**.parquet') ORDER BY id"
+
+query "DROP TABLE IF EXISTS $mt_table, $s3_table, $mt_table_roundtrip, $s3_table_wildcard, $s3_table_wildcard_partition_expression_with_function, $mt_table_partition_expression_with_function, $big_table, $big_destination_max_bytes, $big_destination_max_rows, $mt_table_tf"
