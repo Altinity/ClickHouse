@@ -97,9 +97,9 @@ public:
     void insertData(const char *, size_t) override { throwMustBeDecompressed(); }
     void insertDefault() override { throwMustBeDecompressed(); }
     void popBack(size_t) override { throwMustBeDecompressed(); }
-    StringRef serializeValueIntoArena(size_t, Arena &, char const *&) const override { throwMustBeDecompressed(); }
-    char * serializeValueIntoMemory(size_t, char *) const override { throwMustBeDecompressed(); }
-    void deserializeAndInsertFromArena(ReadBuffer &) override { throwMustBeDecompressed(); }
+    StringRef serializeValueIntoArena(size_t, Arena &, char const *&, const IColumn::SerializationSettings *) const override { throwMustBeDecompressed(); }
+    char * serializeValueIntoMemory(size_t, char *, const IColumn::SerializationSettings *) const override { throwMustBeDecompressed(); }
+    void deserializeAndInsertFromArena(ReadBuffer &, const IColumn::SerializationSettings *) override { throwMustBeDecompressed(); }
     void skipSerializedInArena(ReadBuffer &) const override { throwMustBeDecompressed(); }
     void updateHashWithValue(size_t, SipHash &) const override { throwMustBeDecompressed(); }
     WeakHash32 getWeakHash32() const override { throwMustBeDecompressed(); }
@@ -135,7 +135,9 @@ public:
     void getIndicesOfNonDefaultRows(Offsets &, size_t, size_t) const override { throwMustBeDecompressed(); }
 
     bool hasDynamicStructure() const override { throwMustBeDecompressed(); }
-    void takeDynamicStructureFromSourceColumns(const Columns &) override { throwMustBeDecompressed(); }
+    void takeDynamicStructureFromSourceColumns(const Columns &, std::optional<size_t>) override { throwMustBeDecompressed(); }
+    void takeDynamicStructureFromColumn(const ColumnPtr &) override { throwMustBeDecompressed(); }
+    void fixDynamicStructure() override { throwMustBeDecompressed(); }
 
 protected:
     size_t rows;
