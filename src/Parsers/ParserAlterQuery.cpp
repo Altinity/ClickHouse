@@ -556,8 +556,6 @@ bool ParserAlterCommand::parseImpl(Pos & pos, ASTPtr & node, Expected & expected
 
                 if (s_function.ignore(pos, expected))
                 {
-                    /// Try to parse table function first (e.g., s3(...))
-                    /// ParserFunction with is_table_function=true will only match actual function calls with parentheses
                     ParserFunction table_function_parser(/*allow_function_parameters=*/true, /*is_table_function=*/true);
 
                     if (!table_function_parser.parse(pos, export_table_function, expected))
