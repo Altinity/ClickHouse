@@ -1,6 +1,7 @@
 #include <Columns/IColumn.h>
 #include <Core/Block.h>
 #include <Processors/Merges/Algorithms/MergedData.h>
+#include <Columns/ColumnSparse.h>
 
 namespace DB
 {
@@ -27,8 +28,10 @@ void MergedData::initialize(const Block & header, const IMergingAlgorithm::Input
 
     for (size_t i = 0; i != columns.size(); ++i)
     {
+        /// Sometimes header can contain Sparse columns, we don't support Sparse in merge algorithms.
+        columns[i] = recursiveRemoveSparse(std::move(columns[i]))->assumeMutable();
         if (columns[i]->hasDynamicStructure())
-            columns[i]->takeDynamicStructureFromSourceColumns(source_columns[i]);
+            columns[i]->takeDynamicStructureFromSourceColumns(source_columns[i], max_dynamic_subcolumns);
     }
 }
 
