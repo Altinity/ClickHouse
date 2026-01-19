@@ -1,4 +1,4 @@
-# The configuration file must be named `dco.yml` and placed in the `.github` directory in the default branch of the repository. The values used below are the defaults.
+# The configuration file must be named `dco.yml` and placed in the `.github` directory in the default branch of the repository.
 #
 # This configuration file is backwards compatible with the *dcoapp/app* (https://github.com/dcoapp/app) configuration file.
 

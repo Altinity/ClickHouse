@@ -8,6 +8,7 @@
 #include <IO/ReadBufferFromString.h>
 #include <Common/Arena.h>
 #include <Common/SipHash.h>
+#include <Common/logger_useful.h>
 
 namespace DB
 {
@@ -632,7 +633,6 @@ void ColumnObject::doInsertFrom(const IColumn & src, size_t n)
 
     /// Finally, insert paths from shared data.
     insertFromSharedDataAndFillRemainingDynamicPaths(src_object_column, std::move(src_dynamic_paths_for_shared_data), n, 1);
-    validateDynamicPathsSizes();
 }
 
 #if !defined(DEBUG_OR_SANITIZER_BUILD)
@@ -667,7 +667,6 @@ void ColumnObject::doInsertRangeFrom(const IColumn & src, size_t start, size_t l
 
     /// Finally, insert paths from shared data.
     insertFromSharedDataAndFillRemainingDynamicPaths(src_object_column, std::move(src_dynamic_paths_for_shared_data), start, length);
-    validateDynamicPathsSizes();
 }
 
 void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::ColumnObject & src_object_column, std::vector<std::string_view> && src_dynamic_paths_for_shared_data, size_t start, size_t length)
@@ -730,32 +729,13 @@ void ColumnObject::insertFromSharedDataAndFillRemainingDynamicPaths(const DB::Co
             {
                 /// Deserialize binary value into dynamic column from shared data.
                 if (it->second->size() != current_size)
-                {
-                    if (src_object_column.getDynamicPaths().contains(path))
-                        throw Exception(
-                            ErrorCodes::LOGICAL_ERROR,
-                            "Path {} is present both in shared data and in dynamic paths at row {}. Dynamic path value type: {}. Shared data path value type: {}",
-                            path,
-                            row,
-                            src_object_column.getDynamicPathsPtrs().at(toString(path))->getTypeNameAt(row),
-                            decodeDataType(src_shared_data_values->getDataAt(i).toString())->getName());
-
-                    for (size_t j = offset; j != end; ++j)
-                    {
-                        if (j != i && src_shared_data_paths->getDataAt(j).toView() == path)
-                            throw Exception(
-                            ErrorCodes::LOGICAL_ERROR,
-                            "Path {} is duplicated inside shared data at offsets {} and {}. First value type: {}. Second value type: {}",
-                            path,
-                            i,
-                            j,
-                            decodeDataType(src_shared_data_values->getDataAt(i).toString())->getName(),
-                            decodeDataType(src_shared_data_values->getDataAt(j).toString())->getName());
-                    }
-
                     throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected size of dynamic path {}: {} != {}", path, it->second->size(), current_size);
-                }
+
                 deserializeValueFromSharedData(src_shared_data_values, i, *it->second);
+            }
+            else if (auto * dynamic_path_column = tryToAddNewDynamicPath(path))
+            {
+                deserializeValueFromSharedData(src_shared_data_values, i, *dynamic_path_column);
             }
             else
             {
@@ -914,29 +894,13 @@ void ColumnObject::rollback(const ColumnCheckpoint & checkpoint)
     shared_data->rollback(*object_checkpoint.shared_data);
 }
 
-StringRef ColumnObject::serializeValueIntoArena(size_t n, Arena & arena, const char *& begin) const
+StringRef ColumnObject::serializeValueIntoArena(size_t n, Arena & arena, const char *& begin, const IColumn::SerializationSettings * settings) const
 {
     StringRef res(begin, 0);
     /// First serialize values from typed paths in sorted order. They are the same for all instances of this column.
     for (auto path : sorted_typed_paths)
     {
-        auto data_ref = typed_paths.find(path)->second->serializeValueIntoArena(n, arena, begin);
-        res.data = data_ref.data - res.size;
-        res.size += data_ref.size;
-    }
-
-    /// Second, serialize paths and values in binary format from dynamic paths and shared data in sorted by path order.
-    serializeDynamicPathsAndSharedDataIntoArena(n, arena, begin, res);
-    return res;
-}
-
-StringRef ColumnObject::serializeAggregationStateValueIntoArena(size_t n, Arena & arena, char const *& begin) const
-{
-    StringRef res(begin, 0);
-    /// First serialize values from typed paths in sorted order. They are the same for all instances of this column.
-    for (auto path : sorted_typed_paths)
-    {
-        auto data_ref = typed_paths.find(path)->second->serializeAggregationStateValueIntoArena(n, arena, begin);
+        auto data_ref = typed_paths.find(path)->second->serializeValueIntoArena(n, arena, begin, settings);
         res.data = data_ref.data - res.size;
         res.size += data_ref.size;
     }
@@ -1009,21 +973,11 @@ void ColumnObject::serializePathAndValueIntoArena(DB::Arena & arena, const char 
     res.size += sizeof(size_t) + path_size + sizeof(size_t) + value_size;
 }
 
-void ColumnObject::deserializeAndInsertFromArena(ReadBuffer & in)
+void ColumnObject::deserializeAndInsertFromArena(ReadBuffer & in, const IColumn::SerializationSettings * settings)
 {
     /// First deserialize typed paths. They come first.
     for (auto path : sorted_typed_paths)
-        typed_paths.find(path)->second->deserializeAndInsertFromArena(in);
-
-    /// Second deserialize all other paths and values and insert them into dynamic paths or shared data.
-    deserializeDynamicPathsAndSharedDataFromArena(in);
-}
-
-void ColumnObject::deserializeAndInsertAggregationStateValueFromArena(ReadBuffer & in)
-{
-    /// First deserialize typed paths. They come first.
-    for (auto path : sorted_typed_paths)
-        typed_paths.find(path)->second->deserializeAndInsertAggregationStateValueFromArena(in);
+        typed_paths.find(path)->second->deserializeAndInsertFromArena(in, settings);
 
     /// Second deserialize all other paths and values and insert them into dynamic paths or shared data.
     deserializeDynamicPathsAndSharedDataFromArena(in);
@@ -1345,6 +1299,15 @@ void ColumnObject::reserve(size_t n)
 size_t ColumnObject::capacity() const
 {
     return shared_data->capacity();
+}
+
+void ColumnObject::shrinkToFit()
+{
+    for (auto & [_, column] : typed_paths)
+        column->shrinkToFit();
+    for (auto & [_, column] : dynamic_paths_ptrs)
+        column->shrinkToFit();
+    shared_data->shrinkToFit();
 }
 
 void ColumnObject::ensureOwnership()
@@ -1697,7 +1660,7 @@ bool ColumnObject::dynamicStructureEquals(const IColumn & rhs) const
     return true;
 }
 
-void ColumnObject::takeDynamicStructureFromSourceColumns(const DB::Columns & source_columns)
+void ColumnObject::takeDynamicStructureFromSourceColumns(const Columns & source_columns, std::optional<size_t> max_dynamic_subcolumns)
 {
     if (!empty())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "takeDynamicStructureFromSourceColumns should be called only on empty Object column");
@@ -1755,7 +1718,8 @@ void ColumnObject::takeDynamicStructureFromSourceColumns(const DB::Columns & sou
     dynamic_paths.clear();
     dynamic_paths_ptrs.clear();
     sorted_dynamic_paths.clear();
-    max_dynamic_paths = global_max_dynamic_paths;
+    /// If max_dynamic_subcolumns is set, use it as max number of paths.
+    max_dynamic_paths = max_dynamic_subcolumns ? std::min(*max_dynamic_subcolumns, global_max_dynamic_paths) : global_max_dynamic_paths;
     Statistics new_statistics(Statistics::Source::MERGE);
 
     /// Check if the number of all dynamic paths exceeds the limit.
@@ -1819,7 +1783,7 @@ void ColumnObject::takeDynamicStructureFromSourceColumns(const DB::Columns & sou
             if (it != source_object.dynamic_paths.end())
                 dynamic_path_source_columns.push_back(it->second);
         }
-        column->takeDynamicStructureFromSourceColumns(dynamic_path_source_columns);
+        column->takeDynamicStructureFromSourceColumns(dynamic_path_source_columns, max_dynamic_subcolumns);
     }
 
     /// Typed paths also can contain types with dynamic structure.
@@ -1829,8 +1793,43 @@ void ColumnObject::takeDynamicStructureFromSourceColumns(const DB::Columns & sou
         typed_path_source_columns.reserve(source_columns.size());
         for (const auto & source_column : source_columns)
             typed_path_source_columns.push_back(assert_cast<const ColumnObject &>(*source_column).typed_paths.at(path));
-        column->takeDynamicStructureFromSourceColumns(typed_path_source_columns);
+        column->takeDynamicStructureFromSourceColumns(typed_path_source_columns, max_dynamic_subcolumns);
     }
+}
+
+void ColumnObject::takeDynamicStructureFromColumn(const ColumnPtr & source_column)
+{
+    if (!empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "takeDynamicStructureFromColumn should be called only on empty Object column");
+
+    const auto & source_object = assert_cast<const ColumnObject &>(*source_column);
+
+    for (auto & [path, column] : typed_paths)
+        column->takeDynamicStructureFromColumn(source_object.typed_paths.at(path));
+
+    dynamic_paths.clear();
+    dynamic_paths_ptrs.clear();
+    sorted_dynamic_paths.clear();
+    for (const auto & [path, column] : source_object.getDynamicPaths())
+    {
+        auto it = dynamic_paths.emplace(path, ColumnDynamic::create(max_dynamic_types)).first;
+        it->second->takeDynamicStructureFromColumn(column);
+        dynamic_paths_ptrs.emplace(path, assert_cast<ColumnDynamic *>(it->second.get()));
+        sorted_dynamic_paths.insert(it->first);
+    }
+
+    /// Set max_dynamic_paths to the number of dynamic paths.
+    /// It's needed to avoid adding new unexpected dynamic paths during later inserts into this column.
+    max_dynamic_paths = dynamic_paths.size();
+
+    statistics = source_object.getStatistics();
+}
+
+void ColumnObject::fixDynamicStructure()
+{
+    /// Set max_dynamic_paths to the number of dynamic paths.
+    /// It's needed to avoid adding new unexpected dynamic paths during later inserts into this column.
+    max_dynamic_paths = dynamic_paths.size();
 }
 
 size_t ColumnObject::findPathLowerBoundInSharedData(StringRef path, const ColumnString & shared_data_paths, size_t start, size_t end)
@@ -2071,14 +2070,121 @@ int ColumnObject::doCompareAt(size_t n, size_t m, const IColumn & rhs, int nan_d
     return 1;
 }
 
-void ColumnObject::validateDynamicPathsSizes() const
+void ColumnObject::repairDuplicatesInDynamicPathsAndSharedData(size_t offset)
 {
+    if (dynamic_paths.empty())
+        return;
+
+    /// First, check if all dynamic paths have correct sizes, just in case.
     size_t expected_size = shared_data->size();
     for (const auto & [path, column] : dynamic_paths)
     {
         if (column->size() != expected_size)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected size of dynamic path {}: {} != {}", path, column->size(), expected_size);
     }
+
+    /// Second, iterate over paths in shared data and check if we have any path that is also present in dynamic paths.
+    const auto & shared_data_offsets = getSharedDataOffsets();
+    const auto [shared_data_paths, shared_data_values] = getSharedDataPathsAndValues();
+    /// Remember the first row with duplicates if any. We will start repair from this row.
+    std::optional<size_t> first_row_with_duplicates = std::nullopt;
+    size_t size = shared_data_offsets.size();
+    for (size_t i = offset; i < size; ++i)
+    {
+        size_t shared_data_start = shared_data_offsets[i - 1];
+        size_t shared_data_end = shared_data_offsets[i];
+        for (size_t j = shared_data_start; j < shared_data_end; ++j)
+        {
+            if (dynamic_paths.contains(shared_data_paths->getDataAt(j)))
+            {
+                /// Duplicate is found, no need to iterate further, we need to start repair.
+                first_row_with_duplicates = i;
+                break;
+            }
+        }
+
+        if (first_row_with_duplicates)
+            break;
+    }
+
+    if (!first_row_with_duplicates)
+        return;
+
+    LOG_TRACE(getLogger("ColumnObject"), "Repair duplicates in Object column starting from row {}", *first_row_with_duplicates);
+
+    /// During repair we create new shared data without duplicated dynamic paths
+    /// update corresponding dynamic paths with values from shared data.
+    auto new_shared_data = shared_data->cloneResized(*first_row_with_duplicates);
+    const auto [new_shared_data_paths, new_shared_data_values, new_shared_data_offsets] = getSharedDataPathsValuesAndOffsets(*new_shared_data);
+    new_shared_data_offsets->reserve(size);
+    PathToColumnMap new_dynamic_paths;
+    for (size_t i = *first_row_with_duplicates; i < size; ++i)
+    {
+        size_t shared_data_start = shared_data_offsets[i - 1];
+        size_t shared_data_end = shared_data_offsets[i];
+        for (size_t j = shared_data_start; j < shared_data_end; ++j)
+        {
+            auto path = shared_data_paths->getDataAt(j).toView();
+            auto it = dynamic_paths.find(path);
+            if (it == dynamic_paths.end())
+            {
+                new_shared_data_paths->insertFrom(*shared_data_paths, j);
+                new_shared_data_values->insertFrom(*shared_data_values, j);
+            }
+            /// We update dynamic path with value from shared data only if dynamic path has NULL at this row.
+            else if (it->second->isNullAt(i))
+            {
+                auto new_it = new_dynamic_paths.find(path);
+                if (new_it == new_dynamic_paths.end())
+                {
+                    new_it = new_dynamic_paths.emplace(path, it->second->cloneResized(i)).first;
+                    new_it->second->reserve(size);
+                }
+
+                deserializeValueFromSharedData(shared_data_values, j, *new_it->second);
+            }
+            /// Situation when both values in dynamic path and shared data are non-NULL should not be possible
+            /// and we cannot repair it anyhow. Throw logical error exception in this case.
+            else
+            {
+                auto value = shared_data_values->getDataAt(j).toView();
+                ReadBufferFromMemory buf(value.data(), value.size());
+                auto type_from_shared_data = decodeDataType(buf);
+                if (!isNothing(type_from_shared_data))
+                {
+                    auto type_from_dynamic_path = dynamic_paths_ptrs.find(path)->second->getTypeAt(i);
+                    throw Exception(
+                        ErrorCodes::LOGICAL_ERROR,
+                        "Path {} is present both in dynamic paths and shared data and has two non-null values at the row {}."
+                        "Value type in dynamic paths: {}. Value type in shared data: {}",
+                        path,
+                        i,
+                        type_from_dynamic_path->getName(),
+                        type_from_shared_data->getName());
+                }
+            }
+        }
+
+        new_shared_data_offsets->push_back(new_shared_data_paths->size());
+        /// Update new dynamic paths that were not updated with value from shared data in this row.
+        for (auto & [path, column] : new_dynamic_paths)
+        {
+            if (column->size() == i)
+                column->insertFrom(*dynamic_paths.at(path), i);
+        }
+    }
+
+    for (auto & [path, column] : new_dynamic_paths)
+    {
+        if (column->size() != size)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected size of new dynamic path {}: {} != {}", path, column->size(), size);
+        dynamic_paths_ptrs[path] = assert_cast<ColumnDynamic *>(column.get());
+        dynamic_paths[path] = std::move(column);
+    }
+
+    if (new_shared_data->size() != size)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected size of new shared data: {} != {}", new_shared_data->size(), size);
+    shared_data = std::move(new_shared_data);
 }
 
 }
