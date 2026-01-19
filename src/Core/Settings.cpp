@@ -6929,6 +6929,7 @@ Throw an error if there are pending patch parts when exporting a merge tree part
 )", 0) \
     DECLARE(Bool, export_merge_tree_part_allow_outdated_parts, false, R"(
 Allow exporting parts in the outdated state.
+)", 0) \
     DECLARE(Bool, serialize_string_in_memory_with_zero_byte, true, R"(
 Serialize String values during aggregation with zero byte at the end. Enable to keep compatibility when querying cluster of incompatible versions.
 )", 0) \
