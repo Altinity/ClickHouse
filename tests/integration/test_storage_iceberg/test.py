@@ -4163,3 +4163,75 @@ def test_nested_struct_with_dotted_field(started_cluster, storage_type):
         f"SELECT my_struct.normal_field, `my_struct.weird.field` FROM {TABLE_NAME} ORDER BY id"
     ).strip()
     assert result == expected, f"Expected:\n{expected}\nGot:\n{result}"
+
+
+@pytest.mark.parametrize("storage_type", ["s3"])
+def test_deeply_nested_struct_with_dotted_names(started_cluster, storage_type):
+    """
+    Test deeply nested structs where EVERY level has dots in the name.
+    Structure: my.struct -> some_dot.separated_parent -> weird.field
+    Full path: my.struct.some_dot.separated_parent.weird.field
+
+    This verifies that prefix stripping works correctly at all nesting depths.
+    """
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
+    TABLE_NAME = "test_deeply_nested_dotted_" + storage_type + "_" + get_uuid_str()
+
+    # Create 3-level nested schema with dots at every level
+    nested_schema = StructType(
+        [
+            StructField("id", IntegerType()),
+            StructField(
+                "my.struct",
+                StructType(
+                    [
+                        StructField(
+                            "some_dot.separated_parent",
+                            StructType(
+                                [
+                                    StructField("weird.field", StringType()),
+                                ]
+                            ),
+                        ),
+                    ]
+                ),
+            ),
+        ]
+    )
+
+    data = [
+        (1, (("deep_value1",),)),
+        (2, (("deep_value2",),)),
+        (3, (("deep_value3",),)),
+    ]
+    df = spark.createDataFrame(data=data, schema=nested_schema)
+
+    write_iceberg_from_df(spark, df, TABLE_NAME, mode="overwrite", format_version="2")
+
+    default_upload_directory(
+        started_cluster,
+        storage_type,
+        f"/iceberg_data/default/{TABLE_NAME}/",
+        f"/iceberg_data/default/{TABLE_NAME}/",
+    )
+
+    # Test via table function
+    table_function_expr = get_creation_expression(
+        storage_type, TABLE_NAME, started_cluster, table_function=True
+    )
+
+    # Query the deeply nested dotted field
+    result = instance.query(
+        f"SELECT `my.struct.some_dot.separated_parent.weird.field` FROM {table_function_expr} ORDER BY id"
+    ).strip()
+    expected = "deep_value1\ndeep_value2\ndeep_value3"
+    assert result == expected, f"Expected:\n{expected}\nGot:\n{result}"
+
+    # Test via table engine
+    create_iceberg_table(storage_type, instance, TABLE_NAME, started_cluster)
+
+    result = instance.query(
+        f"SELECT `my.struct.some_dot.separated_parent.weird.field` FROM {TABLE_NAME} ORDER BY id"
+    ).strip()
+    assert result == expected, f"Expected:\n{expected}\nGot:\n{result}"
