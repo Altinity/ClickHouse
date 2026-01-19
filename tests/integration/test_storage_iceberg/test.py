@@ -4099,3 +4099,67 @@ def test_column_names_with_dots(started_cluster, storage_type):
     ).strip()
     expected = "value1\tmulti_dot_value1\nvalue2\tmulti_dot_value2\nvalue3\tmulti_dot_value3"
     assert result == expected, f"Expected:\n{expected}\nGot:\n{result}"
+
+
+@pytest.mark.parametrize("storage_type", ["s3"])
+def test_nested_struct_with_dotted_field(started_cluster, storage_type):
+    """
+    Test that nested struct fields with dot-separated names are read correctly.
+    This tests the fix for prefix stripping (not splitName) in useColumnMapperIfNeeded.
+    E.g., for my_struct.weird.field, we should return "weird.field" not just "field".
+    """
+    instance = started_cluster.instances["node1"]
+    spark = started_cluster.spark_session
+    TABLE_NAME = "test_nested_struct_dotted_field_" + storage_type + "_" + get_uuid_str()
+
+    # Create DataFrame with nested struct containing a dotted field name
+    nested_schema = StructType(
+        [
+            StructField("id", IntegerType()),
+            StructField(
+                "my_struct",
+                StructType(
+                    [
+                        StructField("normal_field", IntegerType()),
+                        StructField("weird.field", StringType()),
+                    ]
+                ),
+            ),
+        ]
+    )
+
+    data = [
+        (1, (100, "nested_dot_value1")),
+        (2, (200, "nested_dot_value2")),
+        (3, (300, "nested_dot_value3")),
+    ]
+    df = spark.createDataFrame(data=data, schema=nested_schema)
+
+    write_iceberg_from_df(spark, df, TABLE_NAME, mode="overwrite", format_version="2")
+
+    default_upload_directory(
+        started_cluster,
+        storage_type,
+        f"/iceberg_data/default/{TABLE_NAME}/",
+        f"/iceberg_data/default/{TABLE_NAME}/",
+    )
+
+    # Test via table function
+    table_function_expr = get_creation_expression(
+        storage_type, TABLE_NAME, started_cluster, table_function=True
+    )
+
+    # Verify nested struct with dotted field via table function
+    result = instance.query(
+        f"SELECT my_struct.normal_field, `my_struct.weird.field` FROM {table_function_expr} ORDER BY id"
+    ).strip()
+    expected = "100\tnested_dot_value1\n200\tnested_dot_value2\n300\tnested_dot_value3"
+    assert result == expected, f"Expected:\n{expected}\nGot:\n{result}"
+
+    # Test via table engine
+    create_iceberg_table(storage_type, instance, TABLE_NAME, started_cluster)
+
+    result = instance.query(
+        f"SELECT my_struct.normal_field, `my_struct.weird.field` FROM {TABLE_NAME} ORDER BY id"
+    ).strip()
+    assert result == expected, f"Expected:\n{expected}\nGot:\n{result}"
