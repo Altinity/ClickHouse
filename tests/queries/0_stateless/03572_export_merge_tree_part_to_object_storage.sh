@@ -18,12 +18,17 @@ mt_table_roundtrip="mt_table_roundtrip_${RANDOM}"
 big_table="big_table_${RANDOM}"
 big_destination_max_bytes="big_destination_max_bytes_${RANDOM}"
 big_destination_max_rows="big_destination_max_rows_${RANDOM}"
+mt_table_tf="mt_table_tf_${RANDOM}"
+mt_alias="mt_alias_${RANDOM}"
+mt_materialized="mt_materialized_${RANDOM}"
+s3_alias_export="s3_alias_export_${RANDOM}"
+s3_materialized_export="s3_materialized_export_${RANDOM}"
 
 query() {
     $CLICKHOUSE_CLIENT --query "$1"
 }
 
-query "DROP TABLE IF EXISTS $mt_table, $s3_table, $mt_table_roundtrip, $s3_table_wildcard, $s3_table_wildcard_partition_expression_with_function, $mt_table_partition_expression_with_function"
+query "DROP TABLE IF EXISTS $mt_table, $s3_table, $mt_table_roundtrip, $s3_table_wildcard, $s3_table_wildcard_partition_expression_with_function, $mt_table_partition_expression_with_function, $mt_alias, $mt_materialized, $s3_alias_export, $s3_materialized_export"
 
 query "CREATE TABLE $mt_table (id UInt64, year UInt16) ENGINE = MergeTree() PARTITION BY year ORDER BY tuple()"
 query "CREATE TABLE $s3_table (id UInt64, year UInt16) ENGINE = S3(s3_conn, filename='$s3_table', format=Parquet, partition_strategy='hive') PARTITION BY year"
@@ -114,4 +119,40 @@ echo "---- Count rows in big_table and big_destination_max_rows"
 query "SELECT COUNT() from $big_table"
 query "SELECT COUNT() from $big_destination_max_rows"
 
-query "DROP TABLE IF EXISTS $mt_table, $s3_table, $mt_table_roundtrip, $s3_table_wildcard, $s3_table_wildcard_partition_expression_with_function, $mt_table_partition_expression_with_function, $big_table, $big_destination_max_bytes, $big_destination_max_rows"
+echo "---- Test ALIAS columns export"
+query "CREATE TABLE $mt_alias (a UInt32, arr Array(UInt64), arr_1 UInt64 ALIAS arr[1]) ENGINE = MergeTree() PARTITION BY a ORDER BY (a, arr[1]) SETTINGS index_granularity = 1"
+query "CREATE TABLE $s3_alias_export (a UInt32, arr Array(UInt64), arr_1 UInt64) ENGINE = S3(s3_conn, filename='$s3_alias_export', format=Parquet, partition_strategy='hive') PARTITION BY a"
+
+query "INSERT INTO $mt_alias VALUES (1, [1, 2, 3]), (1, [10, 20, 30])"
+
+alias_part=$(query "SELECT name FROM system.parts WHERE database = currentDatabase() AND table = '$mt_alias' AND partition_id = '1' AND active = 1 ORDER BY name LIMIT 1" | tr -d '\n')
+
+query "ALTER TABLE $mt_alias EXPORT PART '$alias_part' TO TABLE $s3_alias_export SETTINGS allow_experimental_export_merge_tree_part = 1"
+
+sleep 3
+
+echo "---- Verify ALIAS column data in source table (arr_1 computed from arr[1])"
+query "SELECT a, arr, arr_1 FROM $mt_alias ORDER BY arr"
+
+echo "---- Verify ALIAS column data exported to S3 (should match source)"
+query "SELECT a, arr, arr_1 FROM $s3_alias_export ORDER BY arr"
+
+echo "---- Test MATERIALIZED columns export"
+query "CREATE TABLE $mt_materialized (a UInt32, arr Array(UInt64), arr_1 UInt64 MATERIALIZED arr[1]) ENGINE = MergeTree() PARTITION BY a ORDER BY (a, arr_1) SETTINGS index_granularity = 1"
+query "CREATE TABLE $s3_materialized_export (a UInt32, arr Array(UInt64), arr_1 UInt64) ENGINE = S3(s3_conn, filename='$s3_materialized_export', format=Parquet, partition_strategy='hive') PARTITION BY a"
+
+query "INSERT INTO $mt_materialized VALUES (1, [1, 2, 3]), (1, [10, 20, 30])"
+
+materialized_part=$(query "SELECT name FROM system.parts WHERE database = currentDatabase() AND table = '$mt_materialized' AND partition_id = '1' AND active = 1 ORDER BY name LIMIT 1" | tr -d '\n')
+
+query "ALTER TABLE $mt_materialized EXPORT PART '$materialized_part' TO TABLE $s3_materialized_export SETTINGS allow_experimental_export_merge_tree_part = 1"
+
+sleep 3
+
+echo "---- Verify MATERIALIZED column data in source table (arr_1 computed from arr[1])"
+query "SELECT a, arr, arr_1 FROM $mt_materialized ORDER BY arr"
+
+echo "---- Verify MATERIALIZED column data exported to S3 (should match source)"
+query "SELECT a, arr, arr_1 FROM $s3_materialized_export ORDER BY arr"
+
+query "DROP TABLE IF EXISTS $mt_table, $s3_table, $mt_table_roundtrip, $s3_table_wildcard, $s3_table_wildcard_partition_expression_with_function, $mt_table_partition_expression_with_function, $big_table, $big_destination_max_bytes, $big_destination_max_rows, $mt_alias, $mt_materialized, $s3_alias_export, $s3_materialized_export"

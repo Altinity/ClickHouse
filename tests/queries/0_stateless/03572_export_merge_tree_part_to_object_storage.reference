@@ -42,3 +42,17 @@
 ---- Count rows in big_table and big_destination_max_rows
 4194304
 4194304
+---- Test ALIAS columns export
+---- Verify ALIAS column data in source table (arr_1 computed from arr[1])
+1	[1,2,3]	1
+1	[10,20,30]	10
+---- Verify ALIAS column data exported to S3 (should match source)
+1	[1,2,3]	1
+1	[10,20,30]	10
+---- Test MATERIALIZED columns export
+---- Verify MATERIALIZED column data in source table (arr_1 computed from arr[1])
+1	[1,2,3]	1
+1	[10,20,30]	10
+---- Verify MATERIALIZED column data exported to S3 (should match source)
+1	[1,2,3]	1
+1	[10,20,30]	10

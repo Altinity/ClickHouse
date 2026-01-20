@@ -4,17 +4,20 @@
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
+#include <Interpreters/inplaceBlockConversions.h>
 #include <Core/Settings.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Processors/Executors/CompletedPipelineExecutor.h>
 #include <Processors/QueryPlan/BuildQueryPipelineSettings.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
 #include <Processors/QueryPlan/QueryPlan.h>
+#include <Processors/QueryPlan/ExpressionStep.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Common/Exception.h>
 #include <Common/ProfileEventsScope.h>
 #include <Storages/MergeTree/ExportList.h>
 #include <Formats/FormatFactory.h>
+#include <Databases/enableAllExperimentalSettings.h>
 
 namespace ProfileEvents
 {
@@ -58,7 +61,11 @@ bool ExportPartTask::executeStep()
 
     const auto & metadata_snapshot = manifest.metadata_snapshot;
 
+    // Read only physical columns from the part
     Names columns_to_read = metadata_snapshot->getColumns().getNamesOfPhysical();
+    
+    // But we want all columns (including aliases) in the output
+    NamesAndTypesList all_columns = metadata_snapshot->getColumns().getAll();
 
     MergeTreeSequentialSourceType read_type = MergeTreeSequentialSourceType::Export;
 
@@ -145,6 +152,34 @@ bool ExportPartTask::executeStep()
             prefetch,
             local_context,
             getLogger("ExportPartition"));
+
+        // Add expression step to compute alias and other default columns for export
+        // This materializes virtual columns (like ALIAS) so they can be written to output
+        const auto & current_header = plan_for_part.getCurrentHeader();
+
+        // Enable all experimental settings for default expressions
+        // (same pattern as in IMergeTreeReader::evaluateMissingDefaults)
+        auto context_for_defaults = Context::createCopy(local_context);
+        enableAllExperimentalSettings(context_for_defaults);
+        
+        auto defaults_dag = evaluateMissingDefaults(
+            *current_header,
+            all_columns,
+            metadata_snapshot->getColumns(),
+            context_for_defaults);
+
+        if (defaults_dag)
+        {
+            // Ensure columns are in the correct order matching all_columns
+            defaults_dag->removeUnusedActions(all_columns.getNames(), false);
+            defaults_dag->addMaterializingOutputActions(/*materialize_sparse=*/ false);
+            
+            auto expression_step = std::make_unique<ExpressionStep>(
+                current_header,
+                std::move(*defaults_dag));
+            expression_step->setStepDescription("Compute alias and default expressions for export");
+            plan_for_part.addStep(std::move(expression_step));
+        }
 
         ThreadGroupSwitcher switcher((*exports_list_entry)->thread_group, "");
 

@@ -6242,7 +6242,11 @@ void MergeTreeData::exportPartToTable(
     auto source_metadata_ptr = getInMemoryMetadataPtr();
     auto destination_metadata_ptr = dest_storage->getInMemoryMetadataPtr();
 
-    if (destination_metadata_ptr->getColumns().getAllPhysical().sizeOfDifference(source_metadata_ptr->getColumns().getAllPhysical()))
+    const auto & source_columns = source_metadata_ptr->getColumns();
+
+    const auto & destination_columns = destination_metadata_ptr->getColumns();
+
+    if (destination_columns.getAll().sizeOfDifference(source_columns.getAll()))
         throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS, "Tables have different structure");
 
     if (query_to_string(source_metadata_ptr->getPartitionKeyAST()) != query_to_string(destination_metadata_ptr->getPartitionKeyAST()))

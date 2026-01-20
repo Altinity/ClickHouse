@@ -851,7 +851,6 @@ std::optional<ColumnDefault> ColumnsDescription::getDefault(const String & colum
     return {};
 }
 
-
 bool ColumnsDescription::hasCompressionCodec(const String & column_name) const
 {
     const auto it = columns.get<1>().find(column_name);
