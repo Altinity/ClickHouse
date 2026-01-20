@@ -1,6 +1,6 @@
-# docker build -t clickhouse/fasttest .
+# docker build -t altinityinfra/fasttest .
 ARG FROM_TAG=latest
-FROM clickhouse/test-util:$FROM_TAG
+FROM altinityinfra/test-util:$FROM_TAG
 
 RUN apt-get update \
     && apt-get install \
@@ -66,6 +66,7 @@ RUN mkdir /tmp/ccache \
         -DCMAKE_BUILD_TYPE=None \
         -DZSTD_FROM_INTERNET=ON \
         -DREDIS_STORAGE_BACKEND=OFF \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -Wno-dev \
         -B build \
         -S . \
