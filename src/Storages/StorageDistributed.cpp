@@ -52,6 +52,7 @@
 #include <Parsers/parseQuery.h>
 
 #include <Analyzer/ColumnNode.h>
+#include <Analyzer/ConstantNode.h>
 #include <Analyzer/FunctionNode.h>
 #include <Analyzer/TableNode.h>
 #include <Analyzer/TableFunctionNode.h>
@@ -205,6 +206,7 @@ namespace Setting
     extern const SettingsBool prefer_global_in_and_join;
     extern const SettingsBool enable_global_with_statement;
     extern const SettingsBool allow_experimental_hybrid_table;
+    extern const SettingsBool enable_alias_marker;
 }
 
 namespace DistributedSetting
@@ -794,7 +796,7 @@ namespace
 
 class ReplaseAliasColumnsVisitor : public InDepthQueryTreeVisitor<ReplaseAliasColumnsVisitor>
 {
-    static QueryTreeNodePtr getColumnNodeAliasExpression(const QueryTreeNodePtr & node)
+    QueryTreeNodePtr getColumnNodeAliasExpression(const QueryTreeNodePtr & node) const
     {
         const auto * column_node = node->as<ColumnNode>();
         if (!column_node || !column_node->hasExpression())
@@ -807,16 +809,56 @@ class ReplaseAliasColumnsVisitor : public InDepthQueryTreeVisitor<ReplaseAliasCo
             return nullptr;
 
         auto column_expression = column_node->getExpression();
-        column_expression->setAlias(column_node->getColumnName());
-        return column_expression;
+        const auto & column_name = column_node->getColumnName();
+
+        if (!context->getSettingsRef()[Setting::enable_alias_marker])
+        {
+            column_expression->setAlias(column_name);
+            return column_expression;
+        }
+
+        String alias_id;
+        const auto & source_alias = column_source->getAlias();
+        if (!source_alias.empty())
+            alias_id = source_alias + "." + column_name;
+        else
+            alias_id = column_name;
+
+        if (auto * function_node = column_expression->as<FunctionNode>();
+            function_node && function_node->getFunctionName() == "__aliasMarker")
+        {
+            auto & arguments = function_node->getArguments().getNodes();
+            if (arguments.size() == 2)
+                arguments[1] = std::make_shared<ConstantNode>(alias_id, std::make_shared<DataTypeString>());
+
+            column_expression->setAlias(column_name);
+            return column_expression;
+        }
+
+        QueryTreeNodes arguments;
+        arguments.reserve(2);
+        arguments.emplace_back(std::move(column_expression));
+        arguments.emplace_back(std::make_shared<ConstantNode>(alias_id, std::make_shared<DataTypeString>()));
+
+        auto alias_marker_node = std::make_shared<FunctionNode>("__aliasMarker");
+        alias_marker_node->getArguments().getNodes() = std::move(arguments);
+        alias_marker_node->setAlias(column_name);
+        resolveOrdinaryFunctionNodeByName(*alias_marker_node, "__aliasMarker", context);
+
+        return alias_marker_node;
     }
 
 public:
+    explicit ReplaseAliasColumnsVisitor(ContextPtr context_) : context(std::move(context_)) {}
+
     void visitImpl(QueryTreeNodePtr & node)
     {
         if (auto column_expression = getColumnNodeAliasExpression(node))
             node = column_expression;
     }
+
+private:
+    ContextPtr context;
 };
 
 using ColumnNameToColumnNodeMap = std::unordered_map<std::string, ColumnNodePtr>;
@@ -830,7 +872,7 @@ ColumnNameToColumnNodeMap buildColumnNodesForTableExpression(const QueryTreeNode
 
     // Rebuild per-column nodes (including ALIAS expressions) for the replacement table expression.
     const auto & storage_snapshot = table_node ? table_node->getStorageSnapshot() : table_function_node->getStorageSnapshot();
-    auto get_column_options = GetColumnsOptions(GetColumnsOptions::All).withExtendedObjects().withVirtuals();
+    auto get_column_options = GetColumnsOptions(GetColumnsOptions::All).withVirtuals();
     if (storage_snapshot->storage.supportsSubcolumns())
         get_column_options.withSubcolumns();
 
@@ -1109,7 +1151,7 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
         replace_query_columns_visitor.visit(query_tree_to_modify);
     }
 
-    ReplaseAliasColumnsVisitor replace_alias_columns_visitor;
+    ReplaseAliasColumnsVisitor replace_alias_columns_visitor(query_context);
     replace_alias_columns_visitor.visit(query_tree_to_modify);
 
     const auto & settings = query_context->getSettingsRef();
