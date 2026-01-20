@@ -19,4 +19,9 @@ REGISTER_FUNCTION(ActionName)
     factory.registerFunction<FunctionActionName>();
 }
 
+REGISTER_FUNCTION(AliasMarker)
+{
+    factory.registerFunction<FunctionAliasMarker>();
+}
+
 }
