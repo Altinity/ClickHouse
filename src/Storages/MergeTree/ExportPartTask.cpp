@@ -45,6 +45,42 @@ namespace Setting
     extern const SettingsUInt64 export_merge_tree_part_max_rows_per_file;
 }
 
+namespace
+{
+    void materializeSpecialColumns(
+        const SharedHeader & header,
+        const NamesAndTypesList & all_columns,
+        const ColumnsDescription & columns,
+        const ContextPtr & local_context,
+        QueryPlan & plan_for_part
+    )
+    {
+        // Enable all experimental settings for default expressions
+        // (same pattern as in IMergeTreeReader::evaluateMissingDefaults)
+        auto context_for_defaults = Context::createCopy(local_context);
+        enableAllExperimentalSettings(context_for_defaults);
+        
+        auto defaults_dag = evaluateMissingDefaults(
+            *header,
+            all_columns,
+            columns,
+            context_for_defaults);
+
+        if (defaults_dag)
+        {
+            // Ensure columns are in the correct order matching all_columns
+            defaults_dag->removeUnusedActions(all_columns.getNames(), false);
+            defaults_dag->addMaterializingOutputActions(/*materialize_sparse=*/ false);
+            
+            auto expression_step = std::make_unique<ExpressionStep>(
+                header,
+                std::move(*defaults_dag));
+            expression_step->setStepDescription("Compute alias and default expressions for export");
+            plan_for_part.addStep(std::move(expression_step));
+        }
+    }
+}
+
 ExportPartTask::ExportPartTask(MergeTreeData & storage_, const MergeTreePartExportManifest & manifest_)
     : storage(storage_),
     manifest(manifest_)
@@ -153,33 +189,9 @@ bool ExportPartTask::executeStep()
             local_context,
             getLogger("ExportPartition"));
 
-        // Add expression step to compute alias and other default columns for export
-        // This materializes virtual columns (like ALIAS) so they can be written to output
-        const auto & current_header = plan_for_part.getCurrentHeader();
-
-        // Enable all experimental settings for default expressions
-        // (same pattern as in IMergeTreeReader::evaluateMissingDefaults)
-        auto context_for_defaults = Context::createCopy(local_context);
-        enableAllExperimentalSettings(context_for_defaults);
-        
-        auto defaults_dag = evaluateMissingDefaults(
-            *current_header,
-            all_columns,
-            metadata_snapshot->getColumns(),
-            context_for_defaults);
-
-        if (defaults_dag)
-        {
-            // Ensure columns are in the correct order matching all_columns
-            defaults_dag->removeUnusedActions(all_columns.getNames(), false);
-            defaults_dag->addMaterializingOutputActions(/*materialize_sparse=*/ false);
-            
-            auto expression_step = std::make_unique<ExpressionStep>(
-                current_header,
-                std::move(*defaults_dag));
-            expression_step->setStepDescription("Compute alias and default expressions for export");
-            plan_for_part.addStep(std::move(expression_step));
-        }
+        /// We need to support exporting materialized and alias columns to object storage. For some reason, object storage engines don't support them.
+        /// This is a hack that materializes the columns before the export so they can be exported to tables that have matching columns
+        materializeSpecialColumns(plan_for_part.getCurrentHeader(), all_columns, metadata_snapshot->getColumns(), local_context, plan_for_part);
 
         ThreadGroupSwitcher switcher((*exports_list_entry)->thread_group, "");
 
