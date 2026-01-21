@@ -48,6 +48,66 @@ DROP TABLE test_hybrid_alias_cast;
 DROP TABLE test_hybrid_alias_after;
 DROP TABLE test_hybrid_alias_before;
 
+DROP TABLE IF EXISTS test_hybrid_alias_predicate;
+DROP TABLE IF EXISTS test_hybrid_alias_predicate_left;
+DROP TABLE IF EXISTS test_hybrid_alias_predicate_right;
+
+CREATE TABLE test_hybrid_alias_predicate_left
+(
+    id Int32,
+    value Int32,
+    date_col Date,
+    computed ALIAS value * 2,
+    sum_alias ALIAS id + value
+)
+ENGINE = MergeTree()
+ORDER BY (date_col, id)
+PARTITION BY toYYYYMM(date_col);
+
+CREATE TABLE test_hybrid_alias_predicate_right
+(
+    id Int32,
+    value Int32,
+    date_col Date,
+    computed ALIAS value * 2,
+    sum_alias ALIAS id + value
+)
+ENGINE = MergeTree()
+ORDER BY (date_col, id)
+PARTITION BY toYYYYMM(date_col);
+
+INSERT INTO test_hybrid_alias_predicate_left (id, value, date_col) VALUES
+    (1, 10, '2025-01-15'),
+    (2, 20, '2025-01-16'),
+    (3, 30, '2025-01-17');
+
+INSERT INTO test_hybrid_alias_predicate_right (id, value, date_col) VALUES
+    (4, 40, '2025-01-10'),
+    (5, 50, '2025-01-11'),
+    (6, 60, '2025-01-12');
+
+CREATE TABLE test_hybrid_alias_predicate
+(
+    id Int32,
+    value Int32,
+    date_col Date,
+    computed Int64,
+    sum_alias Int64
+)
+ENGINE = Hybrid(
+    remote('127.0.0.1:9000', currentDatabase(), 'test_hybrid_alias_predicate_left'),
+    computed >= 60,
+    remote('127.0.0.1:9000', currentDatabase(), 'test_hybrid_alias_predicate_right'),
+    computed < 60
+);
+
+SELECT 'Hybrid segment predicates with alias columns';
+SELECT id, value, computed, sum_alias FROM test_hybrid_alias_predicate;
+
+DROP TABLE test_hybrid_alias_predicate;
+DROP TABLE test_hybrid_alias_predicate_left;
+DROP TABLE test_hybrid_alias_predicate_right;
+
 DROP TABLE IF EXISTS test_hybrid_ephem;
 DROP TABLE IF EXISTS test_hybrid_ephem_after;
 DROP TABLE IF EXISTS test_hybrid_ephem_before;
