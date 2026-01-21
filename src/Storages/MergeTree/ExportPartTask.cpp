@@ -49,12 +49,13 @@ namespace
 {
     void materializeSpecialColumns(
         const SharedHeader & header,
-        const NamesAndTypesList & all_columns,
-        const ColumnsDescription & columns,
+        const StorageMetadataPtr & storage_metadata,
         const ContextPtr & local_context,
         QueryPlan & plan_for_part
     )
     {
+        const auto readable_columns = storage_metadata->getColumns().getReadable();
+
         // Enable all experimental settings for default expressions
         // (same pattern as in IMergeTreeReader::evaluateMissingDefaults)
         auto context_for_defaults = Context::createCopy(local_context);
@@ -62,14 +63,14 @@ namespace
         
         auto defaults_dag = evaluateMissingDefaults(
             *header,
-            all_columns,
-            columns,
+            readable_columns,
+            storage_metadata->getColumns(),
             context_for_defaults);
 
         if (defaults_dag)
         {
-            // Ensure columns are in the correct order matching all_columns
-            defaults_dag->removeUnusedActions(all_columns.getNames(), false);
+            /// Ensure columns are in the correct order matching readable_columns
+            defaults_dag->removeUnusedActions(readable_columns.getNames(), false);
             defaults_dag->addMaterializingOutputActions(/*materialize_sparse=*/ false);
             
             auto expression_step = std::make_unique<ExpressionStep>(
@@ -97,11 +98,8 @@ bool ExportPartTask::executeStep()
 
     const auto & metadata_snapshot = manifest.metadata_snapshot;
 
-    // Read only physical columns from the part
-    Names columns_to_read = metadata_snapshot->getColumns().getNamesOfPhysical();
-    
-    // But we want all columns (including aliases) in the output
-    NamesAndTypesList all_columns = metadata_snapshot->getColumns().getAll();
+    /// Read only physical columns from the part
+    const auto columns_to_read = metadata_snapshot->getColumns().getNamesOfPhysical();
 
     MergeTreeSequentialSourceType read_type = MergeTreeSequentialSourceType::Export;
 
@@ -191,7 +189,7 @@ bool ExportPartTask::executeStep()
 
         /// We need to support exporting materialized and alias columns to object storage. For some reason, object storage engines don't support them.
         /// This is a hack that materializes the columns before the export so they can be exported to tables that have matching columns
-        materializeSpecialColumns(plan_for_part.getCurrentHeader(), all_columns, metadata_snapshot->getColumns(), local_context, plan_for_part);
+        materializeSpecialColumns(plan_for_part.getCurrentHeader(), metadata_snapshot, local_context, plan_for_part);
 
         ThreadGroupSwitcher switcher((*exports_list_entry)->thread_group, "");
 

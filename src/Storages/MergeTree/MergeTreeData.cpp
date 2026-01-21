@@ -6246,7 +6246,9 @@ void MergeTreeData::exportPartToTable(
 
     const auto & destination_columns = destination_metadata_ptr->getColumns();
 
-    if (destination_columns.getAll().sizeOfDifference(source_columns.getAll()))
+    /// compare all source readable columns with all destination insertable columns
+    /// this allows us to skip ephemeral columns
+    if (source_columns.getReadable().sizeOfDifference(destination_columns.getInsertable()))
         throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS, "Tables have different structure");
 
     if (query_to_string(source_metadata_ptr->getPartitionKeyAST()) != query_to_string(destination_metadata_ptr->getPartitionKeyAST()))

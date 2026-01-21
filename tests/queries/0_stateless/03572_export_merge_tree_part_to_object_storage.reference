@@ -56,3 +56,24 @@
 ---- Verify MATERIALIZED column data exported to S3 (should match source)
 1	[1,2,3]	1
 1	[10,20,30]	10
+---- Test EPHEMERAL column (not stored, ignored during export)
+---- Verify data in source
+1	ALICE
+1	BOB
+---- Verify exported data
+1	ALICE
+1	BOB
+---- Test Mixed ALIAS, MATERIALIZED, and EPHEMERAL in same table
+---- Verify mixed columns in source table
+1	5	10	15	TEST
+1	10	20	30	PROD
+---- Verify mixed columns exported to S3 (should match source)
+1	5	10	15	TEST
+1	10	20	30	PROD
+---- Test Complex Expressions in computed columns
+---- Verify complex expressions in source table
+1	alice	ALICE	alice-1
+1	bob	BOB	bob-1
+---- Verify complex expressions exported to S3 (should match source)
+1	alice	ALICE	alice-1
+1	bob	BOB	bob-1
