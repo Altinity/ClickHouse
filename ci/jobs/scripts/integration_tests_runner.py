@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import csv
 import glob
 import heapq
@@ -11,10 +13,11 @@ import shutil
 import signal
 import subprocess
 import time
+from functools import lru_cache
 from collections import OrderedDict, defaultdict
 from itertools import chain
 from statistics import median
-from typing import Any, Dict, Final, List, Optional, Set, Tuple
+from typing import Any, Dict, Final, List, Optional, Set, Tuple, Union
 
 import requests
 import yaml  # type: ignore[import-untyped]
@@ -23,20 +26,21 @@ from tests.integration.integration_test_images import IMAGES
 from ci.praktika.info import Info
 from ci.praktika.utils import Shell
 
-CLICKHOUSE_PLAY_HOST = os.environ.get("CLICKHOUSE_PLAY_HOST", "play.clickhouse.com")
-CLICKHOUSE_PLAY_USER = os.environ.get("CLICKHOUSE_PLAY_USER", "play")
-CLICKHOUSE_PLAY_PASSWORD = os.environ.get("CLICKHOUSE_PLAY_PASSWORD", "")
-CLICKHOUSE_PLAY_DB = os.environ.get("CLICKHOUSE_PLAY_DB", "default")
-CLICKHOUSE_PLAY_URL = f"https://{CLICKHOUSE_PLAY_HOST}/"
+CLICKHOUSE_PLAY_HOST = os.environ.get("CHECKS_DATABASE_HOST", "play.clickhouse.com")
+CLICKHOUSE_PLAY_USER = os.environ.get("CLICKHOUSE_TEST_STAT_LOGIN", "play")
+CLICKHOUSE_PLAY_PASSWORD = os.environ.get("CLICKHOUSE_TEST_STAT_PASSWORD", "")
+CLICKHOUSE_PLAY_DB = os.environ.get("CLICKHOUSE_PLAY_DB", "gh-data")
+CLICKHOUSE_PLAY_URL = f"https://{CLICKHOUSE_PLAY_HOST}:8443/"
 
-MAX_RETRY = 1
+
+MAX_RETRY = 2
 NUM_WORKERS = 4
 SLEEP_BETWEEN_RETRIES = 5
 PARALLEL_GROUP_SIZE = 100
 CLICKHOUSE_BINARY_PATH = "usr/bin/clickhouse"
 
-FLAKY_TRIES_COUNT = 2  # run whole pytest several times
-FLAKY_REPEAT_COUNT = 3  # runs test case in single module several times
+FLAKY_TRIES_COUNT = 3  # run whole pytest several times
+FLAKY_REPEAT_COUNT = 5  # runs test case in single module several times
 MAX_TIME_SECONDS = 3600
 
 MAX_TIME_IN_SANDBOX = 20 * 60  # 20 minutes
@@ -91,6 +95,39 @@ def filter_existing_tests(tests_to_run, repo_path):
     return result
 
 
+@lru_cache(maxsize=None)
+def extract_fail_logs(log_path: str) -> dict[str, str]:
+    try:
+        with open(log_path, "r", encoding="utf-8") as log_file:
+            text = log_file.read()
+    except UnicodeDecodeError:
+        logging.warning(
+            "Failed to read log file %s as UTF-8, using errors='replace'",
+            log_path,
+        )
+        with open(log_path, "r", encoding="utf-8", errors="replace") as log_file:
+            text = log_file.read()
+
+    # Regex matches:
+    #  - a line like "_____ test_something [param] _____"
+    #  - captures the test name (with params)
+    #  - captures everything up to the next header or end of file
+    pattern = re.compile(
+        r"_{5,}\s+([^\s].*?)\s+_{5,}(.*?)(?=_{5,}\s+[^\s].*?\s+_{5,}|\Z)",
+        re.S,
+    )
+
+    results = {}
+    for match in pattern.finditer(text):
+        test_name, body = match.groups()
+
+        # Keep only sections that include a failure or captured log
+        if "Captured log" in body or "FAILED" in body:
+            results[test_name.strip()] = body.strip()
+
+    return results
+
+
 def _get_deselect_option(tests):
     return " ".join([f"--deselect {t}" for t in tests])
 
@@ -110,7 +147,7 @@ def clear_ip_tables_and_restart_daemons():
     try:
         logging.info("Killing all alive docker containers")
         subprocess.check_output(
-            "timeout --verbose --signal=KILL 10m docker ps --quiet | xargs --no-run-if-empty docker kill",
+            "timeout --verbose --signal=KILL 3h docker ps --quiet | xargs --no-run-if-empty docker kill",
             shell=True,
         )
     except subprocess.CalledProcessError as err:
@@ -119,7 +156,7 @@ def clear_ip_tables_and_restart_daemons():
     try:
         logging.info("Removing all docker containers")
         subprocess.check_output(
-            "timeout --verbose --signal=KILL 10m docker ps --all --quiet | xargs --no-run-if-empty docker rm --force",
+            "timeout --verbose --signal=KILL 3h docker ps --all --quiet | xargs --no-run-if-empty docker rm --force",
             shell=True,
         )
     except subprocess.CalledProcessError as err:
@@ -320,7 +357,7 @@ class ClickhouseIntegrationTestsRunner:
         out_file_full = os.path.join(self.result_path, "runner_get_all_tests.log")
         report_file = "runner_get_all_tests.jsonl"
         cmd = (
-            f"cd {self.repo_path}/tests/integration && PYTHONPATH='../..:.' timeout --verbose --signal=KILL 2m ./runner {runner_opts} {image_cmd} -- "
+            f"cd {self.repo_path}/tests/integration && PYTHONPATH='../..:.' timeout --verbose --signal=KILL 3h ./runner {runner_opts} {image_cmd} -- "
             f"--setup-plan --report-log={report_file}"
         )
 
@@ -377,6 +414,52 @@ class ClickhouseIntegrationTestsRunner:
         return list(sorted(skip_list_tests))
 
     @staticmethod
+    def _get_broken_tests_rules(repo_path: str) -> dict:
+        broken_tests_file_path = f"{repo_path}/tests/broken_tests.yaml"
+        if (
+            not os.path.isfile(broken_tests_file_path)
+            or os.path.getsize(broken_tests_file_path) == 0
+        ):
+            raise ValueError(
+                "There is something wrong with getting broken tests rules: "
+                f"file '{broken_tests_file_path}' is empty or does not exist."
+            )
+
+        with open(broken_tests_file_path, "r", encoding="utf-8") as broken_tests_file:
+            broken_tests = yaml.safe_load(broken_tests_file)
+
+        compiled_rules = {"exact": {}, "pattern": {}}
+
+        for test in broken_tests:
+            regex = test.get("regex") is True
+            rule = {
+                "reason": test["reason"],
+            }
+            if test.get("message"):
+                rule["message"] = re.compile(test["message"]) if regex else test["message"]
+
+            if test.get("not_message"):
+                rule["not_message"] = (
+                    re.compile(test["not_message"]) if regex else test["not_message"]
+                )
+            if test.get("check_types"):
+                rule["check_types"] = test["check_types"]
+
+            if regex:
+                rule["regex"] = True
+                compiled_rules["pattern"][re.compile(test["name"])] = rule
+            else:
+                compiled_rules["exact"][test["name"]] = rule
+
+        logging.info(
+            "Compiled %s exact rules and %s pattern rules",
+            len(compiled_rules["exact"]),
+            len(compiled_rules["pattern"]),
+        )
+
+        return compiled_rules
+
+    @staticmethod
     def group_test_by_file(tests):
         result = OrderedDict()  # type: OrderedDict
         for test in tests:
@@ -410,6 +493,118 @@ class ClickhouseIntegrationTestsRunner:
             for test in current_counters[state]:
                 main_counters[state].append(test)
 
+    def _handle_broken_tests(
+        self,
+        counters: Dict[str, List[str]],
+        known_broken_tests: Dict[str, Dict[str, str]],
+        log_paths: Union[Dict[str, List[str]], List[str]],
+    ) -> None:
+
+        context_name = self.params["context_name"]
+
+        def get_log_paths(test_name):
+            """Could be a list of logs for all tests or a dict with test name as a key"""
+            log_paths_list = (
+                log_paths[test_name] if isinstance(log_paths, dict) else log_paths
+            )
+            return sorted(
+                [x for x in log_paths_list if x.endswith(".log")], reverse=True
+            )
+
+        broken_tests_log = os.path.join(self.result_path, "broken_tests_handler.log")
+
+        def test_is_known_fail(test_name, test_logs, debug_log_file):
+            if test_logs is None:
+                debug_log_file.write(
+                    f"WARNING: Test '{test_name}' has no logs - cannot match message patterns\n"
+                )
+
+            matching_rules = []
+
+            debug_log_file.write("Potential matching rules:\n")
+            exact_rule = known_broken_tests["exact"].get(test_name)
+            if exact_rule:
+                debug_log_file.write(f"{test_name} - {exact_rule}\n")
+                matching_rules.append(exact_rule)
+
+            for name_re, data in known_broken_tests["pattern"].items():
+                if name_re.fullmatch(test_name):
+                    debug_log_file.write(f"{name_re} - {data}\n")
+                    matching_rules.append(data)
+
+            if not matching_rules:
+                return False
+
+            def matches_substring(substring, log, is_regex):
+                if log is None:
+                    # Cannot match a message pattern if we have no logs
+                    return False
+                if is_regex:
+                    return bool(substring.search(log))
+                return substring in log
+
+            for rule_data in matching_rules:
+                if rule_data.get("check_types") and not any(
+                    ct in context_name for ct in rule_data["check_types"]
+                ):
+                    debug_log_file.write(f"Check types didn't match: '{rule_data['check_types']}' not in '{context_name}'\n")
+                    continue
+
+                is_regex = rule_data.get("regex", False)
+                not_message = rule_data.get("not_message")
+                if not_message and matches_substring(not_message, test_logs, is_regex):
+                    debug_log_file.write(f"Skip rule: Not message matched: '{not_message}'\n")
+                    continue
+                message = rule_data.get("message")
+                if message and not matches_substring(message, test_logs, is_regex):
+                    debug_log_file.write(f"Skip rule: Message didn't match: '{message}'\n")
+                    continue
+
+                debug_log_file.write(f"Test {test_name} matched rule: {rule_data}\n")
+                return rule_data["reason"]
+
+            return False
+
+        with open(broken_tests_log, "a") as log_file:
+            log_file.write(
+                f"{len(known_broken_tests['exact']) + len(known_broken_tests['pattern'])} Known broken tests\n"
+            )
+            for status, tests in counters.items():
+                log_file.write(f"Total tests in {status} state: {len(tests)}\n")
+
+            for fail_status in ("ERROR", "FAILED"):
+                for failed_test in counters[fail_status].copy():
+                    log_file.write(
+                        f"Checking test {failed_test} (status: {fail_status})\n"
+                    )
+
+                    # Should only care about the most recent log file
+                    log_path = get_log_paths(failed_test)[0]
+                    test_logs = extract_fail_logs(log_path)
+                    test_log = test_logs.get(failed_test.split("::")[-1])
+                    if test_log is None:
+                        # Log extraction can fail if the fail was in the teardown
+                        log_file.write(
+                            f"WARNING: Test '{failed_test}' has no logs among {list(test_logs.keys())}, assuming log extraction failed, proceeding with full log\n"
+                        )
+                        with open(log_path, "r", encoding="utf-8") as f:
+                            test_log = f.read()
+
+                    known_fail_reason = test_is_known_fail(
+                        failed_test, test_log, log_file
+                    )
+                    if known_fail_reason is not False:
+                        log_file.write(
+                            f"Test {failed_test} is known to fail: {known_fail_reason}\n"
+                        )
+                        counters[fail_status].remove(failed_test)
+                        counters["BROKEN"].append(failed_test)
+                    else:
+                        log_file.write(f"Test {failed_test} is not known to fail\n")
+
+            for status, tests in counters.items():
+                log_file.write(f"Total tests in {status} state: {len(tests)}\n")
+
     def _get_runner_image_cmd(self):
         image_cmd = ""
         if self._can_run_with(
@@ -417,7 +612,7 @@ class ClickhouseIntegrationTestsRunner:
             "--docker-image-version",
         ):
             for img in IMAGES:
-                if img == "clickhouse/integration-tests-runner":
+                if img == "altinityinfra/integration-tests-runner":
                     runner_version = self.get_image_version(img)
                     logging.info(
                         "Can run with custom docker image version %s", runner_version
@@ -684,6 +879,7 @@ class ClickhouseIntegrationTestsRunner:
         }  # type: Dict
         tests_times = defaultdict(float)  # type: Dict
         tests_log_paths = defaultdict(list)
+        known_broken_tests = self._get_broken_tests_rules(self.repo_path)
         id_counter = 0
         for test_to_run in tests_to_run:
             tries_num = 1 if should_fail else FLAKY_TRIES_COUNT
@@ -701,6 +897,10 @@ class ClickhouseIntegrationTestsRunner:
                     1,
                     FLAKY_REPEAT_COUNT,
                 )
+
+                # Handle broken tests on the group counters that contain test results for a single group
+                self._handle_broken_tests(group_counters, known_broken_tests, log_paths)
+
                 id_counter = id_counter + 1
                 for counter, value in group_counters.items():
                     logging.info(
@@ -803,11 +1003,11 @@ class ClickhouseIntegrationTestsRunner:
                 SELECT
                     splitByString('::', test_name)[1] AS file,
                     median(test_duration_ms) AS test_duration_ms
-                FROM checks
+                FROM `{CLICKHOUSE_PLAY_DB}`.checks
                 WHERE (check_name LIKE 'Integration%')
                     AND (check_start_time >= ({start_time_filter} - toIntervalDay(30)))
                     AND (check_start_time <= ({start_time_filter} - toIntervalHour(2)))
-                    AND ((head_ref = 'master') AND startsWith(head_repo, 'ClickHouse/'))
+                    AND (head_ref LIKE 'antalya-25.8%' OR head_ref LIKE 'releases/25.8%' OR head_ref LIKE 'rebase-cicd-v25.8%')
                     AND (test_name != '')
                     AND (test_status != 'SKIPPED')
                 GROUP BY test_name
@@ -826,6 +1026,11 @@ class ClickhouseIntegrationTestsRunner:
         max_retries = 3
         retry_delay_seconds = 5
 
+        headers = {
+            "X-ClickHouse-User": CLICKHOUSE_PLAY_USER,
+            "X-ClickHouse-Key": CLICKHOUSE_PLAY_PASSWORD,
+        }
+
         for attempt in range(max_retries):
             try:
                 logging.info(
@@ -834,7 +1039,12 @@ class ClickhouseIntegrationTestsRunner:
                     max_retries,
                 )
 
-                response = requests.get(url, timeout=120)
+                response = requests.post(
+                    CLICKHOUSE_PLAY_URL,
+                    timeout=120,
+                    headers=headers,
+                    params={"query": query},
+                )
                 response.raise_for_status()
                 result_data = response.json().get("data", [])
                 tests_execution_times = {
@@ -1107,6 +1317,7 @@ class ClickhouseIntegrationTestsRunner:
         tests_times = defaultdict(float)
         tests_log_paths = defaultdict(list)
         items_to_run = list(grouped_tests.items())
+        known_broken_tests = self._get_broken_tests_rules(self.repo_path)
         logging.info("Total test groups %s", len(items_to_run))
         if self.shuffle_test_groups():
             logging.info("Shuffling test groups")
@@ -1119,6 +1330,10 @@ class ClickhouseIntegrationTestsRunner:
             group_counters, group_test_times, log_paths = self.try_run_test_group(
                 "2h", group, tests, MAX_RETRY, NUM_WORKERS, 0
             )
+
+            # Handle broken tests on the group counters that contain test results for a single group
+            self._handle_broken_tests(group_counters, known_broken_tests, log_paths)
+
             total_tests = 0
             for counter, value in group_counters.items():
                 logging.info(
@@ -1169,7 +1384,7 @@ class ClickhouseIntegrationTestsRunner:
                 for c in counters[state]
             ]
         failed_sum = len(counters["FAILED"]) + len(counters["ERROR"])
-        status_text = f"fail: {failed_sum}, passed: {len(counters['PASSED'])}"
+        status_text = f"fail: {failed_sum}, passed: {len(counters['PASSED'])}, broken: {len(counters['BROKEN'])}"
 
         if not counters or sum(len(counter) for counter in counters.values()) == 0:
             status_text = "No tests found for some reason! It's a bug"
@@ -1225,7 +1440,7 @@ def run():
 
 
 timeout_expired = False
-runner_subprocess = None  # type:Optional[TeePopen]
+runner_subprocess = None
 
 
 def handle_sigterm(signum, _frame):
