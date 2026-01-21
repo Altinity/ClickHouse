@@ -6921,6 +6921,9 @@ This is not a hard limit, and it highly depends on the output format granularity
 Maximum number of rows to write to a single file when exporting a merge tree part. 0 means no limit.
 This is not a hard limit, and it highly depends on the output format granularity and input source chunk size.
 )", 0) \
+    DECLARE(Bool, serialize_string_in_memory_with_zero_byte, true, R"(
+Serialize String values during aggregation with zero byte at the end. Enable to keep compatibility when querying cluster of incompatible versions.
+)", 0) \
     \
     /* ####################################################### */ \
     /* ########### START OF EXPERIMENTAL FEATURES ############ */ \

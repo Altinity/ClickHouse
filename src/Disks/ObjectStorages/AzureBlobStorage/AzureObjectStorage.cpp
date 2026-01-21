@@ -207,13 +207,8 @@ void AzureObjectStorage::listObjects(const std::string & path, PathsWithMetadata
                     {}}));
         }
 
-        if (max_keys)
-        {
-            ssize_t keys_left = static_cast<ssize_t>(max_keys) - children.size();
-            if (keys_left <= 0)
-                break;
-            options.PageSizeHint = keys_left;
-        }
+        if (max_keys && children.size() >= max_keys)
+            break;
     }
 }
 

@@ -60,3 +60,8 @@ SET(VERSION_STRING {string})
     @classmethod
     def store_version_data_in_ci_pipeline(cls):
         Info().store_kv_data("version", cls.get_current_version_as_dict())
+
+
+if __name__ == "__main__":
+    # test;
+    print(CHVersion.get_current_version_as_dict())
