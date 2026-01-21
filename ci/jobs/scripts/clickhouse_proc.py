@@ -131,14 +131,16 @@ class ClickHouseProc:
             )
         print(f"Started setup_minio.sh asynchronously with PID {self.minio_proc.pid}")
 
-        for _ in range(20):
+        print("Waiting for minio to start...")
+        for _ in range(10):
             res = Shell.check(
                 "/mc ls clickminio/test | grep -q .",
                 verbose=True,
             )
             if res:
+                print("Minio started successfully")
                 return True
-            time.sleep(1)
+            time.sleep(3)
         print("Failed to start minio")
         return False
 
@@ -1037,8 +1039,10 @@ if __name__ == "__main__":
             # FIXME: the start_time must be preserved globally in ENV or something like that
             # to get the same values in different DBs
             # As a wild idea, it could be stored in a Info.check_start_timestamp
+            exit(0) # Note (strtgbb): We don't use log exports
             res = ch.start_log_exports(check_start_time=Utils.timestamp())
         elif command == "logs_export_stop":
+            exit(0) # Note (strtgbb): We don't use log exports
             res = ch.stop_log_exports()
         elif command == "start_minio":
             param = sys.argv[2]

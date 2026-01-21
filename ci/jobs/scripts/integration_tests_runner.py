@@ -29,7 +29,7 @@ from ci.praktika.utils import Shell
 CLICKHOUSE_PLAY_HOST = os.environ.get("CHECKS_DATABASE_HOST", "play.clickhouse.com")
 CLICKHOUSE_PLAY_USER = os.environ.get("CLICKHOUSE_TEST_STAT_LOGIN", "play")
 CLICKHOUSE_PLAY_PASSWORD = os.environ.get("CLICKHOUSE_TEST_STAT_PASSWORD", "")
-CLICKHOUSE_PLAY_DB = os.environ.get("CLICKHOUSE_PLAY_DB", "gh-data")
+CLICKHOUSE_PLAY_DB = os.environ.get("CLICKHOUSE_PLAY_DB", "default")
 CLICKHOUSE_PLAY_URL = f"https://{CLICKHOUSE_PLAY_HOST}:8443/"
 
 
