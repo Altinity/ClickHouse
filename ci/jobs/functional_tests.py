@@ -191,13 +191,22 @@ def main():
     runner_options += f" --jobs {nproc}"
 
     if not info.is_local_run:
+        # NOTE(strtgbb): We pass azure credentials through the docker command, not SSM.
         # TODO: find a way to work with Azure secret so it's ok for local tests as well, for now keep azure disabled
         # os.environ["AZURE_CONNECTION_STRING"] = Shell.get_output(
         #     f"aws ssm get-parameter --region us-east-1 --name azure_connection_string --with-decryption --output text --query Parameter.Value",
         #     verbose=True,
         # )
-        # NOTE(strtgbb): We pass azure credentials through the docker command, not SSM.
-        pass
+
+        # NOTE(strtgbb): Azure credentials don't exist in community workflow
+        if info.is_community_pr:
+            print(
+                "NOTE: No azure credentials provided for community PR - disable azure storage"
+            )
+            config_installs_args += " --no-azure"
+
+            # NOTE(strtgbb): With the above, some tests are still trying to use azure, try this:
+            os.environ["USE_AZURE_STORAGE_FOR_MERGE_TREE"] = "0"
     else:
         print("Disable azure for a local run")
         config_installs_args += " --no-azure"
@@ -323,12 +332,13 @@ def main():
             res = res and CH.start()
             res = res and CH.wait_ready()
             if res:
-                if not Info().is_local_run:
-                    if not CH.start_log_exports(stop_watch.start_time):
-                        info.add_workflow_report_message(
-                            "WARNING: Failed to start log export"
-                        )
-                        print("Failed to start log export")
+                # Note (strtgbb): We don't use this
+                # if not Info().is_local_run:
+                #     if not CH.start_log_exports(stop_watch.start_time):
+                #         info.add_workflow_report_message(
+                #             "WARNING: Failed to start log export"
+                #         )
+                #         print("Failed to start log export")
                 if not CH.create_minio_log_tables():
                     info.add_workflow_report_message(
                         "WARNING: Failed to create minio log tables"
