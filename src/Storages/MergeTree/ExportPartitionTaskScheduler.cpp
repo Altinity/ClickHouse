@@ -31,9 +31,6 @@ namespace
         context_copy->setSetting("export_merge_tree_part_max_bytes_per_file", manifest.max_bytes_per_file);
         context_copy->setSetting("export_merge_tree_part_max_rows_per_file", manifest.max_rows_per_file);
 
-        /// always allow exporting outdated parts because the parts have been validated when the query was processed
-        context_copy->setSetting("export_merge_tree_part_allow_outdated_parts", true);
-
         /// always skip pending mutations and patch parts because we already validated the parts during query processing
         context_copy->setSetting("export_merge_tree_part_throw_on_pending_mutations", false);
         context_copy->setSetting("export_merge_tree_part_throw_on_pending_patch_parts", false);
@@ -152,6 +149,7 @@ void ExportPartitionTaskScheduler::run()
                     destination_storage_id,
                     manifest.transaction_id,
                     getContextCopyWithTaskSettings(storage.getContext(), manifest),
+                    /*allow_outdated_parts*/ true,
                     [this, key, zk_part_name, manifest, destination_storage]
                     (MergeTreePartExportManifest::CompletionCallbackResult result)
                     {

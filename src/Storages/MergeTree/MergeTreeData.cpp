@@ -219,7 +219,6 @@ namespace Setting
     extern const SettingsBool output_format_parquet_parallel_encoding;
     extern const SettingsBool export_merge_tree_part_throw_on_pending_mutations;
     extern const SettingsBool export_merge_tree_part_throw_on_pending_patch_parts;
-    extern const SettingsBool export_merge_tree_part_allow_outdated_parts;
 }
 
 namespace MergeTreeSetting
@@ -6226,6 +6225,7 @@ void MergeTreeData::exportPartToTable(
     const StorageID & destination_storage_id,
     const String & transaction_id,
     ContextPtr query_context,
+    bool allow_outdated_parts,
     std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback)
 {
     auto dest_storage = DatabaseCatalog::instance().getTable(destination_storage_id, query_context);
@@ -6258,12 +6258,10 @@ void MergeTreeData::exportPartToTable(
         throw Exception(ErrorCodes::NO_SUCH_DATA_PART, "No such data part '{}' to export in table '{}'",
                         part_name, getStorageID().getFullTableName());
 
-    const bool allow_outdated_parts = query_context->getSettingsRef()[Setting::export_merge_tree_part_allow_outdated_parts];
-
     if (part->getState() == MergeTreeDataPartState::Outdated && !allow_outdated_parts)
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
-            "Part {} is in the outdated state and cannot be exported. Set `export_merge_tree_part_allow_outdated_parts` to true to allow exporting outdated parts",
+            "Part {} is in the outdated state and cannot be exported",
             part_name);
 
     const bool throw_on_pending_mutations = query_context->getSettingsRef()[Setting::export_merge_tree_part_throw_on_pending_mutations];

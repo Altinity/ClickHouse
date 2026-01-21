@@ -66,7 +66,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"cluster_table_function_buckets_batch_size", 0, 0, "New setting."},
             {"export_merge_tree_part_throw_on_pending_mutations", true, true, "New setting."},
             {"export_merge_tree_part_throw_on_pending_patch_parts", true, true, "New setting."},
-            {"export_merge_tree_part_allow_outdated_parts", false, false, "New setting."},
         });
         addSettingsChanges(settings_changes_history, "25.8",
         {
