@@ -36,6 +36,8 @@ echo "---- Export 2020_1_1_0 and 2021_2_2_0"
 query "ALTER TABLE $mt_table EXPORT PART '2020_1_1_0' TO TABLE $s3_table SETTINGS allow_experimental_export_merge_tree_part = 1"
 query "ALTER TABLE $mt_table EXPORT PART '2021_2_2_0' TO TABLE $s3_table SETTINGS allow_experimental_export_merge_tree_part = 1"
 
+sleep 3
+
 echo "---- Both data parts should appear"
 query "SELECT * FROM $s3_table ORDER BY id"
 
