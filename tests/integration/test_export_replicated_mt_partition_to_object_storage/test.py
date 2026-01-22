@@ -747,3 +747,59 @@ def test_multiple_exports_within_a_single_query(cluster):
 #     # Wait for export to finish and then verify destination still reflects the original snapshot (3 rows)
 #     time.sleep(5)
 #     assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == '3\n', "Export did not preserve snapshot at start time after source mutation"
+
+
+def test_export_partition_with_mixed_computed_columns(cluster):
+    """Test export partition with ALIAS, MATERIALIZED, and EPHEMERAL columns."""
+    node = cluster.instances["replica1"]
+
+    mt_table = "mixed_computed_mt_table"
+    s3_table = "mixed_computed_s3_table"
+
+    node.query(f"""
+        CREATE TABLE {mt_table} (
+            id UInt32,
+            value UInt32,
+            tag_input String EPHEMERAL,
+            doubled UInt64 ALIAS value * 2,
+            tripled UInt64 MATERIALIZED value * 3,
+            tag String DEFAULT upper(tag_input)
+        ) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')
+        PARTITION BY id
+        ORDER BY id
+        SETTINGS index_granularity = 1
+    """)
+
+    # Create S3 destination table with regular columns (no EPHEMERAL)
+    node.query(f"""
+        CREATE TABLE {s3_table} (
+            id UInt32,
+            value UInt32,
+            doubled UInt64,
+            tripled UInt64,
+            tag String
+        ) ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')
+        PARTITION BY id
+    """)
+
+    node.query(f"INSERT INTO {mt_table} (id, value, tag_input) VALUES (1, 5, 'test'), (1, 10, 'prod')")
+
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '1' TO TABLE {s3_table}")
+
+    wait_for_export_status(node, mt_table, s3_table, "1", "COMPLETED")
+
+    # Verify source data (ALIAS computed, EPHEMERAL not stored)
+    source_result = node.query(f"SELECT id, value, doubled, tripled, tag FROM {mt_table} ORDER BY value")
+    expected = "1\t5\t10\t15\tTEST\n1\t10\t20\t30\tPROD\n"
+    assert source_result == expected, f"Source table data mismatch. Expected:\n{expected}\nGot:\n{source_result}"
+
+    dest_result = node.query(f"SELECT id, value, doubled, tripled, tag FROM {s3_table} ORDER BY value")
+    assert dest_result == expected, f"Exported data mismatch. Expected:\n{expected}\nGot:\n{dest_result}"
+
+    status = node.query(f"""
+        SELECT status FROM system.replicated_partition_exports
+        WHERE source_table = '{mt_table}'
+            AND destination_table = '{s3_table}'
+            AND partition_id = '1'
+    """)
+    assert status.strip() == "COMPLETED", f"Expected COMPLETED status, got: {status}"

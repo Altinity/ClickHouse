@@ -4,18 +4,21 @@
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
+#include <Interpreters/inplaceBlockConversions.h>
 #include <Core/Settings.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Processors/Executors/CompletedPipelineExecutor.h>
 #include <Processors/QueryPlan/BuildQueryPipelineSettings.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
 #include <Processors/QueryPlan/QueryPlan.h>
+#include <Processors/QueryPlan/ExpressionStep.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include "Common/setThreadName.h"
 #include <Common/Exception.h>
 #include <Common/ProfileEventsScope.h>
 #include <Storages/MergeTree/ExportList.h>
 #include <Formats/FormatFactory.h>
+#include <Databases/enableAllExperimentalSettings.h>
 
 namespace ProfileEvents
 {
@@ -43,6 +46,43 @@ namespace Setting
     extern const SettingsUInt64 export_merge_tree_part_max_rows_per_file;
 }
 
+namespace
+{
+    void materializeSpecialColumns(
+        const SharedHeader & header,
+        const StorageMetadataPtr & storage_metadata,
+        const ContextPtr & local_context,
+        QueryPlan & plan_for_part
+    )
+    {
+        const auto readable_columns = storage_metadata->getColumns().getReadable();
+
+        // Enable all experimental settings for default expressions
+        // (same pattern as in IMergeTreeReader::evaluateMissingDefaults)
+        auto context_for_defaults = Context::createCopy(local_context);
+        enableAllExperimentalSettings(context_for_defaults);
+        
+        auto defaults_dag = evaluateMissingDefaults(
+            *header,
+            readable_columns,
+            storage_metadata->getColumns(),
+            context_for_defaults);
+
+        if (defaults_dag)
+        {
+            /// Ensure columns are in the correct order matching readable_columns
+            defaults_dag->removeUnusedActions(readable_columns.getNames(), false);
+            defaults_dag->addMaterializingOutputActions(/*materialize_sparse=*/ false);
+            
+            auto expression_step = std::make_unique<ExpressionStep>(
+                header,
+                std::move(*defaults_dag));
+            expression_step->setStepDescription("Compute alias and default expressions for export");
+            plan_for_part.addStep(std::move(expression_step));
+        }
+    }
+}
+
 ExportPartTask::ExportPartTask(MergeTreeData & storage_, const MergeTreePartExportManifest & manifest_)
     : storage(storage_),
     manifest(manifest_)
@@ -59,7 +99,8 @@ bool ExportPartTask::executeStep()
 
     const auto & metadata_snapshot = manifest.metadata_snapshot;
 
-    Names columns_to_read = metadata_snapshot->getColumns().getNamesOfPhysical();
+    /// Read only physical columns from the part
+    const auto columns_to_read = metadata_snapshot->getColumns().getNamesOfPhysical();
 
     MergeTreeSequentialSourceType read_type = MergeTreeSequentialSourceType::Export;
 
@@ -148,6 +189,10 @@ bool ExportPartTask::executeStep()
             getLogger("ExportPartition"));
 
         ThreadGroupSwitcher switcher((*exports_list_entry)->thread_group, ThreadName::EXPORT_PART);
+
+        /// We need to support exporting materialized and alias columns to object storage. For some reason, object storage engines don't support them.
+        /// This is a hack that materializes the columns before the export so they can be exported to tables that have matching columns
+        materializeSpecialColumns(plan_for_part.getCurrentHeader(), metadata_snapshot, local_context, plan_for_part);
 
         QueryPlanOptimizationSettings optimization_settings(local_context);
         auto pipeline_settings = BuildQueryPipelineSettings(local_context);
