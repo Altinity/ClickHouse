@@ -72,12 +72,6 @@ Source and destination tables must be 100% compatible:
 - **Default**: `true`
 - **Description**: If set to true, throws if pending patch parts exists for a given part. Note that by default mutations are applied to all parts, which means that if a mutation in practice would only affetct part/partition x, all the other parts/partition will throw upon export. The exception is when the `IN PARTITION` clause was used in the mutation command. Note the `IN PARTITION` clause is not properly implemented for plain MergeTree tables.
 
-### export_merge_tree_part_allow_outdated_parts
-
-- **Type**: `bool`
-- **Default**: `false`
-- **Description**: Allows outdated parts to be exported. By default, only `ACTIVE` parts can be exported.
-
 ## Examples
 
 ### Basic Export to S3
