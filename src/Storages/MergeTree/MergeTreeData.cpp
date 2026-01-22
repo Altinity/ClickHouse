@@ -6226,9 +6226,11 @@ void MergeTreeData::exportPartToTable(const PartitionCommand & command, ContextP
 
     if (table_function_ptr->needStructureHint())
     {
-        auto source_metadata_ptr = getInMemoryMetadataPtr();
-        ColumnsDescription structure_hint = source_metadata_ptr->getColumns();
-        table_function_ptr->setStructureHint(structure_hint);
+        const auto source_metadata_ptr = getInMemoryMetadataPtr();
+
+        /// Grab only the readable columns from the source metadata to skip ephemeral columns
+        const auto readable_columns = ColumnsDescription(source_metadata_ptr->getColumns().getReadable());
+        table_function_ptr->setStructureHint(readable_columns);
     }
 
     if (command.partition_by_expr)
