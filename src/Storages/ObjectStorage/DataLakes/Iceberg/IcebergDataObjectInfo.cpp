@@ -43,6 +43,7 @@ IcebergDataObjectInfo::IcebergDataObjectInfo(Iceberg::ManifestFileEntry data_man
                        data_manifest_file_entry_.file_path_key.empty() ? std::nullopt : std::make_optional(data_manifest_file_entry_.file_path_key))
     , data_object_file_path_key(data_manifest_file_entry_.file_path_key)
     , underlying_format_read_schema_id(data_manifest_file_entry_.schema_id)
+    , file_format(data_manifest_file_entry_.file_format)
     , sequence_number(data_manifest_file_entry_.added_sequence_number)
 {
     if (!position_deletes_objects.empty() && Poco::toUpperInPlace(data_manifest_file_entry_.file_format) != "PARQUET")
@@ -59,10 +60,11 @@ IcebergDataObjectInfo::IcebergDataObjectInfo(
     ObjectStoragePtr resolved_storage,
     const String & resolved_key)
     : PathWithMetadata(resolved_key, std::nullopt,
-                       data_manifest_file_entry_.file_path.empty() ? std::nullopt : std::make_optional(data_manifest_file_entry_.file_path), 
+                       data_manifest_file_entry_.file_path.empty() ? std::nullopt : std::make_optional(data_manifest_file_entry_.file_path),
                        resolved_storage)
     , data_object_file_path_key(data_manifest_file_entry_.file_path_key)
     , underlying_format_read_schema_id(data_manifest_file_entry_.schema_id)
+    , file_format(data_manifest_file_entry_.file_format)
     , sequence_number(data_manifest_file_entry_.added_sequence_number)
 {
     if (!position_deletes_objects.empty() && Poco::toUpperInPlace(data_manifest_file_entry_.file_format) != "PARQUET")
