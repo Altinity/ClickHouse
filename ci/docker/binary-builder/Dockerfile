@@ -1,14 +1,14 @@
-# docker build -t clickhouse/binary-builder .
+# docker build -t altinityinfra/binary-builder .
 ARG FROM_TAG
-FROM clickhouse/fasttest:$FROM_TAG
+FROM altinityinfra/fasttest:$FROM_TAG
 ENV CC=clang-${LLVM_VERSION}
 ENV CXX=clang++-${LLVM_VERSION}
 
 # If the cctools is updated, then first build it in the CI, then update here in a different commit
-COPY --from=clickhouse/cctools:859fb360308eb8ac47ad /cctools /cctools
+COPY --from=altinityinfra/cctools:7c093c1cde57d744be57 /cctools /cctools
 
 # We need OpenSSL FIPS in permissive mode for build on MasterCI
-COPY --from=clickhouse/cctools:859fb360308eb8ac47ad \
+COPY --from=altinityinfra/cctools:7c093c1cde57d744be57 \
   /opt/openssl-fips/openssl.cnf \
   /opt/openssl-fips/fipsmodule.cnf \
   /opt/openssl-fips/fips.so \

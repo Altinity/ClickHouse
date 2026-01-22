@@ -1,4 +1,5 @@
 import platform
+import os
 import sys
 import traceback
 from typing import Dict
@@ -17,6 +18,7 @@ from .result import Result, ResultInfo, _ResultS3
 from .runtime import RunConfig
 from .settings import Settings
 from .utils import Shell, Utils
+from ci.defs.defs import ArtifactNames
 
 assert Settings.CI_CONFIG_RUNS_ON
 
@@ -200,7 +202,9 @@ def _build_dockers(workflow, job_name):
 
 def _config_workflow(workflow: Workflow.Config, job_name) -> Result:
     # debug info
-    GH.print_log_in_group("GITHUB envs", Shell.get_output("env | grep GITHUB"))
+    GH.print_log_in_group(
+        "GITHUB envs", Shell.get_output("env | grep -P '^GITHUB_(?!.*TOKEN)'")
+    )
 
     def _check_yaml_up_to_date():
         print("Check workflows are up to date")
@@ -372,7 +376,12 @@ def _config_workflow(workflow: Workflow.Config, job_name) -> Result:
             )
         )
 
-    if workflow.enable_job_filtering_by_changes and results[-1].is_ok():
+    pr_allows_cache = "[x] <!---no_ci_cache" not in Info().pr_body
+    if (
+        workflow.enable_job_filtering_by_changes
+        and results[-1].is_ok()
+        and pr_allows_cache
+    ):
         print("Filter not affected jobs")
 
         def check_affected_jobs():
@@ -391,6 +400,27 @@ def _config_workflow(workflow: Workflow.Config, job_name) -> Result:
             affected_artifacts = []
             unaffected_jobs_with_artifacts = {}
             all_required_artifacts = set()
+
+            # NOTE (strtgbb): We always want these build artifacts for our report and regression tests.
+            # If we make FinishCIReport and regression tests into praktika jobs, we can remove this.
+            if "CIReport" in workflow.additional_jobs:
+                all_required_artifacts.update(
+                    [
+                        ArtifactNames.CH_AMD_RELEASE,
+                        ArtifactNames.CH_ARM_RELEASE,
+                    ]
+                )
+            if (
+                "Regression" in workflow.additional_jobs
+                and "regression"
+                not in workflow_config.custom_data.get("ci_exclude_tags", [])
+            ):
+                all_required_artifacts.update([ArtifactNames.CH_AMD_BINARY])
+                if "aarch64" not in workflow_config.custom_data.get(
+                    "ci_exclude_tags", []
+                ):
+                    all_required_artifacts.update([ArtifactNames.CH_ARM_BINARY])
+            print(f"Including artifacts for custom jobs [{all_required_artifacts}]")
 
             for job in workflow.jobs:
                 # Skip native Praktika jobs
@@ -453,6 +483,11 @@ def _config_workflow(workflow: Workflow.Config, job_name) -> Result:
         )
 
     if results[-1].is_ok() and workflow.enable_cache:
+        # We can't safely skip this code block entirely if enable_cache=True is set at the workflow level
+        # set DISABLE_CI_CACHE=1 to signal that the cache should be skipped
+        if not pr_allows_cache:
+            os.environ["DISABLE_CI_CACHE"] = "1"
+
         print("Cache Lookup")
         stop_watch = Utils.Stopwatch()
         info = ""
