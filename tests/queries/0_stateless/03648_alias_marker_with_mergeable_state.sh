@@ -13,7 +13,7 @@ FROM numbers(10);
 EOF
 
 echo "---- stage: with_mergeable_state (analyzer=0) ----"
-alias_marker_error_output=$($CLICKHOUSE_CLIENT --enable_analyzer=0 --stage with_mergeable_state --send_logs_level=fatal --query \
+alias_marker_error_output=$($CLICKHOUSE_CLIENT --enable_analyzer=0 --stage with_mergeable_state --query \
   "EXPLAIN header=1 SELECT sum(__aliasMarker(number*2-3,'foo')) AS x FROM numbers(10)" 2>&1)
 if grep -q "Function __aliasMarker is internal and supported only with the analyzer" <<<"${alias_marker_error_output}"
 then
