@@ -125,6 +125,7 @@ struct CatalogSettings
     String aws_access_key_id;
     String aws_secret_access_key;
     String region;
+    String namespaces;
 
     DB::SettingsChanges allChanged() const;
 };

@@ -67,7 +67,11 @@ template <StorageConfiguration BaseStorageConfiguration, typename DataLakeMetada
 class DataLakeConfiguration : public BaseStorageConfiguration, public std::enable_shared_from_this<StorageObjectStorageConfiguration>
 {
 public:
-    explicit DataLakeConfiguration(DataLakeStorageSettingsPtr settings_) : settings(settings_) {}
+    explicit DataLakeConfiguration(
+        DataLakeStorageSettingsPtr settings_,
+        std::optional<std::string> catalog_namespaces_ = std::nullopt)
+        : settings(settings_)
+        , catalog_namespaces(catalog_namespaces_ ? *catalog_namespaces_ : std::string("*")) {}
 
     bool isDataLakeConfiguration() const override { return true; }
 
@@ -287,6 +291,7 @@ public:
                 .aws_access_key_id = (*settings)[DataLakeStorageSetting::storage_aws_access_key_id].value,
                 .aws_secret_access_key = (*settings)[DataLakeStorageSetting::storage_aws_secret_access_key].value,
                 .region = (*settings)[DataLakeStorageSetting::storage_region].value,
+                .namespaces = catalog_namespaces,
             };
 
             return std::make_shared<DataLake::GlueCatalog>(
@@ -308,6 +313,7 @@ public:
                 (*settings)[DataLakeStorageSetting::storage_auth_header],
                 (*settings)[DataLakeStorageSetting::storage_oauth_server_uri].value,
                 (*settings)[DataLakeStorageSetting::storage_oauth_server_use_request_body].value,
+                catalog_namespaces,
                 context);
         }
 
@@ -366,6 +372,7 @@ private:
     DataLakeMetadataPtr current_metadata;
     LoggerPtr log = getLogger("DataLakeConfiguration");
     const DataLakeStorageSettingsPtr settings;
+    std::string catalog_namespaces;
 
     void assertInitializedDL() const
     {
