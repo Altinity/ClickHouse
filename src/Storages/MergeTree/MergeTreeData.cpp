@@ -6252,7 +6252,6 @@ void MergeTreeData::exportPartToTable(const PartitionCommand & command, ContextP
     }
 
     exportPartToTable(part_name, dest_storage, generateSnowflakeIDString(), query_context);
-    return;
 }
 
 void MergeTreeData::exportPartToTable(

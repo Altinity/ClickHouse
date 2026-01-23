@@ -384,9 +384,8 @@ void ASTAlterCommand::formatImpl(WriteBuffer & ostr, const FormatSettings & sett
                 else
                 {
                     if (!to_database.empty())
-                    {
                         ostr << backQuoteIfNeed(to_database) << ".";
-                    }
+
                     ostr << backQuoteIfNeed(to_table);
                 }
                 return;

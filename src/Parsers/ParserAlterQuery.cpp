@@ -559,15 +559,11 @@ bool ParserAlterCommand::parseImpl(Pos & pos, ASTPtr & node, Expected & expected
                     ParserFunction table_function_parser(/*allow_function_parameters=*/true, /*is_table_function=*/true);
 
                     if (!table_function_parser.parse(pos, export_table_function, expected))
-                    {
                         return false;
-                    }
 
                     if (s_partition_by.ignore(pos, expected))
-                    {
                         if (!parser_exp_elem.parse(pos, export_table_function_partition_by_expr, expected))
                             return false;
-                    }
 
                     command->to_table_function = export_table_function.get();
                     command->partition_by_expr = export_table_function_partition_by_expr.get();
