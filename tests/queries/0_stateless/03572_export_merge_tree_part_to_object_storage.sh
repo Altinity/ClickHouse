@@ -31,6 +31,7 @@ mt_complex_expr="mt_complex_expr_${RANDOM}"
 s3_complex_expr_export="s3_complex_expr_export_${RANDOM}"
 mt_ephemeral="mt_ephemeral_${RANDOM}"
 s3_ephemeral_export="s3_ephemeral_export_${RANDOM}"
+s3_mixed_export_table_function="s3_mixed_export_table_function_${RANDOM}"
 
 query() {
     $CLICKHOUSE_CLIENT --query "$1"
@@ -244,6 +245,15 @@ query "SELECT id, value, doubled, tripled, tag FROM $mt_mixed ORDER BY value"
 
 echo "---- Verify mixed columns exported to S3 (should match source)"
 query "SELECT id, value, doubled, tripled, tag FROM $s3_mixed_export ORDER BY value"
+
+echo "---- Test Export to Table Function with mixed columns"
+
+query "ALTER TABLE $mt_mixed EXPORT PART '$mixed_part' TO TABLE FUNCTION s3(s3_conn, filename='$s3_mixed_export_table_function', format=Parquet, partition_strategy='hive') PARTITION BY id SETTINGS allow_experimental_export_merge_tree_part = 1"
+
+sleep 3
+
+echo "---- Verify mixed columns exported to S3"
+query "SELECT * FROM s3(s3_conn, filename='$s3_mixed_export_table_function/**.parquet', format=Parquet) ORDER BY value"
 
 echo "---- Test Complex Expressions in computed columns"
 query "CREATE TABLE $mt_complex_expr (
