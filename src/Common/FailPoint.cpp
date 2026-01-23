@@ -88,6 +88,7 @@ static struct InitFiu
     ONCE(execute_query_calling_empty_set_result_func_on_exception) \
     ONCE(receive_timeout_on_table_status_response) \
     ONCE(delta_kernel_fail_literal_visitor) \
+    ONCE(column_aggregate_function_ensureOwnership_exception) \
     REGULAR(keepermap_fail_drop_data) \
     REGULAR(lazy_pipe_fds_fail_close) \
     PAUSEABLE(infinite_sleep) \
@@ -117,7 +118,8 @@ static struct InitFiu
     REGULAR(sleep_in_logs_flush) \
     ONCE(smt_commit_exception_before_op) \
     ONCE(backup_add_empty_memory_table) \
-    REGULAR(refresh_task_stop_racing_for_running_refresh)
+    REGULAR(refresh_task_stop_racing_for_running_refresh) \
+    ONCE(database_iceberg_gcs)
 
 
 namespace FailPoints
