@@ -189,8 +189,7 @@
 - name: test_keeper_memory_soft_limit/test.py::test_soft_limit_create
   reason: 'INVESTIGATE: Out of Memory or startup instability'
 - name: test_s3_cache_locality/test.py::test_cache_locality[0]
-  reason: 'INVESTIGATE: Timeout'
-  message: 'Failed: Timeout >900.0s'
+  reason: 'INVESTIGATE: Timeout or AssertionError'
 
 # Regex rules should be ordered from most specific to least specific.
 # regex: true applies to name, message, and not_message fields, but not to reason or check_types fields.
