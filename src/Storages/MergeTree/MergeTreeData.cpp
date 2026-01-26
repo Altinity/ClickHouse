@@ -217,6 +217,8 @@ namespace Setting
     extern const SettingsMergeTreePartExportFileAlreadyExistsPolicy export_merge_tree_part_file_already_exists_policy;
     extern const SettingsBool output_format_parallel_formatting;
     extern const SettingsBool output_format_parquet_parallel_encoding;
+    extern const SettingsBool export_merge_tree_part_throw_on_pending_mutations;
+    extern const SettingsBool export_merge_tree_part_throw_on_pending_patch_parts;
 }
 
 namespace MergeTreeSetting
@@ -345,6 +347,7 @@ namespace ErrorCodes
     extern const int TOO_LARGE_LIGHTWEIGHT_UPDATES;
     extern const int UNKNOWN_TABLE;
     extern const int FILE_ALREADY_EXISTS;
+    extern const int PENDING_MUTATIONS_NOT_ALLOWED;
 }
 
 static void checkSuspiciousIndices(const ASTFunction * index_function)
@@ -6451,6 +6454,7 @@ void MergeTreeData::exportPartToTable(
     const StorageID & destination_storage_id,
     const String & transaction_id,
     ContextPtr query_context,
+    bool allow_outdated_parts,
     std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback)
 {
     auto dest_storage = DatabaseCatalog::instance().getTable(destination_storage_id, query_context);
@@ -6488,6 +6492,43 @@ void MergeTreeData::exportPartToTable(
     if (!part)
         throw Exception(ErrorCodes::NO_SUCH_DATA_PART, "No such data part '{}' to export in table '{}'",
                         part_name, getStorageID().getFullTableName());
+
+    if (part->getState() == MergeTreeDataPartState::Outdated && !allow_outdated_parts)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "Part {} is in the outdated state and cannot be exported",
+            part_name);
+
+    const bool throw_on_pending_mutations = query_context->getSettingsRef()[Setting::export_merge_tree_part_throw_on_pending_mutations];
+    const bool throw_on_pending_patch_parts = query_context->getSettingsRef()[Setting::export_merge_tree_part_throw_on_pending_patch_parts];
+
+    MergeTreeData::IMutationsSnapshot::Params mutations_snapshot_params
+    {
+        .metadata_version = source_metadata_ptr->getMetadataVersion(),
+        .min_part_metadata_version = part->getMetadataVersion(),
+        .need_data_mutations = throw_on_pending_mutations,
+        .need_alter_mutations = throw_on_pending_mutations || throw_on_pending_patch_parts,
+        .need_patch_parts = throw_on_pending_patch_parts,
+    };
+
+    const auto mutations_snapshot = getMutationsSnapshot(mutations_snapshot_params);
+
+    const auto alter_conversions = getAlterConversionsForPart(part, mutations_snapshot, query_context);
+
+    /// re-check `throw_on_pending_mutations` because `pending_mutations` might have been filled due to `throw_on_pending_patch_parts`
+    if (throw_on_pending_mutations && alter_conversions->hasMutations())
+    {
+        throw Exception(ErrorCodes::PENDING_MUTATIONS_NOT_ALLOWED,
+            "Part {} can not be exported because there are pending mutations. Either wait for the mutations to be applied or set `export_merge_tree_part_throw_on_pending_mutations` to false",
+            part_name);
+    }
+
+    if (alter_conversions->hasPatches())
+    {
+        throw Exception(ErrorCodes::PENDING_MUTATIONS_NOT_ALLOWED,
+            "Part {} can not be exported because there are pending patch parts. Either wait for the patch parts to be applied or set `export_merge_tree_part_throw_on_pending_patch_parts` to false",
+            part_name);
+    }
 
     {
         const auto format_settings = getFormatSettings(query_context);

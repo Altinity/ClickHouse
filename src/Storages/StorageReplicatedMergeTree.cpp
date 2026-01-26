@@ -205,6 +205,8 @@ namespace Setting
     extern const SettingsMergeTreePartExportFileAlreadyExistsPolicy export_merge_tree_part_file_already_exists_policy;
     extern const SettingsUInt64 export_merge_tree_part_max_bytes_per_file;
     extern const SettingsUInt64 export_merge_tree_part_max_rows_per_file;
+    extern const SettingsBool export_merge_tree_part_throw_on_pending_mutations;
+    extern const SettingsBool export_merge_tree_part_throw_on_pending_patch_parts;
 }
 
 namespace MergeTreeSetting
@@ -311,6 +313,7 @@ namespace ErrorCodes
     extern const int CANNOT_FORGET_PARTITION;
     extern const int TIMEOUT_EXCEEDED;
     extern const int INVALID_SETTING_VALUE;
+    extern const int PENDING_MUTATIONS_NOT_ALLOWED;
 }
 
 namespace ServerSetting
@@ -8216,18 +8219,54 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 
     ops.emplace_back(zkutil::makeCreateRequest(partition_exports_path, "", zkutil::CreateMode::Persistent));
 
-    auto data_parts_lock = readLockParts();
+    DataPartsVector parts;
 
-    const auto parts = getDataPartsVectorInPartitionForInternalUsage(MergeTreeDataPartState::Active, partition_id, data_parts_lock);
+    {
+        auto data_parts_lock = lockParts();
+        parts = getDataPartsVectorInPartitionForInternalUsage(MergeTreeDataPartState::Active, partition_id, data_parts_lock);
+    }
 
     if (parts.empty())
     {
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Partition {} doesn't exist", partition_id);
     }
 
+    const bool throw_on_pending_mutations = query_context->getSettingsRef()[Setting::export_merge_tree_part_throw_on_pending_mutations];
+    const bool throw_on_pending_patch_parts = query_context->getSettingsRef()[Setting::export_merge_tree_part_throw_on_pending_patch_parts];
+
+    MergeTreeData::IMutationsSnapshot::Params mutations_snapshot_params
+    {
+        .metadata_version = getInMemoryMetadataPtr()->getMetadataVersion(),
+        .min_part_metadata_version = MergeTreeData::getMinMetadataVersion(parts),
+        .need_data_mutations = throw_on_pending_mutations,
+        .need_alter_mutations = throw_on_pending_mutations || throw_on_pending_patch_parts,
+        .need_patch_parts = throw_on_pending_patch_parts,
+    };
+
+    const auto mutations_snapshot = getMutationsSnapshot(mutations_snapshot_params);
+
     std::vector<String> part_names;
     for (const auto & part : parts)
     {
+        const auto alter_conversions = getAlterConversionsForPart(part, mutations_snapshot, query_context);
+
+        /// re-check `throw_on_pending_mutations` because `pending_mutations` might have been filled due to `throw_on_pending_patch_parts`
+        if (alter_conversions->hasMutations() && throw_on_pending_mutations)
+        {
+            throw Exception(ErrorCodes::PENDING_MUTATIONS_NOT_ALLOWED,
+                "Partition {} can not be exported because the part {} has pending mutations. Either wait for the mutations to be applied or set `export_merge_tree_part_throw_on_pending_mutations` to false",
+                partition_id,
+                part->name);
+        }
+
+        if (alter_conversions->hasPatches())
+        {
+            throw Exception(ErrorCodes::PENDING_MUTATIONS_NOT_ALLOWED,
+                "Partition {} can not be exported because the part {} has pending patch parts. Either wait for the patch parts to be applied or set `export_merge_tree_part_throw_on_pending_patch_parts` to false",
+                partition_id,
+                part->name);
+        }
+
         part_names.push_back(part->name);
     }
 

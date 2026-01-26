@@ -1030,6 +1030,7 @@ public:
         const StorageID & destination_storage_id,
         const String & transaction_id,
         ContextPtr query_context,
+        bool allow_outdated_parts = false,
         std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback = {});
 
     void killExportPart(const String & transaction_id);

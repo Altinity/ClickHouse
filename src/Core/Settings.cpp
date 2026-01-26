@@ -7342,6 +7342,12 @@ This is not a hard limit, and it highly depends on the output format granularity
 Maximum number of rows to write to a single file when exporting a merge tree part. 0 means no limit.
 This is not a hard limit, and it highly depends on the output format granularity and input source chunk size.
 )", 0) \
+    DECLARE(Bool, export_merge_tree_part_throw_on_pending_mutations, true, R"(
+Throw an error if there are pending mutations when exporting a merge tree part.
+)", 0) \
+    DECLARE(Bool, export_merge_tree_part_throw_on_pending_patch_parts, true, R"(
+Throw an error if there are pending patch parts when exporting a merge tree part.
+)", 0) \
     \
     /* ####################################################### */ \
     /* ########### START OF EXPERIMENTAL FEATURES ############ */ \

@@ -60,6 +60,18 @@ Source and destination tables must be 100% compatible:
 - **Default**: `0`
 - **Description**: Maximum number of rows to write to a single file when exporting a merge tree part. 0 means no limit. This is not a hard limit, and it highly depends on the output format granularity and input source chunk size. Using this might break idempotency, use it with care.
 
+### export_merge_tree_part_throw_on_pending_mutations
+
+- **Type**: `bool`
+- **Default**: `true`
+- **Description**: If set to true, throws if pending mutations exists for a given part. Note that by default mutations are applied to all parts, which means that if a mutation in practice would only affetct part/partition x, all the other parts/partition will throw upon export. The exception is when the `IN PARTITION` clause was used in the mutation command. Note the `IN PARTITION` clause is not properly implemented for plain MergeTree tables.
+
+### export_merge_tree_part_throw_on_pending_patch_parts
+
+- **Type**: `bool`
+- **Default**: `true`
+- **Description**: If set to true, throws if pending patch parts exists for a given part. Note that by default mutations are applied to all parts, which means that if a mutation in practice would only affetct part/partition x, all the other parts/partition will throw upon export. The exception is when the `IN PARTITION` clause was used in the mutation command. Note the `IN PARTITION` clause is not properly implemented for plain MergeTree tables.
+
 ## Examples
 
 ### Basic Export to S3
