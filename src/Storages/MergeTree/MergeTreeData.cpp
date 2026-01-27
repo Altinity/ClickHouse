@@ -6272,7 +6272,7 @@ void MergeTreeData::exportPartToTable(
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Exporting to the same table is not allowed");
     }
 
-    exportPartToTable(part_name, dest_storage, transaction_id, query_context, completion_callback);
+    exportPartToTable(part_name, dest_storage, transaction_id, query_context, allow_outdated_parts, completion_callback);
 }
 
 void MergeTreeData::exportPartToTable(
@@ -6280,6 +6280,7 @@ void MergeTreeData::exportPartToTable(
     const StoragePtr & dest_storage,
     const String & transaction_id,
     ContextPtr query_context,
+    bool allow_outdated_parts,
     std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback)
 {
     if (!dest_storage->supportsImport())
