@@ -78,7 +78,7 @@
 1	5	10	15	TEST
 1	10	20	30	PROD
 ---- Test Export to Table Function with mixed columns
---- Verify mixed columns exported to S3
+---- Verify mixed columns exported to S3
 1	5	10	15	TEST
 1	10	20	30	PROD
 ---- Test Complex Expressions in computed columns
