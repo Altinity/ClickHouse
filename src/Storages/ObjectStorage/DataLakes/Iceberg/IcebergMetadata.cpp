@@ -1077,7 +1077,7 @@ void IcebergMetadata::addDeleteTransformers(
 
             auto [delete_storage_to_use, resolved_delete_key] = resolveObjectStorageForPath(
                 persistent_components.table_location, delete_file.file_path, object_storage, *secondary_storages, local_context);
-            
+
             PathWithMetadata delete_file_object(resolved_delete_key, std::nullopt, delete_file.file_path, delete_storage_to_use);
             {
                 auto schema_read_buffer = createReadBuffer(delete_file_object, delete_storage_to_use, local_context, log);
@@ -1198,8 +1198,7 @@ ColumnMapperPtr IcebergMetadata::getColumnMapperForObject(ObjectInfoPtr object_i
     IcebergDataObjectInfo * iceberg_object_info = dynamic_cast<IcebergDataObjectInfo *>(object_info.get());
     if (!iceberg_object_info)
         return nullptr;
-    auto configuration_ptr = configuration.lock();
-    if (Poco::toLower(configuration_ptr->getFormat()) != "parquet")
+    if (Poco::toLower(iceberg_object_info->file_format) != "parquet")
         return nullptr;
 
     return persistent_components.schema_processor->getColumnMapperById(iceberg_object_info->underlying_format_read_schema_id);
