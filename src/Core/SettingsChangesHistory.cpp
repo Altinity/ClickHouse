@@ -64,6 +64,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
             {"cluster_table_function_split_granularity", "file", "file", "New setting."},
             {"cluster_table_function_buckets_batch_size", 0, 0, "New setting."},
+            {"iceberg_partition_timezone", "", "", "New setting."},
         });
         addSettingsChanges(settings_changes_history, "25.8",
         {
