@@ -113,7 +113,7 @@ def create_s3_table(node, s3_table):
 
 
 def create_tables_and_insert_data(node, mt_table, s3_table, replica_name):
-    node.query(f"CREATE TABLE {mt_table} (id UInt64, year UInt16) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', '{replica_name}') PARTITION BY year ORDER BY tuple()")
+    node.query(f"CREATE TABLE {mt_table} (id UInt64, year UInt16) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', '{replica_name}') PARTITION BY year ORDER BY tuple() SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1")
     node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020), (3, 2020), (4, 2021)")
 
     create_s3_table(node, s3_table)
@@ -720,33 +720,238 @@ def test_multiple_exports_within_a_single_query(cluster):
         """
     ) == "COMPLETED\n", "Export should be marked as COMPLETED"
 
-# def test_source_mutations_during_export_snapshot(cluster):
-#     node = cluster.instances["replica1"]
 
-#     mt_table = "mutations_snapshot_mt_table"
-#     s3_table = "mutations_snapshot_s3_table"
+def test_pending_mutations_throw_before_export_partition(cluster):
+    """Test that pending mutations before export partition throw an error."""
+    node = cluster.instances["replica1"]
 
-#     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
+    mt_table = "pending_mutations_throw_partition_mt_table"
+    s3_table = "pending_mutations_throw_partition_s3_table"
 
-#     # Ensure export sees a consistent snapshot at start time even if we mutate the source later
-#     with PartitionManager() as pm:
-#         pm.add_network_delay(node, delay_ms=5000)
+    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
-#         # Start export of 2020
-#         node.query(
-#             f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table};"
-#         )
+    node.query(f"SYSTEM STOP MERGES {mt_table}")
 
-#     # Mutate the source after export started (delete the same partition)
-#     node.query(f"ALTER TABLE {mt_table} DROP COLUMN id")
+    node.query(f"ALTER TABLE {mt_table} UPDATE id = id + 100 WHERE year = 2020")
 
-#     # assert the mutation has been applied AND the data has not been exported yet
-#     assert node.query(f"SELECT count() FROM {mt_table} WHERE year = 2020") == '0\n', "Mutation has not been applied"
-#     assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == '0\n', "Data has been exported"
+    mutations = node.query(f"SELECT count() FROM system.mutations WHERE table = '{mt_table}' AND is_done = 0")
+    assert mutations.strip() != '0', "Mutation should be pending"
 
-#     # Wait for export to finish and then verify destination still reflects the original snapshot (3 rows)
-#     time.sleep(5)
-#     assert node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020") == '3\n', "Export did not preserve snapshot at start time after source mutation"
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
+        f"SETTINGS export_merge_tree_part_throw_on_pending_mutations=true"
+    )
+
+    assert "PENDING_MUTATIONS_NOT_ALLOWED" in error, f"Expected error about pending mutations, got: {error}"
+
+
+def test_pending_mutations_skip_before_export_partition(cluster):
+    """Test that pending mutations before export partition are skipped with throw_on_pending_mutations=false."""
+    node = cluster.instances["replica1"]
+
+    mt_table = "pending_mutations_skip_partition_mt_table"
+    s3_table = "pending_mutations_skip_partition_s3_table"
+
+    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
+
+    node.query(f"SYSTEM STOP MERGES {mt_table}")
+
+    node.query(f"ALTER TABLE {mt_table} UPDATE id = id + 100 WHERE year = 2020")
+
+    mutations = node.query(f"SELECT count() FROM system.mutations WHERE table = '{mt_table}' AND is_done = 0")
+    assert mutations.strip() != '0', "Mutation should be pending"
+
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
+        f"SETTINGS export_merge_tree_part_throw_on_pending_mutations=false"
+    )
+
+    wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED")
+
+    result = node.query(f"SELECT id FROM {s3_table} WHERE year = 2020 ORDER BY id")
+    assert "101" not in result and "102" not in result and "103" not in result, \
+        "Export should contain original data before mutation"
+    assert "1\n2\n3" in result, "Export should contain original data"
+
+
+def test_pending_patch_parts_throw_before_export_partition(cluster):
+    """Test that pending patch parts before export partition throw an error with default settings."""
+    node = cluster.instances["replica1"]
+
+    mt_table = "pending_patches_throw_partition_mt_table"
+    s3_table = "pending_patches_throw_partition_s3_table"
+
+    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
+
+    node.query(f"SYSTEM STOP MERGES {mt_table}")
+
+    node.query(f"UPDATE {mt_table} SET id = id + 100 WHERE year = 2020")
+
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
+    )
+
+    node.query(f"DROP TABLE {mt_table}")
+
+    assert "PENDING_MUTATIONS_NOT_ALLOWED" in error or "pending patch parts" in error.lower(), \
+        f"Expected error about pending patch parts, got: {error}"
+
+
+def test_pending_patch_parts_skip_before_export_partition(cluster):
+    """Test that pending patch parts before export partition are skipped with throw_on_pending_patch_parts=false."""
+    node = cluster.instances["replica1"]
+
+    mt_table = "pending_patches_skip_partition_mt_table"
+    s3_table = "pending_patches_skip_partition_s3_table"
+
+    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
+
+    node.query(f"SYSTEM STOP MERGES {mt_table}")
+
+    node.query(f"UPDATE {mt_table} SET id = id + 100 WHERE year = 2020")
+
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
+        f"SETTINGS export_merge_tree_part_throw_on_pending_patch_parts=false"
+    )
+
+    wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED")
+
+    result = node.query(f"SELECT id FROM {s3_table} WHERE year = 2020 ORDER BY id")
+    assert "1\n2\n3" in result, "Export should contain original data before patch"
+
+    node.query(f"DROP TABLE {mt_table}")
+
+
+def test_mutations_after_export_partition_started(cluster):
+    """Test that mutations applied after export partition starts don't affect the exported data."""
+    node = cluster.instances["replica1"]
+
+    mt_table = "mutations_after_export_partition_mt_table"
+    s3_table = "mutations_after_export_partition_s3_table"
+
+    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
+
+    # Block traffic to MinIO to delay export
+    minio_ip = cluster.minio_ip
+    minio_port = cluster.minio_port
+
+    with PartitionManager() as pm:
+        pm_rule_reject_responses = {
+            "destination": node.ip_address,
+            "source_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm._add_rule(pm_rule_reject_responses)
+
+        pm_rule_reject_requests = {
+            "destination": minio_ip,
+            "destination_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm._add_rule(pm_rule_reject_requests)
+
+        node.query(
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
+            f"SETTINGS export_merge_tree_part_throw_on_pending_mutations=true"
+        )
+
+        # Wait for export to start
+        wait_for_export_to_start(node, mt_table, s3_table, "2020")
+
+        node.query(f"ALTER TABLE {mt_table} UPDATE id = id + 100 WHERE year = 2020")
+
+    wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED")
+
+    result = node.query(f"SELECT id FROM {s3_table} WHERE year = 2020 ORDER BY id")
+    assert "1\n2\n3" in result, "Export should contain original data before mutation"
+    assert "101" not in result, "Export should not contain mutated data"
+
+
+def test_patch_parts_after_export_partition_started(cluster):
+    """Test that patch parts created after export partition starts don't affect the exported data."""
+    node = cluster.instances["replica1"]
+
+    mt_table = "patches_after_export_partition_mt_table"
+    s3_table = "patches_after_export_partition_s3_table"
+
+    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
+
+    # Block traffic to MinIO to delay export
+    minio_ip = cluster.minio_ip
+    minio_port = cluster.minio_port
+
+    with PartitionManager() as pm:
+        pm_rule_reject_responses = {
+            "destination": node.ip_address,
+            "source_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm._add_rule(pm_rule_reject_responses)
+
+        pm_rule_reject_requests = {
+            "destination": minio_ip,
+            "destination_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm._add_rule(pm_rule_reject_requests)
+
+        node.query(
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
+        )
+
+        # Wait for export to start
+        wait_for_export_to_start(node, mt_table, s3_table, "2020")
+
+        node.query(f"UPDATE {mt_table} SET id = id + 100 WHERE year = 2020")
+
+    wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED")
+
+    result = node.query(f"SELECT id FROM {s3_table} WHERE year = 2020 ORDER BY id")
+    assert "1\n2\n3" in result, "Export should contain original data before patch"
+    assert "101" not in result, "Export should not contain patched data"
+
+    node.query(f"DROP TABLE {mt_table}")
+
+
+def test_mutation_in_partition_clause(cluster):
+    """Test that mutations limited to specific partitions using IN PARTITION clause
+    allow exports of unaffected partitions to succeed."""
+    node = cluster.instances["replica1"]
+
+    mt_table = "mutation_in_partition_clause_mt_table"
+    s3_table = "mutation_in_partition_clause_s3_table"
+
+    create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
+
+    node.query(f"SYSTEM STOP MERGES {mt_table}")
+
+    # Issue a mutation that uses IN PARTITION to limit it to partition 2020
+    node.query(f"ALTER TABLE {mt_table} UPDATE id = id + 100 IN PARTITION '2020' WHERE year = 2020")
+
+    # Verify mutation is pending for 2020
+    mutations = node.query(
+        f"SELECT count() FROM system.mutations WHERE table = '{mt_table}' AND is_done = 0"
+    )
+    assert mutations.strip() != '0', "Mutation should be pending"
+
+    # Export of 2020 should fail (it has pending mutations)
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
+        f"SETTINGS export_merge_tree_part_throw_on_pending_mutations=true"
+    )
+    assert "PENDING_MUTATIONS_NOT_ALLOWED" in error, f"Expected error about pending mutations for partition 2020, got: {error}"
+
+    # Export of 2021 should succeed (no mutations affecting it)
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2021' TO TABLE {s3_table} "
+        f"SETTINGS export_merge_tree_part_throw_on_pending_mutations=true"
+    )
+
+    wait_for_export_status(node, mt_table, s3_table, "2021", "COMPLETED")
+
+    result = node.query(f"SELECT id FROM {s3_table} WHERE year = 2021 ORDER BY id")
+    assert "4" in result, "Export of partition 2021 should contain original data"
 
 
 def test_export_partition_with_mixed_computed_columns(cluster):

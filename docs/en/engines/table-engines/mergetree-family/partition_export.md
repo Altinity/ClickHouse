@@ -70,6 +70,18 @@ TO TABLE [destination_database.]destination_table
   - `error` - Throw an error if the file already exists
   - `overwrite` - Overwrite the file
 
+### export_merge_tree_part_throw_on_pending_mutations
+
+- **Type**: `bool`
+- **Default**: `true`
+- **Description**: If set to true, throws if pending mutations exists for a given part. Note that by default mutations are applied to all parts, which means that if a mutation in practice would only affetct part/partition x, all the other parts/partition will throw upon export. The exception is when the `IN PARTITION` clause was used in the mutation command. Note the `IN PARTITION` clause is not properly implemented for plain MergeTree tables.
+
+### export_merge_tree_part_throw_on_pending_patch_parts
+
+- **Type**: `bool`
+- **Default**: `true`
+- **Description**: If set to true, throws if pending patch parts exists for a given part. Note that by default mutations are applied to all parts, which means that if a mutation in practice would only affetct part/partition x, all the other parts/partition will throw upon export. The exception is when the `IN PARTITION` clause was used in the mutation command. Note the `IN PARTITION` clause is not properly implemented for plain MergeTree tables.
+
 ## Examples
 
 ### Basic Export to S3
