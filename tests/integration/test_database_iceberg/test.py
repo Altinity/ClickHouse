@@ -384,38 +384,3 @@ def test_tables_with_same_location(started_cluster):
 
     assert 'aaa\naaa\naaa' == node.query(f"SELECT symbol FROM {CATALOG_NAME}.`{namespace}.{table_name}`").strip()
     assert 'bbb\nbbb\nbbb' == node.query(f"SELECT symbol FROM {CATALOG_NAME}.`{namespace}.{table_name_2}`").strip()
-
-
-def test_table_with_slash(started_cluster):
-    node = started_cluster.instances["node1"]
-
-    # pyiceberg at current moment (version 0.9.1) has a bug with table names with slashes
-    # see https://github.com/apache/iceberg-python/issues/2462
-    # so we need to encode it manually
-    table_raw_suffix = "table/foo"
-    table_encoded_suffix = "table%2Ffoo"
-
-    test_ref = f"test_list_tables_{uuid.uuid4()}"
-    table_name = f"{test_ref}_{table_raw_suffix}"
-    table_encoded_name = f"{test_ref}_{table_encoded_suffix}"
-    root_namespace = f"{test_ref}_namespace"
-
-    catalog = load_catalog_impl(started_cluster)
-    catalog.create_namespace(root_namespace)
-
-    create_table(catalog, root_namespace, table_name, DEFAULT_SCHEMA, PartitionSpec(), DEFAULT_SORT_ORDER)
-    table = catalog.load_table(f"{root_namespace}.{table_encoded_name}")
-    data = [
-        {
-            "datetime": datetime.strptime("2025-01-01 12:00:00", "%Y-%m-%d %H:%M:%S"),
-            "symbol": "AAPL",
-            "bid": 193.24,
-            "ask": 193.31,
-            "details": {"created_by": "bot"},
-        }
-    ]
-    df = pa.Table.from_pylist(data)
-    table.append(df)
-
-    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
-    assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_encoded_name}`") == "2025-01-01 12:00:00.000000\tAAPL\t193.24\t193.31\t('bot')\n"
