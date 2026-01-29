@@ -13,6 +13,8 @@ mt_table_roundtrip="mt_table_roundtrip_${RANDOM}"
 big_table="big_table_${RANDOM}"
 big_destination_max_bytes="big_destination_max_bytes_${RANDOM}"
 big_destination_max_rows="big_destination_max_rows_${RANDOM}"
+tf_schema_inherit="tf_schema_inherit_${RANDOM}"
+tf_schema_explicit="tf_schema_explicit_${RANDOM}"
 mt_table_tf="mt_table_tf_${RANDOM}"
 mt_alias="mt_alias_${RANDOM}"
 mt_materialized="mt_materialized_${RANDOM}"
@@ -24,6 +26,7 @@ mt_complex_expr="mt_complex_expr_${RANDOM}"
 s3_complex_expr_export="s3_complex_expr_export_${RANDOM}"
 mt_ephemeral="mt_ephemeral_${RANDOM}"
 s3_ephemeral_export="s3_ephemeral_export_${RANDOM}"
+s3_mixed_export_table_function="s3_mixed_export_table_function_${RANDOM}"
 
 query() {
     $CLICKHOUSE_CLIENT --query "$1"
@@ -38,6 +41,8 @@ query "INSERT INTO $mt_table VALUES (1, 2020), (2, 2020), (3, 2020), (4, 2021)"
 echo "---- Export 2020_1_1_0 and 2021_2_2_0"
 query "ALTER TABLE $mt_table EXPORT PART '2020_1_1_0' TO TABLE $s3_table SETTINGS allow_experimental_export_merge_tree_part = 1"
 query "ALTER TABLE $mt_table EXPORT PART '2021_2_2_0' TO TABLE $s3_table SETTINGS allow_experimental_export_merge_tree_part = 1"
+
+sleep 3
 
 echo "---- Both data parts should appear"
 query "SELECT * FROM $s3_table ORDER BY id"
@@ -93,15 +98,18 @@ query "CREATE TABLE $big_destination_max_rows(id UInt64, data String, year UInt1
 # 4194304 is a number that came up during multiple iterations, it does not really mean anything (aside from the fact that the below numbers depend on it)
 query "INSERT INTO $big_table SELECT number AS id, repeat('x', 100) AS data, 2025 AS year FROM numbers(4194304)"
 
+query "INSERT INTO $big_table SELECT number AS id, repeat('x', 100) AS data, 2026 AS year FROM numbers(4194304)"
+
 # make sure we have only one part
 query "OPTIMIZE TABLE $big_table FINAL"
 
-big_part=$(query "SELECT name FROM system.parts WHERE database = currentDatabase() AND table = '$big_table' AND partition_id = '2025' AND active = 1 ORDER BY name LIMIT 1" | tr -d '\n')
+big_part_max_bytes=$(query "SELECT name FROM system.parts WHERE database = currentDatabase() AND table = '$big_table' AND partition_id = '2025' AND active = 1 ORDER BY name LIMIT 1" | tr -d '\n')
+big_part_max_rows=$(query "SELECT name FROM system.parts WHERE database = currentDatabase() AND table = '$big_table' AND partition_id = '2026' AND active = 1 ORDER BY name LIMIT 1" | tr -d '\n')
 
 # this should generate ~4 files
-query "ALTER TABLE $big_table EXPORT PART '$big_part' TO TABLE $big_destination_max_bytes SETTINGS allow_experimental_export_merge_tree_part = 1, export_merge_tree_part_max_bytes_per_file=3500000, output_format_parquet_row_group_size_bytes=1000000"
+query "ALTER TABLE $big_table EXPORT PART '$big_part_max_bytes' TO TABLE $big_destination_max_bytes SETTINGS allow_experimental_export_merge_tree_part = 1, export_merge_tree_part_max_bytes_per_file=3500000, output_format_parquet_row_group_size_bytes=1000000"
 # export_merge_tree_part_max_rows_per_file = 1048576 (which is 4194304/4) to generate 4 files
-query "ALTER TABLE $big_table EXPORT PART '$big_part' TO TABLE $big_destination_max_rows SETTINGS allow_experimental_export_merge_tree_part = 1, export_merge_tree_part_max_rows_per_file=1048576"
+query "ALTER TABLE $big_table EXPORT PART '$big_part_max_rows' TO TABLE $big_destination_max_rows SETTINGS allow_experimental_export_merge_tree_part = 1, export_merge_tree_part_max_rows_per_file=1048576"
 
 # sleeping a little longer because it will write multiple files, trying not be flaky
 sleep 20
@@ -110,15 +118,34 @@ echo "---- Count files in big_destination_max_bytes, should be 5 (4 parquet, 1 c
 query "SELECT count(_file) FROM s3(s3_conn, filename='$big_destination_max_bytes/**', format='One')"
 
 echo "---- Count rows in big_table and big_destination_max_bytes"
-query "SELECT COUNT() from $big_table"
+query "SELECT COUNT() from $big_table WHERE year = 2025"
 query "SELECT COUNT() from $big_destination_max_bytes"
 
 echo "---- Count files in big_destination_max_rows, should be 5 (4 parquet, 1 commit)"
 query "SELECT count(_file) FROM s3(s3_conn, filename='$big_destination_max_rows/**', format='One')"
 
 echo "---- Count rows in big_table and big_destination_max_rows"
-query "SELECT COUNT() from $big_table"
+query "SELECT COUNT() from $big_table WHERE year = 2026"
 query "SELECT COUNT() from $big_destination_max_rows"
+
+echo "---- Table function with schema inheritance (no schema specified)"
+query "CREATE TABLE $mt_table_tf (id UInt64, value String, year UInt16) ENGINE = MergeTree() PARTITION BY year ORDER BY tuple()"
+query "INSERT INTO $mt_table_tf VALUES (100, 'test1', 2022), (101, 'test2', 2022), (102, 'test3', 2023)"
+
+query "ALTER TABLE $mt_table_tf EXPORT PART '2022_1_1_0' TO TABLE FUNCTION s3(s3_conn, filename='$tf_schema_inherit', format='Parquet', partition_strategy='hive') PARTITION BY year SETTINGS allow_experimental_export_merge_tree_part = 1"
+
+sleep 3
+
+echo "---- Data should be exported with inherited schema"
+query "SELECT * FROM s3(s3_conn, filename='$tf_schema_inherit/**.parquet') ORDER BY id"
+
+echo "---- Table function with explicit compatible schema"
+query "ALTER TABLE $mt_table_tf EXPORT PART '2023_2_2_0' TO TABLE FUNCTION s3(s3_conn, filename='$tf_schema_explicit', format='Parquet', structure='id UInt64, value String, year UInt16', partition_strategy='hive') PARTITION BY year SETTINGS allow_experimental_export_merge_tree_part = 1"
+
+sleep 3
+
+echo "---- Data should be exported with explicit schema"
+query "SELECT * FROM s3(s3_conn, filename='$tf_schema_explicit/**.parquet') ORDER BY id"
 
 echo "---- Test ALIAS columns export"
 query "CREATE TABLE $mt_alias (a UInt32, arr Array(UInt64), arr_1 UInt64 ALIAS arr[1]) ENGINE = MergeTree() PARTITION BY a ORDER BY (a, arr[1]) SETTINGS index_granularity = 1"
@@ -214,6 +241,15 @@ query "SELECT id, value, doubled, tripled, tag FROM $mt_mixed ORDER BY value"
 echo "---- Verify mixed columns exported to S3 (should match source)"
 query "SELECT id, value, doubled, tripled, tag FROM $s3_mixed_export ORDER BY value"
 
+echo "---- Test Export to Table Function with mixed columns"
+
+query "ALTER TABLE $mt_mixed EXPORT PART '$mixed_part' TO TABLE FUNCTION s3(s3_conn, filename='$s3_mixed_export_table_function', format=Parquet, partition_strategy='hive') PARTITION BY id SETTINGS allow_experimental_export_merge_tree_part = 1"
+
+sleep 3
+
+echo "---- Verify mixed columns exported to S3"
+query "SELECT * FROM s3(s3_conn, filename='$s3_mixed_export_table_function/**.parquet', format=Parquet) ORDER BY value"
+
 echo "---- Test Complex Expressions in computed columns"
 query "CREATE TABLE $mt_complex_expr (
     id UInt32,
@@ -243,4 +279,4 @@ query "SELECT id, name, upper_name, concat_result FROM $mt_complex_expr ORDER BY
 echo "---- Verify complex expressions exported to S3 (should match source)"
 query "SELECT id, name, upper_name, concat_result FROM $s3_complex_expr_export ORDER BY name"
 
-query "DROP TABLE IF EXISTS $mt_table, $s3_table, $mt_table_roundtrip, $s3_table_wildcard, $s3_table_wildcard_partition_expression_with_function, $mt_table_partition_expression_with_function, $big_table, $big_destination_max_bytes, $big_destination_max_rows, $mt_alias, $mt_materialized, $s3_alias_export, $s3_materialized_export, $mt_ephemeral, $s3_ephemeral_export, $mt_mixed, $s3_mixed_export, $mt_complex_expr, $s3_complex_expr_export"
+query "DROP TABLE IF EXISTS $mt_table, $s3_table, $mt_table_roundtrip, $mt_table_tf, $s3_table_wildcard, $s3_table_wildcard_partition_expression_with_function, $mt_table_partition_expression_with_function, $big_table, $big_destination_max_bytes, $big_destination_max_rows, $mt_alias, $mt_materialized, $s3_alias_export, $s3_materialized_export, $mt_ephemeral, $s3_ephemeral_export, $mt_mixed, $s3_mixed_export, $mt_complex_expr, $s3_complex_expr_export"

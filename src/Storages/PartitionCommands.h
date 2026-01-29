@@ -52,9 +52,13 @@ struct PartitionCommand
     String from_table;
     bool replace = true;
 
-    /// For MOVE PARTITION
+    /// For MOVE PARTITION and EXPORT PART and EXPORT PARTITION
     String to_database;
     String to_table;
+
+    /// For EXPORT PART and EXPORT PARTITION with table functions
+    ASTPtr to_table_function;
+    ASTPtr partition_by_expr;
 
     /// For FETCH PARTITION - path in ZK to the shard, from which to download the partition.
     String from_path;

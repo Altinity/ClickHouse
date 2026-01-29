@@ -576,7 +576,9 @@ AccessRightsElements InterpreterAlterQuery::getRequiredAccessForCommand(const AS
         case ASTAlterCommand::EXPORT_PART:
         {
             required_access.emplace_back(AccessType::ALTER_EXPORT_PART, database, table);
-            required_access.emplace_back(AccessType::INSERT, command.to_database, command.to_table);
+            /// For table functions, access control is handled by the table function itself
+            if (!command.to_table_function)
+                required_access.emplace_back(AccessType::INSERT, command.to_database, command.to_table);
             break;
         }
         case ASTAlterCommand::EXPORT_PARTITION:

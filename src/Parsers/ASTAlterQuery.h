@@ -221,6 +221,9 @@ public:
     /// MOVE PARTITION partition TO TABLE db.table
     String to_database;
     String to_table;
+    /// EXPORT PART/PARTITION to TABLE FUNCTION (e.g., s3())
+    IAST * to_table_function = nullptr;
+    IAST * partition_by_expr = nullptr;
 
     String snapshot_name;
     IAST * snapshot_desc;

@@ -21,6 +21,16 @@ SETTINGS allow_experimental_export_merge_tree_part = 1
          [, setting_name = value, ...]
 ```
 
+## Syntax with table function
+
+```sql
+ALTER TABLE [database.]table_name
+EXPORT PART 'part_name'
+TO TABLE FUNCTION s3(s3_conn, filename='table_function', partition_strategy...)
+SETTINGS allow_experimental_export_merge_tree_part = 1
+         [, setting_name = value, ...]
+```
+
 ### Parameters
 
 - **`table_name`**: The source MergeTree table containing the part to export
@@ -33,6 +43,8 @@ Source and destination tables must be 100% compatible:
 
 1. **Identical schemas** - same columns, types, and order
 2. **Matching partition keys** - partition expressions must be identical
+
+In case a table function is used as the destination, the schema can be omitted and it will be inferred from the source table.
 
 ## Settings
 
@@ -92,6 +104,20 @@ ALTER TABLE mt_table EXPORT PART '2020_1_1_0' TO TABLE s3_table
 SETTINGS allow_experimental_export_merge_tree_part = 1;
 
 ALTER TABLE mt_table EXPORT PART '2021_2_2_0' TO TABLE s3_table 
+SETTINGS allow_experimental_export_merge_tree_part = 1;
+```
+
+### Table function export
+
+```sql
+-- Create source and destination tables
+CREATE TABLE mt_table (id UInt64, year UInt16)
+ENGINE = MergeTree() PARTITION BY year ORDER BY tuple();
+
+-- Insert and export
+INSERT INTO mt_table VALUES (1, 2020), (2, 2020), (3, 2021);
+
+ALTER TABLE mt_table EXPORT PART '2020_1_1_0' TO TABLE FUNCTION s3(s3_conn, filename='table_function', format=Parquet, partition_strategy='hive') PARTITION BY year
 SETTINGS allow_experimental_export_merge_tree_part = 1;
 ```
 

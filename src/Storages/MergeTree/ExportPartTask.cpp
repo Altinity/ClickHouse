@@ -111,19 +111,12 @@ bool ExportPartTask::executeStep()
         block_with_partition_values = manifest.data_part->minmax_idx->getBlock(storage);
     }
 
-    auto destination_storage = DatabaseCatalog::instance().tryGetTable(manifest.destination_storage_id, local_context);
-    if (!destination_storage)
-    {
-        std::lock_guard inner_lock(storage.export_manifests_mutex);
-
-        const auto destination_storage_id_name = manifest.destination_storage_id.getNameForLogs();
-        storage.export_manifests.erase(manifest);
-        throw Exception(ErrorCodes::UNKNOWN_TABLE, "Failed to reconstruct destination storage: {}", destination_storage_id_name);
-    }
+    const auto & destination_storage = manifest.destination_storage_ptr;
+    const auto destination_storage_id = destination_storage->getStorageID();
 
     auto exports_list_entry = storage.getContext()->getExportsList().insert(
         getStorageID(),
-        manifest.destination_storage_id,
+        destination_storage_id,
         manifest.data_part->getBytesOnDisk(),
         manifest.data_part->name,
         std::vector<std::string>{},

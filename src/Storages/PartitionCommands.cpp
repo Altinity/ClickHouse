@@ -139,6 +139,12 @@ std::optional<PartitionCommand> PartitionCommand::parse(const ASTAlterCommand * 
         res.part = command_ast->part;
         res.to_database = command_ast->to_database;
         res.to_table = command_ast->to_table;
+        if (command_ast->to_table_function)
+        {
+            res.to_table_function = command_ast->to_table_function->ptr();
+            if (command_ast->partition_by_expr)
+                res.partition_by_expr = command_ast->partition_by_expr->clone();
+        }
         return res;
     }
     if (command_ast->type == ASTAlterCommand::EXPORT_PARTITION)
@@ -148,6 +154,12 @@ std::optional<PartitionCommand> PartitionCommand::parse(const ASTAlterCommand * 
         res.partition = command_ast->partition->clone();
         res.to_database = command_ast->to_database;
         res.to_table = command_ast->to_table;
+        if (command_ast->to_table_function)
+        {
+            res.to_table_function = command_ast->to_table_function->ptr();
+            if (command_ast->partition_by_expr)
+                res.partition_by_expr = command_ast->partition_by_expr->clone();
+        }
         return res;
     }
     return {};

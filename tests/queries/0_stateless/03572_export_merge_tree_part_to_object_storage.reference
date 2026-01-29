@@ -42,6 +42,13 @@
 ---- Count rows in big_table and big_destination_max_rows
 4194304
 4194304
+---- Table function with schema inheritance (no schema specified)
+---- Data should be exported with inherited schema
+100	test1	2022
+101	test2	2022
+---- Table function with explicit compatible schema
+---- Data should be exported with explicit schema
+102	test3	2023
 ---- Test ALIAS columns export
 ---- Verify ALIAS column data in source table (arr_1 computed from arr[1])
 1	[1,2,3]	1
@@ -68,6 +75,10 @@
 1	5	10	15	TEST
 1	10	20	30	PROD
 ---- Verify mixed columns exported to S3 (should match source)
+1	5	10	15	TEST
+1	10	20	30	PROD
+---- Test Export to Table Function with mixed columns
+---- Verify mixed columns exported to S3
 1	5	10	15	TEST
 1	10	20	30	PROD
 ---- Test Complex Expressions in computed columns
