@@ -2168,7 +2168,7 @@ jobs:
           fi
 
   stateless_tests_amd_asan_flaky_check:
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest, build_amd_asan]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfYXNhbiwgZmxha3kgY2hlY2sp') }}
     name: "Stateless tests (amd_asan, flaky check)"
