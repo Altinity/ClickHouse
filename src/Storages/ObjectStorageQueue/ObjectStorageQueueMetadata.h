@@ -151,6 +151,7 @@ public:
 
     const String & getZooKeeperName() const { return zookeeper_name; }
     zkutil::ZooKeeperPtr getZooKeeper() const { return getZooKeeper(log, zookeeper_name); }
+    // Keep log parameter to match upstream signature; may be unused in this build.
     static zkutil::ZooKeeperPtr getZooKeeper(LoggerPtr log, const String & zookeeper_name);
 
     /// Set local ref count for metadata.

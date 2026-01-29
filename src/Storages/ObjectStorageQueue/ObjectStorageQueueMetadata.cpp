@@ -160,8 +160,9 @@ ObjectStorageQueueMetadata::~ObjectStorageQueueMetadata()
     shutdown();
 }
 
-zkutil::ZooKeeperPtr ObjectStorageQueueMetadata::getZooKeeper(LoggerPtr log, const String & zookeeper_name)
+zkutil::ZooKeeperPtr ObjectStorageQueueMetadata::getZooKeeper(LoggerPtr /* log */, const String & zookeeper_name)
 {
+    // Keep the log parameter to match upstream signature; not used in this build.
     auto context = Context::getGlobalContextInstance();
     return context->getDefaultOrAuxiliaryZooKeeper(zookeeper_name);
 }
