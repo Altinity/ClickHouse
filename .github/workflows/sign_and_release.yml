@@ -11,4 +11,4 @@ jobs:
 
       - name: Upload to prod
         run: |
-          aws s3 sync /home/runner/.cache/bin-repo/ s3://builds.altinity.cloud/Green/bin-repo
+          aws s3 sync /home/runner/.cache/bin-repo/ s3://builds.altinity.cloud/Blue/bin-repo
