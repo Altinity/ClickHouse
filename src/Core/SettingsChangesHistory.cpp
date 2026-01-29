@@ -56,6 +56,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."},
             {"hybrid_table_auto_cast_columns", true, true, "New setting to automatically cast Hybrid table columns when segments disagree on types. Default enabled."},
             {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
+            {"enable_alias_marker", true, true, "New setting."},
             {"input_format_parquet_use_native_reader_v3", false, true, "Seems stable"},
             {"input_format_parquet_verify_checksums", true, true, "New setting."},
             {"output_format_parquet_write_checksums", false, true, "New setting."},
@@ -64,6 +65,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
             {"cluster_table_function_split_granularity", "file", "file", "New setting."},
             {"cluster_table_function_buckets_batch_size", 0, 0, "New setting."},
+            {"export_merge_tree_part_throw_on_pending_mutations", true, true, "New setting."},
+            {"export_merge_tree_part_throw_on_pending_patch_parts", true, true, "New setting."},
         });
         addSettingsChanges(settings_changes_history, "25.8",
         {

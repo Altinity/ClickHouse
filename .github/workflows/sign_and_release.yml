@@ -32,7 +32,7 @@ env:
   ARTIFACT_NAME: build_report_package_release
   AWS_REGION: us-east-1
   SRC_BUCKET: altinity-build-artifacts
-  S3_STORAGE_BUCKET: altinity-test-reports
+  S3_STORAGE_BUCKET: altinity-test-reports-temp
 
 jobs:
   extract-package-info:

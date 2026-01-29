@@ -34,6 +34,7 @@ struct ExportInfo
     UInt64 peak_memory_usage;
     time_t create_time = 0;
     Float64 elapsed;
+    String query_id;
 };
 
 struct ExportsListElement : private boost::noncopyable
@@ -51,6 +52,7 @@ struct ExportsListElement : private boost::noncopyable
     UInt64 total_size_bytes_uncompressed {0};
     std::atomic<UInt64> bytes_read_uncompressed {0};
     time_t create_time {0};
+    String query_id;
 
     Stopwatch watch;
     ThreadGroupPtr thread_group;
@@ -66,6 +68,7 @@ struct ExportsListElement : private boost::noncopyable
         UInt64 total_size_bytes_compressed_,
         UInt64 total_size_bytes_uncompressed_,
         time_t create_time_,
+        const String & query_id_,
         const ContextPtr & context);
 
     ~ExportsListElement();
