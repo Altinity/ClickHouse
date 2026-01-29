@@ -6355,6 +6355,7 @@ void MergeTreeData::exportPartToTable(
             dest_storage,
             part,
             transaction_id,
+            query_context->getCurrentQueryId(),
             query_context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value,
             query_context->getSettingsCopy(),
             source_metadata_ptr,
@@ -9161,6 +9162,7 @@ try
         part_log_elem.rows_read = (*exports_entry)->rows_read;
         part_log_elem.bytes_read_uncompressed = (*exports_entry)->bytes_read_uncompressed;
         part_log_elem.peak_memory_usage = (*exports_entry)->getPeakMemoryUsage();
+        part_log_elem.query_id = (*exports_entry)->query_id;
 
         /// no need to lock because at this point no one is writing to the destination file paths
         part_log_elem.remote_file_paths = (*exports_entry)->destination_file_paths;

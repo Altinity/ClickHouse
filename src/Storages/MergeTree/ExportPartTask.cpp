@@ -92,7 +92,7 @@ bool ExportPartTask::executeStep()
 {
     auto local_context = Context::createCopy(storage.getContext());
     local_context->makeQueryContextForExportPart();
-    local_context->setCurrentQueryId(manifest.transaction_id);
+    local_context->setCurrentQueryId(manifest.query_id);
     local_context->setBackgroundOperationTypeForContext(ClientInfo::BackgroundOperationType::EXPORT_PART);
     local_context->setSettings(manifest.settings);
 
@@ -123,6 +123,7 @@ bool ExportPartTask::executeStep()
         manifest.data_part->getBytesOnDisk(),
         manifest.data_part->getBytesUncompressedOnDisk(),
         manifest.create_time,
+        manifest.query_id,
         local_context);
 
     SinkToStoragePtr sink;
@@ -322,7 +323,7 @@ Priority ExportPartTask::getPriority() const
 
 String ExportPartTask::getQueryId() const
 {
-    return manifest.transaction_id;
+    return manifest.query_id;
 }
 
 }

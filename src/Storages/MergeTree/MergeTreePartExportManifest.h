@@ -47,6 +47,7 @@ struct MergeTreePartExportManifest
         const StoragePtr destination_storage_ptr_,
         const DataPartPtr & data_part_,
         const String & transaction_id_,
+        const String & query_id_,
         FileAlreadyExistsPolicy file_already_exists_policy_,
         const Settings & settings_,
         const StorageMetadataPtr & metadata_snapshot_,
@@ -54,6 +55,7 @@ struct MergeTreePartExportManifest
         : destination_storage_ptr(destination_storage_ptr_),
           data_part(data_part_),
           transaction_id(transaction_id_),
+          query_id(query_id_),
           file_already_exists_policy(file_already_exists_policy_),
           settings(settings_),
           metadata_snapshot(metadata_snapshot_),
@@ -64,6 +66,7 @@ struct MergeTreePartExportManifest
     DataPartPtr data_part;
     /// Used for killing the export.
     String transaction_id;
+    String query_id;
     FileAlreadyExistsPolicy file_already_exists_policy;
     Settings settings;
 
