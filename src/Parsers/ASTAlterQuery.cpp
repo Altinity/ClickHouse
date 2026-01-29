@@ -65,6 +65,10 @@ ASTPtr ASTAlterCommand::clone() const
         res->sql_security = res->children.emplace_back(sql_security->clone()).get();
     if (rename_to)
         res->rename_to = res->children.emplace_back(rename_to->clone()).get();
+    if (to_table_function)
+        res->to_table_function = res->children.emplace_back(to_table_function->clone()).get();
+    if (partition_by_expr)
+        res->partition_by_expr = res->children.emplace_back(partition_by_expr->clone()).get();
 
     return res;
 }
@@ -367,11 +371,23 @@ void ASTAlterCommand::formatImpl(WriteBuffer & ostr, const FormatSettings & sett
         {
             case DataDestinationType::TABLE:
                 ostr << "TABLE ";
-                if (!to_database.empty())
+                if (to_table_function)
                 {
-                    ostr << backQuoteIfNeed(to_database) << ".";
+                    ostr << "FUNCTION ";
+                    to_table_function->format(ostr, settings, state, frame);
+                    if (partition_by_expr)
+                    {
+                        ostr << " PARTITION BY ";
+                        partition_by_expr->format(ostr, settings, state, frame);
+                    }
                 }
-                ostr << backQuoteIfNeed(to_table);
+                else
+                {
+                    if (!to_database.empty())
+                        ostr << backQuoteIfNeed(to_database) << ".";
+
+                    ostr << backQuoteIfNeed(to_table);
+                }
                 return;
             default:
                 break;
@@ -584,6 +600,8 @@ void ASTAlterCommand::forEachPointerToChild(std::function<void(void**)> f)
     f(reinterpret_cast<void **>(&select));
     f(reinterpret_cast<void **>(&sql_security));
     f(reinterpret_cast<void **>(&rename_to));
+    f(reinterpret_cast<void **>(&to_table_function));
+    f(reinterpret_cast<void **>(&partition_by_expr));
 }
 
 
