@@ -13,6 +13,7 @@ ExportsListElement::ExportsListElement(
     UInt64 total_size_bytes_compressed_,
     UInt64 total_size_bytes_uncompressed_,
     time_t create_time_,
+    const String & query_id_,
     const ContextPtr & context)
 : source_table_id(source_table_id_)
 , destination_table_id(destination_table_id_)
@@ -23,6 +24,7 @@ ExportsListElement::ExportsListElement(
 , total_size_bytes_compressed(total_size_bytes_compressed_)
 , total_size_bytes_uncompressed(total_size_bytes_uncompressed_)
 , create_time(create_time_)
+, query_id(query_id_)
 {
     thread_group = ThreadGroup::createForMergeMutate(context);
 }
@@ -55,6 +57,7 @@ ExportInfo ExportsListElement::getInfo() const
     res.peak_memory_usage = getPeakMemoryUsage();
     res.create_time = create_time;
     res.elapsed = watch.elapsedSeconds();
+    res.query_id = query_id;
     return res;
 }
 

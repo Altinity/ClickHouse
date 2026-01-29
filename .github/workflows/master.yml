@@ -4500,8 +4500,13 @@ jobs:
     secrets: inherit
     with:
       runner_type: altinity-regression-tester
+<<<<<<< HEAD
       commit: c5cae9b244e0839fb307a9fb67a40fe80d93810b
       arch: release
+=======
+      commit: 8068ddc009590c457d5f94717c7a0e7797afb9e9
+      arch: x86
+>>>>>>> f3a7dcee7b8 (Merge pull request #1330 from Altinity/query_id_on_part_log)
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout_minutes: 300
       workflow_config: ${{ needs.config_workflow.outputs.data.workflow_config }}

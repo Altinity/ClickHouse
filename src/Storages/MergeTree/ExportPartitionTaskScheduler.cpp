@@ -23,7 +23,7 @@ namespace
     {
         auto context_copy = Context::createCopy(context);
         context_copy->makeQueryContextForExportPart();
-        context_copy->setCurrentQueryId(manifest.transaction_id);
+        context_copy->setCurrentQueryId(manifest.query_id);
         context_copy->setSetting("output_format_parallel_formatting", manifest.parallel_formatting);
         context_copy->setSetting("output_format_parquet_parallel_encoding", manifest.parquet_parallel_encoding);
         context_copy->setSetting("max_threads", manifest.max_threads);

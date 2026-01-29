@@ -4553,6 +4553,7 @@ std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartit
         info.destination_table = metadata.destination_table;
         info.partition_id = metadata.partition_id;
         info.transaction_id = metadata.transaction_id;
+        info.query_id = metadata.query_id;
         info.create_time = metadata.create_time;
         info.source_replica = metadata.source_replica;
         info.parts_count = metadata.number_of_parts;
@@ -8275,6 +8276,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     ExportReplicatedMergeTreePartitionManifest manifest;
 
     manifest.transaction_id = generateSnowflakeIDString();
+    manifest.query_id = query_context->getCurrentQueryId();
     manifest.partition_id = partition_id;
     manifest.destination_database = dest_database;
     manifest.destination_table = dest_table;

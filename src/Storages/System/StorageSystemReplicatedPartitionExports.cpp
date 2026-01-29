@@ -26,6 +26,7 @@ ColumnsDescription StorageSystemReplicatedPartitionExports::getColumnsDescriptio
         {"create_time", std::make_shared<DataTypeDateTime>(), "Date and time when the export command was submitted"},
         {"partition_id", std::make_shared<DataTypeString>(), "ID of the partition"},
         {"transaction_id", std::make_shared<DataTypeString>(), "ID of the transaction."},
+        {"query_id", std::make_shared<DataTypeString>(), "Query ID of the export operation."},
         {"source_replica", std::make_shared<DataTypeString>(), "Name of the source replica."},
         {"parts", std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>()), "List of part names to be exported."},
         {"parts_count", std::make_shared<DataTypeUInt64>(), "Number of parts in the export."},
@@ -123,11 +124,12 @@ void StorageSystemReplicatedPartitionExports::fillData(MutableColumns & res_colu
             res_columns[i++]->insert(info.create_time);
             res_columns[i++]->insert(info.partition_id);
             res_columns[i++]->insert(info.transaction_id);
+            res_columns[i++]->insert(info.query_id);
             res_columns[i++]->insert(info.source_replica);
             Array parts_array;
             parts_array.reserve(info.parts.size());
             for (const auto & part : info.parts)
-                parts_array.push_back(part);
+                parts_array.push_back(part); 
             res_columns[i++]->insert(parts_array);
             res_columns[i++]->insert(info.parts_count);
             res_columns[i++]->insert(info.parts_to_do);
