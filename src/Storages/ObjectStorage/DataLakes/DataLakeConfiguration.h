@@ -427,6 +427,15 @@ public:
         return res;
     }
 
+    bool supportsPrewhere() const override
+    {
+#if USE_AVRO
+        return std::is_same_v<DataLakeMetadata, IcebergMetadata>;
+#else
+        return false;
+#endif
+    }
+
 private:
     const DataLakeStorageSettingsPtr settings;
     ObjectStoragePtr ready_object_storage;
