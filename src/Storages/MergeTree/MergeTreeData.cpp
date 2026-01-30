@@ -3,6 +3,7 @@
 
 #include <Storages/MergeTree/ExportList.h>
 #include <Access/AccessControl.h>
+#include <TableFunctions/TableFunctionFactory.h>
 #include <AggregateFunctions/AggregateFunctionCount.h>
 #include <Analyzer/QueryTreeBuilder.h>
 #include <Analyzer/Utils.h>
@@ -6215,9 +6216,45 @@ void MergeTreeData::exportPartToTable(const PartitionCommand & command, ContextP
 
     const auto part_name = command.partition->as<ASTLiteral &>().value.safeGet<String>();
 
-    const auto database_name = query_context->resolveDatabase(command.to_database);
+    if (!command.to_table_function)
+    {
+        const auto database_name = query_context->resolveDatabase(command.to_database);
+        exportPartToTable(part_name, StorageID{database_name, command.to_table}, generateSnowflakeIDString(), query_context);
 
-    exportPartToTable(part_name, StorageID{database_name, command.to_table}, generateSnowflakeIDString(), query_context);
+        return;
+    }
+
+    auto table_function_ast = command.to_table_function;
+    auto table_function_ptr = TableFunctionFactory::instance().get(command.to_table_function, query_context);
+
+    if (table_function_ptr->needStructureHint())
+    {
+        const auto source_metadata_ptr = getInMemoryMetadataPtr();
+
+        /// Grab only the readable columns from the source metadata to skip ephemeral columns
+        const auto readable_columns = ColumnsDescription(source_metadata_ptr->getColumns().getReadable());
+        table_function_ptr->setStructureHint(readable_columns);
+    }
+
+    if (command.partition_by_expr)
+    {
+        table_function_ptr->setPartitionBy(command.partition_by_expr);
+    }
+
+    auto dest_storage = table_function_ptr->execute(
+        table_function_ast,
+        query_context,
+        table_function_ptr->getName(),
+        /* cached_columns */ {},
+        /* use_global_context */ false,
+        /* is_insert_query */ true);
+
+    if (!dest_storage)
+    {
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Failed to reconstruct destination storage");
+    }
+
+    exportPartToTable(part_name, dest_storage, generateSnowflakeIDString(), query_context);
 }
 
 void MergeTreeData::exportPartToTable(
@@ -6235,6 +6272,17 @@ void MergeTreeData::exportPartToTable(
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Exporting to the same table is not allowed");
     }
 
+    exportPartToTable(part_name, dest_storage, transaction_id, query_context, allow_outdated_parts, completion_callback);
+}
+
+void MergeTreeData::exportPartToTable(
+    const std::string & part_name,
+    const StoragePtr & dest_storage,
+    const String & transaction_id,
+    ContextPtr query_context,
+    bool allow_outdated_parts,
+    std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback)
+{
     if (!dest_storage->supportsImport())
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Destination storage {} does not support MergeTree parts or uses unsupported partitioning", dest_storage->getName());
 
@@ -6304,9 +6352,10 @@ void MergeTreeData::exportPartToTable(
     {
         const auto format_settings = getFormatSettings(query_context);
         MergeTreePartExportManifest manifest(
-            dest_storage->getStorageID(),
+            dest_storage,
             part,
             transaction_id,
+            query_context->getCurrentQueryId(),
             query_context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value,
             query_context->getSettingsCopy(),
             source_metadata_ptr,
@@ -6316,8 +6365,7 @@ void MergeTreeData::exportPartToTable(
 
         if (!export_manifests.emplace(std::move(manifest)).second)
         {
-            throw Exception(ErrorCodes::ABORTED, "Data part '{}' is already being exported to table '{}'",
-                            part_name, dest_storage->getStorageID().getFullTableName());
+            throw Exception(ErrorCodes::ABORTED, "Data part '{}' is already being exported", part_name);
         }
     }
 
@@ -8750,8 +8798,9 @@ std::vector<MergeTreeExportStatus> MergeTreeData::getExportsStatus() const
 
         status.source_database = source_database;
         status.source_table = source_table;
-        status.destination_database = manifest.destination_storage_id.database_name;
-        status.destination_table = manifest.destination_storage_id.table_name;
+        const auto destination_storage_id = manifest.destination_storage_ptr->getStorageID();
+        status.destination_database = destination_storage_id.database_name;
+        status.destination_table = destination_storage_id.table_name;
         status.create_time = manifest.create_time;
         status.part_name = manifest.data_part->name;
 
@@ -9113,6 +9162,7 @@ try
         part_log_elem.rows_read = (*exports_entry)->rows_read;
         part_log_elem.bytes_read_uncompressed = (*exports_entry)->bytes_read_uncompressed;
         part_log_elem.peak_memory_usage = (*exports_entry)->getPeakMemoryUsage();
+        part_log_elem.query_id = (*exports_entry)->query_id;
 
         /// no need to lock because at this point no one is writing to the destination file paths
         part_log_elem.remote_file_paths = (*exports_entry)->destination_file_paths;

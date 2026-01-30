@@ -92,7 +92,7 @@ bool ExportPartTask::executeStep()
 {
     auto local_context = Context::createCopy(storage.getContext());
     local_context->makeQueryContextForExportPart();
-    local_context->setCurrentQueryId(manifest.transaction_id);
+    local_context->setCurrentQueryId(manifest.query_id);
     local_context->setBackgroundOperationTypeForContext(ClientInfo::BackgroundOperationType::EXPORT_PART);
     local_context->setSettings(manifest.settings);
 
@@ -110,19 +110,12 @@ bool ExportPartTask::executeStep()
         block_with_partition_values = manifest.data_part->minmax_idx->getBlock(storage);
     }
 
-    auto destination_storage = DatabaseCatalog::instance().tryGetTable(manifest.destination_storage_id, local_context);
-    if (!destination_storage)
-    {
-        std::lock_guard inner_lock(storage.export_manifests_mutex);
-
-        const auto destination_storage_id_name = manifest.destination_storage_id.getNameForLogs();
-        storage.export_manifests.erase(manifest);
-        throw Exception(ErrorCodes::UNKNOWN_TABLE, "Failed to reconstruct destination storage: {}", destination_storage_id_name);
-    }
+    const auto & destination_storage = manifest.destination_storage_ptr;
+    const auto destination_storage_id = destination_storage->getStorageID();
 
     auto exports_list_entry = storage.getContext()->getExportsList().insert(
         getStorageID(),
-        manifest.destination_storage_id,
+        destination_storage_id,
         manifest.data_part->getBytesOnDisk(),
         manifest.data_part->name,
         std::vector<std::string>{},
@@ -130,6 +123,7 @@ bool ExportPartTask::executeStep()
         manifest.data_part->getBytesOnDisk(),
         manifest.data_part->getBytesUncompressedOnDisk(),
         manifest.create_time,
+        manifest.query_id,
         local_context);
 
     SinkToStoragePtr sink;
@@ -329,7 +323,7 @@ Priority ExportPartTask::getPriority() const
 
 String ExportPartTask::getQueryId() const
 {
-    return manifest.transaction_id;
+    return manifest.query_id;
 }
 
 }
