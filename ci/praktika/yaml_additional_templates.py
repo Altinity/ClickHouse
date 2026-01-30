@@ -72,7 +72,7 @@ class AltinityWorkflowTemplates:
       commit: {REGRESSION_HASH}
       arch: x86
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      timeout_minutes: 300
+      timeout_minutes: 210
       workflow_config: ${{ needs.config_workflow.outputs.data }}
   RegressionTestsAarch64:
     needs: [config_workflow, build_arm_binary]
@@ -84,7 +84,7 @@ class AltinityWorkflowTemplates:
       commit: {REGRESSION_HASH}
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      timeout_minutes: 300
+      timeout_minutes: 210
       workflow_config: ${{ needs.config_workflow.outputs.data }}
 """,
         "SignRelease": r"""
