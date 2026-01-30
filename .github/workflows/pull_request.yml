@@ -278,7 +278,7 @@ jobs:
 
   build_amd_debug:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
-    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
+    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest, fast_test]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFtZF9kZWJ1Zyk=') }}
     name: "Build (amd_debug)"
     outputs:
@@ -323,7 +323,7 @@ jobs:
 
   build_amd_release:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
-    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
+    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest, fast_test]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFtZF9yZWxlYXNlKQ==') }}
     name: "Build (amd_release)"
     outputs:
@@ -368,7 +368,7 @@ jobs:
 
   build_amd_asan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
-    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
+    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest, fast_test]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFtZF9hc2FuKQ==') }}
     name: "Build (amd_asan)"
     outputs:
@@ -413,7 +413,7 @@ jobs:
 
   build_amd_tsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
-    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
+    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest, fast_test]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFtZF90c2FuKQ==') }}
     name: "Build (amd_tsan)"
     outputs:
@@ -458,7 +458,7 @@ jobs:
 
   build_amd_msan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
-    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
+    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest, fast_test]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFtZF9tc2FuKQ==') }}
     name: "Build (amd_msan)"
     outputs:
@@ -503,7 +503,7 @@ jobs:
 
   build_amd_ubsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
-    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
+    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest, fast_test]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFtZF91YnNhbik=') }}
     name: "Build (amd_ubsan)"
     outputs:
@@ -548,7 +548,7 @@ jobs:
 
   build_amd_binary:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
-    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
+    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest, fast_test]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFtZF9iaW5hcnkp') }}
     name: "Build (amd_binary)"
     outputs:
@@ -593,7 +593,7 @@ jobs:
 
   build_arm_release:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
-    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
+    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest, fast_test]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFybV9yZWxlYXNlKQ==') }}
     name: "Build (arm_release)"
     outputs:
@@ -638,7 +638,7 @@ jobs:
 
   build_arm_coverage:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
-    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
+    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest, fast_test]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFybV9jb3ZlcmFnZSk=') }}
     name: "Build (arm_coverage)"
     outputs:
@@ -683,7 +683,7 @@ jobs:
 
   build_arm_binary:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
-    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
+    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest, fast_test]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'QnVpbGQgKGFybV9iaW5hcnkp') }}
     name: "Build (arm_binary)"
     outputs:
@@ -2167,7 +2167,7 @@ jobs:
           fi
 
   stateless_tests_amd_asan_flaky_check:
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest, build_amd_asan]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfYXNhbiwgZmxha3kgY2hlY2sp') }}
     name: "Stateless tests (amd_asan, flaky check)"
@@ -4047,7 +4047,7 @@ jobs:
       commit: 979bb27171f92724bcd8f086989ba623f2e03fdc
       arch: release
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      timeout_minutes: 300
+      timeout_minutes: 210
       workflow_config: ${{ needs.config_workflow.outputs.data }}
   RegressionTestsAarch64:
     needs: [config_workflow, build_arm_binary]
@@ -4059,7 +4059,7 @@ jobs:
       commit: 979bb27171f92724bcd8f086989ba623f2e03fdc
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      timeout_minutes: 300
+      timeout_minutes: 210
       workflow_config: ${{ needs.config_workflow.outputs.data }}
 
   FinishCIReport:
