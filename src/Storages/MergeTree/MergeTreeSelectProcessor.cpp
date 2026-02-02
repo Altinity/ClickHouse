@@ -92,22 +92,25 @@ std::optional<ParallelReadResponse> ParallelReadingExtension::sendReadRequest(
 MergeTreeSelectProcessor::MergeTreeSelectProcessor(
     MergeTreeReadPoolPtr pool_,
     MergeTreeSelectAlgorithmPtr algorithm_,
+    const FilterDAGInfoPtr & row_level_filter_,
     const PrewhereInfoPtr & prewhere_info_,
     const LazilyReadInfoPtr & lazily_read_info_,
     const ExpressionActionsSettings & actions_settings_,
     const MergeTreeReaderSettings & reader_settings_)
     : pool(std::move(pool_))
     , algorithm(std::move(algorithm_))
+    , row_level_filter(row_level_filter_)
     , prewhere_info(prewhere_info_)
     , actions_settings(actions_settings_)
     , prewhere_actions(getPrewhereActions(
+          row_level_filter,
           prewhere_info,
           actions_settings,
           reader_settings_.enable_multiple_prewhere_read_steps,
           reader_settings_.force_short_circuit_execution))
     , lazily_read_info(lazily_read_info_)
     , reader_settings(reader_settings_)
-    , result_header(transformHeader(pool->getHeader(), lazily_read_info, prewhere_info))
+    , result_header(transformHeader(pool->getHeader(), lazily_read_info, row_level_filter, prewhere_info))
 {
     bool has_prewhere_actions_steps = !prewhere_actions.steps.empty();
     if (has_prewhere_actions_steps)
@@ -127,43 +130,46 @@ String MergeTreeSelectProcessor::getName() const
 
 bool tryBuildPrewhereSteps(PrewhereInfoPtr prewhere_info, const ExpressionActionsSettings & actions_settings, PrewhereExprInfo & prewhere, bool force_short_circuit_execution);
 
-PrewhereExprInfo MergeTreeSelectProcessor::getPrewhereActions(PrewhereInfoPtr prewhere_info, const ExpressionActionsSettings & actions_settings, bool enable_multiple_prewhere_read_steps, bool force_short_circuit_execution)
+PrewhereExprInfo MergeTreeSelectProcessor::getPrewhereActions(
+    const FilterDAGInfoPtr & row_level_filter,
+    const PrewhereInfoPtr & prewhere_info,
+    const ExpressionActionsSettings & actions_settings,
+    bool enable_multiple_prewhere_read_steps,
+    bool force_short_circuit_execution)
 {
     PrewhereExprInfo prewhere_actions;
-    if (prewhere_info)
+
+    if (row_level_filter)
     {
-        if (prewhere_info->row_level_filter)
+        PrewhereExprStep row_level_filter_step
         {
-            PrewhereExprStep row_level_filter_step
-            {
-                .type = PrewhereExprStep::Filter,
-                .actions = std::make_shared<ExpressionActions>(prewhere_info->row_level_filter->clone(), actions_settings),
-                .filter_column_name = prewhere_info->row_level_column_name,
-                .remove_filter_column = true,
-                .need_filter = true,
-                .perform_alter_conversions = true,
-                .mutation_version = std::nullopt,
-            };
+            .type = PrewhereExprStep::Filter,
+            .actions = std::make_shared<ExpressionActions>(row_level_filter->actions.clone(), actions_settings),
+            .filter_column_name = row_level_filter->column_name,
+            .remove_filter_column = row_level_filter->do_remove_column,
+            .need_filter = true,
+            .perform_alter_conversions = true,
+            .mutation_version = std::nullopt,
+        };
 
-            prewhere_actions.steps.emplace_back(std::make_shared<PrewhereExprStep>(std::move(row_level_filter_step)));
-        }
+        prewhere_actions.steps.emplace_back(std::make_shared<PrewhereExprStep>(std::move(row_level_filter_step)));
+    }
 
-        if (!enable_multiple_prewhere_read_steps ||
-            !tryBuildPrewhereSteps(prewhere_info, actions_settings, prewhere_actions, force_short_circuit_execution))
+    if (prewhere_info &&
+        (!enable_multiple_prewhere_read_steps || !tryBuildPrewhereSteps(prewhere_info, actions_settings, prewhere_actions, force_short_circuit_execution)))
+    {
+        PrewhereExprStep prewhere_step
         {
-            PrewhereExprStep prewhere_step
-            {
-                .type = PrewhereExprStep::Filter,
-                .actions = std::make_shared<ExpressionActions>(prewhere_info->prewhere_actions.clone(), actions_settings),
-                .filter_column_name = prewhere_info->prewhere_column_name,
-                .remove_filter_column = prewhere_info->remove_prewhere_column,
-                .need_filter = prewhere_info->need_filter,
-                .perform_alter_conversions = true,
-                .mutation_version = std::nullopt,
-            };
+            .type = PrewhereExprStep::Filter,
+            .actions = std::make_shared<ExpressionActions>(prewhere_info->prewhere_actions.clone(), actions_settings),
+            .filter_column_name = prewhere_info->prewhere_column_name,
+            .remove_filter_column = prewhere_info->remove_prewhere_column,
+            .need_filter = prewhere_info->need_filter,
+            .perform_alter_conversions = true,
+            .mutation_version = std::nullopt,
+        };
 
-            prewhere_actions.steps.emplace_back(std::make_shared<PrewhereExprStep>(std::move(prewhere_step)));
-        }
+        prewhere_actions.steps.emplace_back(std::make_shared<PrewhereExprStep>(std::move(prewhere_step)));
     }
 
     return prewhere_actions;
@@ -329,9 +335,10 @@ void MergeTreeSelectProcessor::injectLazilyReadColumns(
 Block MergeTreeSelectProcessor::transformHeader(
     Block block,
     const LazilyReadInfoPtr & lazily_read_info,
+    const FilterDAGInfoPtr & row_level_filter,
     const PrewhereInfoPtr & prewhere_info)
 {
-    auto transformed = SourceStepWithFilter::applyPrewhereActions(std::move(block), prewhere_info);
+    auto transformed = SourceStepWithFilter::applyPrewhereActions(std::move(block), row_level_filter, prewhere_info);
     injectLazilyReadColumns(0, transformed, -1, lazily_read_info);
     return transformed;
 }
