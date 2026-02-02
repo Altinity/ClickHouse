@@ -44,6 +44,12 @@ class DataFileMetaInfo
 public:
     DataFileMetaInfo() = default;
 
+    // Deserialize from json in distributed requests
+    explicit DataFileMetaInfo(const Poco::JSON::Object::Ptr file_info);
+
+    // Serialize to json in distributed requests
+    Poco::JSON::Object::Ptr toJson() const;
+
     // subset of Iceberg::ColumnInfo now
     struct ColumnInfo
     {
@@ -92,7 +98,6 @@ class StorageObjectStorageConfiguration;
 using StorageObjectStorageConfigurationPtr = std::shared_ptr<StorageObjectStorageConfiguration>;
 struct StorageID;
 struct IObjectIterator;
-struct RelativePathWithMetadata;
 class IObjectStorage;
 using ObjectIterator = std::shared_ptr<IObjectIterator>;
 using ObjectStoragePtr = std::shared_ptr<IObjectStorage>;

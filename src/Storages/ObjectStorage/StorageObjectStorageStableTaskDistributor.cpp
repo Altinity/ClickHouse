@@ -179,6 +179,14 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getMatchingFileFromIter
             file_identifier = object_info->getIdentifier();
         }
 
+        auto file_meta_info = object_info->getFileMetaInfo();
+        if (file_meta_info.has_value())
+        {
+            auto file_path = send_over_whole_archive ? file_identifier : object_info->getPath();
+            object_info->command.setFilePath(file_path);
+            object_info->command.setFileMetaInfo(file_meta_info.value());
+        }
+
         size_t file_replica_idx = getReplicaForFile(file_identifier);
         if (file_replica_idx == number_of_current_replica)
         {
