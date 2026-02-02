@@ -4,6 +4,7 @@
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
 #include <Core/Field.h>
+#include <Common/logger_useful.h>
 
 namespace DB
 {
@@ -124,6 +125,82 @@ DataFileMetaInfo::DataFileMetaInfo(
             columns_info[i_name->second] = {column.second.rows_count, column.second.nulls_count, column.second.hyperrectangle};
         }
     }
+}
+
+DataFileMetaInfo::DataFileMetaInfo(Poco::JSON::Object::Ptr file_info)
+{
+    if (!file_info)
+        return;
+
+    auto log = getLogger("DataFileMetaInfo");
+
+    if (file_info->has("columns"))
+    {
+        auto columns = file_info->getArray("columns");
+        for (size_t i = 0; i < columns->size(); ++i)
+        {
+            auto column = columns->getObject(static_cast<UInt32>(i));
+
+            std::string name;
+            if (column->has("name"))
+                name = column->get("name").toString();
+            else
+            {
+                LOG_WARNING(log, "Can't read column name, ignored");
+                continue;
+            }
+
+            DB::DataFileMetaInfo::ColumnInfo column_info;
+            if (column->has("rows"))
+                column_info.rows_count = column->get("rows");
+            if (column->has("nulls"))
+                column_info.nulls_count = column->get("nulls");
+            if (column->has("range"))
+            {
+                Range range("");
+                std::string r = column->get("range");
+                try
+                {
+                    range.deserialize(r);
+                    column_info.hyperrectangle = std::move(range);
+                }
+                catch (const Exception & e)
+                {
+                    LOG_WARNING(log, "Can't read range for column {}, range '{}' ignored, error: {}", name, r, e.what());
+                }
+            }
+
+            columns_info[name] = column_info;
+        }
+    }
+}
+
+Poco::JSON::Object::Ptr DataFileMetaInfo::toJson() const
+{
+    Poco::JSON::Object::Ptr file_info = new Poco::JSON::Object();
+
+    if (!columns_info.empty())
+    {
+        Poco::JSON::Array::Ptr columns = new Poco::JSON::Array();
+
+        for (const auto & column : columns_info)
+        {
+            Poco::JSON::Object::Ptr column_info = new Poco::JSON::Object();
+            column_info->set("name", column.first);
+            if (column.second.rows_count.has_value())
+                column_info->set("rows", column.second.rows_count.value());
+            if (column.second.nulls_count.has_value())
+                column_info->set("nulls", column.second.nulls_count.value());
+            if (column.second.hyperrectangle.has_value())
+                column_info->set("range", column.second.hyperrectangle.value().serialize());
+
+            columns->add(column_info);
+        }
+
+        file_info->set("columns", columns);
+    }
+
+    return file_info;
 }
 
 constexpr size_t FIELD_MASK_ROWS = 0x1;

@@ -125,19 +125,33 @@ struct RelativePathWithMetadata
         explicit CommandInTaskResponse(const std::string & task);
 
         bool isValid() const { return is_valid; }
+        void setFilePath(const std::string & file_path_ )
+        {
+            file_path = file_path_;
+            is_valid = true;
+        }
         void setRetryAfterUs(Poco::Timestamp::TimeDiff time_us)
         {
             retry_after_us = time_us;
             is_valid = true;
         }
+        void setFileMetaInfo(DataFileMetaInfoPtr file_meta_info_ )
+        {
+            file_meta_info = file_meta_info_;
+            is_valid = true;
+        }
 
         std::string toString() const;
 
+        std::optional<std::string> getFilePath() const { return file_path; }
         std::optional<Poco::Timestamp::TimeDiff> getRetryAfterUs() const { return retry_after_us; }
+        std::optional<DataFileMetaInfoPtr> getFileMetaInfo() const { return file_meta_info; }
 
     private:
         bool is_valid = false;
+        std::optional<std::string> file_path;
         std::optional<Poco::Timestamp::TimeDiff> retry_after_us;
+        std::optional<DataFileMetaInfoPtr> file_meta_info;
     };
 
     String relative_path;
@@ -156,7 +170,10 @@ struct RelativePathWithMetadata
         , command(relative_path)
     {
         if (command.isValid())
-            relative_path = "";
+        {
+            relative_path = command.getFilePath().value_or("");
+            file_meta_info = command.getFileMetaInfo();
+        }
     }
 
     explicit RelativePathWithMetadata(const DataFileInfo & info, std::optional<ObjectMetadata> metadata_ = std::nullopt);

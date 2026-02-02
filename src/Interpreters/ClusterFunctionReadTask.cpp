@@ -140,15 +140,6 @@ void ClusterFunctionReadTaskResponse::serialize(WriteBuffer & out, size_t worker
             writeVarUInt(0, out);
         }
     }
-
-    if (protocol_version >= DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_DATA_LAKE_COLUMNS_METADATA)
-    {
-        /// This info is not used when optimization is disabled, so there is no need to send it.
-        if (iceberg_read_optimization_enabled && file_meta_info.has_value())
-            file_meta_info.value()->serialize(out);
-        else
-            DataFileMetaInfo().serialize(out);
-    }
 }
 
 void ClusterFunctionReadTaskResponse::deserialize(ReadBuffer & in)
@@ -201,14 +192,6 @@ void ClusterFunctionReadTaskResponse::deserialize(ReadBuffer & in)
             iceberg_info = Iceberg::IcebergObjectSerializableInfo{};
             iceberg_info->deserializeForClusterFunctionProtocol(in, protocol_version);
         }
-    }
-
-    if (protocol_version >= DBMS_CLUSTER_PROCESSING_PROTOCOL_VERSION_WITH_DATA_LAKE_COLUMNS_METADATA)
-    {
-        auto info = std::make_shared<DataFileMetaInfo>(DataFileMetaInfo::deserialize(in));
-
-        if (!path.empty() && !info->empty())
-            file_meta_info = info;
     }
 }
 

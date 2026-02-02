@@ -116,6 +116,9 @@ public:
     bool nearByWith(const Range & r) const;
 
     String toString() const;
+
+    String serialize() const;
+    void deserialize(const String & range);
 };
 
 Range intersect(const Range & a, const Range & b);
