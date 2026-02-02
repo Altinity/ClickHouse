@@ -139,8 +139,7 @@ class Runner:
         else:
             print("Read GH Environment from workflow data")
             env = _Environment.from_workflow_data()
-        print("Read GH Environment")
-        env = _Environment.from_env()
+
         try:
             version_string = Info().get_kv_data("version")['string']
             os.environ["CLICKHOUSE_VERSION_STRING"] = version_string
