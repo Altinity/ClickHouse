@@ -32,10 +32,10 @@ DO_NOT_TEST_JOBS = [
 ]
 
 PRELIMINARY_JOBS = [
-    JobNames.STYLE_CHECK,
+    # JobNames.STYLE_CHECK,
     JobNames.FAST_TEST,
-    "Build (amd_tidy)",
-    "Build (arm_tidy)",
+    # "Build (amd_tidy)",
+    # "Build (arm_tidy)",
 ]
 
 INTEGRATION_TEST_FLAKY_CHECK_JOBS = [
@@ -178,6 +178,11 @@ def should_skip_job(job_name):
             # comparison with the latest release merge base - do not skip on master
             return False, ""
         return True, "Skipped, not labeled with 'pr-performance'"
+
+    ci_exclude_tags = _info_cache.get_kv_data("ci_exclude_tags") or []
+    for tag in ci_exclude_tags:
+        if tag in job_name:
+            return True, f"Skipped, job name includes excluded tag '{tag}'"
 
     # If only the functional tests script changed, run only the first batch of stateless tests
     if changed_files and all(
