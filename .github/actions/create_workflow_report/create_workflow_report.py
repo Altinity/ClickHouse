@@ -432,7 +432,7 @@ def get_workflow_config() -> dict:
     if os.path.exists("./ci/tmp/workflow_status.json"):
         with open("./ci/tmp/workflow_status.json", "r") as f:
             return json.loads(json.load(f)["config_workflow"]["outputs"]["data"])[
-                "workflow_config"
+                "WORKFLOW_CONFIG"
             ]
 
     workflow_config_files = glob("./ci/tmp/workflow_config*.json")
