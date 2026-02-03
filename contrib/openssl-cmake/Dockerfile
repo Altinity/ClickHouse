@@ -21,16 +21,27 @@ RUN cd /aws-lc-AWS-LC-FIPS-2.0.0 \
 
 # Check that version is reported correctly
 RUN cd /aws-lc-AWS-LC-FIPS-2.0.0/build \
-    && cat <<C_CODE | gcc -x c - -o ./get_version -L./ssl -l:libssl.a -L./crypto -l:libcrypto.a #&& [ "$(./get_version)" == 'AWS-LC FIPS 2.0.0' ]
+    && <<C_CODE gcc -x c - -o ./check_version -L./ssl -l:libssl.a -L./crypto -l:libcrypto.a && ./check_version 'AWS-LC FIPS 2.0.0'
 #include <stdio.h>
+#include <string.h>
 const char* awslc_version_string(void);
-int main(void) {
-  printf("%s\n", awslc_version_string());
-  return 0;
+int expect(const char * expected, const char * actual) {
+    if (strcmp(expected, actual) == 0)
+        return 0;
+    printf("expected %s but got %s", expected, actual);
+    return 1;
+}
+int main(int argc, char * argv[]) {
+    int result = 0;
+    if (argc > 1)
+        result |= expect((const char*)argv[1], awslc_version_string());
+    return result;
 };
 C_CODE
+RUN
 
 #check is in FIPS mode
-RUN /aws-lc-AWS-LC-FIPS-2.0.0/build/tool/bssl isfips
+RUN test $(/aws-lc-AWS-LC-FIPS-2.0.0/build/tool/bssl isfips) = 1
+
 # execute all test
-# RUN find /aws-lc-AWS-LC-FIPS-2.0.0/build -iname '*test*' -type f -executable -exec {} \;
+RUN find /aws-lc-AWS-LC-FIPS-2.0.0/build -iname '*test*' -type f -executable -print -exec {} \;
