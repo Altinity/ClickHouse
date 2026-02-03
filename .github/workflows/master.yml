@@ -4473,7 +4473,7 @@ jobs:
 
   GrypeScanServer:
     needs: [config_workflow, docker_server_image]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VyIHNlcnZlciBpbWFnZQ==') }}
+    if: ${{  !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'RG9ja2VyIHNlcnZlciBpbWFnZQ==') }}
     strategy:
       fail-fast: false
       matrix:
@@ -4486,7 +4486,7 @@ jobs:
       tag-suffix: ${{ matrix.suffix }}
   GrypeScanKeeper:
       needs: [config_workflow, docker_keeper_image]
-      if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VyIGtlZXBlciBpbWFnZQ==') }}
+      if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'RG9ja2VyIGtlZXBlciBpbWFnZQ==') }}
       uses: ./.github/workflows/grype_scan.yml
       secrets: inherit
       with:
@@ -4495,7 +4495,7 @@ jobs:
 
   RegressionTestsRelease:
     needs: [config_workflow, build_amd_binary]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).custom_data.ci_exclude_tags, 'regression')}}
+    if: ${{  !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.custom_data.ci_exclude_tags, 'regression')}}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
@@ -4507,7 +4507,7 @@ jobs:
       workflow_config: ${{ needs.config_workflow.outputs.data.workflow_config }}
   RegressionTestsAarch64:
     needs: [config_workflow, build_arm_binary]
-    if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).custom_data.ci_exclude_tags, 'regression') && !contains(fromJson(needs.config_workflow.outputs.data).custom_data.ci_exclude_tags, 'aarch64')}}
+    if: ${{  !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.custom_data.ci_exclude_tags, 'regression') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.custom_data.ci_exclude_tags, 'aarch64')}}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
