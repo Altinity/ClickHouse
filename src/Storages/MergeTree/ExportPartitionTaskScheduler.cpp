@@ -190,6 +190,49 @@ void ExportPartitionTaskScheduler::run()
                 continue;
             }
 
+            Coordination::Stat processing_part_stat;
+            const auto processing_part_path = fs::path(storage.zookeeper_path) / "exports" / key / "processing" / zk_part_name;
+
+            std::string processing_part_string;
+
+            if (!zk->tryGet(processing_part_path, processing_part_string, &processing_part_stat))
+            {
+                LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to get processing part, will not attempt to schedule export task");
+                continue;
+            }
+        
+            /// todo arthur could this have been cached?
+            auto processing_part_entry = ExportReplicatedMergeTreePartitionProcessingPartEntry::fromJsonString(processing_part_string);
+        
+            /// if the status is pending and the retry count is greater than the limit, then it means the last node that attempted to export this part failed to set the status of the task to failed
+            /// try to fix it manually.
+            if (processing_part_entry.retry_count > manifest.max_retries)
+            {
+                LOG_INFO(
+                    storage.log,
+                     "ExportPartition scheduler task: Retry count limit exceeded for part {} and it is not marked as failed. Trying to mark it as failed",
+                     zk_part_name);
+
+                processing_part_entry.status = ExportReplicatedMergeTreePartitionProcessingPartEntry::Status::FAILED;
+                processing_part_entry.finished_by = "unknown";
+
+                Coordination::Requests ops;
+                const auto export_path = fs::path(storage.zookeeper_path) / "exports" / key;
+
+                ops.emplace_back(zkutil::makeSetRequest(processing_part_path, processing_part_entry.toJsonString(), processing_part_stat.version));
+                ops.emplace_back(zkutil::makeSetRequest(export_path / "status", String(magic_enum::enum_name(ExportReplicatedMergeTreePartitionTaskEntry::Status::FAILED)).data(), -1));
+
+                ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+                ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperMulti);
+                Coordination::Responses responses;
+                if (Coordination::Error::ZOK != zk->tryMulti(ops, responses))
+                {
+                    LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to mark part as failed, skipping");
+                    continue;
+                }
+                continue;
+            }
+
             LOG_INFO(storage.log, "ExportPartition scheduler task: Scheduling part export: {}", zk_part_name);
 
             auto context = getContextCopyWithTaskSettings(storage.getContext(), manifest);
@@ -215,7 +258,7 @@ void ExportPartitionTaskScheduler::run()
                         handlePartExportCompletion(key, zk_part_name, manifest, destination_storage, result);
                     });
 
-                part_export_manifest.task = std::make_shared<ExportPartFromPartitionExportTask>(storage, key, part_export_manifest);
+                part_export_manifest.task = std::make_shared<ExportPartFromPartitionExportTask>(storage, key, part_export_manifest, manifest.max_retries);
 
                 /// todo arthur this might conflict with the standalone export part. what to do in this case?
                 if (!storage.export_manifests.emplace(part_export_manifest).second)
@@ -237,13 +280,22 @@ void ExportPartitionTaskScheduler::run()
                 {
                     LOG_INFO(storage.log, "ExportPartition scheduler task: Exporting part to table");
 
-                    LOG_INFO(storage.log, "ExportPartition scheduler task: Attempting to lock part: {}", zk_part_name);
+                    LOG_INFO(storage.log, "ExportPartition scheduler task: Attempting to lock and increment retry count for part: {}", zk_part_name);
+
+                    processing_part_entry.retry_count++;
+
+                    Coordination::Requests ops;
+                
+                    ops.emplace_back(zkutil::makeSetRequest(processing_part_path, processing_part_entry.toJsonString(), processing_part_stat.version));                    
+                    ops.emplace_back(zkutil::makeCreateRequest(fs::path(storage.zookeeper_path) / "exports" / key / "locks" / zk_part_name, storage.replica_name, zkutil::CreateMode::Ephemeral));
 
                     ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-                    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperCreate);
-                    if (Coordination::Error::ZOK != zk->tryCreate(fs::path(storage.zookeeper_path) / "exports" / key / "locks" / zk_part_name, storage.replica_name, zkutil::CreateMode::Ephemeral))
+                    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperMulti);
+
+                    Coordination::Responses responses;
+                    if (Coordination::Error::ZOK != zk->tryMulti(ops, responses))
                     {
-                        LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to lock part {}, skipping", zk_part_name);
+                        LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to either lock or increment retry count for part {}, skipping", zk_part_name);
                         continue;
                     }
 
@@ -342,7 +394,7 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
     size_t max_retries
 )
 {
-    LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} export failed, will now increment counters", part_name);
+    LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} export failed", part_name);
 
     if (!exception)
     {
@@ -390,10 +442,7 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
     /// todo arthur could this have been cached?
     auto processing_part_entry = ExportReplicatedMergeTreePartitionProcessingPartEntry::fromJsonString(processing_part_string);
 
-    processing_part_entry.retry_count++;
-
     ops.emplace_back(zkutil::makeRemoveRequest(export_path / "locks" / part_name, locked_by_stat.version));
-    ops.emplace_back(zkutil::makeSetRequest(processing_part_path, processing_part_entry.toJsonString(), -1));
 
     LOG_INFO(storage.log, "ExportPartition scheduler task: Updating processing part entry for part {}, retry count: {}, max retries: {}", part_name, processing_part_entry.retry_count, max_retries);
 
@@ -406,10 +455,8 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
         ops.emplace_back(zkutil::makeSetRequest(export_path / "status", String(magic_enum::enum_name(ExportReplicatedMergeTreePartitionTaskEntry::Status::FAILED)).data(), -1));
         LOG_INFO(storage.log, "ExportPartition scheduler task: Retry count limit exceeded for part {}, will try to fail the entire task", part_name);
     }
-    else
-    {
-        LOG_INFO(storage.log, "ExportPartition scheduler task: Retry count limit not exceeded for part {}, will increment retry count", part_name);
-    }
+
+    ops.emplace_back(zkutil::makeSetRequest(processing_part_path, processing_part_entry.toJsonString(), -1));
 
     std::size_t num_exceptions = 0;
 
