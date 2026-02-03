@@ -186,7 +186,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getMatchingFileFromIter
             auto file_meta_info = object_info->getFileMetaInfo();
             if (file_meta_info.has_value())
             {
-                auto file_path = send_over_whole_archive ? file_identifier : object_info->getPath();
+                auto file_path = send_over_whole_archive ? object_info->getPathOrPathToArchiveIfArchive() : object_info->getPath();
                 object_info->command.setFilePath(file_path);
                 object_info->command.setFileMetaInfo(file_meta_info.value());
             }
