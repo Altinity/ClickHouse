@@ -24,11 +24,9 @@ namespace ErrorCodes
 namespace Setting
 {
     extern const SettingsBool cluster_function_process_archive_on_multiple_nodes;
-    extern const SettingsBool allow_experimental_iceberg_read_optimization;
 }
 
 ClusterFunctionReadTaskResponse::ClusterFunctionReadTaskResponse(ObjectInfoPtr object, const ContextPtr & context)
-    : iceberg_read_optimization_enabled(context->getSettingsRef()[Setting::allow_experimental_iceberg_read_optimization])
 {
     if (!object)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "`object` cannot be null");

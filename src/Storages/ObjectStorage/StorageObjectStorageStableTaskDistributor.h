@@ -25,7 +25,8 @@ public:
         std::shared_ptr<IObjectIterator> iterator_,
         std::vector<std::string> && ids_of_nodes_,
         bool send_over_whole_archive_,
-        uint64_t lock_object_storage_task_distribution_ms_);
+        uint64_t lock_object_storage_task_distribution_ms_,
+        bool iceberg_read_optimization_enabled_);
 
     ObjectInfoPtr getNextTask(size_t number_of_current_replica);
 
@@ -54,6 +55,7 @@ private:
 
     std::mutex mutex;
     bool iterator_exhausted = false;
+    bool iceberg_read_optimization_enabled = false;
 
     LoggerPtr log = getLogger("StorageClusterTaskDistributor");
 };

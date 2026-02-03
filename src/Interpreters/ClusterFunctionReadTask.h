@@ -28,8 +28,6 @@ struct ClusterFunctionReadTaskResponse
     /// File's columns info
     std::optional<DataFileMetaInfoPtr> file_meta_info;
 
-    const bool iceberg_read_optimization_enabled = false;
-
     /// Convert received response into ObjectInfo.
     ObjectInfoPtr getObjectInfo() const;
 
