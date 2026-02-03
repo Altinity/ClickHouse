@@ -140,6 +140,10 @@ protected:
         {
             findURLSecretArguments();
         }
+        else if (function->name() == "redis")
+        {
+            findRedisFunctionSecretArguments();
+        }
         else if (function->name() == "ytsaurus")
         {
             findYTsaurusStorageTableEngineSecretArguments();
@@ -194,7 +198,7 @@ protected:
         result.replacement = std::move(uri);
     }
 
-    void findRedisSecretArguments()
+    void findRedisTableEngineSecretArguments()
     {
         /// Redis does not have URL/address argument,
         /// only 'host:port' and separate "password" argument.
@@ -530,7 +534,7 @@ protected:
         }
         else if (engine_name == "Redis")
         {
-            findRedisSecretArguments();
+            findRedisTableEngineSecretArguments();
         }
         else if (engine_name == "YTsaurus")
         {
@@ -626,6 +630,12 @@ protected:
             markSecretArgument(url_arg_idx + 4);
     }
 
+    void findRedisFunctionSecretArguments()
+    {
+        // redis(host:port, key, structure, db_index, password, pool_size)
+        markSecretArgument(4);
+    }
+
     void findYTsaurusStorageTableEngineSecretArguments()
     {
         // YTsaurus('base_uri', 'yt_path', 'auth_token')
@@ -695,6 +705,12 @@ protected:
         const String & engine_name = function->name();
         if (engine_name == "S3")
         {
+            if (isNamedCollectionName(0))
+            {
+                /// BACKUP ... TO S3(named_collection, ..., secret_access_key = 'secret_access_key', ...)
+                findSecretNamedArgument("secret_access_key", 1);
+                return;
+            }
             /// BACKUP ... TO S3(url, [aws_access_key_id, aws_secret_access_key])
             markSecretArgument(2);
         }
