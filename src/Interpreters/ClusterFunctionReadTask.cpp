@@ -82,7 +82,8 @@ ObjectInfoPtr ClusterFunctionReadTaskResponse::getObjectInfo() const
     }
     object->data_lake_metadata = data_lake_metadata;
     object->file_bucket_info = file_bucket_info;
-    object->relative_path_with_metadata.file_meta_info = file_meta_info;
+    if (file_meta_info.has_value())
+        object->relative_path_with_metadata.file_meta_info = file_meta_info;
 
     return object;
 }

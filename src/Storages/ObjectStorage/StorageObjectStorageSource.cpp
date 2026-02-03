@@ -551,7 +551,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                 sleepForMicroseconds(wait_time);
                 continue;
             }
-            object_info->setFileMetaInfo(object_info->getCommand().getFileMetaInfo());
+            object_info->relative_path_with_metadata.setFileMetaInfo(object_info->relative_path_with_metadata.getCommand().getFileMetaInfo());
         }
 
         if (object_info->getPath().empty())

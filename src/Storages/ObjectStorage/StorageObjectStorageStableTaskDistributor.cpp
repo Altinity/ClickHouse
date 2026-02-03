@@ -183,12 +183,12 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getMatchingFileFromIter
 
         if (iceberg_read_optimization_enabled)
         {
-            auto file_meta_info = object_info->getFileMetaInfo();
+            auto file_meta_info = object_info->relative_path_with_metadata.getFileMetaInfo();
             if (file_meta_info.has_value())
             {
                 auto file_path = send_over_whole_archive ? object_info->getPathOrPathToArchiveIfArchive() : object_info->getPath();
-                object_info->command.setFilePath(file_path);
-                object_info->command.setFileMetaInfo(file_meta_info.value());
+                object_info->relative_path_with_metadata.command.setFilePath(file_path);
+                object_info->relative_path_with_metadata.command.setFileMetaInfo(file_meta_info.value());
             }
         }
 
