@@ -117,8 +117,8 @@ public:
 
     String toString() const;
 
-    String serialize() const;
-    void deserialize(const String & range);
+    String serialize(bool base64 = false) const;
+    void deserialize(const String & range, bool base64 = false);
 };
 
 Range intersect(const Range & a, const Range & b);

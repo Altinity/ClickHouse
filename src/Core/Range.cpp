@@ -5,6 +5,7 @@
 #include <IO/ReadBufferFromString.h>
 #include <Common/FieldVisitorToString.h>
 #include <Common/FieldAccurateComparison.h>
+#include <Common/Base64.h>
 
 
 namespace DB
@@ -290,7 +291,7 @@ bool Range::nearByWith(const Range & r) const
     return false;
 }
 
-String Range::serialize() const
+String Range::serialize(bool base64) const
 {
     WriteBufferFromOwnString str;
 
@@ -298,15 +299,18 @@ String Range::serialize() const
     writeFieldBinary(left, str);
     writeFieldBinary(right, str);
 
-    return str.str();
+    if (base64)
+        return base64Encode(str.str());
+    else
+        return str.str();
 }
 
-void Range::deserialize(const String & range)
+void Range::deserialize(const String & range, bool base64)
 {
     if (range.empty())
         throw Exception(ErrorCodes::INCORRECT_DATA, "Empty range dump");
 
-    ReadBufferFromOwnString str(range);
+    ReadBufferFromOwnString str(base64 ? base64Decode(range) : range);
 
     str >> left_included >> right_included;
     left = readFieldBinary(str);
