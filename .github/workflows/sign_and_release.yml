@@ -128,7 +128,6 @@ jobs:
             exit 1
           fi
 
-          if ! aws s3 cp "${SRC_URL}/${ARM_PATH}/clickhouse-common-static.tar" clickhouse-common-static.tar; then
           echo "Uploading processed binaries..."
           if ! aws s3 cp clickhouse "${SRC_URL}/${ARM_PATH}/arm64-bin/non-self-extracting/"; then
             echo "Failed to upload clickhouse binary"
@@ -138,8 +137,8 @@ jobs:
             echo "Failed to upload stripped clickhouse binary"
             exit 1
           fi
-          if ! aws s3 cp clickhouse-common-static-${{ inputs.package_version }}-arm64/usr/bin/clickhouse "${SRC_URL}/${ARM_PATH}/arm64-bin/non-self-extracting/clickhouse-with-symtable"; then
-            echo "Failed to upload stripped clickhouse binary"
+          if ! aws s3 cp "clickhouse-common-static-${{ inputs.package_version }}/usr/bin/clickhouse" "${SRC_URL}/${ARM_PATH}/arm64-bin/non-self-extracting/clickhouse-with-symtable"; then
+            echo "Failed to upload clickhouse-with-symtable binary"
             exit 1
           fi
 
@@ -241,7 +240,7 @@ jobs:
             echo "Failed to upload stripped clickhouse binary"
             exit 1
           fi
-          if ! aws s3 cp clickhouse-common-static-${{ inputs.package_version }}-amd64/usr/bin/clickhouse "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/non-self-extracting/clickhouse-with-symtable"; then
+          if ! aws s3 cp clickhouse-common-static-${{ inputs.package_version }}/usr/bin/clickhouse "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/non-self-extracting/clickhouse-with-symtable"; then
             echo "Failed to upload stripped clickhouse binary"
             exit 1
           fi
