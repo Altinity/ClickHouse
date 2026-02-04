@@ -39,6 +39,11 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         /// controls new feature and it's 'true' by default, use 'false' as previous_value).
         /// It's used to implement `compatibility` setting (see https://github.com/ClickHouse/ClickHouse/issues/35972)
         /// Note: please check if the key already exists to prevent duplicate entries.
+        addSettingsChanges(settings_changes_history, "26.2",
+        {
+            {"default_dictionary_database", "", "", "New setting"},
+            {"iceberg_partition_timezone", "", "", "New setting."},
+        });
         addSettingsChanges(settings_changes_history, "26.1",
         {
             {"parallel_replicas_filter_pushdown", false, false, "New setting"},
@@ -220,7 +225,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"os_threads_nice_value_query", 0, 0, "New setting."},
             {"os_threads_nice_value_materialized_view", 0, 0, "New setting."},
             {"os_thread_priority", 0, 0, "Alias for os_threads_nice_value_query."},
-            {"iceberg_partition_timezone", "", "", "New setting."},
         });
         addSettingsChanges(settings_changes_history, "25.8",
         {
