@@ -121,7 +121,7 @@ jobs:
 
           tar -xvf clickhouse-common-static.tgz
 
-          if readelf -S "clickhouse-common-static-${{ inputs.package_version }}-arm64/usr/bin/clickhouse" | grep -q '\.symtab'; then
+          if readelf -S "clickhouse-common-static-${{ inputs.package_version }}/usr/bin/clickhouse" | grep -q '\.symtab'; then
             echo "✓ Binary has symtable"
           else
             echo "✗ Binary is missing symtable"
@@ -225,7 +225,7 @@ jobs:
 
           tar -xvf clickhouse-common-static.tgz
 
-          if readelf -S "clickhouse-common-static-${{ inputs.package_version }}-amd64/usr/bin/clickhouse" | grep -q '\.symtab'; then
+          if readelf -S "clickhouse-common-static-${{ inputs.package_version }}/usr/bin/clickhouse" | grep -q '\.symtab'; then
             echo "✓ Binary has symtable"
           else
             echo "✗ Binary is missing symtable"
