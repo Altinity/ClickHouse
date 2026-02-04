@@ -100,6 +100,7 @@ struct ExportReplicatedMergeTreePartitionProcessedPartEntry
 struct ExportReplicatedMergeTreePartitionManifest
 {
     String transaction_id;
+    String query_id;
     String partition_id;
     String destination_database;
     String destination_table;
@@ -120,6 +121,7 @@ struct ExportReplicatedMergeTreePartitionManifest
     {
         Poco::JSON::Object json;
         json.set("transaction_id", transaction_id);
+        json.set("query_id", query_id);
         json.set("partition_id", partition_id);
         json.set("destination_database", destination_database);
         json.set("destination_table", destination_table);
@@ -153,6 +155,7 @@ struct ExportReplicatedMergeTreePartitionManifest
 
         ExportReplicatedMergeTreePartitionManifest manifest;
         manifest.transaction_id = json->getValue<String>("transaction_id");
+        manifest.query_id = json->getValue<String>("query_id");
         manifest.partition_id = json->getValue<String>("partition_id");
         manifest.destination_database = json->getValue<String>("destination_database");
         manifest.destination_table = json->getValue<String>("destination_table");
