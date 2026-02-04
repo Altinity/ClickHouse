@@ -7,6 +7,10 @@ option(FAIL_ON_UNSUPPORTED_OPTIONS_COMBINATION
    "Stop/Fail CMake configuration if some ENABLE_XXX option is defined (either ON or OFF)
    but is not possible to satisfy" ON)
 
+option(FIPS_CLICKHOUSE
+    "Build ClickHouse in FIPS mode: that is both BoringSSL and Poco are build in FIPS mode"
+    ON)
+
 # This allows to compile some code conditionally in the private build while having byte-identical source files.
 set (CLICKHOUSE_CLOUD 0)
 

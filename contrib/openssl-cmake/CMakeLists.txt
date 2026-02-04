@@ -11,6 +11,87 @@ endif()
 project(ch-openssl)
 cmake_minimum_required(VERSION 3.5)
 
+
+if(FIPS_CLICKHOUSE)
+
+set(AWSLC_BUILD_DIR "${CMAKE_BINARY_DIR}/awslc-build")
+set(AWSLC_BINARIES_DIR "${AWSLC_BUILD_DIR}/output")
+
+message("Will build AWS-LC FIPS 2.0.0 in FIPS mode according to security policy #4816.")
+# build AWS-LC in FIPS mode accoring to the Security Policy:
+# https://csrc.nist.gov/CSRC/media/projects/cryptographic-module-validation-program/documents/security-policies/140sp4816.pdf
+
+# Build driver - the script that triggers the build and pulls out results from docker container
+file(WRITE ${AWSLC_BUILD_DIR}/build_awclc_fips.sh
+"#!/bin/bash
+set -ex
+
+readonly OUTPUT_DIR=$1
+readonly DOCKERFILE_PATH=$2
+shift 2
+
+docker build . -t awslc-builder -f $DOCKERFILE_PATH
+readonly id=$(docker create awslc-builder)
+
+docker start -a $id #| tr -dc \\\\x0-\\\\x9
+
+mkdir -p $OUTPUT_DIR
+readonly lib_dir='/aws-lc-AWS-LC-FIPS-2.0.0'
+# Copy build artifacts
+docker cp $id:$lib_dir/build/ssl/libssl.a $OUTPUT_DIR
+docker cp $id:$lib_dir/build/crypto/libcrypto.a $OUTPUT_DIR
+docker cp $id:$lib_dir/include $OUTPUT_DIR
+
+docker rm $id"
+)
+
+# patch a single file in krb5 that relies on file missing from this version of BoringSSL
+# SET(krb5_filb_to_patch ${PROJECT_SOURCE_DIR}/contrib/krb5/src/lib/crypto/openssl/enc_provider/aes.c)
+# message("Patching ${krb5_filb_to_patch} to allow building against older version of BoringSSL")
+# file(READ ${krb5_filb_to_patch} FILE_CONTENTS)
+# string(REPLACE "#include <openssl/modes.h>" "//#include <openssl/modes.h>" FILE_CONTENTS "${FILE_CONTENTS}")
+# file(WRITE ${krb5_filb_to_patch} "${FILE_CONTENTS}")
+
+message("Creating directory for AWS-LC binaries and includes in ${AWSLC_BINARIES_DIR}")
+execute_process(COMMAND ${CMAKE_COMMAND} -E make_directory "${AWSLC_BINARIES_DIR}/include")
+
+add_custom_target(build-awslc
+#    COMMENT "Build AWS-LC in FIPS mode with docker (using go1.22 build suite)"
+    DEPENDS ${AWSLC_BINARIES_DIR}/libssl.a ${AWSLC_BINARIES_DIR}/libcrypto.a
+)
+
+add_custom_command(
+    OUTPUT
+        "${AWSLC_BUILD_DIR}/output/libssl.a"
+        "${AWSLC_BUILD_DIR}/output/libcrypto.a"
+    COMMENT "Building AWS-LC in FIPS mode using Docker"
+    COMMAND bash -c "chmod +x ${AWSLC_BUILD_DIR}/build_awclc_fips.sh"
+    COMMAND bash -c "${AWSLC_BUILD_DIR}/build_awclc_fips.sh ${AWSLC_BINARIES_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/Dockerfile"
+    WORKING_DIRECTORY ${AWSLC_BUILD_DIR}
+    USES_TERMINAL # To stream output
+    DEPENDS
+        ${AWSLC_BUILD_DIR}/build_awclc_fips.sh
+)
+
+add_library(crypto UNKNOWN IMPORTED GLOBAL)
+add_dependencies(crypto build-awslc)
+set_target_properties(crypto PROPERTIES
+    IMPORTED_LINK_INTERFACE_LANGUAGES "CXX"
+    IMPORTED_LOCATION "${AWSLC_BINARIES_DIR}/libcrypto.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${AWSLC_BINARIES_DIR}/include"
+)
+
+add_library(ssl UNKNOWN IMPORTED GLOBAL)
+add_dependencies(ssl _crypto)
+set_target_properties(ssl PROPERTIES
+    IMPORTED_LINK_INTERFACE_LANGUAGES "CXX"
+    IMPORTED_LOCATION "${AWSLC_BINARIES_DIR}/libssl.a"
+    INTERFACE_INCLUDE_DIRECTORIES "${AWSLC_BINARIES_DIR}/include"
+)
+
+else() # FIPS_CLICKHOUSE
+
+
 # Below build description was generated from these steps:
 # - Checkout OpenSSL in the desired version (e.g. 3.2)
 # - Take a brief look (but not too long to save your mental sanity) at the supported build options (*)
@@ -1479,6 +1560,8 @@ target_include_directories(ssl
     PRIVATE ${OPENSSL_SOURCE_DIR})
 
 target_link_libraries(ssl crypto)
+
+endif() # FIPS_CLICKHOUSE
 
 add_library(OpenSSL::Crypto ALIAS crypto)
 add_library(OpenSSL::SSL ALIAS ssl)
