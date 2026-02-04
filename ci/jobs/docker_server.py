@@ -19,16 +19,16 @@ ARCH = ("amd64", "arm64")
 temp_path = Path(f"{Utils.cwd()}/ci/tmp")
 
 GITHUB_SERVER_URL = os.getenv("GITHUB_SERVER_URL", "https://github.com")
-with tempfile.NamedTemporaryFile("w", delete=False) as f:
-    GIT_KNOWN_HOSTS_FILE = f.name
-    GIT_PREFIX = (  # All commits to remote are done as robot-clickhouse
-        "git -c user.email=robot-clickhouse@users.noreply.github.com "
-        "-c user.name=robot-clickhouse -c commit.gpgsign=false "
-        "-c core.sshCommand="
-        f"'ssh -o UserKnownHostsFile={GIT_KNOWN_HOSTS_FILE} "
-        "-o StrictHostKeyChecking=accept-new'"
-    )
-    atexit.register(os.remove, f.name)
+# with tempfile.NamedTemporaryFile("w", delete=False) as f:
+#     GIT_KNOWN_HOSTS_FILE = f.name
+#     GIT_PREFIX = (  # All commits to remote are done as robot-clickhouse
+#         "git -c user.email=robot-clickhouse@users.noreply.github.com "
+#         "-c user.name=robot-clickhouse -c commit.gpgsign=false "
+#         "-c core.sshCommand="
+#         f"'ssh -o UserKnownHostsFile={GIT_KNOWN_HOSTS_FILE} "
+#         "-o StrictHostKeyChecking=accept-new'"
+#     )
+#     atexit.register(os.remove, f.name)
 
 
 def read_build_urls(build_name: str):
@@ -326,10 +326,10 @@ def main():
 
     if "server image" in info.job_name:
         image_path = args.image_path or "docker/server"
-        image_repo = args.image_repo or "clickhouse/clickhouse-server"
+        image_repo = args.image_repo or "altinityinfra/clickhouse-server"
     elif "keeper image" in info.job_name:
         image_path = args.image_path or "docker/keeper"
-        image_repo = args.image_repo or "clickhouse/clickhouse-keeper"
+        image_repo = args.image_repo or "altinityinfra/clickhouse-keeper"
     else:
         assert False, f"Unexpected job name [{info.job_name}]"
 
@@ -402,10 +402,10 @@ def main():
                 )
             )
 
-    if not push:
-        # The image is built locally only when we don't push it
-        # See `--output=type=docker`
-        test_docker_library(test_results)
+    # if not push:
+    #     # The image is built locally only when we don't push it
+    #     # See `--output=type=docker`
+    #     test_docker_library(test_results) # NOTE (strtgbb): tests against the official docker library version of ClickHouse
 
     Result.create_from(results=test_results, stopwatch=sw).complete_job()
 
