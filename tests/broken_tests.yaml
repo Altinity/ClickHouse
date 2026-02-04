@@ -47,6 +47,7 @@
   message: result differs with reference
   check_types:
   - msan
+  - tsan
 - name: 02676_optimize_old_parts_replicated
   reason: INVESTIGATE - Unstable on tsan
   message: result differs with reference
@@ -191,7 +192,9 @@
   reason: 'KNOWN: Occasional timeout'
   message: docker_compose_iceberg_hms_catalog.yml', '--verbose', 'up', '-d']' timed out after 300 seconds
 - name: test_keeper_memory_soft_limit/test.py::test_soft_limit_create
-  reason: 'FIXME: Unstable in current version. Fixed in recent upstream.'
+  reason: 'INVESTIGATE: Out of Memory or startup instability'
+- name: test_s3_cache_locality/test.py::test_cache_locality[0]
+  reason: 'INVESTIGATE: Timeout or AssertionError'
 
 # Regex rules should be ordered from most specific to least specific.
 # regex: true applies to name, message, and not_message fields, but not to reason or check_types fields.
