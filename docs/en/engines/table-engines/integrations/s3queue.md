@@ -110,6 +110,9 @@ Default value: `keep`.
 ### `keeper_path` {#keeper_path}
 
 The path in ZooKeeper can be specified as a table engine setting or default path can be formed from the global configuration-provided path and table UUID.
+Absolute values (starting with `/`) are used as-is, while relative values are appended to `s3queue_default_zookeeper_path`.
+To target an auxiliary ZooKeeper cluster, prefix the value with the configured name, for example `analytics_keeper:/clickhouse/queue/orders`.
+The name must exist in `<auxiliary_zookeepers>`, otherwise the engine reports `Unknown auxiliary ZooKeeper name ...`.
 Possible values:
 
 - String.

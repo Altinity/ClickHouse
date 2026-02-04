@@ -246,7 +246,7 @@ ObjectStorageQueueSource::FileIterator::next()
                 }
 
                 Coordination::Responses responses;
-                auto zk_client = Context::getGlobalContextInstance()->getZooKeeper();
+                auto zk_client = metadata->getZooKeeper();
                 auto code = zk_client->tryMulti(requests, responses);
                 if (code == Coordination::Error::ZOK)
                 {
@@ -351,10 +351,11 @@ void ObjectStorageQueueSource::FileIterator::filterProcessableFiles(Source::Obje
     if (enable_hash_ring_filtering && mode == ObjectStorageQueueMode::UNORDERED)
         metadata->filterOutForProcessor(paths, storage_id);
 
+    const auto & zookeeper_name = metadata->getZooKeeperName();
     if (mode == ObjectStorageQueueMode::UNORDERED)
-        ObjectStorageQueueUnorderedFileMetadata::filterOutProcessedAndFailed(paths, metadata->getPath(), log);
+        ObjectStorageQueueUnorderedFileMetadata::filterOutProcessedAndFailed(paths, metadata->getPath(), zookeeper_name, log);
     else
-        ObjectStorageQueueOrderedFileMetadata::filterOutProcessedAndFailed(paths, metadata->getPath(), metadata->getBucketsNum(), log);
+        ObjectStorageQueueOrderedFileMetadata::filterOutProcessedAndFailed(paths, metadata->getPath(), metadata->getBucketsNum(), zookeeper_name, log);
 
     std::unordered_set<std::string> paths_set;
     std::ranges::move(paths, std::inserter(paths_set, paths_set.end()));
@@ -1271,7 +1272,7 @@ void ObjectStorageQueueSource::commit(bool insert_succeeded, const std::string &
         object_storage->removeObjectsIfExist(successful_objects);
     }
 
-    auto zk_client = getContext()->getZooKeeper();
+    auto zk_client = files_metadata->getZooKeeper();
     Coordination::Responses responses;
     auto code = zk_client->tryMulti(requests, responses);
     if (code != Coordination::Error::ZOK)

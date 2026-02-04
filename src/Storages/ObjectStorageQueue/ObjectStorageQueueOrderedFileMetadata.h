@@ -20,6 +20,7 @@ public:
         int bucket_version;
         std::string bucket_lock_path;
         std::string bucket_lock_id_path;
+        std::string zookeeper_name;
     };
     using BucketInfoPtr = std::shared_ptr<const BucketInfo>;
 
@@ -32,6 +33,7 @@ public:
         size_t max_loading_retries_,
         std::atomic<size_t> & metadata_ref_count_,
         bool use_persistent_processing_nodes_,
+        const std::string & zookeeper_name_,
         LoggerPtr log_);
 
     struct BucketHolder;
@@ -44,19 +46,25 @@ public:
         const std::filesystem::path & zk_path,
         const Bucket & bucket,
         const Processor & processor,
+        const std::string & zookeeper_name_,
         LoggerPtr log_);
 
     static ObjectStorageQueueOrderedFileMetadata::Bucket getBucketForPath(const std::string & path, size_t buckets_num);
 
     static std::vector<std::string> getMetadataPaths(size_t buckets_num);
 
-    static void migrateToBuckets(const std::string & zk_path, size_t value, size_t prev_value);
+    static void migrateToBuckets(
+        const std::string & zk_path,
+        size_t value,
+        size_t prev_value,
+        const std::string & zookeeper_name_);
 
     /// Return vector of indexes of filtered paths.
     static void filterOutProcessedAndFailed(
         std::vector<std::string> & paths,
         const std::filesystem::path & zk_path_,
         size_t buckets_num,
+        const std::string & zookeeper_name_,
         LoggerPtr log);
 
     void prepareProcessedAtStartRequests(
@@ -98,6 +106,7 @@ struct ObjectStorageQueueOrderedFileMetadata::BucketHolder : private boost::nonc
         const std::string & bucket_lock_path_,
         const std::string & bucket_lock_id_path_,
         zkutil::ZooKeeperPtr zk_client_,
+        const std::string & zookeeper_name_,
         LoggerPtr log_);
 
     ~BucketHolder();

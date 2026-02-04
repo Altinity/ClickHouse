@@ -70,11 +70,6 @@ namespace
         pcg64 rng(randomSeed());
         return min + rng() % (max - min + 1);
     }
-
-    zkutil::ZooKeeperPtr getZooKeeper()
-    {
-        return Context::getGlobalContextInstance()->getZooKeeper();
-    }
 }
 
 class ObjectStorageQueueMetadata::LocalFileStatuses
@@ -129,6 +124,7 @@ private:
 
 ObjectStorageQueueMetadata::ObjectStorageQueueMetadata(
     ObjectStorageType storage_type_,
+    const std::string & zookeeper_name_,
     const fs::path & zookeeper_path_,
     const ObjectStorageQueueTableMetadata & table_metadata_,
     size_t cleanup_interval_min_ms_,
@@ -139,6 +135,7 @@ ObjectStorageQueueMetadata::ObjectStorageQueueMetadata(
     : table_metadata(table_metadata_)
     , storage_type(storage_type_)
     , mode(table_metadata.getMode())
+    , zookeeper_name(zookeeper_name_)
     , zookeeper_path(zookeeper_path_)
     , keeper_multiread_batch_size(keeper_multiread_batch_size_)
     , cleanup_interval_min_ms(cleanup_interval_min_ms_)
@@ -146,7 +143,10 @@ ObjectStorageQueueMetadata::ObjectStorageQueueMetadata(
     , use_persistent_processing_nodes(use_persistent_processing_nodes_)
     , persistent_processing_node_ttl_seconds(persistent_processing_nodes_ttl_seconds_)
     , buckets_num(table_metadata_.getBucketsNum())
-    , log(getLogger("StorageObjectStorageQueue(" + zookeeper_path_.string() + ")"))
+    , log(getLogger(fmt::format(
+        "StorageObjectStorageQueue({}{})",
+        zookeeper_name_ == zkutil::DEFAULT_ZOOKEEPER_NAME ? "" : zookeeper_name_ + ":",
+        zookeeper_path_.string())))
     , local_file_statuses(std::make_shared<LocalFileStatuses>())
 {
     LOG_TRACE(
@@ -158,6 +158,13 @@ ObjectStorageQueueMetadata::ObjectStorageQueueMetadata(
 ObjectStorageQueueMetadata::~ObjectStorageQueueMetadata()
 {
     shutdown();
+}
+
+zkutil::ZooKeeperPtr ObjectStorageQueueMetadata::getZooKeeper(LoggerPtr /* log */, const String & zookeeper_name)
+{
+    // Keep the log parameter to match upstream signature; not used in this build.
+    auto context = Context::getGlobalContextInstance();
+    return context->getDefaultOrAuxiliaryZooKeeper(zookeeper_name);
 }
 
 void ObjectStorageQueueMetadata::startup()
@@ -214,6 +221,7 @@ ObjectStorageQueueMetadata::FileMetadataPtr ObjectStorageQueueMetadata::getFileM
                 table_metadata.loading_retries,
                 *metadata_ref_count,
                 use_persistent_processing_nodes,
+                zookeeper_name,
                 log);
         case ObjectStorageQueueMode::UNORDERED:
             return std::make_shared<ObjectStorageQueueUnorderedFileMetadata>(
@@ -223,6 +231,7 @@ ObjectStorageQueueMetadata::FileMetadataPtr ObjectStorageQueueMetadata::getFileM
                 table_metadata.loading_retries,
                 *metadata_ref_count,
                 use_persistent_processing_nodes,
+                zookeeper_name,
                 log);
     }
 }
@@ -240,7 +249,7 @@ ObjectStorageQueueMetadata::Bucket ObjectStorageQueueMetadata::getBucketForPath(
 ObjectStorageQueueOrderedFileMetadata::BucketHolderPtr
 ObjectStorageQueueMetadata::tryAcquireBucket(const Bucket & bucket, const Processor & processor)
 {
-    return ObjectStorageQueueOrderedFileMetadata::tryAcquireBucket(zookeeper_path, bucket, processor, log);
+    return ObjectStorageQueueOrderedFileMetadata::tryAcquireBucket(zookeeper_path, bucket, processor, zookeeper_name, log);
 }
 
 void ObjectStorageQueueMetadata::alterSettings(const SettingsChanges & changes, const ContextPtr & context)
@@ -250,7 +259,7 @@ void ObjectStorageQueueMetadata::alterSettings(const SettingsChanges & changes, 
 
     const fs::path alter_settings_lock_path = zookeeper_path / "alter_settings_lock";
     zkutil::EphemeralNodeHolder::Ptr alter_settings_lock;
-    auto zookeeper = getZooKeeper();
+    auto zookeeper = getZooKeeper(log, zookeeper_name);
 
     if (is_initial_query)
     {
@@ -393,12 +402,17 @@ void ObjectStorageQueueMetadata::migrateToBucketsInKeeper(size_t value)
 {
     chassert(table_metadata.buckets == 0 || table_metadata.buckets == 1);
     chassert(buckets_num == 1, "Buckets: " + toString(buckets_num));
-    ObjectStorageQueueOrderedFileMetadata::migrateToBuckets(zookeeper_path, value, /* prev_value */table_metadata.buckets);
+    ObjectStorageQueueOrderedFileMetadata::migrateToBuckets(
+        zookeeper_path,
+        value,
+        /* prev_value */table_metadata.buckets,
+        zookeeper_name);
     buckets_num = value;
     table_metadata.buckets = value;
 }
 
 ObjectStorageQueueTableMetadata ObjectStorageQueueMetadata::syncWithKeeper(
+    const String & zookeeper_name,
     const fs::path & zookeeper_path,
     const ObjectStorageQueueSettings & settings,
     const ColumnsDescription & columns,
@@ -429,7 +443,7 @@ ObjectStorageQueueTableMetadata ObjectStorageQueueMetadata::syncWithKeeper(
     }
 
     const auto table_metadata_path = zookeeper_path / "metadata";
-    auto zookeeper = getZooKeeper();
+    auto zookeeper = getZooKeeper(log, zookeeper_name);
     bool warned = false;
     zookeeper->createAncestors(zookeeper_path);
 
@@ -491,6 +505,7 @@ ObjectStorageQueueTableMetadata ObjectStorageQueueMetadata::syncWithKeeper(
                 table_metadata.loading_retries,
                 noop,
                 /* use_persistent_processing_nodes */false, /// Processing nodes will not be created.
+                zookeeper_name,
                 log).prepareProcessedAtStartRequests(requests, zookeeper);
         }
 
