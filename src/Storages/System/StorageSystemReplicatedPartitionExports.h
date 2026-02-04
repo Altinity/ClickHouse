@@ -13,6 +13,7 @@ struct ReplicatedPartitionExportInfo
     String destination_table;
     String partition_id;
     String transaction_id;
+    String query_id;
     time_t create_time;
     String source_replica;
     size_t parts_count;

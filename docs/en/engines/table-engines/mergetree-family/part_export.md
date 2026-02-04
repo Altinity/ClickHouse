@@ -21,6 +21,16 @@ SETTINGS allow_experimental_export_merge_tree_part = 1
          [, setting_name = value, ...]
 ```
 
+## Syntax with table function
+
+```sql
+ALTER TABLE [database.]table_name
+EXPORT PART 'part_name'
+TO TABLE FUNCTION s3(s3_conn, filename='table_function', partition_strategy...)
+SETTINGS allow_experimental_export_merge_tree_part = 1
+         [, setting_name = value, ...]
+```
+
 ### Parameters
 
 - **`table_name`**: The source MergeTree table containing the part to export
@@ -33,6 +43,8 @@ Source and destination tables must be 100% compatible:
 
 1. **Identical schemas** - same columns, types, and order
 2. **Matching partition keys** - partition expressions must be identical
+
+In case a table function is used as the destination, the schema can be omitted and it will be inferred from the source table.
 
 ## Settings
 
@@ -60,6 +72,18 @@ Source and destination tables must be 100% compatible:
 - **Default**: `0`
 - **Description**: Maximum number of rows to write to a single file when exporting a merge tree part. 0 means no limit. This is not a hard limit, and it highly depends on the output format granularity and input source chunk size. Using this might break idempotency, use it with care.
 
+### export_merge_tree_part_throw_on_pending_mutations
+
+- **Type**: `bool`
+- **Default**: `true`
+- **Description**: If set to true, throws if pending mutations exists for a given part. Note that by default mutations are applied to all parts, which means that if a mutation in practice would only affetct part/partition x, all the other parts/partition will throw upon export. The exception is when the `IN PARTITION` clause was used in the mutation command. Note the `IN PARTITION` clause is not properly implemented for plain MergeTree tables.
+
+### export_merge_tree_part_throw_on_pending_patch_parts
+
+- **Type**: `bool`
+- **Default**: `true`
+- **Description**: If set to true, throws if pending patch parts exists for a given part. Note that by default mutations are applied to all parts, which means that if a mutation in practice would only affetct part/partition x, all the other parts/partition will throw upon export. The exception is when the `IN PARTITION` clause was used in the mutation command. Note the `IN PARTITION` clause is not properly implemented for plain MergeTree tables.
+
 ## Examples
 
 ### Basic Export to S3
@@ -80,6 +104,20 @@ ALTER TABLE mt_table EXPORT PART '2020_1_1_0' TO TABLE s3_table
 SETTINGS allow_experimental_export_merge_tree_part = 1;
 
 ALTER TABLE mt_table EXPORT PART '2021_2_2_0' TO TABLE s3_table 
+SETTINGS allow_experimental_export_merge_tree_part = 1;
+```
+
+### Table function export
+
+```sql
+-- Create source and destination tables
+CREATE TABLE mt_table (id UInt64, year UInt16)
+ENGINE = MergeTree() PARTITION BY year ORDER BY tuple();
+
+-- Insert and export
+INSERT INTO mt_table VALUES (1, 2020), (2, 2020), (3, 2021);
+
+ALTER TABLE mt_table EXPORT PART '2020_1_1_0' TO TABLE FUNCTION s3(s3_conn, filename='table_function', format=Parquet, partition_strategy='hive') PARTITION BY year
 SETTINGS allow_experimental_export_merge_tree_part = 1;
 ```
 

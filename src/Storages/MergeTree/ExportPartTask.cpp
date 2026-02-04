@@ -4,17 +4,20 @@
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
+#include <Interpreters/inplaceBlockConversions.h>
 #include <Core/Settings.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Processors/Executors/CompletedPipelineExecutor.h>
 #include <Processors/QueryPlan/BuildQueryPipelineSettings.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
 #include <Processors/QueryPlan/QueryPlan.h>
+#include <Processors/QueryPlan/ExpressionStep.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Common/Exception.h>
 #include <Common/ProfileEventsScope.h>
 #include <Storages/MergeTree/ExportList.h>
 #include <Formats/FormatFactory.h>
+#include <Databases/enableAllExperimentalSettings.h>
 
 namespace ProfileEvents
 {
@@ -42,6 +45,43 @@ namespace Setting
     extern const SettingsUInt64 export_merge_tree_part_max_rows_per_file;
 }
 
+namespace
+{
+    void materializeSpecialColumns(
+        const SharedHeader & header,
+        const StorageMetadataPtr & storage_metadata,
+        const ContextPtr & local_context,
+        QueryPlan & plan_for_part
+    )
+    {
+        const auto readable_columns = storage_metadata->getColumns().getReadable();
+
+        // Enable all experimental settings for default expressions
+        // (same pattern as in IMergeTreeReader::evaluateMissingDefaults)
+        auto context_for_defaults = Context::createCopy(local_context);
+        enableAllExperimentalSettings(context_for_defaults);
+        
+        auto defaults_dag = evaluateMissingDefaults(
+            *header,
+            readable_columns,
+            storage_metadata->getColumns(),
+            context_for_defaults);
+
+        if (defaults_dag)
+        {
+            /// Ensure columns are in the correct order matching readable_columns
+            defaults_dag->removeUnusedActions(readable_columns.getNames(), false);
+            defaults_dag->addMaterializingOutputActions(/*materialize_sparse=*/ false);
+            
+            auto expression_step = std::make_unique<ExpressionStep>(
+                header,
+                std::move(*defaults_dag));
+            expression_step->setStepDescription("Compute alias and default expressions for export");
+            plan_for_part.addStep(std::move(expression_step));
+        }
+    }
+}
+
 ExportPartTask::ExportPartTask(MergeTreeData & storage_, const MergeTreePartExportManifest & manifest_)
     : storage(storage_),
     manifest(manifest_)
@@ -52,13 +92,14 @@ bool ExportPartTask::executeStep()
 {
     auto local_context = Context::createCopy(storage.getContext());
     local_context->makeQueryContextForExportPart();
-    local_context->setCurrentQueryId(manifest.transaction_id);
+    local_context->setCurrentQueryId(manifest.query_id);
     local_context->setBackgroundOperationTypeForContext(ClientInfo::BackgroundOperationType::EXPORT_PART);
     local_context->setSettings(manifest.settings);
 
     const auto & metadata_snapshot = manifest.metadata_snapshot;
 
-    Names columns_to_read = metadata_snapshot->getColumns().getNamesOfPhysical();
+    /// Read only physical columns from the part
+    const auto columns_to_read = metadata_snapshot->getColumns().getNamesOfPhysical();
 
     MergeTreeSequentialSourceType read_type = MergeTreeSequentialSourceType::Export;
 
@@ -69,19 +110,12 @@ bool ExportPartTask::executeStep()
         block_with_partition_values = manifest.data_part->minmax_idx->getBlock(storage);
     }
 
-    auto destination_storage = DatabaseCatalog::instance().tryGetTable(manifest.destination_storage_id, local_context);
-    if (!destination_storage)
-    {
-        std::lock_guard inner_lock(storage.export_manifests_mutex);
-
-        const auto destination_storage_id_name = manifest.destination_storage_id.getNameForLogs();
-        storage.export_manifests.erase(manifest);
-        throw Exception(ErrorCodes::UNKNOWN_TABLE, "Failed to reconstruct destination storage: {}", destination_storage_id_name);
-    }
+    const auto & destination_storage = manifest.destination_storage_ptr;
+    const auto destination_storage_id = destination_storage->getStorageID();
 
     auto exports_list_entry = storage.getContext()->getExportsList().insert(
         getStorageID(),
-        manifest.destination_storage_id,
+        destination_storage_id,
         manifest.data_part->getBytesOnDisk(),
         manifest.data_part->name,
         std::vector<std::string>{},
@@ -89,6 +123,7 @@ bool ExportPartTask::executeStep()
         manifest.data_part->getBytesOnDisk(),
         manifest.data_part->getBytesUncompressedOnDisk(),
         manifest.create_time,
+        manifest.query_id,
         local_context);
 
     SinkToStoragePtr sink;
@@ -145,6 +180,10 @@ bool ExportPartTask::executeStep()
             prefetch,
             local_context,
             getLogger("ExportPartition"));
+
+        /// We need to support exporting materialized and alias columns to object storage. For some reason, object storage engines don't support them.
+        /// This is a hack that materializes the columns before the export so they can be exported to tables that have matching columns
+        materializeSpecialColumns(plan_for_part.getCurrentHeader(), metadata_snapshot, local_context, plan_for_part);
 
         ThreadGroupSwitcher switcher((*exports_list_entry)->thread_group, "");
 
@@ -284,7 +323,7 @@ Priority ExportPartTask::getPriority() const
 
 String ExportPartTask::getQueryId() const
 {
-    return manifest.transaction_id;
+    return manifest.query_id;
 }
 
 }

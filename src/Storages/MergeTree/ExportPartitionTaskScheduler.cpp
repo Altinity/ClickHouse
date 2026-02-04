@@ -23,13 +23,18 @@ namespace
     {
         auto context_copy = Context::createCopy(context);
         context_copy->makeQueryContextForExportPart();
-        context_copy->setCurrentQueryId(manifest.transaction_id);
+        context_copy->setCurrentQueryId(manifest.query_id);
         context_copy->setSetting("output_format_parallel_formatting", manifest.parallel_formatting);
         context_copy->setSetting("output_format_parquet_parallel_encoding", manifest.parquet_parallel_encoding);
         context_copy->setSetting("max_threads", manifest.max_threads);
         context_copy->setSetting("export_merge_tree_part_file_already_exists_policy", String(magic_enum::enum_name(manifest.file_already_exists_policy)));
         context_copy->setSetting("export_merge_tree_part_max_bytes_per_file", manifest.max_bytes_per_file);
         context_copy->setSetting("export_merge_tree_part_max_rows_per_file", manifest.max_rows_per_file);
+
+        /// always skip pending mutations and patch parts because we already validated the parts during query processing
+        context_copy->setSetting("export_merge_tree_part_throw_on_pending_mutations", false);
+        context_copy->setSetting("export_merge_tree_part_throw_on_pending_patch_parts", false);
+
         return context_copy;
     }
 }
@@ -144,6 +149,7 @@ void ExportPartitionTaskScheduler::run()
                     destination_storage_id,
                     manifest.transaction_id,
                     getContextCopyWithTaskSettings(storage.getContext(), manifest),
+                    /*allow_outdated_parts*/ true,
                     [this, key, zk_part_name, manifest, destination_storage]
                     (MergeTreePartExportManifest::CompletionCallbackResult result)
                     {

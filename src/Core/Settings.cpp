@@ -2111,6 +2111,11 @@ DECLARE(BoolAuto, query_plan_join_swap_table, Field("auto"), R"(
 Apply sharding for JOIN if join keys contain a prefix of PRIMARY KEY for both tables. Supported for hash, parallel_hash and full_sorting_merge algorithms. Usually does not speed up queries but may lower memory consumption.
  )", 0) \
     \
+    DECLARE(Bool, enable_alias_marker, true, R"(
+Enable __aliasMarker injection for ALIAS column expressions when using the analyzer.
+This stabilizes action node names across planner/analyzer stages without changing query semantics.
+)", 0) \
+    \
     DECLARE(UInt64, preferred_block_size_bytes, 1000000, R"(
 This setting adjusts the data block size for query processing and represents additional fine-tuning to the more rough 'max_block_size' setting. If the columns are large and with 'max_block_size' rows the block size is likely to be larger than the specified amount of bytes, its size will be lowered for better CPU cache locality.
 )", 0) \
@@ -6920,6 +6925,12 @@ This is not a hard limit, and it highly depends on the output format granularity
     DECLARE(UInt64, export_merge_tree_part_max_rows_per_file, 0, R"(
 Maximum number of rows to write to a single file when exporting a merge tree part. 0 means no limit.
 This is not a hard limit, and it highly depends on the output format granularity and input source chunk size.
+)", 0) \
+    DECLARE(Bool, export_merge_tree_part_throw_on_pending_mutations, true, R"(
+Throw an error if there are pending mutations when exporting a merge tree part.
+)", 0) \
+    DECLARE(Bool, export_merge_tree_part_throw_on_pending_patch_parts, true, R"(
+Throw an error if there are pending patch parts when exporting a merge tree part.
 )", 0) \
     DECLARE(Bool, serialize_string_in_memory_with_zero_byte, true, R"(
 Serialize String values during aggregation with zero byte at the end. Enable to keep compatibility when querying cluster of incompatible versions.
