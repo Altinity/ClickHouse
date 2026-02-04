@@ -102,15 +102,43 @@ jobs:
           echo "Running clickhouse binary..."
           ./clickhouse -q'q'
 
-          echo "Stripping the binary..."
-          strip clickhouse -o clickhouse-stripped
+          echo "Downloading clickhouse-stripped binary..."
+          if ! aws s3 cp "${SRC_URL}/${ARM_PATH}/clickhouse-stripped" clickhouse-stripped; then
+            echo "Failed to download clickhouse-stripped binary"
+            exit 1
+          fi
 
+          chmod +x clickhouse-stripped
+
+          echo "Running clickhouse-stripped binary..."
+          ./clickhouse-stripped -q'q'
+
+          echo "Downloading clickhouse-common-static tar..."
+          if ! aws s3 cp "${SRC_URL}/${ARM_PATH}/clickhouse-common-static-${{ inputs.package_version }}-arm64.tgz" clickhouse-common-static.tgz; then
+            echo "Failed to download clickhouse-common-static tar"
+            exit 1
+          fi
+
+          tar -xvf clickhouse-common-static.tgz
+
+          if readelf -S "clickhouse-common-static-${{ inputs.package_version }}-arm64/usr/bin/clickhouse" | grep -q '\.symtab'; then
+            echo "✓ Binary has symtable"
+          else
+            echo "✗ Binary is missing symtable"
+            exit 1
+          fi
+
+          if ! aws s3 cp "${SRC_URL}/${ARM_PATH}/clickhouse-common-static.tar" clickhouse-common-static.tar; then
           echo "Uploading processed binaries..."
           if ! aws s3 cp clickhouse "${SRC_URL}/${ARM_PATH}/arm64-bin/non-self-extracting/"; then
             echo "Failed to upload clickhouse binary"
             exit 1
           fi
           if ! aws s3 cp clickhouse-stripped "${SRC_URL}/${ARM_PATH}/arm64-bin/non-self-extracting/"; then
+            echo "Failed to upload stripped clickhouse binary"
+            exit 1
+          fi
+          if ! aws s3 cp clickhouse-common-static-${{ inputs.package_version }}-arm64/usr/bin/clickhouse "${SRC_URL}/${ARM_PATH}/arm64-bin/non-self-extracting/clickhouse-with-symtable"; then
             echo "Failed to upload stripped clickhouse binary"
             exit 1
           fi
@@ -177,8 +205,32 @@ jobs:
           echo "Running clickhouse binary..."
           ./clickhouse -q'q'
 
-          echo "Stripping the binary..."
-          strip clickhouse -o clickhouse-stripped
+          echo "Downloading clickhouse-stripped binary..."
+          if ! aws s3 cp "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/clickhouse-stripped" clickhouse-stripped; then
+            echo "Failed to download clickhouse-stripped binary"
+            exit 1
+          fi
+
+          chmod +x clickhouse-stripped
+
+          echo "Running clickhouse-stripped binary..."
+          ./clickhouse-stripped -q'q'
+
+
+          echo "Downloading clickhouse-common-static tar..."
+          if ! aws s3 cp "${SRC_URL}/${ARM_PATH}/clickhouse-common-static-${{ inputs.package_version }}-amd64.tgz" clickhouse-common-static.tgz; then
+            echo "Failed to download clickhouse-common-static tar"
+            exit 1
+          fi
+
+          tar -xvf clickhouse-common-static.tgz
+
+          if readelf -S "clickhouse-common-static-${{ inputs.package_version }}-amd64/usr/bin/clickhouse" | grep -q '\.symtab'; then
+            echo "✓ Binary has symtable"
+          else
+            echo "✗ Binary is missing symtable"
+            exit 1
+          fi
 
           echo "Uploading processed binaries..."
           if ! aws s3 cp clickhouse "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/non-self-extracting/"; then
@@ -186,6 +238,10 @@ jobs:
             exit 1
           fi
           if ! aws s3 cp clickhouse-stripped "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/non-self-extracting/"; then
+            echo "Failed to upload stripped clickhouse binary"
+            exit 1
+          fi
+          if ! aws s3 cp clickhouse-common-static-${{ inputs.package_version }}-amd64/usr/bin/clickhouse "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/non-self-extracting/clickhouse-with-symtable"; then
             echo "Failed to upload stripped clickhouse binary"
             exit 1
           fi

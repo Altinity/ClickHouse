@@ -69,9 +69,27 @@ jobs:
           echo "Pulling the image"
           docker pull $IMAGE
 
+          # Create container for version and symtable checks
+          echo "Creating container for checks..."
+          CONTAINER_ID=$(docker create $IMAGE $COMPONENT --version)
+
+          # Check if binary has symbol table (not stripped)
+          echo "Checking if binary has symtable..."
+          docker cp "$CONTAINER_ID:/usr/bin/clickhouse" /tmp/clickhouse-check
+          if readelf -S /tmp/clickhouse-check | grep -q '\.symtab'; then
+            echo "✓ Binary has symtable"
+          else
+            echo "✗ Binary is missing symtable"
+            docker rm "$CONTAINER_ID"
+            rm -f /tmp/clickhouse-check
+            exit 1
+          fi
+          rm -f /tmp/clickhouse-check
+
           # Get version and clean it up
           echo "Getting version from image..."
-          VERSION_OUTPUT=$(docker run --rm $IMAGE $COMPONENT --version)
+          VERSION_OUTPUT=$(docker start -a "$CONTAINER_ID")
+          docker rm "$CONTAINER_ID"
           echo "Raw version output: $VERSION_OUTPUT"
 
           # Extract just the version number

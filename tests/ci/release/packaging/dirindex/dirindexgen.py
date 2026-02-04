@@ -1,8 +1,10 @@
 #!/bin/env python3
 
 import argparse
+import re
 import textwrap
 import boto3
+from natsort import natsorted
 
 
 def folder_list_add(folders, key, value):
@@ -37,6 +39,16 @@ def folderjoin(items, slashes=False):
         if not result.endswith("/"):
             result = result + "/"
     return result
+
+
+def is_bin_repo_arch_folder(folder):
+    """
+    Check if the folder is a bin-repo architecture folder that should use natural sorting.
+    Matches patterns like: bin-repo/arm64, antalya-bin-repo/amd64, fips-bin-repo/arm64, etc.
+    """
+    # Match folders ending with (bin-repo|antalya-bin-repo|fips-bin-repo|hotfix-bin-repo)/(arm64|amd64)
+    pattern = r'(bin-repo|antalya-bin-repo|fips-bin-repo|hotfix-bin-repo)/(arm64|amd64)$'
+    return bool(re.search(pattern, folder))
 
 
 def main():
@@ -98,7 +110,13 @@ def main():
             parent_folder = folderjoin(folder.split("/")[:-1], slashes=True)
             indexdata.append(f'<a href="{parent_folder}">{parent_dir_str}</a>' +
                              f'{" ":{maxlen-len(parent_dir_str)}}   {"-":20}   {"-":20}\n')
-        for sub in subs:
+        # Apply natural sorting (descending) for bin-repo architecture folders
+        # to show newest versions first (e.g., v25.3 before v24.8 before v23.8)
+        if is_bin_repo_arch_folder(folder):
+            sorted_subs = list(reversed(natsorted(subs)))
+        else:
+            sorted_subs = sorted(subs)
+        for sub in sorted_subs:
             sub_path = folderjoin([folder, sub], slashes=True)
             indexdata.append(f'<a href="{sub_path}">{sub}/</a>{" ":{maxlen-len(sub)-1}}' +
                              f'   {"-":20}   {"-":20}\n')
