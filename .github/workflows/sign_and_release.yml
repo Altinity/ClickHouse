@@ -217,7 +217,7 @@ jobs:
 
 
           echo "Downloading clickhouse-common-static tar..."
-          if ! aws s3 cp "${SRC_URL}/${ARM_PATH}/clickhouse-common-static-${{ inputs.package_version }}-amd64.tgz" clickhouse-common-static.tgz; then
+          if ! aws s3 cp "${DEST_URL}/packages/AMD_PACKAGES/clickhouse-common-static-${{ inputs.package_version }}-amd64.tgz" clickhouse-common-static.tgz; then
             echo "Failed to download clickhouse-common-static tar"
             exit 1
           fi
