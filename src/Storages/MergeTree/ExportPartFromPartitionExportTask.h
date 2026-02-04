@@ -17,7 +17,8 @@ public:
     explicit ExportPartFromPartitionExportTask(
         StorageReplicatedMergeTree & storage_,
         const std::string & key_,
-        const MergeTreePartExportManifest & manifest_);
+        const MergeTreePartExportManifest & manifest_,
+        size_t max_retries_);
     bool executeStep() override;
     void onCompleted() override;
     StorageID getStorageID() const override;
@@ -30,6 +31,7 @@ private:
     StorageReplicatedMergeTree & storage;
     std::string key;
     MergeTreePartExportManifest manifest;
+    size_t max_retries;
     std::shared_ptr<ExportPartTask> export_part_task;
 };
 
