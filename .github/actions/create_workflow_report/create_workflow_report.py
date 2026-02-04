@@ -431,9 +431,11 @@ def get_workflow_config() -> dict:
     # 25.12+
     if os.path.exists("./ci/tmp/workflow_status.json"):
         with open("./ci/tmp/workflow_status.json", "r") as f:
-            return json.loads(json.load(f)["config_workflow"]["outputs"]["data"])[
-                "WORKFLOW_CONFIG"
-            ]
+            data = json.loads(json.load(f)["config_workflow"]["outputs"]["data"])
+            assert (
+                "WORKFLOW_CONFIG" in data.keys()
+            ), f"WORKFLOW_CONFIG not found in data: {data.keys()}"
+            return data["WORKFLOW_CONFIG"]
 
     workflow_config_files = glob("./ci/tmp/workflow_config*.json")
     if len(workflow_config_files) == 0:
