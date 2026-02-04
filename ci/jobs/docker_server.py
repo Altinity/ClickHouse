@@ -197,7 +197,7 @@ def build_and_push_image(
     init_args = ["docker", "buildx", "build"]
     if push:
         init_args.append("--push")
-        init_args.append("--output=type=image,push-by-digest=true")
+        init_args.append("--output=type=image")
         init_args.append(f"--tag={image.name}")
     else:
         init_args.append("--output=type=docker")
@@ -348,7 +348,7 @@ def main():
         push = True
 
     image = DockerImageData(image_repo, image_path)
-    tags = gen_tags(version_dict["string"], args.tag_type)
+    tags = [f'{info.pr_number}-{version_dict["string"]}']
     repo_urls = {}
     direct_urls: Dict[str, List[str]] = {}
 
