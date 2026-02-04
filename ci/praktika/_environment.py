@@ -133,6 +133,7 @@ class _Environment(MetaClasses.Serializable):
             elif "inputs" in github_event:
                 # assume this is a dispatch
                 EVENT_TYPE = Workflow.Event.DISPATCH
+                EVENT_TIME = github_event.get("repository", {}).get("updated_at", None)
                 SHA = os.getenv(
                     "GITHUB_SHA", "0000000000000000000000000000000000000000"
                 )
