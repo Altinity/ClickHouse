@@ -65,6 +65,10 @@ SET(VERSION_STRING {string})
     @classmethod
     def get_current_version_as_dict(cls):
         version = cls.get_release_version_as_dict()
+
+        # NOTE (strtgbb): Just return, no need for the below logic
+        return version
+
         info = Info()
         try:
             # Check if the commit is directly on the first-parent chain
