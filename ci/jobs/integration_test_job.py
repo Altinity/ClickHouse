@@ -639,15 +639,27 @@ tar -czf ./ci/tmp/logs.tar.gz \
     broken_tests_rules = get_broken_tests_rules("tests/broken_tests.yaml")
     for result in test_results:
         if result.status == Result.StatusExtended.FAIL:
-            last_log_path = sorted([p for p in result.files if p.endswith(".log")])[-1]
-            with open(last_log_path, "r") as log_file:
-                log_content = log_file.read()
-            known_fail_reason = test_is_known_fail(
-                broken_tests_rules,
-                result.name,
-                log_content,
-                job_params,
-            )
+            try:
+                last_log_path = sorted([p for p in result.files if p.endswith(".log")])[
+                    -1
+                ]
+                with open(last_log_path, "r") as log_file:
+                    log_content = log_file.read()
+            except Exception as e:
+                print(f"Error getting last log path for result {result.name}: {e}")
+                print(f"Result files: {result.files}")
+                continue
+            try:
+                known_fail_reason = test_is_known_fail(
+                    broken_tests_rules,
+                    result.name,
+                    log_content,
+                    job_params,
+                )
+            except Exception as e:
+                print(f"Error getting known fail reason for result {result.name}: {e}")
+                continue
+
             if known_fail_reason:
                 result.status = Result.StatusExtended.BROKEN
                 result.info += f"\nMarked as broken: {known_fail_reason}"
