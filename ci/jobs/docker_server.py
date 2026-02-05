@@ -58,10 +58,10 @@ def docker_login(relogin: bool = True) -> None:
         "docker system info | grep --quiet -E 'Username|Registry'"
     ):
         Shell.check(
-            "docker login --username 'robotclickhouse' --password-stdin",
+            "docker login --username 'altinityinfra' --password-stdin",
             strict=True,
             stdin_str=Secret.Config(
-                "dockerhub_robot_password", type=Secret.Type.AWS_SSM_PARAMETER
+                "DOCKER_PASSWORD", type=Secret.Type.GH_SECRET
             ).get_value(),
             encoding="utf-8",
         )
@@ -348,7 +348,7 @@ def main():
         push = True
 
     image = DockerImageData(image_repo, image_path)
-    tags = [f'{info.pr_number}-{version_dict["string"]}']
+    tags = [f'{info.pr_number}-{version_dict["describe"]}']
     repo_urls = {}
     direct_urls: Dict[str, List[str]] = {}
 
