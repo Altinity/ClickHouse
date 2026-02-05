@@ -102,8 +102,31 @@ jobs:
           echo "Running clickhouse binary..."
           ./clickhouse -q'q'
 
-          echo "Stripping the binary..."
-          strip clickhouse -o clickhouse-stripped
+          echo "Downloading clickhouse-stripped binary..."
+          if ! aws s3 cp "${SRC_URL}/${ARM_PATH}/clickhouse-stripped" clickhouse-stripped; then
+            echo "Failed to download clickhouse-stripped binary"
+            exit 1
+          fi
+
+          chmod +x clickhouse-stripped
+
+          echo "Running clickhouse-stripped binary..."
+          ./clickhouse-stripped -q'q'
+
+          echo "Downloading clickhouse-common-static tar..."
+          if ! aws s3 cp "${SRC_URL}/${ARM_PATH}/clickhouse-common-static-${{ inputs.package_version }}-arm64.tgz" clickhouse-common-static.tgz; then
+            echo "Failed to download clickhouse-common-static tar"
+            exit 1
+          fi
+
+          tar -xvf clickhouse-common-static.tgz
+
+          if readelf -S "clickhouse-common-static-${{ inputs.package_version }}/usr/bin/clickhouse" | grep -q '\.symtab'; then
+            echo "✓ Binary has symtable"
+          else
+            echo "✗ Binary is missing symtable"
+            exit 1
+          fi
 
           echo "Uploading processed binaries..."
           if ! aws s3 cp clickhouse "${SRC_URL}/${ARM_PATH}/arm64-bin/non-self-extracting/"; then
@@ -112,6 +135,10 @@ jobs:
           fi
           if ! aws s3 cp clickhouse-stripped "${SRC_URL}/${ARM_PATH}/arm64-bin/non-self-extracting/"; then
             echo "Failed to upload stripped clickhouse binary"
+            exit 1
+          fi
+          if ! aws s3 cp "clickhouse-common-static-${{ inputs.package_version }}/usr/bin/clickhouse" "${SRC_URL}/${ARM_PATH}/arm64-bin/non-self-extracting/clickhouse-with-symtable"; then
+            echo "Failed to upload clickhouse-with-symtable binary"
             exit 1
           fi
 
@@ -177,8 +204,32 @@ jobs:
           echo "Running clickhouse binary..."
           ./clickhouse -q'q'
 
-          echo "Stripping the binary..."
-          strip clickhouse -o clickhouse-stripped
+          echo "Downloading clickhouse-stripped binary..."
+          if ! aws s3 cp "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/clickhouse-stripped" clickhouse-stripped; then
+            echo "Failed to download clickhouse-stripped binary"
+            exit 1
+          fi
+
+          chmod +x clickhouse-stripped
+
+          echo "Running clickhouse-stripped binary..."
+          ./clickhouse-stripped -q'q'
+
+
+          echo "Downloading clickhouse-common-static tar..."
+          if ! aws s3 cp "${DEST_URL}/packages/AMD_PACKAGES/clickhouse-common-static-${{ inputs.package_version }}-amd64.tgz" clickhouse-common-static.tgz; then
+            echo "Failed to download clickhouse-common-static tar"
+            exit 1
+          fi
+
+          tar -xvf clickhouse-common-static.tgz
+
+          if readelf -S "clickhouse-common-static-${{ inputs.package_version }}/usr/bin/clickhouse" | grep -q '\.symtab'; then
+            echo "✓ Binary has symtable"
+          else
+            echo "✗ Binary is missing symtable"
+            exit 1
+          fi
 
           echo "Uploading processed binaries..."
           if ! aws s3 cp clickhouse "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/non-self-extracting/"; then
@@ -186,6 +237,10 @@ jobs:
             exit 1
           fi
           if ! aws s3 cp clickhouse-stripped "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/non-self-extracting/"; then
+            echo "Failed to upload stripped clickhouse binary"
+            exit 1
+          fi
+          if ! aws s3 cp clickhouse-common-static-${{ inputs.package_version }}/usr/bin/clickhouse "${DEST_URL}/packages/AMD_PACKAGES/amd64-bin/non-self-extracting/clickhouse-with-symtable"; then
             echo "Failed to upload stripped clickhouse binary"
             exit 1
           fi
@@ -259,6 +314,20 @@ jobs:
           repository: Altinity/ClickHouse
           path: ClickHouse
 
+      - name: Install required packages
+        run: |
+          echo "Installing required packages..."
+          sudo add-apt-repository -y universe
+          sudo apt-get update
+          sudo apt-get install -y software-properties-common python3-pip apt-utils gnupg rpm createrepo-c file wget
+          wget -q http://archive.ubuntu.com/ubuntu/pool/universe/d/dpkg-sig/dpkg-sig_0.13.1+nmu4_all.deb
+          sudo dpkg -i dpkg-sig_0.13.1+nmu4_all.deb || sudo apt-get install -f -y
+          rm dpkg-sig_0.13.1+nmu4_all.deb
+          sudo apt-add-repository --yes --update ppa:ansible/ansible
+          sudo apt-get install -y ansible
+          sudo ln -s /usr/bin/createrepo_c /usr/bin/createrepo
+          pip3 install boto3 botocore natsort --break-system-packages
+
       - name: Download packages
         run: |
           if ! aws s3 sync "${DEST_URL}/packages/ARM_PACKAGES/" /home/runner/.cache/tmp/packages --exact-timestamps; then
@@ -272,16 +341,6 @@ jobs:
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-
-      - name: Install required packages
-        run: |
-          echo "Installing required packages..."
-          sudo apt-get update
-          sudo apt-get install -y software-properties-common python3-pip dpkg-sig apt-utils gnupg rpm createrepo-c file
-          sudo apt-add-repository --yes --update ppa:ansible/ansible
-          sudo apt-get install -y ansible
-          sudo ln -s /usr/bin/createrepo_c /usr/bin/createrepo
-          pip3 install boto3 botocore
 
       - name: Set up GPG passphrase
         run: |
