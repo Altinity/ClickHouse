@@ -15,7 +15,7 @@ runs:
       shell: bash
       run: |
         mkdir -p ./ci/tmp
-        cat > ./ci/tmp/workflow_config.json << 'EOF'
+        cat > ./ci/tmp/workflow_status.json << 'EOF'
         ${{ inputs.workflow_config }}
         EOF
 

@@ -431,7 +431,10 @@ def get_workflow_config() -> dict:
     # 25.12+
     if os.path.exists("./ci/tmp/workflow_status.json"):
         with open("./ci/tmp/workflow_status.json", "r") as f:
-            data = json.loads(json.load(f)["config_workflow"]["outputs"]["data"])
+            data = json.load(f)["config_workflow"]["outputs"]["data"]
+            assert data is not None, "data is None"
+            if isinstance(data, str):
+                data = json.loads(data)
             assert (
                 "WORKFLOW_CONFIG" in data.keys()
             ), f"WORKFLOW_CONFIG not found in data: {data.keys()}"
