@@ -126,8 +126,8 @@ jobs:
 
       - name: Process multiarch manifest
         run: |
-          echo "Re-tag multiarch image $IMAGE to altinityinfra/$COMPONENT:$NEW_TAG"
-          docker buildx imagetools create --tag "altinityinfra/$COMPONENT:$NEW_TAG" "$IMAGE"
+          echo "Re-tag multiarch image $IMAGE to altinity/$COMPONENT:$NEW_TAG"
+          docker buildx imagetools create --tag "altinity/$COMPONENT:$NEW_TAG" "$IMAGE"
 
           # Create directory for image archives
           mkdir -p image_archives
@@ -136,15 +136,15 @@ jobs:
           for PLATFORM in "linux/amd64" "linux/arm64"; do
             echo "Pulling and saving image for $PLATFORM..."
             # Pull the specific platform image
-            docker pull --platform $PLATFORM "altinityinfra/$COMPONENT:$NEW_TAG"
+            docker pull --platform $PLATFORM "altinity/$COMPONENT:$NEW_TAG"
 
             # Save the image to a tar file
             ARCH=$(echo $PLATFORM | cut -d'/' -f2)
-            docker save "altinityinfra/$COMPONENT:$NEW_TAG" -o "image_archives/${COMPONENT}-${NEW_TAG}-${ARCH}.tar"
+            docker save "altinity/$COMPONENT:$NEW_TAG" -o "image_archives/${COMPONENT}-${NEW_TAG}-${ARCH}.tar"
           done
 
           # Save manifest inspection
-          docker buildx imagetools inspect "altinityinfra/$COMPONENT:$NEW_TAG" > image_archives/manifest.txt
+          docker buildx imagetools inspect "altinity/$COMPONENT:$NEW_TAG" > image_archives/manifest.txt
 
           # Compress the archives
           cd image_archives
