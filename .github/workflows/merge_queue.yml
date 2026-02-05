@@ -9,12 +9,26 @@ env:
   # Force the stdout and stderr streams to be unbuffered
   PYTHONUNBUFFERED: 1
   CHECKOUT_REF: ""
+  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+  CLICKHOUSE_TEST_STAT_URL: ${{ secrets.CLICKHOUSE_TEST_STAT_URL }}
+  CLICKHOUSE_TEST_STAT_LOGIN: ${{ secrets.CLICKHOUSE_TEST_STAT_LOGIN }}
+  CLICKHOUSE_TEST_STAT_PASSWORD: ${{ secrets.CLICKHOUSE_TEST_STAT_PASSWORD }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+  CHECKS_DATABASE_HOST: ${{ secrets.CHECKS_DATABASE_HOST }}
+  AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+  AZURE_ACCOUNT_NAME: ${{ secrets.AZURE_ACCOUNT_NAME }}
+  AZURE_CONTAINER_NAME: ${{ secrets.AZURE_CONTAINER_NAME }}
+  AZURE_STORAGE_ACCOUNT_URL: "https://${{ secrets.AZURE_ACCOUNT_NAME }}.blob.core.windows.net/"
+  ROBOT_TOKEN: ${{ secrets.ROBOT_TOKEN }}
+  GH_TOKEN: ${{ github.token }}
 
 
 jobs:
 
   config_workflow:
-    runs-on: [self-hosted, style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: []
     name: "Config Workflow"
     outputs:
@@ -25,6 +39,26 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Config Workflow"
+
+      - name: Note report location to summary
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
+          COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ "$PR_NUMBER" -eq 0 ]; then
+            PREFIX="REFs/$GITHUB_REF_NAME/$COMMIT_SHA"
+          else
+            PREFIX="PRs/$PR_NUMBER/$COMMIT_SHA"
+          fi
+          REPORT_LINK=https://s3.amazonaws.com/altinity-build-artifacts/$PREFIX/$GITHUB_RUN_ID/ci_run_report.html
+          echo "Workflow Run Report: [View Report]($REPORT_LINK)" >> $GITHUB_STEP_SUMMARY
 
       - name: Prepare env script
         run: |
@@ -53,7 +87,7 @@ jobs:
           fi
 
   dockers_build_amd:
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
     needs: [config_workflow]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'RG9ja2VycyBCdWlsZCAoYW1kKQ==') }}
     name: "Dockers Build (amd)"
@@ -65,6 +99,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Dockers Build (amd)"
 
       - name: Prepare env script
         run: |
@@ -93,7 +134,7 @@ jobs:
           fi
 
   dockers_build_arm:
-    runs-on: [self-hosted, style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: [config_workflow]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'RG9ja2VycyBCdWlsZCAoYXJtKQ==') }}
     name: "Dockers Build (arm)"
@@ -105,6 +146,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Dockers Build (arm)"
 
       - name: Prepare env script
         run: |
@@ -132,48 +180,8 @@ jobs:
             python3 -m praktika run 'Dockers Build (arm)' --workflow "MergeQueueCI" --ci |& tee ./ci/tmp/job.log
           fi
 
-  style_check:
-    runs-on: [self-hosted, style-checker-aarch64]
-    needs: [config_workflow, dockers_build_amd, dockers_build_arm]
-    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3R5bGUgY2hlY2s=') }}
-    name: "Style check"
-    outputs:
-      data: ${{ steps.run.outputs.DATA }}
-      pipeline_status: ${{ steps.run.outputs.pipeline_status || 'undefined' }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ env.CHECKOUT_REF }}
-
-      - name: Prepare env script
-        run: |
-          rm -rf ./ci/tmp
-          mkdir -p ./ci/tmp
-          cat > ./ci/tmp/praktika_setup_env.sh << 'ENV_SETUP_SCRIPT_EOF'
-          export PYTHONPATH=./ci:.:
-
-          cat > ./ci/tmp/workflow_job.json << 'EOF'
-          ${{ toJson(job) }}
-          EOF
-          cat > ./ci/tmp/workflow_status.json << 'EOF'
-          ${{ toJson(needs) }}
-          EOF
-          ENV_SETUP_SCRIPT_EOF
-
-      - name: Run
-        id: run
-        run: |
-          . ./ci/tmp/praktika_setup_env.sh
-          set -o pipefail
-          if command -v ts &> /dev/null; then
-            python3 -m praktika run 'Style check' --workflow "MergeQueueCI" --ci |& ts '[%Y-%m-%d %H:%M:%S]' | tee ./ci/tmp/job.log
-          else
-            python3 -m praktika run 'Style check' --workflow "MergeQueueCI" --ci |& tee ./ci/tmp/job.log
-          fi
-
   fast_test:
-    runs-on: [self-hosted, amd-large]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'RmFzdCB0ZXN0') }}
     name: "Fast test"
@@ -185,6 +193,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Fast test"
 
       - name: Prepare env script
         run: |
@@ -213,7 +228,7 @@ jobs:
           fi
 
   build_amd_binary:
-    runs-on: [self-hosted, arm-large]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9iaW5hcnkp') }}
     name: "Build (amd_binary)"
@@ -225,6 +240,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Build (amd_binary)"
 
       - name: Prepare env script
         run: |
@@ -253,8 +275,8 @@ jobs:
           fi
 
   finish_workflow:
-    runs-on: [self-hosted, style-checker-aarch64]
-    needs: [config_workflow, dockers_build_amd, dockers_build_arm, style_check, fast_test, build_amd_binary]
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
+    needs: [config_workflow, dockers_build_amd, dockers_build_arm, fast_test, build_amd_binary]
     if: ${{ always() }}
     name: "Finish Workflow"
     outputs:
@@ -265,6 +287,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Finish Workflow"
 
       - name: Prepare env script
         run: |

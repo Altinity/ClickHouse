@@ -3,6 +3,13 @@
 name: BackportPR
 
 on:
+  workflow_dispatch:
+    inputs:
+      no_cache:
+        description: Run without cache
+        required: false
+        type: boolean
+        default: false
   pull_request:
     branches: ['2[1-9].[1-9][0-9]', '2[1-9].[1-9]']
 
@@ -10,8 +17,22 @@ env:
   # Force the stdout and stderr streams to be unbuffered
   PYTHONUNBUFFERED: 1
   DISABLE_CI_MERGE_COMMIT: ${{ vars.DISABLE_CI_MERGE_COMMIT || '0' }}
-  DISABLE_CI_CACHE: ${{ vars.DISABLE_CI_CACHE || '0' }}
+  DISABLE_CI_CACHE: ${{ github.event.inputs.no_cache || '0' }}
   CHECKOUT_REF: ${{ vars.DISABLE_CI_MERGE_COMMIT == '1' && github.event.pull_request.head.sha || '' }}
+  DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+  CLICKHOUSE_TEST_STAT_URL: ${{ secrets.CLICKHOUSE_TEST_STAT_URL }}
+  CLICKHOUSE_TEST_STAT_LOGIN: ${{ secrets.CLICKHOUSE_TEST_STAT_LOGIN }}
+  CLICKHOUSE_TEST_STAT_PASSWORD: ${{ secrets.CLICKHOUSE_TEST_STAT_PASSWORD }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+  CHECKS_DATABASE_HOST: ${{ secrets.CHECKS_DATABASE_HOST }}
+  AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+  AZURE_ACCOUNT_NAME: ${{ secrets.AZURE_ACCOUNT_NAME }}
+  AZURE_CONTAINER_NAME: ${{ secrets.AZURE_CONTAINER_NAME }}
+  AZURE_STORAGE_ACCOUNT_URL: "https://${{ secrets.AZURE_ACCOUNT_NAME }}.blob.core.windows.net/"
+  ROBOT_TOKEN: ${{ secrets.ROBOT_TOKEN }}
+  GH_TOKEN: ${{ github.token }}
 
 # Allow updating GH commit statuses and PR comments to post an actual job reports link
 permissions: write-all
@@ -19,7 +40,7 @@ permissions: write-all
 jobs:
 
   config_workflow:
-    runs-on: [self-hosted, style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: []
     name: "Config Workflow"
     outputs:
@@ -30,6 +51,26 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Config Workflow"
+
+      - name: Note report location to summary
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
+          COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ "$PR_NUMBER" -eq 0 ]; then
+            PREFIX="REFs/$GITHUB_REF_NAME/$COMMIT_SHA"
+          else
+            PREFIX="PRs/$PR_NUMBER/$COMMIT_SHA"
+          fi
+          REPORT_LINK=https://s3.amazonaws.com/altinity-build-artifacts/$PREFIX/$GITHUB_RUN_ID/ci_run_report.html
+          echo "Workflow Run Report: [View Report]($REPORT_LINK)" >> $GITHUB_STEP_SUMMARY
 
       - name: Prepare env script
         run: |
@@ -58,7 +99,7 @@ jobs:
           fi
 
   dockers_build_amd:
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
     needs: [config_workflow]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'RG9ja2VycyBCdWlsZCAoYW1kKQ==') }}
     name: "Dockers Build (amd)"
@@ -70,6 +111,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Dockers Build (amd)"
 
       - name: Prepare env script
         run: |
@@ -98,7 +146,7 @@ jobs:
           fi
 
   dockers_build_arm:
-    runs-on: [self-hosted, style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: [config_workflow]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'RG9ja2VycyBCdWlsZCAoYXJtKQ==') }}
     name: "Dockers Build (arm)"
@@ -110,6 +158,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Dockers Build (arm)"
 
       - name: Prepare env script
         run: |
@@ -138,7 +193,7 @@ jobs:
           fi
 
   build_amd_debug:
-    runs-on: [self-hosted, arm-large]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9kZWJ1Zyk=') }}
     name: "Build (amd_debug)"
@@ -150,6 +205,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Build (amd_debug)"
 
       - name: Prepare env script
         run: |
@@ -178,7 +240,7 @@ jobs:
           fi
 
   build_amd_asan:
-    runs-on: [self-hosted, arm-large]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9hc2FuKQ==') }}
     name: "Build (amd_asan)"
@@ -190,6 +252,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Build (amd_asan)"
 
       - name: Prepare env script
         run: |
@@ -218,7 +287,7 @@ jobs:
           fi
 
   build_amd_tsan:
-    runs-on: [self-hosted, arm-large]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF90c2FuKQ==') }}
     name: "Build (amd_tsan)"
@@ -230,6 +299,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Build (amd_tsan)"
 
       - name: Prepare env script
         run: |
@@ -258,7 +334,7 @@ jobs:
           fi
 
   build_amd_release:
-    runs-on: [self-hosted, arm-large]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9yZWxlYXNlKQ==') }}
     name: "Build (amd_release)"
@@ -270,6 +346,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Build (amd_release)"
 
       - name: Prepare env script
         run: |
@@ -298,7 +381,7 @@ jobs:
           fi
 
   build_arm_release:
-    runs-on: [self-hosted, arm-large]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFybV9yZWxlYXNlKQ==') }}
     name: "Build (arm_release)"
@@ -310,6 +393,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Build (arm_release)"
 
       - name: Prepare env script
         run: |
@@ -338,7 +428,7 @@ jobs:
           fi
 
   build_amd_darwin:
-    runs-on: [self-hosted, amd-large]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9kYXJ3aW4p') }}
     name: "Build (amd_darwin)"
@@ -350,6 +440,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Build (amd_darwin)"
 
       - name: Prepare env script
         run: |
@@ -378,7 +475,7 @@ jobs:
           fi
 
   build_arm_darwin:
-    runs-on: [self-hosted, arm-large]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFybV9kYXJ3aW4p') }}
     name: "Build (arm_darwin)"
@@ -390,6 +487,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Build (arm_darwin)"
 
       - name: Prepare env script
         run: |
@@ -418,7 +522,7 @@ jobs:
           fi
 
   docker_server_image:
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_release, build_arm_release]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'RG9ja2VyIHNlcnZlciBpbWFnZQ==') }}
     name: "Docker server image"
@@ -430,6 +534,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Docker server image"
 
       - name: Prepare env script
         run: |
@@ -458,7 +569,7 @@ jobs:
           fi
 
   docker_keeper_image:
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_release, build_arm_release]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'RG9ja2VyIGtlZXBlciBpbWFnZQ==') }}
     name: "Docker keeper image"
@@ -470,6 +581,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Docker keeper image"
 
       - name: Prepare env script
         run: |
@@ -498,7 +616,7 @@ jobs:
           fi
 
   install_packages_amd_release:
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_release]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW5zdGFsbCBwYWNrYWdlcyAoYW1kX3JlbGVhc2Up') }}
     name: "Install packages (amd_release)"
@@ -510,6 +628,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Install packages (amd_release)"
 
       - name: Prepare env script
         run: |
@@ -538,7 +663,7 @@ jobs:
           fi
 
   install_packages_arm_release:
-    runs-on: [self-hosted, style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_arm_release]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW5zdGFsbCBwYWNrYWdlcyAoYXJtX3JlbGVhc2Up') }}
     name: "Install packages (arm_release)"
@@ -550,6 +675,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Install packages (arm_release)"
 
       - name: Prepare env script
         run: |
@@ -578,7 +710,7 @@ jobs:
           fi
 
   compatibility_check_amd_release:
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_release]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'Q29tcGF0aWJpbGl0eSBjaGVjayAoYW1kX3JlbGVhc2Up') }}
     name: "Compatibility check (amd_release)"
@@ -590,6 +722,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Compatibility check (amd_release)"
 
       - name: Prepare env script
         run: |
@@ -618,7 +757,7 @@ jobs:
           fi
 
   compatibility_check_arm_release:
-    runs-on: [self-hosted, style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_arm_release]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'Q29tcGF0aWJpbGl0eSBjaGVjayAoYXJtX3JlbGVhc2Up') }}
     name: "Compatibility check (arm_release)"
@@ -630,6 +769,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Compatibility check (arm_release)"
 
       - name: Prepare env script
         run: |
@@ -658,7 +804,7 @@ jobs:
           fi
 
   stateless_tests_amd_asan_distributed_plan_parallel_1_2:
-    runs-on: [self-hosted, amd-medium-cpu]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_asan]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfYXNhbiwgZGlzdHJpYnV0ZWQgcGxhbiwgcGFyYWxsZWwsIDEvMik=') }}
     name: "Stateless tests (amd_asan, distributed plan, parallel, 1/2)"
@@ -670,6 +816,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Stateless tests (amd_asan, distributed plan, parallel, 1/2)"
 
       - name: Prepare env script
         run: |
@@ -698,7 +851,7 @@ jobs:
           fi
 
   stateless_tests_amd_asan_distributed_plan_parallel_2_2:
-    runs-on: [self-hosted, amd-medium-cpu]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_asan]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfYXNhbiwgZGlzdHJpYnV0ZWQgcGxhbiwgcGFyYWxsZWwsIDIvMik=') }}
     name: "Stateless tests (amd_asan, distributed plan, parallel, 2/2)"
@@ -710,6 +863,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Stateless tests (amd_asan, distributed plan, parallel, 2/2)"
 
       - name: Prepare env script
         run: |
@@ -738,7 +898,7 @@ jobs:
           fi
 
   stateless_tests_amd_asan_db_disk_distributed_plan_sequential:
-    runs-on: [self-hosted, amd-small-mem]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_asan]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfYXNhbiwgZGIgZGlzaywgZGlzdHJpYnV0ZWQgcGxhbiwgc2VxdWVudGlhbCk=') }}
     name: "Stateless tests (amd_asan, db disk, distributed plan, sequential)"
@@ -750,6 +910,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Stateless tests (amd_asan, db disk, distributed plan, sequential)"
 
       - name: Prepare env script
         run: |
@@ -778,7 +945,7 @@ jobs:
           fi
 
   stress_test_amd_tsan:
-    runs-on: [self-hosted, amd-medium]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_tsan]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RyZXNzIHRlc3QgKGFtZF90c2FuKQ==') }}
     name: "Stress test (amd_tsan)"
@@ -790,6 +957,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Stress test (amd_tsan)"
 
       - name: Prepare env script
         run: |
@@ -818,7 +992,7 @@ jobs:
           fi
 
   integration_tests_amd_asan_db_disk_old_analyzer_1_6:
-    runs-on: [self-hosted, amd-medium]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_asan]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDEvNik=') }}
     name: "Integration tests (amd_asan, db disk, old analyzer, 1/6)"
@@ -830,6 +1004,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Integration tests (amd_asan, db disk, old analyzer, 1/6)"
 
       - name: Prepare env script
         run: |
@@ -858,7 +1039,7 @@ jobs:
           fi
 
   integration_tests_amd_asan_db_disk_old_analyzer_2_6:
-    runs-on: [self-hosted, amd-medium]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_asan]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDIvNik=') }}
     name: "Integration tests (amd_asan, db disk, old analyzer, 2/6)"
@@ -870,6 +1051,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Integration tests (amd_asan, db disk, old analyzer, 2/6)"
 
       - name: Prepare env script
         run: |
@@ -898,7 +1086,7 @@ jobs:
           fi
 
   integration_tests_amd_asan_db_disk_old_analyzer_3_6:
-    runs-on: [self-hosted, amd-medium]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_asan]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDMvNik=') }}
     name: "Integration tests (amd_asan, db disk, old analyzer, 3/6)"
@@ -910,6 +1098,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Integration tests (amd_asan, db disk, old analyzer, 3/6)"
 
       - name: Prepare env script
         run: |
@@ -938,7 +1133,7 @@ jobs:
           fi
 
   integration_tests_amd_asan_db_disk_old_analyzer_4_6:
-    runs-on: [self-hosted, amd-medium]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_asan]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDQvNik=') }}
     name: "Integration tests (amd_asan, db disk, old analyzer, 4/6)"
@@ -950,6 +1145,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Integration tests (amd_asan, db disk, old analyzer, 4/6)"
 
       - name: Prepare env script
         run: |
@@ -978,7 +1180,7 @@ jobs:
           fi
 
   integration_tests_amd_asan_db_disk_old_analyzer_5_6:
-    runs-on: [self-hosted, amd-medium]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_asan]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDUvNik=') }}
     name: "Integration tests (amd_asan, db disk, old analyzer, 5/6)"
@@ -990,6 +1192,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Integration tests (amd_asan, db disk, old analyzer, 5/6)"
 
       - name: Prepare env script
         run: |
@@ -1018,7 +1227,7 @@ jobs:
           fi
 
   integration_tests_amd_asan_db_disk_old_analyzer_6_6:
-    runs-on: [self-hosted, amd-medium]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_asan]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDYvNik=') }}
     name: "Integration tests (amd_asan, db disk, old analyzer, 6/6)"
@@ -1030,6 +1239,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Integration tests (amd_asan, db disk, old analyzer, 6/6)"
 
       - name: Prepare env script
         run: |
@@ -1058,7 +1274,7 @@ jobs:
           fi
 
   integration_tests_amd_tsan_1_6:
-    runs-on: [self-hosted, amd-medium]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_tsan]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF90c2FuLCAxLzYp') }}
     name: "Integration tests (amd_tsan, 1/6)"
@@ -1070,6 +1286,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Integration tests (amd_tsan, 1/6)"
 
       - name: Prepare env script
         run: |
@@ -1098,7 +1321,7 @@ jobs:
           fi
 
   integration_tests_amd_tsan_2_6:
-    runs-on: [self-hosted, amd-medium]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_tsan]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF90c2FuLCAyLzYp') }}
     name: "Integration tests (amd_tsan, 2/6)"
@@ -1110,6 +1333,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Integration tests (amd_tsan, 2/6)"
 
       - name: Prepare env script
         run: |
@@ -1138,7 +1368,7 @@ jobs:
           fi
 
   integration_tests_amd_tsan_3_6:
-    runs-on: [self-hosted, amd-medium]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_tsan]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF90c2FuLCAzLzYp') }}
     name: "Integration tests (amd_tsan, 3/6)"
@@ -1150,6 +1380,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Integration tests (amd_tsan, 3/6)"
 
       - name: Prepare env script
         run: |
@@ -1178,7 +1415,7 @@ jobs:
           fi
 
   integration_tests_amd_tsan_4_6:
-    runs-on: [self-hosted, amd-medium]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_tsan]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF90c2FuLCA0LzYp') }}
     name: "Integration tests (amd_tsan, 4/6)"
@@ -1190,6 +1427,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Integration tests (amd_tsan, 4/6)"
 
       - name: Prepare env script
         run: |
@@ -1218,7 +1462,7 @@ jobs:
           fi
 
   integration_tests_amd_tsan_5_6:
-    runs-on: [self-hosted, amd-medium]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_tsan]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF90c2FuLCA1LzYp') }}
     name: "Integration tests (amd_tsan, 5/6)"
@@ -1230,6 +1474,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Integration tests (amd_tsan, 5/6)"
 
       - name: Prepare env script
         run: |
@@ -1258,7 +1509,7 @@ jobs:
           fi
 
   integration_tests_amd_tsan_6_6:
-    runs-on: [self-hosted, amd-medium]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_tsan]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF90c2FuLCA2LzYp') }}
     name: "Integration tests (amd_tsan, 6/6)"
@@ -1270,6 +1521,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Integration tests (amd_tsan, 6/6)"
 
       - name: Prepare env script
         run: |
@@ -1298,7 +1556,7 @@ jobs:
           fi
 
   finish_workflow:
-    runs-on: [self-hosted, style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_debug, build_amd_asan, build_amd_tsan, build_amd_release, build_arm_release, build_amd_darwin, build_arm_darwin, docker_server_image, docker_keeper_image, install_packages_amd_release, install_packages_arm_release, compatibility_check_amd_release, compatibility_check_arm_release, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_asan_db_disk_distributed_plan_sequential, stress_test_amd_tsan, integration_tests_amd_asan_db_disk_old_analyzer_1_6, integration_tests_amd_asan_db_disk_old_analyzer_2_6, integration_tests_amd_asan_db_disk_old_analyzer_3_6, integration_tests_amd_asan_db_disk_old_analyzer_4_6, integration_tests_amd_asan_db_disk_old_analyzer_5_6, integration_tests_amd_asan_db_disk_old_analyzer_6_6, integration_tests_amd_tsan_1_6, integration_tests_amd_tsan_2_6, integration_tests_amd_tsan_3_6, integration_tests_amd_tsan_4_6, integration_tests_amd_tsan_5_6, integration_tests_amd_tsan_6_6]
     if: ${{ always() }}
     name: "Finish Workflow"
@@ -1310,6 +1568,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Finish Workflow"
 
       - name: Prepare env script
         run: |

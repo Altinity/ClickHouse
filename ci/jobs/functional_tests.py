@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import random
 import subprocess
 from pathlib import Path
@@ -123,6 +124,7 @@ OPTIONS_TO_TEST_RUNNER_ARGUMENTS = {
     "azure": " --azure-blob-storage --no-random-settings --no-random-merge-tree-settings",  # azurite is slow, with randomization it can be super slow
     "parallel": "--no-sequential",
     "sequential": "--no-parallel",
+    "amd_tsan": " --timeout 1200",  # NOTE (strtgbb): tsan is slow, increase the timeout to avoid timeout errors
     "flaky check": "--flaky-check",
     "targeted": "--flaky-check",  # to disable tests not compatible with the thread fuzzer
 }
@@ -227,10 +229,12 @@ def main():
 
     if not info.is_local_run:
         # TODO: find a way to work with Azure secret so it's ok for local tests as well, for now keep azure disabled
-        os.environ["AZURE_CONNECTION_STRING"] = Shell.get_output(
-            f"aws ssm get-parameter --region us-east-1 --name azure_connection_string --with-decryption --output text --query Parameter.Value",
-            verbose=True,
-        )
+        # os.environ["AZURE_CONNECTION_STRING"] = Shell.get_output(
+        #     f"aws ssm get-parameter --region us-east-1 --name azure_connection_string --with-decryption --output text --query Parameter.Value",
+        #     verbose=True,
+        # )
+        # NOTE(strtgbb): We pass azure credentials through the docker command, not SSM.
+        pass
     else:
         print("Disable azure for a local run")
         config_installs_args += " --no-azure"
@@ -376,12 +380,13 @@ def main():
 
     if res and JobStages.INSTALL_CLICKHOUSE in stages:
 
-        def configure_log_export():
-            if not info.is_local_run:
-                print("prepare log export config")
-                return CH.create_log_export_config()
-            else:
-                print("skip log export config for local run")
+        # NOTE (strtgbb): Disable log export throughout this file, it depends on aws ssm, which we don't have configured
+        # def configure_log_export():
+        #     if not info.is_local_run:
+        #         print("prepare log export config")
+        #         return CH.create_log_export_config()
+        #     else:
+        #         print("skip log export config for local run")
 
         commands = [
             f"rm -rf /etc/clickhouse-client/* /etc/clickhouse-server/*",
@@ -410,8 +415,8 @@ def main():
             f"prof_active:true,prof_prefix:{temp_dir}/jemalloc_profiles/clickhouse.jemalloc"
         )
 
-        if not is_coverage:
-            commands.append(configure_log_export)
+        # if not is_coverage:
+        #     commands.append(configure_log_export)
 
         results.append(
             Result.from_commands_run(name="Install ClickHouse", command=commands)
@@ -432,12 +437,13 @@ def main():
             res = res and CH.start()
             res = res and CH.wait_ready()
             if res:
-                if not Info().is_local_run:
-                    if not CH.start_log_exports(stop_watch.start_time):
-                        info.add_workflow_report_message(
-                            "WARNING: Failed to start log export"
-                        )
-                        print("Failed to start log export")
+                # Note (strtgbb): We don't use this
+                # if not Info().is_local_run:
+                #     if not CH.start_log_exports(stop_watch.start_time):
+                #         info.add_workflow_report_message(
+                #             "WARNING: Failed to start log export"
+                #         )
+                #         print("Failed to start log export")
                 if not CH.create_minio_log_tables():
                     info.add_workflow_report_message(
                         "WARNING: Failed to create minio log tables"
@@ -464,6 +470,8 @@ def main():
         )
         res = results[-1].is_ok()
 
+    runner_options += f" --known-fails-file-path tests/broken_tests.yaml"
+
     test_result = None
     if res and JobStages.TEST in stages:
         stop_watch_ = Utils.Stopwatch()
@@ -483,7 +491,7 @@ def main():
         run_sets_cnt = rerun_count if is_targeted_check else 1
         rerun_count = 1 if is_targeted_check else rerun_count
 
-        ft_res_processor = FTResultsProcessor(wd=temp_dir)
+        ft_res_processor = FTResultsProcessor(wd=temp_dir, test_options=test_options)
 
         # Track collected test results across multiple runs (only used when run_sets_cnt > 1)
         collected_test_results = []
@@ -563,7 +571,9 @@ def main():
                 )
             )
         elif failed_tests:
-            ft_res_processor = FTResultsProcessor(wd=temp_dir)
+            ft_res_processor = FTResultsProcessor(
+                wd=temp_dir, test_options=test_options
+            )
             run_tests(
                 batch_num=0,
                 batch_total=0,
@@ -686,6 +696,10 @@ def main():
 
     if test_result:
         test_result.sort()
+
+    broken_tests_handler_log = os.path.join(temp_dir, "broken_tests_handler.log")
+    if os.path.exists(broken_tests_handler_log):
+        debug_files.append(broken_tests_handler_log)
 
     R = Result.create_from(
         results=results,

@@ -58,6 +58,7 @@ class Result(MetaClasses.Serializable):
         FAIL = "FAIL"
         SKIPPED = "SKIPPED"
         ERROR = "ERROR"
+        BROKEN = "BROKEN"
 
     class Label:
         OK_ON_RETRY = "retry_ok"
@@ -193,6 +194,7 @@ class Result(MetaClasses.Serializable):
             Result.Status.SUCCESS,
             Result.StatusExtended.OK,
             Result.StatusExtended.SKIPPED,
+            Result.StatusExtended.BROKEN,
         )
 
     def is_success(self):

@@ -31,7 +31,7 @@ def _start_docker_in_docker():
         )
     retries = 20
     for i in range(retries):
-        if Shell.check("docker info > /dev/null", verbose=True):
+        if Shell.check("docker info > /dev/null #In _start_docker_in_docker", verbose=True):
             break
         if i == retries - 1:
             raise RuntimeError(
@@ -339,9 +339,9 @@ tar -czf ./ci/tmp/logs.tar.gz \
                 )  # remove parametrization - does not work with test repeat with --count
         print(f"Parsed {len(targeted_tests)} test names: {targeted_tests}")
 
-    if not Shell.check("docker info > /dev/null", verbose=True):
+    if not Shell.check("docker info > /dev/null #Before calling _start_docker_in_docker", verbose=True):
         _start_docker_in_docker()
-    Shell.check("docker info > /dev/null", verbose=True, strict=True)
+    Shell.check("docker info > /dev/null #After calling _start_docker_in_docker", verbose=True, strict=True)
 
     parallel_test_modules, sequential_test_modules = (
         get_parallel_sequential_tests_to_run(

@@ -144,12 +144,13 @@ def main():
             Shell.check(f"ln -sf {clickhouse_bin_path} {clickhouse_server_link}")
         Shell.check(f"chmod +x {clickhouse_bin_path}")
     else:
-        os.environ["CH_HOSTNAME"] = (
-            "https://build-cache.eu-west-1.aws.clickhouse-staging.com"
-        )
-        os.environ["CH_USER"] = "ci_builder"
-        os.environ["CH_PASSWORD"] = chcache_secret.get_value()
-        os.environ["CH_USE_LOCAL_CACHE"] = "false"
+        # NOTE (strtgbb): Not used yet, but we should look into setting up the secrets for it
+        # os.environ["CH_HOSTNAME"] = (
+        #     "https://build-cache.eu-west-1.aws.clickhouse-staging.com"
+        # )
+        # os.environ["CH_USER"] = "ci_builder"
+        # os.environ["CH_PASSWORD"] = chcache_secret.get_value()
+        # os.environ["CH_USE_LOCAL_CACHE"] = "false"
 
         os.environ["SCCACHE_IDLE_TIMEOUT"] = "7200"
         os.environ["SCCACHE_BUCKET"] = Settings.S3_ARTIFACT_PATH
@@ -261,7 +262,9 @@ def main():
         print(step_name)
         res = res and CH.run_fast_test(test=args.test or "")
         if res:
-            results.append(FTResultsProcessor(wd=Settings.OUTPUT_DIR).run())
+            results.append(
+                FTResultsProcessor(wd=Settings.OUTPUT_DIR, test_options=["fast"]).run()
+            )
             results[-1].set_timing(stopwatch=stop_watch_)
         else:
             results.append(

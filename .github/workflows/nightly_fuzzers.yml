@@ -16,7 +16,7 @@ env:
 jobs:
 
   config_workflow:
-    runs-on: [self-hosted, style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: []
     name: "Config Workflow"
     outputs:
@@ -27,6 +27,26 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Config Workflow"
+
+      - name: Note report location to summary
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
+          COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ "$PR_NUMBER" -eq 0 ]; then
+            PREFIX="REFs/$GITHUB_REF_NAME/$COMMIT_SHA"
+          else
+            PREFIX="PRs/$PR_NUMBER/$COMMIT_SHA"
+          fi
+          REPORT_LINK=https://s3.amazonaws.com/altinity-build-artifacts/$PREFIX/$GITHUB_RUN_ID/ci_run_report.html
+          echo "Workflow Run Report: [View Report]($REPORT_LINK)" >> $GITHUB_STEP_SUMMARY
 
       - name: Prepare env script
         run: |
@@ -55,7 +75,7 @@ jobs:
           fi
 
   dockers_build_amd:
-    runs-on: [self-hosted, style-checker]
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
     needs: [config_workflow]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'RG9ja2VycyBCdWlsZCAoYW1kKQ==') }}
     name: "Dockers Build (amd)"
@@ -67,6 +87,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Dockers Build (amd)"
 
       - name: Prepare env script
         run: |
@@ -95,7 +122,7 @@ jobs:
           fi
 
   dockers_build_arm:
-    runs-on: [self-hosted, style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: [config_workflow]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'RG9ja2VycyBCdWlsZCAoYXJtKQ==') }}
     name: "Dockers Build (arm)"
@@ -107,6 +134,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Dockers Build (arm)"
 
       - name: Prepare env script
         run: |
@@ -135,7 +169,7 @@ jobs:
           fi
 
   build_arm_fuzzers:
-    runs-on: [self-hosted, arm-large]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFybV9mdXp6ZXJzKQ==') }}
     name: "Build (arm_fuzzers)"
@@ -147,6 +181,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Build (arm_fuzzers)"
 
       - name: Prepare env script
         run: |
@@ -175,7 +216,7 @@ jobs:
           fi
 
   libfuzzer_tests:
-    runs-on: [self-hosted, arm-medium]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_arm_fuzzers]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'bGliRnV6emVyIHRlc3Rz') }}
     name: "libFuzzer tests"
@@ -187,6 +228,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "libFuzzer tests"
 
       - name: Prepare env script
         run: |
@@ -215,7 +263,7 @@ jobs:
           fi
 
   finish_workflow:
-    runs-on: [self-hosted, style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_arm_fuzzers, libfuzzer_tests]
     if: ${{ always() }}
     name: "Finish Workflow"
@@ -227,6 +275,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Finish Workflow"
 
       - name: Prepare env script
         run: |

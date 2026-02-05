@@ -134,14 +134,16 @@ class ClickHouseProc:
             )
         print(f"Started setup_minio.sh asynchronously with PID {self.minio_proc.pid}")
 
-        for _ in range(20):
+        print("Waiting for minio to start...")
+        for _ in range(10):
             res = Shell.check(
                 "/mc ls clickminio/test | grep -q .",
                 verbose=True,
             )
             if res:
+                print("Minio started successfully")
                 return True
-            time.sleep(1)
+            time.sleep(3)
         print("Failed to start minio")
         return False
 
@@ -632,7 +634,7 @@ else
 fi
 clickhouse-client --query "CREATE TABLE test.hits_s3  (WatchID UInt64, JavaEnable UInt8, Title String, GoodEvent Int16, EventTime DateTime, EventDate Date, CounterID UInt32, ClientIP UInt32, ClientIP6 FixedString(16), RegionID UInt32, UserID UInt64, CounterClass Int8, OS UInt8, UserAgent UInt8, URL String, Referer String, URLDomain String, RefererDomain String, Refresh UInt8, IsRobot UInt8, RefererCategories Array(UInt16), URLCategories Array(UInt16), URLRegions Array(UInt32), RefererRegions Array(UInt32), ResolutionWidth UInt16, ResolutionHeight UInt16, ResolutionDepth UInt8, FlashMajor UInt8, FlashMinor UInt8, FlashMinor2 String, NetMajor UInt8, NetMinor UInt8, UserAgentMajor UInt16, UserAgentMinor FixedString(2), CookieEnable UInt8, JavascriptEnable UInt8, IsMobile UInt8, MobilePhone UInt8, MobilePhoneModel String, Params String, IPNetworkID UInt32, TraficSourceID Int8, SearchEngineID UInt16, SearchPhrase String, AdvEngineID UInt8, IsArtifical UInt8, WindowClientWidth UInt16, WindowClientHeight UInt16, ClientTimeZone Int16, ClientEventTime DateTime, SilverlightVersion1 UInt8, SilverlightVersion2 UInt8, SilverlightVersion3 UInt32, SilverlightVersion4 UInt16, PageCharset String, CodeVersion UInt32, IsLink UInt8, IsDownload UInt8, IsNotBounce UInt8, FUniqID UInt64, HID UInt32, IsOldCounter UInt8, IsEvent UInt8, IsParameter UInt8, DontCountHits UInt8, WithHash UInt8, HitColor FixedString(1), UTCEventTime DateTime, Age UInt8, Sex UInt8, Income UInt8, Interests UInt16, Robotness UInt8, GeneralInterests Array(UInt16), RemoteIP UInt32, RemoteIP6 FixedString(16), WindowName Int32, OpenerName Int32, HistoryLength Int16, BrowserLanguage FixedString(2), BrowserCountry FixedString(2), SocialNetwork String, SocialAction String, HTTPError UInt16, SendTiming Int32, DNSTiming Int32, ConnectTiming Int32, ResponseStartTiming Int32, ResponseEndTiming Int32, FetchTiming Int32, RedirectTiming Int32, DOMInteractiveTiming Int32, DOMContentLoadedTiming Int32, DOMCompleteTiming Int32, LoadEventStartTiming Int32, LoadEventEndTiming Int32, NSToDOMContentLoadedTiming Int32, FirstPaintTiming Int32, RedirectCount Int8, SocialSourceNetworkID UInt8, SocialSourcePage String, ParamPrice Int64, ParamOrderID String, ParamCurrency FixedString(3), ParamCurrencyID UInt16, GoalsReached Array(UInt32), OpenstatServiceName String, OpenstatCampaignID String, OpenstatAdID String, OpenstatSourceID String, UTMSource String, UTMMedium String, UTMCampaign String, UTMContent String, UTMTerm String, FromTag String, HasGCLID UInt8, RefererHash UInt64, URLHash UInt64, CLID UInt32, YCLID UInt64, ShareService String, ShareURL String, ShareTitle String, ParsedParams Nested(Key1 String, Key2 String, Key3 String, Key4 String, Key5 String, ValueDouble Float64), IslandID FixedString(16), RequestNum UInt32, RequestTry UInt8) ENGINE = MergeTree() PARTITION BY toYYYYMM(EventDate) ORDER BY (CounterID, EventDate, intHash32(UserID)) SAMPLE BY intHash32(UserID) SETTINGS index_granularity = 8192, storage_policy='s3_cache'"
 # AWS S3 is very inefficient, so increase memory even further:
-clickhouse-client --max_execution_time 600 --max_memory_usage 30G --max_memory_usage_for_user 30G --query "INSERT INTO test.hits_s3 SELECT * FROM test.hits SETTINGS enable_filesystem_cache_on_write_operations=0, write_through_distributed_cache=0, max_insert_threads=16"
+clickhouse-client --max_execution_time 900 --max_memory_usage 30G --max_memory_usage_for_user 30G --query "INSERT INTO test.hits_s3 SELECT * FROM test.hits SETTINGS enable_filesystem_cache_on_write_operations=0, write_through_distributed_cache=0, max_insert_threads=16"
 
 clickhouse-client --query "SHOW TABLES FROM test"
 clickhouse-client --query "SELECT count() FROM test.hits"
@@ -661,16 +663,17 @@ clickhouse-client --query "SELECT count() FROM test.visits"
         return exit_code == 0
 
     def terminate(self):
-        if self.minio_proc:
-            # remove the webhook so it doesn't spam with errors once we stop ClickHouse
-            Shell.check(
-                "/mc admin config reset clickminio logger_webhook:ch_server_webhook",
-                verbose=True,
-            )
-            Shell.check(
-                "/mc admin config reset clickminio audit_webhook:ch_audit_webhook",
-                verbose=True,
-            )
+        # NOTE (strtgbb): Log tables are disabled, we don't use them
+        # if self.minio_proc:
+        #     # remove the webhook so it doesn't spam with errors once we stop ClickHouse
+        #     Shell.check(
+        #         "/mc admin config reset clickminio logger_webhook:ch_server_webhook",
+        #         verbose=True,
+        #     )
+        #     Shell.check(
+        #         "/mc admin config reset clickminio audit_webhook:ch_audit_webhook",
+        #         verbose=True,
+        #     )
 
         self._flush_system_logs()
 
@@ -1041,8 +1044,8 @@ quit
             "error_log",
             "query_metric_log",
             "part_log",
-            "minio_audit_logs",
-            "minio_server_logs",
+            # "minio_audit_logs", # NOTE (strtgbb): we do not use these logs
+            # "minio_server_logs",
         ]
         ROWS_COUNT_IN_SYSTEM_TABLE_LIMIT = 10_000_000
 
@@ -1251,6 +1254,7 @@ if __name__ == "__main__":
             else:
                 res = True
         elif command == "logs_export_start":
+            exit(0) # Note (strtgbb): We don't use log exports
             # FIXME: the start_time must be preserved globally in ENV or something like that
             # to get the same values in different DBs
             # As a wild idea, it could be stored in a Info.check_start_timestamp
@@ -1261,6 +1265,7 @@ if __name__ == "__main__":
             else:
                 res = True
         elif command == "logs_export_stop":
+            exit(0) # Note (strtgbb): We don't use log exports
             if not Info().is_local_run:
                 # Disable log export for local runs - ideally this command wouldn't be triggered,
                 # but conditional disabling is complex in legacy bash scripts (run_fuzzer.sh, stress_runner.sh)

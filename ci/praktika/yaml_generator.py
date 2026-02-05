@@ -7,6 +7,7 @@ from .parser import WorkflowConfigParser
 from .settings import Settings
 from .utils import Shell, Utils
 
+from .yaml_additional_templates import AltinityWorkflowTemplates
 
 class YamlGenerator:
     class Templates:
@@ -33,6 +34,13 @@ jobs:
 name: {NAME}
 
 on:
+  workflow_dispatch:
+    inputs:
+      no_cache:
+        description: Run without cache
+        required: false
+        type: boolean
+        default: false
   {EVENT}:
     branches: [{BRANCHES}]
 
@@ -52,7 +60,7 @@ permissions: write-all\
 """
         TEMPLATE_ENV_CHECKOUT_REF_PR = """\
   DISABLE_CI_MERGE_COMMIT: ${{{{ vars.DISABLE_CI_MERGE_COMMIT || '0' }}}}
-  DISABLE_CI_CACHE: ${{{{ vars.DISABLE_CI_CACHE || '0' }}}}
+  DISABLE_CI_CACHE: ${{{{ github.event.inputs.no_cache || '0' }}}}
   CHECKOUT_REF: ${{{{ vars.DISABLE_CI_MERGE_COMMIT == '1' && github.event.pull_request.head.sha || '' }}}}\
 """
         TEMPLATE_ENV_CHECKOUT_REF_DEFAULT = """\
@@ -99,6 +107,7 @@ on:
 env:
   PYTHONUNBUFFERED: 1
 {ENV_CHECKOUT_REFERENCE}
+{ENV_SECRETS}
 
 jobs:
 {JOBS}\
@@ -272,6 +281,11 @@ class PullRequestPushYamlGen:
             needs = ", ".join(map(Utils.normalize_string, job.needs))
             job_name = job.name
             job_addons = []
+
+            job_addons.append(AltinityWorkflowTemplates.JOB_SETUP_STEPS.format(JOB_NAME_GH = job_name))
+            if job_name == Settings.CI_CONFIG_JOB_NAME:
+                job_addons.append(AltinityWorkflowTemplates.ADDITIONAL_CI_CONFIG_STEPS)
+
             for addon in job.addons:
                 if addon.install_python:
                     job_addons.append(
@@ -324,12 +338,14 @@ class PullRequestPushYamlGen:
                 if_expression = YamlGenerator.Templates.TEMPLATE_IF_EXPRESSION_ALWAYS
 
             secrets_envs = []
-            for secret in self.workflow_config.secret_names_gh:
-                secrets_envs.append(
-                    YamlGenerator.Templates.TEMPLATE_SETUP_ENV_SECRETS.format(
-                        SECRET_NAME=secret
-                    )
-                )
+            # note(strtgbb): This adds github secrets to praktika_setup_env.sh
+            # This makes the workflow very verbose and we don't need it
+            # for secret in self.workflow_config.secret_names_gh:
+            #     secrets_envs.append(
+            #         YamlGenerator.Templates.TEMPLATE_SETUP_ENV_SECRETS.format(
+            #             SECRET_NAME=secret
+            #         )
+            #     )
             for var in self.workflow_config.variable_names_gh:
                 secrets_envs.append(
                     YamlGenerator.Templates.TEMPLATE_SETUP_ENV_VARS.format(VAR_NAME=var)
@@ -454,6 +470,7 @@ class PullRequestPushYamlGen:
                     VAR_NAME=secret.name
                 )
         format_kwargs["ENV_SECRETS"] = GH_VAR_ENVS + SECRET_ENVS
+        format_kwargs["ENV_SECRETS"] += AltinityWorkflowTemplates.ADDITIONAL_GLOBAL_ENV
 
         template_1 = base_template.strip().format(
             NAME=self.workflow_config.name,
@@ -462,6 +479,33 @@ class PullRequestPushYamlGen:
             **format_kwargs,
         )
         res = template_1.format(*job_items)
+
+        ALL_JOBS = "\n".join(
+            "      - " + Utils.normalize_string(job.name)
+            for job in self.workflow_config.jobs
+        )
+        if self.workflow_config.additional_jobs:
+            res += AltinityWorkflowTemplates.ADDITIONAL_JOBS_BANNER
+        if "GrypeScan" in self.workflow_config.additional_jobs:
+            res += AltinityWorkflowTemplates.ALTINITY_JOBS["GrypeScan"]
+            ALL_JOBS += "\n      - GrypeScanServer\n      - GrypeScanKeeper"
+        if "Regression" in self.workflow_config.additional_jobs:
+            res += AltinityWorkflowTemplates.ALTINITY_JOBS["Regression"].replace(
+                "{REGRESSION_HASH}", AltinityWorkflowTemplates.REGRESSION_HASH
+            )
+            ALL_JOBS += (
+                "\n      - RegressionTestsRelease\n      - RegressionTestsAarch64"
+            )
+        if "SignRelease" in self.workflow_config.additional_jobs:
+            res += AltinityWorkflowTemplates.ALTINITY_JOBS["SignRelease"]
+            ALL_JOBS += "\n      - SignRelease\n      - SignAarch64"
+        if "CIReport" in self.workflow_config.additional_jobs:
+            res += AltinityWorkflowTemplates.ALTINITY_JOBS["CIReport"].replace(
+                "{ALL_JOBS}", ALL_JOBS
+            )
+        if "SourceUpload" in self.workflow_config.additional_jobs:
+            res += AltinityWorkflowTemplates.ALTINITY_JOBS["SourceUpload"]
+            ALL_JOBS += "\n      - SourceUpload"
 
         return res
 

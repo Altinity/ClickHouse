@@ -181,7 +181,7 @@ def run_stress_test(upgrade_check: bool = False) -> None:
 
     packages_path = temp_path
 
-    docker_image = DockerImage.get_docker_image("clickhouse/stress-test").pull_image()
+    docker_image = DockerImage.get_docker_image("altinityinfra/stress-test").pull_image()
 
     server_log_path = temp_path / "server_log"
     server_log_path.mkdir(parents=True, exist_ok=True)

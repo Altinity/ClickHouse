@@ -45,7 +45,9 @@ class WorkflowYaml:
     name: str
     event: str
     branches: List[str]
+    tags: List[str]
     jobs: List[JobYaml]
+    additional_jobs: List[str]
     job_to_config: Dict[str, JobYaml]
     artifact_to_config: Dict[str, ArtifactYaml]
     secret_names_gh: List[str]
@@ -73,7 +75,9 @@ class WorkflowConfigParser:
             name=self.workflow_name,
             event=config.event,
             branches=[],
+            tags=config.tags,
             jobs=[],
+            additional_jobs=[],
             secret_names_gh=[],
             variable_names_gh=[],
             job_to_config={},
@@ -242,6 +246,8 @@ class WorkflowConfigParser:
         # populate JobYaml.parametrize
         for job in self.config.jobs:
             self.workflow_yaml_config.job_to_config[job.name].parameter = job.parameter
+
+        self.workflow_yaml_config.additional_jobs = self.config.additional_jobs
 
         # populate secrets
         for secret_config in self.config.secrets:

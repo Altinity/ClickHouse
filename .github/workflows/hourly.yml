@@ -16,7 +16,7 @@ env:
 jobs:
 
   config_workflow:
-    runs-on: [self-hosted, style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: []
     name: "Config Workflow"
     outputs:
@@ -27,6 +27,26 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Config Workflow"
+
+      - name: Note report location to summary
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
+          COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ "$PR_NUMBER" -eq 0 ]; then
+            PREFIX="REFs/$GITHUB_REF_NAME/$COMMIT_SHA"
+          else
+            PREFIX="PRs/$PR_NUMBER/$COMMIT_SHA"
+          fi
+          REPORT_LINK=https://s3.amazonaws.com/altinity-build-artifacts/$PREFIX/$GITHUB_RUN_ID/ci_run_report.html
+          echo "Workflow Run Report: [View Report]($REPORT_LINK)" >> $GITHUB_STEP_SUMMARY
 
       - name: Prepare env script
         run: |
@@ -55,7 +75,7 @@ jobs:
           fi
 
   collect_flaky_tests:
-    runs-on: [self-hosted, style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: [config_workflow]
     name: "Collect flaky tests"
     outputs:
@@ -66,6 +86,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Collect flaky tests"
 
       - name: Prepare env script
         run: |
@@ -94,7 +121,7 @@ jobs:
           fi
 
   autoassign_approvers:
-    runs-on: [self-hosted, style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: [config_workflow]
     name: "Autoassign approvers"
     outputs:
@@ -105,6 +132,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Autoassign approvers"
 
       - name: Prepare env script
         run: |
