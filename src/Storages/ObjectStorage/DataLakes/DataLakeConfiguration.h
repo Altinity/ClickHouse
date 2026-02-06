@@ -43,6 +43,7 @@ namespace ErrorCodes
 
 namespace DataLakeStorageSetting
 {
+<<<<<<< HEAD
     extern const DataLakeStorageSettingsBool allow_dynamic_metadata_for_data_lakes;
     extern const DataLakeStorageSettingsDatabaseDataLakeCatalogType storage_catalog_type;
     extern const DataLakeStorageSettingsString object_storage_endpoint;
@@ -52,7 +53,8 @@ namespace DataLakeStorageSetting
     extern const DataLakeStorageSettingsString storage_catalog_url;
     extern const DataLakeStorageSettingsString storage_warehouse;
     extern const DataLakeStorageSettingsString storage_catalog_credential;
-
+    extern DataLakeStorageSettingsString storage_aws_role_arn;
+    extern DataLakeStorageSettingsString storage_aws_role_session_name;
     extern const DataLakeStorageSettingsString storage_auth_scope;
     extern const DataLakeStorageSettingsString storage_auth_header;
     extern const DataLakeStorageSettingsString storage_oauth_server_uri;
@@ -287,6 +289,8 @@ public:
                 .aws_access_key_id = (*settings)[DataLakeStorageSetting::storage_aws_access_key_id].value,
                 .aws_secret_access_key = (*settings)[DataLakeStorageSetting::storage_aws_secret_access_key].value,
                 .region = (*settings)[DataLakeStorageSetting::storage_region].value,
+                .aws_role_arn = (*settings)[DataLakeStorageSetting::storage_aws_role_arn].value,
+                .aws_role_session_name = (*settings)[DataLakeStorageSetting::storage_aws_role_session_name].value
             };
 
             return std::make_shared<DataLake::GlueCatalog>(
