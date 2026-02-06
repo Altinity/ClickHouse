@@ -310,6 +310,7 @@ def main():
     version_dict = None
     if not info.is_local_run:
         version_dict = info.get_kv_data("version")
+        print(f"Version dict from kv data: {version_dict}")
     if not version_dict:
         version_dict = CHVersion.get_current_version_as_dict()
         if not info.is_local_run:
@@ -319,6 +320,7 @@ def main():
             info.add_workflow_report_message(
                 "WARNING: ClickHouse version has not been found in workflow kv storage"
             )
+        print(f"Version dict from repo: {version_dict}")
     assert version_dict
 
     if not info.is_local_run:
