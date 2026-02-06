@@ -395,7 +395,7 @@ def main():
                     repo_urls,
                     os_,
                     tag,
-                    version_dict["describe"],
+                    version_dict["string"],
                     direct_urls,
                     run_url=info.run_url,
                     sha=info.sha,
