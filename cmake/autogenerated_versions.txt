@@ -10,10 +10,18 @@ SET(VERSION_GITHASH c8a1e828dcf9832dc2d71adcbd50c698f93bb69b)
 
 #10000 for altinitystable candidates
 #20000 for altinityedge candidates
+<<<<<<< HEAD
 SET(VERSION_TWEAK 10500)
 SET(VERSION_FLAVOUR altinitytest)
 
 SET(VERSION_DESCRIBE v24.8.14.10500.altinitytest)
 SET(VERSION_STRING 24.8.14.10500.altinitytest)
+=======
+SET(VERSION_TWEAK 10545)
+SET(VERSION_FLAVOUR altinitytest)
+
+SET(VERSION_DESCRIBE v24.8.14.10545.altinitytest)
+SET(VERSION_STRING 24.8.14.10545.altinitytest)
+>>>>>>> 877fd22d439 (pin version)
 
 # end of autochange
