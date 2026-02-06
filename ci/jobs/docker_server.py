@@ -350,7 +350,7 @@ def main():
         push = True
 
     image = DockerImageData(image_repo, image_path)
-    tags = [f'{info.pr_number}-{version_dict["describe"]}']
+    tags = [f'{info.pr_number}-{version_dict["string"]}']
     repo_urls = {}
     direct_urls: Dict[str, List[str]] = {}
 
