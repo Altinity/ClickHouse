@@ -14,6 +14,7 @@
 #    include <openssl/err.h>
 #    include <boost/algorithm/hex.hpp>
 #    include <openssl/evp.h>
+#    include <evp_API_shim.h>
 #endif
 
 // Common part for both parts (with SSL and without)

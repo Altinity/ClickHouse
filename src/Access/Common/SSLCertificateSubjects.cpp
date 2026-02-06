@@ -33,7 +33,7 @@ SSLCertificateSubjects extractSSLCertificateSubjects(const Poco::Net::X509Certif
 
     if (STACK_OF(GENERAL_NAME) * names = static_cast<STACK_OF(GENERAL_NAME) *>(cert_names.get()))
     {
-        for (int i = 0; i < sk_GENERAL_NAME_num(names); ++i)
+        for (size_t i = 0; i < sk_GENERAL_NAME_num(names); ++i)
         {
             const GENERAL_NAME * name = sk_GENERAL_NAME_value(names, i);
             if (name->type == GEN_DNS || name->type == GEN_URI)

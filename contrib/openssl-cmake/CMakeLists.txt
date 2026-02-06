@@ -89,6 +89,15 @@ set_target_properties(ssl PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${AWSLC_BINARIES_DIR}/include"
 )
 
+# API shim include directory
+target_include_directories(ssl INTERFACE
+  "${CMAKE_CURRENT_LIST_DIR}/include"
+)
+
+# Way to inject evp_API_shim.h inclusion to whatever component depends on ssl library.
+target_compile_options(ssl INTERFACE
+  $<$<COMPILE_LANG_AND_ID:C,CXX,GNU,Clang,AppleClang>:-includeevp_API_shim.h>
+)
 else() # FIPS_CLICKHOUSE
 
 
