@@ -132,7 +132,7 @@ class AltinityWorkflowTemplates:
     env:
         COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
-        VERSION: ${{ fromJson(needs.config_workflow.outputs.data).custom_data.version.string }}
+        VERSION: ${{ fromJson(needs.config_workflow.outputs.data).JOB_KV_DATA.version.string }}
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
