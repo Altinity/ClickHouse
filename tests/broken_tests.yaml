@@ -173,6 +173,8 @@
   message: docker_compose_iceberg_hms_catalog.yml', '--verbose', 'up', '-d']' timed out after 300 seconds
 - name: test_keeper_memory_soft_limit/test.py::test_soft_limit_create
   reason: 'FIXME: Unstable in current version. Fixed in recent upstream.'
+- name: test_dirty_pages_force_purge/test.py::test_dirty_pages_force_purge
+  reason: 'KNOWN: https://github.com/Altinity/ClickHouse/issues/1369'
 
 # Regex rules should be ordered from most specific to least specific.
 # regex: true applies to name, message, and not_message fields, but not to reason or check_types fields.
