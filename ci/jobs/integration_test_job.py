@@ -640,41 +640,18 @@ tar -czf ./ci/tmp/logs.tar.gz \
     for result in test_results:
         if result.status == Result.StatusExtended.FAIL:
             try:
-                last_log_path = sorted([p for p in result.files if p.endswith(".log")])[
-                    -1
-                ]
-                with open(last_log_path, "r") as log_file:
-                    log_content = log_file.read()
-            except Exception as e:
-                print(f"Error getting last log path for result {result.name}: {e}")
-                print(
-                    [
-                        a
-                        for a in dir(result)
-                        if not a.startswith("_") and not callable(getattr(result, a))
-                    ]
-                )
-                print(f"Result files: {result.files}")
-                print(f"Result info: {result.info}")
-                print(f"Result links: {result.links}")
-                print(f"Result ext: {result.ext}")
-                print(f"Result results: {result.results}")
-
-                print(f"Error info: {error_info}")
-
-                continue
-            try:
                 known_fail_reason = test_is_known_fail(
                     broken_tests_rules,
                     result.name,
-                    log_content,
+                    result.info,
                     job_params,
                 )
             except Exception as e:
                 print(f"Error getting known fail reason for result {result.name}: {e}")
                 continue
-
-            if known_fail_reason:
+            else:
+                if not known_fail_reason:
+                    continue
                 result.status = Result.StatusExtended.BROKEN
                 result.info += f"\nMarked as broken: {known_fail_reason}"
 
