@@ -656,6 +656,10 @@ tar -czf ./ci/tmp/logs.tar.gz \
                 )
                 print(f"Result files: {result.files}")
                 print(f"Result info: {result.info}")
+                print(f"Result links: {result.links}")
+                print(f"Result ext: {result.ext}")
+                print(f"Result results: {result.results}")
+
                 print(f"Error info: {error_info}")
 
                 continue
