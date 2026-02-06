@@ -647,7 +647,17 @@ tar -czf ./ci/tmp/logs.tar.gz \
                     log_content = log_file.read()
             except Exception as e:
                 print(f"Error getting last log path for result {result.name}: {e}")
+                print(
+                    [
+                        a
+                        for a in dir(result)
+                        if not a.startswith("_") and not callable(getattr(result, a))
+                    ]
+                )
                 print(f"Result files: {result.files}")
+                print(f"Result info: {result.info}")
+                print(f"Error info: {error_info}")
+
                 continue
             try:
                 known_fail_reason = test_is_known_fail(
