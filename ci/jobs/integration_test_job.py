@@ -490,7 +490,7 @@ tar -czf ./ci/tmp/logs.tar.gz \
 
     has_error = False
     if not is_targeted_check:
-        session_timeout = 5400
+        session_timeout = 3600 * 2
     else:
         # For targeted jobs, use a shorter session timeout to keep feedback fast.
         # If this timeout is exceeded but all completed tests have passed, the
