@@ -7389,6 +7389,9 @@ Possible values:
 
 Default value is empty.
 )", 0) \
+    DECLARE(String, export_merge_tree_part_filename_pattern, "{part_name}_{checksum}", R"(
+Pattern for the filename of the exported merge tree part. The `part_name` and `checksum` are calculated and replaced on the fly. Additional macros are supported.
+)", 0) \
     \
     /* ####################################################### */ \
     /* ########### START OF EXPERIMENTAL FEATURES ############ */ \

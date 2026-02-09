@@ -3,11 +3,13 @@
 #include <Storages/MergeTree/MergeTreeSequentialSource.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Interpreters/Context.h>
-#include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/inplaceBlockConversions.h>
 #include <Core/Settings.h>
+#include <Common/Macros.h>
+#include <boost/algorithm/string/replace.hpp>
 #include <Interpreters/ExpressionActions.h>
 #include <Interpreters/ActionsDAG.h>
+#include <Interpreters/DatabaseCatalog.h>
 #include <Processors/Executors/CompletedPipelineExecutor.h>
 #include <Processors/QueryPlan/BuildQueryPipelineSettings.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
@@ -47,6 +49,7 @@ namespace Setting
     extern const SettingsUInt64 export_merge_tree_part_max_bytes_per_file;
     extern const SettingsUInt64 export_merge_tree_part_max_rows_per_file;
     extern const SettingsBool allow_experimental_analyzer;
+    extern const SettingsString export_merge_tree_part_filename_pattern;
 }
 
 namespace
@@ -92,6 +95,23 @@ namespace
             expression_step->setStepDescription("Compute alias and default expressions for export");
             plan_for_part.addStep(std::move(expression_step));
         }
+    }
+
+    String buildDestinationFilename(
+        const MergeTreePartExportManifest & manifest,
+        const StorageID & storage_id,
+        const ContextPtr & local_context)
+    {
+        auto filename = manifest.settings[Setting::export_merge_tree_part_filename_pattern].value;
+
+        boost::replace_all(filename, "{part_name}", manifest.data_part->name);
+        boost::replace_all(filename, "{checksum}", manifest.data_part->checksums.getTotalChecksumHex());
+
+        Macros::MacroExpansionInfo macro_info;
+        macro_info.table_id = storage_id;
+        filename = local_context->getMacros()->expand(filename, macro_info);
+
+        return filename;
     }
 }
 
@@ -154,8 +174,10 @@ bool ExportPartTask::executeStep()
 
     try
     {
+        const auto filename = buildDestinationFilename(manifest, storage.getStorageID(), local_context);
+
         sink = destination_storage->import(
-            manifest.data_part->name + "_" + manifest.data_part->checksums.getTotalChecksumHex(),
+            filename,
             block_with_partition_values,
             new_file_path_callback,
             manifest.file_already_exists_policy == MergeTreePartExportManifest::FileAlreadyExistsPolicy::overwrite,
