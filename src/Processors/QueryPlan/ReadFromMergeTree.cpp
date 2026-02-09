@@ -1437,10 +1437,10 @@ Pipe ReadFromMergeTree::spreadMarkRangesAmongStreamsFinal(
                 columns_with_is_deleted.push_back(data.merging_params.is_deleted_column);
 
             pipe = spreadMarkRangesAmongStreams(
-                std::move(non_intersecting_parts_by_primary_key), index_build_context, num_streams, columns_with_is_deleted);
+                std::move(non_intersecting_parts_by_primary_key), num_streams, columns_with_is_deleted);
             auto [expression, filter_name] = createExpressionForIsDeleted(data.merging_params.is_deleted_column, pipe.getHeader(), context);
 
-            pipe.addSimpleTransform([&](const SharedHeader & header)
+            pipe.addSimpleTransform([&](const Block & header)
             {
                 return std::make_shared<FilterTransform>(header, expression, filter_name, true);
             });
