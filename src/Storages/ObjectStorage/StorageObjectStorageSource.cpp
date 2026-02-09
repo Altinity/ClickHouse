@@ -644,7 +644,12 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             input_format->needOnlyCount();
 
         if (!object_info->getPath().empty())
-            input_format->setStorageRelatedUniqueKey(context_->getSettingsRef(), object_info->getPath() + ":" + object_info->metadata->etag);
+        {
+            if (const auto & metadata = object_info->relative_path_with_metadata.metadata)
+            {
+                input_format->setStorageRelatedUniqueKey(context_->getSettingsRef(), object_info->getPath() + ":" + metadata->etag);
+            }
+        }
 
         builder.init(Pipe(input_format));
 

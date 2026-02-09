@@ -2008,12 +2008,11 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
         case Type::CLEAR_FILESYSTEM_CACHE:
         case Type::CLEAR_DISTRIBUTED_CACHE:
         case Type::SYNC_FILESYSTEM_CACHE:
-        case Type::DROP_PAGE_CACHE:
-        case Type::DROP_SCHEMA_CACHE:
-        case Type::DROP_FORMAT_SCHEMA_CACHE:
+        case Type::CLEAR_PAGE_CACHE:
+        case Type::CLEAR_SCHEMA_CACHE:
+        case Type::CLEAR_FORMAT_SCHEMA_CACHE:
         case Type::DROP_PARQUET_METADATA_CACHE:
-        case Type::DROP_S3_CLIENT_CACHE:
-        case Type::DROP_PARQUET_METADATA_CACHE:
+        case Type::CLEAR_S3_CLIENT_CACHE:
         {
             required_access.emplace_back(AccessType::SYSTEM_DROP_CACHE);
             break;

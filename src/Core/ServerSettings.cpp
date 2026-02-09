@@ -1469,7 +1469,8 @@ The policy on how to perform a scheduling of CPU slots specified by `concurrent_
     ```xml
     <skip_check_for_incorrect_settings>1</skip_check_for_incorrect_settings>
     ```
-    )", 0)
+    )", 0) \
+    DECLARE(UInt64, input_format_parquet_metadata_cache_max_size, 500000000, "Maximum size of parquet file metadata cache", 0)
 
 /// Settings with a path are server settings with at least one layer of nesting that have a fixed structure (no lists, lists, enumerations, repetitions, ...).
 #define LIST_OF_SERVER_SETTINGS_WITH_PATH(DECLARE, ALIAS) \
@@ -1542,8 +1543,7 @@ The policy on how to perform a scheduling of CPU slots specified by `concurrent_
     DECLARE(UInt64, keeper_server_socket_receive_timeout_sec, DBMS_DEFAULT_RECEIVE_TIMEOUT_SEC, R"(Keeper socket receive timeout.)", 0, "keeper_server.socket_receive_timeout_sec") \
     DECLARE(UInt64, keeper_server_socket_send_timeout_sec, DBMS_DEFAULT_SEND_TIMEOUT_SEC, R"(Keeper socket send timeout.)", 0, "keeper_server.socket_send_timeout_sec") \
     DECLARE(String, hdfs_libhdfs3_conf, "", R"(Points libhdfs3 to the right location for its config.)", 0, "hdfs.libhdfs3_conf") \
-    DECLARE(String, config_file, "config.xml", R"(Points to the server config file.)", 0, "config-file") \
-    DECLARE(UInt64, input_format_parquet_metadata_cache_max_size, 500000000, "Maximum size of parquet file metadata cache", 0)
+    DECLARE(String, config_file, "config.xml", R"(Points to the server config file.)", 0, "config-file") 
 
 // clang-format on
 

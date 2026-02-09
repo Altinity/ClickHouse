@@ -373,7 +373,6 @@ namespace ServerSetting
     extern const ServerSettingsBool abort_on_logical_error;
     extern const ServerSettingsUInt64 jemalloc_flush_profile_interval_bytes;
     extern const ServerSettingsBool jemalloc_flush_profile_on_memory_exceeded;
-<<<<<<< HEAD
     extern const ServerSettingsString allowed_disks_for_table_engines;
     extern const ServerSettingsUInt64 s3_credentials_provider_max_cache_size;
     extern const ServerSettingsUInt64 max_open_files;
@@ -420,9 +419,7 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 keeper_server_socket_send_timeout_sec;
     extern const ServerSettingsString hdfs_libhdfs3_conf;
     extern const ServerSettingsString config_file;
-=======
     extern const ServerSettingsUInt64 input_format_parquet_metadata_cache_max_size;
->>>>>>> 67a38d1181c (Merge pull request #1039 from Altinity/fp_antaya_25_8_parquet_metadata_caching)
 }
 
 namespace ErrorCodes
