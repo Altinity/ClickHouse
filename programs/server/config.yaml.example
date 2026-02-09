@@ -925,7 +925,7 @@ query_masking_rules:
 
 send_crash_reports:
     enabled: false
-    endpoint: 'https://crash.clickhouse.com/'
+    endpoint: ''
 
 # Uncomment to disable ClickHouse internal DNS caching.
 # disable_internal_dns_cache: 1
