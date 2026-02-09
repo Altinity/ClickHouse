@@ -103,7 +103,7 @@ public:
     const Path & getPathForRead() const;
 
     // Path used for writing, it should not be globbed and might contain a partition key
-    Path getPathForWrite(const std::string & partition_id = "", const std::string & filename_override) const;
+    Path getPathForWrite(const std::string & partition_id = "") const;
     Path getPathForWrite(const std::string & partition_id, const std::string & filename_override) const;
 
     void setPathForRead(const Path & path)
@@ -261,21 +261,17 @@ public:
         return false;
     }
 
-<<<<<<< HEAD
     virtual void drop(ContextPtr) {}
 
-=======
+    String format = "auto";
+    String compression_method = "auto";
+    String structure = "auto";
+
     PartitionStrategyFactory::StrategyType partition_strategy_type = PartitionStrategyFactory::StrategyType::NONE;
     std::shared_ptr<IPartitionStrategy> partition_strategy;
     /// Whether partition column values are contained in the actual data.
     /// And alternative is with hive partitioning, when they are contained in file path.
     bool partition_columns_in_data_file = true;
-
-private:
->>>>>>> f3bd121d484 (Merge pull request #1041 from Altinity/fp_antalya_25_8_export_mt_part)
-    String format = "auto";
-    String compression_method = "auto";
-    String structure = "auto";
 
 protected:
     void initializeFromParsedArguments(const StorageParsedArguments & parsed_arguments);

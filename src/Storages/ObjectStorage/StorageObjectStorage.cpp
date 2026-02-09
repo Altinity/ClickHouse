@@ -30,7 +30,6 @@
 #include <Storages/ObjectStorage/DataLakes/DeltaLakeMetadataDeltaKernel.h>
 #include <Interpreters/StorageID.h>
 #include <Common/parseGlobs.h>
-#include <Storages/ObjectStorage/MergeTree/StorageObjectStorageImporterSink.h>
 #include <Databases/LoadingStrictnessLevel.h>
 #include <Databases/DataLake/Common.h>
 #include <Storages/ColumnsDescription.h>
@@ -55,6 +54,7 @@ namespace ErrorCodes
     extern const int NOT_IMPLEMENTED;
     extern const int INCORRECT_DATA;
     extern const int BAD_ARGUMENTS;
+    extern const int FILE_ALREADY_EXISTS;
 }
 
 String StorageObjectStorage::getPathSample(ContextPtr context)
@@ -559,8 +559,9 @@ bool StorageObjectStorage::supportsImport() const
 SinkToStoragePtr StorageObjectStorage::import(
     const std::string & file_name,
     Block & block_with_partition_values,
-    ContextPtr local_context,
-    std::function<void(ImportStats)> part_log)
+    std::string & destination_file_path,
+    bool overwrite_if_exists,
+    ContextPtr local_context)
 {
     std::string partition_key;
 
@@ -570,27 +571,25 @@ SinkToStoragePtr StorageObjectStorage::import(
 
         if (!column_with_partition_key->empty())
         {
-            partition_key = column_with_partition_key->getDataAt(0).toString();
+            partition_key = column_with_partition_key->getDataAt(0);
         }
     }
 
-    const auto file_path = configuration->getPathForWrite(partition_key, file_name).path;
+    destination_file_path = configuration->getPathForWrite(partition_key, file_name).path;
 
-    if (object_storage->exists(StoredObject(file_path)))
+    if (!overwrite_if_exists && object_storage->exists(StoredObject(destination_file_path)))
     {
-        LOG_INFO(getLogger("StorageObjectStorage"), "File {} already exists, skipping import", file_path);
-        return nullptr;
+        throw Exception(ErrorCodes::FILE_ALREADY_EXISTS, "File {} already exists", destination_file_path);
     }
-    
-    return std::make_shared<StorageObjectStorageImporterSink>(
-        file_path,
+
+    return std::make_shared<StorageObjectStorageSink>(
+        destination_file_path,
         object_storage,
-        configuration,
         format_settings,
-        getInMemoryMetadataPtr()->getSampleBlock(),
-        part_log,
-        local_context
-    );
+        std::make_shared<const Block>(getInMemoryMetadataPtr()->getSampleBlock()),
+        local_context,
+        configuration->format,
+        configuration->compression_method);
 }
 
 void StorageObjectStorage::truncate(
@@ -773,11 +772,6 @@ void StorageObjectStorage::alter(const AlterCommands & params, ContextPtr contex
 void StorageObjectStorage::checkAlterIsPossible(const AlterCommands & commands, ContextPtr /*context*/) const
 {
     configuration->checkAlterIsPossible(commands);
-}
-
-StorageObjectStorage::Configuration::Path StorageObjectStorage::Configuration::getPathForWrite(const std::string & partition_id, const std::string & filename_override) const
-{
-    return Path {file_path_generator->getPathForWrite(partition_id, filename_override)};
 }
 
 }

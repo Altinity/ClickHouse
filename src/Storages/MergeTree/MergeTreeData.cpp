@@ -6594,7 +6594,7 @@ void MergeTreeData::exportPartToTableImpl(
         manifest.create_time,
         local_context);
 
-    ThreadGroupSwitcher switcher((*exports_list_entry)->thread_group, "");
+    ThreadGroupSwitcher switcher((*exports_list_entry)->thread_group, ThreadName::EXPORT_MT_PART);
 
     QueryPlanOptimizationSettings optimization_settings(local_context);
     auto pipeline_settings = BuildQueryPipelineSettings(local_context);

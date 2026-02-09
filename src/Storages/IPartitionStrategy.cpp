@@ -274,6 +274,15 @@ ColumnPtr WildcardPartitionStrategy::computePartitionKey(const Chunk & chunk)
     return block_with_partition_by_expr.getByName(actions_with_column.column_name).column;
 }
 
+ColumnPtr WildcardPartitionStrategy::computePartitionKey(Block & block)
+{
+    ASTs arguments(1, partition_key_description.definition_ast);
+    ASTPtr partition_by_string = makeASTFunction("toString", std::move(arguments));
+    auto actions_with_column = getPartitionExpressionActions(partition_by_string);
+    actions_with_column.actions->execute(block);
+    return block.getByName(actions_with_column.column_name).column;
+}
+
 HiveStylePartitionStrategy::HiveStylePartitionStrategy(
     KeyDescription partition_key_description_,
     const Block & sample_block_,
@@ -303,6 +312,14 @@ ColumnPtr HiveStylePartitionStrategy::computePartitionKey(const Chunk & chunk)
     actions_with_column.actions->execute(block_with_partition_by_expr);
 
     return block_with_partition_by_expr.getByName(actions_with_column.column_name).column;
+}
+
+ColumnPtr HiveStylePartitionStrategy::computePartitionKey(Block & block)
+{
+    auto hive_ast = buildHivePartitionAST(partition_key_description.definition_ast, getPartitionColumns());
+    auto actions_with_column = getPartitionExpressionActions(hive_ast);
+    actions_with_column.actions->execute(block);
+    return block.getByName(actions_with_column.column_name).column;
 }
 
 ColumnRawPtrs HiveStylePartitionStrategy::getFormatChunkColumns(const Chunk & chunk)

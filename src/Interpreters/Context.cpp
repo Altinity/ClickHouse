@@ -4468,7 +4468,6 @@ ThrottlerPtr Context::getMergesThrottler() const
     return shared->merges_throttler;
 }
 
-<<<<<<< HEAD
 ThrottlerPtr Context::getDistributedCacheReadThrottler() const
 {
     return shared->distributed_cache_read_throttler;
@@ -4477,11 +4476,11 @@ ThrottlerPtr Context::getDistributedCacheReadThrottler() const
 ThrottlerPtr Context::getDistributedCacheWriteThrottler() const
 {
     return shared->distributed_cache_write_throttler;
-=======
+}
+
 ThrottlerPtr Context::getExportsThrottler() const
 {
     return shared->exports_throttler;
->>>>>>> f3bd121d484 (Merge pull request #1041 from Altinity/fp_antalya_25_8_export_mt_part)
 }
 
 void Context::reloadRemoteThrottlerConfig(size_t read_bandwidth, size_t write_bandwidth) const

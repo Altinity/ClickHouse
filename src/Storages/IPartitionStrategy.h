@@ -29,12 +29,7 @@ struct IPartitionStrategy
 
     virtual ColumnPtr computePartitionKey(const Chunk & chunk) = 0;
 
-    ColumnPtr computePartitionKey(Block & block) const
-    {
-        actions_with_column_name.actions->execute(block);
-
-        return block.getByName(actions_with_column_name.column_name).column;
-    }
+    virtual ColumnPtr computePartitionKey(Block & block) = 0;
 
     virtual ColumnRawPtrs getFormatChunkColumns(const Chunk & chunk)
     {
@@ -97,6 +92,8 @@ struct WildcardPartitionStrategy : IPartitionStrategy
     WildcardPartitionStrategy(KeyDescription partition_key_description_, const Block & sample_block_, ContextPtr context_);
 
     ColumnPtr computePartitionKey(const Chunk & chunk) override;
+
+    ColumnPtr computePartitionKey(Block & block) override;
 };
 
 /*
@@ -114,6 +111,8 @@ struct HiveStylePartitionStrategy : IPartitionStrategy
         bool partition_columns_in_data_file_);
 
     ColumnPtr computePartitionKey(const Chunk & chunk) override;
+
+    ColumnPtr computePartitionKey(Block & block) override;
 
     ColumnRawPtrs getFormatChunkColumns(const Chunk & chunk) override;
     Block getFormatHeader() override;
