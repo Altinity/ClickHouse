@@ -195,6 +195,9 @@
   reason: 'INVESTIGATE: Out of Memory or startup instability'
 - name: test_s3_cache_locality/test.py::test_cache_locality[0]
   reason: 'INVESTIGATE: Timeout or AssertionError'
+- name: test_dirty_pages_force_purge/test.py::test_dirty_pages_force_purge
+  reason: 'KNOWN: https://github.com/Altinity/ClickHouse/issues/1369'
+  message: 'RuntimeError: Failed to find peak memory counter'
 
 # Regex rules should be ordered from most specific to least specific.
 # regex: true applies to name, message, and not_message fields, but not to reason or check_types fields.
