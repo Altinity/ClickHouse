@@ -115,6 +115,7 @@ struct ExportReplicatedMergeTreePartitionManifest
     size_t max_bytes_per_file;
     size_t max_rows_per_file;
     MergeTreePartExportManifest::FileAlreadyExistsPolicy file_already_exists_policy;
+    String filename_pattern;
     bool lock_inside_the_task; /// todo temporary
 
     std::string toJsonString() const
@@ -137,6 +138,7 @@ struct ExportReplicatedMergeTreePartitionManifest
         json.set("max_bytes_per_file", max_bytes_per_file);
         json.set("max_rows_per_file", max_rows_per_file);
         json.set("file_already_exists_policy", String(magic_enum::enum_name(file_already_exists_policy)));
+        json.set("filename_pattern", filename_pattern);
         json.set("create_time", create_time);
         json.set("max_retries", max_retries);
         json.set("ttl_seconds", ttl_seconds);
@@ -179,6 +181,7 @@ struct ExportReplicatedMergeTreePartitionManifest
 
         manifest.max_bytes_per_file = json->getValue<size_t>("max_bytes_per_file");
         manifest.max_rows_per_file = json->getValue<size_t>("max_rows_per_file");
+        manifest.filename_pattern = json->getValue<String>("filename_pattern");
 
         manifest.lock_inside_the_task = json->getValue<bool>("lock_inside_the_task");
 

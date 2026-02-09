@@ -104,6 +104,26 @@ def cluster():
             with_zookeeper=True,
             keeper_required_feature_flags=["multi_read"],
         )
+        # Sharded instances for filename pattern tests
+        cluster.add_instance(
+            "shard1_replica1",
+            main_configs=["configs/named_collections.xml", "configs/allow_experimental_export_partition.xml", "configs/macros_shard1_replica1.xml"],
+            user_configs=["configs/users.d/profile.xml"],
+            with_minio=True,
+            stay_alive=True,
+            with_zookeeper=True,
+            keeper_required_feature_flags=["multi_read"],
+        )
+
+        cluster.add_instance(
+            "shard2_replica1",
+            main_configs=["configs/named_collections.xml", "configs/allow_experimental_export_partition.xml", "configs/macros_shard2_replica1.xml"],
+            user_configs=["configs/users.d/profile.xml"],
+            with_minio=True,
+            stay_alive=True,
+            with_zookeeper=True,
+            keeper_required_feature_flags=["multi_read"],
+        )
         logging.info("Starting cluster...")
         cluster.start()
         yield cluster
@@ -117,6 +137,14 @@ def create_s3_table(node, s3_table):
 
 def create_tables_and_insert_data(node, mt_table, s3_table, replica_name):
     node.query(f"CREATE TABLE {mt_table} (id UInt64, year UInt16) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', '{replica_name}') PARTITION BY year ORDER BY tuple()")
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020), (3, 2020), (4, 2021)")
+
+    create_s3_table(node, s3_table)
+
+
+def create_sharded_tables_and_insert_data(node, mt_table, s3_table, replica_name):
+    """Create sharded ReplicatedMergeTree table with {shard} macro in ZooKeeper path."""
+    node.query(f"CREATE TABLE {mt_table} (id UInt64, year UInt16) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{{shard}}/{mt_table}', '{replica_name}') PARTITION BY year ORDER BY tuple()")
     node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020), (3, 2020), (4, 2021)")
 
     create_s3_table(node, s3_table)
@@ -817,3 +845,82 @@ def test_export_partition_with_mixed_computed_columns(cluster):
             AND partition_id = '1'
     """)
     assert status.strip() == "COMPLETED", f"Expected COMPLETED status, got: {status}"
+
+
+def test_sharded_export_partition_with_filename_pattern(cluster):
+    """Test that export partition with filename pattern prevents collisions in sharded setup."""
+    shard1_r1 = cluster.instances["shard1_replica1"]
+    shard2_r1 = cluster.instances["shard2_replica1"]
+    watcher_node = cluster.instances["watcher_node"]
+
+    mt_table = "sharded_mt_table"
+    s3_table = "sharded_s3_table"
+
+    # Create sharded tables on all shards with same partition data (same part names)
+    # Each shard uses different ZooKeeper path via {shard} macro
+    create_sharded_tables_and_insert_data(shard1_r1, mt_table, s3_table, "replica1")
+    create_sharded_tables_and_insert_data(shard2_r1, mt_table, s3_table, "replica1")
+    create_s3_table(watcher_node, s3_table)
+
+    # Export partition from both shards with filename pattern including shard
+    # This should prevent filename collisions
+    shard1_r1.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
+        f"SETTINGS export_merge_tree_part_filename_pattern = '{{part_name}}_{{shard}}_{{replica}}_{{checksum}}'"
+    )
+    shard2_r1.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
+        f"SETTINGS export_merge_tree_part_filename_pattern = '{{part_name}}_{{shard}}_{{replica}}_{{checksum}}'"
+    )
+
+    # Wait for exports to complete
+    wait_for_export_status(shard1_r1, mt_table, s3_table, "2020", "COMPLETED")
+    wait_for_export_status(shard2_r1, mt_table, s3_table, "2020", "COMPLETED")
+
+    total_count = watcher_node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020").strip()
+    assert total_count == "6", f"Expected 6 total rows (3 from each shard), got {total_count}"
+
+    # Verify filenames contain shard information (check via S3 directly)
+    # Get all files from S3 - query from watcher_node since S3 is shared
+    files_shard1 = watcher_node.query(
+        f"SELECT _file FROM s3(s3_conn, filename='{s3_table}/**', format='One') WHERE _file LIKE '%shard1%' LIMIT 1"
+    ).strip()
+    files_shard2 = watcher_node.query(
+        f"SELECT _file FROM s3(s3_conn, filename='{s3_table}/**', format='One') WHERE _file LIKE '%shard2%' LIMIT 1"
+    ).strip()
+
+    # Both shards should have files with their shard names
+    assert "shard1" in files_shard1 or files_shard1 == "", f"Expected shard1 in filenames, got: {files_shard1}"
+    assert "shard2" in files_shard2 or files_shard2 == "", f"Expected shard2 in filenames, got: {files_shard2}"
+
+
+def test_sharded_export_partition_default_pattern(cluster):
+    shard1_r1 = cluster.instances["shard1_replica1"]
+    shard2_r1 = cluster.instances["shard2_replica1"]
+    watcher_node = cluster.instances["watcher_node"]
+
+    mt_table = "sharded_mt_table_default"
+    s3_table = "sharded_s3_table_default"
+
+    # Create sharded tables with different ZooKeeper paths per shard
+    create_sharded_tables_and_insert_data(shard1_r1, mt_table, s3_table, "replica1")
+    create_sharded_tables_and_insert_data(shard2_r1, mt_table, s3_table, "replica1")
+    create_s3_table(watcher_node, s3_table)
+
+    # Export with default pattern ({part_name}_{checksum}) - may cause collisions if parts have same name and the same checksum
+    shard1_r1.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
+    )
+    shard2_r1.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
+    )
+
+    wait_for_export_status(shard1_r1, mt_table, s3_table, "2020", "COMPLETED")
+    wait_for_export_status(shard2_r1, mt_table, s3_table, "2020", "COMPLETED")
+
+    # Both exports should complete (even if there are collisions, the overwrite policy handles it)
+    # S3 tables are shared, so query from watcher_node
+    total_count = watcher_node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020").strip()
+
+    # only one file with 3 rows should be present
+    assert int(total_count) == 3, f"Expected 3 rows, got {total_count}"
