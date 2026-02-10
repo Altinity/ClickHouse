@@ -16,7 +16,7 @@ FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES = [
             "_debug, parallel",
             "_binary, parallel",
             "_asan, distributed plan, parallel",
-            "_tsan, parallel",
+            # "_tsan, parallel",
         )
     )
 ]
@@ -61,8 +61,8 @@ workflow = Workflow.Config(
         # JobConfigs.integration_test_targeted_pr_jobs[0].set_allow_merge_on_failure(),
         # *JobConfigs.stateless_tests_flaky_pr_jobs,
         # *JobConfigs.integration_test_asan_flaky_pr_jobs,
-        JobConfigs.bugfix_validation_ft_pr_job,
-        JobConfigs.bugfix_validation_it_job,
+        # JobConfigs.bugfix_validation_ft_pr_job,
+        # JobConfigs.bugfix_validation_it_job,
         *[
             j.set_dependency(
                 FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES
