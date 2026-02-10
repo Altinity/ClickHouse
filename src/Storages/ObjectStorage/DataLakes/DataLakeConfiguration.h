@@ -435,6 +435,15 @@ class StorageIcebergConfiguration : public StorageObjectStorageConfiguration, pu
 public:
     explicit StorageIcebergConfiguration(DataLakeStorageSettingsPtr settings_) : settings(settings_) {}
  
+    void initialize(
+        ASTs & engine_args,
+        ContextPtr local_context,
+        bool with_table_structure) override
+    {
+        createDynamicConfiguration(engine_args, local_context);
+        getImpl().initialize(engine_args, local_context, with_table_structure);
+    }
+
     ObjectStorageType getType() const override { return getImpl().getType(); }
 
     std::string getTypeName() const override { return getImpl().getTypeName(); }
@@ -478,6 +487,10 @@ public:
 
     std::optional<size_t> totalRows(ContextPtr context) override { return getImpl().totalRows(context); }
     std::optional<size_t> totalBytes(ContextPtr context) override { return getImpl().totalBytes(context); }
+    bool isDataSortedBySortingKey(StorageMetadataPtr storage_metadata, ContextPtr context) const override
+        { return getImpl().isDataSortedBySortingKey(storage_metadata, context); }
+
+    bool needsUpdateForSchemaConsistency() const override  { return getImpl().needsUpdateForSchemaConsistency(); }
 
     IDataLakeMetadata * getExternalMetadata() override { return getImpl().getExternalMetadata(); }
 
@@ -520,10 +533,13 @@ public:
     void initPartitionStrategy(ASTPtr partition_by, const ColumnsDescription & columns, ContextPtr context) override
         { getImpl().initPartitionStrategy(partition_by, columns, context); }
 
+    StorageInMemoryMetadata getStorageSnapshotMetadata(ContextPtr local_context) const override
+        { return getImpl().getStorageSnapshotMetadata(local_context); }
     std::optional<ColumnsDescription> tryGetTableStructureFromMetadata(ContextPtr local_context) const override
         { return getImpl().tryGetTableStructureFromMetadata(local_context); }
 
     bool supportsFileIterator() const override { return getImpl().supportsFileIterator(); }
+    bool supportsParallelInsert() const override { return getImpl().supportsParallelInsert(); }
     bool supportsWrites() const override { return getImpl().supportsWrites(); }
 
     bool supportsPartialPathPrefix() const override { return getImpl().supportsPartialPathPrefix(); }
@@ -580,7 +596,6 @@ public:
     {
         getImpl().mutate(commands, context, storage_id, metadata_snapshot, catalog, format_settings);
     }
-
     void checkMutationIsPossible(const MutationCommands & commands) override { getImpl().checkMutationIsPossible(commands); }
 
     void checkAlterIsPossible(const AlterCommands & commands) override { getImpl().checkAlterIsPossible(commands); }
@@ -588,15 +603,6 @@ public:
     void alter(const AlterCommands & params, ContextPtr context) override { getImpl().alter(params, context); }
 
     const DataLakeStorageSettings & getDataLakeSettings() const override { return getImpl().getDataLakeSettings(); }
-
-    void initialize(
-        ASTs & engine_args,
-        ContextPtr local_context,
-        bool with_table_structure) override
-    {
-        createDynamicConfiguration(engine_args, local_context);
-        getImpl().initialize(engine_args, local_context, with_table_structure);
-    }
 
     ASTPtr createArgsWithAccessData() const override
     {
@@ -607,41 +613,9 @@ public:
         { getImpl().fromNamedCollection(collection, context); }
     void fromAST(ASTs & args, ContextPtr context, bool with_structure) override
         { getImpl().fromAST(args, context, with_structure); }
+    void fromDisk(const String & disk_name, ASTs & args, ContextPtr context, bool with_structure) override
+        { getImpl().fromDisk(disk_name, args, context, with_structure); }
 
-    const String & getFormat() const override { return getImpl().getFormat(); }
-    const String & getCompressionMethod() const override { return getImpl().getCompressionMethod(); }
-    const String & getStructure() const override { return getImpl().getStructure(); }
-
-    PartitionStrategyFactory::StrategyType getPartitionStrategyType() const override { return getImpl().getPartitionStrategyType(); }
-    bool getPartitionColumnsInDataFile() const override { return getImpl().getPartitionColumnsInDataFile(); }
-    std::shared_ptr<IPartitionStrategy> getPartitionStrategy() const override { return getImpl().getPartitionStrategy(); }
-
-    void setFormat(const String & format_) override { getImpl().setFormat(format_); }
-    void setCompressionMethod(const String & compression_method_) override { getImpl().setCompressionMethod(compression_method_); }
-    void setStructure(const String & structure_) override { getImpl().setStructure(structure_); }
-
-    void setPartitionStrategyType(PartitionStrategyFactory::StrategyType partition_strategy_type_) override
-        { getImpl().setPartitionStrategyType(partition_strategy_type_); }
-    void setPartitionColumnsInDataFile(bool partition_columns_in_data_file_) override
-        { getImpl().setPartitionColumnsInDataFile(partition_columns_in_data_file_); }
-    void setPartitionStrategy(const std::shared_ptr<IPartitionStrategy> & partition_strategy_) override
-        { getImpl().setPartitionStrategy(partition_strategy_); }
-
-    ColumnMapperPtr getColumnMapperForObject(ObjectInfoPtr obj) const override { return getImpl().getColumnMapperForObject(obj); }
-
-    ColumnMapperPtr getColumnMapperForCurrentSchema(StorageMetadataPtr storage_metadata_snapshot, ContextPtr context) const override
-        { return getImpl().getColumnMapperForCurrentSchema(storage_metadata_snapshot, context); }
-
-    std::shared_ptr<DataLake::ICatalog> getCatalog(ContextPtr context, bool is_attach) const override
-        { return getImpl().getCatalog(context, is_attach); }
-
-    bool optimize(const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & format_settings) override
-        { return getImpl().optimize(metadata_snapshot, context, format_settings); }
-
-    StorageInMemoryMetadata getStorageSnapshotMetadata(ContextPtr local_context) const override
-        { return getImpl().getStorageSnapshotMetadata(local_context); }
-
-protected:
     /// Find storage_type argument and remove it from args if exists.
     /// Return storage type.
     ObjectStorageType extractDynamicStorageType(ASTs & args, ContextPtr context, ASTPtr * type_arg) const override
@@ -713,13 +687,46 @@ protected:
         return type;
     }
 
+    const String & getFormat() const override { return getImpl().getFormat(); }
+    const String & getCompressionMethod() const override { return getImpl().getCompressionMethod(); }
+    const String & getStructure() const override { return getImpl().getStructure(); }
+
+    PartitionStrategyFactory::StrategyType getPartitionStrategyType() const override { return getImpl().getPartitionStrategyType(); }
+    bool getPartitionColumnsInDataFile() const override { return getImpl().getPartitionColumnsInDataFile(); }
+    std::shared_ptr<IPartitionStrategy> getPartitionStrategy() const override { return getImpl().getPartitionStrategy(); }
+
+    void setFormat(const String & format_) override { getImpl().setFormat(format_); }
+    void setCompressionMethod(const String & compression_method_) override { getImpl().setCompressionMethod(compression_method_); }
+    void setStructure(const String & structure_) override { getImpl().setStructure(structure_); }
+
+    void setPartitionStrategyType(PartitionStrategyFactory::StrategyType partition_strategy_type_) override
+        { getImpl().setPartitionStrategyType(partition_strategy_type_); }
+    void setPartitionColumnsInDataFile(bool partition_columns_in_data_file_) override
+        { getImpl().setPartitionColumnsInDataFile(partition_columns_in_data_file_); }
+    void setPartitionStrategy(const std::shared_ptr<IPartitionStrategy> & partition_strategy_) override
+        { getImpl().setPartitionStrategy(partition_strategy_); }
+
+    void assertInitialized() const override { getImpl().assertInitialized(); }
+
+    ColumnMapperPtr getColumnMapperForObject(ObjectInfoPtr obj) const override { return getImpl().getColumnMapperForObject(obj); }
+
+    ColumnMapperPtr getColumnMapperForCurrentSchema(StorageMetadataPtr storage_metadata_snapshot, ContextPtr context) const override
+        { return getImpl().getColumnMapperForCurrentSchema(storage_metadata_snapshot, context); }
+
+    std::shared_ptr<DataLake::ICatalog> getCatalog(ContextPtr context, bool is_attach) const override
+        { return getImpl().getCatalog(context, is_attach); }
+
+    bool optimize(const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & format_settings) override
+        { return getImpl().optimize(metadata_snapshot, context, format_settings); }
+
+    void drop(ContextPtr context) override { getImpl().drop(context); }
+
+protected:
     void createDynamicConfiguration(ASTs & args, ContextPtr context)
     {
         ObjectStorageType type = extractDynamicStorageType(args, context, nullptr);
         createDynamicStorage(type);
     }
-
-    void assertInitialized() const override { getImpl().assertInitialized(); }
 
 private:
     inline StorageObjectStorageConfiguration & getImpl() const
