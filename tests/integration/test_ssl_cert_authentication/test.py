@@ -414,4 +414,3 @@ def test_x509_san_wildcard_support():
     )
 
     instance.query("DROP USER brian")
->>>>>>> 7b94dc1813a (Merge pull request #65277 from arthurpassos/multi_auth_methods)
