@@ -51,7 +51,7 @@ MultiFileStorageObjectStorageSink::~MultiFileStorageObjectStorageSink()
 /// Output is `table_root/year=2025/month=12/day=12/file.1.parquet`
 std::string MultiFileStorageObjectStorageSink::generateNewFilePath()
 {
-    const auto file_format = Poco::toLower(configuration->getFormat());
+    const auto file_format = Poco::toLower(configuration->format);
     const auto index_string = std::to_string(file_paths.size() + 1);
     std::size_t pos = base_path.rfind(file_format);
 
@@ -85,7 +85,14 @@ std::shared_ptr<StorageObjectStorageSink> MultiFileStorageObjectStorageSink::cre
         throw Exception(ErrorCodes::FILE_ALREADY_EXISTS, "File {} already exists", file_paths.back());
     }
 
-    return std::make_shared<StorageObjectStorageSink>(file_paths.back(), object_storage, configuration, format_settings, sample_block, context);
+    return std::make_shared<StorageObjectStorageSink>(
+        file_paths.back(),
+        object_storage,
+        format_settings,
+        sample_block,
+        context,
+        configuration->format,
+        configuration->compression_method);
 }
 
 void MultiFileStorageObjectStorageSink::consume(Chunk & chunk)

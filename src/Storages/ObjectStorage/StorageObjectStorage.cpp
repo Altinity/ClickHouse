@@ -592,19 +592,14 @@ SinkToStoragePtr StorageObjectStorage::import(
         base_path,
         /* transaction_id= */ file_name, /// not pretty, but the sink needs some sort of id to generate the commit file name. Using the source part name should be enough
         object_storage,
-<<<<<<< HEAD
-=======
         configuration,
         max_bytes_per_file,
         max_rows_per_file,
         overwrite_if_exists,
         new_file_path_callback,
->>>>>>> c24224bdc1e (Merge pull request #1229 from Altinity/max_bytes_rows_per_file)
         format_settings_ ? format_settings_ : format_settings,
         std::make_shared<const Block>(getInMemoryMetadataPtr()->getSampleBlock()),
-        local_context,
-        configuration->format,
-        configuration->compression_method);
+        local_context);
 }
 
 void StorageObjectStorage::commitExportPartitionTransaction(const String & transaction_id, const String & partition_id, const Strings & exported_paths, ContextPtr local_context)
