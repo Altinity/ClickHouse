@@ -109,17 +109,6 @@ void StorageObjectStorageConfiguration::initialize(
         }
     }
 
-    if (configuration_to_initialize.partition_strategy_type == PartitionStrategyFactory::StrategyType::HIVE)
-    {
-        configuration_to_initialize.file_path_generator = std::make_shared<ObjectStorageAppendFilePathGenerator>(
-            configuration_to_initialize.getRawPath().path,
-            configuration_to_initialize.format);
-    }
-    else
-    {
-        configuration_to_initialize.file_path_generator = std::make_shared<ObjectStorageWildcardFilePathGenerator>(configuration_to_initialize.getRawPath().path);
-    }
-
     if (configuration_to_initialize.format == "auto")
     {
         if (configuration_to_initialize.isDataLakeConfiguration())
