@@ -308,16 +308,21 @@ def get_creation_expression(
                 iceberg{engine_part}({storage_arg}, path = '/var/lib/clickhouse/user_files/iceberg_data/default/{table_name}/', format={format})
             """
         else:
-            return (
-                f"""
-                DROP TABLE IF EXISTS {table_name};
-                CREATE TABLE {if_not_exists_prefix} {table_name} {schema}
-                ENGINE=Iceberg{engine_part}({storage_arg}, path = '/var/lib/clickhouse/user_files/iceberg_data/default/{table_name}/', format={format})
-                {order_by}
-                {partition_by}
-                {settings_expression}
+            if table_function:
+                return f"""
+                    iceberg{engine_part}({storage_arg}, path = '/var/lib/clickhouse/user_files/iceberg_data/default/{table_name}', format={format})
                 """
-            )
+            else:
+                return (
+                    f"""
+                    DROP TABLE IF EXISTS {table_name};
+                    CREATE TABLE {if_not_exists_prefix} {table_name} {schema}
+                    ENGINE=Iceberg{engine_part}({storage_arg}, path = '/var/lib/clickhouse/user_files/iceberg_data/default/{table_name}/', format={format})
+                    {order_by}
+                    {partition_by}
+                    {settings_expression}
+                    """
+                )
 
     else:
         raise Exception(f"Unknown iceberg storage type: {storage_type}")

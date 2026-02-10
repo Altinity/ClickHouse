@@ -109,6 +109,13 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
 
     auto log_ = getLogger("StorageObjectStorageCluster");
 
+    if (!is_table_function && !columns_in_table_or_function_definition.empty() && !is_datalake_query && mode_ == LoadingStrictnessLevel::CREATE)
+    {
+        LOG_DEBUG(log_, "Creating new storage with specified columns");
+        configuration->create(
+            object_storage, context_, columns_in_table_or_function_definition, partition_by, order_by, if_not_exists, catalog, table_id_);
+    }
+
     try
     {
         if (!do_lazy_init)
