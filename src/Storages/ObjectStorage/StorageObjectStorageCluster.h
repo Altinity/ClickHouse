@@ -125,6 +125,10 @@ public:
 
     void updateExternalDynamicMetadataIfExists(ContextPtr query_context) override;
 
+    bool supportsDelete() const override;
+
+    bool supportsParallelInsert() const override;
+
 private:
     void updateQueryToSendIfNeeded(
         ASTPtr & query,

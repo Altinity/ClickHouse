@@ -888,4 +888,19 @@ void StorageObjectStorageCluster::onActionLockRemove(StorageActionBlockType acti
     IStorageCluster::onActionLockRemove(action_type);
 }
 
+bool StorageObjectStorageCluster::supportsDelete() const
+{
+    if (pure_storage)
+        return pure_storage->supportsDelete();
+    return IStorageCluster::supportsDelete();
+}
+
+bool StorageObjectStorageCluster::supportsParallelInsert() const
+{
+    if (pure_storage)
+        return pure_storage->supportsParallelInsert();
+    return IStorageCluster::supportsParallelInsert();
+}
+
+
 }
