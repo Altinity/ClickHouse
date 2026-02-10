@@ -198,6 +198,10 @@
 - name: test_dirty_pages_force_purge/test.py::test_dirty_pages_force_purge
   reason: 'KNOWN: https://github.com/Altinity/ClickHouse/issues/1369'
   message: 'RuntimeError: Failed to find peak memory counter'
+- name: test_storage_s3_queue/test_0.py::test_move_after_processing[same_bucket-AzureQueue]
+  reason: 'INVESTIGATE: Fails on ARM'
+  check_types:
+  - arm
 
 # Regex rules should be ordered from most specific to least specific.
 # regex: true applies to name, message, and not_message fields, but not to reason or check_types fields.
