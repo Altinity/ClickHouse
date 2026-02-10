@@ -78,6 +78,16 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"throw_if_deduplication_in_dependent_materialized_views_enabled_with_async_insert", true, false, "It becomes obsolete."},
             {"database_datalake_require_metadata_access", true, true, "New setting."},
             {"automatic_parallel_replicas_min_bytes_per_replica", 0, 1_MiB, "Better default value derived from testing results"},
+            {"allow_experimental_export_merge_tree_part", false, false, "New setting."},
+            {"export_merge_tree_part_overwrite_file_if_exists", false, false, "New setting."},
+            {"export_merge_tree_part_file_already_exists_policy", "skip", "skip", "New setting."},
+            {"export_merge_tree_partition_force_export", false, false, "New setting."},
+            {"export_merge_tree_partition_max_retries", 3, 3, "New setting."},
+            {"export_merge_tree_partition_manifest_ttl", 180, 180, "New setting."},
+            {"export_merge_tree_part_max_bytes_per_file", 0, 0, "New setting."},
+            {"export_merge_tree_part_max_rows_per_file", 0, 0, "New setting."},
+            {"export_merge_tree_part_throw_on_pending_mutations", true, true, "New setting."},
+            {"export_merge_tree_part_throw_on_pending_patch_parts", true, true, "New setting."},
         });
         addSettingsChanges(settings_changes_history, "25.12",
         {
