@@ -25,7 +25,9 @@ Here are links for more information.
 - [Getting Started with Altinity’s Project Antalya blog article](https://altinity.com/blog/getting-started-with-altinitys-project-antalya)
 - [Project Antalya official documentation](https://docs.altinity.com/altinityantalya/)
 - [Feature matrix](Antalya.md)
-- [Project roadmap](https://github.com/Altinity/ClickHouse/issues/804)
+- Project roadmap
+  - [2026](https://github.com/Altinity/ClickHouse/issues/1359)
+  - [2025](https://github.com/Altinity/ClickHouse/issues/804)
 - [Github releases](https://github.com/Altinity/ClickHouse/releases?q=altinityantalya&expanded=false)
 - [Docker images](https://hub.docker.com/r/altinity/clickhouse-server/tags?page=1&name=altinityantalya)
 - [Packages](https://builds.altinity.cloud/#altinityantalya)
