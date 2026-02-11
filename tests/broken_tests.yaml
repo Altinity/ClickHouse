@@ -93,31 +93,31 @@
 - name: 03367_l2_distance_transposed_1
   reason: INVESTIGATE - Float precision issue on Hetzner ARM
   check_types:
-  - arm_binary
+  - cpu-aarch64
 - name: 03369_l2_distance_transposed_variadic
   reason: INVESTIGATE - Float precision issue on Hetzner ARM
   check_types:
-  - arm_binary
+  - cpu-aarch64
 - name: 03367_l2_distance_transposed_2
   reason: INVESTIGATE - Float precision issue on Hetzner ARM
   check_types:
-  - arm_binary
+  - cpu-aarch64
 - name: 03377_qbit_parameters
   reason: INVESTIGATE - Float precision issue on Hetzner ARM
   check_types:
-  - arm_binary
+  - cpu-aarch64
 - name: 03370_l2_distance_transposed_negative
   reason: INVESTIGATE - Float precision issue on Hetzner ARM
   check_types:
-  - arm_binary
+  - cpu-aarch64
 - name: 03375_l2_distance_transposed_partial_reads_pass
   reason: INVESTIGATE - Float precision issue on Hetzner ARM
   check_types:
-  - arm_binary
+  - cpu-aarch64
 - name: 03378_cosine_distance_transposed
   reason: INVESTIGATE - Float precision issue on Hetzner ARM
   check_types:
-  - arm_binary
+  - cpu-aarch64
 - name: test_storage_s3_queue/test_5.py::test_migration[1-s3queue_]
   reason: KNOWN - Sometimes fails due to test order
   message: 'Failed: Timeout >900.0s'
