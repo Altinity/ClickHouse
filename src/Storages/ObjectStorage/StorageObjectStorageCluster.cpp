@@ -120,9 +120,6 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
     {
         if (!do_lazy_init)
         {
-            /// We allow exceptions to be thrown on update(),
-            /// because Cluster engine can only be used as table function,
-            /// so no lazy initialization is allowed.
             configuration->update(
                 object_storage,
                 context_,
@@ -182,7 +179,7 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
 
     /// This will update metadata which contains specific information about table state (e.g. for Iceberg)
 
-    if (configuration->needsUpdateForSchemaConsistency())
+    if (!do_lazy_init && is_table_function && configuration->needsUpdateForSchemaConsistency())
     {
         auto metadata_snapshot = configuration->getStorageSnapshotMetadata(context_);
         setInMemoryMetadata(metadata_snapshot);
@@ -486,9 +483,6 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
 
 void StorageObjectStorageCluster::updateExternalDynamicMetadataIfExists(ContextPtr query_context)
 {
-    if (getClusterName(query_context).empty())
-        return pure_storage->updateExternalDynamicMetadataIfExists(query_context);
-
     configuration->update(
         object_storage,
         query_context,
@@ -498,6 +492,9 @@ void StorageObjectStorageCluster::updateExternalDynamicMetadataIfExists(ContextP
         auto metadata_snapshot = configuration->getStorageSnapshotMetadata(query_context);
         setInMemoryMetadata(metadata_snapshot);
     }
+
+    if (pure_storage)
+        pure_storage->updateExternalDynamicMetadataIfExists(query_context);
 }
 
 RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExtension(
