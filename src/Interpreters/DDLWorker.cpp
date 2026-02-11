@@ -777,7 +777,7 @@ bool DDLWorker::taskShouldBeExecutedOnLeader(const ASTPtr & ast_ddl, const Stora
             alter->isUnlockSnapshot() ||
             alter->isMovePartitionToDiskOrVolumeAlter() ||
             alter->isCommentAlter() ||
-            alter->isExportPartAlter())
+            alter->isExportPartOrExportPartitionAlter())
             return false;
     }
 

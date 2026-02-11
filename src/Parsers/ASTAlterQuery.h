@@ -269,7 +269,7 @@ public:
 
     bool isMovePartitionToDiskOrVolumeAlter() const;
 
-    bool isExportPartAlter() const;
+    bool isExportPartOrExportPartitionAlter() const;
 
     bool isCommentAlter() const;
 

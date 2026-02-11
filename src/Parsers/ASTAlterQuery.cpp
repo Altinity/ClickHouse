@@ -695,9 +695,9 @@ bool ASTAlterQuery::isMovePartitionToDiskOrVolumeAlter() const
     return false;
 }
 
-bool ASTAlterQuery::isExportPartAlter() const
+bool ASTAlterQuery::isExportPartOrExportPartitionAlter() const
 {
-    return isOneCommandTypeOnly(ASTAlterCommand::EXPORT_PART);
+    return isOneCommandTypeOnly(ASTAlterCommand::EXPORT_PART) || isOneCommandTypeOnly(ASTAlterCommand::EXPORT_PARTITION);
 }
 
 
