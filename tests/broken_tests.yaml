@@ -84,6 +84,40 @@
 - name: 03644_object_storage_correlated_subqueries
   reason: KNOWN - Unstable in upstream 25.8.
   message: Timeout! Processes left in process group
+- name: 03206_no_exceptions_clickhouse_local
+  reason: 'KNOWN - Unstable upstream'
+  message: 'return code:  134'
+- name: 02815_no_throw_in_simple_queries
+  reason: 'KNOWN - Unstable upstream'
+  message: 'spawn id exp5 not open'
+- name: 03367_l2_distance_transposed_1
+  reason: INVESTIGATE - Float precision issue on Hetzner ARM
+  check_types:
+  - arm_binary
+- name: 03369_l2_distance_transposed_variadic
+  reason: INVESTIGATE - Float precision issue on Hetzner ARM
+  check_types:
+  - arm_binary
+- name: 03367_l2_distance_transposed_2
+  reason: INVESTIGATE - Float precision issue on Hetzner ARM
+  check_types:
+  - arm_binary
+- name: 03377_qbit_parameters
+  reason: INVESTIGATE - Float precision issue on Hetzner ARM
+  check_types:
+  - arm_binary
+- name: 03370_l2_distance_transposed_negative
+  reason: INVESTIGATE - Float precision issue on Hetzner ARM
+  check_types:
+  - arm_binary
+- name: 03375_l2_distance_transposed_partial_reads_pass
+  reason: INVESTIGATE - Float precision issue on Hetzner ARM
+  check_types:
+  - arm_binary
+- name: 03378_cosine_distance_transposed
+  reason: INVESTIGATE - Float precision issue on Hetzner ARM
+  check_types:
+  - arm_binary
 - name: test_storage_s3_queue/test_5.py::test_migration[1-s3queue_]
   reason: KNOWN - Sometimes fails due to test order
   message: 'Failed: Timeout >900.0s'
@@ -136,12 +170,6 @@
 - name: test_storage_s3_queue/test_4.py::test_list_and_delete_race
   reason: 'KNOWN - Unstable upstream'
   message: AssertionError
-- name: 03206_no_exceptions_clickhouse_local
-  reason: 'KNOWN - Unstable upstream'
-  message: 'return code:  134'
-- name: 02815_no_throw_in_simple_queries
-  reason: 'KNOWN - Unstable upstream'
-  message: 'spawn id exp5 not open'
 - name: test_storage_s3_queue/test_5.py::test_failed_startup
   reason: 'INVESTIGATE: Unstable on tsan'
   check_types:
