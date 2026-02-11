@@ -20,6 +20,7 @@
 #include <Storages/MergeTree/ExportList.h>
 #include <Formats/FormatFactory.h>
 #include <Databases/enableAllExperimentalSettings.h>
+#include <Processors/Sinks/SinkToStorage.h>
 
 namespace ProfileEvents
 {
@@ -251,6 +252,13 @@ bool ExportPartTask::executeStep()
     }
     catch (const Exception & e)
     {
+        /// If an exception is thrown before the pipeline is started, the sink will not be canceled and might leave buffers open.
+        /// Cancel it manually to ensure the buffers are closed.
+        if (sink)
+        {
+            sink->cancel();
+        }
+
         if (e.code() == ErrorCodes::FILE_ALREADY_EXISTS)
         {
             ProfileEvents::increment(ProfileEvents::PartsExportDuplicated);
