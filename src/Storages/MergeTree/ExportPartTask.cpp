@@ -7,6 +7,7 @@
 #include <Interpreters/inplaceBlockConversions.h>
 #include <Core/Settings.h>
 #include <Interpreters/ExpressionActions.h>
+#include <Interpreters/ActionsDAG.h>
 #include <Processors/Executors/CompletedPipelineExecutor.h>
 #include <Processors/QueryPlan/BuildQueryPipelineSettings.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
@@ -44,6 +45,7 @@ namespace Setting
     extern const SettingsUInt64 min_bytes_to_use_direct_io;
     extern const SettingsUInt64 export_merge_tree_part_max_bytes_per_file;
     extern const SettingsUInt64 export_merge_tree_part_max_rows_per_file;
+    extern const SettingsBool allow_experimental_analyzer;
 }
 
 namespace
@@ -61,7 +63,10 @@ namespace
         // (same pattern as in IMergeTreeReader::evaluateMissingDefaults)
         auto context_for_defaults = Context::createCopy(local_context);
         enableAllExperimentalSettings(context_for_defaults);
-        
+
+        /// Copy the behavior of `IMergeTreeReader`, see https://github.com/ClickHouse/ClickHouse/blob/c45224e3f0a6dd9a9217e5d75723f378ffe0a86a/src/Storages/MergeTree/IMergeTreeReader.cpp#L215
+        context_for_defaults->setSetting("enable_analyzer", local_context->getSettingsRef()[Setting::allow_experimental_analyzer].value);
+
         auto defaults_dag = evaluateMissingDefaults(
             *header,
             readable_columns,
@@ -70,13 +75,19 @@ namespace
 
         if (defaults_dag)
         {
+            ActionsDAG base_dag(header->getColumnsWithTypeAndName());
+
+            /// `evaluateMissingDefaults` has a new analyzer path since https://github.com/ClickHouse/ClickHouse/pull/87585
+            /// which returns a DAG that does not contain all columns. We need to merge it with the base DAG to get all columns.
+            auto merged = ActionsDAG::merge(std::move(base_dag), std::move(*defaults_dag));
+
             /// Ensure columns are in the correct order matching readable_columns
-            defaults_dag->removeUnusedActions(readable_columns.getNames(), false);
-            defaults_dag->addMaterializingOutputActions(/*materialize_sparse=*/ false);
+            merged.removeUnusedActions(readable_columns.getNames(), false);
+            merged.addMaterializingOutputActions(/*materialize_sparse=*/ false);
             
             auto expression_step = std::make_unique<ExpressionStep>(
                 header,
-                std::move(*defaults_dag));
+                std::move(merged));
             expression_step->setStepDescription("Compute alias and default expressions for export");
             plan_for_part.addStep(std::move(expression_step));
         }
