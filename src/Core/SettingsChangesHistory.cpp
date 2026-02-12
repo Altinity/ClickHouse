@@ -230,7 +230,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"os_threads_nice_value_query", 0, 0, "New setting."},
             {"os_threads_nice_value_materialized_view", 0, 0, "New setting."},
             {"os_thread_priority", 0, 0, "Alias for os_threads_nice_value_query."},
-            {"allow_retries_in_cluster_requests", false, false, "New setting"},
             {"object_storage_remote_initiator", false, false, "New setting."},
             {"allow_experimental_export_merge_tree_part", false, false, "New setting."},
             {"export_merge_tree_part_overwrite_file_if_exists", false, false, "New setting."},
