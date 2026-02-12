@@ -718,10 +718,10 @@ class JobConfigs:
         *[
             Job.ParamSet(
                 parameter=f"amd_asan, old analyzer, {batch}/{total_batches}",
-                runs_on=RunnerLabels.FUNC_TESTER_AMD,
+                runs_on=RunnerLabels.BUILDER_AMD,
                 requires=[ArtifactNames.CH_AMD_ASAN],
             )
-            for total_batches in (8,)
+            for total_batches in (6,)
             for batch in range(1, total_batches + 1)
         ],
         *[
