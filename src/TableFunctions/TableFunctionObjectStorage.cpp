@@ -471,10 +471,26 @@ void registerTableFunctionPaimon(TableFunctionFactory & factory)
 }
 #endif
 
+#if USE_PARQUET && USE_DELTA_KERNEL_RS
+void registerTableFunctionDeltaLake(TableFunctionFactory & factory)
+{
+    // Register the new local Delta Lake table function
+    factory.registerFunction<TableFunctionDeltaLakeLocal>(
+        {.documentation
+         = {.description = R"(The table function can be used to read the DeltaLake table stored locally.)",
+            .examples{{DeltaLakeLocalDefinition::name, "SELECT * FROM deltaLakeLocal(path)", ""}},
+            .category = FunctionDocumentation::Category::TableFunction},
+         .allow_readonly = false});
+}
+#endif
+
 void registerDataLakeTableFunctions(TableFunctionFactory & factory)
 {
     UNUSED(factory);
 
+#if USE_PARQUET && USE_DELTA_KERNEL_RS
+    registerTableFunctionDeltaLake(factory);
+#endif
 #if USE_AVRO
     registerTableFunctionPaimon(factory);
 #endif

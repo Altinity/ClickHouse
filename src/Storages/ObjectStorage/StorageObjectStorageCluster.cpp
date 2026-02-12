@@ -314,6 +314,7 @@ void StorageObjectStorageCluster::updateQueryForDistributedEngineIfNeeded(ASTPtr
         {"DeltaLake", "deltaLake"},
         {"DeltaLakeS3", "deltaLakeS3"},
         {"DeltaLakeAzure", "deltaLakeAzure"},
+        {"DeltaLakeLocal", "deltaLakeLocal"},
         {"Hudi", "hudi"}
     };
 
