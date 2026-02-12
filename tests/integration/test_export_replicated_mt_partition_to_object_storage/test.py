@@ -20,6 +20,7 @@ def wait_for_export_status(
     poll_interval: float = 0.5,
 ):
     start_time = time.time()
+    last_status = None
     while time.time() - start_time < timeout:
         status = node.query(
             f"""
@@ -29,6 +30,8 @@ def wait_for_export_status(
                 AND partition_id = '{partition_id}'
             """
         ).strip()
+        
+        last_status = status
 
         if status and status == expected_status:
             return status
@@ -36,7 +39,7 @@ def wait_for_export_status(
         time.sleep(poll_interval)
 
     raise TimeoutError(
-        f"Export status did not reach '{expected_status}' within {timeout}s. ")
+        f"Export status did not reach '{expected_status}' within {timeout}s. Last status: '{last_status}'")
 
 
 def wait_for_export_to_start(
@@ -139,26 +142,41 @@ def test_restart_nodes_during_export(cluster):
     with PartitionManager() as pm:
         # Block responses from MinIO (source_port matches MinIO service)
         pm_rule_reject_responses_node1 = {
+            "instance": node,
             "destination": node.ip_address,
+            "protocol": "tcp",
             "source_port": minio_port,
             "action": "REJECT --reject-with tcp-reset",
         }
-        pm._add_rule(pm_rule_reject_responses_node1)
+        pm.add_rule(pm_rule_reject_responses_node1)
 
         pm_rule_reject_responses_node2 = {
+            "instance": node2,
             "destination": node2.ip_address,
+            "protocol": "tcp",
             "source_port": minio_port,
             "action": "REJECT --reject-with tcp-reset",
         }
-        pm._add_rule(pm_rule_reject_responses_node2)
+        pm.add_rule(pm_rule_reject_responses_node2)
 
         # Block requests to MinIO (destination: MinIO, destination_port: minio_port)
-        pm_rule_reject_requests = {
+        pm_rule_reject_requests_node1 = {
+            "instance": node,
             "destination": minio_ip,
+            "protocol": "tcp",
             "destination_port": minio_port,
             "action": "REJECT --reject-with tcp-reset",
         }
-        pm._add_rule(pm_rule_reject_requests)
+        pm.add_rule(pm_rule_reject_requests_node1)
+
+        pm_rule_reject_requests_node2 = {
+            "instance": node2,
+            "destination": minio_ip,
+            "protocol": "tcp",
+            "destination_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm.add_rule(pm_rule_reject_requests_node2)
         
         export_queries = f"""
             ALTER TABLE {mt_table}
@@ -213,19 +231,43 @@ def test_kill_export(cluster):
     with PartitionManager() as pm:
         # Block responses from MinIO (source_port matches MinIO service)
         pm_rule_reject_responses = {
+            "instance": node,
             "destination": node.ip_address,
+            "protocol": "tcp",
             "source_port": minio_port,
             "action": "REJECT --reject-with tcp-reset",
         }
-        pm._add_rule(pm_rule_reject_responses)
+        pm.add_rule(pm_rule_reject_responses)
 
         # Block requests to MinIO (destination: MinIO, destination_port: minio_port)
         pm_rule_reject_requests = {
+            "instance": node,
             "destination": minio_ip,
+            "protocol": "tcp",
             "destination_port": minio_port,
             "action": "REJECT --reject-with tcp-reset",
         }
-        pm._add_rule(pm_rule_reject_requests)
+        pm.add_rule(pm_rule_reject_requests)
+        
+        # Block responses from MinIO for node2
+        pm_rule_reject_responses_node2 = {
+            "instance": node2,
+            "destination": node2.ip_address,
+            "protocol": "tcp",
+            "source_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm.add_rule(pm_rule_reject_responses_node2)
+
+        # Block requests to MinIO from node2
+        pm_rule_reject_requests_node2 = {
+            "instance": node2,
+            "destination": minio_ip,
+            "protocol": "tcp",
+            "destination_port": minio_port,
+            "action": "REJECT --reject-with tcp-reset",
+        }
+        pm.add_rule(pm_rule_reject_requests_node2)
         
         export_queries = f"""
             ALTER TABLE {mt_table}
@@ -237,7 +279,7 @@ def test_kill_export(cluster):
         """
 
         node.query(export_queries)
-    
+        
         # Kill only 2020 while S3 is blocked - retry mechanism keeps exports alive
         # ZooKeeper operations (KILL) proceed quickly since only S3 is blocked
         node.query(f"KILL EXPORT PARTITION WHERE partition_id = '2020' and source_table = '{mt_table}' and destination_table = '{s3_table}'")
@@ -274,19 +316,23 @@ def test_drop_source_table_during_export(cluster):
     with PartitionManager() as pm:
         # Block responses from MinIO (source_port matches MinIO service)
         pm_rule_reject_responses = {
+            "instance": node,
             "destination": node.ip_address,
+            "protocol": "tcp",
             "source_port": minio_port,
             "action": "REJECT --reject-with tcp-reset",
         }
-        pm._add_rule(pm_rule_reject_responses)
+        pm.add_rule(pm_rule_reject_responses)
 
         # Block requests to MinIO (destination: MinIO, destination_port: minio_port)
         pm_rule_reject_requests = {
+            "instance": node,
             "destination": minio_ip,
+            "protocol": "tcp",
             "destination_port": minio_port,
             "action": "REJECT --reject-with tcp-reset",
         }
-        pm._add_rule(pm_rule_reject_requests)
+        pm.add_rule(pm_rule_reject_requests)
         
         export_queries = f"""
             ALTER TABLE {mt_table}
@@ -358,19 +404,23 @@ def test_failure_is_logged_in_system_table(cluster):
     with PartitionManager() as pm:
         # Block responses from MinIO (source_port matches MinIO service)
         pm_rule_reject_responses = {
+            "instance": node,
             "destination": node.ip_address,
+            "protocol": "tcp",
             "source_port": minio_port,
             "action": "REJECT --reject-with tcp-reset",
         }
-        pm._add_rule(pm_rule_reject_responses)
+        pm.add_rule(pm_rule_reject_responses)
 
         # Also block requests to MinIO (destination: MinIO, destination_port: 9001) with REJECT to fail fast
         pm_rule_reject_requests = {
+            "instance": node,
             "destination": minio_ip,
+            "protocol": "tcp",
             "destination_port": minio_port,
             "action": "REJECT --reject-with tcp-reset",
         }
-        pm._add_rule(pm_rule_reject_requests)
+        pm.add_rule(pm_rule_reject_requests)
 
         node.query(
             f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS export_merge_tree_partition_max_retries=1;"
@@ -423,19 +473,23 @@ def test_inject_short_living_failures(cluster):
     with PartitionManager() as pm:
         # Block responses from MinIO (source_port matches MinIO service)
         pm_rule_reject_responses = {
+            "instance": node,
             "destination": node.ip_address,
+            "protocol": "tcp",
             "source_port": minio_port,
             "action": "REJECT --reject-with tcp-reset",
         }
-        pm._add_rule(pm_rule_reject_responses)
+        pm.add_rule(pm_rule_reject_responses)
 
         # Also block requests to MinIO (destination: MinIO, destination_port: 9001) with REJECT to fail fast
         pm_rule_reject_requests = {
+            "instance": node,
             "destination": minio_ip,
+            "protocol": "tcp",
             "destination_port": minio_port,
             "action": "REJECT --reject-with tcp-reset",
         }
-        pm._add_rule(pm_rule_reject_requests)
+        pm.add_rule(pm_rule_reject_requests)
 
         # set big max_retries so that the export does not fail completely
         node.query(
@@ -444,7 +498,7 @@ def test_inject_short_living_failures(cluster):
 
         # wait only for a second to get at least one failure, but not enough to finish the export
         time.sleep(5)
-    
+
     # wait for the export to finish
     wait_for_export_status(node, mt_table, s3_table, "2020", "COMPLETED")
 
@@ -632,11 +686,11 @@ def test_export_partition_permissions(cluster):
     # Grant basic access to all users
     node.query(f"GRANT SELECT ON {mt_table} TO user_no_alter")
     node.query(f"GRANT SELECT ON {s3_table} TO user_no_alter")
-    
+
     # user_no_insert has ALTER on source but no INSERT on destination
     node.query(f"GRANT ALTER ON {mt_table} TO user_no_insert")
     node.query(f"GRANT SELECT ON {s3_table} TO user_no_insert")
-    
+
     # user_with_permissions has both ALTER and INSERT
     node.query(f"GRANT ALTER ON {mt_table} TO user_with_permissions")
     node.query(f"GRANT INSERT ON {s3_table} TO user_with_permissions")
@@ -646,6 +700,7 @@ def test_export_partition_permissions(cluster):
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}",
         user="user_no_alter"
     )
+
     assert "ACCESS_DENIED" in error or "Not enough privileges" in error, \
         f"Expected ACCESS_DENIED error for user without ALTER, got: {error}"
 
@@ -654,6 +709,7 @@ def test_export_partition_permissions(cluster):
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}",
         user="user_no_insert"
     )
+
     assert "ACCESS_DENIED" in error or "Not enough privileges" in error, \
         f"Expected ACCESS_DENIED error for user without INSERT, got: {error}"
 
@@ -838,18 +894,22 @@ def test_mutations_after_export_partition_started(cluster):
 
     with PartitionManager() as pm:
         pm_rule_reject_responses = {
+            "instance": node,
             "destination": node.ip_address,
+            "protocol": "tcp",
             "source_port": minio_port,
             "action": "REJECT --reject-with tcp-reset",
         }
-        pm._add_rule(pm_rule_reject_responses)
+        pm.add_rule(pm_rule_reject_responses)
 
         pm_rule_reject_requests = {
+            "instance": node,
             "destination": minio_ip,
+            "protocol": "tcp",
             "destination_port": minio_port,
             "action": "REJECT --reject-with tcp-reset",
         }
-        pm._add_rule(pm_rule_reject_requests)
+        pm.add_rule(pm_rule_reject_requests)
 
         node.query(
             f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
@@ -883,18 +943,22 @@ def test_patch_parts_after_export_partition_started(cluster):
 
     with PartitionManager() as pm:
         pm_rule_reject_responses = {
+            "instance": node,
             "destination": node.ip_address,
+            "protocol": "tcp",
             "source_port": minio_port,
             "action": "REJECT --reject-with tcp-reset",
         }
-        pm._add_rule(pm_rule_reject_responses)
+        pm.add_rule(pm_rule_reject_responses)
 
         pm_rule_reject_requests = {
+            "instance": node,
             "destination": minio_ip,
+            "protocol": "tcp",
             "destination_port": minio_port,
             "action": "REJECT --reject-with tcp-reset",
         }
-        pm._add_rule(pm_rule_reject_requests)
+        pm.add_rule(pm_rule_reject_requests)
 
         node.query(
             f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
