@@ -230,7 +230,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"os_threads_nice_value_query", 0, 0, "New setting."},
             {"os_threads_nice_value_materialized_view", 0, 0, "New setting."},
             {"os_thread_priority", 0, 0, "Alias for os_threads_nice_value_query."},
-            {"object_storage_remote_initiator", false, false, "New setting."},
             {"allow_experimental_export_merge_tree_part", false, false, "New setting."},
             {"export_merge_tree_part_overwrite_file_if_exists", false, false, "New setting."},
             {"allow_experimental_export_merge_tree_part", false, true, "Turned ON by default for Antalya."},
@@ -240,9 +239,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"export_merge_tree_part_file_already_exists_policy", "skip", "skip", "New setting."},
             {"export_merge_tree_part_max_bytes_per_file", 0, 0, "New setting."},
             {"export_merge_tree_part_max_rows_per_file", 0, 0, "New setting."},
-            {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
-            {"cluster_table_function_split_granularity", "file", "file", "New setting."},
-            {"cluster_table_function_buckets_batch_size", 0, 0, "New setting."},
             {"export_merge_tree_part_throw_on_pending_mutations", true, true, "New setting."},
             {"export_merge_tree_part_throw_on_pending_patch_parts", true, true, "New setting."},
         });
