@@ -181,7 +181,7 @@ def should_skip_job(job_name):
 
     ci_exclude_tags = _info_cache.get_kv_data("ci_exclude_tags") or []
     for tag in ci_exclude_tags:
-        if tag in job_name:
+        if tag in job_name.lower():
             return True, f"Skipped, job name includes excluded tag '{tag}'"
 
     # NOTE (strtgbb): disabled this feature for now
