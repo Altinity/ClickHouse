@@ -1,5 +1,6 @@
 List of pull requests contributed by Altinity developers to ClickHouse® server. It does not include documentation changes.
 
+
 ## 2025
 
 * Few fixes to object storage hive reads & writes	[85538](https://github.com/ClickHouse/ClickHouse/pull/85538)	by @arthurpassos

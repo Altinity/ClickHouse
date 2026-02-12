@@ -75,6 +75,7 @@
 | Iceberg time travel by snapshots                                           |                        https://github.com/Altinity/ClickHouse/pull/733                         |         25.2.2         |https://github.com/ClickHouse/ClickHouse/pull/77439|25.4.1
 | s3Cluster hive partitioning                                                |                        https://github.com/Altinity/ClickHouse/pull/584                         |        24.12.2         |https://github.com/ClickHouse/ClickHouse/pull/73910|
 
+
 <hr>
 
 *© 2024-2026 Altinity Inc. All rights reserved. Altinity®, Altinity.Cloud®, and Altinity Stable Builds® are registered trademarks of Altinity, Inc. ClickHouse® is a registered trademark of ClickHouse, Inc.*
