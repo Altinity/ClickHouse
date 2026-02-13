@@ -146,6 +146,8 @@ def get_broken_tests_rules(broken_tests_file_path: str) -> dict:
 def test_is_known_fail(test_name, test_logs, build_flags, broken_tests_file_path):
     matching_rules = []
 
+    test_name = test_name.replace(".gen", "")  # Remove suffix from templated tests
+
     def matches_substring(substring, log, is_regex):
         if log is None:
             return False
