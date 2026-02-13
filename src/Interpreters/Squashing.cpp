@@ -150,6 +150,7 @@ Chunk Squashing::squash(std::vector<Chunk> && input_chunks, Chunk::ChunkInfoColl
             columns[j]->forEachSubcolumnRecursively(has_object_deprecated_lambda);
             mutable_columns[j]->forEachSubcolumnRecursively(has_object_deprecated_lambda);
             source_columns_list[j].emplace_back(std::move(columns[j]));
+        }
     }
 
     for (size_t i = 0; i != num_columns; ++i)
