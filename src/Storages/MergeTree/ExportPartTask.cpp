@@ -228,6 +228,11 @@ bool ExportPartTask::executeStep()
 
         exec.setCancelCallback(is_cancelled_callback, 100);
 
+        if (isCancelled())
+        {
+            throw Exception(ErrorCodes::QUERY_WAS_CANCELLED, "Export part was cancelled");
+        }
+
         exec.execute();
 
         if (isCancelled())
