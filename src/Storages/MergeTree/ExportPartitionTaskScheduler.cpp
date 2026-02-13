@@ -208,9 +208,10 @@ void ExportPartitionTaskScheduler::run()
                 std::lock_guard part_export_lock(storage.export_manifests_mutex);
 
                 MergeTreePartExportManifest part_export_manifest(
-                    destination_storage->getStorageID(),
+                    destination_storage,
                     part,
                     manifest.transaction_id,
+                    manifest.query_id,
                     context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value,
                     context->getSettingsCopy(),
                     storage.getInMemoryMetadataPtr(),
@@ -259,6 +260,7 @@ void ExportPartitionTaskScheduler::run()
                         destination_storage_id,
                         manifest.transaction_id,
                         getContextCopyWithTaskSettings(storage.getContext(), manifest),
+                        /*allow_outdated_parts*/ true,
                         [this, key, zk_part_name, manifest, destination_storage]
                         (MergeTreePartExportManifest::CompletionCallbackResult result)
                         {
