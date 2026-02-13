@@ -39,6 +39,10 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         /// controls new feature and it's 'true' by default, use 'false' as previous_value).
         /// It's used to implement `compatibility` setting (see https://github.com/ClickHouse/ClickHouse/issues/35972)
         /// Note: please check if the key already exists to prevent duplicate entries.
+        addSettingsChanges(settings_changes_history, "26.1.1.20001",
+        {
+            {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
+        });
         addSettingsChanges(settings_changes_history, "26.1",
         {
             {"parallel_replicas_filter_pushdown", false, false, "New setting"},
@@ -220,17 +224,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"os_threads_nice_value_query", 0, 0, "New setting."},
             {"os_threads_nice_value_materialized_view", 0, 0, "New setting."},
             {"os_thread_priority", 0, 0, "Alias for os_threads_nice_value_query."},
-            {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
-            {"lock_object_storage_task_distribution_ms", 500, 500, "Raised the value to 500 to avoid hoping tasks between executors."},
-            {"object_storage_cluster", "", "", "Antalya: New setting"},
-            {"object_storage_max_nodes", 0, 0, "Antalya: New setting"},
-            {"allow_retries_in_cluster_requests", false, false, "Antalya: New setting"},
-            {"allow_retries_in_cluster_requests", false, false, "New setting"},
-            {"object_storage_remote_initiator", false, false, "New setting."},
-            {"allow_experimental_export_merge_tree_part", false, false, "New setting."},
-            {"export_merge_tree_part_overwrite_file_if_exists", false, false, "New setting."},
-            {"allow_experimental_export_merge_tree_part", false, true, "Turned ON by default for Antalya."},
-            {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."}
         });
         addSettingsChanges(settings_changes_history, "25.8",
         {
