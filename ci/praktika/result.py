@@ -129,6 +129,7 @@ class Result(MetaClasses.Serializable):
                     Result.Status.SKIPPED,
                     Result.StatusExtended.OK,
                     Result.StatusExtended.SKIPPED,
+                    Result.StatusExtended.BROKEN,
                 ):
                     continue
                 elif result.status in (
