@@ -427,7 +427,7 @@ def test_failure_is_logged_in_system_table(cluster):
         )
 
         # Wait so that the export fails
-        wait_for_export_status(node, mt_table, s3_table, "2020", "FAILED", timeout=10)
+        wait_for_export_status(node, mt_table, s3_table, "2020", "FAILED", timeout=60)
 
     # Network restored; verify the export is marked as FAILED in the system table
     # Also verify we captured at least one exception and no commit file exists

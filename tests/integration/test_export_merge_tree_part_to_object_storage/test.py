@@ -208,6 +208,7 @@ def test_data_mutations_after_export_started(cluster):
         pm_rule_reject_responses = {
             "instance": node,
             "destination": node.ip_address,
+            "protocol": "tcp",
             "source_port": minio_port,
             "action": "REJECT --reject-with tcp-reset",
         }
@@ -216,6 +217,7 @@ def test_data_mutations_after_export_started(cluster):
         pm_rule_reject_requests = {
             "instance": node,
             "destination": minio_ip,
+            "protocol": "tcp",
             "destination_port": minio_port,
             "action": "REJECT --reject-with tcp-reset",
         }
