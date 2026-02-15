@@ -24,21 +24,14 @@ query() {
 
 query "DROP TABLE IF EXISTS $mt_alias, $mt_materialized, $s3_alias_export, $s3_materialized_export, $mt_mixed, $s3_mixed_export, $mt_complex_expr, $s3_complex_expr_export, $mt_ephemeral, $s3_ephemeral_export"
 
+# Create all tables
 echo "---- Test ALIAS columns export"
 query "CREATE TABLE $mt_alias (a UInt32, arr Array(UInt64), arr_1 UInt64 ALIAS arr[1]) ENGINE = MergeTree() PARTITION BY a ORDER BY (a, arr[1]) SETTINGS index_granularity = 1"
 query "CREATE TABLE $s3_alias_export (a UInt32, arr Array(UInt64), arr_1 UInt64) ENGINE = S3(s3_conn, filename='$s3_alias_export', format=Parquet, partition_strategy='hive') PARTITION BY a"
 
-query "INSERT INTO $mt_alias VALUES (1, [1, 2, 3]), (1, [10, 20, 30])"
-
-alias_part=$(query "SELECT name FROM system.parts WHERE database = currentDatabase() AND table = '$mt_alias' AND partition_id = '1' AND active = 1 ORDER BY name LIMIT 1" | tr -d '\n')
-
 echo "---- Test MATERIALIZED columns export"
 query "CREATE TABLE $mt_materialized (a UInt32, arr Array(UInt64), arr_1 UInt64 MATERIALIZED arr[1]) ENGINE = MergeTree() PARTITION BY a ORDER BY (a, arr_1) SETTINGS index_granularity = 1"
 query "CREATE TABLE $s3_materialized_export (a UInt32, arr Array(UInt64), arr_1 UInt64) ENGINE = S3(s3_conn, filename='$s3_materialized_export', format=Parquet, partition_strategy='hive') PARTITION BY a"
-
-query "INSERT INTO $mt_materialized VALUES (1, [1, 2, 3]), (1, [10, 20, 30])"
-
-materialized_part=$(query "SELECT name FROM system.parts WHERE database = currentDatabase() AND table = '$mt_materialized' AND partition_id = '1' AND active = 1 ORDER BY name LIMIT 1" | tr -d '\n')
 
 echo "---- Test EPHEMERAL column (not stored, ignored during export)"
 query "CREATE TABLE $mt_ephemeral (
@@ -51,10 +44,6 @@ query "CREATE TABLE $s3_ephemeral_export (
     id UInt32,
     name_upper String
 ) ENGINE = S3(s3_conn, filename='$s3_ephemeral_export', format=Parquet, partition_strategy='hive') PARTITION BY id"
-
-query "INSERT INTO $mt_ephemeral (id, name_input) VALUES (1, 'alice'), (1, 'bob')"
-
-ephemeral_part=$(query "SELECT name FROM system.parts WHERE database = currentDatabase() AND table = '$mt_ephemeral' AND partition_id = '1' AND active = 1 ORDER BY name LIMIT 1" | tr -d '\n')
 
 echo "---- Test Mixed ALIAS, MATERIALIZED, and EPHEMERAL in same table"
 query "CREATE TABLE $mt_mixed (
@@ -74,10 +63,6 @@ query "CREATE TABLE $s3_mixed_export (
     tag String
 ) ENGINE = S3(s3_conn, filename='$s3_mixed_export', format=Parquet, partition_strategy='hive') PARTITION BY id"
 
-query "INSERT INTO $mt_mixed (id, value, tag_input) VALUES (1, 5, 'test'), (1, 10, 'prod')"
-
-mixed_part=$(query "SELECT name FROM system.parts WHERE database = currentDatabase() AND table = '$mt_mixed' AND partition_id = '1' AND active = 1 ORDER BY name LIMIT 1" | tr -d '\n')
-
 echo "---- Test Complex Expressions in computed columns"
 query "CREATE TABLE $mt_complex_expr (
     id UInt32,
@@ -93,11 +78,24 @@ query "CREATE TABLE $s3_complex_expr_export (
     concat_result String
 ) ENGINE = S3(s3_conn, filename='$s3_complex_expr_export', format=Parquet, partition_strategy='hive') PARTITION BY id"
 
+# Insert all data
+query "INSERT INTO $mt_alias VALUES (1, [1, 2, 3]), (1, [10, 20, 30])"
+query "INSERT INTO $mt_materialized VALUES (1, [1, 2, 3]), (1, [10, 20, 30])"
+query "INSERT INTO $mt_ephemeral (id, name_input) VALUES (1, 'alice'), (1, 'bob')"
+query "INSERT INTO $mt_mixed (id, value, tag_input) VALUES (1, 5, 'test'), (1, 10, 'prod')"
 query "INSERT INTO $mt_complex_expr (id, name) VALUES (1, 'alice'), (1, 'bob')"
 
+# Get all part names
+alias_part=$(query "SELECT name FROM system.parts WHERE database = currentDatabase() AND table = '$mt_alias' AND partition_id = '1' AND active = 1 ORDER BY name LIMIT 1" | tr -d '\n')
+materialized_part=$(query "SELECT name FROM system.parts WHERE database = currentDatabase() AND table = '$mt_materialized' AND partition_id = '1' AND active = 1 ORDER BY name LIMIT 1" | tr -d '\n')
+ephemeral_part=$(query "SELECT name FROM system.parts WHERE database = currentDatabase() AND table = '$mt_ephemeral' AND partition_id = '1' AND active = 1 ORDER BY name LIMIT 1" | tr -d '\n')
+mixed_part=$(query "SELECT name FROM system.parts WHERE database = currentDatabase() AND table = '$mt_mixed' AND partition_id = '1' AND active = 1 ORDER BY name LIMIT 1" | tr -d '\n')
 complex_expr_part=$(query "SELECT name FROM system.parts WHERE database = currentDatabase() AND table = '$mt_complex_expr' AND partition_id = '1' AND active = 1 ORDER BY name LIMIT 1" | tr -d '\n')
 
-# Batch all exports together
+# ============================================================================
+# ALL EXPORTS HAPPEN HERE
+# ============================================================================
+
 query "ALTER TABLE $mt_alias EXPORT PART '$alias_part' TO TABLE $s3_alias_export SETTINGS allow_experimental_export_merge_tree_part = 1"
 
 query "ALTER TABLE $mt_materialized EXPORT PART '$materialized_part' TO TABLE $s3_materialized_export SETTINGS allow_experimental_export_merge_tree_part = 1"
@@ -111,8 +109,12 @@ query "ALTER TABLE $mt_mixed EXPORT PART '$mixed_part' TO TABLE FUNCTION s3(s3_c
 
 query "ALTER TABLE $mt_complex_expr EXPORT PART '$complex_expr_part' TO TABLE $s3_complex_expr_export SETTINGS allow_experimental_export_merge_tree_part = 1"
 
-# Sleep once after all exports
-sleep 3
+# ONE BIG SLEEP after all exports
+sleep 20
+
+# ============================================================================
+# ALL SELECTS/VERIFICATIONS HAPPEN HERE
+# ============================================================================
 
 echo "---- Verify ALIAS column data in source table (arr_1 computed from arr[1])"
 query "SELECT a, arr, arr_1 FROM $mt_alias ORDER BY arr"
