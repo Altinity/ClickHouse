@@ -8,6 +8,7 @@ from pr_info import PRInfo
 from build_download_helper import download_builds_filter
 import hashlib
 from pathlib import Path
+import subprocess
 
 GPG_BINARY_SIGNING_KEY = os.getenv("GPG_BINARY_SIGNING_KEY")
 GPG_BINARY_SIGNING_PASSPHRASE = os.getenv("GPG_BINARY_SIGNING_PASSPHRASE")
@@ -46,6 +47,20 @@ def sign_file(file_path):
 
     return out_file_path
 
+def extract_public_key():
+    priv_key_file_path = 'priv.key'
+    with open(priv_key_file_path, 'x') as f:
+        f.write(GPG_BINARY_SIGNING_KEY)
+
+    os.system(f'echo {GPG_BINARY_SIGNING_PASSPHRASE} | gpg --batch --import {priv_key_file_path}')
+
+    # Export public key
+    pub_key_file_path = 'pub.key'
+    os.system(f'gpg --output {pub_key_file_path} --export {priv_key_file_path}')
+    print(f"Extracted public key to {pub_key_file_path}")
+    os.remove(priv_key_file_path)
+    return pub_key_file_path
+
 def main():
     reports_path = Path(REPORT_PATH)
 
@@ -65,6 +80,17 @@ def main():
     # downloads `package_release` artifacts generated
     download_builds_filter(CHECK_NAME, reports_path, Path(TEMP_PATH))
 
+    # Extract and upload public key first
+    pub_key_file_path = extract_public_key()
+    s3_pubkey_path = s3_path_prefix / "public.gpg"
+    s3_helper.upload_build_file_to_s3(Path(pub_key_file_path), str(s3_pubkey_path))
+    print(f'Uploaded public key to {s3_pubkey_path}')
+
+    # Copy public key to TEMP_PATH for artifact upload
+    artifact_pubkey_path = os.path.join(TEMP_PATH, 'public.gpg')
+    os.rename(pub_key_file_path, artifact_pubkey_path)
+    print(f'Copied public key to {artifact_pubkey_path} for artifact upload')
+    
     for f in os.listdir(TEMP_PATH):
         full_path = os.path.join(TEMP_PATH, f)
         if os.path.isdir(full_path):
