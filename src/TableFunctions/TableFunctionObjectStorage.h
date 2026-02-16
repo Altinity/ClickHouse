@@ -25,10 +25,12 @@ struct S3StorageSettings;
 struct AzureStorageSettings;
 struct HDFSStorageSettings;
 
-template <typename Definition, typename Configuration, bool is_data_lake = false>
+template <typename Definition, typename StorageConfiguration, bool is_data_lake = false>
 class TableFunctionObjectStorage : public ITableFunction
 {
 public:
+    using Configuration = StorageConfiguration;
+
     static constexpr auto name = Definition::name;
     using Settings = typename std::conditional_t<
         is_data_lake,

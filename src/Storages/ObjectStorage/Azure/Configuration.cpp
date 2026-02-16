@@ -825,7 +825,7 @@ ASTPtr StorageAzureConfiguration::createArgsWithAccessData() const
     auto arguments = make_intrusive<ASTExpressionList>();
 
     arguments->children.push_back(make_intrusive<ASTLiteral>(connection_params.endpoint.storage_account_url));
-    arguments->children.push_back(make_intrusive<ASTIdentifier>(connection_params.endpoint.container_name));
+    arguments->children.push_back(make_intrusive<ASTLiteral>(connection_params.endpoint.container_name));
     arguments->children.push_back(make_intrusive<ASTLiteral>(blob_path.path));
     if (account_name && account_key)
     {

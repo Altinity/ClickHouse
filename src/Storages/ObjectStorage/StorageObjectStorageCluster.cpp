@@ -593,6 +593,11 @@ void StorageObjectStorageCluster::readFallBackToPure(
     pure_storage->read(query_plan, column_names, storage_snapshot, query_info, context, processed_stage, max_block_size, num_streams);
 }
 
+bool StorageObjectStorageCluster::isClusterSupported() const
+{
+    return configuration->isClusterSupported();
+}
+
 SinkToStoragePtr StorageObjectStorageCluster::writeFallBackToPure(
     const ASTPtr & query,
     const StorageMetadataPtr & metadata_snapshot,
@@ -608,6 +613,10 @@ String StorageObjectStorageCluster::getClusterName(ContextPtr context) const
     /// User can specify cluster name in table definition or in setting `object_storage_cluster`
     /// only for several queries. When it specified in both places, priority is given to the query setting.
     /// When it is empty, non-cluster realization is used.
+
+    if (!isClusterSupported())
+        return "";
+
     auto cluster_name_from_settings = context->getSettingsRef()[Setting::object_storage_cluster].value;
     if (cluster_name_from_settings.empty())
         cluster_name_from_settings = getOriginalClusterName();

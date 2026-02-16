@@ -71,10 +71,12 @@ namespace DataLakeStorageSetting
 template <typename T>
 concept StorageConfiguration = std::derived_from<T, StorageObjectStorageConfiguration>;
 
-template <StorageConfiguration BaseStorageConfiguration, typename DataLakeMetadata>
+template <StorageConfiguration BaseStorageConfiguration, typename DataLakeMetadata, bool is_cluster_supported = true>
 class DataLakeConfiguration : public BaseStorageConfiguration, public std::enable_shared_from_this<StorageObjectStorageConfiguration>
 {
 public:
+    DataLakeConfiguration() {}
+
     explicit DataLakeConfiguration(DataLakeStorageSettingsPtr settings_) : settings(settings_) {}
 
     bool isDataLakeConfiguration() const override { return true; }
@@ -372,6 +374,8 @@ public:
         ready_object_storage = disk->getObjectStorage();
     }
 
+    bool isClusterSupported() const override { return is_cluster_supported; }
+
 private:
     DataLakeMetadataPtr current_metadata;
     LoggerPtr log = getLogger("DataLakeConfiguration");
@@ -433,6 +437,8 @@ class StorageIcebergConfiguration : public StorageObjectStorageConfiguration, pu
     friend class StorageObjectStorageConfiguration;
 
 public:
+    StorageIcebergConfiguration() {}
+
     explicit StorageIcebergConfiguration(DataLakeStorageSettingsPtr settings_) : settings(settings_) {}
  
     void initialize(
@@ -786,7 +792,7 @@ using StorageS3DeltaLakeConfiguration = DataLakeConfiguration<StorageS3Configura
 using StorageAzureDeltaLakeConfiguration = DataLakeConfiguration<StorageAzureConfiguration, DeltaLakeMetadata>;
 #endif
 
-using StorageLocalDeltaLakeConfiguration = DataLakeConfiguration<StorageLocalConfiguration, DeltaLakeMetadata>;
+using StorageLocalDeltaLakeConfiguration = DataLakeConfiguration<StorageLocalConfiguration, DeltaLakeMetadata, /* is_cluster_supported */ false>;
 
 #endif
 

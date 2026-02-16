@@ -90,6 +90,8 @@ protected:
 private:
     static ClusterPtr getClusterImpl(ContextPtr context, const String & cluster_name_, size_t max_hosts = 0);
 
+    virtual bool isClusterSupported() const { return true; }
+
     LoggerPtr log;
     String cluster_name;
 };

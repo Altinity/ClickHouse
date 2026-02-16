@@ -114,7 +114,7 @@ void TableFunctionObjectStorageClusterFallback<Definition, Base>::parseArguments
 
     const auto & settings = context->getSettingsRef();
 
-    is_cluster_function = !settings[Setting::object_storage_cluster].value.empty();
+    is_cluster_function = !settings[Setting::object_storage_cluster].value.empty() && typename Base::Configuration().isClusterSupported();
 
     if (is_cluster_function)
     {

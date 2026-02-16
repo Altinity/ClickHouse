@@ -580,9 +580,9 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
 
     const auto is_secondary_query = context_->getClientInfo().query_kind == ClientInfo::QueryKind::SECONDARY_QUERY;
 
-    auto cluster_name = settings[DatabaseDataLakeSetting::object_storage_cluster].value;
+    std::string cluster_name = configuration->isClusterSupported() ? settings[DatabaseDataLakeSetting::object_storage_cluster].value : "";
 
-    if (can_use_parallel_replicas && !is_secondary_query)
+    if (cluster_name.empty() && can_use_parallel_replicas && !is_secondary_query)
         cluster_name = parallel_replicas_cluster_name;
 
     auto storage_cluster = std::make_shared<StorageObjectStorageCluster>(

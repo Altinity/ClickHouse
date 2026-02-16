@@ -153,6 +153,8 @@ private:
         const StorageSnapshotPtr & storage_snapshot,
         const ContextPtr & context) override;
 
+    bool isClusterSupported() const override;
+
     void updateConfigurationIfNeeded(ContextPtr context) override;
 
     void readFallBackToPure(

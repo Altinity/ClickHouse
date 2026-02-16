@@ -144,7 +144,7 @@ void IStorageCluster::read(
 {
     auto cluster_name_from_settings = getClusterName(context);
 
-    if (cluster_name_from_settings.empty())
+    if (!isClusterSupported() || cluster_name_from_settings.empty())
     {
         readFallBackToPure(query_plan, column_names, storage_snapshot, query_info, context, processed_stage, max_block_size, num_streams);
         return;
@@ -155,7 +155,7 @@ void IStorageCluster::read(
     storage_snapshot->check(column_names);
 
     updateBeforeRead(context);
-    auto cluster = getClusterImpl(context, cluster_name_from_settings, context->getSettingsRef()[Setting::object_storage_max_nodes]);
+    auto cluster = getClusterImpl(context, cluster_name_from_settings, isObjectStorage() ? context->getSettingsRef()[Setting::object_storage_max_nodes] : 0);
 
     /// Calculate the header. This is significant, because some columns could be thrown away in some cases like query with count(*)
 

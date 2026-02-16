@@ -302,6 +302,8 @@ public:
 
     virtual void drop(ContextPtr) {}
 
+    virtual bool isClusterSupported() const { return true; }
+
 private:
     String format = "auto";
     String compression_method = "auto";
