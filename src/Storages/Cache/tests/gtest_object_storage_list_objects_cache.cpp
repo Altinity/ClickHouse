@@ -133,6 +133,57 @@ TEST_F(ObjectStorageListObjectsCacheTest, TTLExpiration)
     EXPECT_FALSE(cache->get(default_key));
 }
 
+TEST_F(ObjectStorageListObjectsCacheTest, TTLUnlimited)
+{
+    cache->clear();
+    cache->setTTL(0); // 0 means unlimited
+    auto value = createTestValue({"test-prefix/file1.txt"});
+
+    cache->set(default_key, value);
+
+    // Verify we can get it immediately
+    auto result1 = cache->get(default_key).value();
+    EXPECT_EQ(result1.size(), 1);
+
+    // Sleep for a reasonable amount (longer than the default 3 second TTL from SetUp)
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+
+    // Should still be available since TTL is unlimited
+    auto result2 = cache->get(default_key).value();
+    EXPECT_EQ(result2.size(), 1);
+    EXPECT_EQ(result2[0]->getPath(), "test-prefix/file1.txt");
+}
+
+TEST_F(ObjectStorageListObjectsCacheTest, TTLSwitchFromUnlimitedToFinite)
+{
+    cache->clear();
+    cache->setTTL(0); // Start with unlimited
+    auto value1 = createTestValue({"test-prefix/file1.txt"});
+    auto key1 = default_key;
+    key1.prefix = "unlimited/";
+
+    cache->set(key1, value1);
+
+    // Switch to finite TTL and add another entry
+    cache->setTTL(1);
+    auto value2 = createTestValue({"test-prefix/file2.txt"});
+    auto key2 = default_key;
+    key2.prefix = "finite/";
+
+    cache->set(key2, value2);
+
+    // Verify both are available immediately
+    EXPECT_TRUE(cache->get(key1).has_value());
+    EXPECT_TRUE(cache->get(key2).has_value());
+
+    // Wait for finite TTL entry to expire
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    // Unlimited entry should still be there, finite should be gone
+    EXPECT_TRUE(cache->get(key1).has_value());
+    EXPECT_FALSE(cache->get(key2).has_value());
+}
+
 TEST_F(ObjectStorageListObjectsCacheTest, BestPrefixMatch)
 {
     cache->clear();

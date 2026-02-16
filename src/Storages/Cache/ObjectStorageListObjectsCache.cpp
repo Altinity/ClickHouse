@@ -142,7 +142,15 @@ void ObjectStorageListObjectsCache::set(
     const std::shared_ptr<Value> & value)
 {
     auto key_with_ttl = key;
-    key_with_ttl.expires_at = std::chrono::steady_clock::now() + std::chrono::seconds(ttl_in_seconds);
+
+    if (ttl_in_seconds == 0)
+    {
+        key_with_ttl.expires_at = std::chrono::steady_clock::time_point::max();
+    }
+    else
+    {
+        key_with_ttl.expires_at = std::chrono::steady_clock::now() + std::chrono::seconds(ttl_in_seconds);
+    }
 
     cache.set(key_with_ttl, value);
 }
