@@ -220,7 +220,7 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
 
                     for (const auto & object_info : *objects_info)
                     {
-                        relative_path_with_metadata.emplace_back(std::make_shared<RelativePathWithMetadata>(object_info->getPath()));
+                        relative_path_with_metadata.emplace_back(std::make_shared<RelativePathWithMetadata>(object_info->getPath(), object_info->getObjectMetadata()));
                     }
 
                     object_iterator = std::make_shared<ObjectStorageIteratorFromList>(std::move(relative_path_with_metadata));
