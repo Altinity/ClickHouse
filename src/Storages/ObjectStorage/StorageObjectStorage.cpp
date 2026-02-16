@@ -132,7 +132,7 @@ StorageObjectStorage::StorageObjectStorage(
         is_datalake_query, columns_in_table_or_function_definition.toString(true));
 
     bool is_delta_lake_cdf = context->getSettingsRef()[Setting::delta_lake_snapshot_start_version] != -1
-            || context->getSettingsRef()[Setting::delta_lake_snapshot_start_version] != -1;
+            || context->getSettingsRef()[Setting::delta_lake_snapshot_end_version] != -1;
 
     if (!is_table_function && is_delta_lake_cdf)
     {

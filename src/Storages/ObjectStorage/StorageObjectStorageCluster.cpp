@@ -35,6 +35,8 @@ namespace Setting
     extern const SettingsObjectStorageGranularityLevel cluster_table_function_split_granularity;
     extern const SettingsBool parallel_replicas_for_cluster_engines;
     extern const SettingsString object_storage_cluster;
+    extern const SettingsInt64 delta_lake_snapshot_start_version;
+    extern const SettingsInt64 delta_lake_snapshot_end_version;
 }
 
 namespace ErrorCodes
@@ -108,6 +110,14 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
     const bool do_lazy_init = lazy_init && !need_resolve_columns_or_format && !configuration->needsUpdateForSchemaConsistency();
 
     auto log_ = getLogger("StorageObjectStorageCluster");
+
+    bool is_delta_lake_cdf = context_->getSettingsRef()[Setting::delta_lake_snapshot_start_version] != -1
+            || context_->getSettingsRef()[Setting::delta_lake_snapshot_end_version] != -1;
+
+    if (!is_table_function && is_delta_lake_cdf)
+    {
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Delta lake CDF is allowed only for deltaLake table function");
+    }
 
     if (!is_table_function && !columns_in_table_or_function_definition.empty() && !is_datalake_query && mode_ == LoadingStrictnessLevel::CREATE)
     {
