@@ -175,6 +175,12 @@
   reason: 'FIXME: Unstable in current version. Fixed in recent upstream.'
 - name: test_dirty_pages_force_purge/test.py::test_dirty_pages_force_purge
   reason: 'KNOWN: https://github.com/Altinity/ClickHouse/issues/1369'
+- name: test_async_load_databases/test.py::test_materialized_views_cascaded_multiple
+  reason: 'KNOWN: Flaky upstream test. Fixed in upstream PR #88573 but not backported to 25.8.'
+  message: "AssertionError"
+- name: test_async_load_databases/test.py::test_materialized_views_replicated
+  reason: 'KNOWN: Flaky upstream test. Fixed in upstream PR #88573 but not backported to 25.8.'
+  message: 'DATABASE_ALREADY_EXISTS'
 
 # Regex rules should be ordered from most specific to least specific.
 # regex: true applies to name, message, and not_message fields, but not to reason or check_types fields.
