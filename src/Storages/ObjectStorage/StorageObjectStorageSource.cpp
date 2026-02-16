@@ -213,7 +213,17 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
 
                 if (auto objects_info = cache.get(cache_key, /*filter_by_prefix=*/ false))
                 {
-                    object_iterator = std::make_shared<ObjectStorageIteratorFromList>(std::move(*objects_info));
+                    /// suboptimal because of the recent upstream changes to the ObjectInfo structure
+                    /// re-think this with more time and see if there is a more optimized approach
+                    RelativePathsWithMetadata relative_path_with_metadata;
+                    relative_path_with_metadata.reserve(objects_info->size());
+
+                    for (const auto & object_info : *objects_info)
+                    {
+                        relative_path_with_metadata.emplace_back(std::make_shared<RelativePathWithMetadata>(object_info->getPath()));
+                    }
+
+                    object_iterator = std::make_shared<ObjectStorageIteratorFromList>(std::move(relative_path_with_metadata));
                 }
                 else
                 {
@@ -227,16 +237,14 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
             }
             
             iterator = std::make_unique<GlobIterator>(
-                object_storage,
+                object_iterator,
                 configuration,
                 predicate,
                 virtual_columns,
                 hive_columns,
                 local_context,
                 is_archive ? nullptr : read_keys,
-                query_settings.list_object_keys_size,
                 query_settings.throw_on_zero_files_match,
-                with_tags,
                 file_progress_callback,
                 std::move(cache_ptr));
         }

@@ -2,7 +2,7 @@
 
 #include <chrono>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
-#include <Storages/ObjectStorage/StorageObjectStorage.h>
+#include <Storages/ObjectStorage/IObjectIterator.h>
 #include <Common/CacheBase.h>
 
 namespace DB
@@ -38,7 +38,7 @@ public:
         bool operator==(const Key & other) const;
     };
 
-    using Value = StorageObjectStorage::ObjectInfos;
+    using Value = ObjectInfos;
     struct KeyHasher
     {
         size_t operator()(const Key & key) const;

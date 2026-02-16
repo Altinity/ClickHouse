@@ -107,8 +107,9 @@ size_t ObjectStorageListObjectsCache::WeightFunction::operator()(const Value & v
 
     for (const auto & object : value)
     {
-        const auto object_metadata = object->metadata;
-        weight += object->relative_path.capacity() + sizeof(object_metadata);
+        const auto object_metadata = object->getObjectMetadata();
+
+        weight += object->getPath().capacity() + sizeof(object_metadata);
 
         // variable size
         if (object_metadata)
@@ -117,6 +118,11 @@ size_t ObjectStorageListObjectsCache::WeightFunction::operator()(const Value & v
             weight += object_metadata->attributes.size() * (sizeof(std::string) * 2);
 
             for (const auto & [k, v] : object_metadata->attributes)
+            {
+                weight += k.capacity() + v.capacity();
+            }
+
+            for (const auto & [k, v] : object_metadata->tags)
             {
                 weight += k.capacity() + v.capacity();
             }
@@ -177,7 +183,7 @@ std::optional<ObjectStorageListObjectsCache::Value> ObjectStorageListObjectsCach
 
     for (const auto & object : *pair->mapped)
     {
-        if (object->relative_path.starts_with(key.prefix))
+        if (object->getPath().starts_with(key.prefix))
         {
             filtered_objects.push_back(object);
         }
