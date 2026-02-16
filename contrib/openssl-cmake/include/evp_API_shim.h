@@ -5,6 +5,10 @@
 // #include <openssl/types.h>
 #include <assert.h>
 
+/* Nudges some of the code into using older API that is fully supported by AWS-LC.
+ */
+#define OPENSSL_IS_BORINGSSL 1
+
 /* Collection of various functions that are present in OpenSSL 3+ API,
     but are missing from AWS-LC API (OpenSSL 1.1.1-style API).
     To simplify porting and minimize code changes at other places,

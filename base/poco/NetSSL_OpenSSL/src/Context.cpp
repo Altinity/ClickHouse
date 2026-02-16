@@ -26,6 +26,7 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
+#include <evp_API_shim.h>
 
 #if defined(BORINGSSL_API_VERSION)
 #if BORINGSSL_API_VERSION <= 9
