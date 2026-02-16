@@ -907,7 +907,7 @@ jobs:
           fi
 
   integration_tests_amd_asan_old_analyzer_1_6:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_asan]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBvbGQgYW5hbHl6ZXIsIDEvNik=') }}
     name: "Integration tests (amd_asan, old analyzer, 1/6)"
@@ -952,7 +952,7 @@ jobs:
           fi
 
   integration_tests_amd_asan_old_analyzer_2_6:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_asan]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBvbGQgYW5hbHl6ZXIsIDIvNik=') }}
     name: "Integration tests (amd_asan, old analyzer, 2/6)"
@@ -997,7 +997,7 @@ jobs:
           fi
 
   integration_tests_amd_asan_old_analyzer_3_6:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_asan]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBvbGQgYW5hbHl6ZXIsIDMvNik=') }}
     name: "Integration tests (amd_asan, old analyzer, 3/6)"
@@ -1042,7 +1042,7 @@ jobs:
           fi
 
   integration_tests_amd_asan_old_analyzer_4_6:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_asan]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBvbGQgYW5hbHl6ZXIsIDQvNik=') }}
     name: "Integration tests (amd_asan, old analyzer, 4/6)"
@@ -1087,7 +1087,7 @@ jobs:
           fi
 
   integration_tests_amd_asan_old_analyzer_5_6:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_asan]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBvbGQgYW5hbHl6ZXIsIDUvNik=') }}
     name: "Integration tests (amd_asan, old analyzer, 5/6)"
@@ -1132,7 +1132,7 @@ jobs:
           fi
 
   integration_tests_amd_asan_old_analyzer_6_6:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_asan]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBvbGQgYW5hbHl6ZXIsIDYvNik=') }}
     name: "Integration tests (amd_asan, old analyzer, 6/6)"
