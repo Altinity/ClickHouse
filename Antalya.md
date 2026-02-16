@@ -8,7 +8,7 @@
 | Enable parquet reader v3 by default                                        |                        https://github.com/Altinity/ClickHouse/pull/1232                        |        25.8.12         |https://github.com/ClickHouse/ClickHouse/pull/88827|25.11.1|
 | Set max message size on parquet v3 reader                                  |                        https://github.com/Altinity/ClickHouse/pull/1198                        |        25.8.12         |https://github.com/ClickHouse/ClickHouse/pull/91737|25.12.1
 | AWS S3 authentication with an explicitly provided IAM role                 |                        https://github.com/Altinity/ClickHouse/pull/986                         |         25.6.5         |https://github.com/ClickHouse/ClickHouse/pull/84011|25.8.1
-| Iceberg table pruning in cluster requests                                  |                        https://github.com/Altinity/ClickHouse/pull/770                         |         25.2.2         ||
+| Iceberg table pruning in cluster requests                                  |                        https://github.com/Altinity/ClickHouse/pull/770                         |         25.2.2         |https://github.com/ClickHouse/ClickHouse/pull/82131|25.7.1|
 | ListObjectsV2 cache                                                        |                        https://github.com/Altinity/ClickHouse/pull/743                         |         25.2.2         ||
 | Improve performance of hive path parsing                                   |                        https://github.com/Altinity/ClickHouse/pull/734                         |         25.2.2         |https://github.com/ClickHouse/ClickHouse/pull/79067|25.5.1
 | Lazy load metadata for metadata for DataLake                               |                        https://github.com/Altinity/ClickHouse/pull/742                         |         25.2.2         ||
@@ -23,6 +23,7 @@
 | Parquet file metadata caching                                              |                        https://github.com/Altinity/ClickHouse/pull/586                         |        24.12.2         ||
 | Parquet file metadata caching: use cache for parquetmetadata format        |                        https://github.com/Altinity/ClickHouse/pull/636                         |        24.12.2         ||
 | Parquet file metadata caching: turn cache on by default                    |https://github.com/Altinity/ClickHouse/pull/669, https://github.com/Altinity/ClickHouse/pull/674|        24.12.2         ||
+| ---                                                                        |
 | <   **SWARMS**   >                                                         |                                                                                                |                        ||
 |Profile events for task distribution in ObjectStorageCluster requests|https://github.com/Altinity/ClickHouse/pull/1172|25.8.12||
 | SYSTEM STOP SWARM MODE command for graceful shutdown of swarm node|https://github.com/Altinity/ClickHouse/pull/1014|25.6.5||
@@ -37,11 +38,13 @@
 | Fix remote call of s3Cluster function                                      |                        https://github.com/Altinity/ClickHouse/pull/583                         |        24.12.2         |https://github.com/ClickHouse/ClickHouse/pull/72625|
 | Cluster auto discovery                                                     |                        https://github.com/Altinity/ClickHouse/pull/629                         |        24.12.2         |https://github.com/ClickHouse/ClickHouse/pull/76001|25.3.1
 | Alternative syntax for object storage cluster functions                    |                        https://github.com/Altinity/ClickHouse/pull/592                         |        24.12.2         |https://github.com/ClickHouse/ClickHouse/pull/70659|25.3.1
-| Limit parsing threads for distibuted case                                  |                        https://github.com/Altinity/ClickHouse/pull/648                         |        24.12.2         ||
+| Limit parsing threads for distributed case                                  |                        https://github.com/Altinity/ClickHouse/pull/648                         |        24.12.2         ||
 | Distributed request to tables with Object Storage Engines                  |                        https://github.com/Altinity/ClickHouse/pull/615                         |        24.12.2         ||
+| ---                                                                        |
 | <   **CATALOGS**   >                                                       |                                                                                                |                        ||
-|Add metrics for Iceberg, S3, and Azure|https://github.com/Altinity/ClickHouse/pull/1123|25.8.9||
-|Add `icebergLocalCluster` table function to allow cluster reads from shared disk|https://github.com/Altinity/ClickHouse/pull/1120|25.8.9||
+|Google cloud storage support for data lakes|https://github.com/Altinity/ClickHouse/pull/1318|25.8.14|https://github.com/ClickHouse/ClickHouse/pull/93866|26.1.1||
+|Add metrics for Iceberg, S3, and Azure|https://github.com/Altinity/ClickHouse/pull/1123|25.8.9|https://github.com/ClickHouse/ClickHouse/pull/93332|
+|Add `icebergLocalCluster` table function to allow cluster reads from shared disk|https://github.com/Altinity/ClickHouse/pull/1120|25.8.9|https://github.com/ClickHouse/ClickHouse/pull/93323|26.1.1|
 |Setting `iceberg_timezone_for_timestamptz` for Iceberg TimestampTZ type|https://github.com/Altinity/ClickHouse/pull/1103|25.8.9||
 |Allow to read Iceberg data from any location|https://github.com/Altinity/ClickHouse/pull/1092|25.8.9||
 |Read optimization using Iceberg metadata|https://github.com/Altinity/ClickHouse/pull/1019|25.8.9||
@@ -57,8 +60,13 @@
 | General engine definition for Iceberg tables                               |                        https://github.com/Altinity/ClickHouse/pull/675                         |         25.2.2         |https://github.com/ClickHouse/ClickHouse/pull/77125|
 | RBAC for S3                                                                |                        https://github.com/Altinity/ClickHouse/pull/688                         |         25.2.2         ||
 | Iceberg REST Catalog integration                                           |                                      same as upstream =>                                       |        24.12.2         |https://github.com/ClickHouse/ClickHouse/pull/71542|24.12.1
+| ---                                                                        |
 | <   **TIERED STORAGE**   >                                                 |                                                                                                |                        ||
-| <   **TIERED STORAGE**   >||||
+|Add query id to system.part_log, system_exports and system.replicated_partition_exports|https://github.com/Altinity/ClickHouse/pull/1330|25.8.14||
+|Allow merge tree materialized / alias columns to be exported through part export|https://github.com/Altinity/ClickHouse/pull/1324|25.8.14||
+|Accept table function as destination for part export|https://github.com/Altinity/ClickHouse/pull/1320|25.8.14||
+|Add settings to control the behavior of pending mutations / patch parts on the export part feature|https://github.com/Altinity/ClickHouse/pull/1294|25.8.14||
+|Add support for ALIAS columns in segments for `engine=Hybrid`|https://github.com/Altinity/ClickHouse/pull/1272|25.8.14||
 |Add ability to split large parquet files on part export|https://github.com/Altinity/ClickHouse/pull/1229|25.8.12||
 |Add experimental support to automatically reconcile column-type mismatches across segments in Hybrid table engine |https://github.com/Altinity/ClickHouse/pull/1156|25.8.9||
 |Preserve the entire format settings object in export part manifest|https://github.com/Altinity/ClickHouse/pull/1144|25.8.9||
@@ -68,9 +76,8 @@
 |Add observability for EXPORT PART|https://github.com/Altinity/ClickHouse/pull/1017|25.6.5||
 | Simple MergeTree part export to object storage|https://github.com/Altinity/ClickHouse/pull/1009|25.6.5||
 | Support for hive partition style reads and writes|https://github.com/Altinity/ClickHouse/pull/934|25.6.5|https://github.com/ClickHouse/ClickHouse/pull/76802|25.8.1
-| Write to Merge tables                                                      |                        https://github.com/Altinity/ClickHouse/pull/683                         |   `25.3.x` (planned)   ||
 | Better S3 URL parsing for Hive partitioning                                |                        https://github.com/Altinity/ClickHouse/pull/700                         |         25.2.2         |https://github.com/ClickHouse/ClickHouse/pull/78185|25.5.1
-| s3Cluster hive partitioning for old analyzer                               |                        https://github.com/Altinity/ClickHouse/pull/703                         |         25.2.2         ||
+| s3Cluster hive partitioning for old analyzer                               |                        https://github.com/Altinity/ClickHouse/pull/703                         |         25.2.2         |https://github.com/ClickHouse/ClickHouse/pull/93284|
 | Support partition pruning in DeltaLake engine                              |                        https://github.com/Altinity/ClickHouse/pull/733                         |         25.2.2         |https://github.com/ClickHouse/ClickHouse/pull/78486|25.4.1
 | Iceberg time travel by snapshots                                           |                        https://github.com/Altinity/ClickHouse/pull/733                         |         25.2.2         |https://github.com/ClickHouse/ClickHouse/pull/77439|25.4.1
 | s3Cluster hive partitioning                                                |                        https://github.com/Altinity/ClickHouse/pull/584                         |        24.12.2         |https://github.com/ClickHouse/ClickHouse/pull/73910|
