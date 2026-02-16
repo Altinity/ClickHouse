@@ -1,7 +1,7 @@
 #pragma once
 
 #include <chrono>
-#include <Disks/ObjectStorages/IObjectStorage.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Common/CacheBase.h>
 
