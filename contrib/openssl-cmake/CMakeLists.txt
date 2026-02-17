@@ -98,6 +98,11 @@ target_include_directories(ssl INTERFACE
 target_compile_options(ssl INTERFACE
   $<$<COMPILE_LANG_AND_ID:C,CXX,GNU,Clang,AppleClang>:-includeevp_API_shim.h>
 )
+
+target_compile_options(ssl INTERFACE
+  -DOPENSSL_IS_BORINGSSL=1
+)
+
 else() # FIPS_CLICKHOUSE
 
 
