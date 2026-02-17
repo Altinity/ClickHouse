@@ -131,8 +131,7 @@ static struct InitFiu
     REGULAR(rmt_delay_commit_part) \
     ONCE(smt_commit_exception_before_op) \
     ONCE(backup_add_empty_memory_table) \
-    REGULAR(refresh_task_stop_racing_for_running_refresh) \
-    ONCE(database_iceberg_gcs)
+    REGULAR(refresh_task_stop_racing_for_running_refresh)
 
 
 namespace FailPoints
