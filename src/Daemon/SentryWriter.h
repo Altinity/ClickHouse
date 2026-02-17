@@ -50,8 +50,8 @@ public:
 
 private:
     static std::unique_ptr<SentryWriter> instance;
-    bool initialized = false;
-    bool anonymize = false;
+    [[maybe_unused]] bool initialized = false;
+    [[maybe_unused]] bool anonymize = false;
     std::string server_data_path;
 
     explicit SentryWriter(Poco::Util::LayeredConfiguration & config);
