@@ -202,8 +202,6 @@ void FutureSetFromSubquery::setQueryPlan(std::unique_ptr<QueryPlan> source_)
 
 void FutureSetFromSubquery::buildExternalTableFromInplaceSet(StoragePtr external_table_)
 {
-    std::lock_guard lock(mutex);
-
     const auto & set = *set_and_key->set;
 
     LOG_TRACE(getLogger("FutureSetFromSubquery"), "Building external table from set of {} elements", set.getTotalRowCount());
