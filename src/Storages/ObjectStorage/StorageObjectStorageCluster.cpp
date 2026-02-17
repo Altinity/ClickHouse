@@ -325,7 +325,10 @@ void StorageObjectStorageCluster::updateQueryForDistributedEngineIfNeeded(ASTPtr
         {"DeltaLakeS3", "deltaLakeS3"},
         {"DeltaLakeAzure", "deltaLakeAzure"},
         {"DeltaLakeLocal", "deltaLakeLocal"},
-        {"Hudi", "hudi"}
+        {"Hudi", "hudi"},
+        {"COSN", "cosn"},
+        {"GCS", "gcs"},
+        {"OSS", "oss"},
     };
 
     auto p = engine_to_function.find(storage_engine_name);

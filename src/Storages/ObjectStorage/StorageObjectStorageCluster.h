@@ -147,6 +147,8 @@ public:
 
     bool parallelizeOutputAfterReading(ContextPtr context) const override;
 
+    bool isObjectStorage() const override { return true; }
+
 private:
     void updateQueryToSendIfNeeded(
         ASTPtr & query,
