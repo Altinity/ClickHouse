@@ -43,7 +43,6 @@ namespace ErrorCodes
 
 namespace DataLakeStorageSetting
 {
-<<<<<<< HEAD
     extern const DataLakeStorageSettingsBool allow_dynamic_metadata_for_data_lakes;
     extern const DataLakeStorageSettingsDatabaseDataLakeCatalogType storage_catalog_type;
     extern const DataLakeStorageSettingsString object_storage_endpoint;
