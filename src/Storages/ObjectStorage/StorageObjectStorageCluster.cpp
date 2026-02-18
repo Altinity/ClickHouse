@@ -413,15 +413,8 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
     }
 
     ASTPtr object_storage_type_arg;
-    if (cluster_name_in_settings)
-        configuration->extractDynamicStorageType(args, context, &object_storage_type_arg);
-    else
-    {
-        auto args_copy = args;
-        // Remove cluster name from args to avoid confusing cluster name and named collection name
-        args_copy.erase(args_copy.begin());
-        configuration->extractDynamicStorageType(args_copy, context, &object_storage_type_arg);
-    }
+    configuration->extractDynamicStorageType(args, context, &object_storage_type_arg, !cluster_name_in_settings);
+
     ASTPtr settings_temporary_storage = nullptr;
     for (auto it = args.begin(); it != args.end(); ++it)
     {

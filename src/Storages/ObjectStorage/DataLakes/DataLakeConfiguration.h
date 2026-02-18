@@ -624,15 +624,24 @@ public:
 
     /// Find storage_type argument and remove it from args if exists.
     /// Return storage type.
-    ObjectStorageType extractDynamicStorageType(ASTs & args, ContextPtr context, ASTPtr * type_arg) const override
+    ObjectStorageType extractDynamicStorageType(ASTs & args, ContextPtr context, ASTPtr * type_arg, bool cluster_name_first) const override
     {
         static const auto * const storage_type_name = "storage_type";
 
-        if (auto named_collection = tryGetNamedCollectionWithOverrides(args, context))
         {
-            if (named_collection->has(storage_type_name))
+            auto args_copy = args;
+            if (cluster_name_first)
             {
-                return objectStorageTypeFromString(named_collection->get<String>(storage_type_name));
+                // Remove cluster name from args to avoid confusing cluster name and named collection name
+                args_copy.erase(args_copy.begin());
+            }
+
+            if (auto named_collection = tryGetNamedCollectionWithOverrides(args_copy, context))
+            {
+                if (named_collection->has(storage_type_name))
+                {
+                    return objectStorageTypeFromString(named_collection->get<String>(storage_type_name));
+                }
             }
         }
 
@@ -730,7 +739,7 @@ public:
 protected:
     void createDynamicConfiguration(ASTs & args, ContextPtr context)
     {
-        ObjectStorageType type = extractDynamicStorageType(args, context, nullptr);
+        ObjectStorageType type = extractDynamicStorageType(args, context, nullptr, false);
         createDynamicStorage(type);
     }
 

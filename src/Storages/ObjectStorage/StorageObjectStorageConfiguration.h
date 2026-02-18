@@ -258,7 +258,7 @@ public:
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "method fromDisk is not implemented");
     }
 
-    virtual ObjectStorageType extractDynamicStorageType(ASTs & /* args */, ContextPtr /* context */, ASTPtr * /* type_arg */) const
+    virtual ObjectStorageType extractDynamicStorageType(ASTs & /* args */, ContextPtr /* context */, ASTPtr * /* type_arg */, bool /* cluster_name_first */) const
     { return ObjectStorageType::None; }
 
     virtual const String & getFormat() const { return format; }
