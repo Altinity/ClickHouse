@@ -118,19 +118,14 @@ public:
         auto node_type = node->getNodeType();
 
         if (types.contains(node_type))
-        {
             passed_node = node;
-            passed_type = node_type;
-        }
     }
 
     QueryTreeNodePtr getNode() const { return passed_node; }
-    std::optional<QueryTreeNodeType> getType() const { return passed_type; }
 
 private:
     std::unordered_set<QueryTreeNodeType> types;
     QueryTreeNodePtr passed_node;
-    std::optional<QueryTreeNodeType> passed_type;
 };
 
 /*
@@ -424,14 +419,12 @@ IStorageCluster::QueryTreeInfo IStorageCluster::getQueryTreeInfo(QueryTreeNodePt
 {
     QueryTreeInfo info;
 
-    SearcherVisitor join_searcher({QueryTreeNodeType::JOIN, QueryTreeNodeType::CROSS_JOIN}, context);
-    join_searcher.visit(query_tree);
-
-    if (join_searcher.getNode())
+    auto & query_node = query_tree->as<QueryNode &>();
+    if (auto join_node = query_node.getJoinTree())
     {
-        if (join_searcher.getType() == QueryTreeNodeType::JOIN)
+        if (join_node->getNodeType() == QueryTreeNodeType::JOIN)
             info.has_join = true;
-        else
+        else if (join_node->getNodeType() == QueryTreeNodeType::CROSS_JOIN)
             info.has_cross_join = true;
     }
 
@@ -441,7 +434,6 @@ IStorageCluster::QueryTreeInfo IStorageCluster::getQueryTreeInfo(QueryTreeNodePt
     if (!table_function_node)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find table or table function node");
 
-    auto & query_node = query_tree->as<QueryNode &>();
     if (query_node.hasWhere() || query_node.hasPrewhere())
     {
         CollectUsedColumnsForSourceVisitor collector_where(table_function_node, context, true);
