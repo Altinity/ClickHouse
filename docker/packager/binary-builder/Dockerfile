@@ -3,7 +3,8 @@ ARG FROM_TAG=latest
 FROM altinityinfra/fasttest:$FROM_TAG
 
 # Refresh the Kitware GPG key inherited from the base image (may have expired)
-RUN curl -fsSL https://apt.kitware.com/keys/kitware-archive-latest.asc | gpg --batch --dearmor -o /etc/apt/trusted.gpg.d/kitware.gpg
+RUN rm -f /etc/apt/trusted.gpg.d/kitware.gpg \
+    && curl -fsSL https://apt.kitware.com/keys/kitware-archive-latest.asc | gpg --batch --dearmor -o /etc/apt/trusted.gpg.d/kitware.gpg
 
 # NOTE(strtgbb) Not sure where LLVM_VERSION is set, so we set it here
 ENV LLVM_VERSION=19
@@ -47,7 +48,9 @@ RUN ARCH=$(uname -m) && \
     rustup target add riscv64gc-unknown-linux-gnu
 
 # A cross-linker for RISC-V 64 (we need it, because LLVM's LLD does not work):
-RUN add-apt-repository ppa:ubuntu-toolchain-r/test --yes \
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends software-properties-common \
+    && add-apt-repository ppa:ubuntu-toolchain-r/test --yes \
     && apt-get update \
     && apt-get install --yes \
         binutils-riscv64-linux-gnu \
