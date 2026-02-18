@@ -280,8 +280,13 @@ def parse_env_variables(
         cmake_flags.append("-DCMAKE_INSTALL_PREFIX=/usr")
         cmake_flags.append("-DCMAKE_INSTALL_SYSCONFDIR=/etc")
         cmake_flags.append("-DCMAKE_INSTALL_LOCALSTATEDIR=/var")
+
+        # FIPS mode begin
         cmake_flags.append("-DFIPS_CLICKHOUSE=1")
         cmake_flags.append("-DENABLE_LIBRARIES=0")
+        cmake_flags.append("-DENABLE_NURAFT=1")
+        # FIPS mode end
+
         # Reduce linking and building time by avoid *install/all dependencies
         cmake_flags.append("-DCMAKE_SKIP_INSTALL_ALL_DEPENDENCY=ON")
         if is_release_build(debug_build, package_type, sanitizer, coverage):
