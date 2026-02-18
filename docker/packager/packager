@@ -104,9 +104,20 @@ def run_docker_image_with_env(
     if ccache_dir is None:
         ccache_mount = ""
 
+    docker_sock = "/var/run/docker.sock"
+    docker_sock_opts = ""
+    if os.path.exists(docker_sock):
+        docker_sock_opts = f"--volume={docker_sock}:{docker_sock}"
+        try:
+            sock_gid = os.stat(docker_sock).st_gid
+            docker_sock_opts += f" --group-add {sock_gid}"
+        except OSError:
+            pass
+
     cmd = (
         f"docker run --network=host --user={user} --rm {ccache_mount} "
         f"--volume={output_dir}:/output --volume={ch_root}:/build {env_part} "
+        f"{docker_sock_opts} "
         f" {extra_parts} "
         f"--volume={cargo_cache_dir}:/rust/cargo/registry {interactive} {image_name} /build/docker/packager/binary-builder/build.sh"
     )
