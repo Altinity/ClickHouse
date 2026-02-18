@@ -1,6 +1,10 @@
 # docker build -t altinityinfra/binary-builder .
 ARG FROM_TAG=latest
 FROM altinityinfra/fasttest:$FROM_TAG
+
+# Refresh the Kitware GPG key inherited from the base image (may have expired)
+RUN curl -fsSL https://apt.kitware.com/keys/kitware-archive-latest.asc | gpg --batch --dearmor -o /etc/apt/trusted.gpg.d/kitware.gpg
+
 # NOTE(strtgbb) Not sure where LLVM_VERSION is set, so we set it here
 ENV LLVM_VERSION=19
 ENV CC=clang-${LLVM_VERSION}
