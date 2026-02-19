@@ -220,7 +220,7 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         /* distributed_processing */can_use_distributed_iterator,
         partition_by,
         order_by,
-        /* is_table_function */false,
+        /* is_table_function */is_table_function,
         /* lazy_init */lazy_init);
 
     auto virtuals_ = getVirtualsPtr();
@@ -453,7 +453,7 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
         {
             throw Exception(
                 ErrorCodes::LOGICAL_ERROR,
-                "Can't find cluster name for table function {}",
+                "Can't find cluster variant for table function {}",
                 table_function->name);
         }
 

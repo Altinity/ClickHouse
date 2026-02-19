@@ -428,7 +428,7 @@ using StorageHDFSPaimonConfiguration = DataLakeConfiguration<StorageHDFSConfigur
 #endif
 
 using StorageLocalIcebergConfiguration = DataLakeConfiguration<StorageLocalConfiguration, IcebergMetadata>;
-using StorageLocalPaimonConfiguration = DataLakeConfiguration<StorageLocalConfiguration, PaimonMetadata>;
+using StorageLocalPaimonConfiguration = DataLakeConfiguration<StorageLocalConfiguration, PaimonMetadata, /* is_cluster_supported */ false>;
 
 /// Class detects storage type by `storage_type` parameter if exists
 /// and uses appropriate implementation - S3, Azure, HDFS or Local
