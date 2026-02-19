@@ -829,3 +829,34 @@ def test_joins(started_cluster):
     )
     res = list(map(str.split, result6.splitlines()))
     assert len(res) == 25
+
+    result7 = node.query(
+        f"""
+        SELECT count() FROM
+            s3Cluster('cluster_simple',
+                'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+                'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') AS t1
+        JOIN
+            join_table AS t2
+        ON 1
+        GROUP BY ALL
+        SETTINGS object_storage_cluster_join_mode='local';
+        """
+    )
+    assert result7.strip() == "625"
+
+    result8 = node.query(
+        f"""
+        SELECT count(), t2.id FROM
+            s3Cluster('cluster_simple',
+                'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+                'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') AS t1
+        JOIN
+            join_table AS t2
+        ON 1
+        GROUP BY ALL
+        SETTINGS object_storage_cluster_join_mode='local';
+        """
+    )
+    res = list(map(str.split, result8.splitlines()))
+    assert len(res) == 25

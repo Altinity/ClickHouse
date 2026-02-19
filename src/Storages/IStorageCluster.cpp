@@ -24,6 +24,7 @@
 #include <Analyzer/QueryTreeBuilder.h>
 #include <Analyzer/QueryNode.h>
 #include <Analyzer/ColumnNode.h>
+#include <Analyzer/ConstantNode.h>
 #include <Analyzer/JoinNode.h>
 #include <Analyzer/InDepthQueryTreeVisitor.h>
 #include <Analyzer/Utils.h>
@@ -105,9 +106,9 @@ public:
 
     explicit SearcherVisitor(std::unordered_set<QueryTreeNodeType> types_, ContextPtr context) : Base(context), types(types_) {}
 
-    bool needChildVisit(QueryTreeNodePtr &, QueryTreeNodePtr & /*child*/)
+    bool needChildVisit(QueryTreeNodePtr & /*parent*/, QueryTreeNodePtr & /*child*/)
     {
-        return !passed_node;
+        return getSubqueryDepth() <= 2 && !passed_node;
     }
 
     void enterImpl(QueryTreeNodePtr & node)
@@ -245,12 +246,22 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
             collector.visit(modified_query_tree);
             const auto & columns = collector.getColumns();
 
-            query_node.resolveProjectionColumns(columns);
-            auto column_nodes_to_select = std::make_shared<ListNode>();
-            column_nodes_to_select->getNodes().reserve(columns.size());
-            for (auto & column : columns)
-                column_nodes_to_select->getNodes().emplace_back(std::make_shared<ColumnNode>(column, table_function_node));
-            query_node.getProjectionNode() = column_nodes_to_select;
+            if (columns.empty())
+            {
+                auto column_nodes_to_select = std::make_shared<ListNode>();
+                column_nodes_to_select->getNodes().reserve(1);
+                column_nodes_to_select->getNodes().emplace_back(std::make_shared<ConstantNode>(1));
+                query_node.getProjectionNode() = column_nodes_to_select;
+            }
+            else
+            {
+                query_node.resolveProjectionColumns(columns);
+                auto column_nodes_to_select = std::make_shared<ListNode>();
+                column_nodes_to_select->getNodes().reserve(columns.size());
+                for (auto & column : columns)
+                    column_nodes_to_select->getNodes().emplace_back(std::make_shared<ColumnNode>(column, table_function_node));
+                query_node.getProjectionNode() = column_nodes_to_select;
+            }
 
             if (info.has_local_columns_in_where)
             {
