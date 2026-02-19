@@ -1,4 +1,5 @@
 import dataclasses
+import os
 from typing import List
 
 from . import Artifact, Job, Workflow
@@ -305,7 +306,8 @@ class PullRequestPushYamlGen:
             for artifact in job.artifacts_gh_provides:
                 uploads_github.append(
                     YamlGenerator.Templates.TEMPLATE_GH_UPLOAD.format(
-                        NAME=artifact.name, PATH=artifact.path
+                        NAME=artifact.name,
+                        PATH=os.path.relpath(artifact.path, os.getcwd()),
                     )
                 )
             downloads_github = []
@@ -331,6 +333,13 @@ class PullRequestPushYamlGen:
                     WORKFLOW_CONFIG_JOB_NAME=config_job_name_normalized,
                     JOB_NAME_BASE64=Utils.to_base64(job_name),
                 )
+
+            elif self.workflow_config.if_condition:
+                # If this is the config workflow and the workflow template sets an if condition, use it
+                if_expression = (
+                    f"\n    if: ${{{{ {self.workflow_config.if_condition} }}}}"
+                )
+
             if job.run_unless_cancelled:
                 if_expression = (
                     YamlGenerator.Templates.TEMPLATE_IF_EXPRESSION_NOT_CANCELLED

@@ -28,6 +28,7 @@ jobs:
   config_workflow:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: []
+    if: ${{ github.repository != github.event.pull_request.head.repo.full_name }}
     name: "Config Workflow"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -183,14 +184,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: CH_AMD_DEBUG
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/build/programs/self-extracting/clickhouse
+          path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact DEB_AMD_DEBUG
         uses: actions/upload-artifact@v4
         with:
           name: DEB_AMD_DEBUG
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/*.deb
+          path: ci/tmp/*.deb
 
   build_amd_asan:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
@@ -243,21 +244,21 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: UNITTEST_AMD_ASAN
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/build/src/unit_tests_dbms
+          path: ci/tmp/build/src/unit_tests_dbms
 
 
       - name: Upload artifact CH_AMD_ASAN
         uses: actions/upload-artifact@v4
         with:
           name: CH_AMD_ASAN
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/build/programs/self-extracting/clickhouse
+          path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact DEB_AMD_ASAN
         uses: actions/upload-artifact@v4
         with:
           name: DEB_AMD_ASAN
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/*.deb
+          path: ci/tmp/*.deb
 
   build_amd_tsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
@@ -310,21 +311,21 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: UNITTEST_AMD_TSAN
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/build/src/unit_tests_dbms
+          path: ci/tmp/build/src/unit_tests_dbms
 
 
       - name: Upload artifact CH_AMD_TSAN
         uses: actions/upload-artifact@v4
         with:
           name: CH_AMD_TSAN
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/build/programs/self-extracting/clickhouse
+          path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact DEB_AMD_TSAN
         uses: actions/upload-artifact@v4
         with:
           name: DEB_AMD_TSAN
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/*.deb
+          path: ci/tmp/*.deb
 
   build_amd_msan:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
@@ -377,21 +378,21 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: UNITTEST_AMD_MSAN
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/build/src/unit_tests_dbms
+          path: ci/tmp/build/src/unit_tests_dbms
 
 
       - name: Upload artifact CH_AMD_MSAN
         uses: actions/upload-artifact@v4
         with:
           name: CH_AMD_MSAN
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/build/programs/self-extracting/clickhouse
+          path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact DEB_AMD_MSAM
         uses: actions/upload-artifact@v4
         with:
           name: DEB_AMD_MSAM
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/*.deb
+          path: ci/tmp/*.deb
 
   build_amd_ubsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
@@ -444,21 +445,21 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: UNITTEST_AMD_UBSAN
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/build/src/unit_tests_dbms
+          path: ci/tmp/build/src/unit_tests_dbms
 
 
       - name: Upload artifact CH_AMD_UBSAN
         uses: actions/upload-artifact@v4
         with:
           name: CH_AMD_UBSAN
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/build/programs/self-extracting/clickhouse
+          path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact DEB_AMD_UBSAN
         uses: actions/upload-artifact@v4
         with:
           name: DEB_AMD_UBSAN
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/*.deb
+          path: ci/tmp/*.deb
 
   build_amd_binary:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
@@ -511,7 +512,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: CH_AMD_BINARY
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/build/programs/self-extracting/clickhouse
+          path: ci/tmp/build/programs/self-extracting/clickhouse
 
   build_arm_asan:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
@@ -564,14 +565,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: CH_ARM_ASAN
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/build/programs/self-extracting/clickhouse
+          path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact DEB_ARM_ASAN
         uses: actions/upload-artifact@v4
         with:
           name: DEB_ARM_ASAN
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/*.deb
+          path: ci/tmp/*.deb
 
   build_arm_binary:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
@@ -624,7 +625,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: CH_ARM_BIN
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/build/programs/self-extracting/clickhouse
+          path: ci/tmp/build/programs/self-extracting/clickhouse
 
   build_arm_tsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
@@ -677,7 +678,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: CH_ARM_TSAN
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/build/programs/self-extracting/clickhouse
+          path: ci/tmp/build/programs/self-extracting/clickhouse
 
   build_amd_release:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
@@ -730,35 +731,35 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: CH_AMD_RELEASE
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/build/programs/self-extracting/clickhouse
+          path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact CH_AMD_RELEASE_STRIPPED
         uses: actions/upload-artifact@v4
         with:
           name: CH_AMD_RELEASE_STRIPPED
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/build/programs/self-extracting/clickhouse-stripped
+          path: ci/tmp/build/programs/self-extracting/clickhouse-stripped
 
 
       - name: Upload artifact DEB_AMD_RELEASE
         uses: actions/upload-artifact@v4
         with:
           name: DEB_AMD_RELEASE
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/*.deb
+          path: ci/tmp/*.deb
 
 
       - name: Upload artifact RPM_AMD_RELEASE
         uses: actions/upload-artifact@v4
         with:
           name: RPM_AMD_RELEASE
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/*.rpm
+          path: ci/tmp/*.rpm
 
 
       - name: Upload artifact TGZ_AMD_RELEASE
         uses: actions/upload-artifact@v4
         with:
           name: TGZ_AMD_RELEASE
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/*64.tgz*
+          path: ci/tmp/*64.tgz*
 
   build_arm_release:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
@@ -811,35 +812,35 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: CH_ARM_RELEASE
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/build/programs/self-extracting/clickhouse
+          path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
       - name: Upload artifact CH_ARM_RELEASE_STRIPPED
         uses: actions/upload-artifact@v4
         with:
           name: CH_ARM_RELEASE_STRIPPED
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/build/programs/self-extracting/clickhouse-stripped
+          path: ci/tmp/build/programs/self-extracting/clickhouse-stripped
 
 
       - name: Upload artifact DEB_ARM_RELEASE
         uses: actions/upload-artifact@v4
         with:
           name: DEB_ARM_RELEASE
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/*.deb
+          path: ci/tmp/*.deb
 
 
       - name: Upload artifact RPM_ARM_RELEASE
         uses: actions/upload-artifact@v4
         with:
           name: RPM_ARM_RELEASE
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/*.rpm
+          path: ci/tmp/*.rpm
 
 
       - name: Upload artifact TGZ_ARM_RELEASE
         uses: actions/upload-artifact@v4
         with:
           name: TGZ_ARM_RELEASE
-          path: /home/stuart/Documents/ClickHouse-Rebase/ci/tmp/*64.tgz*
+          path: ci/tmp/*64.tgz*
 
   quick_functional_tests:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
