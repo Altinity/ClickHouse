@@ -1,6 +1,11 @@
 # docker build -t altinityinfra/binary-builder .
 ARG FROM_TAG=latest
 FROM altinityinfra/fasttest:$FROM_TAG
+
+# Refresh the Kitware GPG key inherited from the base image (may have expired)
+RUN rm -f /etc/apt/trusted.gpg.d/kitware.gpg \
+    && curl -fsSL https://apt.kitware.com/keys/kitware-archive-latest.asc | gpg --batch --dearmor -o /etc/apt/trusted.gpg.d/kitware.gpg
+
 # NOTE(strtgbb) Not sure where LLVM_VERSION is set, so we set it here
 ENV LLVM_VERSION=19
 ENV CC=clang-${LLVM_VERSION}
@@ -43,7 +48,9 @@ RUN ARCH=$(uname -m) && \
     rustup target add riscv64gc-unknown-linux-gnu
 
 # A cross-linker for RISC-V 64 (we need it, because LLVM's LLD does not work):
-RUN add-apt-repository ppa:ubuntu-toolchain-r/test --yes \
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends software-properties-common \
+    && add-apt-repository ppa:ubuntu-toolchain-r/test --yes \
     && apt-get update \
     && apt-get install --yes \
         binutils-riscv64-linux-gnu \
@@ -52,6 +59,20 @@ RUN add-apt-repository ppa:ubuntu-toolchain-r/test --yes \
         yasm \
         zstd \
         zip \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /var/cache/debconf /tmp/*
+
+# Docker CLI for building AWS-LC FIPS inside a nested container (Docker-in-Docker via socket mount)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        gnupg \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
+    && chmod a+r /etc/apt/keyrings/docker.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends docker-ce-cli \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/debconf /tmp/*
 

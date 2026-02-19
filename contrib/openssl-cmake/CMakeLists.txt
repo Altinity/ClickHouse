@@ -45,6 +45,26 @@ docker cp $id:$lib_dir/include $OUTPUT_DIR
 docker rm $id"
 )
 
+# Verification program compiled inside the Docker build to confirm AWS-LC version
+file(WRITE ${AWSLC_BUILD_DIR}/check_version.c
+[=[
+#include <stdio.h>
+#include <string.h>
+const char* awslc_version_string(void);
+int expect(const char * expected, const char * actual) {
+    if (strcmp(expected, actual) == 0)
+        return 0;
+    printf("expected %s but got %s", expected, actual);
+    return 1;
+}
+int main(int argc, char * argv[]) {
+    int result = 0;
+    if (argc > 1)
+        result |= expect((const char*)argv[1], awslc_version_string());
+    return result;
+}
+]=])
+
 # patch a single file in krb5 that relies on file missing from this version of BoringSSL
 # SET(krb5_filb_to_patch ${PROJECT_SOURCE_DIR}/contrib/krb5/src/lib/crypto/openssl/enc_provider/aes.c)
 # message("Patching ${krb5_filb_to_patch} to allow building against older version of BoringSSL")
