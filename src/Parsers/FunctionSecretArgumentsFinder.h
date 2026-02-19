@@ -123,7 +123,11 @@ protected:
         }
         else if (function->name() == "iceberg")
         {
-            findIcebergFunctionSecretArguments();
+            findIcebergFunctionSecretArguments(0);
+        }
+        else if (function ->name() == "icebergCluster")
+        {
+            findIcebergFunctionSecretArguments(1);
         }
         else if ((function->name() == "s3") || (function->name() == "cosn") || (function->name() == "oss") ||
                  (function->name() == "deltaLake") || (function->name() == "hudi") ||
@@ -135,7 +139,7 @@ protected:
         }
         else if ((function->name() == "s3Cluster") || (function ->name() == "hudiCluster") ||
                  (function ->name() == "deltaLakeCluster") || (function ->name() == "deltaLakeS3Cluster") ||
-                 (function ->name() == "icebergS3Cluster") || (function ->name() == "icebergCluster"))
+                 (function ->name() == "icebergS3Cluster"))
         {
             /// s3Cluster('cluster_name', 'url', 'aws_access_key_id', 'aws_secret_access_key', ...)
             findS3FunctionSecretArguments(/* is_cluster_function= */ true);
@@ -371,7 +375,7 @@ protected:
             markSecretArgument(url_arg_idx + 4);
     }
 
-    std::string findIcebergStorageType()
+    std::string findIcebergStorageType(size_t named_collection_pos)
     {
         std::string storage_type = "s3";
 
@@ -385,10 +389,10 @@ protected:
             storage_type = Poco::toLower(storage_type);
             function->arguments->skipArgument(storage_type_idx);
         }
-        else if (isNamedCollectionName(0))
+        else if (isNamedCollectionName(named_collection_pos))
         {
             std::string collection_name;
-            if (function->arguments->at(0)->tryGetString(&collection_name, true))
+            if (function->arguments->at(named_collection_pos)->tryGetString(&collection_name, true))
             {
                 NamedCollectionPtr collection = NamedCollectionFactory::instance().tryGet(collection_name);
                 if (collection && collection->has("storage_type"))
@@ -401,9 +405,9 @@ protected:
         return storage_type;
     }
 
-    void findIcebergFunctionSecretArguments()
+    void findIcebergFunctionSecretArguments(size_t named_collection_pos)
     {
-        auto storage_type = findIcebergStorageType();
+        auto storage_type = findIcebergStorageType(named_collection_pos);
 
         if (storage_type == "s3")
             findS3FunctionSecretArguments(false);
@@ -759,7 +763,7 @@ protected:
 
     void findIcebergTableEngineSecretArguments()
     {
-        auto storage_type = findIcebergStorageType();
+        auto storage_type = findIcebergStorageType(0);
 
         if (storage_type == "s3")
             findS3TableEngineSecretArguments();
