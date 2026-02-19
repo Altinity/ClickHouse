@@ -608,18 +608,27 @@ protected:
                 if (columns_mask[src_index++])
                 {
                     bool inserted = false;
-                    // Extract from specific DataLake metadata if suitable
-                    if (auto * obj = dynamic_cast<StorageObjectStorage *>(table.get()))
-                    {
-                        if (auto * dl_meta = obj->getExternalMetadata(context))
-                        {
-                            if (auto p = dl_meta->partitionKey(context); p.has_value())
-                            {
-                                res_columns[res_index++]->insert(*p);
-                                inserted = true;
-                            }
-                        }
 
+                    try
+                    {
+                        // Extract from specific DataLake metadata if suitable
+                        if (auto * obj = dynamic_cast<StorageObjectStorage *>(table.get()))
+                        {
+                            if (auto * dl_meta = obj->getExternalMetadata(context))
+                            {
+                                if (auto p = dl_meta->partitionKey(context); p.has_value())
+                                {
+                                    res_columns[res_index++]->insert(*p);
+                                    inserted = true;
+                                }
+                            }
+
+                        }
+                    }
+                    catch (const Exception &)
+                    {
+                        /// Failed to get info. It's not critical, just log it.
+                        tryLogCurrentException("StorageSystemTables");
                     }
 
                     if (!inserted)
@@ -635,17 +644,25 @@ protected:
                 {
                     bool inserted = false;
 
-                    // Extract from specific DataLake metadata if suitable
-                    if (auto * obj = dynamic_cast<StorageObjectStorage *>(table.get()))
+                    try
                     {
-                        if (auto * dl_meta = obj->getExternalMetadata(context))
+                        // Extract from specific DataLake metadata if suitable
+                        if (auto * obj = dynamic_cast<StorageObjectStorage *>(table.get()))
                         {
-                            if (auto p = dl_meta->sortingKey(context); p.has_value())
+                            if (auto * dl_meta = obj->getExternalMetadata(context))
                             {
-                                res_columns[res_index++]->insert(*p);
-                                inserted = true;
+                                if (auto p = dl_meta->sortingKey(context); p.has_value())
+                                {
+                                    res_columns[res_index++]->insert(*p);
+                                    inserted = true;
+                                }
                             }
                         }
+                    }
+                    catch (const Exception &)
+                    {
+                        /// Failed to get info. It's not critical, just log it.
+                        tryLogCurrentException("StorageSystemTables");
                     }
 
                     if (!inserted)
