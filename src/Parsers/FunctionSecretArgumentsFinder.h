@@ -123,11 +123,11 @@ protected:
         }
         else if (function->name() == "iceberg")
         {
-            findIcebergFunctionSecretArguments(0);
+            findIcebergFunctionSecretArguments(/* is_cluster_function= */ false);
         }
         else if (function ->name() == "icebergCluster")
         {
-            findIcebergFunctionSecretArguments(1);
+            findIcebergFunctionSecretArguments(/* is_cluster_function= */ true);
         }
         else if ((function->name() == "s3") || (function->name() == "cosn") || (function->name() == "oss") ||
                  (function->name() == "deltaLake") || (function->name() == "hudi") ||
@@ -375,7 +375,7 @@ protected:
             markSecretArgument(url_arg_idx + 4);
     }
 
-    std::string findIcebergStorageType(size_t named_collection_pos)
+    std::string findIcebergStorageType(bool is_cluster_function)
     {
         std::string storage_type = "s3";
 
@@ -389,10 +389,10 @@ protected:
             storage_type = Poco::toLower(storage_type);
             function->arguments->skipArgument(storage_type_idx);
         }
-        else if (isNamedCollectionName(named_collection_pos))
+        else if (isNamedCollectionName(is_cluster_function ? 1 : 0))
         {
             std::string collection_name;
-            if (function->arguments->at(named_collection_pos)->tryGetString(&collection_name, true))
+            if (function->arguments->at(is_cluster_function ? 1 : 0)->tryGetString(&collection_name, true))
             {
                 NamedCollectionPtr collection = NamedCollectionFactory::instance().tryGet(collection_name);
                 if (collection && collection->has("storage_type"))
@@ -405,14 +405,14 @@ protected:
         return storage_type;
     }
 
-    void findIcebergFunctionSecretArguments(size_t named_collection_pos)
+    void findIcebergFunctionSecretArguments(bool is_cluster_function)
     {
-        auto storage_type = findIcebergStorageType(named_collection_pos);
+        auto storage_type = findIcebergStorageType(is_cluster_function);
 
         if (storage_type == "s3")
-            findS3FunctionSecretArguments(false);
+            findS3FunctionSecretArguments(is_cluster_function);
         else if (storage_type == "azure")
-            findAzureBlobStorageFunctionSecretArguments(false);
+            findAzureBlobStorageFunctionSecretArguments(is_cluster_function);
 
         function->arguments->unskipArguments();
     }
