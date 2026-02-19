@@ -22,7 +22,7 @@
 #include <QueryPipeline/Pipe.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Storages/MergeTree/MergeTreeData.h>
-#include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
+#include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
 #include <Storages/SelectQueryInfo.h>
 #include <Storages/StorageView.h>
@@ -609,7 +609,7 @@ protected:
                 {
                     bool inserted = false;
                     // Extract from specific DataLake metadata if suitable
-                    if (auto * obj = dynamic_cast<StorageObjectStorageCluster *>(table.get()))
+                    if (auto * obj = dynamic_cast<StorageObjectStorage *>(table.get()))
                     {
                         if (auto * dl_meta = obj->getExternalMetadata(context))
                         {
@@ -636,7 +636,7 @@ protected:
                     bool inserted = false;
 
                     // Extract from specific DataLake metadata if suitable
-                    if (auto * obj = dynamic_cast<StorageObjectStorageCluster *>(table.get()))
+                    if (auto * obj = dynamic_cast<StorageObjectStorage *>(table.get()))
                     {
                         if (auto * dl_meta = obj->getExternalMetadata(context))
                         {
