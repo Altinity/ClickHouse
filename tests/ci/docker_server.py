@@ -189,8 +189,8 @@ def buildx_args(
     args = [
         f"--platform=linux/{arch}",
         f"--label=build-url={GITHUB_RUN_URL}",
-        f"--label=com.clickhouse.build.githash={git.sha}",
-        f"--label=com.clickhouse.build.version={version}",
+        f"--label=com.altinity.build.githash={git.sha}",
+        f"--label=com.altinity.build.version={version}",
     ]
     if direct_urls:
         args.append(f"--build-arg=DIRECT_DOWNLOAD_URLS='{' '.join(direct_urls)}'")
