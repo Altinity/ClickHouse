@@ -169,7 +169,7 @@ def test_read_constant_columns_optimization(started_cluster_iceberg_with_spark, 
     for replica in started_cluster_iceberg_with_spark.instances.values():
         replica.query("SYSTEM FLUSH LOGS")
 
-    def check_events(query_id, event, expected):
+    def check_events(query_id, event, is_cluster, expected):
         res = instance.query(
             f"""
             SELECT
@@ -183,26 +183,27 @@ def test_read_constant_columns_optimization(started_cluster_iceberg_with_spark, 
             GROUP BY ALL
             FORMAT CSV
             """)
-        # Looks like ReadFileMetadata does not used local file cache in 26.1
-        # metadata.json always downloaded in 26.1
-        # In 25.8 count was equal to expected, in 26.1 it is expected * 3 + 1
-        assert int(res) == expected * 3 + 1
+        # Weird, bu looks like ReadFileMetadata does not used local file cache in 26.1
+        # metadata.json always downloaded in 26.1, once per query or subquery
+        # In 25.8 count was equal to expected, in 26.1 it is expected * 3 + 1 for Local case
+        # expected * 3 + 4 for Cluster case, because each subquery loads mettadata.json
+        assert int(res) == expected * 3 + (4 if is_cluster else 1)
 
     event = "S3GetObject" if storage_type == "s3" else "AzureGetObject"
 
     # Without optimization clickhouse reads all 7 files
-    check_events(all_data_expected_query_id, event, 7)
-    check_events(const_only_expected_query_id, event, 7)
-    check_events(const_partial_expected_query_id, event, 7)
-    check_events(const_partial2_expected_query_id, event, 7)
-    check_events(count_expected_query_id, event, 7)
+    check_events(all_data_expected_query_id, event, run_on_cluster, 7)
+    check_events(const_only_expected_query_id, event, run_on_cluster, 7)
+    check_events(const_partial_expected_query_id, event, run_on_cluster, 7)
+    check_events(const_partial2_expected_query_id, event, run_on_cluster, 7)
+    check_events(count_expected_query_id, event, run_on_cluster, 7)
 
     # If file has only constant columns it is not read
-    check_events(all_data_query_id, event, 5) # 1-2025, 6-2025 must not be read
-    check_events(const_only_query_id, event, 0) # All must not be read
-    check_events(const_partial_query_id, event, 4) # 1-2025, 6-2025 and 2-2025 must not be read
-    check_events(const_partial2_query_id, event, 3) # 6-2025 must not be read, 1-2024, 1-2025, 2-2025 don't have new column 'name'
-    check_events(count_query_id, event, 0) # All must not be read
+    check_events(all_data_query_id, event, run_on_cluster, 5) # 1-2025, 6-2025 must not be read
+    check_events(const_only_query_id, event, run_on_cluster, 0) # All must not be read
+    check_events(const_partial_query_id, event, run_on_cluster, 4) # 1-2025, 6-2025 and 2-2025 must not be read
+    check_events(const_partial2_query_id, event, run_on_cluster, 3) # 6-2025 must not be read, 1-2024, 1-2025, 2-2025 don't have new column 'name'
+    check_events(count_query_id, event, run_on_cluster, 0) # All must not be read
 
     def compare_selects(query):
         result_expected = instance.query(f"{query} SETTINGS allow_experimental_iceberg_read_optimization=0")
