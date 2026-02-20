@@ -24,7 +24,8 @@ std::unique_ptr<CrashWriter> CrashWriter::instance;
 
 void CrashWriter::initialize(Poco::Util::LayeredConfiguration & config)
 {
-    instance.reset(new CrashWriter(config));
+    if (config.getBool("send_crash_reports.enabled", false))
+        instance.reset(new CrashWriter(config));
 }
 
 bool CrashWriter::initialized()
