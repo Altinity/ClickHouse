@@ -34,12 +34,12 @@ from helpers.mock_servers import start_mock_servers
 import boto3
 
 
-def run_s3_mocks(started_cluster, args=[]):
+def run_s3_mocks(started_cluster):
     script_dir = os.path.join(os.path.dirname(__file__), "s3_mocks")
     start_mock_servers(
         started_cluster,
         script_dir,
-        [("mock_sts.py", "sts.us-east-1.amazonaws.com", "80", args)],
+        [("mock_sts.py", "sts.us-east-1.amazonaws.com", "80")],
     )
 
 
