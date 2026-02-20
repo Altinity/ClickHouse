@@ -307,6 +307,7 @@
     M(IcebergAvroFileParsingMicroseconds, "Time spent for parsing avro metadata files for Iceberg tables.", ValueType::Microseconds) \
     M(IcebergJsonFileParsing, "Number of times json metadata files have been parsed.", ValueType::Number) \
     M(IcebergJsonFileParsingMicroseconds, "Time spent for parsing json metadata files for Iceberg tables.", ValueType::Microseconds) \
+    M(IcebergIteratorNextMicroseconds, "Time spent for getting next objects in Iceberg iterator.", ValueType::Microseconds) \
     \
     M(JoinBuildTableRowCount, "Total number of rows in the build table for a JOIN operation.", ValueType::Number) \
     M(JoinProbeTableRowCount, "Total number of rows in the probe table for a JOIN operation.", ValueType::Number) \
