@@ -407,7 +407,7 @@ boost::intrusive_ptr<ASTAuthenticationData> AuthenticationData::toAST() const
         {
             const auto & claims = getJWTClaims();
             if (!claims.empty())
-                node->children.push_back(std::make_shared<ASTLiteral>(claims));
+                node->children.push_back(make_intrusive<ASTLiteral>(claims));
             break;
         }
         case AuthenticationType::KERBEROS:
