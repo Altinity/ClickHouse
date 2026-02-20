@@ -446,6 +446,8 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
             {"deltaLakeS3", "deltaLakeS3Cluster"},
             {"deltaLakeAzure", "deltaLakeAzureCluster"},
             {"hudi", "hudiCluster"},
+            {"paimonS3", "paimonS3Cluster"},
+            {"paimonAzure", "paimonAzureCluster"},
         };
 
         auto p = function_to_cluster_function.find(table_function->name);
