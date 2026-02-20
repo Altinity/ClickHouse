@@ -3925,7 +3925,6 @@ def test_partition_pruning_with_subquery_set(started_cluster, storage_type):
     )
 
 
-
 def test_iceberg_write_minmax(started_cluster):
     instance = started_cluster.instances["node1"]
     TABLE_NAME = "test_iceberg_write_minmax_" + get_uuid_str()
