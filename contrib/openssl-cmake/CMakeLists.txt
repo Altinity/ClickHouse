@@ -123,6 +123,11 @@ target_compile_options(ssl INTERFACE
   -DOPENSSL_IS_BORINGSSL=1
 )
 
+# This is taken from the later in the file when FIPS_CLICKHOUSE is not defined.
+# Without it, the build fails due to using API deprecated in C++23
+target_compile_options(global-group INTERFACE "-Wno-deprecated-declarations")
+target_compile_options(global-group INTERFACE "-Wno-poison-system-directories")
+
 else() # FIPS_CLICKHOUSE
 
 
