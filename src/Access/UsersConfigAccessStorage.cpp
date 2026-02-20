@@ -5,8 +5,6 @@
 #include <Common/Config/ConfigReloader.h>
 #include <Common/ZooKeeper/ZooKeeperNodeCache.h>
 #include <Common/quoteString.h>
-#include <Common/transformEndianness.h>
-#include "Access/Credentials.h"
 #include <Core/Settings.h>
 #include <Poco/Util/AbstractConfiguration.h>
 #include <Poco/JSON/Object.h>
@@ -17,15 +15,6 @@
 
 namespace DB
 {
-namespace ErrorCodes
-{
-    extern const int BAD_ARGUMENTS;
-    extern const int UNKNOWN_ADDRESS_PATTERN_TYPE;
-    extern const int THERE_IS_NO_PROFILE;
-    extern const int NOT_IMPLEMENTED;
-    extern const int SUPPORT_IS_DISABLED;
-}
-
 UsersConfigAccessStorage::UsersConfigAccessStorage(const String & storage_name_, AccessControl & access_control_, bool allow_backup_)
     : IAccessStorage(storage_name_)
     , access_control(access_control_)
