@@ -72,11 +72,6 @@ namespace DB::DatabaseDataLakeSetting
     extern const DatabaseDataLakeSettingsString aws_access_key_id;
     extern const DatabaseDataLakeSettingsString aws_secret_access_key;
     extern const DatabaseDataLakeSettingsString region;
-
-namespace DB::ServerSetting
-{
-    extern const ServerSettingsUInt64 s3_max_redirects;
-    extern const ServerSettingsUInt64 s3_retry_attempts;
 }
 
 namespace CurrentMetrics
@@ -159,9 +154,8 @@ GlueCatalog::GlueCatalog(
         LOG_TRACE(log, "Creating AWS glue client with credentials empty {}, region '{}', endpoint '{}'", credentials.IsEmpty(), region, endpoint);
     }
 
-    credentials_provider = DB::S3::getCredentialsProvider(poco_config, credentials, creds_config);
-    glue_client = std::make_unique<Aws::Glue::GlueClient>(credentials_provider, endpoint_provider, client_configuration);
-
+    std::shared_ptr<DB::S3::S3CredentialsProviderChain> chain = std::make_shared<DB::S3::S3CredentialsProviderChain>(poco_config, credentials, creds_config);
+    glue_client = std::make_unique<Aws::Glue::GlueClient>(chain, endpoint_provider, client_configuration);
 }
 
 GlueCatalog::~GlueCatalog() = default;
@@ -473,8 +467,12 @@ bool GlueCatalog::classifyTimestampTZ(const String & column_name, const TableMet
         {
             if (table_metadata.hasStorageCredentials())
                 table_metadata.getStorageCredentials()->addCredentialsToEngineArgs(args);
-           else if (!credentials.IsExpiredOrEmpty())
-                DataLake::S3Credentials(credentials.GetAWSAccessKeyId(), credentials.GetAWSSecretKey(), credentials.GetSessionToken()).addCredentialsToEngineArgs(args);
+           else
+           {
+               auto credentials = credentials_provider->GetAWSCredentials();
+               if (!credentials.IsExpiredOrEmpty())
+                   DataLake::S3Credentials(credentials.GetAWSAccessKeyId(), credentials.GetAWSSecretKey(), credentials.GetSessionToken()).addCredentialsToEngineArgs(args);
+           }
         }
 
         auto storage_settings = std::make_shared<DB::DataLakeStorageSettings>();
