@@ -102,7 +102,7 @@ set_target_properties(crypto PROPERTIES
 )
 
 add_library(ssl UNKNOWN IMPORTED GLOBAL)
-add_dependencies(ssl _crypto)
+add_dependencies(ssl crypto)
 set_target_properties(ssl PROPERTIES
     IMPORTED_LINK_INTERFACE_LANGUAGES "CXX"
     IMPORTED_LOCATION "${AWSLC_BINARIES_DIR}/libssl.a"
