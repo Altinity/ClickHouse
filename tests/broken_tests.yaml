@@ -84,6 +84,47 @@
 - name: 03644_object_storage_correlated_subqueries
   reason: KNOWN - Unstable in upstream 25.8.
   message: Timeout! Processes left in process group
+- name: 03206_no_exceptions_clickhouse_local
+  reason: 'KNOWN - Unstable upstream'
+  message: 'return code:  134'
+- name: 02815_no_throw_in_simple_queries
+  reason: 'KNOWN - Unstable upstream'
+  message: 'spawn id exp5 not open'
+- name: 03367_l2_distance_transposed_1
+  reason: INVESTIGATE - Float precision issue on Hetzner ARM https://github.com/ClickHouse/ClickHouse/issues/96764
+  check_types:
+  - arm
+  - cpu-aarch64
+- name: 03369_l2_distance_transposed_variadic
+  reason: INVESTIGATE - Float precision issue on Hetzner ARM https://github.com/ClickHouse/ClickHouse/issues/96764
+  check_types:
+  - arm
+  - cpu-aarch64
+- name: 03367_l2_distance_transposed_2
+  reason: INVESTIGATE - Float precision issue on Hetzner ARM https://github.com/ClickHouse/ClickHouse/issues/96764
+  check_types:
+  - arm
+  - cpu-aarch64
+- name: 03377_qbit_parameters
+  reason: INVESTIGATE - Float precision issue on Hetzner ARM https://github.com/ClickHouse/ClickHouse/issues/96764
+  check_types:
+  - arm
+  - cpu-aarch64
+- name: 03370_l2_distance_transposed_negative
+  reason: INVESTIGATE - Float precision issue on Hetzner ARM https://github.com/ClickHouse/ClickHouse/issues/96764
+  check_types:
+  - arm
+  - cpu-aarch64
+- name: 03375_l2_distance_transposed_partial_reads_pass
+  reason: INVESTIGATE - Float precision issue on Hetzner ARM https://github.com/ClickHouse/ClickHouse/issues/96764
+  check_types:
+  - arm
+  - cpu-aarch64
+- name: 03378_cosine_distance_transposed
+  reason: INVESTIGATE - Float precision issue on Hetzner ARM https://github.com/ClickHouse/ClickHouse/issues/96764
+  check_types:
+  - arm
+  - cpu-aarch64
 - name: test_storage_s3_queue/test_5.py::test_migration[1-s3queue_]
   reason: KNOWN - Sometimes fails due to test order
   message: 'Failed: Timeout >900.0s'
@@ -195,9 +236,47 @@
   reason: 'INVESTIGATE: Out of Memory or startup instability'
 - name: test_s3_cache_locality/test.py::test_cache_locality[0]
   reason: 'INVESTIGATE: Timeout or AssertionError'
+- name: test_dirty_pages_force_purge/test.py::test_dirty_pages_force_purge
+  reason: 'KNOWN: https://github.com/Altinity/ClickHouse/issues/1369'
+  message: 'RuntimeError: Failed to find peak memory counter'
+- name: test_storage_s3_queue/test_0.py::test_move_after_processing[same_bucket-AzureQueue]
+  reason: 'INVESTIGATE: Fails on ARM'
+  check_types:
+  - arm_binary
+- name: test_backup_restore_s3/test.py::test_backup_to_s3_different_credentials[data_file_name_from_checksum-non_native_single]
+  reason: 'INVESTIGATE: Timeout on tsan'
+  message: 'Timeout exceeded'
+  check_types:
+  - tsan
+- name: test_backup_restore_s3/test.py::test_backup_restore_system_tables_with_plain_rewritable_disk[data_file_name_from_checksum]
+  reason: 'INVESTIGATE: Timeout on tsan'
+  message: 'Timeout exceeded'
+  check_types:
+  - tsan
+- name: test_backup_restore_s3/test.py::test_backup_restore_system_tables_with_plain_rewritable_disk[data_file_name_from_first_file_name]
+  reason: 'INVESTIGATE: Timeout on tsan'
+  message: 'Timeout exceeded'
+  check_types:
+  - tsan
+- name: test_checking_s3_blobs_paranoid/test.py::test_when_s3_timeout_at_listing
+  reason: 'INVESTIGATE: Unstable on tsan'
+  message: 'Client failed!'
+  check_types:
+  - tsan
+- name: test_checking_s3_blobs_paranoid/test.py::test_query_is_canceled_with_inf_retries
+  reason: 'INVESTIGATE: Unstable on tsan'
+  message: 'Client failed!'
+  check_types:
+  - tsan
+- name: test_checking_s3_blobs_paranoid/test.py::test_adaptive_timeouts[node_with_inf_s3_retries]
+  reason: 'INVESTIGATE: Unstable on tsan'
+  message: 'Client failed!'
+  check_types:
+  - tsan
 
 # Regex rules should be ordered from most specific to least specific.
 # regex: true applies to name, message, and not_message fields, but not to reason or check_types fields.
+# If a test fail matches multiple rules, the report will take the reason from the first name that matches, ignoring message and not_message fields.
 
 # Match all sanitizer related timeouts in stateless tests
 # Note that this style of multiline string is inserting a space before each |.

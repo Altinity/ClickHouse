@@ -807,6 +807,7 @@ def create_workflow_report(
             )
         except Exception as e:
             pr_info_html = e
+            pr_info = {}
 
     fail_results["job_statuses"] = backfill_skipped_statuses(
         fail_results["job_statuses"], pr_number, branch_name, commit_sha

@@ -73,7 +73,7 @@ common_ft_job_config = Job.Config(
         ],
     ),
     result_name_for_cidb="Tests",
-    timeout=int(3600 * 2.5),
+    timeout=int(3600 * 3),
 )
 
 common_stress_job_config = Job.Config(
@@ -109,7 +109,7 @@ common_integration_test_job_config = Job.Config(
             "./ci/jobs/scripts/docker_in_docker.sh",
         ],
     ),
-    run_in_docker=f"altinityinfra/integration-tests-runner+root+--memory={LIMITED_MEM}+--privileged+--dns-search='.'+--security-opt seccomp=unconfined+--cap-add=SYS_PTRACE+{docker_sock_mount}+--volume=clickhouse_integration_tests_volume:/var/lib/docker+--cgroupns=host",
+    run_in_docker=f"altinityinfra/integration-tests-runner+root+--memory={LIMITED_MEM}+--privileged+--dns-search='.'+--security-opt seccomp=unconfined+--cap-add=SYS_PTRACE+{docker_sock_mount}+--volume=clickhouse_integration_tests_volume:/var/lib/docker+--cgroupns=host+--env=CLICKHOUSE_TEST_STAT_URL=$CLICKHOUSE_TEST_STAT_URL+--env=CLICKHOUSE_TEST_STAT_LOGIN=$CLICKHOUSE_TEST_STAT_LOGIN+--env=CLICKHOUSE_TEST_STAT_PASSWORD=$CLICKHOUSE_TEST_STAT_PASSWORD",
 )
 
 BINARY_DOCKER_COMMAND = (

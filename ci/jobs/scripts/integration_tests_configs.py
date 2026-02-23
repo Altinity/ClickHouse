@@ -925,6 +925,11 @@ def get_tests_execution_time(info: Info, job_options: str) -> dict[str, int]:
     assert info.updated_at
     start_time_filter = f"parseDateTimeBestEffort('{info.updated_at}')"
 
+    if info.pr_number == 0:
+        branch_filter = f"head_ref = '{info.git_branch}'"
+    else:
+        branch_filter = f"base_ref = '{info.base_branch}'"
+
     build = job_options.split(",", 1)[0]
 
     query = f"""
@@ -936,12 +941,12 @@ def get_tests_execution_time(info: Info, job_options: str) -> dict[str, int]:
             SELECT
                 splitByString('::', test_name)[1] AS file,
                 median(test_duration_ms) AS test_duration_ms
-            FROM checks
+            FROM `gh-data`.checks
             WHERE (check_name LIKE 'Integration tests%')
                 AND (check_name LIKE '%{build}%')
                 AND (check_start_time >= ({start_time_filter} - toIntervalDay(20)))
                 AND (check_start_time <= ({start_time_filter} - toIntervalHour(5)))
-                AND ((head_ref = 'master') AND startsWith(head_repo, 'ClickHouse/'))
+                AND ({branch_filter})
                 AND (file != '')
                 AND (test_status != 'SKIPPED')
                 AND (test_status != 'FAIL')
