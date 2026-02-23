@@ -132,6 +132,10 @@ RelativePathWithMetadata::CommandInTaskResponse::CommandInTaskResponse(const std
     { /// Not a JSON
         return;
     }
+    catch (const Poco::SyntaxException &)
+    { /// Not a JSON
+        return;
+    }
 }
 
 std::string RelativePathWithMetadata::CommandInTaskResponse::toString() const
