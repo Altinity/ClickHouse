@@ -713,6 +713,14 @@ target_compile_definitions(_krb5 PRIVATE
     LIBDIR="/usr/local/lib"
 )
 
+# stdio.h should've been explicitly included in disp_status.c, hack to fix it:
+target_compile_options(_krb5
+    # PRIVATE -includestdio.h
+    PRIVATE -D_GNU_SOURCE=1
+    PRIVATE -DUSE_BORINGSSL=1
+)
+
 target_link_libraries(_krb5 PRIVATE OpenSSL::Crypto OpenSSL::SSL)
+
 
 add_library(ch_contrib::krb5 ALIAS _krb5)
