@@ -45,4 +45,10 @@ add_library(_amqp-cpp ${SRCS})
 
 target_include_directories (_amqp-cpp SYSTEM BEFORE PUBLIC "${LIBRARY_DIR}/include" "${LIBRARY_DIR}")
 target_link_libraries (_amqp-cpp PUBLIC OpenSSL::Crypto OpenSSL::SSL ch_contrib::uv)
+
+# errno.h should've been explicitly included in sslerrorprinter.cpp, hack to fix it:
+target_compile_options (_amqp-cpp
+    PRIVATE -includeerrno.h
+)
+
 add_library (ch_contrib::amqp_cpp ALIAS _amqp-cpp)

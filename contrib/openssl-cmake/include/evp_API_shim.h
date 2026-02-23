@@ -64,4 +64,9 @@ inline void EVP_CIPHER_free(EVP_CIPHER *cipher)
     (void)(cipher);
 }
 
+// Required for contrib/minizip-ng/mz_crypt_openssl.c mz_crypt_init()
+// since there are no dynamically loaded engines, disabling the flag is Ok:
+// all engines are initialized anyway
+# define OPENSSL_INIT_ENGINE_ALL_BUILTIN 0
+
 #endif
