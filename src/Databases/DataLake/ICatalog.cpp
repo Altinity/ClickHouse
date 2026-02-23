@@ -102,10 +102,15 @@ void TableMetadata::setLocation(const std::string & location_)
     auto pos_to_path = location_.substr(pos_to_bucket).find('/');
 
     if (pos_to_path == std::string::npos)
-    { // empty path, AWS S3Table
-        location_without_path = location_;
-        path.clear();
-        bucket = location_.substr(pos_to_bucket);
+    {
+        if (storage_type_str == "s3://")
+        { // empty path is allowed for AWS S3Table
+            location_without_path = location_;
+            path.clear();
+            bucket = location_.substr(pos_to_bucket);
+        }
+        else
+            throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "Unexpected location format: {}", location_);
     }
     else
     {
