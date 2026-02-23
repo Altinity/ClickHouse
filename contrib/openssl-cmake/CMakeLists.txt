@@ -102,7 +102,7 @@ set_target_properties(crypto PROPERTIES
 )
 
 add_library(ssl UNKNOWN IMPORTED GLOBAL)
-add_dependencies(ssl _crypto)
+add_dependencies(ssl crypto)
 set_target_properties(ssl PROPERTIES
     IMPORTED_LINK_INTERFACE_LANGUAGES "CXX"
     IMPORTED_LOCATION "${AWSLC_BINARIES_DIR}/libssl.a"
@@ -122,6 +122,11 @@ target_compile_options(ssl INTERFACE
 target_compile_options(ssl INTERFACE
   -DOPENSSL_IS_BORINGSSL=1
 )
+
+# This is taken from the later in the file when FIPS_CLICKHOUSE is not defined.
+# Without it, the build fails due to using API deprecated in C++23
+target_compile_options(global-group INTERFACE "-Wno-deprecated-declarations")
+target_compile_options(global-group INTERFACE "-Wno-poison-system-directories")
 
 else() # FIPS_CLICKHOUSE
 
