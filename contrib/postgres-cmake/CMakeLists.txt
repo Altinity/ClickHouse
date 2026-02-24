@@ -24,12 +24,8 @@ set(SRCS
     "${LIBPQ_SOURCE_DIR}/pqexpbuffer.c"
 
     "${POSTGRES_SOURCE_DIR}/src/common/scram-common.c"
-    "${POSTGRES_SOURCE_DIR}/src/common/sha2.c"
-    "${POSTGRES_SOURCE_DIR}/src/common/sha1.c"
-    "${POSTGRES_SOURCE_DIR}/src/common/md5.c"
     "${POSTGRES_SOURCE_DIR}/src/common/md5_common.c"
     "${POSTGRES_SOURCE_DIR}/src/common/hmac_openssl.c"
-    "${POSTGRES_SOURCE_DIR}/src/common/cryptohash.c"
     "${POSTGRES_SOURCE_DIR}/src/common/saslprep.c"
     "${POSTGRES_SOURCE_DIR}/src/common/unicode_norm.c"
     "${POSTGRES_SOURCE_DIR}/src/common/ip.c"
@@ -57,6 +53,19 @@ set(SRCS
     "${POSTGRES_SOURCE_DIR}/src/port/pg_bitutils.c"
     "${POSTGRES_SOURCE_DIR}/src/port/path.c"
 )
+
+# If FIPS_CLICKHOUSE is enabled, we use the "OpenSSL" (AWS-LC) version of the
+# SHA256_Transform and SHA512_Transform functions instead of the internal ones.
+if(FIPS_CLICKHOUSE)
+    list(APPEND SRCS "${POSTGRES_SOURCE_DIR}/src/common/cryptohash_openssl.c")
+else()
+    list(APPEND SRCS
+        "${POSTGRES_SOURCE_DIR}/src/common/sha2.c"
+        "${POSTGRES_SOURCE_DIR}/src/common/sha1.c"
+        "${POSTGRES_SOURCE_DIR}/src/common/md5.c"
+        "${POSTGRES_SOURCE_DIR}/src/common/cryptohash.c"
+    )
+endif()
 
 if(NOT OS_DARWIN)
     set(SRCS ${SRCS}
