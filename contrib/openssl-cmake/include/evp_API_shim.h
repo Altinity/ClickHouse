@@ -1,7 +1,15 @@
 #ifndef AWS_LC_2_0_0_API_SHIM_FOR_OPENSSL_3_INCLUDED
 #define AWS_LC_2_0_0_API_SHIM_FOR_OPENSSL_3_INCLUDED
 
+// This header is being force-included before any other headers in files
+// depending on ssl target, and can pull in some headers itself.
+// librdkafka uses IOV_MAX which is defined in limits.h and pulled by
+// openssl/evp.h which is included by this file. Hence, we need to define _GNU_SOURCE
+// before including any other headers.
+#define _GNU_SOURCE
+
 #include <openssl/evp.h>
+#include <openssl/hmac.h> // HMAC is used by librdkafka
 // #include <openssl/types.h>
 #include <assert.h>
 
@@ -14,7 +22,7 @@
     To simplify porting and minimize code changes at other places,
     those missing functions/defines/constants will be defined here
     if there are trivial way to do it.
- 
+
     ALSO, this header can be included from both C++ and C code,
     so make sure that there are no non-compatible C++ features.
  */
@@ -36,7 +44,7 @@
 /* There are two types of cipher fetching in OpenSSL 3+:
     implicit (`EVP_get_cipherbyname`) and explicit (`EVP_CIPHER_fetch`).
 
-    Those types are necessary for OpenSSL's strategy of loading 
+    Those types are necessary for OpenSSL's strategy of loading
     some of the ciphers from plugins - shared (dynamic) libraries,
     which are called providers in OpenSSL's lingo.
 
@@ -68,5 +76,17 @@ inline void EVP_CIPHER_free(EVP_CIPHER *cipher)
 // since there are no dynamically loaded engines, disabling the flag is Ok:
 // all engines are initialized anyway
 # define OPENSSL_INIT_ENGINE_ALL_BUILTIN 0
+
+// librdkafka uses RAND_priv_bytes, which is not defined in AWS-LC.
+// However, RAND_bytes _is_ defined and is semantically equivalent.
+#define RAND_priv_bytes RAND_bytes
+
+// SSL_CTX_use_cert_and_key is used by librdkafka. We could define it as an
+// inline function, but that would require to include openssl/ssl.h, which is
+// worse for the build time.
+#define SSL_CTX_use_cert_and_key(ctx, cert, pkey, chain, override) \
+    (SSL_CTX_use_certificate((ctx), (cert)) == 1 \
+     && SSL_CTX_use_PrivateKey((ctx), (pkey)) == 1 \
+     && (!(chain) || SSL_CTX_set1_chain((ctx), (chain)) == 1))
 
 #endif
