@@ -212,7 +212,7 @@ Row 2:
 type:              QueryFinish
 is_initial_query2: 0
 tbl:               ['db.test_tiered_watermark_after']
-qry:               SELECT _CAST(`__table1`.`id`, 'UInt32') AS `id`, _CAST(`__table1`.`name`, 'String') AS `name`, `__table1`.`date` AS `date`, _CAST(`__table1`.`value`, 'UInt32') AS `value` FROM `db`.`test_tiered_watermark_after` AS `__table1` WHERE `__table1`.`date` >= '2025-09-01' ORDER BY `id` DESC
+qry:               SELECT _CAST(`__table1`.`id`, 'UInt32') AS `id`, _CAST(`__table1`.`name`, 'String') AS `name`, `__table1`.`date` AS `date`, _CAST(`__table1`.`value`, 'UInt32') AS `value` FROM `db`.`test_tiered_watermark_after` AS `__table1` WHERE `__table1`.`date` >= '2025-09-01' ORDER BY _CAST(`__table1`.`id`, 'UInt32') AS `id` DESC
 log_comment:       test_tiered_watermark2
 
 Row 3:
