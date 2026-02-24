@@ -149,6 +149,7 @@ add_library(_rdkafka ${SRCS})
 add_library(ch_contrib::rdkafka ALIAS _rdkafka)
 target_compile_options(_rdkafka PRIVATE -fno-sanitize=undefined)
 target_compile_definitions(_rdkafka PRIVATE -DCJSON_HIDE_SYMBOLS)
+target_compile_definitions(_rdkafka PRIVATE -D_GNU_SOURCE=1)
 
 # target_include_directories(_rdkafka SYSTEM PUBLIC include)
 target_include_directories(_rdkafka SYSTEM PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include") # for "librdkafka/rdkafka.h"

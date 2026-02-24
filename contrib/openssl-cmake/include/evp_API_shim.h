@@ -1,13 +1,6 @@
 #ifndef AWS_LC_2_0_0_API_SHIM_FOR_OPENSSL_3_INCLUDED
 #define AWS_LC_2_0_0_API_SHIM_FOR_OPENSSL_3_INCLUDED
 
-// This header is being force-included before any other headers in files
-// depending on ssl target, and can pull in some headers itself.
-// librdkafka uses IOV_MAX which is defined in limits.h and pulled by
-// openssl/evp.h which is included by this file. Hence, we need to define _GNU_SOURCE
-// before including any other headers.
-#define _GNU_SOURCE
-
 #include <openssl/evp.h>
 #include <openssl/hmac.h> // HMAC is used by librdkafka
 #include <openssl/ssl.h>
