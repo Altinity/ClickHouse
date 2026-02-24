@@ -226,6 +226,7 @@ void createUniqueAliasesIfNecessary(QueryTreeNodePtr & node, const ContextPtr & 
      * It's required to create a valid AST for distributed query.
      */
     CreateUniqueArrayJoinAliasesVisitor(context).visit(node);
+
 }
 
 }

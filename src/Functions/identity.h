@@ -102,6 +102,27 @@ struct AliasMarkerName
     static constexpr auto name = "__aliasMarker";
 };
 
+/**
+ * __aliasMarker is a transport-time alias preservation hint for distributed SQL paths.
+ *
+ * Why it exists:
+ * - When a distributed query is planned and mergeable-state flows are used, the final aliasing step
+ *   is intentionally skipped.
+ * - That is desired, but it also prevents preserving/injecting initiator-side expression names
+ *   (for example, names coming from ALIAS columns or certain CAST expressions).
+ * - This becomes especially problematic when shard schemas differ slightly.
+ * - Some injected alias columns must preserve a specific output name; otherwise remote headers may diverge
+ *   from initiator expectations (header mismatch, wrong column association, and similar inconsistencies).
+ *
+ * Lifecycle/invariants:
+ * 1) Injected only around rewritten alias expressions that require stable output identity.
+ * 2) Materialized before SQL serialization: the marker id is converted to a String alias identifier.
+ * 3) Consumed by analyzer/planner on receiver to enforce alias naming in actions.
+ * 4) Removed/stripped before forwarding to the next hop, then (if needed) re-injected for that hop only.
+ *
+ * This is a temporary bridge while distributed plan transport still relies on SQL text in these paths.
+ * As query plan serialization fully replaces that boundary, this marker path should become unnecessary.
+ */
 class FunctionAliasMarker : public IFunction
 {
 public:
@@ -110,7 +131,7 @@ public:
 
     String getName() const override { return name; }
     size_t getNumberOfArguments() const override { return 2; }
-    ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {1}; }
+    ColumnNumbers getArgumentsThatAreAlwaysConstant() const override { return {}; }
     bool isSuitableForConstantFolding() const override { return false; }
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo & /*arguments*/) const override { return false; }
 
@@ -118,9 +139,6 @@ public:
     {
         if (arguments.size() != 2)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker expects 2 arguments");
-
-        if (!WhichDataType(arguments[1]).isString())
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker is internal and should not be used directly");
 
         return arguments.front();
     }
