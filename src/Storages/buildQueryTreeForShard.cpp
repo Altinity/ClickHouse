@@ -404,7 +404,10 @@ TableNodePtr executeSubqueryNode(const QueryTreeNodePtr & subquery_node,
     ContextMutablePtr & mutable_context,
     size_t subquery_depth)
 {
-    const auto subquery_hash = subquery_node->getTreeHash();
+    auto subquery_node_to_execute = subquery_node->clone();
+    finalizeAliasMarkersForDistributedSerialization(subquery_node_to_execute, mutable_context);
+
+    const auto subquery_hash = subquery_node_to_execute->getTreeHash();
     const auto temporary_table_name = fmt::format("_data_{}", toString(subquery_hash));
 
     const auto & external_tables = mutable_context->getExternalTables();
@@ -422,7 +425,7 @@ TableNodePtr executeSubqueryNode(const QueryTreeNodePtr & subquery_node,
     auto context_copy = Context::createCopy(mutable_context);
     updateContextForSubqueryExecution(context_copy);
 
-    InterpreterSelectQueryAnalyzer interpreter(subquery_node, context_copy, subquery_options);
+    InterpreterSelectQueryAnalyzer interpreter(subquery_node_to_execute, context_copy, subquery_options);
     auto & query_plan = interpreter.getQueryPlan();
 
     auto sample_block_with_unique_names = *query_plan.getCurrentHeader();
@@ -560,6 +563,10 @@ QueryTreeNodePtr getSubqueryFromTableExpression(
 
 QueryTreeNodePtr buildQueryTreeForShard(const PlannerContextPtr & planner_context, QueryTreeNodePtr query_tree_to_modify, bool allow_global_join_for_right_table)
 {
+    /// Incoming materialized markers are hop-local metadata.
+    /// Strip them before this node prepares/executes subqueries for the next hop.
+    stripMaterializedAliasMarkers(query_tree_to_modify);
+
     CollectColumnSourceToColumnsVisitor collect_column_source_to_columns_visitor;
     collect_column_source_to_columns_visitor.visit(query_tree_to_modify);
 

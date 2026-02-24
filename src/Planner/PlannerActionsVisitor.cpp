@@ -31,6 +31,7 @@
 #include <Functions/indexHint.h>
 
 #include <Interpreters/ExpressionActionsSettings.h>
+#include <Interpreters/ClientInfo.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/Set.h>
 
@@ -91,6 +92,17 @@ String calculateActionNodeNameWithCastIfNeeded(const ConstantNode & constant_nod
     }
 
     return buffer.str();
+}
+
+String tryExtractAliasMarkerIdFromSecondArgument(const QueryTreeNodePtr & argument)
+{
+    if (const auto * second_argument_constant = argument->as<ConstantNode>();
+        second_argument_constant && isString(second_argument_constant->getResultType()))
+    {
+        return second_argument_constant->getValue().safeGet<String>();
+    }
+
+    return {};
 }
 
 class ActionNodeNameHelper
@@ -189,14 +201,12 @@ public:
                 {
                     /// Perform sanity check, because user may call this function with unexpected arguments
                     const auto & function_argument_nodes = function_node.getArguments().getNodes();
-                    if (function_argument_nodes.size() == 2)
-                    {
-                        if (const auto * second_argument = function_argument_nodes.at(1)->as<ConstantNode>())
-                        {
-                            if (isString(second_argument->getResultType()))
-                                result = second_argument->getValue().safeGet<String>();
-                        }
-                    }
+                    if (function_argument_nodes.size() != 2)
+                        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker expects 2 arguments");
+
+                    result = tryExtractAliasMarkerIdFromSecondArgument(function_argument_nodes.at(1));
+                    if (result.empty())
+                        result = calculateActionNodeName(function_argument_nodes.at(0));
 
                     /// Empty node name is not allowed and leads to logical errors
                     if (result.empty())
@@ -1139,15 +1149,11 @@ PlannerActionsVisitorImpl::NodeNameAndNodeMinLevel PlannerActionsVisitorImpl::vi
         if (function_arguments.size() != 2)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker expects 2 arguments");
 
-        const auto * alias_id_node = function_arguments.at(1)->as<ConstantNode>();
-        if (!alias_id_node || !isString(alias_id_node->getResultType()))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker is internal and should not be used directly");
-
-        const auto & alias_id = alias_id_node->getValue().safeGet<String>();
-        if (alias_id.empty())
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Function __aliasMarker is internal and should not be used directly");
-
         auto [child_name, levels] = visitImpl(function_arguments.at(0));
+        auto alias_id = tryExtractAliasMarkerIdFromSecondArgument(function_arguments.at(1));
+        if (alias_id.empty())
+            alias_id = child_name;
+
         if (alias_id == child_name)
             return {child_name, levels};
 

@@ -49,6 +49,8 @@
 
 #include <Analyzer/Resolve/IdentifierResolveScope.h>
 
+#include <base/hex.h>
+
 #include <ranges>
 namespace DB
 {
@@ -977,6 +979,174 @@ void resolveAggregateFunctionNodeByName(FunctionNode & function_node, const Stri
 {
     auto aggregate_function = resolveAggregateFunction(function_node, function_name);
     function_node.resolveAsAggregateFunction(std::move(aggregate_function));
+}
+
+namespace
+{
+
+/// `materialized_only`:
+/// false = strip any marker.
+/// true = strip only markers that arrived in the query already materialized (arg2 is String).
+/// Markers injected in the current rewrite keep arg2 as ColumnNode until finalization.
+bool stripAliasMarker(QueryTreeNodePtr & node, bool materialized_only)
+{
+    auto * function_node = node->as<FunctionNode>();
+    if (!function_node || function_node->getFunctionName() != "__aliasMarker")
+        return false;
+
+    auto & arguments = function_node->getArguments().getNodes();
+    if (arguments.size() != 2 || !arguments[0] || !arguments[1])
+        return false;
+
+    if (materialized_only)
+    {
+        const auto * marker_id_node = arguments[1]->as<ConstantNode>();
+        if (!marker_id_node || !isString(marker_id_node->getResultType()))
+            return false;
+    }
+
+    auto replacement = arguments[0];
+    if (!replacement->hasAlias() && function_node->hasAlias())
+        replacement->setAlias(function_node->getAlias());
+
+    node = std::move(replacement);
+    return true;
+}
+
+String buildDeterministicFallbackAliasMarkerId(const ColumnNode & marker_column_node, const QueryTreeNodePtr & marker_expression_node)
+{
+    IQueryTreeNode::CompareOptions compare_options
+    {
+        .compare_aliases = false,
+        .compare_types = false,
+        .ignore_cte = true,
+    };
+
+    String alias_id = marker_column_node.getColumnName();
+
+    if (const auto & marker_source = marker_column_node.getColumnSourceOrNull())
+    {
+        /// Keep fallback ids deterministic and source-specific when table aliases are not available yet.
+        alias_id += "__src_" + getHexUIntLowercase(marker_source->getTreeHash(compare_options));
+    }
+
+    /// Add expression hash to avoid collapsing different marker payloads with the same column name.
+    alias_id += "__expr_" + getHexUIntLowercase(marker_expression_node->getTreeHash(compare_options));
+
+    return alias_id;
+}
+
+void stripAliasMarkersFromPayloadSubtree(QueryTreeNodePtr & node)
+{
+    while (stripAliasMarker(node, false))
+    {}
+
+    for (auto & child : node->getChildren())
+    {
+        if (child)
+            stripAliasMarkersFromPayloadSubtree(child);
+    }
+}
+
+/// Finalize __aliasMarker nodes right before distributed SQL boundaries.
+/// This pass strips nested markers from arg0 payload and materializes arg2 to String constant.
+class FinalizeAliasMarkersForDistributedSerializationVisitor : public InDepthQueryTreeVisitor<FinalizeAliasMarkersForDistributedSerializationVisitor>
+{
+public:
+    explicit FinalizeAliasMarkersForDistributedSerializationVisitor(ContextPtr context_)
+        : context(std::move(context_))
+    {}
+
+    bool shouldTraverseTopToBottom() const
+    {
+        return false;
+    }
+
+    static bool needChildVisit(const QueryTreeNodePtr & parent_node, const QueryTreeNodePtr &)
+    {
+        auto * function_node = parent_node->as<FunctionNode>();
+        if (!function_node || function_node->getFunctionName() != "__aliasMarker")
+            return true;
+
+        /// __aliasMarker subtrees are processed explicitly in visitImpl:
+        /// arg0 is recursively cleaned from nested wrappers and arg2 is materialized in place.
+        return false;
+    }
+
+    void visitImpl(QueryTreeNodePtr & node)
+    {
+        auto * function_node = node->as<FunctionNode>();
+        if (!function_node || function_node->getFunctionName() != "__aliasMarker")
+            return;
+
+        auto & arguments = function_node->getArguments().getNodes();
+        if (arguments.size() != 2 || !arguments[0] || !arguments[1])
+            return;
+
+        /// Remove nested marker wrappers in payload subtree; keep only this node as the boundary marker.
+        stripAliasMarkersFromPayloadSubtree(arguments[0]);
+
+        String alias_id;
+        if (const auto * marker_column_node = arguments[1]->as<ColumnNode>())
+        {
+            if (const auto & marker_source = marker_column_node->getColumnSourceOrNull();
+                marker_source && marker_source->hasAlias())
+            {
+                alias_id = marker_source->getAlias() + "." + marker_column_node->getColumnName();
+            }
+            else
+            {
+                /// In some distributed subquery execution paths marker ids are materialized
+                /// before alias uniquification assigns source aliases.
+                alias_id = buildDeterministicFallbackAliasMarkerId(*marker_column_node, arguments[0]);
+            }
+        }
+        else if (const auto * marker_id_node = arguments[1]->as<ConstantNode>();
+                 marker_id_node && isString(marker_id_node->getResultType()))
+        {
+            alias_id = marker_id_node->getValue().safeGet<String>();
+        }
+
+        if (alias_id.empty())
+            return;
+
+        arguments[1] = std::make_shared<ConstantNode>(std::move(alias_id), std::make_shared<DataTypeString>());
+        resolveOrdinaryFunctionNodeByName(*function_node, "__aliasMarker", context);
+    }
+
+private:
+    ContextPtr context;
+};
+
+/// Strip incoming __aliasMarker wrappers between distributed hops.
+/// This keeps marker lifecycle hop-local and avoids forwarding stale previous-hop ids.
+class StripMaterializedAliasMarkersVisitor : public InDepthQueryTreeVisitor<StripMaterializedAliasMarkersVisitor>
+{
+public:
+    bool shouldTraverseTopToBottom() const
+    {
+        return false;
+    }
+
+    void visitImpl(QueryTreeNodePtr & node)
+    {
+        while (stripAliasMarker(node, true))
+        {}
+    }
+};
+
+}
+
+void finalizeAliasMarkersForDistributedSerialization(QueryTreeNodePtr & node, const ContextPtr & context)
+{
+    FinalizeAliasMarkersForDistributedSerializationVisitor visitor(context);
+    visitor.visit(node);
+}
+
+void stripMaterializedAliasMarkers(QueryTreeNodePtr & node)
+{
+    StripMaterializedAliasMarkersVisitor visitor;
+    visitor.visit(node);
 }
 
 std::pair<QueryTreeNodePtr, bool> getExpressionSource(const QueryTreeNodePtr & node)
