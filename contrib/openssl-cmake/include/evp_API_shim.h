@@ -10,6 +10,7 @@
 
 #include <openssl/evp.h>
 #include <openssl/hmac.h> // HMAC is used by librdkafka
+#include <openssl/ssl.h>
 // #include <openssl/types.h>
 #include <assert.h>
 
@@ -81,12 +82,54 @@ inline void EVP_CIPHER_free(EVP_CIPHER *cipher)
 // However, RAND_bytes _is_ defined and is semantically equivalent.
 #define RAND_priv_bytes RAND_bytes
 
-// SSL_CTX_use_cert_and_key is used by librdkafka. We could define it as an
-// inline function, but that would require to include openssl/ssl.h, which is
-// worse for the build time.
-#define SSL_CTX_use_cert_and_key(ctx, cert, pkey, chain, override) \
-    (SSL_CTX_use_certificate((ctx), (cert)) == 1 \
-     && SSL_CTX_use_PrivateKey((ctx), (pkey)) == 1 \
-     && (!(chain) || SSL_CTX_set1_chain((ctx), (chain)) == 1))
+// SSL_CTX_use_cert_and_key is used by librdkafka but not provided by AWS-LC.
+// Replicates OpenSSL's behaviour: sets certificate, private key, and optionally
+// the certificate chain on the SSL_CTX.
+static inline int SSL_CTX_use_cert_and_key(SSL_CTX *ctx, X509 *cert,
+                                           EVP_PKEY *pkey, STACK_OF(X509) *chain,
+                                           int override)
+{
+    (void)override;
+    if (SSL_CTX_use_certificate(ctx, cert) != 1)
+        return 0;
+    if (SSL_CTX_use_PrivateKey(ctx, pkey) != 1)
+        return 0;
+    if (chain && SSL_CTX_set1_chain(ctx, chain) != 1)
+        return 0;
+    return 1;
+}
+
+// BIO_get_ssl and BIO_do_handshake are convenience macros in OpenSSL
+// that expand to BIO_ctrl calls that are used by mongodb driver.
+// AWS-LC has the underlying BIO_ctrl and the control constants but not the macros.
+#define BIO_get_ssl(b, sslp) \
+    BIO_ctrl(b, BIO_C_GET_SSL, 0, (char *)(sslp))
+#define BIO_do_handshake(b) \
+    BIO_ctrl(b, BIO_C_DO_STATE_MACHINE, 0, NULL)
+
+// BIO_new_ssl is an OpenSSL convenience function that creates a new BIO
+// wrapping a fresh SSL connection. AWS-LC provides all the building blocks
+// (BIO_f_ssl, SSL_new, BIO_set_ssl) but not this wrapper.
+// Used by mongodb driver.
+static inline BIO *BIO_new_ssl(SSL_CTX *ctx, int client)
+{
+    BIO *bio = BIO_new(BIO_f_ssl());
+    if (!bio)
+        return NULL;
+
+    SSL *ssl = SSL_new(ctx);
+    if (!ssl) {
+        BIO_free(bio);
+        return NULL;
+    }
+
+    if (client)
+        SSL_set_connect_state(ssl);
+    else
+        SSL_set_accept_state(ssl);
+
+    BIO_set_ssl(bio, ssl, BIO_CLOSE);
+    return bio;
+}
 
 #endif
