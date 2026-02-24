@@ -41,6 +41,11 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         /// Note: please check if the key already exists to prevent duplicate entries.
         addSettingsChanges(settings_changes_history, "26.1",
         {
+            // altinity: antalya-specific features
+            {"hybrid_table_auto_cast_columns", true, true, "New setting to automatically cast Hybrid table columns when segments disagree on types. Default enabled."},
+            {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
+            {"enable_alias_marker", true, true, "New setting."},
+            // altinity: antalya-specific features
             {"parallel_replicas_filter_pushdown", false, false, "New setting"},
             {"use_statistics", true, true, "Enable this optimization by default."},
             {"ignore_on_cluster_for_replicated_database", false, false, "Add a new setting to ignore ON CLUSTER clause for DDL queries with a replicated database."},
@@ -220,9 +225,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"os_threads_nice_value_query", 0, 0, "New setting."},
             {"os_threads_nice_value_materialized_view", 0, 0, "New setting."},
             {"os_thread_priority", 0, 0, "Alias for os_threads_nice_value_query."},
-            {"hybrid_table_auto_cast_columns", true, true, "New setting to automatically cast Hybrid table columns when segments disagree on types. Default enabled."},
-            {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
-            {"enable_alias_marker", true, true, "New setting."},
         });
         addSettingsChanges(settings_changes_history, "25.8",
         {
