@@ -301,6 +301,7 @@ def parse_env_variables(
         cmake_flags.append("-DENABLE_CASSANDRA=1")
         cmake_flags.append("-DENABLE_KAFKA=1")
         cmake_flags.append("-DENABLE_LIBPQXX=1")
+        cmake_flags.append("-DENABLE_MYSQL=1")
         # FIPS mode end
 
         # Reduce linking and building time by avoid *install/all dependencies
