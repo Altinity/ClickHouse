@@ -154,9 +154,16 @@ GlueCatalog::GlueCatalog(
         LOG_TRACE(log, "Creating AWS glue client with credentials empty {}, region '{}', endpoint '{}'", credentials.IsEmpty(), region, endpoint);
     }
 
-    std::shared_ptr<DB::S3::S3CredentialsProviderChain> chain = std::make_shared<DB::S3::S3CredentialsProviderChain>(poco_config, credentials, creds_config);
-    credentials_provider = chain;
-    glue_client = std::make_unique<Aws::Glue::GlueClient>(chain, endpoint_provider, client_configuration);
+    credentials_provider = std::make_shared<DB::S3::S3CredentialsProviderChain>(poco_config, credentials, creds_config);
+    if (!creds_config.role_arn.empty())
+        credentials_provider = std::make_shared<DB::S3::AwsAuthSTSAssumeRoleCredentialsProvider>(
+            creds_config.role_arn,
+            creds_config.role_session_name,
+            creds_config.expiration_window_seconds,
+            std::move(credentials_provider),
+            poco_config,
+            creds_config.sts_endpoint_override);
+    glue_client = std::make_unique<Aws::Glue::GlueClient>(credentials_provider, endpoint_provider, client_configuration);
 }
 
 GlueCatalog::~GlueCatalog() = default;
