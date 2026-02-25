@@ -86,6 +86,10 @@ configure_file(${LIB_SOURCE_DIR}/include/libssh/libssh_version.h.cmake ${LIB_BIN
 add_library(_ssh ${libssh_SRCS})
 add_library(ch_contrib::ssh ALIAS _ssh)
 
+target_compile_options(_ssh
+    PRIVATE -DUSE_BORINGSSL=1
+)
+
 target_link_libraries(_ssh PRIVATE OpenSSL::Crypto)
 
 target_include_directories(_ssh PUBLIC "${LIB_SOURCE_DIR}/include" "${LIB_BINARY_DIR}/include")

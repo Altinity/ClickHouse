@@ -118,7 +118,7 @@
 #define HAVE_OPENSSL_CRYPTO_THREADID_SET_CALLBACK 1
 
 /* Define to 1 if you have the `CRYPTO_ctr128_encrypt' function. */
-#define HAVE_OPENSSL_CRYPTO_CTR128_ENCRYPT 1
+#undef HAVE_OPENSSL_CRYPTO_CTR128_ENCRYPT
 
 /* Define to 1 if you have the `EVP_CIPHER_CTX_new' function. */
 #define HAVE_OPENSSL_EVP_CIPHER_CTX_NEW 1

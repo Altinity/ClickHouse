@@ -91,6 +91,8 @@ add_custom_command(
     USES_TERMINAL # To stream output
     DEPENDS
         ${AWSLC_BUILD_DIR}/build_awclc_fips.sh
+        ${AWSLC_BUILD_DIR}/check_version.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/Dockerfile
 )
 
 add_library(crypto UNKNOWN IMPORTED GLOBAL)
