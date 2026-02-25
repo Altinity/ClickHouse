@@ -2,6 +2,7 @@
 
 #if USE_JWT_CPP
 #include <Common/Exception.h>
+#include <mutex>
 #include <Poco/Net/HTTPRequest.h>
 #include <Poco/Net/HTTPResponse.h>
 #include <Poco/Net/HTTPSClientSession.h>
@@ -20,11 +21,17 @@ namespace ErrorCodes
 
 JWKSType JWKSClient::getJWKS()
 {
-    std::shared_lock lock(mutex);
+    {
+        std::shared_lock lock(mutex);
+        auto now = std::chrono::high_resolution_clock::now();
+        auto diff = std::chrono::duration<double>(now - last_request_send).count();
+        if (diff < static_cast<double>(refresh_timeout) && cached_jwks.has_value())
+            return cached_jwks.value();
+    }
 
+    std::unique_lock lock(mutex);
     auto now = std::chrono::high_resolution_clock::now();
     auto diff = std::chrono::duration<double>(now - last_request_send).count();
-
     if (diff < static_cast<double>(refresh_timeout) && cached_jwks.has_value())
         return cached_jwks.value();
 

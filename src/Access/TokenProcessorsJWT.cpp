@@ -285,12 +285,12 @@ bool checkUserClaims(const TokenCredentials & credentials, const String & claims
 }
 }
 
-bool StaticKeyJwtProcessor::checkClaims(const TokenCredentials & credentials, const String & claims_to_check)
+bool StaticKeyJwtProcessor::checkClaims(const TokenCredentials & credentials, const String & claims_to_check) const
 {
     return checkUserClaims(credentials, claims_to_check);
 }
 
-bool JwksJwtProcessor::checkClaims(const TokenCredentials & credentials, const String & claims_to_check)
+bool JwksJwtProcessor::checkClaims(const TokenCredentials & credentials, const String & claims_to_check) const
 {
     return checkUserClaims(credentials, claims_to_check);
 }

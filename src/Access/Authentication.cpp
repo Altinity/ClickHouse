@@ -348,7 +348,10 @@ bool Authentication::areCredentialsValid(
         if (authentication_method.getType() != AuthenticationType::JWT)
             return false;
 
-        return external_authenticators.checkTokenCredentials(*token_credentials);
+        return external_authenticators.checkTokenCredentials(
+            *token_credentials,
+            authentication_method.getTokenProcessorName(),
+            authentication_method.getJWTClaims());
     }
 
     if ([[maybe_unused]] const auto * always_allow_credentials = typeid_cast<const AlwaysAllowCredentials *>(&credentials))

@@ -49,7 +49,7 @@ public:
     bool checkKerberosCredentials(const String & realm, const GSSAcceptorContext & credentials) const;
     bool checkHTTPBasicCredentials(const String & server, const BasicCredentials & credentials, const ClientInfo & client_info, SettingsChanges & settings) const;
 
-    bool checkTokenCredentials(const TokenCredentials & credentials, const String & processor_name = "") const;
+    bool checkTokenCredentials(const TokenCredentials & credentials, const String & processor_name = "", const String & jwt_claims = "") const;
 
     GSSAcceptorContext::Params getKerberosParams() const;
 

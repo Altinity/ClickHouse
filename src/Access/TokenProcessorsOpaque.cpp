@@ -301,6 +301,9 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
     if (!openid_config.contains("userinfo_endpoint") || !openid_config.contains("introspection_endpoint"))
         throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "{}: Cannot extract userinfo_endpoint or introspection_endpoint from OIDC configuration, consider manual configuration.", processor_name);
 
+    userinfo_endpoint = Poco::URI(getValueByKey(openid_config, "userinfo_endpoint").value());
+    token_introspection_endpoint = Poco::URI(getValueByKey(openid_config, "introspection_endpoint").value());
+
     if (openid_config.contains("jwks_uri"))
     {
         LOG_TRACE(getLogger("TokenAuthentication"), "{}: JWKS URI set, local JWT processing will be attempted", processor_name_);

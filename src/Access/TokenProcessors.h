@@ -32,7 +32,10 @@ public:
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Not implemented for ITokenProcessor interface");
     }
 
-    virtual bool checkClaims(const TokenCredentials &, const String &) { return true; }
+    virtual bool checkClaims(const TokenCredentials &, const String &) const { return true; }
+
+    /// True only for JWT processors (static-key/JWKS). Opaque/access token processors do not use per-user claims.
+    virtual bool supportsJwtClaimsRestriction() const { return false; }
 
     UInt64 getTokenCacheLifetime() const { return token_cache_lifetime; }
     String getProcessorName() const { return processor_name; }
@@ -93,7 +96,8 @@ public:
                                    const StaticKeyJwtParams & params);
 
     bool resolveAndValidate(TokenCredentials & credentials) const override;
-    bool checkClaims(const TokenCredentials & credentials, const String & claims_to_check) override;
+    bool checkClaims(const TokenCredentials & credentials, const String & claims_to_check) const override;
+    bool supportsJwtClaimsRestriction() const override { return true; }
 
 private:
     const String claims;
@@ -144,7 +148,8 @@ public:
                                                  std::make_shared<JWKSClient>(jwks_uri_, jwks_cache_lifetime_)) {}
 
     bool resolveAndValidate(TokenCredentials & credentials) const override;
-    bool checkClaims(const TokenCredentials & credentials, const String & claims_to_check) override;
+    bool checkClaims(const TokenCredentials & credentials, const String & claims_to_check) const override;
+    bool supportsJwtClaimsRestriction() const override { return true; }
 
 private:
     const String claims;

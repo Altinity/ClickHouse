@@ -280,6 +280,11 @@ namespace
         else if (has_jwt)
         {
             user->authentication_methods.emplace_back(AuthenticationType::JWT);
+            const auto jwt_config = user_config + ".jwt";
+            if (config.has(jwt_config + ".processor"))
+                user->authentication_methods.back().setTokenProcessorName(config.getString(jwt_config + ".processor"));
+            if (config.has(jwt_config + ".claims"))
+                user->authentication_methods.back().setJWTClaims(config.getString(jwt_config + ".claims"));
         }
         else
         {
