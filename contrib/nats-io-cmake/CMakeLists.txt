@@ -58,6 +58,7 @@ set(SRCS
 
 add_library(_nats_io ${SRCS} ${PS_SOURCES})
 add_library(ch_contrib::nats_io ALIAS _nats_io)
+target_compile_definitions(_nats_io PRIVATE -D_GNU_SOURCE=1)
 
 target_include_directories(_nats_io SYSTEM PUBLIC ${NATS_IO_SOURCE_DIR})
 target_include_directories(_nats_io SYSTEM PUBLIC ${NATS_IO_SOURCE_DIR}/adapters)

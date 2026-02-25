@@ -108,6 +108,7 @@ target_include_directories(_gsasl PUBLIC ${SRC_DIR}/digest-md5)
 target_include_directories(_gsasl PUBLIC "${ClickHouse_SOURCE_DIR}/contrib/libgsasl-cmake/linux_x86_64/include")
 
 target_compile_definitions(_gsasl PRIVATE HAVE_CONFIG_H=1)
+target_compile_definitions(_gsasl PRIVATE _GNU_SOURCE=1)
 
 if (TARGET ch_contrib::krb5)
     target_link_libraries(_gsasl PUBLIC ch_contrib::krb5)
