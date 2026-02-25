@@ -110,13 +110,13 @@ const char * getMethod(EncryptionMethod Method)
     /// a different ciphertext / persistence). When ClickHouse migrated to OpenSSL on all platforms, this twist for s390/x needed to be kept,
     /// otherwise encrypted data on s390/x can no longer be read.
     if (Method == AES_128_GCM_SIV)
-#if defined(__s390x__)
+#if defined(__s390x__) || defined(OPENSSL_IS_BORINGSSL)
         return "AES-128-GCM";
 #else
         return "AES-128-GCM-SIV";
 #endif
     else if (Method == AES_256_GCM_SIV)
-#if defined(__s390x__)
+#if defined(__s390x__) || defined(OPENSSL_IS_BORINGSSL)
         return "AES-256-GCM";
 #else
         return "AES-256-GCM-SIV";
