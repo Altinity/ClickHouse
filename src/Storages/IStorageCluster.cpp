@@ -314,7 +314,11 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
             auto modified_query_tree = query_info.query_tree->clone();
 
             rewriteJoinToGlobalJoin(modified_query_tree, context);
-            modified_query_tree = buildQueryTreeForShard(query_info.planner_context, modified_query_tree, /*allow_global_join_for_right_table*/ true);
+            modified_query_tree = buildQueryTreeForShard(
+                query_info.planner_context,
+                modified_query_tree,
+                /*allow_global_join_for_right_table*/ true,
+                /*find_cross_join*/ true);
             query_to_send = queryNodeToDistributedSelectQuery(modified_query_tree);
             send_external_tables = true;
         }
