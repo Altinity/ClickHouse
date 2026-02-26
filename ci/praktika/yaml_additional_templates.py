@@ -35,7 +35,7 @@ class AltinityWorkflowTemplates:
           echo "Workflow Run Report: [View Report]($REPORT_LINK)" >> $GITHUB_STEP_SUMMARY
 """
     # Additional jobs
-    REGRESSION_HASH = "2feb34cf9b5b342402419de37aa5374395428914"
+    REGRESSION_HASH = "093a8e113f564d6c4273fbd8ddcf659299a4ccdc"
     ALTINITY_JOBS = {
         "GrypeScan": r"""
   GrypeScanServer:
