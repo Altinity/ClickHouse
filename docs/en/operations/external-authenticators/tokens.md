@@ -212,7 +212,7 @@ Example (goes into `users.xml`):
 Here, the JWT payload must contain `["view-profile"]` on path `resource_access.account.roles`, otherwise authentication will not succeed even with a valid JWT.
 
 :::note
-If `claims` is defined, this user will not be able to authenticate using opaque tokens, so, only JWT-based authentication will be available.
+Per-user `claims` are enforced only when the token is a JWT (validated by a JWT processor such as `jwt_static_key` or `jwt_dynamic_jwks`). When the user authenticates with an opaque (access) token (e.g. via Azure, OpenID, or Google token processors), claims are not checked and authentication succeeds if the token is otherwise valid.
 :::
 
 ```
