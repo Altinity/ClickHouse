@@ -125,6 +125,11 @@
   check_types:
   - arm
   - cpu-aarch64
+- name: 01154_move_partition_long
+  reason: INVESTIGATE - Unstable on debug
+  message: 'curl: (28) Operation timed out'
+  check_types:
+  - debug
 - name: test_storage_s3_queue/test_5.py::test_migration[1-s3queue_]
   reason: KNOWN - Sometimes fails due to test order
   message: 'Failed: Timeout >900.0s'
