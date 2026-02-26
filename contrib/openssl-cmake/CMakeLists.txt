@@ -80,19 +80,25 @@ add_custom_target(build-awslc
     DEPENDS ${AWSLC_BINARIES_DIR}/libssl.a ${AWSLC_BINARIES_DIR}/libcrypto.a
 )
 
+if(ARCH_AARCH64)
+    set(DOCKERFILE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/Dockerfile.aarch64)
+else()
+    set(DOCKERFILE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/Dockerfile)
+endif()
+
 add_custom_command(
     OUTPUT
         "${AWSLC_BUILD_DIR}/output/libssl.a"
         "${AWSLC_BUILD_DIR}/output/libcrypto.a"
     COMMENT "Building AWS-LC in FIPS mode using Docker"
     COMMAND bash -c "chmod +x ${AWSLC_BUILD_DIR}/build_awclc_fips.sh"
-    COMMAND bash -c "${AWSLC_BUILD_DIR}/build_awclc_fips.sh ${AWSLC_BINARIES_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/Dockerfile"
+    COMMAND bash -c "${AWSLC_BUILD_DIR}/build_awclc_fips.sh ${AWSLC_BINARIES_DIR} ${DOCKERFILE_PATH}"
     WORKING_DIRECTORY ${AWSLC_BUILD_DIR}
     USES_TERMINAL # To stream output
     DEPENDS
         ${AWSLC_BUILD_DIR}/build_awclc_fips.sh
         ${AWSLC_BUILD_DIR}/check_version.c
-        ${CMAKE_CURRENT_SOURCE_DIR}/Dockerfile
+        ${DOCKERFILE_PATH}
 )
 
 add_library(crypto UNKNOWN IMPORTED GLOBAL)
