@@ -39,6 +39,9 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         /// controls new feature and it's 'true' by default, use 'false' as previous_value).
         /// It's used to implement `compatibility` setting (see https://github.com/ClickHouse/ClickHouse/issues/35972)
         /// Note: please check if the key already exists to prevent duplicate entries.
+        // addSettingsChanges(settings_changes_history, "26.1.3.20001",
+        // {
+        // });
         addSettingsChanges(settings_changes_history, "26.1",
         {
             {"parallel_replicas_filter_pushdown", false, false, "New setting"},
