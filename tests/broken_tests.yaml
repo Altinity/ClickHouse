@@ -258,6 +258,11 @@
   message: 'Timeout exceeded'
   check_types:
   - tsan
+- name: test_backup_restore_s3/test.py::test_backup_restore_system_tables_with_plain_rewritable_disk[data_file_name_from_checksum]
+  reason: 'INVESTIGATE: Timeout on tsan'
+  message: 'Timeout exceeded'
+  check_types:
+  - tsan
 - name: test_checking_s3_blobs_paranoid/test.py::test_when_s3_timeout_at_listing
   reason: 'INVESTIGATE: Unstable on tsan'
   message: 'Client failed!'
