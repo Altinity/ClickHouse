@@ -178,43 +178,43 @@
   reason: 'KNOWN - Unstable upstream'
   message: AssertionError
 - name: test_storage_s3_queue/test_5.py::test_failed_startup
-  reason: 'INVESTIGATE: Unstable on tsan'
+  reason: 'INVESTIGATE - Unstable on tsan'
   check_types:
   - tsan
 - name: test_storage_s3_queue/test_5.py::test_mv_settings[1-ordered]
-  reason: 'INVESTIGATE: Unstable on tsan'
+  reason: 'INVESTIGATE - Unstable on tsan'
   check_types:
   - tsan
 - name: test_storage_s3_queue/test_5.py::test_persistent_processing_nodes_cleanup
-  reason: 'INVESTIGATE: Unstable on tsan'
+  reason: 'INVESTIGATE - Unstable on tsan'
   check_types:
   - tsan
 - name: test_storage_s3_queue/test_5.py::test_detach_attach_table
-  reason: 'INVESTIGATE: Unstable on tsan'
+  reason: 'INVESTIGATE - Unstable on tsan'
   check_types:
   - tsan
 - name: test_storage_s3_queue/test_5.py::test_persistent_processing
-  reason: 'INVESTIGATE: Unstable on tsan'
+  reason: 'INVESTIGATE - Unstable on tsan'
   check_types:
   - tsan
 - name: test_storage_s3_queue/test_5.py::test_shutdown_order
-  reason: 'INVESTIGATE: Unstable on tsan'
+  reason: 'INVESTIGATE - Unstable on tsan'
   check_types:
   - tsan
 - name: test_storage_s3_queue/test_5.py::test_mv_settings[1-unordered]
-  reason: 'INVESTIGATE: Unstable on tsan'
+  reason: 'INVESTIGATE - Unstable on tsan'
   check_types:
   - tsan
 - name: test_storage_s3_queue/test_5.py::test_mv_settings[9999999999-unordered]
-  reason: 'INVESTIGATE: Unstable on tsan'
+  reason: 'INVESTIGATE - Unstable on tsan'
   check_types:
   - tsan
 - name: test_storage_s3_queue/test_5.py::test_mv_settings[9999999999-ordered]
-  reason: 'INVESTIGATE: Unstable on tsan'
+  reason: 'INVESTIGATE - Unstable on tsan'
   check_types:
   - tsan
 - name: test_storage_s3_queue/test_5.py::test_create_or_replace_table
-  reason: 'INVESTIGATE: Unstable on tsan'
+  reason: 'INVESTIGATE - Unstable on tsan'
   check_types:
   - tsan
 - name: test_database_hms/test.py::test_list_tables
@@ -233,51 +233,52 @@
   reason: 'KNOWN: Occasional timeout'
   message: docker_compose_iceberg_hms_catalog.yml', '--verbose', 'up', '-d']' timed out after 300 seconds
 - name: test_keeper_memory_soft_limit/test.py::test_soft_limit_create
-  reason: 'INVESTIGATE: Out of Memory or startup instability'
+  reason: 'INVESTIGATE - Out of Memory or startup instability'
 - name: test_s3_cache_locality/test.py::test_cache_locality[0]
-  reason: 'INVESTIGATE: Timeout or AssertionError'
+  reason: 'INVESTIGATE - Timeout or AssertionError'
 - name: test_dirty_pages_force_purge/test.py::test_dirty_pages_force_purge
   reason: 'KNOWN: https://github.com/Altinity/ClickHouse/issues/1369'
   message: 'RuntimeError: Failed to find peak memory counter'
 - name: test_storage_s3_queue/test_0.py::test_move_after_processing[same_bucket-AzureQueue]
-  reason: 'INVESTIGATE: Fails on ARM'
+  reason: 'INVESTIGATE - Fails on ARM'
   check_types:
   - arm_binary
 - name: test_backup_restore_s3/test.py::test_backup_to_s3_different_credentials[data_file_name_from_checksum-non_native_single]
-  reason: 'INVESTIGATE: Timeout on tsan'
+  reason: 'INVESTIGATE - Timeout on tsan'
   message: 'Timeout exceeded'
   check_types:
   - tsan
 - name: test_backup_restore_s3/test.py::test_backup_restore_system_tables_with_plain_rewritable_disk[data_file_name_from_checksum]
-  reason: 'INVESTIGATE: Timeout on tsan'
+  reason: 'INVESTIGATE - Timeout on tsan'
   message: 'Timeout exceeded'
   check_types:
   - tsan
 - name: test_backup_restore_s3/test.py::test_backup_restore_system_tables_with_plain_rewritable_disk[data_file_name_from_first_file_name]
-  reason: 'INVESTIGATE: Timeout on tsan'
-  message: 'Timeout exceeded'
-  check_types:
-  - tsan
-- name: test_backup_restore_s3/test.py::test_backup_restore_system_tables_with_plain_rewritable_disk[data_file_name_from_checksum]
-  reason: 'INVESTIGATE: Timeout on tsan'
-  message: 'Timeout exceeded'
+  reason: 'INVESTIGATE - Timeout on tsan'
+  message: 'Timeout'
   check_types:
   - tsan
 - name: test_checking_s3_blobs_paranoid/test.py::test_when_s3_timeout_at_listing
-  reason: 'INVESTIGATE: Unstable on tsan'
+  reason: 'INVESTIGATE - Unstable on tsan'
   message: 'Client failed!'
   check_types:
   - tsan
 - name: test_checking_s3_blobs_paranoid/test.py::test_query_is_canceled_with_inf_retries
-  reason: 'INVESTIGATE: Unstable on tsan'
+  reason: 'INVESTIGATE - Unstable on tsan'
   message: 'Client failed!'
   check_types:
   - tsan
 - name: test_checking_s3_blobs_paranoid/test.py::test_adaptive_timeouts[node_with_inf_s3_retries]
-  reason: 'INVESTIGATE: Unstable on tsan'
+  reason: 'INVESTIGATE - Unstable on tsan'
   message: 'Client failed!'
   check_types:
   - tsan
+- name: test_ttl_replicated/test.py::test_ttl_compatibility[node_left1-node_right1-1]
+  reason: 'INVESTIGATE - Unstable on asan'
+  message: 'Client timed out!'
+  check_types:
+  - asan
+
 
 # Regex rules should be ordered from most specific to least specific.
 # regex: true applies to name, message, and not_message fields, but not to reason or check_types fields.
