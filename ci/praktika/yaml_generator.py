@@ -1,4 +1,5 @@
 import dataclasses
+import os
 from typing import List
 
 from . import Artifact, Job, Workflow
@@ -54,16 +55,15 @@ env:
 jobs:
 {JOBS}\
 """
-        TEMPLATE_GH_TOKEN_PERMISSIONS = """\
-# Allow updating GH commit statuses and PR comments to post an actual job reports link
-permissions: write-all\
-"""
+        TEMPLATE_GH_TOKEN_PERMISSIONS = ""
         TEMPLATE_ENV_CHECKOUT_REF_PR = """\
+  GH_TOKEN: ${{{{ github.token }}}}
   DISABLE_CI_MERGE_COMMIT: ${{{{ vars.DISABLE_CI_MERGE_COMMIT || '0' }}}}
   DISABLE_CI_CACHE: ${{{{ github.event.inputs.no_cache || '0' }}}}
   CHECKOUT_REF: ${{{{ vars.DISABLE_CI_MERGE_COMMIT == '1' && github.event.pull_request.head.sha || '' }}}}\
 """
         TEMPLATE_ENV_CHECKOUT_REF_DEFAULT = """\
+  GH_TOKEN: ${{{{ github.token }}}}
   CHECKOUT_REF: ""\
 """
         TEMPLATE_ENV_SECRET = """\
@@ -306,7 +306,8 @@ class PullRequestPushYamlGen:
             for artifact in job.artifacts_gh_provides:
                 uploads_github.append(
                     YamlGenerator.Templates.TEMPLATE_GH_UPLOAD.format(
-                        NAME=artifact.name, PATH=artifact.path
+                        NAME=artifact.name,
+                        PATH=os.path.relpath(artifact.path, os.getcwd()),
                     )
                 )
             downloads_github = []
@@ -322,14 +323,23 @@ class PullRequestPushYamlGen:
             )
 
             if_expression = ""
+            # NOTE (strtgbb): We still want the cache logic, we use it for skipping based on PR config
             if (
-                self.workflow_config.config.enable_cache
-                and job_name_normalized != config_job_name_normalized
+                # self.workflow_config.config.enable_cache
+                # and 
+                job_name_normalized != config_job_name_normalized
             ):
                 if_expression = YamlGenerator.Templates.TEMPLATE_IF_EXPRESSION.format(
                     WORKFLOW_CONFIG_JOB_NAME=config_job_name_normalized,
                     JOB_NAME_BASE64=Utils.to_base64(job_name),
                 )
+
+            elif self.workflow_config.if_condition:
+                # If this is the config workflow and the workflow template sets an if condition, use it
+                if_expression = (
+                    f"\n    if: ${{{{ {self.workflow_config.if_condition} }}}}"
+                )
+
             if job.run_unless_cancelled:
                 if_expression = (
                     YamlGenerator.Templates.TEMPLATE_IF_EXPRESSION_NOT_CANCELLED
@@ -470,7 +480,12 @@ class PullRequestPushYamlGen:
                     VAR_NAME=secret.name
                 )
         format_kwargs["ENV_SECRETS"] = GH_VAR_ENVS + SECRET_ENVS
-        format_kwargs["ENV_SECRETS"] += AltinityWorkflowTemplates.ADDITIONAL_GLOBAL_ENV
+
+        if self.parser.config.secrets:
+            # Only add global env if there are secrets in workflow config
+            format_kwargs[
+                "ENV_SECRETS"
+            ] += AltinityWorkflowTemplates.ADDITIONAL_GLOBAL_ENV
 
         template_1 = base_template.strip().format(
             NAME=self.workflow_config.name,

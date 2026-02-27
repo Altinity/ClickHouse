@@ -58,10 +58,10 @@ def docker_login(relogin: bool = True) -> None:
         "docker system info | grep --quiet -E 'Username|Registry'"
     ):
         Shell.check(
-            "docker login --username 'robotclickhouse' --password-stdin",
+            "docker login --username 'altinityinfra' --password-stdin",
             strict=True,
             stdin_str=Secret.Config(
-                "dockerhub_robot_password", type=Secret.Type.AWS_SSM_PARAMETER
+                "DOCKER_PASSWORD", type=Secret.Type.GH_SECRET
             ).get_value(),
             encoding="utf-8",
         )
@@ -168,8 +168,8 @@ def buildx_args(
     args = [
         f"--platform=linux/{arch}",
         f"--label=build-url={action_url}",
-        f"--label=com.clickhouse.build.githash={sha}",
-        f"--label=com.clickhouse.build.version={version}",
+        f"--label=com.altinity.build.githash={sha}",
+        f"--label=com.altinity.build.version={version}",
     ]
     if direct_urls:
         args.append(f"--build-arg=DIRECT_DOWNLOAD_URLS='{' '.join(direct_urls)}'")
@@ -310,6 +310,7 @@ def main():
     version_dict = None
     if not info.is_local_run:
         version_dict = info.get_kv_data("version")
+        print(f"Version dict from kv data: {version_dict}")
     if not version_dict:
         version_dict = CHVersion.get_current_version_as_dict()
         if not info.is_local_run:
@@ -319,6 +320,7 @@ def main():
             info.add_workflow_report_message(
                 "WARNING: ClickHouse version has not been found in workflow kv storage"
             )
+        print(f"Version dict from repo: {version_dict}")
     assert version_dict
 
     if not info.is_local_run:
@@ -395,7 +397,7 @@ def main():
                     repo_urls,
                     os_,
                     tag,
-                    version_dict["describe"],
+                    version_dict["string"],
                     direct_urls,
                     run_url=info.run_url,
                     sha=info.sha,

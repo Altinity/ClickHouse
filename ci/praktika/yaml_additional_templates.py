@@ -8,7 +8,6 @@ class AltinityWorkflowTemplates:
   AZURE_CONTAINER_NAME: ${{{{ secrets.AZURE_CONTAINER_NAME }}}}
   AZURE_STORAGE_ACCOUNT_URL: "https://${{{{ secrets.AZURE_ACCOUNT_NAME }}}}.blob.core.windows.net/"
   ROBOT_TOKEN: ${{{{ secrets.ROBOT_TOKEN }}}}
-  GH_TOKEN: ${{{{ github.token }}}}
 """
     # Additional pre steps for all jobs
     JOB_SETUP_STEPS = """
@@ -22,6 +21,7 @@ class AltinityWorkflowTemplates:
     # Additional pre steps for config workflow job
     ADDITIONAL_CI_CONFIG_STEPS = r"""
       - name: Note report location to summary
+        if: ${{ !failure() && env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY }}
         env:
           PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
           COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
@@ -49,7 +49,7 @@ class AltinityWorkflowTemplates:
     secrets: inherit
     with:
       docker_image: altinityinfra/clickhouse-server
-      version: ${{ fromJson(needs.config_workflow.outputs.data).custom_data.version.string }}
+      version: ${{ fromJson(needs.config_workflow.outputs.data).JOB_KV_DATA.version.string }}
       tag-suffix: ${{ matrix.suffix }}
   GrypeScanKeeper:
       needs: [config_workflow, docker_keeper_image]
@@ -58,7 +58,7 @@ class AltinityWorkflowTemplates:
       secrets: inherit
       with:
         docker_image: altinityinfra/clickhouse-keeper
-        version: ${{ fromJson(needs.config_workflow.outputs.data).custom_data.version.string }}
+        version: ${{ fromJson(needs.config_workflow.outputs.data).JOB_KV_DATA.version.string }}
 """,
         "Regression": r"""
   RegressionTestsRelease:
@@ -121,7 +121,7 @@ class AltinityWorkflowTemplates:
         if: ${{ !cancelled() }}
         uses: ./.github/actions/create_workflow_report
         with:
-          workflow_config: ${{ needs.config_workflow.outputs.data.workflow_config }}
+          workflow_config: ${{ toJson(needs) }}
           final: true
 """,
         "SourceUpload": r"""
@@ -132,7 +132,7 @@ class AltinityWorkflowTemplates:
     env:
         COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
-        VERSION: ${{ fromJson(needs.config_workflow.outputs.data).custom_data.version.string }}
+        VERSION: ${{ fromJson(needs.config_workflow.outputs.data).JOB_KV_DATA.version.string }}
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6

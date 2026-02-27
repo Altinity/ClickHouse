@@ -92,7 +92,7 @@ def run_tests(
     if "--no-zookeeper" not in extra_args:
         extra_args += " --zookeeper"
     # Remove --report-logs-stats, it hides sanitizer errors in def reportLogStats(args): clickhouse_execute(args, "SYSTEM FLUSH LOGS")
-    command = f"clickhouse-test --testname --check-zookeeper-session --hung-check --memory-limit {5*2**30} --trace \
+    command = f"clickhouse-test --testname --check-zookeeper-session --hung-check --memory-limit {10*2**30} --trace \
                 --capture-client-stacktrace --queries ./tests/queries --test-runs {rerun_count} \
                 {extra_args} \
                 --queries ./tests/queries {('--order=random' if random_order else '')} -- {' '.join(tests) if tests else ''} | ts '%Y-%m-%d %H:%M:%S' \
@@ -234,7 +234,15 @@ def main():
         #     verbose=True,
         # )
         # NOTE(strtgbb): We pass azure credentials through the docker command, not SSM.
-        pass
+        # NOTE(strtgbb): Azure credentials don't exist in community workflow
+        if info.is_community_pr:
+            print(
+                "NOTE: No azure credentials provided for community PR - disable azure storage"
+            )
+            config_installs_args += " --no-azure"
+
+            # NOTE(strtgbb): With the above, some tests are still trying to use azure, try this:
+            os.environ["USE_AZURE_STORAGE_FOR_MERGE_TREE"] = "0"
     else:
         print("Disable azure for a local run")
         config_installs_args += " --no-azure"
