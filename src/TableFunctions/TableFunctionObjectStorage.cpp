@@ -190,6 +190,10 @@ StoragePtr TableFunctionObjectStorage<Definition, Configuration, is_data_lake>::
 
     const auto is_secondary_query = context->getClientInfo().query_kind == ClientInfo::QueryKind::SECONDARY_QUERY;
 
+    bool can_use_distributed_iterator =
+        client_info.collaborate_with_initiator &&
+        context->hasClusterFunctionReadTaskCallback();
+
     if (can_use_parallel_replicas && !is_secondary_query && !is_insert_query)
     {
         storage = std::make_shared<StorageObjectStorageCluster>(
@@ -207,16 +211,13 @@ StoragePtr TableFunctionObjectStorage<Definition, Configuration, is_data_lake>::
             configuration->getCatalog(context, /* attach */ false),
             /* if_not_exists */ false,
             /* is_datalake_query */ false,
+            /* distributed_processing */ can_use_distributed_iterator,
             /* is_table_function */ true,
             /* lazy_init */ false);
 
         storage->startup();
         return storage;
     }
-
-    bool can_use_distributed_iterator =
-        client_info.collaborate_with_initiator &&
-        context->hasClusterFunctionReadTaskCallback();
 
     storage = std::make_shared<StorageObjectStorage>(
         configuration,

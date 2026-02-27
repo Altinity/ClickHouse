@@ -63,6 +63,9 @@ namespace Setting
     extern const SettingsBool allow_experimental_database_glue_catalog;
     extern const SettingsBool allow_experimental_database_hms_catalog;
     extern const SettingsBool use_hive_partitioning;
+    extern const SettingsBool parallel_replicas_for_cluster_engines;
+    extern const SettingsString cluster_for_parallel_replicas;
+
 }
 namespace DataLakeStorageSetting
 {
@@ -434,6 +437,21 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
 
     auto cluster_name = settings[DatabaseDataLakeSetting::object_storage_cluster].value;
 
+    const auto & query_settings = context_->getSettingsRef();
+
+    const auto parallel_replicas_cluster_name = query_settings[Setting::cluster_for_parallel_replicas].toString();
+    if (!parallel_replicas_cluster_name.empty())
+        cluster_name = parallel_replicas_cluster_name;
+
+    const auto can_use_parallel_replicas = !parallel_replicas_cluster_name.empty()
+        && query_settings[Setting::parallel_replicas_for_cluster_engines]
+        && context_->canUseTaskBasedParallelReplicas()
+        && !context_->isDistributed();
+
+    bool can_use_distributed_iterator =
+        context_->getClientInfo().collaborate_with_initiator &&
+        can_use_parallel_replicas;
+
     return std::make_shared<StorageObjectStorageCluster>(
         cluster_name,
         configuration,
@@ -449,6 +467,7 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
         getCatalog(),
         /* if_not_exists */ true,
         /* is_datalake_query */ true,
+        can_use_distributed_iterator,
         /* is_table_function */ true,
         /* lazy_init */ true);
 }
