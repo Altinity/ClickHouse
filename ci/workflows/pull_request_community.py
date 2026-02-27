@@ -1,11 +1,9 @@
-from praktika import Workflow
+import copy
+from praktika import Workflow, Artifact
 
-from ci.defs.defs import BASE_BRANCH, DOCKERS, SECRETS, ArtifactConfigs, JobNames
+from ci.defs.defs import BASE_BRANCH, DOCKERS, ArtifactConfigs, JobNames
 from ci.defs.job_configs import JobConfigs
 from ci.jobs.scripts.workflow_hooks.filter_job import should_skip_job
-from ci.jobs.scripts.workflow_hooks.trusted import can_be_trusted
-
-ALL_FUNCTIONAL_TESTS = [job.name for job in JobConfigs.functional_tests_jobs]
 
 FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES = [
     job.name
@@ -21,34 +19,24 @@ FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES = [
     )
 ]
 
-STYLE_AND_FAST_TESTS = [
-    # JobNames.STYLE_CHECK,
-    JobNames.FAST_TEST,
-    # *[j.name for j in JobConfigs.tidy_build_arm_jobs],
-]
-
-REGULAR_BUILD_NAMES = [job.name for job in JobConfigs.build_jobs]
-
 PLAIN_FUNCTIONAL_TEST_JOB = [
     j for j in JobConfigs.functional_tests_jobs if "amd_debug, parallel" in j.name
 ][0]
 
 workflow = Workflow.Config(
-    name="PR",
+    name="Community PR",
     event=Workflow.Event.PULL_REQUEST,
     base_branches=[BASE_BRANCH, "releases/*", "antalya-*"],
+    if_condition="github.repository != github.event.pull_request.head.repo.full_name",
     jobs=[
-        # JobConfigs.style_check, # NOTE (strtgbb): we don't run style check
-        # JobConfigs.docs_job, # NOTE (strtgbb): we don't build docs
         JobConfigs.fast_test,
-        # *JobConfigs.tidy_build_arm_jobs, # NOTE (strtgbb): we don't run tidy build jobs
-        *[job.set_dependency(STYLE_AND_FAST_TESTS) for job in JobConfigs.build_jobs],
+        *[job.set_dependency([JobNames.FAST_TEST]) for job in JobConfigs.build_jobs],
         *[
-            job.set_dependency(STYLE_AND_FAST_TESTS)
+            job.set_dependency([JobNames.FAST_TEST])
             for job in JobConfigs.extra_validation_build_jobs
         ],
         *[
-            job.set_dependency(STYLE_AND_FAST_TESTS)
+            job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
             for job in JobConfigs.release_build_jobs
         ],
         # *[
@@ -80,8 +68,6 @@ workflow = Workflow.Config(
             for job in JobConfigs.integration_test_jobs_non_required
         ],
         *JobConfigs.unittest_jobs,
-        JobConfigs.docker_server,
-        JobConfigs.docker_keeper,
         *[
             job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
             for job in JobConfigs.install_check_jobs
@@ -90,28 +76,15 @@ workflow = Workflow.Config(
             job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
             for job in JobConfigs.compatibility_test_jobs
         ],
-        *[
-            job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
-            for job in JobConfigs.stress_test_jobs
-        ],
+        # *[
+        #     job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
+        #     for job in JobConfigs.stress_test_jobs
+        # ], # NOTE (strtgbb): Does not support github artifacts
         # *[
         #     job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
         #     for job in JobConfigs.upgrade_test_jobs
         # ], # TODO: customize for our repo
-        *[
-            job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
-            for job in JobConfigs.ast_fuzzer_jobs
-        ],
-        *[
-            job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
-            for job in JobConfigs.buzz_fuzzer_jobs
-        ],
-        # *[
-        #    job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
-        #    for job in JobConfigs.performance_comparison_with_master_head_jobs
-        # ], # NOTE (strtgbb): failed previously due to GH secrets not being handled properly, try again later
     ],
-    additional_jobs=["GrypeScan", "Regression", "CIReport", "SourceUpload"],
     artifacts=[
         *ArtifactConfigs.unittests_binaries,
         *ArtifactConfigs.clickhouse_binaries,
@@ -123,33 +96,25 @@ workflow = Workflow.Config(
         ArtifactConfigs.fuzzers_corpus,
     ],
     dockers=DOCKERS,
-    enable_dockers_manifest_merge=True,
-    secrets=SECRETS,
-    enable_job_filtering_by_changes=True,
-    enable_cache=True,
-    enable_report=True,
-    enable_cidb=True,
-    enable_merge_ready_status=False,  # NOTE (strtgbb): we don't use this, TODO, see if we can use it
+    disable_dockers_build=True,
+    enable_dockers_manifest_merge=False,
+    secrets=[],
+    enable_job_filtering_by_changes=False,  # TODO: Change this back?
+    enable_cache=False,
+    enable_report=False,
+    enable_cidb=False,
+    enable_merge_ready_status=False,
     enable_gh_summary_comment=False,
-    enable_commit_status_on_failure=True,
+    enable_commit_status_on_failure=False,
     enable_open_issues_check=False,
     enable_slack_feed=False,
     pre_hooks=[
-        # can_be_trusted, # NOTE (strtgbb): relies on labels we don't use
         "python3 ./ci/jobs/scripts/workflow_hooks/store_data.py",
-        # "python3 ./ci/jobs/scripts/workflow_hooks/pr_labels_and_category.py", # NOTE (strtgbb): relies on labels we don't use
         "python3 ./ci/jobs/scripts/workflow_hooks/version_log.py",
         "python3 ./ci/jobs/scripts/workflow_hooks/parse_ci_tags.py",
-        # "python3 ./ci/jobs/scripts/workflow_hooks/quick_sync.py", # NOTE (strtgbb): we don't do this
-        # "python3 ./ci/jobs/scripts/workflow_hooks/team_notifications.py",
     ],
     workflow_filter_hooks=[should_skip_job],
-    post_hooks=[
-        # "python3 ./ci/jobs/scripts/workflow_hooks/pr_body_check.py", # NOTE (strtgbb): Maybe we can use this
-        # "python3 ./ci/jobs/scripts/workflow_hooks/feature_docs.py", # NOTE (strtgbb): we don't build docs
-        # "python3 ./ci/jobs/scripts/workflow_hooks/new_tests_check.py", # NOTE (strtgbb): we don't use this
-        # "python3 ./ci/jobs/scripts/workflow_hooks/can_be_merged.py", # NOTE (strtgbb): relies on labels we don't use
-    ],
+    post_hooks=[],
     job_aliases={
         "integration": JobConfigs.integration_test_jobs_non_required[
             0
@@ -157,6 +122,15 @@ workflow = Workflow.Config(
         "functional": PLAIN_FUNCTIONAL_TEST_JOB.name,
     },
 )
+
+# NOTE (strtgbb): use deepcopy to avoid modifying workflows generated after this one
+for i, job in enumerate(workflow.jobs):
+    workflow.jobs[i] = copy.deepcopy(job)
+    workflow.jobs[i].enable_commit_status = False
+
+for i, artifact in enumerate(workflow.artifacts):
+    workflow.artifacts[i] = copy.deepcopy(artifact)
+    workflow.artifacts[i].type = Artifact.Type.GH
 
 WORKFLOWS = [
     workflow,

@@ -8,7 +8,6 @@ class AltinityWorkflowTemplates:
   AZURE_CONTAINER_NAME: ${{{{ secrets.AZURE_CONTAINER_NAME }}}}
   AZURE_STORAGE_ACCOUNT_URL: "https://${{{{ secrets.AZURE_ACCOUNT_NAME }}}}.blob.core.windows.net/"
   ROBOT_TOKEN: ${{{{ secrets.ROBOT_TOKEN }}}}
-  GH_TOKEN: ${{{{ github.token }}}}
 """
     # Additional pre steps for all jobs
     JOB_SETUP_STEPS = """
@@ -22,6 +21,7 @@ class AltinityWorkflowTemplates:
     # Additional pre steps for config workflow job
     ADDITIONAL_CI_CONFIG_STEPS = r"""
       - name: Note report location to summary
+        if: ${{ !failure() && env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY }}
         env:
           PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
           COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
@@ -71,7 +71,7 @@ class AltinityWorkflowTemplates:
       commit: {REGRESSION_HASH}
       arch: release
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      timeout_minutes: 300
+      timeout_minutes: 210
       workflow_config: ${{ needs.config_workflow.outputs.data.workflow_config }}
   RegressionTestsAarch64:
     needs: [config_workflow, build_arm_binary]
@@ -83,7 +83,7 @@ class AltinityWorkflowTemplates:
       commit: {REGRESSION_HASH}
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      timeout_minutes: 300
+      timeout_minutes: 210
       workflow_config: ${{ needs.config_workflow.outputs.data.workflow_config }}
 """,
         "SignRelease": r"""
