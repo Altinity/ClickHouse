@@ -3204,7 +3204,7 @@ jobs:
 
   docker_server_image:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
-    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest, build_amd_release, build_arm_release, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel]
+    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest, build_amd_release, build_arm_release]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VyIHNlcnZlciBpbWFnZQ==') }}
     name: "Docker server image"
     outputs:
@@ -3249,7 +3249,7 @@ jobs:
 
   docker_keeper_image:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
-    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest, build_amd_release, build_arm_release, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel]
+    needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest, build_amd_release, build_arm_release]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.config_workflow.outputs.data).cache_success_base64, 'RG9ja2VyIGtlZXBlciBpbWFnZQ==') }}
     name: "Docker keeper image"
     outputs:
@@ -4045,7 +4045,7 @@ jobs:
     secrets: inherit
     with:
       runner_type: altinity-regression-tester
-      commit: b6ad0719560fc2e01298d287c7564d8e74ae915e
+      commit: 92f4413c775fc750e826951f5d235766c562a98f
       arch: x86
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout_minutes: 210
@@ -4057,7 +4057,7 @@ jobs:
     secrets: inherit
     with:
       runner_type: altinity-regression-tester-aarch64
-      commit: b6ad0719560fc2e01298d287c7564d8e74ae915e
+      commit: 92f4413c775fc750e826951f5d235766c562a98f
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       timeout_minutes: 210

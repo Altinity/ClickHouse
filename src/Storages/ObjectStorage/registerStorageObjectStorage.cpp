@@ -99,6 +99,7 @@ createStorageObjectStorage(const StorageFactory::Arguments & args, StorageObject
         configuration->getCatalog(context, args.query.attach),
         args.query.if_not_exists,
         /* is_datalake_query */ false,
+        /* distributed_processing */ false,
         /* is_table_function */ false,
         /* lazy_init */ false);
 }
