@@ -1,7 +1,8 @@
 #pragma once
 
 #include <Interpreters/Context_fwd.h>
-#include "config.h"
+#include <config.h>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PersistentTableComponents.h>
@@ -118,6 +119,11 @@ std::pair<String, String> parseTransformAndColumn(ASTPtr object, size_t i);
 DataTypePtr getFunctionResultType(const String & iceberg_transform_name, DataTypePtr source_type);
 
 KeyDescription getSortingKeyDescriptionFromMetadata(
+    Poco::JSON::Object::Ptr metadata_object, const NamesAndTypesList & ch_schema, ContextPtr local_context);
+/// Returns Iceberg/Spark-style display string for sort order, e.g. "id desc, hour(ts) asc".
+std::optional<String> getSortingKeyDisplayStringFromMetadata(
+    Poco::JSON::Object::Ptr metadata_object, const NamesAndTypesList & ch_schema);
+std::optional<String> getPartitionKeyStringFromMetadata(
     Poco::JSON::Object::Ptr metadata_object, const NamesAndTypesList & ch_schema, ContextPtr local_context);
 void sortBlockByKeyDescription(Block & block, const KeyDescription & sort_description, ContextPtr context);
 }
