@@ -624,11 +624,13 @@ class JobConfigs:
                 parameter="arm_asan, azure, parallel",
                 runs_on=RunnerLabels.FUNC_TESTER_ARM,
                 requires=[ArtifactNames.CH_ARM_ASAN],
+                timeout=3600 * 4,
             ),
             Job.ParamSet(
                 parameter="arm_asan, azure, sequential",
                 runs_on=RunnerLabels.FUNC_TESTER_ARM,
                 requires=[ArtifactNames.CH_ARM_ASAN],
+                timeout=3600 * 4,
             ),
         )
     )
