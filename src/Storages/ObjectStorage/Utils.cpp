@@ -342,8 +342,9 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
             normalized_path = "s3://" + target_decomposed.authority + "/" + target_decomposed.key;
         }
         S3::URI s3_uri(normalized_path);
-
-        std::string key_to_use = s3_uri.key;
+        
+        std::string key_to_use = target_decomposed.key;
+      
 
         bool use_base_storage = false;
         if (base_storage->getType() == ObjectStorageType::S3)
