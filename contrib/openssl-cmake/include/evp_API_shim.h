@@ -128,6 +128,7 @@ static inline int BIO_do_handshake(BIO *b) {
         BIO_up_ref(BIO_next(b));
         SSL_set_bio(ssl, BIO_next(b), BIO_next(b));
     }
+    BIO_clear_retry_flags(b);
     int ret = SSL_do_handshake(ssl);
     if (ret == 1)
         return 1;
@@ -151,7 +152,7 @@ static inline int X509_VERIFY_PARAM_set1_host_shim(X509_VERIFY_PARAM *param,
                                                      const char *name,
                                                      size_t namelen) {
     return X509_VERIFY_PARAM_set1_host(param, name,
-                                        namelen == 0 ? strlen(name) : namelen);
+                                        namelen == 0 && name? strlen(name) : namelen);
 }
 #define X509_VERIFY_PARAM_set1_host X509_VERIFY_PARAM_set1_host_shim
 
