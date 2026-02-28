@@ -152,9 +152,9 @@ def test_delete_after_processing(started_cluster, mode, engine_name):
     node.query("system flush logs")
 
     if engine_name == "S3Queue":
-        system_tables = ["s3queue_log", "s3queue"]
+        system_tables = ["s3queue_log", "s3queue_metadata_cache"]
     else:
-        system_tables = ["azure_queue_log", "azure_queue"]
+        system_tables = ["azure_queue_log", "azure_queue_metadata_cache"]
 
     for table in system_tables:
         if table.endswith("_log"):
@@ -241,9 +241,9 @@ def test_tag_after_processing(started_cluster, engine_name):
     node.query("system flush logs")
 
     if engine_name == "S3Queue":
-        system_tables = ["s3queue_log", "s3queue"]
+        system_tables = ["s3queue_log", "s3queue_metadata_cache"]
     else:
-        system_tables = ["azure_queue_log", "azure_queue"]
+        system_tables = ["azure_queue_log", "azure_queue_metadata_cache"]
 
     for table in system_tables:
         if table.endswith("_log"):
@@ -361,9 +361,9 @@ def test_move_after_processing(started_cluster, engine_name, move_to):
     node.query("system flush logs")
 
     if engine_name == "S3Queue":
-        system_tables = ["s3queue_log", "s3queue"]
+        system_tables = ["s3queue_log", "s3queue_metadata_cache"]
     else:
-        system_tables = ["azure_queue_log", "azure_queue"]
+        system_tables = ["azure_queue_log", "azure_queue_metadata_cache"]
 
     for table in system_tables:
         if table.endswith("_log"):
