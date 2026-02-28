@@ -54,6 +54,7 @@ class Targeting:
     def __init__(self, info: Info, branch: str = ""):
         self.info = info
         self.branch = branch or getattr(info, 'base_branch', '')
+        self.cidb = CIDBCluster()
         if "stateless" in info.job_name.lower():
             self.job_type = self.STATELESS_JOB_TYPE
         elif "integration" in info.job_name.lower():
@@ -101,7 +102,6 @@ class Targeting:
         ), "Find tests by previous failures applicable only for PRs"
 
         tests = []
-        cidb = CIDBCluster()
         if self.job_type == self.INTEGRATION_JOB_TYPE:
             test_name_pattern = "^test_"
         elif self.job_type == self.STATELESS_JOB_TYPE:
@@ -113,7 +113,9 @@ class Targeting:
             JOB_TYPE=self.job_type,
             TEST_NAME_PATTERN=test_name_pattern,
         )
-        query_result = cidb.do_select_query(query, db_name=Settings.CI_DB_DB_NAME, timeout=20)
+        query_result = self.cidb.do_select_query(
+            query, db_name=Settings.CI_DB_DB_NAME, timeout=20
+        )
         if not query_result:
             return []
         # Parse test names from the query result
@@ -141,10 +143,11 @@ class Targeting:
         and symbol = '{SYMBOL}'
         """
         symbol_to_tests = {}
-        cidb = CIDBCluster()
         for symbol in symbols:
             query = SYMBOL_TO_TESTS_QUERY.format(BRANCH=self.branch, JOB_TYPE=self.job_type, SYMBOL=symbol)
-            result = cidb.do_select_query(query, db_name=Settings.CI_DB_DB_NAME, timeout=20)
+            result = self.cidb.do_select_query(
+                query, db_name=Settings.CI_DB_DB_NAME, timeout=20
+            )
             # Parse the ClickHouse Array result
             if result and result.strip():
                 try:
