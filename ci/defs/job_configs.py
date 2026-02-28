@@ -73,7 +73,7 @@ common_ft_job_config = Job.Config(
         ],
     ),
     result_name_for_cidb="Tests",
-    timeout=int(3600 * 2.5),
+    timeout=int(3600 * 3),
 )
 
 common_stress_job_config = Job.Config(
@@ -624,11 +624,13 @@ class JobConfigs:
                 parameter="arm_asan, azure, parallel",
                 runs_on=RunnerLabels.FUNC_TESTER_ARM,
                 requires=[ArtifactNames.CH_ARM_ASAN],
+                timeout=3600 * 4,
             ),
             Job.ParamSet(
                 parameter="arm_asan, azure, sequential",
                 runs_on=RunnerLabels.FUNC_TESTER_ARM,
                 requires=[ArtifactNames.CH_ARM_ASAN],
+                timeout=3600 * 4,
             ),
         )
     )
