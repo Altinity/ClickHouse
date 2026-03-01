@@ -30,7 +30,10 @@ ClickHouseVersion::ClickHouseVersion(std::string_view version)
         ReadBufferFromString buf(split[i]);
         if (!tryReadIntText(component, buf) || !buf.eof())
         {
-            /// Non-numeric component (e.g. "altinityantalya"): treat this and remaining parts as suffix
+            /// Non-numeric component (e.g. "altinityantalya"): treat this and remaining parts as suffix.
+            /// Valid version must have at least one numeric component (e.g. "26.1.3.20001.altinityantalya").
+            if (components.empty())
+                throw Exception{ErrorCodes::BAD_ARGUMENTS, "Cannot parse ClickHouse version here: {}", version};
             Strings suffix_parts(split.begin() + i, split.end());
             suffix = boost::algorithm::join(suffix_parts, ".");
             break;
