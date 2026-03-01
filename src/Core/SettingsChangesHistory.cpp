@@ -42,6 +42,11 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         // addSettingsChanges(settings_changes_history, "26.1.3.20001",
         // {
         // });
+        addSettingsChanges(settings_changes_history, "26.1.3.20001.altinityantalya",
+        {
+            {"object_storage_cluster", "", "", "Antalya: New setting"},
+            {"object_storage_max_nodes", 0, 0, "Antalya: New setting"},
+        });
         addSettingsChanges(settings_changes_history, "26.1",
         {
             {"parallel_replicas_filter_pushdown", false, false, "New setting"},
@@ -226,6 +231,10 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         });
         // addSettingsChanges(settings_changes_history, "25.8.9.2000",
         // {
+        addSettingsChanges(settings_changes_history, "25.8.16.20001.altinityantalya",
+        {
+            {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."},
+            {"object_storage_remote_initiator", false, false, "New setting."},
         //     {"allow_experimental_iceberg_read_optimization", true, true, "New setting."},
         //     {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
         //     {"lock_object_storage_task_distribution_ms", 500, 500, "Raised the value to 500 to avoid hoping tasks between executors."},
