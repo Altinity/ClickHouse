@@ -188,6 +188,7 @@ BlockIO executeDDLQueryOnCluster(const ASTPtr & query_ptr_, ContextPtr context, 
     entry.setSettingsIfRequired(context);
     entry.tracing_context = OpenTelemetry::CurrentContext();
     entry.initial_query_id = context->getClientInfo().initial_query_id;
+    ddl_worker.updateHostIDs(entry.hosts);
     String node_path = ddl_worker.enqueueQuery(entry, params.retries_info);
 
     return getDDLOnClusterStatus(node_path, ddl_worker.getReplicasDir(), entry, context);
