@@ -109,7 +109,7 @@ $CLICKHOUSE_CLIENT --config $CONFIG --connection test_port -q 'select tcpPort()'
 $CLICKHOUSE_CLIENT --config $CONFIG --connection test_port --port $TEST_PORT -q 'select tcpPort()'
 echo 'secure'
 
-$CLICKHOUSE_CLIENT --config $CONFIG --connection test_secure -q 'select tcpPort()' |& grep -c -F -o -e 'SSL routines::wrong version number' -e 'tcp_secure protocol is disabled because poco library was built without NetSSL support.'
+$CLICKHOUSE_CLIENT --config $CONFIG --connection test_secure -q 'select tcpPort()' |& grep -c -F -o -e 'SSL routines::wrong version number' -e 'WRONG_VERSION_NUMBER' -e 'tcp_secure protocol is disabled because poco library was built without NetSSL support.'
 
 echo 'database'
 $CLICKHOUSE_CLIENT --config $CONFIG --connection test_database -q 'select currentDatabase()'
