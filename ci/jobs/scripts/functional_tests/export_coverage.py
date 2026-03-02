@@ -62,7 +62,7 @@ class CoverageExporter:
 
             if not self.to_file:
                 query = (
-                    f"INSERT INTO FUNCTION remoteSecure('{self.dest.url.removeprefix('https://')}', '{Settings.CI_DB_DB_NAME}.checks_coverage_inverted', '{self.dest.user}', '{self.dest.pwd}') "
+                    f"INSERT INTO FUNCTION remoteSecure('{self.dest.url.removeprefix('https://').split(':')[0]}', '{Settings.CI_DB_DB_NAME}.checks_coverage_inverted', '{self.dest.user}', '{self.dest.pwd}') "
                     "SELECT DISTINCT "
                     "arrayJoin(symbol) AS symbol, "
                     f"'{self.check_start_time}' AS check_start_time, "
