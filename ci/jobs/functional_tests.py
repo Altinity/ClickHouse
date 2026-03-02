@@ -627,6 +627,7 @@ def main():
                     src=CH,
                     dest=cidb_cluster,
                     job_name=info.job_name,
+                    branch=info.git_branch,
                 ).do(),
             )
         )
