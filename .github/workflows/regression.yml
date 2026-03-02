@@ -346,7 +346,7 @@ jobs:
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
       job_name: parquet_${{ matrix.STORAGE }}
-      regression_args: --storage ${{ matrix.STORAGE }} --aws-s3-bucket {{AWS_BUCKET}} --aws-s3-region {{AWS_REGION}} --aws-s3-key-id {{AWS_KEY_ID}} --aws-s3-access-key {{AWS_ACCESS_KEY}}
+      regression_args: --storage ${{ matrix.STORAGE }} --aws-s3-bucket {{AWS_BUCKET}} --aws-s3-region {{AWS_REGION}} --aws-s3-key-id {{AWS_KEY_ID}} --aws-s3-access-key {{AWS_ACCESS_KEY}} --only "/parquet/${{ matrix.STORAGE }}/*"
     secrets: inherit
 
   RBAC:
