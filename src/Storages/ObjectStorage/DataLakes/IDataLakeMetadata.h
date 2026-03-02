@@ -85,7 +85,9 @@ public:
 
     virtual void modifyFormatSettings(FormatSettings &, const Context &) const {}
 
+    static constexpr bool supportsTotalRows() { return false; }
     virtual std::optional<size_t> totalRows(ContextPtr) const { return {}; }
+    static constexpr bool supportsTotalBytes() { return false; }
     virtual std::optional<size_t> totalBytes(ContextPtr) const { return {}; }
 
     /// Data which we are going to read is sorted by sorting key specified in StorageMetadataPtr.
@@ -136,6 +138,9 @@ public:
     virtual void checkAlterIsPossible(const AlterCommands & /*commands*/) { throwNotImplemented("alter"); }
     virtual void alter(const AlterCommands & /*params*/, ContextPtr /*context*/) { throwNotImplemented("alter"); }
     virtual void drop(ContextPtr) { }
+
+    virtual std::optional<String> partitionKey(ContextPtr) const { return {}; }
+    virtual std::optional<String> sortingKey(ContextPtr) const { return {}; }
 
 protected:
     virtual ObjectIterator

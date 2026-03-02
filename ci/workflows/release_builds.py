@@ -48,14 +48,17 @@ workflow = Workflow.Config(
         *ArtifactConfigs.clickhouse_tgzs,
     ],
     dockers=DOCKERS,
+    enable_dockers_manifest_merge=True,
     secrets=SECRETS,
     enable_job_filtering_by_changes=False,
     enable_cache=False,
     enable_report=True,
     enable_cidb=True,
+    enable_merge_ready_status=False,  # NOTE (strtgbb): we don't use this, TODO, see if we can use it
     enable_gh_summary_comment=False,
     enable_commit_status_on_failure=True,
     enable_open_issues_check=False,
+    enable_slack_feed=False,
     pre_hooks=[
         "python3 ./ci/jobs/scripts/workflow_hooks/store_data.py",
         "python3 ./ci/jobs/scripts/workflow_hooks/version_log.py",

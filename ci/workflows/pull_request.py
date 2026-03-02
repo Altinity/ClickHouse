@@ -48,7 +48,7 @@ workflow = Workflow.Config(
             for job in JobConfigs.extra_validation_build_jobs
         ],
         *[
-            job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
+            job.set_dependency(STYLE_AND_FAST_TESTS)
             for job in JobConfigs.release_build_jobs
         ],
         # *[
@@ -57,8 +57,8 @@ workflow = Workflow.Config(
         # ],
         # TODO: stabilize new jobs and remove set_allow_merge_on_failure
         JobConfigs.lightweight_functional_tests_job,
-        # JobConfigs.stateless_tests_targeted_pr_jobs[0].set_allow_merge_on_failure(), # NOTE (strtgbb): Needs configuration
-        # JobConfigs.integration_test_targeted_pr_jobs[0].set_allow_merge_on_failure(),
+        JobConfigs.stateless_tests_targeted_pr_jobs[0].set_allow_merge_on_failure(),
+        JobConfigs.integration_test_targeted_pr_jobs[0].set_allow_merge_on_failure(),
         # *JobConfigs.stateless_tests_flaky_pr_jobs,
         # *JobConfigs.integration_test_asan_flaky_pr_jobs,
         # JobConfigs.bugfix_validation_ft_pr_job,
@@ -80,12 +80,8 @@ workflow = Workflow.Config(
             for job in JobConfigs.integration_test_jobs_non_required
         ],
         *JobConfigs.unittest_jobs,
-        JobConfigs.docker_server.set_dependency(
-            FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES
-        ),
-        JobConfigs.docker_keeper.set_dependency(
-            FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES
-        ),
+        JobConfigs.docker_server,
+        JobConfigs.docker_keeper,
         *[
             job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
             for job in JobConfigs.install_check_jobs
