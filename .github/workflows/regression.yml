@@ -126,7 +126,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        SUITE: [aes_encryption, atomic_insert, base_58, data_types, datetime64_extended_range, disk_level_encryption, dns, engines, example, extended_precision_data_types, functions, kafka, kerberos, key_value, lightweight_delete, memory, part_moves_between_shards, selects, session_timezone, swarms, version, window_functions]
+        SUITE: [aes_encryption, atomic_insert, attach, base_58, clickhouse_keeper_failover,data_types, datetime64_extended_range, disk_level_encryption, dns, engines, example, extended_precision_data_types, functions, jwt_authentication, kafka, kerberos, key_value, lightweight_delete, memory, part_moves_between_shards, selects, session_timezone, settings, swarms, version, window_functions]
     uses: ./.github/workflows/regression-reusable-suite.yml
     with:
       ref: ${{ inputs.commit }}
