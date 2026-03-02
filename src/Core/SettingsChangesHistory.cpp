@@ -39,12 +39,9 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         /// controls new feature and it's 'true' by default, use 'false' as previous_value).
         /// It's used to implement `compatibility` setting (see https://github.com/ClickHouse/ClickHouse/issues/35972)
         /// Note: please check if the key already exists to prevent duplicate entries.
-        // addSettingsChanges(settings_changes_history, "26.1.3.20001",
-        // {
-        // });
         addSettingsChanges(settings_changes_history, "26.1.3.20001.altinityantalya",
         {
-            // {"object_storage_cluster", "", "", "Antalya: New setting"},
+            {"iceberg_partition_timezone", "", "", "New setting."},
             // {"object_storage_max_nodes", 0, 0, "Antalya: New setting"},
         });
         addSettingsChanges(settings_changes_history, "26.1",

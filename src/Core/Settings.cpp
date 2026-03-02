@@ -7348,6 +7348,15 @@ Throw an error if there are pending mutations when exporting a merge tree part.
     DECLARE(Bool, export_merge_tree_part_throw_on_pending_patch_parts, true, R"(
 Throw an error if there are pending patch parts when exporting a merge tree part.
 )", 0) \
+    DECLARE(Timezone, iceberg_partition_timezone, "", R"(
+Time zone by which partitioning of Iceberg tables was performed.
+Possible values:
+
+- Any valid timezone, e.g. `Europe/Berlin`, `UTC` or `Zulu`
+- `` (empty value) - use server or session timezone
+
+Default value is empty.
+)", 0) \
     \
     /* ####################################################### */ \
     /* ########### START OF EXPERIMENTAL FEATURES ############ */ \
