@@ -31,7 +31,7 @@ protected:
     }
 };
 
-ObjectStorageListObjectsCache::Key ObjectStorageListObjectsCacheTest::default_key {"default", "test-bucket", "test-prefix/"};
+ObjectStorageListObjectsCache::Key ObjectStorageListObjectsCacheTest::default_key {"default", "test-bucket", "test-prefix/", false};
 
 TEST_F(ObjectStorageListObjectsCacheTest, BasicSetAndGet)
 {
@@ -206,6 +206,39 @@ TEST_F(ObjectStorageListObjectsCacheTest, BestPrefixMatch)
     // should pick mid_prefix, which has size 2. filter_by_prefix=false so we can assert by size
     auto result = cache->get(long_prefix_key, false).value();
     EXPECT_EQ(result.size(), 2u);
+}
+
+TEST_F(ObjectStorageListObjectsCacheTest, WithTags)
+{
+    cache->clear();
+
+    auto key_with_tags = default_key;
+    key_with_tags.with_tags = true;
+
+    auto value_with_tags = createTestValue({"test.txt"});
+
+    cache->set(key_with_tags, value_with_tags);
+
+    /// we have set with tags, we should be able to retrieve it
+    auto result_with_tags = cache->get(key_with_tags).value();
+    EXPECT_EQ(result_with_tags.size(), 1u);
+    EXPECT_EQ(result_with_tags[0]->getPath(), "test.txt");
+
+    /// querying by a key without tags should return nothing
+    auto result_without_tags = cache->get(default_key);
+    EXPECT_FALSE(result_without_tags.has_value());
+
+    cache->clear();
+
+    cache->set(default_key, value_with_tags);
+
+    /// querying by a key with tags should return nothing
+    EXPECT_FALSE(cache->get(key_with_tags).has_value());
+
+    /// querying by a key without tags should return the value
+    auto result_without_tags_2 = cache->get(default_key).value();
+    EXPECT_EQ(result_without_tags_2.size(), 1u);
+    EXPECT_EQ(result_without_tags_2[0]->getPath(), "test.txt");
 }
 
 }

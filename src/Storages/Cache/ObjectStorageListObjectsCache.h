@@ -26,12 +26,14 @@ public:
             const String & storage_description_,
             const String & bucket_,
             const String & prefix_,
+            bool with_tags_,
             const std::chrono::steady_clock::time_point & expires_at_ = std::chrono::steady_clock::now(),
             std::optional<UUID> user_id_ = std::nullopt);
 
         std::string storage_description;
         std::string bucket;
         std::string prefix;
+        bool with_tags;
         std::chrono::steady_clock::time_point expires_at;
         std::optional<UUID> user_id;
 

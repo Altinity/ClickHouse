@@ -76,13 +76,14 @@ ObjectStorageListObjectsCache::Key::Key(
     const String & storage_description_,
     const String & bucket_,
     const String & prefix_,
+    bool with_tags_,
     const std::chrono::steady_clock::time_point & expires_at_,
     std::optional<UUID> user_id_)
-    : storage_description(storage_description_), bucket(bucket_), prefix(prefix_), expires_at(expires_at_), user_id(user_id_) {}
+    : storage_description(storage_description_), bucket(bucket_), prefix(prefix_), with_tags(with_tags_), expires_at(expires_at_), user_id(user_id_) {}
 
 bool ObjectStorageListObjectsCache::Key::operator==(const Key & other) const
 {
-    return storage_description == other.storage_description && bucket == other.bucket && prefix == other.prefix;
+    return storage_description == other.storage_description && bucket == other.bucket && prefix == other.prefix && with_tags == other.with_tags;
 }
 
 size_t ObjectStorageListObjectsCache::KeyHasher::operator()(const Key & key) const
@@ -92,6 +93,7 @@ size_t ObjectStorageListObjectsCache::KeyHasher::operator()(const Key & key) con
     boost::hash_combine(seed, key.storage_description);
     boost::hash_combine(seed, key.bucket);
     boost::hash_combine(seed, key.prefix);
+    boost::hash_combine(seed, key.with_tags);
 
     return seed;
 }

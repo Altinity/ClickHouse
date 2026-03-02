@@ -209,7 +209,7 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
             if (local_context->getSettingsRef()[Setting::use_object_storage_list_objects_cache] && object_storage->supportsListObjectsCache())
             {
                 auto & cache = ObjectStorageListObjectsCache::instance();
-                ObjectStorageListObjectsCache::Key cache_key {object_storage->getDescription(), configuration->getNamespace(), configuration->getRawPath().cutGlobs(configuration->supportsPartialPathPrefix())};
+                ObjectStorageListObjectsCache::Key cache_key {object_storage->getDescription(), configuration->getNamespace(), configuration->getRawPath().cutGlobs(configuration->supportsPartialPathPrefix()), with_tags};
 
                 if (auto objects_info = cache.get(cache_key, /*filter_by_prefix=*/ false))
                 {
