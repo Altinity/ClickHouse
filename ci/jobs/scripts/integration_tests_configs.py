@@ -928,7 +928,7 @@ def get_tests_execution_time(info: Info, job_options: str) -> dict[str, int]:
     if info.pr_number == 0:
         branch_filter = f"head_ref = '{info.git_branch}'"
     else:
-        branch_filter = f"base_ref = '{info.base_branch}'"
+        branch_filter = f"head_ref = '{info.base_branch}'"
 
     build = job_options.split(",", 1)[0]
 

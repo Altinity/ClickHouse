@@ -11,6 +11,7 @@ concurrency:
 
 env:
   PYTHONUNBUFFERED: 1
+  GH_TOKEN: ${{ github.token }}
   CHECKOUT_REF: ""
 
 jobs:
@@ -36,6 +37,7 @@ jobs:
           test_name: "Config Workflow"
 
       - name: Note report location to summary
+        if: ${{ !failure() && env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY }}
         env:
           PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
           COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
@@ -77,6 +79,7 @@ jobs:
   collect_flaky_tests:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: [config_workflow]
+    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'Q29sbGVjdCBmbGFreSB0ZXN0cw==') }}
     name: "Collect flaky tests"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -123,6 +126,7 @@ jobs:
   autoassign_approvers:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: [config_workflow]
+    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QXV0b2Fzc2lnbiBhcHByb3ZlcnM=') }}
     name: "Autoassign approvers"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
