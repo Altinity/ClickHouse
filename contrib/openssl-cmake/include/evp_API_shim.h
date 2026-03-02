@@ -92,13 +92,69 @@ static inline int SSL_CTX_use_cert_and_key(SSL_CTX *ctx, X509 *cert,
     return 1;
 }
 
-// BIO_get_ssl and BIO_do_handshake are convenience macros in OpenSSL
-// that expand to BIO_ctrl calls that are used by mongodb driver.
-// AWS-LC has the underlying BIO_ctrl and the control constants but not the macros.
+// In OpenSSL, BIO_get_ssl is a macro that calls BIO_ctrl(bio, BIO_C_GET_SSL, 0, &ssl).
+// BIO's ctrl handler catches BIO_C_GET_SSL and writes the SSL pointer to the argument.
+// In AWS-LC FIPS 2.0.0, the SSL BIO's ctrl handler does NOT have a case for BIO_C_GET_SSL.
+// Instead, it falls through to the default case that forwards the ctrl call to
+// SSL_get_rbio(ssl) which doesn't handle it properly either. As a result, ssl argument
+// is never written to, leaving it as unitialized stack garbage.
+// This shim reads the SSL pointer directly from BIO_get_data(bio), which is exactly
+// how AWS-LC's own internal get_ssl() helper works.
 #define BIO_get_ssl(b, sslp) \
-    BIO_ctrl(b, BIO_C_GET_SSL, 0, (char *)(sslp))
-#define BIO_do_handshake(b) \
-    BIO_ctrl(b, BIO_C_DO_STATE_MACHINE, 0, NULL)
+    (*(SSL **)(sslp) = (SSL *)BIO_get_data(b))
+
+// There are two issues with BIO_do_handshake.
+// 1. BIO_C_DO_STATE_MACHINE is not handled by AWS-LC's SSL BIO's ctrl handler,
+//    effectively creating the same issue as BIO_get_ssl.
+// 2. BIO_CTRL_PUSH is not handled by AWS-LC. In OpenSSL, when
+//    BIO_push(ssl_bio, transport_bio) is called, the SSL BIO's ctrl receives
+//    BIO_CTRL_PUSH and internally calls SSL_set_bin(ssl, transport_bio, transport_bio)
+//    to connect the SSL to the network transport. AWS-LC's SSL BIO returns -1
+//    for BIO_CTRL_PUSH and does nothing. This means the SSL object has no transport
+//    BIOs, so it can't read or write data, any handshake would fail.
+// We fix the first one by calling SSL_do_handshake(ssl) directly.
+// Fixing the second one is done lazily: on first call, it checks SSL_get_rbio(ssl)
+// and if it's NULL, it calls BIO_next(b) (the transport BIO that BIO_push chained
+// underneath) as the SSL's read/write BIO. The BIO_up_ref calls are necessary
+// because SSL_set_bio takes ownership of the BIOs and calls BIO_free_all on them.
+// This is not a 1-to-1 equivalent to OpenSSL's BIO_do_handshake, but it is
+// close enough for the MongoDB driver.
+static inline int BIO_do_handshake(BIO *b) {
+    SSL *ssl = (SSL *)BIO_get_data(b);
+    if (!ssl)
+        return 0;
+    if (!SSL_get_rbio(ssl) && BIO_next(b)) {
+        BIO_up_ref(BIO_next(b));
+        BIO_up_ref(BIO_next(b));
+        SSL_set_bio(ssl, BIO_next(b), BIO_next(b));
+    }
+    BIO_clear_retry_flags(b);
+    int ret = SSL_do_handshake(ssl);
+    if (ret == 1)
+        return 1;
+    int err = SSL_get_error(ssl, ret);
+    if (err == SSL_ERROR_WANT_READ)
+        BIO_set_retry_read(b);
+    else if (err == SSL_ERROR_WANT_WRITE)
+        BIO_set_retry_write(b);
+    return ret;
+}
+
+// In OpenSSL, X509_VERIFY_PARAM_set1_host(param, name, namelen) with namelen=0
+// means "use strlen(name)" to determine the length of the name. The MongoDB driver
+// relies on this behaviour.
+// AWS-LC explicitly rejects namelen=0 with a comment "Unlike OpenSSL, we reject
+// trying to set or add an empty name". When it rejects, it sets param->poision=1,
+// then the flag propagates through SSL_set1_param into SSL's verification parameters
+// and causes X509_verify_cert() to fail.
+// This shim replicates OpenSSL's behaviour.
+static inline int X509_VERIFY_PARAM_set1_host_shim(X509_VERIFY_PARAM *param,
+                                                     const char *name,
+                                                     size_t namelen) {
+    return X509_VERIFY_PARAM_set1_host(param, name,
+                                        namelen == 0 && name? strlen(name) : namelen);
+}
+#define X509_VERIFY_PARAM_set1_host X509_VERIFY_PARAM_set1_host_shim
 
 // BIO_new_ssl is an OpenSSL convenience function that creates a new BIO
 // wrapping a fresh SSL connection. AWS-LC provides all the building blocks
