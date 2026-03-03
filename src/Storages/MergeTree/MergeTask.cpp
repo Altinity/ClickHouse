@@ -275,7 +275,7 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::extractMergingAndGatheringColu
             key_columns.insert(name);
         /// If we don't have this column in storage columns, it must be a subcolumn of one of the storage columns.
         else
-            key_columns.insert(Nested::splitName(name).first);
+            key_columns.insert(String(Nested::getColumnFromSubcolumn(name, storage_columns)));
     }
 
     /// Force sign column for Collapsing mode
@@ -331,8 +331,9 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::extractMergingAndGatheringColu
             const auto & column_name = index_columns.front();
             if (storage_columns.contains(column_name))
                 global_ctx->skip_indexes_by_column[column_name].push_back(index);
+            /// If we don't have this column in storage columns, it must be a subcolumn of one of the storage columns.
             else
-                global_ctx->skip_indexes_by_column[Nested::splitName(column_name).first].push_back(index);
+                global_ctx->skip_indexes_by_column[String(Nested::getColumnFromSubcolumn(column_name, storage_columns))].push_back(index);
         }
         else
         {
@@ -342,7 +343,7 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::extractMergingAndGatheringColu
                     key_columns.insert(index_column);
                 /// If we don't have this column in storage columns, it must be a subcolumn of one of the storage columns.
                 else
-                    key_columns.insert(Nested::splitName(index_column).first);
+                    key_columns.insert(String(Nested::getColumnFromSubcolumn(index_column, storage_columns)));
             }
 
             global_ctx->merging_skip_indexes.push_back(index);
@@ -351,9 +352,13 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::extractMergingAndGatheringColu
 
     for (const auto * projection : global_ctx->projections_to_rebuild)
     {
-        Names projection_columns_vec = projection->getRequiredColumns();
-        std::copy(projection_columns_vec.cbegin(), projection_columns_vec.cend(),
-                  std::inserter(key_columns, key_columns.end()));
+        for (const auto & column : projection->getRequiredColumns())
+        {
+            if (projection->with_parent_part_offset && column == "_part_offset")
+                continue;
+
+            key_columns.insert(column);
+        }
     }
 
     /// TODO: also force "summing" and "aggregating" columns to make Horizontal merge only for such columns
@@ -887,16 +892,12 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::prepareProjectionsToMergeAndRe
 }
 
 
-void MergeTask::ExecuteAndFinalizeHorizontalPart::calculateProjections(const Block & block) const
+void MergeTask::ExecuteAndFinalizeHorizontalPart::calculateProjections(const Block & block, UInt64 starting_offset) const
 {
     for (size_t i = 0, size = global_ctx->projections_to_rebuild.size(); i < size; ++i)
     {
         const auto & projection = *global_ctx->projections_to_rebuild[i];
-        Block block_with_required_columns;
-        for (const auto & name : projection.getRequiredColumns())
-            if (name != "_part_offset")
-                block_with_required_columns.insert(block.getByName(name));
-        Block block_to_squash = projection.calculate(block_with_required_columns, global_ctx->context);
+        Block block_to_squash = projection.calculate(block, starting_offset, global_ctx->context);
         /// Avoid replacing the projection squash header if nothing was generated (it used to return an empty block)
         if (block_to_squash.rows() == 0)
             return;
@@ -1012,6 +1013,7 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::executeImpl() const
             }
         }
 
+        size_t starting_offset = global_ctx->rows_written;
         global_ctx->rows_written += block.rows();
         const_cast<MergedBlockOutputStream &>(*global_ctx->to).write(block);
 
@@ -1021,7 +1023,7 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::executeImpl() const
                 block, MergeTreeData::getMinMaxColumnsNames(global_ctx->metadata_snapshot->getPartitionKey()));
         }
 
-        calculateProjections(block);
+        calculateProjections(block, starting_offset);
 
         UInt64 result_rows = 0;
         UInt64 result_bytes = 0;
