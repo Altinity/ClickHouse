@@ -134,7 +134,7 @@ jobs:
           fi
 
   build_amd_debug:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, fast_test]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9kZWJ1Zyk=') }}
     name: "Build (amd_debug)"
@@ -194,7 +194,7 @@ jobs:
           path: ci/tmp/*.deb
 
   build_amd_asan:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, fast_test]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9hc2FuKQ==') }}
     name: "Build (amd_asan)"
@@ -261,7 +261,7 @@ jobs:
           path: ci/tmp/*.deb
 
   build_amd_tsan:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, fast_test]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF90c2FuKQ==') }}
     name: "Build (amd_tsan)"
@@ -328,7 +328,7 @@ jobs:
           path: ci/tmp/*.deb
 
   build_amd_msan:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, fast_test]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9tc2FuKQ==') }}
     name: "Build (amd_msan)"
@@ -395,7 +395,7 @@ jobs:
           path: ci/tmp/*.deb
 
   build_amd_ubsan:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, fast_test]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF91YnNhbik=') }}
     name: "Build (amd_ubsan)"
@@ -462,7 +462,7 @@ jobs:
           path: ci/tmp/*.deb
 
   build_amd_binary:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, fast_test]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9iaW5hcnkp') }}
     name: "Build (amd_binary)"
@@ -575,7 +575,7 @@ jobs:
           path: ci/tmp/*.deb
 
   build_arm_binary:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, fast_test]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFybV9iaW5hcnkp') }}
     name: "Build (arm_binary)"
@@ -628,7 +628,7 @@ jobs:
           path: ci/tmp/build/programs/self-extracting/clickhouse
 
   build_arm_tsan:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, fast_test]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFybV90c2FuKQ==') }}
     name: "Build (arm_tsan)"
@@ -681,7 +681,7 @@ jobs:
           path: ci/tmp/build/programs/self-extracting/clickhouse
 
   build_amd_release:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, fast_test, build_amd_debug, build_amd_asan, build_arm_binary, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9yZWxlYXNlKQ==') }}
     name: "Build (amd_release)"
