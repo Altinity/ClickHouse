@@ -54,7 +54,12 @@ class Targeting:
     def __init__(self, info: Info, branch: str = ""):
         self.info = info
         self.branch = branch or getattr(info, 'base_branch', '')
-        self.cidb = CIDBCluster()
+        # NOTE (strtgbb): Read credentials from env directly to avoid
+        # a mutation bug in CIDBCluster's secret resolution path.
+        url = os.environ.get(Settings.SECRET_CI_DB_URL, "")
+        user = os.environ.get(Settings.SECRET_CI_DB_USER, "")
+        pwd = os.environ.get(Settings.SECRET_CI_DB_PASSWORD, "")
+        self.cidb = CIDBCluster(url=url, user=user, pwd=pwd)
         if "stateless" in info.job_name.lower():
             self.job_type = self.STATELESS_JOB_TYPE
         elif "integration" in info.job_name.lower():
