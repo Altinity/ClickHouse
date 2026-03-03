@@ -81,6 +81,10 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"jemalloc_profile_text_symbolize_with_inline", true, true, "New setting to control whether to include inline frames when symbolizing jemalloc heap profile. When enabled, inline frames are included at the cost of slower symbolization; when disabled, they are skipped for faster output"},
             {"jemalloc_profile_text_collapsed_use_count", false, false, "New setting to aggregate by allocation count instead of bytes in the collapsed jemalloc heap profile format"},
             {"opentelemetry_start_keeper_trace_probability", "auto", "auto", "New setting"},
+        addSettingsChanges(settings_changes_history, "26.1.3.20001.altinityantalya",
+        {
+            {"iceberg_partition_timezone", "", "", "New setting."},
+            // {"object_storage_max_nodes", 0, 0, "Antalya: New setting"},
         });
         addSettingsChanges(settings_changes_history, "26.1",
         {
@@ -264,8 +268,11 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"os_threads_nice_value_materialized_view", 0, 0, "New setting."},
             {"os_thread_priority", 0, 0, "Alias for os_threads_nice_value_query."},
         });
-        // addSettingsChanges(settings_changes_history, "25.8.9.2000",
-        // {
+        addSettingsChanges(settings_changes_history, "25.8.16.20001.altinityantalya",
+        {
+            {"input_format_parquet_use_metadata_cache", true, true, "New setting, turned ON by default"}, // https://github.com/Altinity/ClickHouse/pull/586
+            // {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."},
+            // {"object_storage_remote_initiator", false, false, "New setting."},
         //     {"allow_experimental_iceberg_read_optimization", true, true, "New setting."},
         //     {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
         //     {"lock_object_storage_task_distribution_ms", 500, 500, "Raised the value to 500 to avoid hoping tasks between executors."},
@@ -279,20 +286,19 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         //     {"export_merge_tree_partition_manifest_ttl", 180, 180, "New setting."},
         //     {"export_merge_tree_part_file_already_exists_policy", "skip", "skip", "New setting."},
         //     {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."},
-        //     {"hybrid_table_auto_cast_columns", true, true, "New setting to automatically cast Hybrid table columns when segments disagree on types. Default enabled."},
-        //     {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
-        //     {"enable_alias_marker", true, true, "New setting."},
+            {"hybrid_table_auto_cast_columns", true, true, "New setting to automatically cast Hybrid table columns when segments disagree on types. Default enabled."},
+            {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
+            {"enable_alias_marker", true, true, "New setting."},
         //     {"input_format_parquet_use_native_reader_v3", false, true, "Seems stable"},
         //     {"input_format_parquet_verify_checksums", true, true, "New setting."},
         //     {"output_format_parquet_write_checksums", false, true, "New setting."},
         //     {"export_merge_tree_part_max_bytes_per_file", 0, 0, "New setting."},
         //     {"export_merge_tree_part_max_rows_per_file", 0, 0, "New setting."},
-        //     {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
         //     {"cluster_table_function_split_granularity", "file", "file", "New setting."},
         //     {"cluster_table_function_buckets_batch_size", 0, 0, "New setting."},
         //     {"export_merge_tree_part_throw_on_pending_mutations", true, true, "New setting."},
         //     {"export_merge_tree_part_throw_on_pending_patch_parts", true, true, "New setting."},
-        // });
+        });
         addSettingsChanges(settings_changes_history, "25.8",
         {
             {"output_format_json_quote_64bit_integers", true, false, "Disable quoting of the 64 bit integers in JSON by default"},

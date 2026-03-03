@@ -14,6 +14,7 @@ workflow = Workflow.Config(
         # *JobConfigs.tidy_build_arm_jobs,
         *JobConfigs.build_jobs,
         *JobConfigs.release_build_jobs,
+        *JobConfigs.coverage_build_jobs,
         # *[ # NOTE (strtgbb): we don't run special build jobs
         #     job.set_dependency(
         #         REGULAR_BUILD_NAMES  # + [JobConfigs.tidy_build_arm_jobs[0].name]  # NOTE (strtgbb): we don't run tidy build jobs
@@ -40,6 +41,7 @@ workflow = Workflow.Config(
         #   job error: java.lang.AssertionError: CREATE TABLE IF NOT EXISTS database0NoREC.t1 (c0 String MATERIALIZED (-1457864079) CODEC (NONE)) ENGINE = MergeTree()  ORDER BY tuple()  SETTINGS allow_suspicious_indices=1;
         # *JobConfigs.sqlancer_master_jobs,
         JobConfigs.sqltest_master_job,
+        *JobConfigs.functional_tests_jobs_coverage,
     ],
     additional_jobs=[
         "GrypeScan",
@@ -67,7 +69,7 @@ workflow = Workflow.Config(
     enable_report=True,
     enable_cidb=True,
     enable_commit_status_on_failure=True,
-    enable_slack_feed=True,
+    enable_slack_feed=False,
     pre_hooks=[
         "python3 ./ci/jobs/scripts/workflow_hooks/store_data.py",
         "python3 ./ci/jobs/scripts/workflow_hooks/version_log.py",
