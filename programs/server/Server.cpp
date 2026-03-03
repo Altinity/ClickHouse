@@ -164,6 +164,10 @@
 #   include <azure/core/diagnostics/logger.hpp>
 #endif
 
+#if USE_PARQUET
+#   include <Processors/Formats/Impl/ParquetFileMetaDataCache.h>
+#endif
+
 
 /// A minimal file used when the server is run without installation
 constexpr unsigned char resource_embedded_xml[] =
@@ -419,6 +423,7 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 object_storage_list_objects_cache_ttl;
     extern const ServerSettingsUInt64 object_storage_list_objects_cache_size;
     extern const ServerSettingsUInt64 object_storage_list_objects_cache_max_entries;
+    extern const ServerSettingsUInt64 input_format_parquet_metadata_cache_max_size;
 }
 
 namespace ErrorCodes
@@ -2749,6 +2754,10 @@ try
     ObjectStorageListObjectsCache::instance().setTTL(server_settings[ServerSetting::object_storage_list_objects_cache_ttl]);
 
     auto replicas_reconnector = ReplicasReconnector::init(global_context);
+
+#if USE_PARQUET
+    ParquetFileMetaDataCache::instance()->setMaxSizeInBytes(server_settings[ServerSetting::input_format_parquet_metadata_cache_max_size]);
+#endif
 
     /// Set current database name before loading tables and databases because
     /// system logs may copy global context.

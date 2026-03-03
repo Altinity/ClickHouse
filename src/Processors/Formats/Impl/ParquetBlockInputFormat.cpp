@@ -8,6 +8,9 @@
 
 #if USE_PARQUET
 
+#include <Core/Settings.h>
+#include <Core/ServerSettings.h>
+#include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 #include <Common/ThreadPool.h>
 #include <Common/setThreadName.h>
@@ -34,6 +37,7 @@
 #include <Common/FieldAccurateComparison.h>
 #include <Processors/Formats/Impl/Parquet/parquetBloomFilterHash.h>
 #include <Interpreters/Context.h>
+#include <Processors/Formats/Impl/ParquetFileMetaDataCache.h>
 #include <Interpreters/convertFieldToType.h>
 #include <Storages/MergeTree/KeyCondition.h>
 #include <Processors/Formats/Impl/ParquetV3BlockInputFormat.h>
@@ -45,6 +49,8 @@ namespace ProfileEvents
     extern const Event ParquetFetchWaitTimeMicroseconds;
     extern const Event ParquetReadRowGroups;
     extern const Event ParquetPrunedRowGroups;
+    extern const Event ParquetMetaDataCacheHits;
+    extern const Event ParquetMetaDataCacheMisses;
 }
 
 namespace CurrentMetrics
@@ -60,6 +66,16 @@ namespace CurrentMetrics
 
 namespace DB
 {
+
+namespace Setting
+{
+    extern const SettingsBool input_format_parquet_use_metadata_cache;
+}
+
+namespace ServerSetting
+{
+    extern const ServerSettingsUInt64 input_format_parquet_metadata_cache_max_size;
+}
 
 namespace ErrorCodes
 {
@@ -545,6 +561,49 @@ static std::vector<Range> getHyperrectangleForRowGroup(const parquet::FileMetaDa
     return hyperrectangle;
 }
 
+std::shared_ptr<parquet::FileMetaData> ParquetBlockInputFormat::readMetadataFromFile()
+{
+    createArrowFileIfNotCreated();
+    return parquet::ReadMetaData(arrow_file);
+}
+
+std::shared_ptr<parquet::FileMetaData> ParquetBlockInputFormat::getFileMetaData()
+{
+    // in-memory cache is not implemented for local file operations, only for remote files
+    // there is a chance the user sets `input_format_parquet_use_metadata_cache=1` for a local file operation
+    // and the cache_key won't be set. Therefore, we also need to check for metadata_cache.key
+    if (!metadata_cache.use_cache || metadata_cache.key.empty())
+    {
+        return readMetadataFromFile();
+    }
+
+    auto [parquet_file_metadata, loaded] = ParquetFileMetaDataCache::instance()->getOrSet(
+        metadata_cache.key,
+        [&]()
+        {
+            return readMetadataFromFile();
+        }
+    );
+    if (loaded)
+        ProfileEvents::increment(ProfileEvents::ParquetMetaDataCacheMisses);
+    else
+        ProfileEvents::increment(ProfileEvents::ParquetMetaDataCacheHits);
+    return parquet_file_metadata;
+}
+
+void ParquetBlockInputFormat::createArrowFileIfNotCreated()
+{
+    if (arrow_file)
+    {
+        return;
+    }
+
+    // Create arrow file adapter.
+    // TODO: Make the adapter do prefetching on IO threads, based on the full set of ranges that
+    //       we'll need to read (which we know in advance). Use max_download_threads for that.
+    arrow_file = asArrowFile(*in, format_settings, is_stopped, "Parquet", PARQUET_MAGIC_BYTES, /* avoid_buffering */ true);
+}
+
 std::unordered_set<std::size_t> getBloomFilterFilteringColumnKeys(const KeyCondition::RPN & rpn)
 {
     std::unordered_set<std::size_t> column_keys;
@@ -691,7 +750,7 @@ void ParquetBlockInputFormat::initializeIfNeeded()
     if (is_stopped)
         return;
 
-    metadata = parquet::ReadMetaData(arrow_file);
+    metadata = getFileMetaData();
     if (buckets_to_read)
     {
         std::unordered_set<size_t> set_to_read(buckets_to_read->row_group_ids.begin(), buckets_to_read->row_group_ids.end());
@@ -807,6 +866,8 @@ void ParquetBlockInputFormat::initializeIfNeeded()
         }
     }
 
+    bool has_row_groups_to_read = false;
+
     auto skip_row_group_based_on_filters = [&](int row_group)
     {
         if (!format_settings.parquet.filter_push_down && !format_settings.parquet.bloom_filter_push_down)
@@ -865,7 +926,20 @@ void ParquetBlockInputFormat::initializeIfNeeded()
         row_group_batches.back().total_bytes_compressed += row_group_size;
         auto rows = adaptive_chunk_size(row_group);
         row_group_batches.back().adaptive_chunk_size = rows ? rows : format_settings.parquet.max_block_size;
+
+        has_row_groups_to_read = true;
     }
+
+    if (has_row_groups_to_read)
+    {
+        createArrowFileIfNotCreated();
+    }
+}
+
+void ParquetBlockInputFormat::setStorageRelatedUniqueKey(const Settings & settings, const String & key_)
+{
+    metadata_cache.key = key_;
+    metadata_cache.use_cache = settings[Setting::input_format_parquet_use_metadata_cache];
 }
 
 void ParquetBlockInputFormat::initializeRowGroupBatchReader(size_t row_group_batch_idx)
