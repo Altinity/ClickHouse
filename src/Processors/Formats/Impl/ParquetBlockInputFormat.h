@@ -94,6 +94,7 @@ public:
     size_t getApproxBytesReadForChunk() const override { return previous_approx_bytes_read_for_chunk; }
 
     void setBucketsToRead(const FileBucketInfoPtr & buckets_to_read_) override;
+    void setStorageRelatedUniqueKey(const Settings & settings, const String & key_) override;
 
 private:
     Chunk read() override;
@@ -112,6 +113,13 @@ private:
     void scheduleRowGroup(size_t row_group_batch_idx);
 
     void threadFunction(size_t row_group_batch_idx);
+
+    void createArrowFileIfNotCreated();
+    std::shared_ptr<parquet::FileMetaData> readMetadataFromFile();
+
+    std::shared_ptr<parquet::FileMetaData> getFileMetaData();
+
+    inline bool supportPrefetch() const;
 
     // Data layout in the file:
     //
@@ -361,6 +369,13 @@ private:
     bool is_initialized = false;
     std::optional<std::unordered_map<String, String>> parquet_names_to_clickhouse;
     std::optional<std::unordered_map<String, String>> clickhouse_names_to_parquet;
+    struct Cache
+    {
+        String key;
+        bool use_cache = false;
+    };
+
+    Cache metadata_cache;
 };
 
 class ArrowParquetSchemaReader : public ISchemaReader

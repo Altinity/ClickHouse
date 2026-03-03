@@ -121,8 +121,8 @@ env:
 jobs:
   Common:
     if: |
-      fromJson(inputs.workflow_config).custom_data.ci_regression_jobs[0] == null ||
-      contains(fromJson(inputs.workflow_config).custom_data.ci_regression_jobs, 'common')
+      fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs[0] == null ||
+      contains(fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs, 'common')
     strategy:
       fail-fast: false
       matrix:
@@ -145,8 +145,8 @@ jobs:
 
   AggregateFunctions:
     if: |
-      fromJson(inputs.workflow_config).custom_data.ci_regression_jobs[0] == null ||
-      contains(fromJson(inputs.workflow_config).custom_data.ci_regression_jobs, 'aggregate_functions')
+      fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs[0] == null ||
+      contains(fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs, 'aggregate_functions')
     strategy:
       fail-fast: false
       matrix:
@@ -170,8 +170,8 @@ jobs:
     secrets: inherit
   Alter:
     if: |
-      fromJson(inputs.workflow_config).custom_data.ci_regression_jobs[0] == null ||
-      contains(fromJson(inputs.workflow_config).custom_data.ci_regression_jobs, 'alter')
+      fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs[0] == null ||
+      contains(fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs, 'alter')
     strategy:
       fail-fast: false
       matrix:
@@ -202,8 +202,8 @@ jobs:
 
   Benchmark:
     if: |
-      fromJson(inputs.workflow_config).custom_data.ci_regression_jobs[0] == null ||
-      contains(fromJson(inputs.workflow_config).custom_data.ci_regression_jobs, 'benchmark')
+      fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs[0] == null ||
+      contains(fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs, 'benchmark')
     strategy:
       fail-fast: false
       matrix:
@@ -228,8 +228,8 @@ jobs:
 
   ClickHouseKeeper:
     if: |
-      fromJson(inputs.workflow_config).custom_data.ci_regression_jobs[0] == null ||
-      contains(fromJson(inputs.workflow_config).custom_data.ci_regression_jobs, 'clickhouse_keeper')
+      fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs[0] == null ||
+      contains(fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs, 'clickhouse_keeper')
     strategy:
       fail-fast: false
       matrix:
@@ -256,8 +256,8 @@ jobs:
 
   Iceberg:
     if: |
-      fromJson(inputs.workflow_config).custom_data.ci_regression_jobs[0] == null ||
-      contains(fromJson(inputs.workflow_config).custom_data.ci_regression_jobs, 'iceberg')
+      fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs[0] == null ||
+      contains(fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs, 'iceberg')
     strategy:
       fail-fast: false
       matrix:
@@ -281,8 +281,8 @@ jobs:
     secrets: inherit
   LDAP:
     if: |
-      fromJson(inputs.workflow_config).custom_data.ci_regression_jobs[0] == null ||
-      contains(fromJson(inputs.workflow_config).custom_data.ci_regression_jobs, 'ldap')
+      fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs[0] == null ||
+      contains(fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs, 'ldap')
     strategy:
       fail-fast: false
       matrix:
@@ -305,8 +305,8 @@ jobs:
 
   Parquet:
     if: |
-      fromJson(inputs.workflow_config).custom_data.ci_regression_jobs[0] == null ||
-      contains(fromJson(inputs.workflow_config).custom_data.ci_regression_jobs, 'parquet')
+      fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs[0] == null ||
+      contains(fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs, 'parquet')
     uses: ./.github/workflows/regression-reusable-suite.yml
     with:
       ref: ${{ inputs.commit }}
@@ -325,8 +325,8 @@ jobs:
 
   ParquetS3:
     if: |
-      fromJson(inputs.workflow_config).custom_data.ci_regression_jobs[0] == null ||
-      contains(fromJson(inputs.workflow_config).custom_data.ci_regression_jobs, 'parquet')
+      fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs[0] == null ||
+      contains(fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs, 'parquet')
     strategy:
       fail-fast: false
       matrix:
@@ -346,13 +346,13 @@ jobs:
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
       job_name: parquet_${{ matrix.STORAGE }}
-      regression_args: --storage ${{ matrix.STORAGE }} --aws-s3-bucket {{AWS_BUCKET}} --aws-s3-region {{AWS_REGION}} --aws-s3-key-id {{AWS_KEY_ID}} --aws-s3-access-key {{AWS_ACCESS_KEY}}
+      regression_args: --storage ${{ matrix.STORAGE }} --aws-s3-bucket {{AWS_BUCKET}} --aws-s3-region {{AWS_REGION}} --aws-s3-key-id {{AWS_KEY_ID}} --aws-s3-access-key {{AWS_ACCESS_KEY}} --only "/parquet/${{ matrix.STORAGE }}/*"
     secrets: inherit
 
   RBAC:
     if: |
-      fromJson(inputs.workflow_config).custom_data.ci_regression_jobs[0] == null ||
-      contains(fromJson(inputs.workflow_config).custom_data.ci_regression_jobs, 'rbac')
+      fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs[0] == null ||
+      contains(fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs, 'rbac')
     strategy:
       fail-fast: false
       matrix:
@@ -376,8 +376,8 @@ jobs:
     secrets: inherit
   SSLServer:
     if: |
-      fromJson(inputs.workflow_config).custom_data.ci_regression_jobs[0] == null ||
-      contains(fromJson(inputs.workflow_config).custom_data.ci_regression_jobs, 'ssl_server')
+      fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs[0] == null ||
+      contains(fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs, 'ssl_server')
     strategy:
       fail-fast: false
       matrix:
@@ -402,8 +402,8 @@ jobs:
 
   S3:
     if: |
-      fromJson(inputs.workflow_config).custom_data.ci_regression_jobs[0] == null ||
-      contains(fromJson(inputs.workflow_config).custom_data.ci_regression_jobs, 's3')
+      fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs[0] == null ||
+      contains(fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs, 's3')
     strategy:
       fail-fast: false
       matrix:
@@ -434,8 +434,8 @@ jobs:
 
   S3Export:
     if: |
-      fromJson(inputs.workflow_config).custom_data.ci_regression_jobs[0] == null ||
-      contains(fromJson(inputs.workflow_config).custom_data.ci_regression_jobs, 's3')
+      fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs[0] == null ||
+      contains(fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs, 's3')
     strategy:
       fail-fast: false
       matrix:
@@ -462,8 +462,8 @@ jobs:
 
   TieredStorage:
     if: |
-      fromJson(inputs.workflow_config).custom_data.ci_regression_jobs[0] == null ||
-      contains(fromJson(inputs.workflow_config).custom_data.ci_regression_jobs, 'tiered_storage')
+      fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs[0] == null ||
+      contains(fromJson(inputs.workflow_config).JOB_KV_DATA.ci_regression_jobs, 'tiered_storage')
     strategy:
       fail-fast: false
       matrix:

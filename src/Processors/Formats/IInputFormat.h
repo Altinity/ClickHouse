@@ -8,6 +8,7 @@
 #include <base/types.h>
 #include <Core/BlockMissingValues.h>
 #include <Processors/ISource.h>
+#include <Core/Settings.h>
 
 
 namespace DB
@@ -127,6 +128,9 @@ public:
     virtual size_t getApproxBytesReadForChunk() const { return 0; }
 
     void needOnlyCount() { need_only_count = true; }
+
+    /// Set additional info/key/id related to underlying storage of the ReadBuffer
+    virtual void setStorageRelatedUniqueKey(const Settings & /*settings*/, const String & /*key*/) {}
 
 protected:
     ReadBuffer & getReadBuffer() const { chassert(in); return *in; }
