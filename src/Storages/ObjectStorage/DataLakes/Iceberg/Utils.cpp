@@ -17,6 +17,7 @@
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
+#include <Parsers/ASTOrderByElement.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergTableStateSnapshot.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergWrites.h>
@@ -62,6 +63,7 @@ namespace DB::ErrorCodes
 extern const int FILE_DOESNT_EXIST;
 extern const int BAD_ARGUMENTS;
 extern const int ICEBERG_SPECIFICATION_VIOLATION;
+extern const int LOGICAL_ERROR;
 }
 
 namespace DB::DataLakeStorageSetting
@@ -81,6 +83,7 @@ namespace ProfileEvents
 namespace DB::Setting
 {
     extern const SettingsUInt64 output_format_compression_level;
+    extern const SettingsTimezone iceberg_partition_timezone;
 }
 
 /// Hard to imagine a hint file larger than 10 MB
@@ -240,27 +243,31 @@ bool writeMetadataFileAndVersionHint(
 }
 
 
-std::optional<TransformAndArgument> parseTransformAndArgument(const String & transform_name_src)
+std::optional<TransformAndArgument> parseTransformAndArgument(const String & transform_name_src, const String & time_zone)
 {
     std::string transform_name = Poco::toLower(transform_name_src);
 
+    std::optional<String> time_zone_opt;
+    if (!time_zone.empty())
+        time_zone_opt = time_zone;
+
     if (transform_name == "year" || transform_name == "years")
-        return TransformAndArgument{"toYearNumSinceEpoch", std::nullopt};
+        return TransformAndArgument{"toYearNumSinceEpoch", std::nullopt, time_zone_opt};
 
     if (transform_name == "month" || transform_name == "months")
-        return TransformAndArgument{"toMonthNumSinceEpoch", std::nullopt};
+        return TransformAndArgument{"toMonthNumSinceEpoch", std::nullopt, time_zone_opt};
 
     if (transform_name == "day" || transform_name == "date" || transform_name == "days" || transform_name == "dates")
-        return TransformAndArgument{"toRelativeDayNum", std::nullopt};
+        return TransformAndArgument{"toRelativeDayNum", std::nullopt, time_zone_opt};
 
     if (transform_name == "hour" || transform_name == "hours")
-        return TransformAndArgument{"toRelativeHourNum", std::nullopt};
+        return TransformAndArgument{"toRelativeHourNum", std::nullopt, time_zone_opt};
 
     if (transform_name == "identity")
-        return TransformAndArgument{"identity", std::nullopt};
+        return TransformAndArgument{"identity", std::nullopt, std::nullopt};
 
     if (transform_name == "void")
-        return TransformAndArgument{"tuple", std::nullopt};
+        return TransformAndArgument{"tuple", std::nullopt, std::nullopt};
 
     if (transform_name.starts_with("truncate") || transform_name.starts_with("bucket"))
     {
@@ -284,11 +291,11 @@ std::optional<TransformAndArgument> parseTransformAndArgument(const String & tra
 
         if (transform_name.starts_with("truncate"))
         {
-            return TransformAndArgument{"icebergTruncate", argument};
+            return TransformAndArgument{"icebergTruncate", argument, std::nullopt};
         }
         else if (transform_name.starts_with("bucket"))
         {
-            return TransformAndArgument{"icebergBucket", argument};
+            return TransformAndArgument{"icebergBucket", argument, std::nullopt};
         }
     }
     return std::nullopt;
@@ -694,63 +701,161 @@ std::pair<Poco::JSON::Object::Ptr, Int32> getPartitionSpec(
     return {result, partition_iter};
 }
 
-std::pair<String, String> parseTransformAndColumn(ASTPtr object, size_t i)
+static String parseColumnArgument(const ASTPtr & arg_ast, const String & clickhouse_name, const String & error_suffix)
 {
-    if (auto * identifier = object->as<ASTIdentifier>(); identifier)
-        return {"identity", identifier->name()};
+    const auto * identifier = arg_ast ? arg_ast->as<ASTIdentifier>() : nullptr;
+    if (!identifier)
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "Invalid iceberg sort order function {}: {}",
+            clickhouse_name, error_suffix);
+    return identifier->name();
+}
 
-    static const std::unordered_map<String, String> clickhouse_name_to_iceberg = {
-        {"identity", "identity"},
-        {"icebergBucket", "bucket"},
-        {"icebergTruncate", "truncate"},
-        {"toYearNumSinceEpoch", "year"},
-        {"toMonthNumSinceEpoch", "month"},
-        {"toRelativeDayNum", "day"},
-        {"toRelativeHourNum", "hour"}
-    };
+static std::pair<String, String> parseFunction(const ASTPtr & func_object)
+{
+    const static std::unordered_map<String, String> clickhouse_name_to_iceberg = {
+            {"identity", "identity"},
+            {"icebergBucket", "bucket"},
+            {"icebergTruncate", "truncate"},
+            {"toYearNumSinceEpoch", "year"},
+            {"toMonthNumSinceEpoch", "month"},
+            {"toRelativeDayNum", "day"},
+            {"toRelativeHourNum", "hour"}
+        };
 
-    auto parse_function = [] (ASTPtr func_object) -> std::pair<String, String> {
-        auto * func = func_object->as<ASTFunction>();
-        String clickhouse_name = func->name;
-        auto args = func->children[0]->children;
-        std::optional<size_t> arg;
-        String column_name;
-        if (args.size() == 2)
-        {
-            arg = args[0]->as<ASTLiteral>()->value.safeGet<UInt64>();
-            column_name = args[1]->as<ASTIdentifier>()->name();
-        }
-        else
-            column_name = args[0]->as<ASTIdentifier>()->name();
+    const auto * func = func_object ? func_object->as<ASTFunction>() : nullptr;
+    if (!func)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid iceberg sort order expression, expected a function");
 
-        if (!clickhouse_name_to_iceberg.contains(clickhouse_name))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported function {} for iceberg", clickhouse_name);
-        const auto & transform_base = clickhouse_name_to_iceberg.at(clickhouse_name);
+    const String & clickhouse_name = func->name;
+    const auto it = clickhouse_name_to_iceberg.find(clickhouse_name);
+    if (it == clickhouse_name_to_iceberg.end())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported function {} for iceberg", clickhouse_name);
 
-        String transform = transform_base;
-        if (arg.has_value())
-            transform += "[" + std::to_string(arg.value()) + "]";
+    const auto * args_list = func->arguments ? func->arguments->as<ASTExpressionList>() : nullptr;
+    if (!args_list)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid iceberg sort order function {}: arguments are missing", clickhouse_name);
+    const auto & args = args_list->children;
 
-        return {transform, column_name};
-    };
+    std::optional<size_t> arg;
+    String column_name;
 
-    if (auto * func = object->as<ASTFunction>(); func->name != "tuple")
+    if (args.size() == 1)
     {
-        return parse_function(object);
+        column_name = parseColumnArgument(args[0], clickhouse_name, "expected a column identifier as an argument");
+    }
+    else if (args.size() == 2)
+    {
+        const auto * literal = args[0] ? args[0]->as<ASTLiteral>() : nullptr;
+        if (!literal)
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "Invalid iceberg sort order function {}: expected (integer_literal, column_identifier), but there is no integer_literal",
+                clickhouse_name);
+
+        column_name = parseColumnArgument(args[1], clickhouse_name, "expected (integer_literal, column_identifier), but there is no column_identifier");
+
+        UInt64 u_param = 0;
+        Int64 i_param = 0;
+        if (literal->value.tryGet(u_param))
+            arg = static_cast<size_t>(u_param);
+        else if (literal->value.tryGet(i_param) && i_param >= 0)
+            arg = static_cast<size_t>(i_param);
+        else
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "Invalid iceberg sort order function {}: expected a non-negative integer literal as first argument",
+                clickhouse_name);
+    }
+    else
+    {
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "Invalid iceberg sort order function {}: expected 1 or 2 arguments, but got {}",
+            clickhouse_name, args.size());
     }
 
-    chassert(!object->children.empty());
-    chassert(object->children[0]->as<ASTExpressionList>());
-    auto function_desc = object->children[0]->children[i];
-    if (auto * identifier = function_desc->as<ASTIdentifier>(); identifier)
+    String transform = it->second;
+    if (arg.has_value())
+        transform += "[" + std::to_string(arg.value()) + "]";
+
+    return {transform, column_name};
+}
+
+static ASTPtr unwrapOrderByElement(ASTPtr ast)
+{
+    if (!ast)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid iceberg sort order expression");
+    if (const auto * elem = ast->as<ASTStorageOrderByElement>())
+    {
+        if (elem->children.size() != 1 || !elem->children.front())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid iceberg sort order expression");
+        return elem->children.front();
+    }
+    return ast;
+}
+
+
+/// Parse transform and argument from input parameter
+/// "x" -> {"identity", "x"}
+/// "identity(x)" -> {"identity", "x"}
+/// "bucket(16, x)" -> {"bucket[16]", "x"}
+static std::pair<String, String> parseTransformAndColumnElement(ASTPtr element)
+{
+    element = unwrapOrderByElement(element);
+
+    if (const auto * identifier = element->as<ASTIdentifier>())
         return {"identity", identifier->name()};
 
-    chassert(!function_desc->children.empty());
-    function_desc = function_desc->children[0];
-    if (auto * identifier = function_desc->as<ASTIdentifier>(); identifier)
-        return {"identity", identifier->name()};
+    if (const auto * func = element->as<ASTFunction>(); func && func->name != "tuple")
+        return parseFunction(element);
 
-    return parse_function(function_desc);
+    throw Exception(
+        ErrorCodes::BAD_ARGUMENTS,
+        "Invalid iceberg sort order expression '{}', expected a column identifier or a supported function",
+        element->getColumnName());
+}
+
+static std::vector<std::pair<String, String>> parseTransformAndColumnPairs(ASTPtr object)
+{
+    if (!object)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid iceberg sort order expression");
+
+    std::vector<std::pair<String, String>> result;
+
+    if (const auto * expression_list = object->as<ASTExpressionList>())
+    {
+        result.reserve(expression_list->children.size());
+        for (const auto & child : expression_list->children)
+        {
+            result.push_back(parseTransformAndColumnElement(child));
+        }
+        return result;
+    }
+
+    if (const auto * identifier = object->as<ASTIdentifier>())
+    {
+        result.push_back({"identity", identifier->name()});
+        return result;
+    }
+
+    if (const auto * func = object->as<ASTFunction>(); func && func->name == "tuple")
+    {
+        const auto * args_list = func->arguments ? func->arguments->as<ASTExpressionList>() : nullptr;
+        if (!args_list)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid iceberg sort order tuple expression");
+
+        result.reserve(args_list->children.size());
+        for (const auto & child : args_list->children)
+        {
+            result.push_back(parseTransformAndColumnElement(child));
+        }
+        return result;
+    }
+
+    result.push_back(parseTransformAndColumnElement(object));
+    return result;
 }
 
 std::pair<Poco::JSON::Object::Ptr, String> createEmptyMetadataFile(
@@ -835,11 +940,18 @@ std::pair<Poco::JSON::Object::Ptr, String> createEmptyMetadataFile(
         Names sort_columns = sort_columns_key_description.column_names;
         std::vector<bool> reverse_flags = sort_columns_key_description.reverse_flags;
 
+        auto transform_and_column_pairs = parseTransformAndColumnPairs(order_by);
+        if (transform_and_column_pairs.size() != sort_columns.size())
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "Invalid iceberg sort order: expected {} elements, but got {}",
+                sort_columns.size(), transform_and_column_pairs.size());
+
         Poco::JSON::Array::Ptr sorting_fields = new Poco::JSON::Array;
-        for (size_t i = 0; i < sort_columns.size(); ++i)
+        for (size_t i = 0; i < transform_and_column_pairs.size(); ++i)
         {
+            const auto & [transform_name, column_name] = transform_and_column_pairs[i];
             Poco::JSON::Object::Ptr sorting_field = new Poco::JSON::Object;
-            auto [transform_name, column_name] = parseTransformAndColumn(sort_columns_key_description.definition_ast, i);
             sorting_field->set(f_source_id, column_name_to_source_id[column_name]);
             sorting_field->set(f_transform, transform_name);
             if (reverse_flags.empty() || !reverse_flags[i])
@@ -1138,7 +1250,8 @@ KeyDescription getSortingKeyDescriptionFromMetadata(Poco::JSON::Object::Ptr meta
             auto column_name = source_id_to_column_name[source_id];
             int direction = field->getValue<String>(f_direction) == "asc" ? 1 : -1;
             auto iceberg_transform_name = field->getValue<String>(f_transform);
-            auto clickhouse_transform_name = parseTransformAndArgument(iceberg_transform_name);
+            auto clickhouse_transform_name = parseTransformAndArgument(iceberg_transform_name,
+                local_context->getSettingsRef()[Setting::iceberg_partition_timezone]);
             String full_argument;
             if (clickhouse_transform_name->transform_name != "identity")
             {
@@ -1147,7 +1260,10 @@ KeyDescription getSortingKeyDescriptionFromMetadata(Poco::JSON::Object::Ptr meta
                 {
                     full_argument += std::to_string(*clickhouse_transform_name->argument) +  ", ";
                 }
-                full_argument += column_name + ")";
+                full_argument += column_name;
+                if (clickhouse_transform_name->time_zone)
+                    full_argument += ", " + *clickhouse_transform_name->time_zone;
+                full_argument += ")";
             }
             else
             {
@@ -1164,6 +1280,124 @@ KeyDescription getSortingKeyDescriptionFromMetadata(Poco::JSON::Object::Ptr meta
         return KeyDescription{};
     order_by_str.pop_back();
     return KeyDescription::parse(order_by_str, column_description, local_context, true);
+}
+
+/// Format one partition field for display in Iceberg/Spark style, e.g. "day(ts)" or "bucket(16, id)".
+static String formatPartitionFieldDisplay(const String & iceberg_transform_name, const String & column_name)
+{
+    std::string name = Poco::toLower(iceberg_transform_name);
+    if (name == "identity")
+        return column_name;
+    if (name == "year" || name == "years")
+        return "year(" + column_name + ")";
+    if (name == "month" || name == "months")
+        return "month(" + column_name + ")";
+    if (name == "day" || name == "date" || name == "days" || name == "dates")
+        return "day(" + column_name + ")";
+    if (name == "hour" || name == "hours")
+        return "hour(" + column_name + ")";
+    if (name.starts_with("truncate") && name.back() == ']')
+    {
+        auto p = name.find('[');
+        if (p != std::string::npos)
+            return "truncate(" + name.substr(p + 1, name.size() - p - 2) + ", " + column_name + ")";
+    }
+    if (name.starts_with("bucket") && name.back() == ']')
+    {
+        auto p = name.find('[');
+        if (p != std::string::npos)
+            return "bucket(" + name.substr(p + 1, name.size() - p - 2) + ", " + column_name + ")";
+    }
+    return column_name;
+}
+
+std::optional<String> getPartitionKeyStringFromMetadata(Poco::JSON::Object::Ptr metadata_object, const NamesAndTypesList & /* ch_schema */, ContextPtr /* local_context */)
+{
+    if (!metadata_object->has(f_partition_specs) || !metadata_object->has(f_default_spec_id))
+        return std::nullopt;
+    auto partition_spec_id = metadata_object->getValue<Int64>(f_default_spec_id);
+    Poco::JSON::Array::Ptr partition_specs = metadata_object->getArray(f_partition_specs);
+    std::unordered_map<Int64, String> source_id_to_column_name;
+    auto [schema, current_schema_id] = parseTableSchemaV2Method(metadata_object);
+    auto mapper = createColumnMapper(schema)->getStorageColumnEncoding();
+    for (const auto & [col_name, source_id] : mapper)
+        source_id_to_column_name[source_id] = col_name;
+
+    Poco::JSON::Object::Ptr partition_spec;
+    for (size_t i = 0; i < partition_specs->size(); ++i)
+    {
+        auto spec = partition_specs->getObject(static_cast<UInt32>(i));
+        if (spec->getValue<Int64>(f_spec_id) == partition_spec_id)
+        {
+            partition_spec = spec;
+            break;
+        }
+    }
+    if (!partition_spec || !partition_spec->has(f_fields))
+        return std::nullopt;
+    auto fields = partition_spec->getArray(f_fields);
+    if (fields->size() == 0)
+        return std::nullopt;
+
+    std::vector<String> part_exprs;
+    for (UInt32 i = 0; i < fields->size(); ++i)
+    {
+        auto field = fields->getObject(i);
+        auto source_id = field->getValue<Int64>(f_source_id);
+        auto it = source_id_to_column_name.find(source_id);
+        if (it == source_id_to_column_name.end())
+            return std::nullopt;
+        String column_name = it->second;
+        auto iceberg_transform_name = field->getValue<String>(f_transform);
+        part_exprs.push_back(formatPartitionFieldDisplay(iceberg_transform_name, column_name));
+    }
+    String result;
+    for (size_t i = 0; i < part_exprs.size(); ++i)
+    {
+        if (i != 0)
+            result += ", ";
+        result += part_exprs[i];
+    }
+    return result;
+}
+
+std::optional<String> getSortingKeyDisplayStringFromMetadata(Poco::JSON::Object::Ptr metadata_object, const NamesAndTypesList & /* ch_schema */)
+{
+    if (!metadata_object->has(f_sort_orders) || !metadata_object->has(f_default_sort_order_id))
+        return std::nullopt;
+    auto sort_order_id = metadata_object->getValue<Int64>(f_default_sort_order_id);
+    Poco::JSON::Array::Ptr sort_orders = metadata_object->getArray(f_sort_orders);
+    std::unordered_map<Int64, String> source_id_to_column_name;
+    auto [schema, current_schema_id] = parseTableSchemaV2Method(metadata_object);
+    auto mapper = createColumnMapper(schema)->getStorageColumnEncoding();
+    for (const auto & [col_name, source_id] : mapper)
+        source_id_to_column_name[source_id] = col_name;
+
+    for (UInt32 i = 0; i < sort_orders->size(); ++i)
+    {
+        auto sort_order = sort_orders->getObject(i);
+        if (sort_order->getValue<Int64>(f_order_id) != sort_order_id)
+            continue;
+        auto sort_fields = sort_order->getArray(f_fields);
+        String result;
+        for (UInt32 j = 0; j < sort_fields->size(); ++j)
+        {
+            auto field = sort_fields->getObject(j);
+            auto source_id = field->getValue<Int64>(f_source_id);
+            auto it = source_id_to_column_name.find(source_id);
+            if (it == source_id_to_column_name.end())
+                return std::nullopt;
+            String column_name = it->second;
+            String direction = field->getValue<String>(f_direction) == "asc" ? " asc" : " desc";
+            auto iceberg_transform_name = field->getValue<String>(f_transform);
+            String expr = formatPartitionFieldDisplay(iceberg_transform_name, column_name);
+            if (!result.empty())
+                result += ", ";
+            result += expr + direction;
+        }
+        return result.empty() ? std::nullopt : std::optional<String>(result);
+    }
+    return std::nullopt;
 }
 
 DataTypePtr getFunctionResultType(const String & iceberg_transform_name, DataTypePtr source_type)
