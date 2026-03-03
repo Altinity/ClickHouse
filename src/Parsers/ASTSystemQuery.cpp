@@ -575,6 +575,7 @@ void ASTSystemQuery::formatImpl(WriteBuffer & ostr, const FormatSettings & setti
         case Type::CLEAR_TEXT_INDEX_CACHES:
         case Type::CLEAR_COMPILED_EXPRESSION_CACHE:
         case Type::CLEAR_S3_CLIENT_CACHE:
+        case Type::DROP_PARQUET_METADATA_CACHE:
         case Type::CLEAR_ICEBERG_METADATA_CACHE:
         case Type::RESET_COVERAGE:
         case Type::RESTART_REPLICAS:

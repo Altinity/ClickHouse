@@ -39,8 +39,9 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         /// controls new feature and it's 'true' by default, use 'false' as previous_value).
         /// It's used to implement `compatibility` setting (see https://github.com/ClickHouse/ClickHouse/issues/35972)
         /// Note: please check if the key already exists to prevent duplicate entries.
-        addSettingsChanges(settings_changes_history, "26.1.3.20001",
+        addSettingsChanges(settings_changes_history, "26.1.3.20001.altinityantalya",
         {
+            {"iceberg_partition_timezone", "", "", "New setting."},
             {"object_storage_cluster", "", "", "Antalya: New setting"},
             {"object_storage_max_nodes", 0, 0, "Antalya: New setting"},
         });
@@ -226,8 +227,9 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"os_threads_nice_value_materialized_view", 0, 0, "New setting."},
             {"os_thread_priority", 0, 0, "Alias for os_threads_nice_value_query."},
         });
-        addSettingsChanges(settings_changes_history, "25.8.9.2000",
+        addSettingsChanges(settings_changes_history, "25.8.16.20001.altinityantalya",
         {
+            {"input_format_parquet_use_metadata_cache", true, true, "New setting, turned ON by default"}, // https://github.com/Altinity/ClickHouse/pull/586
             {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."},
             {"object_storage_remote_initiator", false, false, "New setting."},
         //     {"allow_experimental_iceberg_read_optimization", true, true, "New setting."},
@@ -244,12 +246,14 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         //     {"hybrid_table_auto_cast_columns", true, true, "New setting to automatically cast Hybrid table columns when segments disagree on types. Default enabled."},
         //     {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
         //     {"enable_alias_marker", true, true, "New setting."},
+            {"hybrid_table_auto_cast_columns", true, true, "New setting to automatically cast Hybrid table columns when segments disagree on types. Default enabled."},
+            {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
+            {"enable_alias_marker", true, true, "New setting."},
         //     {"input_format_parquet_use_native_reader_v3", false, true, "Seems stable"},
         //     {"input_format_parquet_verify_checksums", true, true, "New setting."},
         //     {"output_format_parquet_write_checksums", false, true, "New setting."},
         //     {"export_merge_tree_part_max_bytes_per_file", 0, 0, "New setting."},
         //     {"export_merge_tree_part_max_rows_per_file", 0, 0, "New setting."},
-        //     {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
         //     {"cluster_table_function_split_granularity", "file", "file", "New setting."},
         //     {"cluster_table_function_buckets_batch_size", 0, 0, "New setting."},
         //     {"export_merge_tree_part_throw_on_pending_mutations", true, true, "New setting."},

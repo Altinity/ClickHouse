@@ -59,10 +59,11 @@ namespace DataLakeStorageSetting
     extern const DataLakeStorageSettingsString storage_aws_access_key_id;
     extern const DataLakeStorageSettingsString storage_aws_secret_access_key;
     extern const DataLakeStorageSettingsString storage_region;
+    extern const DataLakeStorageSettingsString storage_aws_role_arn;
+    extern const DataLakeStorageSettingsString storage_aws_role_session_name;
     extern const DataLakeStorageSettingsString storage_catalog_url;
     extern const DataLakeStorageSettingsString storage_warehouse;
     extern const DataLakeStorageSettingsString storage_catalog_credential;
-
     extern const DataLakeStorageSettingsString storage_auth_scope;
     extern const DataLakeStorageSettingsString storage_auth_header;
     extern const DataLakeStorageSettingsString storage_oauth_server_uri;
@@ -189,10 +190,20 @@ public:
         return std::nullopt;
     }
 
+    bool supportsTotalRows() const override
+    {
+        return DataLakeMetadata::supportsTotalRows();
+    }
+
     std::optional<size_t> totalRows(ContextPtr local_context) override
     {
         assertInitializedDL();
         return current_metadata->totalRows(local_context);
+    }
+
+    bool supportsTotalBytes() const override
+    {
+        return DataLakeMetadata::supportsTotalBytes();
     }
 
     std::optional<size_t> totalBytes(ContextPtr local_context) override
@@ -327,6 +338,8 @@ public:
                 .aws_access_key_id = (*settings)[DataLakeStorageSetting::storage_aws_access_key_id].value,
                 .aws_secret_access_key = (*settings)[DataLakeStorageSetting::storage_aws_secret_access_key].value,
                 .region = (*settings)[DataLakeStorageSetting::storage_region].value,
+                .aws_role_arn = (*settings)[DataLakeStorageSetting::storage_aws_role_arn].value,
+                .aws_role_session_name = (*settings)[DataLakeStorageSetting::storage_aws_role_session_name].value
             };
 
             return std::make_shared<DataLake::GlueCatalog>(
@@ -478,7 +491,7 @@ public:
     StorageIcebergConfiguration() {}
 
     explicit StorageIcebergConfiguration(DataLakeStorageSettingsPtr settings_) : settings(settings_) {}
- 
+
     void initialize(
         ASTs & engine_args,
         ContextPtr local_context,

@@ -806,6 +806,15 @@ namespace
     A value of `0` means unlimited.
     :::
     )", 0) \
+    DECLARE(Bool, enable_token_auth, true, R"(
+    Controls whether token-based (JWT) authentication is enabled.
+    When disabled:
+    - Token processors from the `token_processors` section are not parsed.
+    - `TokenAccessStorage` (token user directory) is not added.
+    - Authentication via tokens (`--jwt` option in clickhouse-client or `Authorization: Bearer` HTTP header) is rejected.
+
+    Default value: `true` (token authentication is enabled).
+    )", 0) \
     DECLARE(UInt64, concurrent_threads_soft_limit_num, 0, R"(
     The maximum number of query processing threads, excluding threads for retrieving data from remote servers, allowed to run all queries. This is not a hard limit. In case if the limit is reached the query will still get at least one thread to run. Query can upscale to desired number of threads during execution if more threads become available.
 
@@ -1469,7 +1478,8 @@ The policy on how to perform a scheduling of CPU slots specified by `concurrent_
     ```xml
     <skip_check_for_incorrect_settings>1</skip_check_for_incorrect_settings>
     ```
-    )", 0)
+    )", 0) \
+    DECLARE(UInt64, input_format_parquet_metadata_cache_max_size, 500000000, "Maximum size of parquet file metadata cache", 0)
 
 /// Settings with a path are server settings with at least one layer of nesting that have a fixed structure (no lists, lists, enumerations, repetitions, ...).
 #define LIST_OF_SERVER_SETTINGS_WITH_PATH(DECLARE, ALIAS) \
@@ -1542,7 +1552,7 @@ The policy on how to perform a scheduling of CPU slots specified by `concurrent_
     DECLARE(UInt64, keeper_server_socket_receive_timeout_sec, DBMS_DEFAULT_RECEIVE_TIMEOUT_SEC, R"(Keeper socket receive timeout.)", 0, "keeper_server.socket_receive_timeout_sec") \
     DECLARE(UInt64, keeper_server_socket_send_timeout_sec, DBMS_DEFAULT_SEND_TIMEOUT_SEC, R"(Keeper socket send timeout.)", 0, "keeper_server.socket_send_timeout_sec") \
     DECLARE(String, hdfs_libhdfs3_conf, "", R"(Points libhdfs3 to the right location for its config.)", 0, "hdfs.libhdfs3_conf") \
-    DECLARE(String, config_file, "config.xml", R"(Points to the server config file.)", 0, "config-file")
+    DECLARE(String, config_file, "config.xml", R"(Points to the server config file.)", 0, "config-file") 
 
 // clang-format on
 
