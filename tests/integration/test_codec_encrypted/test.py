@@ -27,16 +27,16 @@ def make_storage_with_key(id):
             """cat > /etc/clickhouse-server/config.d/storage_keys_config.xml << EOF
 <clickhouse>
     <encryption_codecs>
-        <aes_128_gcm_siv>
+        <aes_128_gcm>
             <key_hex id="0">83e84e9a4eb11535c0670dc62d808ee0</key_hex>
             <key id="1">abcdefghijklmnop</key>
             <current_key_id>{cur_id}</current_key_id>
-        </aes_128_gcm_siv>
-        <aes_256_gcm_siv>
+        </aes_128_gcm>
+        <aes_256_gcm>
             <key_hex id="0">83e84e9a4eb11535c0670dc62d808ee083e84e9a4eb11535c0670dc62d808ee0</key_hex>
             <key id="1">abcdefghijklmnopabcdefghijklmnop</key>
             <current_key_id>{cur_id}</current_key_id>
-        </aes_256_gcm_siv>
+        </aes_256_gcm>
     </encryption_codecs>
 </clickhouse>
 EOF""".format(
