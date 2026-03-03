@@ -41,6 +41,7 @@ jobs:
   config_workflow:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: []
+    if: ${{ github.repository == github.event.pull_request.head.repo.full_name }}
     name: "Config Workflow"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
