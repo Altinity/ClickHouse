@@ -165,6 +165,10 @@
 #   include <azure/core/diagnostics/logger.hpp>
 #endif
 
+#if USE_PARQUET
+#   include <Processors/Formats/Impl/ParquetFileMetaDataCache.h>
+#endif
+
 
 /// A minimal file used when the server is run without installation
 constexpr unsigned char resource_embedded_xml[] =
@@ -424,6 +428,7 @@ namespace ServerSetting
     extern const ServerSettingsString hdfs_libhdfs3_conf;
     extern const ServerSettingsString config_file;
     extern const ServerSettingsString users_to_ignore_early_memory_limit_check;
+    extern const ServerSettingsUInt64 input_format_parquet_metadata_cache_max_size;
 }
 
 namespace ErrorCodes
@@ -2791,6 +2796,10 @@ try
     CompressionCodecEncrypted::Configuration::instance().load(config(), "encryption_codecs");
 
     auto replicas_reconnector = ReplicasReconnector::init(global_context);
+
+#if USE_PARQUET
+    ParquetFileMetaDataCache::instance()->setMaxSizeInBytes(server_settings[ServerSetting::input_format_parquet_metadata_cache_max_size]);
+#endif
 
     /// Set current database name before loading tables and databases because
     /// system logs may copy global context.
