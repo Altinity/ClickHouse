@@ -39,9 +39,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         /// controls new feature and it's 'true' by default, use 'false' as previous_value).
         /// It's used to implement `compatibility` setting (see https://github.com/ClickHouse/ClickHouse/issues/35972)
         /// Note: please check if the key already exists to prevent duplicate entries.
-        addSettingsChanges(settings_changes_history, "26.1.1.20001",
-        {
-            {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
         addSettingsChanges(settings_changes_history, "26.1.3.20001.altinityantalya",
         {
             {"iceberg_partition_timezone", "", "", "New setting."},
@@ -235,7 +232,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             // {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."},
             // {"object_storage_remote_initiator", false, false, "New setting."},
         //     {"allow_experimental_iceberg_read_optimization", true, true, "New setting."},
-        //     {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
+            {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
         //     {"lock_object_storage_task_distribution_ms", 500, 500, "Raised the value to 500 to avoid hoping tasks between executors."},
         //     {"allow_retries_in_cluster_requests", false, false, "New setting"},
         //     {"object_storage_remote_initiator", false, false, "New setting."},
