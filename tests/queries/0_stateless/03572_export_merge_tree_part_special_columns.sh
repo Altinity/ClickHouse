@@ -83,6 +83,7 @@ query "INSERT INTO $mt_alias VALUES (1, [1, 2, 3]), (1, [10, 20, 30])"
 query "INSERT INTO $mt_materialized VALUES (1, [1, 2, 3]), (1, [10, 20, 30])"
 query "INSERT INTO $mt_ephemeral (id, name_input) VALUES (1, 'alice'), (1, 'bob')"
 query "INSERT INTO $mt_mixed (id, value, tag_input) VALUES (1, 5, 'test'), (1, 10, 'prod')"
+query "INSERT INTO $mt_mixed (id, value, tag_input) VALUES (2, 15, 'dev')"
 query "INSERT INTO $mt_complex_expr (id, name) VALUES (1, 'alice'), (1, 'bob')"
 
 # Get all part names
@@ -90,6 +91,7 @@ alias_part=$(query "SELECT name FROM system.parts WHERE database = currentDataba
 materialized_part=$(query "SELECT name FROM system.parts WHERE database = currentDatabase() AND table = '$mt_materialized' AND partition_id = '1' AND active = 1 ORDER BY name LIMIT 1" | tr -d '\n')
 ephemeral_part=$(query "SELECT name FROM system.parts WHERE database = currentDatabase() AND table = '$mt_ephemeral' AND partition_id = '1' AND active = 1 ORDER BY name LIMIT 1" | tr -d '\n')
 mixed_part=$(query "SELECT name FROM system.parts WHERE database = currentDatabase() AND table = '$mt_mixed' AND partition_id = '1' AND active = 1 ORDER BY name LIMIT 1" | tr -d '\n')
+mixed_part_2=$(query "SELECT name FROM system.parts WHERE database = currentDatabase() AND table = '$mt_mixed' AND partition_id = '2' AND active = 1 ORDER BY name LIMIT 1" | tr -d '\n')
 complex_expr_part=$(query "SELECT name FROM system.parts WHERE database = currentDatabase() AND table = '$mt_complex_expr' AND partition_id = '1' AND active = 1 ORDER BY name LIMIT 1" | tr -d '\n')
 
 # ============================================================================
@@ -105,7 +107,7 @@ query "ALTER TABLE $mt_ephemeral EXPORT PART '$ephemeral_part' TO TABLE $s3_ephe
 query "ALTER TABLE $mt_mixed EXPORT PART '$mixed_part' TO TABLE $s3_mixed_export SETTINGS allow_experimental_export_merge_tree_part = 1"
 
 echo "---- Test Export to Table Function with mixed columns"
-query "ALTER TABLE $mt_mixed EXPORT PART '$mixed_part' TO TABLE FUNCTION s3(s3_conn, filename='$s3_mixed_export_table_function', format=Parquet, partition_strategy='hive') PARTITION BY id SETTINGS allow_experimental_export_merge_tree_part = 1"
+query "ALTER TABLE $mt_mixed EXPORT PART '$mixed_part_2' TO TABLE FUNCTION s3(s3_conn, filename='$s3_mixed_export_table_function', format=Parquet, partition_strategy='hive') PARTITION BY id SETTINGS allow_experimental_export_merge_tree_part = 1"
 
 query "ALTER TABLE $mt_complex_expr EXPORT PART '$complex_expr_part' TO TABLE $s3_complex_expr_export SETTINGS allow_experimental_export_merge_tree_part = 1"
 
@@ -137,7 +139,7 @@ query "SELECT id, name_upper FROM $s3_ephemeral_export ORDER BY name_upper"
 echo "---- Verify mixed columns in source table"
 query "SELECT id, value, doubled, tripled, tag FROM $mt_mixed ORDER BY value"
 
-echo "---- Verify mixed columns exported to S3 (should match source)"
+echo "---- Verify mixed columns exported to S3"
 query "SELECT id, value, doubled, tripled, tag FROM $s3_mixed_export ORDER BY value"
 
 echo "---- Verify mixed columns exported to S3"

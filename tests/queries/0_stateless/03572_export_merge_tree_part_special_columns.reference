@@ -25,12 +25,12 @@
 ---- Verify mixed columns in source table
 1	5	10	15	TEST
 1	10	20	30	PROD
----- Verify mixed columns exported to S3 (should match source)
-1	5	10	15	TEST
-1	10	20	30	PROD
+2	15	30	45	DEV
 ---- Verify mixed columns exported to S3
 1	5	10	15	TEST
 1	10	20	30	PROD
+---- Verify mixed columns exported to S3
+2	15	30	45	DEV
 ---- Verify complex expressions in source table
 1	alice	ALICE	alice-1
 1	bob	BOB	bob-1
