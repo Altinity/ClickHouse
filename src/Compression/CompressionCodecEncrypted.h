@@ -13,8 +13,15 @@ namespace DB
 /// Now we have two algorithms.
 enum EncryptionMethod
 {
+#if defined(FIPS_CLICKHOUSE) && FIPS_CLICKHOUSE
+// Since _SIV methods are not explicitly included into a "white list" of ciphers in security policy
+// we have to use non-SIV ciphers here
+    AES_128_GCM,
+    AES_256_GCM,
+#else
     AES_128_GCM_SIV,
     AES_256_GCM_SIV,
+#endif
     MAX_ENCRYPTION_METHOD
 };
 

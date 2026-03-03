@@ -29,10 +29,17 @@ namespace ErrorCodes
 
 EncryptionMethod toEncryptionMethod(const std::string & name)
 {
+#if defined(FIPS_CLICKHOUSE) && FIPS_CLICKHOUSE
+    if (name == "AES_128_GCM")
+        return AES_128_GCM;
+    if (name == "AES_256_GCM")
+        return AES_256_GCM;
+#else
     if (name == "AES_128_GCM_SIV")
         return AES_128_GCM_SIV;
     if (name == "AES_256_GCM_SIV")
         return AES_256_GCM_SIV;
+#endif
     throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown encryption method. Got {}", name);
 }
 
@@ -42,20 +49,34 @@ namespace
 /// Get string name for method. Return empty string for undefined Method
 String getMethodName(EncryptionMethod Method)
 {
+#if defined(FIPS_CLICKHOUSE) && FIPS_CLICKHOUSE
+    if (Method == AES_128_GCM)
+        return "AES_128_GCM";
+    if (Method == AES_256_GCM)
+        return "AES_256_GCM";
+#else
     if (Method == AES_128_GCM_SIV)
         return "AES_128_GCM_SIV";
     if (Method == AES_256_GCM_SIV)
         return "AES_256_GCM_SIV";
+#endif
     return "";
 }
 
 /// Get method code (used for codec, to understand which one we are using)
 uint8_t getMethodCode(EncryptionMethod Method)
 {
+#if defined(FIPS_CLICKHOUSE) && FIPS_CLICKHOUSE
+    if (Method == AES_128_GCM)
+        return static_cast<uint8_t>(CompressionMethodByte::AES_128_GCM);
+    if (Method == AES_256_GCM)
+        return static_cast<uint8_t>(CompressionMethodByte::AES_256_GCM);
+#else
     if (Method == AES_128_GCM_SIV)
         return static_cast<uint8_t>(CompressionMethodByte::AES_128_GCM_SIV);
     if (Method == AES_256_GCM_SIV)
         return static_cast<uint8_t>(CompressionMethodByte::AES_256_GCM_SIV);
+#endif
     throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown encryption method. Got {}", getMethodName(Method));
 }
 
@@ -86,10 +107,17 @@ const String empty_nonce = {"\0\0\0\0\0\0\0\0\0\0\0\0", actual_nonce_size};
 /// Find out key size for each algorithm
 UInt64 methodKeySize(EncryptionMethod Method)
 {
+#if defined(FIPS_CLICKHOUSE) && FIPS_CLICKHOUSE
+    if (Method == AES_128_GCM)
+        return 16;
+    if (Method == AES_256_GCM)
+        return 32;
+#else
     if (Method == AES_128_GCM_SIV)
         return 16;
     if (Method == AES_256_GCM_SIV)
         return 32;
+#endif
     throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown encryption method. Got {}", getMethodName(Method));
 }
 
@@ -104,6 +132,12 @@ std::string lastErrorString()
 /// Get encryption/decryption algorithms.
 const char * getMethod(EncryptionMethod Method)
 {
+#if defined(FIPS_CLICKHOUSE) && FIPS_CLICKHOUSE
+    if (Method == AES_128_GCM)
+        return "AES-128-GCM";
+    else if (Method == AES_256_GCM)
+        return "AES-256-GCM";
+#else
     /// The encrypting codecs were originally implemented using boringssl's API. At a later point and for FIPS-related reasons, an
     /// implementation based on OpenSSL was added specifically for s390/x. At that time, OpenSSL did not provide *-SIV ciphers (they were
     /// only added with OpenSSL 3.2), whereas boringssl provided them for ages. As a result, s390/x used non-SIV ciphers instead (leading to
@@ -120,6 +154,7 @@ const char * getMethod(EncryptionMethod Method)
         return "AES-256-GCM";
 #else
         return "AES-256-GCM-SIV";
+#endif
 #endif
     else
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown encryption method. Got {}", getMethodName(Method));
@@ -440,7 +475,11 @@ void CompressionCodecEncrypted::Configuration::load(const Poco::Util::AbstractCo
     /// In case of an error, throw exception
     std::unique_ptr<Params> new_params;
     static constexpr std::pair<std::string_view, EncryptionMethod> config_encryption_methods[] =
+#if defined(FIPS_CLICKHOUSE) && FIPS_CLICKHOUSE
+        {{".aes_128_gcm", AES_128_GCM}, {".aes_256_gcm", AES_256_GCM}};
+#else
         {{".aes_128_gcm_siv", AES_128_GCM_SIV}, {".aes_256_gcm_siv", AES_256_GCM_SIV}};
+#endif
     for (const auto& config_encryption_method : config_encryption_methods)
     {
         auto encryption_method_key = config_prefix + config_encryption_method.first.data();
@@ -644,7 +683,7 @@ namespace DB
 /// Register codecs for all algorithms
 void registerCodecEncrypted(CompressionCodecFactory & factory)
 {
-    registerEncryptionCodec(factory, AES_128_GCM_SIV);
-    registerEncryptionCodec(factory, AES_256_GCM_SIV);
+    registerEncryptionCodec(factory, AES_128_GCM);
+    registerEncryptionCodec(factory, AES_256_GCM);
 }
 }

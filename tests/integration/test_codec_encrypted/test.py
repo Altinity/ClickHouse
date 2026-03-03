@@ -53,7 +53,7 @@ def test_different_keys(start_cluster):
         """
         CREATE TABLE encrypted_test_128 (
             id Int64,
-            data String Codec(AES_128_GCM_SIV)
+            data String Codec(AES_128_GCM)
         ) ENGINE=MergeTree()
         ORDER BY id
         """
@@ -63,7 +63,7 @@ def test_different_keys(start_cluster):
         """
         CREATE TABLE encrypted_test_256 (
             id Int64,
-            data String Codec(AES_256_GCM_SIV)
+            data String Codec(AES_256_GCM)
         ) ENGINE=MergeTree()
         ORDER BY id
         """

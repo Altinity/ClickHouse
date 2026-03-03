@@ -129,6 +129,7 @@ target_compile_options(ssl INTERFACE
 
 target_compile_options(ssl INTERFACE
   -DOPENSSL_IS_BORINGSSL=1
+  -DFIPS_CLICKHOUSE=1
 )
 
 # This is taken from the later in the file when FIPS_CLICKHOUSE is not defined.
