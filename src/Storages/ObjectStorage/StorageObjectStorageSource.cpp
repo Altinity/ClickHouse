@@ -659,6 +659,14 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         if (need_only_count)
             input_format->needOnlyCount();
 
+        if (!object_info->getPath().empty())
+        {
+            if (const auto & metadata = object_info->relative_path_with_metadata.metadata)
+            {
+                input_format->setStorageRelatedUniqueKey(context_->getSettingsRef(), object_info->getPath() + ":" + metadata->etag);
+            }
+        }
+
         builder.init(Pipe(input_format));
 
         configuration->addDeleteTransformers(object_info, builder, format_settings, parser_shared_resources, context_);
