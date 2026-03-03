@@ -389,7 +389,6 @@ Chunk StorageObjectStorageSource::generate()
                 },
                 read_context);
 
-
             /// Not empty when allow_experimental_iceberg_read_optimization=true
             /// and some columns were removed from read list as columns with constant values.
             /// Restore data for these columns.
@@ -456,6 +455,23 @@ Chunk StorageObjectStorageSource::generate()
                 }
             }
 #endif
+
+            /// Convert any Const columns to full columns before returning.
+            /// This is necessary because when chunks with different Const values (e.g., partition columns
+            /// from different files in DeltaLake) are squashed together during INSERT, the squashing code
+            /// doesn't properly handle merging Const columns with different constant values.
+            /// By converting to full columns here, we ensure the values are preserved correctly.
+            if (chunk.hasColumns())
+            {
+                size_t chunk_num_rows = chunk.getNumRows();
+                auto columns = chunk.detachColumns();
+                for (auto & column : columns)
+                {
+                    if (column->isConst())
+                        column = column->cloneResized(chunk_num_rows)->convertToFullColumnIfConst();
+                }
+                chunk.setColumns(std::move(columns), chunk_num_rows);
+            }
 
             return chunk;
         }
@@ -1017,7 +1033,7 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
                 /* read_until_position */std::nullopt,
                 context_->getFilesystemCacheLog());
 
-            LOG_TEST(
+            LOG_TRACE(
                 log,
                 "Using filesystem cache `{}` (path: {}, etag: {}, hash: {})",
                 filesystem_cache_name,
@@ -1035,10 +1051,12 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     }
 
     if (!use_async_buffer)
+    {
+        LOG_TRACE(log, "Downloading object {} of size {} without initial prefetch", object_info.getPath(), object_size);
         return impl;
+    }
 
-    LOG_TRACE(log, "Downloading object of size {} with initial prefetch", object_size);
-
+    LOG_TRACE(log, "Downloading object {} of size {} with initial prefetch", object_info.getPath(), object_size);
     bool prefer_bigger_buffer_size = effective_read_settings.filesystem_cache_prefer_bigger_buffer_size
         && impl->isCached();
 
