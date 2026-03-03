@@ -89,8 +89,8 @@ For ClickHouse-style multithreaded systems, prioritize these checks before lower
   - transition mapping,
   - why it is a defect (not a design preference),
   - smallest logical repro steps,
-  - likely fix direction (one line),
-  - regression test direction (one line),
+  - likely fix direction (short, concrete: 2-4 bullets or sentences),
+  - regression test direction (short, concrete: 2-4 bullets or sentences),
   - affected subsystem and blast radius,
   - at least one code snippet proving the defect.
 - Separate “not confirmed” or “needs runtime proof” from confirmed defects.
@@ -112,6 +112,41 @@ For ClickHouse-style multithreaded systems, prioritize these checks before lower
 8. Assumptions & Limits
 9. Confidence rating and confidence-raising evidence
 10. Residual risks and untested paths
+
+## Standard Audit Report Template (Default: Pointed PR Style)
+
+Default report style should match concise PR review comments:
+- fail-first and action-oriented,
+- only confirmed defects (no pass-by-pass narrative),
+- one short summary line when there are no confirmed defects.
+
+Use the compact template below by default. Use the full 10-section canonical format only when explicitly requested.
+
+```markdown
+Audit update for PR #<id> (<short title/scope>):
+
+Confirmed defects:
+
+- **<Severity>: <short defect title>**
+  - Impact: <concrete user/system impact>
+  - Anchor: `<file>` / `<function or code path>`
+  - Trigger: <smallest condition that triggers defect>
+  - Why defect: <1-2 lines, behavior not preference>
+  - Fix direction (short): <2-4 bullets or sentences>
+  - Regression test direction (short): <2-4 bullets or sentences including positive and edge/failure cases>
+  - Evidence:
+    ```start:end:path
+    // minimal proving snippet
+    ```
+
+<repeat per defect, sorted High -> Medium -> Low>
+
+Coverage summary:
+- Scope reviewed: <partitions or key areas, one line>
+- Categories failed: <count/list>
+- Categories passed: <count only>
+- Assumptions/limits: <one line>
+```
 
 ## Severity Rubric
 
