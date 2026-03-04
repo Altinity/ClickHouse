@@ -65,6 +65,10 @@ ASTPtr ASTAlterCommand::clone() const
         res->sql_security = res->children.emplace_back(sql_security->clone()).get();
     if (rename_to)
         res->rename_to = res->children.emplace_back(rename_to->clone()).get();
+    if (to_table_function)
+        res->to_table_function = res->children.emplace_back(to_table_function->clone()).get();
+    if (partition_by_expr)
+        res->partition_by_expr = res->children.emplace_back(partition_by_expr->clone()).get();
 
     return res;
 }
@@ -368,6 +372,49 @@ void ASTAlterCommand::formatImpl(WriteBuffer & ostr, const FormatSettings & sett
             ostr << quoteString(move_destination_name);
         }
     }
+    else if (type == ASTAlterCommand::EXPORT_PART)
+    {
+        ostr << "EXPORT PART ";
+        partition->format(ostr, settings, state, frame);
+        ostr << " TO ";
+        switch (move_destination_type)
+        {
+            case DataDestinationType::TABLE:
+                ostr << "TABLE ";
+                if (to_table_function)
+                {
+                    ostr << "FUNCTION ";
+                    to_table_function->format(ostr, settings, state, frame);
+                    if (partition_by_expr)
+                    {
+                        ostr << " PARTITION BY ";
+                        partition_by_expr->format(ostr, settings, state, frame);
+                    }
+                }
+                else
+                {
+                    if (!to_database.empty())
+                        ostr << backQuoteIfNeed(to_database) << ".";
+
+                    ostr << backQuoteIfNeed(to_table);
+                }
+                return;
+            default:
+                break;
+        }
+
+    }
+    else if (type == ASTAlterCommand::EXPORT_PARTITION)
+    {
+        ostr << "EXPORT PARTITION ";
+        partition->format(ostr, settings, state, frame);
+        ostr << " TO TABLE ";
+        if (!to_database.empty())
+        {
+            ostr << backQuoteIfNeed(to_database) << ".";
+        }
+        ostr << backQuoteIfNeed(to_table);
+    }
     else if (type == ASTAlterCommand::REPLACE_PARTITION)
     {
         ostr << (replace ? "REPLACE" : "ATTACH") << " PARTITION "
@@ -572,6 +619,8 @@ void ASTAlterCommand::forEachPointerToChild(std::function<void(IAST **, boost::i
     f(&select, nullptr);
     f(&sql_security, nullptr);
     f(&rename_to, nullptr);
+    f(&to_table_function, nullptr);
+    f(&partition_by_expr, nullptr);
 }
 
 
@@ -644,6 +693,11 @@ bool ASTAlterQuery::isMovePartitionToDiskOrVolumeAlter() const
         return true;
     }
     return false;
+}
+
+bool ASTAlterQuery::isExportPartOrExportPartitionAlter() const
+{
+    return isOneCommandTypeOnly(ASTAlterCommand::EXPORT_PART) || isOneCommandTypeOnly(ASTAlterCommand::EXPORT_PARTITION);
 }
 
 
