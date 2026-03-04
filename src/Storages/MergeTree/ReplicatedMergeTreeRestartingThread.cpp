@@ -27,6 +27,7 @@ namespace DB
 namespace ServerSetting
 {
     extern const ServerSettingsInsertDeduplicationVersions insert_deduplication_version;
+    extern const ServerSettingsBool enable_experimental_export_merge_tree_partition_feature;
 }
 
 namespace MergeTreeSetting
@@ -179,6 +180,14 @@ bool ReplicatedMergeTreeRestartingThread::runImpl()
     storage.mutations_updating_task->activateAndSchedule();
     storage.mutations_finalizing_task->activateAndSchedule();
     storage.merge_selecting_task->activateAndSchedule();
+
+    if (storage.getContext()->getServerSettings()[ServerSetting::enable_experimental_export_merge_tree_partition_feature])
+    {
+        storage.export_merge_tree_partition_updating_task->activateAndSchedule();
+        storage.export_merge_tree_partition_select_task->activateAndSchedule();
+        storage.export_merge_tree_partition_status_handling_task->activateAndSchedule();
+    }
+
     storage.cleanup_thread.start();
     storage.async_block_ids_cache.start();
     storage.part_check_thread.start();
