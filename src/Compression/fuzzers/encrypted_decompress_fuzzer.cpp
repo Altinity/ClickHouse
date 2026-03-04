@@ -308,8 +308,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size)
             return 0;
 
         auto config = generator.getResult();
+#if defined(FIPS_CLICKHOUSE) && FIPS_CLICKHOUSE
         auto codec_128 = getCompressionCodecEncrypted(DB::AES_128_GCM_SIV);
         auto codec_256 = getCompressionCodecEncrypted(DB::AES_256_GCM_SIV);
+#else
+        auto codec_128 = getCompressionCodecEncrypted(DB::AES_128_GCM_SIV);
+        auto codec_256 = getCompressionCodecEncrypted(DB::AES_256_GCM_SIV);
+#endif
         DB::CompressionCodecEncrypted::Configuration::instance().tryLoad(*config, "");
 
         size_t data_size = size - generator.keySize();

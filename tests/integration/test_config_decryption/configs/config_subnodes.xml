@@ -1,14 +1,15 @@
 <clickhouse>
 
     <encryption_codecs>
-        <aes_128_gcm_siv>
+        <aes_128_gcm>
             <key_hex>00112233445566778899aabbccddeeff</key_hex>
-        </aes_128_gcm_siv>
+        </aes_128_gcm>
     </encryption_codecs>
 
     <!-- tags with "encrypted_by" must not have nested tags -->
-    <interserver_http_credentials encrypted_by="AES_128_GCM_SIV">
-        <password>96260000000B0000000000E8FE3C087CED2205A5071078B29FD5C3B97F824911DED3217E980C</password>
+    <interserver_http_credentials encrypted_by="AES_128_GCM">
+        <!-- plaintext: 60000000000 -->
+        <password>FA260000000B00000000002BC9170775238FE4AF735B4AE0DE79EE1EB544ACC3D2D8D4CAA99E</password>
     </interserver_http_credentials>
 
 </clickhouse>

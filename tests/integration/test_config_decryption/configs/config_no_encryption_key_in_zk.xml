@@ -1,8 +1,8 @@
 <clickhouse>
     <!-- no encryption key found in ZK -->
     <encryption_codecs>
-        <aes_128_gcm_siv>
+        <aes_128_gcm>
             <key_hex from_zk="/invalid_key"/>
-        </aes_128_gcm_siv>
+        </aes_128_gcm>
     </encryption_codecs>
 </clickhouse>

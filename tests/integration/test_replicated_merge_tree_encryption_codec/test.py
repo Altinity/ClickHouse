@@ -46,7 +46,7 @@ def create_table():
         """
         CREATE TABLE tbl ON CLUSTER 'cluster' (
             id Int64,
-            str String Codec(AES_128_GCM_SIV)
+            str String Codec(AES_128_GCM)
         ) ENGINE=ReplicatedMergeTree('/clickhouse/tables/tbl/', '{replica}')
         ORDER BY id
         """

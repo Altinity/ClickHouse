@@ -1,7 +1,7 @@
 <clickhouse>
     <encryption_codecs>
-        <aes_128_gcm_siv>
+        <aes_128_gcm>
             <key>0000000000000000</key>
-        </aes_128_gcm_siv>
+        </aes_128_gcm>
     </encryption_codecs>
 </clickhouse>
