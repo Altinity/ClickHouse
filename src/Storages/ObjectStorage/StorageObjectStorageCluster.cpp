@@ -1,3 +1,4 @@
+#include <optional>
 #include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
 
 #include <Common/Exception.h>
@@ -112,6 +113,11 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
     StorageInMemoryMetadata metadata;
     metadata.setColumns(columns);
     metadata.setConstraints(constraints_);
+
+    if (configuration->partition_strategy)
+    {
+        metadata.partition_key = configuration->partition_strategy->getPartitionKeyDescription();
+    }
 
     setVirtuals(VirtualColumnUtils::getVirtualsForFileLikeStorage(
         metadata.columns,
@@ -273,7 +279,7 @@ RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExten
         local_context,
         predicate,
         filter,
-        virtual_columns,
+        getVirtualsList(),
         hive_partition_columns_to_read_from_file_path,
         nullptr,
         local_context->getFileProgressCallback(),
