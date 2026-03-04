@@ -429,7 +429,7 @@ ObjectInfoPtr IcebergIterator::next(size_t)
                 logger,
                 "Finally got {} position delete elements for data file {}",
                 object_info->info.position_deletes_objects.size(),
-                object_info->info.data_object_file_path_key);
+                object_info->info.data_object_file_path_from_metadata);
         }
 
         for (const auto & equality_delete :
@@ -444,7 +444,7 @@ ObjectInfoPtr IcebergIterator::next(size_t)
                 logger,
                 "Finally got {} equality delete elements for data file {}",
                 object_info->info.equality_deletes_objects.size(),
-                object_info->info.data_object_file_path_key);
+                object_info->info.data_object_file_path_from_metadata);
         }
 
         ProfileEvents::increment(ProfileEvents::IcebergMetadataReturnedObjectInfos);
