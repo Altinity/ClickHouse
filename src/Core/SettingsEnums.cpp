@@ -440,4 +440,7 @@ IMPLEMENT_SETTING_ENUM(DeduplicateInsertSelectMode, ErrorCodes::BAD_ARGUMENTS,
      {"force_enable", DeduplicateInsertSelectMode::FORCE_ENABLE},
      {"disable", DeduplicateInsertSelectMode::DISABLE},
      {"enable_even_for_bad_queries", DeduplicateInsertSelectMode::ENABLE_EVEN_FOR_BAD_QUERIES}})
+
+IMPLEMENT_SETTING_AUTO_ENUM(MergeTreePartExportFileAlreadyExistsPolicy, ErrorCodes::BAD_ARGUMENTS);
+
 }

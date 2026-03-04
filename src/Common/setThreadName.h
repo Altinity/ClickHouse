@@ -157,6 +157,7 @@ namespace DB
     M(ZOOKEEPER_ACL_WATCHER, "ZooACLWatch") \
     M(ZOOKEEPER_RECV, "ZooKeeperRecv") \
     M(ZOOKEEPER_SEND, "ZooKeeperSend") \
+    M(EXPORT_PART, "ExportPart") \
 
 
 enum class ThreadName : uint8_t
