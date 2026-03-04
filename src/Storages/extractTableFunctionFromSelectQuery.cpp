@@ -20,14 +20,25 @@ ASTTableExpression * extractTableExpressionASTPtrFromSelectQuery(ASTPtr & query)
     return table_expression;
 }
 
+ASTPtr extractTableFunctionASTPtrFromSelectQuery(ASTPtr & query)
+{
+    auto table_expression = extractTableExpressionASTPtrFromSelectQuery(query);
+    return table_expression ? table_expression->table_function : nullptr;
+}
+
+ASTPtr extractTableASTPtrFromSelectQuery(ASTPtr & query)
+{
+    auto table_expression = extractTableExpressionASTPtrFromSelectQuery(query);
+    return table_expression ? table_expression->database_and_table_name : nullptr;
+}
+
 ASTFunction * extractTableFunctionFromSelectQuery(ASTPtr & query)
 {
-    auto * table_expression = extractTableExpressionASTPtrFromSelectQuery(query);
-    if (!table_expression->table_function)
+    auto table_function_ast = extractTableFunctionASTPtrFromSelectQuery(query);
+    if (!table_function_ast)
         return nullptr;
 
-    auto * table_function = table_expression->table_function->as<ASTFunction>();
-    return table_function;
+    return table_function_ast->as<ASTFunction>();
 }
 
 ASTExpressionList * extractTableFunctionArgumentsFromSelectQuery(ASTPtr & query)
