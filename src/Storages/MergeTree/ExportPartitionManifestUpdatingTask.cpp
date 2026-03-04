@@ -418,6 +418,7 @@ std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::
         info.destination_table = metadata.destination_table;
         info.partition_id = metadata.partition_id;
         info.transaction_id = metadata.transaction_id;
+        info.query_id = metadata.query_id;
         info.create_time = metadata.create_time;
         info.source_replica = metadata.source_replica;
         info.parts_count = metadata.number_of_parts;
@@ -448,6 +449,7 @@ std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::
         info.destination_table = entry.manifest.destination_table;
         info.partition_id = entry.manifest.partition_id;
         info.transaction_id = entry.manifest.transaction_id;
+        info.query_id = entry.manifest.query_id;
         info.create_time = entry.manifest.create_time;
         info.source_replica = entry.manifest.source_replica;
         info.parts_count = entry.manifest.number_of_parts;

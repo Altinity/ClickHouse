@@ -37,6 +37,9 @@ bool ExportPartFromPartitionExportTask::executeStep()
         return false;
     }
 
+    std::lock_guard inner_lock(storage.export_manifests_mutex);
+    storage.export_manifests.erase(manifest);
+
     LOG_INFO(storage.log, "ExportPartFromPartitionExportTask: Failed to lock part {}, skipping", part_name);
     return false;
 }

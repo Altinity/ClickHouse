@@ -418,7 +418,7 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
         LOG_INFO(storage.log, "ExportPartition scheduler task: Retry count limit not exceeded for part {}, will increment retry count", part_name);
     }
 
-    std::size_t num_exceptions = 0;
+    std::size_t num_exceptions = std::numeric_limits<size_t>::max();
 
     const auto exceptions_per_replica_path = export_path / "exceptions_per_replica" / storage.replica_name;
     const auto count_path = exceptions_per_replica_path / "count";
@@ -430,10 +430,17 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
     {
         LOG_INFO(storage.log, "ExportPartition scheduler task: Exceptions per replica path exists, no need to create it");
         std::string num_exceptions_string;
-        zk->tryGet(count_path, num_exceptions_string);
+        if (zk->tryGet(count_path, num_exceptions_string))
+        {
+            num_exceptions = parse<size_t>(num_exceptions_string);
+        }
+        else
+        {
+            LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to get number of exceptions, will use zero");
+        }
+
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
-        num_exceptions = parse<size_t>(num_exceptions_string);
 
         ops.emplace_back(zkutil::makeSetRequest(last_exception_path / "part", part_name, -1));
         ops.emplace_back(zkutil::makeSetRequest(last_exception_path / "exception", exception->message(), -1));
