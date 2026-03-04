@@ -46,6 +46,7 @@
 #include <Processors/Executors/PullingPipelineExecutor.h>
 #include <Processors/Sources/SourceFromSingleChunk.h>
 #include <QueryPipeline/QueryPipeline.h>
+#include <Storages/Cache/ObjectStorageListObjectsCache.h>
 #include <Storages/Freeze.h>
 #include <Storages/MaterializedView/RefreshTask.h>
 #include <Storages/ObjectStorage/Azure/Configuration.h>
@@ -75,6 +76,10 @@
 
 #if USE_PROTOBUF
 #include <Formats/ProtobufSchemas.h>
+#endif
+
+#if USE_PARQUET
+#include <Processors/Formats/Impl/ParquetFileMetaDataCache.h>
 #endif
 
 #if USE_AWS_S3
@@ -453,6 +458,16 @@ BlockIO InterpreterSystemQuery::execute()
             getContext()->clearQueryResultCache(query.query_result_cache_tag);
             break;
         }
+        case Type::DROP_PARQUET_METADATA_CACHE:
+        {
+#if USE_PARQUET
+            getContext()->checkAccess(AccessType::SYSTEM_DROP_PARQUET_METADATA_CACHE);
+            ParquetFileMetaDataCache::instance()->clear();
+            break;
+#else
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "The server was compiled without the support for Parquet");
+#endif
+        }
         case Type::CLEAR_COMPILED_EXPRESSION_CACHE:
 #if USE_EMBEDDED_COMPILER
             getContext()->checkAccess(AccessType::SYSTEM_DROP_COMPILED_EXPRESSION_CACHE);
@@ -470,7 +485,12 @@ BlockIO InterpreterSystemQuery::execute()
 #else
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "The server was compiled without the support for AWS S3");
 #endif
-
+        case Type::DROP_OBJECT_STORAGE_LIST_OBJECTS_CACHE:
+        {
+            getContext()->checkAccess(AccessType::SYSTEM_DROP_OBJECT_STORAGE_LIST_OBJECTS_CACHE);
+            ObjectStorageListObjectsCache::instance().clear();
+            break;
+        }
         case Type::CLEAR_FILESYSTEM_CACHE:
         {
             getContext()->checkAccess(AccessType::SYSTEM_DROP_FILESYSTEM_CACHE);
@@ -1997,7 +2017,9 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
         case Type::CLEAR_PAGE_CACHE:
         case Type::CLEAR_SCHEMA_CACHE:
         case Type::CLEAR_FORMAT_SCHEMA_CACHE:
+        case Type::DROP_PARQUET_METADATA_CACHE:
         case Type::CLEAR_S3_CLIENT_CACHE:
+        case Type::DROP_OBJECT_STORAGE_LIST_OBJECTS_CACHE:
         {
             required_access.emplace_back(AccessType::SYSTEM_DROP_CACHE);
             break;

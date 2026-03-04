@@ -72,6 +72,7 @@ namespace Setting
     extern const SettingsBool cluster_function_process_archive_on_multiple_nodes;
     extern const SettingsBool table_engine_read_through_distributed_cache;
     extern const SettingsUInt64 s3_path_filter_limit;
+    extern const SettingsBool use_object_storage_list_objects_cache;
 }
 
 namespace ErrorCodes
@@ -201,18 +202,52 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
         // If paths contains a value, validate the extracted paths and use the key-based iterator
         // (even if the result is empty, indicating no scanning is required).
         if (!paths)
+        {
+            std::shared_ptr<IObjectStorageIterator> object_iterator = nullptr;
+            std::unique_ptr<GlobIterator::ListObjectsCacheWithKey> cache_ptr = nullptr;
+
+            if (local_context->getSettingsRef()[Setting::use_object_storage_list_objects_cache] && object_storage->supportsListObjectsCache())
+            {
+                auto & cache = ObjectStorageListObjectsCache::instance();
+                ObjectStorageListObjectsCache::Key cache_key {object_storage->getDescription(), configuration->getNamespace(), configuration->getRawPath().cutGlobs(configuration->supportsPartialPathPrefix()), with_tags};
+
+                if (auto objects_info = cache.get(cache_key, /*filter_by_prefix=*/ false))
+                {
+                    /// suboptimal because of the recent upstream changes to the ObjectInfo structure
+                    /// re-think this with more time and see if there is a more optimized approach
+                    RelativePathsWithMetadata relative_path_with_metadata;
+                    relative_path_with_metadata.reserve(objects_info->size());
+
+                    for (const auto & object_info : *objects_info)
+                    {
+                        relative_path_with_metadata.emplace_back(std::make_shared<RelativePathWithMetadata>(object_info->getPath(), object_info->getObjectMetadata()));
+                    }
+
+                    object_iterator = std::make_shared<ObjectStorageIteratorFromList>(std::move(relative_path_with_metadata));
+                }
+                else
+                {
+                    cache_ptr = std::make_unique<GlobIterator::ListObjectsCacheWithKey>(cache, cache_key);
+                    object_iterator = object_storage->iterate(configuration->getRawPath().cutGlobs(configuration->supportsPartialPathPrefix()), query_settings.list_object_keys_size, with_tags);
+                }
+            }
+            else
+            {
+                object_iterator = object_storage->iterate(configuration->getRawPath().cutGlobs(configuration->supportsPartialPathPrefix()), query_settings.list_object_keys_size, with_tags);
+            }
+            
             iterator = std::make_unique<GlobIterator>(
-                object_storage,
+                object_iterator,
                 configuration,
                 predicate,
                 virtual_columns,
                 hive_columns,
                 local_context,
                 is_archive ? nullptr : read_keys,
-                query_settings.list_object_keys_size,
                 query_settings.throw_on_zero_files_match,
-                with_tags,
-                file_progress_callback);
+                file_progress_callback,
+                std::move(cache_ptr));
+        }
         else
         {
             // Validate that extracted paths match the glob pattern to prevent scanning unallowed data
@@ -385,7 +420,6 @@ Chunk StorageObjectStorageSource::generate()
                 },
                 read_context);
 
-
 #if USE_PARQUET
             if (chunk_size && chunk.hasColumns())
             {
@@ -442,6 +476,23 @@ Chunk StorageObjectStorageSource::generate()
                 }
             }
 #endif
+
+            /// Convert any Const columns to full columns before returning.
+            /// This is necessary because when chunks with different Const values (e.g., partition columns
+            /// from different files in DeltaLake) are squashed together during INSERT, the squashing code
+            /// doesn't properly handle merging Const columns with different constant values.
+            /// By converting to full columns here, we ensure the values are preserved correctly.
+            if (chunk.hasColumns())
+            {
+                size_t chunk_num_rows = chunk.getNumRows();
+                auto columns = chunk.detachColumns();
+                for (auto & column : columns)
+                {
+                    if (column->isConst())
+                        column = column->cloneResized(chunk_num_rows)->convertToFullColumnIfConst();
+                }
+                chunk.setColumns(std::move(columns), chunk_num_rows);
+            }
 
             return chunk;
         }
@@ -643,6 +694,14 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         if (need_only_count)
             input_format->needOnlyCount();
 
+        if (!object_info->getPath().empty())
+        {
+            if (const auto & metadata = object_info->relative_path_with_metadata.metadata)
+            {
+                input_format->setStorageRelatedUniqueKey(context_->getSettingsRef(), object_info->getPath() + ":" + metadata->etag);
+            }
+        }
+
         builder.init(Pipe(input_format));
 
         configuration->addDeleteTransformers(object_info, builder, format_settings, parser_shared_resources, context_);
@@ -840,7 +899,7 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
                 /* read_until_position */std::nullopt,
                 context_->getFilesystemCacheLog());
 
-            LOG_TEST(
+            LOG_TRACE(
                 log,
                 "Using filesystem cache `{}` (path: {}, etag: {}, hash: {})",
                 filesystem_cache_name,
@@ -858,10 +917,12 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
     }
 
     if (!use_async_buffer)
+    {
+        LOG_TRACE(log, "Downloading object {} of size {} without initial prefetch", object_info.getPath(), object_size);
         return impl;
+    }
 
-    LOG_TRACE(log, "Downloading object of size {} with initial prefetch", object_size);
-
+    LOG_TRACE(log, "Downloading object {} of size {} with initial prefetch", object_info.getPath(), object_size);
     bool prefer_bigger_buffer_size = effective_read_settings.filesystem_cache_prefer_bigger_buffer_size
         && impl->isCached();
 
@@ -892,19 +953,18 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
 }
 
 StorageObjectStorageSource::GlobIterator::GlobIterator(
-    ObjectStoragePtr object_storage_,
-    StorageObjectStorageConfigurationPtr configuration_,
+    const ObjectStorageIteratorPtr & object_storage_iterator_,
+    ConfigurationPtr configuration_,
     const ActionsDAG::Node * predicate,
     const NamesAndTypesList & virtual_columns_,
     const NamesAndTypesList & hive_columns_,
     ContextPtr context_,
     ObjectInfos * read_keys_,
-    size_t list_object_keys_size,
     bool throw_on_zero_files_match_,
-    bool with_tags,
-    std::function<void(FileProgress)> file_progress_callback_)
+    std::function<void(FileProgress)> file_progress_callback_,
+    std::unique_ptr<ListObjectsCacheWithKey> list_cache_)
     : WithContext(context_)
-    , object_storage(object_storage_)
+    , object_storage_iterator(object_storage_iterator_)
     , configuration(configuration_)
     , virtual_columns(virtual_columns_)
     , hive_columns(hive_columns_)
@@ -913,14 +973,13 @@ StorageObjectStorageSource::GlobIterator::GlobIterator(
     , read_keys(read_keys_)
     , local_context(context_)
     , file_progress_callback(file_progress_callback_)
+    , list_cache(std::move(list_cache_))
 {
     const auto & reading_path = configuration->getPathForRead();
     if (reading_path.hasGlobs())
     {
         const auto & key_with_globs = reading_path;
         const auto key_prefix = reading_path.cutGlobs(configuration->supportsPartialPathPrefix());
-
-        object_storage_iterator = object_storage->iterate(key_prefix, list_object_keys_size, with_tags);
 
         matcher = std::make_unique<re2::RE2>(makeRegexpPatternFromGlobs(key_with_globs.path));
         if (!matcher->ok())
@@ -985,6 +1044,10 @@ ObjectInfoPtr StorageObjectStorageSource::GlobIterator::nextUnlocked(size_t /* p
             auto result = object_storage_iterator->getCurrentBatchAndScheduleNext();
             if (!result.has_value())
             {
+                if (list_cache)
+                {
+                    list_cache->set(std::move(object_list));
+                }
                 is_finished = true;
                 return {};
             }
@@ -994,6 +1057,11 @@ ObjectInfoPtr StorageObjectStorageSource::GlobIterator::nextUnlocked(size_t /* p
                 result->end(),
                 std::back_inserter(new_batch),
                 [&](const std::shared_ptr<RelativePathWithMetadata> & object) { return std::make_shared<ObjectInfo>(*object); });
+
+            if (list_cache)
+            {
+                object_list.insert(object_list.end(), new_batch.begin(), new_batch.end());
+            }
 
             for (auto it = new_batch.begin(); it != new_batch.end();)
             {

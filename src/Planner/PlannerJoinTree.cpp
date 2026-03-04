@@ -1448,7 +1448,9 @@ JoinTreeQueryPlan buildQueryPlanForTableExpression(QueryTreeNodePtr table_expres
                     /// Overall, IStorage::read    -> FetchColumns returns normal column names (except Distributed, which is inconsistent)
                     /// Interpreter::getQueryPlan  -> FetchColumns returns identifiers (why?) and this the reason for the bug ^ in Distributed
                     /// Hopefully there is no other case when we read from Distributed up to FetchColumns.
-                    if (table_node && table_node->getStorage()->isRemote() && select_query_options.to_stage == QueryProcessingStage::FetchColumns)
+                    if (table_node && table_node->getStorage()->isRemote())
+                        updated_actions_dag_outputs.push_back(output_node);
+                    else if (table_function_node && table_function_node->getStorage()->isRemote())
                         updated_actions_dag_outputs.push_back(output_node);
                 }
                 else
@@ -2356,8 +2358,12 @@ void tryMakeDirectJoinWithMergeTree(const JoinOperator & join_operator,
         return;
     if (root_node->children.size() != 1 || !root_node->children.front())
         return;
-    auto * reading_step = typeid_cast<ReadFromMergeTree *>(root_node->children.front()->step.get());
-    if (!reading_step)
+
+    const auto * children_step = root_node->children.front()->step.get();
+    bool is_allowed_storage = typeid_cast<const ReadFromMergeTree *>(children_step)
+                           || typeid_cast<const ReadNothingStep *>(children_step)
+                           || typeid_cast<const ReadFromPreparedSource *>(children_step);
+    if (!is_allowed_storage)
         return;
 
     if (lhs.fromRight() && rhs.fromLeft())
