@@ -1,3 +1,4 @@
+#include <optional>
 #include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
 
 #include <Common/Exception.h>
@@ -118,6 +119,11 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
     }
 
     metadata.setConstraints(constraints_);
+
+    if (configuration->partition_strategy)
+    {
+        metadata.partition_key = configuration->partition_strategy->getPartitionKeyDescription();
+    }
 
     setVirtuals(VirtualColumnUtils::getVirtualsForFileLikeStorage(
         metadata.columns,
