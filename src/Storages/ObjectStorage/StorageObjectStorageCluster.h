@@ -52,6 +52,24 @@ public:
         const ASTInsertQuery & query,
         ContextPtr context) override;
 
+    bool supportsImport() const override;
+
+    SinkToStoragePtr import(
+        const std::string & file_name,
+        Block & block_with_partition_values,
+        const std::function<void(const std::string &)> & new_file_path_callback,
+        bool overwrite_if_exists,
+        std::size_t max_bytes_per_file,
+        std::size_t max_rows_per_file,
+        const std::optional<FormatSettings> & format_settings_,
+        ContextPtr context) override;
+
+    void commitExportPartitionTransaction(
+        const String & transaction_id,
+        const String & partition_id,
+        const Strings & exported_paths,
+        ContextPtr local_context) override;
+
     void drop() override;
 
     void dropInnerTableIfAny(bool sync, ContextPtr context) override;

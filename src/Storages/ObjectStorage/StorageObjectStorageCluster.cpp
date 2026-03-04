@@ -1002,4 +1002,56 @@ bool StorageObjectStorageCluster::parallelizeOutputAfterReading(ContextPtr conte
     return IStorageCluster::parallelizeOutputAfterReading(context);
 }
 
+bool StorageObjectStorageCluster::supportsImport() const
+{
+    if (pure_storage)
+        return pure_storage->supportsImport();
+    return IStorageCluster::supportsImport();
+}
+
+SinkToStoragePtr StorageObjectStorageCluster::import(
+    const std::string & file_name,
+    Block & block_with_partition_values,
+    const std::function<void(const std::string &)> & new_file_path_callback,
+    bool overwrite_if_exists,
+    std::size_t max_bytes_per_file,
+    std::size_t max_rows_per_file,
+    const std::optional<FormatSettings> & format_settings_,
+    ContextPtr context)
+{
+    if (pure_storage)
+        return pure_storage->import(
+            file_name,
+            block_with_partition_values,
+            new_file_path_callback,
+            overwrite_if_exists,
+            max_bytes_per_file,
+            max_rows_per_file,
+            format_settings_,
+            context);
+    return IStorageCluster::import(
+        file_name,
+        block_with_partition_values,
+        new_file_path_callback,
+        overwrite_if_exists,
+        max_bytes_per_file,
+        max_rows_per_file,
+        format_settings_,
+        context);
+}
+
+void StorageObjectStorageCluster::commitExportPartitionTransaction(
+    const String & transaction_id,
+    const String & partition_id,
+    const Strings & exported_paths,
+    ContextPtr local_context)
+{
+    if (pure_storage)
+    {
+        pure_storage->commitExportPartitionTransaction(transaction_id, partition_id, exported_paths, local_context);
+        return;
+    }
+    IStorageCluster::commitExportPartitionTransaction(transaction_id, partition_id, exported_paths, local_context);
+}
+
 }
