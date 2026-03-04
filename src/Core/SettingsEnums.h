@@ -164,6 +164,16 @@ enum class DistributedProductMode : uint8_t
 
 DECLARE_SETTING_ENUM(DistributedProductMode)
 
+/// The setting for executing object storage cluster function or table JOIN sections.
+enum class ObjectStorageClusterJoinMode : uint8_t
+{
+    LOCAL,       /// Convert to local query
+    GLOBAL,      /// Convert to global query
+    ALLOW        /// Enable
+};
+
+DECLARE_SETTING_ENUM(ObjectStorageClusterJoinMode)
+
 /// How the query result cache handles queries with non-deterministic functions, e.g. now()
 enum class QueryResultCacheNondeterministicFunctionHandling : uint8_t
 {
@@ -561,5 +571,14 @@ enum class DeduplicateInsertSelectMode : uint8_t
 };
 
 DECLARE_SETTING_ENUM(DeduplicateInsertSelectMode)
+
+enum class MergeTreePartExportFileAlreadyExistsPolicy : uint8_t
+{
+    skip,
+    error,
+    overwrite,
+};
+
+DECLARE_SETTING_ENUM(MergeTreePartExportFileAlreadyExistsPolicy)
 
 }

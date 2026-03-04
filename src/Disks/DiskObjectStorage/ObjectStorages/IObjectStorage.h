@@ -130,6 +130,7 @@ struct RelativePathWithMetadata
 
     std::string getFileName() const { return std::filesystem::path(relative_path).filename(); }
     std::string getPath() const { return relative_path; }
+    std::string getFileNameWithoutExtension() const { return std::filesystem::path(relative_path).stem(); }
 };
 
 struct ObjectKeyWithMetadata
@@ -329,6 +330,8 @@ public:
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "The method 'tagObjects' is only implemented for S3 and Azure storages");
     }
 #endif
+
+    virtual bool supportsListObjectsCache() { return false; }
 };
 
 using ObjectStoragePtr = std::shared_ptr<IObjectStorage>;
