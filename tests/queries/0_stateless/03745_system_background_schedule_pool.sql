@@ -15,7 +15,11 @@ DROP TABLE test_table_03745;
 DROP TABLE IF EXISTS test_merge_tree_03745;
 CREATE TABLE test_merge_tree_03745 (x UInt64, y String) ENGINE = MergeTree() ORDER BY x SETTINGS refresh_statistics_interval = '0';
 INSERT INTO test_merge_tree_03745 VALUES (1, 'a'), (2, 'b');
+<<<<<<< HEAD
 SELECT pool, database, table, table_uuid != toUUIDOrDefault(0) AS has_uuid, log_name FROM system.background_schedule_pool WHERE database = currentDatabase() ORDER BY ALL;
+=======
+SELECT pool, database, table, table_uuid != toUUIDOrDefault(0) AS has_uuid, log_name FROM system.background_schedule_pool WHERE database = currentDatabase() ORDER BY (pool, database, table, log_name);
+>>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
 DROP TABLE test_merge_tree_03745;
 
 -- Test 3: Distributed table (distributed pool)

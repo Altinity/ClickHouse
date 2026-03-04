@@ -140,6 +140,20 @@ public:
     UInt64 obsolete_count_participating_replicas{0};
     UInt64 number_of_current_replica{0};
 
+<<<<<<< HEAD
+=======
+    enum class BackgroundOperationType : uint8_t
+    {
+        NOT_A_BACKGROUND_OPERATION = 0,
+        MERGE = 1,
+        MUTATION = 2,
+        EXPORT_PART = 3,
+    };
+
+    /// It's ClientInfo and context created for background operation (not real query)
+    BackgroundOperationType background_operation_type{BackgroundOperationType::NOT_A_BACKGROUND_OPERATION};
+
+>>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
     bool empty() const { return query_kind == QueryKind::NO_QUERY; }
 
     /** Serialization and deserialization.

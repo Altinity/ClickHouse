@@ -148,10 +148,20 @@ void StorageObjectStorageConfiguration::initialize(
     else
         FormatFactory::instance().checkFormatName(configuration_to_initialize.format);
 
-    /// It might be changed on `StorageObjectStorageConfiguration::initPartitionStrategy`
+    if (configuration_to_initialize.partition_strategy_type == PartitionStrategyFactory::StrategyType::HIVE)
+    {
+        configuration_to_initialize.file_path_generator = std::make_shared<ObjectStorageAppendFilePathGenerator>(
+            configuration_to_initialize.getRawPath().path,
+            configuration_to_initialize.format);
+    }
+    else
+    {
+        configuration_to_initialize.file_path_generator = std::make_shared<ObjectStorageWildcardFilePathGenerator>(configuration_to_initialize.getRawPath().path);
+    }
+
     /// We shouldn't set path for disk setup because path prefix is already set in used object_storage.
     if (disk_name.empty())
-        configuration_to_initialize.read_path = configuration_to_initialize.getRawPath();
+        configuration_to_initialize.read_path = configuration_to_initialize.file_path_generator->getPathForRead();
 
     configuration_to_initialize.initialized = true;
 }
@@ -191,7 +201,6 @@ void StorageObjectStorageConfiguration::initPartitionStrategy(ASTPtr partition_b
 
     if (partition_strategy)
     {
-        read_path = partition_strategy->getPathForRead(getRawPath().path);
         LOG_DEBUG(getLogger("StorageObjectStorageConfiguration"), "Initialized partition strategy {}", magic_enum::enum_name(partition_strategy_type));
     }
 }
@@ -203,8 +212,10 @@ const StorageObjectStorageConfiguration::Path & StorageObjectStorageConfiguratio
 
 StorageObjectStorageConfiguration::Path StorageObjectStorageConfiguration::getPathForWrite(const std::string & partition_id) const
 {
-    auto raw_path = getRawPath();
+    return getPathForWrite(partition_id, /* filename_override */ "");
+}
 
+<<<<<<< HEAD
     if (!schema_hash.empty())
         boost::replace_all(raw_path.path, SCHEMA_HASH_WILDCARD, schema_hash);
 
@@ -214,6 +225,11 @@ StorageObjectStorageConfiguration::Path StorageObjectStorageConfiguration::getPa
     }
 
     return Path {partition_strategy->getPathForWrite(raw_path.path, partition_id)};
+=======
+StorageObjectStorageConfiguration::Path StorageObjectStorageConfiguration::getPathForWrite(const std::string & partition_id, const std::string & filename_override) const
+{
+    return Path {file_path_generator->getPathForWrite(partition_id, filename_override)};
+>>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
 }
 
 bool StorageObjectStorageConfiguration::Path::hasPartitionWildcard() const
@@ -222,7 +238,17 @@ bool StorageObjectStorageConfiguration::Path::hasPartitionWildcard() const
     return path.find(PARTITION_ID_WILDCARD) != String::npos;
 }
 
+<<<<<<< HEAD
 bool StorageObjectStorageConfiguration::Path::hasSchemaHashWildcard() const
+=======
+bool StorageObjectStorageConfiguration::Path::hasExportFilenameWildcard() const
+{
+    return path.find(ObjectStorageWildcardFilePathGenerator::FILE_WILDCARD) != String::npos;
+}
+
+
+bool StorageObjectStorageConfiguration::Path::hasGlobsIgnorePartitionWildcard() const
+>>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
 {
     return path.find(StorageObjectStorageConfiguration::SCHEMA_HASH_WILDCARD) != String::npos;
 }

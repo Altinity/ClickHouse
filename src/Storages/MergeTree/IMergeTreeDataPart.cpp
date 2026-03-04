@@ -341,6 +341,7 @@ String IMergeTreeDataPart::MinMaxIndex::getFileColumnName(const String & column_
     return stream_name;
 }
 
+<<<<<<< HEAD
 IMergeTreeDataPart::MinMaxIndexPtr IMergeTreeDataPart::getMinMaxIndex() const
 {
     std::lock_guard lock(minmax_idx_mutex);
@@ -365,6 +366,42 @@ void IMergeTreeDataPart::setMinMaxIndex(MinMaxIndexPtr minmax_index) const
 {
     std::lock_guard lock(minmax_idx_mutex);
     minmax_idx = std::move(minmax_index);
+=======
+Block IMergeTreeDataPart::MinMaxIndex::getBlock(const MergeTreeData & data) const
+{
+    if (!initialized)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Attempt to get block from uninitialized MinMax index.");
+
+    Block block;
+
+    const auto metadata_snapshot = data.getInMemoryMetadataPtr();
+    const auto & partition_key = metadata_snapshot->getPartitionKey();
+
+    const auto minmax_column_names = data.getMinMaxColumnsNames(partition_key);
+    const auto minmax_column_types = data.getMinMaxColumnsTypes(partition_key);
+    const auto minmax_idx_size = minmax_column_types.size();
+
+    for (size_t i = 0; i < minmax_idx_size; ++i)
+    {
+        const auto & data_type = minmax_column_types[i];
+        const auto & column_name = minmax_column_names[i];
+
+        const auto column = data_type->createColumn();
+
+        auto range = hyperrectangle.at(i);
+        range.shrinkToIncludedIfPossible();
+
+        const auto & min_val = range.left;
+        const auto & max_val = range.right;
+
+        column->insert(min_val);
+        column->insert(max_val);
+
+        block.insert(ColumnWithTypeAndName(column->getPtr(), data_type, column_name));
+    }
+
+    return block;
+>>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
 }
 
 void IMergeTreeDataPart::incrementStateMetric(MergeTreeDataPartState state_) const

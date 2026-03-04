@@ -1,5 +1,27 @@
 #pragma once
 
+<<<<<<< HEAD
+=======
+#include <atomic>
+#include <expected>
+
+#include <base/UUID.h>
+#include <base/defines.h>
+#include <pcg_random.hpp>
+
+#include <Common/EventNotifier.h>
+#include <Common/ProfileEventsScope.h>
+#include <Common/Throttler.h>
+#include <Common/ZooKeeper/ZooKeeper.h>
+#include <Common/ZooKeeper/ZooKeeperRetries.h>
+#include <Common/randomSeed.h>
+#include "Interpreters/CancellationCode.h"
+#include "Storages/MergeTree/ExportPartitionManifestUpdatingTask.h"
+#include "Storages/MergeTree/ExportPartitionTaskScheduler.h"
+#include <Storages/ExportReplicatedMergeTreePartitionTaskEntry.h>
+#include <Core/BackgroundSchedulePool.h>
+#include <DataTypes/DataTypesNumber.h>
+>>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
 #include <Interpreters/Cluster.h>
 #include <Interpreters/PartLog.h>
 #include <Parsers/SyncReplicaMode.h>
@@ -94,6 +116,8 @@ namespace DB
 
 class ZooKeeperWithFaultInjection;
 using ZooKeeperWithFaultInjectionPtr = std::shared_ptr<ZooKeeperWithFaultInjection>;
+
+struct ReplicatedPartitionExportInfo;
 
 class StorageReplicatedMergeTree final : public MergeTreeData
 {
@@ -368,6 +392,8 @@ public:
     using ShutdownDeadline = std::chrono::time_point<std::chrono::system_clock>;
     void waitForUniquePartsToBeFetchedByOtherReplicas(ShutdownDeadline shutdown_deadline);
 
+    std::vector<ReplicatedPartitionExportInfo> getPartitionExportsInfo() const;
+
 private:
     std::atomic_bool are_restoring_replica {false};
 
@@ -392,6 +418,8 @@ private:
     friend class MergeFromLogEntryTask;
     friend class MutateFromLogEntryTask;
     friend class ReplicatedMergeMutateTaskBase;
+    friend class ExportPartitionManifestUpdatingTask;
+    friend class ExportPartitionTaskScheduler;
 
     using MergeStrategyPicker = ReplicatedMergeTreeMergeStrategyPicker;
     using LogEntry = ReplicatedMergeTreeLogEntry;
@@ -504,6 +532,26 @@ private:
     /// A task that marks finished mutations as done.
     BackgroundSchedulePoolTaskHolder mutations_finalizing_task;
 
+    BackgroundSchedulePoolTaskHolder export_merge_tree_partition_updating_task;
+
+    /// mostly handle kill operations
+    BackgroundSchedulePoolTaskHolder export_merge_tree_partition_status_handling_task;
+    std::shared_ptr<ExportPartitionManifestUpdatingTask> export_merge_tree_partition_manifest_updater;
+
+    std::shared_ptr<ExportPartitionTaskScheduler> export_merge_tree_partition_task_scheduler;
+
+    Coordination::WatchCallbackPtr export_merge_tree_partition_watch_callback;
+
+    std::mutex export_merge_tree_partition_mutex;
+
+    BackgroundSchedulePoolTaskHolder export_merge_tree_partition_select_task;
+
+    ExportPartitionTaskEntriesContainer export_merge_tree_partition_task_entries;
+    
+    // Convenience references to indexes
+    ExportPartitionTaskEntriesContainer::index<ExportPartitionTaskEntryTagByCompositeKey>::type & export_merge_tree_partition_task_entries_by_key;
+    ExportPartitionTaskEntriesContainer::index<ExportPartitionTaskEntryTagByTransactionId>::type & export_merge_tree_partition_task_entries_by_transaction_id;
+    ExportPartitionTaskEntriesContainer::index<ExportPartitionTaskEntryTagByCreateTime>::type & export_merge_tree_partition_task_entries_by_create_time;
     /// A thread that removes old parts, log entries, and blocks.
     ReplicatedMergeTreeCleanupThread cleanup_thread;
 
@@ -736,6 +784,14 @@ private:
     /// Checks if some mutations are done and marks them as done.
     void mutationsFinalizingTask();
 
+    void selectPartsToExport();
+
+    /// update in-memory list of partition exports
+    void exportMergeTreePartitionUpdatingTask();
+
+    /// handle status changes for export partition tasks
+    void exportMergeTreePartitionStatusHandlingTask();
+
     /** Write the selected parts to merge into the log,
       * Call when merge_selecting_mutex is locked.
       * Returns false if any part is not in ZK.
@@ -918,6 +974,7 @@ private:
     void movePartitionToTable(const StoragePtr & dest_table, const ASTPtr & partition, ContextPtr query_context) override;
     void movePartitionToShard(const ASTPtr & partition, bool move_part, const String & to, ContextPtr query_context) override;
     CancellationCode killPartMoveToShard(const UUID & task_uuid) override;
+    CancellationCode killExportPartition(const String & transaction_id) override;
     void fetchPartition(
         const ASTPtr & partition,
         const StorageMetadataPtr & metadata_snapshot,
@@ -925,7 +982,8 @@ private:
         bool fetch_part,
         ContextPtr query_context) override;
     void forgetPartition(const ASTPtr & partition, ContextPtr query_context) override;
-
+    
+    void exportPartitionToTable(const PartitionCommand &, ContextPtr) override;
 
     /// NOTE: there are no guarantees for concurrent merges. Dropping part can
     /// be concurrently merged into some covering part and dropPart will do
@@ -956,8 +1014,6 @@ private:
         const Strings & replicas, const String & mutation_id) const;
 
     MutationsSnapshotPtr getMutationsSnapshot(const IMutationsSnapshot::Params & params) const override;
-
-    void startBackgroundMovesIfNeeded() override;
 
     /// Attaches restored parts to the storage.
     void attachRestoredParts(MutableDataPartsVector && parts, const std::optional<ZooKeeperRetriesInfo> & zookeeper_retries_info) override;

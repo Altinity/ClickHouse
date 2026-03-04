@@ -312,17 +312,13 @@ ColumnPtr WildcardPartitionStrategy::computePartitionKey(const Chunk & chunk) co
     return block_with_partition_by_expr.getByName(actions_with_column.column_name).column;
 }
 
-std::string WildcardPartitionStrategy::getPathForRead(
-    const std::string & prefix)
+ColumnPtr WildcardPartitionStrategy::computePartitionKey(Block & block)
 {
-    return prefix;
-}
-
-std::string WildcardPartitionStrategy::getPathForWrite(
-    const std::string & prefix,
-    const std::string & partition_key)
-{
-    return PartitionedSink::replaceWildcards(prefix, partition_key);
+    ASTs arguments(1, partition_key_description.definition_ast);
+    ASTPtr partition_by_string = makeASTFunction("toString", std::move(arguments));
+    auto actions_with_column = getPartitionExpressionActions(partition_by_string);
+    actions_with_column.actions->execute(block);
+    return block.getByName(actions_with_column.column_name).column;
 }
 
 HiveStylePartitionStrategy::HiveStylePartitionStrategy(
@@ -350,6 +346,7 @@ HiveStylePartitionStrategy::HiveStylePartitionStrategy(
     cacheDeterministicActions(cached_result, actions_with_column);
 }
 
+<<<<<<< HEAD
 std::string HiveStylePartitionStrategy::getPathForRead(const std::string & prefix)
 {
     return prefix + "**." + Poco::toLower(file_format);
@@ -386,6 +383,9 @@ std::string HiveStylePartitionStrategy::getPathForWrite(
 }
 
 ColumnPtr HiveStylePartitionStrategy::computePartitionKey(const Chunk & chunk) const
+=======
+ColumnPtr HiveStylePartitionStrategy::computePartitionKey(const Chunk & chunk)
+>>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
 {
     auto actions_with_column = getCachedOrBuildActions(
         cached_result,
@@ -397,6 +397,14 @@ ColumnPtr HiveStylePartitionStrategy::computePartitionKey(const Chunk & chunk) c
     actions_with_column.actions->execute(block_with_partition_by_expr);
 
     return block_with_partition_by_expr.getByName(actions_with_column.column_name).column;
+}
+
+ColumnPtr HiveStylePartitionStrategy::computePartitionKey(Block & block)
+{
+    auto hive_ast = buildHivePartitionAST(partition_key_description.definition_ast, getPartitionColumns());
+    auto actions_with_column = getPartitionExpressionActions(hive_ast);
+    actions_with_column.actions->execute(block);
+    return block.getByName(actions_with_column.column_name).column;
 }
 
 ColumnRawPtrs HiveStylePartitionStrategy::getFormatChunkColumns(const Chunk & chunk)

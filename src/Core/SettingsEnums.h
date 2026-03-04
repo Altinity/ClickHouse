@@ -540,6 +540,7 @@ enum class DeduplicateInsertSelectMode : uint8_t
 
 DECLARE_SETTING_ENUM(DeduplicateInsertSelectMode)
 
+<<<<<<< HEAD
 enum class DeduplicateInsertMode : uint8_t
 {
     BACKWARD_COMPATIBLE_CHOICE = 0,
@@ -575,5 +576,15 @@ enum class S3UriStyle : uint8_t
 };
 
 DECLARE_SETTING_ENUM(S3UriStyle)
+=======
+enum class MergeTreePartExportFileAlreadyExistsPolicy : uint8_t
+{
+    skip,
+    error,
+    overwrite,
+};
+
+DECLARE_SETTING_ENUM(MergeTreePartExportFileAlreadyExistsPolicy)
+>>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
 
 }

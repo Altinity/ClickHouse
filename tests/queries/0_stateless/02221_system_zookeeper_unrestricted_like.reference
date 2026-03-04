@@ -8,7 +8,11 @@ blocks
 columns
 columns
 creator_info
+<<<<<<< HEAD
 deduplication_hashes
+=======
+exports
+>>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
 failed_parts
 flags
 host
@@ -50,7 +54,11 @@ blocks
 columns
 columns
 creator_info
+<<<<<<< HEAD
 deduplication_hashes
+=======
+exports
+>>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
 failed_parts
 flags
 host

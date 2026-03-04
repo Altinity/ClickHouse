@@ -1,3 +1,4 @@
+#include <optional>
 #include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
 
 #include <Common/Exception.h>
@@ -117,8 +118,17 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         }
     }
 
+<<<<<<< HEAD
     metadata.setConstraints(constraints_);
     metadata.setVirtuals(VirtualColumnUtils::getVirtualsForFileLikeStorage(
+=======
+    if (configuration->partition_strategy)
+    {
+        metadata.partition_key = configuration->partition_strategy->getPartitionKeyDescription();
+    }
+
+    setVirtuals(VirtualColumnUtils::getVirtualsForFileLikeStorage(
+>>>>>>> c4ff900581f (Merge pull request #1388 from Altinity/fp_antalya_26_1_export_part_partition)
         metadata.columns,
         context_,
         /* format_settings */std::nullopt,
