@@ -511,6 +511,7 @@ public:
     const String & getRawURI() const override { return getImpl().getRawURI(); }
     const Path & getPathForRead() const override { return getImpl().getPathForRead(); }
     Path getPathForWrite(const std::string & partition_id) const override { return getImpl().getPathForWrite(partition_id); }
+    Path getPathForWrite(const std::string & partition_id, const std::string & filename_override) const override { return getImpl().getPathForWrite(partition_id, filename_override); }
 
     void setPathForRead(const Path & path) override { getImpl().setPathForRead(path); }
 
