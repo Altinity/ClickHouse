@@ -125,10 +125,20 @@ void StorageObjectStorageConfiguration::initialize(
     else
         FormatFactory::instance().checkFormatName(format);
 
-    /// It might be changed on `StorageObjectStorageConfiguration::initPartitionStrategy`
+    if (configuration_to_initialize.partition_strategy_type == PartitionStrategyFactory::StrategyType::HIVE)
+    {
+        configuration_to_initialize.file_path_generator = std::make_shared<ObjectStorageAppendFilePathGenerator>(
+            configuration_to_initialize.getRawPath().path,
+            configuration_to_initialize.format);
+    }
+    else
+    {
+        configuration_to_initialize.file_path_generator = std::make_shared<ObjectStorageWildcardFilePathGenerator>(configuration_to_initialize.getRawPath().path);
+    }
+
     /// We shouldn't set path for disk setup because path prefix is already set in used object_storage.
     if (disk_name.empty())
-        read_path = getRawPath();
+        read_path = file_path_generator->getPathForRead();
 
     initialized = true;
 }
@@ -147,7 +157,6 @@ void StorageObjectStorageConfiguration::initPartitionStrategy(ASTPtr partition_b
 
     if (partition_strategy)
     {
-        read_path = partition_strategy->getPathForRead(getRawPath().path);
         LOG_DEBUG(getLogger("StorageObjectStorageConfiguration"), "Initialized partition strategy {}", magic_enum::enum_name(partition_strategy_type));
     }
 }
@@ -159,14 +168,12 @@ const StorageObjectStorageConfiguration::Path & StorageObjectStorageConfiguratio
 
 StorageObjectStorageConfiguration::Path StorageObjectStorageConfiguration::getPathForWrite(const std::string & partition_id) const
 {
-    auto raw_path = getRawPath();
+    return getPathForWrite(partition_id, /* filename_override */ "");
+}
 
-    if (!partition_strategy)
-    {
-        return raw_path;
-    }
-
-    return Path {partition_strategy->getPathForWrite(raw_path.path, partition_id)};
+StorageObjectStorageConfiguration::Path StorageObjectStorageConfiguration::getPathForWrite(const std::string & partition_id, const std::string & filename_override) const
+{
+    return Path {file_path_generator->getPathForWrite(partition_id, filename_override)};
 }
 
 bool StorageObjectStorageConfiguration::Path::hasPartitionWildcard() const
@@ -174,6 +181,12 @@ bool StorageObjectStorageConfiguration::Path::hasPartitionWildcard() const
     static const String PARTITION_ID_WILDCARD = "{_partition_id}";
     return path.find(PARTITION_ID_WILDCARD) != String::npos;
 }
+
+bool StorageObjectStorageConfiguration::Path::hasExportFilenameWildcard() const
+{
+    return path.find(ObjectStorageWildcardFilePathGenerator::FILE_WILDCARD) != String::npos;
+}
+
 
 bool StorageObjectStorageConfiguration::Path::hasGlobsIgnorePartitionWildcard() const
 {
