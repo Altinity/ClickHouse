@@ -71,7 +71,7 @@ def started_cluster():
         cluster = ClickHouseCluster(__file__)
         cluster.add_instance(
             "s0_0_0",
-            main_configs=["configs/cluster.xml", "configs/named_collections.xml"],
+            main_configs=["configs/cluster.xml", "configs/named_collections.xml", "configs/cluster1.xml"],
             user_configs=["configs/users.xml"],
             macros={"replica": "node1", "shard": "shard1"},
             with_minio=True,
@@ -860,3 +860,26 @@ def test_joins(started_cluster):
     )
     res = list(map(str.split, result8.splitlines()))
     assert len(res) == 25
+
+
+def test_cluster_undefined_on_secondary_nodes(started_cluster):
+    node = started_cluster.instances["s0_0_0"]
+
+    expected_result = node.query(
+        f"""
+        SELECT * from s3(
+            'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') ORDER BY (name, value, polygon)
+        """
+    )
+
+    result = node.query(
+        f"""
+        SELECT * from s3Cluster(
+            'undefined_cluster',
+            'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') ORDER BY (name, value, polygon)
+        """
+    )
+
+    assert result == expected_result
