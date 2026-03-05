@@ -128,8 +128,9 @@ def test_restart_nodes_during_export(cluster):
     node2 = cluster.instances["replica2"]
     watcher_node = cluster.instances["watcher_node"]
 
-    mt_table = "disaster_mt_table"
-    s3_table = "disaster_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"disaster_mt_table_{postfix}"
+    s3_table = f"disaster_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
     create_tables_and_insert_data(node2, mt_table, s3_table, "replica2")
@@ -218,8 +219,9 @@ def test_kill_export(cluster):
     node2 = cluster.instances["replica2"]
     watcher_node = cluster.instances["watcher_node"]
 
-    mt_table = "kill_export_mt_table"
-    s3_table = "kill_export_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"kill_export_mt_table_{postfix}"
+    s3_table = f"kill_export_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
     create_tables_and_insert_data(node2, mt_table, s3_table, "replica2")
@@ -302,8 +304,9 @@ def test_drop_source_table_during_export(cluster):
     # node2 = cluster.instances["replica2"]
     watcher_node = cluster.instances["watcher_node"]
 
-    mt_table = "drop_source_table_during_export_mt_table"
-    s3_table = "drop_source_table_during_export_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"drop_source_table_during_export_mt_table_{postfix}"
+    s3_table = f"drop_source_table_during_export_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
     # create_tables_and_insert_data(node2, mt_table, s3_table, "replica2")
@@ -356,9 +359,10 @@ def test_drop_source_table_during_export(cluster):
 def test_concurrent_exports_to_different_targets(cluster):
     node = cluster.instances["replica1"]
 
-    mt_table = "concurrent_diff_targets_mt_table"
-    s3_table_a = "concurrent_diff_targets_s3_a"
-    s3_table_b = "concurrent_diff_targets_s3_b"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"concurrent_diff_targets_mt_table_{postfix}"
+    s3_table_a = f"concurrent_diff_targets_s3_a_{postfix}"
+    s3_table_b = f"concurrent_diff_targets_s3_b_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table_a, "replica1")
     create_s3_table(node, s3_table_b)
@@ -393,8 +397,9 @@ def test_concurrent_exports_to_different_targets(cluster):
 def test_failure_is_logged_in_system_table(cluster):
     node = cluster.instances["replica1"]
 
-    mt_table = "failure_is_logged_in_system_table_mt_table"
-    s3_table = "failure_is_logged_in_system_table_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"failure_is_logged_in_system_table_mt_table_{postfix}"
+    s3_table = f"failure_is_logged_in_system_table_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
@@ -462,8 +467,9 @@ def test_failure_is_logged_in_system_table(cluster):
 def test_inject_short_living_failures(cluster):
     node = cluster.instances["replica1"]
 
-    mt_table = "inject_short_living_failures_mt_table"
-    s3_table = "inject_short_living_failures_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"inject_short_living_failures_mt_table_{postfix}"
+    s3_table = f"inject_short_living_failures_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
@@ -531,8 +537,9 @@ def test_inject_short_living_failures(cluster):
 def test_export_ttl(cluster):
     node = cluster.instances["replica1"]
 
-    mt_table = "export_ttl_mt_table"
-    s3_table = "export_ttl_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"export_ttl_mt_table_{postfix}"
+    s3_table = f"export_ttl_s3_table_{postfix}"
 
     expiration_time = 3
 
@@ -566,8 +573,9 @@ def test_export_ttl(cluster):
 def test_export_partition_file_already_exists_policy(cluster):
     node = cluster.instances["replica1"]
 
-    mt_table = "export_partition_file_already_exists_policy_mt_table"
-    s3_table = "export_partition_file_already_exists_policy_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"export_partition_file_already_exists_policy_mt_table_{postfix}"
+    s3_table = f"export_partition_file_already_exists_policy_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
@@ -653,8 +661,9 @@ def test_export_partition_file_already_exists_policy(cluster):
 def test_export_partition_feature_is_disabled(cluster):
     replica_with_export_disabled = cluster.instances["replica_with_export_disabled"]
 
-    mt_table = "export_partition_feature_is_disabled_mt_table"
-    s3_table = "export_partition_feature_is_disabled_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"export_partition_feature_is_disabled_mt_table_{postfix}"
+    s3_table = f"export_partition_feature_is_disabled_s3_table_{postfix}"
 
     create_tables_and_insert_data(replica_with_export_disabled, mt_table, s3_table, "replica1")
 
@@ -673,8 +682,9 @@ def test_export_partition_permissions(cluster):
     """
     node = cluster.instances["replica1"]
 
-    mt_table = "permissions_mt_table"
-    s3_table = "permissions_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"permissions_mt_table_{postfix}"
+    s3_table = f"permissions_s3_table_{postfix}"
 
     # Create tables as default user
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
@@ -744,8 +754,9 @@ def test_export_partition_permissions(cluster):
 def test_multiple_exports_within_a_single_query(cluster):
     node = cluster.instances["replica1"]
 
-    mt_table = "multiple_exports_within_a_single_query_mt_table"
-    s3_table = "multiple_exports_within_a_single_query_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"multiple_exports_within_a_single_query_mt_table_{postfix}"
+    s3_table = f"multiple_exports_within_a_single_query_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
@@ -782,8 +793,9 @@ def test_pending_mutations_throw_before_export_partition(cluster):
     """Test that pending mutations before export partition throw an error."""
     node = cluster.instances["replica1"]
 
-    mt_table = "pending_mutations_throw_partition_mt_table"
-    s3_table = "pending_mutations_throw_partition_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"pending_mutations_throw_partition_mt_table_{postfix}"
+    s3_table = f"pending_mutations_throw_partition_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
@@ -806,8 +818,9 @@ def test_pending_mutations_skip_before_export_partition(cluster):
     """Test that pending mutations before export partition are skipped with throw_on_pending_mutations=false."""
     node = cluster.instances["replica1"]
 
-    mt_table = "pending_mutations_skip_partition_mt_table"
-    s3_table = "pending_mutations_skip_partition_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"pending_mutations_skip_partition_mt_table_{postfix}"
+    s3_table = f"pending_mutations_skip_partition_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
@@ -835,8 +848,9 @@ def test_pending_patch_parts_throw_before_export_partition(cluster):
     """Test that pending patch parts before export partition throw an error with default settings."""
     node = cluster.instances["replica1"]
 
-    mt_table = "pending_patches_throw_partition_mt_table"
-    s3_table = "pending_patches_throw_partition_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"pending_patches_throw_partition_mt_table_{postfix}"
+    s3_table = f"pending_patches_throw_partition_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
@@ -858,8 +872,9 @@ def test_pending_patch_parts_skip_before_export_partition(cluster):
     """Test that pending patch parts before export partition are skipped with throw_on_pending_patch_parts=false."""
     node = cluster.instances["replica1"]
 
-    mt_table = "pending_patches_skip_partition_mt_table"
-    s3_table = "pending_patches_skip_partition_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"pending_patches_skip_partition_mt_table_{postfix}"
+    s3_table = f"pending_patches_skip_partition_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
@@ -884,8 +899,9 @@ def test_mutations_after_export_partition_started(cluster):
     """Test that mutations applied after export partition starts don't affect the exported data."""
     node = cluster.instances["replica1"]
 
-    mt_table = "mutations_after_export_partition_mt_table"
-    s3_table = "mutations_after_export_partition_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"mutations_after_export_partition_mt_table_{postfix}"
+    s3_table = f"mutations_after_export_partition_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
@@ -933,8 +949,9 @@ def test_patch_parts_after_export_partition_started(cluster):
     """Test that patch parts created after export partition starts don't affect the exported data."""
     node = cluster.instances["replica1"]
 
-    mt_table = "patches_after_export_partition_mt_table"
-    s3_table = "patches_after_export_partition_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"patches_after_export_partition_mt_table_{postfix}"
+    s3_table = f"patches_after_export_partition_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
@@ -984,8 +1001,9 @@ def test_mutation_in_partition_clause(cluster):
     allow exports of unaffected partitions to succeed."""
     node = cluster.instances["replica1"]
 
-    mt_table = "mutation_in_partition_clause_mt_table"
-    s3_table = "mutation_in_partition_clause_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"mutation_in_partition_clause_mt_table_{postfix}"
+    s3_table = f"mutation_in_partition_clause_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
@@ -1023,8 +1041,9 @@ def test_export_partition_with_mixed_computed_columns(cluster):
     """Test export partition with ALIAS, MATERIALIZED, and EPHEMERAL columns."""
     node = cluster.instances["replica1"]
 
-    mt_table = "mixed_computed_mt_table"
-    s3_table = "mixed_computed_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"mixed_computed_mt_table_{postfix}"
+    s3_table = f"mixed_computed_s3_table_{postfix}"
 
     node.query(f"""
         CREATE TABLE {mt_table} (
