@@ -43,7 +43,7 @@
   - tsan
   - msan
 - name: 03321_clickhouse_local_initialization_not_too_slow_even_under_sanitizers
-  reason: INVESTIGATE - Unstable on msan
+  reason: INVESTIGATE - Unstable on msan, tsan
   message: result differs with reference
   check_types:
   - msan
@@ -79,6 +79,10 @@
 - name: 00024_random_counters
   reason: INVESTIGATE - random timeout
   message: Timeout! Processes left in process group
+- name: 03211_nested_json_merges
+  reason: KNOWN - Unstable upstream
+- name: 03644_object_storage_correlated_subqueries
+  reason: KNOWN - Unstable in upstream 25.8.
 - name: test_storage_s3_queue/test_5.py::test_migration[1-s3queue_]
   reason: KNOWN - Sometimes fails due to test order
   message: 'Failed: Timeout >900.0s'
@@ -187,9 +191,17 @@
   reason: 'KNOWN: Occasional timeout'
   message: docker_compose_iceberg_hms_catalog.yml', '--verbose', 'up', '-d']' timed out after 300 seconds
 - name: test_keeper_memory_soft_limit/test.py::test_soft_limit_create
-  reason: 'INVESTIGATE: Out of Memory or startup instability'
+  reason: 'FIXME: Unstable in current version. Fixed in recent upstream.'
 - name: test_s3_cache_locality/test.py::test_cache_locality[0]
   reason: 'INVESTIGATE: Timeout or AssertionError'
+- name: test_dirty_pages_force_purge/test.py::test_dirty_pages_force_purge
+  reason: 'KNOWN: https://github.com/Altinity/ClickHouse/issues/1369'
+- name: test_async_load_databases/test.py::test_materialized_views_cascaded_multiple
+  reason: 'KNOWN: Flaky upstream test. Fixed in upstream PR #88573 but not backported to 25.8.'
+  message: AssertionError
+- name: test_async_load_databases/test.py::test_materialized_views_replicated
+  reason: 'KNOWN: Flaky upstream test. Fixed in upstream PR #88573 but not backported to 25.8.'
+  message: 'DATABASE_ALREADY_EXISTS'
 
 # Regex rules should be ordered from most specific to least specific.
 # regex: true applies to name, message, and not_message fields, but not to reason or check_types fields.
