@@ -3,6 +3,7 @@
 
 #include <Common/Exception.h>
 #include <Common/StringUtils.h>
+#include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTSetQuery.h>
 #include <Interpreters/Context.h>
 
@@ -92,6 +93,7 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
     std::shared_ptr<DataLake::ICatalog> catalog,
     bool if_not_exists,
     bool is_datalake_query,
+    bool distributed_processing,
     bool is_table_function,
     bool lazy_init)
     : IStorageCluster(
@@ -196,7 +198,7 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         catalog,
         if_not_exists,
         is_datalake_query,
-        /* distributed_processing */false,
+        distributed_processing,
         partition_by,
         /* is_table_function */false,
         /* lazy_init */lazy_init,
@@ -369,13 +371,7 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
 
     auto * table_function = extractTableFunctionFromSelectQuery(query);
     if (!table_function)
-    {
-        throw Exception(
-            ErrorCodes::LOGICAL_ERROR,
-            "Expected SELECT query from table function {}, got '{}'",
-            configuration->getEngineName(), query->formatForErrorMessage());
-    }
-
+        return;
     auto * expression_list = table_function->arguments->as<ASTExpressionList>();
     if (!expression_list)
     {
