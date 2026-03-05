@@ -116,6 +116,7 @@ def create_s3_table(node, s3_table):
 
 
 def create_tables_and_insert_data(node, mt_table, s3_table, replica_name):
+    node.query(f"DROP TABLE IF EXISTS {mt_table} SYNC")
     node.query(f"CREATE TABLE {mt_table} (id UInt64, year UInt16) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', '{replica_name}') PARTITION BY year ORDER BY tuple() SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1")
     node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020), (3, 2020), (4, 2021)")
 
