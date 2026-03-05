@@ -69,6 +69,17 @@ def wait_for_export_to_start(
     raise TimeoutError(f"Export did not start within {timeout}s. ")
 
 
+def skip_if_remote_database_disk_enabled(cluster):
+    """Skip test if any instance in the cluster has remote database disk enabled.
+
+    Tests that block MinIO cannot run when remote database disk is enabled,
+    as the database metadata is stored on MinIO and blocking it would break the database.
+    """
+    for instance in cluster.instances.values():
+        if instance.with_remote_database_disk:
+            pytest.skip("Test cannot run with remote database disk enabled (db disk), as it blocks MinIO which stores database metadata")
+
+
 @pytest.fixture(scope="module")
 def cluster():
     try:
@@ -124,6 +135,7 @@ def create_tables_and_insert_data(node, mt_table, s3_table, replica_name):
 
 
 def test_restart_nodes_during_export(cluster):
+    skip_if_remote_database_disk_enabled(cluster)
     node = cluster.instances["replica1"]
     node2 = cluster.instances["replica2"]
     watcher_node = cluster.instances["watcher_node"]
@@ -215,6 +227,7 @@ def test_restart_nodes_during_export(cluster):
 
 
 def test_kill_export(cluster):
+    skip_if_remote_database_disk_enabled(cluster)
     node = cluster.instances["replica1"]
     node2 = cluster.instances["replica2"]
     watcher_node = cluster.instances["watcher_node"]
@@ -300,6 +313,7 @@ def test_kill_export(cluster):
 
 
 def test_drop_source_table_during_export(cluster):
+    skip_if_remote_database_disk_enabled(cluster)
     node = cluster.instances["replica1"]
     # node2 = cluster.instances["replica2"]
     watcher_node = cluster.instances["watcher_node"]
@@ -395,6 +409,7 @@ def test_concurrent_exports_to_different_targets(cluster):
 
 
 def test_failure_is_logged_in_system_table(cluster):
+    skip_if_remote_database_disk_enabled(cluster)
     node = cluster.instances["replica1"]
 
     postfix = str(uuid.uuid4()).replace("-", "_")
@@ -465,6 +480,7 @@ def test_failure_is_logged_in_system_table(cluster):
 
 
 def test_inject_short_living_failures(cluster):
+    skip_if_remote_database_disk_enabled(cluster)
     node = cluster.instances["replica1"]
 
     postfix = str(uuid.uuid4()).replace("-", "_")
@@ -897,6 +913,7 @@ def test_pending_patch_parts_skip_before_export_partition(cluster):
 
 def test_mutations_after_export_partition_started(cluster):
     """Test that mutations applied after export partition starts don't affect the exported data."""
+    skip_if_remote_database_disk_enabled(cluster)
     node = cluster.instances["replica1"]
 
     postfix = str(uuid.uuid4()).replace("-", "_")
@@ -947,6 +964,7 @@ def test_mutations_after_export_partition_started(cluster):
 
 def test_patch_parts_after_export_partition_started(cluster):
     """Test that patch parts created after export partition starts don't affect the exported data."""
+    skip_if_remote_database_disk_enabled(cluster)
     node = cluster.instances["replica1"]
 
     postfix = str(uuid.uuid4()).replace("-", "_")
