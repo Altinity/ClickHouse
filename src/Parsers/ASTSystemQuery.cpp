@@ -634,8 +634,13 @@ void ASTSystemQuery::formatImpl(WriteBuffer & ostr, const FormatSettings & setti
         case Type::STOP_REPLICATED_DDL_QUERIES:
         case Type::START_REPLICATED_DDL_QUERIES:
         case Type::RECONNECT_ZOOKEEPER:
+<<<<<<< HEAD
         case Type::FREE_MEMORY:
         case Type::RESET_DDL_WORKER:
+=======
+        case Type::STOP_SWARM_MODE:
+        case Type::START_SWARM_MODE:
+>>>>>>> 05010e84270 (Merge pull request #1414 from Altinity/frontport/antalya-26.1/rendezvous_hashing)
             break;
         case Type::SYNC_FILESYSTEM_CACHE:
         {

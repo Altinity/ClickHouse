@@ -1,6 +1,23 @@
 #pragma once
 
 #include "config.h"
+#include <Core/Range.h>
+#include <Core/Types.h>
+
+#include <optional>
+
+namespace DB::Iceberg
+{
+
+struct ColumnInfo
+{
+    std::optional<Int64> rows_count;
+    std::optional<Int64> bytes_size;
+    std::optional<Int64> nulls_count;
+    std::optional<DB::Range> hyperrectangle;
+};
+
+}
 
 #if USE_AVRO
 
@@ -44,6 +61,7 @@ enum class ManifestFileContentType
 
 String FileContentTypeToString(FileContentType type);
 
+<<<<<<< HEAD
 struct ColumnInfo
 {
     std::optional<Int64> rows_count;
@@ -51,6 +69,8 @@ struct ColumnInfo
     std::optional<Int64> nulls_count;
 };
 
+=======
+>>>>>>> 05010e84270 (Merge pull request #1414 from Altinity/frontport/antalya-26.1/rendezvous_hashing)
 struct PartitionSpecsEntry
 {
     Int32 source_id;
