@@ -41,7 +41,7 @@ jobs:
   config_workflow:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: []
-    if: ${{ github.repository == github.event.pull_request.head.repo.full_name }}
+    if: ${{ github.repository == github.event.pull_request.head.repo.full_name || github.event_name == 'workflow_dispatch' }}
     name: "Config Workflow"
     outputs:
       data: ${{ steps.run.outputs.DATA }}
@@ -241,7 +241,7 @@ jobs:
           fi
 
   fast_test:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'RmFzdCB0ZXN0') }}
     name: "Fast test"
