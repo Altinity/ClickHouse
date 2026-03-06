@@ -24,6 +24,7 @@ workflow = Workflow.Config(
     name="PR",
     event=Workflow.Event.PULL_REQUEST,
     base_branches=[BASE_BRANCH, "releases/*", "antalya-*"],
+    if_condition="github.repository == github.event.pull_request.head.repo.full_name",
     jobs=[
         # JobConfigs.style_check, # NOTE (strtgbb): we don't run style check
         # JobConfigs.docs_job, # NOTE (strtgbb): we don't build docs
@@ -71,12 +72,8 @@ workflow = Workflow.Config(
             for job in JobConfigs.integration_test_jobs_non_required
         ],
         JobConfigs.integration_test_asan_flaky_pr_job,
-        JobConfigs.docker_sever.set_dependency(
-            FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES
-        ),
-        JobConfigs.docker_keeper.set_dependency(
-            FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES
-        ),
+        JobConfigs.docker_sever,
+        JobConfigs.docker_keeper,
         *[
             job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
             for job in JobConfigs.install_check_jobs

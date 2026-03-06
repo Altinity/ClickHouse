@@ -25,6 +25,7 @@ public:
         std::shared_ptr<DataLake::ICatalog> catalog,
         bool if_not_exists,
         bool is_datalake_query,
+        bool distributed_processing,
         bool is_table_function,
         bool lazy_init);
 

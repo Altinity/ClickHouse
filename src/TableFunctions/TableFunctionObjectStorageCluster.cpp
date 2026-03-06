@@ -77,6 +77,7 @@ StoragePtr TableFunctionObjectStorageCluster<Definition, Configuration, is_data_
             /* catalog*/ nullptr,
             /* if_not_exists */ false,
             /* is_datalake_query */ false,
+            /* distributed_processing */ false,
             /* is_table_function */ true,
             /* lazy_init */ true);
     }
