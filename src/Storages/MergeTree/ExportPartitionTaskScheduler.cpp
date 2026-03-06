@@ -449,11 +449,10 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
     {
         LOG_INFO(storage.log, "ExportPartition scheduler task: Exceptions per replica path does not exist, will create it");
         ops.emplace_back(zkutil::makeCreateRequest(exceptions_per_replica_path, "", zkutil::CreateMode::Persistent));
-        ops.emplace_back(zkutil::makeCreateRequest(count_path, "0", zkutil::CreateMode::Persistent));
+        ops.emplace_back(zkutil::makeCreateRequest(count_path, "1", zkutil::CreateMode::Persistent));
         ops.emplace_back(zkutil::makeCreateRequest(last_exception_path, "", zkutil::CreateMode::Persistent));
         ops.emplace_back(zkutil::makeCreateRequest(last_exception_path / "part", part_name, zkutil::CreateMode::Persistent));
         ops.emplace_back(zkutil::makeCreateRequest(last_exception_path / "exception", exception->message(), zkutil::CreateMode::Persistent));
-        ops.emplace_back(zkutil::makeSetRequest(count_path, "1", zkutil::CreateMode::Persistent));
     }
 
     ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
