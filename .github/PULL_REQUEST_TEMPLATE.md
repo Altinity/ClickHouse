@@ -31,7 +31,7 @@ tests/ci/cancel_and_rerun_workflow_lambda/app.py
 - [ ] <!---ci_exclude_stateless--> Stateless tests
 - [ ] <!---ci_exclude_stateful--> Stateful tests
 - [ ] <!---ci_exclude_performance--> Performance tests
-- [x] <!---ci_exclude_asan--> All with ASAN
+- [ ] <!---ci_exclude_asan--> All with ASAN
 - [x] <!---ci_exclude_tsan--> All with TSAN
 - [x] <!---ci_exclude_msan--> All with MSAN
 - [x] <!---ci_exclude_ubsan--> All with UBSAN
