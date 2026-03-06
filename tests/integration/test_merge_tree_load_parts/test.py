@@ -76,7 +76,12 @@ def test_merge_tree_load_parts(started_cluster):
         == "1\n"
     )
 
-    node1.query("ALTER TABLE mt_load_parts MODIFY SETTING old_parts_lifetime = 1")
+    node1.query(
+        "ALTER TABLE mt_load_parts MODIFY SETTING "
+        "old_parts_lifetime = 1, cleanup_delay_period = 1, "
+        "cleanup_delay_period_random_add = 0, "
+        "cleanup_thread_preferred_points_per_iteration = 0"
+    )
     node1.query("DETACH TABLE mt_load_parts")
     node1.query("ATTACH TABLE mt_load_parts")
 
