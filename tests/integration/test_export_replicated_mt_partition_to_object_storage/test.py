@@ -125,6 +125,31 @@ def cluster():
         cluster.shutdown()
 
 
+@pytest.fixture(autouse=True)
+def drop_tables_after_test(cluster):
+    """Drop all tables in the default database after every test.
+
+    Without this, ReplicatedMergeTree tables from completed tests remain alive and keep
+    running ZooKeeper background threads (merge selector, queue log, cleanup, export manifest
+    updater).  With many tables alive simultaneously the ZooKeeper session becomes overwhelmed
+    and subsequent tests start seeing operation-timeout / session-expired errors.
+    """
+    yield
+    for instance_name, instance in cluster.instances.items():
+        try:
+            tables_str = instance.query(
+                "SELECT name FROM system.tables WHERE database = 'default' FORMAT TabSeparated"
+            ).strip()
+            if not tables_str:
+                continue
+            for table in tables_str.split('\n'):
+                table = table.strip()
+                if table:
+                    instance.query(f"DROP TABLE IF EXISTS default.`{table}` SYNC")
+        except Exception as e:
+            logging.warning(f"drop_tables_after_test: cleanup failed on {instance_name}: {e}")
+
+
 def create_s3_table(node, s3_table):
     node.query(f"CREATE TABLE {s3_table} (id UInt64, year UInt16) ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive') PARTITION BY year")
 
