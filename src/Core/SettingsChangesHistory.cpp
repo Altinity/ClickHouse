@@ -43,6 +43,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         {
             {"iceberg_partition_timezone", "", "", "New setting."},
             // {"object_storage_max_nodes", 0, 0, "Antalya: New setting"},
+            {"s3_propagate_credentials_to_other_storages", false, false, "New setting"},
         });
         addSettingsChanges(settings_changes_history, "26.1",
         {
