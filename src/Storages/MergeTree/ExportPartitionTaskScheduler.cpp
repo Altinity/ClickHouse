@@ -418,8 +418,6 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
         LOG_INFO(storage.log, "ExportPartition scheduler task: Retry count limit not exceeded for part {}, will increment retry count", part_name);
     }
 
-    std::size_t num_exceptions = std::numeric_limits<size_t>::max();
-
     const auto exceptions_per_replica_path = export_path / "exceptions_per_replica" / storage.replica_name;
     const auto count_path = exceptions_per_replica_path / "count";
     const auto last_exception_path = exceptions_per_replica_path / "last_exception";
@@ -432,11 +430,13 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
         std::string num_exceptions_string;
         if (zk->tryGet(count_path, num_exceptions_string))
         {
-            num_exceptions = parse<size_t>(num_exceptions_string);
+            const auto num_exceptions = parse<size_t>(num_exceptions_string) + 1;
+            ops.emplace_back(zkutil::makeSetRequest(count_path, std::to_string(num_exceptions), -1));
         }
         else
         {
-            LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to get number of exceptions, will use zero");
+            /// TODO maybe we should find a better way to handle this case, not urgent
+            LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to get number of exceptions, will not increment it");
         }
 
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
@@ -453,10 +453,8 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
         ops.emplace_back(zkutil::makeCreateRequest(last_exception_path, "", zkutil::CreateMode::Persistent));
         ops.emplace_back(zkutil::makeCreateRequest(last_exception_path / "part", part_name, zkutil::CreateMode::Persistent));
         ops.emplace_back(zkutil::makeCreateRequest(last_exception_path / "exception", exception->message(), zkutil::CreateMode::Persistent));
+        ops.emplace_back(zkutil::makeSetRequest(count_path, "1", zkutil::CreateMode::Persistent));
     }
-
-    num_exceptions++;
-    ops.emplace_back(zkutil::makeSetRequest(count_path, std::to_string(num_exceptions), -1));
 
     ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
     ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperMulti);
