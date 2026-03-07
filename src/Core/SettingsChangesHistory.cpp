@@ -43,6 +43,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         {
             {"iceberg_partition_timezone", "", "", "New setting."},
             // {"object_storage_max_nodes", 0, 0, "Antalya: New setting"},
+            {"s3_propagate_credentials_to_other_storages", false, false, "New setting"},
         });
         addSettingsChanges(settings_changes_history, "26.1",
         {
@@ -232,10 +233,10 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"input_format_parquet_use_metadata_cache", true, true, "New setting, turned ON by default"}, // https://github.com/Altinity/ClickHouse/pull/586
             // {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."},
             // {"object_storage_remote_initiator", false, false, "New setting."},
-        //     {"allow_experimental_iceberg_read_optimization", true, true, "New setting."},
+            {"allow_experimental_iceberg_read_optimization", true, true, "New setting."},
             {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
-        //     {"lock_object_storage_task_distribution_ms", 500, 500, "Raised the value to 500 to avoid hoping tasks between executors."},
-        //     {"allow_retries_in_cluster_requests", false, false, "New setting"},
+            {"lock_object_storage_task_distribution_ms", 500, 500, "New setting."},
+            {"allow_retries_in_cluster_requests", false, false, "New setting"},
         //     {"object_storage_remote_initiator", false, false, "New setting."},
             {"allow_experimental_export_merge_tree_part", false, true, "Turned ON by default for Antalya."},
             {"export_merge_tree_part_overwrite_file_if_exists", false, false, "New setting."},
@@ -252,6 +253,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         //     {"output_format_parquet_write_checksums", false, true, "New setting."},
             {"export_merge_tree_part_max_bytes_per_file", 0, 0, "New setting."},
             {"export_merge_tree_part_max_rows_per_file", 0, 0, "New setting."},
+            {"export_merge_tree_partition_lock_inside_the_task", false, false, "New setting."},
+            {"export_merge_tree_partition_system_table_prefer_remote_information", true, true, "New setting."},
         //     {"cluster_table_function_split_granularity", "file", "file", "New setting."},
         //     {"cluster_table_function_buckets_batch_size", 0, 0, "New setting."},
         {"export_merge_tree_part_throw_on_pending_mutations", true, true, "New setting."},

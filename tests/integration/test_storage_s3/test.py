@@ -77,6 +77,7 @@ def started_cluster():
                 "configs/access.xml",
                 "configs/users.xml",
                 "configs/s3_retry.xml",
+                "configs/lock_object_storage_task_distribution_ms.xml",
             ],
         )
         cluster.add_instance(
@@ -125,6 +126,7 @@ def started_cluster():
                 "configs/users.xml",
                 "configs/s3_retry.xml",
                 "configs/process_archives_as_whole_with_cluster.xml",
+                "configs/lock_object_storage_task_distribution_ms.xml",
             ],
         )
         cluster.add_instance(

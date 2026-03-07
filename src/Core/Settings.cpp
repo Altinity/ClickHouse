@@ -580,6 +580,9 @@ Use multiple threads for azure multipart upload.
     DECLARE(Bool, s3_throw_on_zero_files_match, false, R"(
 Throw an error, when ListObjects request cannot match any files
 )", 0) \
+    DECLARE(Bool, s3_propagate_credentials_to_other_storages, false, R"(
+Allow copying base storage credentials to secondary object storages with a different endpoint. Default: 0 (credentials only copied when endpoint matches base).
+)", 0) \
     DECLARE(Bool, hdfs_throw_on_zero_files_match, false, R"(
 Throw an error if matched zero files according to glob expansion rules.
 
@@ -7369,6 +7372,14 @@ Throw an error if there are pending mutations when exporting a merge tree part.
     DECLARE(Bool, export_merge_tree_part_throw_on_pending_patch_parts, true, R"(
 Throw an error if there are pending patch parts when exporting a merge tree part.
 )", 0) \
+    DECLARE(Bool, export_merge_tree_partition_lock_inside_the_task, false, R"(
+Only lock a part when the task is already running. This might help with busy waiting where the scheduler locks a part, but the task ends in the pending list.
+On the other hand, there is a chance once the task executes that part has already been locked by another replica and the task will simply early exit.
+)", 0) \
+    DECLARE(Bool, export_merge_tree_partition_system_table_prefer_remote_information, true, R"(
+Controls whether the system.replicated_partition_exports will prefer to query ZooKeeper to get the most up to date information or use the local information.
+Querying ZooKeeper is expensive, and only available if the ZooKeeper feature flag MULTI_READ is enabled.
+)", 0) \
     DECLARE(Timezone, iceberg_partition_timezone, "", R"(
 Time zone by which partitioning of Iceberg tables was performed.
 Possible values:
@@ -7544,6 +7555,19 @@ Default number of tasks for parallel reading in distributed query. Tasks are spr
     DECLARE(Bool, distributed_plan_optimize_exchanges, true, R"(
 Removes unnecessary exchanges in distributed query plan. Disable it for debugging.
 )", 0) \
+    DECLARE(UInt64, lock_object_storage_task_distribution_ms, 500, R"(
+In object storage distribution queries do not distribute tasks on non-prefetched nodes until prefetched node is active.
+Determines how long the free executor node (one that finished processing all of it assigned tasks) should wait before "stealing" tasks from queue of currently busy executor nodes.
+
+Possible values:
+
+- 0  - steal tasks immediately after freeing up.
+- >0 - wait for specified period of time before stealing tasks.
+
+Having this `>0` helps with cache reuse and might improve overall query time.
+Because busy node might have warmed-up caches for this specific task, while free node needs to fetch lots of data from S3.
+Which might take longer than just waiting for the busy node and generate extra traffic.
+)", EXPERIMENTAL) \
     DECLARE(String, distributed_plan_force_exchange_kind, "", R"(
 Force specified kind of Exchange operators between distributed query stages.
 
@@ -7591,6 +7615,9 @@ If the number of set bits in a runtime bloom filter exceeds this ratio the filte
 )", EXPERIMENTAL) \
     DECLARE(Bool, rewrite_in_to_join, false, R"(
 Rewrite expressions like 'x IN subquery' to JOIN. This might be useful for optimizing the whole query with join reordering.
+)", EXPERIMENTAL) \
+    DECLARE(Bool, allow_experimental_iceberg_read_optimization, true, R"(
+Allow Iceberg read optimization based on Iceberg metadata.
 )", EXPERIMENTAL) \
     \
     /** Experimental timeSeries* aggregate functions. */ \
@@ -7743,7 +7770,8 @@ Allow experimental database engine DataLakeCatalog with catalog_type = 'paimon_r
     MAKE_OBSOLETE(M, Bool, use_json_alias_for_old_object_type, false) \
     MAKE_OBSOLETE(M, Bool, describe_extend_object_types, false) \
     MAKE_OBSOLETE(M, Bool, allow_experimental_object_type, false) \
-    MAKE_OBSOLETE(M, BoolAuto, insert_select_deduplicate, Field{"auto"})
+    MAKE_OBSOLETE(M, BoolAuto, insert_select_deduplicate, Field{"auto"}) \
+    MAKE_OBSOLETE(M, Bool, allow_retries_in_cluster_requests, false) \
     /** The section above is for obsolete settings. Do not add anything there. */
 #endif /// __CLION_IDE__
 
