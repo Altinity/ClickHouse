@@ -1446,6 +1446,7 @@ protected:
     friend class VersionMetadataOnKeeper; // for access to log
     friend class MutationsState; // for access to log
     friend class ExportPartTask;
+    friend class ExportPartFromPartitionExportTask;
 
     bool require_part_metadata;
 

@@ -7826,6 +7826,7 @@ Throw an error if there are pending mutations when exporting a merge tree part.
     DECLARE(Bool, export_merge_tree_part_throw_on_pending_patch_parts, true, R"(
 Throw an error if there are pending patch parts when exporting a merge tree part.
 )", 0) \
+<<<<<<< HEAD
     DECLARE(UInt64, shared_merge_tree_sequential_consistency_initial_parts_update_backoff_ms, 50, R"(
 Initial backoff in milliseconds for parts update when using `select_sequential_consistency` with `SharedMergeTree`. Only available in ClickHouse Cloud.
 )", 0) \
@@ -7840,6 +7841,19 @@ If set to a non-zero value and `join_algorithm` is `hash`, `parallel_hash`, `def
 )", 0) \
     DECLARE(Double, max_bytes_ratio_before_external_join, 0.5, R"(
 The ratio of available memory that is allowed for `JOIN`. Once reached, the hash join will be converted to grace hash join to spill the right-side data to disk.
+=======
+    DECLARE(Bool, export_merge_tree_partition_lock_inside_the_task, false, R"(
+Only lock a part when the task is already running. This might help with busy waiting where the scheduler locks a part, but the task ends in the pending list.
+On the other hand, there is a chance once the task executes that part has already been locked by another replica and the task will simply early exit.
+)", 0) \
+    DECLARE(Bool, export_merge_tree_partition_system_table_prefer_remote_information, true, R"(
+Controls whether the system.replicated_partition_exports will prefer to query ZooKeeper to get the most up to date information or use the local information.
+Querying ZooKeeper is expensive, and only available if the ZooKeeper feature flag MULTI_READ is enabled.
+)", 0) \
+    DECLARE(Timezone, iceberg_partition_timezone, "", R"(
+Time zone by which partitioning of Iceberg tables was performed.
+Possible values:
+>>>>>>> 664f99e7e2d (Merge pull request #1402 from Altinity/26_1_export_improvements_test)
 
 For example, if set to `0.6`, `JOIN` will allow using `60%` of the available memory (to server/user/merges) for the right-side hash table at the beginning of the execution; after that, it starts spilling to disk.
 

@@ -40,9 +40,16 @@ TEST_CONFIGS = [
         False,
         "10-node cluster; fully isolated per test module",
     ),
+<<<<<<< HEAD
     TC("test_storage_iceberg_no_spark/", False, "minio/azurite per cluster; fully isolated"),
     TC("test_storage_iceberg_with_spark_cache/", False, "package-scoped Spark session; each xdist worker gets its own instance"),
     TC("test_storage_iceberg_concurrent/", False, "package-scoped Spark session; each xdist worker gets its own instance"),
+=======
+    TC("test_storage_iceberg_no_spark/", True, "no idea why i'm sequential"),
+    TC("test_storage_iceberg_with_spark_cache/", True, "no idea why i'm sequential"),
+    TC("test_storage_iceberg_concurrent/", True, "no idea why i'm sequential"),
+    TC("test_export_replicated_mt_partition_to_object_storage/", True, "ZooKeeper can't handle too many parallel requests"),
+>>>>>>> 664f99e7e2d (Merge pull request #1402 from Altinity/26_1_export_improvements_test)
 ]
 
 IMAGES_ENV = {
