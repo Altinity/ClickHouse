@@ -1,4 +1,6 @@
 #include <Storages/ObjectStorage/StorageObjectStorageStableTaskDistributor.h>
+#include <Storages/ObjectStorage/Utils.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Common/SipHash.h>
 #include <consistent_hashing.h>
 #include <optional>
@@ -123,7 +125,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getPreQueuedFile(size_t
         auto next_file = files.back();
         files.pop_back();
 
-        auto file_identifier = send_over_whole_archive ? next_file->getPathOrPathToArchiveIfArchive() : next_file->getIdentifier();
+        auto file_identifier = send_over_whole_archive ? next_file->getPathOrPathToArchiveIfArchive() : getAbsolutePathFromObjectInfo(next_file).value_or(next_file->getIdentifier());
         auto it = unprocessed_files.find(file_identifier);
         if (it == unprocessed_files.end())
             continue;
@@ -178,7 +180,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getMatchingFileFromIter
         }
         else
         {
-            file_identifier = object_info->getIdentifier();
+            file_identifier = getAbsolutePathFromObjectInfo(object_info).value_or(object_info->getIdentifier());
         }
 
         if (iceberg_read_optimization_enabled)
@@ -248,7 +250,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(s
                 auto next_file = it->second.first;
                 unprocessed_files.erase(it);
 
-                auto file_path = send_over_whole_archive ? next_file->getPathOrPathToArchiveIfArchive() : next_file->getPath();
+                auto file_path = send_over_whole_archive ? next_file->getPathOrPathToArchiveIfArchive() : getAbsolutePathFromObjectInfo(next_file).value_or(next_file->getPath());
                 LOG_TRACE(
                     log,
                     "Iterator exhausted. Assigning unprocessed file {} to replica {} from matched replica {}",
