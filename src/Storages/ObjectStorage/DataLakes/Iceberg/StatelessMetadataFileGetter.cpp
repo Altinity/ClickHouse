@@ -104,7 +104,6 @@ Iceberg::ManifestFilePtr getManifestFile(
             inherited_sequence_number,
             inherited_snapshot_id,
             persistent_table_components.table_location,
-            persistent_table_components.common_namespace,
             local_context,
             absolute_path);
     };
