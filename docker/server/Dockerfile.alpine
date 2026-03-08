@@ -12,7 +12,7 @@ RUN arch=${TARGETARCH:-amd64} \
         arm64) ln /lib/linux-gnu/ld-linux-aarch64.so.1 /lib/linux-gnu/ld-2.35.so ;; \
     esac
 
-FROM alpine
+FROM alpine:3.23
 
 ENV LANG=en_US.UTF-8 \
     LANGUAGE=en_US:en \
