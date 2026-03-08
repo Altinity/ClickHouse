@@ -16,7 +16,12 @@ class FileMetaData;
 namespace DB
 {
 
-class ParquetFileMetaDataCache : public CacheBase<String, parquet::FileMetaData>
+struct ParquetFileMetaDataWeightFunction
+{
+    size_t operator()(const parquet::FileMetaData & metadata) const;
+};
+
+class ParquetFileMetaDataCache : public CacheBase<String, parquet::FileMetaData, std::hash<String>, ParquetFileMetaDataWeightFunction>
 {
 public:
     static ParquetFileMetaDataCache * instance();

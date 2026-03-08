@@ -26,6 +26,7 @@ struct ColumnInfo
 #include <Storages/KeyDescription.h>
 #include <Storages/MergeTree/KeyCondition.h>
 #include <Core/Field.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage_fwd.h>
 
 #include <cstdint>
 
@@ -67,7 +68,7 @@ using PartitionSpecification = std::vector<PartitionSpecsEntry>;
 struct ManifestFileEntry : public boost::noncopyable
 {
     // It's the original string in the Iceberg metadata
-    String file_path_key;
+    String file_path_from_metadata;
     // It's a processed file path to be used by Object Storage
     String file_path;
     Int64 row_number;
@@ -93,7 +94,7 @@ struct ManifestFileEntry : public boost::noncopyable
     String dumpDeletesMatchingInfo() const;
 
     ManifestFileEntry(
-        const String& file_path_key_,
+        const String& file_path_from_metadata_,
         const String& file_path_,
         Int64 row_number_,
         ManifestEntryStatus status_,
@@ -108,7 +109,7 @@ struct ManifestFileEntry : public boost::noncopyable
         std::optional<String> upper_reference_data_file_path_,
         std::optional<std::vector<Int32>> equality_ids_,
         std::optional<Int32> sort_order_id_)
-        : file_path_key(file_path_key_)
+        : file_path_from_metadata(file_path_from_metadata_)
         , file_path(file_path_)
         , row_number(row_number_)
         , status(status_)

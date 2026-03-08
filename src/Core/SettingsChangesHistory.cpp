@@ -42,6 +42,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         addSettingsChanges(settings_changes_history, "26.1.3.20001.altinityantalya",
         {
             {"iceberg_partition_timezone", "", "", "New setting."},
+            // {"object_storage_max_nodes", 0, 0, "Antalya: New setting"},
+            {"s3_propagate_credentials_to_other_storages", false, false, "New setting"},
         });
         addSettingsChanges(settings_changes_history, "26.1",
         {
@@ -251,6 +253,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         //     {"output_format_parquet_write_checksums", false, true, "New setting."},
             {"export_merge_tree_part_max_bytes_per_file", 0, 0, "New setting."},
             {"export_merge_tree_part_max_rows_per_file", 0, 0, "New setting."},
+            {"export_merge_tree_partition_lock_inside_the_task", false, false, "New setting."},
+            {"export_merge_tree_partition_system_table_prefer_remote_information", true, true, "New setting."},
         //     {"cluster_table_function_split_granularity", "file", "file", "New setting."},
         //     {"cluster_table_function_buckets_batch_size", 0, 0, "New setting."},
             {"export_merge_tree_part_throw_on_pending_mutations", true, true, "New setting."},
