@@ -162,16 +162,8 @@ ManifestFileCacheKeys getManifestList(
         {
             const std::string file_path
                 = manifest_list_deserializer.getValueFromRowByName(i, f_manifest_path, TypeIndex::String).safeGet<std::string>();
-<<<<<<< HEAD
-            const auto manifest_file_name = getProperFilePathFromMetadataInfo(
-                file_path,
-                persistent_table_components.table_path,
-                persistent_table_components.table_location,
-                persistent_table_components.common_namespace);
-=======
 
             const auto manifest_absolute_path = makeAbsolutePath(persistent_table_components.table_location, file_path);
->>>>>>> bbabcaa96e8b7fe8f70ecd0bd4f76fb0f76f2166
             Int64 added_sequence_number = 0;
             auto added_snapshot_id = manifest_list_deserializer.getValueFromRowByName(i, f_added_snapshot_id);
             if (added_snapshot_id.isNull())
