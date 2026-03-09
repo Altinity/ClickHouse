@@ -69,6 +69,8 @@ ASTPtr ASTAlterCommand::clone() const
         res->to_table_function = res->children.emplace_back(to_table_function->clone()).get();
     if (partition_by_expr)
         res->partition_by_expr = res->children.emplace_back(partition_by_expr->clone()).get();
+    if (execute_args)
+        res->execute_args = res->children.emplace_back(execute_args->clone()).get();
 
     return res;
 }
@@ -592,6 +594,13 @@ void ASTAlterCommand::formatImpl(WriteBuffer & ostr, const FormatSettings & sett
             partition->format(ostr, settings, state, frame);
         }
     }
+    else if (type == ASTAlterCommand::EXECUTE_COMMAND)
+    {
+        ostr << "EXECUTE " << execute_command_name << "(";
+        if (execute_args)
+            execute_args->format(ostr, settings, state, frame);
+        ostr << ")";
+    }
     else
         throw Exception(ErrorCodes::UNEXPECTED_AST_STRUCTURE, "Unexpected type of ALTER");
 }
@@ -621,6 +630,7 @@ void ASTAlterCommand::forEachPointerToChild(std::function<void(IAST **, boost::i
     f(&rename_to, nullptr);
     f(&to_table_function, nullptr);
     f(&partition_by_expr, nullptr);
+    f(&execute_args, nullptr);
 }
 
 
