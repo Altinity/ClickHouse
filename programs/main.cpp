@@ -64,6 +64,11 @@ int mainEntryClickHouseKeeperBench(int argc, char ** argv);
 int mainEntryClickHouseKeeperDataDumper(int argc, char ** argv);
 #endif
 
+#if defined(FIPS_CLICKHOUSE)
+int mainEntryClickHouseSslShim(int argc, char ** argv);
+int mainEntryClickHouseSslHandshaker(int argc, char ** argv);
+#endif
+
 // install
 int mainEntryClickHouseInstall(int argc, char ** argv);
 int mainEntryClickHouseStart(int argc, char ** argv);
@@ -115,6 +120,10 @@ std::pair<std::string_view, MainFunc> clickhouse_applications[] =
 #endif
 #if USE_NURAFT
     {"keeper-data-dumper", mainEntryClickHouseKeeperDataDumper},
+#endif
+#if defined(FIPS_CLICKHOUSE)
+    {"ssl-shim", mainEntryClickHouseSslShim},
+    {"ssl-handshaker", mainEntryClickHouseSslHandshaker},
 #endif
     // install
     {"install", mainEntryClickHouseInstall},

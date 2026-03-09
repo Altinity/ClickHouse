@@ -127,6 +127,11 @@ if (ENABLE_CLICKHOUSE_KEEPER)
     add_subdirectory (keeper)
 endif()
 
+if (FIPS_CLICKHOUSE AND DEFINED AWSLC_SRC_DIR)
+    add_subdirectory (ssl-shim)
+    add_subdirectory (ssl-handshaker)
+endif()
+
 if (ENABLE_CLICKHOUSE_SELF_EXTRACTING AND NOT ENABLE_DUMMY_LAUNCHERS)
     add_subdirectory (self-extracting)
 endif ()
@@ -140,6 +145,14 @@ endif ()
 
 target_link_libraries (clickhouse PRIVATE clickhouse_common_io ${HARMFUL_LIB})
 target_include_directories (clickhouse PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
+# The ssl-shim/ssl-handshaker objects are compiled with the system compiler
+# (libstdc++ ABI) to match the Docker-built aws-lc libraries. Linking
+# libstdc++.a alongside ClickHouse's libc++/libcxxabi creates a few
+# duplicate symbols (std::exception, etc.) that are safe to coalesce.
+if (FIPS_CLICKHOUSE AND DEFINED AWSLC_SRC_DIR)
+    target_link_options(clickhouse PRIVATE "LINKER:--allow-multiple-definition")
+endif()
 
 if (ENABLE_CLICKHOUSE_KEEPER)
     clickhouse_target_link_split_lib(clickhouse keeper)
@@ -224,6 +237,13 @@ if (ENABLE_CLICKHOUSE_KEEPER_CLIENT)
 
     list(APPEND CLICKHOUSE_BUNDLE clickhouse-keeper-client)
 endif ()
+
+if (FIPS_CLICKHOUSE AND DEFINED AWSLC_SRC_DIR)
+    clickhouse_program_install(clickhouse-ssl-shim ssl-shim)
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        clickhouse_program_install(clickhouse-ssl-handshaker ssl-handshaker)
+    endif()
+endif()
 
 add_custom_target (clickhouse-bundle ALL DEPENDS ${CLICKHOUSE_BUNDLE})
 
