@@ -154,6 +154,19 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getMatchingFileFromIter
     {
         ObjectInfoPtr object_info;
 
+        if (iterator->has_concurrent_next())
+        {
+            object_info = iterator->next(0);
+
+            if (!object_info)
+            {
+                LOG_TEST(log, "Iterator is exhausted");
+                std::lock_guard lock(mutex);
+                iterator_exhausted = true;
+                break;
+            }
+        }
+        else
         {
             std::lock_guard lock(mutex);
             object_info = iterator->next(0);

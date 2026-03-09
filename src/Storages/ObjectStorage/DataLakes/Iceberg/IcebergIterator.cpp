@@ -61,6 +61,7 @@ extern const Event IcebergPartitionPrunedFiles;
 extern const Event IcebergMinMaxIndexPrunedFiles;
 extern const Event IcebergMetadataReadWaitTimeMicroseconds;
 extern const Event IcebergMetadataReturnedObjectInfos;
+extern const Event IcebergIteratorNextMicroseconds;
 };
 
 
@@ -119,6 +120,8 @@ defineDeletesSpan(ManifestFileEntry data_object_, const std::vector<ManifestFile
 
 std::optional<ManifestFileEntry> SingleThreadIcebergKeysIterator::next()
 {
+    ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::IcebergIteratorNextMicroseconds);
+
     if (!data_snapshot)
     {
         return std::nullopt;
