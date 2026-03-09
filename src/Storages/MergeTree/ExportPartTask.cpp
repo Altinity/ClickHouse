@@ -19,6 +19,7 @@
 #include "Common/setThreadName.h"
 #include <Common/Exception.h>
 #include <Common/ProfileEventsScope.h>
+#include <Databases/DatabaseReplicated.h>
 #include <Storages/MergeTree/ExportList.h>
 #include <Formats/FormatFactory.h>
 #include <Databases/enableAllExperimentalSettings.h>
@@ -109,6 +110,16 @@ namespace
 
         Macros::MacroExpansionInfo macro_info;
         macro_info.table_id = storage_id;
+
+        if (auto database = DatabaseCatalog::instance().tryGetDatabase(storage_id.database_name))
+        {
+            if (const auto replicated = dynamic_cast<const DatabaseReplicated *>(database.get()))
+            {
+                macro_info.shard = replicated->getShardName();
+                macro_info.replica = replicated->getReplicaName();
+            }
+        }
+
         filename = local_context->getMacros()->expand(filename, macro_info);
 
         return filename;

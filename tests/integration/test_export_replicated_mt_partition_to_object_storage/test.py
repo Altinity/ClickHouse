@@ -1225,6 +1225,86 @@ def test_sharded_export_partition_with_filename_pattern(cluster):
     assert "shard2" in files_shard2 or files_shard2 == "", f"Expected shard2 in filenames, got: {files_shard2}"
 
 
+def test_export_partition_from_replicated_database_uses_db_shard_replica_macros(cluster):
+    """Test that {shard} and {replica} in the filename pattern are expanded from the
+    DatabaseReplicated identity, NOT from server config macros.
+
+    replica1 has no <shard>/<replica> entries in its server config <macros> section.
+    Without the fix buildDestinationFilename() leaves macro_info.shard/replica unset, so
+    Macros::expand() falls through to the config-macros lookup and throws NO_ELEMENTS_IN_CONFIG.
+    With the fix the DatabaseReplicated shard_name / replica_name are injected into macro_info
+    before the expand call, and the pattern resolves correctly.
+    """
+    node = cluster.instances["replica1"]
+    watcher_node = cluster.instances["watcher_node"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    db_name = f"repdb_{postfix}"
+    table_name = "mt_table"
+    s3_table = f"s3_dbreplicated_{postfix}"
+
+    # These values exist only in the DatabaseReplicated definition – they are NOT
+    # present anywhere in replica1's server config <macros>.
+    db_shard = "db_shard_x"
+    db_replica = "db_replica_y"
+
+    node.query(
+        f"CREATE DATABASE {db_name} "
+        f"ENGINE = Replicated('/clickhouse/databases/{db_name}', '{db_shard}', '{db_replica}')")
+
+    node.query(f"""
+        CREATE TABLE {db_name}.{table_name}
+        (id UInt64, year UInt16)
+        ENGINE = ReplicatedMergeTree()
+        PARTITION BY year ORDER BY tuple()""")
+
+    node.query(f"INSERT INTO {db_name}.{table_name} VALUES (1, 2020), (2, 2020), (3, 2020)")
+    # Stop merges so part names stay stable during the test.
+    node.query(f"SYSTEM STOP MERGES {db_name}.{table_name}")
+
+    node.query(
+        f"CREATE TABLE {s3_table} (id UInt64, year UInt16) "
+        f"ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive') "
+        f"PARTITION BY year")
+
+    watcher_node.query(
+        f"CREATE TABLE {s3_table} (id UInt64, year UInt16) "
+        f"ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive') "
+        f"PARTITION BY year")
+
+    # Export with {shard} and {replica} in the pattern.
+    # Before the fix: Macros::expand throws NO_ELEMENTS_IN_CONFIG because replica1 has
+    # no <shard>/<replica> server config macros.
+    # After the fix: DatabaseReplicated's shard_name/replica_name are wired into
+    # macro_info before the expand call, so this succeeds and produces the right names.
+    node.query(
+        f"ALTER TABLE {db_name}.{table_name} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
+        f"SETTINGS export_merge_tree_part_filename_pattern = "
+        f"'{{part_name}}_{{shard}}_{{replica}}_{{checksum}}'")
+
+    # A FAILED status here almost certainly means the macro expansion threw
+    # NO_ELEMENTS_IN_CONFIG (i.e. the fix is missing or broken).
+    wait_for_export_status(node, table_name, s3_table, "2020", "COMPLETED")
+
+    # Data should have landed in S3.
+    count = watcher_node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020").strip()
+    assert count == "3", f"Expected 3 exported rows, got {count}"
+
+    # The exported filename must contain the exact shard and replica names from the
+    # DatabaseReplicated definition, proving the fix injected them (not server config macros).
+    filename = watcher_node.query(
+        f"SELECT _file FROM s3(s3_conn, filename='{s3_table}/**/*.parquet', format='One') LIMIT 1"
+    ).strip()
+
+    assert db_shard in filename, (
+        f"Expected filename to contain DatabaseReplicated shard '{db_shard}', got: {filename!r}. "
+        "Suggests {shard} was not expanded from the DatabaseReplicated identity.")
+
+    assert db_replica in filename, (
+        f"Expected filename to contain DatabaseReplicated replica '{db_replica}', got: {filename!r}. "
+        "Suggests {replica} was not expanded from the DatabaseReplicated identity.")
+
+
 def test_sharded_export_partition_default_pattern(cluster):
     shard1_r1 = cluster.instances["shard1_replica1"]
     shard2_r1 = cluster.instances["shard2_replica1"]
