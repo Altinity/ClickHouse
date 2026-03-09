@@ -8,7 +8,6 @@ class AltinityWorkflowTemplates:
   AZURE_CONTAINER_NAME: ${{{{ secrets.AZURE_CONTAINER_NAME }}}}
   AZURE_STORAGE_ACCOUNT_URL: "https://${{{{ secrets.AZURE_ACCOUNT_NAME }}}}.blob.core.windows.net/"
   ROBOT_TOKEN: ${{{{ secrets.ROBOT_TOKEN }}}}
-  GH_TOKEN: ${{{{ github.token }}}}
 """
     # Additional pre steps for all jobs
     JOB_SETUP_STEPS = """
@@ -22,6 +21,7 @@ class AltinityWorkflowTemplates:
     # Additional pre steps for config workflow job
     ADDITIONAL_CI_CONFIG_STEPS = r"""
       - name: Note report location to summary
+        if: ${{ !failure() && env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY }}
         env:
           PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
           COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
@@ -35,7 +35,7 @@ class AltinityWorkflowTemplates:
           echo "Workflow Run Report: [View Report]($REPORT_LINK)" >> $GITHUB_STEP_SUMMARY
 """
     # Additional jobs
-    REGRESSION_HASH = "c5cae9b244e0839fb307a9fb67a40fe80d93810b"
+    REGRESSION_HASH = "a54216bbc29eb458e25011a68bacc77f4ae73c19"
     ALTINITY_JOBS = {
         "GrypeScan": r"""
   GrypeScanServer:
@@ -63,7 +63,7 @@ class AltinityWorkflowTemplates:
         "Regression": r"""
   RegressionTestsRelease:
     needs: [config_workflow, build_amd_binary]
-    if: ${{  !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.custom_data.ci_exclude_tags, 'regression')}}
+    if: ${{  !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(fromJson(needs.config_workflow.outputs.data).JOB_KV_DATA.ci_exclude_tags, 'regression')}}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
@@ -71,11 +71,11 @@ class AltinityWorkflowTemplates:
       commit: {REGRESSION_HASH}
       arch: release
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      timeout_minutes: 300
-      workflow_config: ${{ needs.config_workflow.outputs.data.workflow_config }}
+      timeout_minutes: 210
+      workflow_config: ${{ needs.config_workflow.outputs.data }}
   RegressionTestsAarch64:
     needs: [config_workflow, build_arm_binary]
-    if: ${{  !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.custom_data.ci_exclude_tags, 'regression') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.custom_data.ci_exclude_tags, 'aarch64')}}
+    if: ${{  !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(fromJson(needs.config_workflow.outputs.data).JOB_KV_DATA.ci_exclude_tags, 'regression') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.custom_data.ci_exclude_tags, 'aarch64')}}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
@@ -83,8 +83,8 @@ class AltinityWorkflowTemplates:
       commit: {REGRESSION_HASH}
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      timeout_minutes: 300
-      workflow_config: ${{ needs.config_workflow.outputs.data.workflow_config }}
+      timeout_minutes: 210
+      workflow_config: ${{ needs.config_workflow.outputs.data }}
 """,
         "SignRelease": r"""
   SignRelease:

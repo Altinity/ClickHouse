@@ -580,6 +580,9 @@ Use multiple threads for azure multipart upload.
     DECLARE(Bool, s3_throw_on_zero_files_match, false, R"(
 Throw an error, when ListObjects request cannot match any files
 )", 0) \
+    DECLARE(Bool, s3_propagate_credentials_to_other_storages, false, R"(
+Allow copying base storage credentials to secondary object storages with a different endpoint. Default: 0 (credentials only copied when endpoint matches base).
+)", 0) \
     DECLARE(Bool, hdfs_throw_on_zero_files_match, false, R"(
 Throw an error if matched zero files according to glob expansion rules.
 
@@ -1914,6 +1917,22 @@ Possible values:
 - `global` — Replaces the `IN`/`JOIN` query with `GLOBAL IN`/`GLOBAL JOIN.`
 - `allow` — Allows the use of these types of subqueries.
 )", IMPORTANT) \
+    DECLARE(ObjectStorageClusterJoinMode, object_storage_cluster_join_mode, ObjectStorageClusterJoinMode::ALLOW, R"(
+Changes the behaviour of object storage cluster function or table.
+
+ClickHouse applies this setting when the query contains the product of object storage cluster function or table, i.e. when the query for a object storage cluster function or table contains a non-GLOBAL subquery for the object storage cluster function or table.
+
+Restrictions:
+
+- Only applied for JOIN subqueries.
+- Only if the FROM section uses a object storage cluster function or table.
+
+Possible values:
+
+- `local` — Replaces the database and table in the subquery with local ones for the destination server (shard), leaving the normal `IN`/`JOIN.`
+- `global` — Unsupported for now. Replaces the `IN`/`JOIN` query with `GLOBAL IN`/`GLOBAL JOIN.`
+- `allow` — Default value. Allows the use of these types of subqueries.
+)", 0) \
     \
     DECLARE(UInt64, max_concurrent_queries_for_all_users, 0, R"(
 Throw exception if the value of this setting is less or equal than the current number of simultaneously processed queries.
@@ -2280,6 +2299,11 @@ Show internal aliases (such as __table1) in EXPLAIN PLAN instead of those specif
     \
     DECLARE(UInt64, query_plan_max_step_description_length, 500, R"(
 Maximum length of step description in EXPLAIN PLAN.
+)", 0) \
+    \
+    DECLARE(Bool, enable_alias_marker, true, R"(
+Enable __aliasMarker injection for ALIAS column expressions when using the analyzer.
+This stabilizes action node names across planner/analyzer stages without changing query semantics.
 )", 0) \
     \
     DECLARE(UInt64, preferred_block_size_bytes, 1000000, R"(
@@ -7315,6 +7339,56 @@ Allows creation of [QBit](../../sql-reference/data-types/qbit.md) data type.
 )", BETA, allow_experimental_qbit_type) \
     DECLARE(UInt64, archive_adaptive_buffer_max_size_bytes, 8 * DBMS_DEFAULT_BUFFER_SIZE, R"(
 Limits the maximum size of the adaptive buffer used when writing to archive files (for example, tar archives)", 0) \
+    DECLARE(Bool, export_merge_tree_part_overwrite_file_if_exists, false, R"(
+Overwrite file if it already exists when exporting a merge tree part
+)", 0) \
+    DECLARE(Bool, export_merge_tree_partition_force_export, false, R"(
+Ignore existing partition export and overwrite the zookeeper entry
+)", 0) \
+    DECLARE(UInt64, export_merge_tree_partition_max_retries, 3, R"(
+Maximum number of retries for exporting a merge tree part in an export partition task
+)", 0) \
+    DECLARE(UInt64, export_merge_tree_partition_manifest_ttl, 180, R"(
+Determines how long the manifest will live in ZooKeeper. It prevents the same partition from being exported twice to the same destination.
+This setting does not affect / delete in progress tasks. It'll only cleanup the completed ones.
+)", 0) \
+    DECLARE(MergeTreePartExportFileAlreadyExistsPolicy, export_merge_tree_part_file_already_exists_policy, MergeTreePartExportFileAlreadyExistsPolicy::skip, R"(
+Possible values:
+- skip - Skip the file if it already exists.
+- error - Throw an error if the file already exists.
+- overwrite - Overwrite the file.
+)", 0) \
+    DECLARE(UInt64, export_merge_tree_part_max_bytes_per_file, 0, R"(
+Maximum number of bytes to write to a single file when exporting a merge tree part. 0 means no limit.
+This is not a hard limit, and it highly depends on the output format granularity and input source chunk size.
+)", 0) \
+    DECLARE(UInt64, export_merge_tree_part_max_rows_per_file, 0, R"(
+Maximum number of rows to write to a single file when exporting a merge tree part. 0 means no limit.
+This is not a hard limit, and it highly depends on the output format granularity and input source chunk size.
+)", 0) \
+    DECLARE(Bool, export_merge_tree_part_throw_on_pending_mutations, true, R"(
+Throw an error if there are pending mutations when exporting a merge tree part.
+)", 0) \
+    DECLARE(Bool, export_merge_tree_part_throw_on_pending_patch_parts, true, R"(
+Throw an error if there are pending patch parts when exporting a merge tree part.
+)", 0) \
+    DECLARE(Bool, export_merge_tree_partition_lock_inside_the_task, false, R"(
+Only lock a part when the task is already running. This might help with busy waiting where the scheduler locks a part, but the task ends in the pending list.
+On the other hand, there is a chance once the task executes that part has already been locked by another replica and the task will simply early exit.
+)", 0) \
+    DECLARE(Bool, export_merge_tree_partition_system_table_prefer_remote_information, true, R"(
+Controls whether the system.replicated_partition_exports will prefer to query ZooKeeper to get the most up to date information or use the local information.
+Querying ZooKeeper is expensive, and only available if the ZooKeeper feature flag MULTI_READ is enabled.
+)", 0) \
+    DECLARE(Timezone, iceberg_partition_timezone, "", R"(
+Time zone by which partitioning of Iceberg tables was performed.
+Possible values:
+
+- Any valid timezone, e.g. `Europe/Berlin`, `UTC` or `Zulu`
+- `` (empty value) - use server or session timezone
+
+Default value is empty.
+)", 0) \
     \
     /* ####################################################### */ \
     /* ########### START OF EXPERIMENTAL FEATURES ############ */ \
@@ -7338,6 +7412,12 @@ Allows creation of tables with the [TimeSeries](../../engines/table-engines/inte
 - 0 — the [TimeSeries](../../engines/table-engines/integrations/time-series.md) table engine is disabled.
 - 1 — the [TimeSeries](../../engines/table-engines/integrations/time-series.md) table engine is enabled.
 )", EXPERIMENTAL) \
+    DECLARE(Bool, allow_experimental_hybrid_table, false, R"(
+Allows creation of tables with the [Hybrid](../../engines/table-engines/special/hybrid.md) table engine.
+)", EXPERIMENTAL) \
+    DECLARE(Bool, hybrid_table_auto_cast_columns, true, R"(
+Automatically cast columns to the schema defined in Hybrid tables when remote segments expose different physical types. Works only with analyzer. Enabled by default, does nothing if (experimental) Hybrid tables are disabled; disable it if it causes issues. Segment schemas are cached when the Hybrid table is created or attached; if a segment schema changes later, detach/attach or recreate the Hybrid table so the cached headers stay in sync.
+)", 0) \
     DECLARE(Bool, allow_experimental_codecs, false, R"(
 If it is set to true, allow to specify experimental compression codecs (but we don't have those yet and this option does nothing).
 )", EXPERIMENTAL) \
@@ -7457,6 +7537,9 @@ Write full paths (including s3://) into iceberg metadata files.
     DECLARE(String, iceberg_metadata_compression_method, "", R"(
 Method to compress `.metadata.json` file.
 )", EXPERIMENTAL) \
+    DECLARE(Bool, use_object_storage_list_objects_cache, false, R"(
+Cache the list of objects returned by list objects calls in object storage
+)", EXPERIMENTAL) \
     DECLARE(Bool, make_distributed_plan, false, R"(
 Make distributed query plan.
 )", EXPERIMENTAL) \
@@ -7472,6 +7555,19 @@ Default number of tasks for parallel reading in distributed query. Tasks are spr
     DECLARE(Bool, distributed_plan_optimize_exchanges, true, R"(
 Removes unnecessary exchanges in distributed query plan. Disable it for debugging.
 )", 0) \
+    DECLARE(UInt64, lock_object_storage_task_distribution_ms, 500, R"(
+In object storage distribution queries do not distribute tasks on non-prefetched nodes until prefetched node is active.
+Determines how long the free executor node (one that finished processing all of it assigned tasks) should wait before "stealing" tasks from queue of currently busy executor nodes.
+
+Possible values:
+
+- 0  - steal tasks immediately after freeing up.
+- >0 - wait for specified period of time before stealing tasks.
+
+Having this `>0` helps with cache reuse and might improve overall query time.
+Because busy node might have warmed-up caches for this specific task, while free node needs to fetch lots of data from S3.
+Which might take longer than just waiting for the busy node and generate extra traffic.
+)", EXPERIMENTAL) \
     DECLARE(String, distributed_plan_force_exchange_kind, "", R"(
 Force specified kind of Exchange operators between distributed query stages.
 
@@ -7520,11 +7616,17 @@ If the number of set bits in a runtime bloom filter exceeds this ratio the filte
     DECLARE(Bool, rewrite_in_to_join, false, R"(
 Rewrite expressions like 'x IN subquery' to JOIN. This might be useful for optimizing the whole query with join reordering.
 )", EXPERIMENTAL) \
+    DECLARE(Bool, allow_experimental_iceberg_read_optimization, true, R"(
+Allow Iceberg read optimization based on Iceberg metadata.
+)", EXPERIMENTAL) \
     \
     /** Experimental timeSeries* aggregate functions. */ \
     DECLARE_WITH_ALIAS(Bool, allow_experimental_time_series_aggregate_functions, false, R"(
 Experimental timeSeries* aggregate functions for Prometheus-like timeseries resampling, rate, delta calculation.
 )", EXPERIMENTAL, allow_experimental_ts_to_grid_aggregate_function) \
+    DECLARE(Bool, allow_experimental_export_merge_tree_part, true, R"(
+Experimental export merge tree part.
+)", EXPERIMENTAL) \
     \
     DECLARE(String, promql_database, "", R"(
 Specifies the database name used by the 'promql' dialect. Empty string means the current database.
@@ -7668,7 +7770,8 @@ Allow experimental database engine DataLakeCatalog with catalog_type = 'paimon_r
     MAKE_OBSOLETE(M, Bool, use_json_alias_for_old_object_type, false) \
     MAKE_OBSOLETE(M, Bool, describe_extend_object_types, false) \
     MAKE_OBSOLETE(M, Bool, allow_experimental_object_type, false) \
-    MAKE_OBSOLETE(M, BoolAuto, insert_select_deduplicate, Field{"auto"})
+    MAKE_OBSOLETE(M, BoolAuto, insert_select_deduplicate, Field{"auto"}) \
+    MAKE_OBSOLETE(M, Bool, allow_retries_in_cluster_requests, false) \
     /** The section above is for obsolete settings. Do not add anything there. */
 #endif /// __CLION_IDE__
 

@@ -28,6 +28,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PersistentTableComponents.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/StatelessMetadataFileGetter.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
+#include <Storages/ObjectStorage/Utils.h>
 
 namespace DB
 {
@@ -82,7 +83,9 @@ public:
 
     IcebergHistory getHistory(ContextPtr local_context) const;
 
+    static constexpr bool supportsTotalRows() { return true; }
     std::optional<size_t> totalRows(ContextPtr Local_context) const override;
+    static constexpr bool supportsTotalBytes() { return true; }
     std::optional<size_t> totalBytes(ContextPtr Local_context) const override;
 
     bool isDataSortedBySortingKey(StorageMetadataPtr storage_metadata_snapshot, ContextPtr context) const override;
@@ -129,6 +132,15 @@ public:
 
     void drop(ContextPtr context) override;
 
+    ObjectIterator createIcebergKeysIterator(
+        Strings && data_files_,
+        ObjectStoragePtr,
+        IDataLakeMetadata::FileProgressCallback callback_,
+        ContextPtr local_context);
+
+    std::optional<String> partitionKey(ContextPtr) const override;
+    std::optional<String> sortingKey(ContextPtr) const override;
+
 private:
     Iceberg::PersistentTableComponents initializePersistentTableComponents(
         StorageObjectStorageConfigurationPtr configuration, IcebergMetadataFilesCachePtr cache_ptr, ContextPtr context_);
@@ -145,12 +157,15 @@ private:
     getRelevantDataSnapshotFromTableStateSnapshot(Iceberg::TableStateSnapshot table_state_snapshot, ContextPtr local_context) const;
     std::pair<Iceberg::IcebergDataSnapshotPtr, Iceberg::TableStateSnapshot> getRelevantState(const ContextPtr & context) const;
 
+    std::optional<String> getPartitionKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
+    KeyDescription getSortingKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
+
     LoggerPtr log;
     const ObjectStoragePtr object_storage;
+    mutable std::shared_ptr<SecondaryStorages> secondary_storages; // Sometimes data or manifests can be located on another storage
     DB::Iceberg::PersistentTableComponents persistent_components;
     const DataLakeStorageSettings & data_lake_settings;
     const String write_format;
-    KeyDescription getSortingKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
 };
 }
 

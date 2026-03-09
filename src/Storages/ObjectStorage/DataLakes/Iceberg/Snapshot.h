@@ -18,6 +18,8 @@ struct IcebergDataSnapshot
     std::optional<size_t> total_rows;
     std::optional<size_t> total_bytes;
     std::optional<size_t> total_position_delete_rows;
+    std::optional<String> partition_key;
+    std::optional<String> sorting_key;
 
     std::optional<size_t> getTotalRows() const
     {
@@ -34,7 +36,7 @@ struct IcebergHistoryRecord
     DB::DateTime64 made_current_at;
     Int64 parent_id;
     bool is_current_ancestor;
-    String manifest_list_path;
+    String manifest_list_absolute_path;
 
     Int32 added_files = 0;
     Int32 added_records = 0;

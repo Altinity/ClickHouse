@@ -48,6 +48,7 @@ class WorkflowYaml:
     tags: List[str]
     jobs: List[JobYaml]
     additional_jobs: List[str]
+    if_condition: str
     job_to_config: Dict[str, JobYaml]
     artifact_to_config: Dict[str, ArtifactYaml]
     secret_names_gh: List[str]
@@ -78,6 +79,7 @@ class WorkflowConfigParser:
             tags=config.tags,
             jobs=[],
             additional_jobs=[],
+            if_condition=config.if_condition,
             secret_names_gh=[],
             variable_names_gh=[],
             job_to_config={},
@@ -238,7 +240,8 @@ class WorkflowConfigParser:
                     assert (
                         False
                     ), f"Artifact [{artifact_name}] has unsupported type [{artifact.type}]"
-            if artifact.type == Artifact.Type.GH:
+            # NOTE (strtgbb): Added a check that provided_by is not empty, which is the case for artifacts that are defined in defs.py but not used in a workflow
+            if artifact.type == Artifact.Type.GH and artifact.provided_by != "":
                 self.workflow_yaml_config.job_to_config[
                     artifact.provided_by
                 ].artifacts_gh_provides.append(artifact)

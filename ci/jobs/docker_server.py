@@ -168,8 +168,8 @@ def buildx_args(
     args = [
         f"--platform=linux/{arch}",
         f"--label=build-url={action_url}",
-        f"--label=com.clickhouse.build.githash={sha}",
-        f"--label=com.clickhouse.build.version={version}",
+        f"--label=com.altinity.build.githash={sha}",
+        f"--label=com.altinity.build.version={version}",
     ]
     if direct_urls:
         args.append(f"--build-arg=DIRECT_DOWNLOAD_URLS='{' '.join(direct_urls)}'")

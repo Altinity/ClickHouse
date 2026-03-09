@@ -16,6 +16,7 @@
 #include <Storages/StorageFactory.h>
 #include <Formats/FormatFilterInfo.h>
 #include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
+#include <Storages/ObjectStorage/ObjectStorageFilePathGenerator.h>
 
 namespace DB
 {
@@ -69,6 +70,7 @@ public:
         std::string path;
 
         bool hasPartitionWildcard() const;
+        bool hasExportFilenameWildcard() const;
         bool hasGlobsIgnorePartitionWildcard() const;
         bool hasGlobs() const;
         std::string cutGlobs(bool supports_partial_prefix) const;
@@ -100,8 +102,10 @@ public:
     virtual const String & getRawURI() const = 0;
 
     const Path & getPathForRead() const;
+
     // Path used for writing, it should not be globbed and might contain a partition key
     Path getPathForWrite(const std::string & partition_id = "") const;
+    Path getPathForWrite(const std::string & partition_id, const std::string & filename_override) const;
 
     void setPathForRead(const Path & path)
     {
@@ -139,7 +143,9 @@ public:
 
     virtual bool isDataLakeConfiguration() const { return false; }
 
+    virtual bool supportsTotalRows() const { return false; }
     virtual std::optional<size_t> totalRows(ContextPtr) { return {}; }
+    virtual bool supportsTotalBytes() const { return false; }
     virtual std::optional<size_t> totalBytes(ContextPtr) { return {}; }
     /// NOTE: In this function we are going to check is data which we are going to read sorted by sorting key specified in StorageMetadataPtr.
     /// It may look confusing that this function checks only StorageMetadataPtr, and not StorageSnapshot.
@@ -263,11 +269,12 @@ public:
     String format = "auto";
     String compression_method = "auto";
     String structure = "auto";
+
     PartitionStrategyFactory::StrategyType partition_strategy_type = PartitionStrategyFactory::StrategyType::NONE;
+    std::shared_ptr<IPartitionStrategy> partition_strategy;
     /// Whether partition column values are contained in the actual data.
     /// And alternative is with hive partitioning, when they are contained in file path.
     bool partition_columns_in_data_file = true;
-    std::shared_ptr<IPartitionStrategy> partition_strategy;
 
 protected:
     void initializeFromParsedArguments(const StorageParsedArguments & parsed_arguments);
@@ -286,6 +293,8 @@ private:
     // Path used for reading, by default it is the same as `getRawPath`
     // When using `partition_strategy=hive`, a recursive reading pattern will be appended `'table_root/**.parquet'
     Path read_path;
+
+    std::shared_ptr<ObjectStorageFilePathGenerator> file_path_generator;
 };
 
 using StorageObjectStorageConfigurationPtr = std::shared_ptr<StorageObjectStorageConfiguration>;

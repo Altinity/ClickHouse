@@ -52,6 +52,8 @@ namespace DataLakeStorageSetting
     extern DataLakeStorageSettingsString storage_aws_access_key_id;
     extern DataLakeStorageSettingsString storage_aws_secret_access_key;
     extern DataLakeStorageSettingsString storage_region;
+    extern DataLakeStorageSettingsString storage_aws_role_arn;
+    extern DataLakeStorageSettingsString storage_aws_role_session_name;
     extern DataLakeStorageSettingsString storage_catalog_url;
     extern DataLakeStorageSettingsString storage_warehouse;
     extern DataLakeStorageSettingsString storage_catalog_credential;
@@ -183,10 +185,20 @@ public:
         return std::nullopt;
     }
 
+    bool supportsTotalRows() const override
+    {
+        return DataLakeMetadata::supportsTotalRows();
+    }
+
     std::optional<size_t> totalRows(ContextPtr local_context) override
     {
         assertInitialized();
         return current_metadata->totalRows(local_context);
+    }
+
+    bool supportsTotalBytes() const override
+    {
+        return DataLakeMetadata::supportsTotalBytes();
     }
 
     std::optional<size_t> totalBytes(ContextPtr local_context) override
@@ -322,6 +334,8 @@ public:
                 .aws_secret_access_key = (*settings)[DataLakeStorageSetting::storage_aws_secret_access_key].value,
                 .region = (*settings)[DataLakeStorageSetting::storage_region].value,
                 .namespaces = catalog_namespaces,
+                .aws_role_arn = (*settings)[DataLakeStorageSetting::storage_aws_role_arn].value,
+                .aws_role_session_name = (*settings)[DataLakeStorageSetting::storage_aws_role_session_name].value
             };
 
             return std::make_shared<DataLake::GlueCatalog>(

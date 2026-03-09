@@ -58,6 +58,8 @@ namespace DatabaseDataLakeSetting
     extern const DatabaseDataLakeSettingsString aws_access_key_id;
     extern const DatabaseDataLakeSettingsString aws_secret_access_key;
     extern const DatabaseDataLakeSettingsString region;
+    extern const DatabaseDataLakeSettingsString aws_role_arn;
+    extern const DatabaseDataLakeSettingsString aws_role_session_name;
     extern const DatabaseDataLakeSettingsString onelake_tenant_id;
     extern const DatabaseDataLakeSettingsString onelake_client_id;
     extern const DatabaseDataLakeSettingsString onelake_client_secret;
@@ -144,6 +146,8 @@ std::shared_ptr<DataLake::ICatalog> DatabaseDataLake::getCatalog() const
         .aws_secret_access_key = settings[DatabaseDataLakeSetting::aws_secret_access_key].value,
         .region = settings[DatabaseDataLakeSetting::region].value,
         .namespaces = settings[DatabaseDataLakeSetting::namespaces].value
+        .aws_role_arn = settings[DatabaseDataLakeSetting::aws_role_arn].value,
+        .aws_role_session_name = settings[DatabaseDataLakeSetting::aws_role_session_name].value,
     };
 
     switch (settings[DatabaseDataLakeSetting::catalog_type].value)
@@ -502,7 +506,9 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
                 LOG_DEBUG(log, "Has no credentials");
             }
         }
-        else if (!lightweight && table_metadata.requiresCredentials() && std::find(vended_credentials_catalogs.begin(), vended_credentials_catalogs.end(), catalog->getCatalogType()) == vended_credentials_catalogs.end())
+        else if (!lightweight && table_metadata.requiresCredentials()
+            && std::find(vended_credentials_catalogs.begin(), vended_credentials_catalogs.end(), catalog->getCatalogType()) == vended_credentials_catalogs.end()
+            && table_metadata.getStorageType() != DatabaseDataLakeStorageType::Local)
         {
             throw Exception(
                ErrorCodes::BAD_ARGUMENTS,
