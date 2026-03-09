@@ -41,11 +41,6 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
 }
 
-namespace Setting
-{
-extern const SettingsBool input_format_parquet_use_metadata_cache;
-}
-
 static NamesAndTypesList getHeaderForParquetMetadata()
 {
     NamesAndTypesList names_and_types{
@@ -144,35 +139,10 @@ void checkHeader(const Block & header)
 static std::shared_ptr<parquet::FileMetaData> getFileMetadata(
     ReadBuffer & in,
     const FormatSettings & format_settings,
-    std::atomic<int> & is_stopped,
-    ParquetMetadataInputFormat::Cache metadata_cache)
+    std::atomic<int> & is_stopped)
 {
-    // in-memory cache is not implemented for local file operations, only for remote files
-    // there is a chance the user sets `input_format_parquet_use_metadata_cache=1` for a local file operation
-    // and the cache_key won't be set. Therefore, we also need to check for metadata_cache.key
-    if (!metadata_cache.use_cache || metadata_cache.key.empty())
-    {
-        auto arrow_file = asArrowFile(in, format_settings, is_stopped, "Parquet", PARQUET_MAGIC_BYTES, /* avoid_buffering */ true);
-        return parquet::ReadMetaData(arrow_file);
-    }
-
-    auto [parquet_file_metadata, loaded] = ParquetFileMetaDataCache::instance()->getOrSet(
-        metadata_cache.key,
-        [&]()
-        {
-            auto arrow_file = asArrowFile(in, format_settings, is_stopped, "Parquet", PARQUET_MAGIC_BYTES, /* avoid_buffering */ true);
-            return parquet::ReadMetaData(arrow_file);
-        }
-    );
-
-    if (loaded)
-        ProfileEvents::increment(ProfileEvents::ParquetMetaDataCacheMisses);
-    else
-        ProfileEvents::increment(ProfileEvents::ParquetMetaDataCacheHits);
-
-    return parquet_file_metadata;
-
-
+    auto arrow_file = asArrowFile(in, format_settings, is_stopped, "Parquet", PARQUET_MAGIC_BYTES, /* avoid_buffering */ true);
+    return parquet::ReadMetaData(arrow_file);
 }
 
 ParquetMetadataInputFormat::ParquetMetadataInputFormat(ReadBuffer & in_, SharedHeader header_, const FormatSettings & format_settings_)
@@ -187,7 +157,7 @@ Chunk ParquetMetadataInputFormat::read()
     if (done)
         return res;
 
-    auto metadata = getFileMetadata(*in, format_settings, is_stopped, metadata_cache);
+    auto metadata = getFileMetadata(*in, format_settings, is_stopped);
 
     const auto & header = getPort().getHeader();
     auto names_and_types = getHeaderForParquetMetadata();
@@ -526,12 +496,6 @@ void ParquetMetadataInputFormat::resetParser()
 {
     IInputFormat::resetParser();
     done = false;
-}
-
-void ParquetMetadataInputFormat::setStorageRelatedUniqueKey(const Settings & settings, const String & key_)
-{
-    metadata_cache.key = key_;
-    metadata_cache.use_cache = settings[Setting::input_format_parquet_use_metadata_cache];
 }
 
 ParquetMetadataSchemaReader::ParquetMetadataSchemaReader(ReadBuffer & in_)

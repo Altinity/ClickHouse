@@ -369,13 +369,6 @@ private:
     bool is_initialized = false;
     std::optional<std::unordered_map<String, String>> parquet_names_to_clickhouse;
     std::optional<std::unordered_map<String, String>> clickhouse_names_to_parquet;
-    struct Cache
-    {
-        String key;
-        bool use_cache = false;
-    };
-
-    Cache metadata_cache;
 };
 
 class ArrowParquetSchemaReader : public ISchemaReader
