@@ -113,14 +113,16 @@ For ClickHouse-style multithreaded systems, prioritize these checks before lower
 9. Confidence rating and confidence-raising evidence
 10. Residual risks and untested paths
 
-## Standard Audit Report Template (Default: Pointed PR Style)
+## Standard Audit Report Template (Default: Short PR Comment Form)
 
-Default report style should match concise PR review comments:
-- fail-first and action-oriented,
-- only confirmed defects (no pass-by-pass narrative),
-- one short summary line when there are no confirmed defects.
+Default report style should mirror this pattern:
+- `Audit update for PR #<id> (<scope>):`
+- `Confirmed defects:`
+- short defect bullets by severity
+- `Coverage summary:`
 
-Use the compact template below by default. Use the full 10-section canonical format only when explicitly requested.
+Use this short form by default unless the user explicitly asks for the full canonical report.
+Keep wording concise and action-oriented. Do not include long narrative sections in short form.
 
 ```markdown
 Audit update for PR #<id> (<short title/scope>):
@@ -136,7 +138,7 @@ Confirmed defects:
   - Regression test direction (short): <2-4 bullets or sentences including positive and edge/failure cases>
   - Evidence:
     ```start:end:path
-    // minimal proving snippet
+    // minimal proving snippet from code under review
     ```
 
 <repeat per defect, sorted High -> Medium -> Low>
@@ -147,6 +149,16 @@ Coverage summary:
 - Categories passed: <count only>
 - Assumptions/limits: <one line>
 ```
+
+### Short-form constraints (required)
+
+- Report confirmed defects only (High/Medium/Low order).
+- Keep each defect concise (target: 6-10 lines excluding snippet).
+- Include at least one code snippet per confirmed defect.
+- Snippet must directly show the defect condition or branch inconsistency.
+- If no confirmed defects:
+  - output one line: `No confirmed defects in reviewed scope.`
+  - still include `Coverage summary` with assumptions/limits.
 
 ## Severity Rubric
 
