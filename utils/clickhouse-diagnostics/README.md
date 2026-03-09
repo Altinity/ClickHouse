@@ -235,7 +235,7 @@ Uptime: **13 minutes and 51 seconds**
 	<send_crash_reports>
 		<enabled>false</enabled>
 		<anonymize>false</anonymize>
-		<endpoint>https://6f33034cfe684dd7a3ab9875e57b1c8d@o388870.ingest.sentry.io/5226277</endpoint>
+		<endpoint></endpoint>
 	</send_crash_reports>
 	<listen_host>0.0.0.0</listen_host>
 	<https_port>8443</https_port>
