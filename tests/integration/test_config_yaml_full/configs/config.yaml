@@ -133,5 +133,5 @@ query_masking_rules:
 send_crash_reports:
   enabled: false
   anonymize: false
-  endpoint: 'https://6f33034cfe684dd7a3ab9875e57b1c8d@o388870.ingest.sentry.io/5226277'
+  endpoint: ''
 
