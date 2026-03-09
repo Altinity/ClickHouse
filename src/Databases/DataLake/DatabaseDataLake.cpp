@@ -145,9 +145,9 @@ std::shared_ptr<DataLake::ICatalog> DatabaseDataLake::getCatalog() const
         .aws_access_key_id = settings[DatabaseDataLakeSetting::aws_access_key_id].value,
         .aws_secret_access_key = settings[DatabaseDataLakeSetting::aws_secret_access_key].value,
         .region = settings[DatabaseDataLakeSetting::region].value,
-        .namespaces = settings[DatabaseDataLakeSetting::namespaces].value
+        .namespaces = settings[DatabaseDataLakeSetting::namespaces].value,
         .aws_role_arn = settings[DatabaseDataLakeSetting::aws_role_arn].value,
-        .aws_role_session_name = settings[DatabaseDataLakeSetting::aws_role_session_name].value,
+        .aws_role_session_name = settings[DatabaseDataLakeSetting::aws_role_session_name].value
     };
 
     switch (settings[DatabaseDataLakeSetting::catalog_type].value)
