@@ -21,6 +21,7 @@ struct IObjectIterator
     virtual ObjectInfoPtr next(size_t) = 0;
     virtual size_t estimatedKeysCount() = 0;
     virtual std::optional<UInt64> getSnapshotVersion() const { return std::nullopt; }
+    virtual bool has_concurrent_next() const { return false; }
 };
 
 using ObjectIterator = std::shared_ptr<IObjectIterator>;
