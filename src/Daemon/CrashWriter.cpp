@@ -24,8 +24,7 @@ std::unique_ptr<CrashWriter> CrashWriter::instance;
 
 void CrashWriter::initialize(Poco::Util::LayeredConfiguration & config)
 {
-    if (config.getBool("send_crash_reports.enabled", false))
-        instance.reset(new CrashWriter(config));
+    instance.reset(new CrashWriter(config));
 }
 
 bool CrashWriter::initialized()
@@ -67,6 +66,12 @@ void CrashWriter::sendError(Type type, int sig_or_error, std::string_view error_
     if (!instance)
     {
         LOG_INFO(logger, "Not sending crash report");
+        return;
+    }
+
+    if (endpoint.empty())
+    {
+        LOG_DEBUG(logger, "Not sending crash report (crash reporting is disabled)");
         return;
     }
 
