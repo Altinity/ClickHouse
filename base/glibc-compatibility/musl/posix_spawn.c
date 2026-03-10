@@ -1,5 +1,5 @@
-/// Very limited implementation. Half of code from Musl was cut.
-/// This is Ok, because for now, this function is used only from clang driver.
+/// Implementation based on Musl's posix_spawn, with file actions support
+/// restored for use by AWS-LC's split-handshake tests (and any other caller).
 
 #define _GNU_SOURCE
 #include <spawn.h>
@@ -14,6 +14,19 @@
 #include <spawn.h>
 #include <errno.h>
 #include "syscall.h"
+
+#define FDOP_CLOSE 1
+#define FDOP_DUP2 2
+#define FDOP_OPEN 3
+#define FDOP_CHDIR 4
+#define FDOP_FCHDIR 5
+
+struct fdop {
+	struct fdop *next, *prev;
+	int cmd, fd, srcfd, oflag;
+	mode_t mode;
+	char path[];
+};
 
 struct args {
 	int p[2];
@@ -45,11 +58,71 @@ static int child(void *args_vp)
 	pthread_sigmask(SIG_SETMASK, (attr->__flags & POSIX_SPAWN_SETSIGMASK)
 		? &attr->__ss : &args->oldmask, 0);
 
-	args->exec(args->path, args->argv, args->envp);
-	ret = -errno;
+	/* Process file actions in POSIX-specified order (oldest-added first).
+	 * The linked list is built by prepending, so we traverse to the tail
+	 * and walk backwards via prev pointers. */
+	if (args->fa) {
+		struct fdop *op = (struct fdop *)args->fa->__actions;
+		struct fdop *tail;
+		for (tail = op; tail && tail->next; tail = tail->next);
+		for (op = tail; op; op = op->prev) {
+			long r;
+			switch (op->cmd) {
+			case FDOP_CLOSE:
+				__syscall(SYS_close, op->fd);
+				break;
+			case FDOP_DUP2:
+				if (op->srcfd == op->fd) {
+					r = __syscall(SYS_fcntl, op->fd, F_GETFD);
+					if (r < 0) { ret = -(int)r; goto fail; }
+					if (r & FD_CLOEXEC) {
+						r = __syscall(SYS_fcntl, op->fd, F_SETFD, (int)r & ~FD_CLOEXEC);
+						if (r < 0) { ret = -(int)r; goto fail; }
+					}
+				} else {
+#ifdef SYS_dup2
+					r = __syscall(SYS_dup2, op->srcfd, op->fd);
+#else
+					r = __syscall(SYS_dup3, op->srcfd, op->fd, 0);
+#endif
+					if (r < 0) { ret = -(int)r; goto fail; }
+				}
+				break;
+			case FDOP_OPEN: {
+#ifdef SYS_open
+				int fd = __syscall(SYS_open, op->path, op->oflag, op->mode);
+#else
+				int fd = __syscall(SYS_openat, AT_FDCWD, op->path, op->oflag, op->mode);
+#endif
+				if (fd < 0) { ret = -fd; goto fail; }
+				if (fd != op->fd) {
+#ifdef SYS_dup2
+					r = __syscall(SYS_dup2, fd, op->fd);
+#else
+					r = __syscall(SYS_dup3, fd, op->fd, 0);
+#endif
+					__syscall(SYS_close, fd);
+					if (r < 0) { ret = -(int)r; goto fail; }
+				}
+				break;
+			}
+			case FDOP_CHDIR:
+				r = __syscall(SYS_chdir, op->path);
+				if (r < 0) { ret = -(int)r; goto fail; }
+				break;
+			case FDOP_FCHDIR:
+				r = __syscall(SYS_fchdir, op->fd);
+				if (r < 0) { ret = -(int)r; goto fail; }
+				break;
+			}
+		}
+	}
 
+	args->exec(args->path, args->argv, args->envp);
+	ret = errno;
+
+fail:
 	/* Since sizeof errno < PIPE_BUF, the write is atomic. */
-	ret = -ret;
 	if (ret) while (__syscall(SYS_write, p, &ret, sizeof ret) < 0);
 	_exit(127);
 }
