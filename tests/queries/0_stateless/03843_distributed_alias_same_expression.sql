@@ -48,4 +48,20 @@ ORDER BY dt
 LIMIT 1
 SETTINGS enable_analyzer = 1, enable_alias_marker = 1, serialize_query_plan = 1;
 
+SELECT 'sixth';
+SELECT alias_String_7_0 AS query_alias_0, alias_String_7_1 AS query_alias_1
+FROM remote('127.0.0.{1,2}', currentDatabase(), test_alias_same_expr_remote)
+ORDER BY dt
+LIMIT 1
+SETTINGS enable_analyzer = 1, enable_alias_marker = 1
+FORMAT TSVWithNames;
+
+SELECT 'seventh';
+SELECT alias_String_7_0, alias_String_7_1
+FROM remote('127.0.0.{1,2}', currentDatabase(), test_alias_same_expr_remote)
+ORDER BY dt
+LIMIT 1
+SETTINGS enable_analyzer = 1, enable_alias_marker = 1
+FORMAT TSVWithNames;
+
 DROP TABLE test_alias_same_expr_remote;
