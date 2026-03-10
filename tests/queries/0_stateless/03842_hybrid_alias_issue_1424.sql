@@ -1,4 +1,4 @@
-SET allow_experimental_hybrid_table = 1, enable_analyzer = 1;
+SET allow_experimental_hybrid_table = 1, enable_analyzer = 1, enable_alias_marker = 1;
 
 DROP TABLE IF EXISTS test_hybrid_issue_1424;
 DROP TABLE IF EXISTS test_hybrid_issue_1424_left;

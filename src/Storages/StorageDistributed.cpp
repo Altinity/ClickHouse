@@ -857,14 +857,17 @@ class ReplaseAliasColumnsVisitor : public InDepthQueryTreeVisitor<ReplaseAliasCo
             return nullptr;
 
         auto column_expression = column_node->getExpression();
-        const String original_expression_alias = column_expression->hasAlias() ? column_expression->getAlias() : String{};
+        const String output_alias = column_node->hasAlias() ? column_node->getAlias() : String{};
 
         const auto & settings = context->getSettingsRef();
-        /// With serialized query plans we transfer actions directly and do not need SQL-only alias markers.
-        const bool use_alias_marker = settings[Setting::enable_alias_marker] && !settings[Setting::serialize_query_plan];
+        const bool use_alias_marker = settings[Setting::enable_alias_marker];
         if (!use_alias_marker)
         {
-            return column_expression;
+            auto column_expression_with_alias = column_expression->clone();
+            column_expression_with_alias->removeAlias();
+            if (!output_alias.empty())
+                column_expression_with_alias->setAlias(output_alias);
+            return column_expression_with_alias;
         }
 
         if (auto * function_node = column_expression->as<FunctionNode>();
@@ -885,11 +888,9 @@ class ReplaseAliasColumnsVisitor : public InDepthQueryTreeVisitor<ReplaseAliasCo
 
         auto alias_marker_node = std::make_shared<FunctionNode>("__aliasMarker");
         alias_marker_node->getArguments().getNodes() = std::move(arguments);
-        if (!original_expression_alias.empty())
-        {
-            alias_marker_node->getArguments().getNodes()[0]->removeAlias();
-            alias_marker_node->setAlias(original_expression_alias);
-        }
+        alias_marker_node->getArguments().getNodes()[0]->removeAlias();
+        if (!output_alias.empty())
+            alias_marker_node->setAlias(output_alias);
         resolveOrdinaryFunctionNodeByName(*alias_marker_node, "__aliasMarker", context);
 
         return alias_marker_node;
