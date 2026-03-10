@@ -41,6 +41,8 @@ public:
     size_t estimatedKeysCount() override { return iterator->estimatedKeysCount(); }
     std::optional<UInt64> getSnapshotVersion() const override { return iterator->getSnapshotVersion(); }
 
+    bool has_concurrent_next() const override { return iterator->has_concurrent_next(); }
+
 private:
     const ObjectIterator iterator;
     const std::string object_namespace;
@@ -62,11 +64,14 @@ public:
     size_t estimatedKeysCount() override { return iterator->estimatedKeysCount(); }
     std::optional<UInt64> getSnapshotVersion() const override { return iterator->getSnapshotVersion(); }
 
+    bool has_concurrent_next() const override { return true; }
+
 private:
     const ObjectIterator iterator;
     String format;
     ObjectStoragePtr object_storage;
     FormatSettings format_settings;
+    std::mutex mutex;
 
     std::queue<ObjectInfoPtr> pending_objects_info;
     const LoggerPtr log = getLogger("GlobIterator");
