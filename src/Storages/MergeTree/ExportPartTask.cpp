@@ -167,7 +167,7 @@ bool ExportPartTask::executeStep()
 
     try
     {
-        const auto filename = buildDestinationFilename(manifest, destination_storage_id, local_context);
+        const auto filename = buildDestinationFilename(manifest, storage.getStorageID(), local_context);
 
         sink = destination_storage->import(
             filename,
