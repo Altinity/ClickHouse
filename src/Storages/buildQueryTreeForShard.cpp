@@ -38,6 +38,7 @@ namespace Setting
     extern const SettingsDistributedProductMode distributed_product_mode;
     extern const SettingsUInt64 min_external_table_block_size_rows;
     extern const SettingsUInt64 min_external_table_block_size_bytes;
+    extern const SettingsNonZeroUInt64 max_parallel_replicas;
     extern const SettingsBool parallel_replicas_prefer_local_join;
     extern const SettingsBool prefer_global_in_and_join;
     extern const SettingsBool enable_add_distinct_to_in_subqueries;
@@ -509,9 +510,11 @@ QueryTreeNodePtr getSubqueryFromTableExpression(
 
 QueryTreeNodePtr buildQueryTreeForShard(const PlannerContextPtr & planner_context, QueryTreeNodePtr query_tree_to_modify, bool allow_global_join_for_right_table)
 {
-    /// Incoming materialized markers are hop-local metadata.
-    /// Strip them before this node prepares/executes subqueries for the next hop.
-    stripMaterializedAliasMarkers(query_tree_to_modify);
+    /// Incoming materialized markers are usually hop-local metadata.
+    /// Keep them when this shard is about to fan out again via parallel replicas,
+    /// because that path reuses the already materialized markers and does not re-inject them.
+    if (planner_context->getQueryContext()->getSettingsRef()[Setting::max_parallel_replicas] <= 1)
+        stripMaterializedAliasMarkers(query_tree_to_modify);
 
     CollectColumnSourceToColumnsVisitor collect_column_source_to_columns_visitor;
     collect_column_source_to_columns_visitor.visit(query_tree_to_modify);
