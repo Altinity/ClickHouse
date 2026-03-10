@@ -139,6 +139,14 @@ def create_tables_and_insert_data(node, mt_table, s3_table, replica_name):
     create_s3_table(node, s3_table)
 
 
+def create_sharded_tables_and_insert_data(node, mt_table, s3_table, replica_name):
+    """Create sharded ReplicatedMergeTree table with {shard} macro in ZooKeeper path."""
+    node.query(f"CREATE TABLE {mt_table} (id UInt64, year UInt16) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{{shard}}/{mt_table}', '{replica_name}') PARTITION BY year ORDER BY tuple()")
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020), (3, 2020), (4, 2021)")
+
+    create_s3_table(node, s3_table)
+
+
 def test_restart_nodes_during_export(cluster):
     node = cluster.instances["replica1"]
     node2 = cluster.instances["replica2"]
