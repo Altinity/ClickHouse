@@ -41,4 +41,11 @@ ORDER BY dt
 LIMIT 1
 SETTINGS enable_analyzer = 1, enable_alias_marker = 0; -- { serverError NUMBER_OF_COLUMNS_DOESNT_MATCH }
 
+SELECT 'fifth';
+SELECT dt, alias_String_7_0, alias_String_7_1
+FROM remote('127.0.0.{1,2}', currentDatabase(), test_alias_same_expr_remote)
+ORDER BY dt
+LIMIT 1
+SETTINGS enable_analyzer = 1, enable_alias_marker = 1, serialize_query_plan = 1;
+
 DROP TABLE test_alias_same_expr_remote;
