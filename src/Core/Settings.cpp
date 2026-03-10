@@ -6935,6 +6935,9 @@ Throw an error if there are pending patch parts when exporting a merge tree part
     DECLARE(Bool, serialize_string_in_memory_with_zero_byte, true, R"(
 Serialize String values during aggregation with zero byte at the end. Enable to keep compatibility when querying cluster of incompatible versions.
 )", 0) \
+    DECLARE(String, export_merge_tree_part_filename_pattern, "{part_name}_{checksum}", R"(
+Pattern for the filename of the exported merge tree part. The `part_name` and `checksum` are calculated and replaced on the fly. Additional macros are supported.
+)", 0) \
     \
     /* ####################################################### */ \
     /* ########### START OF EXPERIMENTAL FEATURES ############ */ \
