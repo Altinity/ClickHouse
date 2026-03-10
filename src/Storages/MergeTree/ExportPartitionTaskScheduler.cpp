@@ -266,6 +266,8 @@ void ExportPartitionTaskScheduler::run()
                         {
                             handlePartExportCompletion(key, zk_part_name, manifest, destination_storage, result);
                         });
+
+                    scheduled_exports_count++;
                 }
                 catch (const Exception &)
                 {
@@ -277,7 +279,6 @@ void ExportPartitionTaskScheduler::run()
                 }
             }
 
-            scheduled_exports_count++;
         }
     }
 }
