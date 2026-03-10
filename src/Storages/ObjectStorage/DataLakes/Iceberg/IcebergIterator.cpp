@@ -321,7 +321,7 @@ IcebergIterator::IcebergIterator(
     producer_task.emplace(
         [this, thread_group = DB::CurrentThread::getGroup()]()
         {
-            ThreadGroupSwitcher switcher(thread_group, "IcebergKeysIterator");
+            ThreadGroupSwitcher switcher(thread_group, "IcebergKeys");
 
             while (!blocking_queue.isFinished())
             {
