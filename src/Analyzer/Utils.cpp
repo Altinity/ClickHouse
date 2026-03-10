@@ -1009,29 +1009,6 @@ bool stripAliasMarker(QueryTreeNodePtr & node, bool materialized_only)
     return true;
 }
 
-String buildDeterministicFallbackAliasMarkerId(const ColumnNode & marker_column_node, const QueryTreeNodePtr & marker_expression_node)
-{
-    IQueryTreeNode::CompareOptions compare_options
-    {
-        .compare_aliases = false,
-        .compare_types = false,
-        .ignore_cte = true,
-    };
-
-    String alias_id = marker_column_node.getColumnName();
-
-    if (const auto & marker_source = marker_column_node.getColumnSourceOrNull())
-    {
-        /// Keep fallback ids deterministic and source-specific when table aliases are not available yet.
-        alias_id += "__src_" + getHexUIntLowercase(marker_source->getTreeHash(compare_options));
-    }
-
-    /// Add expression hash to avoid collapsing different marker payloads with the same column name.
-    alias_id += "__expr_" + getHexUIntLowercase(marker_expression_node->getTreeHash(compare_options));
-
-    return alias_id;
-}
-
 void stripAliasMarkersFromPayloadSubtree(QueryTreeNodePtr & node)
 {
     while (stripAliasMarker(node, false))
@@ -1092,9 +1069,11 @@ public:
             }
             else
             {
-                /// In some distributed subquery execution paths marker ids are materialized
-                /// before alias uniquification assigns source aliases.
-                alias_id = buildDeterministicFallbackAliasMarkerId(*marker_column_node, arguments[0]);
+                throw Exception(
+                    ErrorCodes::LOGICAL_ERROR,
+                    "__aliasMarker expects the second argument to resolve to a column with a source alias before distributed serialization. "
+                    "Column '{}' has an unnamed or missing source",
+                    marker_column_node->getColumnName());
             }
         }
         else if (const auto * marker_id_node = arguments[1]->as<ConstantNode>();
