@@ -41,6 +41,8 @@ public:
     size_t estimatedKeysCount() override { return iterator->estimatedKeysCount(); }
     std::optional<UInt64> getSnapshotVersion() const override { return iterator->getSnapshotVersion(); }
 
+    bool has_concurrent_next() const override { return iterator->has_concurrent_next(); }
+
 private:
     const ObjectIterator iterator;
     const std::string object_namespace;
@@ -61,6 +63,8 @@ public:
     ObjectInfoPtr next(size_t) override;
     size_t estimatedKeysCount() override { return iterator->estimatedKeysCount(); }
     std::optional<UInt64> getSnapshotVersion() const override { return iterator->getSnapshotVersion(); }
+
+    bool has_concurrent_next() const override { return iterator->has_concurrent_next(); }
 
 private:
     const ObjectIterator iterator;

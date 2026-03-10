@@ -319,8 +319,10 @@ IcebergIterator::IcebergIterator(
     std::sort(equality_deletes_files.begin(), equality_deletes_files.end());
     std::sort(position_deletes_files.begin(), position_deletes_files.end());
     producer_task.emplace(
-        [this]()
+        [this, thread_group = DB::CurrentThread::getGroup()]()
         {
+            ThreadGroupSwitcher switcher(thread_group, "IcebergKeysIterator");
+
             while (!blocking_queue.isFinished())
             {
                 std::optional<ManifestFileEntry> entry;
