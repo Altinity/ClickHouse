@@ -1030,16 +1030,6 @@ def test_export_partition_with_mixed_computed_columns(cluster):
     assert status.strip() == "COMPLETED", f"Expected COMPLETED status, got: {status}"
 
 
-def skip_if_remote_database_disk_enabled(cluster):
-    """Skip test if any instance in the cluster has remote database disk enabled.
-
-    In this branch, this is useful for test_export_partition_from_replicated_database_uses_db_shard_replica_macros
-    """
-    for instance in cluster.instances.values():
-        if instance.with_remote_database_disk:
-            pytest.skip("Test cannot run with remote database disk enabled (db disk)")
-
-
 def test_sharded_export_partition_with_filename_pattern(cluster):
     """Test that export partition with filename pattern prevents collisions in sharded setup."""
     shard1_r1 = cluster.instances["shard1_replica1"]
@@ -1097,11 +1087,6 @@ def test_export_partition_from_replicated_database_uses_db_shard_replica_macros(
     With the fix the DatabaseReplicated shard_name / replica_name are injected into macro_info
     before the expand call, and the pattern resolves correctly.
     """
-
-    # The remote disk test suite sets the shard and replica macros in https://github.com/Altinity/ClickHouse/blob/bbabcaa96e8b7fe8f70ecd0bd4f76fb0f76f2166/tests/integration/helpers/cluster.py#L4356
-    # When expanding the macros, the configured ones are preferred over the ones from the DatabaseReplicated definition.
-    # Therefore, this test fails. It is easier to skip it than to fix it.
-    skip_if_remote_database_disk_enabled(cluster)
 
     node = cluster.instances["replica1"]
     watcher_node = cluster.instances["watcher_node"]
