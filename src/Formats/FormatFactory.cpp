@@ -518,7 +518,8 @@ InputFormatPtr FormatFactory::getInputImpl(
         format = std::make_shared<ParallelParsingInputFormat>(params);
     }
     // 2. Prefer to use metadata-aware creator if we have object metadata
-    else if (creators.random_access_input_creator_with_metadata && object_with_metadata.has_value())
+    else if (creators.random_access_input_creator_with_metadata
+        && object_with_metadata.has_value() && format_settings.parquet.use_native_reader_v3)
     {
         format = creators.random_access_input_creator_with_metadata(
             buf, sample, format_settings, context->getReadSettings(), is_remote_fs,
