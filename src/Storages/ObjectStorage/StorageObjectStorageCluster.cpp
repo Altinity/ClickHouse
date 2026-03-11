@@ -132,7 +132,7 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
 
     try
     {
-        if (!do_lazy_init && !catalog)
+        if (!do_lazy_init)
         {
             configuration->update(
                 object_storage,
@@ -198,7 +198,7 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
 
     /// This will update metadata which contains specific information about table state (e.g. for Iceberg)
 
-    if (!do_lazy_init && !catalog && is_table_function && configuration->needsUpdateForSchemaConsistency())
+    if (!do_lazy_init && is_table_function && configuration->needsUpdateForSchemaConsistency())
     {
         auto metadata_snapshot = configuration->getStorageSnapshotMetadata(context_);
         setInMemoryMetadata(metadata_snapshot);
