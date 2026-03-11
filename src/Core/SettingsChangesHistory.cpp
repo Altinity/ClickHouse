@@ -230,9 +230,9 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         });
         addSettingsChanges(settings_changes_history, "25.8.16.20001.altinityantalya",
         {
-            {"allow_experimental_database_iceberg", false, true, "Turned ON by default for Antalya."},
-            {"allow_experimental_database_unity_catalog", false, true, "Turned ON by default for Antalya."},
-            {"allow_experimental_database_glue_catalog", false, true, "Turned ON by default for Antalya."},
+            {"allow_database_iceberg", false, true, "Turned ON by default for Antalya."},
+            {"allow_database_unity_catalog", false, true, "Turned ON by default for Antalya."},
+            {"allow_database_glue_catalog", false, true, "Turned ON by default for Antalya."},
 
             {"input_format_parquet_use_metadata_cache", true, true, "New setting, turned ON by default"}, // https://github.com/Altinity/ClickHouse/pull/586
             // {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."},
