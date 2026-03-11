@@ -25,7 +25,6 @@ set(AWSLC_SHIM_INCLUDE_FLAGS
     -I${AWSLC_SRC_DIR}/include
     -I${AWSLC_SRC_DIR}
     -I${AWSLC_SSL_TEST_DIR}
-    -I${AWSLC_SRC_DIR}/third_party/googletest/include
 )
 
 # Build each aws-lc shim source file with the system compiler (matching

@@ -28,7 +28,6 @@ set(AWSLC_HSHAKER_INCLUDE_FLAGS
     -I${AWSLC_SRC_DIR}/include
     -I${AWSLC_SRC_DIR}
     -I${AWSLC_SSL_TEST_DIR}
-    -I${AWSLC_SRC_DIR}/third_party/googletest/include
 )
 
 set(AWSLC_HSHAKER_OBJS)
