@@ -67,6 +67,7 @@ int mainEntryClickHouseKeeperDataDumper(int argc, char ** argv);
 #if defined(FIPS_CLICKHOUSE)
 int mainEntryClickHouseSslShim(int argc, char ** argv);
 int mainEntryClickHouseSslHandshaker(int argc, char ** argv);
+int mainEntryClickHouseAcvpServer(int argc, char ** argv);
 #endif
 
 // install
@@ -124,6 +125,7 @@ std::pair<std::string_view, MainFunc> clickhouse_applications[] =
 #if defined(FIPS_CLICKHOUSE)
     {"ssl-shim", mainEntryClickHouseSslShim},
     {"ssl-handshaker", mainEntryClickHouseSslHandshaker},
+    {"acvp-server", mainEntryClickHouseAcvpServer},
 #endif
     // install
     {"install", mainEntryClickHouseInstall},
