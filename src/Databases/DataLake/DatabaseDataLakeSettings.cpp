@@ -31,6 +31,7 @@ namespace ErrorCodes
     DECLARE(String, aws_role_arn, "", "Role arn for AWS connection for Glue catalog", 0) \
     DECLARE(String, aws_role_session_name, "", "Role session name for AWS connection for Glue catalog", 0) \
     DECLARE(String, storage_endpoint, "", "Object storage endpoint", 0) \
+    DECLARE(String, namespaces, "*", "Comma-separated list of allowed namespaces", 0) \
 
 #define LIST_OF_DATABASE_ICEBERG_SETTINGS(M, ALIAS) \
     DATABASE_ICEBERG_RELATED_SETTINGS(M, ALIAS) \
