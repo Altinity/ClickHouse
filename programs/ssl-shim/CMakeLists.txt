@@ -25,6 +25,7 @@ set(AWSLC_SHIM_INCLUDE_FLAGS
     -I${AWSLC_SRC_DIR}/include
     -I${AWSLC_SRC_DIR}
     -I${AWSLC_SSL_TEST_DIR}
+    -I${AWSLC_SRC_DIR}/third_party/googletest/include
 )
 
 # Build each aws-lc shim source file with the system compiler (matching
@@ -68,9 +69,9 @@ add_custom_command(
     OUTPUT "${GLIBC_COMPAT_OBJ}"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${SHIM_OBJ_DIR}"
     COMMAND /usr/bin/cc -fPIC -O2 -w
-        -c "${CMAKE_CURRENT_SOURCE_DIR}/glibc_compat.c"
+        -c "${CMAKE_CURRENT_SOURCE_DIR}/../ssl-common/glibc_compat.c"
         -o "${GLIBC_COMPAT_OBJ}"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/glibc_compat.c"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../ssl-common/glibc_compat.c"
     COMMENT "Building glibc C23 compat shim"
 )
 list(APPEND AWSLC_SHIM_OBJS "${GLIBC_COMPAT_OBJ}")
