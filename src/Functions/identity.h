@@ -149,7 +149,8 @@ struct AliasMarkerName
  *    to a String alias identifier.
  * 3) Consumed on the receiver by adding a projection step where it appears, so that identity is enforced
  *    in actions without changing the user-facing aliasing logic.
- * 4) Removed before forwarding to the next hop, then re-injected there only if that hop still needs it.
+ * 4) Preserved while forwarding to the next hop. Nested marker chains are allowed and each marker may
+ *    contribute an alias step during actions construction.
  *
  * This is a temporary bridge while distributed plan transport still relies on SQL text in these paths.
  * As query plan serialization fully replaces that boundary, this marker path should become unnecessary.

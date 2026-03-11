@@ -157,14 +157,9 @@ void resolveOrdinaryFunctionNodeByName(FunctionNode & function_node, const Strin
 /// Arguments and parameters are taken from the node.
 void resolveAggregateFunctionNodeByName(FunctionNode & function_node, const String & function_name);
 
-/// Finalize __aliasMarker nodes before distributed SQL boundaries:
-/// 1) collapse nested wrappers to keep only current-hop marker id;
-/// 2) materialize marker id (arg2) to String ConstantNode.
+/// Finalize __aliasMarker nodes before distributed SQL boundaries by materializing
+/// marker ids in arg2 from ColumnNode to String ConstantNode when needed.
 void finalizeAliasMarkersForDistributedSerialization(QueryTreeNodePtr & node, const ContextPtr & context);
-
-/// Remove incoming/materialized __aliasMarker wrappers (arg2 is String ConstantNode),
-/// preserving wrapped expressions.
-void stripMaterializedAliasMarkers(QueryTreeNodePtr & node);
 
 /// Returns single source of expression node.
 /// First element of pair is source node, can be nullptr if there are no sources or multiple sources.

@@ -870,14 +870,6 @@ class ReplaseAliasColumnsVisitor : public InDepthQueryTreeVisitor<ReplaseAliasCo
             return column_expression_with_alias;
         }
 
-        if (auto * function_node = column_expression->as<FunctionNode>();
-            function_node && function_node->getFunctionName() == "__aliasMarker")
-        {
-            auto & arguments = function_node->getArguments().getNodes();
-            if (!arguments.empty() && arguments[0])
-                column_expression = arguments[0];
-        }
-
         QueryTreeNodes arguments;
         arguments.reserve(2);
         /// Preserve the original column reference in arg2 so normal analyzer passes

@@ -984,49 +984,9 @@ void resolveAggregateFunctionNodeByName(FunctionNode & function_node, const Stri
 namespace
 {
 
-/// `materialized_only`:
-/// false = strip any marker.
-/// true = strip only markers that arrived in the query already materialized (arg2 is String).
-/// Markers injected in the current rewrite keep arg2 as ColumnNode until finalization.
-bool stripAliasMarker(QueryTreeNodePtr & node, bool materialized_only)
-{
-    auto * function_node = node->as<FunctionNode>();
-    if (!function_node || function_node->getFunctionName() != "__aliasMarker")
-        return false;
-
-    auto & arguments = function_node->getArguments().getNodes();
-    if (arguments.size() != 2 || !arguments[0] || !arguments[1])
-        return false;
-
-    if (materialized_only)
-    {
-        const auto * marker_id_node = arguments[1]->as<ConstantNode>();
-        if (!marker_id_node || !isString(marker_id_node->getResultType()))
-            return false;
-    }
-
-    auto replacement = arguments[0];
-    if (!replacement->hasAlias() && function_node->hasAlias())
-        replacement->setAlias(function_node->getAlias());
-
-    node = std::move(replacement);
-    return true;
-}
-
-void stripAliasMarkersFromPayloadSubtree(QueryTreeNodePtr & node)
-{
-    while (stripAliasMarker(node, false))
-    {}
-
-    for (auto & child : node->getChildren())
-    {
-        if (child)
-            stripAliasMarkersFromPayloadSubtree(child);
-    }
-}
-
 /// Finalize __aliasMarker nodes right before distributed SQL boundaries.
-/// This pass strips nested markers from arg0 payload and materializes arg2 to String constant.
+/// This pass preserves nested markers and materializes arg2 to String constant
+/// only when arg2 is ColumnNode.
 class FinalizeAliasMarkersForDistributedSerializationVisitor : public InDepthQueryTreeVisitor<FinalizeAliasMarkersForDistributedSerializationVisitor>
 {
 public:
@@ -1039,15 +999,11 @@ public:
         return false;
     }
 
-    static bool needChildVisit(const QueryTreeNodePtr & parent_node, const QueryTreeNodePtr &)
+    static bool needChildVisit(const QueryTreeNodePtr &, const QueryTreeNodePtr &)
     {
-        auto * function_node = parent_node->as<FunctionNode>();
-        if (!function_node || function_node->getFunctionName() != "__aliasMarker")
-            return true;
-
-        /// __aliasMarker subtrees are processed explicitly in visitImpl:
-        /// arg0 is recursively cleaned from nested wrappers and arg2 is materialized in place.
-        return false;
+        /// Keep traversing marker payload recursively so nested chains are preserved
+        /// and each marker can materialize its own arg2 when needed.
+        return true;
     }
 
     void visitImpl(QueryTreeNodePtr & node)
@@ -1059,9 +1015,6 @@ public:
         auto & arguments = function_node->getArguments().getNodes();
         if (arguments.size() != 2 || !arguments[0] || !arguments[1])
             return;
-
-        /// Remove nested marker wrappers in payload subtree; keep only this node as the boundary marker.
-        stripAliasMarkersFromPayloadSubtree(arguments[0]);
 
         String alias_id;
         if (const auto * marker_column_node = arguments[1]->as<ColumnNode>())
@@ -1083,7 +1036,8 @@ public:
         else if (const auto * marker_id_node = arguments[1]->as<ConstantNode>();
                  marker_id_node && isString(marker_id_node->getResultType()))
         {
-            alias_id = marker_id_node->getValue().safeGet<String>();
+            /// Already materialized marker id from a previous hop. Keep as is.
+            return;
         }
 
         if (alias_id.empty())
@@ -1097,34 +1051,11 @@ private:
     ContextPtr context;
 };
 
-/// Strip incoming __aliasMarker wrappers between distributed hops.
-/// This keeps marker lifecycle hop-local and avoids forwarding stale previous-hop ids.
-class StripMaterializedAliasMarkersVisitor : public InDepthQueryTreeVisitor<StripMaterializedAliasMarkersVisitor>
-{
-public:
-    bool shouldTraverseTopToBottom() const
-    {
-        return false;
-    }
-
-    void visitImpl(QueryTreeNodePtr & node)
-    {
-        while (stripAliasMarker(node, true))
-        {}
-    }
-};
-
 }
 
 void finalizeAliasMarkersForDistributedSerialization(QueryTreeNodePtr & node, const ContextPtr & context)
 {
     FinalizeAliasMarkersForDistributedSerializationVisitor visitor(context);
-    visitor.visit(node);
-}
-
-void stripMaterializedAliasMarkers(QueryTreeNodePtr & node)
-{
-    StripMaterializedAliasMarkersVisitor visitor;
     visitor.visit(node);
 }
 
