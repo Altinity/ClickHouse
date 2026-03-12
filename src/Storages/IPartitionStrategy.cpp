@@ -193,8 +193,11 @@ const KeyDescription & IPartitionStrategy::getPartitionKeyDescription() const
 IPartitionStrategy::PartitionExpressionActionsAndColumnName
 IPartitionStrategy::getPartitionExpressionActions(ASTPtr & expression_ast)
 {
-    if (cached_result)
-        return *cached_result;
+    {
+        std::lock_guard lock(cached_result_mutex);
+        if (cached_result)
+            return *cached_result;
+    }
 
     auto syntax_result = TreeRewriter(context).analyze(expression_ast, sample_block.getNamesAndTypesList());
     auto actions_dag = ExpressionAnalyzer(expression_ast, syntax_result, context).getActionsDAG(false);
@@ -205,7 +208,14 @@ IPartitionStrategy::getPartitionExpressionActions(ASTPtr & expression_ast)
     result.column_name = expression_ast->getColumnName();
 
     if (!result.actions->getActionsDAG().hasNonDeterministic())
+    {
+        std::lock_guard lock(cached_result_mutex);
+
+        if (cached_result)
+            return *cached_result;
+
         cached_result = result;
+    }
 
     return result;
 }

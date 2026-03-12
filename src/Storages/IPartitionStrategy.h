@@ -4,6 +4,7 @@
 #include <Parsers/IAST_fwd.h>
 #include <Storages/KeyDescription.h>
 #include <Processors/Chunk.h>
+#include <mutex>
 
 namespace DB
 {
@@ -55,6 +56,7 @@ protected:
     const Block sample_block;
     ContextPtr context;
 
+    std::mutex cached_result_mutex;
     std::optional<PartitionExpressionActionsAndColumnName> cached_result;
 };
 
