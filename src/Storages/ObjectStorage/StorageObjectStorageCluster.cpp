@@ -111,7 +111,7 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
     configuration->initPartitionStrategy(partition_by, columns_in_table_or_function_definition, context_);
 
     const bool need_resolve_columns_or_format = columns_in_table_or_function_definition.empty() || (configuration->getFormat() == "auto");
-    const bool do_lazy_init = lazy_init && !need_resolve_columns_or_format && !configuration->needsUpdateForSchemaConsistency();
+    const bool do_lazy_init = lazy_init && !need_resolve_columns_or_format && (!configuration->needsUpdateForSchemaConsistency() || catalog);
 
     auto log_ = getLogger("StorageObjectStorageCluster");
 
