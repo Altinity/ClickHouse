@@ -1,5 +1,17 @@
-/// Implementation based on Musl's posix_spawn, with file actions support
-/// restored for use by AWS-LC's split-handshake tests (and any other caller).
+/// Full posix_spawn implementation based on upstream musl.
+/// https://git.musl-libc.org/cgit/musl/tree/src/process/posix_spawn.c
+///
+/// Adaptations from upstream:
+/// - Uses glibc sysroot field names (__ss/__sd instead of __mask/__def)
+///   since <spawn.h> resolves to the glibc sysroot header in this build.
+/// - Takes exec function as a parameter (__posix_spawnx) because glibc's
+///   posix_spawnattr_t has no __fn field for posix_spawnp dispatch.
+/// - Omits LOCK(__abort_lock) / UNLOCK(__abort_lock) (musl-internal lock
+///   guarding against abort() races; not available outside musl).
+/// - Omits __get_handler_set / __libc_sigaction signal disposition reset
+///   (musl internals not available; signals are blocked for the child's
+///   brief pre-exec window, so parent handlers cannot fire).
+/// - Uses clone() instead of musl-internal __clone().
 
 #define _GNU_SOURCE
 #include <spawn.h>
@@ -9,10 +21,9 @@
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <syscall.h>
-#include <sys/signal.h>
 #include <pthread.h>
-#include <spawn.h>
 #include <errno.h>
+#include <limits.h>
 #include "syscall.h"
 
 #define FDOP_CLOSE 1
@@ -38,16 +49,108 @@ struct args {
 	char *const *argv, *const *envp;
 };
 
-void __get_handler_set(sigset_t *);
+static int __sys_dup2(int old, int new)
+{
+#ifdef SYS_dup2
+	return __syscall(SYS_dup2, old, new);
+#else
+	return __syscall(SYS_dup3, old, new, 0);
+#endif
+}
 
 static int child(void *args_vp)
 {
-	int ret;
+	int i, ret;
+	struct sigaction sa = {0};
 	struct args *args = args_vp;
 	int p = args->p[1];
+	const posix_spawn_file_actions_t *fa = args->fa;
 	const posix_spawnattr_t *restrict attr = args->attr;
 
 	close(args->p[0]);
+
+	if (attr->__flags & POSIX_SPAWN_SETSIGDEF) {
+		for (i=1; i<_NSIG; i++) {
+			if (sigismember(&attr->__sd, i)) {
+				sa.sa_handler = SIG_DFL;
+				__syscall(SYS_rt_sigaction, i, &sa, 0, _NSIG/8);
+			}
+		}
+	}
+
+	if (attr->__flags & POSIX_SPAWN_SETSID)
+		if ((ret=__syscall(SYS_setsid)) < 0)
+			goto fail;
+
+	if (attr->__flags & POSIX_SPAWN_SETPGROUP)
+		if ((ret=__syscall(SYS_setpgid, 0, attr->__pgrp)))
+			goto fail;
+
+	if (attr->__flags & POSIX_SPAWN_RESETIDS)
+		if ((ret=__syscall(SYS_setgid, __syscall(SYS_getgid))) ||
+		    (ret=__syscall(SYS_setuid, __syscall(SYS_getuid))) )
+			goto fail;
+
+	if (fa && fa->__actions) {
+		struct fdop *op;
+		int fd;
+		for (op = fa->__actions; op->next; op = op->next);
+		for (; op; op = op->prev) {
+			/* It's possible that a file operation would clobber
+			 * the pipe fd used for synchronizing with the
+			 * parent. To avoid that, we dup the pipe onto
+			 * an unoccupied fd. */
+			if (op->fd == p) {
+				ret = __syscall(SYS_dup, p);
+				if (ret < 0) goto fail;
+				__syscall(SYS_close, p);
+				p = ret;
+			}
+			switch(op->cmd) {
+			case FDOP_CLOSE:
+				__syscall(SYS_close, op->fd);
+				break;
+			case FDOP_DUP2:
+				fd = op->srcfd;
+				if (fd == p) {
+					ret = -EBADF;
+					goto fail;
+				}
+				if (fd != op->fd) {
+					if ((ret=__sys_dup2(fd, op->fd))<0)
+						goto fail;
+				} else {
+					ret = __syscall(SYS_fcntl, fd, F_GETFD);
+					ret = __syscall(SYS_fcntl, fd, F_SETFD,
+						ret & ~FD_CLOEXEC);
+					if (ret<0)
+						goto fail;
+				}
+				break;
+			case FDOP_OPEN:
+#ifdef SYS_open
+				fd = __syscall(SYS_open, op->path, op->oflag, op->mode);
+#else
+				fd = __syscall(SYS_openat, AT_FDCWD, op->path, op->oflag, op->mode);
+#endif
+				if ((ret=fd) < 0) goto fail;
+				if (fd != op->fd) {
+					if ((ret=__sys_dup2(fd, op->fd))<0)
+						goto fail;
+					__syscall(SYS_close, fd);
+				}
+				break;
+			case FDOP_CHDIR:
+				ret = __syscall(SYS_chdir, op->path);
+				if (ret<0) goto fail;
+				break;
+			case FDOP_FCHDIR:
+				ret = __syscall(SYS_fchdir, op->fd);
+				if (ret<0) goto fail;
+				break;
+			}
+		}
+	}
 
 	/* Close-on-exec flag may have been lost if we moved the pipe
 	 * to a different fd. We don't use F_DUPFD_CLOEXEC above because
@@ -58,72 +161,17 @@ static int child(void *args_vp)
 	pthread_sigmask(SIG_SETMASK, (attr->__flags & POSIX_SPAWN_SETSIGMASK)
 		? &attr->__ss : &args->oldmask, 0);
 
-	/* Process file actions in POSIX-specified order (oldest-added first).
-	 * The linked list is built by prepending, so we traverse to the tail
-	 * and walk backwards via prev pointers. */
-	if (args->fa) {
-		struct fdop *op = (struct fdop *)args->fa->__actions;
-		struct fdop *tail;
-		for (tail = op; tail && tail->next; tail = tail->next);
-		for (op = tail; op; op = op->prev) {
-			long r;
-			switch (op->cmd) {
-			case FDOP_CLOSE:
-				__syscall(SYS_close, op->fd);
-				break;
-			case FDOP_DUP2:
-				if (op->srcfd == op->fd) {
-					r = __syscall(SYS_fcntl, op->fd, F_GETFD);
-					if (r < 0) { ret = -(int)r; goto fail; }
-					if (r & FD_CLOEXEC) {
-						r = __syscall(SYS_fcntl, op->fd, F_SETFD, (int)r & ~FD_CLOEXEC);
-						if (r < 0) { ret = -(int)r; goto fail; }
-					}
-				} else {
-#ifdef SYS_dup2
-					r = __syscall(SYS_dup2, op->srcfd, op->fd);
-#else
-					r = __syscall(SYS_dup3, op->srcfd, op->fd, 0);
-#endif
-					if (r < 0) { ret = -(int)r; goto fail; }
-				}
-				break;
-			case FDOP_OPEN: {
-#ifdef SYS_open
-				int fd = __syscall(SYS_open, op->path, op->oflag, op->mode);
-#else
-				int fd = __syscall(SYS_openat, AT_FDCWD, op->path, op->oflag, op->mode);
-#endif
-				if (fd < 0) { ret = -fd; goto fail; }
-				if (fd != op->fd) {
-#ifdef SYS_dup2
-					r = __syscall(SYS_dup2, fd, op->fd);
-#else
-					r = __syscall(SYS_dup3, fd, op->fd, 0);
-#endif
-					__syscall(SYS_close, fd);
-					if (r < 0) { ret = -(int)r; goto fail; }
-				}
-				break;
-			}
-			case FDOP_CHDIR:
-				r = __syscall(SYS_chdir, op->path);
-				if (r < 0) { ret = -(int)r; goto fail; }
-				break;
-			case FDOP_FCHDIR:
-				r = __syscall(SYS_fchdir, op->fd);
-				if (r < 0) { ret = -(int)r; goto fail; }
-				break;
-			}
-		}
-	}
-
 	args->exec(args->path, args->argv, args->envp);
-	ret = errno;
+	ret = -errno;
 
 fail:
 	/* Since sizeof errno < PIPE_BUF, the write is atomic. */
-	if (ret) while (__syscall(SYS_write, p, &ret, sizeof ret) < 0);
+	ret = -ret;
+	if (ret) {
+		int r;
+		do r = __syscall(SYS_write, p, &ret, sizeof ret);
+		while (r<0 && r!=-EPIPE);
+	}
 	_exit(127);
 }
 
@@ -135,12 +183,9 @@ int __posix_spawnx(pid_t *restrict res, const char *restrict path,
 	char *const argv[restrict], char *const envp[restrict])
 {
 	pid_t pid;
-	char stack[1024];
+	char stack[1024+PATH_MAX];
 	int ec=0, cs;
 	struct args args;
-
-	if (pipe2(args.p, O_CLOEXEC))
-		return errno;
 
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cs);
 
@@ -150,6 +195,15 @@ int __posix_spawnx(pid_t *restrict res, const char *restrict path,
 	args.attr = attr ? attr : &(const posix_spawnattr_t){0};
 	args.argv = argv;
 	args.envp = envp;
+
+	sigset_t allsigs;
+	sigfillset(&allsigs);
+	pthread_sigmask(SIG_BLOCK, &allsigs, &args.oldmask);
+
+	if (pipe2(args.p, O_CLOEXEC)) {
+		ec = errno;
+		goto fail;
+	}
 
 	pid = clone(child, stack+sizeof stack,
 		CLONE_VM|CLONE_VFORK|SIGCHLD, &args);
@@ -166,6 +220,8 @@ int __posix_spawnx(pid_t *restrict res, const char *restrict path,
 
 	if (!ec && res) *res = pid;
 
+fail:
+	pthread_sigmask(SIG_SETMASK, &args.oldmask, 0);
 	pthread_setcancelstate(cs, 0);
 
 	return ec;
