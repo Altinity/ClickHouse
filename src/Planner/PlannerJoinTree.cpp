@@ -149,6 +149,25 @@ namespace ErrorCodes
 namespace
 {
 
+bool canMatchByNameWithoutAmbiguity(const ColumnsWithTypeAndName & source, const ColumnsWithTypeAndName & result)
+{
+    if (source.size() != result.size())
+        return false;
+
+    NameSet source_names;
+    NameSet result_names;
+
+    for (const auto & source_column : source)
+        if (!source_names.insert(source_column.name).second)
+            return false;
+
+    for (const auto & result_column : result)
+        if (!result_names.insert(result_column.name).second)
+            return false;
+
+    return source_names == result_names;
+}
+
 /// Check if current user has privileges to SELECT columns from table
 /// Throws an exception if access to any column from `column_names` is not granted
 /// If `column_names` is empty, check access to any columns and return names of accessible columns
@@ -1482,10 +1501,16 @@ JoinTreeQueryPlan buildQueryPlanForTableExpression(QueryTreeNodePtr table_expres
             auto expected_block = *expected_header;
             materializeBlockInplace(expected_block);
 
+            const auto & source_columns = query_plan.getCurrentHeader()->getColumnsWithTypeAndName();
+            const auto & expected_columns = expected_block.getColumnsWithTypeAndName();
+            auto match_columns_mode = canMatchByNameWithoutAmbiguity(source_columns, expected_columns)
+                ? ActionsDAG::MatchColumnsMode::Name
+                : ActionsDAG::MatchColumnsMode::Position;
+
             auto rename_actions_dag = ActionsDAG::makeConvertingActions(
-                query_plan.getCurrentHeader()->getColumnsWithTypeAndName(),
-                expected_block.getColumnsWithTypeAndName(),
-                ActionsDAG::MatchColumnsMode::Position,
+                source_columns,
+                expected_columns,
+                match_columns_mode,
                 planner_context->getQueryContext(),
                 true /*ignore_constant_values*/,
                 false /*add_cast_columns*/,
