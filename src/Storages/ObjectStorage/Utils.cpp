@@ -513,9 +513,11 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
             normalized_path = "gs://" + target_decomposed.authority + "/" + target_decomposed.key;
         }
         S3::URI s3_uri(normalized_path);
-
-        std::string key_to_use = s3_uri.key;
-
+      
+        // Use key (parsed without URI decoding) so that percent-encoded
+        // characters in object keys (e.g. %2F in Iceberg partition paths) are preserved.
+        std::string key_to_use = target_decomposed.key;
+      
         bool use_base_storage = false;
         if (base_storage->getType() == ObjectStorageType::S3)
         {
