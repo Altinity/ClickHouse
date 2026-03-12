@@ -37,14 +37,26 @@ SELECT 'prefer_localhost_replica_0';
 SELECT x, a, b, c, d, inner_c, inner_d
 FROM test_dod_double_alias_outer
 ORDER BY x
-SETTINGS enable_analyzer = 1, enable_alias_marker = 1, prefer_localhost_replica = 0
+SETTINGS
+    enable_analyzer = 1,
+    enable_alias_marker = 1,
+    prefer_localhost_replica = 0,
+    enable_parallel_replicas = 0,
+    max_parallel_replicas = 1,
+    parallel_replicas_local_plan = 0
 FORMAT TSVWithNames;
 
 SELECT 'prefer_localhost_replica_1';
 SELECT x, a, b, c, d, inner_c, inner_d
 FROM test_dod_double_alias_outer
 ORDER BY x
-SETTINGS enable_analyzer = 1, enable_alias_marker = 1, prefer_localhost_replica = 1
+SETTINGS
+    enable_analyzer = 1,
+    enable_alias_marker = 1,
+    prefer_localhost_replica = 1,
+    enable_parallel_replicas = 0,
+    max_parallel_replicas = 1,
+    parallel_replicas_local_plan = 0
 FORMAT TSVWithNames;
 
 SELECT 'prefer_localhost_replica_0_serialize_query_plan_1';
@@ -55,6 +67,9 @@ SETTINGS
     enable_analyzer = 1,
     enable_alias_marker = 1,
     prefer_localhost_replica = 0,
+    enable_parallel_replicas = 0,
+    max_parallel_replicas = 1,
+    parallel_replicas_local_plan = 0,
     serialize_query_plan = 1
 FORMAT TSVWithNames;
 
@@ -66,6 +81,9 @@ SETTINGS
     enable_analyzer = 1,
     enable_alias_marker = 1,
     prefer_localhost_replica = 1,
+    enable_parallel_replicas = 0,
+    max_parallel_replicas = 1,
+    parallel_replicas_local_plan = 0,
     serialize_query_plan = 1
 FORMAT TSVWithNames;
 
