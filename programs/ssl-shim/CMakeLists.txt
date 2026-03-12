@@ -113,3 +113,8 @@ set(CLICKHOUSE_SSL_SHIM_INCLUDE PRIVATE ${AWSLC_SRC_DIR}/include)
 clickhouse_program_add(ssl-shim)
 add_dependencies(clickhouse-ssl-shim-lib awslc_shim_lib build-awslc)
 target_compile_options(clickhouse-ssl-shim-lib PRIVATE -Wno-everything)
+# The system-compiled shim objects use libstdc++ (matching the Docker-built
+# libssl.a ABI), which creates a few duplicate symbols with ClickHouse's
+# libc++/libcxxabi (e.g. std::exception). Propagate via INTERFACE so the
+# flag only enters the link when this target is actually consumed.
+target_link_options(clickhouse-ssl-shim-lib INTERFACE "LINKER:--allow-multiple-definition")
