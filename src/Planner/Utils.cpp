@@ -50,6 +50,7 @@
 #include <Processors/QueryPlan/ExpressionStep.h>
 #include <Processors/QueryPlan/AggregatingStep.h>
 #include <Processors/QueryPlan/LimitStep.h>
+#include <Common/logger_useful.h>
 
 namespace DB
 {
@@ -695,6 +696,105 @@ QueryPlanStepPtr projectOnlyUsedColumns(
     auto step = std::make_unique<ExpressionStep>(stream_header, std::move(project_only_used_columns_actions));
     step->setStepDescription("Project only used columns");
     return step;
+}
+
+void logPositionConversionMismatch(
+    const ColumnsWithTypeAndName & source_columns,
+    const ColumnsWithTypeAndName & result_columns,
+    const ContextPtr & context,
+    std::string_view location)
+{
+    static auto log = getLogger("PositionConversion");
+
+    if (source_columns.size() != result_columns.size())
+    {
+        LOG_TRACE(
+            log,
+            "Position conversion fallback at {}. query_id={} columns_count_mismatch source={} result={} source_header=[{}] result_header=[{}]",
+            location,
+            context ? context->getCurrentQueryId() : "",
+            source_columns.size(),
+            result_columns.size(),
+            Block(source_columns).dumpNames(),
+            Block(result_columns).dumpNames());
+        return;
+    }
+
+    std::vector<std::string> mismatches;
+    mismatches.reserve(source_columns.size());
+
+    for (size_t i = 0; i < source_columns.size(); ++i)
+    {
+        const auto & source_column = source_columns[i];
+        const auto & result_column = result_columns[i];
+
+        if (source_column.name == result_column.name && source_column.type->equals(*result_column.type))
+            continue;
+
+        mismatches.push_back(fmt::format(
+            "#{} {}:{} -> {}:{}",
+            i,
+            source_column.name,
+            source_column.type->getName(),
+            result_column.name,
+            result_column.type->getName()));
+    }
+
+    if (mismatches.empty())
+        return;
+
+    LOG_TRACE(
+        log,
+        "Position conversion fallback at {}. query_id={} source_header=[{}] result_header=[{}] mismatches=[{}]",
+        location,
+        context ? context->getCurrentQueryId() : "",
+        Block(source_columns).dumpNames(),
+        Block(result_columns).dumpNames(),
+        fmt::join(mismatches, "; "));
+}
+
+ActionsDAG makeConvertingActionsPreferNameThenPosition(
+    const ColumnsWithTypeAndName & source_columns,
+    const ColumnsWithTypeAndName & result_columns,
+    const ContextPtr & context,
+    std::string_view location,
+    bool ignore_constant_values,
+    bool add_cast_columns,
+    NameToNameMap * new_names)
+{
+    static auto log = getLogger("PositionConversion");
+
+    try
+    {
+        return ActionsDAG::makeConvertingActions(
+            source_columns,
+            result_columns,
+            ActionsDAG::MatchColumnsMode::Name,
+            context,
+            ignore_constant_values,
+            add_cast_columns,
+            new_names);
+    }
+    catch (const Exception & e)
+    {
+        LOG_TRACE(
+            log,
+            "Name conversion is not possible at {}. query_id={} reason={}",
+            location,
+            context ? context->getCurrentQueryId() : "",
+            e.message());
+
+        logPositionConversionMismatch(source_columns, result_columns, context, location);
+
+        return ActionsDAG::makeConvertingActions(
+            source_columns,
+            result_columns,
+            ActionsDAG::MatchColumnsMode::Position,
+            context,
+            ignore_constant_values,
+            add_cast_columns,
+            new_names);
+    }
 }
 
 }

@@ -23,6 +23,8 @@
 
 #include <Interpreters/WindowDescription.h>
 
+#include <string_view>
+
 namespace DB
 {
 
@@ -123,5 +125,22 @@ bool optimizePlanForExists(QueryPlan & query_plan);
 QueryPlanStepPtr projectOnlyUsedColumns(
     const SharedHeader & stream_header,
     const ColumnIdentifiers & used_column_identifiers);
+
+/// Trace-report mismatches before Position-based conversion.
+void logPositionConversionMismatch(
+    const ColumnsWithTypeAndName & source_columns,
+    const ColumnsWithTypeAndName & result_columns,
+    const ContextPtr & context,
+    std::string_view location);
+
+/// Try Name-based conversion first, fallback to Position with detailed trace report.
+ActionsDAG makeConvertingActionsPreferNameThenPosition(
+    const ColumnsWithTypeAndName & source_columns,
+    const ColumnsWithTypeAndName & result_columns,
+    const ContextPtr & context,
+    std::string_view location,
+    bool ignore_constant_values,
+    bool add_cast_columns,
+    NameToNameMap * new_names = nullptr);
 
 }
