@@ -289,7 +289,7 @@ namespace ErrorCodes
     - `v2`
     - `v3`
     )", 0) \
-    DECLARE(Bool, write_marks_for_substreams_in_compact_parts, false, R"(
+    DECLARE(Bool, write_marks_for_substreams_in_compact_parts, true, R"(
     Enables writing marks per each substream instead of per each column in Compact parts.
     It allows to read individual subcolumns from the data part efficiently.
     )", 0) \
