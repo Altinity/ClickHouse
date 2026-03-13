@@ -295,26 +295,6 @@ void registerTableFunctionObjectStorageClusterFallback(TableFunctionFactory & fa
     }
     );
 
-    factory.registerFunction<TableFunctionIcebergLocalClusterFallback>(
-    {
-        .documentation = {
-            .description=R"(The table function can be used to read the Iceberg table stored on shared disk in parallel for many nodes in a specified cluster or from single node.)",
-            .examples{
-                {
-                    "icebergLocal",
-                    "SELECT * FROM icebergLocal(filename)", ""
-                },
-                {
-                    "icebergLocal",
-                    "SELECT * FROM icebergLocal(filename) "
-                    "SETTINGS object_storage_cluster='cluster'", ""
-                },
-            },
-            .category = FunctionDocumentation::Category::TableFunction
-        },
-        .allow_readonly = false
-    }
-    );
 #endif
 
 #if USE_AVRO && USE_AWS_S3

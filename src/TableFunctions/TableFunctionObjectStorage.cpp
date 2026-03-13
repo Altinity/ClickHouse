@@ -330,12 +330,7 @@ template class TableFunctionObjectStorage<HudiClusterDefinition, StorageS3HudiCo
 #if USE_AVRO
 void registerTableFunctionIceberg(TableFunctionFactory & factory)
 {
-    factory.registerFunction<TableFunctionIcebergLocal>(
-        {.documentation
-         = {.description = R"(The table function can be used to read the Iceberg table stored locally.)",
-            .examples{{IcebergLocalDefinition::name, "SELECT * FROM icebergLocal(filename)", ""}},
-            .category = FunctionDocumentation::Category::TableFunction},
-         .allow_readonly = false});
+    UNUSED(factory);
 }
 #endif
 }

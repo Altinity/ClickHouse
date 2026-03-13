@@ -157,13 +157,6 @@ void registerTableFunctionIcebergCluster(TableFunctionFactory & factory)
             .category = FunctionDocumentation::Category::TableFunction},
          .allow_readonly = false});
 
-    factory.registerFunction<TableFunctionIcebergLocalCluster>(
-        {.documentation
-         = {.description = R"(The table function can be used to read the Iceberg table stored on shared storage in parallel for many nodes in a specified cluster.)",
-            .examples{{IcebergLocalClusterDefinition::name, "SELECT * FROM icebergLocalCluster(cluster, filename, format, [,compression])", ""}},
-            .category = FunctionDocumentation::Category::TableFunction},
-         .allow_readonly = false});
-
 #   if USE_AWS_S3
     factory.registerFunction<TableFunctionIcebergS3Cluster>(
         {.documentation
