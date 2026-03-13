@@ -341,12 +341,6 @@ void registerTableFunctionIceberg(TableFunctionFactory & factory)
             .category{""}},
          .allow_readonly = false});
 #endif
-    factory.registerFunction<TableFunctionIcebergLocal>(
-        {.documentation
-         = {.description = R"(The table function can be used to read the Iceberg table stored locally.)",
-            .examples{{"icebergLocal", "SELECT * FROM icebergLocal(filename)", ""}},
-            .category{""}},
-         .allow_readonly = false});
 }
 #endif
 

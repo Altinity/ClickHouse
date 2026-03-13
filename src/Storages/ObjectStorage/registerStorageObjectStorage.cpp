@@ -231,19 +231,6 @@ void registerStorageIceberg(StorageFactory & factory)
             .has_builtin_setting_fn = StorageObjectStorageSettings::hasBuiltin,
         });
 #    endif
-    factory.registerStorage(
-        "IcebergLocal",
-        [&](const StorageFactory::Arguments & args)
-        {
-            auto configuration = std::make_shared<StorageLocalIcebergConfiguration>();
-            return createStorageObjectStorage(args, configuration);
-        },
-        {
-            .supports_settings = true,
-            .supports_schema_inference = true,
-            .source_access_type = AccessType::FILE,
-            .has_builtin_setting_fn = StorageObjectStorageSettings::hasBuiltin,
-        });
 }
 
 #endif

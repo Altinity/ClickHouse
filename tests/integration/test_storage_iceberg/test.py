@@ -258,22 +258,6 @@ def get_creation_expression(
                     + settings_expression
                 )
 
-    elif storage_type == "local":
-        assert not run_on_cluster
-
-        if table_function:
-            return f"""
-                icebergLocal(local, path = '/iceberg_data/default/{table_name}/', format={format})
-            """
-        else:
-            return (
-                f"""
-                DROP TABLE IF EXISTS {table_name};
-                CREATE TABLE {table_name}
-                ENGINE=IcebergLocal(local, path = '/iceberg_data/default/{table_name}/', format={format})"""
-                + settings_expression
-            )
-
     else:
         raise Exception(f"Unknown iceberg storage type: {storage_type}")
 
@@ -336,11 +320,7 @@ def create_initial_data_file(
 def default_upload_directory(
     started_cluster, storage_type, local_path, remote_path, **kwargs
 ):
-    if storage_type == "local":
-        return started_cluster.default_local_uploader.upload_directory(
-            local_path, remote_path, **kwargs
-        )
-    elif storage_type == "s3":
+    if storage_type == "s3":
         print(kwargs)
         return started_cluster.default_s3_uploader.upload_directory(
             local_path, remote_path, **kwargs
@@ -354,7 +334,7 @@ def default_upload_directory(
 
 
 @pytest.mark.parametrize("format_version", ["1", "2"])
-@pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
+@pytest.mark.parametrize("storage_type", ["s3", "azure"])
 def test_single_iceberg_file(started_cluster, format_version, storage_type):
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
@@ -384,7 +364,7 @@ def test_single_iceberg_file(started_cluster, format_version, storage_type):
 
 
 @pytest.mark.parametrize("format_version", ["1", "2"])
-@pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
+@pytest.mark.parametrize("storage_type", ["s3", "azure"])
 def test_partition_by(started_cluster, format_version, storage_type):
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
@@ -419,7 +399,7 @@ def test_partition_by(started_cluster, format_version, storage_type):
 
 
 @pytest.mark.parametrize("format_version", ["1", "2"])
-@pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
+@pytest.mark.parametrize("storage_type", ["s3", "azure"])
 def test_multiple_iceberg_files(started_cluster, format_version, storage_type):
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
@@ -479,7 +459,7 @@ def test_multiple_iceberg_files(started_cluster, format_version, storage_type):
 
 
 @pytest.mark.parametrize("format_version", ["1", "2"])
-@pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
+@pytest.mark.parametrize("storage_type", ["s3", "azure"])
 def test_types(started_cluster, format_version, storage_type):
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
@@ -645,7 +625,7 @@ def test_cluster_table_function(started_cluster, format_version, storage_type):
 
 
 @pytest.mark.parametrize("format_version", ["1", "2"])
-@pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
+@pytest.mark.parametrize("storage_type", ["s3", "azure"])
 def test_delete_files(started_cluster, format_version, storage_type):
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
@@ -715,7 +695,7 @@ def test_delete_files(started_cluster, format_version, storage_type):
 
 
 @pytest.mark.parametrize("format_version", ["1", "2"])
-@pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
+@pytest.mark.parametrize("storage_type", ["s3", "azure"])
 @pytest.mark.parametrize("is_table_function", [False, True])
 def test_evolved_schema_simple(
     started_cluster, format_version, storage_type, is_table_function
@@ -1123,7 +1103,7 @@ def test_evolved_schema_simple(
 
 
 @pytest.mark.parametrize("format_version", ["1", "2"])
-@pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
+@pytest.mark.parametrize("storage_type", ["s3", "azure"])
 def test_not_evolved_schema(started_cluster, format_version, storage_type):
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
@@ -1442,7 +1422,7 @@ def test_not_evolved_schema(started_cluster, format_version, storage_type):
 
 
 @pytest.mark.parametrize("format_version", ["1", "2"])
-@pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
+@pytest.mark.parametrize("storage_type", ["s3", "azure"])
 def test_evolved_schema_complex(started_cluster, format_version, storage_type):
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
@@ -1535,7 +1515,7 @@ def test_evolved_schema_complex(started_cluster, format_version, storage_type):
     assert "UNSUPPORTED_METHOD" in error
 
 
-@pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
+@pytest.mark.parametrize("storage_type", ["s3", "azure"])
 def test_row_based_deletes(started_cluster, storage_type):
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
@@ -1572,7 +1552,7 @@ def test_row_based_deletes(started_cluster, storage_type):
 
 
 @pytest.mark.parametrize("format_version", ["1", "2"])
-@pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
+@pytest.mark.parametrize("storage_type", ["s3", "azure"])
 def test_schema_inference(started_cluster, format_version, storage_type):
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
@@ -1640,7 +1620,7 @@ def test_schema_inference(started_cluster, format_version, storage_type):
 
 
 @pytest.mark.parametrize("format_version", ["1", "2"])
-@pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
+@pytest.mark.parametrize("storage_type", ["s3", "azure"])
 def test_explanation(started_cluster, format_version, storage_type):
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
@@ -1695,7 +1675,7 @@ def test_explanation(started_cluster, format_version, storage_type):
 
 
 @pytest.mark.parametrize("format_version", ["1", "2"])
-@pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
+@pytest.mark.parametrize("storage_type", ["s3", "azure"])
 def test_metadata_file_selection(started_cluster, format_version, storage_type):
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
@@ -1730,7 +1710,7 @@ def test_metadata_file_selection(started_cluster, format_version, storage_type):
 
 
 @pytest.mark.parametrize("format_version", ["1", "2"])
-@pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
+@pytest.mark.parametrize("storage_type", ["s3", "azure"])
 def test_metadata_file_format_with_uuid(started_cluster, format_version, storage_type):
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session
@@ -1908,7 +1888,7 @@ def test_filesystem_cache(started_cluster, storage_type):
     )
 
 
-@pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
+@pytest.mark.parametrize("storage_type", ["s3", "azure"])
 def test_partition_pruning(started_cluster, storage_type):
     if is_arm() and storage_type == "hdfs":
         pytest.skip("Disabled test IcebergHDFS for aarch64")
@@ -2129,7 +2109,7 @@ def test_partition_pruning(started_cluster, storage_type):
         == 1
     )
 
-@pytest.mark.parametrize("storage_type", ["s3", "azure", "local"])
+@pytest.mark.parametrize("storage_type", ["s3", "azure"])
 def test_explicit_metadata_file(started_cluster, storage_type):
     instance = started_cluster.instances["node1"]
     spark = started_cluster.spark_session

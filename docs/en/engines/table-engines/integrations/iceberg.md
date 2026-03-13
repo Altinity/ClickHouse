@@ -1,6 +1,6 @@
 ---
 description: 'This engine provides a read-only integration with existing Apache Iceberg
-  tables in Amazon S3, Azure, HDFS and locally stored tables.'
+  tables in Amazon S3, Azure and HDFS.'
 sidebar_label: 'Iceberg'
 sidebar_position: 90
 slug: /engines/table-engines/integrations/iceberg
@@ -17,7 +17,7 @@ The Iceberg Table Engine is available but may have limitations. ClickHouse wasn'
 For optimal compatibility, we suggest using the Iceberg Table Function while we continue to improve support for the Iceberg Table Engine.
 :::
 
-This engine provides a read-only integration with existing Apache [Iceberg](https://iceberg.apache.org/) tables in Amazon S3, Azure, HDFS and locally stored tables.
+This engine provides a read-only integration with existing Apache [Iceberg](https://iceberg.apache.org/) tables in Amazon S3, Azure and HDFS.
 
 ## Create Table {#create-table}
 
@@ -32,9 +32,6 @@ CREATE TABLE iceberg_table_azure
 
 CREATE TABLE iceberg_table_hdfs
     ENGINE = IcebergHDFS(path_to_table, [,format] [,compression_method])
-
-CREATE TABLE iceberg_table_local
-    ENGINE = IcebergLocal(path_to_table, [,format] [,compression_method])
 ```
 
 **Engine arguments**
