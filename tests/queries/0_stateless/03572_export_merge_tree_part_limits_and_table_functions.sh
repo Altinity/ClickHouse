@@ -55,8 +55,35 @@ query "ALTER TABLE $mt_table_tf EXPORT PART '2022_1_1_0' TO TABLE FUNCTION s3(s3
 echo "---- Table function with explicit compatible schema"
 query "ALTER TABLE $mt_table_tf EXPORT PART '2023_2_2_0' TO TABLE FUNCTION s3(s3_conn, filename='$tf_schema_explicit', format='Parquet', structure='id UInt64, value String, year UInt16', partition_strategy='hive') PARTITION BY year SETTINGS allow_experimental_export_merge_tree_part = 1"
 
-# ONE BIG SLEEP after all exports (longer because it writes multiple files)
-sleep 20
+# Wait for all exports to complete
+wait_for_exports() {
+    local timeout=${1:-60}
+    local poll_interval=${2:-0.5}
+    local start_time=$(date +%s)
+    local elapsed=0
+    
+    echo "Waiting for exports to complete (timeout: ${timeout}s)..."
+    
+    while [ $elapsed -lt $timeout ]; do
+        # Check if any exports are still in progress for our tables/parts
+        local active_exports=$(query "SELECT count() FROM system.exports WHERE (source_table = '$big_table' AND part_name IN ('$big_part_max_bytes', '$big_part_max_rows')) OR (source_table = '$mt_table_tf' AND part_name IN ('2022_1_1_0', '2023_2_2_0'))" | tr -d '\n')
+        
+        if [ "$active_exports" = "0" ]; then
+            echo "All exports completed."
+            return 0
+        fi
+        
+        sleep $poll_interval
+        elapsed=$(($(date +%s) - start_time))
+    done
+    
+    echo "Timeout waiting for exports to complete after ${timeout}s"
+    echo "Remaining exports:"
+    query "SELECT source_table, part_name, elapsed, rows_read, total_rows_to_read FROM system.exports WHERE (source_table = '$big_table' AND part_name IN ('$big_part_max_bytes', '$big_part_max_rows')) OR (source_table = '$mt_table_tf' AND part_name IN ('2022_1_1_0', '2023_2_2_0'))"
+    return 1
+}
+
+wait_for_exports 60
 
 # ============================================================================
 # ALL SELECTS/VERIFICATIONS HAPPEN HERE
