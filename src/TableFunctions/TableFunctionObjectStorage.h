@@ -133,7 +133,6 @@ using TableFunctionIcebergAzure = TableFunctionObjectStorage<IcebergAzureDefinit
 #    if USE_HDFS
 using TableFunctionIcebergHDFS = TableFunctionObjectStorage<IcebergHDFSDefinition, StorageHDFSIcebergConfiguration, true>;
 #    endif
-using TableFunctionIcebergLocal = TableFunctionObjectStorage<IcebergLocalDefinition, StorageLocalIcebergConfiguration, true>;
 #endif
 #if USE_PARQUET && USE_DELTA_KERNEL_RS
 #if USE_AWS_S3
@@ -143,8 +142,6 @@ using TableFunctionDeltaLakeS3 = TableFunctionObjectStorage<DeltaLakeS3Definitio
 #if USE_AZURE_BLOB_STORAGE
 using TableFunctionDeltaLakeAzure = TableFunctionObjectStorage<DeltaLakeAzureDefinition, StorageAzureDeltaLakeConfiguration, true>;
 #endif
-// New alias for local Delta Lake table function
-using TableFunctionDeltaLakeLocal = TableFunctionObjectStorage<DeltaLakeLocalDefinition, StorageLocalDeltaLakeConfiguration, true>;
 #endif
 #if USE_AWS_S3
 using TableFunctionHudi = TableFunctionObjectStorage<HudiDefinition, StorageS3HudiConfiguration, true>;

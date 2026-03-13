@@ -1893,14 +1893,6 @@ void StatementGenerator::getNextTableEngine(RandomGenerator & rg, bool use_exter
     {
         this->ids.emplace_back(EmbeddedRocksDB);
     }
-    if ((fc.engine_mask & allow_icebergLocal) != 0)
-    {
-        this->ids.emplace_back(IcebergLocal);
-    }
-    if ((fc.engine_mask & allow_deltalakelocal) != 0)
-    {
-        this->ids.emplace_back(DeltaLakeLocal);
-    }
     if (fc.allow_memory_tables && (fc.engine_mask & allow_memory) != 0)
     {
         this->ids.emplace_back(Memory);

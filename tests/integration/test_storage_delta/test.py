@@ -314,19 +314,6 @@ def create_delta_table(
             """
             + allow_dynamic_metadata_for_datalakes_suffix
         )
-    elif storage_type == "local":
-        # For local storage, we need to use the absolute path
-        user_files_path = os.path.join(
-            SCRIPT_DIR, f"{cluster.instances_dir_name}/node1/database/user_files"
-        )
-        table_path = os.path.join(user_files_path, table_name)
-        instance.query(
-            f"""
-            DROP TABLE IF EXISTS {table_name};
-            CREATE TABLE {table_name}
-            ENGINE=DeltaLakeLocal('{table_path}', {format})
-            """
-        )
     else:
         raise Exception(f"Unknown delta lake storage type: {storage_type}")
 
@@ -341,10 +328,6 @@ def default_upload_directory(
         )
     elif storage_type == "azure":
         return started_cluster.default_azure_uploader.upload_directory(
-            local_path, remote_path, **kwargs
-        )
-    elif storage_type == "local":
-        return started_cluster.local_uploader.upload_directory(
             local_path, remote_path, **kwargs
         )
     else:
@@ -372,7 +355,7 @@ def create_initial_data_file(
 
 @pytest.mark.parametrize(
     "use_delta_kernel, storage_type",
-    [("1", "s3"), ("0", "s3"), ("0", "azure"), ("1", "local")],
+    [("1", "s3"), ("0", "s3"), ("0", "azure")],
 )
 def test_single_log_file(started_cluster, use_delta_kernel, storage_type):
     instance = get_node(started_cluster, use_delta_kernel)
@@ -390,8 +373,7 @@ def test_single_log_file(started_cluster, use_delta_kernel, storage_type):
     )
     table_path = os.path.join(user_files_path, TABLE_NAME)
 
-    # We need to exclude the leading slash for local storage protocol file://
-    delta_path = table_path if storage_type == "local" else f"/{TABLE_NAME}"
+    delta_path = f"/{TABLE_NAME}"
     write_delta_from_file(spark, parquet_data_path, delta_path)
 
     files = default_upload_directory(
@@ -418,7 +400,7 @@ def test_single_log_file(started_cluster, use_delta_kernel, storage_type):
 
 @pytest.mark.parametrize(
     "use_delta_kernel, storage_type",
-    [("1", "s3"), ("0", "s3"), ("0", "azure"), ("1", "local")],
+    [("1", "s3"), ("0", "s3"), ("0", "azure")],
 )
 def test_partition_by(started_cluster, use_delta_kernel, storage_type):
     instance = get_node(started_cluster, use_delta_kernel)
@@ -432,8 +414,7 @@ def test_partition_by(started_cluster, use_delta_kernel, storage_type):
     )
     table_path = os.path.join(user_files_path, TABLE_NAME)
 
-    # We need to exclude the leading slash for local storage protocol file://
-    delta_path = table_path if storage_type == "local" else f"/{TABLE_NAME}"
+    delta_path = f"/{TABLE_NAME}"
 
     write_delta_from_df(
         spark,
@@ -463,7 +444,7 @@ def test_partition_by(started_cluster, use_delta_kernel, storage_type):
 
 @pytest.mark.parametrize(
     "use_delta_kernel, storage_type",
-    [("1", "s3"), ("0", "s3"), ("0", "azure"), ("1", "local")],
+    [("1", "s3"), ("0", "s3"), ("0", "azure")],
 )
 def test_checkpoint(started_cluster, use_delta_kernel, storage_type):
     instance = get_node(started_cluster, use_delta_kernel)
@@ -477,8 +458,8 @@ def test_checkpoint(started_cluster, use_delta_kernel, storage_type):
         SCRIPT_DIR, f"{cluster.instances_dir_name}/{instance.name}/database/user_files"
     )
     table_path = os.path.join(user_files_path, TABLE_NAME)
-    # We need to exclude the leading slash for local storage protocol file://
-    delta_path = table_path if storage_type == "local" else f"/{TABLE_NAME}"
+
+    delta_path = f"/{TABLE_NAME}"
 
     write_delta_from_df(
         spark,
@@ -3267,141 +3248,6 @@ def test_concurrent_queries(started_cluster, partitioned):
         assert len(file_names) == sum(success)
 
 
-def test_writes_spark_compatibility(started_cluster):
-    instance = started_cluster.instances["node1"]
-    instance_disabled_kernel = cluster.instances["node_with_disabled_delta_kernel"]
-    minio_client = started_cluster.minio_client
-    bucket = started_cluster.minio_bucket
-    table_name = randomize_table_name("test_writes")
-    result_file = f"{table_name}_data"
-
-    schema = pa.schema([("id", pa.int32()), ("name", pa.string())])
-    empty_arrays = [pa.array([], type=pa.int32()), pa.array([], type=pa.string())]
-    write_deltalake(
-        f"file:///{result_file}",
-        pa.Table.from_arrays(empty_arrays, schema=schema),
-        mode="overwrite",
-    )
-
-    LocalUploader(instance).upload_directory(f"/{result_file}/", f"/{result_file}/")
-    files = (
-        instance.exec_in_container(["bash", "-c", f"ls /{result_file}"])
-        .strip()
-        .split("\n")
-    )
-    assert len(files) == 1
-    assert "_delta_log" == files[0]
-    assert "" in instance.exec_in_container(
-        ["bash", "-c", f"ls /{result_file}/_delta_log"]
-    )
-
-    instance.query(
-        f"CREATE TABLE {table_name} (id Int32, name String) ENGINE = DeltaLakeLocal('/{result_file}') SETTINGS output_format_parquet_compression_method = 'none'"
-    )
-    instance.query(
-        f"INSERT INTO {table_name} SELECT number, toString(number) FROM numbers(10)"
-    )
-
-    LocalDownloader(instance).download_directory(f"/{result_file}/", f"/{result_file}/")
-
-    files = (
-        instance.exec_in_container(["bash", "-c", f"ls /{result_file}"])
-        .strip()
-        .split("\n")
-    )
-    assert len(files) == 2
-    pfile = files[0] if files[0].endswith(".parquet") else files[1]
-
-    table = pq.read_table(f"/{result_file}/{pfile}")
-    df = table.to_pandas()
-    assert (
-        "0   0    0\n1   1    1\n2   2    2\n3   3    3\n4   4    4\n5   5    5\n6   6    6\n7   7    7\n8   8    8\n9   9    9"
-        in str(df)
-    )
-
-    spark = started_cluster.spark_session
-    df = spark.read.format("delta").load(f"/{result_file}").collect()
-    assert (
-        "[Row(id=0, name='0'), Row(id=1, name='1'), Row(id=2, name='2'), Row(id=3, name='3'), Row(id=4, name='4'), Row(id=5, name='5'), Row(id=6, name='6'), Row(id=7, name='7'), Row(id=8, name='8'), Row(id=9, name='9')]"
-        == str(df)
-    )
-
-    instance.query(
-        f"INSERT INTO {table_name} SELECT number, toString(number) FROM numbers(10, 10)"
-    )
-    LocalDownloader(instance).download_directory(f"/{result_file}/", f"/{result_file}/")
-    files = (
-        instance.exec_in_container(["bash", "-c", f"ls /{result_file}"])
-        .strip()
-        .split("\n")
-    )
-    assert len(files) == 3
-
-    df = spark.read.format("delta").load(f"/{result_file}").collect()
-    assert (
-        "[Row(id=10, name='10'), Row(id=11, name='11'), Row(id=12, name='12'), Row(id=13, name='13'), Row(id=14, name='14'), Row(id=15, name='15'), Row(id=16, name='16'), Row(id=17, name='17'), Row(id=18, name='18'), Row(id=19, name='19'), Row(id=0, name='0'), Row(id=1, name='1'), Row(id=2, name='2'), Row(id=3, name='3'), Row(id=4, name='4'), Row(id=5, name='5'), Row(id=6, name='6'), Row(id=7, name='7'), Row(id=8, name='8'), Row(id=9, name='9')]"
-        == str(df)
-    )
-
-
-@pytest.mark.parametrize("partitioned", [False, True])
-@pytest.mark.parametrize("limit_enabled", [False, True])
-def test_write_limits(started_cluster, partitioned, limit_enabled):
-    instance = started_cluster.instances["node1"]
-    minio_client = started_cluster.minio_client
-    bucket = started_cluster.minio_bucket
-    table_name = randomize_table_name("test_write_limits")
-    result_file = f"{table_name}_data"
-
-    schema = pa.schema([("id", pa.int32()), ("name", pa.string())])
-    empty_arrays = [pa.array([], type=pa.int32()), pa.array([], type=pa.string())]
-    write_deltalake(
-        f"file:///{result_file}",
-        pa.Table.from_arrays(empty_arrays, schema=schema),
-        mode="overwrite",
-        partition_by=["id"] if partitioned else [],
-    )
-    LocalUploader(instance).upload_directory(f"/{result_file}/", f"/{result_file}/")
-    files = (
-        instance.exec_in_container(["bash", "-c", f"ls /{result_file}"])
-        .strip()
-        .split("\n")
-    )
-    assert len(files) == 1
-
-    instance.query(
-        f"CREATE TABLE {table_name} (id Int32, name String) ENGINE = DeltaLakeLocal('/{result_file}') SETTINGS output_format_parquet_compression_method = 'none'"
-    )
-
-    num_rows = 1000000
-    partitions_num = 5
-    limit_rows = 10 if limit_enabled else (num_rows + 1)
-    instance.query(
-        f"INSERT INTO {table_name} SELECT number % {partitions_num}, randomString(10) FROM numbers({num_rows}) SETTINGS delta_lake_insert_max_rows_in_data_file = {limit_rows}, max_insert_block_size = 1000, min_chunk_bytes_for_parallel_parsing = 1000"
-    )
-
-    files = LocalDownloader(instance).download_directory(f"/{result_file}/", f"/{result_file}/")
-    data_files = [file for file in files if file.endswith(".parquet")]
-    assert len(data_files) > 0, f"No data files: {files}"
-
-    if partitioned:
-        if limit_enabled:
-            assert len(data_files) > partitions_num, f"Data files: {data_files}"
-        else:
-            assert len(data_files) == partitions_num, f"Data files: {data_files}"
-    else:
-        if limit_enabled:
-            assert len(data_files) > 1, f"Data files: {data_files}"
-        else:
-            assert len(data_files) == 1, f"Data files: {data_files}"
-
-    assert num_rows == int(instance.query(f"SELECT count() FROM {table_name}"))
-
-    spark = started_cluster.spark_session
-    df = spark.read.format("delta").load(f"/{result_file}")
-    assert df.count() == num_rows
-
-
 def test_column_mapping_id(started_cluster):
     node = started_cluster.instances["node1"]
     table_name = randomize_table_name("test_column_mapping_id")
@@ -3533,39 +3379,3 @@ deltaLake(
         "2025-06-04\t('100022','2025-06-04 18:40:56.000000','2025-06-09 21:19:00.364000')\t100022"
         == node.query(f"SELECT * FROM {table_name} ORDER BY all").strip()
     )
-
-
-def test_write_column_order(started_cluster):
-    instance = started_cluster.instances["node1"]
-    minio_client = started_cluster.minio_client
-    bucket = started_cluster.minio_bucket
-    table_name = randomize_table_name("test_write_column_order")
-    result_file = f"{table_name}_data"
-    schema = pa.schema([("c1", pa.int32()), ("c0", pa.string())])
-    empty_arrays = [pa.array([], type=pa.int32()), pa.array([], type=pa.string())]
-    write_deltalake(
-        f"file:///{result_file}",
-        pa.Table.from_arrays(empty_arrays, schema=schema),
-        mode="overwrite",
-    )
-    LocalUploader(instance).upload_directory(f"/{result_file}/", f"/{result_file}/")
-
-    instance.query(
-        f"CREATE TABLE {table_name} (c0 String, c1 Int32) ENGINE = DeltaLakeLocal('/{result_file}') SETTINGS output_format_parquet_compression_method = 'none'"
-    )
-    num_rows = 10
-    instance.query(
-        f"INSERT INTO {table_name} (c1, c0) SELECT number as c1, toString(number % 2) as c0 FROM numbers(10)"
-    )
-
-    assert num_rows == int(instance.query(f"SELECT count() FROM {table_name}"))
-    assert (
-        "0\t0\n1\t1\n0\t2\n1\t3\n0\t4\n1\t5\n0\t6\n1\t7\n0\t8\n1\t9"
-        == instance.query(f"SELECT c0, c1 FROM {table_name}").strip()
-    )
-
-    instance.query(
-        f"INSERT INTO {table_name} (c1, c0) SELECT c1, c0 FROM generateRandom('c1 Int32, c0 String', 16920040705558589162, 7706, 3) LIMIT {num_rows}"
-    )
-
-    assert num_rows * 2 == int(instance.query(f"SELECT count() FROM {table_name}"))

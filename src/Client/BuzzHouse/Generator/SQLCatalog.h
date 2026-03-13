@@ -236,23 +236,19 @@ public:
 
     bool isDeltaLakeAzureEngine() const { return teng == TableEngineValues::DeltaLakeAzure; }
 
-    bool isDeltaLakeLocalEngine() const { return teng == TableEngineValues::DeltaLakeLocal; }
-
-    bool isAnyDeltaLakeEngine() const { return teng >= TableEngineValues::DeltaLakeS3 && teng <= TableEngineValues::DeltaLakeLocal; }
+    bool isAnyDeltaLakeEngine() const { return teng >= TableEngineValues::DeltaLakeS3 && teng <= TableEngineValues::DeltaLakeAzure; }
 
     bool isIcebergS3Engine() const { return teng == TableEngineValues::IcebergS3; }
 
     bool isIcebergAzureEngine() const { return teng == TableEngineValues::IcebergAzure; }
 
-    bool isIcebergLocalEngine() const { return teng == TableEngineValues::IcebergLocal; }
-
-    bool isAnyIcebergEngine() const { return teng >= TableEngineValues::IcebergS3 && teng <= TableEngineValues::IcebergLocal; }
+    bool isAnyIcebergEngine() const { return teng >= TableEngineValues::IcebergS3 && teng <= TableEngineValues::IcebergAzure; }
 
     bool isOnS3() const { return isIcebergS3Engine() || isDeltaLakeS3Engine() || isAnyS3Engine(); }
 
     bool isOnAzure() const { return isIcebergAzureEngine() || isDeltaLakeAzureEngine() || isAnyAzureEngine(); }
 
-    bool isOnLocal() const { return isIcebergLocalEngine() || isDeltaLakeLocalEngine(); }
+    bool isOnLocal() const { return false; }
 
     bool isMergeEngine() const { return teng == TableEngineValues::Merge; }
 

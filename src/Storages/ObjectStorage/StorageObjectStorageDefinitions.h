@@ -61,12 +61,6 @@ struct IcebergAzureDefinition
     static constexpr auto storage_engine_name = "IcebergAzure";
 };
 
-struct IcebergLocalDefinition
-{
-    static constexpr auto name = "icebergLocal";
-    static constexpr auto storage_engine_name = "IcebergLocal";
-};
-
 struct IcebergHDFSDefinition
 {
     static constexpr auto name = "icebergHDFS";
@@ -89,12 +83,6 @@ struct DeltaLakeAzureDefinition
 {
     static constexpr auto name = "deltaLakeAzure";
     static constexpr auto storage_engine_name = "DeltaLakeAzure";
-};
-
-struct DeltaLakeLocalDefinition
-{
-    static constexpr auto name = "deltaLakeLocal";
-    static constexpr auto storage_engine_name = "DeltaLakeLocal";
 };
 
 struct HudiDefinition

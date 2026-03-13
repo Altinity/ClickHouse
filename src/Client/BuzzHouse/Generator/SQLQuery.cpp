@@ -311,17 +311,6 @@ void StatementGenerator::setTableFunction(
             }
             afunc->set_credential(sc.named_collection);
         }
-        else if (t.isOnLocal())
-        {
-            lfunc = tfunc->mutable_local();
-            const LocalFunc_FName val = (allow_chaos && rg.nextLargeNumber() < 11)
-                ? static_cast<LocalFunc_FName>(rg.randomInt<uint32_t>(1, 2))
-                : (t.isIcebergLocalEngine() ? LocalFunc_FName::LocalFunc_FName_icebergLocal
-                                            : LocalFunc_FName::LocalFunc_FName_deltaLakeLocal);
-
-            lfunc->set_fname(val);
-            lfunc->set_credential("local");
-        }
         else if (t.isFileEngine())
         {
             FileFunc * ffunc = tfunc->mutable_file();

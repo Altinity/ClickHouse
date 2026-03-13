@@ -237,8 +237,6 @@ def get_creation_expression(
             engine_part = "Azure"
         elif (storage_type == "hdfs"):
             engine_part = "HDFS"
-        elif (storage_type == "local"):
-            engine_part = "Local"
 
     if_not_exists_prefix = ""
     if if_not_exists:
@@ -284,28 +282,6 @@ def get_creation_expression(
                     DROP TABLE IF EXISTS {table_name};
                     CREATE TABLE {if_not_exists_prefix} {table_name} {schema}
                     ENGINE=Iceberg{engine_part}({storage_arg}, container = {cluster.azure_container_name}, storage_account_url = '{cluster.env_variables["AZURITE_STORAGE_ACCOUNT_URL"]}', blob_path = '/iceberg_data/default/{table_name}/', format={format})
-                    {partition_by}
-                    {settings_expression}
-                    """
-                )
-
-    elif storage_type == "local":
-        if run_on_cluster:
-            assert table_function
-            return f"""
-                iceberg{engine_part}Cluster('cluster_simple', {storage_arg}, path = '/iceberg_data/default/{table_name}/', format={format})
-            """
-        else:
-            if table_function:
-                return f"""
-                    iceberg{engine_part}({storage_arg}, path = '/iceberg_data/default/{table_name}/', format={format})
-                """
-            else:
-                return (
-                    f"""
-                    DROP TABLE IF EXISTS {table_name};
-                    CREATE TABLE {if_not_exists_prefix} {table_name} {schema}
-                    ENGINE=Iceberg{engine_part}({storage_arg}, path = '/iceberg_data/default/{table_name}/', format={format})
                     {partition_by}
                     {settings_expression}
                     """
