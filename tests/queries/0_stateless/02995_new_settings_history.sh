@@ -25,10 +25,21 @@ fi
 # Baselines generated with v25.12.1 (pre-release)
 # clickhouse local --query "select name, default from system.settings order by name format TSV" > 02995_settings_25_12_1.tsv
 # clickhouse local --query "select name, value from system.merge_tree_settings order by name format TSV" > 02995_merge_tree_settings_settings_25_12_1.tsv
+# Previous Antalya release baseline:  (same format as 02995_settings_25_12_1.tsv). Settings listed there are considered known; keep empty or generate from previous Antalya build.
+
+# To generate the previous Antalya release baseline:
+# docker run --rm --entrypoint clickhouse <antalya_docker_image> \
+#     local -q "select name, default from system.settings order by name format TSV" \
+#     > 02995_settings_25_8_16_20001_antalya.tsv
+
 $CLICKHOUSE_LOCAL --query "
     WITH old_settings AS
     (
         SELECT * FROM file('${CUR_DIR}/02995_settings_25_12_1.tsv', 'TSV', 'name String, default String')
+    ),
+    old_antalya_settings AS
+    (
+        SELECT * FROM file('${CUR_DIR}/02995_settings_25_8_16_20001_antalya.tsv', 'TSV', 'name String, default String')
     ),
     old_merge_tree_settings AS
     (
@@ -52,7 +63,7 @@ $CLICKHOUSE_LOCAL --query "
         )) AND (name NOT IN (
             SELECT arrayJoin(tupleElement(changes, 'name'))
             FROM system.settings_changes
-            WHERE type = 'Session' AND splitByChar('.', version)[1]::UInt64 > 25 OR (splitByChar('.', version)[1]::UInt64 == 25 AND splitByChar('.', version)[2]::UInt64 > 12)
+            WHERE type = 'Session' AND (splitByChar('.', version)[1]::UInt64 > 25 OR (splitByChar('.', version)[1]::UInt64 == 25 AND splitByChar('.', version)[2]::UInt64 > 12) OR position(version, 'altinityantalya') > 0)
         ))
         UNION ALL
         (
@@ -64,7 +75,7 @@ $CLICKHOUSE_LOCAL --query "
             )) AND (name NOT IN (
                 SELECT arrayJoin(tupleElement(changes, 'name'))
                 FROM system.settings_changes
-                WHERE type = 'MergeTree' AND splitByChar('.', version)[1]::UInt64 > 25 OR (splitByChar('.', version)[1]::UInt64 == 25 AND splitByChar('.', version)[2]::UInt64 > 12)
+                WHERE type = 'MergeTree' AND (splitByChar('.', version)[1]::UInt64 > 25 OR (splitByChar('.', version)[1]::UInt64 == 25 AND splitByChar('.', version)[2]::UInt64 > 12) OR position(version, 'altinityantalya') > 0)
             ))
         )
         UNION ALL
@@ -75,7 +86,7 @@ $CLICKHOUSE_LOCAL --query "
             WHERE (new_settings.default != old_settings.default) AND (name NOT IN (
                 SELECT arrayJoin(tupleElement(changes, 'name'))
                 FROM system.settings_changes
-                WHERE type = 'Session' AND splitByChar('.', version)[1]::UInt64 > 25 OR (splitByChar('.', version)[1]::UInt64 == 25 AND splitByChar('.', version)[2]::UInt64 > 12)
+                WHERE type = 'Session' AND (splitByChar('.', version)[1]::UInt64 > 25 OR (splitByChar('.', version)[1]::UInt64 == 25 AND splitByChar('.', version)[2]::UInt64 > 12) OR position(version, 'altinityantalya') > 0)
             )) AND ${IGNORE_SETTINGS_FOR_SANITIZERS}
         )
         UNION ALL
@@ -86,8 +97,33 @@ $CLICKHOUSE_LOCAL --query "
             WHERE (new_merge_tree_settings.default != old_merge_tree_settings.default) AND (name NOT IN (
                 SELECT arrayJoin(tupleElement(changes, 'name'))
                 FROM system.settings_changes
-                WHERE type = 'MergeTree' AND splitByChar('.', version)[1]::UInt64 > 25 OR (splitByChar('.', version)[1]::UInt64 == 25 AND splitByChar('.', version)[2]::UInt64 > 12)
+                WHERE type = 'MergeTree' AND (splitByChar('.', version)[1]::UInt64 > 25 OR (splitByChar('.', version)[1]::UInt64 == 25 AND splitByChar('.', version)[2]::UInt64 > 12) OR position(version, 'altinityantalya') > 0)
             )) AND ${IGNORED_MERGETREE_SETTINGS_FOR_CLOUD}
+        )
+        UNION ALL
+        (
+            SELECT 'PLEASE ADD THE NEW SETTING TO SettingsChangesHistory.cpp (Antalya): ' || name || ' WAS ADDED'
+            FROM new_settings
+            WHERE (name NOT IN (SELECT name FROM old_antalya_settings))
+            AND (name NOT IN (
+                SELECT arrayJoin(tupleElement(changes, 'name'))
+                FROM system.settings_changes
+                WHERE type = 'Session'
+            ))
+            AND (SELECT count() FROM old_antalya_settings) > 0
+        )
+        UNION ALL
+        (
+            SELECT 'PLEASE ADD THE SETTING VALUE CHANGE TO SettingsChangesHistory.cpp (Antalya): ' || name || ' WAS CHANGED FROM ' || old_antalya_settings.default || ' TO ' || new_settings.default
+            FROM new_settings
+            JOIN old_antalya_settings ON new_settings.name = old_antalya_settings.name
+            WHERE (new_settings.default != old_antalya_settings.default)
+            AND (name NOT IN (
+                SELECT arrayJoin(tupleElement(changes, 'name'))
+                FROM system.settings_changes
+                WHERE type = 'Session'
+            ))
+            AND ${IGNORE_SETTINGS_FOR_SANITIZERS}
         )
     )
 "

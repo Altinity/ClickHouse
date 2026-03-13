@@ -1,5 +1,8 @@
 #pragma once
 
+#include <Interpreters/Context_fwd.h>
+#include <config.h>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PersistentTableComponents.h>
@@ -11,9 +14,20 @@
 #include <Poco/JSON/Object.h>
 #include <Poco/JSON/Parser.h>
 
+#include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
+
+namespace DB
+{
+struct ObjectInfo;
+using ObjectInfoPtr = std::shared_ptr<ObjectInfo>;
+
+/// These functions are always available; they return fallback values when USE_AVRO is not defined
+ObjectStoragePtr getResolvedStorageFromObjectInfo([[maybe_unused]] const ObjectInfoPtr & object_info, const ObjectStoragePtr & default_storage);
+std::optional<String> getAbsolutePathFromObjectInfo([[maybe_unused]] const ObjectInfoPtr & object_info);
+}
+
 #if USE_AVRO
 
-#include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <IO/CompressedReadBufferWrapper.h>
 #include <IO/CompressionMethod.h>
 #include <Storages/ColumnsDescription.h>
@@ -48,15 +62,18 @@ bool writeMetadataFileAndVersionHint(
     bool try_write_version_hint
 );
 
-std::string getProperFilePathFromMetadataInfo(std::string_view data_path, std::string_view common_path, std::string_view table_location);
-
 struct TransformAndArgument
 {
     String transform_name;
     std::optional<size_t> argument;
+    /// When Iceberg table is partitioned by time, splitting by partitions can be made using different timezone
+    /// (UTC in most cases). This timezone can be set with setting `iceberg_partition_timezone`, value is in this member.
+    /// When Iceberg partition condition converted to ClickHouse function in `parseTransformAndArgument` method
+    /// `time_zone` added as second argument to functions like `toRelativeDayNum`, `toYearNumSinceEpoch`, etc.
+    std::optional<String> time_zone;
 };
 
-std::optional<TransformAndArgument> parseTransformAndArgument(const String & transform_name_src);
+std::optional<TransformAndArgument> parseTransformAndArgument(const String & transform_name_src, const String & time_zone);
 
 Poco::JSON::Object::Ptr getMetadataJSONObject(
     const String & metadata_file_path,
@@ -99,14 +116,14 @@ std::pair<Poco::JSON::Object::Ptr, Int32> parseTableSchemaV1Method(const Poco::J
 std::pair<Poco::JSON::Object::Ptr, Int32> parseTableSchemaV2Method(const Poco::JSON::Object::Ptr & metadata_object);
 std::string normalizeUuid(const std::string & uuid);
 
-/// Parse transform and argument from input parameter
-/// "x" -> {"identity", "x"}
-/// "identity(x)" -> {"identity", "x"}
-/// "bucket(16, x)" -> {"bucket[16]", "x"}
-std::pair<String, String> parseTransformAndColumn(ASTPtr object, size_t i);
 DataTypePtr getFunctionResultType(const String & iceberg_transform_name, DataTypePtr source_type);
 
 KeyDescription getSortingKeyDescriptionFromMetadata(
+    Poco::JSON::Object::Ptr metadata_object, const NamesAndTypesList & ch_schema, ContextPtr local_context);
+/// Returns Iceberg/Spark-style display string for sort order, e.g. "id desc, hour(ts) asc".
+std::optional<String> getSortingKeyDisplayStringFromMetadata(
+    Poco::JSON::Object::Ptr metadata_object, const NamesAndTypesList & ch_schema);
+std::optional<String> getPartitionKeyStringFromMetadata(
     Poco::JSON::Object::Ptr metadata_object, const NamesAndTypesList & ch_schema, ContextPtr local_context);
 void sortBlockByKeyDescription(Block & block, const KeyDescription & sort_description, ContextPtr context);
 }

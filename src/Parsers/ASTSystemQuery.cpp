@@ -575,7 +575,9 @@ void ASTSystemQuery::formatImpl(WriteBuffer & ostr, const FormatSettings & setti
         case Type::CLEAR_TEXT_INDEX_CACHES:
         case Type::CLEAR_COMPILED_EXPRESSION_CACHE:
         case Type::CLEAR_S3_CLIENT_CACHE:
+        case Type::DROP_PARQUET_METADATA_CACHE:
         case Type::CLEAR_ICEBERG_METADATA_CACHE:
+        case Type::DROP_OBJECT_STORAGE_LIST_OBJECTS_CACHE:
         case Type::RESET_COVERAGE:
         case Type::RESTART_REPLICAS:
         case Type::JEMALLOC_PURGE:
@@ -602,6 +604,8 @@ void ASTSystemQuery::formatImpl(WriteBuffer & ostr, const FormatSettings & setti
         case Type::STOP_REPLICATED_DDL_QUERIES:
         case Type::START_REPLICATED_DDL_QUERIES:
         case Type::RECONNECT_ZOOKEEPER:
+        case Type::STOP_SWARM_MODE:
+        case Type::START_SWARM_MODE:
             break;
         case Type::UNKNOWN:
         case Type::END:

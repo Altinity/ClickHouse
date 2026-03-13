@@ -6,6 +6,7 @@
 #include <compare>
 #include <optional>
 
+#include <Interpreters/Context.h>
 #include <Interpreters/IcebergMetadataLog.h>
 
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
@@ -13,7 +14,9 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PositionDeleteTransform.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
+#include <Storages/ObjectStorage/Utils.h>
 
+#include <Core/Settings.h>
 #include <Core/TypeId.h>
 #include <DataTypes/DataTypesDecimal.h>
 #include <Poco/JSON/Parser.h>
@@ -32,6 +35,11 @@ namespace DB::ErrorCodes
     extern const int ICEBERG_SPECIFICATION_VIOLATION;
     extern const int LOGICAL_ERROR;
     extern const int BAD_ARGUMENTS;
+}
+
+namespace DB::Setting
+{
+    extern const SettingsTimezone iceberg_partition_timezone;
 }
 
 namespace DB::Iceberg
@@ -219,7 +227,7 @@ ManifestFileContent::ManifestFileContent(
         auto transform_name = partition_specification_field->getValue<String>(f_partition_transform);
         auto partition_name = partition_specification_field->getValue<String>(f_partition_name);
         common_partition_specification.emplace_back(source_id, transform_name, partition_name);
-        auto partition_ast = getASTFromTransform(transform_name, numeric_column_name);
+        auto partition_ast = getASTFromTransform(transform_name, numeric_column_name, context->getSettingsRef()[Setting::iceberg_partition_timezone]);
         /// Unsupported partition key expression
         if (partition_ast == nullptr)
             continue;
@@ -245,7 +253,6 @@ ManifestFileContent::ManifestFileContent(
         if (format_version_ > 1)
             content_type = FileContentType(manifest_file_deserializer.getValueFromRowByName(i, c_data_file_content, TypeIndex::Int32).safeGet<UInt64>());
         const auto status = ManifestEntryStatus(manifest_file_deserializer.getValueFromRowByName(i, f_status, TypeIndex::Int32).safeGet<UInt64>());
-
 
         if (status == ManifestEntryStatus::DELETED)
             continue;
@@ -289,9 +296,8 @@ ManifestFileContent::ManifestFileContent(
         }
         const auto schema_id = schema_id_opt.has_value() ? schema_id_opt.value() : manifest_schema_id;
 
-        const auto file_path_key
-            = manifest_file_deserializer.getValueFromRowByName(i, c_data_file_file_path, TypeIndex::String).safeGet<String>();
-        const auto file_path = getProperFilePathFromMetadataInfo(manifest_file_deserializer.getValueFromRowByName(i, c_data_file_file_path, TypeIndex::String).safeGet<String>(), common_path, table_location);
+        const auto file_path_from_metadata = manifest_file_deserializer.getValueFromRowByName(i, c_data_file_file_path, TypeIndex::String).safeGet<String>();
+        const auto file_path = makeAbsolutePath(table_location, file_path_from_metadata);
 
         /// NOTE: This is weird, because in manifest file partition looks like this:
         /// {
@@ -345,6 +351,11 @@ ManifestFileContent::ManifestFileContent(
                     const auto & column_number_and_bound = column_stats.safeGet<Tuple>();
                     Int32 number = static_cast<Int32>(column_number_and_bound[0].safeGet<Int32>());
                     const Field & bound_value = column_number_and_bound[1];
+
+                    if (!value_for_bounds.contains(number))
+                    {
+                        value_for_bounds[number] = std::make_pair(Field{}, Field{});
+                    }
 
                     if (path == c_data_file_lower_bounds)
                         value_for_bounds[number].first = bound_value;
@@ -430,29 +441,29 @@ ManifestFileContent::ManifestFileContent(
         switch (content_type)
         {
             case FileContentType::DATA:
-                this->data_files_without_deleted.emplace_back(
-                    std::make_shared<ManifestFileEntry>(
-                        file_path_key,
-                        file_path,
-                        i,
-                        status,
-                        added_sequence_number,
-                        snapshot_id,
-                        schema_id,
-                        partition_key_value,
-                        common_partition_specification,
-                        columns_infos,
-                        file_format,
-                        /*lower_reference_data_file_path_ = */ std::nullopt,
-                        /*upper_reference_data_file_path_ = */ std::nullopt,
-                        /*equality_ids*/ std::nullopt,
-                        sort_order_id));
+                this->data_files_without_deleted.emplace_back(std::make_shared<ManifestFileEntry>(
+                    file_path_from_metadata,
+                    file_path,
+                    i,
+                    status,
+                    added_sequence_number,
+                    snapshot_id,
+                    schema_id,
+                    partition_key_value,
+                    common_partition_specification,
+                    columns_infos,
+                    file_format,
+                    /*lower_reference_data_file_path_ = */ std::nullopt,
+                    /*upper_reference_data_file_path_ = */ std::nullopt,
+                    /*equality_ids*/ std::nullopt,
+                    sort_order_id));
                 break;
             case FileContentType::POSITION_DELETE:
             {
                 /// reference_file_path can be absent in schema for some reason, though it is present in specification: https://iceberg.apache.org/spec/#manifests
                 std::optional<String> lower_reference_data_file_path = std::nullopt;
                 std::optional<String> upper_reference_data_file_path = std::nullopt;
+                bool bounds_set_by_referenced_data_file = false;
                 if (manifest_file_deserializer.hasPath(c_data_file_referenced_data_file))
                 {
                     Field reference_file_path_field = manifest_file_deserializer.getValueFromRowByName(i, c_data_file_referenced_data_file);
@@ -460,18 +471,24 @@ ManifestFileContent::ManifestFileContent(
                     {
                         lower_reference_data_file_path = reference_file_path_field.safeGet<String>();
                         upper_reference_data_file_path = reference_file_path_field.safeGet<String>();
+                        bounds_set_by_referenced_data_file = true;
                     }
                 }
-                else if (auto it = value_for_bounds.find(IcebergPositionDeleteTransform::data_file_path_column_field_id);
-                         it != value_for_bounds.end())
+                if (!bounds_set_by_referenced_data_file)
                 {
-                    auto & [lower, upper] = it->second;
-                    lower_reference_data_file_path = lower.safeGet<String>();
-                    upper_reference_data_file_path = upper.safeGet<String>();
+                    if (auto it = value_for_bounds.find(IcebergPositionDeleteTransform::data_file_path_column_field_id);
+                        it != value_for_bounds.end())
+                    {
+                        auto & [lower, upper] = it->second;
+                        if (!lower.isNull())
+                            lower_reference_data_file_path = lower.safeGet<String>();
+                        if (!upper.isNull())
+                            upper_reference_data_file_path = upper.safeGet<String>();
+                    }
                 }
                 this->position_deletes_files_without_deleted.emplace_back(
                     std::make_shared<ManifestFileEntry>(
-                        file_path_key,
+                        file_path_from_metadata,
                         file_path,
                         i,
                         status,
@@ -503,7 +520,7 @@ ManifestFileContent::ManifestFileContent(
                             "Couldn't find field {} in equality delete file entry", c_data_file_equality_ids);
                 this->equality_deletes_files.emplace_back(
                     std::make_shared<ManifestFileEntry>(
-                        file_path_key,
+                        file_path_from_metadata,
                         file_path,
                         i,
                         status,

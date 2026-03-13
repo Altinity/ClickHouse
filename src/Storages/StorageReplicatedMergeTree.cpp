@@ -7,6 +7,7 @@
 
 #include <base/hex.h>
 #include <base/interpolate.h>
+#include "Common/ZooKeeper/IKeeper.h"
 #include <Common/DateLUTImpl.h>
 #include <Common/FailPoint.h>
 #include <Common/Macros.h>
@@ -68,6 +69,7 @@
 #include <Storages/MergeTree/ZeroCopyLock.h>
 #include <Storages/PartitionCommands.h>
 #include <Storages/StorageReplicatedMergeTree.h>
+#include <Storages/System/StorageSystemReplicatedPartitionExports.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeSinkPatch.h>
 #include <Storages/MergeTree/PatchParts/PatchPartsLock.h>
@@ -117,6 +119,13 @@
 #include <Backups/RestorerFromBackup.h>
 
 #include <Common/scope_guard_safe.h>
+#include "Functions/generateSnowflakeID.h"
+#include "Interpreters/StorageID.h"
+#include "QueryPipeline/QueryPlanResourceHolder.h"
+#include "Storages/ExportReplicatedMergeTreePartitionManifest.h"
+#include "Storages/ExportReplicatedMergeTreePartitionTaskEntry.h"
+#include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/MergeTree/ReplicatedMergeTreeLogEntry.h>
 #include <IO/SharedThreadPools.h>
 
 #include <base/types.h>
@@ -148,6 +157,15 @@ namespace ProfileEvents
     extern const Event ReplicaPartialShutdown;
     extern const Event ReplicatedCoveredPartsInZooKeeperOnStart;
     extern const Event MergesRejectedByMemoryLimit;
+    extern const Event ExportPartitionZooKeeperRequests;
+    extern const Event ExportPartitionZooKeeperGet;
+    extern const Event ExportPartitionZooKeeperGetChildren;
+    extern const Event ExportPartitionZooKeeperCreate;
+    extern const Event ExportPartitionZooKeeperSet;
+    extern const Event ExportPartitionZooKeeperRemove;
+    extern const Event ExportPartitionZooKeeperRemoveRecursive;
+    extern const Event ExportPartitionZooKeeperMulti;
+    extern const Event ExportPartitionZooKeeperExists;
 }
 
 namespace CurrentMetrics
@@ -186,6 +204,19 @@ namespace Setting
     extern const SettingsInt64 replication_wait_for_inactive_replica_timeout;
     extern const SettingsUInt64 select_sequential_consistency;
     extern const SettingsBool update_sequential_consistency;
+    extern const SettingsBool allow_experimental_export_merge_tree_part;
+    extern const SettingsBool export_merge_tree_partition_force_export;
+    extern const SettingsUInt64 export_merge_tree_partition_max_retries;
+    extern const SettingsUInt64 export_merge_tree_partition_manifest_ttl;
+    extern const SettingsBool output_format_parallel_formatting;
+    extern const SettingsBool output_format_parquet_parallel_encoding;
+    extern const SettingsMaxThreads max_threads;
+    extern const SettingsMergeTreePartExportFileAlreadyExistsPolicy export_merge_tree_part_file_already_exists_policy;
+    extern const SettingsUInt64 export_merge_tree_part_max_bytes_per_file;
+    extern const SettingsUInt64 export_merge_tree_part_max_rows_per_file;
+    extern const SettingsBool export_merge_tree_part_throw_on_pending_mutations;
+    extern const SettingsBool export_merge_tree_part_throw_on_pending_patch_parts;
+    extern const SettingsBool export_merge_tree_partition_lock_inside_the_task;
 }
 
 namespace MergeTreeSetting
@@ -291,6 +322,13 @@ namespace ErrorCodes
     extern const int FAULT_INJECTED;
     extern const int CANNOT_FORGET_PARTITION;
     extern const int TIMEOUT_EXCEEDED;
+    extern const int INVALID_SETTING_VALUE;
+    extern const int PENDING_MUTATIONS_NOT_ALLOWED;
+}
+
+namespace ServerSetting
+{
+    extern const ServerSettingsBool enable_experimental_export_merge_tree_partition_feature;
 }
 
 namespace ActionLocks
@@ -419,6 +457,9 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
     , merge_strategy_picker(*this)
     , queue(*this, merge_strategy_picker)
     , fetcher(*this)
+    , export_merge_tree_partition_task_entries_by_key(export_merge_tree_partition_task_entries.get<ExportPartitionTaskEntryTagByCompositeKey>())
+    , export_merge_tree_partition_task_entries_by_transaction_id(export_merge_tree_partition_task_entries.get<ExportPartitionTaskEntryTagByTransactionId>())
+    , export_merge_tree_partition_task_entries_by_create_time(export_merge_tree_partition_task_entries.get<ExportPartitionTaskEntryTagByCreateTime>())
     , cleanup_thread(*this)
     , async_block_ids_cache(*this)
     , part_check_thread(*this)
@@ -462,6 +503,31 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
     /// This can lead to redundant exceptions during startup.
     /// Will be activated by restarting thread.
     mutations_finalizing_task->deactivate();
+
+    if (getContext()->getServerSettings()[ServerSetting::enable_experimental_export_merge_tree_partition_feature])
+    {
+        export_merge_tree_partition_manifest_updater = std::make_shared<ExportPartitionManifestUpdatingTask>(*this);
+
+        export_merge_tree_partition_task_scheduler = std::make_shared<ExportPartitionTaskScheduler>(*this);
+
+        export_merge_tree_partition_updating_task = getContext()->getSchedulePool().createTask(
+            getStorageID(), getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_updating_task)", [this] { exportMergeTreePartitionUpdatingTask(); });
+
+        export_merge_tree_partition_updating_task->deactivate();
+
+        export_merge_tree_partition_status_handling_task = getContext()->getSchedulePool().createTask(
+            getStorageID(), getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_status_handling_task)", [this] { exportMergeTreePartitionStatusHandlingTask(); });
+
+        export_merge_tree_partition_status_handling_task->deactivate();
+
+        export_merge_tree_partition_watch_callback = export_merge_tree_partition_updating_task->getWatchCallback();
+
+        export_merge_tree_partition_select_task = getContext()->getSchedulePool().createTask(
+            getStorageID(), getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_select_task)", [this] { selectPartsToExport(); });
+
+        export_merge_tree_partition_select_task->deactivate();
+    }
+
 
     bool has_zookeeper = getContext()->hasZooKeeper() || getContext()->hasAuxiliaryZooKeeper(zookeeper_info.zookeeper_name);
     if (has_zookeeper)
@@ -890,6 +956,7 @@ void StorageReplicatedMergeTree::createNewZooKeeperNodesAttempt() const
     futures.push_back(zookeeper->asyncTryCreateNoThrow(zookeeper_path + "/quorum/last_part", String(), zkutil::CreateMode::Persistent));
     futures.push_back(zookeeper->asyncTryCreateNoThrow(zookeeper_path + "/quorum/failed_parts", String(), zkutil::CreateMode::Persistent));
     futures.push_back(zookeeper->asyncTryCreateNoThrow(zookeeper_path + "/mutations", String(), zkutil::CreateMode::Persistent));
+    futures.push_back(zookeeper->asyncTryCreateNoThrow(zookeeper_path + "/exports", String(), zkutil::CreateMode::Persistent));
 
 
     futures.push_back(zookeeper->asyncTryCreateNoThrow(zookeeper_path + "/quorum/parallel", String(), zkutil::CreateMode::Persistent));
@@ -1051,6 +1118,8 @@ bool StorageReplicatedMergeTree::createTableIfNotExistsAttempt(const StorageMeta
         ops.emplace_back(zkutil::makeCreateRequest(zookeeper_path + "/quorum/failed_parts", "",
             zkutil::CreateMode::Persistent));
         ops.emplace_back(zkutil::makeCreateRequest(zookeeper_path + "/mutations", "",
+            zkutil::CreateMode::Persistent));
+        ops.emplace_back(zkutil::makeCreateRequest(zookeeper_path + "/exports", "",
             zkutil::CreateMode::Persistent));
 
         /// And create first replica atomically. See also "createReplica" method that is used to create not the first replicas.
@@ -4358,6 +4427,56 @@ void StorageReplicatedMergeTree::mutationsFinalizingTask()
     }
 }
 
+void StorageReplicatedMergeTree::exportMergeTreePartitionUpdatingTask()
+{   
+    try
+    {
+        export_merge_tree_partition_manifest_updater->poll();
+    }
+    catch (...)
+    {
+        tryLogCurrentException(log, __PRETTY_FUNCTION__);
+    }
+
+
+    export_merge_tree_partition_updating_task->scheduleAfter(30 * 1000);
+}
+
+void StorageReplicatedMergeTree::selectPartsToExport()
+{
+    try
+    {
+        export_merge_tree_partition_task_scheduler->run();
+    }
+    catch (...)
+    {
+        tryLogCurrentException(log, __PRETTY_FUNCTION__);
+    }
+
+    export_merge_tree_partition_select_task->scheduleAfter(1000 * 5);
+}
+
+void StorageReplicatedMergeTree::exportMergeTreePartitionStatusHandlingTask()
+{
+    try
+    {
+        export_merge_tree_partition_manifest_updater->handleStatusChanges();
+    }
+    catch (...)
+    {
+        tryLogCurrentException(log, __PRETTY_FUNCTION__);
+    }
+}
+
+std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartitionExportsInfo(bool prefer_remote_information) const
+{
+    if (prefer_remote_information && getZooKeeper()->isFeatureEnabled(DB::KeeperFeatureFlag::MULTI_READ))
+    {
+        return export_merge_tree_partition_manifest_updater->getPartitionExportsInfo();
+    }
+
+    return export_merge_tree_partition_manifest_updater->getPartitionExportsInfoLocal();
+}
 
 StorageReplicatedMergeTree::CreateMergeEntryResult StorageReplicatedMergeTree::createLogEntryToMergeParts(
     zkutil::ZooKeeperPtr & zookeeper,
@@ -5644,7 +5763,7 @@ void StorageReplicatedMergeTree::startupImpl(bool from_attach_thread, const ZooK
             restarting_thread.start(true);
         });
 
-        startBackgroundMovesIfNeeded();
+        startBackgroundMoves();
 
         part_moves_between_shards_orchestrator.start();
 
@@ -5743,6 +5862,13 @@ void StorageReplicatedMergeTree::partialShutdown()
     mutations_updating_task->deactivate();
     mutations_finalizing_task->deactivate();
 
+    if (getContext()->getServerSettings()[ServerSetting::enable_experimental_export_merge_tree_partition_feature])
+    {
+        export_merge_tree_partition_updating_task->deactivate();
+        export_merge_tree_partition_select_task->deactivate();
+        export_merge_tree_partition_status_handling_task->deactivate();
+    }
+
     cleanup_thread.stop();
     async_block_ids_cache.stop();
     part_check_thread.stop();
@@ -5812,6 +5938,17 @@ void StorageReplicatedMergeTree::shutdown(bool)
         /// Wait for all of them
         std::lock_guard lock(data_parts_exchange_ptr->rwlock);
     }
+
+    {
+        std::lock_guard lock(export_merge_tree_partition_mutex);
+        export_merge_tree_partition_task_entries.clear();
+    }
+
+    {
+        std::lock_guard lock(export_manifests_mutex);
+        export_manifests.clear();
+    }
+
     LOG_TRACE(log, "Shutdown finished");
 }
 
@@ -6508,7 +6645,7 @@ void StorageReplicatedMergeTree::alter(
 
     if (!query_settings[Setting::allow_suspicious_primary_key])
     {
-        MergeTreeData::verifySortingKey(future_metadata.sorting_key, merging_params);
+        MergeTreeData::verifySortingKey(future_metadata.sorting_key);
     }
 
     {
@@ -7897,6 +8034,233 @@ void StorageReplicatedMergeTree::fetchPartition(
     } while (!missing_parts.empty());
 
     LOG_TRACE(log, "Fetch took {} sec. ({} tries)", watch.elapsedSeconds(), try_no);
+}
+
+void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand & command, ContextPtr query_context)
+{
+    if (!query_context->getServerSettings()[ServerSetting::enable_experimental_export_merge_tree_partition_feature])
+    {
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+            "Exporting merge tree partition is experimental. Set the server setting `enable_experimental_export_merge_tree_partition_feature` to enable it");
+    }
+
+    const auto dest_database = query_context->resolveDatabase(command.to_database);
+    const auto dest_table = command.to_table;
+    const auto dest_storage_id = StorageID(dest_database, dest_table);
+    auto dest_storage = DatabaseCatalog::instance().getTable({dest_database, dest_table}, query_context);
+
+    if (dest_storage->getStorageID() == this->getStorageID())
+    {
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Exporting to the same table is not allowed");
+    }
+
+    if (!dest_storage->supportsImport())
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Destination storage {} does not support MergeTree parts or uses unsupported partitioning", dest_storage->getName());
+
+    auto query_to_string = [] (const ASTPtr & ast)
+    {
+        return ast ? ast->formatWithSecretsOneLine() : "";
+    };
+
+    auto src_snapshot = getInMemoryMetadataPtr();
+    auto destination_snapshot = dest_storage->getInMemoryMetadataPtr();
+
+    /// compare all source readable columns with all destination insertable columns
+    /// this allows us to skip ephemeral columns
+    if (src_snapshot->getColumns().getReadable().sizeOfDifference(destination_snapshot->getColumns().getInsertable()))
+        throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS, "Tables have different structure");
+
+    if (query_to_string(src_snapshot->getPartitionKeyAST()) != query_to_string(destination_snapshot->getPartitionKeyAST()))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
+
+    zkutil::ZooKeeperPtr zookeeper = getZooKeeperAndAssertNotReadonly();
+
+    const String partition_id = getPartitionIDFromQuery(command.partition, query_context);
+    
+    const auto exports_path = fs::path(zookeeper_path) / "exports";
+
+    const auto export_key = partition_id + "_" + dest_storage_id.getQualifiedName().getFullName();
+
+    const auto partition_exports_path = fs::path(exports_path) / export_key;
+
+    /// check if entry already exists
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperExists);
+    if (zookeeper->exists(partition_exports_path))
+    {
+        LOG_INFO(log, "Export with key {} is already exported or it is being exported. Checking if it has expired so that we can overwrite it", export_key);
+
+        bool has_expired = false;
+
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperExists);
+        if (zookeeper->exists(fs::path(partition_exports_path) / "metadata.json"))
+        {
+            std::string metadata_json;
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
+            if (zookeeper->tryGet(fs::path(partition_exports_path) / "metadata.json", metadata_json))
+            {
+                const auto manifest = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
+
+                const auto now = time(nullptr);
+                const auto expiration_time = manifest.create_time + manifest.ttl_seconds;
+
+                LOG_INFO(log, "Export with key {} has expiration time {}, now is {}", export_key, expiration_time, now);
+
+                if (static_cast<time_t>(expiration_time) < now)
+                {
+                    has_expired = true;
+                }
+            }
+        }
+
+        if (!has_expired && !query_context->getSettingsRef()[Setting::export_merge_tree_partition_force_export])
+        {
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Export with key {} already exported or it is being exported, and it has not expired. Set `export_merge_tree_partition_force_export` to overwrite it.", export_key);
+        }
+
+        LOG_INFO(log, "Overwriting export with key {}", export_key);
+
+        /// Not putting in ops (same transaction) because we can't construct a "tryRemoveRecursive" request.
+        /// It is possible that the zk being used does not support RemoveRecursive requests.
+        /// It is ok for this to be non transactional. Worst case scenario an on-going export is going to be killed and a new task won't be scheduled.
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRemoveRecursive);
+        zookeeper->tryRemoveRecursive(partition_exports_path);
+    }
+
+    Coordination::Requests ops;
+
+    ops.emplace_back(zkutil::makeCreateRequest(partition_exports_path, "", zkutil::CreateMode::Persistent));
+
+    DataPartsVector parts;
+
+    {
+        auto data_parts_lock = lockParts();
+        parts = getDataPartsVectorInPartitionForInternalUsage(MergeTreeDataPartState::Active, partition_id, data_parts_lock);
+    }
+
+    if (parts.empty())
+    {
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Partition {} doesn't exist", partition_id);
+    }
+
+    const bool throw_on_pending_mutations = query_context->getSettingsRef()[Setting::export_merge_tree_part_throw_on_pending_mutations];
+    const bool throw_on_pending_patch_parts = query_context->getSettingsRef()[Setting::export_merge_tree_part_throw_on_pending_patch_parts];
+
+    MergeTreeData::IMutationsSnapshot::Params mutations_snapshot_params
+    {
+        .metadata_version = getInMemoryMetadataPtr()->getMetadataVersion(),
+        .min_part_metadata_version = MergeTreeData::getMinMetadataVersion(parts),
+        .need_data_mutations = throw_on_pending_mutations,
+        .need_alter_mutations = throw_on_pending_mutations || throw_on_pending_patch_parts,
+        .need_patch_parts = throw_on_pending_patch_parts,
+    };
+
+    const auto mutations_snapshot = getMutationsSnapshot(mutations_snapshot_params);
+
+    std::vector<String> part_names;
+    for (const auto & part : parts)
+    {
+        const auto alter_conversions = getAlterConversionsForPart(part, mutations_snapshot, query_context);
+
+        /// re-check `throw_on_pending_mutations` because `pending_mutations` might have been filled due to `throw_on_pending_patch_parts`
+        if (alter_conversions->hasMutations() && throw_on_pending_mutations)
+        {
+            throw Exception(ErrorCodes::PENDING_MUTATIONS_NOT_ALLOWED,
+                "Partition {} can not be exported because the part {} has pending mutations. Either wait for the mutations to be applied or set `export_merge_tree_part_throw_on_pending_mutations` to false",
+                partition_id,
+                part->name);
+        }
+
+        if (alter_conversions->hasPatches())
+        {
+            throw Exception(ErrorCodes::PENDING_MUTATIONS_NOT_ALLOWED,
+                "Partition {} can not be exported because the part {} has pending patch parts. Either wait for the patch parts to be applied or set `export_merge_tree_part_throw_on_pending_patch_parts` to false",
+                partition_id,
+                part->name);
+        }
+
+        part_names.push_back(part->name);
+    }
+
+    /// TODO arthur somehow check if the list of parts is updated "enough"
+
+    ExportReplicatedMergeTreePartitionManifest manifest;
+
+    manifest.transaction_id = generateSnowflakeIDString();
+    manifest.query_id = query_context->getCurrentQueryId();
+    manifest.partition_id = partition_id;
+    manifest.destination_database = dest_database;
+    manifest.destination_table = dest_table;
+    manifest.source_replica = replica_name;
+    manifest.number_of_parts = part_names.size();
+    manifest.parts = part_names;
+    manifest.create_time = time(nullptr);
+    manifest.max_retries = query_context->getSettingsRef()[Setting::export_merge_tree_partition_max_retries];
+    manifest.ttl_seconds = query_context->getSettingsRef()[Setting::export_merge_tree_partition_manifest_ttl];
+    manifest.max_threads = query_context->getSettingsRef()[Setting::max_threads];
+    manifest.parallel_formatting = query_context->getSettingsRef()[Setting::output_format_parallel_formatting];
+    manifest.parquet_parallel_encoding = query_context->getSettingsRef()[Setting::output_format_parquet_parallel_encoding];
+    manifest.max_bytes_per_file = query_context->getSettingsRef()[Setting::export_merge_tree_part_max_bytes_per_file];
+    manifest.max_rows_per_file = query_context->getSettingsRef()[Setting::export_merge_tree_part_max_rows_per_file];
+    manifest.lock_inside_the_task = query_context->getSettingsRef()[Setting::export_merge_tree_partition_lock_inside_the_task];
+
+
+    manifest.file_already_exists_policy = query_context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value;
+
+    ops.emplace_back(zkutil::makeCreateRequest(
+        fs::path(partition_exports_path) / "metadata.json", 
+        manifest.toJsonString(), 
+        zkutil::CreateMode::Persistent));
+
+    ops.emplace_back(zkutil::makeCreateRequest(
+        fs::path(partition_exports_path) / "exceptions_per_replica", 
+        "", 
+        zkutil::CreateMode::Persistent));
+
+    ops.emplace_back(zkutil::makeCreateRequest(
+        fs::path(partition_exports_path) / "processing", 
+        "", 
+        zkutil::CreateMode::Persistent));
+
+    for (const auto & part : part_names)
+    {
+        ExportReplicatedMergeTreePartitionProcessingPartEntry entry;
+        entry.status = ExportReplicatedMergeTreePartitionProcessingPartEntry::Status::PENDING;
+        entry.part_name = part;
+        entry.retry_count = 0;
+
+        ops.emplace_back(zkutil::makeCreateRequest(
+            fs::path(partition_exports_path) / "processing" / part,
+            entry.toJsonString(),
+            zkutil::CreateMode::Persistent));
+    }
+    
+    ops.emplace_back(zkutil::makeCreateRequest(
+        fs::path(partition_exports_path) / "processed", 
+        "", 
+        zkutil::CreateMode::Persistent));
+
+    ops.emplace_back(zkutil::makeCreateRequest(
+        fs::path(partition_exports_path) / "locks", 
+        "", 
+        zkutil::CreateMode::Persistent));
+
+    /// status: IN_PROGRESS, COMPLETED, FAILED
+    ops.emplace_back(zkutil::makeCreateRequest(
+        fs::path(partition_exports_path) / "status", 
+        "PENDING", 
+        zkutil::CreateMode::Persistent));
+
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperMulti);
+    Coordination::Responses responses;
+    Coordination::Error code = zookeeper->tryMulti(ops, responses);
+
+    if (code != Coordination::Error::ZOK)
+        throw zkutil::KeeperException::fromPath(code, partition_exports_path);
 }
 
 
@@ -9330,6 +9694,89 @@ CancellationCode StorageReplicatedMergeTree::killPartMoveToShard(const UUID & ta
     return part_moves_between_shards_orchestrator.killPartMoveToShard(task_uuid);
 }
 
+CancellationCode StorageReplicatedMergeTree::killExportPartition(const String & transaction_id)
+{
+    auto try_set_status_to_killed = [this](const zkutil::ZooKeeperPtr & zk, const std::string & status_path)
+    {
+        Coordination::Stat stat;
+        std::string status_from_zk_string;
+
+        if (!zk->tryGet(status_path, status_from_zk_string, &stat))
+        {
+            /// found entry locally, but not in zk. It might have been deleted by another replica and we did not have time to update the local entry.
+            LOG_INFO(log, "Export partition task not found in zk, can not cancel it");
+            return CancellationCode::CancelCannotBeSent;
+        }
+
+        const auto status_from_zk = magic_enum::enum_cast<ExportReplicatedMergeTreePartitionTaskEntry::Status>(status_from_zk_string);
+
+        if (!status_from_zk)
+        {
+            LOG_INFO(log, "Export partition task status is invalid, can not cancel it");
+            return CancellationCode::CancelCannotBeSent;
+        }
+
+        if (status_from_zk.value() != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
+        {
+            LOG_INFO(log, "Export partition task is {}, can not cancel it", String(magic_enum::enum_name(status_from_zk.value())));
+            return CancellationCode::CancelCannotBeSent;
+        }
+
+        if (zk->trySet(status_path, String(magic_enum::enum_name(ExportReplicatedMergeTreePartitionTaskEntry::Status::KILLED)), stat.version) != Coordination::Error::ZOK)
+        {
+            LOG_INFO(log, "Status has been updated while trying to kill the export partition task, can not cancel it");
+            return CancellationCode::CancelCannotBeSent;
+        }
+
+        return CancellationCode::CancelSent;
+    };
+
+    std::lock_guard lock(export_merge_tree_partition_mutex);
+
+    const auto zk = getZooKeeper();
+
+    /// if we have the entry locally, no need to list from zk. we can save some requests.
+    const auto & entry = export_merge_tree_partition_task_entries_by_transaction_id.find(transaction_id);
+    if (entry != export_merge_tree_partition_task_entries_by_transaction_id.end())
+    {
+        LOG_INFO(log, "Export partition task found locally, trying to cancel it");
+        /// found locally, no need to get children on zk
+        if (entry->status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
+        {
+            LOG_INFO(log, "Export partition task is not pending, can not cancel it");
+            return CancellationCode::CancelCannotBeSent;
+        }
+
+        return try_set_status_to_killed(zk, fs::path(zookeeper_path) / "exports" / entry->getCompositeKey() / "status");
+    }
+    else
+    {
+        LOG_INFO(log, "Export partition task not found locally, trying to find it on zk");
+        /// for some reason, we don't have the entry locally. ls on zk to find the entry
+        const auto exports_path = fs::path(zookeeper_path) / "exports";
+
+        const auto export_keys = zk->getChildren(exports_path);
+        String export_key_to_be_cancelled;
+
+        for (const auto & export_key : export_keys)
+        {
+            std::string metadata_json;
+            if (!zk->tryGet(fs::path(exports_path) / export_key / "metadata.json", metadata_json))
+                continue;
+            const auto manifest = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
+            if (manifest.transaction_id == transaction_id)
+            {
+                LOG_INFO(log, "Export partition task found on zk, trying to cancel it");
+                return try_set_status_to_killed(zk, fs::path(exports_path) / export_key / "status");
+            }
+        }
+    }
+
+    LOG_INFO(log, "Export partition task not found, can not cancel it");
+
+    return CancellationCode::NotFound;
+}
+
 void StorageReplicatedMergeTree::getCommitPartOps(
     Coordination::Requests & ops,
     const DataPartPtr & part,
@@ -9887,13 +10334,6 @@ MutationCounters StorageReplicatedMergeTree::getMutationCounters() const
 {
     return queue.getMutationCounters();
 }
-
-void StorageReplicatedMergeTree::startBackgroundMovesIfNeeded()
-{
-    if (areBackgroundMovesNeeded())
-        background_moves_assignee.start();
-}
-
 
 std::unique_ptr<MergeTreeSettings> StorageReplicatedMergeTree::getDefaultSettings() const
 {

@@ -11,6 +11,7 @@ concurrency:
 
 env:
   PYTHONUNBUFFERED: 1
+  GH_TOKEN: ${{ github.token }}
   CHECKOUT_REF: ""
 
 jobs:
@@ -36,6 +37,7 @@ jobs:
           test_name: "Config Workflow"
 
       - name: Note report location to summary
+        if: ${{ !failure() && env.AWS_ACCESS_KEY_ID && env.AWS_SECRET_ACCESS_KEY }}
         env:
           PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
           COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
@@ -169,7 +171,7 @@ jobs:
           fi
 
   build_arm_fuzzers:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFybV9mdXp6ZXJzKQ==') }}
     name: "Build (arm_fuzzers)"

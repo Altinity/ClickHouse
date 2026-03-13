@@ -98,7 +98,7 @@ def test_is_known_fail(broken_tests_rules, test_name, test_logs, job_flags):
 
         for rule_data in matching_rules:
             if rule_data.get("check_types") and not any(
-                ct in job_flags for ct in rule_data["check_types"]
+                ct in flag for ct in rule_data["check_types"] for flag in job_flags
             ):
                 log_file.write(
                     f"Skip rule: Check types didn't match: '{rule_data['check_types']}' not in '{job_flags}'\n"

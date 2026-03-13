@@ -3,6 +3,7 @@
 
 #include <Core/NamesAndTypes.h>
 #include <Core/Types.h>
+#include <Core/Range.h>
 #include <Databases/DataLake/ICatalog.h>
 #include <Formats/FormatFilterInfo.h>
 #include <Formats/FormatParserSharedResources.h>
@@ -13,6 +14,8 @@
 #include <Storages/AlterCommands.h>
 #include <Storages/MutationCommands.h>
 #include <Storages/prepareReadingFromFormat.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/SchemaProcessor.h>
+
 
 namespace DataLake
 {
@@ -25,7 +28,64 @@ namespace DB
 namespace ErrorCodes
 {
 extern const int UNSUPPORTED_METHOD;
-}
+};
+
+namespace Iceberg
+{
+struct ColumnInfo;
+};
+
+class DataFileMetaInfo
+{
+public:
+    DataFileMetaInfo() = default;
+
+    // Deserialize from json in distributed requests
+    explicit DataFileMetaInfo(const Poco::JSON::Object::Ptr file_info);
+
+    // Serialize to json in distributed requests
+    Poco::JSON::Object::Ptr toJson() const;
+
+    // subset of Iceberg::ColumnInfo now
+    struct ColumnInfo
+    {
+        std::optional<Int64> rows_count;
+        std::optional<Int64> nulls_count;
+        std::optional<DB::Range> hyperrectangle;
+    };
+
+    // Extract metadata from Iceberg structure
+    explicit DataFileMetaInfo(
+        const Iceberg::IcebergSchemaProcessor & schema_processor,
+        Int32 schema_id,
+        const std::unordered_map<Int32, Iceberg::ColumnInfo> & columns_info_);
+
+    void serialize(WriteBuffer & out) const;
+    static DataFileMetaInfo deserialize(ReadBuffer & in);
+
+    bool empty() const { return columns_info.empty(); }
+
+    std::unordered_map<std::string, ColumnInfo> columns_info;
+};
+
+using DataFileMetaInfoPtr = std::shared_ptr<DataFileMetaInfo>;
+
+struct DataFileInfo
+{
+    std::string file_path;
+    std::optional<DataFileMetaInfoPtr> file_meta_info;
+
+    explicit DataFileInfo(const std::string & file_path_)
+        : file_path(file_path_) {}
+
+    explicit DataFileInfo(std::string && file_path_)
+        : file_path(std::move(file_path_)) {}
+
+    bool operator==(const DataFileInfo & rhs) const
+    {
+        return file_path == rhs.file_path;
+    }
+};
 
 class SinkToStorage;
 using SinkToStoragePtr = std::shared_ptr<SinkToStorage>;
@@ -33,7 +93,6 @@ class StorageObjectStorageConfiguration;
 using StorageObjectStorageConfigurationPtr = std::shared_ptr<StorageObjectStorageConfiguration>;
 struct StorageID;
 struct IObjectIterator;
-struct RelativePathWithMetadata;
 class IObjectStorage;
 struct ObjectInfo;
 using ObjectInfoPtr = std::shared_ptr<ObjectInfo>;
@@ -85,7 +144,9 @@ public:
 
     virtual void modifyFormatSettings(FormatSettings &, const Context &) const {}
 
+    static constexpr bool supportsTotalRows() { return false; }
     virtual std::optional<size_t> totalRows(ContextPtr) const { return {}; }
+    static constexpr bool supportsTotalBytes() { return false; }
     virtual std::optional<size_t> totalBytes(ContextPtr) const { return {}; }
 
     /// Data which we are going to read is sorted by sorting key specified in StorageMetadataPtr.
@@ -136,6 +197,9 @@ public:
     virtual void checkAlterIsPossible(const AlterCommands & /*commands*/) { throwNotImplemented("alter"); }
     virtual void alter(const AlterCommands & /*params*/, ContextPtr /*context*/) { throwNotImplemented("alter"); }
     virtual void drop(ContextPtr) { }
+
+    virtual std::optional<String> partitionKey(ContextPtr) const { return {}; }
+    virtual std::optional<String> sortingKey(ContextPtr) const { return {}; }
 
 protected:
     virtual ObjectIterator

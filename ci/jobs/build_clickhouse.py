@@ -112,6 +112,16 @@ def main():
         os.environ["SCCACHE_IDLE_TIMEOUT"] = "7200"
         os.environ["SCCACHE_BUCKET"] = Settings.S3_ARTIFACT_PATH
         os.environ["SCCACHE_S3_KEY_PREFIX"] = "ccache/sccache"
+
+        if info.is_community_pr:
+            print(
+                "NOTE: Community contribution - set sccache to run without AWS credentials"
+            )
+            os.environ["SCCACHE_S3_NO_CREDENTIALS"] = "1"
+            # NOTE (strtgbb): sccache will throw an error if AWS credentials are present with SCCACHE_S3_NO_CREDENTIALS=1
+            os.environ.pop("AWS_SECRET_ACCESS_KEY", None)
+            os.environ.pop("AWS_ACCESS_KEY_ID", None)
+
         os.environ["CTCACHE_LOG_LEVEL"] = "debug"
         os.environ["CTCACHE_DIR"] = f"{build_dir}/ccache/clang-tidy-cache"
         os.environ["CTCACHE_S3_BUCKET"] = Settings.S3_ARTIFACT_PATH

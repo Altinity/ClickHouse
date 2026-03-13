@@ -572,4 +572,13 @@ enum class DeduplicateInsertSelectMode : uint8_t
 
 DECLARE_SETTING_ENUM(DeduplicateInsertSelectMode)
 
+enum class MergeTreePartExportFileAlreadyExistsPolicy : uint8_t
+{
+    skip,
+    error,
+    overwrite,
+};
+
+DECLARE_SETTING_ENUM(MergeTreePartExportFileAlreadyExistsPolicy)
+
 }

@@ -32,6 +32,7 @@ TEST_CONFIGS = [
     TC("test_storage_iceberg_no_spark/", True, "no idea why i'm sequential"),
     TC("test_storage_iceberg_with_spark_cache/", True, "no idea why i'm sequential"),
     TC("test_storage_iceberg_concurrent/", True, "no idea why i'm sequential"),
+    TC("test_export_replicated_mt_partition_to_object_storage/", True, "ZooKeeper can't handle too many parallel requests"),
 ]
 
 IMAGES_ENV = {
@@ -928,7 +929,7 @@ def get_tests_execution_time(info: Info, job_options: str) -> dict[str, int]:
     if info.pr_number == 0:
         branch_filter = f"head_ref = '{info.git_branch}'"
     else:
-        branch_filter = f"base_ref = '{info.base_branch}'"
+        branch_filter = f"head_ref = '{info.base_branch}'"
 
     build = job_options.split(",", 1)[0]
 

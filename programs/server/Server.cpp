@@ -87,6 +87,7 @@
 #include <Storages/System/attachSystemTables.h>
 #include <Storages/System/attachInformationSchemaTables.h>
 #include <Storages/Cache/registerRemoteFileMetadatas.h>
+#include <Storages/Cache/ObjectStorageListObjectsCache.h>
 #include <AggregateFunctions/registerAggregateFunctions.h>
 #include <Functions/UserDefined/IUserDefinedSQLObjectsStorage.h>
 #include <Functions/registerFunctions.h>
@@ -161,6 +162,10 @@
 #if USE_AZURE_BLOB_STORAGE
 #   include <azure/storage/common/internal/xml_wrapper.hpp>
 #   include <azure/core/diagnostics/logger.hpp>
+#endif
+
+#if USE_PARQUET
+#   include <Processors/Formats/Impl/ParquetFileMetaDataCache.h>
 #endif
 
 
@@ -415,6 +420,10 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 keeper_server_socket_send_timeout_sec;
     extern const ServerSettingsString hdfs_libhdfs3_conf;
     extern const ServerSettingsString config_file;
+    extern const ServerSettingsUInt64 object_storage_list_objects_cache_ttl;
+    extern const ServerSettingsUInt64 object_storage_list_objects_cache_size;
+    extern const ServerSettingsUInt64 object_storage_list_objects_cache_max_entries;
+    extern const ServerSettingsUInt64 input_format_parquet_metadata_cache_max_size;
 }
 
 namespace ErrorCodes
@@ -425,6 +434,9 @@ namespace ErrorCodes
 namespace FileCacheSetting
 {
     extern const FileCacheSettingsBool load_metadata_asynchronously;
+    extern const ServerSettingsUInt64 object_storage_list_objects_cache_size;
+    extern const ServerSettingsUInt64 object_storage_list_objects_cache_max_entries;
+    extern const ServerSettingsUInt64 object_storage_list_objects_cache_ttl;
 }
 
 }
@@ -1357,8 +1369,8 @@ try
         server_settings[ServerSetting::max_thread_pool_size],
         server_settings[ServerSetting::max_thread_pool_free_size],
         server_settings[ServerSetting::thread_pool_queue_size],
-        has_trace_collector ? server_settings[ServerSetting::global_profiler_real_time_period_ns] : 0,
-        has_trace_collector ? server_settings[ServerSetting::global_profiler_cpu_time_period_ns] : 0);
+        has_trace_collector ? server_settings[ServerSetting::global_profiler_real_time_period_ns].value : 0,
+        has_trace_collector ? server_settings[ServerSetting::global_profiler_cpu_time_period_ns].value : 0);
 
     if (has_trace_collector)
     {
@@ -2558,6 +2570,8 @@ try
 
     }
 
+    global_context->startSwarmMode();
+
     {
         std::lock_guard lock(servers_lock);
         /// We should start interserver communications before (and more important shutdown after) tables.
@@ -2737,7 +2751,15 @@ try
     /// try set up encryption. There are some errors in config, error will be printed and server wouldn't start.
     CompressionCodecEncrypted::Configuration::instance().load(config(), "encryption_codecs");
 
+    ObjectStorageListObjectsCache::instance().setMaxSizeInBytes(server_settings[ServerSetting::object_storage_list_objects_cache_size]);
+    ObjectStorageListObjectsCache::instance().setMaxCount(server_settings[ServerSetting::object_storage_list_objects_cache_max_entries]);
+    ObjectStorageListObjectsCache::instance().setTTL(server_settings[ServerSetting::object_storage_list_objects_cache_ttl]);
+
     auto replicas_reconnector = ReplicasReconnector::init(global_context);
+
+#if USE_PARQUET
+    ParquetFileMetaDataCache::instance()->setMaxSizeInBytes(server_settings[ServerSetting::input_format_parquet_metadata_cache_max_size]);
+#endif
 
     /// Set current database name before loading tables and databases because
     /// system logs may copy global context.
@@ -3021,6 +3043,8 @@ try
             stop_acme_instance();
 
             is_cancelled = true;
+
+            global_context->stopSwarmMode();
 
             LOG_DEBUG(log, "Waiting for current connections to close.");
 
