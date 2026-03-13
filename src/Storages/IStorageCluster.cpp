@@ -381,7 +381,7 @@ void IStorageCluster::read(
     auto this_ptr = std::static_pointer_cast<IStorageCluster>(shared_from_this());
 
     std::optional<Tables> external_tables = std::nullopt;
-    if (send_external_tables)
+    if (send_external_tables && query_info.planner_context && query_info.planner_context->getMutableQueryContext())
         external_tables = query_info.planner_context->getMutableQueryContext()->getExternalTables();
 
     auto reading = std::make_unique<ReadFromCluster>(
