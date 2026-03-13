@@ -332,20 +332,6 @@ void registerStorageDeltaLake(StorageFactory & factory)
             .has_builtin_setting_fn = DataLakeStorageSettings::hasBuiltin,
         });
 #    endif
-    factory.registerStorage(
-        DeltaLakeLocalDefinition::storage_engine_name,
-        [&](const StorageFactory::Arguments & args)
-        {
-            const auto storage_settings = getDataLakeStorageSettings(*args.storage_def);
-            auto configuration = std::make_shared<StorageLocalDeltaLakeConfiguration>(storage_settings);
-            return createStorageObjectStorage(args, configuration);
-        },
-        {
-            .supports_settings = true,
-            .supports_schema_inference = true,
-            .source_access_type = AccessTypeObjects::Source::FILE,
-            .has_builtin_setting_fn = StorageObjectStorageSettings::hasBuiltin,
-        });
 }
 #endif
 
