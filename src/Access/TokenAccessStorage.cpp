@@ -583,7 +583,7 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
     }
 
     if (id)
-        return AuthResult{ .user_id = *id, .authentication_data = AuthenticationData(AuthenticationType::JWT) };
+        return AuthResult{ .user_id = *id, .authentication_data = AuthenticationData(AuthenticationType::JWT), .user_name = credentials.getUserName()  };
     return std::nullopt;
 }
 
