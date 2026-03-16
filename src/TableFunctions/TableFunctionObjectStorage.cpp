@@ -31,6 +31,7 @@ namespace DB
 
 namespace Setting
 {
+    extern const SettingsBool allow_local_data_lakes;
     extern const SettingsUInt64 allow_experimental_parallel_reading_from_replicas;
     extern const SettingsBool parallel_replicas_for_cluster_engines;
     extern const SettingsString cluster_for_parallel_replicas;
@@ -40,6 +41,7 @@ namespace Setting
 namespace ErrorCodes
 {
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
+    extern const int SUPPORT_IS_DISABLED;
 }
 
 template <typename Definition, typename Configuration>
@@ -79,6 +81,15 @@ std::vector<size_t> TableFunctionObjectStorage<Definition, Configuration>::skipA
 template <typename Definition, typename Configuration>
 void TableFunctionObjectStorage<Definition, Configuration>::parseArguments(const ASTPtr & ast_function, ContextPtr context)
 {
+    if constexpr (std::is_same_v<Definition, IcebergLocalDefinition>)
+    {
+        if (!context->getSettingsRef()[Setting::allow_local_data_lakes])
+            throw Exception(
+                ErrorCodes::SUPPORT_IS_DISABLED,
+                "Table function '{}' is disabled. Set `allow_local_data_lakes` to enable it",
+                Definition::name);
+    }
+
     /// Clone ast function, because we can modify its arguments like removing headers.
     auto ast_copy = ast_function->clone();
     ASTs & args_func = ast_copy->children;
