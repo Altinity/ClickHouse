@@ -9,9 +9,9 @@
 #include <Core/UUID.h>
 #include <DataTypes/DataTypeSet.h>
 #include <Formats/FormatFilterInfo.h>
-#include <Formats/FormatParserSharedResources.h>
 #include <Formats/ReadSchemaUtils.h>
 #include <Functions/FunctionFactory.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/MetadataGenerator.h>
 #include <Functions/IFunctionAdaptors.h>
 #include <Functions/tuple.h>
 #include <Processors/Formats/ISchemaReader.h>
@@ -515,6 +515,83 @@ void IcebergMetadata::mutate(
         configuration->getTypeName(),
         configuration->getNamespace()
     );
+}
+
+void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICatalog> catalog, const StorageID & storage_id)
+{
+    if (!context->getSettingsRef()[Setting::allow_experimental_insert_into_iceberg].value)
+    {
+        throw Exception(
+            ErrorCodes::SUPPORT_IS_DISABLED,
+            "Iceberg truncate is experimental. "
+            "To allow its usage, enable setting allow_experimental_insert_into_iceberg");
+    }
+
+    auto [actual_data_snapshot, actual_table_state_snapshot] = getRelevantState(context);
+    auto metadata_object = getMetadataJSONObject(
+        actual_table_state_snapshot.metadata_file_path,
+        object_storage,
+        persistent_components.metadata_cache,
+        context,
+        log,
+        persistent_components.metadata_compression_method,
+        persistent_components.table_uuid);
+
+    Int64 parent_snapshot_id = actual_table_state_snapshot.snapshot_id.value_or(0);
+    
+    auto config_path = persistent_components.table_path;
+    if (config_path.empty() || config_path.back() != '/')
+        config_path += "/";
+    if (!config_path.starts_with('/'))
+        config_path = '/' + config_path;
+    
+    FileNamesGenerator filename_generator;
+    if (!context->getSettingsRef()[Setting::write_full_path_in_iceberg_metadata])
+    {
+        filename_generator = FileNamesGenerator(
+            config_path, config_path, (catalog != nullptr && catalog->isTransactional()), persistent_components.metadata_compression_method, write_format);
+    }
+    else
+    {
+        auto bucket = metadata_object->getValue<String>(Iceberg::f_location);
+        if (bucket.empty() || bucket.back() != '/')
+            bucket += "/";
+        filename_generator = FileNamesGenerator(
+            bucket, config_path, (catalog != nullptr && catalog->isTransactional()), persistent_components.metadata_compression_method, write_format);
+    }
+    
+    Int32 new_metadata_version = actual_table_state_snapshot.metadata_version + 1;
+    filename_generator.setVersion(new_metadata_version);
+    
+    auto [metadata_name, storage_metadata_name] = filename_generator.generateMetadataName();
+
+    auto [new_snapshot, manifest_list_name, storage_manifest_list_name] = MetadataGenerator(metadata_object).generateNextMetadata(
+        filename_generator, metadata_name, parent_snapshot_id, 
+        /* added_files */ 0, /* added_records */ 0, /* added_files_size */ 0, 
+        /* num_partitions */ 0, /* added_delete_files */ 0, /* num_deleted_rows */ 0);
+
+    // generate manifest list with 0 manifest files
+    auto write_settings = context->getWriteSettings();
+    auto buf = object_storage->writeObject(
+        StoredObject(storage_manifest_list_name),
+        WriteMode::Rewrite,
+        std::nullopt,
+        DBMS_DEFAULT_BUFFER_SIZE,
+        write_settings
+    );
+    generateManifestList(filename_generator, metadata_object, object_storage, context, {}, new_snapshot, 0, *buf, Iceberg::FileContentType::DATA, false);
+    buf->finalize();
+    
+    String metadata_content = dumpMetadataObjectToString(metadata_object);
+    writeMessageToFile(metadata_content, storage_metadata_name, object_storage, context, "*", "", persistent_components.metadata_compression_method);
+    
+    if (catalog)
+    {
+        const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
+        bool success = catalog->updateMetadata(namespace_name, table_name, storage_metadata_name, metadata_object);
+        if (!success)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Failed to commit Iceberg truncate update to catalog.");
+    }
 }
 
 void IcebergMetadata::checkMutationIsPossible(const MutationCommands & commands)
