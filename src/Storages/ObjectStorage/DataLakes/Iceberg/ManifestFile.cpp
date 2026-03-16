@@ -164,9 +164,10 @@ ManifestFileContent::ManifestFileContent(
     const String & path_to_manifest_file_)
     : path_to_manifest_file(path_to_manifest_file_)
 {
+    auto dump_metadata = [&]()->String { return manifest_file_deserializer.getMetadataContent(); };
     insertRowToLogTable(
         context,
-        manifest_file_deserializer.getMetadataContent(),
+        dump_metadata,
         DB::IcebergMetadataLogLevel::ManifestFileMetadata,
         common_path,
         path_to_manifest_file,
@@ -211,7 +212,7 @@ ManifestFileContent::ManifestFileContent(
     const Poco::JSON::Object::Ptr & schema_object = json.extract<Poco::JSON::Object::Ptr>();
     Int32 manifest_schema_id = schema_object->getValue<int>(f_schema_id);
 
-    schema_processor.addIcebergTableSchema(schema_object);
+    schema_processor.addIcebergTableSchema(schema_object, context);
 
     for (size_t i = 0; i != partition_specification->size(); ++i)
     {
@@ -241,9 +242,10 @@ ManifestFileContent::ManifestFileContent(
 
     for (size_t i = 0; i < manifest_file_deserializer.rows(); ++i)
     {
+        auto dump_row_metadata = [&]()->String { return manifest_file_deserializer.getContent(i); };
         insertRowToLogTable(
             context,
-            manifest_file_deserializer.getContent(i),
+            dump_row_metadata,
             DB::IcebergMetadataLogLevel::ManifestFileEntry,
             common_path,
             path_to_manifest_file,
