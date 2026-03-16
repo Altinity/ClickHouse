@@ -5976,6 +5976,9 @@ Normally this setting should be set in user profile (users.xml or queries like `
 
 Note that initially (24.12) there was a server setting (`send_settings_to_client`), but latter it got replaced with this client setting, for better usability.
 )", 0) \
+    DECLARE(Bool, allow_local_data_lakes, false, R"(
+Allow using local data lake engines and table functions (IcebergLocal, DeltaLakeLocal, etc.).
+)", 0) \
     \
     /* ####################################################### */ \
     /* ########### START OF EXPERIMENTAL FEATURES ############ */ \
