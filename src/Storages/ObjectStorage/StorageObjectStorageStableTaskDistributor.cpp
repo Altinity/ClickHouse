@@ -49,13 +49,16 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getNextTask(size_t numb
 
     saveLastNodeActivity(number_of_current_replica);
 
-    auto processed_file_list_ptr = replica_to_files_to_be_processed.find(number_of_current_replica);
-    if (processed_file_list_ptr == replica_to_files_to_be_processed.end())
-        throw Exception(
-            ErrorCodes::LOGICAL_ERROR,
-            "Replica number {} was marked as lost, can't set task for it anymore",
-            number_of_current_replica
-        );
+    {
+        std::lock_guard lock(mutex);
+        auto processed_file_list_ptr = replica_to_files_to_be_processed.find(number_of_current_replica);
+        if (processed_file_list_ptr == replica_to_files_to_be_processed.end())
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "Replica number {} was marked as lost, can't set task for it anymore",
+                number_of_current_replica
+            );
+    }
 
     // 1. Check pre-queued files first
     auto file = getPreQueuedFile(number_of_current_replica);
@@ -67,7 +70,19 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getNextTask(size_t numb
         file = getAnyUnprocessedFile(number_of_current_replica);
 
     if (file)
-        processed_file_list_ptr->second.push_back(file);
+    {
+        std::lock_guard lock(mutex);
+        auto processed_file_list_ptr = replica_to_files_to_be_processed.find(number_of_current_replica);
+        if (processed_file_list_ptr == replica_to_files_to_be_processed.end())
+        { // It is possible that replica was lost after check in the begining of the method
+            auto file_identifier = getFileIdentifier(file);
+            auto file_replica_idx = getReplicaForFile(file_identifier);
+            unprocessed_files.emplace(file_identifier, std::make_pair(file, file_replica_idx));
+            connection_to_files[file_replica_idx].push_back(file);
+        }
+        else
+            processed_file_list_ptr->second.push_back(file);
+    }
 
     return file;
 }
@@ -183,7 +198,13 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getMatchingFileFromIter
             }
         }
 
-        size_t file_replica_idx = getReplicaForFile(file_identifier);
+        size_t file_replica_idx;
+
+        {
+            std::lock_guard lock(mutex);
+            file_replica_idx = getReplicaForFile(file_identifier);
+        }
+
         if (file_replica_idx == number_of_current_replica)
         {
             LOG_TRACE(
