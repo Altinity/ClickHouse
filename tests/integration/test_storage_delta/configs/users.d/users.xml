@@ -5,6 +5,7 @@
             <profile>default</profile>
             <named_collection_control>1</named_collection_control>
             <delta_lake_enable_expression_visitor_logging>1</delta_lake_enable_expression_visitor_logging>
+            <allow_local_data_lakes>1</allow_local_data_lakes>
         </default>
     </users>
 </clickhouse>
