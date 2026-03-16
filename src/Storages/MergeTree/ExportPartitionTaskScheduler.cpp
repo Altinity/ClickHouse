@@ -236,6 +236,8 @@ void ExportPartitionTaskScheduler::run()
                     LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to schedule export part task, skipping");
                     return;
                 }
+
+                scheduled_exports_count++
             }
             else
             {
