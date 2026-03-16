@@ -30,7 +30,7 @@ def wait_for_export_status(
                 AND partition_id = '{partition_id}'
             """
         ).strip()
-        
+
         last_status = status
 
         if status and status == expected_status:
@@ -60,12 +60,12 @@ def wait_for_export_to_start(
               AND partition_id = '{partition_id}'
             """
         ).strip()
-        
+
         if count != '0':
             return True
-        
+
         time.sleep(poll_interval)
-    
+
     raise TimeoutError(f"Export did not start within {timeout}s. ")
 
 
@@ -85,7 +85,7 @@ def cluster():
     try:
         cluster = ClickHouseCluster(__file__)
         cluster.add_instance(
-            "replica1", 
+            "replica1",
             main_configs=["configs/named_collections.xml", "configs/allow_experimental_export_partition.xml"],
             user_configs=["configs/users.d/profile.xml"],
             with_minio=True,
@@ -94,7 +94,7 @@ def cluster():
             keeper_required_feature_flags=["multi_read"],
         )
         cluster.add_instance(
-            "replica2", 
+            "replica2",
             main_configs=["configs/named_collections.xml", "configs/allow_experimental_export_partition.xml"],
             user_configs=["configs/users.d/profile.xml"],
             with_minio=True,
@@ -104,13 +104,13 @@ def cluster():
         )
         # node that does not participate in the export, but will have visibility over the s3 table
         cluster.add_instance(
-            "watcher_node", 
+            "watcher_node",
             main_configs=["configs/named_collections.xml"],
             user_configs=[],
             with_minio=True,
         )
         cluster.add_instance(
-            "replica_with_export_disabled", 
+            "replica_with_export_disabled",
             main_configs=["configs/named_collections.xml", "configs/disable_experimental_export_partition.xml"],
             user_configs=["configs/users.d/profile.xml"],
             with_minio=True,
@@ -155,6 +155,7 @@ def create_s3_table(node, s3_table):
 
 
 def create_tables_and_insert_data(node, mt_table, s3_table, replica_name):
+    node.query(f"DROP TABLE IF EXISTS {mt_table} SYNC")
     node.query(f"CREATE TABLE {mt_table} (id UInt64, year UInt16) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', '{replica_name}') PARTITION BY year ORDER BY tuple() SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1")
     node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020), (3, 2020), (4, 2021)")
 
@@ -218,7 +219,7 @@ def test_restart_nodes_during_export(cluster):
             "action": "REJECT --reject-with tcp-reset",
         }
         pm.add_rule(pm_rule_reject_requests_node2)
-        
+
         export_queries = f"""
             ALTER TABLE {mt_table}
             EXPORT PARTITION ID '2020' TO TABLE {s3_table}
@@ -294,7 +295,7 @@ def test_kill_export(cluster, system_table_prefer_remote_information):
             "action": "REJECT --reject-with tcp-reset",
         }
         pm.add_rule(pm_rule_reject_requests)
-        
+
         # Block responses from MinIO for node2
         pm_rule_reject_responses_node2 = {
             "instance": node2,
@@ -314,7 +315,7 @@ def test_kill_export(cluster, system_table_prefer_remote_information):
             "action": "REJECT --reject-with tcp-reset",
         }
         pm.add_rule(pm_rule_reject_requests_node2)
-        
+
         export_queries = f"""
             ALTER TABLE {mt_table}
             EXPORT PARTITION ID '2020' TO TABLE {s3_table}
@@ -325,7 +326,7 @@ def test_kill_export(cluster, system_table_prefer_remote_information):
         """
 
         node.query(export_queries)
-        
+
         # Kill only 2020 while S3 is blocked - retry mechanism keeps exports alive
         # ZooKeeper operations (KILL) proceed quickly since only S3 is blocked
         node.query(f"KILL EXPORT PARTITION WHERE partition_id = '2020' and source_table = '{mt_table}' and destination_table = '{s3_table}'")
@@ -387,7 +388,7 @@ def test_drop_source_table_during_export(cluster):
             "action": "REJECT --reject-with tcp-reset",
         }
         pm.add_rule(pm_rule_reject_requests)
-        
+
         export_queries = f"""
             ALTER TABLE {mt_table}
             EXPORT PARTITION ID '2020' TO TABLE {s3_table};
