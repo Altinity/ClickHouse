@@ -110,7 +110,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         {
             // {"iceberg_partition_timezone", "", "", "New setting."},
             // {"s3_propagate_credentials_to_other_storages", false, false, "New setting"},
-            // {"export_merge_tree_part_filename_pattern", "", "{part_name}_{checksum}", "New setting"},
+            {"export_merge_tree_part_filename_pattern", "", "{part_name}_{checksum}", "New setting"},
             // {"use_parquet_metadata_cache", false, true, "Enables cache of parquet file metadata."},
             // {"input_format_parquet_use_metadata_cache", true, false, "Obsolete. No-op"}, // https://github.com/Altinity/ClickHouse/pull/586
             // {"object_storage_remote_initiator_cluster", "", "", "New setting."},
