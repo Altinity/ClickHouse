@@ -237,7 +237,7 @@ void ExportPartitionTaskScheduler::run()
                     return;
                 }
 
-                scheduled_exports_count++
+                scheduled_exports_count++;
             }
             else
             {
