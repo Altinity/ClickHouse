@@ -11,7 +11,6 @@
 #include <boost/algorithm/string/case_conv.hpp>
 #include <Poco/Util/AbstractConfiguration.h>
 
-
 namespace DB
 {
 
@@ -20,7 +19,9 @@ struct URIConverter
     static void modifyURI(Poco::URI & uri, std::unordered_map<std::string, std::string> mapper)
     {
         Macros macros({{"bucket", uri.getHost()}});
-        uri = macros.expand(mapper[uri.getScheme()]).empty() ? uri : Poco::URI(macros.expand(mapper[uri.getScheme()]) + uri.getPathAndQuery());
+        uri = macros.expand(mapper[uri.getScheme()]).empty()
+            ? uri
+            : Poco::URI(macros.expand(mapper[uri.getScheme()]) + uri.getPathAndQuery(), /*enable_url_encoding*/ false);
     }
 };
 
@@ -54,7 +55,7 @@ URI::URI(const std::string & uri_, bool allow_archive_path_syntax)
     else
         uri_str = uri_;
 
-    uri = Poco::URI(uri_str);
+    uri = Poco::URI(uri_str, /*enable_url_encoding*/ false);
 
     std::unordered_map<std::string, std::string> mapper;
     auto context = Context::getGlobalContextInstance();
