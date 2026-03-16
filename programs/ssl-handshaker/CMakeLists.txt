@@ -71,6 +71,18 @@ add_custom_command(
 )
 list(APPEND AWSLC_HSHAKER_OBJS "${GLIBC_COMPAT_HS_OBJ}")
 
+set(POSIX_SPAWN_2_HS_OBJ "${HSHAKER_OBJ_DIR}/posix_spawn_2.o")
+add_custom_command(
+    OUTPUT "${POSIX_SPAWN_2_HS_OBJ}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${HSHAKER_OBJ_DIR}"
+    COMMAND /usr/bin/cc -fPIC -O2 -w
+        -c "${CMAKE_CURRENT_SOURCE_DIR}/../ssl-common/posix_spawn_2.c"
+        -o "${POSIX_SPAWN_2_HS_OBJ}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../ssl-common/posix_spawn_2.c"
+    COMMENT "Building full posix_spawn for ssl-handshaker"
+)
+list(APPEND AWSLC_HSHAKER_OBJS "${POSIX_SPAWN_2_HS_OBJ}")
+
 set(AWSLC_HSHAKER_LIB "${HSHAKER_OBJ_DIR}/libawslc_handshaker.a")
 add_custom_command(
     OUTPUT "${AWSLC_HSHAKER_LIB}"
@@ -102,4 +114,7 @@ set(CLICKHOUSE_SSL_HANDSHAKER_INCLUDE PRIVATE ${AWSLC_SRC_DIR}/include)
 clickhouse_program_add(ssl-handshaker)
 add_dependencies(clickhouse-ssl-handshaker-lib awslc_handshaker_lib build-awslc)
 target_compile_options(clickhouse-ssl-handshaker-lib PRIVATE -Wno-everything)
-target_link_options(clickhouse-ssl-handshaker-lib INTERFACE "LINKER:--allow-multiple-definition")
+target_link_options(clickhouse-ssl-handshaker-lib INTERFACE
+    "LINKER:--allow-multiple-definition"
+    "LINKER:--wrap=posix_spawn"
+)

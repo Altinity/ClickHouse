@@ -75,6 +75,21 @@ add_custom_command(
 )
 list(APPEND AWSLC_SHIM_OBJS "${GLIBC_COMPAT_OBJ}")
 
+# Full posix_spawn with file-actions support (the base CH stub omits them).
+# Bundled in the same archive so the linker pulls it in when
+# handshake_util.cc's posix_spawn reference is resolved.
+set(POSIX_SPAWN_2_OBJ "${SHIM_OBJ_DIR}/posix_spawn_2.o")
+add_custom_command(
+    OUTPUT "${POSIX_SPAWN_2_OBJ}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${SHIM_OBJ_DIR}"
+    COMMAND /usr/bin/cc -fPIC -O2 -w
+        -c "${CMAKE_CURRENT_SOURCE_DIR}/../ssl-common/posix_spawn_2.c"
+        -o "${POSIX_SPAWN_2_OBJ}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../ssl-common/posix_spawn_2.c"
+    COMMENT "Building full posix_spawn for ssl-shim"
+)
+list(APPEND AWSLC_SHIM_OBJS "${POSIX_SPAWN_2_OBJ}")
+
 # Bundle all system-compiled objects into a static library
 set(AWSLC_SHIM_LIB "${SHIM_OBJ_DIR}/libawslc_shim.a")
 add_custom_command(
@@ -117,4 +132,7 @@ target_compile_options(clickhouse-ssl-shim-lib PRIVATE -Wno-everything)
 # libssl.a ABI), which creates a few duplicate symbols with ClickHouse's
 # libc++/libcxxabi (e.g. std::exception). Propagate via INTERFACE so the
 # flag only enters the link when this target is actually consumed.
-target_link_options(clickhouse-ssl-shim-lib INTERFACE "LINKER:--allow-multiple-definition")
+target_link_options(clickhouse-ssl-shim-lib INTERFACE
+    "LINKER:--allow-multiple-definition"
+    "LINKER:--wrap=posix_spawn"
+)
