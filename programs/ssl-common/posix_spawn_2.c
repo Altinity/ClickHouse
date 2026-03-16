@@ -1,10 +1,10 @@
-/// Full posix_spawn with file-actions support for SSL/ACVP test programs.
-/// Based on upstream musl: https://git.musl-libc.org/cgit/musl/tree/src/process/posix_spawn.c
+/// Based on musl's posix_spawn.c: https://git.musl-libc.org/cgit/musl/tree/src/process/posix_spawn.c
 ///
 /// Compiled with the system compiler and linked only into the ssl-shim
-/// and ssl-handshaker targets via --wrap=posix_spawn. All references to
-/// posix_spawn in the final binary are redirected here; the original
-/// limited stub in glibc-compatibility remains untouched.
+/// and ssl-handshaker archives. The AWS-LC sources are compiled with
+/// -Dposix_spawn=__ssl_posix_spawn so only their posix_spawn calls are
+/// redirected here; the rest of ClickHouse continues to use the original
+/// limited stub in glibc-compatibility, completely unaffected.
 ///
 /// The child function uses raw inline-asm syscalls (not glibc wrappers)
 /// because CLONE_VM shares the parent's TLS, and glibc's syscall()
@@ -253,9 +253,10 @@ out:
 	return ec;
 }
 
-/* Linked via --wrap=posix_spawn: the linker redirects all posix_spawn
- * references in the binary to __wrap_posix_spawn. */
-int __wrap_posix_spawn(pid_t *restrict res, const char *restrict path,
+/* Called by AWS-LC objects compiled with -Dposix_spawn=__ssl_posix_spawn.
+ * Only those translation units are redirected; all other CH code uses
+ * the original posix_spawn from glibc-compatibility. */
+int __ssl_posix_spawn(pid_t *restrict res, const char *restrict path,
 	const posix_spawn_file_actions_t *fa,
 	const posix_spawnattr_t *restrict attr,
 	char *const argv[restrict], char *const envp[restrict])

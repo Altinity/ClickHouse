@@ -38,9 +38,9 @@ foreach(src ${AWSLC_HSHAKER_CXX_SRCS})
     string(SUBSTRING "${dir_hash}" 0 8 dir_tag)
     set(obj "${HSHAKER_OBJ_DIR}/${base}_${dir_tag}.o")
 
-    set(extra_defs "")
+    set(extra_defs -Dposix_spawn=__ssl_posix_spawn)
     if("${base}" STREQUAL "handshaker")
-        set(extra_defs -Dmain=handshaker_main)
+        list(APPEND extra_defs -Dmain=handshaker_main)
     endif()
 
     add_custom_command(
@@ -114,7 +114,4 @@ set(CLICKHOUSE_SSL_HANDSHAKER_INCLUDE PRIVATE ${AWSLC_SRC_DIR}/include)
 clickhouse_program_add(ssl-handshaker)
 add_dependencies(clickhouse-ssl-handshaker-lib awslc_handshaker_lib build-awslc)
 target_compile_options(clickhouse-ssl-handshaker-lib PRIVATE -Wno-everything)
-target_link_options(clickhouse-ssl-handshaker-lib INTERFACE
-    "LINKER:--allow-multiple-definition"
-    "LINKER:--wrap=posix_spawn"
-)
+target_link_options(clickhouse-ssl-handshaker-lib INTERFACE "LINKER:--allow-multiple-definition")

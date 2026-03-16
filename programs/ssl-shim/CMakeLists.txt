@@ -40,9 +40,9 @@ foreach(src ${AWSLC_SHIM_CXX_SRCS})
     string(SUBSTRING "${dir_hash}" 0 8 dir_tag)
     set(obj "${SHIM_OBJ_DIR}/${base}_${dir_tag}.o")
 
-    set(extra_defs "")
+    set(extra_defs -Dposix_spawn=__ssl_posix_spawn)
     if("${base}" STREQUAL "bssl_shim")
-        set(extra_defs -Dmain=bssl_shim_main)
+        list(APPEND extra_defs -Dmain=bssl_shim_main)
     endif()
 
     add_custom_command(
@@ -132,7 +132,4 @@ target_compile_options(clickhouse-ssl-shim-lib PRIVATE -Wno-everything)
 # libssl.a ABI), which creates a few duplicate symbols with ClickHouse's
 # libc++/libcxxabi (e.g. std::exception). Propagate via INTERFACE so the
 # flag only enters the link when this target is actually consumed.
-target_link_options(clickhouse-ssl-shim-lib INTERFACE
-    "LINKER:--allow-multiple-definition"
-    "LINKER:--wrap=posix_spawn"
-)
+target_link_options(clickhouse-ssl-shim-lib INTERFACE "LINKER:--allow-multiple-definition")
