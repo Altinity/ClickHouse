@@ -55,6 +55,7 @@ public:
     MergeTreeSelectProcessor(
         MergeTreeReadPoolPtr pool_,
         MergeTreeSelectAlgorithmPtr algorithm_,
+        const FilterDAGInfoPtr & row_level_filter_,
         const PrewhereInfoPtr & prewhere_info_,
         const ExpressionActionsSettings & actions_settings_,
         const MergeTreeReadTask::BlockSizeParams & block_size_params_,
@@ -62,7 +63,10 @@ public:
 
     String getName() const;
 
-    static Block transformHeader(Block block, const PrewhereInfoPtr & prewhere_info);
+    static Block transformHeader(
+        Block block,
+        const FilterDAGInfoPtr & row_level_filter,
+        const PrewhereInfoPtr & prewhere_info);
     Block getHeader() const { return result_header; }
 
     ChunkAndProgress read();
@@ -72,7 +76,8 @@ public:
     const MergeTreeReaderSettings & getSettings() const { return reader_settings; }
 
     static PrewhereExprInfo getPrewhereActions(
-        PrewhereInfoPtr prewhere_info,
+        const FilterDAGInfoPtr & row_level_filter,
+        const PrewhereInfoPtr & prewhere_info,
         const ExpressionActionsSettings & actions_settings,
         bool enable_multiple_prewhere_read_steps,
         bool force_short_circuit_execution);
@@ -86,6 +91,7 @@ private:
     const MergeTreeReadPoolPtr pool;
     const MergeTreeSelectAlgorithmPtr algorithm;
 
+    const FilterDAGInfoPtr row_level_filter;
     const PrewhereInfoPtr prewhere_info;
     const ExpressionActionsSettings actions_settings;
     const PrewhereExprInfo prewhere_actions;

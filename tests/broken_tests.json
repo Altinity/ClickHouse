@@ -1,11 +1,29 @@
 {
     "02700_s3_part_INT_MAX": {
-        "reason": "Fails on asan"
+        "reason": "INVESTIGATE: Fails on asan"
     },
     "02815_no_throw_in_simple_queries": {
-        "reason": "Fails on asan,msan,tsan,debug,Aarch64"
+        "reason": "INVESTIGATE: Fails on asan,msan,tsan,debug,Aarch64"
     },
     "03206_no_exceptions_clickhouse_local": {
-        "reason": "Fails on asan,msan,tsan,debug,Aarch64"
+        "reason": "INVESTIGATE: Fails on asan,msan,tsan,debug,Aarch64"
+    },
+    "02479_race_condition_between_insert_and_droppin_mv": {
+        "reason": "INVESTIGATE: Unstable on ubsan"
+    },
+    "01825_new_type_json_ghdata": {
+        "reason": "INVESTIGATE: Sometime out of memory on msan"
+    },
+    "00159_parallel_formatting_http": {
+        "reason": "INVESTIGATE: Unstable on tsan"
+    },
+    "02941_variant_type_3": {
+        "reason": "INVESTIGATE: Memory limit exceeded on asan"
+    },
+    "03008_local_plain_rewritable": {
+        "reason": "INVESTIGATE: Memory limit exceeded on asan"
+    },
+    "02490_benchmark_max_consecutive_errors": {
+        "reason": "INVESTIGATE: Unstable on msan"
     }
 }

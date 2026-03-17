@@ -297,6 +297,8 @@ def test_https_non_ssl_auth():
 
 
 def test_create_user():
+    instance.query("DROP USER IF EXISTS emma")
+
     instance.query("CREATE USER emma IDENTIFIED WITH ssl_certificate CN 'client3'")
     assert (
         execute_query_https("SELECT currentUser()", user="emma", cert_name="client3")
@@ -330,12 +332,16 @@ def test_create_user():
         instance.query(
             "SELECT name, auth_type, auth_params FROM system.users WHERE name IN ['emma', 'lucy'] ORDER BY name"
         )
-        == 'emma\tssl_certificate\t{"common_names":["client2"]}\n'
-        'lucy\tssl_certificate\t{"common_names":["client2","client3"]}\n'
+        == "emma\t['ssl_certificate']\t['{\"common_names\":[\"client2\"]}']\n"
+        'lucy\t[\'ssl_certificate\']\t[\'{"common_names":["client2","client3"]}\']\n'
     )
+
+    instance.query("DROP USER IF EXISTS emma")
 
 
 def test_x509_san_support():
+    instance.query("DROP USER IF EXISTS jemma")
+
     assert (
         execute_query_native(
             instance, "SELECT currentUser()", user="jerome", cert_name="client4"
@@ -350,7 +356,7 @@ def test_x509_san_support():
         instance.query(
             "SELECT name, auth_type, auth_params FROM system.users WHERE name='jerome'"
         )
-        == 'jerome\tssl_certificate\t{"subject_alt_names":["URI:spiffe:\\\\/\\\\/foo.com\\\\/bar","URI:spiffe:\\\\/\\\\/foo.com\\\\/baz"]}\n'
+        == 'jerome\t[\'ssl_certificate\']\t[\'{"subject_alt_names":["URI:spiffe:\\\\/\\\\/foo.com\\\\/bar","URI:spiffe:\\\\/\\\\/foo.com\\\\/baz"]}\']\n'
     )
     # user `jerome` is configured via xml config, but `show create` should work regardless.
     assert (
@@ -369,3 +375,5 @@ def test_x509_san_support():
         instance.query("SHOW CREATE USER jemma")
         == "CREATE USER jemma IDENTIFIED WITH ssl_certificate SAN \\'URI:spiffe://foo.com/bar\\', \\'URI:spiffe://foo.com/baz\\'\n"
     )
+
+    instance.query("DROP USER IF EXISTS jemma")

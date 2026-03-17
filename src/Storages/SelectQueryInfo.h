@@ -41,12 +41,8 @@ using ClusterPtr = std::shared_ptr<Cluster>;
 
 struct PrewhereInfo
 {
-    /// Actions for row level security filter. Applied separately before prewhere_actions.
-    /// This actions are separate because prewhere condition should not be executed over filtered rows.
-    std::optional<ActionsDAG> row_level_filter;
     /// Actions which are executed on block in order to get filter column for prewhere step.
     ActionsDAG prewhere_actions;
-    String row_level_column_name;
     String prewhere_column_name;
     bool remove_prewhere_column = false;
     bool need_filter = false;
@@ -58,23 +54,7 @@ struct PrewhereInfo
 
     std::string dump() const;
 
-    PrewhereInfoPtr clone() const
-    {
-        PrewhereInfoPtr prewhere_info = std::make_shared<PrewhereInfo>();
-
-        if (row_level_filter)
-            prewhere_info->row_level_filter = row_level_filter->clone();
-
-        prewhere_info->prewhere_actions = prewhere_actions.clone();
-
-        prewhere_info->row_level_column_name = row_level_column_name;
-        prewhere_info->prewhere_column_name = prewhere_column_name;
-        prewhere_info->remove_prewhere_column = remove_prewhere_column;
-        prewhere_info->need_filter = need_filter;
-        prewhere_info->generated_by_optimizer = generated_by_optimizer;
-
-        return prewhere_info;
-    }
+    PrewhereInfo clone() const;
 };
 
 /// Helper struct to store all the information about the filter expression.
@@ -212,7 +192,11 @@ struct SelectQueryInfo
     bool has_window = false;
     bool has_order_by = false;
     bool need_aggregate = false;
+
+    /// Actions for row level security filter. Applied separately before prewhere.
+    /// These actions are separate because prewhere condition should not be executed over filtered rows.
     PrewhereInfoPtr prewhere_info;
+    FilterDAGInfoPtr row_level_filter;
 
     /// If query has aggregate functions
     bool has_aggregates = false;

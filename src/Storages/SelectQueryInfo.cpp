@@ -33,4 +33,19 @@ std::unordered_map<std::string, ColumnWithTypeAndName> SelectQueryInfo::buildNod
     return node_name_to_input_node_column;
 }
 
+PrewhereInfo PrewhereInfo::clone() const
+{
+    PrewhereInfo prewhere_info;
+
+    prewhere_info.prewhere_actions = prewhere_actions.clone();
+
+    prewhere_info.prewhere_column_name = prewhere_column_name;
+    prewhere_info.remove_prewhere_column = remove_prewhere_column;
+    prewhere_info.need_filter = need_filter;
+    prewhere_info.generated_by_optimizer = generated_by_optimizer;
+
+    return prewhere_info;
+}
+
+
 }

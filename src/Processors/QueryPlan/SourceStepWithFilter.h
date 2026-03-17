@@ -27,7 +27,6 @@ public:
         : ISourceStep(std::move(output_stream_))
         , required_source_columns(column_names_)
         , query_info(query_info_)
-        , prewhere_info(query_info.prewhere_info)
         , storage_snapshot(storage_snapshot_)
         , context(context_)
     {
@@ -37,7 +36,8 @@ public:
     std::optional<ActionsDAG> detachFilterActionsDAG() { return std::move(filter_actions_dag); }
 
     const SelectQueryInfo & getQueryInfo() const { return query_info; }
-    const PrewhereInfoPtr & getPrewhereInfo() const { return prewhere_info; }
+    const FilterDAGInfoPtr & getRowLevelFilter() const { return query_info.row_level_filter; }
+    const PrewhereInfoPtr & getPrewhereInfo() const { return query_info.prewhere_info; }
     ContextPtr getContext() const { return context; }
     const StorageSnapshotPtr & getStorageSnapshot() const { return storage_snapshot; }
 
@@ -71,12 +71,11 @@ public:
 
     void describeActions(JSONBuilder::JSONMap & map) const override;
 
-    static Block applyPrewhereActions(Block block, const PrewhereInfoPtr & prewhere_info);
+    static Block applyPrewhereActions(Block block, const FilterDAGInfoPtr & row_level_filter, const PrewhereInfoPtr & prewhere_info);
 
 protected:
     Names required_source_columns;
     SelectQueryInfo query_info;
-    PrewhereInfoPtr prewhere_info;
     StorageSnapshotPtr storage_snapshot;
     ContextPtr context;
     std::optional<size_t> limit;

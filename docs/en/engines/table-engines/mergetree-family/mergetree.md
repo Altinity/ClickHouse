@@ -519,7 +519,7 @@ Determines the lifetime of values.
 
 The `TTL` clause can be set for the whole table and for each individual column. Table-level `TTL` can also specify the logic of automatic moving data between disks and volumes, or recompressing parts where all the data has been expired.
 
-Expressions must evaluate to [Date](/docs/en/sql-reference/data-types/date.md) or [DateTime](/docs/en/sql-reference/data-types/datetime.md) data type.
+Expressions must evaluate to [Date](/docs/en/sql-reference/data-types/date.md), [Date32](/docs/en/sql-reference/data-types/date32.md), [DateTime](/docs/en/sql-reference/data-types/datetime.md) or [DateTime64](/docs/en/sql-reference/data-types/datetime64.md) data type.
 
 **Syntax**
 

@@ -1,1 +1,16 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="54" height="48" markdown="1" viewBox="0 0 9 8"><style>.o{fill:#fc0}.r{fill:red}</style><path d="M0,7 h1 v1 h-1 z" class="r"/><path d="M0,0 h1 v7 h-1 z" class="o"/><path d="M2,0 h1 v8 h-1 z" class="o"/><path d="M4,0 h1 v8 h-1 z" class="o"/><path d="M6,0 h1 v8 h-1 z" class="o"/><path d="M8,3.25 h1 v1.5 h-1 z" class="o"/></svg>
+<svg viewBox="0 0 150 150" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:svg="http://www.w3.org/2000/svg">
+<style xmlns="http://www.w3.org/2000/svg" type="text/css">
+
+polygon {
+    fill:#199DCF;
+    fill-opacity:1;
+}
+
+</style>
+  <polygon points="18.72 72.33 101.38 24.24 75.41 9.24 75.41 9.29 18.61 42.09 18.72 42.16 18.72 72.33 18.72 72.33"/>
+  <polygon points="23.82 75.09 47.01 88.57 47.01 61.59 23.82 75.09 23.82 75.09"/>
+  <polygon points="72.77 109.26 18.72 78.06 18.72 140.46 72.77 109.26 72.77 109.26"/>
+  <polygon points="101.3 56.84 129.55 40.4 106.41 27.04 78.07 43.53 101.3 56.84 101.3 56.84"/>
+  <polygon points="103.67 63.96 103.67 123.77 132.09 140.18 132.09 80.49 103.67 63.96 103.67 63.96"/>
+  <polygon points="106.23 59.7 132.09 74.67 132.09 44.66 106.23 59.7 106.23 59.7"/>
+</svg>
