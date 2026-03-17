@@ -6938,6 +6938,15 @@ Serialize String values during aggregation with zero byte at the end. Enable to 
     DECLARE(Bool, allow_local_data_lakes, false, R"(
 Allow using local data lake engines and table functions (IcebergLocal, DeltaLakeLocal, etc.).
 )", 0) \
+    DECLARE(Timezone, iceberg_partition_timezone, "", R"(
+Time zone by which partitioning of Iceberg tables was performed.
+Possible values:
+
+- Any valid timezone, e.g. `Europe/Berlin`, `UTC` or `Zulu`
+- `` (empty value) - use server or session timezone
+
+Default value is empty.
+)", 0) \
     \
     /* ####################################################### */ \
     /* ########### START OF EXPERIMENTAL FEATURES ############ */ \
