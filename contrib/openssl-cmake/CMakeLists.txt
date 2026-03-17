@@ -17,6 +17,45 @@ if(FIPS_CLICKHOUSE)
 set(AWSLC_BUILD_DIR "${CMAKE_BINARY_DIR}/awslc-build")
 set(AWSLC_BINARIES_DIR "${AWSLC_BUILD_DIR}/output")
 
+# If the caller didn't supply -DAWSLC_SRC_DIR=…, download the matching
+# source archive so ssl-shim / ssl-handshaker / acvp-server can compile
+# the AWS-LC test harness files with the system compiler.
+if(NOT DEFINED AWSLC_SRC_DIR)
+    set(_AWSLC_ZIP "${AWSLC_BUILD_DIR}/AWS-LC-FIPS-2.0.0.zip")
+    set(AWSLC_SRC_DIR "${AWSLC_BUILD_DIR}/aws-lc-AWS-LC-FIPS-2.0.0" CACHE PATH
+        "Path to AWS-LC source tree (auto-downloaded when not set)")
+
+    if(NOT EXISTS "${AWSLC_SRC_DIR}/ssl/test/bssl_shim.cc")
+        message(STATUS "Downloading AWS-LC FIPS 2.0.0 source for ssl-shim/handshaker/acvp targets")
+        file(DOWNLOAD
+            "https://github.com/aws/aws-lc/archive/refs/tags/AWS-LC-FIPS-2.0.0.zip"
+            "${_AWSLC_ZIP}"
+            EXPECTED_HASH SHA256=6241ec2f13a5f80224ee9cd8592ed66a97d426481066feaa4efc6f24e60bbc96
+            STATUS _dl_status
+        )
+        list(GET _dl_status 0 _dl_code)
+        if(NOT _dl_code EQUAL 0)
+            list(GET _dl_status 1 _dl_msg)
+            message(WARNING "AWS-LC source download failed (${_dl_msg}); "
+                            "ssl-shim/handshaker/acvp targets will be unavailable")
+            unset(AWSLC_SRC_DIR CACHE)
+        else()
+            execute_process(
+                COMMAND ${CMAKE_COMMAND} -E tar xf "${_AWSLC_ZIP}"
+                WORKING_DIRECTORY "${AWSLC_BUILD_DIR}"
+                RESULT_VARIABLE _extract_rc
+            )
+            if(NOT _extract_rc EQUAL 0)
+                message(WARNING "AWS-LC source extraction failed; "
+                                "ssl-shim/handshaker/acvp targets will be unavailable")
+                unset(AWSLC_SRC_DIR CACHE)
+            else()
+                message(STATUS "AWS-LC source available at ${AWSLC_SRC_DIR}")
+            endif()
+        endif()
+    endif()
+endif()
+
 message("Will build AWS-LC FIPS 2.0.0 in FIPS mode according to security policy #4816.")
 # build AWS-LC in FIPS mode accoring to the Security Policy:
 # https://csrc.nist.gov/CSRC/media/projects/cryptographic-module-validation-program/documents/security-policies/140sp4816.pdf
