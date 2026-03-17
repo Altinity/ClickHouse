@@ -6935,6 +6935,15 @@ Throw an error if there are pending patch parts when exporting a merge tree part
     DECLARE(Bool, serialize_string_in_memory_with_zero_byte, true, R"(
 Serialize String values during aggregation with zero byte at the end. Enable to keep compatibility when querying cluster of incompatible versions.
 )", 0) \
+    DECLARE(Timezone, iceberg_partition_timezone, "", R"(
+Time zone by which partitioning of Iceberg tables was performed.
+Possible values:
+
+- Any valid timezone, e.g. `Europe/Berlin`, `UTC` or `Zulu`
+- `` (empty value) - use server or session timezone
+
+Default value is empty.
+)", 0) \
     \
     /* ####################################################### */ \
     /* ########### START OF EXPERIMENTAL FEATURES ############ */ \
