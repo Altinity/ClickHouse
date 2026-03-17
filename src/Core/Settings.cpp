@@ -6938,6 +6938,9 @@ Serialize String values during aggregation with zero byte at the end. Enable to 
     DECLARE(Bool, allow_local_data_lakes, false, R"(
 Allow using local data lake engines and table functions (IcebergLocal, DeltaLakeLocal, etc.).
 )", 0) \
+    DECLARE(String, export_merge_tree_part_filename_pattern, "{part_name}_{checksum}", R"(
+Pattern for the filename of the exported merge tree part. The `part_name` and `checksum` are calculated and replaced on the fly. Additional macros are supported.
+)", 0) \
     DECLARE(Timezone, iceberg_partition_timezone, "", R"(
 Time zone by which partitioning of Iceberg tables was performed.
 Possible values:

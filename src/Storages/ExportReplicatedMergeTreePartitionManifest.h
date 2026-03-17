@@ -116,6 +116,7 @@ struct ExportReplicatedMergeTreePartitionManifest
     size_t max_bytes_per_file;
     size_t max_rows_per_file;
     MergeTreePartExportManifest::FileAlreadyExistsPolicy file_already_exists_policy;
+    String filename_pattern;
 
     std::string toJsonString() const
     {
@@ -141,6 +142,7 @@ struct ExportReplicatedMergeTreePartitionManifest
         json.set("create_time", create_time);
         json.set("max_retries", max_retries);
         json.set("ttl_seconds", ttl_seconds);
+        json.set("filename_pattern", filename_pattern);
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
         Poco::JSON::Stringifier::stringify(json, oss);
@@ -173,6 +175,7 @@ struct ExportReplicatedMergeTreePartitionManifest
         manifest.parquet_parallel_encoding = json->getValue<bool>("parquet_parallel_encoding");
         manifest.max_bytes_per_file = json->getValue<size_t>("max_bytes_per_file");
         manifest.max_rows_per_file = json->getValue<size_t>("max_rows_per_file");
+        manifest.filename_pattern = json->getValue<String>("filename_pattern");
         if (json->has("file_already_exists_policy"))
         {
             const auto file_already_exists_policy = magic_enum::enum_cast<MergeTreePartExportManifest::FileAlreadyExistsPolicy>(json->getValue<String>("file_already_exists_policy"));
