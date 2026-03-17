@@ -538,13 +538,12 @@ void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICa
         persistent_components.table_uuid);
 
     Int64 parent_snapshot_id = actual_table_state_snapshot.snapshot_id.value_or(0);
-    
     auto config_path = persistent_components.table_path;
     if (config_path.empty() || config_path.back() != '/')
         config_path += "/";
     if (!config_path.starts_with('/'))
         config_path = '/' + config_path;
-    
+
     FileNamesGenerator filename_generator;
     if (!context->getSettingsRef()[Setting::write_full_path_in_iceberg_metadata])
     {
@@ -559,15 +558,14 @@ void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICa
         filename_generator = FileNamesGenerator(
             bucket, config_path, (catalog != nullptr && catalog->isTransactional()), persistent_components.metadata_compression_method, write_format);
     }
-    
+ 
     Int32 new_metadata_version = actual_table_state_snapshot.metadata_version + 1;
     filename_generator.setVersion(new_metadata_version);
-    
     auto [metadata_name, storage_metadata_name] = filename_generator.generateMetadataName();
 
     auto [new_snapshot, manifest_list_name, storage_manifest_list_name] = MetadataGenerator(metadata_object).generateNextMetadata(
-        filename_generator, metadata_name, parent_snapshot_id, 
-        /* added_files */ 0, /* added_records */ 0, /* added_files_size */ 0, 
+        filename_generator, metadata_name, parent_snapshot_id,
+        /* added_files */ 0, /* added_records */ 0, /* added_files_size */ 0,
         /* num_partitions */ 0, /* added_delete_files */ 0, /* num_deleted_rows */ 0);
 
     // generate manifest list with 0 manifest files
@@ -581,10 +579,9 @@ void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICa
     );
     generateManifestList(filename_generator, metadata_object, object_storage, context, {}, new_snapshot, 0, *buf, Iceberg::FileContentType::DATA, false);
     buf->finalize();
-    
+
     String metadata_content = dumpMetadataObjectToString(metadata_object);
     writeMessageToFile(metadata_content, storage_metadata_name, object_storage, context, "*", "", persistent_components.metadata_compression_method);
-    
     if (catalog)
     {
         const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());

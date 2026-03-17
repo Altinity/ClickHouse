@@ -645,15 +645,12 @@ void StorageObjectStorage::truncate(
 
     if (configuration->isDataLakeConfiguration())
     {
-        if (isDataLake())
-        {
-            auto * data_lake_metadata = getExternalMetadata(context);
-            if (!data_lake_metadata || !data_lake_metadata->supportsTruncate())
-                throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Truncate is not supported for this data lake engine");
-            
-            data_lake_metadata->truncate(context, catalog, getStorageID());
-            return;
-        }
+        auto * data_lake_metadata = getExternalMetadata(context);
+        if (!data_lake_metadata || !data_lake_metadata->supportsTruncate())
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Truncate is not supported for this data lake engine");
+ 
+        data_lake_metadata->truncate(context, catalog, getStorageID());
+        return;
     }
 
     if (path.hasGlobs())

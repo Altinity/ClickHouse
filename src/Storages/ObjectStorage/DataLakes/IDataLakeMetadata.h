@@ -142,7 +142,7 @@ public:
     virtual bool supportsWrites() const { return false; }
     virtual bool supportsParallelInsert() const { return false; }
 
-    virtual void modifyFormatSettings(FormatSettings & /*format_settings*/, const Context & /*local_context*/) const {}
+    virtual void modifyFormatSettings(FormatSettings &, const Context &) const {}
 
     virtual bool supportsTruncate() const { return false; }
     virtual void truncate(ContextPtr /*context*/, std::shared_ptr<DataLake::ICatalog> /*catalog*/, const StorageID & /*storage_id*/)

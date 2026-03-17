@@ -36,7 +36,6 @@ def test_iceberg_truncate(started_cluster_iceberg_no_spark):
     )
 
     table_name = "test_truncate"
-    
     table = catalog.create_table(
         identifier=f"{namespace}.{table_name}",
         schema=schema,
@@ -63,7 +62,7 @@ def test_iceberg_truncate(started_cluster_iceberg_no_spark):
         SETTINGS catalog_type='rest', warehouse='demo', storage_endpoint='http://minio:9000/warehouse-rest';
         """
     )
-    
+
     # Assert data from ClickHouse
     assert int(instance.query(f"SELECT count() FROM {namespace}.{table_name}").strip()) == 3
 
