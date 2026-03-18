@@ -39,6 +39,10 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         /// controls new feature and it's 'true' by default, use 'false' as previous_value).
         /// It's used to implement `compatibility` setting (see https://github.com/ClickHouse/ClickHouse/issues/35972)
         /// Note: please check if the key already exists to prevent duplicate entries.
+        addSettingsChanges(settings_changes_history, "25.8.16.20002",
+        {
+            {"allow_local_data_lakes", false, false, "New setting."},
+        });
         addSettingsChanges(settings_changes_history, "25.8.9.2000",
         {
             {"allow_experimental_iceberg_read_optimization", true, true, "New setting."},
@@ -65,8 +69,10 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
             {"cluster_table_function_split_granularity", "file", "file", "New setting."},
             {"cluster_table_function_buckets_batch_size", 0, 0, "New setting."},
+            {"iceberg_partition_timezone", "", "", "New setting."},
             {"export_merge_tree_part_throw_on_pending_mutations", true, true, "New setting."},
             {"export_merge_tree_part_throw_on_pending_patch_parts", true, true, "New setting."},
+            {"export_merge_tree_part_filename_pattern", "", "{part_name}_{checksum}", "New setting"},
         });
         addSettingsChanges(settings_changes_history, "25.8",
         {

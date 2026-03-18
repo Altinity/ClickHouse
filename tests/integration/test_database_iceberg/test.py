@@ -5,7 +5,7 @@ import os
 import random
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 
 import pyarrow as pa
 import pytest
@@ -26,7 +26,8 @@ from pyiceberg.types import (
     StringType,
     StructType,
     TimestampType,
-    TimestamptzType
+    TimestamptzType,
+    TimeType,
 )
 from pyiceberg.table.sorting import UNSORTED_SORT_ORDER
 
@@ -939,3 +940,91 @@ def test_cluster_select(started_cluster):
         assert len(cluster_secondary_queries) == 1
 
     assert node2.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`", settings={"parallel_replicas_for_cluster_engines":1, 'enable_parallel_replicas': 2, 'cluster_for_parallel_replicas': 'cluster_simple', 'parallel_replicas_for_cluster_engines' : 1}) == 'pablo\n'
+
+
+@pytest.mark.parametrize("storage_type", ["s3"])
+def test_partitioning_by_time(started_cluster, storage_type):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_partitioning_by_time_{uuid.uuid4()}"
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+
+    namespace = f"{root_namespace}.A"
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+
+    schema = Schema(
+        NestedField(
+            field_id=1,
+            name="key",
+            field_type=TimeType(),
+            required=False
+        ),
+        NestedField(
+            field_id=2,
+            name="value",
+            field_type=StringType(),
+            required=False,
+        ),
+    )
+
+    partition_spec = PartitionSpec(
+        PartitionField(
+            source_id=1, field_id=1000, transform=IdentityTransform(), name="partition_key"
+        )
+    )
+
+    table = create_table(catalog, namespace, table_name, schema=schema, partition_spec=partition_spec)
+    data = [{"key": dtime(12,0,0), "value": "test"}]
+    df = pa.Table.from_pylist(data)
+    table.append(df)
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+
+    # Fix test when https://github.com/Altinity/ClickHouse/issues/15355 is resolved
+    # Must be 43200
+    assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{namespace}.{table_name}`") == "43200000000\ttest\n"
+
+
+@pytest.mark.parametrize("storage_type", ["s3"])
+def test_partitioning_by_string(started_cluster, storage_type):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_partitioning_by_string_{uuid.uuid4()}"
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+
+    namespace = f"{root_namespace}.A"
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+
+    schema = Schema(
+        NestedField(
+            field_id=1,
+            name="key",
+            field_type=StringType(),
+            required=False
+        ),
+        NestedField(
+            field_id=2,
+            name="value",
+            field_type=StringType(),
+            required=False,
+        ),
+    )
+
+    partition_spec = PartitionSpec(
+        PartitionField(
+            source_id=1, field_id=1000, transform=IdentityTransform(), name="partition_key"
+        )
+    )
+
+    table = create_table(catalog, namespace, table_name, schema=schema, partition_spec=partition_spec)
+    data = [{"key": "a:b,c[d=e/f%g?h", "value": "test"}]
+    df = pa.Table.from_pylist(data)
+    table.append(df)
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+
+    assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{namespace}.{table_name}`") == "a:b,c[d=e/f%g?h\ttest\n"
