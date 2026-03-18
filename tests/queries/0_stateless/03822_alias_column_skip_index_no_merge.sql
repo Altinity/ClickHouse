@@ -16,7 +16,7 @@ CREATE TABLE test_alias_skip_idx
 )
 ENGINE = MergeTree
 ORDER BY c
-SETTINGS index_granularity = 8192, add_minmax_index_for_numeric_columns = 0;
+SETTINGS index_granularity = 8192;
 
 INSERT INTO test_alias_skip_idx SELECT number FROM numbers(10);
 INSERT INTO test_alias_skip_idx SELECT number + 200 FROM numbers(10);
@@ -43,7 +43,7 @@ CREATE TABLE test_nested_alias_idx
 )
 ENGINE = MergeTree
 ORDER BY c
-SETTINGS index_granularity = 8192, add_minmax_index_for_numeric_columns = 0;
+SETTINGS index_granularity = 8192;
 
 INSERT INTO test_nested_alias_idx SELECT number FROM numbers(10);
 INSERT INTO test_nested_alias_idx SELECT number + 200 FROM numbers(10);
