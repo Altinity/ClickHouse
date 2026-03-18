@@ -6,4 +6,9 @@
             <named_collection_control>1</named_collection_control>
         </default>
     </users>
+    <profiles>
+        <default>
+            <allow_local_data_lakes>1</allow_local_data_lakes>
+        </default>
+    </profiles>
 </clickhouse>
