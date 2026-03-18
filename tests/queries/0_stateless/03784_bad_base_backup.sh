@@ -22,6 +22,7 @@ function thread()
 
     $CLICKHOUSE_CLIENT --query="
     SET allow_suspicious_low_cardinality_types = 1;
+    SET allow_local_data_lakes = 1;
 
     DROP DATABASE IF EXISTS d1_$CLICKHOUSE_DATABASE;
     DROP DATABASE IF EXISTS d2_$CLICKHOUSE_DATABASE;

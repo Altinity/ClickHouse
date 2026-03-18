@@ -87,7 +87,10 @@ def started_cluster():
                 "configs/config.d/filesystem_caches.xml",
                 "configs/config.d/metadata_log.xml",
             ],
-            user_configs=["configs/users.d/users.xml"],
+            user_configs=[
+                "configs/users.d/users.xml",
+                "configs/users.d/allow_local_data_lakes.xml",
+            ],
             with_minio=True,
             with_azurite=True,
             stay_alive=True,
@@ -101,7 +104,10 @@ def started_cluster():
                 "configs/config.d/filesystem_caches.xml",
                 "configs/config.d/metadata_log.xml",
             ],
-            user_configs=["configs/users.d/users.xml"],
+            user_configs=[
+                "configs/users.d/users.xml",
+                "configs/users.d/allow_local_data_lakes.xml",
+            ],
             stay_alive=True,
         )
         cluster.add_instance(
@@ -113,7 +119,10 @@ def started_cluster():
                 "configs/config.d/filesystem_caches.xml",
                 "configs/config.d/metadata_log.xml",
             ],
-            user_configs=["configs/users.d/users.xml"],
+            user_configs=[
+                "configs/users.d/users.xml",
+                "configs/users.d/allow_local_data_lakes.xml",
+            ],
             stay_alive=True,
         )
 
