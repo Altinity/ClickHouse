@@ -62,7 +62,12 @@ def test_iceberg_truncate(started_cluster_iceberg_no_spark):
     instance.query(
         f"""
         CREATE DATABASE {namespace} ENGINE = DataLakeCatalog('http://rest:8181/v1', 'minio', 'minio123')
-        SETTINGS catalog_type='rest', warehouse='demo', storage_endpoint='http://minio:9000/warehouse-rest';
+        SETTINGS 
+            catalog_type='rest', 
+            warehouse='demo', 
+            storage_endpoint='http://minio:9000/warehouse-rest',
+            s3_access_key_id='minio',
+            s3_secret_access_key='minio123';
         """,
         settings={"allow_database_iceberg": 1}
     )
