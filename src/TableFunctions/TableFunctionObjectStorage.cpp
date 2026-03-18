@@ -87,7 +87,7 @@ void TableFunctionObjectStorage<Definition, Configuration>::parseArguments(const
             throw Exception(
                 ErrorCodes::SUPPORT_IS_DISABLED,
                 "Table function '{}' is disabled. Set `allow_local_data_lakes` to enable it",
-                Definition::name);
+                getName());
     }
 
     /// Clone ast function, because we can modify its arguments like removing headers.
@@ -120,6 +120,15 @@ template <typename Definition, typename Configuration>
 ColumnsDescription TableFunctionObjectStorage<
     Definition, Configuration>::getActualTableStructure(ContextPtr context, bool is_insert_query) const
 {
+    if constexpr (std::is_same_v<Definition, IcebergLocalDefinition>)
+    {
+        if (!context->getSettingsRef()[Setting::allow_local_data_lakes])
+            throw Exception(
+                ErrorCodes::SUPPORT_IS_DISABLED,
+                "Table function '{}' is disabled. Set `allow_local_data_lakes` to enable it",
+                getName());
+    }
+
     if (configuration->structure == "auto")
     {
         context->checkAccess(getSourceAccessType());
@@ -140,6 +149,15 @@ StoragePtr TableFunctionObjectStorage<Definition, Configuration>::executeImpl(
     ColumnsDescription cached_columns,
     bool is_insert_query) const
 {
+    if constexpr (std::is_same_v<Definition, IcebergLocalDefinition>)
+    {
+        if (!context->getSettingsRef()[Setting::allow_local_data_lakes])
+            throw Exception(
+                ErrorCodes::SUPPORT_IS_DISABLED,
+                "Table function '{}' is disabled. Set `allow_local_data_lakes` to enable it",
+                getName());
+    }
+
     chassert(configuration);
     ColumnsDescription columns;
 
@@ -297,6 +315,10 @@ template class TableFunctionObjectStorage<HDFSDefinition, StorageHDFSConfigurati
 template class TableFunctionObjectStorage<HDFSClusterDefinition, StorageHDFSConfiguration>;
 #endif
 template class TableFunctionObjectStorage<LocalDefinition, StorageLocalConfiguration>;
+
+#if USE_AVRO
+template class TableFunctionObjectStorage<IcebergLocalDefinition, StorageLocalIcebergConfiguration>;
+#endif
 
 #if USE_AVRO && USE_AWS_S3
 template class TableFunctionObjectStorage<IcebergS3ClusterDefinition, StorageS3IcebergConfiguration>;
