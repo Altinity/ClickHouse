@@ -342,9 +342,9 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
             normalized_path = "s3://" + target_decomposed.authority + "/" + target_decomposed.key;
         }
         // enable_url_encoding=false, path from metadata must have correct encoding already
-        S3::URI s3_uri(normalized_path);
+        S3::URI s3_uri(normalized_path, /*allow_archive_path_syntax*/ false, /*enable_url_encoding*/ false);
 
-        std::string key_to_use = target_decomposed.key;
+        std::string key_to_use = s3_uri.key;
 
         bool use_base_storage = false;
         if (base_storage->getType() == ObjectStorageType::S3)
@@ -366,7 +366,7 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
             {
                 normalized_table_location = "s3://" + table_location_decomposed.authority + "/" + table_location_decomposed.key;
             }
-            S3::URI base_s3_uri(normalized_table_location);
+            S3::URI base_s3_uri(normalized_table_location, /*allow_archive_path_syntax*/ false, /*enable_url_encoding*/ false);
 
             if (s3URIMatches(s3_uri, base_s3_uri.bucket, base_s3_uri.endpoint, target_scheme_normalized))
                 use_base_storage = true;
