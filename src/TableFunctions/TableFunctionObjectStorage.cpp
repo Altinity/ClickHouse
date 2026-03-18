@@ -97,8 +97,7 @@ TableFunctionObjectStorage<Definition, Configuration, is_data_lake>::createEmpty
 template <typename Definition, typename Configuration, bool is_data_lake>
 void TableFunctionObjectStorage<Definition, Configuration, is_data_lake>::parseArguments(const ASTPtr & ast_function, ContextPtr context)
 {
-    if constexpr (std::is_same_v<Definition, IcebergLocalDefinition> || std::is_same_v<Definition, IcebergLocalClusterDefinition>
-                  || std::is_same_v<Definition, DeltaLakeLocalDefinition>)
+    if constexpr (std::is_same_v<Definition, IcebergLocalDefinition> || std::is_same_v<Definition, DeltaLakeLocalDefinition>)
     {
         if (!context->getSettingsRef()[Setting::allow_local_data_lakes])
             throw Exception(
