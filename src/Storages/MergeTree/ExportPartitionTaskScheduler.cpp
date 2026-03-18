@@ -56,7 +56,9 @@ namespace
         context_copy->setSetting("export_merge_tree_part_throw_on_pending_mutations", false);
         context_copy->setSetting("export_merge_tree_part_throw_on_pending_patch_parts", false);
 
-        return context_copy;
+        context_copy->setSetting("export_merge_tree_part_filename_pattern", manifest.filename_pattern);
+
+	return context_copy;
     }
 }
 
@@ -236,6 +238,8 @@ void ExportPartitionTaskScheduler::run()
                     LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to schedule export part task, skipping");
                     return;
                 }
+
+                scheduled_exports_count++;
             }
             else
             {
@@ -266,6 +270,8 @@ void ExportPartitionTaskScheduler::run()
                         {
                             handlePartExportCompletion(key, zk_part_name, manifest, destination_storage, result);
                         });
+
+                    scheduled_exports_count++;
                 }
                 catch (const Exception &)
                 {
@@ -277,7 +283,6 @@ void ExportPartitionTaskScheduler::run()
                 }
             }
 
-            scheduled_exports_count++;
         }
     }
 }
