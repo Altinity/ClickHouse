@@ -44,6 +44,7 @@
 #include <Interpreters/IcebergMetadataLog.h>
 
 #include <Storages/ObjectStorage/DataLakes/Common/Common.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/MetadataGenerator.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSource.h>
 #include <IO/CompressedReadBufferWrapper.h>
 #include <Interpreters/ExpressionActions.h>
@@ -68,7 +69,6 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Snapshot.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/StatelessMetadataFileGetter.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
-
 #include <Common/ProfileEvents.h>
 #include <Common/SharedLockGuard.h>
 #include <Common/logger_useful.h>
@@ -1185,6 +1185,276 @@ KeyDescription IcebergMetadata::getSortingKey(ContextPtr local_context, TableSta
     auto sort_order_id = metadata_object->getValue<Int64>(f_default_sort_order_id);
     result.sort_order_id = sort_order_id;
     return result;
+}
+
+SinkToStoragePtr IcebergMetadata::import(
+    std::shared_ptr<DataLake::ICatalog> catalog,
+    const std::function<void(const std::string &)> & /* new_file_path_callback */,
+    SharedHeader sample_block,
+    const std::string & iceberg_metadata_json_string,
+    const std::optional<FormatSettings> & format_settings,
+    ContextPtr context)
+{
+    Poco::JSON::Parser parser; /// For some reason base/base/JSON.h can not parse this json file
+    Poco::Dynamic::Var json = parser.parse(iceberg_metadata_json_string);
+    Poco::JSON::Object::Ptr metadata_json = json.extract<Poco::JSON::Object::Ptr>();
+
+    return std::make_shared<IcebergImportSink>(
+        catalog, persistent_components, metadata_json, object_storage, context, format_settings, write_format, sample_block);
+}
+
+bool IcebergMetadata::commitImportPartitionTransactionImpl(
+    FileNamesGenerator & filename_generator,
+    Poco::JSON::Object::Ptr initial_metadata,
+    Int64 original_schema_id,
+    std::optional<ChunkPartitioner> & partitioner,
+    ContextPtr context,
+    SharedHeader sample_block,
+    const std::string & partition_key)
+{
+    auto [metadata_name, storage_metadata_name] = filename_generator.generateMetadataName();
+
+    Int64 parent_snapshot = -1;
+    if (initial_metadata->has(Iceberg::f_current_snapshot_id))
+        parent_snapshot = initial_metadata->getValue<Int64>(Iceberg::f_current_snapshot_id);
+
+    /// todo arthur
+    Int32 total_data_files = 10;
+    Int32 total_rows = 10;
+    Int32 total_chunks_size = 10;
+
+    auto [new_snapshot, manifest_list_name, storage_manifest_list_name] = MetadataGenerator(initial_metadata).generateNextMetadata(
+        filename_generator, metadata_name, parent_snapshot, total_data_files, total_rows, total_chunks_size, total_data_files, /* added_delete_files */0, /* num_deleted_rows */0);
+
+    String manifest_entry_name;
+    String storage_manifest_entry_name;
+    Int32 manifest_lengths = 0;
+
+    auto cleanup = [&] (bool retry_because_of_metadata_conflict)
+    {
+        if (!retry_because_of_metadata_conflict)
+        {
+            /// todo arthur
+            // for (const auto & [_, writer] : writer_per_partition_key)
+            //     writer.clearAllDataFiles();
+        }
+
+        // for (const auto & manifest_filename_in_storage : manifest_entries_in_storage)
+        object_storage->removeObjectIfExists(StoredObject(storage_manifest_entry_name));
+
+        object_storage->removeObjectIfExists(StoredObject(storage_manifest_list_name));
+
+        if (retry_because_of_metadata_conflict)
+        {
+            auto [last_version, metadata_path, compression_method] = getLatestOrExplicitMetadataFileAndVersion(
+                object_storage,
+                persistent_components.table_path,
+                data_lake_settings,
+                persistent_components.metadata_cache,
+                context,
+                getLogger("IcebergWrites").get(),
+                persistent_components.table_uuid);
+
+            LOG_DEBUG(log, "Rereading metadata file {} with version {}", metadata_path, last_version);
+
+            auto metadata_compression_method = compression_method;
+            filename_generator.setVersion(last_version + 1);
+
+            auto metadata = getMetadataJSONObject(
+                metadata_path,
+                object_storage,
+                persistent_components.metadata_cache,
+                context,
+                getLogger("IcebergWrites"),
+                compression_method,
+                persistent_components.table_uuid);
+            const auto partition_spec_id = metadata->getValue<Int64>(Iceberg::f_default_spec_id);
+            auto partitions_specs = metadata->getArray(Iceberg::f_partition_specs);
+
+            auto new_schema_id = metadata->getValue<Int64>(Iceberg::f_current_schema_id);
+            if (new_schema_id != original_schema_id)
+                throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Metadata changed during write operation, try again");
+
+            Poco::JSON::Object::Ptr current_schema;
+            auto schemas = metadata->getArray(Iceberg::f_schemas);
+            for (size_t i = 0; i < schemas->size(); ++i)
+            {
+                if (schemas->getObject(static_cast<UInt32>(i))->getValue<Int32>(Iceberg::f_schema_id) == original_schema_id)
+                {
+                    current_schema = schemas->getObject(static_cast<UInt32>(i));
+                }
+            }
+            for (size_t i = 0; i < partitions_specs->size(); ++i)
+            {
+                auto current_partition_spec = partitions_specs->getObject(static_cast<UInt32>(i));
+                if (current_partition_spec->getValue<Int64>(Iceberg::f_spec_id) == partition_spec_id)
+                {
+                    partititon_spec = current_partition_spec;
+                    if (current_partition_spec->getArray(Iceberg::f_fields)->size() > 0)
+                        partitioner = ChunkPartitioner(current_partition_spec->getArray(Iceberg::f_fields), current_schema, context, sample_block);
+                    break;
+                }
+            }
+        }
+    };
+
+    try
+    {
+        std::tie(manifest_entry_name, storage_manifest_entry_name) = filename_generator.generateManifestEntryName();
+
+        auto buffer_manifest_entry = object_storage->writeObject(
+            StoredObject(storage_manifest_entry_name), WriteMode::Rewrite, std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());
+
+        try
+        {
+            generateManifestFile(
+                metadata,
+                partitioner ? partitioner->getColumns() : std::vector<String>{},
+                partition_key,
+                partitioner ? partitioner->getResultTypes() : std::vector<DataTypePtr>{},
+                {},// todo arthurwriter.getDataFiles(),
+                {},// todo arthurwriter.getResultStatistics(),
+                sample_block,
+                new_snapshot,
+                write_format,
+                partititon_spec,
+                partition_spec_id,
+                *buffer_manifest_entry,
+                Iceberg::FileContentType::DATA);
+            buffer_manifest_entry->finalize();
+            manifest_lengths += buffer_manifest_entry->count();
+        }
+        catch (...)
+        {
+            cleanup(false);
+            throw;
+        }
+
+        {
+            auto buffer_manifest_list = object_storage->writeObject(
+                StoredObject(storage_manifest_list_name), WriteMode::Rewrite, std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());
+
+            try
+            {
+                generateManifestList(
+                    filename_generator, metadata, object_storage, context, {manifest_entry_name}, new_snapshot, manifest_lengths, *buffer_manifest_list, Iceberg::FileContentType::DATA);
+                buffer_manifest_list->finalize();
+            }
+            catch (...)
+            {
+                cleanup(false);
+                throw;
+            }
+        }
+
+        {
+            std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+            Poco::JSON::Stringifier::stringify(metadata, oss, 4);
+            std::string json_representation = removeEscapedSlashes(oss.str());
+
+            fiu_do_on(FailPoints::iceberg_writes_cleanup,
+            {
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Failpoint for cleanup enabled");
+            });
+
+            LOG_DEBUG(log, "Writing new metadata file {}", storage_metadata_name);
+            auto hint = filename_generator.generateVersionHint();
+            if (!writeMetadataFileAndVersionHint(
+                    storage_metadata_name,
+                    json_representation,
+                    hint.path_in_storage,
+                    storage_metadata_name,
+                    object_storage,
+                    context,
+                    metadata_compression_method,
+                    data_lake_settings[DataLakeStorageSetting::iceberg_use_version_hint]))
+            {
+                LOG_DEBUG(log, "Failed to write metadata {}, retrying", storage_metadata_name);
+                cleanup(true);
+                return false;
+            }
+            else
+            {
+                LOG_DEBUG(log, "Metadata file {} written", storage_metadata_name);
+            }
+
+            if (catalog)
+            {
+                String catalog_filename = metadata_name;
+                if (!catalog_filename.starts_with(blob_storage_type_name))
+                    catalog_filename = blob_storage_type_name + "://" + blob_storage_namespace_name + "/" + metadata_name;
+
+                const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
+                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot))
+                {
+                    cleanup(true);
+                    return false;
+                }
+            }
+        }
+    }
+    catch (...)
+    {
+        cleanup(false);
+        throw;
+    }
+
+    return true;
+}
+
+void IcebergMetadata::commitExportPartitionTransaction(
+    std::shared_ptr<DataLake::ICatalog> catalog,
+    const std::string & iceberg_metadata_json_string,
+    ContextPtr context)
+{
+    Poco::JSON::Parser parser; /// For some reason base/base/JSON.h can not parse this json file
+    Poco::Dynamic::Var json = parser.parse(iceberg_metadata_json_string);
+    Poco::JSON::Object::Ptr metadata = json.extract<Poco::JSON::Object::Ptr>();
+
+    const auto metadata_compression_method = CompressionMethod::Gzip;
+    auto config_path = persistent_components.table_path;
+    if (config_path.empty() || config_path.back() != '/')
+        config_path += "/";
+    if (!config_path.starts_with('/'))
+        config_path = '/' + config_path;
+
+    FileNamesGenerator filename_generator;
+    if (!context->getSettingsRef()[Setting::write_full_path_in_iceberg_metadata])
+    {
+        filename_generator = FileNamesGenerator(
+            config_path, config_path, (catalog != nullptr && catalog->isTransactional()), metadata_compression_method, write_format);
+    }
+    else
+    {
+        auto bucket = metadata->getValue<String>(Iceberg::f_location);
+        if (bucket.empty() || bucket.back() != '/')
+            bucket += "/";
+        filename_generator = FileNamesGenerator(
+            bucket, config_path, (catalog != nullptr && catalog->isTransactional()), metadata_compression_method, write_format);
+    }
+
+    std::optional<ChunkPartitioner> partitioner;
+
+    size_t i = 0;
+    while (i < 10)
+    {
+        if (commitImportPartitionTransactionImpl(filename_generator, metadata, partitioner, context, sample_block, partition_key))
+            break;
+        ++i;
+    }
+}
+
+Poco::JSON::Object::Ptr IcebergMetadata::getMetadataJSON(ContextPtr local_context) const
+{
+    auto [actual_data_snapshot, actual_table_state_snapshot] = getRelevantState(local_context);
+    return getMetadataJSONObject(
+        actual_table_state_snapshot.metadata_file_path,
+        object_storage,
+        persistent_components.metadata_cache,
+        local_context,
+        log,
+        persistent_components.metadata_compression_method,
+        persistent_components.table_uuid);
 }
 
 }

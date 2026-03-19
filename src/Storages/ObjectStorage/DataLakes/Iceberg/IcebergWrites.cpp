@@ -1044,6 +1044,107 @@ bool IcebergStorageSink::initializeMetadata()
     return true;
 }
 
+IcebergImportSink::IcebergImportSink(
+    std::shared_ptr<DataLake::ICatalog> catalog_,
+    const Iceberg::PersistentTableComponents & persistent_table_components_,
+    Poco::JSON::Object::Ptr metadata_json_,
+    ObjectStoragePtr object_storage_,
+    ContextPtr context_,
+    std::optional<FormatSettings> format_settings_,
+    const String & write_format_,
+    SharedHeader sample_block_)
+    : SinkToStorage(sample_block_)
+    , catalog(catalog_)
+    , persistent_table_components(persistent_table_components_)
+    , metadata_json(metadata_json_)
+    , object_storage(object_storage_)
+    , context(context_)
+    , format_settings(format_settings_)
+    , write_format(write_format_)
+    , sample_block(sample_block_)
+{
+    const auto current_schema_id = metadata_json->getValue<Int64>(Iceberg::f_current_schema_id);
+    const auto schemas = metadata_json->getArray(Iceberg::f_schemas);
+
+    for (size_t i = 0; i < schemas->size(); ++i)
+    {
+        if (schemas->getObject(static_cast<UInt32>(i))->getValue<Int32>(Iceberg::f_schema_id) == current_schema_id)
+        {
+            current_schema = schemas->getObject(static_cast<UInt32>(i));
+            break;
+        }
+    }
+
+    const auto metadata_compression_method = CompressionMethod::Gzip;
+    auto config_path = persistent_table_components.table_path;
+    if (config_path.empty() || config_path.back() != '/')
+        config_path += "/";
+    if (!config_path.starts_with('/'))
+        config_path = '/' + config_path;
+
+    if (!context_->getSettingsRef()[Setting::write_full_path_in_iceberg_metadata])
+    {
+        filename_generator = FileNamesGenerator(
+            config_path, config_path, (catalog != nullptr && catalog->isTransactional()), metadata_compression_method, write_format);
+    }
+    else
+    {
+        auto bucket = metadata_json->getValue<String>(Iceberg::f_location);
+        if (bucket.empty() || bucket.back() != '/')
+            bucket += "/";
+        filename_generator = FileNamesGenerator(
+            bucket, config_path, (catalog != nullptr && catalog->isTransactional()), metadata_compression_method, write_format);
+    }
+
+    const auto last_version = 1;
+
+    filename_generator.setVersion(last_version + 1);
+
+    writer = std::make_unique<MultipleFileWriter>(
+        context->getSettingsRef()[Setting::iceberg_insert_max_rows_in_data_file],
+        context->getSettingsRef()[Setting::iceberg_insert_max_bytes_in_data_file],
+        current_schema->getArray(Iceberg::f_fields),
+        filename_generator,
+        object_storage,
+        context,
+        format_settings,
+        write_format,
+        sample_block);
+}
+
+void IcebergImportSink::consume(Chunk & chunk)
+{
+    if (isCancelled())
+        return;
+
+    /// todo arthur remember to introduce callbacks for new filenames
+    writer->consume(chunk);
+}
+
+void IcebergImportSink::onFinish()
+{
+    if (isCancelled())
+        return;
+
+    finalizeBuffers();
+    releaseBuffers();
+}
+
+void IcebergImportSink::finalizeBuffers()
+{
+    writer->finalize();
+}
+
+void IcebergImportSink::releaseBuffers()
+{
+    writer->release();
+}
+
+void IcebergImportSink::cancelBuffers()
+{
+    writer->cancel();
+}
+
 }
 
 // NOLINTEND(clang-analyzer-core.uninitialized.UndefReturn)

@@ -215,6 +215,8 @@ public:
         return metadata.get();
     }
 
+    virtual bool ignorePartitionCompatibilityForImport() const { return false; }
+
     /// Same as getInMemoryMetadataPtr() but may return nullopt in some specific engines like Alias
     virtual std::optional<StorageMetadataPtr> tryGetInMemoryMetadataPtr() const { return getInMemoryMetadataPtr(); }
 
@@ -493,6 +495,7 @@ It is currently only implemented in StorageObjectStorage.
         bool /* overwrite_if_exists */,
         std::size_t /* max_bytes_per_file */,
         std::size_t /* max_rows_per_file */,
+        const std::optional<std::string> & /* iceberg_metadata_json_string */,
         const std::optional<FormatSettings> & /* format_settings */,
         ContextPtr /* context */)
     {

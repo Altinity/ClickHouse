@@ -118,6 +118,7 @@ struct ExportReplicatedMergeTreePartitionManifest
     MergeTreePartExportManifest::FileAlreadyExistsPolicy file_already_exists_policy;
     String filename_pattern;
     bool lock_inside_the_task; /// todo temporary
+    String iceberg_metadata_json;
 
     std::string toJsonString() const
     {
@@ -129,7 +130,12 @@ struct ExportReplicatedMergeTreePartitionManifest
         json.set("destination_table", destination_table);
         json.set("source_replica", source_replica);
         json.set("number_of_parts", number_of_parts);
-        
+
+        if (!iceberg_metadata_json.empty())
+        {
+            json.set("iceberg_metadata_json", iceberg_metadata_json);
+        }
+
         Poco::JSON::Array::Ptr parts_array = new Poco::JSON::Array();
         for (const auto & part : parts)
             parts_array->add(part);
@@ -166,6 +172,12 @@ struct ExportReplicatedMergeTreePartitionManifest
         manifest.source_replica = json->getValue<String>("source_replica");
         manifest.number_of_parts = json->getValue<size_t>("number_of_parts");
         manifest.max_retries = json->getValue<size_t>("max_retries");
+
+        if (json->has("iceberg_metadata_json"))
+        {
+            manifest.iceberg_metadata_json = json->getValue<String>("iceberg_metadata_json");
+        }
+
         auto parts_array = json->getArray("parts");
         for (size_t i = 0; i < parts_array->size(); ++i)
             manifest.parts.push_back(parts_array->getElement<String>(static_cast<unsigned int>(i)));

@@ -194,6 +194,7 @@ bool ExportPartTask::executeStep()
             manifest.file_already_exists_policy == MergeTreePartExportManifest::FileAlreadyExistsPolicy::overwrite,
             manifest.settings[Setting::export_merge_tree_part_max_bytes_per_file],
             manifest.settings[Setting::export_merge_tree_part_max_rows_per_file],
+            manifest.iceberg_metadata_json,
             getFormatSettings(local_context),
             local_context);
 

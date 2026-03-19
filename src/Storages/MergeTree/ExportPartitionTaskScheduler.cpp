@@ -217,6 +217,7 @@ void ExportPartitionTaskScheduler::run()
                     context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value,
                     context->getSettingsCopy(),
                     storage.getInMemoryMetadataPtr(),
+                    manifest.iceberg_metadata_json,
                     [this, key, zk_part_name, manifest, destination_storage]
                     (MergeTreePartExportManifest::CompletionCallbackResult result)
                     {
@@ -262,6 +263,7 @@ void ExportPartitionTaskScheduler::run()
                         destination_storage_id,
                         manifest.transaction_id,
                         getContextCopyWithTaskSettings(storage.getContext(), manifest),
+                        manifest.iceberg_metadata_json,
                         /*allow_outdated_parts*/ true,
                         [this, key, zk_part_name, manifest, destination_storage]
                         (MergeTreePartExportManifest::CompletionCallbackResult result)

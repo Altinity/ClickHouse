@@ -172,6 +172,22 @@ public:
         throwNotImplemented("write");
     }
 
+    virtual bool supportsImport() const
+    {
+        return false;
+    }
+
+    virtual SinkToStoragePtr import(
+        std::shared_ptr<DataLake::ICatalog> /* catalog */,
+        const std::function<void(const std::string &)> & /* new_file_path_callback */,
+        SharedHeader /* sample_block */,
+        const std::string & /* iceberg_metadata_json_string */,
+        const std::optional<FormatSettings> & /* format_settings_ */,
+        ContextPtr /* context */)
+        {
+            throwNotImplemented("import");
+        }
+
     virtual bool optimize(
         const StorageMetadataPtr & /*metadata_snapshot*/, ContextPtr /*context*/, const std::optional<FormatSettings> & /*format_settings*/)
     {

@@ -130,6 +130,46 @@ private:
 
 };
 
+class IcebergImportSink : public SinkToStorage
+{
+public:
+    IcebergImportSink(
+        // catalog
+        std::shared_ptr<DataLake::ICatalog> catalog_,
+        const Iceberg::PersistentTableComponents & persistent_table_components_,
+        Poco::JSON::Object::Ptr metadata_json_,
+        ObjectStoragePtr object_storage_,
+        ContextPtr context_,
+        std::optional<FormatSettings> format_settings_,
+        const String & write_format_,
+        SharedHeader sample_block_);
+
+    ~IcebergImportSink() override = default;
+
+    String getName() const override { return "IcebergImportSink"; }
+
+    void consume(Chunk & chunk) override;
+
+    void onFinish() override;
+
+private:
+    void finalizeBuffers();
+    void releaseBuffers();
+    void cancelBuffers();
+
+    std::shared_ptr<DataLake::ICatalog> catalog;
+    const Iceberg::PersistentTableComponents & persistent_table_components;
+    Poco::JSON::Object::Ptr metadata_json;
+    Poco::JSON::Object::Ptr current_schema;
+    FileNamesGenerator filename_generator;
+    ObjectStoragePtr object_storage;
+    ContextPtr context;
+    std::optional<FormatSettings> format_settings;
+    const String& write_format;
+    SharedHeader sample_block;
+    std::unique_ptr<MultipleFileWriter> writer;
+};
+
 }
 
 #endif

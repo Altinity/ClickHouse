@@ -67,6 +67,7 @@
 #include <Storages/MergeTree/ReplicatedMergeTreeSink.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeTableMetadata.h>
 #include <Storages/MergeTree/ZeroCopyLock.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
 #include <Storages/PartitionCommands.h>
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/System/StorageSystemReplicatedPartitionExports.h>
@@ -8208,9 +8209,25 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     manifest.max_rows_per_file = query_context->getSettingsRef()[Setting::export_merge_tree_part_max_rows_per_file];
     manifest.lock_inside_the_task = query_context->getSettingsRef()[Setting::export_merge_tree_partition_lock_inside_the_task];
 
-
     manifest.file_already_exists_policy = query_context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value;
     manifest.filename_pattern = query_context->getSettingsRef()[Setting::export_merge_tree_part_filename_pattern].value;
+
+    if (dest_storage->isDataLake())
+    {
+        auto * object_storage = dynamic_cast<StorageObjectStorage *>(dest_storage.get());
+
+        auto * iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage->getExternalMetadata(query_context));
+        if (!iceberg_metadata)
+        {
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Destination storage {} is a data lake but not an iceberg table", dest_storage->getName());
+        }
+
+        const auto metadata_object = iceberg_metadata->getMetadataJSON(query_context);
+            
+        std::ostringstream oss;
+        metadata_object->stringify(oss);
+        manifest.iceberg_metadata_json = oss.str();
+    }
 
     ops.emplace_back(zkutil::makeCreateRequest(
         fs::path(partition_exports_path) / "metadata.json", 

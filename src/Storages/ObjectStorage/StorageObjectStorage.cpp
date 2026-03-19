@@ -554,6 +554,11 @@ bool StorageObjectStorage::optimize(
 
 bool StorageObjectStorage::supportsImport() const
 {
+    if (isDataLake())
+    {
+        return configuration->getExternalMetadata()->supportsImport();
+    }
+
     if (!configuration->getPartitionStrategy())
         return false;
 
@@ -563,6 +568,11 @@ bool StorageObjectStorage::supportsImport() const
     return configuration->getPartitionStrategyType() == PartitionStrategyFactory::StrategyType::HIVE;
 }
 
+bool StorageObjectStorage::ignorePartitionCompatibilityForImport() const
+{
+    /// todo arthur maybe it should be isIceberg, but that's ok for now
+    return isDataLake();
+}
 
 SinkToStoragePtr StorageObjectStorage::import(
     const std::string & file_name,
@@ -571,9 +581,22 @@ SinkToStoragePtr StorageObjectStorage::import(
     bool overwrite_if_exists,
     std::size_t max_bytes_per_file,
     std::size_t max_rows_per_file,
+    const std::optional<std::string> & iceberg_metadata_json_string,
     const std::optional<FormatSettings> & format_settings_,
     ContextPtr local_context)
 {
+    if (isDataLake())
+    {
+        // configuration->getme
+        return configuration->getExternalMetadata()->import(
+            catalog,
+            new_file_path_callback,
+            std::make_shared<const Block>(getInMemoryMetadataPtr()->getSampleBlock()),
+            *iceberg_metadata_json_string,
+            format_settings_ ? format_settings_ : format_settings,
+            local_context);
+    }
+
     std::string partition_key;
 
     if (configuration->getPartitionStrategy())

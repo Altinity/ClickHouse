@@ -61,6 +61,7 @@ public:
         bool overwrite_if_exists,
         std::size_t max_bytes_per_file,
         std::size_t max_rows_per_file,
+        const std::optional<std::string> & iceberg_metadata_json_string,
         const std::optional<FormatSettings> & format_settings_,
         ContextPtr context) override;
 

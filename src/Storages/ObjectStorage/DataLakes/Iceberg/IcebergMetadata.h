@@ -1,4 +1,6 @@
 #pragma once
+#include "Storages/ObjectStorage/DataLakes/Iceberg/ChunkPartitioner.h"
+#include "Storages/ObjectStorage/DataLakes/Iceberg/FileNamesGenerator.h"
 #include "config.h"
 
 #if USE_AVRO
@@ -106,6 +108,34 @@ public:
         ContextPtr context,
         std::shared_ptr<DataLake::ICatalog> catalog) override;
 
+    bool supportsImport() const override { return true; }
+
+    SinkToStoragePtr import(
+        std::shared_ptr<DataLake::ICatalog> catalog,
+        const std::function<void(const std::string &)> & new_file_path_callback,
+        SharedHeader sample_block,
+        const std::string & iceberg_metadata_json_string,
+        const std::optional<FormatSettings> & format_settings,
+        ContextPtr context) override;
+
+    void commitExportPartitionTransaction(
+        FileNamesGenerator & filename_generator,
+        Poco::JSON::Object::Ptr initial_metadata,
+        Int64 original_schema_id,
+        std::optional<ChunkPartitioner> & partitioner,
+        ContextPtr context,
+        SharedHeader sample_block,
+        const std::string & partition_key);
+
+
+    bool commitImportPartitionTransactionImpl(
+        FileNamesGenerator & filename_generator,
+        Poco::JSON::Object::Ptr initial_metadata,
+        std::optional<ChunkPartitioner> & partitioner,
+        ContextPtr context,
+        SharedHeader sample_block,
+        const std::string & partition_key);
+
     CompressionMethod getCompressionMethod() const { return persistent_components.metadata_compression_method; }
 
     bool optimize(const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & format_settings) override;
@@ -143,6 +173,8 @@ public:
 
     std::optional<String> partitionKey(ContextPtr) const override;
     std::optional<String> sortingKey(ContextPtr) const override;
+
+    Poco::JSON::Object::Ptr getMetadataJSON(ContextPtr local_context) const;
 
 private:
     Iceberg::PersistentTableComponents initializePersistentTableComponents(
