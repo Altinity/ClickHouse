@@ -583,6 +583,12 @@ void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICa
         /* num_partitions */ 0, /* added_delete_files */ 0, /* num_deleted_rows */ 0);
 
     // generate manifest list with 0 manifest files
+    int format_version = 1;
+    if (metadata_object->has("format-version"))
+        format_version = metadata_object->getValue<int>("format-version");
+    bool is_v2 = (format_version == 2);
+
+    // generate manifest list with 0 manifest files
     auto write_settings = context->getWriteSettings();
     auto buf = object_storage->writeObject(
         StoredObject(storage_manifest_list_name),
@@ -591,7 +597,7 @@ void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICa
         DBMS_DEFAULT_BUFFER_SIZE,
         write_settings
     );
-    generateManifestList(filename_generator, metadata_object, object_storage, context, {}, new_snapshot, 0, *buf, Iceberg::FileContentType::DATA, false);
+    generateManifestList(filename_generator, metadata_object, object_storage, context, {}, new_snapshot, 0, *buf, Iceberg::FileContentType::DATA, is_v2);
     buf->finalize();
 
     String metadata_content = dumpMetadataObjectToString(metadata_object);
