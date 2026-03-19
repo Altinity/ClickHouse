@@ -26,6 +26,9 @@ S3_BUCKET = "altinity-build-artifacts"
 GITHUB_REPO = "Altinity/ClickHouse"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
 
+CVE_SEVERITY_ORDER = {"critical": 1, "high": 2, "medium": 3, "low": 4, "negligible": 5}
+
+
 def get_commit_statuses(sha: str) -> pd.DataFrame:
     """
     Fetch commit statuses for a given SHA and return as a pandas DataFrame.
@@ -536,11 +539,9 @@ def get_cves(pr_number, commit_sha, branch):
         return pd.DataFrame()
 
     df = pd.DataFrame(rows).drop_duplicates()
-    df = df.sort_values(
+    df = df.sort_values(by="docker_image").sort_values(
         by="severity",
-        key=lambda col: col.str.lower().map(
-            {"critical": 1, "high": 2, "medium": 3, "low": 4, "negligible": 5}
-        ),
+        key=lambda col: col.str.lower().map(CVE_SEVERITY_ORDER),
     )
     return df
 
@@ -588,6 +589,9 @@ def format_results_as_html_table(results) -> str:
             "Message": lambda m: m.replace("\n", " "),
             "Identifier": lambda i: url_to_html_link(
                 "https://nvd.nist.gov/vuln/detail/" + i
+            ),
+            "Severity": lambda s: (
+                f'<span data-sort="{CVE_SEVERITY_ORDER.get(str(s).lower(), 6)}">{s}</span>'
             ),
         },
         escape=False,
