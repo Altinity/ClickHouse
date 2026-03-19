@@ -706,7 +706,10 @@ def test_show_tables_optimization(started_cluster):
     )
 
     node.query(f"SYSTEM ENABLE FAILPOINT lightweight_show_tables")
-    node.query(f"SHOW TABLES FROM {CATALOG_NAME}", timeout=5)
+    try:
+        node.query(f"SHOW TABLES FROM {CATALOG_NAME}", timeout=5)
+    finally:
+        node.query(f"SYSTEM DISABLE FAILPOINT lightweight_show_tables")
 
 def test_table_without_metadata_location(started_cluster):
     """
