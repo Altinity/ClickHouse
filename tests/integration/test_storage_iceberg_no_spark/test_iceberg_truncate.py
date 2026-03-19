@@ -60,7 +60,7 @@ def test_iceberg_truncate(started_cluster_iceberg_no_spark):
     instance.query(f"DROP DATABASE IF EXISTS {namespace}")
     instance.query(
         f"""
-        CREATE DATABASE {namespace} ENGINE = DataLakeCatalog('http://rest:8181/v1', 'minio', 'minio123')
+        CREATE DATABASE {namespace} ENGINE = DataLakeCatalog('http://rest:8181/v1', 'minio', '{minio_secret_key}')
         SETTINGS 
             catalog_type='rest', 
             warehouse='demo', 
