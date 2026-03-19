@@ -541,10 +541,13 @@ def get_cves(pr_number, commit_sha, branch):
         return pd.DataFrame()
 
     df = pd.DataFrame(rows).drop_duplicates()
-    df = df.sort_values(by="docker_image").sort_values(
-        by="severity",
-        key=lambda col: col.str.lower().map(CVE_SEVERITY_ORDER),
-    )
+
+    def _cve_sort_key(col):
+        if col.name == "severity":
+            return col.str.lower().map(CVE_SEVERITY_ORDER)
+        return col
+
+    df = df.sort_values(by=["severity", "docker_image"], key=_cve_sort_key)
     return df
 
 
