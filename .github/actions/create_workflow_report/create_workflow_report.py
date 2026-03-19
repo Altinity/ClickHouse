@@ -434,7 +434,9 @@ def get_cves(pr_number, commit_sha):
         Bucket=S3_BUCKET, Prefix=s3_prefix, Delimiter="/"
     )
     grype_result_dirs = [
-        content["Prefix"] for content in response.get("CommonPrefixes", [])
+        content["Prefix"]
+        for content in response.get("CommonPrefixes", [])
+        if isinstance(content, dict) and content.get("Prefix")
     ]
 
     if len(grype_result_dirs) == 0:
@@ -579,10 +581,15 @@ def main():
         "pr_new_fails": [],
         "checks_errors": get_checks_errors(db_client, args.commit_sha, branch_name),
         "regression_fails": get_regression_fails(db_client, args.actions_run_url),
-        "docker_images_cves": (
-            [] if not args.cves else get_cves(args.pr_number, args.commit_sha)
-        ),
+        "docker_images_cves": [],
     }
+
+    try:
+        fail_results["docker_images_cves"] = (
+            [] if not args.cves else get_cves(args.pr_number, args.commit_sha)
+        )
+    except Exception as e:
+        print(f"Error in get_cves: {e}")
 
     # get_cves returns ... in the case where no Grype result files were found.
     # This might occur when run in preview mode.
