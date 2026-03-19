@@ -22,7 +22,9 @@
 #include <errno.h>
 #include <limits.h>
 
-/* ── raw x86-64 syscall wrappers (no errno, no TLS) ────────────── */
+/* ── raw syscall wrappers (no errno, no TLS) ────────────────────── */
+
+#if defined(__x86_64__)
 
 static inline long raw_sc0(long n)
 {
@@ -65,6 +67,63 @@ static inline long raw_sc4(long n, long a1, long a2, long a3, long a4)
 		: "rcx", "r11", "memory");
 	return ret;
 }
+
+#elif defined(__aarch64__)
+
+static inline long raw_sc0(long n)
+{
+	register long x8 __asm__("x8") = n;
+	register long x0 __asm__("x0");
+	__asm__ __volatile__ ("svc 0" : "=r"(x0)
+		: "r"(x8) : "memory");
+	return x0;
+}
+
+static inline long raw_sc1(long n, long a1)
+{
+	register long x8 __asm__("x8") = n;
+	register long x0 __asm__("x0") = a1;
+	__asm__ __volatile__ ("svc 0" : "=r"(x0)
+		: "r"(x8), "0"(x0) : "memory");
+	return x0;
+}
+
+static inline long raw_sc2(long n, long a1, long a2)
+{
+	register long x8 __asm__("x8") = n;
+	register long x0 __asm__("x0") = a1;
+	register long x1 __asm__("x1") = a2;
+	__asm__ __volatile__ ("svc 0" : "=r"(x0)
+		: "r"(x8), "0"(x0), "r"(x1) : "memory");
+	return x0;
+}
+
+static inline long raw_sc3(long n, long a1, long a2, long a3)
+{
+	register long x8 __asm__("x8") = n;
+	register long x0 __asm__("x0") = a1;
+	register long x1 __asm__("x1") = a2;
+	register long x2 __asm__("x2") = a3;
+	__asm__ __volatile__ ("svc 0" : "=r"(x0)
+		: "r"(x8), "0"(x0), "r"(x1), "r"(x2) : "memory");
+	return x0;
+}
+
+static inline long raw_sc4(long n, long a1, long a2, long a3, long a4)
+{
+	register long x8 __asm__("x8") = n;
+	register long x0 __asm__("x0") = a1;
+	register long x1 __asm__("x1") = a2;
+	register long x2 __asm__("x2") = a3;
+	register long x3 __asm__("x3") = a4;
+	__asm__ __volatile__ ("svc 0" : "=r"(x0)
+		: "r"(x8), "0"(x0), "r"(x1), "r"(x2), "r"(x3) : "memory");
+	return x0;
+}
+
+#else
+#error "posix_spawn_2.c: unsupported architecture"
+#endif
 
 /* ── file-action constants & struct (must match glibc-compatibility.c) ── */
 
