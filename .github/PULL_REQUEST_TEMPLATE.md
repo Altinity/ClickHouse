@@ -37,7 +37,7 @@ tests/ci/cancel_and_rerun_workflow_lambda/app.py
 - [x] <!---ci_exclude_ubsan--> All with UBSAN
 - [x] <!---ci_exclude_coverage--> All with Coverage
 - [ ] <!---ci_exclude_aarch64|arm--> All with Aarch64
-- [x] <!---ci_exclude_regression--> All Regression
+- [ ] <!---ci_exclude_regression--> All Regression
 - [ ] <!---no_ci_cache--> Disable CI Cache
 
 #### Regression jobs to run:
@@ -46,10 +46,12 @@ tests/ci/cancel_and_rerun_workflow_lambda/app.py
 - [ ] <!---ci_regression_alter--> Alter (1.5h)
 - [ ] <!---ci_regression_benchmark--> Benchmark (30m)
 - [ ] <!---ci_regression_clickhouse_keeper--> ClickHouse Keeper (1h)
-- [ ] <!---ci_regression_iceberg--> Iceberg (2h)
+- [x] <!---ci_regression_iceberg--> Iceberg (2h)
 - [ ] <!---ci_regression_ldap--> LDAP (1h)
-- [ ] <!---ci_regression_parquet--> Parquet (1.5h)
+- [x] <!---ci_regression_parquet--> Parquet (1.5h)
 - [ ] <!---ci_regression_rbac--> RBAC (1.5h)
 - [ ] <!---ci_regression_ssl_server--> SSL Server (1h)
 - [ ] <!---ci_regression_s3--> S3 (2h)
+- [x] <!---ci_regression_s3_export--> S3 Export (2h)
+- [x] <!---ci_regression_swarms--> Swarms (30m)
 - [ ] <!---ci_regression_tiered_storage--> Tiered Storage (2h)
