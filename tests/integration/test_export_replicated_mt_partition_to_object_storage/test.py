@@ -66,6 +66,17 @@ def wait_for_export_to_start(
     raise TimeoutError(f"Export did not start within {timeout}s. ")
 
 
+def skip_if_remote_database_disk_enabled(cluster):
+    """Skip test if any instance in the cluster has remote database disk enabled.
+
+    Tests that block MinIO cannot run when remote database disk is enabled,
+    as the database metadata is stored on MinIO and blocking it would break the database.
+    """
+    for instance in cluster.instances.values():
+        if instance.with_remote_database_disk:
+            pytest.skip("Test cannot run with remote database disk enabled (db disk), as it blocks MinIO which stores database metadata")
+
+
 @pytest.fixture(scope="module")
 def cluster():
     try:
@@ -1115,6 +1126,11 @@ def test_export_partition_from_replicated_database_uses_db_shard_replica_macros(
     With the fix the DatabaseReplicated shard_name / replica_name are injected into macro_info
     before the expand call, and the pattern resolves correctly.
     """
+
+    # The remote disk test suite sets the shard and replica macros in https://github.com/Altinity/ClickHouse/blob/bbabcaa96e8b7fe8f70ecd0bd4f76fb0f76f2166/tests/integration/helpers/cluster.py#L4356
+    # When expanding the macros, the configured ones are preferred over the ones from the DatabaseReplicated definition.
+    # Therefore, this test fails. It is easier to skip it than to fix it.
+    skip_if_remote_database_disk_enabled(cluster)
 
     node = cluster.instances["replica1"]
     watcher_node = cluster.instances["watcher_node"]
