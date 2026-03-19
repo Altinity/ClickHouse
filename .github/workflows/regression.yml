@@ -126,7 +126,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        SUITE: [aes_encryption, atomic_insert, base_58, data_types, datetime64_extended_range, disk_level_encryption, dns, engines, example, extended_precision_data_types, functions, kafka, kerberos, key_value, lightweight_delete, memory, part_moves_between_shards, selects, session_timezone, swarms, version, window_functions]
+        SUITE: [aes_encryption, atomic_insert, base_58, data_types, datetime64_extended_range, disk_level_encryption, dns, engines, example, extended_precision_data_types, functions, kafka, kerberos, key_value, lightweight_delete, memory, part_moves_between_shards, selects, session_timezone, version, window_functions]
     uses: ./.github/workflows/regression-reusable-suite.yml
     with:
       ref: ${{ inputs.commit }}
@@ -435,7 +435,7 @@ jobs:
   S3Export:
     if: |
       fromJson(inputs.workflow_config).custom_data.ci_regression_jobs[0] == null ||
-      contains(fromJson(inputs.workflow_config).custom_data.ci_regression_jobs, 's3')
+      contains(fromJson(inputs.workflow_config).custom_data.ci_regression_jobs, 's3_export')
     strategy:
       fail-fast: false
       matrix:
@@ -459,6 +459,26 @@ jobs:
       regression_args: --storage minio
       extra_args: --only ":/try*" "minio/export tests/export ${{ matrix.PART }}/*"
     secrets: inherit
+
+  Swarms:
+      if: |
+        fromJson(inputs.workflow_config).custom_data.ci_regression_jobs[0] == null ||
+        contains(fromJson(inputs.workflow_config).custom_data.ci_regression_jobs, 'swarms')
+      uses: ./.github/workflows/regression-reusable-suite.yml
+      with:
+        ref: ${{ inputs.commit }}
+        workflow_config: ${{ inputs.workflow_config }}
+        suite_name: swarms
+        suite_executable: regression.py
+        output_format: new-fails
+        flags: --with-analyzer
+        timeout_minutes: ${{ inputs.timeout_minutes }}
+        runner_arch: ${{ inputs.arch }}
+        runner_type: ${{ inputs.runner_type }}
+        build_sha: ${{ inputs.build_sha }}
+        set_commit_status: true
+        job_name: swarms
+      secrets: inherit
 
   TieredStorage:
     if: |
