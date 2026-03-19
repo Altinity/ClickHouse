@@ -982,9 +982,7 @@ def test_partitioning_by_time(started_cluster, storage_type):
 
     create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
 
-    # Fix test when https://github.com/Altinity/ClickHouse/issues/15355 is resolved
-    # Must be 43200
-    assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{namespace}.{table_name}`") == "43200000000\ttest\n"
+    assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{namespace}.{table_name}`") == "12:00:00.000000\ttest\n"
 
 
 @pytest.mark.parametrize("storage_type", ["s3"])
@@ -1012,6 +1010,12 @@ def test_partitioning_by_string(started_cluster, storage_type):
             field_type=StringType(),
             required=False,
         ),
+        NestedField(
+            field_id=3,
+            name="time_value",
+            field_type=TimeType(),
+            required=False,
+        ),
     )
 
     partition_spec = PartitionSpec(
@@ -1021,10 +1025,10 @@ def test_partitioning_by_string(started_cluster, storage_type):
     )
 
     table = create_table(catalog, namespace, table_name, schema=schema, partition_spec=partition_spec)
-    data = [{"key": "a:b,c[d=e/f%g?h", "value": "test"}]
+    data = [{"key": "a:b,c[d=e/f%g?h", "value": "test", "time_value": dtime(12,0,0)}]
     df = pa.Table.from_pylist(data)
     table.append(df)
 
     create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
 
-    assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{namespace}.{table_name}`") == "a:b,c[d=e/f%g?h\ttest\n"
+    assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{namespace}.{table_name}`") == "a:b,c[d=e/f%g?h\ttest\t12:00:00.000000\n"
