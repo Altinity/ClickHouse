@@ -19,6 +19,7 @@ struct PersistentTableComponents
     const CompressionMethod metadata_compression_method;
     const String table_path;
     const std::optional<String> table_uuid;
+    const String common_namespace;
 };
 
 }

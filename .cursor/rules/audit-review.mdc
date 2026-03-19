@@ -9,20 +9,27 @@ Use this format when the user asks for a deep audit, fault injection, or review 
 
 ## Required Output
 
-- Report **confirmed defects only** first.
-- Classify each finding as **High**, **Medium**, or **Low**.
-- For each finding include:
+The audit process must remain deep (all analysis dimensions below are still required), but the final user-visible report must include only:
+
+1. **Confirmed defects**
+2. **Coverage summary**
+
+Output rules:
+
+- Report **confirmed defects only** (no hypotheticals).
+- Classify each defect as **High**, **Medium**, or **Low**.
+- For each confirmed defect include:
   - short title,
   - concrete impact,
   - exact file/function reference,
   - brief proof sketch tied to code path,
-  - at least one **code snippet** that demonstrates the defect condition.
-- Include an **Assumptions & Limits** section for static reasoning:
-  - what was not executed at runtime,
-  - what could not be proven without dynamic testing.
-- Include **audit confidence**:
-  - overall confidence (High/Medium/Low),
-  - what additional evidence would raise confidence.
+  - code snippet(s) **only when needed** to prove the defect condition.
+- If no defects are confirmed, explicitly output `No confirmed defects in reviewed scope.`
+- Include a concise **Coverage summary** with:
+  - scope reviewed,
+  - categories failed,
+  - categories passed,
+  - assumptions/limits (single concise line).
 
 ## Severity Rubric (Required)
 
@@ -119,18 +126,10 @@ Use this format when the user asks for a deep audit, fault injection, or review 
   - one primary defect per root cause, with secondary manifestations listed under it.
 - If no defects are found, explicitly report residual risks and untested paths.
 
-## Canonical Report Order (Required)
+## Report Order (Required)
 
-1. Scope and partitions (if large PR)
-2. Call graph
-3. Transition matrix
-4. Logical code-path testing summary
-5. Fault categories and category-by-category injection results
-6. Confirmed defects (High/Medium/Low)
-7. Coverage accounting + stop-condition status
-8. Assumptions & Limits
-9. Confidence rating and confidence-raising evidence
-10. Residual risks and untested paths
+1. Confirmed defects (High/Medium/Low)
+2. Coverage summary
 
 ## Multithreaded DB Priority
 

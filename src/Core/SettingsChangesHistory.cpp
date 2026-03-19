@@ -44,6 +44,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"iceberg_partition_timezone", "", "", "New setting."},
             // {"object_storage_max_nodes", 0, 0, "Antalya: New setting"},
             {"s3_propagate_credentials_to_other_storages", false, false, "New setting"},
+            {"export_merge_tree_part_filename_pattern", "", "{part_name}_{checksum}", "New setting"},
         });
         addSettingsChanges(settings_changes_history, "26.1",
         {
@@ -230,9 +231,16 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         });
         addSettingsChanges(settings_changes_history, "25.8.16.20001.altinityantalya",
         {
+            {"allow_experimental_database_iceberg", false, true, "Turned ON by default for Antalya."},
+            {"allow_experimental_database_unity_catalog", false, true, "Turned ON by default for Antalya."},
+            {"allow_experimental_database_glue_catalog", false, true, "Turned ON by default for Antalya."},
+            {"allow_database_iceberg", false, true, "Turned ON by default for Antalya (alias)."},
+            {"allow_database_unity_catalog", false, true, "Turned ON by default for Antalya (alias)."},
+            {"allow_database_glue_catalog", false, true, "Turned ON by default for Antalya (alias)."},
+
             {"input_format_parquet_use_metadata_cache", true, true, "New setting, turned ON by default"}, // https://github.com/Altinity/ClickHouse/pull/586
-            // {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."},
-            // {"object_storage_remote_initiator", false, false, "New setting."},
+            {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."},
+            {"object_storage_remote_initiator", false, false, "New setting."},
             {"allow_experimental_iceberg_read_optimization", true, true, "New setting."},
             {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
             {"lock_object_storage_task_distribution_ms", 500, 500, "New setting."},
@@ -257,8 +265,10 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"export_merge_tree_partition_system_table_prefer_remote_information", true, true, "New setting."},
         //     {"cluster_table_function_split_granularity", "file", "file", "New setting."},
         //     {"cluster_table_function_buckets_batch_size", 0, 0, "New setting."},
-        {"export_merge_tree_part_throw_on_pending_mutations", true, true, "New setting."},
-        {"export_merge_tree_part_throw_on_pending_patch_parts", true, true, "New setting."},
+            {"export_merge_tree_part_throw_on_pending_mutations", true, true, "New setting."},
+            {"export_merge_tree_part_throw_on_pending_patch_parts", true, true, "New setting."},
+            {"object_storage_cluster", "", "", "Antalya: New setting"},
+            {"object_storage_max_nodes", 0, 0, "Antalya: New setting"},
         });
         addSettingsChanges(settings_changes_history, "25.8",
         {

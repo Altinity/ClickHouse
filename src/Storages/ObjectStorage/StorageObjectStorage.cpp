@@ -69,6 +69,11 @@ String StorageObjectStorage::getPathSample(ContextPtr context)
     if (context->getSettingsRef()[Setting::use_hive_partitioning])
         local_distributed_processing = false;
 
+    const auto path = configuration->getRawPath();
+
+    if (!configuration->isArchive() && !path.hasGlobs() && !local_distributed_processing)
+        return path.path;
+
     auto file_iterator = StorageObjectStorageSource::createFileIterator(
         configuration,
         query_settings,
@@ -83,11 +88,6 @@ String StorageObjectStorage::getPathSample(ContextPtr context)
         nullptr, // read_keys
         {} // file_progress_callback
     );
-
-    const auto path = configuration->getRawPath();
-
-    if (!configuration->isArchive() && !path.hasGlobs() && !local_distributed_processing)
-        return path.path;
 
     if (auto file = file_iterator->next(0))
         return file->getPath();
@@ -105,13 +105,14 @@ StorageObjectStorage::StorageObjectStorage(
     std::optional<FormatSettings> format_settings_,
     LoadingStrictnessLevel mode,
     std::shared_ptr<DataLake::ICatalog> catalog_,
-    bool if_not_exists_,
+    bool /*if_not_exists_*/,
     bool is_datalake_query,
     bool distributed_processing_,
     ASTPtr partition_by_,
-    ASTPtr order_by_,
+    ASTPtr /*order_by_*/,
     bool is_table_function,
-    bool lazy_init)
+    bool lazy_init,
+    std::optional<std::string> sample_path_)
     : IStorage(table_id_)
     , configuration(configuration_)
     , object_storage(object_storage_)
@@ -123,9 +124,9 @@ StorageObjectStorage::StorageObjectStorage(
 {
     configuration->initPartitionStrategy(partition_by_, columns_in_table_or_function_definition, context);
 
-    const bool need_resolve_columns_or_format = columns_in_table_or_function_definition.empty() || (configuration->format == "auto");
+    const bool need_resolve_columns_or_format = columns_in_table_or_function_definition.empty() || (configuration->getFormat() == "auto");
     const bool need_resolve_sample_path = context->getSettingsRef()[Setting::use_hive_partitioning]
-        && !configuration->partition_strategy
+        && !configuration->getPartitionStrategy()
         && !configuration->isDataLakeConfiguration();
     const bool do_lazy_init = lazy_init && !need_resolve_columns_or_format && !need_resolve_sample_path;
 
@@ -136,18 +137,11 @@ StorageObjectStorage::StorageObjectStorage(
         is_datalake_query, columns_in_table_or_function_definition.toString(true));
 
     bool is_delta_lake_cdf = context->getSettingsRef()[Setting::delta_lake_snapshot_start_version] != -1
-            || context->getSettingsRef()[Setting::delta_lake_snapshot_start_version] != -1;
+            || context->getSettingsRef()[Setting::delta_lake_snapshot_end_version] != -1;
 
     if (!is_table_function && is_delta_lake_cdf)
     {
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Delta lake CDF is allowed only for deltaLake table function");
-    }
-
-    if (!is_table_function && !columns_in_table_or_function_definition.empty() && !is_datalake_query && mode == LoadingStrictnessLevel::CREATE)
-    {
-        LOG_DEBUG(log, "Creating new storage with specified columns");
-        configuration->create(
-            object_storage, context, columns_in_table_or_function_definition, partition_by_, order_by_, if_not_exists_, catalog, storage_id);
     }
 
     bool updated_configuration = false;
@@ -179,11 +173,11 @@ StorageObjectStorage::StorageObjectStorage(
     /// (e.g. read always follows constructor immediately).
     update_configuration_on_read_write = !is_table_function || !updated_configuration;
 
-    std::string sample_path;
+    std::string sample_path = sample_path_.value_or("");
 
     ColumnsDescription columns{columns_in_table_or_function_definition};
     if (need_resolve_columns_or_format)
-        resolveSchemaAndFormat(columns, configuration->format, object_storage, configuration, format_settings, sample_path, context);
+        resolveSchemaAndFormat(columns, object_storage, configuration, format_settings, sample_path, context);
     else
         validateSupportedColumns(columns, *configuration);
 
@@ -191,7 +185,7 @@ StorageObjectStorage::StorageObjectStorage(
 
     /// FIXME: We need to call getPathSample() lazily on select
     /// in case it failed to be initialized in constructor.
-    if (updated_configuration && sample_path.empty() && need_resolve_sample_path && !configuration->partition_strategy)
+    if (updated_configuration && sample_path.empty() && need_resolve_sample_path && !configuration->getPartitionStrategy())
     {
         try
         {
@@ -223,7 +217,7 @@ StorageObjectStorage::StorageObjectStorage(
             sample_path);
     }
 
-    bool format_supports_prewhere = FormatFactory::instance().checkIfFormatSupportsPrewhere(configuration->format, context, format_settings);
+    bool format_supports_prewhere = FormatFactory::instance().checkIfFormatSupportsPrewhere(configuration->getFormat(), context, format_settings);
 
     /// TODO: Known problems with datalake prewhere:
     ///  * If the iceberg table went through schema evolution, columns read from file may need to
@@ -255,16 +249,16 @@ StorageObjectStorage::StorageObjectStorage(
     metadata.setComment(comment);
 
     /// I am not sure this is actually required, but just in case
-    if (configuration->partition_strategy)
+    if (configuration->getPartitionStrategy())
     {
-        metadata.partition_key = configuration->partition_strategy->getPartitionKeyDescription();
+        metadata.partition_key = configuration->getPartitionStrategy()->getPartitionKeyDescription();
     }
 
     setVirtuals(VirtualColumnUtils::getVirtualsForFileLikeStorage(
         metadata.columns,
         context,
         format_settings,
-        configuration->partition_strategy_type,
+        configuration->getPartitionStrategyType(),
         sample_path));
 
     setInMemoryMetadata(metadata);
@@ -286,17 +280,17 @@ String StorageObjectStorage::getName() const
 
 bool StorageObjectStorage::prefersLargeBlocks() const
 {
-    return FormatFactory::instance().checkIfOutputFormatPrefersLargeBlocks(configuration->format);
+    return FormatFactory::instance().checkIfOutputFormatPrefersLargeBlocks(configuration->getFormat());
 }
 
 bool StorageObjectStorage::parallelizeOutputAfterReading(ContextPtr context) const
 {
-    return FormatFactory::instance().checkParallelizeOutputAfterReading(configuration->format, context);
+    return FormatFactory::instance().checkParallelizeOutputAfterReading(configuration->getFormat(), context);
 }
 
 bool StorageObjectStorage::supportsSubsetOfColumns(const ContextPtr & context) const
 {
-    return FormatFactory::instance().checkIfFormatSupportsSubsetOfColumns(configuration->format, context, format_settings);
+    return FormatFactory::instance().checkIfFormatSupportsSubsetOfColumns(configuration->getFormat(), context, format_settings);
 }
 
 bool StorageObjectStorage::supportsPrewhere() const
@@ -390,7 +384,7 @@ void StorageObjectStorage::read(
             /* if_not_updated_before */ false);
     }
 
-    if (configuration->partition_strategy && configuration->partition_strategy_type != PartitionStrategyFactory::StrategyType::HIVE)
+    if (configuration->getPartitionStrategy() && configuration->getPartitionStrategyType() != PartitionStrategyFactory::StrategyType::HIVE)
     {
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
                         "Reading from a partitioned {} storage is not implemented yet",
@@ -522,10 +516,10 @@ SinkToStoragePtr StorageObjectStorage::write(
 
     /// Not a data lake, just raw object storage
 
-    if (configuration->partition_strategy)
+    if (configuration->getPartitionStrategy())
     {
         auto sink_creator = std::make_shared<PartitionedStorageObjectStorageSink>(object_storage, configuration, format_settings, sample_block, local_context);
-        return std::make_shared<PartitionedSink>(configuration->partition_strategy, sink_creator, local_context, sample_block);
+        return std::make_shared<PartitionedSink>(configuration->getPartitionStrategy(), sink_creator, local_context, sample_block);
     }
 
     auto paths = configuration->getPaths();
@@ -541,8 +535,8 @@ SinkToStoragePtr StorageObjectStorage::write(
         format_settings,
         sample_block,
         local_context,
-        configuration->format,
-        configuration->compression_method);
+        configuration->getFormat(),
+        configuration->getCompressionMethod());
 }
 
 bool StorageObjectStorage::optimize(
@@ -560,13 +554,13 @@ bool StorageObjectStorage::optimize(
 
 bool StorageObjectStorage::supportsImport() const
 {
-    if (!configuration->partition_strategy)
+    if (!configuration->getPartitionStrategy())
         return false;
 
-    if (configuration->partition_strategy_type == PartitionStrategyFactory::StrategyType::WILDCARD)
+    if (configuration->getPartitionStrategyType() == PartitionStrategyFactory::StrategyType::WILDCARD)
         return configuration->getRawPath().hasExportFilenameWildcard();
 
-    return configuration->partition_strategy_type == PartitionStrategyFactory::StrategyType::HIVE;
+    return configuration->getPartitionStrategyType() == PartitionStrategyFactory::StrategyType::HIVE;
 }
 
 
@@ -582,9 +576,9 @@ SinkToStoragePtr StorageObjectStorage::import(
 {
     std::string partition_key;
 
-    if (configuration->partition_strategy)
+    if (configuration->getPartitionStrategy())
     {
-        const auto column_with_partition_key = configuration->partition_strategy->computePartitionKey(block_with_partition_values);
+        const auto column_with_partition_key = configuration->getPartitionStrategy()->computePartitionKey(block_with_partition_values);
 
         if (!column_with_partition_key->empty())
         {
@@ -714,7 +708,7 @@ ColumnsDescription StorageObjectStorage::resolveSchemaFromData(
 {
     ObjectInfos read_keys;
     auto iterator = createReadBufferIterator(object_storage, configuration, format_settings, read_keys, context);
-    auto schema = readSchemaFromFormat(configuration->format, format_settings, *iterator, context);
+    auto schema = readSchemaFromFormat(configuration->getFormat(), format_settings, *iterator, context);
     sample_path = iterator->getLastFilePath();
     return schema;
 }
@@ -735,7 +729,7 @@ std::string StorageObjectStorage::resolveFormatFromData(
 
 std::pair<ColumnsDescription, std::string> StorageObjectStorage::resolveSchemaAndFormatFromData(
     const ObjectStoragePtr & object_storage,
-    const StorageObjectStorageConfigurationPtr & configuration,
+    StorageObjectStorageConfigurationPtr & configuration,
     const std::optional<FormatSettings> & format_settings,
     std::string & sample_path,
     const ContextPtr & context)
@@ -744,13 +738,13 @@ std::pair<ColumnsDescription, std::string> StorageObjectStorage::resolveSchemaAn
     auto iterator = createReadBufferIterator(object_storage, configuration, format_settings, read_keys, context);
     auto [columns, format] = detectFormatAndReadSchema(format_settings, *iterator, context);
     sample_path = iterator->getLastFilePath();
-    configuration->format = format;
+    configuration->setFormat(format);
     return std::pair(columns, format);
 }
 
 void StorageObjectStorage::addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const
 {
-    configuration->addStructureAndFormatToArgsIfNeeded(args, "", configuration->format, context, /*with_structure=*/false);
+    configuration->addStructureAndFormatToArgsIfNeeded(args, "", configuration->getFormat(), context, /*with_structure=*/false);
 }
 
 SchemaCache & StorageObjectStorage::getSchemaCache(const ContextPtr & context, const std::string & storage_engine_name)
