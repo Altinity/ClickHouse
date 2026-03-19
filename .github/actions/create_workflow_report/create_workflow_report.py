@@ -501,7 +501,9 @@ def get_cves(pr_number, commit_sha, branch):
                 Bucket=S3_BUCKET, Prefix=s3_prefix, Delimiter="/"
             )
             grype_result_dirs.extend(
-                content["Prefix"] for content in response.get("CommonPrefixes", [])
+                content["Prefix"]
+                for content in response.get("CommonPrefixes", [])
+                if isinstance(content, dict) and content.get("Prefix")
             )
         except Exception as e:
             print(f"Error listing S3 objects at {s3_prefix}: {e}")
@@ -776,10 +778,15 @@ def create_workflow_report(
         "pr_new_fails": [],
         "checks_errors": get_checks_errors(db_client, commit_sha, branch_name),
         "regression_fails": get_regression_fails(db_client, actions_run_url),
-        "docker_images_cves": (
-            [] if not check_cves else get_cves(pr_number, commit_sha, branch_name)
-        ),
+        "docker_images_cves": [],
     }
+
+    try:
+        fail_results["docker_images_cves"] = (
+            [] if not check_cves else get_cves(pr_number, commit_sha, branch_name)
+        )
+    except Exception as e:
+        print(f"Error in get_cves: {e}")
 
     # get_cves returns ... in the case where no Grype result files were found.
     # This might occur when run in preview mode.
