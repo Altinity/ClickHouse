@@ -23,6 +23,7 @@
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
+#include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
 #include <Storages/ObjectStorage/DataLakes/IDataLakeMetadata.h>
 #include <Storages/SelectQueryInfo.h>
 #include <Storages/StorageView.h>
@@ -622,6 +623,17 @@ protected:
                                     inserted = true;
                                 }
                             }
+                        }
+                        else if (auto * obj_cluster = dynamic_cast<StorageObjectStorageCluster *>(table.get()))
+                        {
+                            if (auto * dl_meta = obj_cluster->getExternalMetadata(context))
+                            {
+                                if (auto p = dl_meta->partitionKey(context); p.has_value())
+                                {
+                                    res_columns[res_index++]->insert(*p);
+                                    inserted = true;
+                                }
+                            }
 
                         }
                     }
@@ -650,6 +662,17 @@ protected:
                         if (auto * obj = dynamic_cast<StorageObjectStorage *>(table.get()))
                         {
                             if (auto * dl_meta = obj->getExternalMetadata(context))
+                            {
+                                if (auto p = dl_meta->sortingKey(context); p.has_value())
+                                {
+                                    res_columns[res_index++]->insert(*p);
+                                    inserted = true;
+                                }
+                            }
+                        }
+                        else if (auto * obj_cluster = dynamic_cast<StorageObjectStorageCluster *>(table.get()))
+                        {
+                            if (auto * dl_meta = obj_cluster->getExternalMetadata(context))
                             {
                                 if (auto p = dl_meta->sortingKey(context); p.has_value())
                                 {
