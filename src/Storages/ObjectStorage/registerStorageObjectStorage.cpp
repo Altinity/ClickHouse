@@ -18,6 +18,12 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int SUPPORT_IS_DISABLED;
+}
+
+namespace Setting
+{
+    extern const SettingsBool allow_local_data_lakes;
 }
 
 namespace
@@ -235,6 +241,11 @@ void registerStorageIceberg(StorageFactory & factory)
         "IcebergLocal",
         [&](const StorageFactory::Arguments & args)
         {
+            if (!args.getLocalContext()->getSettingsRef()[Setting::allow_local_data_lakes])
+                throw Exception(
+                    ErrorCodes::SUPPORT_IS_DISABLED,
+                    "IcebergLocal is disabled. Set `allow_local_data_lakes` to enable it");
+
             auto configuration = std::make_shared<StorageLocalIcebergConfiguration>();
             return createStorageObjectStorage(args, configuration);
         },
