@@ -42,6 +42,11 @@ docker cp $id:$lib_dir/build/ssl/libssl.a $OUTPUT_DIR
 docker cp $id:$lib_dir/build/crypto/libcrypto.a $OUTPUT_DIR
 docker cp $id:$lib_dir/include $OUTPUT_DIR
 
+# Extract pre-built test harness libraries (symbol-localized, with libstdc++ baked in)
+docker cp $id:/harness-output/libawslc_shim.a $OUTPUT_DIR
+docker cp $id:/harness-output/libawslc_handshaker.a $OUTPUT_DIR
+docker cp $id:/harness-output/libawslc_acvp_server.a $OUTPUT_DIR
+
 docker rm $id"
 )
 
@@ -70,7 +75,12 @@ execute_process(COMMAND ${CMAKE_COMMAND} -E make_directory "${AWSLC_BINARIES_DIR
 
 add_custom_target(build-awslc
     COMMENT "Build AWS-LC in FIPS mode with docker"
-    DEPENDS ${AWSLC_BINARIES_DIR}/libssl.a ${AWSLC_BINARIES_DIR}/libcrypto.a
+    DEPENDS
+        ${AWSLC_BINARIES_DIR}/libssl.a
+        ${AWSLC_BINARIES_DIR}/libcrypto.a
+        ${AWSLC_BINARIES_DIR}/libawslc_shim.a
+        ${AWSLC_BINARIES_DIR}/libawslc_handshaker.a
+        ${AWSLC_BINARIES_DIR}/libawslc_acvp_server.a
 )
 
 if(ARCH_AARCH64)
@@ -83,7 +93,20 @@ add_custom_command(
     OUTPUT
         "${AWSLC_BUILD_DIR}/output/libssl.a"
         "${AWSLC_BUILD_DIR}/output/libcrypto.a"
+        "${AWSLC_BUILD_DIR}/output/libawslc_shim.a"
+        "${AWSLC_BUILD_DIR}/output/libawslc_handshaker.a"
+        "${AWSLC_BUILD_DIR}/output/libawslc_acvp_server.a"
     COMMENT "Building AWS-LC in FIPS mode using docker"
+    # Copy test harness build inputs into the Docker context directory
+    COMMAND ${CMAKE_COMMAND} -E copy
+        ${ClickHouse_SOURCE_DIR}/programs/ssl-common/posix_spawn_2.c
+        ${AWSLC_BUILD_DIR}/posix_spawn_2.c
+    COMMAND ${CMAKE_COMMAND} -E copy
+        ${ClickHouse_SOURCE_DIR}/programs/ssl-common/glibc_compat.c
+        ${AWSLC_BUILD_DIR}/glibc_compat.c
+    COMMAND ${CMAKE_COMMAND} -E copy
+        ${CMAKE_CURRENT_SOURCE_DIR}/build_test_harness.sh
+        ${AWSLC_BUILD_DIR}/build_test_harness.sh
     COMMAND bash -c "chmod +x ${AWSLC_BUILD_DIR}/build_awclc_fips.sh"
     COMMAND bash -c "${AWSLC_BUILD_DIR}/build_awclc_fips.sh ${AWSLC_BINARIES_DIR} ${DOCKERFILE_PATH}"
     WORKING_DIRECTORY ${AWSLC_BUILD_DIR}
@@ -92,6 +115,9 @@ add_custom_command(
         ${AWSLC_BUILD_DIR}/build_awclc_fips.sh
         ${AWSLC_BUILD_DIR}/check_version.c
         ${DOCKERFILE_PATH}
+        ${ClickHouse_SOURCE_DIR}/programs/ssl-common/posix_spawn_2.c
+        ${ClickHouse_SOURCE_DIR}/programs/ssl-common/glibc_compat.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/build_test_harness.sh
 )
 
 add_library(crypto UNKNOWN IMPORTED GLOBAL)
@@ -129,6 +155,45 @@ target_compile_options(ssl INTERFACE
 # Without it, the build fails due to using API deprecated in C++23
 target_compile_options(global-group INTERFACE "-Wno-deprecated-declarations")
 target_compile_options(global-group INTERFACE "-Wno-poison-system-directories")
+
+# ── Test harness IMPORTED libraries ──────────────────────────────────────────
+# These archives are built inside Docker (build_test_harness.sh), partially
+# linked with libstdc++ via `ld -r`, and symbol-localized so only the entry
+# point is globally visible.  No --allow-multiple-definition needed.
+
+add_library(awslc_shim STATIC IMPORTED GLOBAL)
+add_dependencies(awslc_shim build-awslc)
+set_target_properties(awslc_shim PROPERTIES
+    IMPORTED_LOCATION "${AWSLC_BINARIES_DIR}/libawslc_shim.a")
+
+add_library(awslc_handshaker STATIC IMPORTED GLOBAL)
+add_dependencies(awslc_handshaker build-awslc)
+set_target_properties(awslc_handshaker PROPERTIES
+    IMPORTED_LOCATION "${AWSLC_BINARIES_DIR}/libawslc_handshaker.a")
+
+add_library(awslc_acvp_server STATIC IMPORTED GLOBAL)
+add_dependencies(awslc_acvp_server build-awslc)
+set_target_properties(awslc_acvp_server PROPERTIES
+    IMPORTED_LOCATION "${AWSLC_BINARIES_DIR}/libawslc_acvp_server.a")
+
+# ── Test harness program libraries ───────────────────────────────────────────
+# Linked into the main clickhouse binary via clickhouse_program_install()
+# in programs/CMakeLists.txt.  The entry-point .cpp files stay in programs/.
+
+add_library(clickhouse-ssl-shim-lib
+    ${ClickHouse_SOURCE_DIR}/programs/ssl-shim/SslShim.cpp)
+target_link_libraries(clickhouse-ssl-shim-lib PRIVATE awslc_shim ssl crypto)
+add_dependencies(clickhouse-ssl-shim-lib build-awslc)
+
+add_library(clickhouse-ssl-handshaker-lib
+    ${ClickHouse_SOURCE_DIR}/programs/ssl-handshaker/SslHandshaker.cpp)
+target_link_libraries(clickhouse-ssl-handshaker-lib PRIVATE awslc_handshaker ssl crypto)
+add_dependencies(clickhouse-ssl-handshaker-lib build-awslc)
+
+add_library(clickhouse-acvp-server-lib
+    ${ClickHouse_SOURCE_DIR}/programs/acvp-server/AcvpServer.cpp)
+target_link_libraries(clickhouse-acvp-server-lib PRIVATE awslc_acvp_server crypto)
+add_dependencies(clickhouse-acvp-server-lib build-awslc)
 
 else() # FIPS_CLICKHOUSE
 
