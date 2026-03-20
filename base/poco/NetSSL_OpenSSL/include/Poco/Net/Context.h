@@ -148,6 +148,11 @@ namespace Net
             /// Specifies the supported ciphers in OpenSSL notation.
             /// Defaults to "ALL:!ADH:!LOW:!EXP:!MD5:!3DES:@STRENGTH".
 
+            std::string cipherSuites;
+            /// Specifies the supported TLSv1.3 ciphersuites in OpenSSL notation.
+            /// Defaults to "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256"
+            /// (FIPS-approved ciphersuites only).
+
             std::string dhParamsFile;
             /// Specifies a file containing Diffie-Hellman parameters.
             /// If empty, the default parameters are used.
