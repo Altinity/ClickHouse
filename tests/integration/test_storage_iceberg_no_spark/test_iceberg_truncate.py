@@ -92,5 +92,15 @@ def test_iceberg_truncate(started_cluster_iceberg_no_spark):
     # Assert PyIceberg reads the empty snapshot successfully
     assert len(table.scan().to_arrow()) == 0
 
+    # 7. Verify Writable State
+    # Append a new row to ensure truncation didn't break table state
+    new_df = pa.Table.from_pylist([
+        {"id": 4, "val": "D"}
+    ])
+    table.append(new_df)
+
+    # Assert new row count via ClickHouse
+    assert int(instance.query(f"SELECT count() FROM {namespace}.{ch_table_identifier}").strip()) == 1
+
     # Cleanup
     instance.query(f"DROP DATABASE {namespace}")

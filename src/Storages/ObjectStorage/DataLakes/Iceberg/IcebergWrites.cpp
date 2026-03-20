@@ -451,6 +451,53 @@ void generateManifestList(
     else
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown iceberg version {}", version);
 
+    // For empty manifest list (e.g. TRUNCATE), write a valid Avro container
+    // file manually so we can embed the full schema JSON with field-ids intact,
+    // without triggering the DataFileWriter constructor's eager writeHeader()
+    // which commits encoder state before we can override avro.schema.
+    if (manifest_entry_names.empty() && !use_previous_snapshots)
+    {
+        auto write_avro_long = [](WriteBuffer & out, int64_t val)
+        {
+            uint64_t n = (static_cast<uint64_t>(val) << 1) ^ static_cast<uint64_t>(val >> 63);
+            while (n & ~0x7fULL)
+            {
+                char c = static_cast<char>((n & 0x7f) | 0x80);
+                out.write(&c, 1);
+                n >>= 7;
+            }
+            char c = static_cast<char>(n);
+            out.write(&c, 1);
+        };
+
+        auto write_avro_bytes = [&](WriteBuffer & out, const String & s)
+        {
+            write_avro_long(out, static_cast<int64_t>(s.size()));
+            out.write(s.data(), s.size());
+        };
+
+        // Avro Object Container File header
+        buf.write("Obj\x01", 4);
+
+        // Metadata map: 2 entries (codec + schema)
+        write_avro_long(buf, 2);
+        write_avro_bytes(buf, "avro.codec");
+        write_avro_bytes(buf, "null");
+        write_avro_bytes(buf, "avro.schema");
+        write_avro_bytes(buf, schema_representation); // full JSON, field-ids intact
+
+        // End of metadata map
+        write_avro_long(buf, 0);
+
+        // Sync marker (16 zero bytes — valid, no data blocks follow)
+        static const char sync_marker[16] = {};
+        buf.write(sync_marker, 16);
+
+        // No data blocks for empty manifest list
+        buf.finalize();
+        return;
+    }
+
     auto schema = avro::compileJsonSchemaFromString(schema_representation); // NOLINT
 
     auto adapter = std::make_unique<OutputStreamWriteBufferAdapter>(buf);
@@ -1028,7 +1075,7 @@ bool IcebergStorageSink::initializeMetadata()
                     catalog_filename = blob_storage_type_name + "://" + blob_storage_namespace_name + "/" + metadata_name;
 
                 const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
-                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot))
+                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, metadata))
                 {
                     cleanup(true);
                     return false;

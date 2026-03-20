@@ -938,9 +938,9 @@ bool RestCatalog::updateMetadata(const String & namespace_name, const String & t
     {
         sendRequest(endpoint, request_body);
     }
-    catch (const DB::HTTPException &)
+    catch (const DB::HTTPException & ex)
     {
-        return false;
+        throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Failed to update metadata via REST: {}", ex.displayText());
     }
     return true;
 }
