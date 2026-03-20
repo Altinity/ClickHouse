@@ -18,7 +18,7 @@ class SentryHandler(http.server.BaseHTTPRequestHandler):
                     + post_data.decode()
                 )
             elif (
-                b'"http://6f33034cfe684dd7a3ab9875e57b1c8d@localhost:9500/5226277"'
+                b'"http://test-dsn@localhost:9500/1"'
                 not in post_data
             ):
                 f.write("INCORRECT_POST_DATA")

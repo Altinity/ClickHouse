@@ -1,0 +1,73 @@
+merge_expressions=0
+Expression (Project names)
+  Expression (Projection)
+    Filter (WHERE)
+      Expression (Change column names to column identifiers)
+        Expression (Compute alias columns)
+          ReadFromMergeTree (default.test_alias_skip_idx)
+          Indexes:
+            PrimaryKey
+              Keys: 
+                c
+              Condition: (plus(c, 1) in [101, +Inf))
+              Parts: 1/2
+              Granules: 1/2
+            Skip
+              Name: idx_a
+              Description: minmax GRANULARITY 1
+              Parts: 1/1
+              Granules: 1/1
+enable_optimizations=0
+Expression (Project names)
+  Expression (Projection)
+    Filter (WHERE)
+      Expression (Change column names to column identifiers)
+        Expression (Compute alias columns)
+          ReadFromMergeTree (default.test_alias_skip_idx)
+          Indexes:
+            PrimaryKey
+              Keys: 
+                c
+              Condition: (plus(c, 1) in [101, +Inf))
+              Parts: 1/2
+              Granules: 1/2
+            Skip
+              Name: idx_a
+              Description: minmax GRANULARITY 1
+              Parts: 1/1
+              Granules: 1/1
+nested_alias
+Expression (Project names)
+  Expression (Projection)
+    Filter (WHERE)
+      Expression (Change column names to column identifiers)
+        Expression (Compute alias columns)
+          ReadFromMergeTree (default.test_nested_alias_idx)
+          Indexes:
+            PrimaryKey
+              Keys: 
+                c
+              Condition: (plus(plus(c, 1), 1) in [101, +Inf))
+              Parts: 1/2
+              Granules: 1/2
+            Skip
+              Name: idx_a2
+              Description: minmax GRANULARITY 1
+              Parts: 1/1
+              Granules: 1/1
+default_settings
+Expression ((Project names + Projection))
+  Filter ((WHERE + (Change column names to column identifiers + Compute alias columns)))
+    ReadFromMergeTree (default.test_alias_skip_idx)
+    Indexes:
+      PrimaryKey
+        Keys: 
+          c
+        Condition: (plus(c, 1) in [101, +Inf))
+        Parts: 1/2
+        Granules: 1/2
+      Skip
+        Name: idx_a
+        Description: minmax GRANULARITY 1
+        Parts: 1/1
+        Granules: 1/1
