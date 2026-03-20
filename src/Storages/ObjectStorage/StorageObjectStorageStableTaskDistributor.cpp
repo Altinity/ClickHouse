@@ -329,8 +329,9 @@ void StorageObjectStorageStableTaskDistributor::rescheduleTasksFromReplica(size_
             "All replicas were marked as lost"
         );
 
+    auto files = std::move(processed_file_list_ptr->second);
     replica_to_files_to_be_processed.erase(number_of_current_replica);
-    for (const auto & file : processed_file_list_ptr->second)
+    for (const auto & file : files)
     {
         auto file_replica_idx = getReplicaForFile(file->getAbsolutePath().value_or(file->getPath()));
         unprocessed_files.emplace(file->getAbsolutePath().value_or(file->getPath()), std::make_pair(file, file_replica_idx));
