@@ -244,3 +244,8 @@ WHERE
     query LIKE '%18138372FAD4B94533CD4881F03DC6C69296DD897234E0CEE83F727E2E6B1F63%' OR
     query LIKE '%8DCDD69CE7D121DE8013062AEAEB2A148910D50E%' OR
     query like '%$2a$12$rz5iy2LhuwBezsM88ZzWiemOVUeJ94xHTzwAlLMDhTzwUxOHaY64q%');
+
+SELECT '-- multiple authentication methods';
+CREATE USER u1_01292 IDENTIFIED WITH plaintext_password by '1', kerberos REALM 'qwerty10', bcrypt_password by '3', ldap SERVER 'abc';
+SELECT name, auth_type, auth_params FROM system.users WHERE name = 'u1_01292' ORDER BY name;
+DROP USER u1_01292;
