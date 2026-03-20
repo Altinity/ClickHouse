@@ -187,7 +187,15 @@ bool ExportPartTask::executeStep()
         The simples way is this one, and given the release timeline, I am opting for it.
     */
     (*exports_list_entry)->thread_group->setCancelPredicate(
-        [this]() -> bool { return isCancelled(); });
+        [weak_this = weak_from_this()]() -> bool
+        {
+            if (auto shared_this = weak_this.lock())
+            {
+                return shared_this->isCancelled();
+            }
+
+            return true;
+        });
 
     SinkToStoragePtr sink;
 
