@@ -42,7 +42,8 @@ Context::Params::Params():
 	verificationMode(VERIFY_RELAXED),
 	verificationDepth(9),
 	loadDefaultCAs(false),
-	cipherList("ALL:!ADH:!LOW:!EXP:!MD5:!3DES:@STRENGTH")
+	cipherList("ALL:!ADH:!LOW:!EXP:!MD5:!3DES:@STRENGTH"),
+	cipherSuites("TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256")
 {
 }
 
@@ -322,6 +323,7 @@ void Context::init(const Params& params)
 			SSL_CTX_set_verify(_pSSLContext, params.verificationMode, &SSLManager::verifyClientCallback);
 
 		SSL_CTX_set_cipher_list(_pSSLContext, params.cipherList.c_str());
+		SSL_CTX_set_ciphersuites(_pSSLContext, params.cipherSuites.c_str());
 		SSL_CTX_set_verify_depth(_pSSLContext, params.verificationDepth);
 		SSL_CTX_set_mode(_pSSLContext, SSL_MODE_AUTO_RETRY);
 		SSL_CTX_set_session_cache_mode(_pSSLContext, SSL_SESS_CACHE_OFF);
