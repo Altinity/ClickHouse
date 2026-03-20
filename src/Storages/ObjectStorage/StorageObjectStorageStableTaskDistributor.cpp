@@ -48,6 +48,9 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getNextTask(size_t numb
     {
         std::lock_guard lock(mutex);
         auto processed_file_list_ptr = replica_to_files_to_be_processed.find(number_of_current_replica);
+        // rescheduleTasksFromReplica can be called only when error catched in RemoteQueryExecutor::processPacket
+        // so getnextTash can't bealled after that
+        // Check only for logical eeror in code
         if (processed_file_list_ptr == replica_to_files_to_be_processed.end())
             throw Exception(
                 ErrorCodes::LOGICAL_ERROR,
@@ -69,15 +72,15 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getNextTask(size_t numb
     {
         std::lock_guard lock(mutex);
         auto processed_file_list_ptr = replica_to_files_to_be_processed.find(number_of_current_replica);
+
         if (processed_file_list_ptr == replica_to_files_to_be_processed.end())
-        { // It is possible that replica was lost after check in the begining of the method
-            auto file_identifier = getFileIdentifier(file);
-            auto file_replica_idx = getReplicaForFile(file_identifier);
-            unprocessed_files.emplace(file_identifier, std::make_pair(file, file_replica_idx));
-            connection_to_files[file_replica_idx].push_back(file);
-        }
-        else
-            processed_file_list_ptr->second.push_back(file);
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "Replica number {} was marked as lost, can't set task for it anymore",
+                number_of_current_replica
+            );
+
+        processed_file_list_ptr->second.push_back(file);
     }
 
     return file;
