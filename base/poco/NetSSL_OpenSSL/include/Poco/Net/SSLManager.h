@@ -121,8 +121,8 @@ namespace Net
     ///    - loadDefaultCAFile (boolean): Specifies whether the builtin CA certificates from OpenSSL are used.
     ///    - cipherList (string): Specifies the supported ciphers in OpenSSL notation
     ///      (e.g. "ALL:!ADH:!LOW:!EXP:!MD5:@STRENGTH"). Only applies to TLSv1.2 and below.
-    ///    - cipherSuites (string): Specifies the supported TLSv1.3 ciphersuites in OpenSSL notation
-    ///      (e.g. "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"). If empty, the library default is used.
+    ///    - cipherSuites (string): Specifies the supported TLSv1.3 ciphersuites in OpenSSL notation.
+    ///      Defaults to "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256" (FIPS-approved ciphersuites only).
     ///    - preferServerCiphers (bool): When choosing a cipher, use the server's preferences instead of the
     ///      client preferences. When not called, the SSL server will always follow the clients
     ///      preferences. When called, the SSL/TLS server will choose following its own
