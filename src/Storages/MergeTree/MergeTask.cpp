@@ -552,8 +552,19 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::executeImpl()
     {
         Block block;
 
+<<<<<<< HEAD
         if (ctx->is_cancelled() || !global_ctx->merging_executor->pull(block))
+=======
+        /// Latch the cancellation: capture the blocker state once and, if it is
+        /// set, persist it into merge_list_element so that `checkOperationIsNotCanceled`
+        /// in `finalize` reliably throws ABORTED even if SYSTEM START MERGES
+        /// clears the blocker between these two reads.
+        bool cancelled = ctx->is_cancelled();
+        if (cancelled || !global_ctx->merging_executor->pull(block))
+>>>>>>> b35ebd017c2 (Merge pull request #99628 from Desel72/fix/issue-99578)
         {
+            if (cancelled)
+                global_ctx->merge_list_element_ptr->is_cancelled.store(true, std::memory_order_relaxed);
             finalize();
             return false;
         }
@@ -782,9 +793,16 @@ bool MergeTask::VerticalMergeStage::executeVerticalMergeForOneColumn() const
     {
         Block block;
 
-        if (global_ctx->isCancelled()
-            || !ctx->executor->pull(block))
+        /// Latch the cancellation so that `finalizeVerticalMergeForOneColumn`
+        /// sees it via `checkOperationIsNotCanceled` even if the blocker is
+        /// released between these two reads.
+        bool cancelled = global_ctx->isCancelled();
+        if (cancelled || !ctx->executor->pull(block))
+        {
+            if (cancelled)
+                global_ctx->merge_list_element_ptr->is_cancelled.store(true, std::memory_order_relaxed);
             return false;
+        }
 
         ctx->column_elems_written += block.rows();
         ctx->column_to->write(block);
