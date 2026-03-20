@@ -205,8 +205,8 @@ static int spawn_child(void *args_vp)
 					goto fail;
 				}
 				if (fd != op->fd) {
-					if ((ret = raw_sc2(SYS_dup2,
-							fd, op->fd)) < 0)
+					if ((ret = raw_sc3(SYS_dup3,
+							fd, op->fd, 0)) < 0)
 						goto fail;
 				} else {
 					ret = raw_sc3(SYS_fcntl, fd,
@@ -222,8 +222,8 @@ static int spawn_child(void *args_vp)
 					(long)op->path, op->oflag, op->mode);
 				if ((ret = fd) < 0) goto fail;
 				if (fd != op->fd) {
-					if ((ret = raw_sc2(SYS_dup2,
-							fd, op->fd)) < 0)
+					if ((ret = raw_sc3(SYS_dup3,
+							fd, op->fd, 0)) < 0)
 						goto fail;
 					raw_sc1(SYS_close, fd);
 				}
