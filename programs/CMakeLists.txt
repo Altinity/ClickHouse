@@ -62,12 +62,6 @@ else()
     message(STATUS "ClickHouse keeper-client mode: OFF")
 endif()
 
-if (FIPS_CLICKHOUSE AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    set(ENABLE_CLICKHOUSE_SSL_SHIM 1)
-    set(ENABLE_CLICKHOUSE_SSL_HANDSHAKER 1)
-    set(ENABLE_CLICKHOUSE_ACVP_SERVER 1)
-endif()
-
 configure_file (config_tools.h.in ${CONFIG_INCLUDE_PATH}/config_tools.h)
 
 macro(clickhouse_target_link_split_lib target name)
@@ -230,16 +224,6 @@ if (ENABLE_CLICKHOUSE_KEEPER_CLIENT)
 
     list(APPEND CLICKHOUSE_BUNDLE clickhouse-keeper-client)
 endif ()
-
-if (ENABLE_CLICKHOUSE_SSL_SHIM)
-    clickhouse_program_install(clickhouse-ssl-shim ssl-shim)
-endif()
-if (ENABLE_CLICKHOUSE_SSL_HANDSHAKER)
-    clickhouse_program_install(clickhouse-ssl-handshaker ssl-handshaker)
-endif()
-if (ENABLE_CLICKHOUSE_ACVP_SERVER)
-    clickhouse_program_install(clickhouse-acvp-server acvp-server)
-endif()
 
 add_custom_target (clickhouse-bundle ALL DEPENDS ${CLICKHOUSE_BUNDLE})
 

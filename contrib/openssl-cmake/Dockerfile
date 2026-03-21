@@ -30,9 +30,3 @@ RUN test $(/aws-lc-AWS-LC-FIPS-2.0.0/build/tool/bssl isfips) = 1
 
 # execute all test
 RUN find /aws-lc-AWS-LC-FIPS-2.0.0/build -iname '*test*' -type f -executable -print -exec {} \;
-
-# Build test harness libraries for ClickHouse FIPS testing integration
-COPY posix_spawn_2.c glibc_compat.c /tmp/
-COPY build_test_harness.sh /tmp/
-RUN chmod +x /tmp/build_test_harness.sh && \
-    /tmp/build_test_harness.sh /aws-lc-AWS-LC-FIPS-2.0.0 /harness-output
