@@ -14,6 +14,7 @@
 #include <Storages/ObjectStorage/DataLakes/DataLakeConfiguration.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergWrites.h>
 #include <Common/DateLUTImpl.h>
+#include <Common/ErrnoException.h>
 
 namespace DB
 {

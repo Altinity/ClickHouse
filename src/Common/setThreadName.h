@@ -159,6 +159,8 @@ namespace DB
     M(ZOOKEEPER_RECV, "ZooKeeperRecv") \
     M(ZOOKEEPER_SEND, "ZooKeeperSend") \
     M(EXPORT_PART, "ExportPart") \
+    M(BLOB_KILLER_TASK, "BlobKillerTask") \
+    M(BLOB_COPIER_TASK, "BlobCopierTask") \
 
 
 enum class ThreadName : uint8_t

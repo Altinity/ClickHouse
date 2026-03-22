@@ -175,11 +175,11 @@ public:
 
     }
 
-    ObjectStoragePtr createObjectStorage(ContextPtr context, bool is_readonly) override
+    ObjectStoragePtr createObjectStorage(ContextPtr context, bool is_readonly, StorageObjectStorageConfiguration::CredentialsConfigurationCallback refresh_credentials_callback) override
     {
         if (ready_object_storage)
             return ready_object_storage;
-        return BaseStorageConfiguration::createObjectStorage(context, is_readonly);
+        return BaseStorageConfiguration::createObjectStorage(context, is_readonly, refresh_credentials_callback);
     }
 
     std::optional<ColumnsDescription> tryGetTableStructureFromMetadata(ContextPtr local_context) const override
@@ -190,9 +190,9 @@ public:
         return std::nullopt;
     }
 
-    bool supportsTotalRows() const override
+    bool supportsTotalRows(ContextPtr context, ObjectStorageType storage_type) const override
     {
-        return DataLakeMetadata::supportsTotalRows();
+        return DataLakeMetadata::supportsTotalRows(context, storage_type);
     }
 
     std::optional<size_t> totalRows(ContextPtr local_context) override
@@ -201,9 +201,9 @@ public:
         return current_metadata->totalRows(local_context);
     }
 
-    bool supportsTotalBytes() const override
+    bool supportsTotalBytes(ContextPtr context, ObjectStorageType storage_type) const override
     {
-        return DataLakeMetadata::supportsTotalBytes();
+        return DataLakeMetadata::supportsTotalBytes(context, storage_type);
     }
 
     std::optional<size_t> totalBytes(ContextPtr local_context) override
@@ -230,19 +230,27 @@ public:
         return current_metadata->getSchemaTransformer(local_context, object_info);
     }
 
-    StorageInMemoryMetadata getStorageSnapshotMetadata(ContextPtr context) const override
+    std::optional<DataLakeTableStateSnapshot> getTableStateSnapshot(ContextPtr context) const override
     {
         assertInitializedDL();
-        return current_metadata->getStorageSnapshotMetadata(context);
+        return current_metadata->getTableStateSnapshot(context);
     }
 
-    /// This method should work even if metadata is not initialized
-    bool needsUpdateForSchemaConsistency() const override
+    std::unique_ptr<StorageInMemoryMetadata> buildStorageMetadataFromState(
+        const DataLakeTableStateSnapshot & state, ContextPtr context) const override
     {
-#if USE_AVRO
-        return std::is_same_v<IcebergMetadata, DataLakeMetadata>;
-#endif
-        return false;
+        assertInitialized();
+        auto metadata = current_metadata->buildStorageMetadataFromState(state, context);
+        if (metadata)
+            LOG_TEST(log, "Built storage metadata from state with columns: {}",
+                metadata->getColumns().toString(/* include_comments */false));
+        return metadata;
+    }
+
+    bool shouldReloadSchemaForConsistency(ContextPtr context) const override
+    {
+        assertInitialized();
+        return current_metadata->shouldReloadSchemaForConsistency(context);
     }
 
     IDataLakeMetadata * getExternalMetadata() override
@@ -391,8 +399,7 @@ public:
 
     bool isClusterSupported() const override { return is_cluster_supported; }
 
-    ASTPtr createArgsWithAccessData() const override
-    {
+    ASTPtr createArgsWithAccessData() const override {
         auto res = BaseStorageConfiguration::createArgsWithAccessData();
 
         auto iceberg_metadata_file_path = (*settings)[DataLakeStorageSetting::iceberg_metadata_file_path];
@@ -425,6 +432,15 @@ public:
         }
 
         return res;
+    }
+
+    bool supportsPrewhere() const override
+    {
+#if USE_AVRO
+        return std::is_same_v<DataLakeMetadata, IcebergMetadata>;
+#else
+        return false;
+#endif
     }
 
 private:

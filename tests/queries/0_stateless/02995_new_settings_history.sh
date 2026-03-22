@@ -35,7 +35,7 @@ fi
 $CLICKHOUSE_LOCAL --query "
     WITH old_settings AS
     (
-        SELECT * FROM file('${CUR_DIR}/02995_settings_25_12_1.tsv', 'TSV', 'name String, default String')
+        SELECT * FROM file('${CUR_DIR}/02995_settings_26_1_1.tsv', 'TSV', 'name String, default String')
     ),
     old_antalya_settings AS
     (
@@ -43,7 +43,7 @@ $CLICKHOUSE_LOCAL --query "
     ),
     old_merge_tree_settings AS
     (
-        SELECT * FROM file('${CUR_DIR}/02995_merge_tree_settings_settings_25_12_1.tsv', 'TSV', 'name String, default String')
+        SELECT * FROM file('${CUR_DIR}/02995_merge_tree_settings_settings_26_1_1.tsv', 'TSV', 'name String, default String')
     ),
     new_settings AS
     (
@@ -63,7 +63,11 @@ $CLICKHOUSE_LOCAL --query "
         )) AND (name NOT IN (
             SELECT arrayJoin(tupleElement(changes, 'name'))
             FROM system.settings_changes
+<<<<<<< HEAD
             WHERE type = 'Session' AND (splitByChar('.', version)[1]::UInt64 > 25 OR (splitByChar('.', version)[1]::UInt64 == 25 AND splitByChar('.', version)[2]::UInt64 > 12) OR position(version, 'altinityantalya') > 0)
+=======
+            WHERE type = 'Session' AND splitByChar('.', version)[1]::UInt64 > 26 OR (splitByChar('.', version)[1]::UInt64 == 26 AND splitByChar('.', version)[2]::UInt64 > 1)
+>>>>>>> v26.2.1.1139-stable
         ))
         UNION ALL
         (
@@ -75,7 +79,11 @@ $CLICKHOUSE_LOCAL --query "
             )) AND (name NOT IN (
                 SELECT arrayJoin(tupleElement(changes, 'name'))
                 FROM system.settings_changes
+<<<<<<< HEAD
                 WHERE type = 'MergeTree' AND (splitByChar('.', version)[1]::UInt64 > 25 OR (splitByChar('.', version)[1]::UInt64 == 25 AND splitByChar('.', version)[2]::UInt64 > 12) OR position(version, 'altinityantalya') > 0)
+=======
+                WHERE type = 'MergeTree' AND splitByChar('.', version)[1]::UInt64 > 26 OR (splitByChar('.', version)[1]::UInt64 == 26 AND splitByChar('.', version)[2]::UInt64 > 1)
+>>>>>>> v26.2.1.1139-stable
             ))
         )
         UNION ALL
@@ -86,7 +94,11 @@ $CLICKHOUSE_LOCAL --query "
             WHERE (new_settings.default != old_settings.default) AND (name NOT IN (
                 SELECT arrayJoin(tupleElement(changes, 'name'))
                 FROM system.settings_changes
+<<<<<<< HEAD
                 WHERE type = 'Session' AND (splitByChar('.', version)[1]::UInt64 > 25 OR (splitByChar('.', version)[1]::UInt64 == 25 AND splitByChar('.', version)[2]::UInt64 > 12) OR position(version, 'altinityantalya') > 0)
+=======
+                WHERE type = 'Session' AND splitByChar('.', version)[1]::UInt64 > 26 OR (splitByChar('.', version)[1]::UInt64 == 26 AND splitByChar('.', version)[2]::UInt64 > 1)
+>>>>>>> v26.2.1.1139-stable
             )) AND ${IGNORE_SETTINGS_FOR_SANITIZERS}
         )
         UNION ALL
@@ -97,7 +109,11 @@ $CLICKHOUSE_LOCAL --query "
             WHERE (new_merge_tree_settings.default != old_merge_tree_settings.default) AND (name NOT IN (
                 SELECT arrayJoin(tupleElement(changes, 'name'))
                 FROM system.settings_changes
+<<<<<<< HEAD
                 WHERE type = 'MergeTree' AND (splitByChar('.', version)[1]::UInt64 > 25 OR (splitByChar('.', version)[1]::UInt64 == 25 AND splitByChar('.', version)[2]::UInt64 > 12) OR position(version, 'altinityantalya') > 0)
+=======
+                WHERE type = 'MergeTree' AND splitByChar('.', version)[1]::UInt64 > 26 OR (splitByChar('.', version)[1]::UInt64 == 26 AND splitByChar('.', version)[2]::UInt64 > 1)
+>>>>>>> v26.2.1.1139-stable
             )) AND ${IGNORED_MERGETREE_SETTINGS_FOR_CLOUD}
         )
         UNION ALL

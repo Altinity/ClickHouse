@@ -8,6 +8,7 @@ blocks
 columns
 columns
 creator_info
+deduplication_hashes
 exports
 failed_parts
 flags
@@ -50,7 +51,11 @@ blocks
 columns
 columns
 creator_info
+<<<<<<< HEAD
 exports
+=======
+deduplication_hashes
+>>>>>>> v26.2.1.1139-stable
 failed_parts
 flags
 host

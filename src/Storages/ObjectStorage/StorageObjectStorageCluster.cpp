@@ -151,16 +151,11 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
         tryLogCurrentException(log_);
     }
 
-    // For tables need to update configuration on each read
-    // because data can be changed after previous update
-    update_configuration_on_read_write = !is_table_function;
-
     ColumnsDescription columns{columns_in_table_or_function_definition};
     std::string sample_path;
     if (need_resolve_columns_or_format)
         resolveSchemaAndFormat(columns, object_storage, configuration, {}, sample_path, context_);
-    else
-        validateSupportedColumns(columns, *configuration);
+
     configuration->check(context_);
 
     if (sample_path.empty()
@@ -180,6 +175,22 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
 
     StorageInMemoryMetadata metadata;
     metadata.setColumns(columns);
+    if (is_table_function && configuration->isDataLakeConfiguration())
+    {
+        /// For datalake table functions, always pin the current snapshot version so that
+        /// query execution uses the same snapshot as query analysis (logical-race fix).
+        /// Additionally reload columns from the snapshot when the per-format setting is enabled.
+        if (auto state = configuration->getTableStateSnapshot(context_))
+        {
+            metadata.setDataLakeTableState(*state);
+            if (configuration->shouldReloadSchemaForConsistency(context_))
+            {
+                if (auto metadata_snapshot = configuration->buildStorageMetadataFromState(*state, context_))
+                    metadata = *metadata_snapshot;
+            }
+        }
+    }
+
     metadata.setConstraints(constraints_);
 
     if (configuration->getPartitionStrategy())
@@ -251,7 +262,7 @@ std::optional<UInt64> StorageObjectStorageCluster::totalRows(ContextPtr query_co
     configuration->update(
         object_storage,
         query_context,
-        /* if_not_updated_before */ false);
+        /* if_not_updated_before */ true);
     return configuration->totalRows(query_context);
 }
 
@@ -262,7 +273,7 @@ std::optional<UInt64> StorageObjectStorageCluster::totalBytes(ContextPtr query_c
     configuration->update(
         object_storage,
         query_context,
-        /* if_not_updated_before */ false);
+        /* if_not_updated_before */ true);
     return configuration->totalBytes(query_context);
 }
 
@@ -510,18 +521,34 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
 
 void StorageObjectStorageCluster::updateExternalDynamicMetadataIfExists(ContextPtr query_context)
 {
+    if (!configuration->isDataLakeConfiguration())
+        return;
+
+    /// Always force an update to pick up the latest snapshot version.
+    /// Using if_not_updated_before=true would leave latest_snapshot_version
+    /// stale from the first query and silently omit new files.
     configuration->update(
         object_storage,
         query_context,
-        /* if_not_updated_before */ true);
-    if (configuration->needsUpdateForSchemaConsistency())
+        /* if_not_updated_before */ false);
+
+    auto state = configuration->getTableStateSnapshot(query_context);
+    if (!state)
+        return;
+
+    auto new_metadata = *getInMemoryMetadataPtr();
+    new_metadata.setDataLakeTableState(*state);
+
+    if (configuration->shouldReloadSchemaForConsistency(query_context))
     {
-        auto metadata_snapshot = configuration->getStorageSnapshotMetadata(query_context);
-        setInMemoryMetadata(metadata_snapshot);
+        if (auto metadata_snapshot = configuration->buildStorageMetadataFromState(*state, query_context))
+            new_metadata = *metadata_snapshot;
     }
 
     if (pure_storage)
         pure_storage->updateExternalDynamicMetadataIfExists(query_context);
+
+    setInMemoryMetadata(new_metadata);
 }
 
 class TaskDistributor : public TaskIterator

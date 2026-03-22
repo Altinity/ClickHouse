@@ -97,6 +97,26 @@ namespace
     }
 }
 
+bool isNotFoundError(Aws::S3::S3Errors error)
+{
+    return error == Aws::S3::S3Errors::RESOURCE_NOT_FOUND || error == Aws::S3::S3Errors::NO_SUCH_KEY
+        || error == Aws::S3::S3Errors::NO_SUCH_BUCKET;
+}
+
+bool isAuthenticationError(Aws::S3::S3Errors error)
+{
+    return error == Aws::S3::S3Errors::ACCESS_DENIED
+        || error == Aws::S3::S3Errors::INVALID_ACCESS_KEY_ID
+        || error == Aws::S3::S3Errors::INVALID_SIGNATURE;
+}
+
+String getAuthenticationErrorHint(Aws::S3::S3Errors error)
+{
+    if (isAuthenticationError(error))
+        return " Please check your AWS credentials and permissions.";
+    return "";
+}
+
 ObjectAttributes getObjectTags(
     const S3::Client & client,
     const String & bucket,
@@ -110,21 +130,16 @@ ObjectAttributes getObjectTags(
         const auto & error = tag_outcome.GetError();
         throw S3Exception(
             error.GetErrorType(),
-            "Failed to get object tags: {}. HTTP response code: {}",
+            "Failed to get object tags: {}. HTTP response code: {}.{}",
             error.GetMessage(),
-            static_cast<size_t>(error.GetResponseCode()));
+            static_cast<size_t>(error.GetResponseCode()),
+            getAuthenticationErrorHint(error.GetErrorType()));
     }
 
     for (const auto & tag : tag_outcome.GetResult().GetTagSet())
         tags[tag.GetKey()] = tag.GetValue();
 
     return tags;
-}
-
-bool isNotFoundError(Aws::S3::S3Errors error)
-{
-    return error == Aws::S3::S3Errors::RESOURCE_NOT_FOUND || error == Aws::S3::S3Errors::NO_SUCH_KEY
-        || error == Aws::S3::S3Errors::NO_SUCH_BUCKET;
 }
 
 ObjectInfo getObjectInfoIfExists(
@@ -146,9 +161,10 @@ ObjectInfo getObjectInfoIfExists(
 
     throw S3Exception(
         error.GetErrorType(),
-        "Failed to get object info: {}. HTTP response code: {}",
+        "Failed to get object info: {}. HTTP response code: {}.{}",
         error.GetMessage(),
-        static_cast<size_t>(error.GetResponseCode()));
+        static_cast<size_t>(error.GetResponseCode()),
+        getAuthenticationErrorHint(error.GetErrorType()));
 }
 
 ObjectInfo getObjectInfo(
@@ -168,9 +184,10 @@ ObjectInfo getObjectInfo(
 
     throw S3Exception(
         error.GetErrorType(),
-        "Failed to get object info: {}. HTTP response code: {}",
+        "Failed to get object info: {}. HTTP response code: {}.{}",
         error.GetMessage(),
-        static_cast<size_t>(error.GetResponseCode()));
+        static_cast<size_t>(error.GetResponseCode()),
+        getAuthenticationErrorHint(error.GetErrorType()));
 }
 
 size_t getObjectSize(
@@ -199,8 +216,9 @@ bool objectExists(
         return false;
 
     throw S3Exception(error.GetErrorType(),
-        "Failed to check existence of key {} in bucket {}: {}. HTTP response code: {}, error type: {}",
-        key, bucket, error.GetMessage(), static_cast<size_t>(error.GetResponseCode()), error.GetErrorType());
+        "Failed to check existence of key {} in bucket {}: {}. HTTP response code: {}, error type: {}.{}",
+        key, bucket, error.GetMessage(), static_cast<size_t>(error.GetResponseCode()),
+        error.GetErrorType(), getAuthenticationErrorHint(error.GetErrorType()));
 }
 
 void checkObjectExists(

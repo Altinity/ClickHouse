@@ -175,6 +175,7 @@ struct Reader
         bool use_bloom_filter = false;
         const KeyCondition * column_index_condition = nullptr;
         bool use_prewhere = false;
+        size_t first_step_to_calculate = 0;
         bool only_for_prewhere = false; // can remove this column after applying prewhere
 
         bool used_by_key_condition = false;
@@ -416,6 +417,7 @@ struct Reader
 
 
         /// Fields below are used only by ReadManager.
+        std::atomic<size_t> read_ptr {0};
 
         /// Indexes of the first subgroup that didn't finish
         /// {prewhere, reading main columns, delivering final chunk}.
@@ -545,7 +547,7 @@ private:
     void decompressPageIfCompressed(PageState & page);
     void createPageDecoder(PageState & page, ColumnChunk & column, const PrimitiveColumnInfo & column_info);
     bool skipRowsInPage(size_t target_row_idx, PageState & page, ColumnChunk & column, const PrimitiveColumnInfo & column_info);
-    void readRowsInPage(size_t end_row_idx, ColumnSubchunk & subchunk, ColumnChunk & column, const PrimitiveColumnInfo & column_info);
+    void readRowsInPage(size_t end_row_idx, ColumnSubchunk & subchunk, ColumnChunk & column, const PrimitiveColumnInfo & column_info, const RowSubgroup * row_subgroup = nullptr);
 };
 
 }

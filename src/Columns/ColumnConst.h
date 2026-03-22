@@ -34,7 +34,7 @@ public:
         return convertToFullColumn();
     }
 
-    ColumnPtr removeLowCardinality() const;
+    ColumnPtr convertToFullColumnIfLowCardinality() const override;
 
     std::string getName() const override
     {
@@ -170,10 +170,7 @@ public:
         ++s;
     }
 
-    void popBack(size_t n) override
-    {
-        s -= n;
-    }
+    void popBack(size_t n) override;
 
     std::string_view
     serializeValueIntoArena(size_t, Arena & arena, char const *& begin, const IColumn::SerializationSettings * settings) const override
@@ -256,9 +253,9 @@ public:
 
     void gather(ColumnGathererStream &) override;
 
-    void getExtremes(Field & min, Field & max) const override
+    void getExtremes(Field & min, Field & max, size_t start, size_t end) const override
     {
-        data->getExtremes(min, max);
+        data->getExtremes(min, max, start, end);
     }
 
     void forEachSubcolumn(ColumnCallback callback) const override

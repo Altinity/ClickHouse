@@ -71,7 +71,7 @@ void ReadManager::init(FormatParserSharedResourcesPtr parser_shared_resources_, 
     /// Distribute memory budget among stages.
     /// The distribution is static to make sure no stage gets starved if others eat all the memory.
     /// E.g. if the budget was shared among all stages, maybe PrewhereData could run far ahead and
-    /// eat all memory, and MainData would have to execute in one thread to minimize memory usage.
+    /// The distribution is static to make sure no stage gets starved if others eat all the memory.
     double sum = 0;
     stages[size_t(ReadStage::MainData)].memory_target_fraction *= 10;
     if (reader.format_filter_info->prewhere_info || reader.format_filter_info->row_level_filter)
@@ -439,16 +439,8 @@ void ReadManager::finishRowSubgroupStage(size_t row_group_idx, size_t row_subgro
         if (*advanced_read_ptr == row_group.subgroups.size())
         {
             /// If we've read (not necessarily delivered) all subgroups, we can deallocate things
-            /// like dictionary page and offset index.
-            /// Only do it in the thread that has advanced row_group.read_ptr to the final value -
-            /// there can only be one such thread.
-            /// (I.e. avoid this race condition: one thread increments read_ptr, another thread sees the
-            ///  new value, both threads call clearColumnChunk in parallel, the computer explodes.)
-            /// Don't touch columns with use_prewhere == true, they're cleared by
-            /// ReadStage::PrewhereData instead, which might be happening in parallel with us
-            /// (but doesn't prewhere happen before MainData read? yes, but the clearColumnChunk call
-            ///  happens after advancing prewhere_ptr, so another thread may do MainData+clearColumnChunk
-            ///  before the thread that did prewhere is still clearing the corresponding columns).
+            /// like dictionary page and offset index. Clear all columns (including PREWHERE-only),
+            /// since we scheduled ColumnData prefetches for all of them and must release the memory.
             for (size_t i = 0; i < reader.primitive_columns.size(); ++i)
                 if (!reader.primitive_columns[i].use_prewhere)
                     clearColumnChunk(row_group.columns.at(i), diff);
@@ -887,6 +879,16 @@ ReadManager::ReadResult ReadManager::read()
                     chassert(row_group.delivery_ptr.load(std::memory_order_relaxed) == row_group.subgroups.size());
                     for (const RowSubgroup & subgroup : row_group.subgroups)
                         chassert(subgroup.stage.load(std::memory_order_relaxed) == ReadStage::Deallocated);
+                    for (size_t i = 0; i < stages.size(); ++i)
+                    {
+                        size_t mem = stages[i].memory_usage.load(std::memory_order_relaxed);
+                        size_t batches = stages[i].batches_in_progress.load(std::memory_order_relaxed);
+                        size_t unsched = 0;
+                        for (const auto & tasks : stages[i].row_group_tasks_to_schedule)
+                            unsched += tasks.size();
+                        if (mem != 0 || batches != 0 || unsched != 0)
+                            throw Exception(ErrorCodes::LOGICAL_ERROR, "Leak in memory or task accounting in parquet reader: got {} bytes, {} batches, {} tasks in stage {}", mem, batches, unsched, i);
+                    }
                 }
                 for (size_t i = 0; i < stages.size(); ++i)
                 {
