@@ -81,7 +81,17 @@ public:
     getMessageTypeForFormatSchema(const FormatSchemaInfo & info, WithEnvelope with_envelope, const String & google_protos_path);
 
 private:
-    std::unordered_map<String, std::shared_ptr<ImporterWithSourceTree>> importers;
+    using ImporterKey = std::pair<String, WithEnvelope>;
+    struct ImporterKeyHash
+    {
+        size_t operator()(const ImporterKey & key) const
+        {
+            auto h1 = std::hash<String>{}(key.first);
+            auto h2 = std::hash<uint8_t>{}(static_cast<uint8_t>(key.second));
+            return h1 ^ (h2 << 1);
+        }
+    };
+    std::unordered_map<ImporterKey, std::shared_ptr<ImporterWithSourceTree>, ImporterKeyHash> importers;
     std::mutex mutex;
 };
 
