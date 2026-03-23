@@ -51,6 +51,15 @@ build_target() {
     # (same libstdc++ members pulled into shim, handshaker, acvp) don't clash.
     objcopy --redefine-syms="$obj_dir/redefine.txt" --weaken "$obj_dir/combined.o"
 
+    # Sanity check: no prefixed undefined symbols should remain.
+    # If any do, they would silently resolve to NULL at link time (weak undef).
+    bad=$(nm -u "$obj_dir/combined.o" | grep "$PREFIX" || true)
+    if [ -n "$bad" ]; then
+        echo "ERROR: $name has prefixed undefined symbols that will not resolve:" >&2
+        echo "$bad" >&2
+        exit 1
+    fi
+
     ar rcs "$OUTDIR/lib${name}.a" "$obj_dir/combined.o"
     rm -rf "$obj_dir"
 }
