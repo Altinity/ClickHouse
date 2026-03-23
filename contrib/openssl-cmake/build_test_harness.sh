@@ -42,23 +42,23 @@ build_target() {
     awk -v p="$PREFIX" '{print p $0 " " $0}' "$obj_dir/undef.txt"  > "$obj_dir/redefine.txt"
     awk -v p="$PREFIX" '{print p $0 " " $0}' "$obj_dir/entry.txt" >> "$obj_dir/redefine.txt"
 
+    # Collect defined symbols — only these need weakening (to avoid
+    # duplicate-definition errors when multiple archives pull the same
+    # libstdc++ members).  Undefined symbols must stay strong so the
+    # linker errors out if they cannot be resolved, instead of silently
+    # binding them to NULL.
+    # Names are prefixed to match post-pass-1 state.
+    nm --defined-only "$obj_dir/combined.o" | awk -v p="$PREFIX" \
+        'NF>=3{print p $NF}' | sort -u > "$obj_dir/weaken.txt"
+
     # Two passes: objcopy applies --redefine-syms BEFORE --prefix-symbols
     # in a single invocation, so we must split them.
     # Pass 1: prefix every symbol.
     objcopy --prefix-symbols="$PREFIX" "$obj_dir/combined.o"
     # Pass 2: restore undefined refs + entry point to original names,
-    # and weaken all defined symbols so duplicates across archives
-    # (same libstdc++ members pulled into shim, handshaker, acvp) don't clash.
-    objcopy --redefine-syms="$obj_dir/redefine.txt" --weaken "$obj_dir/combined.o"
-
-    # Sanity check: no prefixed undefined symbols should remain.
-    # If any do, they would silently resolve to NULL at link time (weak undef).
-    bad=$(nm -u "$obj_dir/combined.o" | grep "$PREFIX" || true)
-    if [ -n "$bad" ]; then
-        echo "ERROR: $name has prefixed undefined symbols that will not resolve:" >&2
-        echo "$bad" >&2
-        exit 1
-    fi
+    # and weaken only defined symbols.
+    objcopy --redefine-syms="$obj_dir/redefine.txt" \
+            --weaken-symbols="$obj_dir/weaken.txt" "$obj_dir/combined.o"
 
     ar rcs "$OUTDIR/lib${name}.a" "$obj_dir/combined.o"
     rm -rf "$obj_dir"
