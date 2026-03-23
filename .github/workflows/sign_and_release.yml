@@ -11,4 +11,55 @@ jobs:
 
       - name: Upload to prod
         run: |
-          aws s3 sync /home/runner/.cache/bin-repo/ s3://builds.altinity.cloud/Blue/bin-repo
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.3.19.33.altinitystable/packages/AMD_PACKAGES/clickhouse-client-23.3.19.33.altinitystable-amd64.tgz /home/runner/.cache/tgz-repo/clickhouse-client-23.3.19.33.altinitystable-amd64.tgz
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.3.19.33.altinitystable/packages/AMD_PACKAGES/clickhouse-client-23.3.19.33.altinitystable-amd64.tgz.sha512 /home/runner/.cache/tgz-repo/clickhouse-client-23.3.19.33.altinitystable-amd64.tgz.sha512
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.3.19.33.altinitystable/packages/ARM_PACKAGES/clickhouse-client-23.3.19.33.altinitystable-arm64.tgz /home/runner/.cache/tgz-repo/clickhouse-client-23.3.19.33.altinitystable-arm64.tgz
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.3.19.33.altinitystable/packages/ARM_PACKAGES/clickhouse-client-23.3.19.33.altinitystable-arm64.tgz.sha512 /home/runner/.cache/tgz-repo/clickhouse-client-23.3.19.33.altinitystable-arm64.tgz.sha512
+
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.3.19.33.altinitystable/packages/AMD_PACKAGES/clickhouse-common-static-23.3.19.33.altinitystable-amd64.tgz /home/runner/.cache/tgz-repo/clickhouse-common-static-23.3.19.33.altinitystable-amd64.tgz
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.3.19.33.altinitystable/packages/AMD_PACKAGES/clickhouse-common-static-23.3.19.33.altinitystable-amd64.tgz.sha512 /home/runner/.cache/tgz-repo/clickhouse-common-static-23.3.19.33.altinitystable-amd64.tgz.sha512
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.3.19.33.altinitystable/packages/ARM_PACKAGES/clickhouse-common-static-23.3.19.33.altinitystable-arm64.tgz /home/runner/.cache/tgz-repo/clickhouse-common-static-23.3.19.33.altinitystable-arm64.tgz
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.3.19.33.altinitystable/packages/ARM_PACKAGES/clickhouse-common-static-23.3.19.33.altinitystable-arm64.tgz.sha512 /home/runner/.cache/tgz-repo/clickhouse-common-static-23.3.19.33.altinitystable-arm64.tgz.sha512
+
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.3.19.33.altinitystable/packages/AMD_PACKAGES/clickhouse-common-static-dbg-23.3.19.33.altinitystable-amd64.tgz /home/runner/.cache/tgz-repo/clickhouse-common-static-dbg-23.3.19.33.altinitystable-amd64.tgz
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.3.19.33.altinitystable/packages/AMD_PACKAGES/clickhouse-common-static-dbg-23.3.19.33.altinitystable-amd64.tgz.sha512 /home/runner/.cache/tgz-repo/clickhouse-common-static-dbg-23.3.19.33.altinitystable-amd64.tgz.sha512
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.3.19.33.altinitystable/packages/ARM_PACKAGES/clickhouse-common-static-dbg-23.3.19.33.altinitystable-arm64.tgz /home/runner/.cache/tgz-repo/clickhouse-common-static-dbg-23.3.19.33.altinitystable-arm64.tgz
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.3.19.33.altinitystable/packages/ARM_PACKAGES/clickhouse-common-static-dbg-23.3.19.33.altinitystable-arm64.tgz.sha512 /home/runner/.cache/tgz-repo/clickhouse-common-static-dbg-23.3.19.33.altinitystable-arm64.tgz.sha512
+
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.3.19.33.altinitystable/packages/AMD_PACKAGES/clickhouse-server-23.3.19.33.altinitystable-amd64.tgz /home/runner/.cache/tgz-repo/clickhouse-server-23.3.19.33.altinitystable-amd64.tgz
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.3.19.33.altinitystable/packages/AMD_PACKAGES/clickhouse-server-23.3.19.33.altinitystable-amd64.tgz.sha512 /home/runner/.cache/tgz-repo/clickhouse-server-23.3.19.33.altinitystable-amd64.tgz.sha512
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.3.19.33.altinitystable/packages/ARM_PACKAGES/clickhouse-server-23.3.19.33.altinitystable-arm64.tgz /home/runner/.cache/tgz-repo/clickhouse-server-23.3.19.33.altinitystable-arm64.tgz
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.3.19.33.altinitystable/packages/ARM_PACKAGES/clickhouse-server-23.3.19.33.altinitystable-arm64.tgz.sha512 /home/runner/.cache/tgz-repo/clickhouse-server-23.3.19.33.altinitystable-arm64.tgz.sha512
+
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.8.16.43.altinitystable/packages/AMD_PACKAGES/clickhouse-client-23.8.16.43.altinitystable-amd64.tgz /home/runner/.cache/tgz-repo/clickhouse-client-23.8.16.43.altinitystable-amd64.tgz
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.8.16.43.altinitystable/packages/AMD_PACKAGES/clickhouse-client-23.8.16.43.altinitystable-amd64.tgz.sha512 /home/runner/.cache/tgz-repo/clickhouse-client-23.8.16.43.altinitystable-amd64.tgz.sha512
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.8.16.43.altinitystable/packages/ARM_PACKAGES/clickhouse-client-23.8.16.43.altinitystable-arm64.tgz /home/runner/.cache/tgz-repo/clickhouse-client-23.8.16.43.altinitystable-arm64.tgz
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.8.16.43.altinitystable/packages/ARM_PACKAGES/clickhouse-client-23.8.16.43.altinitystable-arm64.tgz.sha512 /home/runner/.cache/tgz-repo/clickhouse-client-23.8.16.43.altinitystable-arm64.tgz.sha512
+
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.8.16.43.altinitystable/packages/AMD_PACKAGES/clickhouse-common-static-23.8.16.43.altinitystable-amd64.tgz /home/runner/.cache/tgz-repo/clickhouse-common-static-23.8.16.43.altinitystable-amd64.tgz
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.8.16.43.altinitystable/packages/AMD_PACKAGES/clickhouse-common-static-23.8.16.43.altinitystable-amd64.tgz.sha512 /home/runner/.cache/tgz-repo/clickhouse-common-static-23.8.16.43.altinitystable-amd64.tgz.sha512
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.8.16.43.altinitystable/packages/ARM_PACKAGES/clickhouse-common-static-23.8.16.43.altinitystable-arm64.tgz /home/runner/.cache/tgz-repo/clickhouse-common-static-23.8.16.43.altinitystable-arm64.tgz
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.8.16.43.altinitystable/packages/ARM_PACKAGES/clickhouse-common-static-23.8.16.43.altinitystable-arm64.tgz.sha512 /home/runner/.cache/tgz-repo/clickhouse-common-static-23.8.16.43.altinitystable-arm64.tgz.sha512
+
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.8.16.43.altinitystable/packages/AMD_PACKAGES/clickhouse-common-static-dbg-23.8.16.43.altinitystable-amd64.tgz /home/runner/.cache/tgz-repo/clickhouse-common-static-dbg-23.8.16.43.altinitystable-amd64.tgz
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.8.16.43.altinitystable/packages/AMD_PACKAGES/clickhouse-common-static-dbg-23.8.16.43.altinitystable-amd64.tgz.sha512 /home/runner/.cache/tgz-repo/clickhouse-common-static-dbg-23.8.16.43.altinitystable-amd64.tgz.sha512
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.8.16.43.altinitystable/packages/ARM_PACKAGES/clickhouse-common-static-dbg-23.8.16.43.altinitystable-arm64.tgz /home/runner/.cache/tgz-repo/clickhouse-common-static-dbg-23.8.16.43.altinitystable-arm64.tgz
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.8.16.43.altinitystable/packages/ARM_PACKAGES/clickhouse-common-static-dbg-23.8.16.43.altinitystable-arm64.tgz.sha512 /home/runner/.cache/tgz-repo/clickhouse-common-static-dbg-23.8.16.43.altinitystable-arm64.tgz.sha512
+
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.8.16.43.altinitystable/packages/AMD_PACKAGES/clickhouse-server-23.8.16.43.altinitystable-amd64.tgz /home/runner/.cache/tgz-repo/clickhouse-server-23.8.16.43.altinitystable-amd64.tgz
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.8.16.43.altinitystable/packages/AMD_PACKAGES/clickhouse-server-23.8.16.43.altinitystable-amd64.tgz.sha512 /home/runner/.cache/tgz-repo/clickhouse-server-23.8.16.43.altinitystable-amd64.tgz.sha512
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.8.16.43.altinitystable/packages/ARM_PACKAGES/clickhouse-server-23.8.16.43.altinitystable-arm64.tgz /home/runner/.cache/tgz-repo/clickhouse-server-23.8.16.43.altinitystable-arm64.tgz
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.8.16.43.altinitystable/packages/ARM_PACKAGES/clickhouse-server-23.8.16.43.altinitystable-arm64.tgz.sha512 /home/runner/.cache/tgz-repo/clickhouse-server-23.8.16.43.altinitystable-arm64.tgz.sha512
+
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.3.19.33.altinitystable/packages/AMD_PACKAGES/clickhouse-keeper-23.3.19.33.altinitystable-amd64.tgz /home/runner/.cache/tgz-repo/clickhouse-keeper-23.3.19.33.altinitystable-amd64.tgz
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.3.19.33.altinitystable/packages/AMD_PACKAGES/clickhouse-keeper-23.3.19.33.altinitystable-amd64.tgz.sha512 /home/runner/.cache/tgz-repo/clickhouse-keeper-23.3.19.33.altinitystable-amd64.tgz.sha512
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.3.19.33.altinitystable/packages/ARM_PACKAGES/clickhouse-keeper-23.3.19.33.altinitystable-arm64.tgz /home/runner/.cache/tgz-repo/clickhouse-keeper-23.3.19.33.altinitystable-arm64.tgz
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.3.19.33.altinitystable/packages/ARM_PACKAGES/clickhouse-keeper-23.3.19.33.altinitystable-arm64.tgz.sha512 /home/runner/.cache/tgz-repo/clickhouse-keeper-23.3.19.33.altinitystable-arm64.tgz.sha512
+          
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.8.16.43.altinitystable/packages/AMD_PACKAGES/clickhouse-keeper-23.8.16.43.altinitystable-amd64.tgz /home/runner/.cache/tgz-repo/clickhouse-keeper-23.8.16.43.altinitystable-amd64.tgz
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.8.16.43.altinitystable/packages/AMD_PACKAGES/clickhouse-keeper-23.8.16.43.altinitystable-amd64.tgz.sha512 /home/runner/.cache/tgz-repo/clickhouse-keeper-23.8.16.43.altinitystable-amd64.tgz.sha512
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.8.16.43.altinitystable/packages/ARM_PACKAGES/clickhouse-keeper-23.8.16.43.altinitystable-arm64.tgz /home/runner/.cache/tgz-repo/clickhouse-keeper-23.8.16.43.altinitystable-arm64.tgz
+          aws s3 cp s3://altinity-test-reports/builds/released/v23.8.16.43.altinitystable/packages/ARM_PACKAGES/clickhouse-keeper-23.8.16.43.altinitystable-arm64.tgz.sha512 /home/runner/.cache/tgz-repo/clickhouse-keeper-23.8.16.43.altinitystable-arm64.tgz.sha512
+
+          aws s3 sync /home/runner/.cache/tgz-repo/ s3://builds.altinity.cloud/Blue/tgz-repo/
+          aws s3 sync /home/runner/.cache/tgz-repo/ s3://builds.altinity.cloud/Green/tgz-repo/
