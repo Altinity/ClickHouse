@@ -97,7 +97,7 @@ namespace Net
     ///            <requireTLSv1>true|false</requireTLSv1>
     ///            <requireTLSv1_1>true|false</requireTLSv1_1>
     ///            <requireTLSv1_2>true|false</requireTLSv1_2>
-    ///            <disableProtocols>sslv2,sslv3,tlsv1,tlsv1_1,tlsv1_2</disableProtocols>
+    ///            <disableProtocols>sslv2,sslv3,tlsv1,tlsv1_1,tlsv1_2,tlsv1_3</disableProtocols>
     ///            <dhParamsFile>dh.pem</dhParamsFile>
     ///            <ecdhCurve>prime256v1</ecdhCurve>
     ///          </server|client>
