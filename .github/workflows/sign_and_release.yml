@@ -11,8 +11,8 @@ jobs:
 
       - name: Download tgz
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_REPORT_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_REPORT_SECRET_ACCESS_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.READ_ONLY_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.READ_ONLY_AWS_SECRET_ACCESS_KEY }}
         run: |
           aws s3 cp s3://altinity-test-reports/builds/released/v23.3.19.33.altinitystable/packages/AMD_PACKAGES/clickhouse-client-23.3.19.33.altinitystable-amd64.tgz /home/runner/.cache/tgz-repo/clickhouse-client-23.3.19.33.altinitystable-amd64.tgz
           aws s3 cp s3://altinity-test-reports/builds/released/v23.3.19.33.altinitystable/packages/AMD_PACKAGES/clickhouse-client-23.3.19.33.altinitystable-amd64.tgz.sha512 /home/runner/.cache/tgz-repo/clickhouse-client-23.3.19.33.altinitystable-amd64.tgz.sha512
