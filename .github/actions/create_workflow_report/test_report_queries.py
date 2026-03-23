@@ -62,6 +62,17 @@ def check_result_matches_expect(df: pd.DataFrame, expect: list[str]) -> None:
             ),
         ),
         (
+            "stateless_fail_in_teardown_no_reruns",
+            "0cd90a87ab7b2ad83d24df87d96af5d3de7858c2",
+            "feature/antalya-26.1/json_part2",
+            (
+                "00411_long_accurate_number_comparison_int4",
+                "03572_export_merge_tree_part_limits_and_table_functions",
+                "Exception in test runner",
+                "Some queries hung",
+            ),
+        ),
+        (
             "stateless_and_integration_passed_after_reruns",
             "49bb3f7beb5e6e424a1e94c749478fd23a8e6196",
             "antalya-25.8",
