@@ -331,7 +331,6 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
                 /*allow_global_join_for_right_table*/ true,
                 /*find_cross_join*/ true);
             query_to_send = queryNodeToDistributedSelectQuery(modified_query_tree);
-            send_external_tables = true;
         }
 
         return;
@@ -412,7 +411,7 @@ void IStorageCluster::read(
     auto this_ptr = std::static_pointer_cast<IStorageCluster>(shared_from_this());
 
     std::optional<Tables> external_tables = std::nullopt;
-    if (send_external_tables && query_info.planner_context && query_info.planner_context->getMutableQueryContext())
+    if (query_info.planner_context && query_info.planner_context->getMutableQueryContext())
         external_tables = query_info.planner_context->getMutableQueryContext()->getExternalTables();
 
     auto reading = std::make_unique<ReadFromCluster>(
@@ -615,7 +614,7 @@ QueryProcessingStage::Enum IStorageCluster::getQueryProcessingStage(
     {
         if (!context->getSettingsRef()[Setting::allow_experimental_analyzer])
             throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-                "object_storage_cluster_join_mode!='allow' is not supported without allow_experimental_analyzer=false");
+                "object_storage_cluster_join_mode!='allow' is not supported without allow_experimental_analyzer=true");
 
         if (object_storage_cluster_join_mode == ObjectStorageClusterJoinMode::LOCAL)
         {

@@ -108,7 +108,6 @@ private:
 
     LoggerPtr log;
     String cluster_name;
-    bool send_external_tables = false;
 
     struct QueryTreeInfo
     {
