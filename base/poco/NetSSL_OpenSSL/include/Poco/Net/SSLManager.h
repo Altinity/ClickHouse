@@ -78,7 +78,7 @@ namespace Net
     ///            <verificationDepth>1..9</verificationDepth>
     ///            <loadDefaultCAFile>true|false</loadDefaultCAFile>
     ///            <cipherList>ALL:!ADH:!LOW:!EXP:!MD5:!3DES:@STRENGTH</cipherList>
-    ///            <cipherSuites>TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384</cipherSuites>
+    ///            <cipherSuites>TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256</cipherSuites>
     ///            <preferServerCiphers>true|false</preferServerCiphers>
     ///            <privateKeyPassphraseHandler>
     ///                <name>KeyFileHandler</name>
