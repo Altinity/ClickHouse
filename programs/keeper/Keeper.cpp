@@ -177,6 +177,14 @@ void Keeper::initialize(Poco::Util::Application & self)
         Poco::Environment::osName(),
         Poco::Environment::osVersion(),
         Poco::Environment::osArchitecture());
+
+#if USE_SSL && defined(FIPS_CLICKHOUSE)
+    if (FIPS_mode())
+    {
+        LOG_INFO(&logger(), "Starting in FIPS mode, KAT test result: {}, Integrity check: {}",
+                BORINGSSL_self_test(), BORINGSSL_integrity_test());
+    }
+#endif
 }
 
 std::string Keeper::getDefaultConfigFileName() const
