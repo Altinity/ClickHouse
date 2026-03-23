@@ -142,28 +142,26 @@ def get_run_details(run_id: str) -> dict:
     return response.json()
 
 
-def get_checks_fails(client: Client, commit_sha: str, branch_name: str):
+def _checks_latest_test_status_cte(commit_sha: str, branch_name: str) -> str:
     """
-    Get tests that did not succeed for the given commit and branch.
-    Exclude checks that have status 'error' as they are counted in get_checks_errors.
+    Shared filtering for gh-data.checks: anchor time excludes stateless teardown checks
+    (Stateless% + test_name not matching ^[0-9]{5}); keep rows with check_start_time
+    >= anchor so main + teardown phases are included.
     """
-    query = f"""WITH checks_for_commit AS (
+    return f"""WITH checks_with_anchor AS (
             SELECT
                 check_name,
                 test_name,
                 report_url,
                 check_status,
                 test_status,
-                check_start_time
+                check_start_time,
+                maxIf(
+                    check_start_time,
+                    NOT (check_name LIKE 'Stateless%' AND NOT match(test_name, '^[0-9]{{5}}'))
+                ) OVER (PARTITION BY check_name) AS latest_check_start_time
             FROM `gh-data`.checks
             WHERE commit_sha = '{commit_sha}' AND head_ref = '{branch_name}'
-        ),
-        latest_start_time_for_checks AS (
-            SELECT
-                *,
-                max(check_start_time) OVER (PARTITION BY check_name) AS latest_check_start_time
-            FROM checks_for_commit
-            WHERE NOT (check_name LIKE 'Stateless%' AND NOT match(test_name, '^[0-9]{{5}}')) -- Exclude stateless teardown checks
         ),
         rows_from_latest_check_run AS (
             SELECT
@@ -173,7 +171,7 @@ def get_checks_fails(client: Client, commit_sha: str, branch_name: str):
                 check_status,
                 test_status,
                 check_start_time
-            FROM latest_start_time_for_checks
+            FROM checks_with_anchor
             WHERE check_start_time >= latest_check_start_time
         ),
         latest_test_status AS (
@@ -185,7 +183,15 @@ def get_checks_fails(client: Client, commit_sha: str, branch_name: str):
                 report_url AS results_link
             FROM rows_from_latest_check_run
             GROUP BY check_name, test_name, report_url
-        )
+        )"""
+
+
+def get_checks_fails(client: Client, commit_sha: str, branch_name: str):
+    """
+    Get tests that did not succeed for the given commit and branch.
+    Exclude checks that have status 'error' as they are counted in get_checks_errors.
+    """
+    query = f"""{_checks_latest_test_status_cte(commit_sha, branch_name)}
         SELECT job_status, job_name, status AS test_status, test_name, results_link
         FROM latest_test_status
         WHERE test_status IN ('FAIL', 'ERROR')
@@ -257,19 +263,10 @@ def get_checks_known_fails(
     if len(known_fails) == 0:
         return pd.DataFrame()
 
-    query = f"""SELECT job_name, status as test_status, test_name, results_link
-        FROM (
-            SELECT
-                check_name as job_name,
-                argMax(test_status, check_start_time) as status,
-                test_name,
-                report_url as results_link,
-                task_url
-            FROM `gh-data`.checks
-            WHERE commit_sha='{commit_sha}' AND head_ref='{branch_name}'
-            GROUP BY check_name, test_name, report_url, task_url
-        )
-        WHERE test_status='BROKEN'
+    query = f"""{_checks_latest_test_status_cte(commit_sha, branch_name)}
+        SELECT job_name, status AS test_status, test_name, results_link
+        FROM latest_test_status
+        WHERE status = 'BROKEN'
         ORDER BY job_name, test_name
         """
 
@@ -296,22 +293,12 @@ def get_checks_errors(client: Client, commit_sha: str, branch_name: str):
     """
     Get checks that have status 'error' for the given commit and branch.
     """
-    query = f"""SELECT job_status, job_name, status as test_status, test_name, results_link
-            FROM (
-                SELECT
-                    argMax(check_status, check_start_time) as job_status,
-                    check_name as job_name,
-                    argMax(test_status, check_start_time) as status,
-                    test_name,
-                    report_url as results_link,
-                    task_url
-                FROM `gh-data`.checks
-                WHERE commit_sha='{commit_sha}' AND head_ref='{branch_name}'
-                GROUP BY check_name, test_name, report_url, task_url
-            )
-            WHERE job_status=='error'
-            ORDER BY job_name, test_name
-            """
+    query = f"""{_checks_latest_test_status_cte(commit_sha, branch_name)}
+        SELECT job_status, job_name, status AS test_status, test_name, results_link
+        FROM latest_test_status
+        WHERE job_status = 'error'
+        ORDER BY job_name, test_name
+        """
     return client.query_dataframe(query)
 
 
