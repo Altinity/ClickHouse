@@ -147,7 +147,7 @@ namespace Net
     ///    - requireTLSv1_1 (boolean): Require a TLSv1.1 connection.
     ///    - requireTLSv1_2 (boolean): Require a TLSv1.2 connection.
     ///    - disableProtocols (string): A comma-separated list of protocols that should be
-    ///      disabled. Valid protocol names are sslv2, sslv3, tlsv1, tlsv1_1, tlsv1_2.
+    ///      disabled. Valid protocol names are sslv2, sslv3, tlsv1, tlsv1_1, tlsv1_2, tlsv1_3.
     ///    - dhParamsFile (string): Specifies a file containing Diffie-Hellman parameters.
     ///      If not specified or empty, the default parameters are used.
     ///    - ecdhCurve (string): Specifies the name of the curve to use for ECDH, based
