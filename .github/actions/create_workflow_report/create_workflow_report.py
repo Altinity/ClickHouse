@@ -147,23 +147,51 @@ def get_checks_fails(client: Client, commit_sha: str, branch_name: str):
     Get tests that did not succeed for the given commit and branch.
     Exclude checks that have status 'error' as they are counted in get_checks_errors.
     """
-    query = f"""SELECT job_status, job_name, status as test_status, test_name, results_link
-            FROM (
-                SELECT
-                    argMax(check_status, check_start_time) as job_status,
-                    check_name as job_name,
-                    argMax(test_status, check_start_time) as status,
-                    test_name,
-                    report_url as results_link,
-                    task_url
-                FROM `gh-data`.checks
-                WHERE commit_sha='{commit_sha}' AND head_ref='{branch_name}'
-                GROUP BY check_name, test_name, report_url, task_url
-            )
-            WHERE test_status IN ('FAIL', 'ERROR')
-            AND job_status!='error'
-            ORDER BY job_name, test_name
-            """
+    query = f"""WITH checks_for_commit AS (
+            SELECT
+                check_name,
+                test_name,
+                report_url,
+                check_status,
+                test_status,
+                check_start_time
+            FROM `gh-data`.checks
+            WHERE commit_sha = '{commit_sha}' AND head_ref = '{branch_name}'
+        ),
+        latest_start_time_for_checks AS (
+            SELECT
+                *,
+                max(check_start_time) OVER (PARTITION BY check_name) AS latest_check_start_time
+            FROM checks_for_commit
+            WHERE NOT (check_name LIKE 'Stateless%' AND NOT match(test_name, '^[0-9]{{5}}')) -- Exclude stateless teardown checks
+        ),
+        rows_from_latest_check_run AS (
+            SELECT
+                check_name,
+                test_name,
+                report_url,
+                check_status,
+                test_status,
+                check_start_time
+            FROM latest_start_time_for_checks
+            WHERE check_start_time >= latest_check_start_time
+        ),
+        latest_test_status AS (
+            SELECT
+                argMax(check_status, check_start_time) AS job_status,
+                check_name AS job_name,
+                argMax(test_status, check_start_time) AS status,
+                test_name,
+                report_url AS results_link
+            FROM rows_from_latest_check_run
+            GROUP BY check_name, test_name, report_url
+        )
+        SELECT job_status, job_name, status AS test_status, test_name, results_link
+        FROM latest_test_status
+        WHERE test_status IN ('FAIL', 'ERROR')
+        AND job_status != 'error'
+        ORDER BY job_name, test_name
+        """
     return client.query_dataframe(query)
 
 
