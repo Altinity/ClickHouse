@@ -68,6 +68,7 @@ CLICKHOUSE_ROOT_DIR = p.join(p.dirname(__file__), "../../..")
 LOCAL_DOCKER_COMPOSE_DIR = p.join(CLICKHOUSE_ROOT_DIR, "tests/integration/compose/")
 DEFAULT_ENV_NAME = ".env"
 
+sensitive_var_pattern = re.compile(r"[A-Z_]*(SECRET|PASSWORD|KEY|TOKEN|AZURE)[A-Z_]*")
 
 def find_default_config_path():
     path = os.environ.get("CLICKHOUSE_TESTS_BASE_CONFIG_DIR", None)
@@ -520,6 +521,8 @@ class ClickHouseCluster:
         server_binaries=[],
     ):
         for param in list(os.environ.keys()):
+            if sensitive_var_pattern.match(param):
+                continue
             logging.debug("ENV %40s %s" % (param, os.environ[param]))
         self.base_path = base_path
         self.base_dir = p.dirname(base_path)
