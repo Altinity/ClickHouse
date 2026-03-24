@@ -356,6 +356,7 @@ def get_new_fails_this_pr(
     """
     Get tests that failed in the PR but passed in the base branch.
     Compares both checks and regression test results.
+    Always includes targeted checks (``targeted`` in job_name).
     """
     base_sha = pr_info.get("base", {}).get("sha")
     if not base_sha:
@@ -433,7 +434,9 @@ def get_new_fails_this_pr(
 
     # Filter PR results to only include new fails
     mask = all_pr_fails.apply(
-        lambda row: (row["job_name"], row["test_name"]) in new_fails, axis=1
+        lambda row: (row["job_name"], row["test_name"]) in new_fails
+        or "targeted" in row["job_name"],
+        axis=1,
     )
     new_fails_df = all_pr_fails[mask]
 
