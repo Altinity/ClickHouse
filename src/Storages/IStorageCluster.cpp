@@ -390,6 +390,10 @@ IStorageCluster::RemoteCallVariables IStorageCluster::convertToRemote(
     const std::string & cluster_name_from_settings,
     ASTPtr query_to_send)
 {
+    /// TODO: Allow to use secret for remote queries
+    if (!cluster->getSecret().empty())
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Can't convert query to remote when cluster uses secret");
+
     auto host_addresses = cluster->getShardsAddresses();
     if (host_addresses.empty())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Empty cluster {}", cluster_name_from_settings);
@@ -430,7 +434,18 @@ IStorageCluster::RemoteCallVariables IStorageCluster::convertToRemote(
     if (!table_expression)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find table expression");
 
-    auto remote_query = makeASTFunction(remote_function_name, std::make_shared<ASTLiteral>(host_name), table_expression->table_function);
+    std::shared_ptr<ASTFunction> remote_query;
+
+    if (shard_addresses[0].user_specified)
+    {
+        remote_query = makeASTFunction(remote_function_name,
+            std::make_shared<ASTLiteral>(host_name),
+            table_expression->table_function,
+            std::make_shared<ASTLiteral>(shard_addresses[0].user),
+            std::make_shared<ASTLiteral>(shard_addresses[0].password));
+    }
+    else
+        remote_query = makeASTFunction(remote_function_name, std::make_shared<ASTLiteral>(host_name), table_expression->table_function);
 
     table_expression->table_function = remote_query;
 
