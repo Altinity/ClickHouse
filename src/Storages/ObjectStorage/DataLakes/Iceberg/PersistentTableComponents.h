@@ -5,6 +5,7 @@
 
 #include <IO/CompressionMethod.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadataFilesCache.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergPath.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/SchemaProcessor.h>
 
 namespace DB::Iceberg
@@ -20,7 +21,11 @@ struct PersistentTableComponents
     const CompressionMethod metadata_compression_method;
     const String table_path;
     const std::optional<String> table_uuid;
+<<<<<<< HEAD
     const String common_namespace;
+=======
+    const IcebergPathResolver path_resolver;
+>>>>>>> 8268bbd46d2 (Merge pull request #100420 from ClickHouse/divanik/rerevert_spark_azure_fixes)
 };
 
 }
