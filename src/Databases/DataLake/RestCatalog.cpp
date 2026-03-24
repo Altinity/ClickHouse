@@ -236,7 +236,6 @@ DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(bool update_token) const
         headers.emplace_back("Authorization", "Bearer " + access_token->token);
         return headers;
     }
-
     return {};
 }
 
@@ -366,10 +365,6 @@ DB::HTTPHeaderEntries OneLakeCatalog::getAuthHeaders(bool update_token) const
 AccessToken OneLakeCatalog::retrieveAccessToken() const
 {
     static constexpr auto oauth_tokens_endpoint = "oauth/tokens";
-
-    /// TODO:
-    /// 1. support oauth2-server-uri
-    /// https://github.com/apache/iceberg/blob/918f81f3c3f498f46afcea17c1ac9cdc6913cb5c/open-api/rest-catalog-open-api.yaml#L183C82-L183C99
 
     Poco::URI url;
     DB::ReadWriteBufferFromHTTP::OutStreamCallback out_stream_callback;
