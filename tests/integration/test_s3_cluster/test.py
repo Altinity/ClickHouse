@@ -1218,6 +1218,7 @@ def test_joins(started_cluster):
 def test_object_storage_remote_initiator(started_cluster):
     node = started_cluster.instances["s0_0_0"]
 
+    # Simple cluster
     query_id = uuid.uuid4().hex
     result = node.query(
         f"""
@@ -1245,6 +1246,7 @@ def test_object_storage_remote_initiator(started_cluster):
     # initial node + describe table + remote initiator + 2 subqueries on replicas
     assert queries == ["5"]
 
+    # Cluster with dots in the host names
     query_id = uuid.uuid4().hex
     result = node.query(
         f"""
@@ -1271,3 +1273,74 @@ def test_object_storage_remote_initiator(started_cluster):
 
     # initial node + describe table + remote initiator + 2 subqueries on replicas
     assert queries == ["5"]
+
+    users = node.query(
+        f"""
+        SELECT DISTINCT hostname, user
+            FROM clusterAllReplicas('cluster_all', system.query_log)
+            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
+            ORDER BY ALL
+            FORMAT TSV
+        """
+    ).splitlines()
+
+    assert users == ["c2.s0_0_0\tdefault",
+                     "c2.s0_0_1\tdefault",
+                     "s0_0_0\tdefault"]
+
+    # Cluster with user and password
+    query_id = uuid.uuid4().hex
+    result = node.query(
+        f"""
+        SELECT * from s3Cluster(
+            'cluster_with_username_and_password',
+            'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') ORDER BY (name, value, polygon)
+        SETTINGS object_storage_remote_initiator=1
+        """,
+        query_id = query_id,
+    )
+
+    assert result is not None
+
+    node.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster_all'")
+    queries = node.query(
+        f"""
+        SELECT count()
+            FROM clusterAllReplicas('cluster_all', system.query_log)
+            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
+            FORMAT TSV
+        """
+    ).splitlines()
+
+    # initial node + describe table + remote initiator + 2 subqueries on replicas
+    assert queries == ["5"]
+
+    users = node.query(
+        f"""
+        SELECT DISTINCT hostname, user
+            FROM clusterAllReplicas('cluster_all', system.query_log)
+            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
+            ORDER BY ALL
+            FORMAT TSV
+        """
+    ).splitlines()
+
+    assert users == ["s0_0_0\tdefault",
+                     "s0_0_1\tfoo",
+                     "s0_1_0\tfoo"]
+
+    # Cluster with secret
+    query_id = uuid.uuid4().hex
+    result = node.query_and_get_error(
+        f"""
+        SELECT * from s3Cluster(
+            'cluster_with_secret',
+            'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') ORDER BY (name, value, polygon)
+        SETTINGS object_storage_remote_initiator=1
+        """,
+        query_id = query_id,
+    )
+
+    assert "Can't convert query to remote when cluster uses secret" in result
