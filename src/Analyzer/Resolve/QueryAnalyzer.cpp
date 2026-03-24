@@ -57,6 +57,8 @@
 #include <boost/algorithm/string/predicate.hpp>
 #include <ranges>
 
+#include <Common/logger_useful.h>
+
 namespace DB
 {
 namespace Setting
@@ -3861,6 +3863,7 @@ void QueryAnalyzer::resolveTableFunction(QueryTreeNodePtr & table_function_node,
             {
                 auto table_function_node_to_resolve_typed = std::make_shared<TableFunctionNode>(table_function_argument_function_name);
                 table_function_node_to_resolve_typed->getArgumentsNode() = table_function_argument_function->getArgumentsNode();
+                table_function_node_to_resolve_typed->setSettingsChanges(table_function_argument_function->getSettingsChanges());
 
                 QueryTreeNodePtr table_function_node_to_resolve = std::move(table_function_node_to_resolve_typed);
                 if (table_function_argument_function_name == "view")
