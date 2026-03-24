@@ -51,8 +51,6 @@ namespace ProfileEvents
     extern const Event ParquetFetchWaitTimeMicroseconds;
     extern const Event ParquetReadRowGroups;
     extern const Event ParquetPrunedRowGroups;
-    extern const Event ParquetMetaDataCacheHits;
-    extern const Event ParquetMetaDataCacheMisses;
 }
 
 namespace CurrentMetrics
@@ -559,25 +557,6 @@ static std::vector<Range> getHyperrectangleForRowGroup(const parquet::FileMetaDa
     return hyperrectangle;
 }
 
-std::shared_ptr<parquet::FileMetaData> ParquetBlockInputFormat::readMetadataFromFile()
-{
-    createArrowFileIfNotCreated();
-    return parquet::ReadMetaData(arrow_file);
-}
-
-void ParquetBlockInputFormat::createArrowFileIfNotCreated()
-{
-    if (arrow_file)
-    {
-        return;
-    }
-
-    // Create arrow file adapter.
-    // TODO: Make the adapter do prefetching on IO threads, based on the full set of ranges that
-    //       we'll need to read (which we know in advance). Use max_download_threads for that.
-    arrow_file = asArrowFile(*in, format_settings, is_stopped, "Parquet", PARQUET_MAGIC_BYTES, /* avoid_buffering */ true);
-}
-
 std::unordered_set<std::size_t> getBloomFilterFilteringColumnKeys(const KeyCondition::RPN & rpn)
 {
     std::unordered_set<std::size_t> column_keys;
@@ -840,8 +819,6 @@ void ParquetBlockInputFormat::initializeIfNeeded()
         }
     }
 
-    bool has_row_groups_to_read = false;
-
     auto skip_row_group_based_on_filters = [&](int row_group)
     {
         if (!format_settings.parquet.filter_push_down && !format_settings.parquet.bloom_filter_push_down)
@@ -900,13 +877,6 @@ void ParquetBlockInputFormat::initializeIfNeeded()
         row_group_batches.back().total_bytes_compressed += row_group_size;
         auto rows = adaptive_chunk_size(row_group);
         row_group_batches.back().adaptive_chunk_size = rows ? rows : format_settings.parquet.max_block_size;
-
-        has_row_groups_to_read = true;
-    }
-
-    if (has_row_groups_to_read)
-    {
-        createArrowFileIfNotCreated();
     }
 }
 

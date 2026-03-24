@@ -27,12 +27,6 @@
 #include <Processors/Formats/Impl/ParquetFileMetaDataCache.h>
 
 
-namespace ProfileEvents
-{
-extern const Event ParquetMetaDataCacheHits;
-extern const Event ParquetMetaDataCacheMisses;
-}
-
 namespace DB
 {
 
