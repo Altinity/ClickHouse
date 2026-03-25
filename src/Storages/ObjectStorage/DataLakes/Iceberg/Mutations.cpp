@@ -517,7 +517,7 @@ static bool writeMetadataFiles(
                     catalog_filename = blob_storage_type_name + "://" + blob_storage_namespace_name + "/" + metadata_name;
 
                 const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
-                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, metadata))
+                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot))
                 {
                     cleanup();
                     return false;
