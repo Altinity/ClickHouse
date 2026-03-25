@@ -126,7 +126,7 @@ public:
         AllowedNamespaces() {}
         explicit AllowedNamespaces(const std::string & namespaces_);
 
-        /// Check if nested namespaces (nesetd=true) or tables (nested=false) are allowed in namespace
+        /// Check if nested namespaces (nested=true) or tables (nested=false) are allowed in namespace
         bool isNamespaceAllowed(const std::string & namespace_, bool nested) const;
 
     private:
