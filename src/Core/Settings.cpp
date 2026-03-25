@@ -7157,6 +7157,9 @@ Allow Iceberg read optimization based on Iceberg metadata.
     DECLARE(Bool, object_storage_remote_initiator, false, R"(
 Execute request to object storage as remote on one of object_storage_cluster nodes.
 )", EXPERIMENTAL) \
+    DECLARE(String, object_storage_remote_initiator_cluster, "", R"(
+Cluster to choose remote initiator, when `object_storage_remote_initiator` is true. When empty, `object_storage_cluster` is used.
+)", EXPERIMENTAL) \
     \
     /** Experimental timeSeries* aggregate functions. */ \
     DECLARE_WITH_ALIAS(Bool, allow_experimental_time_series_aggregate_functions, false, R"(
