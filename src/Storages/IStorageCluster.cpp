@@ -49,11 +49,10 @@ namespace Setting
     extern const SettingsBool async_query_sending_for_remote;
     extern const SettingsBool async_socket_for_remote;
     extern const SettingsBool skip_unavailable_shards;
-    extern const SettingsBool parallel_replicas_local_plan;
-    extern const SettingsString cluster_for_parallel_replicas;
     extern const SettingsNonZeroUInt64 max_parallel_replicas;
     extern const SettingsUInt64 object_storage_max_nodes;
     extern const SettingsBool object_storage_remote_initiator;
+    extern const SettingsString object_storage_remote_initiator_cluster;
     extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode;
 }
 
@@ -330,8 +329,6 @@ void IStorageCluster::read(
 
     const auto & settings = context->getSettingsRef();
 
-    auto cluster = getClusterImpl(context, cluster_name_from_settings, isObjectStorage() ? settings[Setting::object_storage_max_nodes] : 0);
-
     /// Calculate the header. This is significant, because some columns could be thrown away in some cases like query with count(*)
 
     SharedHeader sample_block;
@@ -354,7 +351,11 @@ void IStorageCluster::read(
 
     if (settings[Setting::object_storage_remote_initiator])
     {
-        auto storage_and_context = convertToRemote(cluster, context, cluster_name_from_settings, query_to_send);
+        auto remote_initiator_cluster_name = settings[Setting::object_storage_remote_initiator_cluster].value;
+        if (remote_initiator_cluster_name.empty())
+            remote_initiator_cluster_name = cluster_name_from_settings;
+        auto remote_initiator_cluster = getClusterImpl(context, remote_initiator_cluster_name);
+        auto storage_and_context = convertToRemote(remote_initiator_cluster, context, remote_initiator_cluster_name, query_to_send);
         auto src_distributed = std::dynamic_pointer_cast<StorageDistributed>(storage_and_context.storage);
         auto modified_query_info = query_info;
         modified_query_info.cluster = src_distributed->getCluster();
@@ -362,6 +363,8 @@ void IStorageCluster::read(
         storage_and_context.storage->read(query_plan, column_names, new_storage_snapshot, modified_query_info, storage_and_context.context, processed_stage, max_block_size, num_streams);
         return;
     }
+
+    auto cluster = getClusterImpl(context, cluster_name_from_settings, isObjectStorage() ? settings[Setting::object_storage_max_nodes] : 0);
 
     RestoreQualifiedNamesVisitor::Data data;
     data.distributed_table = DatabaseAndTableWithAlias(*getTableExpression(query_to_send->as<ASTSelectQuery &>(), 0));
