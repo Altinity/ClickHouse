@@ -258,15 +258,19 @@ void IcebergMetadata::backgroundMetadataPrefetcherThread()
         /// first, we fetch the latest metadata version and cache it;
         /// as a part of the same method, we download metadata.json of the latest metadata version
         /// and after parsing it, we fetch manifest lists, parse and cache them
-        auto ctx = Context::getGlobalContextInstance()->getBackgroundContext();
+        auto ctx = Context::createCopy(Context::getGlobalContextInstance());
         auto [actual_data_snapshot, actual_table_state_snapshot] = getRelevantState(ctx, true);
         if (actual_data_snapshot)
         {
             for (const auto & entry : actual_data_snapshot->manifest_list_entries)
             {
                 /// second, we fetch, parse and cache each manifest file
-                auto manifest_file_ptr = getManifestFileEntriesHandle(
-                    object_storage, persistent_components, ctx, log, entry, actual_table_state_snapshot.schema_id);
+                auto manifest_file_ptr = Iceberg::getManifestFile(
+                    object_storage, persistent_components, ctx, log,
+                    entry.manifest_file_absolute_path,
+                    entry.added_sequence_number,
+                    entry.added_snapshot_id,
+                    *secondary_storages);
             }
         }
 
