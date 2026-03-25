@@ -44,7 +44,6 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadataFilesCache.h>
 #include <Storages/ObjectStorageQueue/ObjectStorageQueueMetadataFactory.h>
 #include <Processors/Formats/Impl/ParquetMetadataCache.h>
-#include <Storages/StreamingStorageRegistry.h>
 #include <Storages/MergeTree/VectorSimilarityIndexCache.h>
 #include <Storages/Distributed/DistributedSettings.h>
 #include <Storages/CompressionCodecSelector.h>
