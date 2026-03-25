@@ -178,6 +178,7 @@ std::shared_ptr<DataLake::ICatalog> DatabaseDataLake::getCatalog() const
                 settings[DatabaseDataLakeSetting::auth_scope].value,
                 settings[DatabaseDataLakeSetting::oauth_server_uri].value,
                 settings[DatabaseDataLakeSetting::oauth_server_use_request_body].value,
+                settings[DatabaseDataLakeSetting::namespaces].value,
                 Context::getGlobalContextInstance());
             break;
         }

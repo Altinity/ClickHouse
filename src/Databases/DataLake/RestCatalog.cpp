@@ -161,6 +161,7 @@ RestCatalog::RestCatalog(
     const std::string & auth_scope_,
     const std::string & oauth_server_uri_,
     bool oauth_server_use_request_body_,
+    const std::string & namespaces_,
     DB::ContextPtr context_)
     : ICatalog(warehouse_)
     , DB::WithContext(context_)
@@ -172,6 +173,7 @@ RestCatalog::RestCatalog(
     , auth_scope(auth_scope_)
     , oauth_server_uri(oauth_server_uri_)
     , oauth_server_use_request_body(oauth_server_use_request_body_)
+    , allowed_namespaces(namespaces_)
 {
     update_token_if_expired = true;
     config = loadConfig();
