@@ -318,7 +318,6 @@ ASTPtr FunctionNode::toASTImpl(const ConvertToASTOptions & options) const
         settings_ast->changes = settings_changes;
         settings_ast->is_standalone = false;
         function_ast->arguments->children.push_back(settings_ast);
-        function_ast->children.push_back(std::move(settings_ast));
     }
 
     return function_ast;
