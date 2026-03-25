@@ -874,12 +874,12 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
         InputFormatPtr input_format;
         if (context_->getSettingsRef()[Setting::use_parquet_metadata_cache] && use_native_reader_v3
-            && (object_info->getFileFormat().value_or(configuration->format) == "Parquet")
+            && (object_info->getFileFormat().value_or(configuration->getFormat()) == "Parquet")
             && !object_info->getObjectMetadata()->etag.empty())
         {
             const std::optional<RelativePathWithMetadata> object_with_metadata = object_info->relative_path_with_metadata;
             input_format = FormatFactory::instance().getInputWithMetadata(
-                object_info->getFileFormat().value_or(configuration->format),
+                object_info->getFileFormat().value_or(configuration->getFormat()),
                 *read_buf,
                 initial_header,
                 context_,
@@ -898,7 +898,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         else
         {
             input_format = FormatFactory::instance().getInput(
-            object_info->getFileFormat().value_or(configuration->format),
+            object_info->getFileFormat().value_or(configuration->getFormat()),
             *read_buf,
             initial_header,
             context_,
@@ -1027,10 +1027,6 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
             && (object_storage->getType() == ObjectStorageType::Azure
                 || object_storage->getType() == ObjectStorageType::S3);
     }
-
-    bool use_page_cache = !use_distributed_cache && !use_filesystem_cache
-        && effective_read_settings.page_cache && effective_read_settings.use_page_cache_for_object_storage;
-
 
     /// We need object metadata for a few use cases:
     /// 1. object size suggests whether we need to use prefetch
