@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import time
 from pathlib import Path
 from itertools import combinations
 import json
@@ -14,6 +15,7 @@ import pandas as pd
 from jinja2 import Environment, FileSystemLoader
 import requests
 from clickhouse_driver import Client
+from clickhouse_driver.errors import ServerException
 import boto3
 from botocore.exceptions import NoCredentialsError
 import yaml
@@ -25,6 +27,31 @@ DATABASE_PASSWORD_VAR = "CLICKHOUSE_TEST_STAT_PASSWORD"
 S3_BUCKET = "altinity-build-artifacts"
 GITHUB_REPO = "Altinity/ClickHouse"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+
+
+def _is_clickhouse_memory_limit_error(exc: BaseException) -> bool:
+    if isinstance(exc, ServerException) and getattr(exc, "code", None) == 241:
+        return True
+    msg = str(exc).lower()
+    return "memory limit" in msg or "memory_limit" in msg
+
+
+def query_dataframe_with_retry(
+    client: Client,
+    query: str,
+    *,
+    max_attempts: int = 5,
+    backoff_seconds: float = 3.0,
+) -> pd.DataFrame:
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return client.query_dataframe(query)
+        except Exception as e:
+            if not _is_clickhouse_memory_limit_error(e) or attempt >= max_attempts:
+                raise
+            wait = backoff_seconds * attempt
+            time.sleep(wait)
+
 
 def get_commit_statuses(sha: str) -> pd.DataFrame:
     """
@@ -198,7 +225,7 @@ def get_checks_fails(client: Client, commit_sha: str, branch_name: str):
         AND job_status != 'error'
         ORDER BY job_name, test_name
         """
-    return client.query_dataframe(query)
+    return query_dataframe_with_retry(client, query)
 
 
 def get_broken_tests_rules(broken_tests_file_path):
@@ -270,7 +297,7 @@ def get_checks_known_fails(
         ORDER BY job_name, test_name
         """
 
-    df = client.query_dataframe(query)
+    df = query_dataframe_with_retry(client, query)
 
     if df.shape[0] == 0:
         return df
@@ -299,7 +326,7 @@ def get_checks_errors(client: Client, commit_sha: str, branch_name: str):
         WHERE job_status = 'error'
         ORDER BY job_name, test_name
         """
-    return client.query_dataframe(query)
+    return query_dataframe_with_retry(client, query)
 
 
 def drop_prefix_rows(df, column_to_clean):
@@ -341,7 +368,7 @@ def get_regression_fails(client: Client, job_url: str):
             WHERE job_url LIKE '{job_url}%'
             AND status IN ('Fail', 'Error')
             """
-    df = client.query_dataframe(query)
+    df = query_dataframe_with_retry(client, query)
     df = drop_prefix_rows(df, "test_name")
     df["job_name"] = df["job_name"].str.title()
     return df
@@ -396,7 +423,7 @@ def get_new_fails_this_pr(
             WHERE test_status NOT IN ('FAIL', 'ERROR')
             ORDER BY job_name, test_name
             """
-    base_checks = client.query_dataframe(base_checks_query)
+    base_checks = query_dataframe_with_retry(client, base_checks_query)
 
     # Get regression results from base branch that didn't fail
     base_regression_query = f"""SELECT arch, job_name, status, test_name, results_link
@@ -415,7 +442,7 @@ def get_new_fails_this_pr(
             )
             WHERE status NOT IN ('Fail', 'Error')
             """
-    base_regression = client.query_dataframe(base_regression_query)
+    base_regression = query_dataframe_with_retry(client, base_regression_query)
     if len(base_regression) > 0:
         base_regression["job_name"] = base_regression.apply(
             lambda row: f"{row['arch']} {row['job_name']}".strip(), axis=1
