@@ -57,8 +57,6 @@
 #include <boost/algorithm/string/predicate.hpp>
 #include <ranges>
 
-#include <Common/logger_useful.h>
-
 namespace DB
 {
 namespace Setting
