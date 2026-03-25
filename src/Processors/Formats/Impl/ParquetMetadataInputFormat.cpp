@@ -24,7 +24,6 @@
 #include <DataTypes/NestedUtils.h>
 #include <Core/Settings.h>
 #include <Common/ProfileEvents.h>
-#include <Processors/Formats/Impl/ParquetFileMetaDataCache.h>
 
 
 namespace DB
