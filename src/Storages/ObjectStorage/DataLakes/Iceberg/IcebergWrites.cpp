@@ -1317,7 +1317,8 @@ IcebergImportSink::IcebergImportSink(
         }
     }
 
-    const auto metadata_compression_method = CompressionMethod::Gzip;
+    const auto metadata_compression_method = persistent_table_components.metadata_compression_method;
+
     auto config_path = persistent_table_components.table_path;
     if (config_path.empty() || config_path.back() != '/')
         config_path += "/";

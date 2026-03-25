@@ -1467,6 +1467,16 @@ void IcebergMetadata::commitExportPartitionTransaction(
     StorageObjectStorageConfigurationPtr configuration,
     ContextPtr context)
 {
+
+    MetadataFileWithInfo updated_metadata_file_info = getLatestOrExplicitMetadataFileAndVersion(
+        object_storage,
+        persistent_components.table_path,
+        data_lake_settings,
+        persistent_components.metadata_cache,
+        context,
+        getLogger("IcebergMetadata").get(),
+        persistent_components.table_uuid);
+
     Poco::JSON::Parser parser; /// For some reason base/base/JSON.h can not parse this json file
     Poco::Dynamic::Var json = parser.parse(iceberg_metadata_json_string);
     Poco::JSON::Object::Ptr metadata = json.extract<Poco::JSON::Object::Ptr>();
@@ -1543,7 +1553,7 @@ void IcebergMetadata::commitExportPartitionTransaction(
         }
     }
 
-    const auto metadata_compression_method = CompressionMethod::Gzip;
+    const auto metadata_compression_method = persistent_components.metadata_compression_method;
     auto config_path = persistent_components.table_path;
     if (config_path.empty() || config_path.back() != '/')
         config_path += "/";
@@ -1564,6 +1574,7 @@ void IcebergMetadata::commitExportPartitionTransaction(
         filename_generator = FileNamesGenerator(
             bucket, config_path, (catalog != nullptr && catalog->isTransactional()), metadata_compression_method, write_format);
     }
+    filename_generator.setVersion(updated_metadata_file_info.version + 1);
 
     size_t attempt = 0;
     while (attempt < 10)
