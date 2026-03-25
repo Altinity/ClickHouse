@@ -116,25 +116,50 @@ public:
         SharedHeader sample_block,
         const std::string & iceberg_metadata_json_string,
         const std::optional<FormatSettings> & format_settings,
+        Int64 original_schema_id,
+        Int64 partition_spec_id,
+        Row partition_values,
+        std::vector<String> partition_columns,
+        std::vector<DataTypePtr> partition_types,
         ContextPtr context) override;
 
+    /// Commit an export-partition transaction. All parameters that are saved in ZooKeeper at the
+    /// start of the export operation (schema_id, partition_spec_id, partition_values,
+    /// partition_columns, partition_types) must be provided by the caller.
+    /// The partition spec object is derived from the metadata using partition_spec_id.
+    /// If the live metadata has diverged (schema or partition spec changed) the call throws
+    /// immediately — the caller must restart from scratch.
+    ///
+    /// data_file_paths contains the metadata-path for each exported data file (as recorded in
+    /// ZooKeeper).  For every path a co-located sidecar Avro file (same path, ".avro" extension)
+    /// must exist in the object storage; it supplies record_count and file_size_in_bytes.
     void commitExportPartitionTransaction(
-        FileNamesGenerator & filename_generator,
-        Poco::JSON::Object::Ptr initial_metadata,
+        std::shared_ptr<DataLake::ICatalog> catalog,
+        const StorageID & table_id,
+        const std::string & iceberg_metadata_json_string,
         Int64 original_schema_id,
-        std::optional<ChunkPartitioner> & partitioner,
-        ContextPtr context,
+        Int64 partition_spec_id,
+        const std::string & partition_values_json,
         SharedHeader sample_block,
-        const std::string & partition_key);
-
+        const std::vector<String> & data_file_paths,
+        StorageObjectStorageConfigurationPtr configuration,
+        ContextPtr context) override;
 
     bool commitImportPartitionTransactionImpl(
         FileNamesGenerator & filename_generator,
-        Poco::JSON::Object::Ptr initial_metadata,
-        std::optional<ChunkPartitioner> & partitioner,
-        ContextPtr context,
+        Poco::JSON::Object::Ptr & metadata,
+        Int64 original_schema_id,
+        Int64 partition_spec_id,
+        const std::vector<Field> & partition_values,
+        const std::vector<String> & partition_columns,
+        const std::vector<DataTypePtr> & partition_types,
         SharedHeader sample_block,
-        const std::string & partition_key);
+        const std::vector<String> & data_file_paths,
+        std::shared_ptr<DataLake::ICatalog> catalog,
+        const StorageID & table_id,
+        const String & blob_storage_type_name,
+        const String & blob_storage_namespace_name,
+        ContextPtr context);
 
     CompressionMethod getCompressionMethod() const { return persistent_components.metadata_compression_method; }
 

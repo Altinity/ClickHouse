@@ -30,6 +30,11 @@ public:
 
     std::vector<std::pair<PartitionKey, Chunk>> partitionChunk(const Chunk & chunk);
 
+    /// Compute the partition key for a single representative row.
+    /// @param source_block  A 1-row Block containing (at least) the partition source columns.
+    ///                      Column names must match those referenced by the partition spec.
+    Row computePartitionKey(const Block & source_block) const;
+
     const std::vector<String> & getColumns() const { return columns_to_apply; }
 
     const std::vector<DataTypePtr> & getResultTypes() const { return result_data_types; }

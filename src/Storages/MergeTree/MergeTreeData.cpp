@@ -6495,7 +6495,8 @@ void MergeTreeData::exportPartToTable(
     ContextPtr query_context,
     const std::optional<String> & iceberg_metadata_json,
     bool allow_outdated_parts,
-    std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback)
+    std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback,
+    const String & partition_values_json)
 {
     auto dest_storage = DatabaseCatalog::instance().getTable(destination_storage_id, query_context);
 
@@ -6504,7 +6505,7 @@ void MergeTreeData::exportPartToTable(
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Exporting to the same table is not allowed");
     }
 
-    exportPartToTable(part_name, dest_storage, transaction_id, query_context, iceberg_metadata_json, allow_outdated_parts, completion_callback);
+    exportPartToTable(part_name, dest_storage, transaction_id, query_context, iceberg_metadata_json, allow_outdated_parts, completion_callback, partition_values_json);
 }
 
 void MergeTreeData::exportPartToTable(
@@ -6514,7 +6515,8 @@ void MergeTreeData::exportPartToTable(
     ContextPtr query_context,
     const std::optional<String> & iceberg_metadata_json_,
     bool allow_outdated_parts,
-    std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback)
+    std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback,
+    const String & partition_values_json)
 {
     if (!dest_storage->supportsImport())
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Destination storage {} does not support MergeTree parts or uses unsupported partitioning", dest_storage->getName());
@@ -6562,8 +6564,11 @@ void MergeTreeData::exportPartToTable(
     if (source_columns.getReadable().sizeOfDifference(destination_columns.getInsertable()))
         throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS, "Tables have different structure");
 
-    if (query_to_string(source_metadata_ptr->getPartitionKeyAST()) != query_to_string(destination_metadata_ptr->getPartitionKeyAST()))
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
+    if (!dest_storage->ignorePartitionCompatibilityForImport())
+    {
+        if (query_to_string(source_metadata_ptr->getPartitionKeyAST()) != query_to_string(destination_metadata_ptr->getPartitionKeyAST()))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
+    }
 
     auto part = getPartIfExists(part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
 
@@ -6618,7 +6623,8 @@ void MergeTreeData::exportPartToTable(
             query_context->getSettingsCopy(),
             source_metadata_ptr,
             iceberg_metadata_json,
-            completion_callback);
+            completion_callback,
+            partition_values_json);
 
         std::lock_guard lock(export_manifests_mutex);
 

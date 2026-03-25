@@ -25,6 +25,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFile.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ChunkPartitioner.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/DataFileStatistics.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataFileEntry.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/MultipleFileWriter.h>
 
 #include <Common/randomSeed.h>
@@ -45,6 +46,54 @@ namespace DB
 
 String removeEscapedSlashes(const String & json_str);
 
+/// Metadata stored in a data-file sidecar Avro file.
+/// The sidecar lives next to the data file and carries the fields that
+/// IcebergDataFileEntry records but that cannot be inferred cheaply from the
+/// data file itself (row count, byte size, and column statistics).
+struct DataFileSidecarMetadata
+{
+    Int64 record_count = 0;
+    Int64 file_size_in_bytes = 0;
+    /// Column statistics in Iceberg wire format.
+    /// Vectors are empty when the sidecar predates column-stats support or when the
+    /// writer could not collect statistics for a particular field.
+    IcebergSerializedFileStats column_stats;
+};
+
+/// Read a data-file sidecar and return its metadata.
+/// Supports both the old two-field format (no column stats) and the new six-field format.
+DataFileSidecarMetadata readDataFileSidecar(
+    const String & sidecar_storage_path,
+    const ObjectStoragePtr & object_storage,
+    const ContextPtr & context);
+
+/// Write a sidecar Avro file alongside a data file.
+/// When column_stats is provided all six fields are written; otherwise only the two
+/// basic counters are written (backward-compatible format).
+void writeDataFileSidecar(
+    const String & data_file_storage_path,
+    Int64 record_count,
+    Int64 file_size_in_bytes,
+    const ObjectStoragePtr & object_storage,
+    const ContextPtr & context,
+    std::optional<IcebergSerializedFileStats> column_stats = std::nullopt);
+
+/// Convert in-memory DataFileStatistics (ClickHouse-internal) to the Iceberg wire format.
+/// Bounds are serialized to bytes using the same encoding used in the manifest file,
+/// so the result can be stored in sidecar Avro files and used at commit time on any node.
+IcebergSerializedFileStats serializeDataFileStats(
+    const DataFileStatistics & stats,
+    SharedHeader sample_block,
+    Int64 record_count,
+    Int64 file_size_in_bytes);
+
+/// Generate an Iceberg manifest file for a set of data files.
+///
+/// \param data_file_statistics  Aggregate column statistics applied to every file (regular
+///     INSERT and mutation paths).  Ignored when \p per_file_stats is non-empty.
+/// \param per_file_stats  Per-file pre-serialized statistics (export-commit path).
+///     When non-empty each entry overrides both the record count / file size AND the column
+///     statistics for the corresponding file.  Leave empty to preserve the existing behaviour.
 void generateManifestFile(
     Poco::JSON::Object::Ptr metadata,
     const std::vector<String> & partition_columns,
@@ -58,7 +107,8 @@ void generateManifestFile(
     Poco::JSON::Object::Ptr partition_spec,
     Int64 partition_spec_id,
     WriteBuffer & buf,
-    Iceberg::FileContentType content_type);
+    Iceberg::FileContentType content_type,
+    const std::vector<IcebergSerializedFileStats> & per_file_stats = {});
 
 void generateManifestList(
     const FileNamesGenerator & filename_generator,
@@ -134,7 +184,6 @@ class IcebergImportSink : public SinkToStorage
 {
 public:
     IcebergImportSink(
-        // catalog
         std::shared_ptr<DataLake::ICatalog> catalog_,
         const Iceberg::PersistentTableComponents & persistent_table_components_,
         Poco::JSON::Object::Ptr metadata_json_,
@@ -142,7 +191,14 @@ public:
         ContextPtr context_,
         std::optional<FormatSettings> format_settings_,
         const String & write_format_,
-        SharedHeader sample_block_);
+        SharedHeader sample_block_,
+        Int64 original_schema_id_,
+        Int64 partition_spec_id_,
+        Row partition_values_,
+        std::vector<String> partition_columns_,
+        std::vector<DataTypePtr> partition_types_,
+        const DataLakeStorageSettings & data_lake_settings_,
+        std::function<void(const std::string &)> new_file_path_callback_ = {});
 
     ~IcebergImportSink() override = default;
 
@@ -151,6 +207,12 @@ public:
     void consume(Chunk & chunk) override;
 
     void onFinish() override;
+
+    Int64 getOriginalSchemaId() const { return original_schema_id; }
+    Int64 getPartitionSpecId() const { return partition_spec_id; }
+    const Row & getPartitionValues() const { return partition_values; }
+    const std::vector<String> & getPartitionColumns() const { return partition_columns; }
+    const std::vector<DataTypePtr> & getPartitionTypes() const { return partition_types; }
 
 private:
     void finalizeBuffers();
@@ -168,6 +230,14 @@ private:
     const String& write_format;
     SharedHeader sample_block;
     std::unique_ptr<MultipleFileWriter> writer;
+    const DataLakeStorageSettings & data_lake_settings;
+    std::function<void(const std::string &)> new_file_path_callback;
+
+    Int64 original_schema_id;
+    Int64 partition_spec_id;
+    Row partition_values;
+    std::vector<String> partition_columns;
+    std::vector<DataTypePtr> partition_types;
 };
 
 }

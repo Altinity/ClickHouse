@@ -21,6 +21,7 @@
 #include <Common/ProfileEventsScope.h>
 #include <Databases/DatabaseReplicated.h>
 #include <Storages/MergeTree/ExportList.h>
+#include <Storages/IStorage.h>
 #include <Formats/FormatFactory.h>
 #include <Databases/enableAllExperimentalSettings.h>
 #include <Processors/Sinks/SinkToStorage.h>
@@ -196,7 +197,8 @@ bool ExportPartTask::executeStep()
             manifest.settings[Setting::export_merge_tree_part_max_rows_per_file],
             manifest.iceberg_metadata_json,
             getFormatSettings(local_context),
-            local_context);
+            local_context,
+            manifest.partition_values_json.empty() ? std::optional<std::string>{} : std::optional<std::string>{manifest.partition_values_json});
 
         bool apply_deleted_mask = true;
         bool read_with_direct_io = local_context->getSettingsRef()[Setting::min_bytes_to_use_direct_io] > manifest.data_part->getBytesOnDisk();
@@ -272,6 +274,22 @@ bool ExportPartTask::executeStep()
         if (isCancelled())
         {
             throw Exception(ErrorCodes::QUERY_WAS_CANCELLED, "Export part was cancelled");
+        }
+
+        /// For the direct EXPORT PART → Iceberg path there is no deferred-commit callback
+        /// (the partition-export path provides one that writes to ZooKeeper).
+        /// Commit the Iceberg metadata inline here so the rows become visible immediately.
+        if (destination_storage->isDataLake() && !manifest.completion_callback)
+        {
+            IStorage::IcebergCommitExportPartitionArguments iceberg_args;
+            iceberg_args.metadata_json_string = manifest.iceberg_metadata_json;
+            iceberg_args.partition_values_json = manifest.partition_values_json;
+            destination_storage->commitExportPartitionTransaction(
+                manifest.transaction_id,
+                manifest.data_part->info.getPartitionId(),
+                (*exports_list_entry)->destination_file_paths,
+                iceberg_args,
+                local_context);
         }
 
         std::lock_guard inner_lock(storage.export_manifests_mutex);

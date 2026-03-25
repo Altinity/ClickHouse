@@ -419,12 +419,15 @@ def test_drop_source_table_during_export(cluster):
 
         export_queries = f"""
             ALTER TABLE {mt_table}
-            EXPORT PARTITION ID '2020' TO TABLE {s3_table};
+            EXPORT PARTITION ID '2020' TO TABLE {s3_table} SETTINGS s3_retry_attempts = 500, export_merge_tree_partition_max_retries = 50;
             ALTER TABLE {mt_table}
-            EXPORT PARTITION ID '2021' TO TABLE {s3_table};
+            EXPORT PARTITION ID '2021' TO TABLE {s3_table} SETTINGS s3_retry_attempts = 500, export_merge_tree_partition_max_retries = 50;
         """
 
         node.query(export_queries)
+
+        wait_for_export_status(node, mt_table, s3_table, "2020", "PENDING")
+        wait_for_export_status(node, mt_table, s3_table, "2021", "PENDING")
 
         # This should kill the background operations and drop the table
         node.query(f"DROP TABLE {mt_table}")
@@ -1342,3 +1345,84 @@ def test_sharded_export_partition_default_pattern(cluster):
 
     # only one file with 3 rows should be present
     assert int(total_count) == 3, f"Expected 3 rows, got {total_count}"
+
+
+def create_iceberg_s3_table(node, iceberg_table: str, suffix: str):
+    """Create an IcebergS3 table that points to a per-test MinIO prefix."""
+    node.query(
+        f"""
+        CREATE TABLE {iceberg_table}
+        (id Int64, year Int32)
+        ENGINE = IcebergS3(
+            'http://minio1:9001/root/data/{suffix}/{iceberg_table}/',
+            'minio',
+            'ClickHouse_Minio_P@ssw0rd'
+        )
+        SETTINGS iceberg_format_version = 2
+        """
+    )
+
+
+def test_export_partition_to_iceberg(cluster):
+    """
+    Export a ReplicatedMergeTree partition to an IcebergS3 table and verify:
+    - the export completes successfully,
+    - the correct number of rows is visible via the Iceberg engine,
+    - the data content is correct.
+    """
+    node = cluster.instances["replica1"]
+    node2 = cluster.instances["replica2"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"iceberg_mt_{postfix}"
+    iceberg_table = f"iceberg_dst_{postfix}"
+
+    # Set up replicated source table with data in two partitions
+    node.query(
+        f"""
+        CREATE TABLE {mt_table}
+        (id Int64, year Int32)
+        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')
+        PARTITION BY year
+        ORDER BY tuple()
+        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
+        """
+    )
+    node2.query(
+        f"""
+        CREATE TABLE {mt_table}
+        (id Int64, year Int32)
+        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica2')
+        PARTITION BY year
+        ORDER BY tuple()
+        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
+        """
+    )
+
+    node.query(
+        f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020), (3, 2020), (4, 2021)"
+    )
+    # Wait for replication to both replicas
+    node2.query(f"SYSTEM SYNC REPLICA {mt_table}")
+
+    # Create the Iceberg destination table on node1 (initialises the S3 metadata).
+    # node2 does not need a local handle for this test: the export is triggered from node1
+    # and the result is verified by querying node1.
+    create_iceberg_s3_table(node, iceberg_table, postfix)
+
+    # Trigger export of partition 2020 (3 rows) from both replicas
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}")
+
+    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED", timeout=60)
+
+    # Verify row count in the Iceberg table
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 3, f"Expected 3 rows in Iceberg table after export, got {count}"
+
+    # Verify data content
+    result = node.query(
+        f"SELECT id, year FROM {iceberg_table} ORDER BY id"
+    ).strip()
+    assert result == "1\t2020\n2\t2020\n3\t2020", (
+        f"Unexpected data in Iceberg table:\n{result}"
+    )

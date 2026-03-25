@@ -63,12 +63,19 @@ public:
         std::size_t max_rows_per_file,
         const std::optional<std::string> & iceberg_metadata_json_string,
         const std::optional<FormatSettings> & format_settings_,
-        ContextPtr context) override;
+        ContextPtr context,
+        const std::optional<std::string> & partition_values_json = std::nullopt) override;
+
+
+    bool ignorePartitionCompatibilityForImport() const override;
+
+    bool isDataLake() const override;
 
     void commitExportPartitionTransaction(
         const String & transaction_id,
         const String & partition_id,
         const Strings & exported_paths,
+        const IcebergCommitExportPartitionArguments & iceberg_commit_export_partition_arguments,
         ContextPtr local_context) override;
 
     void drop() override;

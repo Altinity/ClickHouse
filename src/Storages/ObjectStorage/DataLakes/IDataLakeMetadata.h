@@ -1,9 +1,11 @@
 #pragma once
 #include <boost/noncopyable.hpp>
 
+#include <Core/Field.h>
 #include <Core/NamesAndTypes.h>
 #include <Core/Types.h>
 #include <Core/Range.h>
+#include <DataTypes/IDataType.h>
 #include <Databases/DataLake/ICatalog.h>
 #include <Formats/FormatFilterInfo.h>
 #include <Formats/FormatParserSharedResources.h>
@@ -183,9 +185,29 @@ public:
         SharedHeader /* sample_block */,
         const std::string & /* iceberg_metadata_json_string */,
         const std::optional<FormatSettings> & /* format_settings_ */,
+        Int64 /* original_schema_id */,
+        Int64 /* partition_spec_id */,
+        Row /* partition_values */,
+        std::vector<String> /* partition_columns */,
+        std::vector<DataTypePtr> /* partition_types */,
         ContextPtr /* context */)
         {
             throwNotImplemented("import");
+        }
+    
+    virtual void commitExportPartitionTransaction(
+        std::shared_ptr<DataLake::ICatalog> /* catalog */,
+        const StorageID & /* table_id */,
+        const std::string & /* iceberg_metadata_json_string */,
+        Int64 /* original_schema_id */,
+        Int64 /* partition_spec_id */,
+        const std::string & /* partition_values_json */,
+        SharedHeader /* sample_block */,
+        const std::vector<String> & /* data_file_paths */,
+        StorageObjectStorageConfigurationPtr /* configuration */,
+        ContextPtr /* context */)
+        {
+            throwNotImplemented("commitExportPartitionTransaction");
         }
 
     virtual bool optimize(

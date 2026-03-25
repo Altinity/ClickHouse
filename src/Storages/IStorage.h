@@ -20,6 +20,7 @@
 #include <Common/RWLock.h>
 #include <Common/TypePromotion.h>
 #include <DataTypes/Serializations/SerializationInfo.h>
+#include <Poco/JSON/Object.h>
 
 #include <expected>
 #include <optional>
@@ -497,15 +498,25 @@ It is currently only implemented in StorageObjectStorage.
         std::size_t /* max_rows_per_file */,
         const std::optional<std::string> & /* iceberg_metadata_json_string */,
         const std::optional<FormatSettings> & /* format_settings */,
-        ContextPtr /* context */)
+        ContextPtr /* context */,
+        const std::optional<std::string> & /* partition_values_json */ = std::nullopt)
     {
       throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Import is not implemented for storage {}", getName());
     }
+
+    struct IcebergCommitExportPartitionArguments
+    {
+      std::string metadata_json_string;
+      /// JSON-serialized array of partition column values (after transforms).
+      /// Deserialized at commit time using the types derived from metadata_json_string.
+      std::string partition_values_json;
+    };
 
     virtual void commitExportPartitionTransaction(
       const String & /* transaction_id */,
       const String & /* partition_id */,
       const Strings & /* exported_paths */,
+      const IcebergCommitExportPartitionArguments & /* iceberg_commit_export_partition_arguments */,
       ContextPtr /* local_context */)
   {
       throw Exception(ErrorCodes::NOT_IMPLEMENTED, "commitExportPartitionTransaction is not implemented for storage type {}", getName());

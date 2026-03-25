@@ -114,6 +114,16 @@ static constexpr auto MAX_TRANSACTION_RETRIES = 100;
 namespace
 {
 
+/// Replace the file extension of `path` with ".avro", or append ".avro" when there is none.
+String sidecarStoragePath(const String & data_file_storage_path)
+{
+    auto dot_pos = data_file_storage_path.rfind('.');
+    auto slash_pos = data_file_storage_path.rfind('/');
+    if (dot_pos != String::npos && (slash_pos == String::npos || dot_pos > slash_pos))
+        return data_file_storage_path.substr(0, dot_pos) + ".avro";
+    return data_file_storage_path + ".avro";
+}
+
 bool canDumpIcebergStats(const Field & field, DataTypePtr type)
 {
     switch (type->getTypeId())
@@ -208,6 +218,172 @@ String removeEscapedSlashes(const String & json_str)
     return result;
 }
 
+DataFileSidecarMetadata readDataFileSidecar(
+    const String & sidecar_storage_path,
+    const ObjectStoragePtr & object_storage,
+    const ContextPtr & context)
+{
+    auto buf = object_storage->readObject(StoredObject(sidecar_storage_path), context->getReadSettings());
+    auto input_stream = std::make_unique<AvroInputStreamReadBufferAdapter>(*buf);
+    avro::DataFileReader<avro::GenericDatum> reader(std::move(input_stream));
+
+    avro::GenericDatum datum(reader.readerSchema());
+    if (!reader.read(datum))
+        throw Exception(
+            ErrorCodes::BAD_ARGUMENTS,
+            "Data file sidecar '{}' contains no records",
+            sidecar_storage_path);
+
+    const auto & record = datum.value<avro::GenericRecord>();
+    DataFileSidecarMetadata result;
+    result.record_count = record.field("record_count").value<Int64>();
+    result.file_size_in_bytes = record.field("file_size_in_bytes").value<Int64>();
+    result.column_stats.record_count = result.record_count;
+    result.column_stats.file_size_in_bytes = result.file_size_in_bytes;
+
+    /// Read column statistics when present (new-format sidecars only;
+    /// old two-field sidecars leave the vectors empty via Avro defaults).
+    size_t field_idx = 0;
+    if (reader.readerSchema().root()->nameIndex("column_sizes", field_idx))
+    {
+        auto read_long_map = [&](const std::string & name, std::vector<std::pair<Int32, Int64>> & out)
+        {
+            const auto & arr = record.field(name).value<avro::GenericArray>().value();
+            for (const auto & item : arr)
+            {
+                const auto & r = item.value<avro::GenericRecord>();
+                out.emplace_back(r.field("key").value<Int32>(), r.field("value").value<Int64>());
+            }
+        };
+
+        auto read_bytes_map = [&](const std::string & name, std::vector<std::pair<Int32, std::vector<uint8_t>>> & out)
+        {
+            const auto & arr = record.field(name).value<avro::GenericArray>().value();
+            for (const auto & item : arr)
+            {
+                const auto & r = item.value<avro::GenericRecord>();
+                out.emplace_back(r.field("key").value<Int32>(), r.field("value").value<std::vector<uint8_t>>());
+            }
+        };
+
+        read_long_map("column_sizes",      result.column_stats.column_sizes);
+        read_long_map("null_value_counts", result.column_stats.null_value_counts);
+        read_bytes_map("lower_bounds",     result.column_stats.lower_bounds);
+        read_bytes_map("upper_bounds",     result.column_stats.upper_bounds);
+    }
+
+    return result;
+}
+
+void writeDataFileSidecar(
+    const String & data_file_storage_path,
+    Int64 record_count,
+    Int64 file_size_in_bytes,
+    const ObjectStoragePtr & object_storage,
+    const ContextPtr & context,
+    std::optional<IcebergSerializedFileStats> column_stats)
+{
+    const String sidecar_path = sidecarStoragePath(data_file_storage_path);
+    auto buf = object_storage->writeObject(
+        StoredObject(sidecar_path), WriteMode::Rewrite, std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());
+
+    {
+        auto schema = avro::compileJsonSchemaFromString(data_file_sidecar_schema);
+        auto adapter = std::make_unique<OutputStreamWriteBufferAdapter>(*buf);
+        avro::DataFileWriter<avro::GenericDatum> writer(std::move(adapter), schema);
+
+        avro::GenericDatum datum(schema.root());
+        avro::GenericRecord & rec = datum.value<avro::GenericRecord>();
+        rec.field("record_count") = avro::GenericDatum(record_count);
+        rec.field("file_size_in_bytes") = avro::GenericDatum(file_size_in_bytes);
+
+        if (column_stats)
+        {
+            auto write_long_map = [&](const std::string & name, const std::vector<std::pair<Int32, Int64>> & entries)
+            {
+                auto & field = rec.field(name);
+                auto & arr = field.value<avro::GenericArray>();
+                auto schema_element = arr.schema()->leafAt(0);
+                for (const auto & [k, v] : entries)
+                {
+                    avro::GenericDatum item(schema_element);
+                    auto & item_rec = item.value<avro::GenericRecord>();
+                    item_rec.field("key") = avro::GenericDatum(k);
+                    item_rec.field("value") = avro::GenericDatum(v);
+                    arr.value().push_back(item);
+                }
+            };
+
+            auto write_bytes_map = [&](const std::string & name, const std::vector<std::pair<Int32, std::vector<uint8_t>>> & entries)
+            {
+                auto & field = rec.field(name);
+                auto & arr = field.value<avro::GenericArray>();
+                auto schema_element = arr.schema()->leafAt(0);
+                for (const auto & [k, v] : entries)
+                {
+                    avro::GenericDatum item(schema_element);
+                    auto & item_rec = item.value<avro::GenericRecord>();
+                    item_rec.field("key") = avro::GenericDatum(k);
+                    item_rec.field("value") = avro::GenericDatum(v);
+                    arr.value().push_back(item);
+                }
+            };
+
+            write_long_map("column_sizes",      column_stats->column_sizes);
+            write_long_map("null_value_counts",  column_stats->null_value_counts);
+            write_bytes_map("lower_bounds",      column_stats->lower_bounds);
+            write_bytes_map("upper_bounds",      column_stats->upper_bounds);
+        }
+
+        writer.write(datum);
+        writer.flush();
+        // writer destructor writes the Avro end-of-file sync marker
+    }
+
+    buf->finalize();
+}
+
+IcebergSerializedFileStats serializeDataFileStats(
+    const DataFileStatistics & stats,
+    SharedHeader sample_block,
+    Int64 record_count,
+    Int64 file_size_in_bytes)
+{
+    IcebergSerializedFileStats result;
+    result.record_count = record_count;
+    result.file_size_in_bytes = file_size_in_bytes;
+
+    for (const auto & [field_id, sz] : stats.getColumnSizes())
+        result.column_sizes.emplace_back(static_cast<Int32>(field_id), static_cast<Int64>(sz));
+
+    for (const auto & [field_id, cnt] : stats.getNullCounts())
+        result.null_value_counts.emplace_back(static_cast<Int32>(field_id), static_cast<Int64>(cnt));
+
+    std::unordered_map<size_t, size_t> field_id_to_col_idx;
+    {
+        auto field_ids = stats.getFieldIds();
+        for (size_t i = 0; i < field_ids.size(); ++i)
+            field_id_to_col_idx[field_ids[i]] = i;
+    }
+
+    auto serialize_bounds = [&](const std::vector<std::pair<size_t, Field>> & bounds,
+                                std::vector<std::pair<Int32, std::vector<uint8_t>>> & out)
+    {
+        if (!canWriteStatistics(bounds, field_id_to_col_idx, sample_block))
+            return;
+        for (const auto & [field_id, value] : bounds)
+        {
+            auto bytes = dumpFieldToBytes(value, sample_block->getDataTypes()[field_id_to_col_idx.at(field_id)]);
+            out.emplace_back(static_cast<Int32>(field_id), std::move(bytes));
+        }
+    };
+
+    serialize_bounds(stats.getLowerBounds(), result.lower_bounds);
+    serialize_bounds(stats.getUpperBounds(), result.upper_bounds);
+
+    return result;
+}
+
 void extendSchemaForPartitions(
     String & schema,
     const std::vector<String> & partition_columns,
@@ -249,7 +425,8 @@ void generateManifestFile(
     Poco::JSON::Object::Ptr partition_spec,
     Int64 partition_spec_id,
     WriteBuffer & buf,
-    Iceberg::FileContentType content_type)
+    Iceberg::FileContentType content_type,
+    const std::vector<IcebergSerializedFileStats> & per_file_stats)
 {
     Int32 version = metadata->getValue<Int32>(Iceberg::f_format_version);
     String schema_representation;
@@ -282,8 +459,9 @@ void generateManifestFile(
     Poco::JSON::Stringifier::stringify(partition_spec->getArray(Iceberg::f_fields), oss_partition_spec, 4);
     writer.setMetadata(Iceberg::f_partition_spec, oss_partition_spec.str());
     writer.setMetadata(Iceberg::f_partition_spec_id, std::to_string(partition_spec_id));
-    for (const auto & data_file_name : data_file_names)
+    for (size_t file_idx = 0; file_idx < data_file_names.size(); ++file_idx)
     {
+        const auto & data_file_name = data_file_names[file_idx];
         avro::GenericDatum manifest_datum(root_schema);
         avro::GenericRecord & manifest = manifest_datum.value<avro::GenericRecord>();
 
@@ -325,62 +503,112 @@ void generateManifestFile(
         data_file.field(Iceberg::f_file_path) = avro::GenericDatum(data_file_name);
         data_file.field(Iceberg::f_file_format) = avro::GenericDatum(format);
 
-        if (data_file_statistics)
+        /// Export path: per-file serialized stats override everything (record count, file size,
+        /// and all column statistics).  Existing insert/mutation paths use the aggregate path below.
+        if (!per_file_stats.empty() && file_idx < per_file_stats.size())
         {
-            auto set_fields = [&]<typename T, typename U>(
-                                  const std::vector<std::pair<size_t, T>> & statistics, const std::string & field_name, U && dump_function)
+            const auto & pf = per_file_stats[file_idx];
+
+            auto write_long_map = [&](const std::vector<std::pair<Int32, Int64>> & entries, const String & field_name)
             {
-                auto & data_file_record = data_file.field(field_name);
-                data_file_record.selectBranch(1);
-                auto & record_values = data_file_record.value<avro::GenericArray>();
-                auto schema_element = record_values.schema()->leafAt(0);
-                for (const auto & [field_id, value] : statistics)
+                if (entries.empty())
+                    return;
+                auto & field = data_file.field(field_name);
+                field.selectBranch(1);
+                auto & arr = field.value<avro::GenericArray>();
+                auto schema_element = arr.schema()->leafAt(0);
+                for (const auto & [k, v] : entries)
                 {
-                    avro::GenericDatum record_datum(schema_element);
-                    auto & record = record_datum.value<avro::GenericRecord>();
-                    record.field(Iceberg::f_key) = static_cast<Int32>(field_id);
-                    record.field(Iceberg::f_value) = dump_function(field_id, value);
-                    record_values.value().push_back(record_datum);
+                    avro::GenericDatum item(schema_element);
+                    auto & item_rec = item.value<avro::GenericRecord>();
+                    item_rec.field(Iceberg::f_key) = avro::GenericDatum(k);
+                    item_rec.field(Iceberg::f_value) = avro::GenericDatum(v);
+                    arr.value().push_back(item);
                 }
             };
 
-            auto statistics = data_file_statistics->getColumnSizes();
-            set_fields(statistics, Iceberg::f_column_sizes, [](size_t, size_t value) { return static_cast<Int32>(value); });
+            auto write_bytes_map = [&](const std::vector<std::pair<Int32, std::vector<uint8_t>>> & entries, const String & field_name)
+            {
+                if (entries.empty())
+                    return;
+                auto & field = data_file.field(field_name);
+                field.selectBranch(1);
+                auto & arr = field.value<avro::GenericArray>();
+                auto schema_element = arr.schema()->leafAt(0);
+                for (const auto & [k, v] : entries)
+                {
+                    avro::GenericDatum item(schema_element);
+                    auto & item_rec = item.value<avro::GenericRecord>();
+                    item_rec.field(Iceberg::f_key) = avro::GenericDatum(k);
+                    item_rec.field(Iceberg::f_value) = avro::GenericDatum(v);
+                    arr.value().push_back(item);
+                }
+            };
 
-            statistics = data_file_statistics->getNullCounts();
-            set_fields(statistics, Iceberg::f_null_value_counts, [](size_t, size_t value) { return static_cast<Int32>(value); });
+            write_long_map(pf.column_sizes, Iceberg::f_column_sizes);
+            write_long_map(pf.null_value_counts, Iceberg::f_null_value_counts);
+            write_bytes_map(pf.lower_bounds, Iceberg::f_lower_bounds);
+            write_bytes_map(pf.upper_bounds, Iceberg::f_upper_bounds);
 
-            std::unordered_map<size_t, size_t> field_id_to_column_index;
-            auto field_ids = data_file_statistics->getFieldIds();
-            for (size_t i = 0; i < field_ids.size(); ++i)
-                field_id_to_column_index[field_ids[i]] = i;
-
-            auto dump_fields = [&](size_t field_id, Field value)
-            { return dumpFieldToBytes(value, sample_block->getDataTypes()[field_id_to_column_index.at(field_id)]); };
-
-            auto lower_statistics = data_file_statistics->getLowerBounds();
-            if (canWriteStatistics(lower_statistics, field_id_to_column_index, sample_block))
-                set_fields(lower_statistics, Iceberg::f_lower_bounds, dump_fields);
-            auto upper_statistics = data_file_statistics->getUpperBounds();
-            if (canWriteStatistics(upper_statistics, field_id_to_column_index, sample_block))
-                set_fields(upper_statistics, Iceberg::f_upper_bounds, dump_fields);
-        }
-        auto summary = new_snapshot->getObject(Iceberg::f_summary);
-        if (summary->has(Iceberg::f_added_records))
-        {
-            Int64 added_records = summary->getValue<Int64>(Iceberg::f_added_records);
-            Int64 added_files_size = summary->getValue<Int64>(Iceberg::f_added_files_size);
-
-            data_file.field(Iceberg::f_record_count) = avro::GenericDatum(added_records);
-            data_file.field(Iceberg::f_file_size_in_bytes) = avro::GenericDatum(added_files_size);
+            data_file.field(Iceberg::f_record_count) = avro::GenericDatum(pf.record_count);
+            data_file.field(Iceberg::f_file_size_in_bytes) = avro::GenericDatum(pf.file_size_in_bytes);
         }
         else
         {
-            Int64 added_records = summary->getValue<Int64>(Iceberg::f_added_position_deletes);
-            Int64 added_files_size = summary->getValue<Int64>(Iceberg::f_added_files_size);
+            /// Regular INSERT / mutation path: aggregate column statistics applied to every file.
+            if (data_file_statistics)
+            {
+                auto set_fields = [&]<typename T, typename U>(
+                                      const std::vector<std::pair<size_t, T>> & statistics, const std::string & field_name, U && dump_function)
+                {
+                    auto & data_file_record = data_file.field(field_name);
+                    data_file_record.selectBranch(1);
+                    auto & record_values = data_file_record.value<avro::GenericArray>();
+                    auto schema_element = record_values.schema()->leafAt(0);
+                    for (const auto & [field_id, value] : statistics)
+                    {
+                        avro::GenericDatum record_datum(schema_element);
+                        auto & record = record_datum.value<avro::GenericRecord>();
+                        record.field(Iceberg::f_key) = static_cast<Int32>(field_id);
+                        record.field(Iceberg::f_value) = dump_function(field_id, value);
+                        record_values.value().push_back(record_datum);
+                    }
+                };
 
-            data_file.field(Iceberg::f_record_count) = avro::GenericDatum(added_records);
-            data_file.field(Iceberg::f_file_size_in_bytes) = avro::GenericDatum(added_files_size);
+                auto statistics = data_file_statistics->getColumnSizes();
+                set_fields(statistics, Iceberg::f_column_sizes, [](size_t, size_t value) { return static_cast<Int32>(value); });
+
+                statistics = data_file_statistics->getNullCounts();
+                set_fields(statistics, Iceberg::f_null_value_counts, [](size_t, size_t value) { return static_cast<Int32>(value); });
+
+                std::unordered_map<size_t, size_t> field_id_to_column_index;
+                auto field_ids = data_file_statistics->getFieldIds();
+                for (size_t i = 0; i < field_ids.size(); ++i)
+                    field_id_to_column_index[field_ids[i]] = i;
+
+                auto dump_fields = [&](size_t field_id, Field value)
+                { return dumpFieldToBytes(value, sample_block->getDataTypes()[field_id_to_column_index.at(field_id)]); };
+
+                auto lower_statistics = data_file_statistics->getLowerBounds();
+                if (canWriteStatistics(lower_statistics, field_id_to_column_index, sample_block))
+                    set_fields(lower_statistics, Iceberg::f_lower_bounds, dump_fields);
+                auto upper_statistics = data_file_statistics->getUpperBounds();
+                if (canWriteStatistics(upper_statistics, field_id_to_column_index, sample_block))
+                    set_fields(upper_statistics, Iceberg::f_upper_bounds, dump_fields);
+            }
+
+            /// Record count and file size from the snapshot summary (aggregate for all files).
+            auto summary = new_snapshot->getObject(Iceberg::f_summary);
+            if (summary->has(Iceberg::f_added_records))
+            {
+                data_file.field(Iceberg::f_record_count) = avro::GenericDatum(summary->getValue<Int64>(Iceberg::f_added_records));
+                data_file.field(Iceberg::f_file_size_in_bytes) = avro::GenericDatum(summary->getValue<Int64>(Iceberg::f_added_files_size));
+            }
+            else
+            {
+                data_file.field(Iceberg::f_record_count) = avro::GenericDatum(summary->getValue<Int64>(Iceberg::f_added_position_deletes));
+                data_file.field(Iceberg::f_file_size_in_bytes) = avro::GenericDatum(summary->getValue<Int64>(Iceberg::f_added_files_size));
+            }
         }
         avro::GenericRecord & partition_record = data_file.field("partition").value<avro::GenericRecord>();
         for (size_t i = 0; i < partition_columns.size(); ++i)
@@ -1052,7 +1280,14 @@ IcebergImportSink::IcebergImportSink(
     ContextPtr context_,
     std::optional<FormatSettings> format_settings_,
     const String & write_format_,
-    SharedHeader sample_block_)
+    SharedHeader sample_block_,
+    Int64 original_schema_id_,
+    Int64 partition_spec_id_,
+    Row partition_values_,
+    std::vector<String> partition_columns_,
+    std::vector<DataTypePtr> partition_types_,
+    const DataLakeStorageSettings & data_lake_settings_,
+    std::function<void(const std::string &)> new_file_path_callback_)
     : SinkToStorage(sample_block_)
     , catalog(catalog_)
     , persistent_table_components(persistent_table_components_)
@@ -1062,6 +1297,13 @@ IcebergImportSink::IcebergImportSink(
     , format_settings(format_settings_)
     , write_format(write_format_)
     , sample_block(sample_block_)
+    , data_lake_settings(data_lake_settings_)
+    , new_file_path_callback(std::move(new_file_path_callback_))
+    , original_schema_id(original_schema_id_)
+    , partition_spec_id(partition_spec_id_)
+    , partition_values(std::move(partition_values_))
+    , partition_columns(std::move(partition_columns_))
+    , partition_types(std::move(partition_types_))
 {
     const auto current_schema_id = metadata_json->getValue<Int64>(Iceberg::f_current_schema_id);
     const auto schemas = metadata_json->getArray(Iceberg::f_schemas);
@@ -1096,7 +1338,16 @@ IcebergImportSink::IcebergImportSink(
             bucket, config_path, (catalog != nullptr && catalog->isTransactional()), metadata_compression_method, write_format);
     }
 
-    const auto last_version = 1;
+    const auto [last_version, unused_meta_path, unused_compression] = getLatestOrExplicitMetadataFileAndVersion(
+        object_storage,
+        persistent_table_components.table_path,
+        data_lake_settings,
+        persistent_table_components.metadata_cache,
+        context_,
+        getLogger("IcebergWrites").get(),
+        persistent_table_components.table_uuid);
+    (void)unused_meta_path;
+    (void)unused_compression;
 
     filename_generator.setVersion(last_version + 1);
 
@@ -1109,7 +1360,8 @@ IcebergImportSink::IcebergImportSink(
         context,
         format_settings,
         write_format,
-        sample_block);
+        sample_block,
+        new_file_path_callback);
 }
 
 void IcebergImportSink::consume(Chunk & chunk)
@@ -1117,7 +1369,6 @@ void IcebergImportSink::consume(Chunk & chunk)
     if (isCancelled())
         return;
 
-    /// todo arthur remember to introduce callbacks for new filenames
     writer->consume(chunk);
 }
 
@@ -1127,6 +1378,16 @@ void IcebergImportSink::onFinish()
         return;
 
     finalizeBuffers();
+
+    for (const auto & entry : writer->getDataFileEntries())
+    {
+        std::optional<IcebergSerializedFileStats> serialized_stats;
+        if (entry.statistics)
+            serialized_stats = serializeDataFileStats(*entry.statistics, sample_block, entry.record_count, entry.file_size_in_bytes);
+
+        writeDataFileSidecar(entry.path, entry.record_count, entry.file_size_in_bytes, object_storage, context, std::move(serialized_stats));
+    }
+
     releaseBuffers();
 }
 

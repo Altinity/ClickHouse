@@ -100,7 +100,10 @@ namespace ExportPartitionUtils
             return;
         }
 
-        destination_storage->commitExportPartitionTransaction(manifest.transaction_id, manifest.partition_id, exported_paths, context);
+        IStorage::IcebergCommitExportPartitionArguments iceberg_args;
+        iceberg_args.metadata_json_string = manifest.iceberg_metadata_json;
+        iceberg_args.partition_values_json = manifest.partition_values_json;
+        destination_storage->commitExportPartitionTransaction(manifest.transaction_id, manifest.partition_id, exported_paths, iceberg_args, context);
 
         LOG_INFO(log, "ExportPartition: Committed export, mark as completed");
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);

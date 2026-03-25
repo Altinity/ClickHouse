@@ -73,6 +73,36 @@ ChunkPartitioner::ChunkPartitioner(
     }
 }
 
+Row ChunkPartitioner::computePartitionKey(const Block & source_block) const
+{
+    Row key;
+    key.reserve(functions.size());
+    for (size_t i = 0; i < functions.size(); ++i)
+    {
+        ColumnsWithTypeAndName arguments;
+        if (function_params[i].has_value())
+        {
+            auto type = std::make_shared<DataTypeUInt64>();
+            auto col = ColumnUInt64::create();
+            col->insert(*function_params[i]);
+            arguments.push_back({ColumnConst::create(std::move(col), 1), type, "#"});
+        }
+        arguments.push_back(source_block.getByName(columns_to_apply[i]));
+        if (function_time_zones[i].has_value())
+        {
+            auto type = std::make_shared<DataTypeString>();
+            auto col = ColumnString::create();
+            col->insert(*function_time_zones[i]);
+            arguments.push_back({ColumnConst::create(std::move(col), 1), type, "PartitioningTimezone"});
+        }
+        auto result = functions[i]->build(arguments)->execute(arguments, std::make_shared<DataTypeString>(), 1, false);
+        Field field;
+        result->get(0, field);
+        key.push_back(std::move(field));
+    }
+    return key;
+}
+
 size_t ChunkPartitioner::PartitionKeyHasher::operator()(const PartitionKey & key) const
 {
     size_t result = 0;

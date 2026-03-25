@@ -68,6 +68,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PositionDeleteTransform.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Snapshot.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/StatelessMetadataFileGetter.h>
+#include <Common/FailPoint.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Common/ProfileEvents.h>
 #include <Common/SharedLockGuard.h>
@@ -1189,10 +1190,15 @@ KeyDescription IcebergMetadata::getSortingKey(ContextPtr local_context, TableSta
 
 SinkToStoragePtr IcebergMetadata::import(
     std::shared_ptr<DataLake::ICatalog> catalog,
-    const std::function<void(const std::string &)> & /* new_file_path_callback */,
+    const std::function<void(const std::string &)> & new_file_path_callback,
     SharedHeader sample_block,
     const std::string & iceberg_metadata_json_string,
     const std::optional<FormatSettings> & format_settings,
+    Int64 original_schema_id,
+    Int64 partition_spec_id,
+    Row partition_values,
+    std::vector<String> partition_columns,
+    std::vector<DataTypePtr> partition_types,
     ContextPtr context)
 {
     Poco::JSON::Parser parser; /// For some reason base/base/JSON.h can not parse this json file
@@ -1200,48 +1206,99 @@ SinkToStoragePtr IcebergMetadata::import(
     Poco::JSON::Object::Ptr metadata_json = json.extract<Poco::JSON::Object::Ptr>();
 
     return std::make_shared<IcebergImportSink>(
-        catalog, persistent_components, metadata_json, object_storage, context, format_settings, write_format, sample_block);
+        catalog, persistent_components, metadata_json, object_storage, context, format_settings, write_format, sample_block,
+        original_schema_id, partition_spec_id,
+        std::move(partition_values), std::move(partition_columns), std::move(partition_types),
+        data_lake_settings, new_file_path_callback);
+}
+
+namespace FailPoints
+{
+    extern const char iceberg_writes_cleanup[];
+}
+
+namespace
+{
+/// Replace the file extension of `path` with ".avro".
+/// E.g. "/table/data/data-uuid.parquet" -> "/table/data/data-uuid.avro".
+/// If the path has no extension (no '.' after the last '/') ".avro" is appended.
+String replaceFileExtensionWithAvro(const String & path)
+{
+    auto dot_pos = path.rfind('.');
+    auto slash_pos = path.rfind('/');
+    if (dot_pos != String::npos && (slash_pos == String::npos || dot_pos > slash_pos))
+        return path.substr(0, dot_pos) + ".avro";
+    return path + ".avro";
+}
 }
 
 bool IcebergMetadata::commitImportPartitionTransactionImpl(
     FileNamesGenerator & filename_generator,
-    Poco::JSON::Object::Ptr initial_metadata,
+    Poco::JSON::Object::Ptr & metadata,
     Int64 original_schema_id,
-    std::optional<ChunkPartitioner> & partitioner,
-    ContextPtr context,
+    Int64 partition_spec_id,
+    const std::vector<Field> & partition_values,
+    const std::vector<String> & partition_columns,
+    const std::vector<DataTypePtr> & partition_types,
     SharedHeader sample_block,
-    const std::string & partition_key)
+    const std::vector<String> & data_file_paths,
+    std::shared_ptr<DataLake::ICatalog> catalog,
+    const StorageID & table_id,
+    const String & blob_storage_type_name,
+    const String & blob_storage_namespace_name,
+    ContextPtr context)
 {
+    CompressionMethod metadata_compression_method = persistent_components.metadata_compression_method;
+
+    /// Derive the partition spec object from the metadata by matching spec-id.
+    auto lookupPartitionSpec = [](const Poco::JSON::Object::Ptr & meta, Int64 spec_id) -> Poco::JSON::Object::Ptr
+    {
+        auto specs = meta->getArray(Iceberg::f_partition_specs);
+        for (size_t i = 0; i < specs->size(); ++i)
+        {
+            auto spec = specs->getObject(static_cast<UInt32>(i));
+            if (spec->getValue<Int64>(Iceberg::f_spec_id) == spec_id)
+                return spec;
+        }
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "Partition spec with id {} not found in table metadata", spec_id);
+    };
+    Poco::JSON::Object::Ptr partition_spec = lookupPartitionSpec(metadata, partition_spec_id);
+
     auto [metadata_name, storage_metadata_name] = filename_generator.generateMetadataName();
 
     Int64 parent_snapshot = -1;
-    if (initial_metadata->has(Iceberg::f_current_snapshot_id))
-        parent_snapshot = initial_metadata->getValue<Int64>(Iceberg::f_current_snapshot_id);
+    if (metadata->has(Iceberg::f_current_snapshot_id))
+        parent_snapshot = metadata->getValue<Int64>(Iceberg::f_current_snapshot_id);
 
-    /// todo arthur
-    Int32 total_data_files = 10;
-    Int32 total_rows = 10;
-    Int32 total_chunks_size = 10;
+    Int32 total_data_files = static_cast<Int32>(data_file_paths.size());
+    Int32 total_rows = 0;
+    Int32 total_chunks_size = 0;
+    /// Per-file serialized stats read from sidecar files.
+    /// These carry accurate per-file record counts, file sizes, and column statistics
+    /// for use in manifest entries instead of the snapshot-level aggregate.
+    std::vector<IcebergSerializedFileStats> per_file_stats;
+    per_file_stats.reserve(data_file_paths.size());
+    for (const auto & path : data_file_paths)
+    {
+        const String sidecar_path = replaceFileExtensionWithAvro(
+            filename_generator.convertMetadataPathToStoragePath(path));
+        auto sidecar = readDataFileSidecar(sidecar_path, object_storage, context);
+        total_rows += static_cast<Int32>(sidecar.record_count);
+        total_chunks_size += static_cast<Int32>(sidecar.file_size_in_bytes);
+        per_file_stats.push_back(std::move(sidecar.column_stats));
+    }
 
-    auto [new_snapshot, manifest_list_name, storage_manifest_list_name] = MetadataGenerator(initial_metadata).generateNextMetadata(
+    auto [new_snapshot, manifest_list_name, storage_manifest_list_name] = MetadataGenerator(metadata).generateNextMetadata(
         filename_generator, metadata_name, parent_snapshot, total_data_files, total_rows, total_chunks_size, total_data_files, /* added_delete_files */0, /* num_deleted_rows */0);
 
     String manifest_entry_name;
     String storage_manifest_entry_name;
     Int32 manifest_lengths = 0;
 
-    auto cleanup = [&] (bool retry_because_of_metadata_conflict)
+    auto cleanup = [&](bool retry_because_of_metadata_conflict)
     {
-        if (!retry_because_of_metadata_conflict)
-        {
-            /// todo arthur
-            // for (const auto & [_, writer] : writer_per_partition_key)
-            //     writer.clearAllDataFiles();
-        }
-
-        // for (const auto & manifest_filename_in_storage : manifest_entries_in_storage)
         object_storage->removeObjectIfExists(StoredObject(storage_manifest_entry_name));
-
         object_storage->removeObjectIfExists(StoredObject(storage_manifest_list_name));
 
         if (retry_because_of_metadata_conflict)
@@ -1257,10 +1314,10 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
 
             LOG_DEBUG(log, "Rereading metadata file {} with version {}", metadata_path, last_version);
 
-            auto metadata_compression_method = compression_method;
+            metadata_compression_method = compression_method;
             filename_generator.setVersion(last_version + 1);
 
-            auto metadata = getMetadataJSONObject(
+            metadata = getMetadataJSONObject(
                 metadata_path,
                 object_storage,
                 persistent_components.metadata_cache,
@@ -1268,39 +1325,36 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
                 getLogger("IcebergWrites"),
                 compression_method,
                 persistent_components.table_uuid);
-            const auto partition_spec_id = metadata->getValue<Int64>(Iceberg::f_default_spec_id);
-            auto partitions_specs = metadata->getArray(Iceberg::f_partition_specs);
 
-            auto new_schema_id = metadata->getValue<Int64>(Iceberg::f_current_schema_id);
+            /// For the export path the schema and partition spec are fixed at the start of the
+            /// operation (saved in ZooKeeper). If either changed we must fail immediately —
+            /// the caller has to restart the export from scratch.
+            const auto new_schema_id = metadata->getValue<Int64>(Iceberg::f_current_schema_id);
             if (new_schema_id != original_schema_id)
-                throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Metadata changed during write operation, try again");
+                throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                    "Table schema changed during export (expected schema {}, got {}). Restart the export operation.",
+                    original_schema_id, new_schema_id);
 
-            Poco::JSON::Object::Ptr current_schema;
-            auto schemas = metadata->getArray(Iceberg::f_schemas);
-            for (size_t i = 0; i < schemas->size(); ++i)
-            {
-                if (schemas->getObject(static_cast<UInt32>(i))->getValue<Int32>(Iceberg::f_schema_id) == original_schema_id)
-                {
-                    current_schema = schemas->getObject(static_cast<UInt32>(i));
-                }
-            }
-            for (size_t i = 0; i < partitions_specs->size(); ++i)
-            {
-                auto current_partition_spec = partitions_specs->getObject(static_cast<UInt32>(i));
-                if (current_partition_spec->getValue<Int64>(Iceberg::f_spec_id) == partition_spec_id)
-                {
-                    partititon_spec = current_partition_spec;
-                    if (current_partition_spec->getArray(Iceberg::f_fields)->size() > 0)
-                        partitioner = ChunkPartitioner(current_partition_spec->getArray(Iceberg::f_fields), current_schema, context, sample_block);
-                    break;
-                }
-            }
+            const Int64 new_partition_spec_id = metadata->getValue<Int64>(Iceberg::f_default_spec_id);
+            if (new_partition_spec_id != partition_spec_id)
+                throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                    "Partition spec changed during export (expected spec {}, got {}). Restart the export operation.",
+                    partition_spec_id, new_partition_spec_id);
+
+            partition_spec = lookupPartitionSpec(metadata, partition_spec_id);
+
+            /// partition_values, partition_columns, partition_types, and
+            /// data_file_paths are all fixed from the saved state — no update needed.
         }
     };
 
     try
     {
-        std::tie(manifest_entry_name, storage_manifest_entry_name) = filename_generator.generateManifestEntryName();
+        {
+            auto result = filename_generator.generateManifestEntryName();
+            manifest_entry_name = result.path_in_metadata;
+            storage_manifest_entry_name = result.path_in_storage;
+        }
 
         auto buffer_manifest_entry = object_storage->writeObject(
             StoredObject(storage_manifest_entry_name), WriteMode::Rewrite, std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());
@@ -1309,18 +1363,19 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
         {
             generateManifestFile(
                 metadata,
-                partitioner ? partitioner->getColumns() : std::vector<String>{},
-                partition_key,
-                partitioner ? partitioner->getResultTypes() : std::vector<DataTypePtr>{},
-                {},// todo arthurwriter.getDataFiles(),
-                {},// todo arthurwriter.getResultStatistics(),
+                partition_columns,
+                partition_values,
+                partition_types,
+                data_file_paths,
+                std::nullopt,  /// aggregate DataFileStatistics unused: per_file_stats carries per-file column stats
                 sample_block,
                 new_snapshot,
                 write_format,
-                partititon_spec,
+                partition_spec,
                 partition_spec_id,
                 *buffer_manifest_entry,
-                Iceberg::FileContentType::DATA);
+                Iceberg::FileContentType::DATA,
+                per_file_stats);
             buffer_manifest_entry->finalize();
             manifest_lengths += buffer_manifest_entry->count();
         }
@@ -1373,10 +1428,8 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
                 cleanup(true);
                 return false;
             }
-            else
-            {
-                LOG_DEBUG(log, "Metadata file {} written", storage_metadata_name);
-            }
+
+            LOG_DEBUG(log, "Metadata file {} written", storage_metadata_name);
 
             if (catalog)
             {
@@ -1404,12 +1457,91 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
 
 void IcebergMetadata::commitExportPartitionTransaction(
     std::shared_ptr<DataLake::ICatalog> catalog,
+    const StorageID & table_id,
     const std::string & iceberg_metadata_json_string,
+    Int64 original_schema_id,
+    Int64 partition_spec_id,
+    const std::string & partition_values_json,
+    SharedHeader sample_block,
+    const std::vector<String> & data_file_paths,
+    StorageObjectStorageConfigurationPtr configuration,
     ContextPtr context)
 {
     Poco::JSON::Parser parser; /// For some reason base/base/JSON.h can not parse this json file
     Poco::Dynamic::Var json = parser.parse(iceberg_metadata_json_string);
     Poco::JSON::Object::Ptr metadata = json.extract<Poco::JSON::Object::Ptr>();
+
+    /// Derive partition_columns and partition_types from the snapshot-pinned schema and partition spec.
+    /// Only the partition_values need to be persisted externally; columns and types are fully
+    /// recoverable from the metadata JSON that is already stored in ZooKeeper.
+    std::vector<String> partition_columns;
+    std::vector<DataTypePtr> partition_types;
+    {
+        /// Build source-id → ClickHouse DataTypePtr from the schema that was current at export time.
+        std::unordered_map<Int32, DataTypePtr> source_id_to_type;
+        const auto schemas = metadata->getArray(Iceberg::f_schemas);
+        for (size_t i = 0; i < schemas->size(); ++i)
+        {
+            auto schema = schemas->getObject(static_cast<UInt32>(i));
+            if (schema->getValue<Int32>(Iceberg::f_schema_id) != static_cast<Int32>(original_schema_id))
+                continue;
+            auto fields = schema->getArray(Iceberg::f_fields);
+            for (size_t j = 0; j < fields->size(); ++j)
+            {
+                auto field = fields->getObject(static_cast<UInt32>(j));
+                Poco::Dynamic::Var type_var = field->get(Iceberg::f_type);
+                if (!type_var.isString())
+                    continue; /// complex types cannot be partition source columns
+                try
+                {
+                    source_id_to_type[field->getValue<Int32>(Iceberg::f_id)] =
+                        IcebergSchemaProcessor::getSimpleType(type_var.extract<String>(), context);
+                }
+                catch (...) {} /// ignore types unknown to this CH version
+            }
+            break;
+        }
+
+        /// Walk the partition spec to derive column names and post-transform result types.
+        const auto specs = metadata->getArray(Iceberg::f_partition_specs);
+        for (size_t i = 0; i < specs->size(); ++i)
+        {
+            auto spec = specs->getObject(static_cast<UInt32>(i));
+            if (spec->getValue<Int64>(Iceberg::f_spec_id) != partition_spec_id)
+                continue;
+            auto spec_fields = spec->getArray(Iceberg::f_fields);
+            for (size_t j = 0; j < spec_fields->size(); ++j)
+            {
+                auto sf = spec_fields->getObject(static_cast<UInt32>(j));
+                partition_columns.push_back(sf->getValue<String>(Iceberg::f_name));
+                Int32 source_id = sf->getValue<Int32>(Iceberg::f_source_id);
+                String transform = sf->getValue<String>(Iceberg::f_transform);
+                DataTypePtr src_type = source_id_to_type.count(source_id)
+                    ? source_id_to_type.at(source_id)
+                    : std::make_shared<DataTypeInt32>();
+                partition_types.push_back(Iceberg::getFunctionResultType(transform, src_type));
+            }
+            break;
+        }
+    }
+
+    /// Deserialize partition values from the JSON string using the types derived above.
+    /// Partition values are small numbers (epoch-based counters or identity integers) or strings,
+    /// so Int64 covers the signed/unsigned numeric cases without information loss.
+    std::vector<Field> partition_values;
+    if (!partition_values_json.empty() && !partition_types.empty())
+    {
+        Poco::JSON::Parser val_parser;
+        auto arr = val_parser.parse(partition_values_json).extract<Poco::JSON::Array::Ptr>();
+        for (std::size_t i = 0; i < arr->size() && i < partition_types.size(); ++i)
+        {
+            Poco::Dynamic::Var var = arr->get(static_cast<unsigned int>(i));
+            if (var.isString())
+                partition_values.push_back(Field(var.extract<String>()));
+            else
+                partition_values.push_back(Field(var.convert<Int64>()));
+        }
+    }
 
     const auto metadata_compression_method = CompressionMethod::Gzip;
     auto config_path = persistent_components.table_path;
@@ -1433,15 +1565,31 @@ void IcebergMetadata::commitExportPartitionTransaction(
             bucket, config_path, (catalog != nullptr && catalog->isTransactional()), metadata_compression_method, write_format);
     }
 
-    std::optional<ChunkPartitioner> partitioner;
-
-    size_t i = 0;
-    while (i < 10)
+    size_t attempt = 0;
+    while (attempt < 10)
     {
-        if (commitImportPartitionTransactionImpl(filename_generator, metadata, partitioner, context, sample_block, partition_key))
-            break;
-        ++i;
+        if (commitImportPartitionTransactionImpl(
+                filename_generator,
+                metadata,
+                original_schema_id,
+                partition_spec_id,
+                partition_values,
+                partition_columns,
+                partition_types,
+                sample_block,
+                data_file_paths,
+                catalog,
+                table_id,
+                configuration->getTypeName(),
+                configuration->getNamespace(),
+                context))
+            return;
+        ++attempt;
     }
+
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+        "Failed to commit export partition transaction after {} attempts due to repeated metadata conflicts.",
+        attempt);
 }
 
 Poco::JSON::Object::Ptr IcebergMetadata::getMetadataJSON(ContextPtr local_context) const

@@ -68,6 +68,7 @@
 #include <Storages/MergeTree/ReplicatedMergeTreeTableMetadata.h>
 #include <Storages/MergeTree/ZeroCopyLock.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
+#include <Poco/JSON/Stringifier.h>
 #include <Storages/PartitionCommands.h>
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/System/StorageSystemReplicatedPartitionExports.h>
@@ -127,6 +128,7 @@
 #include "Storages/ExportReplicatedMergeTreePartitionTaskEntry.h"
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeLogEntry.h>
+#include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
 #include <IO/SharedThreadPools.h>
 
 #include <base/types.h>
@@ -8072,8 +8074,11 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     if (src_snapshot->getColumns().getReadable().sizeOfDifference(destination_snapshot->getColumns().getInsertable()))
         throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS, "Tables have different structure");
 
-    if (query_to_string(src_snapshot->getPartitionKeyAST()) != query_to_string(destination_snapshot->getPartitionKeyAST()))
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
+    if (!dest_storage->ignorePartitionCompatibilityForImport())
+    {
+        if (query_to_string(src_snapshot->getPartitionKeyAST()) != query_to_string(destination_snapshot->getPartitionKeyAST()))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
+    }
 
     zkutil::ZooKeeperPtr zookeeper = getZooKeeperAndAssertNotReadonly();
 
@@ -8214,7 +8219,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 
     if (dest_storage->isDataLake())
     {
-        auto * object_storage = dynamic_cast<StorageObjectStorage *>(dest_storage.get());
+        auto * object_storage = dynamic_cast<StorageObjectStorageCluster *>(dest_storage.get());
 
         auto * iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage->getExternalMetadata(query_context));
         if (!iceberg_metadata)
@@ -8224,9 +8229,83 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 
         const auto metadata_object = iceberg_metadata->getMetadataJSON(query_context);
             
-        std::ostringstream oss;
+        std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+        oss.exceptions(std::ios::failbit);
         metadata_object->stringify(oss);
         manifest.iceberg_metadata_json = oss.str();
+
+        /// Compute Iceberg partition values from the first source part.
+        /// All parts in the same MergeTree partition share identical partition key values,
+        /// so one representative part is sufficient.
+        if (src_snapshot->hasPartitionKey() && parts[0]->minmax_idx)
+        {
+            const auto original_schema_id = metadata_object->getValue<Int64>(Iceberg::f_current_schema_id);
+            const auto partition_spec_id   = metadata_object->getValue<Int64>(Iceberg::f_default_spec_id);
+
+            Poco::JSON::Object::Ptr current_schema_json;
+            {
+                const auto schemas = metadata_object->getArray(Iceberg::f_schemas);
+                for (size_t i = 0; i < schemas->size(); ++i)
+                {
+                    auto s = schemas->getObject(static_cast<UInt32>(i));
+                    if (s->getValue<Int32>(Iceberg::f_schema_id) == static_cast<Int32>(original_schema_id))
+                    {
+                        current_schema_json = s;
+                        break;
+                    }
+                }
+            }
+
+            Poco::JSON::Object::Ptr partition_spec_json;
+            {
+                const auto specs = metadata_object->getArray(Iceberg::f_partition_specs);
+                for (size_t i = 0; i < specs->size(); ++i)
+                {
+                    auto s = specs->getObject(static_cast<UInt32>(i));
+                    if (s->getValue<Int64>(Iceberg::f_spec_id) == partition_spec_id)
+                    {
+                        partition_spec_json = s;
+                        break;
+                    }
+                }
+            }
+
+#if USE_AVRO
+            if (current_schema_json && partition_spec_json)
+            {
+                auto spec_fields = partition_spec_json->getArray(Iceberg::f_fields);
+                if (spec_fields && spec_fields->size() > 0)
+                {
+                    auto sample_block = std::make_shared<const Block>(dest_storage->getInMemoryMetadataPtr()->getSampleBlock());
+                    ChunkPartitioner partitioner(spec_fields, current_schema_json, query_context, sample_block);
+
+                    Block minmax_block = parts[0]->minmax_idx->getBlock(*this);
+                    Block single_row_block;
+                    for (size_t i = 0; i < minmax_block.columns(); ++i)
+                    {
+                        const auto & col = minmax_block.getByPosition(i);
+                        single_row_block.insert({col.column->cut(0, 1), col.type, col.name});
+                    }
+                    const Row partition_values = partitioner.computePartitionKey(single_row_block);
+
+                    Poco::JSON::Array::Ptr pv_arr = new Poco::JSON::Array();
+                    for (const auto & field : partition_values)
+                    {
+                        if (field.getType() == Field::Types::String)
+                            pv_arr->add(field.safeGet<String>());
+                        else if (field.getType() == Field::Types::UInt64)
+                            pv_arr->add(field.safeGet<UInt64>());
+                        else
+                            pv_arr->add(field.safeGet<Int64>());
+                    }
+                    std::ostringstream pv_oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+                    pv_oss.exceptions(std::ios::failbit);
+                    Poco::JSON::Stringifier::stringify(*pv_arr, pv_oss);
+                    manifest.partition_values_json = pv_oss.str();
+                }
+            }
+#endif
+        }
     }
 
     ops.emplace_back(zkutil::makeCreateRequest(

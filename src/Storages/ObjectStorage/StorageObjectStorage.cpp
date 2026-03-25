@@ -36,6 +36,9 @@
 #include <Storages/HivePartitioningUtils.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSettings.h>
 #include <Storages/ObjectStorage/MultiFileStorageObjectStorageSink.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/ChunkPartitioner.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
+#include <Poco/JSON/Parser.h>
 
 
 namespace DB
@@ -583,17 +586,94 @@ SinkToStoragePtr StorageObjectStorage::import(
     std::size_t max_rows_per_file,
     const std::optional<std::string> & iceberg_metadata_json_string,
     const std::optional<FormatSettings> & format_settings_,
-    ContextPtr local_context)
+    ContextPtr local_context,
+    const std::optional<std::string> & partition_values_json)
 {
     if (isDataLake())
     {
-        // configuration->getme
+        /// Parse the Iceberg metadata to locate the current schema and the default partition spec.
+        Poco::JSON::Parser iceberg_parser;
+        Poco::JSON::Object::Ptr iceberg_metadata =
+            iceberg_parser.parse(*iceberg_metadata_json_string).extract<Poco::JSON::Object::Ptr>();
+
+        const auto original_schema_id = iceberg_metadata->getValue<Int64>(Iceberg::f_current_schema_id);
+
+        Poco::JSON::Object::Ptr current_schema;
+        const auto schemas = iceberg_metadata->getArray(Iceberg::f_schemas);
+        for (size_t i = 0; i < schemas->size(); ++i)
+        {
+            auto schema = schemas->getObject(static_cast<UInt32>(i));
+            if (schema->getValue<Int32>(Iceberg::f_schema_id) == original_schema_id)
+            {
+                current_schema = schema;
+                break;
+            }
+        }
+
+        const auto partition_spec_id = iceberg_metadata->getValue<Int64>(Iceberg::f_default_spec_id);
+
+        Poco::JSON::Object::Ptr partition_spec;
+        const auto specs = iceberg_metadata->getArray(Iceberg::f_partition_specs);
+        for (size_t i = 0; i < specs->size(); ++i)
+        {
+            auto spec = specs->getObject(static_cast<UInt32>(i));
+            if (spec->getValue<Int64>(Iceberg::f_spec_id) == partition_spec_id)
+            {
+                partition_spec = spec;
+                break;
+            }
+        }
+
+        /// Build the partitioner from the Iceberg partition spec and schema.
+        /// Always needed to derive partition_columns and partition_types; computePartitionKey()
+        /// is skipped when the caller already supplies pre-serialized partition values (export-partition path).
+        auto sample_block_ptr = std::make_shared<const Block>(getInMemoryMetadataPtr()->getSampleBlock());
+        ChunkPartitioner partitioner(partition_spec->getArray(Iceberg::f_fields), current_schema, local_context, sample_block_ptr);
+
+        std::vector<String> partition_columns = partitioner.getColumns();
+        std::vector<DataTypePtr> partition_types = partitioner.getResultTypes();
+
+        Row partition_values;
+        if (partition_values_json.has_value() && !partition_values_json->empty())
+        {
+            /// Pre-computed by the export-partition path (replicated MergeTree).
+            /// Deserialize using the types derived from the partition spec above.
+            Poco::JSON::Parser val_parser;
+            auto arr = val_parser.parse(*partition_values_json).extract<Poco::JSON::Array::Ptr>();
+            for (size_t i = 0; i < arr->size() && i < partition_types.size(); ++i)
+            {
+                Poco::Dynamic::Var var = arr->get(static_cast<unsigned int>(i));
+                if (var.isString())
+                    partition_values.push_back(Field(var.extract<String>()));
+                else
+                    partition_values.push_back(Field(var.convert<Int64>()));
+            }
+        }
+        else
+        {
+            /// Per-part (non-replicated) export: derive from the minmax index block.
+            /// block_with_partition_values has 2 rows (min, max); row 0 is representative
+            /// because all rows in the same MergeTree partition share the same key value.
+            Block single_row_block;
+            for (size_t i = 0; i < block_with_partition_values.columns(); ++i)
+            {
+                const auto & col = block_with_partition_values.getByPosition(i);
+                single_row_block.insert({col.column->cut(0, 1), col.type, col.name});
+            }
+            partition_values = partitioner.computePartitionKey(single_row_block);
+        }
+
         return configuration->getExternalMetadata()->import(
             catalog,
             new_file_path_callback,
-            std::make_shared<const Block>(getInMemoryMetadataPtr()->getSampleBlock()),
+            sample_block_ptr,
             *iceberg_metadata_json_string,
             format_settings_ ? format_settings_ : format_settings,
+            original_schema_id,
+            partition_spec_id,
+            std::move(partition_values),
+            std::move(partition_columns),
+            std::move(partition_types),
             local_context);
     }
 
@@ -625,8 +705,40 @@ SinkToStoragePtr StorageObjectStorage::import(
         local_context);
 }
 
-void StorageObjectStorage::commitExportPartitionTransaction(const String & transaction_id, const String & partition_id, const Strings & exported_paths, ContextPtr local_context)
+void StorageObjectStorage::commitExportPartitionTransaction(
+    const String & transaction_id,
+    const String & partition_id,
+    const Strings & exported_paths,
+    const IcebergCommitExportPartitionArguments & iceberg_commit_export_partition_arguments,
+    ContextPtr local_context)
 {
+    if (isDataLake())
+    {
+        /// Parse the Iceberg metadata snapshot (stored in ZooKeeper at export-start time) to
+        /// extract the schema-id and partition-spec-id that were current when the export began.
+        /// partition_columns and partition_types are derived inside commitExportPartitionTransaction
+        /// from the same JSON, so only partition_values need to be carried here.
+        Poco::JSON::Parser iceberg_parser;
+        Poco::JSON::Object::Ptr iceberg_metadata =
+            iceberg_parser.parse(iceberg_commit_export_partition_arguments.metadata_json_string).extract<Poco::JSON::Object::Ptr>();
+
+        const auto original_schema_id = iceberg_metadata->getValue<Int64>(Iceberg::f_current_schema_id);
+        const auto partition_spec_id   = iceberg_metadata->getValue<Int64>(Iceberg::f_default_spec_id);
+
+        configuration->getExternalMetadata()->commitExportPartitionTransaction(
+            catalog,
+            storage_id,
+            iceberg_commit_export_partition_arguments.metadata_json_string,
+            original_schema_id,
+            partition_spec_id,
+            iceberg_commit_export_partition_arguments.partition_values_json,
+            std::make_shared<const Block>(getInMemoryMetadataPtr()->getSampleBlock()),
+            exported_paths,
+            configuration,
+            local_context);
+        return;
+    }
+
     const String commit_object = configuration->getRawPath().path + "/commit_" + partition_id + "_" + transaction_id;
 
     /// if file already exists, nothing to be done

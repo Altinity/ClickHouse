@@ -222,7 +222,8 @@ void ExportPartitionTaskScheduler::run()
                     (MergeTreePartExportManifest::CompletionCallbackResult result)
                     {
                         handlePartExportCompletion(key, zk_part_name, manifest, destination_storage, result);
-                    });
+                    },
+                    manifest.partition_values_json);
 
                 part_export_manifest.task = std::make_shared<ExportPartFromPartitionExportTask>(storage, key, part_export_manifest);
 
@@ -269,7 +270,8 @@ void ExportPartitionTaskScheduler::run()
                         (MergeTreePartExportManifest::CompletionCallbackResult result)
                         {
                             handlePartExportCompletion(key, zk_part_name, manifest, destination_storage, result);
-                        });
+                        },
+                        manifest.partition_values_json);
                 }
                 catch (const Exception &)
                 {

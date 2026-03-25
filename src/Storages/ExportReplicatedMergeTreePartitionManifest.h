@@ -119,6 +119,9 @@ struct ExportReplicatedMergeTreePartitionManifest
     String filename_pattern;
     bool lock_inside_the_task; /// todo temporary
     String iceberg_metadata_json;
+    /// Iceberg-only: JSON array of partition column values (after transforms) for this partition.
+    /// Columns and types are derived at commit time from iceberg_metadata_json; only values are persisted.
+    String partition_values_json;
 
     std::string toJsonString() const
     {
@@ -134,6 +137,11 @@ struct ExportReplicatedMergeTreePartitionManifest
         if (!iceberg_metadata_json.empty())
         {
             json.set("iceberg_metadata_json", iceberg_metadata_json);
+        }
+
+        if (!partition_values_json.empty())
+        {
+            json.set("partition_values_json", partition_values_json);
         }
 
         Poco::JSON::Array::Ptr parts_array = new Poco::JSON::Array();
@@ -176,6 +184,11 @@ struct ExportReplicatedMergeTreePartitionManifest
         if (json->has("iceberg_metadata_json"))
         {
             manifest.iceberg_metadata_json = json->getValue<String>("iceberg_metadata_json");
+        }
+
+        if (json->has("partition_values_json"))
+        {
+            manifest.partition_values_json = json->getValue<String>("partition_values_json");
         }
 
         auto parts_array = json->getArray("parts");
