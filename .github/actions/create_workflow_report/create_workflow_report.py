@@ -28,6 +28,7 @@ S3_BUCKET = "altinity-build-artifacts"
 GITHUB_REPO = "Altinity/ClickHouse"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
 
+CVE_SEVERITY_ORDER = {"critical": 1, "high": 2, "medium": 3, "low": 4, "negligible": 5}
 
 def _is_clickhouse_memory_limit_error(exc: BaseException) -> bool:
     if isinstance(exc, ServerException) and getattr(exc, "code", None) == 241:
@@ -51,7 +52,6 @@ def query_dataframe_with_retry(
                 raise
             wait = backoff_seconds * attempt
             time.sleep(wait)
-
 
 def get_commit_statuses(sha: str) -> pd.DataFrame:
     """
@@ -543,7 +543,9 @@ def get_cves(pr_number, commit_sha, branch):
                 Bucket=S3_BUCKET, Prefix=s3_prefix, Delimiter="/"
             )
             grype_result_dirs.extend(
-                content["Prefix"] for content in response.get("CommonPrefixes", [])
+                content["Prefix"]
+                for content in response.get("CommonPrefixes", [])
+                if isinstance(content, dict) and content.get("Prefix")
             )
         except Exception as e:
             print(f"Error listing S3 objects at {s3_prefix}: {e}")
@@ -581,12 +583,13 @@ def get_cves(pr_number, commit_sha, branch):
         return pd.DataFrame()
 
     df = pd.DataFrame(rows).drop_duplicates()
-    df = df.sort_values(
-        by="severity",
-        key=lambda col: col.str.lower().map(
-            {"critical": 1, "high": 2, "medium": 3, "low": 4, "negligible": 5}
-        ),
-    )
+
+    def _cve_sort_key(col):
+        if col.name == "severity":
+            return col.str.lower().map(CVE_SEVERITY_ORDER)
+        return col
+
+    df = df.sort_values(by=["severity", "docker_image"], key=_cve_sort_key)
     return df
 
 
@@ -633,6 +636,9 @@ def format_results_as_html_table(results) -> str:
             "Message": lambda m: m.replace("\n", " "),
             "Identifier": lambda i: url_to_html_link(
                 "https://nvd.nist.gov/vuln/detail/" + i
+            ),
+            "Severity": lambda s: (
+                f'<span data-sort="{CVE_SEVERITY_ORDER.get(str(s).lower(), 6)}">{s}</span>'
             ),
         },
         escape=False,
@@ -817,10 +823,15 @@ def create_workflow_report(
         "pr_new_fails": [],
         "checks_errors": get_checks_errors(db_client, commit_sha, branch_name),
         "regression_fails": get_regression_fails(db_client, actions_run_url),
-        "docker_images_cves": (
-            [] if not check_cves else get_cves(pr_number, commit_sha, branch_name)
-        ),
+        "docker_images_cves": [],
     }
+
+    try:
+        fail_results["docker_images_cves"] = (
+            [] if not check_cves else get_cves(pr_number, commit_sha, branch_name)
+        )
+    except Exception as e:
+        print(f"Error in get_cves: {e}")
 
     # get_cves returns ... in the case where no Grype result files were found.
     # This might occur when run in preview mode.
