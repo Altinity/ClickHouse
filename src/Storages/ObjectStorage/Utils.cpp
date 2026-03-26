@@ -518,6 +518,15 @@ std::pair<DB::ObjectStoragePtr, std::string> resolveObjectStorageForPath(
         // Use key (parsed without URI decoding) so that percent-encoded
         // characters in object keys (e.g. %2F in Iceberg partition paths) are preserved.
         std::string key_to_use = target_decomposed.key;
+
+        // For path-style HTTP(S) URLs, SchemeAuthorityKey puts <bucket>/<key> in .key
+        // because the bucket lives in the URL path, not the hostname.
+        // Strip the bucket prefix so the key is relative to the bucket.
+        if (!s3_uri.is_virtual_hosted_style
+            && key_to_use.starts_with(s3_uri.bucket + "/"))
+        {
+            key_to_use = key_to_use.substr(s3_uri.bucket.size() + 1);
+        }
       
         bool use_base_storage = false;
         if (base_storage->getType() == ObjectStorageType::S3)
