@@ -86,6 +86,7 @@
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/PrimaryIndexCache.h>
 #include <Storages/Statistics/ConditionSelectivityEstimator.h>
+#include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
 #include <Storages/MergeTree/checkDataPart.h>
 #include <Storages/MutationCommands.h>
 #include <Storages/MergeTree/ActiveDataPartSet.h>
@@ -6531,7 +6532,7 @@ void MergeTreeData::exportPartToTable(
         }
         else
         {
-            auto * object_storage = dynamic_cast<StorageObjectStorage *>(dest_storage.get());
+            auto * object_storage = dynamic_cast<StorageObjectStorageCluster *>(dest_storage.get());
 
             auto * iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage->getExternalMetadata(query_context));
             if (!iceberg_metadata)

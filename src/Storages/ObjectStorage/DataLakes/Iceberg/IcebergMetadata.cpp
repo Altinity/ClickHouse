@@ -1461,7 +1461,7 @@ void IcebergMetadata::commitExportPartitionTransaction(
     const std::string & iceberg_metadata_json_string,
     Int64 original_schema_id,
     Int64 partition_spec_id,
-    const std::string & partition_values_json,
+    const std::vector<Field> & partition_values,
     SharedHeader sample_block,
     const std::vector<String> & data_file_paths,
     StorageObjectStorageConfigurationPtr configuration,
@@ -1532,24 +1532,6 @@ void IcebergMetadata::commitExportPartitionTransaction(
                 partition_types.push_back(Iceberg::getFunctionResultType(transform, src_type));
             }
             break;
-        }
-    }
-
-    /// Deserialize partition values from the JSON string using the types derived above.
-    /// Partition values are small numbers (epoch-based counters or identity integers) or strings,
-    /// so Int64 covers the signed/unsigned numeric cases without information loss.
-    std::vector<Field> partition_values;
-    if (!partition_values_json.empty() && !partition_types.empty())
-    {
-        Poco::JSON::Parser val_parser;
-        auto arr = val_parser.parse(partition_values_json).extract<Poco::JSON::Array::Ptr>();
-        for (std::size_t i = 0; i < arr->size() && i < partition_types.size(); ++i)
-        {
-            Poco::Dynamic::Var var = arr->get(static_cast<unsigned int>(i));
-            if (var.isString())
-                partition_values.push_back(Field(var.extract<String>()));
-            else
-                partition_values.push_back(Field(var.convert<Int64>()));
         }
     }
 

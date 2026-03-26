@@ -139,7 +139,7 @@ public:
         const std::string & iceberg_metadata_json_string,
         Int64 original_schema_id,
         Int64 partition_spec_id,
-        const std::string & partition_values_json,
+        const std::vector<Field> & partition_values,
         SharedHeader sample_block,
         const std::vector<String> & data_file_paths,
         StorageObjectStorageConfigurationPtr configuration,

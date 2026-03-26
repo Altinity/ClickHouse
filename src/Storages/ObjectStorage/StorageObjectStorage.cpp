@@ -731,7 +731,7 @@ void StorageObjectStorage::commitExportPartitionTransaction(
             iceberg_commit_export_partition_arguments.metadata_json_string,
             original_schema_id,
             partition_spec_id,
-            iceberg_commit_export_partition_arguments.partition_values_json,
+            iceberg_commit_export_partition_arguments.partition_values,
             std::make_shared<const Block>(getInMemoryMetadataPtr()->getSampleBlock()),
             exported_paths,
             configuration,

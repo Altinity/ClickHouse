@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Core/Field.h>
 #include <Core/Names.h>
 #include <Core/QueryProcessingStage.h>
 #include <Databases/IDatabase.h>
@@ -507,9 +508,11 @@ It is currently only implemented in StorageObjectStorage.
     struct IcebergCommitExportPartitionArguments
     {
       std::string metadata_json_string;
-      /// JSON-serialized array of partition column values (after transforms).
-      /// Deserialized at commit time using the types derived from metadata_json_string.
-      std::string partition_values_json;
+      /// Partition column values (after transforms). Callers are responsible for
+      /// populating this: the partition-export path parses them from the persisted
+      /// JSON string, while the direct EXPORT PART path reads them from the part's
+      /// partition key.
+      std::vector<Field> partition_values;
     };
 
     virtual void commitExportPartitionTransaction(
