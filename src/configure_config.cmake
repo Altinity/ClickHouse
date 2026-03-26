@@ -202,3 +202,8 @@ if (TARGET ch_contrib::sha3iuf)
 endif()
 
 set(SOURCE_DIR ${PROJECT_SOURCE_DIR})
+
+if (FIPS_CLICKHOUSE)
+    set(OPENSSL_IS_BORING_SSL 1)
+    set(OPENSSL_VERSION "AWS-LC-FIPS-2.0.0")
+endif()
