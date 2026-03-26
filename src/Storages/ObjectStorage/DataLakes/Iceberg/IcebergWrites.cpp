@@ -457,6 +457,12 @@ void generateManifestList(
     // which commits encoder state before we can override avro.schema.
     if (manifest_entry_names.empty() && !use_previous_snapshots)
     {
+        // Avro uses zigzag encoding for integers to efficiently represent small negative numbers.
+        // Positive n maps to 2n, negative n maps to 2(-n)-1, so small magnitudes
+        // stay small regardless of sign. The value is then written as a variable-length
+        // base-128 integer (little-endian), where the high bit of each byte indicates
+        // whether more bytes follow.
+        // See: https://avro.apache.org/docs/1.11.1/specification/#binary-encoding
         auto write_avro_long = [](WriteBuffer & out, int64_t val)
         {
             uint64_t n = (static_cast<uint64_t>(val) << 1) ^ static_cast<uint64_t>(val >> 63);
