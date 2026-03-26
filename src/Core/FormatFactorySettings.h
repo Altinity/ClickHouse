@@ -1536,6 +1536,7 @@ Automatically create parent directories when using INTO OUTFILE if they do not a
     MAKE_OBSOLETE(M, Bool, input_format_orc_import_nested, false) \
     MAKE_OBSOLETE(M, Bool, output_format_enable_streaming, false) \
     MAKE_OBSOLETE(M, Bool, input_format_parquet_use_native_reader, false) \
+    MAKE_OBSOLETE(M, Bool, input_format_parquet_use_metadata_cache, false) \
 
 #endif // __CLION_IDE__
 
