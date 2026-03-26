@@ -608,6 +608,7 @@ public:
     bool supportsFileIterator() const override { return getImpl().supportsFileIterator(); }
     bool supportsParallelInsert() const override { return getImpl().supportsParallelInsert(); }
     bool supportsWrites() const override { return getImpl().supportsWrites(); }
+    bool supportsPrewhere() const override { return getImpl().supportsPrewhere(); }
 
     bool supportsPartialPathPrefix() const override { return getImpl().supportsPartialPathPrefix(); }
 
