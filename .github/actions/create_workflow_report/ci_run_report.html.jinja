@@ -168,6 +168,7 @@
   {% endif %}
   <h2>Table of Contents</h2>
   <ul>
+    {%- if pr_number == 0 %}<li><a href="#prs-in-release">PRs in Release</a> ({{ counts.prs_in_release }})</li>{% endif %}
     {%- if pr_number != 0 %}<li><a href="#new-fails-pr">New Fails in PR</a> ({{ counts.pr_new_fails }})</li>{% endif %}
     <li><a href="#ci-jobs-status">CI Jobs Status</a> ({{ counts.jobs_status }})</li>
     <li><a href="#checks-errors">Checks Errors</a> ({{ counts.checks_errors }})</li>
@@ -176,6 +177,14 @@
     <li><a href="#docker-images-cves">Docker Images CVEs</a> ({{ counts.cves }})</li>
     <li><a href="#checks-known-fails">Checks Known Fails</a> ({{ counts.checks_known_fails }})</li>
   </ul>
+
+  {%- if pr_number == 0 -%}
+  <h2 id="prs-in-release">PRs in Release</h2>
+  {% if prs_in_release_missing_verification %}
+  <p style="font-weight: bold;color: red;">Some PRs are missing verification.</p>
+  {% endif %}
+  {{ prs_in_release_html }}
+  {%- endif %}
 
   {%- if pr_number != 0 -%}
   <h2 id="new-fails-pr">New Fails in PR</h2>
