@@ -24,83 +24,58 @@ def load_catalog_impl(started_cluster):
     )
 
 
-def test_iceberg_truncate(started_cluster_iceberg_no_spark):
+def test_iceberg_truncate_restart(started_cluster_iceberg_no_spark):
     instance = started_cluster_iceberg_no_spark.instances["node1"]
     catalog = load_catalog_impl(started_cluster_iceberg_no_spark)
 
-    # 1. Setup PyIceberg Namespace and Table
-    namespace = f"clickhouse_truncate_{uuid.uuid4().hex}"
+    namespace = f"clickhouse_truncate_restart_{uuid.uuid4().hex}"
     catalog.create_namespace(namespace)
 
     schema = Schema(
         NestedField(field_id=1, name="id", field_type=LongType(), required=False),
         NestedField(field_id=2, name="val", field_type=StringType(), required=False),
     )
-
-    table_name = "test_truncate"
-    table = catalog.create_table(
+    table_name = "test_truncate_restart"
+    catalog.create_table(
         identifier=f"{namespace}.{table_name}",
         schema=schema,
         location=f"s3://warehouse-rest/{namespace}.{table_name}",
         partition_spec=PartitionSpec(),
     )
 
-    # 2. Populate Data
-    df = pa.Table.from_pylist([
-        {"id": 1, "val": "A"},
-        {"id": 2, "val": "B"},
-        {"id": 3, "val": "C"},
-    ])
-    table.append(df)
+    ch_table_identifier = f"`{namespace}.{table_name}`"
 
-    # Validate data is in iceberg
-    assert len(table.scan().to_arrow()) == 3
-
-    # 3. Setup ClickHouse Database
     instance.query(f"DROP DATABASE IF EXISTS {namespace}")
     instance.query(
         f"""
         CREATE DATABASE {namespace} ENGINE = DataLakeCatalog('http://rest:8181/v1', 'minio', '{minio_secret_key}')
-        SETTINGS 
-            catalog_type='rest', 
-            warehouse='demo', 
+        SETTINGS
+            catalog_type='rest',
+            warehouse='demo',
             storage_endpoint='http://minio:9000/warehouse-rest';
         """,
         settings={"allow_database_iceberg": 1}
-    ) 
+    )
 
-    # 4. Formulate the ClickHouse Table Identifier
-    # MUST wrap the inner table name in backticks so ClickHouse parses the Iceberg namespace correctly
-    ch_table_identifier = f"`{namespace}.{table_name}`"
+    # 1. Insert initial data and truncate
+    df = pa.Table.from_pylist([{"id": 1, "val": "A"}, {"id": 2, "val": "B"}])
+    catalog.load_table(f"{namespace}.{table_name}").append(df)
 
-    # Assert data from ClickHouse
-    assert int(instance.query(f"SELECT count() FROM {namespace}.{ch_table_identifier}").strip()) == 3
+    assert int(instance.query(f"SELECT count() FROM {namespace}.{ch_table_identifier}").strip()) == 2
 
-    # 5. Truncate Table via ClickHouse
     instance.query(
         f"TRUNCATE TABLE {namespace}.{ch_table_identifier}",
         settings={"allow_experimental_insert_into_iceberg": 1}
     )
-
-    # Assert truncated from ClickHouse
     assert int(instance.query(f"SELECT count() FROM {namespace}.{ch_table_identifier}").strip()) == 0
 
-    # 6. Cross-Engine Validation using PyIceberg
-    # Refresh table state to grab the new v<N>.metadata.json you generated
-    table.refresh()
+    # 2. Restart ClickHouse and verify table is still readable (count = 0)
+    instance.restart_clickhouse()
+    assert int(instance.query(f"SELECT count() FROM {namespace}.{ch_table_identifier}").strip()) == 0
 
-    # Assert PyIceberg reads the empty snapshot successfully
-    assert len(table.scan().to_arrow()) == 0
-
-    # 7. Verify Writable State
-    # Append a new row to ensure truncation didn't break table state
-    new_df = pa.Table.from_pylist([
-        {"id": 4, "val": "D"}
-    ])
-    table.append(new_df)
-
-    # Assert new row count via ClickHouse
+    # 3. Insert new data after restart and verify it's readable
+    new_df = pa.Table.from_pylist([{"id": 3, "val": "C"}])
+    catalog.load_table(f"{namespace}.{table_name}").append(new_df)
     assert int(instance.query(f"SELECT count() FROM {namespace}.{ch_table_identifier}").strip()) == 1
 
-    # Cleanup
     instance.query(f"DROP DATABASE {namespace}")

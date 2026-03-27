@@ -430,6 +430,31 @@ void generateManifestFile(
     writer.close();
 }
 
+// Avro uses zigzag encoding for integers to efficiently represent small negative
+// numbers. Positive n maps to 2n, negative n maps to 2(-n)-1, keeping small
+// magnitudes compact regardless of sign. The value is then serialized as a
+// variable-length base-128 integer (little-endian), where the high bit of each
+// byte signals whether more bytes follow.
+// See: https://avro.apache.org/docs/1.11.1/specification/#binary-encoding
+static void writeAvroLong(WriteBuffer & out, int64_t val)
+{
+    uint64_t n = (static_cast<uint64_t>(val) << 1) ^ static_cast<uint64_t>(val >> 63);
+    while (n & ~0x7fULL)
+    {
+        char c = static_cast<char>((n & 0x7f) | 0x80);
+        out.write(&c, 1);
+        n >>= 7;
+    }
+    char c = static_cast<char>(n);
+    out.write(&c, 1);
+}
+
+static void writeAvroBytes(WriteBuffer & out, const String & s)
+{
+    writeAvroLong(out, static_cast<int64_t>(s.size()));
+    out.write(s.data(), s.size());
+}
+
 void generateManifestList(
     const FileNamesGenerator & filename_generator,
     Poco::JSON::Object::Ptr metadata,
@@ -457,49 +482,28 @@ void generateManifestList(
     // which commits encoder state before we can override avro.schema.
     if (manifest_entry_names.empty() && !use_previous_snapshots)
     {
-        // Avro uses zigzag encoding for integers to efficiently represent small negative numbers.
-        // Positive n maps to 2n, negative n maps to 2(-n)-1, so small magnitudes
-        // stay small regardless of sign. The value is then written as a variable-length
-        // base-128 integer (little-endian), where the high bit of each byte indicates
-        // whether more bytes follow.
-        // See: https://avro.apache.org/docs/1.11.1/specification/#binary-encoding
-        auto write_avro_long = [](WriteBuffer & out, int64_t val)
-        {
-            uint64_t n = (static_cast<uint64_t>(val) << 1) ^ static_cast<uint64_t>(val >> 63);
-            while (n & ~0x7fULL)
-            {
-                char c = static_cast<char>((n & 0x7f) | 0x80);
-                out.write(&c, 1);
-                n >>= 7;
-            }
-            char c = static_cast<char>(n);
-            out.write(&c, 1);
-        };
-
-        auto write_avro_bytes = [&](WriteBuffer & out, const String & s)
-        {
-            write_avro_long(out, static_cast<int64_t>(s.size()));
-            out.write(s.data(), s.size());
-        };
-
-        // Avro Object Container File header
+        // For an empty manifest list (e.g. after TRUNCATE), we write a minimal valid
+        // Avro Object Container File manually rather than using avro::DataFileWriter.
+        // The reason: DataFileWriter calls writeHeader() eagerly in its constructor,
+        // committing the binary encoder state. Post-construction setMetadata() calls
+        // corrupt StreamWriter::next_ causing a NULL dereference on close(). Writing
+        // the OCF header directly ensures the full schema JSON (with Iceberg field-ids)
+        // is embedded intact — the Avro C++ library strips unknown field properties
+        // like field-id during schema node serialization.
+        // Avro OCF format: [magic(4)] [metadata_map] [sync_marker(16)] [no data blocks]
         buf.write("Obj\x01", 4);
 
-        // Metadata map: 2 entries (codec + schema)
-        write_avro_long(buf, 2);
-        write_avro_bytes(buf, "avro.codec");
-        write_avro_bytes(buf, "null");
-        write_avro_bytes(buf, "avro.schema");
-        write_avro_bytes(buf, schema_representation); // full JSON, field-ids intact
+        writeAvroLong(buf, 2);  // 2 metadata entries
+        writeAvroBytes(buf, "avro.codec");
+        writeAvroBytes(buf, "null");
+        writeAvroBytes(buf, "avro.schema");
+        writeAvroBytes(buf, schema_representation);  // full JSON with field-ids intact
 
-        // End of metadata map
-        write_avro_long(buf, 0);
+        writeAvroLong(buf, 0);  // end of metadata map
 
-        // Sync marker (16 zero bytes — valid, no data blocks follow)
         static const char sync_marker[16] = {};
         buf.write(sync_marker, 16);
 
-        // No data blocks for empty manifest list
         buf.finalize();
         return;
     }

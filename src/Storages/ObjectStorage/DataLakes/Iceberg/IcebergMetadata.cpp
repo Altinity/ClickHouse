@@ -540,9 +540,6 @@ void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICa
             "Iceberg truncate is experimental. "
             "To allow its usage, enable setting allow_experimental_insert_into_iceberg");
 
-    // Bug 1 fix: REMOVE the isTransactional() guard entirely.
-    // REST/transactional catalogs are the primary target of this feature.
-
     auto [actual_data_snapshot, actual_table_state_snapshot] = getRelevantState(context);
     auto metadata_object = getMetadataJSONObject(
         actual_table_state_snapshot.metadata_file_path,
@@ -553,18 +550,21 @@ void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICa
         persistent_components.metadata_compression_method,
         persistent_components.table_uuid);
 
-    // Bug 4 fix: use -1 as the Iceberg "no parent" sentinel
+    // Use -1 as the Iceberg spec sentinel for "no parent snapshot"
+    // (distinct from snapshot ID 0 which is a valid snapshot).
     Int64 parent_snapshot_id = actual_table_state_snapshot.snapshot_id.value_or(-1);
 
     auto config_path = persistent_components.table_path;
     if (!config_path.starts_with('/')) config_path = '/' + config_path;
     if (!config_path.ends_with('/')) config_path += "/";
 
-    // Bug 3 fix: restore isTransactional flag in FileNamesGenerator
     bool is_transactional = (catalog != nullptr && catalog->isTransactional());
+
+    // Transactional catalogs (e.g. REST) require a fully-qualified blob URI
+    // (scheme://bucket/path) so the catalog can resolve the metadata location
+    // independently of any local path configuration. Non-transactional catalogs
+    // use bare paths relative to the object storage root.
     FileNamesGenerator filename_generator;
-    // Transactional catalogs (REST) require full S3 URIs — force location-based path.
-    // Non-transactional respects the write_full_path_in_iceberg_metadata setting.
     if (is_transactional || context->getSettingsRef()[Setting::write_full_path_in_iceberg_metadata])
     {
         String location = metadata_object->getValue<String>(Iceberg::f_location);
@@ -579,7 +579,7 @@ void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICa
             config_path, config_path, false,
             persistent_components.metadata_compression_method, write_format);
     }
- 
+
     Int32 new_metadata_version = actual_table_state_snapshot.metadata_version + 1;
     filename_generator.setVersion(new_metadata_version);
 
@@ -587,7 +587,9 @@ void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICa
 
     auto [new_snapshot, manifest_list_name, storage_manifest_list_name] = MetadataGenerator(metadata_object).generateNextMetadata(
         filename_generator, metadata_name, parent_snapshot_id,
-        0, 0, 0, 0, 0, 0, std::nullopt, std::nullopt, /*is_truncate=*/true);
+        /* added_files */ 0, /* added_records */ 0, /* added_files_size */ 0,
+        /* num_partitions */ 0, /* added_delete_files */ 0, /* num_deleted_rows */ 0,
+        std::nullopt, std::nullopt, /*is_truncate=*/true);
 
     auto write_settings = context->getWriteSettings();
     auto buf = object_storage->writeObject(
@@ -595,31 +597,32 @@ void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICa
         WriteMode::Rewrite, std::nullopt,
         DBMS_DEFAULT_BUFFER_SIZE, write_settings);
 
-    generateManifestList(filename_generator, metadata_object, object_storage, context,
-        {}, new_snapshot, 0, *buf, Iceberg::FileContentType::DATA, /*use_previous_snapshots=*/false);
+    generateManifestList(filename_generator, metadata_object, object_storage,
+        context, {}, new_snapshot, 0, *buf, Iceberg::FileContentType::DATA, /*use_previous_snapshots=*/false);
     buf->finalize();
 
     String metadata_content = dumpMetadataObjectToString(metadata_object);
     writeMessageToFile(metadata_content, storage_metadata_name, object_storage,
         context, "*", "", persistent_components.metadata_compression_method);
 
-    // Bug 2 fix: restore the catalog commit, matching the pattern from IcebergWrites.cpp
     if (catalog)
     {
-        // Build the catalog-visible path (blob URI for transactional, bare path otherwise)
+        // Transactional catalogs require a fully-qualified blob URI so the catalog
+        // can resolve the metadata location independently of local path configuration.
         String catalog_filename = metadata_name;
         if (is_transactional)
         {
-            const String blob_storage_type_name = Poco::toLower(String(magic_enum::enum_name(object_storage->getType())));
-            const auto blob_storage_namespace_name = persistent_components.table_path;
-            catalog_filename = blob_storage_type_name + "://" + blob_storage_namespace_name + "/" + metadata_name;
+            // Build full URI from the table's location field (e.g. "s3://bucket/namespace.table")
+            // combined with the relative metadata name.
+            String location = metadata_object->getValue<String>(Iceberg::f_location);
+            if (!location.ends_with("/")) location += "/";
+            catalog_filename = location + metadata_name;
         }
 
         const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
-        // Pass metadata_object (not new_snapshot) — matches the fix already applied in
-        // IcebergWrites.cpp and Mutations.cpp
         if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot))
-            throw Exception(ErrorCodes::INCORRECT_DATA, "Failed to commit Iceberg truncate update to catalog.");
+            throw Exception(ErrorCodes::INCORRECT_DATA,
+                "Failed to commit Iceberg truncate update to catalog.");
     }
 }
 
