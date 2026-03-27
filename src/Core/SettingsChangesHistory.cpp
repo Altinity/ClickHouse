@@ -47,6 +47,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"export_merge_tree_part_filename_pattern", "", "{part_name}_{checksum}", "New setting"},
             {"use_parquet_metadata_cache", false, true, "Enables cache of parquet file metadata."},
             {"input_format_parquet_use_metadata_cache", true, false, "Obsolete. No-op"}, // https://github.com/Altinity/ClickHouse/pull/586
+            {"iceberg_metadata_staleness_ms", 0, 0, "New setting allowing using cached metadata version at READ operations to prevent fetching from remote catalog"},
         });
         addSettingsChanges(settings_changes_history, "26.1",
         {

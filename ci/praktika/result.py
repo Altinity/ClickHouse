@@ -65,6 +65,7 @@ class Result(MetaClasses.Serializable):
         FAILED_ON_RETRY = "retry_failed"
         BLOCKER = "blocker"
         ISSUE = "issue"
+        INFRA = "infra"
 
     name: str
     status: str
