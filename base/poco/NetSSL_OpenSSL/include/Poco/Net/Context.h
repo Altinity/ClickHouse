@@ -102,7 +102,8 @@ namespace Net
             PROTO_SSLV3 = 0x02,
             PROTO_TLSV1 = 0x04,
             PROTO_TLSV1_1 = 0x08,
-            PROTO_TLSV1_2 = 0x10
+            PROTO_TLSV1_2 = 0x10,
+            PROTO_TLSV1_3 = 0x20
         };
 
         struct NetSSL_API CAPaths
@@ -147,6 +148,11 @@ namespace Net
             std::string cipherList;
             /// Specifies the supported ciphers in OpenSSL notation.
             /// Defaults to "ALL:!ADH:!LOW:!EXP:!MD5:!3DES:@STRENGTH".
+
+            std::string cipherSuites;
+            /// Specifies the supported TLSv1.3 ciphersuites in OpenSSL notation.
+            /// Defaults to "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256"
+            /// (FIPS-approved ciphersuites only).
 
             std::string dhParamsFile;
             /// Specifies a file containing Diffie-Hellman parameters.
