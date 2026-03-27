@@ -5164,7 +5164,9 @@ Possible values:
 - 0 - Disabled
 - 1 - Enabled
 )", 0) \
-    \
+    DECLARE(UInt64, iceberg_metadata_staleness_ms, 0, R"(
+If non-zero, skip fetching iceberg metadata from remote catalog if there is a cached metadata snapshot, more recent than the given staleness window. Zero means to always fetch the latest metadata version from the remote catalog. Setting this a non-zero trades staleness to a lower latency of read operations.
+)", 0) \
     DECLARE(Bool, use_query_cache, false, R"(
 If turned on, `SELECT` queries may utilize the [query cache](../query-cache.md). Parameters [enable_reads_from_query_cache](#enable_reads_from_query_cache)
 and [enable_writes_to_query_cache](#enable_writes_to_query_cache) control in more detail how the cache is used.
@@ -7398,6 +7400,9 @@ Possible values:
 - `` (empty value) - use server or session timezone
 
 Default value is empty.
+)", 0) \
+    DECLARE(String, export_merge_tree_part_filename_pattern, "{part_name}_{checksum}", R"(
+Pattern for the filename of the exported merge tree part. The `part_name` and `checksum` are calculated and replaced on the fly. Additional macros are supported.
 )", 0) \
     \
     /* ####################################################### */ \

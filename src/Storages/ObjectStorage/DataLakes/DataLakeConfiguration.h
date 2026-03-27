@@ -434,11 +434,11 @@ public:
     }
 
 private:
-    DataLakeMetadataPtr current_metadata;
-    LoggerPtr log = getLogger("DataLakeConfiguration");
     const DataLakeStorageSettingsPtr settings;
     ObjectStoragePtr ready_object_storage;
     std::string catalog_namespaces;
+    DataLakeMetadataPtr current_metadata;
+    LoggerPtr log = getLogger("DataLakeConfiguration");
 
     void assertInitializedDL() const
     {

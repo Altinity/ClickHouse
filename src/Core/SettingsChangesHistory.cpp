@@ -44,6 +44,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"iceberg_partition_timezone", "", "", "New setting."},
             // {"object_storage_max_nodes", 0, 0, "Antalya: New setting"},
             {"s3_propagate_credentials_to_other_storages", false, false, "New setting"},
+            {"export_merge_tree_part_filename_pattern", "", "{part_name}_{checksum}", "New setting"},
+            {"iceberg_metadata_staleness_ms", 0, 0, "New setting allowing using cached metadata version at READ operations to prevent fetching from remote catalog"},
         });
         addSettingsChanges(settings_changes_history, "26.1",
         {
