@@ -437,6 +437,7 @@ enum class DatabaseDataLakeCatalogType : uint8_t
     GLUE,
     ICEBERG_HIVE,
     ICEBERG_ONELAKE,
+    ICEBERG_BIGLAKE,
     PAIMON_REST,
 };
 

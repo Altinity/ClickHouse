@@ -122,6 +122,11 @@ CLICKHOUSE_ERROR_LOG_FILE = "/var/log/clickhouse-server/clickhouse-server.err.lo
 # NOTE(vnemkov): this is a docker tag, make sure it doesn't include initial 'v'
 CLICKHOUSE_CI_MIN_TESTED_VERSION = "23.3.19.33.altinitystable"
 
+# `Nullable(Tuple)` experimental feature is introduced in 26.1. This has lead to changes in the output return type
+# of many aggregate functions from `Tuple(...)` to `Nullable(Tuple(...))`. This version can be used as baseline to do
+# compatibility checks for features that are affected by this experimental feature.
+CLICKHOUSE_CI_PRE_NULLABLE_TUPLE_VERSION = "25.12"
+
 ZOOKEEPER_CONTAINERS = ("zoo1", "zoo2", "zoo3")
 
 NET_LOCK_PATH = "/tmp/docker_net.lock"
