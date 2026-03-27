@@ -132,4 +132,18 @@ TEST(ResolveObjectStorageForPathKey, VirtualHostedHttpsKeyMayStartWithBucketName
     assertResolveReturnsBaseKey("s3://bucket/warehouse", path, std::move(base_uri), "bucket/nested/file.parquet");
 }
 
+TEST(ResolveObjectStorageForPathKey, S3SchemeKeyMayStartWithBucketNamePrefix)
+{
+    const char * path = "s3://bucket/bucket/nested/file.parquet";
+    S3::URI target(path);
+    ASSERT_TRUE(target.is_virtual_hosted_style)
+        << "Requires s3:// -> virtual-hosted mapping (global context); use HTTPS test if this fails";
+
+    S3::URI base_uri;
+    base_uri.bucket = target.bucket;
+    base_uri.endpoint = target.endpoint;
+
+    assertResolveReturnsBaseKey("s3://bucket/warehouse", path, std::move(base_uri), "bucket/nested/file.parquet");
+}
+
 #endif
