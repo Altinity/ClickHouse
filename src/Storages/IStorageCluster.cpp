@@ -349,8 +349,16 @@ void IStorageCluster::read(
 
     updateQueryToSendIfNeeded(query_to_send, storage_snapshot, context);
 
+    /// In case the current node is not supposed to initiate the clustered query
+    /// Sends this query to a remote initiator using the `remote` table function
     if (settings[Setting::object_storage_remote_initiator])
     {
+        /// Re-writes queries in the form of:
+        /// Input: SELECT * FROM iceberg(...) SETTINGS object_storage_cluster='swarm', object_storage_remote_initiator=1
+        /// Output: SELECT * FROM remote('remote_host', icebergCluster('swarm', ...)
+        /// Where `remote_host` is a random host from the cluster which will execute the query
+        /// This means the initiator node belongs to the same cluster that will execute the query
+        /// In case remote_initiator_cluster_name is set, the initiator might be set to a different cluster
         auto remote_initiator_cluster_name = settings[Setting::object_storage_remote_initiator_cluster].value;
         if (remote_initiator_cluster_name.empty())
             remote_initiator_cluster_name = cluster_name_from_settings;
@@ -424,6 +432,7 @@ IStorageCluster::RemoteCallVariables IStorageCluster::convertToRemote(
     /// Clean object_storage_remote_initiator setting to avoid infinite remote call
     auto new_context = Context::createCopy(context);
     new_context->setSetting("object_storage_remote_initiator", false);
+    new_context->setSetting("object_storage_remote_initiator_cluster", false);
 
     auto * select_query = query_to_send->as<ASTSelectQuery>();
     if (!select_query)
@@ -446,7 +455,7 @@ IStorageCluster::RemoteCallVariables IStorageCluster::convertToRemote(
     boost::intrusive_ptr<ASTFunction> remote_query;
 
     if (shard_addresses[0].user_specified)
-    {
+    { // with user/password for clsuter access remote query is executed from this user, add it in query parameters
         remote_query = makeASTFunction(remote_function_name,
             make_intrusive<ASTLiteral>(host_name),
             table_expression->table_function,
@@ -454,7 +463,9 @@ IStorageCluster::RemoteCallVariables IStorageCluster::convertToRemote(
             make_intrusive<ASTLiteral>(shard_addresses[0].password));
     }
     else
+    { // without specified user/password remote query is executed from default user
         remote_query = makeASTFunction(remote_function_name, make_intrusive<ASTLiteral>(host_name), table_expression->table_function);
+    }
 
     table_expression->table_function = remote_query;
 
