@@ -361,13 +361,6 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
         throw Exception(ErrorCodes::LOGICAL_ERROR, "ExportPartition scheduler task: No exception provided for error handling. Sounds like a bug");
     }
 
-    /// Early exit if the query was cancelled - no need to increment error counts
-    if (exception->code() == ErrorCodes::QUERY_WAS_CANCELLED)
-    {
-        LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} export was cancelled, skipping error handling", part_name);
-        return;
-    }
-
     Coordination::Stat locked_by_stat;
     std::string locked_by;
 
@@ -382,6 +375,14 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
     if (locked_by != storage.replica_name)
     {
         LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} is locked by another replica, will not increment error counts", part_name);
+        return;
+    }
+
+    /// Early exit if the query was cancelled - no need to increment error counts
+    if (exception->code() == ErrorCodes::QUERY_WAS_CANCELLED)
+    {
+        zk->tryRemove(export_path / "locks" / part_name, locked_by_stat.version);
+        LOG_INFO(storage.log, "ExportPartition scheduler task: Part {} export was cancelled, skipping error handling", part_name);
         return;
     }
 
