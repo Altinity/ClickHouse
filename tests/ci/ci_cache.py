@@ -918,7 +918,6 @@ if __name__ == "__main__":
         "package_asan": "bbbd3519d1",
         "package_ubsan": "bbbd3519d1",
         "package_tsan": "bbbd3519d1",
-        "package_msan": "bbbd3519d1",
         "package_debug": "bbbd3519d1",
         "package_release_coverage": "bbbd3519d1",
         "binary_release": "bbbd3519d1",

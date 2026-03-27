@@ -100,8 +100,6 @@ class TestCIConfig(unittest.TestCase):
                     expected_builds = [CI.BuildNames.PACKAGE_AARCH64_ASAN]
                 elif "asan" in job:
                     expected_builds = [CI.BuildNames.PACKAGE_ASAN]
-                elif "msan" in job:
-                    expected_builds = [CI.BuildNames.PACKAGE_MSAN]
                 elif "tsan" in job:
                     expected_builds = [CI.BuildNames.PACKAGE_TSAN]
                 elif "ubsan" in job:

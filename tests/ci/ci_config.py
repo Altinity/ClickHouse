@@ -136,14 +136,6 @@ class CI:
                 package_type="deb",
             ),
         ),
-        BuildNames.PACKAGE_MSAN: CommonJobConfigs.BUILD.with_properties(
-            build_config=BuildConfig(
-                name=BuildNames.PACKAGE_MSAN,
-                compiler="clang-19",
-                sanitizer="memory",
-                package_type="deb",
-            ),
-        ),
         BuildNames.PACKAGE_DEBUG: CommonJobConfigs.BUILD.with_properties(
             build_config=BuildConfig(
                 name=BuildNames.PACKAGE_DEBUG,
@@ -298,9 +290,6 @@ class CI:
         JobNames.STATELESS_TEST_TSAN: CommonJobConfigs.STATELESS_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_TSAN], num_batches=6, timeout=9000
         ),
-        JobNames.STATELESS_TEST_MSAN: CommonJobConfigs.STATELESS_TEST.with_properties(
-            required_builds=[BuildNames.PACKAGE_MSAN], num_batches=6, timeout=9000
-        ),
         JobNames.STATELESS_TEST_UBSAN: CommonJobConfigs.STATELESS_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_UBSAN], num_batches=2
         ),
@@ -345,14 +334,8 @@ class CI:
         JobNames.STRESS_TEST_UBSAN: CommonJobConfigs.STRESS_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_UBSAN],
         ),
-        JobNames.STRESS_TEST_MSAN: CommonJobConfigs.STRESS_TEST.with_properties(
-            required_builds=[BuildNames.PACKAGE_MSAN],
-        ),
         JobNames.STRESS_TEST_AZURE_TSAN: CommonJobConfigs.STRESS_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_TSAN], release_only=True
-        ),
-        JobNames.STRESS_TEST_AZURE_MSAN: CommonJobConfigs.STRESS_TEST.with_properties(
-            required_builds=[BuildNames.PACKAGE_MSAN], release_only=True
         ),
         JobNames.UPGRADE_TEST_ASAN: CommonJobConfigs.UPGRADE_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_ASAN],
@@ -361,11 +344,6 @@ class CI:
         ),
         JobNames.UPGRADE_TEST_TSAN: CommonJobConfigs.UPGRADE_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_TSAN],
-            random_bucket="upgrade_with_sanitizer",
-            pr_only=True,
-        ),
-        JobNames.UPGRADE_TEST_MSAN: CommonJobConfigs.UPGRADE_TEST.with_properties(
-            required_builds=[BuildNames.PACKAGE_MSAN],
             random_bucket="upgrade_with_sanitizer",
             pr_only=True,
         ),
@@ -418,9 +396,6 @@ class CI:
         JobNames.UNIT_TEST_ASAN: CommonJobConfigs.UNIT_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_ASAN],
         ),
-        JobNames.UNIT_TEST_MSAN: CommonJobConfigs.UNIT_TEST.with_properties(
-            required_builds=[BuildNames.PACKAGE_MSAN],
-        ),
         JobNames.UNIT_TEST_TSAN: CommonJobConfigs.UNIT_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_TSAN],
         ),
@@ -433,9 +408,6 @@ class CI:
         JobNames.AST_FUZZER_TEST_ASAN: CommonJobConfigs.ASTFUZZER_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_ASAN],
         ),
-        JobNames.AST_FUZZER_TEST_MSAN: CommonJobConfigs.ASTFUZZER_TEST.with_properties(
-            required_builds=[BuildNames.PACKAGE_MSAN],
-        ),
         JobNames.AST_FUZZER_TEST_TSAN: CommonJobConfigs.ASTFUZZER_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_TSAN],
         ),
@@ -447,9 +419,6 @@ class CI:
         ),
         JobNames.BUZZHOUSE_TEST_ASAN: CommonJobConfigs.BUZZHOUSE_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_ASAN],
-        ),
-        JobNames.BUZZHOUSE_TEST_MSAN: CommonJobConfigs.BUZZHOUSE_TEST.with_properties(
-            required_builds=[BuildNames.PACKAGE_MSAN],
         ),
         JobNames.BUZZHOUSE_TEST_TSAN: CommonJobConfigs.BUZZHOUSE_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_TSAN],
@@ -743,7 +712,6 @@ BUILD_NAMES_MAPPING = {
     "Build (amd_binary)": BuildNames.BINARY_RELEASE,
     "Build (amd_asan)": BuildNames.PACKAGE_ASAN,
     "Build (amd_tsan)": BuildNames.PACKAGE_TSAN,
-    "Build (amd_msan)": BuildNames.PACKAGE_MSAN,
     "Build (amd_ubsan)": BuildNames.PACKAGE_UBSAN,
     "Build (arm_release)": BuildNames.PACKAGE_AARCH64,
     "Build (arm_asan)": BuildNames.PACKAGE_AARCH64_ASAN,
