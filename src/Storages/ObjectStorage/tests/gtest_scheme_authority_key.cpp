@@ -119,4 +119,17 @@ TEST(ResolveObjectStorageForPathKey, S3SchemePreservesPercentEncodedSlash)
     assertResolveReturnsBaseKey("s3://bucket/warehouse", path, std::move(base_uri), "partition=us%2Fwest/file.parquet");
 }
 
+TEST(ResolveObjectStorageForPathKey, VirtualHostedHttpsKeyMayStartWithBucketNamePrefix)
+{
+    const char * path = "https://bucket.s3.amazonaws.com/bucket/nested/file.parquet";
+    S3::URI target(path);
+    ASSERT_TRUE(target.is_virtual_hosted_style);
+
+    S3::URI base_uri;
+    base_uri.bucket = target.bucket;
+    base_uri.endpoint = target.endpoint;
+
+    assertResolveReturnsBaseKey("s3://bucket/warehouse", path, std::move(base_uri), "bucket/nested/file.parquet");
+}
+
 #endif
