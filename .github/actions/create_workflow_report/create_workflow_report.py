@@ -32,6 +32,8 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
 
 CVE_SEVERITY_ORDER = {"critical": 1, "high": 2, "medium": 3, "low": 4, "negligible": 5}
 
+PR_LABELS_VERIFIED = {"verified", "verified-with-issue", "no-verification-needed"}
+
 def _is_clickhouse_memory_limit_error(exc: BaseException) -> bool:
     if isinstance(exc, ServerException) and getattr(exc, "code", None) == 241:
         return True
@@ -173,7 +175,7 @@ def get_run_details(run_id: str) -> dict:
 
 def _enrich_prs_in_release_merge_prs(df: pd.DataFrame, repo: str) -> tuple[pd.DataFrame, bool]:
     if len(df) == 0:
-        return pd.DataFrame(columns=["pr_number", "pr_name", "labels"]), False
+        return pd.DataFrame(columns=["pr_number", "pr_name", "pr_labels"]), False
     if not GITHUB_TOKEN:
         raise Exception("GITHUB_TOKEN is required to fetch PR titles and labels")
     headers = {
@@ -193,16 +195,15 @@ def _enrich_prs_in_release_merge_prs(df: pd.DataFrame, repo: str) -> tuple[pd.Da
             )
         pr = response.json()
         label_names = [l["name"] for l in pr.get("labels", [])]
-        if any(ln.lower() == "cicd" for ln in label_names):
+        if "cicd" in label_names:
             continue
-        lowered = {ln.lower() for ln in label_names}
-        if "verified" not in lowered and "verified-with-issue" not in lowered:
+        if not PR_LABELS_VERIFIED.intersection(label_names):
             missing_verification = True
         rows.append(
             {
                 "pr_number": pr_number,
                 "pr_name": pr.get("title", ""),
-                "labels": ", ".join(sorted(label_names)),
+                "pr_labels": ", ".join(sorted(label_names)),
             }
         )
     return pd.DataFrame(rows), missing_verification
@@ -337,12 +338,12 @@ def get_prs_in_release_dataframe(
     repo: str = GITHUB_REPO,
     cwd: str | None = None,
 ) -> tuple[pd.DataFrame, bool]:
-    """
+    f"""
     PRs merged into branch_ref that belong in the next release notes: after the latest GitHub
     Release tag on this history, or after the oldest rebase bootstrap if no such tag exists.
     Only merge commits whose subject has from <repo_owner>/ (e.g. from Altinity/) are included.
     Columns: pr_number, pr_name, labels. Omits PRs labeled cicd.
-    Second value is True if any listed PR lacks verified or verified-with-issue.
+    Second value is True if any listed PR lacks verified labels.
     """
     branch_sha = _git_rev_parse(branch_ref, cwd)
     if not branch_sha:
@@ -794,6 +795,15 @@ def url_to_html_link(url: str) -> str:
     return f'<a href="{url}">{text}</a>'
 
 
+def format_pr_labels_with_verification(labels: str) -> str:
+    """Format the PR labels with verification."""
+    labels_list = labels.split(", ")
+    if PR_LABELS_VERIFIED.intersection(labels_list):
+        return labels
+    else:
+        return f'<span style="font-weight: bold; color: red;">{labels} (missing verification)</span>'
+
+
 def format_test_name_for_linewrap(text: str) -> str:
     """Tweak the test name to improve line wrapping."""
     return f'<span style="line-break: anywhere;">{text}</span>'
@@ -843,6 +853,7 @@ def format_results_as_html_table(results) -> str:
         "PR Number": lambda n: url_to_html_link(
             f"https://github.com/{GITHUB_REPO}/pull/{n}"
         ),
+        "PR Labels": format_pr_labels_with_verification,
     }
 
     html = results.to_html(
