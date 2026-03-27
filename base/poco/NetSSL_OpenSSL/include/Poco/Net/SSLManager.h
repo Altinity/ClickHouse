@@ -78,6 +78,7 @@ namespace Net
     ///            <verificationDepth>1..9</verificationDepth>
     ///            <loadDefaultCAFile>true|false</loadDefaultCAFile>
     ///            <cipherList>ALL:!ADH:!LOW:!EXP:!MD5:!3DES:@STRENGTH</cipherList>
+    ///            <cipherSuites>TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256</cipherSuites>
     ///            <preferServerCiphers>true|false</preferServerCiphers>
     ///            <privateKeyPassphraseHandler>
     ///                <name>KeyFileHandler</name>
@@ -119,7 +120,9 @@ namespace Net
     ///      will fail if a certificate chain larger than this is encountered.
     ///    - loadDefaultCAFile (boolean): Specifies whether the builtin CA certificates from OpenSSL are used.
     ///    - cipherList (string): Specifies the supported ciphers in OpenSSL notation
-    ///      (e.g. "ALL:!ADH:!LOW:!EXP:!MD5:@STRENGTH").
+    ///      (e.g. "ALL:!ADH:!LOW:!EXP:!MD5:@STRENGTH"). Only applies to TLSv1.2 and below.
+    ///    - cipherSuites (string): Specifies the supported TLSv1.3 ciphersuites in OpenSSL notation.
+    ///      Defaults to "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256" (FIPS-approved ciphersuites only).
     ///    - preferServerCiphers (bool): When choosing a cipher, use the server's preferences instead of the
     ///      client preferences. When not called, the SSL server will always follow the clients
     ///      preferences. When called, the SSL/TLS server will choose following its own
@@ -278,6 +281,8 @@ namespace Net
         static const std::string CFG_CIPHER_LIST;
         static const std::string CFG_CYPHER_LIST; // for backwards compatibility
         static const std::string VAL_CIPHER_LIST;
+        static const std::string CFG_CIPHER_SUITES;
+        static const std::string VAL_CIPHER_SUITES;
         static const std::string CFG_PREFER_SERVER_CIPHERS;
         static const std::string CFG_DELEGATE_HANDLER;
         static const std::string VAL_DELEGATE_HANDLER;
