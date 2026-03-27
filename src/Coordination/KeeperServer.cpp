@@ -123,6 +123,18 @@ auto getSslContextProvider(const Poco::Util::AbstractConfiguration & config, std
     params.loadDefaultCAs = config.getBool(load_default_ca_file_property, false);
     params.verificationMode = Poco::Net::Utility::convertVerificationMode(config.getString(verification_mode_property, "none"));
 
+    String cipher_list_property = fmt::format("openSSL.{}.cipherList", key);
+    String cypher_list_property = fmt::format("openSSL.{}.cypherList", key);
+    String cipher_suites_property = fmt::format("openSSL.{}.cipherSuites", key);
+    String dh_params_file_property = fmt::format("openSSL.{}.dhParamsFile", key);
+    String ecdh_curve_property = fmt::format("openSSL.{}.ecdhCurve", key);
+
+    params.cipherList = config.getString(cipher_list_property, Poco::Net::SSLManager::VAL_CIPHER_LIST);
+    params.cipherList = config.getString(cypher_list_property, params.cipherList);
+    params.cipherSuites = config.getString(cipher_suites_property, Poco::Net::SSLManager::VAL_CIPHER_SUITES);
+    params.dhParamsFile = config.getString(dh_params_file_property, "");
+    params.ecdhCurve = config.getString(ecdh_curve_property, "");
+
     std::string disabled_protocols_list = config.getString(fmt::format("openSSL.{}.disableProtocols", key), "");
     Poco::StringTokenizer dp_tok(disabled_protocols_list, ";,", Poco::StringTokenizer::TOK_TRIM | Poco::StringTokenizer::TOK_IGNORE_EMPTY);
     int disabled_protocols = 0;
