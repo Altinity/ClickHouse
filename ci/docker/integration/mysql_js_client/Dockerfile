@@ -1,4 +1,4 @@
-# docker build -t clickhouse/mysql-js-client .
+# docker build -t altinityinfra/mysql-js-client .
 # MySQL JavaScript client docker container
 # Rebuild to enable SBOM/provenance attestations (see #97903, #98511)
 

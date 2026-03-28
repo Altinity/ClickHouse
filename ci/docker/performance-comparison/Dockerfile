@@ -1,7 +1,7 @@
-# docker build -t clickhouse/performance-comparison .
+# docker build -t altinityinfra/performance-comparison .
 
 ARG FROM_TAG=latest
-FROM clickhouse/test-base:$FROM_TAG
+FROM altinityinfra/test-base:$FROM_TAG
 
 # Remove problematic Kitware repository
 RUN rm -f /etc/apt/sources.list.d/*kitware* || true
