@@ -118,6 +118,7 @@ void TableFunctionObjectStorageClusterFallback<Definition, Base>::parseArguments
 
     if (is_cluster_function)
     {
+        /// Name may be empty, but cluster workaround may be used in remote initiator case
         ASTPtr cluster_name_arg = std::make_shared<ASTLiteral>(settings[Setting::object_storage_cluster].value);
         args.insert(args.begin(), cluster_name_arg);
         BaseCluster::parseArgumentsImpl(args, context);
