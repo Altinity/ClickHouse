@@ -6,6 +6,7 @@ FROM node:22-alpine
 
 WORKDIR /usr/app
 
-RUN npm install -g npm@11 && npm install mysql
+# NOTE (strtgbb): removed npm upgrade step to avoid a dependency issue
+RUN npm install mysql
 
 COPY ./test.js ./test.js
