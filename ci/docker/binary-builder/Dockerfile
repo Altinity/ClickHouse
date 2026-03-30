@@ -23,6 +23,9 @@ RUN apt-get update \
 
 RUN add-apt-repository ppa:ubuntu-toolchain-r/test --yes \
     && apt-get update \
+    && apt-get remove --yes clang-tools-${LLVM_VERSION} || true \
+    && apt-get install --yes \
+        clang-tools-${LLVM_VERSION} \
     && apt-get install --yes \
         binutils-dev \
         build-essential \
