@@ -114,10 +114,11 @@ void TableFunctionObjectStorageClusterFallback<Definition, Base>::parseArguments
 
     const auto & settings = context->getSettingsRef();
 
-    is_cluster_function = !settings[Setting::object_storage_cluster].value.empty() && typename Base::Configuration().isClusterSupported();
+    is_cluster_function = typename Base::Configuration().isClusterSupported();
 
     if (is_cluster_function)
     {
+        /// Name may be empty, but cluster workaround may be used in remote initiator case
         ASTPtr cluster_name_arg = make_intrusive<ASTLiteral>(settings[Setting::object_storage_cluster].value);
         args.insert(args.begin(), cluster_name_arg);
         BaseCluster::parseArgumentsImpl(args, context);
