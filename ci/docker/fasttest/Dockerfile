@@ -110,7 +110,7 @@ RUN ARCH=$(uname -m) && \
     rustup target add riscv64gc-unknown-linux-gnu
 
 # Note, libmpfr6 is also a requirement for gdb
-COPY --from=altinityinfra/cctools:33434f0a9e7e979bc907 /opt/gdb /opt/gdb
+COPY --from=altinityinfra/cctools:c0aae9395f33405b6e2b /opt/gdb /opt/gdb
 # Give suid to gdb to grant it attach permissions
 RUN chmod u+s /opt/gdb/bin/gdb
 ENV PATH="/opt/gdb/bin:${PATH}"

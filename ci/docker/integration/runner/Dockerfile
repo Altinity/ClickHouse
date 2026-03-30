@@ -94,10 +94,10 @@ RUN set -x \
 COPY modprobe.sh /usr/local/bin/modprobe
 COPY misc/ /misc/
 
-COPY --from=altinityinfra/cctools:33434f0a9e7e979bc907 /opt/gdb /opt/gdb
+COPY --from=altinityinfra/cctools:c0aae9395f33405b6e2b /opt/gdb /opt/gdb
 ENV PATH="/opt/gdb/bin:${PATH}"
 
-COPY --from=altinityinfra/cctools:33434f0a9e7e979bc907 \
+COPY --from=altinityinfra/cctools:c0aae9395f33405b6e2b \
   /opt/openssl-fips/openssl.cnf \
   /opt/openssl-fips/fipsmodule.cnf \
   /opt/openssl-fips/fips.so \
