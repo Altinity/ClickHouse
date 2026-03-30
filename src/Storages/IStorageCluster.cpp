@@ -426,7 +426,7 @@ IStorageCluster::RemoteCallVariables IStorageCluster::convertToRemote(
     /// Clean object_storage_remote_initiator setting to avoid infinite remote call
     auto new_context = Context::createCopy(context);
     new_context->setSetting("object_storage_remote_initiator", false);
-    new_context->setSetting("object_storage_remote_initiator_cluster", false);
+    new_context->setSetting("object_storage_remote_initiator_cluster", String(""));
 
     auto * select_query = query_to_send->as<ASTSelectQuery>();
     if (!select_query)
