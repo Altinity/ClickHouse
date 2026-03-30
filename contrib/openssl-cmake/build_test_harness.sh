@@ -21,6 +21,7 @@ CXXFLAGS="-std=c++17 -fPIC -g -O2 -fno-exceptions -w"
 CFLAGS="-fPIC -O2 -w"
 INC="-I$SRC/include -I$SRC -I$SRC/ssl/test"
 STDCXX=$(c++ -print-file-name=libstdc++.a)
+LIBGCC=$(cc -print-libgcc-file-name)
 PREFIX="__awslc_"
 
 # build_target <name> <entry_grep> <obj_dir>
@@ -28,7 +29,7 @@ PREFIX="__awslc_"
 #   then restores undefined refs and entry point to original names.
 build_target() {
     local name=$1 entry_grep=$2 obj_dir=$3
-    ld -r -o "$obj_dir/combined.o" "$obj_dir"/*.o "$STDCXX"
+    ld -r -o "$obj_dir/combined.o" "$obj_dir"/*.o "$STDCXX" "$LIBGCC"
 
     # Collect undefined symbols — these reference external libraries
     # (libssl, libcrypto, libc, pthreads) and must keep their original names.
