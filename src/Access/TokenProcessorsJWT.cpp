@@ -4,6 +4,11 @@
 #include <Common/Base64.h>
 #include <Common/logger_useful.h>
 #include <Poco/String.h>
+#include <openssl/bio.h>
+#include <openssl/bn.h>
+#include <openssl/ec.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
 
 namespace DB {
 
@@ -154,6 +159,60 @@ bool check_claims(const String & claims, const picojson::value::object & payload
     if (!json.is<picojson::object>())
         throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Bad JWT claims: is not an object");
     return check_claims(json.get<picojson::value::object>(), payload, "");
+}
+
+std::string create_public_key_from_ec_components(const std::string & x, const std::string & y, int curve_nid)
+{
+    auto decode_base64url = [](const std::string & value)
+    {
+        return jwt::base::decode<jwt::alphabet::base64url>(jwt::base::pad<jwt::alphabet::base64url>(value));
+    };
+
+    auto decoded_x = decode_base64url(x);
+    auto decoded_y = decode_base64url(y);
+
+    BIGNUM * raw_x_bn = BN_bin2bn(reinterpret_cast<const unsigned char *>(decoded_x.data()), static_cast<int>(decoded_x.size()), nullptr);
+    BIGNUM * raw_y_bn = BN_bin2bn(reinterpret_cast<const unsigned char *>(decoded_y.data()), static_cast<int>(decoded_y.size()), nullptr);
+    std::unique_ptr<BIGNUM, decltype(&BN_free)> x_bn(raw_x_bn, BN_free);
+    std::unique_ptr<BIGNUM, decltype(&BN_free)> y_bn(raw_y_bn, BN_free);
+    if (!x_bn || !y_bn)
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: failed to parse EC key coordinates");
+
+    std::unique_ptr<EC_KEY, decltype(&EC_KEY_free)> ec_key(EC_KEY_new_by_curve_name(curve_nid), EC_KEY_free);
+    if (!ec_key)
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: failed to construct EC key");
+
+    const EC_GROUP * group = EC_KEY_get0_group(ec_key.get());
+    if (!group)
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: failed to read EC group");
+
+    std::unique_ptr<EC_POINT, decltype(&EC_POINT_free)> point(EC_POINT_new(group), EC_POINT_free);
+    if (!point)
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: failed to create EC point");
+
+    if (EC_POINT_set_affine_coordinates(group, point.get(), x_bn.get(), y_bn.get(), nullptr) != 1)
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: invalid EC public key point");
+
+    if (EC_KEY_set_public_key(ec_key.get(), point.get()) != 1)
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: failed to set EC public key");
+
+    std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> evp_key(EVP_PKEY_new(), EVP_PKEY_free);
+    if (!evp_key)
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: failed to allocate EVP key");
+
+    if (EVP_PKEY_assign_EC_KEY(evp_key.get(), ec_key.release()) != 1)
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: failed to assign EC key");
+
+    std::unique_ptr<BIO, decltype(&BIO_free)> bio(BIO_new(BIO_s_mem()), BIO_free);
+    if (!bio)
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: failed to allocate BIO");
+
+    if (PEM_write_bio_PUBKEY(bio.get(), evp_key.get()) != 1)
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: failed to encode EC public key");
+
+    char * data = nullptr;
+    auto len = BIO_get_mem_data(bio.get(), &data);
+    return std::string(data, len);
 }
 
 }
@@ -392,12 +451,50 @@ bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
 
     if (public_key.empty())
     {
-        if (!(jwk.has_jwk_claim("n") && jwk.has_jwk_claim("e")))
-            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "{}: invalid JWK: 'n' or 'e' not found", processor_name);
-        LOG_TRACE(getLogger("TokenAuthentication"), "{}: `issuer` or `x5c` not present, verifying {} with RSA components", processor_name, username);
-        const auto modulus = jwk.get_jwk_claim("n").as_string();
-        const auto exponent = jwk.get_jwk_claim("e").as_string();
-        public_key = jwt::helper::create_public_key_from_rsa_components(modulus, exponent);
+        if (jwk.has_jwk_claim("x") && jwk.has_jwk_claim("y"))
+        {
+            int curve_nid = NID_undef;
+            std::optional<String> expected_crv;
+            if (algo == "es256")
+            {
+                curve_nid = NID_X9_62_prime256v1;
+                expected_crv = "P-256";
+            }
+            else if (algo == "es384")
+            {
+                curve_nid = NID_secp384r1;
+                expected_crv = "P-384";
+            }
+            else if (algo == "es512")
+            {
+                curve_nid = NID_secp521r1;
+                expected_crv = "P-521";
+            }
+
+            if (curve_nid == NID_undef)
+                throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: unknown algorithm {}", algo);
+
+            if (jwk.has_jwk_claim("crv"))
+            {
+                const auto crv = jwk.get_jwk_claim("crv").as_string();
+                if (expected_crv.has_value() && crv != expected_crv.value())
+                    throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: `crv` in JWK does not match JWT algorithm");
+            }
+
+            LOG_TRACE(getLogger("TokenAuthentication"), "{}: `x5c` not present, verifying {} with EC components", processor_name, username);
+            const auto x = jwk.get_jwk_claim("x").as_string();
+            const auto y = jwk.get_jwk_claim("y").as_string();
+            public_key = create_public_key_from_ec_components(x, y, curve_nid);
+        }
+        else
+        {
+            if (!(jwk.has_jwk_claim("n") && jwk.has_jwk_claim("e")))
+                throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "{}: invalid JWK: neither 'x'/'y' nor 'n'/'e' found", processor_name);
+            LOG_TRACE(getLogger("TokenAuthentication"), "{}: `issuer` or `x5c` not present, verifying {} with RSA components", processor_name, username);
+            const auto modulus = jwk.get_jwk_claim("n").as_string();
+            const auto exponent = jwk.get_jwk_claim("e").as_string();
+            public_key = jwt::helper::create_public_key_from_rsa_components(modulus, exponent);
+        }
     }
 
     if (jwk.has_algorithm() && Poco::toLower(jwk.get_algorithm()) != algo)
@@ -409,6 +506,12 @@ bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
         verifier = verifier.allow_algorithm(jwt::algorithm::rs384(public_key, "", "", ""));
     else if (algo == "rs512")
         verifier = verifier.allow_algorithm(jwt::algorithm::rs512(public_key, "", "", ""));
+    else if (algo == "es256")
+        verifier = verifier.allow_algorithm(jwt::algorithm::es256(public_key, "", "", ""));
+    else if (algo == "es384")
+        verifier = verifier.allow_algorithm(jwt::algorithm::es384(public_key, "", "", ""));
+    else if (algo == "es512")
+        verifier = verifier.allow_algorithm(jwt::algorithm::es512(public_key, "", "", ""));
     else
         throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: unknown algorithm {}", algo);
 
