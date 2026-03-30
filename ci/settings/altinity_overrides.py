@@ -1,3 +1,5 @@
+import os
+
 S3_BUCKET_NAME = "altinity-build-artifacts"
 S3_REPORT_BUCKET_NAME = "altinity-build-artifacts"
 S3_BUCKET_HTTP_ENDPOINT = "altinity-build-artifacts.s3.amazonaws.com"
@@ -40,6 +42,10 @@ CI_DB_TABLE_NAME = "checks"
 SECRET_CI_DB_URL = "CLICKHOUSE_TEST_STAT_URL"
 SECRET_CI_DB_USER = "CLICKHOUSE_TEST_STAT_LOGIN"
 SECRET_CI_DB_PASSWORD = "CLICKHOUSE_TEST_STAT_PASSWORD"
+
+# to post links for reading statistics in html report (with read-only user)
+CI_DB_READ_USER: str = ""
+CI_DB_READ_URL: str = os.environ.get("CLICKHOUSE_TEST_STAT_URL", "")
 
 USE_CUSTOM_GH_AUTH = False
 # SECRET_GH_APP_ID: str = "woolenwolf_gh_app.clickhouse-app-id"
