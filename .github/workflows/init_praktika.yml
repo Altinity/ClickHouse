@@ -19,9 +19,11 @@ jobs:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     name: "Init praktika"
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
       - name: Init praktika report
         run: |
-            export PYTHONPATH=./ci:.:
             pip install htmlmin
-            python3 -m praktika html
+            python3 -m ci.praktika infrastructure --deploy --only html
   
