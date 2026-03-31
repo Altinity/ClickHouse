@@ -1971,7 +1971,7 @@ class ClickHouseCluster:
         hostname=None,
         env_variables=None,
         instance_env_variables=False,
-        image="clickhouse/integration-test",
+        image="altinityinfra/integration-test",
         tag=None,
         # keep the docker container running when clickhouse server is stopped
         stay_alive=False,
@@ -5647,7 +5647,7 @@ class ClickHouseInstance:
 
         if (
             self.randomize_settings
-            and self.image == "clickhouse/integration-test"
+            and self.image == "altinityinfra/integration-test"
             and self.tag == DOCKER_BASE_TAG
             and self.base_config_dir == DEFAULT_BASE_CONFIG_DIR
         ):
