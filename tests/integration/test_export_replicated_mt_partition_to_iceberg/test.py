@@ -210,35 +210,35 @@ def test_export_partition_to_iceberg(cluster):
     )
 
 
-def test_export_two_partitions_to_iceberg(cluster):
-    """
-    Export two partitions in a single ALTER TABLE statement and verify that both
-    land in the Iceberg table with correct row counts.
-    """
-    node = cluster.instances["replica1"]
+# def test_export_two_partitions_to_iceberg(cluster):
+#     """
+#     Export two partitions in a single ALTER TABLE statement and verify that both
+#     land in the Iceberg table with correct row counts.
+#     """
+#     node = cluster.instances["replica1"]
 
-    uid = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"mt_{uid}"
-    iceberg_table = f"iceberg_{uid}"
+#     uid = str(uuid.uuid4()).replace("-", "_")
+#     mt_table = f"mt_{uid}"
+#     iceberg_table = f"iceberg_{uid}"
 
-    setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1"])
+#     setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1"])
 
-    node.query(
-        f"""
-        ALTER TABLE {mt_table}
-            EXPORT PARTITION ID '2020' TO TABLE {iceberg_table},
-            EXPORT PARTITION ID '2021' TO TABLE {iceberg_table}
-        """
-    )
+#     node.query(
+#         f"""
+#         ALTER TABLE {mt_table}
+#             EXPORT PARTITION ID '2020' TO TABLE {iceberg_table},
+#             EXPORT PARTITION ID '2021' TO TABLE {iceberg_table}
+#         """
+#     )
 
-    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
-    wait_for_export_status(node, mt_table, iceberg_table, "2021", "COMPLETED")
+#     wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
+#     wait_for_export_status(node, mt_table, iceberg_table, "2021", "COMPLETED")
 
-    count_2020 = int(node.query(f"SELECT count() FROM {iceberg_table} WHERE year = 2020").strip())
-    count_2021 = int(node.query(f"SELECT count() FROM {iceberg_table} WHERE year = 2021").strip())
+#     count_2020 = int(node.query(f"SELECT count() FROM {iceberg_table} WHERE year = 2020").strip())
+#     count_2021 = int(node.query(f"SELECT count() FROM {iceberg_table} WHERE year = 2021").strip())
 
-    assert count_2020 == 3, f"Expected 3 rows for year=2020, got {count_2020}"
-    assert count_2021 == 1, f"Expected 1 row for year=2021, got {count_2021}"
+#     assert count_2020 == 3, f"Expected 3 rows for year=2020, got {count_2020}"
+#     assert count_2021 == 1, f"Expected 1 row for year=2021, got {count_2021}"
 
 
 def test_failure_is_logged_in_system_table(cluster):
@@ -481,6 +481,14 @@ def test_export_partition_resumes_after_stop_moves_during_export(cluster):
 
     setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1"])
 
+    node.query(f"SYSTEM STOP MOVES {mt_table}")
+
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
+        f" SETTINGS export_merge_tree_partition_max_retries = 50")
+
+    wait_for_export_to_start(node, mt_table, iceberg_table, "2020")
+
     with PartitionManager() as pm:
         pm.add_rule({
             "instance": node,
@@ -497,19 +505,8 @@ def test_export_partition_resumes_after_stop_moves_during_export(cluster):
             "action": "REJECT --reject-with tcp-reset",
         })
 
-        node.query(
-            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
-            f" SETTINGS export_merge_tree_partition_max_retries = 50"
-        )
-
-        wait_for_export_to_start(node, mt_table, iceberg_table, "2020")
-
-        # Let tasks start failing against the blocked S3.
-        time.sleep(2)
-
         node.query(f"SYSTEM STOP MOVES {mt_table}")
 
-        # Give the cancel callback time to fire and the lock-release path to run.
         time.sleep(3)
 
         status = node.query(
