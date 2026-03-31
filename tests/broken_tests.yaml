@@ -283,6 +283,11 @@
   message: 'Client timed out!'
   check_types:
   - asan
+- name: 03572_export_merge_tree_part_limits_and_table_functions
+  reason: 'INVESTIGATE - Unstable on tsan'
+  message: 'timeout: 60s'
+  check_types:
+  - tsan
 
 
 # Regex rules should be ordered from most specific to least specific.
