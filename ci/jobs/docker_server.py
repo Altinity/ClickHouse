@@ -166,8 +166,8 @@ def buildx_args(
     action_url: str,
 ) -> List[str]:
     args = [
-        "--provenance=true",
-        "--sbom=true",
+        # "--provenance=true", # NOTE (strtgbb): Disable for now, incompatible with current CI
+        # "--sbom=true",
         f"--platform=linux/{arch}",
         f"--label=build-url={action_url}",
         f"--label=com.altinity.build.githash={sha}",
