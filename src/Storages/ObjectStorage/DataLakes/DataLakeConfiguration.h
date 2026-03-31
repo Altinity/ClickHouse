@@ -433,6 +433,15 @@ public:
         return res;
     }
 
+    bool supportsPrewhere() const override
+    {
+#if USE_AVRO
+        return std::is_same_v<DataLakeMetadata, IcebergMetadata>;
+#else
+        return false;
+#endif
+    }
+
 private:
     const DataLakeStorageSettingsPtr settings;
     ObjectStoragePtr ready_object_storage;
@@ -606,6 +615,7 @@ public:
     bool supportsFileIterator() const override { return getImpl().supportsFileIterator(); }
     bool supportsParallelInsert() const override { return getImpl().supportsParallelInsert(); }
     bool supportsWrites() const override { return getImpl().supportsWrites(); }
+    bool supportsPrewhere() const override { return getImpl().supportsPrewhere(); }
 
     bool supportsPartialPathPrefix() const override { return getImpl().supportsPartialPathPrefix(); }
 
