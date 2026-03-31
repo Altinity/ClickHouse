@@ -115,12 +115,8 @@ public:
         const std::function<void(const std::string &)> & new_file_path_callback,
         SharedHeader sample_block,
         const std::string & iceberg_metadata_json_string,
+        const std::optional<std::string> & partition_values_json,
         const std::optional<FormatSettings> & format_settings,
-        Int64 original_schema_id,
-        Int64 partition_spec_id,
-        Row partition_values,
-        std::vector<String> partition_columns,
-        std::vector<DataTypePtr> partition_types,
         ContextPtr context) override;
 
     /// Commit an export-partition transaction. All parameters that are saved in ZooKeeper at the
