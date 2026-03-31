@@ -121,6 +121,10 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             // {"iceberg_metadata_staleness_ms", 0, 0, "New setting allowing using cached metadata version at READ operations to prevent fetching from remote catalog"},
             {"export_merge_tree_partition_task_timeout_seconds", 0, 3600, "New setting to control the timeout for export partition tasks."},
             {"export_merge_tree_partition_manifest_ttl", 180, 86400, "Reasonable default for real usage"},
+            {"s3_propagate_credentials_to_other_storages", false, false, "New setting"},
+            {"export_merge_tree_part_filename_pattern", "", "{part_name}_{checksum}", "New setting"},
+            {"object_storage_remote_initiator_cluster", "", "", "New setting."},
+            {"iceberg_metadata_staleness_ms", 0, 0, "New setting allowing using cached metadata version at READ operations to prevent fetching from remote catalog"},
         });
         addSettingsChanges(settings_changes_history, "26.1",
         {
