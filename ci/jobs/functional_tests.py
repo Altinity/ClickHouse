@@ -662,7 +662,7 @@ def main():
                 )
             )
         elif failed_tests:
-            ft_res_processor = FTResultsProcessor(wd=temp_dir)
+            ft_res_processor = FTResultsProcessor(wd=temp_dir, test_options=test_options)
             run_tests(
                 batch_num=0,
                 batch_total=0,
