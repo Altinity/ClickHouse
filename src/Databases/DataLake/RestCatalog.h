@@ -143,7 +143,7 @@ public:
         bool allow_tables = false;
     };
 
-private:
+protected:
     AllowedNamespaces allowed_namespaces;
 
     Poco::Net::HTTPBasicCredentials credentials{};
@@ -202,6 +202,7 @@ public:
         const std::string & auth_scope_,
         const std::string & oauth_server_uri_,
         bool oauth_server_use_request_body_,
+        const std::string & namespaces_,
         DB::ContextPtr context_);
 
     DB::DatabaseDataLakeCatalogType getCatalogType() const override
@@ -232,6 +233,7 @@ public:
         const std::string & google_adc_client_secret_,
         const std::string & google_adc_refresh_token_,
         const std::string & google_adc_quota_project_id_,
+        const std::string & namespaces_,
         DB::ContextPtr context_);
 
     DB::DatabaseDataLakeCatalogType getCatalogType() const override
