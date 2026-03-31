@@ -5,10 +5,11 @@
 #include <Common/logger_useful.h>
 #include <Poco/String.h>
 #include <openssl/bio.h>
-#include <openssl/bn.h>
-#include <openssl/ec.h>
+#include <openssl/core_names.h>
 #include <openssl/evp.h>
+#include <openssl/param_build.h>
 #include <openssl/pem.h>
+#include <cstring>
 
 namespace DB {
 
@@ -171,37 +172,54 @@ std::string create_public_key_from_ec_components(const std::string & x, const st
     auto decoded_x = decode_base64url(x);
     auto decoded_y = decode_base64url(y);
 
-    BIGNUM * raw_x_bn = BN_bin2bn(reinterpret_cast<const unsigned char *>(decoded_x.data()), static_cast<int>(decoded_x.size()), nullptr);
-    BIGNUM * raw_y_bn = BN_bin2bn(reinterpret_cast<const unsigned char *>(decoded_y.data()), static_cast<int>(decoded_y.size()), nullptr);
-    std::unique_ptr<BIGNUM, decltype(&BN_free)> x_bn(raw_x_bn, BN_free);
-    std::unique_ptr<BIGNUM, decltype(&BN_free)> y_bn(raw_y_bn, BN_free);
-    if (!x_bn || !y_bn)
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: failed to parse EC key coordinates");
+    size_t coordinate_size = 0;
+    if (curve_nid == NID_X9_62_prime256v1)
+        coordinate_size = 32;
+    else if (curve_nid == NID_secp384r1)
+        coordinate_size = 48;
+    else if (curve_nid == NID_secp521r1)
+        coordinate_size = 66;
+    else
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: unsupported EC curve");
 
-    std::unique_ptr<EC_KEY, decltype(&EC_KEY_free)> ec_key(EC_KEY_new_by_curve_name(curve_nid), EC_KEY_free);
-    if (!ec_key)
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: failed to construct EC key");
+    if (decoded_x.size() > coordinate_size || decoded_y.size() > coordinate_size)
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: invalid EC key coordinates length");
 
-    const EC_GROUP * group = EC_KEY_get0_group(ec_key.get());
-    if (!group)
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: failed to read EC group");
+    std::vector<unsigned char> public_key_octets(1 + 2 * coordinate_size, 0);
+    public_key_octets[0] = 0x04; // Uncompressed point format.
+    std::memcpy(public_key_octets.data() + 1 + (coordinate_size - decoded_x.size()), decoded_x.data(), decoded_x.size());
+    std::memcpy(public_key_octets.data() + 1 + coordinate_size + (coordinate_size - decoded_y.size()), decoded_y.data(), decoded_y.size());
 
-    std::unique_ptr<EC_POINT, decltype(&EC_POINT_free)> point(EC_POINT_new(group), EC_POINT_free);
-    if (!point)
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: failed to create EC point");
+    const char * group_name = OBJ_nid2sn(curve_nid);
+    if (!group_name)
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: unsupported EC curve");
 
-    if (EC_POINT_set_affine_coordinates(group, point.get(), x_bn.get(), y_bn.get(), nullptr) != 1)
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: invalid EC public key point");
+    std::unique_ptr<OSSL_PARAM_BLD, decltype(&OSSL_PARAM_BLD_free)> params_bld(OSSL_PARAM_BLD_new(), OSSL_PARAM_BLD_free);
+    if (!params_bld)
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: failed to allocate OpenSSL parameter builder");
 
-    if (EC_KEY_set_public_key(ec_key.get(), point.get()) != 1)
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: failed to set EC public key");
+    if (OSSL_PARAM_BLD_push_utf8_string(params_bld.get(), OSSL_PKEY_PARAM_GROUP_NAME, group_name, 0) != 1)
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: failed to set EC group parameter");
 
-    std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> evp_key(EVP_PKEY_new(), EVP_PKEY_free);
-    if (!evp_key)
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: failed to allocate EVP key");
+    if (OSSL_PARAM_BLD_push_octet_string(params_bld.get(), OSSL_PKEY_PARAM_PUB_KEY, public_key_octets.data(), public_key_octets.size()) != 1)
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: failed to set EC public key parameter");
 
-    if (EVP_PKEY_assign_EC_KEY(evp_key.get(), ec_key.release()) != 1)
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: failed to assign EC key");
+    std::unique_ptr<OSSL_PARAM, decltype(&OSSL_PARAM_free)> params(OSSL_PARAM_BLD_to_param(params_bld.get()), OSSL_PARAM_free);
+    if (!params)
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: failed to build OpenSSL parameters");
+
+    std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)> key_ctx(EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr), EVP_PKEY_CTX_free);
+    if (!key_ctx)
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: failed to create EVP key context");
+
+    if (EVP_PKEY_fromdata_init(key_ctx.get()) <= 0)
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: failed to initialize EVP key import");
+
+    EVP_PKEY * raw_evp_key = nullptr;
+    if (EVP_PKEY_fromdata(key_ctx.get(), &raw_evp_key, EVP_PKEY_PUBLIC_KEY, params.get()) <= 0)
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: failed to import EC public key");
+
+    std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> evp_key(raw_evp_key, EVP_PKEY_free);
 
     std::unique_ptr<BIO, decltype(&BIO_free)> bio(BIO_new(BIO_s_mem()), BIO_free);
     if (!bio)
@@ -451,8 +469,12 @@ bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
 
     if (public_key.empty())
     {
-        if (jwk.has_jwk_claim("x") && jwk.has_jwk_claim("y"))
+        const auto key_type = jwk.get_key_type();
+        if (key_type == "EC")
         {
+            if (!(jwk.has_jwk_claim("x") && jwk.has_jwk_claim("y")))
+                throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "{}: invalid JWK: missing 'x'/'y' claims for EC key type", processor_name);
+
             int curve_nid = NID_undef;
             std::optional<String> expected_crv;
             if (algo == "es256")
@@ -486,15 +508,17 @@ bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
             const auto y = jwk.get_jwk_claim("y").as_string();
             public_key = create_public_key_from_ec_components(x, y, curve_nid);
         }
-        else
+        else if (key_type == "RSA")
         {
             if (!(jwk.has_jwk_claim("n") && jwk.has_jwk_claim("e")))
-                throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "{}: invalid JWK: neither 'x'/'y' nor 'n'/'e' found", processor_name);
+                throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "{}: invalid JWK: missing 'n'/'e' claims for RSA key type", processor_name);
             LOG_TRACE(getLogger("TokenAuthentication"), "{}: `issuer` or `x5c` not present, verifying {} with RSA components", processor_name, username);
             const auto modulus = jwk.get_jwk_claim("n").as_string();
             const auto exponent = jwk.get_jwk_claim("e").as_string();
             public_key = jwt::helper::create_public_key_from_rsa_components(modulus, exponent);
         }
+        else
+            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "{}: invalid JWK key type '{}'", processor_name, key_type);
     }
 
     if (jwk.has_algorithm() && Poco::toLower(jwk.get_algorithm()) != algo)
