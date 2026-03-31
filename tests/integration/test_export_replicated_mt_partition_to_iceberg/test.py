@@ -530,6 +530,270 @@ def test_export_partition_resumes_after_stop_moves_during_export(cluster):
     assert count == 3, f"Expected 3 rows in Iceberg table after export completed, got {count}"
 
 
+def _make_iceberg_s3(node, name: str, columns: str, partition_by: str = "") -> None:
+    """Create an IcebergS3 table at a per-test MinIO prefix."""
+    pclause = f"PARTITION BY {partition_by}" if partition_by else ""
+    node.query(
+        f"""
+        CREATE TABLE {name} ({columns})
+        ENGINE = IcebergS3(
+            'http://minio1:9001/root/data/{name}/',
+            'minio',
+            'ClickHouse_Minio_P@ssw0rd'
+        )
+        {pclause} SETTINGS s3_retry_attempts = 1
+        """
+    )
+
+
+def _make_rmt(node, name: str, columns: str, partition_by: str) -> None:
+    """Create a single-replica ReplicatedMergeTree with the given partition key."""
+    node.query(
+        f"""
+        CREATE TABLE {name} ({columns})
+        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{name}', 'replica1')
+        PARTITION BY {partition_by} ORDER BY tuple()
+        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
+        """
+    )
+
+
+def _first_partition_id(node, table: str) -> str:
+    """Return the partition_id of the first active part of *table*."""
+    return node.query(
+        f"SELECT partition_id FROM system.parts"
+        f" WHERE table = '{table}' AND database = currentDatabase()"
+        f" AND active LIMIT 1"
+    ).strip()
+
+
+def test_partition_transform_compatibility_accepted(cluster):
+    """
+    Verify that EXPORT PARTITION is accepted (no BAD_ARGUMENTS) for every
+    supported transform when the MergeTree and Iceberg partition specs match.
+
+    Cases covered:
+    1. Compound identity (year, region)
+    2. Year transform  – toYearNumSinceEpoch(event_date)
+    3. Month transform – toMonthNumSinceEpoch(event_date)
+    4. truncate[4]     – icebergTruncate(4, category)
+    5. bucket[8]       – icebergBucket(8, user_id)
+    6. Compound mixed  – (toYearNumSinceEpoch(event_date), icebergBucket(16, user_id))
+    """
+    node = cluster.instances["replica1"]
+    uid = str(uuid.uuid4()).replace("-", "_")
+
+    def check_accepted(mt, iceberg, description):
+        pid = _first_partition_id(node, mt)
+        node.query(
+            f"ALTER TABLE {mt} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg}"
+        )
+
+    # 1. Compound identity: (year, region)
+    cols = "id Int64, year Int32, region String"
+    t = f"mt_acc_1_{uid}"; i = f"iceberg_acc_1_{uid}"
+    _make_rmt(node, t, cols, "(year, region)")
+    node.query(f"INSERT INTO {t} VALUES (1, 2023, 'EU')")
+    _make_iceberg_s3(node, i, cols, "(year, region)")
+    check_accepted(t, i, "compound identity (year, region)")
+
+    # 2. Year transform
+    cols = "id Int64, event_date Date"
+    t = f"mt_acc_2_{uid}"; i = f"iceberg_acc_2_{uid}"
+    _make_rmt(node, t, cols, "toYearNumSinceEpoch(event_date)")
+    node.query(f"INSERT INTO {t} VALUES (1, '2020-06-15')")
+    _make_iceberg_s3(node, i, cols, "toYearNumSinceEpoch(event_date)")
+    check_accepted(t, i, "year transform")
+
+    # 3. Month transform
+    cols = "id Int64, event_date Date"
+    t = f"mt_acc_3_{uid}"; i = f"iceberg_acc_3_{uid}"
+    _make_rmt(node, t, cols, "toMonthNumSinceEpoch(event_date)")
+    node.query(f"INSERT INTO {t} VALUES (1, '2020-06-15')")
+    _make_iceberg_s3(node, i, cols, "toMonthNumSinceEpoch(event_date)")
+    check_accepted(t, i, "month transform")
+
+    # 4. truncate[4]
+    cols = "id Int64, category String"
+    t = f"mt_acc_4_{uid}"; i = f"iceberg_acc_4_{uid}"
+    _make_rmt(node, t, cols, "icebergTruncate(4, category)")
+    node.query(f"INSERT INTO {t} VALUES (1, 'clickhouse')")
+    _make_iceberg_s3(node, i, cols, "icebergTruncate(4, category)")
+    check_accepted(t, i, "truncate[4]")
+
+    # 5. bucket[8]
+    cols = "id Int64, user_id Int64"
+    t = f"mt_acc_5_{uid}"; i = f"iceberg_acc_5_{uid}"
+    _make_rmt(node, t, cols, "icebergBucket(8, user_id)")
+    node.query(f"INSERT INTO {t} VALUES (1, 42)")
+    _make_iceberg_s3(node, i, cols, "icebergBucket(8, user_id)")
+    check_accepted(t, i, "bucket[8]")
+
+    # 6. Compound mixed: year(event_date) + bucket[16](user_id)
+    cols = "id Int64, event_date Date, user_id Int64"
+    t = f"mt_acc_6_{uid}"; i = f"iceberg_acc_6_{uid}"
+    _make_rmt(node, t, cols, "(toYearNumSinceEpoch(event_date), icebergBucket(16, user_id))")
+    node.query(f"INSERT INTO {t} VALUES (1, '2021-03-01', 99)")
+    _make_iceberg_s3(node, i, cols, "(toYearNumSinceEpoch(event_date), icebergBucket(16, user_id))")
+    check_accepted(t, i, "compound year+bucket[16]")
+
+
+def test_partition_transform_compatibility_rejected(cluster):
+    """
+    Verify that mismatched partition specs are rejected with BAD_ARGUMENTS.
+
+    Cases covered:
+    1. Compound field order reversed: MergeTree (year, region) vs Iceberg (region, year)
+    2. Transform mismatch on same column: year-transform vs identity
+    3. Bucket count mismatch: bucket[8] vs bucket[16]
+    4. Truncate width mismatch: truncate[4] vs truncate[8]
+    5. Field-count mismatch: 2-field MergeTree vs 1-field Iceberg
+    6. Unsupported MergeTree expression (intDiv — not an Iceberg transform)
+    """
+    node = cluster.instances["replica1"]
+    uid = str(uuid.uuid4()).replace("-", "_")
+
+    def assert_rejected(mt, iceberg, description):
+        # The compatibility check fires synchronously; any partition ID works here.
+        pid = _first_partition_id(node, mt)
+        error = node.query_and_get_error(
+            f"ALTER TABLE {mt} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg}"
+        )
+        assert "BAD_ARGUMENTS" in error, (
+            f"[{description}] Expected BAD_ARGUMENTS, got: {error!r}"
+        )
+
+    # 1. Compound field order reversed
+    cols = "id Int64, year Int32, region String"
+    t = f"mt_rej_1_{uid}"; i = f"iceberg_rej_1_{uid}"
+    _make_rmt(node, t, cols, "(year, region)")
+    node.query(f"INSERT INTO {t} VALUES (1, 2020, 'EU')")
+    _make_iceberg_s3(node, i, cols, "(region, year)")
+    assert_rejected(t, i, "compound field order reversed")
+
+    # 2. Transform mismatch: MergeTree year-transform, Iceberg identity on same Date col
+    cols = "id Int64, event_date Date"
+    t = f"mt_rej_2_{uid}"; i = f"iceberg_rej_2_{uid}"
+    _make_rmt(node, t, cols, "toYearNumSinceEpoch(event_date)")
+    node.query(f"INSERT INTO {t} VALUES (1, '2020-01-01')")
+    _make_iceberg_s3(node, i, cols, "event_date")   # identity, not year-transform
+    assert_rejected(t, i, "year-transform vs identity on same column")
+
+    # 3. Bucket count mismatch: bucket[8] vs bucket[16]
+    cols = "id Int64, user_id Int64"
+    t = f"mt_rej_3_{uid}"; i = f"iceberg_rej_3_{uid}"
+    _make_rmt(node, t, cols, "icebergBucket(8, user_id)")
+    node.query(f"INSERT INTO {t} VALUES (1, 42)")
+    _make_iceberg_s3(node, i, cols, "icebergBucket(16, user_id)")
+    assert_rejected(t, i, "bucket[8] vs bucket[16]")
+
+    # 4. Truncate width mismatch: truncate[4] vs truncate[8]
+    cols = "id Int64, category String"
+    t = f"mt_rej_4_{uid}"; i = f"iceberg_rej_4_{uid}"
+    _make_rmt(node, t, cols, "icebergTruncate(4, category)")
+    node.query(f"INSERT INTO {t} VALUES (1, 'clickhouse')")
+    _make_iceberg_s3(node, i, cols, "icebergTruncate(8, category)")
+    assert_rejected(t, i, "truncate[4] vs truncate[8]")
+
+    # 5. Field-count mismatch: MergeTree has 2 fields, Iceberg has 1
+    cols = "id Int64, year Int32, region String"
+    t = f"mt_rej_5_{uid}"; i = f"iceberg_rej_5_{uid}"
+    _make_rmt(node, t, cols, "(year, region)")
+    node.query(f"INSERT INTO {t} VALUES (1, 2020, 'EU')")
+    _make_iceberg_s3(node, i, cols, "year")
+    assert_rejected(t, i, "2-field MergeTree vs 1-field Iceberg")
+
+    # 6. Unsupported MergeTree expression: intDiv(year, 100) is not an Iceberg transform
+    cols = "id Int64, year Int32"
+    t = f"mt_rej_6_{uid}"; i = f"iceberg_rej_6_{uid}"
+    _make_rmt(node, t, cols, "intDiv(year, 100)")
+    node.query(f"INSERT INTO {t} VALUES (1, 2020)")
+    _make_iceberg_s3(node, i, cols, "year")
+    assert_rejected(t, i, "unsupported MergeTree expression intDiv")
+
+
+def test_partition_key_compatibility_check(cluster):
+    """
+    Verify that EXPORT PARTITION throws BAD_ARGUMENTS synchronously when the
+    MergeTree partition key does not match the Iceberg table's partition spec,
+    and is accepted without error when the keys match.
+
+    Three cases:
+    1. Column mismatch   – MergeTree PARTITION BY year, Iceberg PARTITION BY id
+    2. Count mismatch    – MergeTree PARTITION BY year, Iceberg unpartitioned
+    3. Matching keys     – both PARTITION BY year (must be accepted)
+    """
+    node = cluster.instances["replica1"]
+
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"mt_{uid}"
+
+    create_replicated_mt(node, mt_table, "replica1")
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020), (3, 2021)")
+    node.query(f"SYSTEM SYNC REPLICA {mt_table}")
+
+    # --- Case 1: Iceberg partitioned by 'id' but MergeTree by 'year' ---
+    iceberg_col_mismatch = f"iceberg_col_mismatch_{uid}"
+    node.query(
+        f"""
+        CREATE TABLE {iceberg_col_mismatch}
+        (id Int64, year Int32)
+        ENGINE = IcebergS3(
+            'http://minio1:9001/root/data/{iceberg_col_mismatch}/',
+            'minio',
+            'ClickHouse_Minio_P@ssw0rd'
+        )
+        PARTITION BY id SETTINGS s3_retry_attempts = 1
+        """
+    )
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_col_mismatch}"
+    )
+    assert "BAD_ARGUMENTS" in error, (
+        f"Expected BAD_ARGUMENTS for partition column mismatch, got: {error!r}"
+    )
+
+    # --- Case 2: Iceberg unpartitioned but MergeTree PARTITION BY year ---
+    iceberg_count_mismatch = f"iceberg_count_mismatch_{uid}"
+    node.query(
+        f"""
+        CREATE TABLE {iceberg_count_mismatch}
+        (id Int64, year Int32)
+        ENGINE = IcebergS3(
+            'http://minio1:9001/root/data/{iceberg_count_mismatch}/',
+            'minio',
+            'ClickHouse_Minio_P@ssw0rd'
+        )
+        SETTINGS s3_retry_attempts = 1
+        """
+    )
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_count_mismatch}"
+    )
+    assert "BAD_ARGUMENTS" in error, (
+        f"Expected BAD_ARGUMENTS for partition count mismatch, got: {error!r}"
+    )
+
+    # --- Case 3: Matching partition keys (both PARTITION BY year) ---
+    iceberg_match = f"iceberg_match_{uid}"
+    node.query(
+        f"""
+        CREATE TABLE {iceberg_match}
+        (id Int64, year Int32)
+        ENGINE = IcebergS3(
+            'http://minio1:9001/root/data/{iceberg_match}/',
+            'minio',
+            'ClickHouse_Minio_P@ssw0rd'
+        )
+        PARTITION BY year SETTINGS s3_retry_attempts = 1
+        """
+    )
+    # Should not raise — the check passes so the export is accepted synchronously
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_match}"
+    )
+
+
 def test_export_ttl(cluster):
     """
     After a manifest TTL expires the same partition can be re-exported, and the

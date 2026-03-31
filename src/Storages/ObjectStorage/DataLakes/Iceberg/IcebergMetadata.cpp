@@ -1193,7 +1193,6 @@ SinkToStoragePtr IcebergMetadata::import(
     const std::function<void(const std::string &)> & new_file_path_callback,
     SharedHeader sample_block,
     const std::string & iceberg_metadata_json_string,
-    const std::optional<std::string> & partition_values_json,
     const std::optional<FormatSettings> & format_settings,
     ContextPtr context)
 {
@@ -1201,77 +1200,9 @@ SinkToStoragePtr IcebergMetadata::import(
     Poco::Dynamic::Var json = parser.parse(iceberg_metadata_json_string);
     Poco::JSON::Object::Ptr metadata_json = json.extract<Poco::JSON::Object::Ptr>();
 
-    const auto original_schema_id = metadata_json->getValue<Int64>(Iceberg::f_current_schema_id);
-
-    Poco::JSON::Object::Ptr current_schema;
-    const auto schemas = metadata_json->getArray(Iceberg::f_schemas);
-    for (size_t i = 0; i < schemas->size(); ++i)
-    {
-        auto schema = schemas->getObject(static_cast<UInt32>(i));
-        if (schema->getValue<Int32>(Iceberg::f_schema_id) == original_schema_id)
-        {
-            current_schema = schema;
-            break;
-        }
-    }
-
-    const auto partition_spec_id = metadata_json->getValue<Int64>(Iceberg::f_default_spec_id);
-
-    Poco::JSON::Object::Ptr partition_spec;
-    const auto specs = metadata_json->getArray(Iceberg::f_partition_specs);
-    for (size_t i = 0; i < specs->size(); ++i)
-    {
-        auto spec = specs->getObject(static_cast<UInt32>(i));
-        if (spec->getValue<Int64>(Iceberg::f_spec_id) == partition_spec_id)
-        {
-            partition_spec = spec;
-            break;
-        }
-    }
-
-    /// Build the partitioner from the Iceberg partition spec and schema.
-    /// Always needed to derive partition_columns and partition_types; computePartitionKey()
-    /// is skipped when the caller already supplies pre-serialized partition values (export-partition path).
-    ChunkPartitioner partitioner(partition_spec->getArray(Iceberg::f_fields), current_schema, context, sample_block);
-
-    std::vector<String> partition_columns = partitioner.getColumns();
-    std::vector<DataTypePtr> partition_types = partitioner.getResultTypes();
-
-    Row partition_values;
-    if (partition_values_json.has_value() && !partition_values_json->empty())
-    {
-        /// Pre-computed by the export-partition path (replicated MergeTree).
-        /// Deserialize using the types derived from the partition spec above.
-        Poco::JSON::Parser val_parser;
-        auto arr = val_parser.parse(*partition_values_json).extract<Poco::JSON::Array::Ptr>();
-        for (size_t i = 0; i < arr->size() && i < partition_types.size(); ++i)
-        {
-            Poco::Dynamic::Var var = arr->get(static_cast<unsigned int>(i));
-            if (var.isString())
-                partition_values.push_back(Field(var.extract<String>()));
-            else
-                partition_values.push_back(Field(var.convert<Int64>()));
-        }
-    }
-    // else
-    // {
-    //     /// Per-part (non-replicated) export: derive from the minmax index block.
-    //     /// block_with_partition_values has 2 rows (min, max); row 0 is representative
-    //     /// because all rows in the same MergeTree partition share the same key value.
-    //     Block single_row_block;
-    //     for (size_t i = 0; i < block_with_partition_values.columns(); ++i)
-    //     {
-    //         const auto & col = block_with_partition_values.getByPosition(i);
-    //         single_row_block.insert({col.column->cut(0, 1), col.type, col.name});
-    //     }
-    //     partition_values = partitioner.computePartitionKey(single_row_block);
-    // }
-
     return std::make_shared<IcebergImportSink>(
-        catalog, persistent_components, metadata_json, object_storage, context, format_settings, write_format, sample_block,
-        original_schema_id, partition_spec_id,
-        std::move(partition_values), std::move(partition_columns), std::move(partition_types),
-        data_lake_settings, new_file_path_callback);
+        catalog, persistent_components, metadata_json, object_storage,
+        context, format_settings, write_format, sample_block, data_lake_settings, new_file_path_callback);
 }
 
 namespace FailPoints

@@ -95,7 +95,7 @@ Row ChunkPartitioner::computePartitionKey(const Block & source_block) const
             col->insert(*function_time_zones[i]);
             arguments.push_back({ColumnConst::create(std::move(col), 1), type, "PartitioningTimezone"});
         }
-        auto result = functions[i]->build(arguments)->execute(arguments, std::make_shared<DataTypeString>(), 1, false);
+        auto result = functions[i]->build(arguments)->execute(arguments, result_data_types[i], 1, false);
         Field field;
         result->get(0, field);
         key.push_back(std::move(field));

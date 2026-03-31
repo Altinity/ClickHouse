@@ -1062,8 +1062,7 @@ SinkToStoragePtr StorageObjectStorageCluster::import(
     std::size_t max_rows_per_file,
     const std::optional<std::string> & iceberg_metadata_json_string,
     const std::optional<FormatSettings> & format_settings_,
-    ContextPtr context,
-    const std::optional<std::string> & partition_values_json)
+    ContextPtr context)
 {
     if (pure_storage)
         return pure_storage->import(
@@ -1075,8 +1074,7 @@ SinkToStoragePtr StorageObjectStorageCluster::import(
             max_rows_per_file,
             iceberg_metadata_json_string,
             format_settings_,
-            context,
-            partition_values_json);
+            context);
     return IStorageCluster::import(
         file_name,
         block_with_partition_values,
@@ -1086,8 +1084,7 @@ SinkToStoragePtr StorageObjectStorageCluster::import(
         max_rows_per_file,
         iceberg_metadata_json_string,
         format_settings_,
-        context,
-        partition_values_json);
+        context);
 }
 
 bool StorageObjectStorageCluster::isDataLake() const

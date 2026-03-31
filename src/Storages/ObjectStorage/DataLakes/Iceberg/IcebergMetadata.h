@@ -115,7 +115,6 @@ public:
         const std::function<void(const std::string &)> & new_file_path_callback,
         SharedHeader sample_block,
         const std::string & iceberg_metadata_json_string,
-        const std::optional<std::string> & partition_values_json,
         const std::optional<FormatSettings> & format_settings,
         ContextPtr context) override;
 

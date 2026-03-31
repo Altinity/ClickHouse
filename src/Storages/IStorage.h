@@ -497,8 +497,7 @@ It is currently only implemented in StorageObjectStorage.
         std::size_t /* max_rows_per_file */,
         const std::optional<std::string> & /* iceberg_metadata_json_string */,
         const std::optional<FormatSettings> & /* format_settings */,
-        ContextPtr /* context */,
-        const std::optional<std::string> & /* partition_values_json */ = std::nullopt)
+        ContextPtr /* context */)
     {
       throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Import is not implemented for storage {}", getName());
     }

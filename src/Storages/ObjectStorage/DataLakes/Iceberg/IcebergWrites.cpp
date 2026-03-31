@@ -1281,11 +1281,6 @@ IcebergImportSink::IcebergImportSink(
     std::optional<FormatSettings> format_settings_,
     const String & write_format_,
     SharedHeader sample_block_,
-    Int64 original_schema_id_,
-    Int64 partition_spec_id_,
-    Row partition_values_,
-    std::vector<String> partition_columns_,
-    std::vector<DataTypePtr> partition_types_,
     const DataLakeStorageSettings & data_lake_settings_,
     std::function<void(const std::string &)> new_file_path_callback_)
     : SinkToStorage(sample_block_)
@@ -1299,11 +1294,6 @@ IcebergImportSink::IcebergImportSink(
     , sample_block(sample_block_)
     , data_lake_settings(data_lake_settings_)
     , new_file_path_callback(std::move(new_file_path_callback_))
-    , original_schema_id(original_schema_id_)
-    , partition_spec_id(partition_spec_id_)
-    , partition_values(std::move(partition_values_))
-    , partition_columns(std::move(partition_columns_))
-    , partition_types(std::move(partition_types_))
 {
     const auto current_schema_id = metadata_json->getValue<Int64>(Iceberg::f_current_schema_id);
     const auto schemas = metadata_json->getArray(Iceberg::f_schemas);

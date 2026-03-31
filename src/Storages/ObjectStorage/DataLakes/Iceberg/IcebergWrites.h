@@ -192,11 +192,6 @@ public:
         std::optional<FormatSettings> format_settings_,
         const String & write_format_,
         SharedHeader sample_block_,
-        Int64 original_schema_id_,
-        Int64 partition_spec_id_,
-        Row partition_values_,
-        std::vector<String> partition_columns_,
-        std::vector<DataTypePtr> partition_types_,
         const DataLakeStorageSettings & data_lake_settings_,
         std::function<void(const std::string &)> new_file_path_callback_ = {});
 
@@ -207,12 +202,6 @@ public:
     void consume(Chunk & chunk) override;
 
     void onFinish() override;
-
-    Int64 getOriginalSchemaId() const { return original_schema_id; }
-    Int64 getPartitionSpecId() const { return partition_spec_id; }
-    const Row & getPartitionValues() const { return partition_values; }
-    const std::vector<String> & getPartitionColumns() const { return partition_columns; }
-    const std::vector<DataTypePtr> & getPartitionTypes() const { return partition_types; }
 
 private:
     void finalizeBuffers();
@@ -232,12 +221,6 @@ private:
     std::unique_ptr<MultipleFileWriter> writer;
     const DataLakeStorageSettings & data_lake_settings;
     std::function<void(const std::string &)> new_file_path_callback;
-
-    Int64 original_schema_id;
-    Int64 partition_spec_id;
-    Row partition_values;
-    std::vector<String> partition_columns;
-    std::vector<DataTypePtr> partition_types;
 };
 
 }

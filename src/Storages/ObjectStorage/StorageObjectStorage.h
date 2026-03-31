@@ -86,8 +86,7 @@ public:
         std::size_t /* max_rows_per_file */,
         const std::optional<std::string> & /* iceberg_metadata_json_string */,
         const std::optional<FormatSettings> & /* format_settings_ */,
-        ContextPtr /* context */,
-        const std::optional<std::string> & /* partition_values_json */ = std::nullopt) override;
+        ContextPtr /* context */) override;
 
     void commitExportPartitionTransaction(
         const String & transaction_id,

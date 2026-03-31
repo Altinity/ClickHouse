@@ -590,8 +590,7 @@ SinkToStoragePtr StorageObjectStorage::import(
     std::size_t max_rows_per_file,
     const std::optional<std::string> & iceberg_metadata_json_string,
     const std::optional<FormatSettings> & format_settings_,
-    ContextPtr local_context,
-    const std::optional<std::string> & partition_values_json)
+    ContextPtr local_context)
 {
     /// We did configuration->update() in constructor,
     /// so in case of table function there is no need to do the same here again.
@@ -610,7 +609,6 @@ SinkToStoragePtr StorageObjectStorage::import(
             new_file_path_callback,
             std::make_shared<const Block>(getInMemoryMetadataPtr()->getSampleBlock()),
             *iceberg_metadata_json_string,
-            partition_values_json,
             format_settings_ ? format_settings_ : format_settings,
             local_context);
     }

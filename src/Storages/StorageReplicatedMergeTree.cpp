@@ -8283,16 +8283,26 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
         /// the same order.
         if (current_schema_json && partition_spec_json)
         {
-            /// Build column_name → Iceberg source-id from the destination schema.
+            /// Build column_name → Iceberg source-id from the destination schema (and the inverse).
             std::unordered_map<String, Int32> column_name_to_source_id;
+            std::unordered_map<Int32, String> source_id_to_column_name;
             {
                 const auto schema_fields = current_schema_json->getArray(Iceberg::f_fields);
                 for (size_t i = 0; i < schema_fields->size(); ++i)
                 {
                     auto f = schema_fields->getObject(static_cast<UInt32>(i));
-                    column_name_to_source_id[f->getValue<String>(Iceberg::f_name)] = f->getValue<Int32>(Iceberg::f_id);
+                    const auto col_name  = f->getValue<String>(Iceberg::f_name);
+                    const auto source_id = f->getValue<Int32>(Iceberg::f_id);
+                    column_name_to_source_id[col_name]  = source_id;
+                    source_id_to_column_name[source_id] = col_name;
                 }
             }
+
+            auto source_id_to_name = [&](Int32 id) -> String
+            {
+                auto it = source_id_to_column_name.find(id);
+                return it != source_id_to_column_name.end() ? it->second : fmt::format("<unknown source_id={}>", id);
+            };
 
             /// Convert the MergeTree PARTITION BY AST into the equivalent Iceberg spec.
             Poco::JSON::Array::Ptr expected_fields;
@@ -8332,10 +8342,11 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
                 if (expected_source_id != actual_source_id || expected_transform != actual_transform)
                     throw Exception(ErrorCodes::BAD_ARGUMENTS,
                         "Cannot export partition to Iceberg table: partition field {} mismatch. "
-                        "Source MergeTree maps to Iceberg source_id={} transform='{}', "
-                        "but destination Iceberg has source_id={} transform='{}'.",
-                        i, expected_source_id, expected_transform,
-                        actual_source_id, actual_transform);
+                        "Source MergeTree maps to column '{}' (source_id={}) transform='{}', "
+                        "but destination Iceberg has column '{}' (source_id={}) transform='{}'.",
+                        i,
+                        source_id_to_name(expected_source_id), expected_source_id, expected_transform,
+                        source_id_to_name(actual_source_id),   actual_source_id,   actual_transform);
             }
         }
 

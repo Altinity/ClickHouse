@@ -197,8 +197,7 @@ bool ExportPartTask::executeStep()
             manifest.settings[Setting::export_merge_tree_part_max_rows_per_file],
             manifest.iceberg_metadata_json,
             getFormatSettings(local_context),
-            local_context,
-            manifest.partition_values_json.empty() ? std::optional<std::string>{} : std::optional<std::string>{manifest.partition_values_json});
+            local_context);
 
         bool apply_deleted_mask = true;
         bool read_with_direct_io = local_context->getSettingsRef()[Setting::min_bytes_to_use_direct_io] > manifest.data_part->getBytesOnDisk();
