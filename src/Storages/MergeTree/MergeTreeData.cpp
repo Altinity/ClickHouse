@@ -6565,7 +6565,7 @@ void MergeTreeData::exportPartToTable(
     if (source_columns.getReadable().sizeOfDifference(destination_columns.getInsertable()))
         throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS, "Tables have different structure");
 
-    if (!dest_storage->ignorePartitionCompatibilityForImport())
+    if (!dest_storage->isDataLake())
     {
         if (query_to_string(source_metadata_ptr->getPartitionKeyAST()) != query_to_string(destination_metadata_ptr->getPartitionKeyAST()))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");

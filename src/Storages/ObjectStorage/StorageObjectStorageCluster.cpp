@@ -1090,13 +1090,6 @@ SinkToStoragePtr StorageObjectStorageCluster::import(
         partition_values_json);
 }
 
-bool StorageObjectStorageCluster::ignorePartitionCompatibilityForImport() const
-{
-    if (pure_storage)
-        return pure_storage->ignorePartitionCompatibilityForImport();
-    return IStorageCluster::ignorePartitionCompatibilityForImport();
-}
-
 bool StorageObjectStorageCluster::isDataLake() const
 {
     if (pure_storage)

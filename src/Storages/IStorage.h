@@ -217,8 +217,6 @@ public:
         return metadata.get();
     }
 
-    virtual bool ignorePartitionCompatibilityForImport() const { return false; }
-
     /// Same as getInMemoryMetadataPtr() but may return nullopt in some specific engines like Alias
     virtual std::optional<StorageMetadataPtr> tryGetInMemoryMetadataPtr() const { return getInMemoryMetadataPtr(); }
 

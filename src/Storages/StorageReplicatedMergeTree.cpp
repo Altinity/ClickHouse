@@ -68,6 +68,7 @@
 #include <Storages/MergeTree/ReplicatedMergeTreeTableMetadata.h>
 #include <Storages/MergeTree/ZeroCopyLock.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Poco/JSON/Stringifier.h>
 #include <Storages/PartitionCommands.h>
 #include <Storages/StorageReplicatedMergeTree.h>
@@ -8081,11 +8082,12 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     if (src_snapshot->getColumns().getReadable().sizeOfDifference(destination_snapshot->getColumns().getInsertable()))
         throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS, "Tables have different structure");
 
-    if (!dest_storage->ignorePartitionCompatibilityForImport())
+    if (!dest_storage->isDataLake())
     {
         if (query_to_string(src_snapshot->getPartitionKeyAST()) != query_to_string(destination_snapshot->getPartitionKeyAST()))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
     }
+    
 
     zkutil::ZooKeeperPtr zookeeper = getZooKeeperAndAssertNotReadonly();
 
@@ -8241,43 +8243,107 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
         metadata_object->stringify(oss);
         manifest.iceberg_metadata_json = oss.str();
 
+        /// Extract the current Iceberg schema and partition spec — needed for both the
+        /// compatibility check below and the partition-values computation further down.
+        const auto original_schema_id = metadata_object->getValue<Int64>(Iceberg::f_current_schema_id);
+        const auto partition_spec_id   = metadata_object->getValue<Int64>(Iceberg::f_default_spec_id);
+
+        Poco::JSON::Object::Ptr current_schema_json;
+        {
+            const auto schemas = metadata_object->getArray(Iceberg::f_schemas);
+            for (size_t i = 0; i < schemas->size(); ++i)
+            {
+                auto s = schemas->getObject(static_cast<UInt32>(i));
+                if (s->getValue<Int32>(Iceberg::f_schema_id) == static_cast<Int32>(original_schema_id))
+                {
+                    current_schema_json = s;
+                    break;
+                }
+            }
+        }
+
+        Poco::JSON::Object::Ptr partition_spec_json;
+        {
+            const auto specs = metadata_object->getArray(Iceberg::f_partition_specs);
+            for (size_t i = 0; i < specs->size(); ++i)
+            {
+                auto s = specs->getObject(static_cast<UInt32>(i));
+                if (s->getValue<Int64>(Iceberg::f_spec_id) == partition_spec_id)
+                {
+                    partition_spec_json = s;
+                    break;
+                }
+            }
+        }
+
+#if USE_AVRO
+        /// Verify that the source MergeTree partition key is compatible with the destination
+        /// Iceberg partition spec.  Export does not repartition data, so the two must agree
+        /// on every field: same source column (by Iceberg field-id) and same transform, in
+        /// the same order.
+        if (current_schema_json && partition_spec_json)
+        {
+            /// Build column_name → Iceberg source-id from the destination schema.
+            std::unordered_map<String, Int32> column_name_to_source_id;
+            {
+                const auto schema_fields = current_schema_json->getArray(Iceberg::f_fields);
+                for (size_t i = 0; i < schema_fields->size(); ++i)
+                {
+                    auto f = schema_fields->getObject(static_cast<UInt32>(i));
+                    column_name_to_source_id[f->getValue<String>(Iceberg::f_name)] = f->getValue<Int32>(Iceberg::f_id);
+                }
+            }
+
+            /// Convert the MergeTree PARTITION BY AST into the equivalent Iceberg spec.
+            Poco::JSON::Array::Ptr expected_fields;
+            try
+            {
+                const auto expected_spec = Iceberg::getPartitionSpec(
+                    src_snapshot->getPartitionKeyAST(), column_name_to_source_id).first;
+                expected_fields = expected_spec->getArray(Iceberg::f_fields);
+            }
+            catch (const Exception & e)
+            {
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export partition to Iceberg table: the source MergeTree partition "
+                    "key cannot be represented as an Iceberg partition spec: {}", e.message());
+            }
+
+            const auto actual_fields = partition_spec_json->getArray(Iceberg::f_fields);
+            const size_t expected_size = expected_fields ? expected_fields->size() : 0;
+            const size_t actual_size   = actual_fields   ? actual_fields->size()   : 0;
+
+            if (expected_size != actual_size)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export partition to Iceberg table: partition scheme mismatch. "
+                    "Source MergeTree has {} partition field(s), destination Iceberg table has {}.",
+                    expected_size, actual_size);
+
+            for (size_t i = 0; i < expected_size; ++i)
+            {
+                auto ef = expected_fields->getObject(static_cast<UInt32>(i));
+                auto af = actual_fields->getObject(static_cast<UInt32>(i));
+
+                const auto expected_source_id = ef->getValue<Int32>(Iceberg::f_source_id);
+                const auto actual_source_id   = af->getValue<Int32>(Iceberg::f_source_id);
+                const auto expected_transform = ef->getValue<String>(Iceberg::f_transform);
+                const auto actual_transform   = af->getValue<String>(Iceberg::f_transform);
+
+                if (expected_source_id != actual_source_id || expected_transform != actual_transform)
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "Cannot export partition to Iceberg table: partition field {} mismatch. "
+                        "Source MergeTree maps to Iceberg source_id={} transform='{}', "
+                        "but destination Iceberg has source_id={} transform='{}'.",
+                        i, expected_source_id, expected_transform,
+                        actual_source_id, actual_transform);
+            }
+        }
+
         /// Compute Iceberg partition values from the first source part.
         /// All parts in the same MergeTree partition share identical partition key values,
         /// so one representative part is sufficient.
         if (src_snapshot->hasPartitionKey() && parts[0]->minmax_idx)
         {
-            const auto original_schema_id = metadata_object->getValue<Int64>(Iceberg::f_current_schema_id);
-            const auto partition_spec_id   = metadata_object->getValue<Int64>(Iceberg::f_default_spec_id);
-
-            Poco::JSON::Object::Ptr current_schema_json;
-            {
-                const auto schemas = metadata_object->getArray(Iceberg::f_schemas);
-                for (size_t i = 0; i < schemas->size(); ++i)
-                {
-                    auto s = schemas->getObject(static_cast<UInt32>(i));
-                    if (s->getValue<Int32>(Iceberg::f_schema_id) == static_cast<Int32>(original_schema_id))
-                    {
-                        current_schema_json = s;
-                        break;
-                    }
-                }
-            }
-
-            Poco::JSON::Object::Ptr partition_spec_json;
-            {
-                const auto specs = metadata_object->getArray(Iceberg::f_partition_specs);
-                for (size_t i = 0; i < specs->size(); ++i)
-                {
-                    auto s = specs->getObject(static_cast<UInt32>(i));
-                    if (s->getValue<Int64>(Iceberg::f_spec_id) == partition_spec_id)
-                    {
-                        partition_spec_json = s;
-                        break;
-                    }
-                }
-            }
-
-#if USE_AVRO
             if (current_schema_json && partition_spec_json)
             {
                 auto spec_fields = partition_spec_json->getArray(Iceberg::f_fields);
@@ -8311,8 +8377,8 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
                     manifest.partition_values_json = pv_oss.str();
                 }
             }
-#endif
         }
+#endif
     }
 
     ops.emplace_back(zkutil::makeCreateRequest(

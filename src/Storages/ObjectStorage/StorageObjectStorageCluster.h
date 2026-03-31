@@ -67,8 +67,6 @@ public:
         const std::optional<std::string> & partition_values_json = std::nullopt) override;
 
 
-    bool ignorePartitionCompatibilityForImport() const override;
-
     bool isDataLake() const override;
 
     void commitExportPartitionTransaction(

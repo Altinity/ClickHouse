@@ -75,9 +75,6 @@ public:
         ContextPtr context,
         bool async_insert) override;
 
-
-    bool ignorePartitionCompatibilityForImport() const override;
-
     bool supportsImport(ContextPtr) const override;
 
     SinkToStoragePtr import(

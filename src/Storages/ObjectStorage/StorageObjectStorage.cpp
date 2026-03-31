@@ -581,12 +581,6 @@ bool StorageObjectStorage::supportsImport(ContextPtr local_context) const
     return configuration->getPartitionStrategyType() == PartitionStrategyFactory::StrategyType::HIVE;
 }
 
-bool StorageObjectStorage::ignorePartitionCompatibilityForImport() const
-{
-    /// todo arthur maybe it should be isIceberg, but that's ok for now
-    return isDataLake();
-}
-
 SinkToStoragePtr StorageObjectStorage::import(
     const std::string & file_name,
     Block & block_with_partition_values,
@@ -614,7 +608,7 @@ SinkToStoragePtr StorageObjectStorage::import(
         return configuration->getExternalMetadata()->import(
             catalog,
             new_file_path_callback,
-            std::make_shared<const Block>(block_with_partition_values),
+            std::make_shared<const Block>(getInMemoryMetadataPtr()->getSampleBlock()),
             *iceberg_metadata_json_string,
             partition_values_json,
             format_settings_ ? format_settings_ : format_settings,
