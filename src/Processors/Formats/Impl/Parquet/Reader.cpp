@@ -2064,7 +2064,7 @@ void Reader::applyPrewhere(RowSubgroup & row_subgroup, const RowGroup & row_grou
             const ColumnWithTypeAndName & col = extended_sample_block.getByPosition(idx_in_output_block);
             block.insert({getOrFormOutputColumn(row_subgroup, idx_in_output_block), col.type, col.name});
         }
-        addDummyColumnWithRowCount(block, row_subgroup.filter.rows_total);
+        addDummyColumnWithRowCount(block, row_subgroup.filter.rows_pass);
 
         step.actions.execute(block);
 
