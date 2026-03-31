@@ -6519,7 +6519,7 @@ void MergeTreeData::exportPartToTable(
     std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback,
     const String & partition_values_json)
 {
-    if (!dest_storage->supportsImport())
+    if (!dest_storage->supportsImport(query_context))
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Destination storage {} does not support MergeTree parts or uses unsupported partitioning", dest_storage->getName());
 
     std::string iceberg_metadata_json;

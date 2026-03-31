@@ -78,7 +78,7 @@ public:
 
     bool ignorePartitionCompatibilityForImport() const override;
 
-    bool supportsImport() const override;
+    bool supportsImport(ContextPtr) const override;
 
     SinkToStoragePtr import(
         const std::string & /* file_name */,

@@ -480,7 +480,7 @@ public:
         ContextPtr /*context*/,
         bool /*async_insert*/);
 
-    virtual bool supportsImport() const
+    virtual bool supportsImport(ContextPtr) const
     {
       return false;
     }

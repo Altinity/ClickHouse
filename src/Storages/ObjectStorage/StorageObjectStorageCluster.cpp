@@ -1046,11 +1046,11 @@ bool StorageObjectStorageCluster::parallelizeOutputAfterReading(ContextPtr conte
     return IStorageCluster::parallelizeOutputAfterReading(context);
 }
 
-bool StorageObjectStorageCluster::supportsImport() const
+bool StorageObjectStorageCluster::supportsImport(ContextPtr context) const
 {
     if (pure_storage)
-        return pure_storage->supportsImport();
-    return IStorageCluster::supportsImport();
+        return pure_storage->supportsImport(context);
+    return IStorageCluster::supportsImport(context);
 }
 
 SinkToStoragePtr StorageObjectStorageCluster::import(

@@ -555,11 +555,21 @@ bool StorageObjectStorage::optimize(
     return configuration->optimize(metadata_snapshot, context, format_settings);
 }
 
-bool StorageObjectStorage::supportsImport() const
+bool StorageObjectStorage::supportsImport(ContextPtr local_context) const
 {
     if (isDataLake())
     {
-        return configuration->getExternalMetadata()->supportsImport();
+        /// We did configuration->update() in constructor,
+        /// so in case of table function there is no need to do the same here again.
+        if (update_configuration_on_read_write)
+        {
+            configuration->update(
+                object_storage,
+                local_context,
+                /* if_not_updated_before */ false);
+        }
+
+        return configuration->getExternalMetadata()->supportsImport(local_context);
     }
 
     if (!configuration->getPartitionStrategy())
@@ -589,6 +599,16 @@ SinkToStoragePtr StorageObjectStorage::import(
     ContextPtr local_context,
     const std::optional<std::string> & partition_values_json)
 {
+    /// We did configuration->update() in constructor,
+    /// so in case of table function there is no need to do the same here again.
+    if (update_configuration_on_read_write)
+    {
+        configuration->update(
+            object_storage,
+            local_context,
+            /* if_not_updated_before */ false);
+    }
+
     if (isDataLake())
     {
         /// Parse the Iceberg metadata to locate the current schema and the default partition spec.

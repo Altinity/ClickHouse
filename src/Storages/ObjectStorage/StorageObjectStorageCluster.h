@@ -52,7 +52,7 @@ public:
         const ASTInsertQuery & query,
         ContextPtr context) override;
 
-    bool supportsImport() const override;
+    bool supportsImport(ContextPtr context) const override;
 
     SinkToStoragePtr import(
         const std::string & file_name,

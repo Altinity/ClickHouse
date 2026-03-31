@@ -174,7 +174,7 @@ public:
         throwNotImplemented("write");
     }
 
-    virtual bool supportsImport() const
+    virtual bool supportsImport(ContextPtr) const
     {
         return false;
     }

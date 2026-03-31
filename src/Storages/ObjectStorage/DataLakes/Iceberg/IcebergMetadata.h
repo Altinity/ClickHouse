@@ -108,7 +108,7 @@ public:
         ContextPtr context,
         std::shared_ptr<DataLake::ICatalog> catalog) override;
 
-    bool supportsImport() const override { return true; }
+    bool supportsImport(ContextPtr) const override { return true; }
 
     SinkToStoragePtr import(
         std::shared_ptr<DataLake::ICatalog> catalog,
@@ -144,22 +144,6 @@ public:
         const std::vector<String> & data_file_paths,
         StorageObjectStorageConfigurationPtr configuration,
         ContextPtr context) override;
-
-    bool commitImportPartitionTransactionImpl(
-        FileNamesGenerator & filename_generator,
-        Poco::JSON::Object::Ptr & metadata,
-        Int64 original_schema_id,
-        Int64 partition_spec_id,
-        const std::vector<Field> & partition_values,
-        const std::vector<String> & partition_columns,
-        const std::vector<DataTypePtr> & partition_types,
-        SharedHeader sample_block,
-        const std::vector<String> & data_file_paths,
-        std::shared_ptr<DataLake::ICatalog> catalog,
-        const StorageID & table_id,
-        const String & blob_storage_type_name,
-        const String & blob_storage_namespace_name,
-        ContextPtr context);
 
     CompressionMethod getCompressionMethod() const { return persistent_components.metadata_compression_method; }
 
@@ -219,6 +203,22 @@ private:
 
     std::optional<String> getPartitionKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
     KeyDescription getSortingKey(ContextPtr local_context, Iceberg::TableStateSnapshot actual_table_state_snapshot) const;
+
+    bool commitImportPartitionTransactionImpl(
+        FileNamesGenerator & filename_generator,
+        Poco::JSON::Object::Ptr & metadata,
+        Int64 original_schema_id,
+        Int64 partition_spec_id,
+        const std::vector<Field> & partition_values,
+        const std::vector<String> & partition_columns,
+        const std::vector<DataTypePtr> & partition_types,
+        SharedHeader sample_block,
+        const std::vector<String> & data_file_paths,
+        std::shared_ptr<DataLake::ICatalog> catalog,
+        const StorageID & table_id,
+        const String & blob_storage_type_name,
+        const String & blob_storage_namespace_name,
+        ContextPtr context);
 
     LoggerPtr log;
     const ObjectStoragePtr object_storage;

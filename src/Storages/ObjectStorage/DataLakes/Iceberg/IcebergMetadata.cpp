@@ -1309,7 +1309,7 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
                 data_lake_settings,
                 persistent_components.metadata_cache,
                 context,
-                getLogger("IcebergWrites").get(),
+                getLogger("IcebergMetadata").get(),
                 persistent_components.table_uuid);
 
             LOG_DEBUG(log, "Rereading metadata file {} with version {}", metadata_path, last_version);
@@ -1322,7 +1322,7 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
                 object_storage,
                 persistent_components.metadata_cache,
                 context,
-                getLogger("IcebergWrites"),
+                getLogger("IcebergMetadata"),
                 compression_method,
                 persistent_components.table_uuid);
 

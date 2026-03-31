@@ -4450,7 +4450,14 @@ void StorageReplicatedMergeTree::selectPartsToExport()
 {
     try
     {
-        export_merge_tree_partition_task_scheduler->run();
+        if (parts_mover.moves_blocker.isCancelled())
+        {
+            LOG_INFO(log, "Export partition select task: Moves are blocked, skipping");
+        }
+        else
+        {
+            export_merge_tree_partition_task_scheduler->run();
+        }
     }
     catch (...)
     {
@@ -8058,7 +8065,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Exporting to the same table is not allowed");
     }
 
-    if (!dest_storage->supportsImport())
+    if (!dest_storage->supportsImport(query_context))
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Destination storage {} does not support MergeTree parts or uses unsupported partitioning", dest_storage->getName());
 
     auto query_to_string = [] (const ASTPtr & ast)
