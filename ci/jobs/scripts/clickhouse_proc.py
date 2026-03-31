@@ -791,7 +791,7 @@ clickhouse-client --query "SELECT count() FROM test.visits"
             reader_thread.join()
             return process.returncode == 0
 
-    def terminate(self):
+    def terminate(self, force=False):
         # NOTE (strtgbb): Log tables are disabled, we don't use them
         # if self.minio_proc:
         #     # remove the webhook so it doesn't spam with errors once we stop ClickHouse
