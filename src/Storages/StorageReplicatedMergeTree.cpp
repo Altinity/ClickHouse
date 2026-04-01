@@ -8363,45 +8363,27 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
             }
         }
 
-        /// Compute Iceberg partition values from the first source part.
-        /// All parts in the same MergeTree partition share identical partition key values,
-        /// so one representative part is sufficient.
-        if (src_snapshot->hasPartitionKey() && parts[0]->minmax_idx)
+        /// Serialize Iceberg partition values from the stored partition tuple of the first part.
+        /// All parts in the same MergeTree partition share identical partition key values.
+        /// partition.value already holds post-transform results: MergeTree evaluates the same
+        /// functions that Iceberg partition transforms map to (guaranteed by the compatibility
+        /// check above), so no further function execution is needed here.
+        if (src_snapshot->hasPartitionKey() && !parts[0]->partition.value.empty())
         {
-            if (current_schema_json && partition_spec_json)
+            Poco::JSON::Array::Ptr pv_arr = new Poco::JSON::Array();
+            for (const Field & field : parts[0]->partition.value)
             {
-                auto spec_fields = partition_spec_json->getArray(Iceberg::f_fields);
-                if (spec_fields && spec_fields->size() > 0)
-                {
-                    auto sample_block = std::make_shared<const Block>(dest_storage->getInMemoryMetadataPtr()->getSampleBlock());
-                    ChunkPartitioner partitioner(spec_fields, current_schema_json, query_context, sample_block);
-
-                    Block minmax_block = parts[0]->minmax_idx->getBlock(*this);
-                    Block single_row_block;
-                    for (size_t i = 0; i < minmax_block.columns(); ++i)
-                    {
-                        const auto & col = minmax_block.getByPosition(i);
-                        single_row_block.insert({col.column->cut(0, 1), col.type, col.name});
-                    }
-
-                    const Row partition_values = partitioner.computePartitionKey(single_row_block);
-
-                    Poco::JSON::Array::Ptr pv_arr = new Poco::JSON::Array();
-                    for (const auto & field : partition_values)
-                    {
-                        if (field.getType() == Field::Types::String)
-                            pv_arr->add(field.safeGet<String>());
-                        else if (field.getType() == Field::Types::UInt64)
-                            pv_arr->add(field.safeGet<UInt64>());
-                        else
-                            pv_arr->add(field.safeGet<Int64>());
-                    }
-                    std::ostringstream pv_oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-                    pv_oss.exceptions(std::ios::failbit);
-                    Poco::JSON::Stringifier::stringify(*pv_arr, pv_oss);
-                    manifest.partition_values_json = pv_oss.str();
-                }
+                if (field.getType() == Field::Types::String)
+                    pv_arr->add(field.safeGet<String>());
+                else if (field.getType() == Field::Types::UInt64)
+                    pv_arr->add(field.safeGet<UInt64>());
+                else
+                    pv_arr->add(field.safeGet<Int64>());
             }
+            std::ostringstream pv_oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+            pv_oss.exceptions(std::ios::failbit);
+            Poco::JSON::Stringifier::stringify(*pv_arr, pv_oss);
+            manifest.partition_values_json = pv_oss.str();
         }
 #endif
     }
