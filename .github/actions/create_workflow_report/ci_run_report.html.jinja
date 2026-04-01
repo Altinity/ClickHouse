@@ -180,9 +180,6 @@
 
   {%- if pr_number == 0 -%}
   <h2 id="prs-in-release">PRs in Release</h2>
-  {% if prs_in_release_missing_verification %}
-  <p style="font-weight: bold;color: red;">Some PRs are missing verification.</p>
-  {% endif %}
   {{ prs_in_release_html }}
   {%- endif %}
 

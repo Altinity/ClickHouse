@@ -33,7 +33,6 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
 
 CVE_SEVERITY_ORDER = {"critical": 1, "high": 2, "medium": 3, "low": 4, "negligible": 5}
 
-PR_LABELS_VERIFIED = {"verified", "verified-with-issue"}
 
 def _is_clickhouse_memory_limit_error(exc: BaseException) -> bool:
     if isinstance(exc, ServerException) and getattr(exc, "code", None) == 241:
@@ -174,9 +173,9 @@ def get_run_details(run_id: str) -> dict:
     return response.json()
 
 
-def _enrich_prs_in_release_merge_prs(df: pd.DataFrame, repo: str) -> tuple[pd.DataFrame, bool]:
+def _enrich_prs_in_release_merge_prs(df: pd.DataFrame, repo: str) -> pd.DataFrame:
     if len(df) == 0:
-        return pd.DataFrame(columns=["pr_number", "pr_name", "pr_labels"]), False
+        return pd.DataFrame(columns=["pr_number", "pr_name", "pr_labels"])
     if not GITHUB_TOKEN:
         raise Exception("GITHUB_TOKEN is required to fetch PR titles and labels")
     headers = {
@@ -184,7 +183,6 @@ def _enrich_prs_in_release_merge_prs(df: pd.DataFrame, repo: str) -> tuple[pd.Da
         "Accept": "application/vnd.github.v3+json",
     }
     rows = []
-    missing_verification = False
     for pr_number in df["pr_number"].tolist():
         response = requests.get(
             f"https://api.github.com/repos/{repo}/pulls/{pr_number}",
@@ -196,8 +194,6 @@ def _enrich_prs_in_release_merge_prs(df: pd.DataFrame, repo: str) -> tuple[pd.Da
             )
         pr = response.json()
         label_names = [l["name"] for l in pr.get("labels", [])]
-        if not PR_LABELS_VERIFIED.intersection(label_names):
-            missing_verification = True
         rows.append(
             {
                 "pr_number": pr_number,
@@ -205,7 +201,7 @@ def _enrich_prs_in_release_merge_prs(df: pd.DataFrame, repo: str) -> tuple[pd.Da
                 "pr_labels": ", ".join(sorted(label_names)),
             }
         )
-    return pd.DataFrame(rows), missing_verification
+    return pd.DataFrame(rows)
 
 
 def _git_rev_parse(ref: str, cwd: str | None) -> str | None:
@@ -337,13 +333,12 @@ def get_prs_in_release_dataframe(
     *,
     repo: str = GITHUB_REPO,
     cwd: str,
-) -> tuple[pd.DataFrame, bool]:
+) -> pd.DataFrame:
     f"""
     PRs merged into branch_ref that belong in the next release notes: after the latest GitHub
     Release tag on this history, or after the oldest rebase bootstrap if no such tag exists.
     Only merge commits whose subject has from <repo_owner>/ (e.g. from Altinity/) are included.
     Columns: pr_number, pr_name, labels. Omits PRs labeled cicd.
-    Second value is True if any listed PR lacks verified labels.
     """
     branch_sha = _git_rev_parse(branch_ref, cwd)
     if not branch_sha:
@@ -815,7 +810,7 @@ def url_to_html_link(url: str) -> str:
 def format_pr_labels_with_verification(labels: str) -> str:
     """Format the PR labels with verification."""
     labels_list = labels.split(", ")
-    if PR_LABELS_VERIFIED.intersection(labels_list):
+    if "verified" in labels_list:
         return labels
     else:
         return f'<span style="font-weight: bold; color: red;">{labels} (missing verification)</span>'
@@ -1051,7 +1046,6 @@ def create_workflow_report(
         settings={"use_numpy": True},
     )
 
-    prs_in_release_missing_verification = False
     results_dfs = {
         "prs_in_release": [],
         "job_statuses": get_commit_statuses(commit_sha),
@@ -1065,9 +1059,7 @@ def create_workflow_report(
 
     if pr_number == 0 and not mark_preview:
         try:
-            prs_df, prs_in_release_missing_verification = get_prs_in_release_dataframe(
-                branch_name, cwd=os.getcwd()
-            )
+            prs_df = get_prs_in_release_dataframe(branch_name, cwd=os.getcwd())
             results_dfs["prs_in_release"] = prs_df
         except Exception as e:
             print(f"Error in get_prs_in_release_dataframe: {e}")
@@ -1141,7 +1133,6 @@ def create_workflow_report(
         "base_sha": "" if pr_number == 0 else pr_info.get("base", {}).get("sha"),
         "date": f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
         "is_preview": mark_preview,
-        "prs_in_release_missing_verification": prs_in_release_missing_verification,
         "counts": {
             "jobs_status": f"{sum(results_dfs['job_statuses']['job_status'].value_counts().get(x, 0) for x in ('failure', 'error'))} fail/error",
             "checks_errors": len(results_dfs["checks_errors"]),
