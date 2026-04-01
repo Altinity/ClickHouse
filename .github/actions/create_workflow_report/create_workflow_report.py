@@ -33,7 +33,7 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
 
 CVE_SEVERITY_ORDER = {"critical": 1, "high": 2, "medium": 3, "low": 4, "negligible": 5}
 
-PR_LABELS_VERIFIED = {"verified", "verified-with-issue", "no-verification-needed"}
+PR_LABELS_VERIFIED = {"verified", "verified-with-issue"}
 
 def _is_clickhouse_memory_limit_error(exc: BaseException) -> bool:
     if isinstance(exc, ServerException) and getattr(exc, "code", None) == 241:
@@ -196,8 +196,6 @@ def _enrich_prs_in_release_merge_prs(df: pd.DataFrame, repo: str) -> tuple[pd.Da
             )
         pr = response.json()
         label_names = [l["name"] for l in pr.get("labels", [])]
-        if "cicd" in label_names:
-            continue
         if not PR_LABELS_VERIFIED.intersection(label_names):
             missing_verification = True
         rows.append(
