@@ -5164,6 +5164,14 @@ Possible values:
 - 0 - Disabled
 - 1 - Enabled
 )", 0) \
+    DECLARE(Bool, use_parquet_metadata_cache, true, R"(
+If turned on, parquet format may utilize the parquet metadata cache.
+
+Possible values:
+
+- 0 - Disabled
+- 1 - Enabled
+)", 0) \
     DECLARE(UInt64, iceberg_metadata_staleness_ms, 0, R"(
 If non-zero, skip fetching iceberg metadata from remote catalog if there is a cached metadata snapshot, more recent than the given staleness window. Zero means to always fetch the latest metadata version from the remote catalog. Setting this a non-zero trades staleness to a lower latency of read operations.
 )", 0) \
@@ -7658,6 +7666,9 @@ Rewrite expressions like 'x IN subquery' to JOIN. This might be useful for optim
 )", EXPERIMENTAL) \
     DECLARE(Bool, object_storage_remote_initiator, false, R"(
 Execute request to object storage as remote on one of object_storage_cluster nodes.
+)", EXPERIMENTAL) \
+    DECLARE(String, object_storage_remote_initiator_cluster, "", R"(
+Cluster to choose remote initiator, when `object_storage_remote_initiator` is true. When empty, `object_storage_cluster` is used.
 )", EXPERIMENTAL) \
     DECLARE(Bool, allow_experimental_iceberg_read_optimization, true, R"(
 Allow Iceberg read optimization based on Iceberg metadata.

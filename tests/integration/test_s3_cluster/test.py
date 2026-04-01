@@ -116,7 +116,7 @@ def started_cluster():
         )
         cluster.add_instance(
             "c2.s0_0_0",
-            main_configs=["configs/cluster.xml", "configs/named_collections.xml"],
+            main_configs=["configs/cluster.xml", "configs/named_collections.xml", "configs/hidden_clusters.xml"],
             user_configs=["configs/users.xml"],
             macros={"replica": "replica1", "shard": "shard1"},
             with_zookeeper=True,
@@ -124,7 +124,7 @@ def started_cluster():
         )
         cluster.add_instance(
             "c2.s0_0_1",
-            main_configs=["configs/cluster.xml", "configs/named_collections.xml"],
+            main_configs=["configs/cluster.xml", "configs/named_collections.xml", "configs/hidden_clusters.xml"],
             user_configs=["configs/users.xml"],
             macros={"replica": "replica2", "shard": "shard1"},
             with_zookeeper=True,
@@ -951,7 +951,7 @@ def test_hive_partitioning(started_cluster, allow_experimental_analyzer):
             FROM s3('http://minio1:9001/root/data/hive/key=**.parquet', 'minio', '{minio_secret_key}', 'Parquet', 'key Int32, value Int32')
             WHERE key <= 2
             FORMAT TSV
-            SETTINGS enable_filesystem_cache = 0, use_query_cache = 0, use_cache_for_count_from_files = 0, use_hive_partitioning = 0
+            SETTINGS enable_filesystem_cache = 0, use_query_cache = 0, use_cache_for_count_from_files = 0, use_hive_partitioning = 0, use_parquet_metadata_cache = 0
         """,
         query_id=query_id_full,
     )
@@ -965,7 +965,7 @@ def test_hive_partitioning(started_cluster, allow_experimental_analyzer):
             FROM s3('http://minio1:9001/root/data/hive/key=**.parquet', 'minio', '{minio_secret_key}', 'Parquet', 'key Int32, value Int32')
             WHERE key <= 2
             FORMAT TSV
-            SETTINGS enable_filesystem_cache = 0, use_query_cache = 0, use_cache_for_count_from_files = 0, use_hive_partitioning = 1
+            SETTINGS enable_filesystem_cache = 0, use_query_cache = 0, use_cache_for_count_from_files = 0, use_hive_partitioning = 1, use_parquet_metadata_cache = 0
         """,
         query_id=query_id_optimized,
     )
@@ -979,7 +979,7 @@ def test_hive_partitioning(started_cluster, allow_experimental_analyzer):
             FROM s3Cluster(cluster_simple, 'http://minio1:9001/root/data/hive/key=**.parquet', 'minio', '{minio_secret_key}', 'Parquet', 'key Int32, value Int32')
             WHERE key <= 2
             FORMAT TSV
-            SETTINGS enable_filesystem_cache = 0, use_query_cache = 0, use_cache_for_count_from_files = 0, use_hive_partitioning = 0
+            SETTINGS enable_filesystem_cache = 0, use_query_cache = 0, use_cache_for_count_from_files = 0, use_hive_partitioning = 0, use_parquet_metadata_cache = 0
         """,
         query_id=query_id_cluster_full,
     )
@@ -993,7 +993,7 @@ def test_hive_partitioning(started_cluster, allow_experimental_analyzer):
             FROM s3Cluster(cluster_simple, 'http://minio1:9001/root/data/hive/key=**.parquet', 'minio', '{minio_secret_key}', 'Parquet', 'key Int32, value Int32')
             WHERE key <= 2
             FORMAT TSV
-            SETTINGS enable_filesystem_cache = 0, use_query_cache = 0, use_cache_for_count_from_files = 0, use_hive_partitioning = 1
+            SETTINGS enable_filesystem_cache = 0, use_query_cache = 0, use_cache_for_count_from_files = 0, use_hive_partitioning = 1, use_parquet_metadata_cache = 0
         """,
         query_id=query_id_cluster_optimized,
     )
@@ -1218,6 +1218,7 @@ def test_joins(started_cluster):
 def test_object_storage_remote_initiator(started_cluster):
     node = started_cluster.instances["s0_0_0"]
 
+    # Simple cluster
     query_id = uuid.uuid4().hex
     result = node.query(
         f"""
@@ -1245,6 +1246,7 @@ def test_object_storage_remote_initiator(started_cluster):
     # initial node + describe table + remote initiator + 2 subqueries on replicas
     assert queries == ["5"]
 
+    # Cluster with dots in the host names
     query_id = uuid.uuid4().hex
     result = node.query(
         f"""
@@ -1271,3 +1273,122 @@ def test_object_storage_remote_initiator(started_cluster):
 
     # initial node + describe table + remote initiator + 2 subqueries on replicas
     assert queries == ["5"]
+
+    users = node.query(
+        f"""
+        SELECT DISTINCT hostname, user
+            FROM clusterAllReplicas('cluster_all', system.query_log)
+            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
+            ORDER BY ALL
+            FORMAT TSV
+        """
+    ).splitlines()
+
+    assert users == ["c2.s0_0_0\tdefault",
+                     "c2.s0_0_1\tdefault",
+                     "s0_0_0\tdefault"]
+
+    # Cluster with user and password
+    query_id = uuid.uuid4().hex
+    result = node.query(
+        f"""
+        SELECT * from s3Cluster(
+            'cluster_with_username_and_password',
+            'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') ORDER BY (name, value, polygon)
+        SETTINGS object_storage_remote_initiator=1
+        """,
+        query_id = query_id,
+    )
+
+    assert result is not None
+
+    node.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster_all'")
+    queries = node.query(
+        f"""
+        SELECT count()
+            FROM clusterAllReplicas('cluster_all', system.query_log)
+            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
+            FORMAT TSV
+        """
+    ).splitlines()
+
+    # initial node + describe table + remote initiator + 2 subqueries on replicas
+    assert queries == ["5"]
+
+    users = node.query(
+        f"""
+        SELECT DISTINCT hostname, user
+            FROM clusterAllReplicas('cluster_all', system.query_log)
+            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
+            ORDER BY ALL
+            FORMAT TSV
+        """
+    ).splitlines()
+
+    assert users == ["s0_0_0\tdefault",
+                     "s0_0_1\tfoo",
+                     "s0_1_0\tfoo"]
+
+    # Cluster with secret
+    query_id = uuid.uuid4().hex
+    result = node.query_and_get_error(
+        f"""
+        SELECT * from s3Cluster(
+            'cluster_with_secret',
+            'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') ORDER BY (name, value, polygon)
+        SETTINGS object_storage_remote_initiator=1
+        """,
+        query_id = query_id,
+    )
+
+    assert "Can't convert query to remote when cluster uses secret" in result
+
+    # Different cluster for remote initiator and query execution
+    # with `hidden_cluster_with_username_and_password` existed only in `cluster_with_dots` nodes
+    query_id = uuid.uuid4().hex
+
+    result = node.query(
+        f"""
+        SELECT * from s3(
+            'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') ORDER BY (name, value, polygon)
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_cluster='hidden_cluster_with_username_and_password',
+            object_storage_remote_initiator_cluster='cluster_with_dots'
+        """,
+        query_id = query_id,
+    )
+
+    assert result is not None
+
+    node.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster_all'")
+    queries = node.query(
+        f"""
+        SELECT count()
+            FROM clusterAllReplicas('cluster_all', system.query_log)
+            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
+            FORMAT TSV
+        """
+    ).splitlines()
+
+    # initial node + describe table + remote initiator + 2 subqueries on replicas
+    assert queries == ["5"]
+
+    users = node.query(
+        f"""
+        SELECT DISTINCT hostname, user
+            FROM clusterAllReplicas('cluster_all', system.query_log)
+            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
+            ORDER BY ALL
+            FORMAT TSV
+        """
+    ).splitlines()
+
+    # Random host from 'cluster_with_dots' for remote query
+    assert users[0] in ["c2.s0_0_0\tdefault", "c2.s0_0_1\tdefault"]
+    assert users[1:] == ["s0_0_0\tdefault",
+                     "s0_0_1\tfoo",
+                     "s0_1_0\tfoo"]
