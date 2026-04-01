@@ -650,7 +650,7 @@ void StorageObjectStorage::commitExportPartitionTransaction(
 {
     if (isDataLake())
     {
-        /// Parse the Iceberg metadata snapshot (stored in ZooKeeper at export-start time) to
+        /// Parse the Iceberg metadata snapshot (stored in ZooKeeper at export-start time) only to
         /// extract the schema-id and partition-spec-id that were current when the export began.
         /// partition_columns and partition_types are derived inside commitExportPartitionTransaction
         /// from the same JSON, so only partition_values need to be carried here.
@@ -664,7 +664,6 @@ void StorageObjectStorage::commitExportPartitionTransaction(
         configuration->getExternalMetadata()->commitExportPartitionTransaction(
             catalog,
             storage_id,
-            iceberg_commit_export_partition_arguments.metadata_json_string,
             original_schema_id,
             partition_spec_id,
             iceberg_commit_export_partition_arguments.partition_values,

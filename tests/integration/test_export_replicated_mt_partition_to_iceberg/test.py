@@ -210,35 +210,35 @@ def test_export_partition_to_iceberg(cluster):
     )
 
 
-# def test_export_two_partitions_to_iceberg(cluster):
-#     """
-#     Export two partitions in a single ALTER TABLE statement and verify that both
-#     land in the Iceberg table with correct row counts.
-#     """
-#     node = cluster.instances["replica1"]
+def test_export_two_partitions_to_iceberg(cluster):
+    """
+    Export two partitions in a single ALTER TABLE statement and verify that both
+    land in the Iceberg table with correct row counts.
+    """
+    node = cluster.instances["replica1"]
 
-#     uid = str(uuid.uuid4()).replace("-", "_")
-#     mt_table = f"mt_{uid}"
-#     iceberg_table = f"iceberg_{uid}"
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"mt_{uid}"
+    iceberg_table = f"iceberg_{uid}"
 
-#     setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1"])
+    setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1"])
 
-#     node.query(
-#         f"""
-#         ALTER TABLE {mt_table}
-#             EXPORT PARTITION ID '2020' TO TABLE {iceberg_table},
-#             EXPORT PARTITION ID '2021' TO TABLE {iceberg_table}
-#         """
-#     )
+    node.query(
+        f"""
+        ALTER TABLE {mt_table}
+            EXPORT PARTITION ID '2020' TO TABLE {iceberg_table},
+            EXPORT PARTITION ID '2021' TO TABLE {iceberg_table}
+        """
+    )
 
-#     wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
-#     wait_for_export_status(node, mt_table, iceberg_table, "2021", "COMPLETED")
+    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
+    wait_for_export_status(node, mt_table, iceberg_table, "2021", "COMPLETED")
 
-#     count_2020 = int(node.query(f"SELECT count() FROM {iceberg_table} WHERE year = 2020").strip())
-#     count_2021 = int(node.query(f"SELECT count() FROM {iceberg_table} WHERE year = 2021").strip())
+    count_2020 = int(node.query(f"SELECT count() FROM {iceberg_table} WHERE year = 2020").strip())
+    count_2021 = int(node.query(f"SELECT count() FROM {iceberg_table} WHERE year = 2021").strip())
 
-#     assert count_2020 == 3, f"Expected 3 rows for year=2020, got {count_2020}"
-#     assert count_2021 == 1, f"Expected 1 row for year=2021, got {count_2021}"
+    assert count_2020 == 3, f"Expected 3 rows for year=2020, got {count_2020}"
+    assert count_2021 == 1, f"Expected 1 row for year=2021, got {count_2021}"
 
 
 def test_failure_is_logged_in_system_table(cluster):

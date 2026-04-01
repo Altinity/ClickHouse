@@ -24,6 +24,7 @@
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 
 #include <IO/CompressionMethod.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataFileEntry.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataObjectInfo.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergIterator.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergTableStateSnapshot.h>
@@ -131,7 +132,6 @@ public:
     void commitExportPartitionTransaction(
         std::shared_ptr<DataLake::ICatalog> catalog,
         const StorageID & table_id,
-        const std::string & iceberg_metadata_json_string,
         Int64 original_schema_id,
         Int64 partition_spec_id,
         const std::vector<Field> & partition_values,
@@ -202,6 +202,7 @@ private:
     bool commitImportPartitionTransactionImpl(
         FileNamesGenerator & filename_generator,
         Poco::JSON::Object::Ptr & metadata,
+        Poco::JSON::Object::Ptr & partition_spec,
         Int64 original_schema_id,
         Int64 partition_spec_id,
         const std::vector<Field> & partition_values,
@@ -209,6 +210,10 @@ private:
         const std::vector<DataTypePtr> & partition_types,
         SharedHeader sample_block,
         const std::vector<String> & data_file_paths,
+        const std::vector<IcebergSerializedFileStats> & per_file_stats,
+        Int32 total_data_files,
+        Int32 total_rows,
+        Int32 total_chunks_size,
         std::shared_ptr<DataLake::ICatalog> catalog,
         const StorageID & table_id,
         const String & blob_storage_type_name,
