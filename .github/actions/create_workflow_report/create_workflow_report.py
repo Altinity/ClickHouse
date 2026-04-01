@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import sys
 import time
 from pathlib import Path
 from itertools import combinations
@@ -337,7 +338,7 @@ def get_prs_in_release_dataframe(
     branch_ref: str = "HEAD",
     *,
     repo: str = GITHUB_REPO,
-    cwd: str | None = None,
+    cwd: str,
 ) -> tuple[pd.DataFrame, bool]:
     f"""
     PRs merged into branch_ref that belong in the next release notes: after the latest GitHub
@@ -350,8 +351,25 @@ def get_prs_in_release_dataframe(
     if not branch_sha:
         raise Exception(f"Cannot resolve branch ref: {branch_ref!r}")
 
+    # CI often checks out with --depth=1 and --no-tags; fetch enough history and tags once.
+    subprocess.run(
+        ["git", "fetch", "--tags", "origin"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
     baseline_ref, baseline_sha = _find_release_baseline(branch_ref, repo, cwd)
     if not baseline_sha:
+        # If no release tag, try to find rebase commit 200 commits back.
+        subprocess.run(
+            ["git", "fetch", "--deepen=200", "origin", branch_ref],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
         rebase_sha = _find_rebase_baseline(branch_ref, cwd)
         if not rebase_sha:
             raise Exception(
