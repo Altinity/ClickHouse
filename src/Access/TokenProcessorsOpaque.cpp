@@ -114,7 +114,7 @@ bool GoogleTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
 
     auto token_info = getObjectFromURI(Poco::URI("https://www.googleapis.com/oauth2/v3/tokeninfo"), token);
     if (token_info.contains("exp"))
-        credentials.setExpiresAt(std::chrono::system_clock::from_time_t((getValueByKey<time_t>(token_info, "exp").value())));
+        credentials.setExpiresAt(std::chrono::system_clock::from_time_t(static_cast<time_t>(getValueByKey<double>(token_info, "exp").value())));
 
     /// Groups info can only be retrieved if user email is known.
     /// If no email found in user info, we skip this step and there are no external roles for the user.

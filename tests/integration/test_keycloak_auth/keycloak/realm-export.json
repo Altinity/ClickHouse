@@ -1,0 +1,72 @@
+{
+  "realm": "clickhouse-test",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "clients": [
+    {
+      "clientId": "clickhouse",
+      "enabled": true,
+      "secret": "test-secret",
+      "publicClient": false,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "standardFlowEnabled": true,
+      "attributes": {
+        "oauth2.device.authorization.grant.enabled": "true"
+      },
+      "redirectUris": ["*"],
+      "webOrigins": ["*"],
+      "protocol": "openid-connect"
+    }
+  ],
+  "users": [
+    {
+      "username": "alice",
+      "enabled": true,
+      "credentials": [
+        {
+          "type": "password",
+          "value": "secret",
+          "temporary": false
+        }
+      ],
+      "groups": ["analysts"]
+    }
+  ],
+  "groups": [
+    {
+      "name": "analysts"
+    }
+  ],
+  "clientScopes": [
+    {
+      "name": "groups",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "config": {
+            "full.path": "false",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "claim.name": "groups",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "defaultDefaultClientScopes": [
+    "profile",
+    "email",
+    "roles",
+    "web-origins",
+    "groups"
+  ]
+}
