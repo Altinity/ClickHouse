@@ -8339,7 +8339,20 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
                 const auto expected_transform = ef->getValue<String>(Iceberg::f_transform);
                 const auto actual_transform   = af->getValue<String>(Iceberg::f_transform);
 
-                if (expected_source_id != actual_source_id || expected_transform != actual_transform)
+                /// Normalize both transform names through parseTransformAndArgument so that
+                /// equivalent aliases ("day"/"days", "hour"/"hours", "year"/"years", etc.)
+                /// produced by different writers (ClickHouse vs Spark/Trino) compare equal.
+                /// Comparison is on {function_name, argument}; time_zone is writer-specific
+                /// and not part of the partition spec identity.
+                const auto expected_canonical = Iceberg::parseTransformAndArgument(expected_transform, "");
+                const auto actual_canonical   = Iceberg::parseTransformAndArgument(actual_transform, "");
+                const bool transforms_match =
+                    (expected_canonical && actual_canonical)
+                        ? (expected_canonical->transform_name == actual_canonical->transform_name
+                           && expected_canonical->argument    == actual_canonical->argument)
+                        : (expected_transform == actual_transform);
+
+                if (expected_source_id != actual_source_id || !transforms_match)
                     throw Exception(ErrorCodes::BAD_ARGUMENTS,
                         "Cannot export partition to Iceberg table: partition field {} mismatch. "
                         "Source MergeTree maps to column '{}' (source_id={}) transform='{}', "
@@ -8370,6 +8383,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
                         const auto & col = minmax_block.getByPosition(i);
                         single_row_block.insert({col.column->cut(0, 1), col.type, col.name});
                     }
+
                     const Row partition_values = partitioner.computePartitionKey(single_row_block);
 
                     Poco::JSON::Array::Ptr pv_arr = new Poco::JSON::Array();
