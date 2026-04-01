@@ -171,6 +171,9 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
         bool has_any_rows = false;
         while (executor.pull(block))
         {
+            if (block.rows() == 0)
+                continue;
+
             has_any_rows = true;
             Chunk chunk(block.getColumns(), block.rows());
             auto partition_result = getPartitionedChunks(chunk, chunk_partitioner);
@@ -277,6 +280,9 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
         Block block;
         while (executor.pull(block))
         {
+            if (block.rows() == 0)
+                continue;
+
             auto data_block = getNonVirtualColumns(block);
             Chunk chunk(data_block.getColumns(), data_block.rows());
             auto partition_result = getPartitionedChunks(chunk, chunk_partitioner);
