@@ -316,14 +316,22 @@ void IStorageCluster::read(
     size_t max_block_size,
     size_t num_streams)
 {
+    if (!isClusterSupported())
+    {
+        readFallBackToPure(query_plan, column_names, storage_snapshot, query_info, context, processed_stage, max_block_size, num_streams);
+        return;
+    }
+
     auto cluster_name_from_settings = getClusterName(context);
     const auto & settings = context->getSettingsRef();
     ASTPtr query_to_send = query_info.query;
 
-    if (!isClusterSupported() || cluster_name_from_settings.empty())
+    if (cluster_name_from_settings.empty())
     {
         if (settings[Setting::object_storage_remote_initiator])
         {
+            /// rewrite query to execute `remote('remote_host', s3(...))`
+            /// remote_host can execute query itself or make on-cluster query depends on own `object_storage_cluster` setting
             updateConfigurationIfNeeded(context);
             updateQueryWithJoinToSendIfNeeded(query_to_send, query_info.query_tree, context);
             updateQueryToSendIfNeeded(query_to_send, storage_snapshot, context, /*make_cluster_function*/ false);
@@ -451,8 +459,8 @@ IStorageCluster::RemoteCallVariables IStorageCluster::convertToRemote(
 
     /// Clean object_storage_remote_initiator setting to avoid infinite remote call
     auto new_context = Context::createCopy(context);
-    new_context->setSetting("object_storage_remote_initiator", false);
-    new_context->setSetting("object_storage_remote_initiator_cluster", String(""));
+    std::vector<std::string> settings_to_remove = {"object_storage_remote_initiator", "object_storage_remote_initiator_cluster"};
+    new_context->resetSettingsToDefaultValue(settings_to_remove);
 
     auto * select_query = query_to_send->as<ASTSelectQuery>();
     if (!select_query)
@@ -462,10 +470,11 @@ IStorageCluster::RemoteCallVariables IStorageCluster::convertToRemote(
     if (query_settings)
     {
         auto & settings_ast = query_settings->as<ASTSetQuery &>();
-        if (settings_ast.changes.removeSetting("object_storage_remote_initiator") && settings_ast.changes.empty())
-        {
+        bool settings_changed = false;
+        for (const auto & setting_to_remove : settings_to_remove)
+            settings_changed |= settings_ast.changes.removeSetting(setting_to_remove);
+        if (settings_changed && settings_ast.changes.empty())
             select_query->setExpression(ASTSelectQuery::Expression::SETTINGS, {});
-        }
     }
 
     ASTTableExpression * table_expression = extractTableExpressionASTPtrFromSelectQuery(query_to_send);
