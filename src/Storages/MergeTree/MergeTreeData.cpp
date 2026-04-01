@@ -6497,7 +6497,7 @@ void MergeTreeData::exportPartToTable(
     const std::optional<String> & iceberg_metadata_json,
     bool allow_outdated_parts,
     std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback,
-    const String & partition_values_json)
+    std::vector<Field> partition_values)
 {
     auto dest_storage = DatabaseCatalog::instance().getTable(destination_storage_id, query_context);
 
@@ -6506,7 +6506,7 @@ void MergeTreeData::exportPartToTable(
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Exporting to the same table is not allowed");
     }
 
-    exportPartToTable(part_name, dest_storage, transaction_id, query_context, iceberg_metadata_json, allow_outdated_parts, completion_callback, partition_values_json);
+    exportPartToTable(part_name, dest_storage, transaction_id, query_context, iceberg_metadata_json, allow_outdated_parts, completion_callback, std::move(partition_values));
 }
 
 void MergeTreeData::exportPartToTable(
@@ -6517,7 +6517,7 @@ void MergeTreeData::exportPartToTable(
     const std::optional<String> & iceberg_metadata_json_,
     bool allow_outdated_parts,
     std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback,
-    const String & partition_values_json)
+    std::vector<Field> partition_values)
 {
     if (!dest_storage->supportsImport(query_context))
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Destination storage {} does not support MergeTree parts or uses unsupported partitioning", dest_storage->getName());
@@ -6615,6 +6615,13 @@ void MergeTreeData::exportPartToTable(
     }
 
     {
+        /// Partition values for the Iceberg commit:
+        ///   ZK path  → pre-parsed Fields passed by the scheduler (non-empty partition_values arg)
+        ///   Direct EXPORT PART path → derive from the stored partition tuple, which already
+        ///   holds post-transform values (MergeTree runs the same functions Iceberg transforms map to)
+        if (partition_values.empty() && !iceberg_metadata_json.empty())
+            partition_values = part->partition.value;
+
         MergeTreePartExportManifest manifest(
             dest_storage,
             part,
@@ -6625,7 +6632,7 @@ void MergeTreeData::exportPartToTable(
             source_metadata_ptr,
             iceberg_metadata_json,
             completion_callback,
-            partition_values_json);
+            std::move(partition_values));
 
         std::lock_guard lock(export_manifests_mutex);
 

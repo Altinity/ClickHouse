@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Core/Field.h>
 #include <Interpreters/StorageID.h>
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Storages/StorageSnapshot.h>
@@ -53,7 +54,7 @@ struct MergeTreePartExportManifest
         const StorageMetadataPtr & metadata_snapshot_,
         const String & iceberg_metadata_json_,
         std::function<void(CompletionCallbackResult)> completion_callback_ = {},
-        const String & partition_values_json_ = {})
+        std::vector<Field> partition_values_ = {})
         : destination_storage_ptr(destination_storage_ptr_),
           data_part(data_part_),
           transaction_id(transaction_id_),
@@ -62,7 +63,7 @@ struct MergeTreePartExportManifest
           settings(settings_),
           metadata_snapshot(metadata_snapshot_),
           iceberg_metadata_json(iceberg_metadata_json_),
-          partition_values_json(partition_values_json_),
+          partition_values(std::move(partition_values_)),
           completion_callback(completion_callback_),
           create_time(time(nullptr)) {}
 
@@ -79,9 +80,10 @@ struct MergeTreePartExportManifest
     StorageMetadataPtr metadata_snapshot;
 
     String iceberg_metadata_json;
-    /// Pre-computed Iceberg partition values (JSON array) for the export-partition path.
-    /// Empty for per-part exports; in that case import() derives values from the minmax index.
-    String partition_values_json;
+    /// Pre-computed Iceberg partition values for the Iceberg commit.
+    /// Populated by exportPartToTable from either the ZK manifest (EXPORT PARTITION path)
+    /// or from data_part->partition.value (direct EXPORT PART path).
+    std::vector<Field> partition_values;
 
     std::function<void(CompletionCallbackResult)> completion_callback;
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <base/types.h>
+#include <Core/Field.h>
 #include <Interpreters/StorageID.h>
 #include <Poco/JSON/Object.h>
 #include <Poco/JSON/Array.h>
@@ -122,6 +123,9 @@ struct ExportReplicatedMergeTreePartitionManifest
     /// Iceberg-only: JSON array of partition column values (after transforms) for this partition.
     /// Columns and types are derived at commit time from iceberg_metadata_json; only values are persisted.
     String partition_values_json;
+    /// Transient: parsed form of partition_values_json, populated by fromJsonString.
+    /// Not serialized to ZooKeeper. Used at commit time to avoid re-parsing JSON on each commit attempt.
+    std::vector<Field> partition_values;
 
     std::string toJsonString() const
     {
@@ -189,6 +193,17 @@ struct ExportReplicatedMergeTreePartitionManifest
         if (json->has("partition_values_json"))
         {
             manifest.partition_values_json = json->getValue<String>("partition_values_json");
+
+            Poco::JSON::Parser val_parser;
+            auto arr = val_parser.parse(manifest.partition_values_json).extract<Poco::JSON::Array::Ptr>();
+            for (size_t i = 0; i < arr->size(); ++i)
+            {
+                Poco::Dynamic::Var var = arr->get(static_cast<unsigned int>(i));
+                if (var.isString())
+                    manifest.partition_values.push_back(Field(var.extract<String>()));
+                else
+                    manifest.partition_values.push_back(Field(var.convert<Int64>()));
+            }
         }
 
         auto parts_array = json->getArray("parts");

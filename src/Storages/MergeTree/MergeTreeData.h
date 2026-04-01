@@ -1033,7 +1033,7 @@ public:
         const std::optional<String> & iceberg_metadata_json = std::nullopt,
         bool allow_outdated_parts = false,
         std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback = {},
-        const String & partition_values_json = {});
+        std::vector<Field> partition_values = {});
 
     void exportPartToTable(
         const std::string & part_name,
@@ -1043,7 +1043,7 @@ public:
         const std::optional<String> & iceberg_metadata_json = std::nullopt,
         bool allow_outdated_parts = false,
         std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback = {},
-        const String & partition_values_json = {});
+        std::vector<Field> partition_values = {});
 
     void killExportPart(const String & transaction_id);
 

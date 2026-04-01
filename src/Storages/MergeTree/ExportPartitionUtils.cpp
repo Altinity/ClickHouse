@@ -5,8 +5,6 @@
 #include "Storages/ExportReplicatedMergeTreePartitionManifest.h"
 #include "Storages/ExportReplicatedMergeTreePartitionTaskEntry.h"
 #include <filesystem>
-#include <Poco/JSON/Parser.h>
-#include <Poco/Dynamic/Var.h>
 
 namespace ProfileEvents
 {
@@ -107,16 +105,7 @@ namespace ExportPartitionUtils
         if (!manifest.iceberg_metadata_json.empty())
         {
             iceberg_args.metadata_json_string = manifest.iceberg_metadata_json;
-            Poco::JSON::Parser val_parser;
-            auto arr = val_parser.parse(manifest.partition_values_json).extract<Poco::JSON::Array::Ptr>();
-            for (size_t i = 0; i < arr->size(); ++i)
-            {
-                Poco::Dynamic::Var var = arr->get(static_cast<unsigned int>(i));
-                if (var.isString())
-                    iceberg_args.partition_values.push_back(Field(var.extract<String>()));
-                else
-                    iceberg_args.partition_values.push_back(Field(var.convert<Int64>()));
-            }
+            iceberg_args.partition_values = manifest.partition_values;
         }
 
         destination_storage->commitExportPartitionTransaction(manifest.transaction_id, manifest.partition_id, exported_paths, iceberg_args, context);

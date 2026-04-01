@@ -223,7 +223,7 @@ void ExportPartitionTaskScheduler::run()
                     {
                         handlePartExportCompletion(key, zk_part_name, manifest, destination_storage, result);
                     },
-                    manifest.partition_values_json);
+                    manifest.partition_values);
 
                 part_export_manifest.task = std::make_shared<ExportPartFromPartitionExportTask>(storage, key, part_export_manifest);
 
@@ -271,7 +271,7 @@ void ExportPartitionTaskScheduler::run()
                         {
                             handlePartExportCompletion(key, zk_part_name, manifest, destination_storage, result);
                         },
-                        manifest.partition_values_json);
+                        manifest.partition_values);
                 }
                 catch (const Exception &)
                 {
