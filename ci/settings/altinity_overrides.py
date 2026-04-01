@@ -45,7 +45,7 @@ SECRET_CI_DB_PASSWORD = "CLICKHOUSE_TEST_STAT_PASSWORD"
 
 # to post links for reading statistics in html report (with read-only user)
 CI_DB_READ_USER: str = ""
-CI_DB_READ_URL: str = os.environ.get("CLICKHOUSE_TEST_STAT_URL") + "/play"
+CI_DB_READ_URL: str = os.environ.get("CLICKHOUSE_TEST_STAT_URL", "") + "play"
 
 USE_CUSTOM_GH_AUTH = False
 # SECRET_GH_APP_ID: str = "woolenwolf_gh_app.clickhouse-app-id"
