@@ -80,7 +80,11 @@ class DataLakeConfiguration : public BaseStorageConfiguration, public std::enabl
 public:
     DataLakeConfiguration() {}
 
-    explicit DataLakeConfiguration(DataLakeStorageSettingsPtr settings_) : settings(settings_) {}
+    explicit DataLakeConfiguration(
+        DataLakeStorageSettingsPtr settings_,
+        std::optional<std::string> catalog_namespaces_ = std::nullopt)
+        : settings(settings_)
+        , catalog_namespaces(catalog_namespaces_.value_or("*")) {}
 
     bool isDataLakeConfiguration() const override { return true; }
 
@@ -338,6 +342,7 @@ public:
                 .aws_access_key_id = (*settings)[DataLakeStorageSetting::storage_aws_access_key_id].value,
                 .aws_secret_access_key = (*settings)[DataLakeStorageSetting::storage_aws_secret_access_key].value,
                 .region = (*settings)[DataLakeStorageSetting::storage_region].value,
+                .namespaces = catalog_namespaces,
                 .aws_role_arn = (*settings)[DataLakeStorageSetting::storage_aws_role_arn].value,
                 .aws_role_session_name = (*settings)[DataLakeStorageSetting::storage_aws_role_session_name].value
             };
@@ -361,6 +366,7 @@ public:
                 (*settings)[DataLakeStorageSetting::storage_auth_header],
                 (*settings)[DataLakeStorageSetting::storage_oauth_server_uri].value,
                 (*settings)[DataLakeStorageSetting::storage_oauth_server_use_request_body].value,
+                catalog_namespaces,
                 context);
         }
 
@@ -427,9 +433,19 @@ public:
         return res;
     }
 
+    bool supportsPrewhere() const override
+    {
+#if USE_AVRO
+        return std::is_same_v<DataLakeMetadata, IcebergMetadata>;
+#else
+        return false;
+#endif
+    }
+
 private:
     const DataLakeStorageSettingsPtr settings;
     ObjectStoragePtr ready_object_storage;
+    std::string catalog_namespaces;
     DataLakeMetadataPtr current_metadata;
     LoggerPtr log = getLogger("DataLakeConfiguration");
 
@@ -599,6 +615,7 @@ public:
     bool supportsFileIterator() const override { return getImpl().supportsFileIterator(); }
     bool supportsParallelInsert() const override { return getImpl().supportsParallelInsert(); }
     bool supportsWrites() const override { return getImpl().supportsWrites(); }
+    bool supportsPrewhere() const override { return getImpl().supportsPrewhere(); }
 
     bool supportsPartialPathPrefix() const override { return getImpl().supportsPartialPathPrefix(); }
 

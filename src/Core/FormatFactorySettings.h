@@ -1527,7 +1527,6 @@ Allow to write information about geo columns in parquet metadata and encode colu
     DECLARE(Bool, into_outfile_create_parent_directories, false, R"(
 Automatically create parent directories when using INTO OUTFILE if they do not already exists.
 )", 0) \
-    DECLARE(Bool, input_format_parquet_use_metadata_cache, true, R"(Enable parquet file metadata caching)", 0) \
 // End of FORMAT_FACTORY_SETTINGS
 
 #define OBSOLETE_FORMAT_SETTINGS(M, ALIAS) \
@@ -1537,6 +1536,7 @@ Automatically create parent directories when using INTO OUTFILE if they do not a
     MAKE_OBSOLETE(M, Bool, input_format_orc_import_nested, false) \
     MAKE_OBSOLETE(M, Bool, output_format_enable_streaming, false) \
     MAKE_OBSOLETE(M, Bool, input_format_parquet_use_native_reader, false) \
+    MAKE_OBSOLETE(M, Bool, input_format_parquet_use_metadata_cache, false) \
 
 #endif // __CLION_IDE__
 
