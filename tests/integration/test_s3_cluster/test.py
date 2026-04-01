@@ -951,7 +951,7 @@ def test_hive_partitioning(started_cluster, allow_experimental_analyzer):
             FROM s3('http://minio1:9001/root/data/hive/key=**.parquet', 'minio', '{minio_secret_key}', 'Parquet', 'key Int32, value Int32')
             WHERE key <= 2
             FORMAT TSV
-            SETTINGS enable_filesystem_cache = 0, use_query_cache = 0, use_cache_for_count_from_files = 0, use_hive_partitioning = 0
+            SETTINGS enable_filesystem_cache = 0, use_query_cache = 0, use_cache_for_count_from_files = 0, use_hive_partitioning = 0, use_parquet_metadata_cache = 0
         """,
         query_id=query_id_full,
     )
@@ -965,7 +965,7 @@ def test_hive_partitioning(started_cluster, allow_experimental_analyzer):
             FROM s3('http://minio1:9001/root/data/hive/key=**.parquet', 'minio', '{minio_secret_key}', 'Parquet', 'key Int32, value Int32')
             WHERE key <= 2
             FORMAT TSV
-            SETTINGS enable_filesystem_cache = 0, use_query_cache = 0, use_cache_for_count_from_files = 0, use_hive_partitioning = 1
+            SETTINGS enable_filesystem_cache = 0, use_query_cache = 0, use_cache_for_count_from_files = 0, use_hive_partitioning = 1, use_parquet_metadata_cache = 0
         """,
         query_id=query_id_optimized,
     )
@@ -979,7 +979,7 @@ def test_hive_partitioning(started_cluster, allow_experimental_analyzer):
             FROM s3Cluster(cluster_simple, 'http://minio1:9001/root/data/hive/key=**.parquet', 'minio', '{minio_secret_key}', 'Parquet', 'key Int32, value Int32')
             WHERE key <= 2
             FORMAT TSV
-            SETTINGS enable_filesystem_cache = 0, use_query_cache = 0, use_cache_for_count_from_files = 0, use_hive_partitioning = 0
+            SETTINGS enable_filesystem_cache = 0, use_query_cache = 0, use_cache_for_count_from_files = 0, use_hive_partitioning = 0, use_parquet_metadata_cache = 0
         """,
         query_id=query_id_cluster_full,
     )
@@ -993,7 +993,7 @@ def test_hive_partitioning(started_cluster, allow_experimental_analyzer):
             FROM s3Cluster(cluster_simple, 'http://minio1:9001/root/data/hive/key=**.parquet', 'minio', '{minio_secret_key}', 'Parquet', 'key Int32, value Int32')
             WHERE key <= 2
             FORMAT TSV
-            SETTINGS enable_filesystem_cache = 0, use_query_cache = 0, use_cache_for_count_from_files = 0, use_hive_partitioning = 1
+            SETTINGS enable_filesystem_cache = 0, use_query_cache = 0, use_cache_for_count_from_files = 0, use_hive_partitioning = 1, use_parquet_metadata_cache = 0
         """,
         query_id=query_id_cluster_optimized,
     )

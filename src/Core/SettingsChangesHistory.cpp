@@ -44,6 +44,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"iceberg_partition_timezone", "", "", "New setting."},
             {"s3_propagate_credentials_to_other_storages", false, false, "New setting"},
             {"export_merge_tree_part_filename_pattern", "", "{part_name}_{checksum}", "New setting"},
+            {"use_parquet_metadata_cache", false, true, "Enables cache of parquet file metadata."},
+            {"input_format_parquet_use_metadata_cache", true, false, "Obsolete. No-op"}, // https://github.com/Altinity/ClickHouse/pull/586
             {"object_storage_remote_initiator_cluster", "", "", "New setting."},
             {"iceberg_metadata_staleness_ms", 0, 0, "New setting allowing using cached metadata version at READ operations to prevent fetching from remote catalog"},
         });
@@ -239,7 +241,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"allow_database_iceberg", false, true, "Turned ON by default for Antalya (alias)."},
             {"allow_database_unity_catalog", false, true, "Turned ON by default for Antalya (alias)."},
             {"allow_database_glue_catalog", false, true, "Turned ON by default for Antalya (alias)."},
-
             {"input_format_parquet_use_metadata_cache", true, true, "New setting, turned ON by default"}, // https://github.com/Altinity/ClickHouse/pull/586
             {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."},
             {"object_storage_remote_initiator", false, false, "New setting."},

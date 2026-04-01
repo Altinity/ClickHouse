@@ -44,6 +44,7 @@ namespace ErrorCodes
     DECLARE(String, google_adc_credentials_file, "", "Path to JSON file containing Google Application Default Credentials. If set, credentials will be loaded from this file. File should contain: type, client_id, client_secret, refresh_token, and optionally quota_project_id", 0) \
     DECLARE(String, dlf_access_key_id, "", "Access id of DLF token for Paimon REST Catalog", 0) \
     DECLARE(String, dlf_access_key_secret, "", "Access secret of DLF token for Paimon REST Catalog", 0) \
+    DECLARE(String, namespaces, "*", "Comma-separated list of allowed namespaces", 0) \
 
 #define LIST_OF_DATABASE_ICEBERG_SETTINGS(M, ALIAS) \
     DATABASE_ICEBERG_RELATED_SETTINGS(M, ALIAS) \
