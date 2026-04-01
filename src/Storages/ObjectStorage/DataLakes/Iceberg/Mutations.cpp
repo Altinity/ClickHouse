@@ -677,13 +677,16 @@ void alter(
     ObjectStoragePtr object_storage,
     const DataLakeStorageSettings & data_lake_settings,
     PersistentTableComponents & persistent_table_components,
-    const String & write_format)
+    const String & write_format,
+    StorageID storage_id,
+    std::shared_ptr<DataLake::ICatalog> catalog,
+    const String & blob_storage_type_name,
+    const String & blob_storage_namespace_name)
 {
     if (params.size() != 1)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Params with size 1 is not supported");
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Iceberg alter supports exactly one command at a time, got {}", params.size());
 
-    size_t i = 0;
-    while (i++ < MAX_TRANSACTION_RETRIES)
+    for (size_t i = 0; i < MAX_TRANSACTION_RETRIES; ++i)
     {
         FileNamesGenerator filename_generator(
             persistent_table_components.table_path, persistent_table_components.table_path, false, CompressionMethod::None, write_format);
@@ -730,6 +733,8 @@ void alter(
 
         auto [metadata_name, storage_metadata_name] = filename_generator.generateMetadataName();
 
+        LOG_INFO(log, "Iceberg alter: writing metadata to '{}', latest version was {}", storage_metadata_name, last_version);
+
         auto hint = filename_generator.generateVersionHint();
         if (writeMetadataFileAndVersionHint(
                 storage_metadata_name,
@@ -740,11 +745,43 @@ void alter(
                 context,
                 compression_method,
                 data_lake_settings[DataLakeStorageSetting::iceberg_use_version_hint]))
-            break;
+        {
+            if (catalog)
+            {
+                String catalog_filename = metadata_name;
+                if (!catalog_filename.starts_with(blob_storage_type_name))
+                    catalog_filename = blob_storage_type_name + "://" + blob_storage_namespace_name + "/" + metadata_name;
+
+                const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
+                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, metadata))
+                {
+                    LOG_WARNING(log, "Iceberg alter: catalog update failed for '{}'", catalog_filename);
+                    continue;
+                }
+            }
+            return;
+        }
+
+        bool file_exists = object_storage->exists(StoredObject(storage_metadata_name));
+        LOG_WARNING(log, "Iceberg alter: failed to write metadata to '{}' (attempt {}, file exists: {})",
+            storage_metadata_name, i + 1, file_exists);
+
+        if (file_exists && catalog)
+        {
+            String catalog_filename = metadata_name;
+            if (!catalog_filename.starts_with(blob_storage_type_name))
+                catalog_filename = blob_storage_type_name + "://" + blob_storage_namespace_name + "/" + metadata_name;
+
+            const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
+            if (catalog->updateMetadata(namespace_name, table_name, catalog_filename, metadata))
+            {
+                LOG_INFO(log, "Iceberg alter: adopted existing metadata file '{}' and updated catalog", storage_metadata_name);
+                return;
+            }
+        }
     }
 
-    if (i == MAX_TRANSACTION_RETRIES)
-        throw Exception(ErrorCodes::LIMIT_EXCEEDED, "Too many unsuccessed retries to alter iceberg table");
+    throw Exception(ErrorCodes::LIMIT_EXCEEDED, "Too many unsuccessful retries to alter iceberg table");
 }
 
 #endif

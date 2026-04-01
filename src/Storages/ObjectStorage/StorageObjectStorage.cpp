@@ -792,14 +792,17 @@ void StorageObjectStorage::checkMutationIsPossible(const MutationCommands & comm
 
 void StorageObjectStorage::alter(const AlterCommands & params, ContextPtr context, AlterLockHolder & /*alter_lock_holder*/)
 {
+    configuration->update(object_storage, context, /* if_not_updated_before */ true);
+
     StorageInMemoryMetadata new_metadata = getInMemoryMetadata();
     params.apply(new_metadata, context);
 
-    configuration->alter(params, context);
+    configuration->alter(params, context, getStorageID(), catalog);
 
-    DatabaseCatalog::instance()
-        .getDatabase(storage_id.database_name)
-        ->alterTable(context, storage_id, new_metadata, /*validate_new_create_query=*/true);
+    auto database = DatabaseCatalog::instance().getDatabase(storage_id.database_name);
+    if (!database->isDatalakeCatalog())
+        database->alterTable(context, storage_id, new_metadata, /*validate_new_create_query=*/true);
+
     setInMemoryMetadata(new_metadata);
 }
 
