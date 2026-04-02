@@ -55,8 +55,14 @@ Explicit table UUID to read metadata for. Ignored if iceberg_metadata_file_path 
     DECLARE(Bool, iceberg_recent_metadata_file_by_last_updated_ms_field, false, R"(
 If enabled, the engine would use the metadata file with the most recent last_updated_ms json field. Does not make sense to use with iceberg_metadata_file_path.
 )", 0) \
+    DECLARE(UInt32, iceberg_metadata_async_prefetch_period_ms, 0, R"(
+The period in milliseconds to asynchronously prefetch the latest metadata snapshot from a remote iceberg catalog. Default is 0 - disabled.
+)", 0) \
     DECLARE(Bool, iceberg_use_version_hint, false, R"(
 Get latest metadata path from version-hint.text file.
+)", 0) \
+    DECLARE(String, object_storage_cluster, "", R"(
+Cluster for distributed requests
 )", 0) \
     DECLARE(NonZeroUInt64, iceberg_format_version, 2, R"(
 Metadata format version.

@@ -226,6 +226,8 @@
           element.className = element.className.replace(regex_dir, '') + dir
         }
         function getValue(element) {
+          var childWithSort = element.querySelector('[data-sort]')
+          if (childWithSort) return childWithSort.getAttribute('data-sort')
           return (
             (alt_sort && element.getAttribute('data-sort-alt')) ||
             element.getAttribute('data-sort') || element.innerText

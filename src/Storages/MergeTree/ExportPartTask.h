@@ -7,7 +7,7 @@
 namespace DB
 {
 
-class ExportPartTask : public IExecutableTask
+class ExportPartTask : public IExecutableTask, public std::enable_shared_from_this<ExportPartTask>
 {
 public:
     explicit ExportPartTask(
@@ -18,6 +18,7 @@ public:
     StorageID getStorageID() const override;
     Priority getPriority() const override;
     String getQueryId() const override;
+    const MergeTreePartExportManifest & getManifest() const;
 
     void cancel() noexcept override;
 

@@ -42,7 +42,7 @@ public:
         bool skip_not_loaded) const override;
 
     /// skip_not_loaded flag ignores all non-iceberg tables
-    DatabaseTablesIteratorPtr getLightweightTablesIterator(
+    std::vector<LightWeightTableDetails> getLightweightTablesIterator(
         ContextPtr context,
         const FilterByNameFunction & filter_by_table_name,
         bool skip_not_loaded) const override;
@@ -84,7 +84,7 @@ private:
     void validateSettings();
     std::shared_ptr<DataLake::ICatalog> getCatalog() const;
 
-    std::shared_ptr<StorageObjectStorageConfiguration> getConfiguration(
+    StorageObjectStorageConfigurationPtr getConfiguration(
         DatabaseDataLakeStorageType type,
         DataLakeStorageSettingsPtr storage_settings) const;
 

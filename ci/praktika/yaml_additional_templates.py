@@ -35,7 +35,7 @@ class AltinityWorkflowTemplates:
           echo "Workflow Run Report: [View Report]($REPORT_LINK)" >> $GITHUB_STEP_SUMMARY
 """
     # Additional jobs
-    REGRESSION_HASH = "a54216bbc29eb458e25011a68bacc77f4ae73c19"
+    REGRESSION_HASH = "7b671c109330ac55f7eedabe05e6aea7530ffdd5"
     ALTINITY_JOBS = {
         "GrypeScan": r"""
   GrypeScanServer:
@@ -62,7 +62,7 @@ class AltinityWorkflowTemplates:
 """,
         "Regression": r"""
   RegressionTestsRelease:
-    needs: [config_workflow, build_amd_binary]
+    needs: [config_workflow, build_amd_binary, stateless_tests_amd_debug_parallel]
     if: ${{  !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(fromJson(needs.config_workflow.outputs.data).JOB_KV_DATA.ci_exclude_tags, 'regression')}}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
@@ -74,7 +74,7 @@ class AltinityWorkflowTemplates:
       timeout_minutes: 210
       workflow_config: ${{ needs.config_workflow.outputs.data }}
   RegressionTestsAarch64:
-    needs: [config_workflow, build_arm_binary]
+    needs: [config_workflow, build_arm_binary, stateless_tests_arm_binary_parallel]
     if: ${{  !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(fromJson(needs.config_workflow.outputs.data).JOB_KV_DATA.ci_exclude_tags, 'regression') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.custom_data.ci_exclude_tags, 'aarch64')}}
     uses: ./.github/workflows/regression.yml
     secrets: inherit

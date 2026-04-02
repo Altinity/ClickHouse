@@ -86,7 +86,7 @@ DeltaLakeMetadataDeltaKernel::DeltaLakeMetadataDeltaKernel(
             object_storage,
             context,
             log))
-    , format_name(configuration_.lock()->format)
+    , format_name(configuration_.lock()->getFormat())
 {
     object_storage_common = object_storage;
 #ifdef DEBUG_OR_SANITIZER_BUILD
@@ -406,8 +406,8 @@ SinkToStoragePtr DeltaLakeMetadataDeltaKernel::write(
             context,
             sample_block,
             format_settings,
-            configuration->format,
-            configuration->compression_method);
+            configuration->getFormat(),
+            configuration->getCompressionMethod());
     }
 
     return std::make_shared<DeltaLakePartitionedSink>(
@@ -417,8 +417,8 @@ SinkToStoragePtr DeltaLakeMetadataDeltaKernel::write(
         context,
         sample_block,
         format_settings,
-        configuration->format,
-        configuration->compression_method);
+        configuration->getFormat(),
+        configuration->getCompressionMethod());
 }
 
 void DeltaLakeMetadataDeltaKernel::logMetadataFiles(ContextPtr context) const

@@ -4,6 +4,8 @@
 #include <queue>
 #include <string>
 #include <unordered_set>
+#include <Storages/System/StorageSystemReplicatedPartitionExports.h>
+#include <Storages/ExportReplicatedMergeTreePartitionTaskEntry.h>
 namespace DB
 {
 
@@ -21,11 +23,16 @@ public:
 
     void addStatusChange(const std::string & key);
 
+    std::vector<ReplicatedPartitionExportInfo> getPartitionExportsInfo() const;
+
+    std::vector<ReplicatedPartitionExportInfo> getPartitionExportsInfoLocal() const;
+
 private:
     StorageReplicatedMergeTree & storage;
 
     void addTask(
         const ExportReplicatedMergeTreePartitionManifest & metadata,
+        ExportReplicatedMergeTreePartitionTaskEntry::Status status,
         const std::string & key,
         auto & entries_by_key
     );

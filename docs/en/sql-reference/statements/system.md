@@ -101,6 +101,10 @@ Clears the mark cache.
 
 Clears the iceberg metadata cache.
 
+## SYSTEM DROP PARQUET METADATA CACHE {#drop-parquet-metadata-cache}
+
+Clears the parquet metadata cache.
+
 ## SYSTEM CLEAR|DROP TEXT INDEX CACHES {#drop-text-index-caches}
 
 Clears the text index's header, dictionary and postings caches.
@@ -219,6 +223,12 @@ Normally shuts down ClickHouse (like `service clickhouse-server stop` / `kill {$
 ## SYSTEM KILL {#kill}
 
 Aborts ClickHouse process (like `kill -9 {$ pid_clickhouse-server}`)
+
+## SYSTEM PRESHUTDOWN {#preshutdown}
+
+<CloudNotSupportedBadge/>
+
+Prepare node for graceful shutdown. Unregister in autodiscovered clusters, stop accepting distributed requests to object storages (s3Cluster, icebergCluster, etc.).
 
 ## SYSTEM INSTRUMENT {#instrument}
 

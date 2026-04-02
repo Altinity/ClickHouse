@@ -10,7 +10,7 @@ doc_type: 'reference'
 
 # Iceberg table engine {#iceberg-table-engine}
 
-:::warning 
+:::warning
 We recommend using the [Iceberg Table Function](/sql-reference/table-functions/iceberg.md) for working with Iceberg data in ClickHouse. The Iceberg Table Function currently provides sufficient functionality, offering a partial read-only interface for Iceberg tables.
 
 The Iceberg Table Engine is available but may have limitations. ClickHouse wasn't originally designed to support tables with externally changing schemas, which can affect the functionality of the Iceberg Table Engine. As a result, some features that work with regular tables may be unavailable or may not function correctly, especially when using the old analyzer.
@@ -78,7 +78,7 @@ Table engine `Iceberg` is an alias to `IcebergS3` now.
 At the moment, with the help of CH, you can read iceberg tables, the schema of which has changed over time. We currently support reading tables where columns have been added and removed, and their order has changed. You can also change a column where a value is required to one where NULL is allowed. Additionally, we support permitted type casting for simple types, namely:  
 * int -> long
 * float -> double
-* decimal(P, S) -> decimal(P', S) where P' > P. 
+* decimal(P, S) -> decimal(P', S) where P' > P.
 
 Currently, it is not possible to change nested structures or the types of elements within arrays and maps.
 
@@ -94,7 +94,7 @@ ClickHouse supports time travel for Iceberg tables, allowing you to query histor
 
 ## Processing of tables with deleted rows {#deleted-rows}
 
-Currently, only Iceberg tables with [position deletes](https://iceberg.apache.org/spec/#position-delete-files) are supported. 
+Currently, only Iceberg tables with [position deletes](https://iceberg.apache.org/spec/#position-delete-files) are supported.
 
 The following deletion methods are **not supported**:
 - [Equality deletes](https://iceberg.apache.org/spec/#equality-delete-files)
@@ -102,12 +102,12 @@ The following deletion methods are **not supported**:
 
 ### Basic usage {#basic-usage}
  ```sql
- SELECT * FROM example_table ORDER BY 1 
+ SELECT * FROM example_table ORDER BY 1
  SETTINGS iceberg_timestamp_ms = 1714636800000
  ```
 
  ```sql
- SELECT * FROM example_table ORDER BY 1 
+ SELECT * FROM example_table ORDER BY 1
  SETTINGS iceberg_snapshot_id = 3547395809148285433
  ```
 
@@ -132,21 +132,21 @@ Consider this sequence of operations:
  ```sql
  -- Create a table with two columns
   CREATE TABLE IF NOT EXISTS spark_catalog.db.time_travel_example (
-  order_number int, 
+  order_number int,
   product_code string
-  ) 
-  USING iceberg 
+  )
+  USING iceberg
   OPTIONS ('format-version'='2')
 
 -- Insert data into the table
-  INSERT INTO spark_catalog.db.time_travel_example VALUES 
+  INSERT INTO spark_catalog.db.time_travel_example VALUES
     (1, 'Mars')
 
   ts1 = now() // A piece of pseudo code
 
 -- Alter table to add a new column
   ALTER TABLE spark_catalog.db.time_travel_example ADD COLUMN (price double)
- 
+
   ts2 = now()
 
 -- Insert data into the table
@@ -192,10 +192,10 @@ A time travel query at a current moment might show a different schema than the c
 ```sql
 -- Create a table
   CREATE TABLE IF NOT EXISTS spark_catalog.db.time_travel_example_2 (
-  order_number int, 
+  order_number int,
   product_code string
-  ) 
-  USING iceberg 
+  )
+  USING iceberg
   OPTIONS ('format-version'='2')
 
 -- Insert initial data into the table
@@ -234,10 +234,10 @@ The second one is that while doing time travel you can't get state of table befo
 ```sql
 -- Create a table
   CREATE TABLE IF NOT EXISTS spark_catalog.db.time_travel_example_3 (
-  order_number int, 
+  order_number int,
   product_code string
-  ) 
-  USING iceberg 
+  )
+  USING iceberg
   OPTIONS ('format-version'='2');
 
   ts = now();
@@ -275,9 +275,9 @@ After identifying candidate files using the above rules, the system determines w
   * The file with the highest version number is selected
   * (Version appears as `V` in filenames formatted as `V.metadata.json` or `V-uuid.metadata.json`)
 
-**Note**: All mentioned settings are engine-level settings and must be specified during table creation as shown below:
+**Note**: All mentioned settings (unless explicitly specified otherwise) are engine-level settings and must be specified during table creation as shown below:
 
-```sql 
+```sql
 CREATE TABLE example_table ENGINE = Iceberg(
     's3://bucket/path/to/iceberg_table'
 ) SETTINGS iceberg_metadata_table_uuid = '6f6f6407-c6a5-465f-a808-ea8900e35a38';
@@ -292,6 +292,90 @@ CREATE TABLE example_table ENGINE = Iceberg(
 ## Metadata cache {#metadata-cache}
 
 `Iceberg` table engine and table function support metadata cache storing the information of manifest files, manifest list and metadata json. The cache is stored in memory. This feature is controlled by setting `use_iceberg_metadata_files_cache`, which is enabled by default.
+
+## Asynchronous metadata prefetching {#async-metadata-prefetch}
+
+Asynchronous metadata prefetching can be enabled at `Iceberg` table creation by setting `iceberg_metadata_async_prefetch_period_ms`. If set to 0 (default) or if metadata caching is not enabled, the asynchronous prefetching is disabled.
+In order to enable this feature, a non-zero value of milliseconds should be given. It represents interval between prefetching cycles.
+
+If enabled, the server will run a recurring background operation to list the remote catalog and to detect new metadata version. It will then parse it and recursively walk the snapshot, fetching active manifest list files and manifest files.
+The files already available at the metadata cache, won't be downloaded again. At the end of each prefetching cycle, the latest metadata snapshot is available at the metadata cache.
+
+```sql
+CREATE TABLE example_table ENGINE = Iceberg(
+    's3://bucket/path/to/iceberg_table'
+) SETTINGS
+    iceberg_metadata_async_prefetch_period_ms = 60000;
+```
+
+In order to make the most of asynchronous metadata prefetching at read operations, `iceberg_metadata_staleness_ms` parameter should be specified as Query or Session parameter. By default (0 - not specified) in the context of each query, the server will fetch latest metadata from the remote catalog.
+By specifying tolerance to metadata staleness, the server is allowed to use the cached version of metadata snapshot without calling the remote catalog. If there's metadata version in cache, and it has been downloaded within the given window of staleness, it will be used to process the query.
+Otherwise the latest version will be fetched from the remote catalog.
+
+```sql
+SELECT count() FROM icebench_table WHERE ...
+SETTINGS iceberg_metadata_staleness_ms=120000
+```
+
+**Note**: Asynchronous metadata prefetching runs at `ICEBERG_SCEDULE_POOL`, which is server-side threadpool for background operations on active `Iceberg` tables. The size of this threadpool is controlled by `iceberg_background_schedule_pool_size` server configuration parameter (default is 10).
+
+**Note**: Current expectation is that metadata cache size is sufficient to hold the latest metadata snapshot in full for all active tables, if asynchronous prefetching is enabled.
+
+## Altinity Antalya branch
+
+### Specify storage type in arguments
+
+Only in the Altinity Antalya branch does `Iceberg` table engine support all storage types. The storage type can be specified using the named argument `storage_type`. Supported values are `s3`, `azure`, `hdfs`, and `local`.
+
+```sql
+CREATE TABLE iceberg_table_s3
+    ENGINE = Iceberg(storage_type='s3', url,  [, NOSIGN | access_key_id, secret_access_key, [session_token]], format, [,compression])
+
+CREATE TABLE iceberg_table_azure
+    ENGINE = Iceberg(storage_type='azure', connection_string|storage_account_url, container_name, blobpath, [account_name, account_key, format, compression])
+
+CREATE TABLE iceberg_table_hdfs
+    ENGINE = Iceberg(storage_type='hdfs', path_to_table, [,format] [,compression_method])
+
+CREATE TABLE iceberg_table_local
+    ENGINE = Iceberg(storage_type='local', path_to_table, [,format] [,compression_method])
+```
+
+### Specify storage type in named collection
+
+Only in Altinity Antalya branch `storage_type` can be included as part of a named collection. This allows for centralized configuration of storage settings.
+
+```xml
+<clickhouse>
+    <named_collections>
+        <iceberg_conf>
+            <url>http://test.s3.amazonaws.com/clickhouse-bucket/</url>
+            <access_key_id>test<access_key_id>
+            <secret_access_key>test</secret_access_key>
+            <format>auto</format>
+            <structure>auto</structure>
+            <storage_type>s3</storage_type>
+        </iceberg_conf>
+    </named_collections>
+</clickhouse>
+```
+
+```sql
+CREATE TABLE iceberg_table ENGINE=Iceberg(iceberg_conf, filename = 'test_table')
+```
+
+The default value for `storage_type` is `s3`.
+
+### The `object_storage_cluster` setting.
+
+Only in the Altinity Antalya branch is an alternative syntax for the `Iceberg` table engine available. This syntax allows execution on a cluster when the `object_storage_cluster` setting is non-empty and contains the cluster name.
+
+```sql
+CREATE TABLE iceberg_table_s3
+    ENGINE = Iceberg(storage_type='s3', url,  [, NOSIGN | access_key_id, secret_access_key, [session_token]], format, [,compression]);
+
+SELECT * FROM iceberg_table_s3 SETTINGS object_storage_cluster='cluster_simple';
+```
 
 ## See also {#see-also}
 

@@ -3,11 +3,13 @@
 #include <Storages/MergeTree/MergeTreeSequentialSource.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Interpreters/Context.h>
-#include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/inplaceBlockConversions.h>
 #include <Core/Settings.h>
+#include <Common/Macros.h>
+#include <boost/algorithm/string/replace.hpp>
 #include <Interpreters/ExpressionActions.h>
 #include <Interpreters/ActionsDAG.h>
+#include <Interpreters/DatabaseCatalog.h>
 #include <Processors/Executors/CompletedPipelineExecutor.h>
 #include <Processors/QueryPlan/BuildQueryPipelineSettings.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
@@ -17,6 +19,7 @@
 #include "Common/setThreadName.h"
 #include <Common/Exception.h>
 #include <Common/ProfileEventsScope.h>
+#include <Databases/DatabaseReplicated.h>
 #include <Storages/MergeTree/ExportList.h>
 #include <Formats/FormatFactory.h>
 #include <Databases/enableAllExperimentalSettings.h>
@@ -47,6 +50,7 @@ namespace Setting
     extern const SettingsUInt64 export_merge_tree_part_max_bytes_per_file;
     extern const SettingsUInt64 export_merge_tree_part_max_rows_per_file;
     extern const SettingsBool allow_experimental_analyzer;
+    extern const SettingsString export_merge_tree_part_filename_pattern;
 }
 
 namespace
@@ -93,12 +97,44 @@ namespace
             plan_for_part.addStep(std::move(expression_step));
         }
     }
+
+    String buildDestinationFilename(
+        const MergeTreePartExportManifest & manifest,
+        const StorageID & storage_id,
+        const ContextPtr & local_context)
+    {
+        auto filename = manifest.settings[Setting::export_merge_tree_part_filename_pattern].value;
+
+        boost::replace_all(filename, "{part_name}", manifest.data_part->name);
+        boost::replace_all(filename, "{checksum}", manifest.data_part->checksums.getTotalChecksumHex());
+
+        Macros::MacroExpansionInfo macro_info;
+        macro_info.table_id = storage_id;
+
+        if (auto database = DatabaseCatalog::instance().tryGetDatabase(storage_id.database_name))
+        {
+            if (const auto replicated = dynamic_cast<const DatabaseReplicated *>(database.get()))
+            {
+                macro_info.shard = replicated->getShardName();
+                macro_info.replica = replicated->getReplicaName();
+            }
+        }
+
+        filename = local_context->getMacros()->expand(filename, macro_info);
+
+        return filename;
+    }
 }
 
 ExportPartTask::ExportPartTask(MergeTreeData & storage_, const MergeTreePartExportManifest & manifest_)
     : storage(storage_),
     manifest(manifest_)
 {
+}
+
+const MergeTreePartExportManifest & ExportPartTask::getManifest() const
+{
+    return manifest;
 }
 
 bool ExportPartTask::executeStep()
@@ -139,6 +175,28 @@ bool ExportPartTask::executeStep()
         manifest.query_id,
         local_context);
 
+    /*
+        This is a hack to fix the issue where S3 is out, ClickHouse keeps retrying S3 requests deep
+        in the AWS SDK and never check for the `isCancelled()` flag. That prevents the task from being killed / cancelled. It also prevents the table from being dropped.
+
+        Merges and mutations don't suffer from this problem because they don't make requests to S3 :). Select statements
+        do make requests to S3, but the cancel predicate is properly setup for regular queries.
+
+        I think this is the first time we have a background operation that makes requests to S3, so we need to connect the dots.
+
+        The simples way is this one, and given the release timeline, I am opting for it.
+    */
+    (*exports_list_entry)->thread_group->setCancelPredicate(
+        [weak_this = weak_from_this()]() -> bool
+        {
+            if (auto shared_this = weak_this.lock())
+            {
+                return shared_this->isCancelled();
+            }
+
+            return true;
+        });
+
     SinkToStoragePtr sink;
 
     const auto new_file_path_callback = [&exports_list_entry](const std::string & file_path)
@@ -149,8 +207,12 @@ bool ExportPartTask::executeStep()
 
     try
     {
+        ThreadGroupSwitcher switcher((*exports_list_entry)->thread_group, ThreadName::EXPORT_PART);
+
+        const auto filename = buildDestinationFilename(manifest, storage.getStorageID(), local_context);
+
         sink = destination_storage->import(
-            manifest.data_part->name + "_" + manifest.data_part->checksums.getTotalChecksumHex(),
+            filename,
             block_with_partition_values,
             new_file_path_callback,
             manifest.file_already_exists_policy == MergeTreePartExportManifest::FileAlreadyExistsPolicy::overwrite,
@@ -194,8 +256,6 @@ bool ExportPartTask::executeStep()
             local_context,
             getLogger("ExportPartition"));
 
-        ThreadGroupSwitcher switcher((*exports_list_entry)->thread_group, ThreadName::EXPORT_PART);
-
         /// We need to support exporting materialized and alias columns to object storage. For some reason, object storage engines don't support them.
         /// This is a hack that materializes the columns before the export so they can be exported to tables that have matching columns
         materializeSpecialColumns(plan_for_part.getCurrentHeader(), metadata_snapshot, local_context, plan_for_part);
@@ -222,6 +282,11 @@ bool ExportPartTask::executeStep()
         };
 
         exec.setCancelCallback(is_cancelled_callback, 100);
+
+        if (isCancelled())
+        {
+            throw Exception(ErrorCodes::QUERY_WAS_CANCELLED, "Export part was cancelled");
+        }
 
         exec.execute();
 
@@ -318,6 +383,7 @@ bool ExportPartTask::executeStep()
 
 void ExportPartTask::cancel() noexcept
 {
+    LOG_INFO(getLogger("ExportPartTask"), "Export part {} task cancel() method called", manifest.data_part->name);
     cancel_requested.store(true);
     pipeline.cancel();
 }
