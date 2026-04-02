@@ -32,6 +32,28 @@ struct AccessToken
     }
 };
 
+/// Result of building the Iceberg REST catalog request body for `RestCatalog::updateMetadata`.
+struct UpdateMetadataRequestBodyResult
+{
+    enum class Status
+    {
+        /// `new_snapshot` is null; caller should not send HTTP and return true.
+        Skip,
+        /// `request_body` is valid; caller should `sendRequest`.
+        Ok,
+        /// Validation failed; caller should return false.
+        Error,
+    };
+    Status status = Status::Error;
+    Poco::JSON::Object::Ptr request_body;
+};
+
+/// Builds the JSON body for `POST .../namespaces/{ns}/tables/{table}` (Iceberg REST update).
+UpdateMetadataRequestBodyResult buildUpdateMetadataRequestBody(
+    const String & namespace_name,
+    const String & table_name,
+    Poco::JSON::Object::Ptr new_snapshot);
+
 class RestCatalog : public ICatalog, public DB::WithContext
 {
 public:
