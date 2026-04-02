@@ -1244,6 +1244,7 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
     FileNamesGenerator & filename_generator,
     Poco::JSON::Object::Ptr & metadata,
     Poco::JSON::Object::Ptr & partition_spec,
+    const String & transaction_id,
     Int64 original_schema_id,
     Int64 partition_spec_id,
     const std::vector<Field> & partition_values,
@@ -1271,6 +1272,12 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
 
     auto [new_snapshot, manifest_list_name, storage_manifest_list_name] = MetadataGenerator(metadata).generateNextMetadata(
         filename_generator, metadata_name, parent_snapshot, total_data_files, total_rows, total_chunks_size, total_data_files, /* added_delete_files */0, /* num_deleted_rows */0);
+
+    /// Embed the stable transaction identifier in the snapshot summary so that a retry after crash
+    /// can detect the commit already happened by scanning the live snapshots array, without extra S3
+    /// files. The field is a ClickHouse extension; Spark/Flink readers ignore unknown summary keys.
+    new_snapshot->getObject(Iceberg::f_summary)->set(
+        Iceberg::f_clickhouse_export_partition_transaction_id, transaction_id);
 
     String manifest_entry_name;
     String storage_manifest_entry_name;
@@ -1438,6 +1445,7 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
 void IcebergMetadata::commitExportPartitionTransaction(
     std::shared_ptr<DataLake::ICatalog> catalog,
     const StorageID & table_id,
+    const String & transaction_id,
     Int64 original_schema_id,
     Int64 partition_spec_id,
     const std::vector<Field> & partition_values,
@@ -1485,6 +1493,31 @@ void IcebergMetadata::commitExportPartitionTransaction(
             "Partition spec changed before export could commit (expected spec {}, got {}). "
             "Restart the export operation.",
             partition_spec_id, latest_spec_id);
+
+    /// Idempotency check: if a previous attempt already committed this transaction the snapshot
+    /// (with our transaction_id embedded in its summary) is still present in the snapshots array
+    /// unless an external engine ran expireSnapshots in the meantime. If found, skip re-committing.
+    if (const auto snapshots = metadata->getArray(Iceberg::f_snapshots))
+    {
+        for (size_t i = 0; i < snapshots->size(); ++i)
+        {
+            auto snap = snapshots->getObject(static_cast<UInt32>(i));
+            if (auto summary = snap->getObject(Iceberg::f_summary))
+            {
+                String tid;
+                if (summary->has(Iceberg::f_clickhouse_export_partition_transaction_id))
+                    tid = summary->getValue<String>(Iceberg::f_clickhouse_export_partition_transaction_id);
+                if (tid == transaction_id)
+                {
+                    LOG_INFO(log,
+                        "Export transaction {} already committed as snapshot {}, skipping re-commit",
+                        transaction_id,
+                        snap->getValue<Int64>(Iceberg::f_metadata_snapshot_id));
+                    return;
+                }
+            }
+        }
+    }
 
     /// Derive partition_columns and partition_types from the schema and partition spec.
     /// The IDs are validated equal above so derivation from the latest metadata yields
@@ -1590,6 +1623,7 @@ void IcebergMetadata::commitExportPartitionTransaction(
                 filename_generator,
                 metadata,
                 partition_spec,
+                transaction_id,
                 original_schema_id,
                 partition_spec_id,
                 partition_values,

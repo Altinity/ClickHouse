@@ -664,6 +664,7 @@ void StorageObjectStorage::commitExportPartitionTransaction(
         configuration->getExternalMetadata()->commitExportPartitionTransaction(
             catalog,
             storage_id,
+            transaction_id,
             original_schema_id,
             partition_spec_id,
             iceberg_commit_export_partition_arguments.partition_values,

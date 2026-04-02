@@ -132,6 +132,7 @@ public:
     void commitExportPartitionTransaction(
         std::shared_ptr<DataLake::ICatalog> catalog,
         const StorageID & table_id,
+        const String & transaction_id,
         Int64 original_schema_id,
         Int64 partition_spec_id,
         const std::vector<Field> & partition_values,
@@ -203,6 +204,7 @@ private:
         FileNamesGenerator & filename_generator,
         Poco::JSON::Object::Ptr & metadata,
         Poco::JSON::Object::Ptr & partition_spec,
+        const String & transaction_id,
         Int64 original_schema_id,
         Int64 partition_spec_id,
         const std::vector<Field> & partition_values,

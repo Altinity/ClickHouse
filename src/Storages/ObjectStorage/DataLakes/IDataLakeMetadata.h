@@ -186,13 +186,14 @@ public:
         const std::string & /* iceberg_metadata_json_string */,
         const std::optional<FormatSettings> & /* format_settings_ */,
         ContextPtr /* context */)
-        {
-            throwNotImplemented("import");
-        }
-    
+    {
+        throwNotImplemented("import");
+    }
+
     virtual void commitExportPartitionTransaction(
         std::shared_ptr<DataLake::ICatalog> /* catalog */,
         const StorageID & /* table_id */,
+        const String & /* transaction_id */,
         Int64 /* original_schema_id */,
         Int64 /* partition_spec_id */,
         const std::vector<Field> & /* partition_values */,
