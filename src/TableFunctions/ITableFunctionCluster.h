@@ -76,8 +76,6 @@ protected:
         /// Cluster name is always the first
         cluster_name = checkAndGetLiteralArgument<String>(args[0], "cluster_name");
 
-        context->getClientInfo().query_kind == ClientInfo::QueryKind::SECONDARY_QUERY;
-
         /// Remove check cluster existing here
         /// In query like
         /// remote('remote_host', xxxCluster('remote_cluster', ...))
