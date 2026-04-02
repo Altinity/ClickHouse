@@ -76,11 +76,6 @@ protected:
         /// Cluster name is always the first
         cluster_name = checkAndGetLiteralArgument<String>(args[0], "cluster_name");
 
-        /// Cluster resolving is not required for secondary query
-        const auto is_secondary_query = context->getClientInfo().query_kind == ClientInfo::QueryKind::SECONDARY_QUERY;
-
-        if (!is_secondary_query && !context->tryGetCluster(cluster_name))
-            throw Exception(ErrorCodes::CLUSTER_DOESNT_EXIST, "Requested cluster '{}' not found", cluster_name);
         /// Remove check cluster existing here
         /// In query like
         /// remote('remote_host', xxxCluster('remote_cluster', ...))
