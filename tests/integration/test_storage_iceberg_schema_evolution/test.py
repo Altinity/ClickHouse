@@ -38,7 +38,7 @@ def started_cluster():
         cluster.add_instance(
             "node1",
             main_configs=["configs/config.d/cluster.xml", "configs/config.d/named_collections.xml"],
-            user_configs=[],
+            user_configs=["configs/users.d/allow_local_data_lakes.xml"],
             with_minio=True,
             with_azurite=True,
             stay_alive=True,

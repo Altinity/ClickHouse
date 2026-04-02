@@ -52,6 +52,7 @@ namespace DatabaseDataLakeSetting
     extern const DatabaseDataLakeSettingsString aws_access_key_id;
     extern const DatabaseDataLakeSettingsString aws_secret_access_key;
     extern const DatabaseDataLakeSettingsString region;
+    extern const DatabaseDataLakeSettingsString namespaces;
     extern const DatabaseDataLakeSettingsString aws_role_arn;
     extern const DatabaseDataLakeSettingsString aws_role_session_name;
 }
@@ -126,6 +127,7 @@ std::shared_ptr<DataLake::ICatalog> DatabaseDataLake::getCatalog() const
         .aws_access_key_id = settings[DatabaseDataLakeSetting::aws_access_key_id].value,
         .aws_secret_access_key = settings[DatabaseDataLakeSetting::aws_secret_access_key].value,
         .region = settings[DatabaseDataLakeSetting::region].value,
+        .namespaces = settings[DatabaseDataLakeSetting::namespaces].value,
         .aws_role_arn = settings[DatabaseDataLakeSetting::aws_role_arn].value,
         .aws_role_session_name = settings[DatabaseDataLakeSetting::aws_role_session_name].value,
     };
@@ -142,6 +144,7 @@ std::shared_ptr<DataLake::ICatalog> DatabaseDataLake::getCatalog() const
                 settings[DatabaseDataLakeSetting::auth_header],
                 settings[DatabaseDataLakeSetting::oauth_server_uri].value,
                 settings[DatabaseDataLakeSetting::oauth_server_use_request_body].value,
+                settings[DatabaseDataLakeSetting::namespaces].value,
                 Context::getGlobalContextInstance());
             break;
         }
@@ -151,6 +154,7 @@ std::shared_ptr<DataLake::ICatalog> DatabaseDataLake::getCatalog() const
                 settings[DatabaseDataLakeSetting::warehouse].value,
                 url,
                 settings[DatabaseDataLakeSetting::catalog_credential].value,
+                settings[DatabaseDataLakeSetting::namespaces].value,
                 Context::getGlobalContextInstance());
             break;
         }
@@ -202,24 +206,24 @@ StorageObjectStorageConfigurationPtr DatabaseDataLake::getConfiguration(
 #if USE_AWS_S3
                 case DB::DatabaseDataLakeStorageType::S3:
                 {
-                    return std::make_shared<StorageS3IcebergConfiguration>(storage_settings);
+                    return std::make_shared<StorageS3IcebergConfiguration>(storage_settings, settings[DatabaseDataLakeSetting::namespaces].value);
                 }
 #endif
 #if USE_AZURE_BLOB_STORAGE
                 case DB::DatabaseDataLakeStorageType::Azure:
                 {
-                    return std::make_shared<StorageAzureIcebergConfiguration>(storage_settings);
+                    return std::make_shared<StorageAzureIcebergConfiguration>(storage_settings, settings[DatabaseDataLakeSetting::namespaces].value);
                 }
 #endif
 #if USE_HDFS
                 case DB::DatabaseDataLakeStorageType::HDFS:
                 {
-                    return std::make_shared<StorageHDFSIcebergConfiguration>(storage_settings);
+                    return std::make_shared<StorageHDFSIcebergConfiguration>(storage_settings, settings[DatabaseDataLakeSetting::namespaces].value);
                 }
 #endif
                 case DB::DatabaseDataLakeStorageType::Local:
                 {
-                    return std::make_shared<StorageLocalIcebergConfiguration>(storage_settings);
+                    return std::make_shared<StorageLocalIcebergConfiguration>(storage_settings, settings[DatabaseDataLakeSetting::namespaces].value);
                 }
                 /// Fake storage in case when catalog store not only
                 /// primary-type tables (DeltaLake or Iceberg), but for
@@ -231,7 +235,7 @@ StorageObjectStorageConfigurationPtr DatabaseDataLake::getConfiguration(
                 /// dependencies and the most lightweight
                 case DB::DatabaseDataLakeStorageType::Other:
                 {
-                    return std::make_shared<StorageLocalIcebergConfiguration>(storage_settings);
+                    return std::make_shared<StorageLocalIcebergConfiguration>(storage_settings, settings[DatabaseDataLakeSetting::namespaces].value);
                 }
 #if !USE_AWS_S3 || !USE_AZURE_BLOB_STORAGE || !USE_HDFS
                 default:
@@ -248,12 +252,12 @@ StorageObjectStorageConfigurationPtr DatabaseDataLake::getConfiguration(
 #if USE_AWS_S3
                 case DB::DatabaseDataLakeStorageType::S3:
                 {
-                    return std::make_shared<StorageS3DeltaLakeConfiguration>(storage_settings);
+                    return std::make_shared<StorageS3DeltaLakeConfiguration>(storage_settings, settings[DatabaseDataLakeSetting::namespaces].value);
                 }
 #endif
                 case DB::DatabaseDataLakeStorageType::Local:
                 {
-                    return std::make_shared<StorageLocalDeltaLakeConfiguration>(storage_settings);
+                    return std::make_shared<StorageLocalDeltaLakeConfiguration>(storage_settings, settings[DatabaseDataLakeSetting::namespaces].value);
                 }
                 /// Fake storage in case when catalog store not only
                 /// primary-type tables (DeltaLake or Iceberg), but for
@@ -265,7 +269,7 @@ StorageObjectStorageConfigurationPtr DatabaseDataLake::getConfiguration(
                 /// dependencies and the most lightweight
                 case DB::DatabaseDataLakeStorageType::Other:
                 {
-                    return std::make_shared<StorageLocalDeltaLakeConfiguration>(storage_settings);
+                    return std::make_shared<StorageLocalDeltaLakeConfiguration>(storage_settings, settings[DatabaseDataLakeSetting::namespaces].value);
                 }
                 default:
                     throw Exception(ErrorCodes::BAD_ARGUMENTS,
@@ -280,12 +284,12 @@ StorageObjectStorageConfigurationPtr DatabaseDataLake::getConfiguration(
 #if USE_AWS_S3
                 case DB::DatabaseDataLakeStorageType::S3:
                 {
-                    return std::make_shared<StorageS3IcebergConfiguration>(storage_settings);
+                    return std::make_shared<StorageS3IcebergConfiguration>(storage_settings, settings[DatabaseDataLakeSetting::namespaces].value);
                 }
 #endif
                 case DB::DatabaseDataLakeStorageType::Other:
                 {
-                    return std::make_shared<StorageLocalIcebergConfiguration>(storage_settings);
+                    return std::make_shared<StorageLocalIcebergConfiguration>(storage_settings, settings[DatabaseDataLakeSetting::namespaces].value);
                 }
                 default:
                     throw Exception(ErrorCodes::BAD_ARGUMENTS,

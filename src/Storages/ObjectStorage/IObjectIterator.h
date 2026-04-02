@@ -21,6 +21,7 @@ struct IObjectIterator
     virtual ObjectInfoPtr next(size_t) = 0;
     virtual size_t estimatedKeysCount() = 0;
     virtual std::optional<UInt64> getSnapshotVersion() const { return std::nullopt; }
+    virtual bool has_concurrent_next() const { return false; }
 };
 
 using ObjectIterator = std::shared_ptr<IObjectIterator>;
@@ -39,6 +40,8 @@ public:
     ObjectInfoPtr next(size_t) override;
     size_t estimatedKeysCount() override { return iterator->estimatedKeysCount(); }
     std::optional<UInt64> getSnapshotVersion() const override { return iterator->getSnapshotVersion(); }
+
+    bool has_concurrent_next() const override { return iterator->has_concurrent_next(); }
 
 private:
     const ObjectIterator iterator;
@@ -61,11 +64,14 @@ public:
     size_t estimatedKeysCount() override { return iterator->estimatedKeysCount(); }
     std::optional<UInt64> getSnapshotVersion() const override { return iterator->getSnapshotVersion(); }
 
+    bool has_concurrent_next() const override { return true; }
+
 private:
     const ObjectIterator iterator;
     String format;
     ObjectStoragePtr object_storage;
     FormatSettings format_settings;
+    std::mutex mutex;
 
     std::queue<ObjectInfoPtr> pending_objects_info;
     const LoggerPtr log = getLogger("GlobIterator");

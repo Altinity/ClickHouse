@@ -91,6 +91,9 @@ ObjectIteratorSplitByBuckets::ObjectIteratorSplitByBuckets(
 
 ObjectInfoPtr ObjectIteratorSplitByBuckets::next(size_t id)
 {
+    /// pending_objects_info is not thread-safe
+    std::lock_guard<std::mutex> lock(mutex);
+
     if (!pending_objects_info.empty())
     {
         auto result = pending_objects_info.front();

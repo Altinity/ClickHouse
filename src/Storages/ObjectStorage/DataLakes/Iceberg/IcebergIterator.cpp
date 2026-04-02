@@ -61,6 +61,7 @@ extern const Event IcebergPartitionPrunedFiles;
 extern const Event IcebergMinMaxIndexPrunedFiles;
 extern const Event IcebergMetadataReadWaitTimeMicroseconds;
 extern const Event IcebergMetadataReturnedObjectInfos;
+extern const Event IcebergIteratorNextMicroseconds;
 };
 
 
@@ -119,6 +120,8 @@ defineDeletesSpan(ManifestFileEntry data_object_, const std::vector<ManifestFile
 
 std::optional<ManifestFileEntry> SingleThreadIcebergKeysIterator::next()
 {
+    ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::IcebergIteratorNextMicroseconds);
+
     if (!data_snapshot)
     {
         return std::nullopt;
@@ -316,8 +319,10 @@ IcebergIterator::IcebergIterator(
     std::sort(equality_deletes_files.begin(), equality_deletes_files.end());
     std::sort(position_deletes_files.begin(), position_deletes_files.end());
     producer_task.emplace(
-        [this]()
+        [this, thread_group = DB::CurrentThread::getGroup()]()
         {
+            ThreadGroupSwitcher switcher(thread_group, "IcebergKeys");
+
             while (!blocking_queue.isFinished())
             {
                 std::optional<ManifestFileEntry> entry;

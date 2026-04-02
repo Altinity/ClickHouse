@@ -11,16 +11,17 @@
 #include <boost/algorithm/string/case_conv.hpp>
 #include <Poco/Util/AbstractConfiguration.h>
 
-
 namespace DB
 {
 
 struct URIConverter
 {
-    static void modifyURI(Poco::URI & uri, std::unordered_map<std::string, std::string> mapper)
+    static void modifyURI(Poco::URI & uri, std::unordered_map<std::string, std::string> mapper, bool enable_url_encoding)
     {
         Macros macros({{"bucket", uri.getHost()}});
-        uri = macros.expand(mapper[uri.getScheme()]).empty() ? uri : Poco::URI(macros.expand(mapper[uri.getScheme()]) + uri.getPathAndQuery());
+        uri = macros.expand(mapper[uri.getScheme()]).empty()
+            ? uri
+            : Poco::URI(macros.expand(mapper[uri.getScheme()]) + uri.getPathAndQuery(), enable_url_encoding);
     }
 };
 
@@ -32,7 +33,7 @@ namespace ErrorCodes
 namespace S3
 {
 
-URI::URI(const std::string & uri_, bool allow_archive_path_syntax)
+URI::URI(const std::string & uri_, bool allow_archive_path_syntax, bool enable_url_encoding)
 {
     /// Case when bucket name represented in domain name of S3 URL.
     /// E.g. (https://bucket-name.s3.region.amazonaws.com/key)
@@ -54,7 +55,7 @@ URI::URI(const std::string & uri_, bool allow_archive_path_syntax)
     else
         uri_str = uri_;
 
-    uri = Poco::URI(uri_str);
+    uri = Poco::URI(uri_str, enable_url_encoding);
 
     std::unordered_map<std::string, std::string> mapper;
     auto context = Context::getGlobalContextInstance();
@@ -76,7 +77,7 @@ URI::URI(const std::string & uri_, bool allow_archive_path_syntax)
         }
 
         if (!mapper.empty())
-            URIConverter::modifyURI(uri, mapper);
+            URIConverter::modifyURI(uri, mapper, enable_url_encoding);
     }
 
     storage_name = "S3";

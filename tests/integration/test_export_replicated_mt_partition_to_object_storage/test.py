@@ -101,6 +101,26 @@ def cluster():
             stay_alive=True,
             with_zookeeper=True,
         )
+
+        # Sharded instances for filename pattern tests
+        cluster.add_instance(
+            "shard1_replica1",
+            main_configs=["configs/named_collections.xml", "configs/allow_experimental_export_partition.xml", "configs/macros_shard1_replica1.xml"],
+            user_configs=["configs/users.d/profile.xml"],
+            with_minio=True,
+            stay_alive=True,
+            with_zookeeper=True,
+        )
+
+        cluster.add_instance(
+            "shard2_replica1",
+            main_configs=["configs/named_collections.xml", "configs/allow_experimental_export_partition.xml", "configs/macros_shard2_replica1.xml"],
+            user_configs=["configs/users.d/profile.xml"],
+            with_minio=True,
+            stay_alive=True,
+            with_zookeeper=True,
+        )
+
         logging.info("Starting cluster...")
         cluster.start()
         yield cluster
@@ -119,13 +139,22 @@ def create_tables_and_insert_data(node, mt_table, s3_table, replica_name):
     create_s3_table(node, s3_table)
 
 
+def create_sharded_tables_and_insert_data(node, mt_table, s3_table, replica_name):
+    """Create sharded ReplicatedMergeTree table with {shard} macro in ZooKeeper path."""
+    node.query(f"CREATE TABLE {mt_table} (id UInt64, year UInt16) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{{shard}}/{mt_table}', '{replica_name}') PARTITION BY year ORDER BY tuple()")
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020), (3, 2020), (4, 2021)")
+
+    create_s3_table(node, s3_table)
+
+
 def test_restart_nodes_during_export(cluster):
     node = cluster.instances["replica1"]
     node2 = cluster.instances["replica2"]
     watcher_node = cluster.instances["watcher_node"]
 
-    mt_table = "disaster_mt_table"
-    s3_table = "disaster_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"disaster_mt_table_{postfix}"
+    s3_table = f"disaster_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
     create_tables_and_insert_data(node2, mt_table, s3_table, "replica2")
@@ -199,8 +228,9 @@ def test_kill_export(cluster):
     node2 = cluster.instances["replica2"]
     watcher_node = cluster.instances["watcher_node"]
 
-    mt_table = "kill_export_mt_table"
-    s3_table = "kill_export_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"kill_export_mt_table_{postfix}"
+    s3_table = f"kill_export_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
     create_tables_and_insert_data(node2, mt_table, s3_table, "replica2")
@@ -259,8 +289,9 @@ def test_drop_source_table_during_export(cluster):
     # node2 = cluster.instances["replica2"]
     watcher_node = cluster.instances["watcher_node"]
 
-    mt_table = "drop_source_table_during_export_mt_table"
-    s3_table = "drop_source_table_during_export_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"drop_source_table_during_export_mt_table_{postfix}"
+    s3_table = f"drop_source_table_during_export_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
     # create_tables_and_insert_data(node2, mt_table, s3_table, "replica2")
@@ -309,9 +340,10 @@ def test_drop_source_table_during_export(cluster):
 def test_concurrent_exports_to_different_targets(cluster):
     node = cluster.instances["replica1"]
 
-    mt_table = "concurrent_diff_targets_mt_table"
-    s3_table_a = "concurrent_diff_targets_s3_a"
-    s3_table_b = "concurrent_diff_targets_s3_b"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"concurrent_diff_targets_mt_table_{postfix}"
+    s3_table_a = f"concurrent_diff_targets_s3_a_{postfix}"
+    s3_table_b = f"concurrent_diff_targets_s3_b_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table_a, "replica1")
     create_s3_table(node, s3_table_b)
@@ -346,8 +378,9 @@ def test_concurrent_exports_to_different_targets(cluster):
 def test_failure_is_logged_in_system_table(cluster):
     node = cluster.instances["replica1"]
 
-    mt_table = "failure_is_logged_in_system_table_mt_table"
-    s3_table = "failure_is_logged_in_system_table_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"failure_is_logged_in_system_table_mt_table_{postfix}"
+    s3_table = f"failure_is_logged_in_system_table_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
@@ -411,8 +444,9 @@ def test_failure_is_logged_in_system_table(cluster):
 def test_inject_short_living_failures(cluster):
     node = cluster.instances["replica1"]
 
-    mt_table = "inject_short_living_failures_mt_table"
-    s3_table = "inject_short_living_failures_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"inject_short_living_failures_mt_table_{postfix}"
+    s3_table = f"inject_short_living_failures_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
@@ -476,8 +510,9 @@ def test_inject_short_living_failures(cluster):
 def test_export_ttl(cluster):
     node = cluster.instances["replica1"]
 
-    mt_table = "export_ttl_mt_table"
-    s3_table = "export_ttl_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"export_ttl_mt_table_{postfix}"
+    s3_table = f"export_ttl_s3_table_{postfix}"
 
     expiration_time = 3
 
@@ -511,8 +546,9 @@ def test_export_ttl(cluster):
 def test_export_partition_file_already_exists_policy(cluster):
     node = cluster.instances["replica1"]
 
-    mt_table = "export_partition_file_already_exists_policy_mt_table"
-    s3_table = "export_partition_file_already_exists_policy_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"export_partition_file_already_exists_policy_mt_table_{postfix}"
+    s3_table = f"export_partition_file_already_exists_policy_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
@@ -598,8 +634,9 @@ def test_export_partition_file_already_exists_policy(cluster):
 def test_export_partition_feature_is_disabled(cluster):
     replica_with_export_disabled = cluster.instances["replica_with_export_disabled"]
 
-    mt_table = "export_partition_feature_is_disabled_mt_table"
-    s3_table = "export_partition_feature_is_disabled_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"export_partition_feature_is_disabled_mt_table_{postfix}"
+    s3_table = f"export_partition_feature_is_disabled_s3_table_{postfix}"
 
     create_tables_and_insert_data(replica_with_export_disabled, mt_table, s3_table, "replica1")
 
@@ -618,8 +655,9 @@ def test_export_partition_permissions(cluster):
     """
     node = cluster.instances["replica1"]
 
-    mt_table = "permissions_mt_table"
-    s3_table = "permissions_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"permissions_mt_table_{postfix}"
+    s3_table = f"permissions_s3_table_{postfix}"
 
     # Create tables as default user
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
@@ -687,8 +725,9 @@ def test_export_partition_permissions(cluster):
 def test_multiple_exports_within_a_single_query(cluster):
     node = cluster.instances["replica1"]
 
-    mt_table = "multiple_exports_within_a_single_query_mt_table"
-    s3_table = "multiple_exports_within_a_single_query_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"multiple_exports_within_a_single_query_mt_table_{postfix}"
+    s3_table = f"multiple_exports_within_a_single_query_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
@@ -725,8 +764,9 @@ def test_pending_mutations_throw_before_export_partition(cluster):
     """Test that pending mutations before export partition throw an error."""
     node = cluster.instances["replica1"]
 
-    mt_table = "pending_mutations_throw_partition_mt_table"
-    s3_table = "pending_mutations_throw_partition_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"pending_mutations_throw_partition_mt_table_{postfix}"
+    s3_table = f"pending_mutations_throw_partition_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
@@ -749,8 +789,9 @@ def test_pending_mutations_skip_before_export_partition(cluster):
     """Test that pending mutations before export partition are skipped with throw_on_pending_mutations=false."""
     node = cluster.instances["replica1"]
 
-    mt_table = "pending_mutations_skip_partition_mt_table"
-    s3_table = "pending_mutations_skip_partition_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"pending_mutations_skip_partition_mt_table_{postfix}"
+    s3_table = f"pending_mutations_skip_partition_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
@@ -778,8 +819,9 @@ def test_pending_patch_parts_throw_before_export_partition(cluster):
     """Test that pending patch parts before export partition throw an error with default settings."""
     node = cluster.instances["replica1"]
 
-    mt_table = "pending_patches_throw_partition_mt_table"
-    s3_table = "pending_patches_throw_partition_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"pending_patches_throw_partition_mt_table_{postfix}"
+    s3_table = f"pending_patches_throw_partition_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
@@ -801,8 +843,9 @@ def test_pending_patch_parts_skip_before_export_partition(cluster):
     """Test that pending patch parts before export partition are skipped with throw_on_pending_patch_parts=false."""
     node = cluster.instances["replica1"]
 
-    mt_table = "pending_patches_skip_partition_mt_table"
-    s3_table = "pending_patches_skip_partition_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"pending_patches_skip_partition_mt_table_{postfix}"
+    s3_table = f"pending_patches_skip_partition_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
@@ -827,8 +870,9 @@ def test_mutations_after_export_partition_started(cluster):
     """Test that mutations applied after export partition starts don't affect the exported data."""
     node = cluster.instances["replica1"]
 
-    mt_table = "mutations_after_export_partition_mt_table"
-    s3_table = "mutations_after_export_partition_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"mutations_after_export_partition_mt_table_{postfix}"
+    s3_table = f"mutations_after_export_partition_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
@@ -872,8 +916,9 @@ def test_patch_parts_after_export_partition_started(cluster):
     """Test that patch parts created after export partition starts don't affect the exported data."""
     node = cluster.instances["replica1"]
 
-    mt_table = "patches_after_export_partition_mt_table"
-    s3_table = "patches_after_export_partition_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"patches_after_export_partition_mt_table_{postfix}"
+    s3_table = f"patches_after_export_partition_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
@@ -919,8 +964,9 @@ def test_mutation_in_partition_clause(cluster):
     allow exports of unaffected partitions to succeed."""
     node = cluster.instances["replica1"]
 
-    mt_table = "mutation_in_partition_clause_mt_table"
-    s3_table = "mutation_in_partition_clause_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"mutation_in_partition_clause_mt_table_{postfix}"
+    s3_table = f"mutation_in_partition_clause_s3_table_{postfix}"
 
     create_tables_and_insert_data(node, mt_table, s3_table, "replica1")
 
@@ -958,8 +1004,9 @@ def test_export_partition_with_mixed_computed_columns(cluster):
     """Test export partition with ALIAS, MATERIALIZED, and EPHEMERAL columns."""
     node = cluster.instances["replica1"]
 
-    mt_table = "mixed_computed_mt_table"
-    s3_table = "mixed_computed_s3_table"
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"mixed_computed_mt_table_{postfix}"
+    s3_table = f"mixed_computed_s3_table_{postfix}"
 
     node.query(f"""
         CREATE TABLE {mt_table} (
@@ -1008,3 +1055,165 @@ def test_export_partition_with_mixed_computed_columns(cluster):
             AND partition_id = '1'
     """)
     assert status.strip() == "COMPLETED", f"Expected COMPLETED status, got: {status}"
+
+
+def test_sharded_export_partition_with_filename_pattern(cluster):
+    """Test that export partition with filename pattern prevents collisions in sharded setup."""
+    shard1_r1 = cluster.instances["shard1_replica1"]
+    shard2_r1 = cluster.instances["shard2_replica1"]
+    watcher_node = cluster.instances["watcher_node"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"sharded_mt_table_{postfix}"
+    s3_table = f"sharded_s3_table_{postfix}"
+
+    # Create sharded tables on all shards with same partition data (same part names)
+    # Each shard uses different ZooKeeper path via {shard} macro
+    create_sharded_tables_and_insert_data(shard1_r1, mt_table, s3_table, "replica1")
+    create_sharded_tables_and_insert_data(shard2_r1, mt_table, s3_table, "replica1")
+    create_s3_table(watcher_node, s3_table)
+
+    # Export partition from both shards with filename pattern including shard
+    # This should prevent filename collisions
+    shard1_r1.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
+        f"SETTINGS export_merge_tree_part_filename_pattern = '{{part_name}}_{{shard}}_{{replica}}_{{checksum}}'"
+    )
+    shard2_r1.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
+        f"SETTINGS export_merge_tree_part_filename_pattern = '{{part_name}}_{{shard}}_{{replica}}_{{checksum}}'"
+    )
+
+    # Wait for exports to complete
+    wait_for_export_status(shard1_r1, mt_table, s3_table, "2020", "COMPLETED")
+    wait_for_export_status(shard2_r1, mt_table, s3_table, "2020", "COMPLETED")
+
+    total_count = watcher_node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020").strip()
+    assert total_count == "6", f"Expected 6 total rows (3 from each shard), got {total_count}"
+
+    # Verify filenames contain shard information (check via S3 directly)
+    # Get all files from S3 - query from watcher_node since S3 is shared
+    files_shard1 = watcher_node.query(
+        f"SELECT _file FROM s3(s3_conn, filename='{s3_table}/**', format='One') WHERE _file LIKE '%shard1%' LIMIT 1"
+    ).strip()
+    files_shard2 = watcher_node.query(
+        f"SELECT _file FROM s3(s3_conn, filename='{s3_table}/**', format='One') WHERE _file LIKE '%shard2%' LIMIT 1"
+    ).strip()
+
+    # Both shards should have files with their shard names
+    assert "shard1" in files_shard1 or files_shard1 == "", f"Expected shard1 in filenames, got: {files_shard1}"
+    assert "shard2" in files_shard2 or files_shard2 == "", f"Expected shard2 in filenames, got: {files_shard2}"
+
+
+def test_export_partition_from_replicated_database_uses_db_shard_replica_macros(cluster):
+    """Test that {shard} and {replica} in the filename pattern are expanded from the
+    DatabaseReplicated identity, NOT from server config macros.
+
+    replica1 has no <shard>/<replica> entries in its server config <macros> section.
+    Without the fix buildDestinationFilename() leaves macro_info.shard/replica unset, so
+    Macros::expand() falls through to the config-macros lookup and throws NO_ELEMENTS_IN_CONFIG.
+    With the fix the DatabaseReplicated shard_name / replica_name are injected into macro_info
+    before the expand call, and the pattern resolves correctly.
+    """
+
+    node = cluster.instances["replica1"]
+    watcher_node = cluster.instances["watcher_node"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    db_name = f"repdb_{postfix}"
+    table_name = "mt_table"
+    s3_table = f"s3_dbreplicated_{postfix}"
+
+    # These values exist only in the DatabaseReplicated definition – they are NOT
+    # present anywhere in replica1's server config <macros>.
+    db_shard = "db_shard_x"
+    db_replica = "db_replica_y"
+
+    node.query(
+        f"CREATE DATABASE {db_name} "
+        f"ENGINE = Replicated('/clickhouse/databases/{db_name}', '{db_shard}', '{db_replica}')")
+
+    node.query(f"""
+        CREATE TABLE {db_name}.{table_name}
+        (id UInt64, year UInt16)
+        ENGINE = ReplicatedMergeTree()
+        PARTITION BY year ORDER BY tuple()""")
+
+    node.query(f"INSERT INTO {db_name}.{table_name} VALUES (1, 2020), (2, 2020), (3, 2020)")
+    # Stop merges so part names stay stable during the test.
+    node.query(f"SYSTEM STOP MERGES {db_name}.{table_name}")
+
+    node.query(
+        f"CREATE TABLE {s3_table} (id UInt64, year UInt16) "
+        f"ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive') "
+        f"PARTITION BY year")
+
+    watcher_node.query(
+        f"CREATE TABLE {s3_table} (id UInt64, year UInt16) "
+        f"ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive') "
+        f"PARTITION BY year")
+
+    # Export with {shard} and {replica} in the pattern.
+    # Before the fix: Macros::expand throws NO_ELEMENTS_IN_CONFIG because replica1 has
+    # no <shard>/<replica> server config macros.
+    # After the fix: DatabaseReplicated's shard_name/replica_name are wired into
+    # macro_info before the expand call, so this succeeds and produces the right names.
+    node.query(
+        f"ALTER TABLE {db_name}.{table_name} EXPORT PARTITION ID '2020' TO TABLE {s3_table} "
+        f"SETTINGS export_merge_tree_part_filename_pattern = "
+        f"'{{part_name}}_{{shard}}_{{replica}}_{{checksum}}'")
+
+    # A FAILED status here almost certainly means the macro expansion threw
+    # NO_ELEMENTS_IN_CONFIG (i.e. the fix is missing or broken).
+    wait_for_export_status(node, table_name, s3_table, "2020", "COMPLETED")
+
+    # Data should have landed in S3.
+    count = watcher_node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020").strip()
+    assert count == "3", f"Expected 3 exported rows, got {count}"
+
+    # The exported filename must contain the exact shard and replica names from the
+    # DatabaseReplicated definition, proving the fix injected them (not server config macros).
+    filename = watcher_node.query(
+        f"SELECT _file FROM s3(s3_conn, filename='{s3_table}/**/*.parquet', format='One') LIMIT 1"
+    ).strip()
+
+    assert db_shard in filename, (
+        f"Expected filename to contain DatabaseReplicated shard '{db_shard}', got: {filename!r}. "
+        "Suggests {shard} was not expanded from the DatabaseReplicated identity.")
+
+    assert db_replica in filename, (
+        f"Expected filename to contain DatabaseReplicated replica '{db_replica}', got: {filename!r}. "
+        "Suggests {replica} was not expanded from the DatabaseReplicated identity.")
+
+
+def test_sharded_export_partition_default_pattern(cluster):
+    shard1_r1 = cluster.instances["shard1_replica1"]
+    shard2_r1 = cluster.instances["shard2_replica1"]
+    watcher_node = cluster.instances["watcher_node"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"sharded_mt_table_default_{postfix}"
+    s3_table = f"sharded_s3_table_default_{postfix}"
+
+    # Create sharded tables with different ZooKeeper paths per shard
+    create_sharded_tables_and_insert_data(shard1_r1, mt_table, s3_table, "replica1")
+    create_sharded_tables_and_insert_data(shard2_r1, mt_table, s3_table, "replica1")
+    create_s3_table(watcher_node, s3_table)
+
+    # Export with default pattern ({part_name}_{checksum}) - may cause collisions if parts have same name and the same checksum
+    shard1_r1.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
+    )
+    shard2_r1.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {s3_table}"
+    )
+
+    wait_for_export_status(shard1_r1, mt_table, s3_table, "2020", "COMPLETED")
+    wait_for_export_status(shard2_r1, mt_table, s3_table, "2020", "COMPLETED")
+
+    # Both exports should complete (even if there are collisions, the overwrite policy handles it)
+    # S3 tables are shared, so query from watcher_node
+    total_count = watcher_node.query(f"SELECT count() FROM {s3_table} WHERE year = 2020").strip()
+
+    # only one file with 3 rows should be present
+    assert int(total_count) == 3, f"Expected 3 rows, got {total_count}"

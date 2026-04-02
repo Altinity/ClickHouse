@@ -100,6 +100,8 @@ public:
     size_t estimatedKeysCount() override;
     ~IcebergIterator() override;
 
+    bool has_concurrent_next() const override { return true; }
+
 private:
     std::unique_ptr<ActionsDAG> filter_dag;
     ObjectStoragePtr object_storage;
