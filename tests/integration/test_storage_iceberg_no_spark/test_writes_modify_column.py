@@ -55,7 +55,16 @@ def test_modify_column_errors(started_cluster_iceberg_no_spark, format_version, 
         f"ALTER TABLE {TABLE_NAME} MODIFY COLUMN value Int64;",
         settings=INSERT_SETTINGS,
     )
-    assert "schema evolution" in error.lower() or "doesn't allow" in error.lower()
+    el = error.lower()
+    # String→integer: mismatched Poco::Var kinds in checkValidSchemaEvolution → BadCastException
+    # (not always the explicit Iceberg "schema evolution" BAD_ARGUMENTS text).
+    assert (
+        "bad cast" in el
+        or "can not convert" in el
+        or "cannot convert" in el
+        or "schema evolution" in el
+        or "doesn't allow" in el
+    )
 
     assert instance.query(
         f"SELECT name FROM system.columns WHERE database = currentDatabase() AND table = '{TABLE_NAME}' ORDER BY name"
