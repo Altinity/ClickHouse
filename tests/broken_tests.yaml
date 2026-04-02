@@ -283,6 +283,16 @@
   message: 'Client timed out!'
   check_types:
   - asan
+- name: 03572_export_merge_tree_part_limits_and_table_functions
+  reason: 'INVESTIGATE - Unstable on tsan'
+  message: 'timeout: 60s'
+  check_types:
+  - tsan
+- name: 00157_cache_dictionary
+  reason: 'KNOWN: Timeout on coverage build (Altinity infra-specific)'
+  message: 'DB::Exception: Timeout exceeded'
+  check_types:
+  - sanitize-coverage
 
 
 # Regex rules should be ordered from most specific to least specific.

@@ -1,3 +1,5 @@
+#include <base/defines.h>
+#include <base/sleep.h>
 #include "config.h"
 #if USE_AVRO
 
@@ -9,9 +11,9 @@
 #include <Core/UUID.h>
 #include <DataTypes/DataTypeSet.h>
 #include <Formats/FormatFilterInfo.h>
-#include <Formats/FormatParserSharedResources.h>
 #include <Formats/ReadSchemaUtils.h>
 #include <Functions/FunctionFactory.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/MetadataGenerator.h>
 #include <Functions/IFunctionAdaptors.h>
 #include <Functions/tuple.h>
 #include <Processors/Formats/ISchemaReader.h>
@@ -31,6 +33,7 @@
 #include <Databases/DataLake/Common.h>
 #include <Disks/DiskType.h>
 #include <Core/ColumnsWithTypeAndName.h>
+#include <Core/ServerSettings.h>
 #include <Core/Settings.h>
 #include <Core/NamesAndTypes.h>
 #include <Databases/DataLake/ICatalog.h>
@@ -88,6 +91,7 @@ namespace DataLakeStorageSetting
 {
 extern const DataLakeStorageSettingsString iceberg_metadata_file_path;
 extern const DataLakeStorageSettingsString iceberg_metadata_table_uuid;
+extern const DataLakeStorageSettingsUInt32 iceberg_metadata_async_prefetch_period_ms;
 extern const DataLakeStorageSettingsBool iceberg_recent_metadata_file_by_last_updated_ms_field;
 extern const DataLakeStorageSettingsBool iceberg_use_version_hint;
 extern const DataLakeStorageSettingsNonZeroUInt64 iceberg_format_version;
@@ -101,6 +105,7 @@ extern const int NOT_IMPLEMENTED;
 extern const int ICEBERG_SPECIFICATION_VIOLATION;
 extern const int TABLE_ALREADY_EXISTS;
 extern const int SUPPORT_IS_DISABLED;
+extern const int INCORRECT_DATA;
 }
 
 namespace Setting
@@ -149,7 +154,7 @@ Iceberg::PersistentTableComponents IcebergMetadata::initializePersistentTableCom
     StorageObjectStorageConfigurationPtr configuration, IcebergMetadataFilesCachePtr cache_ptr, ContextPtr context_)
 {
     const auto [metadata_version, metadata_file_path, compression_method]
-        = getLatestOrExplicitMetadataFileAndVersion(object_storage, configuration->getPathForRead().path, configuration->getDataLakeSettings(), cache_ptr, context_, log.get(), std::nullopt);
+        = getLatestOrExplicitMetadataFileAndVersion(object_storage, configuration->getPathForRead().path, configuration->getDataLakeSettings(), cache_ptr, context_, log.get(), std::nullopt, true);
     LOG_DEBUG(log, "Latest metadata file path is {}, version {}", metadata_file_path, metadata_version);
     auto metadata_object
         = getMetadataJSONObject(metadata_file_path, object_storage, cache_ptr, context_, log, compression_method, std::nullopt);
@@ -183,7 +188,7 @@ Iceberg::PersistentTableComponents IcebergMetadata::initializePersistentTableCom
     };
 }
 
-std::pair<IcebergDataSnapshotPtr, TableStateSnapshot> IcebergMetadata::getRelevantState(const ContextPtr & context) const
+std::pair<IcebergDataSnapshotPtr, TableStateSnapshot> IcebergMetadata::getRelevantState(const ContextPtr & context, bool force_fetch_latest_metadata) const
 {
     const auto [metadata_version, metadata_file_path, compression_method] = getLatestOrExplicitMetadataFileAndVersion(
         object_storage,
@@ -192,7 +197,8 @@ std::pair<IcebergDataSnapshotPtr, TableStateSnapshot> IcebergMetadata::getReleva
         persistent_components.metadata_cache,
         context,
         log.get(),
-        persistent_components.table_uuid);
+        persistent_components.table_uuid,
+        force_fetch_latest_metadata);
     return getState(context, metadata_file_path, metadata_version);
 }
 
@@ -208,6 +214,80 @@ IcebergMetadata::IcebergMetadata(
     , data_lake_settings(configuration_->getDataLakeSettings())
     , write_format(configuration_->getFormat())
 {
+    /// TODO: for now it's okay to start/stop the task via constructor/destructor. Once refactored, we'd need to plumb startup/shutdown and schedule the task from there
+    if (cache_ptr && data_lake_settings[DataLakeStorageSetting::iceberg_metadata_async_prefetch_period_ms] != 0)
+    {
+        background_metadata_prefetch_task = context_->getIcebergSchedulePool().createTask(
+            StorageID("", persistent_components.table_uuid ? *persistent_components.table_uuid : persistent_components.table_path),
+            "backgroundMetadataPrefetcherThread",
+            [this]
+            {
+                this->backgroundMetadataPrefetcherThread();
+            }
+        );
+        background_metadata_prefetch_task->activateAndSchedule();
+    }
+}
+
+IcebergMetadata::~IcebergMetadata()
+{
+    if (background_metadata_prefetch_task)
+        background_metadata_prefetch_task->deactivate();
+}
+
+void IcebergMetadata::backgroundMetadataPrefetcherThread()
+{
+    size_t interval = data_lake_settings[DataLakeStorageSetting::iceberg_metadata_async_prefetch_period_ms];
+    SCOPE_EXIT({
+        background_metadata_prefetch_task->scheduleAfter(interval);
+    });
+
+    try
+    {
+        if (!Context::getGlobalContextInstance())
+        {
+            /// Should never happen, but if seen, this is clear indicator that the task should be started/stopped via startup/shutdown mechanism (check TODOs above)
+            LOG_DEBUG(log, "backgroundMetadataPrefetcherThread: no global context - skipping");
+            return;
+        }
+
+        Stopwatch watch;
+
+        /// TODO: also we'd want to run all these download operations as separate scheduled tasks - to parallelize it and
+        ///       to prevent running a heavy multi-step operation as: IO > deserialization > parsing > IO > deserialization > parsing > ...
+        ///       We'll be able to achieve that after getting asyncIterator refactoring
+
+        /// first, we fetch the latest metadata version and cache it;
+        /// as a part of the same method, we download metadata.json of the latest metadata version
+        /// and after parsing it, we fetch manifest lists, parse and cache them
+        auto ctx = Context::createCopy(Context::getGlobalContextInstance());
+        auto [actual_data_snapshot, actual_table_state_snapshot] = getRelevantState(ctx, true);
+        if (actual_data_snapshot)
+        {
+            for (const auto & entry : actual_data_snapshot->manifest_list_entries)
+            {
+                /// second, we fetch, parse and cache each manifest file
+                auto manifest_file_ptr = Iceberg::getManifestFile(
+                    object_storage, persistent_components, ctx, log,
+                    entry.manifest_file_absolute_path,
+                    entry.added_sequence_number,
+                    entry.added_snapshot_id,
+                    *secondary_storages);
+            }
+        }
+
+        LOG_TRACE(log, "backgroundMetadataPrefetcherThread: interval={} prefetch_time_ms={} table_path={}/{} latest_metadata={}/{}",
+                 interval,
+                 watch.elapsedMilliseconds(),
+                 persistent_components.table_path,
+                 persistent_components.table_uuid ? *(persistent_components.table_uuid) : "no_uuid",
+                 actual_table_state_snapshot.metadata_version,
+                 actual_table_state_snapshot.metadata_file_path);
+    }
+    catch (...)
+    {
+        DB::tryLogCurrentException(log);
+    }
 }
 
 Int32 IcebergMetadata::parseTableSchema(
@@ -530,6 +610,100 @@ void IcebergMetadata::mutate(
         configuration->getTypeName(),
         configuration->getNamespace()
     );
+}
+
+void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICatalog> catalog, const StorageID & storage_id)
+{
+    if (!context->getSettingsRef()[Setting::allow_experimental_insert_into_iceberg].value)
+        throw Exception(
+            ErrorCodes::SUPPORT_IS_DISABLED,
+            "Iceberg truncate is experimental. "
+            "To allow its usage, enable setting allow_experimental_insert_into_iceberg");
+
+    auto [actual_data_snapshot, actual_table_state_snapshot] = getRelevantState(context);
+    auto metadata_object = getMetadataJSONObject(
+        actual_table_state_snapshot.metadata_file_path,
+        object_storage,
+        persistent_components.metadata_cache,
+        context,
+        log,
+        persistent_components.metadata_compression_method,
+        persistent_components.table_uuid);
+
+    // Use -1 as the Iceberg spec sentinel for "no parent snapshot"
+    // (distinct from snapshot ID 0 which is a valid snapshot).
+    Int64 parent_snapshot_id = actual_table_state_snapshot.snapshot_id.value_or(-1);
+
+    auto config_path = persistent_components.table_path;
+    if (!config_path.starts_with('/')) config_path = '/' + config_path;
+    if (!config_path.ends_with('/')) config_path += "/";
+
+    bool is_transactional = (catalog != nullptr && catalog->isTransactional());
+
+    // Transactional catalogs (e.g. REST) require a fully-qualified blob URI
+    // (scheme://bucket/path) so the catalog can resolve the metadata location
+    // independently of any local path configuration. Non-transactional catalogs
+    // use bare paths relative to the object storage root.
+    FileNamesGenerator filename_generator;
+    if (is_transactional || context->getSettingsRef()[Setting::write_full_path_in_iceberg_metadata])
+    {
+        String location = metadata_object->getValue<String>(Iceberg::f_location);
+        if (!location.ends_with("/")) location += "/";
+        filename_generator = FileNamesGenerator(
+            location, config_path, is_transactional,
+            persistent_components.metadata_compression_method, write_format);
+    }
+    else
+    {
+        filename_generator = FileNamesGenerator(
+            config_path, config_path, false,
+            persistent_components.metadata_compression_method, write_format);
+    }
+
+    Int32 new_metadata_version = actual_table_state_snapshot.metadata_version + 1;
+    filename_generator.setVersion(new_metadata_version);
+
+    auto [metadata_name, storage_metadata_name] = filename_generator.generateMetadataName();
+
+    auto [new_snapshot, manifest_list_name, storage_manifest_list_name] = MetadataGenerator(metadata_object).generateNextMetadata(
+        filename_generator, metadata_name, parent_snapshot_id,
+        /* added_files */ 0, /* added_records */ 0, /* added_files_size */ 0,
+        /* num_partitions */ 0, /* added_delete_files */ 0, /* num_deleted_rows */ 0,
+        std::nullopt, std::nullopt, /*is_truncate=*/true);
+
+    auto write_settings = context->getWriteSettings();
+    auto buf = object_storage->writeObject(
+        StoredObject(storage_manifest_list_name),
+        WriteMode::Rewrite, std::nullopt,
+        DBMS_DEFAULT_BUFFER_SIZE, write_settings);
+
+    generateManifestList(filename_generator, metadata_object, object_storage,
+        context, {}, new_snapshot, 0, *buf, Iceberg::FileContentType::DATA, /*use_previous_snapshots=*/false);
+    buf->finalize();
+
+    String metadata_content = dumpMetadataObjectToString(metadata_object);
+    writeMessageToFile(metadata_content, storage_metadata_name, object_storage,
+        context, "*", "", persistent_components.metadata_compression_method);
+
+    if (catalog)
+    {
+        // Transactional catalogs require a fully-qualified blob URI so the catalog
+        // can resolve the metadata location independently of local path configuration.
+        String catalog_filename = metadata_name;
+        if (is_transactional)
+        {
+            // Build full URI from the table's location field (e.g. "s3://bucket/namespace.table")
+            // combined with the relative metadata name.
+            String location = metadata_object->getValue<String>(Iceberg::f_location);
+            if (!location.ends_with("/")) location += "/";
+            catalog_filename = location + metadata_name;
+        }
+
+        const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
+        if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot))
+            throw Exception(ErrorCodes::INCORRECT_DATA,
+                "Failed to commit Iceberg truncate update to catalog.");
+    }
 }
 
 void IcebergMetadata::checkMutationIsPossible(const MutationCommands & commands)
