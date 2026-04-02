@@ -1,10 +1,12 @@
 #include <Storages/MergeTree/ExportPartitionUtils.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include <Common/ProfileEvents.h>
+#include <Common/FailPoint.h>
 #include <Common/logger_useful.h>
 #include "Storages/ExportReplicatedMergeTreePartitionManifest.h"
 #include "Storages/ExportReplicatedMergeTreePartitionTaskEntry.h"
 #include <filesystem>
+#include <thread>
 
 namespace ProfileEvents
 {
@@ -16,6 +18,16 @@ namespace ProfileEvents
 
 namespace DB
 {
+
+namespace ErrorCodes
+{
+    extern const int FAULT_INJECTED;
+}
+
+namespace FailPoints
+{
+    extern const char iceberg_export_after_commit_before_zk_completed[];
+}
 
 namespace fs = std::filesystem;
 
@@ -109,6 +121,15 @@ namespace ExportPartitionUtils
         }
 
         destination_storage->commitExportPartitionTransaction(manifest.transaction_id, manifest.partition_id, exported_paths, iceberg_args, context);
+
+        /// Failpoint to simulate a crash after the Iceberg commit succeeds but before
+        /// ZooKeeper is updated to COMPLETED. Used by idempotency integration tests.
+        fiu_do_on(FailPoints::iceberg_export_after_commit_before_zk_completed,
+        {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            throw Exception(ErrorCodes::FAULT_INJECTED,
+                "Failpoint: simulating crash after Iceberg commit, before ZK COMPLETED");
+        });
 
         LOG_INFO(log, "ExportPartition: Committed export, mark as completed");
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);

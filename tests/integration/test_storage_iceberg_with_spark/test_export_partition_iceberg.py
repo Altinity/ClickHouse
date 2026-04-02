@@ -439,3 +439,60 @@ def test_rejected_compound_order_reversed(export_cluster):
         insert_values="(1, 2024, 'EU')",
     )
     assert "BAD_ARGUMENTS" in error, f"Expected BAD_ARGUMENTS, got: {error!r}"
+
+
+def test_idempotency_after_commit_crash(export_cluster):
+    """
+    Verify that an Iceberg export commit is idempotent when ClickHouse crashes (via
+    std::terminate() in a failpoint) after the Iceberg metadata is written but before
+    ZooKeeper is updated to COMPLETED.
+
+    Expected behaviour:
+    - The failpoint fires once: std::terminate() kills the process immediately after the
+      Iceberg commit; ZK task remains PENDING.
+    - ClickHouse is restarted.  The scheduler picks up the PENDING task and retries the
+      commit.  commitExportPartitionTransaction finds the transaction_id already present in
+      the Iceberg snapshot summary and skips re-committing.
+    - The task eventually reaches COMPLETED.
+    - The row count in the Iceberg table is exactly the number inserted (no duplicates).
+    """
+    node = export_cluster.instances["node1"]
+    spark = export_cluster.spark_session
+
+    uid = str(uuid.uuid4()).replace("-", "_")
+    source = f"rmt_{uid}"
+    iceberg = f"spark_{uid}"
+
+    _spark_iceberg(
+        export_cluster,
+        spark,
+        iceberg,
+        f"CREATE TABLE {iceberg} (id BIGINT, year INT)"
+        f" USING iceberg PARTITIONED BY (identity(year)) OPTIONS('format-version'='2')",
+    )
+    _attach_ch_iceberg(node, iceberg, "id Int64, year Int32", export_cluster)
+    _make_rmt(node, source, "id Int64, year Int32", "year")
+    node.query(f"INSERT INTO {source} VALUES (1, 2024), (2, 2024), (3, 2024)")
+
+    pid = _first_partition_id(node, source)
+
+    # Enable the ONCE failpoint. When the background scheduler thread reaches the
+    # injection point (after a successful Iceberg commit), std::terminate() is called
+    # and the process exits immediately without setting ZK COMPLETED.
+    node.query("SYSTEM ENABLE FAILPOINT iceberg_export_after_commit_before_zk_completed")
+    node.query(f"ALTER TABLE {source} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg}")
+
+    # the fail point will sleep for 10 seconds. Wait for 5 and then re-start clickhouse.
+    time.sleep(5)
+
+    # Restart ClickHouse. The ZK task is still PENDING; the scheduler will pick it up.
+    node.restart_clickhouse()
+
+    # On restart the scheduler retries the commit. commitExportPartitionTransaction
+    # detects the transaction_id in the existing Iceberg snapshot summary and returns
+    # without re-writing any data, then sets ZK COMPLETED.
+    _wait_for_export(node, source, iceberg, pid, timeout=60)
+
+    # Exactly 3 rows — no duplicates from the idempotent re-commit.
+    count = int(node.query(f"SELECT count() FROM {iceberg}").strip())
+    assert count == 3, f"Expected 3 rows (no duplicates), got {count}"

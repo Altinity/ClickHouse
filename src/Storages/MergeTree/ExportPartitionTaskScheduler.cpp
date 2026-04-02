@@ -272,14 +272,10 @@ void ExportPartitionTaskScheduler::run()
                         (MergeTreePartExportManifest::CompletionCallbackResult result)
                         {
                             handlePartExportCompletion(key, zk_part_name, manifest, destination_storage, result);
-<<<<<<< HEAD
                         },
                         manifest.partition_values);
-=======
-                        });
 
                     scheduled_exports_count++;
->>>>>>> antalya-26.1
                 }
                 catch (const Exception &)
                 {
