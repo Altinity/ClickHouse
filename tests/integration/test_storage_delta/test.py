@@ -47,6 +47,8 @@ from helpers.mock_servers import start_mock_servers
 from helpers.config_cluster import minio_access_key
 from helpers.config_cluster import minio_secret_key
 
+pytestmark = pytest.mark.skip(reason="DeltaLake not supported in FIPS")
+
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 
 
