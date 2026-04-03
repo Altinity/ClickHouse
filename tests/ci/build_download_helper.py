@@ -128,7 +128,6 @@ BUILD_TO_REPORT = {
     BuildNames.PACKAGE_ASAN: "artifact_report_build_amd_asan.json",
     BuildNames.PACKAGE_UBSAN: "artifact_report_build_amd_ubsan.json",
     BuildNames.PACKAGE_TSAN: "artifact_report_build_amd_tsan.json",
-    BuildNames.PACKAGE_MSAN: "artifact_report_build_amd_msan.json",
     BuildNames.PACKAGE_DEBUG: "artifact_report_build_amd_debug.json",
     BuildNames.PACKAGE_AARCH64: "artifact_report_build_arm_release.json",
     BuildNames.PACKAGE_AARCH64_ASAN: "artifact_report_build_arm_asan.json",

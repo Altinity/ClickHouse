@@ -106,7 +106,6 @@ class BuildNames(metaclass=WithIter):
     PACKAGE_ASAN = "package_asan"
     PACKAGE_UBSAN = "package_ubsan"
     PACKAGE_TSAN = "package_tsan"
-    PACKAGE_MSAN = "package_msan"
     PACKAGE_DEBUG = "package_debug"
     PACKAGE_AARCH64 = "package_aarch64"
     PACKAGE_AARCH64_ASAN = "package_aarch64_asan"
@@ -146,7 +145,6 @@ class JobNames(metaclass=WithIter):
     STATELESS_TEST_ASAN = "Stateless tests (asan)"
     STATELESS_TEST_AARCH64_ASAN = "Stateless tests (aarch64, asan)"
     STATELESS_TEST_TSAN = "Stateless tests (tsan)"
-    STATELESS_TEST_MSAN = "Stateless tests (msan)"
     STATELESS_TEST_UBSAN = "Stateless tests (ubsan)"
     STATELESS_TEST_OLD_ANALYZER_S3_REPLICATED_RELEASE = (
         "Stateless tests (release, old analyzer, s3, DatabaseReplicated)"
@@ -162,10 +160,8 @@ class JobNames(metaclass=WithIter):
     STRESS_TEST_ASAN = "Stress test (asan)"
     STRESS_TEST_TSAN = "Stress test (tsan)"
     STRESS_TEST_UBSAN = "Stress test (ubsan)"
-    STRESS_TEST_MSAN = "Stress test (msan)"
     STRESS_TEST_DEBUG = "Stress test (debug)"
     STRESS_TEST_AZURE_TSAN = "Stress test (azure, tsan)"
-    STRESS_TEST_AZURE_MSAN = "Stress test (azure, msan)"
 
     INTEGRATION_TEST = "Integration tests (release)"
     INTEGRATION_TEST_ASAN = "Integration tests (asan)"
@@ -177,23 +173,19 @@ class JobNames(metaclass=WithIter):
     UPGRADE_TEST_DEBUG = "Upgrade check (debug)"
     UPGRADE_TEST_ASAN = "Upgrade check (asan)"
     UPGRADE_TEST_TSAN = "Upgrade check (tsan)"
-    UPGRADE_TEST_MSAN = "Upgrade check (msan)"
 
     UNIT_TEST = "Unit tests (binary)"
     UNIT_TEST_ASAN = "Unit tests (asan)"
-    UNIT_TEST_MSAN = "Unit tests (msan)"
     UNIT_TEST_TSAN = "Unit tests (tsan)"
     UNIT_TEST_UBSAN = "Unit tests (ubsan)"
 
     AST_FUZZER_TEST_DEBUG = "AST fuzzer (debug)"
     AST_FUZZER_TEST_ASAN = "AST fuzzer (asan)"
-    AST_FUZZER_TEST_MSAN = "AST fuzzer (msan)"
     AST_FUZZER_TEST_TSAN = "AST fuzzer (tsan)"
     AST_FUZZER_TEST_UBSAN = "AST fuzzer (ubsan)"
 
     BUZZHOUSE_TEST_DEBUG = "BuzzHouse (debug)"
     BUZZHOUSE_TEST_ASAN = "BuzzHouse (asan)"
-    BUZZHOUSE_TEST_MSAN = "BuzzHouse (msan)"
     BUZZHOUSE_TEST_TSAN = "BuzzHouse (tsan)"
     BUZZHOUSE_TEST_UBSAN = "BuzzHouse (ubsan)"
 
@@ -621,7 +613,6 @@ REQUIRED_CHECKS = [
     JobNames.STATELESS_TEST_FLAKY_ASAN,
     JobNames.STYLE_CHECK,
     JobNames.UNIT_TEST_ASAN,
-    JobNames.UNIT_TEST_MSAN,
     JobNames.UNIT_TEST,
     JobNames.UNIT_TEST_TSAN,
     JobNames.UNIT_TEST_UBSAN,
