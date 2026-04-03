@@ -60,6 +60,57 @@ namespace
 
 	return context_copy;
     }
+
+    Coordination::Requests getErrorRequests(
+        const std::filesystem::path & export_path,
+        const std::string & replica_name,
+        const zkutil::ZooKeeperPtr & zk,
+        const LoggerPtr & log,
+        const std::string & part_name,
+        const std::optional<Exception> & exception
+    )
+    {
+        Coordination::Requests ops;
+
+        const auto exceptions_per_replica_path = export_path / "exceptions_per_replica" / replica_name;
+        const auto count_path = exceptions_per_replica_path / "count";
+        const auto last_exception_path = exceptions_per_replica_path / "last_exception";
+    
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperExists);
+        if (zk->exists(exceptions_per_replica_path))
+        {
+            LOG_INFO(log, "ExportPartition scheduler task: Exceptions per replica path exists, no need to create it");
+            std::string num_exceptions_string;
+            if (zk->tryGet(count_path, num_exceptions_string))
+            {
+                const auto num_exceptions = parse<size_t>(num_exceptions_string) + 1;
+                ops.emplace_back(zkutil::makeSetRequest(count_path, std::to_string(num_exceptions), -1));
+            }
+            else
+            {
+                /// TODO maybe we should find a better way to handle this case, not urgent
+                LOG_INFO(log, "ExportPartition scheduler task: Failed to get number of exceptions, will not increment it");
+            }
+    
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
+    
+            ops.emplace_back(zkutil::makeSetRequest(last_exception_path / "part", part_name, -1));
+            ops.emplace_back(zkutil::makeSetRequest(last_exception_path / "exception", exception->message(), -1));
+        }
+        else
+        {
+            LOG_INFO(log, "ExportPartition scheduler task: Exceptions per replica path does not exist, will create it");
+            ops.emplace_back(zkutil::makeCreateRequest(exceptions_per_replica_path, "", zkutil::CreateMode::Persistent));
+            ops.emplace_back(zkutil::makeCreateRequest(count_path, "1", zkutil::CreateMode::Persistent));
+            ops.emplace_back(zkutil::makeCreateRequest(last_exception_path, "", zkutil::CreateMode::Persistent));
+            ops.emplace_back(zkutil::makeCreateRequest(last_exception_path / "part", part_name, zkutil::CreateMode::Persistent));
+            ops.emplace_back(zkutil::makeCreateRequest(last_exception_path / "exception", exception->message(), zkutil::CreateMode::Persistent));
+        }
+
+        return ops;
+    }
 }
 
 ExportPartitionTaskScheduler::ExportPartitionTaskScheduler(StorageReplicatedMergeTree & storage_)
@@ -346,7 +397,24 @@ void ExportPartitionTaskScheduler::handlePartExportSuccess(
 
     LOG_INFO(storage.log, "ExportPartition scheduler task: All parts are processed, will try to commit export partition");
 
-    ExportPartitionUtils::commit(manifest, destination_storage, zk, storage.log.load(), export_path, storage.getContext());
+    try
+    {
+        ExportPartitionUtils::commit(manifest, destination_storage, zk, storage.log.load(), export_path, storage.getContext());
+    }
+    catch (const Exception & e)
+    {
+        const auto error_requests = getErrorRequests(export_path, storage.replica_name, zk, storage.log.load(), part_name, e);
+        
+        LOG_INFO(storage.log, "ExportPartition scheduler task: Caught exception while committing export partition, {}", e.message());
+
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperMulti);
+        Coordination::Responses responses;
+        if (Coordination::Error::ZOK != zk->tryMulti(error_requests, responses))
+        {
+            LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to update zookeeper with the commit exception");
+        }
+    }
 }
 
 void ExportPartitionTaskScheduler::handlePartExportFailure(
@@ -454,42 +522,8 @@ void ExportPartitionTaskScheduler::handlePartExportFailure(
         LOG_INFO(storage.log, "ExportPartition scheduler task: Retry count limit not exceeded for part {}, will increment retry count", part_name);
     }
 
-    const auto exceptions_per_replica_path = export_path / "exceptions_per_replica" / storage.replica_name;
-    const auto count_path = exceptions_per_replica_path / "count";
-    const auto last_exception_path = exceptions_per_replica_path / "last_exception";
-
-    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperExists);
-    if (zk->exists(exceptions_per_replica_path))
-    {
-        LOG_INFO(storage.log, "ExportPartition scheduler task: Exceptions per replica path exists, no need to create it");
-        std::string num_exceptions_string;
-        if (zk->tryGet(count_path, num_exceptions_string))
-        {
-            const auto num_exceptions = parse<size_t>(num_exceptions_string) + 1;
-            ops.emplace_back(zkutil::makeSetRequest(count_path, std::to_string(num_exceptions), -1));
-        }
-        else
-        {
-            /// TODO maybe we should find a better way to handle this case, not urgent
-            LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to get number of exceptions, will not increment it");
-        }
-
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
-
-        ops.emplace_back(zkutil::makeSetRequest(last_exception_path / "part", part_name, -1));
-        ops.emplace_back(zkutil::makeSetRequest(last_exception_path / "exception", exception->message(), -1));
-    }
-    else
-    {
-        LOG_INFO(storage.log, "ExportPartition scheduler task: Exceptions per replica path does not exist, will create it");
-        ops.emplace_back(zkutil::makeCreateRequest(exceptions_per_replica_path, "", zkutil::CreateMode::Persistent));
-        ops.emplace_back(zkutil::makeCreateRequest(count_path, "1", zkutil::CreateMode::Persistent));
-        ops.emplace_back(zkutil::makeCreateRequest(last_exception_path, "", zkutil::CreateMode::Persistent));
-        ops.emplace_back(zkutil::makeCreateRequest(last_exception_path / "part", part_name, zkutil::CreateMode::Persistent));
-        ops.emplace_back(zkutil::makeCreateRequest(last_exception_path / "exception", exception->message(), zkutil::CreateMode::Persistent));
-    }
+    auto error_requests = getErrorRequests(export_path, storage.replica_name, zk, storage.log.load(), part_name, exception);
+    ops.insert(ops.end(), error_requests.begin(), error_requests.end());
 
     ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
     ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperMulti);

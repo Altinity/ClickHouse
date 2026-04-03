@@ -343,6 +343,7 @@ void writeDataFileSidecar(
     buf->finalize();
 }
 
+/// vibe coded - needs extra attention
 IcebergSerializedFileStats serializeDataFileStats(
     const DataFileStatistics & stats,
     SharedHeader sample_block,
@@ -503,6 +504,7 @@ void generateManifestFile(
         data_file.field(Iceberg::f_file_path) = avro::GenericDatum(data_file_name);
         data_file.field(Iceberg::f_file_format) = avro::GenericDatum(format);
 
+        /// vibe coded - needs extra attention
         /// Export path: per-file serialized stats override everything (record count, file size,
         /// and all column statistics).  Existing insert/mutation paths use the aggregate path below.
         if (!per_file_stats.empty() && file_idx < per_file_stats.size())

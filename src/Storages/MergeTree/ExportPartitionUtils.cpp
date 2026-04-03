@@ -126,6 +126,7 @@ namespace ExportPartitionUtils
         /// ZooKeeper is updated to COMPLETED. Used by idempotency integration tests.
         fiu_do_on(FailPoints::iceberg_export_after_commit_before_zk_completed,
         {
+            LOG_INFO(log, "Failpoint: simulating crash after Iceberg commit, before ZK COMPLETED");
             std::this_thread::sleep_for(std::chrono::seconds(10));
             throw Exception(ErrorCodes::FAULT_INJECTED,
                 "Failpoint: simulating crash after Iceberg commit, before ZK COMPLETED");

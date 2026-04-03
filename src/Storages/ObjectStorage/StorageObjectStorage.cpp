@@ -648,6 +648,16 @@ void StorageObjectStorage::commitExportPartitionTransaction(
     const IcebergCommitExportPartitionArguments & iceberg_commit_export_partition_arguments,
     ContextPtr local_context)
 {
+    /// We did configuration->update() in constructor,
+    /// so in case of table function there is no need to do the same here again.
+    if (update_configuration_on_read_write)
+    {
+        configuration->update(
+            object_storage,
+            local_context,
+            /* if_not_updated_before */ false);
+    }
+
     if (isDataLake())
     {
         /// Parse the Iceberg metadata snapshot (stored in ZooKeeper at export-start time) only to

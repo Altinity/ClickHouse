@@ -1528,7 +1528,7 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
                 partition_values,
                 partition_types,
                 data_file_paths,
-                std::nullopt,  /// aggregate DataFileStatistics unused: per_file_stats carries per-file column stats
+                std::nullopt,  /// per_file_stats is filled, no need for the generic aggregate
                 sample_block,
                 new_snapshot,
                 write_format,
@@ -1790,10 +1790,13 @@ void IcebergMetadata::commitExportPartitionTransaction(
         per_file_stats.push_back(std::move(sidecar.column_stats));
     }
 
+    std::optional<Exception> last_exception;
     size_t attempt = 0;
     while (attempt < 10)
     {
-        if (commitImportPartitionTransactionImpl(
+        try
+        {
+            if (commitImportPartitionTransactionImpl(
                 filename_generator,
                 metadata,
                 partition_spec,
@@ -1814,10 +1817,25 @@ void IcebergMetadata::commitExportPartitionTransaction(
                 configuration->getTypeName(),
                 configuration->getNamespace(),
                 context))
-            return;
+            {
+                return;
+            }
+        }
+        catch (const Exception & e)
+        {
+            last_exception = e;
+        }
+
         ++attempt;
     }
 
+    /// todo arthur gosh this looks bad
+    if (last_exception)
+    {
+        throw *last_exception;
+    }
+
+    /// todo arthur not implemented does not make sense
     throw Exception(ErrorCodes::NOT_IMPLEMENTED,
         "Failed to commit export partition transaction after {} attempts due to repeated metadata conflicts.",
         attempt);
