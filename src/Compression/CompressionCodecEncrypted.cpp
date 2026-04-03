@@ -683,7 +683,12 @@ namespace DB
 /// Register codecs for all algorithms
 void registerCodecEncrypted(CompressionCodecFactory & factory)
 {
+#if defined(FIPS_CLICKHOUSE) && FIPS_CLICKHOUSE
     registerEncryptionCodec(factory, AES_128_GCM);
     registerEncryptionCodec(factory, AES_256_GCM);
+#else
+    registerEncryptionCodec(factory, AES_128_GCM_SIV);
+    registerEncryptionCodec(factory, AES_256_GCM_SIV);
+#endif
 }
 }
