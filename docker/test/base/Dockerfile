@@ -3,6 +3,10 @@
 ARG FROM_TAG=latest
 FROM altinityinfra/test-util:$FROM_TAG
 
+# Refresh the Kitware GPG key inherited from the base image (may have expired)
+RUN rm -f /etc/apt/trusted.gpg.d/kitware.gpg \
+    && curl -fsSL https://apt.kitware.com/keys/kitware-archive-latest.asc | gpg --batch --dearmor -o /etc/apt/trusted.gpg.d/kitware.gpg
+
 RUN apt-get update \
     && apt-get install \
         lcov \
