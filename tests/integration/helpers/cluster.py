@@ -469,6 +469,16 @@ class ClickHouseCluster:
         #    [1]: https://github.com/ClickHouse/ClickHouse/issues/43426#issuecomment-1368512678
         self.env_variables["ASAN_OPTIONS"] = "use_sigaltstack=0"
         self.env_variables["TSAN_OPTIONS"] = "use_sigaltstack=0"
+        lsan_suppressions_file = p.abspath(
+            p.join(HELPERS_DIR, "lsan_suppressions.txt")
+        )
+        if p.exists(lsan_suppressions_file):
+            self.lsan_suppressions_file = lsan_suppressions_file
+            self.env_variables["LSAN_OPTIONS"] = (
+                "suppressions=/etc/clickhouse-server/lsan_suppressions.txt"
+            )
+        else:
+            self.lsan_suppressions_file = None
         self.env_variables["CLICKHOUSE_WATCHDOG_ENABLE"] = "0"
         self.env_variables["CLICKHOUSE_NATS_TLS_SECURE"] = "0"
         self.up_called = False
@@ -4736,6 +4746,10 @@ class ClickHouseInstance:
             shutil.copytree(
                 self.coredns_config_dir, p.abspath(p.join(self.path, "coredns_config"))
             )
+
+        # Copy LSAN suppressions if available (mounted at /etc/clickhouse-server/)
+        if self.cluster.lsan_suppressions_file:
+            shutil.copy(self.cluster.lsan_suppressions_file, instance_config_dir)
 
         # Copy config.d configs
         logging.debug(
