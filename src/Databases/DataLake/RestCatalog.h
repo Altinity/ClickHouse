@@ -148,7 +148,7 @@ protected:
 
     Poco::Net::HTTPBasicCredentials credentials{};
 
-    DB::ReadWriteBufferFromHTTPPtr createReadBuffer(
+    virtual DB::ReadWriteBufferFromHTTPPtr createReadBuffer(
         const std::string & endpoint,
         const Poco::URI::QueryParameters & params = {},
         const DB::HTTPHeaderEntries & headers = {}) const;
@@ -183,7 +183,7 @@ protected:
     AccessToken retrieveAccessTokenOAuth() const;
     static void parseCatalogConfigurationSettings(const Poco::JSON::Object::Ptr & object, Config & result);
 
-    void sendRequest(
+    virtual void sendRequest(
         const String & endpoint,
         Poco::JSON::Object::Ptr request_body,
         const String & method = Poco::Net::HTTPRequest::HTTP_POST,
