@@ -7,6 +7,8 @@
 
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
+#include <Common/setThreadName.h>
+#include <Common/threadPoolCallbackRunner.h>
 #include <Core/ServerSettings.h>
 #include <Core/Settings.h>
 #include <Interpreters/Context.h>
@@ -22,6 +24,8 @@
 
 #include <aws/core/auth/AWSCredentials.h>
 #include <aws/core/auth/signer/AWSAuthV4Signer.h>
+
+#include <mutex>
 
 namespace DB::ErrorCodes
 {
@@ -101,7 +105,8 @@ S3TablesCatalog::S3TablesCatalog(
         credentials_provider,
         "s3tables",
         Aws::String(region.data(), region.size()),
-        Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Always);
+        Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Always,
+        /* urlEscapePath = */ false);
 
     config = loadConfig();
 
@@ -111,6 +116,88 @@ S3TablesCatalog::S3TablesCatalog(
         Poco::URI::encode(warehouse_, "", encoded_warehouse);
         config.prefix = encoded_warehouse;
     }
+}
+
+DB::Names S3TablesCatalog::getTables() const
+{
+    auto namespaces = getNamespaces("");
+
+    auto & pool = getContext()->getIcebergCatalogThreadpool();
+    DB::ThreadPoolCallbackRunnerLocal<void> runner(pool, DB::ThreadName::DATALAKE_REST_CATALOG);
+
+    DB::Names tables;
+    std::mutex mutex;
+    for (const auto & ns : namespaces)
+    {
+        if (!allowed_namespaces.isNamespaceAllowed(ns, /*nested*/ false))
+            continue;
+        runner.enqueueAndKeepTrack(
+            [&, ns]
+            {
+                auto tables_in_ns = RestCatalog::getTables(ns);
+                std::lock_guard lock(mutex);
+                std::move(tables_in_ns.begin(), tables_in_ns.end(), std::back_inserter(tables));
+            });
+    }
+    runner.waitForAllToFinishAndRethrowFirstError();
+    return tables;
+}
+
+bool S3TablesCatalog::tryGetTableMetadata(
+    const std::string & namespace_name,
+    const std::string & table_name,
+    DB::ContextPtr context_,
+    TableMetadata & result) const
+{
+    if (!RestCatalog::tryGetTableMetadata(namespace_name, table_name, context_, result))
+        return false;
+
+    if (!result.requiresCredentials())
+        return true;
+
+    bool need_credentials = !result.hasStorageCredentials() || !result.getStorageCredentials();
+    if (!need_credentials)
+    {
+        auto creds = std::dynamic_pointer_cast<S3Credentials>(result.getStorageCredentials());
+        if (creds && creds->isEmpty())
+            need_credentials = true;
+    }
+
+    if (need_credentials)
+    {
+        LOG_DEBUG(log, "S3 Tables: no vended credentials for {}.{}, injecting catalog IAM credentials", namespace_name, table_name);
+        auto aws_creds = credentials_provider->GetAWSCredentials();
+        result.setStorageCredentials(std::make_shared<S3Credentials>(
+            String(aws_creds.GetAWSAccessKeyId().c_str(), aws_creds.GetAWSAccessKeyId().size()),
+            String(aws_creds.GetAWSSecretKey().c_str(), aws_creds.GetAWSSecretKey().size()),
+            String(aws_creds.GetSessionToken().c_str(), aws_creds.GetSessionToken().size())));
+    }
+
+    if (result.getEndpoint().empty())
+    {
+        String regional_endpoint = "https://s3." + region + ".amazonaws.com";
+        LOG_DEBUG(log, "S3 Tables: no s3.endpoint for {}.{}, injecting regional endpoint: {}", namespace_name, table_name, regional_endpoint);
+        result.setEndpoint(regional_endpoint);
+    }
+
+    if (result.hasDataLakeSpecificProperties())
+    {
+        auto props = result.getDataLakeSpecificProperties();
+        if (props.has_value() && !props->iceberg_metadata_file_location.empty())
+        {
+            const String & loc = props->iceberg_metadata_file_location;
+            auto scheme_end = loc.find("://");
+            if (scheme_end != String::npos)
+            {
+                auto path_start = loc.find('/', scheme_end + 3);
+                if (path_start != String::npos)
+                    props->iceberg_metadata_file_location = loc.substr(path_start + 1);
+            }
+            result.setDataLakeSpecificProperties(std::move(props));
+        }
+    }
+
+    return true;
 }
 
 DB::HTTPHeaderEntries S3TablesCatalog::getAuthHeaders(bool /* update_token */) const

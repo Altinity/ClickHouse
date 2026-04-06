@@ -34,6 +34,14 @@ public:
 
     DB::DatabaseDataLakeCatalogType getCatalogType() const override { return DB::DatabaseDataLakeCatalogType::S3_TABLES; }
 
+    DB::Names getTables() const override;
+
+    bool tryGetTableMetadata(
+        const std::string & namespace_name,
+        const std::string & table_name,
+        DB::ContextPtr context_,
+        TableMetadata & result) const override;
+
     DB::ReadWriteBufferFromHTTPPtr createReadBuffer(
         const std::string & endpoint,
         const Poco::URI::QueryParameters & params = {},
