@@ -6549,6 +6549,7 @@ void MergeTreeData::exportPartToTable(
             iceberg_metadata_json = oss.str();
         }
 #else
+        (void)iceberg_metadata_json_;
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Data lake export requires Avro support");
 #endif
     }
