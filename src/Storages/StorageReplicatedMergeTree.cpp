@@ -8236,9 +8236,9 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     manifest.filename_pattern = query_context->getSettingsRef()[Setting::export_merge_tree_part_filename_pattern].value;
     manifest.write_full_path_in_iceberg_metadata = query_context->getSettingsRef()[Setting::write_full_path_in_iceberg_metadata];
 
-#if USE_AVRO
     if (dest_storage->isDataLake())
     {
+#if USE_AVRO
         auto * object_storage = dynamic_cast<StorageObjectStorageCluster *>(dest_storage.get());
 
         auto * iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage->getExternalMetadata(query_context));
@@ -8395,8 +8395,10 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
             Poco::JSON::Stringifier::stringify(*pv_arr, pv_oss);
             manifest.partition_values_json = pv_oss.str();
         }
-    }
+#else
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Data lake export requires Avro support");
 #endif
+    }
 
     ops.emplace_back(zkutil::makeCreateRequest(
         fs::path(partition_exports_path) / "metadata.json", 

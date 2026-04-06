@@ -6524,9 +6524,10 @@ void MergeTreeData::exportPartToTable(
 
     std::string iceberg_metadata_json;
 
-#if USE_AVRO
+
     if (dest_storage->isDataLake())
     {
+#if USE_AVRO
         if (iceberg_metadata_json_)
         {
             iceberg_metadata_json = *iceberg_metadata_json_;
@@ -6547,8 +6548,10 @@ void MergeTreeData::exportPartToTable(
             metadata_object->stringify(oss);
             iceberg_metadata_json = oss.str();
         }
-    }
+#else
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Data lake export requires Avro support");
 #endif
+    }
 
     auto query_to_string = [] (const ASTPtr & ast)
     {
