@@ -83,7 +83,18 @@ namespace
                 }
 
                 /// it sounds like a replica exported the last part, but was not able to commit the export. Try to fix it
-                ExportPartitionUtils::commit(metadata, destination_storage, zk, log, entry_path, context);
+                try
+                {
+                    ExportPartitionUtils::commit(metadata, destination_storage, zk, log, entry_path, context);
+                }
+                catch (const Exception & e)
+                {
+                    LOG_WARNING(log,
+                        "ExportPartition Manifest Updating Task: "
+                        "Caught exception while committing export for {}: {}",
+                        entry_path, e.message());
+                    return false;
+                }
 
                 return true;
             }

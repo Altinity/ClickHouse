@@ -126,6 +126,8 @@ extern const SettingsBool allow_experimental_iceberg_compaction;
 extern const SettingsBool iceberg_delete_data_on_drop;
 }
 
+static constexpr size_t MAX_TRANSACTION_RETRIES = 100;
+
 namespace
 {
 String dumpMetadataObjectToString(const Poco::JSON::Object::Ptr & metadata_object)
@@ -1459,6 +1461,12 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
 
     auto cleanup = [&](bool retry_because_of_metadata_conflict)
     {
+        if (!retry_because_of_metadata_conflict)
+        {
+            for (const auto & path : data_file_paths)
+                object_storage->removeObjectIfExists(StoredObject(path));
+        }
+
         object_storage->removeObjectIfExists(StoredObject(storage_manifest_entry_name));
         object_storage->removeObjectIfExists(StoredObject(storage_manifest_list_name));
 
@@ -1471,7 +1479,8 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
                 persistent_components.metadata_cache,
                 context,
                 getLogger("IcebergMetadata").get(),
-                persistent_components.table_uuid);
+                persistent_components.table_uuid,
+                true);
 
             LOG_DEBUG(log, "Rereading metadata file {} with version {}", metadata_path, last_version);
 
@@ -1606,9 +1615,20 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
                 }
             }
         }
+
+        if (persistent_table_components.metadata_cache)
+        {
+            /// If there's an active metadata cache
+            /// We can't just cache 'our' written version as latest, because it could've been overwritten by a concurrent catalog update
+            /// This is why, we are safely invalidating the cache, and the very next reader will get the most up-to-date latest version
+            persistent_table_components.metadata_cache->remove(persistent_table_components.table_path);
+            if (persistent_table_components.table_uuid)
+                persistent_table_components.metadata_cache->remove(*persistent_table_components.table_uuid);
+        }
     }
     catch (...)
     {
+        LOG_ERROR(log, "Failed to commit import partition transaction: {}", getCurrentExceptionMessage(false));
         cleanup(false);
         throw;
     }
@@ -1636,7 +1656,8 @@ void IcebergMetadata::commitExportPartitionTransaction(
         persistent_components.metadata_cache,
         context,
         getLogger("IcebergMetadata").get(),
-        persistent_components.table_uuid);
+        persistent_components.table_uuid,
+        true);
 
     /// Latest metadata is ALWAYS necessary to commit - but we abort in case schema or partition spec changed
     Poco::JSON::Object::Ptr metadata = getMetadataJSONObject(
@@ -1784,13 +1805,10 @@ void IcebergMetadata::commitExportPartitionTransaction(
         per_file_stats.push_back(std::move(sidecar.column_stats));
     }
 
-    std::optional<Exception> last_exception;
     size_t attempt = 0;
-    while (attempt < 10)
+    while (attempt < MAX_TRANSACTION_RETRIES)
     {
-        try
-        {
-            if (commitImportPartitionTransactionImpl(
+        if (commitImportPartitionTransactionImpl(
                 filename_generator,
                 metadata,
                 partition_spec,
@@ -1811,25 +1829,13 @@ void IcebergMetadata::commitExportPartitionTransaction(
                 configuration->getTypeName(),
                 configuration->getNamespace(),
                 context))
-            {
-                return;
-            }
-        }
-        catch (const Exception & e)
         {
-            last_exception = e;
+            return;
         }
 
         ++attempt;
     }
 
-    /// todo arthur gosh this looks bad
-    if (last_exception)
-    {
-        throw *last_exception;
-    }
-
-    /// todo arthur not implemented does not make sense
     throw Exception(ErrorCodes::NOT_IMPLEMENTED,
         "Failed to commit export partition transaction after {} attempts due to repeated metadata conflicts.",
         attempt);
