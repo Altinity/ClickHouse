@@ -95,7 +95,6 @@
 #include <Storages/MergeTree/LoadedMergeTreeDataPartInfoForReader.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
-#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Storages/MergeTree/MergeTreeIndexGranularityAdaptive.h>
 #include <Functions/generateSnowflakeID.h>
@@ -6525,6 +6524,7 @@ void MergeTreeData::exportPartToTable(
 
     std::string iceberg_metadata_json;
 
+#if USE_AVRO
     if (dest_storage->isDataLake())
     {
         if (iceberg_metadata_json_)
@@ -6548,6 +6548,7 @@ void MergeTreeData::exportPartToTable(
             iceberg_metadata_json = oss.str();
         }
     }
+#endif
 
     auto query_to_string = [] (const ASTPtr & ast)
     {

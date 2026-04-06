@@ -8236,6 +8236,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     manifest.filename_pattern = query_context->getSettingsRef()[Setting::export_merge_tree_part_filename_pattern].value;
     manifest.write_full_path_in_iceberg_metadata = query_context->getSettingsRef()[Setting::write_full_path_in_iceberg_metadata];
 
+#if USE_AVRO
     if (dest_storage->isDataLake())
     {
         auto * object_storage = dynamic_cast<StorageObjectStorageCluster *>(dest_storage.get());
@@ -8286,7 +8287,6 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
             }
         }
 
-#if USE_AVRO
         /// Verify that the source MergeTree partition key is compatible with the destination
         /// Iceberg partition spec.  Export does not repartition data, so the two must agree
         /// on every field: same source column (by Iceberg field-id) and same transform, in
@@ -8395,8 +8395,8 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
             Poco::JSON::Stringifier::stringify(*pv_arr, pv_oss);
             manifest.partition_values_json = pv_oss.str();
         }
-#endif
     }
+#endif
 
     ops.emplace_back(zkutil::makeCreateRequest(
         fs::path(partition_exports_path) / "metadata.json", 
