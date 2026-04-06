@@ -15,6 +15,8 @@ namespace ExportPartitionUtils
 {
     std::vector<std::string> getExportedPaths(const LoggerPtr & log, const zkutil::ZooKeeperPtr & zk, const std::string & export_path);
 
+    ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ExportReplicatedMergeTreePartitionManifest & manifest);
+
     void commit(
         const ExportReplicatedMergeTreePartitionManifest & manifest,
         const StoragePtr & destination_storage,

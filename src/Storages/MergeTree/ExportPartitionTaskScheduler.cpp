@@ -40,26 +40,7 @@ namespace ErrorCodes
 
 namespace
 {
-    ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ExportReplicatedMergeTreePartitionManifest & manifest)
-    {
-        auto context_copy = Context::createCopy(context);
-        context_copy->makeQueryContextForExportPart();
-        context_copy->setCurrentQueryId(manifest.query_id);
-        context_copy->setSetting("output_format_parallel_formatting", manifest.parallel_formatting);
-        context_copy->setSetting("output_format_parquet_parallel_encoding", manifest.parquet_parallel_encoding);
-        context_copy->setSetting("max_threads", manifest.max_threads);
-        context_copy->setSetting("export_merge_tree_part_file_already_exists_policy", String(magic_enum::enum_name(manifest.file_already_exists_policy)));
-        context_copy->setSetting("export_merge_tree_part_max_bytes_per_file", manifest.max_bytes_per_file);
-        context_copy->setSetting("export_merge_tree_part_max_rows_per_file", manifest.max_rows_per_file);
-
-        /// always skip pending mutations and patch parts because we already validated the parts during query processing
-        context_copy->setSetting("export_merge_tree_part_throw_on_pending_mutations", false);
-        context_copy->setSetting("export_merge_tree_part_throw_on_pending_patch_parts", false);
-
-        context_copy->setSetting("export_merge_tree_part_filename_pattern", manifest.filename_pattern);
-
-	return context_copy;
-    }
+    
 
     Coordination::Requests getErrorRequests(
         const std::filesystem::path & export_path,
@@ -250,7 +231,7 @@ void ExportPartitionTaskScheduler::run()
 
             LOG_INFO(storage.log, "ExportPartition scheduler task: Scheduling part export: {}", zk_part_name);
 
-            auto context = getContextCopyWithTaskSettings(storage.getContext(), manifest);
+            auto context = ExportPartitionUtils::getContextCopyWithTaskSettings(storage.getContext(), manifest);
 
             /// todo arthur this code path does not perform all the validations a simple part export does because we are not calling exportPartToTable directly.
             /// the schema and everything else has been validated when the export partition task was created, but nothing prevents the destination table from being
@@ -316,7 +297,7 @@ void ExportPartitionTaskScheduler::run()
                         part->name,
                         destination_storage_id,
                         manifest.transaction_id,
-                        getContextCopyWithTaskSettings(storage.getContext(), manifest),
+                        context,
                         manifest.iceberg_metadata_json,
                         /*allow_outdated_parts*/ true,
                         [this, key, zk_part_name, manifest, destination_storage]
@@ -399,7 +380,8 @@ void ExportPartitionTaskScheduler::handlePartExportSuccess(
 
     try
     {
-        ExportPartitionUtils::commit(manifest, destination_storage, zk, storage.log.load(), export_path, storage.getContext());
+        auto context = ExportPartitionUtils::getContextCopyWithTaskSettings(storage.getContext(), manifest);
+        ExportPartitionUtils::commit(manifest, destination_storage, zk, storage.log.load(), export_path, context);
     }
     catch (const Exception & e)
     {

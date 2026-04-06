@@ -119,6 +119,7 @@ struct ExportReplicatedMergeTreePartitionManifest
     MergeTreePartExportManifest::FileAlreadyExistsPolicy file_already_exists_policy;
     String filename_pattern;
     bool lock_inside_the_task; /// todo temporary
+    bool write_full_path_in_iceberg_metadata = false;
     String iceberg_metadata_json;
     /// Iceberg-only: JSON array of partition column values (after transforms) for this partition.
     /// Columns and types are derived at commit time from iceberg_metadata_json; only values are persisted.
@@ -163,6 +164,7 @@ struct ExportReplicatedMergeTreePartitionManifest
         json.set("max_retries", max_retries);
         json.set("ttl_seconds", ttl_seconds);
         json.set("lock_inside_the_task", lock_inside_the_task);
+        json.set("write_full_path_in_iceberg_metadata", write_full_path_in_iceberg_metadata);
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
         Poco::JSON::Stringifier::stringify(json, oss);
@@ -231,6 +233,8 @@ struct ExportReplicatedMergeTreePartitionManifest
         }
 
         manifest.lock_inside_the_task = json->getValue<bool>("lock_inside_the_task");
+
+        manifest.write_full_path_in_iceberg_metadata = json->getValue<bool>("write_full_path_in_iceberg_metadata");
 
         return manifest;
     }

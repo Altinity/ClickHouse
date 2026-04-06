@@ -34,7 +34,7 @@ namespace
         const zkutil::ZooKeeperPtr & zk,
         const std::string & entry_path,
         const LoggerPtr & log,
-        const ContextPtr & context,
+        const ContextPtr & storage_context,
         const std::string & key,
         const ExportReplicatedMergeTreePartitionManifest & metadata,
         const time_t now,
@@ -58,6 +58,8 @@ namespace
         }
         else if (is_pending)
         {
+            auto context = ExportPartitionUtils::getContextCopyWithTaskSettings(storage_context, metadata);
+
             ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
             ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildren);
             std::vector<std::string> parts_in_processing_or_pending;

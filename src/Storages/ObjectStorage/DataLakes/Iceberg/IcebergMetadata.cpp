@@ -1638,10 +1638,7 @@ void IcebergMetadata::commitExportPartitionTransaction(
         getLogger("IcebergMetadata").get(),
         persistent_components.table_uuid);
 
-    /// Read the actual latest metadata from S3. Using the ZK-pinned JSON as the base would cause
-    /// data loss under concurrent exports: if another writer committed after the ZK snapshot was
-    /// taken, building the new snapshot chain on the stale object skips those commits and their
-    /// data files are no longer reachable from the current snapshot.
+    /// Latest metadata is ALWAYS necessary to commit - but we abort in case schema or partition spec changed
     Poco::JSON::Object::Ptr metadata = getMetadataJSONObject(
         updated_metadata_file_info.path,
         object_storage,
@@ -1653,7 +1650,6 @@ void IcebergMetadata::commitExportPartitionTransaction(
 
     /// Fail fast if the table schema or partition spec changed between export-start and commit.
     /// The exported data files and partition values were produced against the original spec;
-    /// committing them against a different spec would corrupt the table.
     const auto latest_schema_id = metadata->getValue<Int64>(Iceberg::f_current_schema_id);
     if (latest_schema_id != original_schema_id)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
@@ -1773,8 +1769,7 @@ void IcebergMetadata::commitExportPartitionTransaction(
     /// Resolve the partition spec once — if it is absent the export cannot proceed.
     Poco::JSON::Object::Ptr partition_spec = lookupPartitionSpec(metadata, partition_spec_id);
 
-    /// Load per-file sidecar stats once. The data files are immutable after being written,
-    /// so there is no need to re-read them on each retry attempt.
+    /// Load per-file sidecar stats, necessary to populate the manifest file stats
     std::vector<IcebergSerializedFileStats> per_file_stats;
     const Int32 total_data_files = static_cast<Int32>(data_file_paths.size());
     Int32 total_rows = 0;

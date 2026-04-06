@@ -7,6 +7,7 @@
 #include "Storages/ExportReplicatedMergeTreePartitionTaskEntry.h"
 #include <filesystem>
 #include <thread>
+#include <Interpreters/Context.h>
 
 namespace ProfileEvents
 {
@@ -33,6 +34,28 @@ namespace fs = std::filesystem;
 
 namespace ExportPartitionUtils
 {
+    ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ExportReplicatedMergeTreePartitionManifest & manifest)
+    {
+        auto context_copy = Context::createCopy(context);
+        context_copy->makeQueryContextForExportPart();
+        context_copy->setCurrentQueryId(manifest.query_id);
+        context_copy->setSetting("output_format_parallel_formatting", manifest.parallel_formatting);
+        context_copy->setSetting("output_format_parquet_parallel_encoding", manifest.parquet_parallel_encoding);
+        context_copy->setSetting("max_threads", manifest.max_threads);
+        context_copy->setSetting("export_merge_tree_part_file_already_exists_policy", String(magic_enum::enum_name(manifest.file_already_exists_policy)));
+        context_copy->setSetting("export_merge_tree_part_max_bytes_per_file", manifest.max_bytes_per_file);
+        context_copy->setSetting("export_merge_tree_part_max_rows_per_file", manifest.max_rows_per_file);
+
+        /// always skip pending mutations and patch parts because we already validated the parts during query processing
+        context_copy->setSetting("export_merge_tree_part_throw_on_pending_mutations", false);
+        context_copy->setSetting("export_merge_tree_part_throw_on_pending_patch_parts", false);
+
+        context_copy->setSetting("export_merge_tree_part_filename_pattern", manifest.filename_pattern);
+        context_copy->setSetting("write_full_path_in_iceberg_metadata", manifest.write_full_path_in_iceberg_metadata);
+
+	    return context_copy;
+    }
+
     /// Collect all the exported paths from the processed parts
     /// If multiRead is supported by the keeper implementation, it is done in a single request
     /// Otherwise, multiple async requests are sent
@@ -95,8 +118,11 @@ namespace ExportPartitionUtils
         const zkutil::ZooKeeperPtr & zk,
         const LoggerPtr & log,
         const std::string & entry_path,
-        const ContextPtr & context)
+        const ContextPtr & context_in)
     {
+        auto context = Context::createCopy(context_in);
+        context->setSetting("write_full_path_in_iceberg_metadata", manifest.write_full_path_in_iceberg_metadata);
+
         const auto exported_paths = ExportPartitionUtils::getExportedPaths(log, zk, entry_path);
 
         if (exported_paths.empty())
