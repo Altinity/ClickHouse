@@ -1777,8 +1777,7 @@ void IcebergMetadata::commitExportPartitionTransaction(
     per_file_stats.reserve(static_cast<size_t>(total_data_files));
     for (const auto & path : data_file_paths)
     {
-        const String sidecar_path = replaceFileExtensionWithAvro(
-            filename_generator.convertMetadataPathToStoragePath(path));
+        const String sidecar_path = replaceFileExtensionWithAvro(path);
         auto sidecar = readDataFileSidecar(sidecar_path, object_storage, context);
         total_rows        += static_cast<Int32>(sidecar.record_count);
         total_chunks_size += static_cast<Int32>(sidecar.file_size_in_bytes);
