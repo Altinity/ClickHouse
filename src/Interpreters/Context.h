@@ -102,6 +102,7 @@ class PageCache;
 class MMappedFileCache;
 class UncompressedCache;
 class IcebergMetadataFilesCache;
+class ParquetMetadataCache;
 class VectorSimilarityIndexCache;
 class TextIndexDictionaryBlockCache;
 class TextIndexHeaderCache;
@@ -1376,6 +1377,13 @@ public:
     void clearIcebergMetadataFilesCache() const;
 #endif
 
+#if USE_PARQUET
+    void setParquetMetadataCache(const String & cache_policy, size_t max_size_in_bytes, size_t max_entries, double size_ratio);
+    void updateParquetMetadataCacheConfiguration(const Poco::Util::AbstractConfiguration & config);
+    std::shared_ptr<ParquetMetadataCache> getParquetMetadataCache() const;
+    void clearParquetMetadataCache() const;
+#endif
+
     void setAllowedDisksForTableEngines(std::unordered_set<String> && allowed_disks_) { allowed_disks = std::move(allowed_disks_); }
     const std::unordered_set<String> & getAllowedDisksForTableEngines() const { return allowed_disks; }
 
@@ -1415,6 +1423,7 @@ public:
     BackgroundSchedulePool & getSchedulePool() const;
     BackgroundSchedulePool & getMessageBrokerSchedulePool() const;
     BackgroundSchedulePool & getDistributedSchedulePool() const;
+    BackgroundSchedulePool & getIcebergSchedulePool() const;
 
     /// Has distributed_ddl configuration or not.
     bool hasDistributedDDL() const;
