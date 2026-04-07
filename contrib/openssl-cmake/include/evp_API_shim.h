@@ -125,7 +125,6 @@ static inline int BIO_do_handshake(BIO *b) {
         return 0;
     if (!SSL_get_rbio(ssl) && BIO_next(b)) {
         BIO_up_ref(BIO_next(b));
-        BIO_up_ref(BIO_next(b));
         SSL_set_bio(ssl, BIO_next(b), BIO_next(b));
     }
     BIO_clear_retry_flags(b);
