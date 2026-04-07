@@ -709,6 +709,12 @@ namespace
 
         void insertData(IColumn & column, capnp::Data::Reader data)
         {
+            if (data.size() == 0)
+            {
+                column.insertDefault();
+                return;
+            }
+
             if (data.size() != expected_value_size)
                 throw Exception(ErrorCodes::INCORRECT_DATA, "Unexpected size of {} value: {}", data_type->getName(), data.size());
 
