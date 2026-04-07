@@ -34,6 +34,8 @@ from helpers.s3_tools import (
     prepare_s3_bucket,
 )
 
+pytestmark = pytest.mark.skip(reason="DeltaLake not supported in FIPS")
+
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 METADATA_SERVER_HOSTNAME = "resolver"
 METADATA_SERVER_PORT = 8080

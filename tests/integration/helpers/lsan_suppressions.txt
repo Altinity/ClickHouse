@@ -1,0 +1,7 @@
+# AWS-LC FIPS 2.0.0: suppress per-thread FIPS service indicator state leak.
+# The service indicator tracks whether each crypto operation used a FIPS-approved
+# algorithm. It is allocated via CRYPTO_set_thread_local on first use and freed
+# by a pthread TLS destructor when the thread exits. In ClickHouse, the crypto
+# operations run on GlobalThreadPool worker threads that outlive LSAN's check.
+# https://github.com/aws/aws-lc/blob/AWS-LC-FIPS-2.0.0/crypto/fipsmodule/service_indicator/service_indicator.c#L57
+leak:service_indicator_get

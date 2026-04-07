@@ -1830,12 +1830,27 @@ class TestCase:
                 "ASAN_OPTIONS",
                 "MSAN_OPTIONS",
                 "UBSAN_OPTIONS",
+                "LSAN_OPTIONS",
             ]:
                 current_options = os.environ.get(env_name, None)
                 if current_options is None:
                     os.environ[env_name] = f"log_path={args.client_log}"
                 elif "log_path=" not in current_options:
                     os.environ[env_name] += f":log_path={args.client_log}"
+
+            # Ensure LSAN picks up the suppressions file if available
+            lsan_suppressions = os.path.join(
+                os.path.dirname(os.path.realpath(__file__)),
+                "config",
+                "lsan_suppressions.txt",
+            )
+            if os.path.exists(lsan_suppressions):
+                current = os.environ.get("LSAN_OPTIONS", "")
+                if "suppressions=" not in current:
+                    sep = ":" if current else ""
+                    os.environ["LSAN_OPTIONS"] = (
+                        current + sep + f"suppressions={lsan_suppressions}"
+                    )
 
             os.environ["CLICKHOUSE_CLIENT_OPT"] = (
                 os.environ["CLICKHOUSE_CLIENT_OPT"]

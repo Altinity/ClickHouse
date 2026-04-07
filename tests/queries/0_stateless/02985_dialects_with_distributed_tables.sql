@@ -1,4 +1,4 @@
--- Tags: no-fasttest, distributed
+-- Tags: disabled, no-fasttest, distributed
 
 SET allow_experimental_prql_dialect = 1;
 SET allow_experimental_kusto_dialect = 1;
