@@ -40,6 +40,8 @@ std::optional<String> getAbsolutePathFromObjectInfo([[maybe_unused]] const Objec
 namespace DB::Iceberg
 {
 
+Iceberg::MetadataFileWithInfo getMetadataFileAndVersion(const std::string & path);
+
 void writeMessageToFile(
     const String & data,
     const String & filename,

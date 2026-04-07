@@ -1,24 +1,25 @@
 """
-Tests for EXPORT PARTITION to a catalog-backed Iceberg table (Nessie REST catalog).
+Tests for EXPORT PARTITION to a catalog-backed Iceberg table (Glue catalog via Moto).
 
-These tests verify that the catalog commit path (catalog->updateMetadata CAS) is
+These tests verify that the catalog commit path (catalog->updateMetadata) is
 exercised correctly for EXPORT PARTITION. A dedicated module-level cluster fixture
-combines ZooKeeper (for ReplicatedMergeTree) with the Nessie docker-compose stack,
-which brings its own MinIO for the warehouse bucket.
+combines ZooKeeper (for ReplicatedMergeTree) with the Glue docker-compose stack
+(Moto mock + MinIO warehouse bucket).
 
 Test coverage:
     test_catalog_basic_export      — single partition exported; catalog shows new snapshot
-    test_catalog_concurrent_export — two partitions exported in parallel; both CAS commits succeed
+    test_catalog_concurrent_export — two partitions exported in parallel; both commits succeed
     test_catalog_idempotent_retry  — crash after catalog commit; restart; no data duplication
 """
 
 import logging
+import os
 import threading
 import time
 import uuid
 
 import pytest
-from pyiceberg.catalog.rest import RestCatalog
+from pyiceberg.catalog import load_catalog
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.transforms import IdentityTransform
@@ -28,11 +29,9 @@ from helpers.cluster import ClickHouseCluster
 from helpers.config_cluster import minio_access_key, minio_secret_key
 
 
-# Nessie is exposed on the host at port 19120 (mapped from the container).
-NESSIE_BASE_URL = "http://localhost:19120/iceberg/"
-WAREHOUSE_NAME = "warehouse"
-# ClickHouse DataLakeCatalog database name used across tests in this module.
-CH_CATALOG_DB = "nessie_export_catalog"
+GLUE_BASE_URL = "http://glue:3000"
+GLUE_BASE_URL_LOCAL = "http://localhost:3000"
+CH_CATALOG_DB = "glue_export_catalog"
 
 
 # ---------------------------------------------------------------------------
@@ -44,10 +43,12 @@ CH_CATALOG_DB = "nessie_export_catalog"
 def catalog_export_cluster():
     """
     Cluster with ZooKeeper (for ReplicatedMergeTree / EXPORT PARTITION) and the
-    Nessie docker-compose stack (Nessie REST catalog + MinIO warehouse bucket).
+    Glue docker-compose stack (Moto mock + MinIO warehouse bucket).
     Spark is not needed; pyiceberg handles table creation and catalog inspection.
     """
     try:
+        os.environ["AWS_ACCESS_KEY_ID"] = "testing"
+        os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
         cluster = ClickHouseCluster(__file__)
         cluster.add_instance(
             "node1",
@@ -57,10 +58,7 @@ def catalog_export_cluster():
             stay_alive=True,
             with_zookeeper=True,
             keeper_required_feature_flags=["multi_read"],
-            with_iceberg_catalog=True,
-            extra_parameters={
-                "docker_compose_file_name": "docker_compose_iceberg_nessie_catalog.yml"
-            },
+            with_glue_catalog=True,
         )
         cluster.start()
 
@@ -93,38 +91,38 @@ def cleanup_tables(catalog_export_cluster):
 # ---------------------------------------------------------------------------
 
 
-def _load_catalog(cluster) -> RestCatalog:
+def _load_catalog(cluster):
     """
-    Connect to Nessie from the test host via the localhost-mapped port (19120).
-    MinIO is accessed on port 9002 (external), which maps to the container port 9000.
+    Connect to the Moto Glue mock from the test host via localhost:3000.
+    MinIO is accessed via the container IP for S3 operations.
     """
     minio_ip = cluster.get_instance_ip("minio")
-    return RestCatalog(
-        name="nessie",
-        warehouse=WAREHOUSE_NAME,
-        uri=NESSIE_BASE_URL,
-        token="dummy",
+    return load_catalog(
+        "glue_test",
         **{
-            "s3.endpoint": f"http://{minio_ip}:9002",
+            "type": "glue",
+            "glue.endpoint": GLUE_BASE_URL_LOCAL,
+            "glue.region": "us-east-1",
+            "s3.endpoint": f"http://{minio_ip}:9000",
             "s3.access-key-id": minio_access_key,
             "s3.secret-access-key": minio_secret_key,
-            "s3.region": "us-east-1",
-            "s3.path-style-access": "true",
         },
     )
 
 
 def _setup_ch_catalog_db(node, db_name: str = CH_CATALOG_DB) -> None:
-    """Drop-and-recreate the ClickHouse DataLakeCatalog database pointing at Nessie."""
+    """Drop-and-recreate the ClickHouse DataLakeCatalog database pointing at Glue (Moto)."""
     node.query(f"DROP DATABASE IF EXISTS {db_name}")
     node.query(
         f"""
-        SET allow_experimental_database_iceberg = 1;
+        SET write_full_path_in_iceberg_metadata = 1;
+        SET allow_database_glue_catalog = 1;
         CREATE DATABASE {db_name}
-        ENGINE = DataLakeCatalog('http://nessie:19120/iceberg/', 'minio', '{minio_secret_key}')
-        SETTINGS catalog_type = 'rest',
-                 warehouse = 'warehouse',
-                 storage_endpoint = 'http://minio:9000/warehouse-rest'
+        ENGINE = DataLakeCatalog('{GLUE_BASE_URL}', '{minio_access_key}', '{minio_secret_key}')
+        SETTINGS catalog_type = 'glue',
+                 warehouse = 'test',
+                 storage_endpoint = 'http://minio:9000/warehouse-glue',
+                 region = 'us-east-1'
         """
     )
 
@@ -169,19 +167,18 @@ def _partition_id_for(node, table: str, region: str) -> str:
     ).strip()
 
 
-def _create_iceberg_table(catalog: RestCatalog, ns: str, tbl: str) -> None:
+def _create_iceberg_table(catalog, ns: str, tbl: str) -> None:
     """
     Create a simple identity(region)-partitioned Iceberg table in the catalog.
     Using format-version 2 and uncompressed metadata for test simplicity.
     """
     catalog.create_table(
         identifier=f"{ns}.{tbl}",
-
-        # todo arthur check if I need to support non-nullable to nullable.
         schema=Schema(
             NestedField(field_id=1, name="id", field_type=LongType(), required=True),
             NestedField(field_id=2, name="region", field_type=StringType(), required=True),
         ),
+        location=f"s3://warehouse-glue/data/{tbl}",
         partition_spec=PartitionSpec(
             PartitionField(
                 source_id=2,
@@ -207,7 +204,7 @@ def test_catalog_basic_export(catalog_export_cluster):
     """
     Create a catalog-registered Iceberg table via pyiceberg, export one partition
     from a ReplicatedMergeTree, and verify:
-    - The catalog (Nessie) shows a new snapshot after the export.
+    - The catalog (Glue) shows a new snapshot after the export.
     - SELECT via the DataLakeCatalog database returns the correct row count.
 
     This test exercises the catalog commit path:
@@ -231,7 +228,10 @@ def test_catalog_basic_export(catalog_export_cluster):
     pid = _partition_id_for(node, source, "EU")
     dest_ch = f"`{CH_CATALOG_DB}`.`{ns}.{tbl}`"
 
-    node.query(f"ALTER TABLE {source} EXPORT PARTITION ID '{pid}' TO TABLE {dest_ch}")
+    node.query(
+        f"ALTER TABLE {source} EXPORT PARTITION ID '{pid}' TO TABLE {dest_ch}",
+        settings={"write_full_path_in_iceberg_metadata": 1},
+    )
     _wait_for_export(node, source, pid)
 
     count = int(node.query(f"SELECT count() FROM {dest_ch}").strip())
@@ -239,16 +239,15 @@ def test_catalog_basic_export(catalog_export_cluster):
 
     iceberg_tbl = catalog.load_table(f"{ns}.{tbl}")
     assert iceberg_tbl.current_snapshot() is not None, \
-        "Expected at least one snapshot in Nessie after the export"
+        "Expected at least one snapshot in Glue after the export"
 
 
 def test_catalog_concurrent_export(catalog_export_cluster):
     """
     Export two partitions concurrently to the same catalog-backed Iceberg table.
 
-    Both commits go through catalog->updateMetadata (Nessie CAS). The second
-    committer will see a metadata-version conflict and retry against the updated
-    metadata written by the first committer. Both commits must ultimately succeed.
+    Both commits go through catalog->updateMetadata (Glue). Both commits must
+    ultimately succeed.
 
     Verifies:
     - Total row count equals total inserted (no rows lost).
@@ -278,7 +277,8 @@ def test_catalog_concurrent_export(catalog_export_cluster):
     def export_partition(pid: str) -> None:
         try:
             node.query(
-                f"ALTER TABLE {source} EXPORT PARTITION ID '{pid}' TO TABLE {dest_ch}"
+                f"ALTER TABLE {source} EXPORT PARTITION ID '{pid}' TO TABLE {dest_ch}",
+                settings={"write_full_path_in_iceberg_metadata": 1},
             )
             _wait_for_export(node, source, pid, timeout=120)
         except Exception as exc:
@@ -310,12 +310,12 @@ def test_catalog_idempotent_retry(catalog_export_cluster):
 
     After restart the scheduler retries the PENDING task.
     IcebergMetadata::commitExportPartitionTransaction finds the transaction_id already
-    embedded in a Nessie snapshot summary field
-    (clickhouse.export-partition-transaction-id) and returns without re-committing.
+    embedded in a snapshot summary field (clickhouse.export-partition-transaction-id)
+    and returns without re-committing.
 
     Verifies:
     - Exactly 3 rows in the Iceberg table (no duplicates from the re-commit).
-    - Exactly 1 snapshot in the Nessie catalog (the idempotent retry was a no-op).
+    - Exactly 1 snapshot in the Glue catalog (the idempotent retry was a no-op).
     """
     node = catalog_export_cluster.instances["node1"]
     catalog = _load_catalog(catalog_export_cluster)
@@ -337,7 +337,10 @@ def test_catalog_idempotent_retry(catalog_export_cluster):
     # Enable the ONCE failpoint: after a successful catalog commit the process
     # calls std::terminate() before writing ZK COMPLETED — simulating a hard crash.
     node.query("SYSTEM ENABLE FAILPOINT iceberg_export_after_commit_before_zk_completed")
-    node.query(f"ALTER TABLE {source} EXPORT PARTITION ID '{pid}' TO TABLE {dest_ch}")
+    node.query(
+        f"ALTER TABLE {source} EXPORT PARTITION ID '{pid}' TO TABLE {dest_ch}",
+        settings={"write_full_path_in_iceberg_metadata": 1},
+    )
 
     # Give the background scheduler time to export the data files and reach the
     # failpoint.  The crash is immediate (std::terminate), so 10 s is generous.
@@ -349,8 +352,8 @@ def test_catalog_idempotent_retry(catalog_export_cluster):
     _setup_ch_catalog_db(node)
 
     # The scheduler picks up the PENDING task and retries. commitExportPartitionTransaction
-    # detects the transaction_id in the existing Nessie snapshot summary and skips
-    # the re-commit, then marks the task COMPLETED in ZooKeeper.
+    # detects the transaction_id in the existing snapshot summary and skips the
+    # re-commit, then marks the task COMPLETED in ZooKeeper.
     _wait_for_export(node, source, pid, timeout=120)
 
     count = int(node.query(f"SELECT count() FROM {dest_ch}").strip())

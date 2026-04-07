@@ -1472,15 +1472,36 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
 
         if (retry_because_of_metadata_conflict)
         {
-            auto [last_version, metadata_path, compression_method] = getLatestOrExplicitMetadataFileAndVersion(
-                object_storage,
-                persistent_components.table_path,
-                data_lake_settings,
-                persistent_components.metadata_cache,
-                context,
-                getLogger("IcebergMetadata").get(),
-                persistent_components.table_uuid,
-                true);
+            MetadataFileWithInfo latest_metadata_file_info;
+            if (catalog && catalog->isTransactional())
+            {
+                const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
+                DataLake::TableMetadata table_metadata = DataLake::TableMetadata().withLocation().withDataLakeSpecificProperties();
+                catalog->getTableMetadata(namespace_name, table_name, context, table_metadata);
+
+                auto table_specific_properties = table_metadata.getDataLakeSpecificProperties();
+                if (!table_specific_properties.has_value() || table_specific_properties->iceberg_metadata_file_location.empty())
+                    throw Exception(ErrorCodes::LOGICAL_ERROR, "Catalog didn't return iceberg metadata location for table {}.{}", namespace_name, table_name);
+
+                String metadata_path = table_metadata.getMetadataLocation(table_specific_properties->iceberg_metadata_file_location);
+                if (!metadata_path.starts_with(persistent_components.table_path))
+                    metadata_path = std::filesystem::path(persistent_components.table_path) / metadata_path;
+                latest_metadata_file_info = Iceberg::getMetadataFileAndVersion(metadata_path);
+            }
+            else
+            {
+                latest_metadata_file_info = getLatestOrExplicitMetadataFileAndVersion(
+                    object_storage,
+                    persistent_components.table_path,
+                    data_lake_settings,
+                    persistent_components.metadata_cache,
+                    context,
+                    getLogger("IcebergWrites").get(),
+                    persistent_components.table_uuid,
+                    true);
+            }
+
+            auto [last_version, metadata_path, compression_method] = latest_metadata_file_info;
 
             LOG_DEBUG(log, "Rereading metadata file {} with version {}", metadata_path, last_version);
 
@@ -1562,7 +1583,7 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
             try
             {
                 generateManifestList(
-                    filename_generator, metadata, object_storage, context, {manifest_entry_name}, new_snapshot, manifest_lengths, *buffer_manifest_list, Iceberg::FileContentType::DATA);
+                    filename_generator, metadata, object_storage, context, {manifest_entry_name}, new_snapshot, manifest_lengths, *buffer_manifest_list, Iceberg::FileContentType::DATA, true);
                 buffer_manifest_list->finalize();
             }
             catch (...)
@@ -1616,14 +1637,14 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
             }
         }
 
-        if (persistent_table_components.metadata_cache)
+        if (persistent_components.metadata_cache)
         {
             /// If there's an active metadata cache
             /// We can't just cache 'our' written version as latest, because it could've been overwritten by a concurrent catalog update
             /// This is why, we are safely invalidating the cache, and the very next reader will get the most up-to-date latest version
-            persistent_table_components.metadata_cache->remove(persistent_table_components.table_path);
-            if (persistent_table_components.table_uuid)
-                persistent_table_components.metadata_cache->remove(*persistent_table_components.table_uuid);
+            persistent_components.metadata_cache->remove(persistent_components.table_path);
+            if (persistent_components.table_uuid)
+                persistent_components.metadata_cache->remove(*persistent_components.table_uuid);
         }
     }
     catch (...)
