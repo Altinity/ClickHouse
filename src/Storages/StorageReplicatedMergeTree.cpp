@@ -8373,28 +8373,6 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
             }
         }
 
-        /// Serialize Iceberg partition values from the stored partition tuple of the first part.
-        /// All parts in the same MergeTree partition share identical partition key values.
-        /// partition.value already holds post-transform results: MergeTree evaluates the same
-        /// functions that Iceberg partition transforms map to (guaranteed by the compatibility
-        /// check above), so no further function execution is needed here.
-        if (src_snapshot->hasPartitionKey() && !parts[0]->partition.value.empty())
-        {
-            Poco::JSON::Array::Ptr pv_arr = new Poco::JSON::Array();
-            for (const Field & field : parts[0]->partition.value)
-            {
-                if (field.getType() == Field::Types::String)
-                    pv_arr->add(field.safeGet<String>());
-                else if (field.getType() == Field::Types::UInt64)
-                    pv_arr->add(field.safeGet<UInt64>());
-                else
-                    pv_arr->add(field.safeGet<Int64>());
-            }
-            std::ostringstream pv_oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-            pv_oss.exceptions(std::ios::failbit);
-            Poco::JSON::Stringifier::stringify(*pv_arr, pv_oss);
-            manifest.partition_values_json = pv_oss.str();
-        }
 #else
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Data lake export requires Avro support");
 #endif

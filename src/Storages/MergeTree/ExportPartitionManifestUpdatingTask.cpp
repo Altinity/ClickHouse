@@ -35,6 +35,7 @@ namespace
         const std::string & entry_path,
         const LoggerPtr & log,
         const ContextPtr & storage_context,
+        StorageReplicatedMergeTree & storage,
         const std::string & key,
         const ExportReplicatedMergeTreePartitionManifest & metadata,
         const time_t now,
@@ -85,7 +86,7 @@ namespace
                 /// it sounds like a replica exported the last part, but was not able to commit the export. Try to fix it
                 try
                 {
-                    ExportPartitionUtils::commit(metadata, destination_storage, zk, log, entry_path, context);
+                    ExportPartitionUtils::commit(metadata, destination_storage, zk, log, entry_path, context, storage);
                 }
                 catch (const Exception & e)
                 {
@@ -571,6 +572,7 @@ void ExportPartitionManifestUpdatingTask::poll()
                 entry_path,
                 storage.log.load(),
                 storage.getContext(),
+                storage,
                 key,
                 metadata,
                 now,

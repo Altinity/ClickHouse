@@ -5,6 +5,7 @@
 #include <Common/logger_useful.h>
 #include "Storages/ExportReplicatedMergeTreePartitionManifest.h"
 #include "Storages/ExportReplicatedMergeTreePartitionTaskEntry.h"
+#include <Storages/MergeTree/MergeTreeData.h>
 #include <filesystem>
 #include <thread>
 #include <Interpreters/Context.h>
@@ -23,6 +24,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int FAULT_INJECTED;
+    extern const int BAD_ARGUMENTS;
 }
 
 namespace FailPoints
@@ -34,6 +36,24 @@ namespace fs = std::filesystem;
 
 namespace ExportPartitionUtils
 {
+    std::vector<Field> getPartitionValuesForIcebergCommit(
+        MergeTreeData & storage, const String & partition_id)
+    {
+        auto lock = storage.readLockParts();
+        const auto parts = storage.getDataPartsVectorInPartitionForInternalUsage(
+            MergeTreeDataPartState::Active, partition_id, lock);
+        
+        /// todo arthur: bad arguments for now, pick a better one
+        if (parts.empty())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Cannot find active part for partition_id '{}' to derive Iceberg partition "
+                "values. Edge case: the partition may have been dropped after export started, "
+                "or this replica has not yet received any part for this partition. "
+                "The commit will be retried.",
+                partition_id);
+        return parts.front()->partition.value;
+    }
+
     ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ExportReplicatedMergeTreePartitionManifest & manifest)
     {
         auto context_copy = Context::createCopy(context);
@@ -118,7 +138,8 @@ namespace ExportPartitionUtils
         const zkutil::ZooKeeperPtr & zk,
         const LoggerPtr & log,
         const std::string & entry_path,
-        const ContextPtr & context_in)
+        const ContextPtr & context_in,
+        MergeTreeData & source_storage)
     {
         auto context = Context::createCopy(context_in);
         context->setSetting("write_full_path_in_iceberg_metadata", manifest.write_full_path_in_iceberg_metadata);
@@ -143,7 +164,9 @@ namespace ExportPartitionUtils
         if (!manifest.iceberg_metadata_json.empty())
         {
             iceberg_args.metadata_json_string = manifest.iceberg_metadata_json;
-            iceberg_args.partition_values = manifest.partition_values;
+            if (source_storage.getInMemoryMetadataPtr()->hasPartitionKey())
+                iceberg_args.partition_values =
+                    getPartitionValuesForIcebergCommit(source_storage, manifest.partition_id);
         }
 
         destination_storage->commitExportPartitionTransaction(manifest.transaction_id, manifest.partition_id, exported_paths, iceberg_args, context);

@@ -254,8 +254,7 @@ void ExportPartitionTaskScheduler::run()
                     (MergeTreePartExportManifest::CompletionCallbackResult result)
                     {
                         handlePartExportCompletion(key, zk_part_name, manifest, destination_storage, result);
-                    },
-                    manifest.partition_values);
+                    });
 
                 part_export_manifest.task = std::make_shared<ExportPartFromPartitionExportTask>(storage, key, part_export_manifest);
 
@@ -304,8 +303,7 @@ void ExportPartitionTaskScheduler::run()
                         (MergeTreePartExportManifest::CompletionCallbackResult result)
                         {
                             handlePartExportCompletion(key, zk_part_name, manifest, destination_storage, result);
-                        },
-                        manifest.partition_values);
+                        });
 
                     scheduled_exports_count++;
                 }
@@ -381,7 +379,7 @@ void ExportPartitionTaskScheduler::handlePartExportSuccess(
     try
     {
         auto context = ExportPartitionUtils::getContextCopyWithTaskSettings(storage.getContext(), manifest);
-        ExportPartitionUtils::commit(manifest, destination_storage, zk, storage.log.load(), export_path, context);
+        ExportPartitionUtils::commit(manifest, destination_storage, zk, storage.log.load(), export_path, context, storage);
     }
     catch (const Exception & e)
     {

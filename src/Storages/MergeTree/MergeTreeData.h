@@ -1032,8 +1032,7 @@ public:
         ContextPtr query_context,
         const std::optional<String> & iceberg_metadata_json = std::nullopt,
         bool allow_outdated_parts = false,
-        std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback = {},
-        std::vector<Field> partition_values = {});
+        std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback = {});
 
     void exportPartToTable(
         const std::string & part_name,
@@ -1042,8 +1041,7 @@ public:
         ContextPtr query_context,
         const std::optional<String> & iceberg_metadata_json = std::nullopt,
         bool allow_outdated_parts = false,
-        std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback = {},
-        std::vector<Field> partition_values = {});
+        std::function<void(MergeTreePartExportManifest::CompletionCallbackResult)> completion_callback = {});
 
     void killExportPart(const String & transaction_id);
 
