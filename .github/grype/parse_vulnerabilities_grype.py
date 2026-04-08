@@ -3,12 +3,15 @@ import json
 
 from testflows.core import *
 
-xfails = {}
+xfails = {
+    "/docker vulnerabilities/CVE-2026-2673@nvd﹕cpe,High": [
+        (Fail, "Marked as Low severity by OpenSSL: https://openssl-library.org/news/secadv/20260313.txt")
+    ],
+}
 
-
-@Name("docker vulnerabilities")
-@XFails(xfails)
 @TestModule
+@XFails(xfails)
+@Name("docker vulnerabilities")
 def docker_vulnerabilities(self):
     with Given("I gather grype scan results"):
         with open("./result.json", "r") as f:
