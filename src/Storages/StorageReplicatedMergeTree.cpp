@@ -4438,16 +4438,25 @@ void StorageReplicatedMergeTree::mutationsFinalizingTask()
 }
 
 void StorageReplicatedMergeTree::exportMergeTreePartitionUpdatingTask()
-{   
+{
     try
     {
         export_merge_tree_partition_manifest_updater->poll();
+    }
+    catch (const Coordination::Exception & e)
+    {
+        tryLogCurrentException(log, __PRETTY_FUNCTION__);
+        if (e.code == Coordination::Error::ZSESSIONEXPIRED)
+        {
+            LOG_DEBUG(log, "Export partition updating task: ZooKeeper session expired, waking up restarting thread");
+            restarting_thread.wakeup();
+            return;
+        }
     }
     catch (...)
     {
         tryLogCurrentException(log, __PRETTY_FUNCTION__);
     }
-
 
     export_merge_tree_partition_updating_task->scheduleAfter(30 * 1000);
 }
@@ -4478,6 +4487,16 @@ void StorageReplicatedMergeTree::exportMergeTreePartitionStatusHandlingTask()
     try
     {
         export_merge_tree_partition_manifest_updater->handleStatusChanges();
+    }
+    catch (const Coordination::Exception & e)
+    {
+        tryLogCurrentException(log, __PRETTY_FUNCTION__);
+        if (e.code == Coordination::Error::ZSESSIONEXPIRED)
+        {
+            restarting_thread.wakeup();
+            return;
+        }
+        // status handling is event-driven; re-triggered by next watch callback
     }
     catch (...)
     {
