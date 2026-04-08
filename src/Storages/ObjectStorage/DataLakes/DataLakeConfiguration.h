@@ -39,12 +39,12 @@
 #include <Common/filesystemHelpers.h>
 #include <Disks/DiskType.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
-#include <Databases/DataLake/RestCatalog.h>
-#include <Databases/DataLake/GlueCatalog.h>
 #include <Storages/ObjectStorage/StorageObjectStorageConfiguration.h>
 #include <Storages/ObjectStorage/Utils.h>
 #include <Disks/DiskObjectStorage/DiskObjectStorage.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/DatabaseCatalog.h>
+#include <Databases/DataLake/DatabaseDataLake.h>
 #include <Core/Settings.h>
 
 #include <fmt/ranges.h>
@@ -348,8 +348,9 @@ public:
             catalog);
     }
 
-    std::shared_ptr<DataLake::ICatalog> getCatalog([[maybe_unused]] ContextPtr context, [[maybe_unused]] bool is_attach) const override
+    std::shared_ptr<DataLake::ICatalog> getCatalog([[maybe_unused]] ContextPtr context, [[maybe_unused]] const StorageID & table_id) const override
     {
+<<<<<<< HEAD
 #if USE_AWS_S3 && USE_AVRO
         if ((*settings)[DataLakeStorageSetting::storage_catalog_type].value == DatabaseDataLakeCatalogType::GLUE)
         {
@@ -387,7 +388,22 @@ public:
         }
 
 #endif
+=======
+#if USE_AVRO && USE_PARQUET
+        if ((*settings)[DataLakeStorageSetting::storage_catalog_type].changed || (*settings)[DataLakeStorageSetting::storage_aws_access_key_id].changed)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Don't use deprecated settings storage_catalog_type and storage_catalog_url");
+        const String db_name = table_id.hasDatabase() ? table_id.database_name : context->getCurrentDatabase();
+        DatabasePtr database = DatabaseCatalog::instance().tryGetDatabase(db_name);
+        if (!database)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Database {} not found", db_name);
+        auto datalake_database = std::dynamic_pointer_cast<DatabaseDataLake>(database);
+        if (!datalake_database)
+            return nullptr;
+        return datalake_database->getCatalog();
+#else
+>>>>>>> 4f3766e352c (Merge pull request #100334 from ClickHouse/change_insert_interface)
         return nullptr;
+#endif
     }
 
     bool optimize(const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & format_settings) override
