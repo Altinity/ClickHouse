@@ -352,6 +352,181 @@ def test_compound_transform(export_cluster):
     assert int(node.query(f"SELECT count() FROM {iceberg}").strip()) == 3
 
 
+def test_identity_int64(export_cluster):
+    """Spark identity(user_id) on BIGINT  <->  PARTITION BY user_id (Int64).
+
+    Int64 → Avro 'long' is already handled by getAvroType(). This test covers
+    the identity transform on a 64-bit integer column, which is not covered by
+    the existing test_identity_transform (which uses Int32).
+    """
+    node, _, iceberg, _ = _run_accepted(
+        export_cluster,
+        spark_ddl="CREATE TABLE {TABLE} (id BIGINT, user_id BIGINT)"
+                  " USING iceberg PARTITIONED BY (identity(user_id))"
+                  " OPTIONS('format-version'='2')",
+        ch_schema="id Int64, user_id Int64",
+        rmt_columns="id Int64, user_id Int64",
+        rmt_partition_by="user_id",
+        insert_values="(1, 100), (2, 100), (3, 100)",
+    )
+    assert int(node.query(f"SELECT count() FROM {iceberg}").strip()) == 3
+
+
+def test_identity_date(export_cluster):
+    """Spark identity(event_date) on DATE  <->  PARTITION BY event_date (Date32).
+
+    Date32 → Avro 'int' is already handled by getAvroType(). This test covers
+    the identity transform directly on a date column. Existing date-related tests
+    (test_year_transform, test_month_transform, etc.) use time-based transforms
+    such as years() and months(), not identity().
+    """
+    node, _, iceberg, _ = _run_accepted(
+        export_cluster,
+        spark_ddl="CREATE TABLE {TABLE} (id BIGINT, event_date DATE)"
+                  " USING iceberg PARTITIONED BY (identity(event_date))"
+                  " OPTIONS('format-version'='2')",
+        ch_schema="id Int64, event_date Date32",
+        rmt_columns="id Int64, event_date Date32",
+        rmt_partition_by="event_date",
+        insert_values="(1, '2024-03-15'), (2, '2024-03-15'), (3, '2024-03-15')",
+    )
+    assert int(node.query(f"SELECT count() FROM {iceberg}").strip()) == 3
+
+
+def test_identity_string(export_cluster):
+    """Spark identity(region) on STRING  <->  PARTITION BY region (String).
+
+    String → Avro 'string' is already handled by getAvroType(). This test covers
+    identity on a string column as the sole partition field. The existing
+    test_compound_transform uses identity(region) only as part of a multi-field spec,
+    so a standalone string identity partition was not previously exercised end-to-end.
+    """
+    node, _, iceberg, _ = _run_accepted(
+        export_cluster,
+        spark_ddl="CREATE TABLE {TABLE} (id BIGINT, region STRING)"
+                  " USING iceberg PARTITIONED BY (identity(region))"
+                  " OPTIONS('format-version'='2')",
+        ch_schema="id Int64, region String",
+        rmt_columns="id Int64, region String",
+        rmt_partition_by="region",
+        insert_values="(1, 'EU'), (2, 'EU'), (3, 'EU')",
+    )
+    assert int(node.query(f"SELECT count() FROM {iceberg}").strip()) == 3
+
+
+def test_truncate_int64(export_cluster):
+    """Spark truncate(10, amount) on BIGINT  <->  PARTITION BY icebergTruncate(10, amount) (Int64).
+
+    Int64 truncate produces floor(v / 10) * 10, so all rows with amount=42 land in
+    partition value 40 (same partition). This is a distinct code path from truncate on
+    String (which trims a character prefix). The existing test_truncate_transform uses
+    String only, leaving the integer truncate path untested.
+    """
+    node, _, iceberg, _ = _run_accepted(
+        export_cluster,
+        spark_ddl="CREATE TABLE {TABLE} (id BIGINT, amount BIGINT)"
+                  " USING iceberg PARTITIONED BY (truncate(10, amount))"
+                  " OPTIONS('format-version'='2')",
+        ch_schema="id Int64, amount Int64",
+        rmt_columns="id Int64, amount Int64",
+        rmt_partition_by="icebergTruncate(10, amount)",
+        # All rows have amount=42 → truncated partition value is 40.
+        insert_values="(1, 42), (2, 42), (3, 42)",
+    )
+    assert int(node.query(f"SELECT count() FROM {iceberg}").strip()) == 3
+
+
+def test_bucket_string(export_cluster):
+    """Spark bucket(8, name) on STRING  <->  PARTITION BY icebergBucket(8, name) (String).
+
+    Bucket on strings uses Murmur3 hash of the UTF-8 bytes, a different hash path than
+    bucket on integers. All rows share the same name so they land in the same bucket.
+    The existing test_bucket_transform uses BIGINT only, leaving string bucketing untested.
+    """
+    node, _, iceberg, _ = _run_accepted(
+        export_cluster,
+        spark_ddl="CREATE TABLE {TABLE} (id BIGINT, name STRING)"
+                  " USING iceberg PARTITIONED BY (bucket(8, name))"
+                  " OPTIONS('format-version'='2')",
+        ch_schema="id Int64, name String",
+        rmt_columns="id Int64, name String",
+        rmt_partition_by="icebergBucket(8, name)",
+        # All rows share the same name → same Murmur3 bucket.
+        insert_values="(1, 'alice'), (2, 'alice'), (3, 'alice')",
+    )
+    assert int(node.query(f"SELECT count() FROM {iceberg}").strip()) == 3
+
+
+def test_year_transform_timestamp(export_cluster):
+    """Spark years(ts) on TIMESTAMP  <->  PARTITION BY toYearNumSinceEpoch(ts) (DateTime64(6)).
+
+    DateTime64 → Avro 'long' is already handled by getAvroType(). The year transform on
+    TIMESTAMP follows a different branch than on DATE (long vs int in Avro). The existing
+    test_year_transform uses DATE only. All three rows fall within the same year.
+    """
+    node, _, iceberg, _ = _run_accepted(
+        export_cluster,
+        spark_ddl="CREATE TABLE {TABLE} (id BIGINT, ts TIMESTAMP)"
+                  " USING iceberg PARTITIONED BY (years(ts))"
+                  " OPTIONS('format-version'='2')",
+        ch_schema="id Int64, ts DateTime64(6)",
+        rmt_columns="id Int64, ts DateTime64(6)",
+        rmt_partition_by="toYearNumSinceEpoch(ts)",
+        insert_values=(
+            "(1, '2023-01-15 08:00:00'), "
+            "(2, '2023-06-01 12:00:00'), "
+            "(3, '2023-12-31 23:59:59')"
+        ),
+    )
+    assert int(node.query(f"SELECT count() FROM {iceberg}").strip()) == 3
+
+
+def test_month_transform_timestamp(export_cluster):
+    """Spark months(ts) on TIMESTAMP  <->  PARTITION BY toMonthNumSinceEpoch(ts) (DateTime64(6)).
+
+    Analogous to test_year_transform_timestamp but for the month transform.
+    All three rows fall within the same calendar month.
+    """
+    node, _, iceberg, _ = _run_accepted(
+        export_cluster,
+        spark_ddl="CREATE TABLE {TABLE} (id BIGINT, ts TIMESTAMP)"
+                  " USING iceberg PARTITIONED BY (months(ts))"
+                  " OPTIONS('format-version'='2')",
+        ch_schema="id Int64, ts DateTime64(6)",
+        rmt_columns="id Int64, ts DateTime64(6)",
+        rmt_partition_by="toMonthNumSinceEpoch(ts)",
+        insert_values=(
+            "(1, '2023-06-01 00:00:00'), "
+            "(2, '2023-06-15 12:00:00'), "
+            "(3, '2023-06-30 23:59:59')"
+        ),
+    )
+    assert int(node.query(f"SELECT count() FROM {iceberg}").strip()) == 3
+
+
+def test_day_transform_timestamp(export_cluster):
+    """Spark days(ts) on TIMESTAMP  <->  PARTITION BY toRelativeDayNum(ts) (DateTime64(6)).
+
+    Analogous to test_year_transform_timestamp but for the day transform.
+    All three rows fall within the same calendar day.
+    """
+    node, _, iceberg, _ = _run_accepted(
+        export_cluster,
+        spark_ddl="CREATE TABLE {TABLE} (id BIGINT, ts TIMESTAMP)"
+                  " USING iceberg PARTITIONED BY (days(ts))"
+                  " OPTIONS('format-version'='2')",
+        ch_schema="id Int64, ts DateTime64(6)",
+        rmt_columns="id Int64, ts DateTime64(6)",
+        rmt_partition_by="toRelativeDayNum(ts)",
+        insert_values=(
+            "(1, '2023-06-15 00:00:00'), "
+            "(2, '2023-06-15 12:00:00'), "
+            "(3, '2023-06-15 23:59:59')"
+        ),
+    )
+    assert int(node.query(f"SELECT count() FROM {iceberg}").strip()) == 3
+
+
 # ---------------------------------------------------------------------------
 # Unhappy-path tests — BAD_ARGUMENTS must be raised synchronously
 # ---------------------------------------------------------------------------
