@@ -69,6 +69,10 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         addSettingsChanges(settings_changes_history, "25.4",
         {
         });
+        addSettingsChanges(settings_changes_history, "25.3.8",
+        {
+            {"allow_local_data_lakes", false, false, "New setting to guard local data lake engines and table functions"},
+        });
         addSettingsChanges(settings_changes_history, "25.3",
         {
             /// Release closed. Please use 25.4
