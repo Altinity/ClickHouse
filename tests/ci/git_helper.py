@@ -25,8 +25,9 @@ class VersionType:
     STABLE = "altinitystable"
     TESTING = "altinitytest"
     ANTALYA = "altinityantalya"
+    FIPS = "altinityfips"
 
-    VALID = (NEW, TESTING, PRESTABLE, STABLE, LTS, ANTALYA,
+    VALID = (NEW, TESTING, PRESTABLE, STABLE, LTS, ANTALYA, FIPS,
             # NOTE (vnemkov): we don't use those directly, but it is used in unit-tests
             "stable",
             "prestable",
