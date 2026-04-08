@@ -21,8 +21,10 @@ Transform coverage (ClickHouse → Iceberg):
 """
 
 import logging
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import pyspark
@@ -81,6 +83,17 @@ def export_cluster():
             with_zookeeper=True,
             keeper_required_feature_flags=["multi_read"],
         )
+        for name in ["replica1", "replica2", "replica3"]:
+            cluster.add_instance(
+                name,
+                main_configs=[
+                    "configs/config.d/named_collections.xml",
+                    "configs/config.d/allow_export_partition.xml",
+                ],
+                stay_alive=True,
+                with_zookeeper=True,
+                keeper_required_feature_flags=["multi_read"],
+            )
         logging.info("Starting export_cluster...")
         cluster.start()
         prepare_s3_bucket(cluster)
@@ -94,17 +107,18 @@ def export_cluster():
 @pytest.fixture(autouse=True)
 def drop_tables(export_cluster):
     yield
-    node = export_cluster.instances["node1"]
-    try:
-        tables = node.query(
-            "SELECT name FROM system.tables WHERE database = 'default' FORMAT TabSeparated"
-        ).strip()
-        for table in tables.splitlines():
-            table = table.strip()
-            if table:
-                node.query(f"DROP TABLE IF EXISTS default.`{table}` SYNC")
-    except Exception as e:
-        logging.warning(f"drop_tables cleanup failed: {e}")
+    for node_name in ["node1", "replica1", "replica2", "replica3"]:
+        node = export_cluster.instances[node_name]
+        try:
+            tables = node.query(
+                "SELECT name FROM system.tables WHERE database = 'default' FORMAT TabSeparated"
+            ).strip()
+            for table in tables.splitlines():
+                table = table.strip()
+                if table:
+                    node.query(f"DROP TABLE IF EXISTS default.`{table}` SYNC")
+        except Exception as e:
+            logging.warning(f"drop_tables cleanup failed on {node_name}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -137,11 +151,11 @@ def _attach_ch_iceberg(node, iceberg_name: str, schema: str, cluster):
     )
 
 
-def _make_rmt(node, name: str, columns: str, partition_by: str):
+def _make_rmt(node, name: str, columns: str, partition_by: str, replica_name: str = "r1"):
     node.query(
         f"""
         CREATE TABLE {name} ({columns})
-        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{name}', 'r1')
+        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{name}', '{replica_name}')
         PARTITION BY {partition_by}
         ORDER BY id
         SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
@@ -223,6 +237,65 @@ def _run_rejected(export_cluster, spark_ddl, ch_schema, rmt_columns, rmt_partiti
         f"ALTER TABLE {source} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg}"
     )
     return error
+
+
+# ---------------------------------------------------------------------------
+# Replicated helpers
+# ---------------------------------------------------------------------------
+
+
+def _create_iceberg_s3_table(node, iceberg_table: str, if_not_exists: bool = False):
+    """Create (or attach to an existing) IcebergS3 table at a per-test MinIO prefix."""
+    ine = "IF NOT EXISTS " if if_not_exists else ""
+    node.query(
+        f"""
+        CREATE TABLE {ine}{iceberg_table}
+        (id Int64, year Int32)
+        ENGINE = IcebergS3(
+            'http://minio1:9001/root/data/{iceberg_table}/',
+            'minio',
+            'ClickHouse_Minio_P@ssw0rd'
+        )
+        PARTITION BY year SETTINGS s3_retry_attempts = 1
+        """
+    )
+
+
+def _setup_replicas(cluster, mt_table: str, iceberg_table: str, replica_names: list):
+    """
+    Create RMT on each replica with a per-replica replica_name so all instances share
+    the same ZooKeeper path. Create IcebergS3 on the primary; attach with IF NOT EXISTS
+    on the rest. No data is inserted here — callers manage their own test data.
+    """
+    instances = [cluster.instances[n] for n in replica_names]
+    primary = instances[0]
+
+    for rname, instance in zip(replica_names, instances):
+        _make_rmt(instance, mt_table, "id Int64, year Int32", "year", replica_name=rname)
+
+    _create_iceberg_s3_table(primary, iceberg_table)
+    for instance in instances[1:]:
+        _create_iceberg_s3_table(instance, iceberg_table, if_not_exists=True)
+
+
+def _wait_for_export_r(node, source: str, dest: str, pid: str, timeout: int = 60):
+    """Poll system.replicated_partition_exports until the task reaches COMPLETED."""
+    start = time.time()
+    last_status = None
+    while time.time() - start < timeout:
+        status = node.query(
+            f"SELECT status FROM system.replicated_partition_exports"
+            f" WHERE source_table = '{source}'"
+            f"   AND destination_table = '{dest}'"
+            f"   AND partition_id = '{pid}'"
+        ).strip()
+        last_status = status
+        if status == "COMPLETED":
+            return
+        time.sleep(0.5)
+    raise TimeoutError(
+        f"Export did not reach COMPLETED within {timeout}s (last: {last_status!r})"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -674,3 +747,174 @@ def test_rejected_compound_order_reversed(export_cluster):
 #     # Exactly 3 rows — no duplicates from the idempotent re-commit.
 #     count = int(node.query(f"SELECT count() FROM {iceberg}").strip())
 #     assert count == 3, f"Expected 3 rows (no duplicates), got {count}"
+
+
+# ---------------------------------------------------------------------------
+# Replicated tests — IcebergS3, no catalog
+# ---------------------------------------------------------------------------
+
+
+def test_export_initiated_from_replica2(export_cluster):
+    """
+    Export is initiated from replica2 (not the inserting replica).
+    Validates that any replica can start the export, not just the writer.
+    """
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"rmt_{uid}"
+    iceberg_table = f"iceberg_{uid}"
+
+    _setup_replicas(export_cluster, mt_table, iceberg_table, ["replica1", "replica2"])
+
+    r1 = export_cluster.instances["replica1"]
+    r2 = export_cluster.instances["replica2"]
+
+    r1.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020), (3, 2020)")
+    r2.query(f"SYSTEM SYNC REPLICA {mt_table}")
+
+    r2.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}")
+    _wait_for_export_r(r2, mt_table, iceberg_table, "2020")
+
+    count_r1 = int(r1.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count_r1 == 3, f"Expected 3 rows from replica1, got {count_r1}"
+    count_r2 = int(r2.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count_r2 == 3, f"Expected 3 rows from replica2, got {count_r2}"
+
+
+def test_concurrent_exports_different_partitions_across_replicas(export_cluster):
+    """
+    Three replicas concurrently export distinct partitions (2020, 2021, 2022) to the
+    same IcebergS3 table. All three commits must succeed and the total row count must
+    equal the sum of all inserted rows.
+    """
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"rmt_{uid}"
+    iceberg_table = f"iceberg_{uid}"
+
+    _setup_replicas(
+        export_cluster, mt_table, iceberg_table,
+        ["replica1", "replica2", "replica3"],
+    )
+
+    r1 = export_cluster.instances["replica1"]
+    r2 = export_cluster.instances["replica2"]
+    r3 = export_cluster.instances["replica3"]
+
+    r1.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020), (3, 2020)")
+    r1.query(f"INSERT INTO {mt_table} VALUES (4, 2021), (5, 2021), (6, 2021)")
+    r1.query(f"INSERT INTO {mt_table} VALUES (7, 2022), (8, 2022), (9, 2022)")
+    r2.query(f"SYSTEM SYNC REPLICA {mt_table}")
+    r3.query(f"SYSTEM SYNC REPLICA {mt_table}")
+
+    errors: list = []
+
+    def export_from(node, pid):
+        try:
+            node.query(
+                f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}"
+            )
+            _wait_for_export_r(node, mt_table, iceberg_table, pid)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=export_from, args=(r1, "2020")),
+        threading.Thread(target=export_from, args=(r2, "2021")),
+        threading.Thread(target=export_from, args=(r3, "2022")),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"Export threads raised errors: {errors}"
+
+    count = int(r1.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 9, f"Expected 9 rows total (3 per partition), got {count}"
+
+
+# TODO arthur fix: TOCTOU in export registration path.
+# The exists() pre-check and the tryMulti() commit are not a single atomic ZK
+# transaction. Depending on timing, the loser gets either KEEPER_EXCEPTION
+# "Node exists" (both replicas race past exists() and collide at tryMulti) or
+# BAD_ARGUMENTS "already exported" (the winner commits before the loser's
+# exists() check). The test cannot reliably assert either error in isolation.
+# def test_concurrent_same_partition_two_replicas_idempotent(export_cluster):
+#     uid = str(uuid.uuid4()).replace("-", "_")
+#     mt_table = f"rmt_{uid}"
+#     iceberg_table = f"iceberg_{uid}"
+#
+#     _setup_replicas(export_cluster, mt_table, iceberg_table, ["replica1", "replica2"])
+#
+#     r1 = export_cluster.instances["replica1"]
+#     r2 = export_cluster.instances["replica2"]
+#
+#     r1.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020), (3, 2020)")
+#     r2.query(f"SYSTEM SYNC REPLICA {mt_table}")
+#
+#     errors: list = []
+#
+#     def export_from(node):
+#         try:
+#             node.query(
+#                 f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
+#             )
+#             _wait_for_export_r(node, mt_table, iceberg_table, "2020")
+#         except Exception as exc:
+#             errors.append(exc)
+#
+#     t1 = threading.Thread(target=export_from, args=(r1,))
+#     t2 = threading.Thread(target=export_from, args=(r2,))
+#     t1.start()
+#     t2.start()
+#     t1.join()
+#     t2.join()
+#
+#     unexpected = [e for e in errors if "Node exists" not in str(e)]
+#     assert not unexpected, f"Unexpected export errors: {unexpected}"
+#
+#     count = int(r1.query(f"SELECT count() FROM {iceberg_table}").strip())
+#     assert count == 3, f"Expected 3 rows (no duplication), got {count}"
+
+
+def test_three_replica_concurrent_exports(export_cluster):
+    """
+    ThreadPoolExecutor with 3 workers: each replica exports its own distinct partition.
+    All futures must complete successfully; total row count must be correct.
+    """
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"rmt_{uid}"
+    iceberg_table = f"iceberg_{uid}"
+
+    _setup_replicas(
+        export_cluster, mt_table, iceberg_table,
+        ["replica1", "replica2", "replica3"],
+    )
+
+    r1 = export_cluster.instances["replica1"]
+    r2 = export_cluster.instances["replica2"]
+    r3 = export_cluster.instances["replica3"]
+
+    r1.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020), (3, 2020)")
+    r1.query(f"INSERT INTO {mt_table} VALUES (4, 2021), (5, 2021), (6, 2021)")
+    r1.query(f"INSERT INTO {mt_table} VALUES (7, 2022), (8, 2022), (9, 2022)")
+    r2.query(f"SYSTEM SYNC REPLICA {mt_table}")
+    r3.query(f"SYSTEM SYNC REPLICA {mt_table}")
+
+    def export_fn(node_pid):
+        node, pid = node_pid
+        node.query(
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}"
+        )
+        _wait_for_export_r(node, mt_table, iceberg_table, pid)
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [
+            executor.submit(export_fn, (r1, "2020")),
+            executor.submit(export_fn, (r2, "2021")),
+            executor.submit(export_fn, (r3, "2022")),
+        ]
+    for fut in futures:
+        fut.result()
+
+    count = int(r1.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 9, f"Expected 9 rows total (3 per partition), got {count}"

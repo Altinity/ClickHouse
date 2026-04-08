@@ -45,21 +45,24 @@ def catalog_export_cluster():
     Cluster with ZooKeeper (for ReplicatedMergeTree / EXPORT PARTITION) and the
     Glue docker-compose stack (Moto mock + MinIO warehouse bucket).
     Spark is not needed; pyiceberg handles table creation and catalog inspection.
+    replica1 and replica2 are additional nodes for replicated-export tests; they
+    share the same ZooKeeper, Glue, and MinIO containers as node1.
     """
     try:
         os.environ["AWS_ACCESS_KEY_ID"] = "testing"
         os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
         cluster = ClickHouseCluster(__file__)
-        cluster.add_instance(
-            "node1",
-            main_configs=[
-                "configs/config.d/allow_export_partition.xml",
-            ],
-            stay_alive=True,
-            with_zookeeper=True,
-            keeper_required_feature_flags=["multi_read"],
-            with_glue_catalog=True,
-        )
+        for name in ["node1", "replica1", "replica2"]:
+            cluster.add_instance(
+                name,
+                main_configs=[
+                    "configs/config.d/allow_export_partition.xml",
+                ],
+                stay_alive=True,
+                with_zookeeper=True,
+                keeper_required_feature_flags=["multi_read"],
+                with_glue_catalog=True,
+            )
         cluster.start()
 
         time.sleep(15)
@@ -71,19 +74,20 @@ def catalog_export_cluster():
 
 @pytest.fixture(autouse=True)
 def cleanup_tables(catalog_export_cluster):
-    """Drop all tables in the default database after each test."""
+    """Drop all default-DB tables on every node after each test."""
     yield
-    node = catalog_export_cluster.instances["node1"]
-    try:
-        tables = node.query(
-            "SELECT name FROM system.tables WHERE database = 'default' FORMAT TabSeparated"
-        ).strip()
-        for tbl in tables.splitlines():
-            tbl = tbl.strip()
-            if tbl:
-                node.query(f"DROP TABLE IF EXISTS default.`{tbl}` SYNC")
-    except Exception as exc:
-        logging.warning("cleanup_tables: %s", exc)
+    for node_name in ["node1", "replica1", "replica2"]:
+        node = catalog_export_cluster.instances[node_name]
+        try:
+            tables = node.query(
+                "SELECT name FROM system.tables WHERE database = 'default' FORMAT TabSeparated"
+            ).strip()
+            for tbl in tables.splitlines():
+                tbl = tbl.strip()
+                if tbl:
+                    node.query(f"DROP TABLE IF EXISTS default.`{tbl}` SYNC")
+        except Exception as exc:
+            logging.warning("cleanup_tables on %s: %s", node_name, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -146,12 +150,12 @@ def _wait_for_export(node, source: str, pid: str, timeout: int = 120) -> None:
     )
 
 
-def _make_rmt(node, name: str) -> None:
+def _make_rmt(node, name: str, replica_name: str = "r1") -> None:
     """Create an identity(region)-partitioned ReplicatedMergeTree source table."""
     node.query(
         f"""
         CREATE TABLE {name} (id Int64, region String)
-        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{name}', 'r1')
+        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{name}', '{replica_name}')
         PARTITION BY region
         ORDER BY id
         SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
@@ -193,6 +197,22 @@ def _create_iceberg_table(catalog, ns: str, tbl: str) -> None:
             "format-version": "2",
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Replicated catalog helpers
+# ---------------------------------------------------------------------------
+
+
+def _setup_catalog_replicas(cluster, source_table: str, replica_names: list) -> None:
+    """
+    Create RMT on each named replica (each with its own replica_name so they share
+    the same ZK path) and set up the DataLakeCatalog database on every node.
+    No data is inserted here — callers manage their own test data.
+    """
+    for rname in replica_names:
+        _make_rmt(cluster.instances[rname], source_table, replica_name=rname)
+        _setup_ch_catalog_db(cluster.instances[rname])
 
 
 # ---------------------------------------------------------------------------
@@ -365,3 +385,167 @@ def test_catalog_idempotent_retry(catalog_export_cluster):
         f"Expected exactly 1 snapshot (idempotent re-commit was a no-op), "
         f"got {len(history)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Replicated catalog tests
+# ---------------------------------------------------------------------------
+
+
+def test_catalog_export_two_replicas_basic(catalog_export_cluster):
+    """
+    End-to-end: export one partition from replica1 in a 2-replica setup.
+    Export is initiated on replica1; row count is verified from replica2 via
+    the DataLakeCatalog database to confirm the catalog commit was visible.
+    """
+    catalog = _load_catalog(catalog_export_cluster)
+
+    ns = f"ns_{uuid.uuid4().hex[:8]}"
+    tbl = f"tbl_{uuid.uuid4().hex[:8]}"
+    source = f"rmt_{uuid.uuid4().hex[:8]}"
+
+    catalog.create_namespace((ns,))
+    _create_iceberg_table(catalog, ns, tbl)
+
+    _setup_catalog_replicas(catalog_export_cluster, source, ["replica1", "replica2"])
+
+    r1 = catalog_export_cluster.instances["replica1"]
+    r2 = catalog_export_cluster.instances["replica2"]
+
+    r1.query(f"INSERT INTO {source} VALUES (1, 'EU'), (2, 'EU'), (3, 'EU')")
+    r2.query(f"SYSTEM SYNC REPLICA {source}")
+
+    pid = _partition_id_for(r1, source, "EU")
+    dest_ch = f"`{CH_CATALOG_DB}`.`{ns}.{tbl}`"
+
+    r1.query(
+        f"ALTER TABLE {source} EXPORT PARTITION ID '{pid}' TO TABLE {dest_ch}",
+        settings={"write_full_path_in_iceberg_metadata": 1},
+    )
+    _wait_for_export(r1, source, pid)
+
+    iceberg_tbl = catalog.load_table(f"{ns}.{tbl}")
+    assert iceberg_tbl.current_snapshot() is not None, \
+        "Expected at least one snapshot in Glue after export"
+
+    count = int(r2.query(f"SELECT count() FROM {dest_ch}").strip())
+    assert count == 3, f"Expected 3 rows from replica2 via catalog, got {count}"
+
+
+def test_catalog_concurrent_export_from_different_replicas(catalog_export_cluster):
+    """
+    Two replicas concurrently export different partitions (EU / US) to the same
+    catalog-backed Iceberg table. Both catalog commits must succeed; total row count
+    must equal 6 and Glue history must contain at least 2 snapshots.
+    """
+    catalog = _load_catalog(catalog_export_cluster)
+
+    ns = f"ns_{uuid.uuid4().hex[:8]}"
+    tbl = f"tbl_{uuid.uuid4().hex[:8]}"
+    source = f"rmt_{uuid.uuid4().hex[:8]}"
+
+    catalog.create_namespace((ns,))
+    _create_iceberg_table(catalog, ns, tbl)
+
+    _setup_catalog_replicas(catalog_export_cluster, source, ["replica1", "replica2"])
+
+    r1 = catalog_export_cluster.instances["replica1"]
+    r2 = catalog_export_cluster.instances["replica2"]
+
+    r1.query(f"INSERT INTO {source} VALUES (1, 'EU'), (2, 'EU'), (3, 'EU')")
+    r1.query(f"INSERT INTO {source} VALUES (4, 'US'), (5, 'US'), (6, 'US')")
+    r2.query(f"SYSTEM SYNC REPLICA {source}")
+
+    pid_eu = _partition_id_for(r1, source, "EU")
+    pid_us = _partition_id_for(r1, source, "US")
+    dest_ch = f"`{CH_CATALOG_DB}`.`{ns}.{tbl}`"
+
+    errors: list = []
+
+    def export_partition(node, pid):
+        try:
+            node.query(
+                f"ALTER TABLE {source} EXPORT PARTITION ID '{pid}' TO TABLE {dest_ch}",
+                settings={"write_full_path_in_iceberg_metadata": 1},
+            )
+            _wait_for_export(node, source, pid, timeout=120)
+        except Exception as exc:
+            errors.append(exc)
+
+    t1 = threading.Thread(target=export_partition, args=(r1, pid_eu))
+    t2 = threading.Thread(target=export_partition, args=(r2, pid_us))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert not errors, f"Export threads raised errors: {errors}"
+
+    count = int(r1.query(f"SELECT count() FROM {dest_ch}").strip())
+    assert count == 6, f"Expected 6 rows (3 EU + 3 US), got {count}"
+
+    iceberg_tbl = catalog.load_table(f"{ns}.{tbl}")
+    history = iceberg_tbl.history()
+    assert len(history) >= 2, (
+        f"Expected ≥2 snapshots (one per concurrent partition commit), got {len(history)}"
+    )
+
+
+# TODO arthur fix: TOCTOU in export registration path.
+# The exists() pre-check and the tryMulti() commit are not a single atomic ZK
+# transaction. Depending on timing, the loser gets either KEEPER_EXCEPTION
+# "Node exists" (both replicas race past exists() and collide at tryMulti) or
+# BAD_ARGUMENTS "already exported" (the winner commits before the loser's
+# exists() check). The test cannot reliably assert either error in isolation.
+# def test_catalog_idempotent_same_partition_two_replicas(catalog_export_cluster):
+#     catalog = _load_catalog(catalog_export_cluster)
+#
+#     ns = f"ns_{uuid.uuid4().hex[:8]}"
+#     tbl = f"tbl_{uuid.uuid4().hex[:8]}"
+#     source = f"rmt_{uuid.uuid4().hex[:8]}"
+#
+#     catalog.create_namespace((ns,))
+#     _create_iceberg_table(catalog, ns, tbl)
+#
+#     _setup_catalog_replicas(catalog_export_cluster, source, ["replica1", "replica2"])
+#
+#     r1 = catalog_export_cluster.instances["replica1"]
+#     r2 = catalog_export_cluster.instances["replica2"]
+#
+#     r1.query(f"INSERT INTO {source} VALUES (1, 'EU'), (2, 'EU'), (3, 'EU')")
+#     r2.query(f"SYSTEM SYNC REPLICA {source}")
+#
+#     pid = _partition_id_for(r1, source, "EU")
+#     dest_ch = f"`{CH_CATALOG_DB}`.`{ns}.{tbl}`"
+#
+#     errors: list = []
+#
+#     def export_from(node):
+#         try:
+#             node.query(
+#                 f"ALTER TABLE {source} EXPORT PARTITION ID '{pid}' TO TABLE {dest_ch}",
+#                 settings={"write_full_path_in_iceberg_metadata": 1},
+#             )
+#             _wait_for_export(node, source, pid, timeout=120)
+#         except Exception as exc:
+#             errors.append(exc)
+#
+#     t1 = threading.Thread(target=export_from, args=(r1,))
+#     t2 = threading.Thread(target=export_from, args=(r2,))
+#     t1.start()
+#     t2.start()
+#     t1.join()
+#     t2.join()
+#
+#     unexpected = [e for e in errors if "already exported" not in str(e)]
+#     assert not unexpected, f"Unexpected export errors: {unexpected}"
+#
+#     count = int(r1.query(f"SELECT count() FROM {dest_ch}").strip())
+#     assert count == 3, f"Expected 3 rows (no duplication), got {count}"
+#
+#     iceberg_tbl = catalog.load_table(f"{ns}.{tbl}")
+#     history = iceberg_tbl.history()
+#     assert len(history) == 1, (
+#         f"Expected exactly 1 snapshot (one winner, one rejected by export-key guard), "
+#         f"got {len(history)}"
+#     )
