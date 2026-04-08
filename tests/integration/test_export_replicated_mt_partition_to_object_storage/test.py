@@ -88,6 +88,7 @@ def wait_for_exception_count(
             WHERE source_table = '{mt_table}'
               AND destination_table = '{s3_table}'
               AND partition_id = '{partition_id}'
+              SETTINGS export_merge_tree_partition_system_table_prefer_remote_information = 1
             """
         ).strip()
         
@@ -651,6 +652,7 @@ def test_inject_short_living_failures(cluster):
         WHERE source_table = '{mt_table}'
           AND destination_table = '{s3_table}'
           AND partition_id = '2020'
+          SETTINGS export_merge_tree_partition_system_table_prefer_remote_information = 1
         """
     )
     assert int(exception_count.strip()) >= 1, "Expected at least one exception"
