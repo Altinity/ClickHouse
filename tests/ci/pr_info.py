@@ -62,6 +62,10 @@ class EventType:
 def get_pr_for_commit(sha, ref):
     if not ref:
         return None
+    # Tag pushes (refs/tags/...) are not expected to have a corresponding PR head ref.
+    # Avoid noisy warnings and unnecessary GH API calls in this case.
+    if isinstance(ref, str) and ref.startswith("refs/tags/"):
+        return None
     try_get_pr_url = (
         f"https://api.github.com/repos/{GITHUB_REPOSITORY}/commits/{sha}/pulls"
     )
@@ -246,7 +250,8 @@ class PRInfo:
                 except ValueError:
                     logging.error("Failed to convert %s to integer", merged_pr)
             self.sha = github_event["after"]
-            pull_request = get_pr_for_commit(self.sha, github_event["ref"])
+            event_ref = github_event.get("ref", "")
+            pull_request = get_pr_for_commit(self.sha, event_ref)
 
             if pull_request is None or pull_request["state"] == "closed":
                 # it's merged PR to master, or there is no PR (build against specific commit or tag)
@@ -256,7 +261,12 @@ class PRInfo:
                 self.labels = set()
                 self.base_ref = ref
                 self.base_name = self.repo_full_name
-                self.head_ref = ref
+                # For tags, keep self.ref as "refs/tags/...", but use the tag name as head_ref.
+                # This makes build report naming/selection deterministic and consistent across helpers.
+                if isinstance(event_ref, str) and event_ref.startswith("refs/tags/"):
+                    self.head_ref = event_ref[10:]
+                else:
+                    self.head_ref = ref
                 self.head_name = self.repo_full_name
                 before_sha = github_event["before"]
                 # in case of just a tag on exsiting commit, "before_sha" is 0000000000000000000000000000000000000000
