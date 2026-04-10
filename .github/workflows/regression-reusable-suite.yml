@@ -60,6 +60,7 @@ jobs:
       SUITE_EXECUTABLE: ${{ inputs.suite_executable }}
       STORAGE: ${{ inputs.storage_path }}
       PART: ${{ inputs.part }}
+      REPORT_JOB_NAME: ${{ format('{0}{1}', inputs.job_name != '' && inputs.job_name || inputs.suite_name, inputs.part != '' && format('_{0}', inputs.part) || '') }}
       # AWS credentials
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -153,7 +154,7 @@ jobs:
           --clickhouse-binary-path ${{ env.clickhouse_path }}
           ${{ env.REGRESSION_ARGS }}
           ${{ inputs.extra_args }}
-          --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name=$GITHUB_JOB job.retry=$GITHUB_RUN_ATTEMPT job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
+          --attr project="$GITHUB_REPOSITORY" project.id="$GITHUB_REPOSITORY_ID" package="${{ env.clickhouse_path }}" version="${{ env.version }}" user.name="$GITHUB_ACTOR" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name="$REPORT_JOB_NAME" job.retry=$GITHUB_RUN_ATTEMPT job.url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" arch="$(uname -i)"
           ${{ env.args }} || EXITCODE=$?;
           .github/add_link_to_logs.sh;
           exit $EXITCODE
