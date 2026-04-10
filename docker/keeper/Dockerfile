@@ -16,7 +16,7 @@ RUN arch=${TARGETARCH:-amd64} \
     esac
 
 
-FROM alpine:3.21
+FROM alpine
 
 ENV LANG=en_US.UTF-8 \
     LANGUAGE=en_US:en \
@@ -83,6 +83,9 @@ RUN clickhouse-keeper --version \
     && chown clickhouse:clickhouse "${DEFAULT_DATA_DIR}" \
     && chown root:clickhouse "${DEFAULT_LOG_DIR}" \
     && chmod ugo+Xrw -R "${DEFAULT_DATA_DIR}" "${DEFAULT_LOG_DIR}" "${DEFAULT_CONFIG_DIR}"
+
+RUN apk del --no-cache --purge openssl
+RUN apk upgrade --no-cache libcrypto3 libssl3
 
 # /var/lib/clickhouse is necessary due to the current default configuration for Keeper
 VOLUME "${DEFAULT_DATA_DIR}" /var/lib/clickhouse
