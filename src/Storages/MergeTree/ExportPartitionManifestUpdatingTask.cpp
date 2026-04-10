@@ -671,17 +671,22 @@ void ExportPartitionManifestUpdatingTask::addStatusChange(const std::string & ke
 
 void ExportPartitionManifestUpdatingTask::handleStatusChanges()
 {
-    std::lock_guard lock(status_changes_mutex);
+    std::queue<std::string> local_status_changes;
+    {
+        std::lock_guard lock(status_changes_mutex);
+        std::swap(status_changes, local_status_changes);
+    }
+
     std::lock_guard task_entries_lock(storage.export_merge_tree_partition_mutex);
     auto zk = storage.getZooKeeper();
 
-    LOG_INFO(storage.log, "ExportPartition Manifest Updating task: handling status changes. Number of status changes: {}", status_changes.size());
+    LOG_INFO(storage.log, "ExportPartition Manifest Updating task: handling status changes. Number of status changes: {}", local_status_changes.size());
 
-    while (!status_changes.empty())
+    while (!local_status_changes.empty())
     {
-        LOG_INFO(storage.log, "ExportPartition Manifest Updating task: handling status change for task {}", status_changes.front());
-        const auto key = status_changes.front();
-        status_changes.pop();
+        LOG_INFO(storage.log, "ExportPartition Manifest Updating task: handling status change for task {}", local_status_changes.front());
+        const auto key = local_status_changes.front();
+        local_status_changes.pop();
 
         auto it = storage.export_merge_tree_partition_task_entries_by_key.find(key);
         if (it == storage.export_merge_tree_partition_task_entries_by_key.end())
