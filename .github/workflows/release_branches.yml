@@ -417,7 +417,7 @@ jobs:
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
-      runner_type: altinity-on-demand, altinity-regression-tester
+      runner_type: altinity-regression-tester
       commit: e0669dcd0b17ad5fe0c85ce8592f47d5c36ffa06
       arch: release
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
@@ -428,7 +428,7 @@ jobs:
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
-      runner_type: altinity-on-demand, altinity-regression-tester-aarch64
+      runner_type: altinity-regression-tester-aarch64
       commit: e0669dcd0b17ad5fe0c85ce8592f47d5c36ffa06
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
