@@ -137,7 +137,7 @@ jobs:
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 sha: '${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}',
-                state: '${{ steps.parse_grype.outcome }}',
+                state: '${{ steps.parse_grype.outcome == 'success' && 'success' || 'failure' }}',
                 target_url: '${{ steps.upload_results.outputs.https_s3_path }}/results.html',
                 description: 'Grype Scan Completed with ${{ steps.create_summary.outputs.total_high_critical }} high/critical vulnerabilities',
                 context: 'Grype Scan ${{ steps.set_version.outputs.docker_image || inputs.docker_image }}'
