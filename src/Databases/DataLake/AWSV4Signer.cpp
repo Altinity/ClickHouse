@@ -21,7 +21,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
-    extern const int LOGICAL_ERROR;
+    extern const int S3_ERROR;
 }
 }
 
@@ -83,7 +83,7 @@ void signRequestWithAWSV4(
 
     static constexpr bool sign_body = true;
     if (!signer.SignRequest(request, region.c_str(), service.c_str(), sign_body))
-        throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "AWS SigV4 signing failed");
+        throw DB::Exception(DB::ErrorCodes::S3_ERROR, "AWS SigV4 signing failed");
 
     bool has_authorization = false;
     for (const auto & [key, value] : request.GetHeaders())
