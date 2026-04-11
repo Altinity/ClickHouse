@@ -216,20 +216,38 @@ DB::ReadWriteBufferFromHTTPPtr S3TablesCatalog::createReadBuffer(
     if (!params.empty())
         url.setQueryParameters(params);
 
-    DB::HTTPHeaderEntries signed_headers;
-    signRequestWithAWSV4(Poco::Net::HTTPRequest::HTTP_GET, url, headers, "", *signer, region, signing_service, signed_headers);
+    auto create_buffer = [&]
+    {
+        DB::HTTPHeaderEntries signed_headers;
+        signRequestWithAWSV4(Poco::Net::HTTPRequest::HTTP_GET, url, headers, "", *signer, region, signing_service, signed_headers);
+
+        return DB::BuilderRWBufferFromHTTP(url)
+            .withConnectionGroup(DB::HTTPConnectionGroupType::HTTP)
+            .withSettings(getContext()->getReadSettings())
+            .withTimeouts(DB::ConnectionTimeouts::getHTTPTimeouts(context->getSettingsRef(), context->getServerSettings()))
+            .withHostFilter(&getContext()->getRemoteHostFilter())
+            .withHeaders(signed_headers)
+            .withDelayInit(false)
+            .withSkipNotFound(false)
+            .create(credentials);
+    };
 
     LOG_DEBUG(log, "Requesting: {}", url.toString());
 
-    return DB::BuilderRWBufferFromHTTP(url)
-        .withConnectionGroup(DB::HTTPConnectionGroupType::HTTP)
-        .withSettings(getContext()->getReadSettings())
-        .withTimeouts(DB::ConnectionTimeouts::getHTTPTimeouts(context->getSettingsRef(), context->getServerSettings()))
-        .withHostFilter(&getContext()->getRemoteHostFilter())
-        .withHeaders(signed_headers)
-        .withDelayInit(false)
-        .withSkipNotFound(false)
-        .create(credentials);
+    try
+    {
+        return create_buffer();
+    }
+    catch (const DB::HTTPException & e)
+    {
+        const auto status = e.getHTTPStatus();
+        if (status == Poco::Net::HTTPResponse::HTTPStatus::HTTP_UNAUTHORIZED
+            || status == Poco::Net::HTTPResponse::HTTPStatus::HTTP_FORBIDDEN)
+        {
+            return create_buffer();
+        }
+        throw;
+    }
 }
 
 void S3TablesCatalog::sendRequest(
