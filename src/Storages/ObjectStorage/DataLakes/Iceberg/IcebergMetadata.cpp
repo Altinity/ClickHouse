@@ -1690,22 +1690,6 @@ void IcebergMetadata::commitExportPartitionTransaction(
         updated_metadata_file_info.compression_method,
         persistent_components.table_uuid);
 
-    /// Fail fast if the table schema or partition spec changed between export-start and commit.
-    /// The exported data files and partition values were produced against the original spec;
-    const auto latest_schema_id = metadata->getValue<Int64>(Iceberg::f_current_schema_id);
-    if (latest_schema_id != original_schema_id)
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-            "Table schema changed before export could commit (expected schema {}, got {}). "
-            "Restart the export operation.",
-            original_schema_id, latest_schema_id);
-
-    const auto latest_spec_id = metadata->getValue<Int64>(Iceberg::f_default_spec_id);
-    if (latest_spec_id != partition_spec_id)
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-            "Partition spec changed before export could commit (expected spec {}, got {}). "
-            "Restart the export operation.",
-            partition_spec_id, latest_spec_id);
-
     /// Idempotency check: if a previous attempt already committed this transaction the snapshot
     /// (with our transaction_id embedded in its summary) is still present in the snapshots array
     /// unless an external engine ran expireSnapshots in the meantime. If found, skip re-committing.
@@ -1730,6 +1714,22 @@ void IcebergMetadata::commitExportPartitionTransaction(
             }
         }
     }
+
+    /// Fail fast if the table schema or partition spec changed between export-start and commit.
+    /// The exported data files and partition values were produced against the original spec;
+    const auto latest_schema_id = metadata->getValue<Int64>(Iceberg::f_current_schema_id);
+    if (latest_schema_id != original_schema_id)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "Table schema changed before export could commit (expected schema {}, got {}). "
+            "Restart the export operation.",
+            original_schema_id, latest_schema_id);
+
+    const auto latest_spec_id = metadata->getValue<Int64>(Iceberg::f_default_spec_id);
+    if (latest_spec_id != partition_spec_id)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "Partition spec changed before export could commit (expected spec {}, got {}). "
+            "Restart the export operation.",
+            partition_spec_id, latest_spec_id);
 
     /// Derive partition_columns and partition_types from the schema and partition spec.
     /// The IDs are validated equal above so derivation from the latest metadata yields
