@@ -141,13 +141,24 @@ DatabaseDataLake::DatabaseDataLake(
 
 void DatabaseDataLake::validateSettings()
 {
-    if (settings[DatabaseDataLakeSetting::catalog_type].value == DB::DatabaseDataLakeCatalogType::GLUE
-        || settings[DatabaseDataLakeSetting::catalog_type].value == DB::DatabaseDataLakeCatalogType::S3_TABLES)
+    if (settings[DatabaseDataLakeSetting::catalog_type].value == DB::DatabaseDataLakeCatalogType::GLUE)
     {
         if (settings[DatabaseDataLakeSetting::region].value.empty())
             throw Exception(
-                ErrorCodes::BAD_ARGUMENTS, "`region` setting cannot be empty for Glue or S3 Tables catalog. "
+                ErrorCodes::BAD_ARGUMENTS, "`region` setting cannot be empty for Glue catalog. "
                 "Please specify 'SETTINGS region=<region_name>' in the CREATE DATABASE query");
+    }
+    else if (settings[DatabaseDataLakeSetting::catalog_type].value == DB::DatabaseDataLakeCatalogType::S3_TABLES)
+    {
+        if (settings[DatabaseDataLakeSetting::region].value.empty())
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS, "`region` setting cannot be empty for S3 Tables catalog. "
+                "Please specify 'SETTINGS region=<region_name>' in the CREATE DATABASE query");
+
+        if (settings[DatabaseDataLakeSetting::warehouse].value.empty())
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS, "`warehouse` setting cannot be empty for S3 Tables catalog. "
+                "Please specify 'SETTINGS warehouse=<table_bucket_arn>' in the CREATE DATABASE query");
     }
     else if (settings[DatabaseDataLakeSetting::warehouse].value.empty())
     {

@@ -30,6 +30,8 @@
 namespace DB::ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int DATALAKE_DATABASE_ERROR;
+    extern const int CATALOG_NAMESPACE_DISABLED;
 }
 
 namespace DB::Setting
@@ -200,100 +202,52 @@ bool S3TablesCatalog::tryGetTableMetadata(
     return true;
 }
 
-DB::HTTPHeaderEntries S3TablesCatalog::getAuthHeaders(bool /* update_token */) const
+void S3TablesCatalog::dropTable(const String & namespace_name, const String & table_name) const
 {
-    return {};
-}
+    if (!allowed_namespaces.isNamespaceAllowed(namespace_name, /*nested*/ false))
+        throw DB::Exception(DB::ErrorCodes::CATALOG_NAMESPACE_DISABLED,
+            "Failed to drop table {}, namespace {} is filtered by `namespaces` database parameter",
+            table_name, namespace_name);
 
-DB::ReadWriteBufferFromHTTPPtr S3TablesCatalog::createReadBuffer(
-    const std::string & endpoint,
-    const Poco::URI::QueryParameters & params,
-    const DB::HTTPHeaderEntries & headers) const
-{
-    const auto & context = getContext();
+    const std::string endpoint
+        = (base_url / config.prefix / "namespaces" / namespace_name / "tables" / table_name).string()
+        + "?purgeRequested=True";
 
-    Poco::URI url(base_url / endpoint, /* enable_url_encoding */ false);
-    if (!params.empty())
-        url.setQueryParameters(params);
-
-    auto create_buffer = [&]
-    {
-        DB::HTTPHeaderEntries signed_headers;
-        signRequestWithAWSV4(Poco::Net::HTTPRequest::HTTP_GET, url, headers, "", *signer, region, signing_service, signed_headers);
-
-        return DB::BuilderRWBufferFromHTTP(url)
-            .withConnectionGroup(DB::HTTPConnectionGroupType::HTTP)
-            .withSettings(getContext()->getReadSettings())
-            .withTimeouts(DB::ConnectionTimeouts::getHTTPTimeouts(context->getSettingsRef(), context->getServerSettings()))
-            .withHostFilter(&getContext()->getRemoteHostFilter())
-            .withHeaders(signed_headers)
-            .withDelayInit(false)
-            .withSkipNotFound(false)
-            .create(credentials);
-    };
-
-    LOG_DEBUG(log, "Requesting: {}", url.toString());
-
+    Poco::JSON::Object::Ptr request_body = nullptr;
     try
     {
-        return create_buffer();
+        sendRequest(endpoint, request_body, Poco::Net::HTTPRequest::HTTP_DELETE, true);
     }
-    catch (const DB::HTTPException & e)
+    catch (const DB::HTTPException & ex)
     {
-        const auto status = e.getHTTPStatus();
-        if (status == Poco::Net::HTTPResponse::HTTPStatus::HTTP_UNAUTHORIZED
-            || status == Poco::Net::HTTPResponse::HTTPStatus::HTTP_FORBIDDEN)
-        {
-            return create_buffer();
-        }
-        throw;
+        if (ex.getHTTPStatus() == Poco::Net::HTTPResponse::HTTP_NOT_FOUND)
+            // 404 is returned by the API when the table does
+            LOG_DEBUG(log, "S3 Tables: table {}.{} already does not exist (404 on purge-delete)", namespace_name, table_name);
+        else
+            throw DB::Exception(DB::ErrorCodes::DATALAKE_DATABASE_ERROR, "Failed to drop table {}", ex.displayText());
     }
 }
 
-void S3TablesCatalog::sendRequest(
-    const String & endpoint,
-    Poco::JSON::Object::Ptr request_body,
+DB::HTTPHeaderEntries S3TablesCatalog::getAuthHeaders(
+    bool /*update_token*/,
     const String & method,
-    bool ignore_result) const
+    const Poco::URI & url,
+    const DB::HTTPHeaderEntries & extra_headers,
+    const String & body) const
 {
-    std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-    if (request_body)
-        request_body->stringify(oss);
-    const std::string body_str = DB::removeEscapedSlashes(oss.str());
+    DB::HTTPHeaderEntries all_signed;
+    signRequestWithAWSV4(method, url, extra_headers, body, *signer, region, signing_service, all_signed);
 
-    DB::HTTPHeaderEntries extra_headers;
-    if (!body_str.empty())
-        extra_headers.emplace_back("Content-Type", "application/json");
-
-    const auto & context = getContext();
-
-    Poco::URI url(endpoint, /* enable_url_encoding */ false);
-
-    DB::HTTPHeaderEntries signed_headers;
-    signRequestWithAWSV4(method, url, extra_headers, body_str, *signer, region, signing_service, signed_headers);
-
-    DB::ReadWriteBufferFromHTTP::OutStreamCallback out_stream_callback;
-    if (!body_str.empty())
+    // signRequestWithAWSV4 returns both input extra_headers and signer-added auth
+    // headers. Only return the auth portion (authorization, x-amz-*); the caller
+    // appends the original request headers separately.
+    DB::HTTPHeaderEntries auth_headers;
+    for (auto & h : all_signed)
     {
-        out_stream_callback = [body_str](std::ostream & os) { os << body_str; };
+        if (h.name == "authorization" || h.name.starts_with("x-amz-"))
+            auth_headers.push_back(std::move(h));
     }
-
-    auto wb = DB::BuilderRWBufferFromHTTP(url)
-                  .withConnectionGroup(DB::HTTPConnectionGroupType::HTTP)
-                  .withMethod(method)
-                  .withSettings(context->getReadSettings())
-                  .withTimeouts(DB::ConnectionTimeouts::getHTTPTimeouts(context->getSettingsRef(), context->getServerSettings()))
-                  .withHostFilter(&context->getRemoteHostFilter())
-                  .withHeaders(signed_headers)
-                  .withOutCallback(out_stream_callback)
-                  .withSkipNotFound(false)
-                  .create(credentials);
-
-    String response_str;
-    if (!ignore_result)
-        readJSONObjectPossiblyInvalid(response_str, *wb);
-    else
-        wb->ignoreAll();
+    return auth_headers;
 }
 
 }

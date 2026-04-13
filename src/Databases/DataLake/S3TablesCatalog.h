@@ -42,19 +42,15 @@ public:
         DB::ContextPtr context_,
         TableMetadata & result) const override;
 
-    DB::ReadWriteBufferFromHTTPPtr createReadBuffer(
-        const std::string & endpoint,
-        const Poco::URI::QueryParameters & params = {},
-        const DB::HTTPHeaderEntries & headers = {}) const override;
-
-    void sendRequest(
-        const String & endpoint,
-        Poco::JSON::Object::Ptr request_body,
-        const String & method = Poco::Net::HTTPRequest::HTTP_POST,
-        bool ignore_result = false) const override;
+    void dropTable(const String & namespace_name, const String & table_name) const override;
 
 protected:
-    DB::HTTPHeaderEntries getAuthHeaders(bool /* update_token */) const override;
+    DB::HTTPHeaderEntries getAuthHeaders(
+        bool update_token,
+        const String & method = {},
+        const Poco::URI & url = {},
+        const DB::HTTPHeaderEntries & extra_headers = {},
+        const String & body = {}) const override;
 
 private:
     const String region;
