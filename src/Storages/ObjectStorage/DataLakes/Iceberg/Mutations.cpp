@@ -32,6 +32,7 @@
 namespace DB::ErrorCodes
 {
 extern const int BAD_ARGUMENTS;
+extern const int DATALAKE_DATABASE_ERROR;
 extern const int LOGICAL_ERROR;
 extern const int LIMIT_EXCEEDED;
 }
@@ -755,8 +756,10 @@ void alter(
                 const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
                 if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, metadata))
                 {
-                    LOG_WARNING(log, "Iceberg alter: catalog update failed for '{}'", catalog_filename);
-                    continue;
+                    throw Exception(
+                        ErrorCodes::DATALAKE_DATABASE_ERROR,
+                        "Iceberg alter: catalog commit failed for '{}' after metadata file was written successfully",
+                        catalog_filename);
                 }
             }
             return;
