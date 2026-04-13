@@ -766,13 +766,14 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
         tryLogCurrentException(storage.log, __PRETTY_FUNCTION__);
 
         LOG_INFO(storage.log, "ExportPartition Manifest Updating task: exception thrown while handling status changes, enqueuing remaining status changes back to the status_changes queue. Number of remaining status changes: {}", local_status_changes.size());
+
+        std::lock_guard lock(status_changes_mutex);
+
         /// It is possible that an exception is thrown while handling the status. In this scenario
         /// we need to enqueue the remaining status changes back to the status_changes queue not to lose them.
         /// The other solution to this problem would be to ignore it and schedule a poll - maybe it is simpler?
         if (!local_status_changes.empty())
         {
-            std::lock_guard lock(status_changes_mutex);
-
             // Prepend remaining items before any newly-arrived items
             while (!status_changes.empty())
             {
