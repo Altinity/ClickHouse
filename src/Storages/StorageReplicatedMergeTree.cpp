@@ -8264,7 +8264,14 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     if (dest_storage->isDataLake())
     {
 #if USE_AVRO
+        /// ever since Anton introduced swarms, object storage instances are always a StorageObjectStorageCluster
         auto * object_storage = dynamic_cast<StorageObjectStorageCluster *>(dest_storage.get());
+
+        /// in theory this should never happen, but just in case
+        if (!object_storage)
+        {
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Destination storage {} is not a StorageObjectStorageCluster", dest_storage->getName());
+        }
 
         auto * iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage->getExternalMetadata(query_context));
         if (!iceberg_metadata)
