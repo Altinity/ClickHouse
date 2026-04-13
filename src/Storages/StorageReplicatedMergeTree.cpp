@@ -4494,13 +4494,19 @@ void StorageReplicatedMergeTree::exportMergeTreePartitionStatusHandlingTask()
         if (e.code == Coordination::Error::ZSESSIONEXPIRED)
         {
             restarting_thread.wakeup();
-            return;
         }
-        // status handling is event-driven; re-triggered by next watch callback
+        else
+        {
+            /// if an exception is thrown, we might have unprocessed status changes, so we need to schedule the task again
+            export_merge_tree_partition_status_handling_task->scheduleAfter(5000);
+        }
+
+        return;
     }
     catch (...)
     {
         tryLogCurrentException(log, __PRETTY_FUNCTION__);
+        export_merge_tree_partition_status_handling_task->scheduleAfter(5000);
     }
 }
 

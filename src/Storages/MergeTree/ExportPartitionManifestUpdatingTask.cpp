@@ -6,6 +6,7 @@
 #include <Common/ZooKeeper/Types.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include <Common/ProfileEvents.h>
+#include <Common/FailPoint.h>
 #include <Interpreters/DatabaseCatalog.h>
 
 namespace ProfileEvents
@@ -21,6 +22,17 @@ namespace ProfileEvents
 
 namespace DB
 {
+
+namespace ErrorCodes
+{
+    extern const int FAULT_INJECTED;
+}
+
+namespace FailPoints
+{
+    extern const char export_partition_status_change_throw[];
+}
+
 namespace
 {
     /*
@@ -671,67 +683,109 @@ void ExportPartitionManifestUpdatingTask::addStatusChange(const std::string & ke
 
 void ExportPartitionManifestUpdatingTask::handleStatusChanges()
 {
+    /// copy the events to a local queue to avoid holding the status_changes_mutex while also holding export_merge_tree_partition_mutex
     std::queue<std::string> local_status_changes;
     {
         std::lock_guard lock(status_changes_mutex);
         std::swap(status_changes, local_status_changes);
     }
 
-    std::lock_guard task_entries_lock(storage.export_merge_tree_partition_mutex);
-    auto zk = storage.getZooKeeper();
-
-    LOG_INFO(storage.log, "ExportPartition Manifest Updating task: handling status changes. Number of status changes: {}", local_status_changes.size());
-
-    while (!local_status_changes.empty())
+    try
     {
-        LOG_INFO(storage.log, "ExportPartition Manifest Updating task: handling status change for task {}", local_status_changes.front());
-        const auto key = local_status_changes.front();
-        local_status_changes.pop();
+        std::lock_guard task_entries_lock(storage.export_merge_tree_partition_mutex);
+        auto zk = storage.getZooKeeper();
 
-        auto it = storage.export_merge_tree_partition_task_entries_by_key.find(key);
-        if (it == storage.export_merge_tree_partition_task_entries_by_key.end())
-            continue;
+        LOG_INFO(storage.log, "ExportPartition Manifest Updating task: handling status changes. Number of status changes: {}", local_status_changes.size());
 
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
-        /// get new status from zk
-        std::string new_status_string;
-        if (!zk->tryGet(fs::path(storage.zookeeper_path) / "exports" / key / "status", new_status_string))
+        while (!local_status_changes.empty())
         {
-            LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Failed to get new status for task {}, skipping", key);
-            continue;
-        }
+            const auto & key = local_status_changes.front();
+            LOG_INFO(storage.log, "ExportPartition Manifest Updating task: handling status change for task {}", key);
 
-        const auto new_status = magic_enum::enum_cast<ExportReplicatedMergeTreePartitionTaskEntry::Status>(new_status_string);
-        if (!new_status)
-        {
-            LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Invalid status {} for task {}, skipping", new_status_string, key);
-            continue;
-        }
-
-        LOG_INFO(storage.log, "ExportPartition Manifest Updating task: status changed for task {}. New status: {}", key, magic_enum::enum_name(*new_status).data());
-
-        /// If status changed to KILLED, cancel local export operations
-        if (*new_status == ExportReplicatedMergeTreePartitionTaskEntry::Status::KILLED)
-        {
-            try
+            fiu_do_on(FailPoints::export_partition_status_change_throw,
             {
-                LOG_INFO(storage.log, "ExportPartition Manifest Updating task: killing export partition for task {}", key);
-                storage.killExportPart(it->manifest.transaction_id);
-            }
-            catch (...)
+                throw Exception(ErrorCodes::FAULT_INJECTED,
+                    "Failpoint: simulating exception during status change handling for key {}", key);
+            });
+
+            auto it = storage.export_merge_tree_partition_task_entries_by_key.find(key);
+            if (it == storage.export_merge_tree_partition_task_entries_by_key.end())
             {
-                tryLogCurrentException(storage.log, __PRETTY_FUNCTION__);
+                local_status_changes.pop();
+                continue;
             }
+
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
+            /// get new status from zk
+            std::string new_status_string;
+            if (!zk->tryGet(fs::path(storage.zookeeper_path) / "exports" / key / "status", new_status_string))
+            {
+                LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Failed to get new status for task {}, skipping", key);
+                local_status_changes.pop();
+                continue;
+            }
+
+            const auto new_status = magic_enum::enum_cast<ExportReplicatedMergeTreePartitionTaskEntry::Status>(new_status_string);
+            if (!new_status)
+            {
+                LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Invalid status {} for task {}, skipping", new_status_string, key);
+                local_status_changes.pop();
+                continue;
+            }
+
+            LOG_INFO(storage.log, "ExportPartition Manifest Updating task: status changed for task {}. New status: {}", key, magic_enum::enum_name(*new_status).data());
+
+            /// If status changed to KILLED, cancel local export operations
+            if (*new_status == ExportReplicatedMergeTreePartitionTaskEntry::Status::KILLED)
+            {
+                try
+                {
+                    LOG_INFO(storage.log, "ExportPartition Manifest Updating task: killing export partition for task {}", key);
+                    storage.killExportPart(it->manifest.transaction_id);
+                }
+                catch (...)
+                {
+                    tryLogCurrentException(storage.log, __PRETTY_FUNCTION__);
+                }
+            }
+
+            it->status = *new_status;
+
+            if (it->status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
+            {
+                /// we no longer need to keep the data parts alive
+                it->part_references.clear();
+            }
+
+            local_status_changes.pop();
         }
+    }
+    catch (...)
+    {
+        tryLogCurrentException(storage.log, __PRETTY_FUNCTION__);
 
-        it->status = *new_status;
-
-        if (it->status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
+        LOG_INFO(storage.log, "ExportPartition Manifest Updating task: exception thrown while handling status changes, enqueuing remaining status changes back to the status_changes queue. Number of remaining status changes: {}", local_status_changes.size());
+        /// It is possible that an exception is thrown while handling the status. In this scenario
+        /// we need to enqueue the remaining status changes back to the status_changes queue not to lose them.
+        /// The other solution to this problem would be to ignore it and schedule a poll - maybe it is simpler?
+        if (!local_status_changes.empty())
         {
-            /// we no longer need to keep the data parts alive
-            it->part_references.clear();
+            std::lock_guard lock(status_changes_mutex);
+
+            // Prepend remaining items before any newly-arrived items
+            while (!status_changes.empty())
+            {
+                local_status_changes.push(std::move(status_changes.front()));
+                status_changes.pop();
+            }
+
+            std::swap(status_changes, local_status_changes);
         }
+
+        LOG_INFO(storage.log, "ExportPartition Manifest Updating task: The new number of pending status after enqueueing unprocessed ones is {}", status_changes.size());
+
+        throw;
     }
 }
 
