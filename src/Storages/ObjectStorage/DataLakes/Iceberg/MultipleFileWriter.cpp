@@ -95,14 +95,17 @@ std::vector<IcebergDataFileEntry> MultipleFileWriter::getDataFileEntries() const
 {
     chassert(data_file_names.size() == per_file_record_counts.size());
     chassert(data_file_names.size() == per_file_stats_list.size());
+
     std::vector<IcebergDataFileEntry> entries;
     entries.reserve(data_file_names.size());
+
     for (size_t i = 0; i < data_file_names.size(); ++i)
-        entries.push_back({
-            .path = data_file_names[i],
-            .record_count = per_file_record_counts[i],
-            .file_size_in_bytes = per_file_byte_sizes[i],
-            .statistics = per_file_stats_list[i]});
+        entries.emplace_back(
+            data_file_names[i],
+            per_file_record_counts[i],
+            per_file_byte_sizes[i],
+            per_file_stats_list[i]);
+
     return entries;
 }
 

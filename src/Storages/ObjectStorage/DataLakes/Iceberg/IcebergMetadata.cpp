@@ -1384,6 +1384,7 @@ SinkToStoragePtr IcebergMetadata::import(
 namespace FailPoints
 {
     extern const char iceberg_writes_cleanup[];
+    extern const char iceberg_writes_non_retry_cleanup[];
 }
 
 namespace
@@ -1461,11 +1462,9 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
 
     auto cleanup = [&](bool retry_because_of_metadata_conflict)
     {
-        if (!retry_because_of_metadata_conflict)
-        {
-            for (const auto & path : data_file_paths)
-                object_storage->removeObjectIfExists(StoredObject(path));
-        }
+        /// We can't cleanup the data files upon retry even if retry_because_of_metadata_conflict == false
+        /// because this replica or some other replica might attempt to commit the same transaction later
+        /// todo arthur: in the future, we should consider failing the entire task if retry_because_of_metadata_conflict = true
 
         object_storage->removeObjectIfExists(StoredObject(storage_manifest_entry_name));
         object_storage->removeObjectIfExists(StoredObject(storage_manifest_list_name));
@@ -1552,6 +1551,11 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
 
         try
         {
+            fiu_do_on(FailPoints::iceberg_writes_non_retry_cleanup,
+            {
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Failpoint for cleanup enabled");
+            });
+
             generateManifestFile(
                 metadata,
                 partition_columns,
@@ -1597,11 +1601,6 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
             std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
             Poco::JSON::Stringifier::stringify(metadata, oss, 4);
             std::string json_representation = removeEscapedSlashes(oss.str());
-
-            fiu_do_on(FailPoints::iceberg_writes_cleanup,
-            {
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Failpoint for cleanup enabled");
-            });
 
             LOG_DEBUG(log, "Writing new metadata file {}", storage_metadata_name);
             auto hint = filename_generator.generateVersionHint();

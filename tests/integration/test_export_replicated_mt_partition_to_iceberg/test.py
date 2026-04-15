@@ -831,3 +831,25 @@ def test_export_ttl(cluster):
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
     )
     wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
+
+
+def test_export_data_files_are_not_cleaned_up_on_commit_failure(cluster):
+    """
+    Verify that the data files are not cleaned up on commit failure and the export is retried.
+    This is to avoid data loss.
+
+    If the data files were cleaned up, a retry would commit a new snapshot that points to dangling references.
+    """
+    node = cluster.instances["replica1"]
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"mt_{uid}"
+    iceberg_table = f"iceberg_{uid}"
+    setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1"])
+
+    node.query("SYSTEM ENABLE FAILPOINT iceberg_writes_non_retry_cleanup")
+
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}")
+    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table} WHERE year = 2020").strip())
+    assert count == 3, f"Expected 3 rows after first export, got {count}"
