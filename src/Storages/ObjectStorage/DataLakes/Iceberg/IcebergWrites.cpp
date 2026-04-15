@@ -114,16 +114,6 @@ static constexpr auto MAX_TRANSACTION_RETRIES = 100;
 namespace
 {
 
-/// Replace the file extension of `path` with ".avro", or append ".avro" when there is none.
-String sidecarStoragePath(const String & data_file_storage_path)
-{
-    auto dot_pos = data_file_storage_path.rfind('.');
-    auto slash_pos = data_file_storage_path.rfind('/');
-    if (dot_pos != String::npos && (slash_pos == String::npos || dot_pos > slash_pos))
-        return data_file_storage_path.substr(0, dot_pos) + ".avro";
-    return data_file_storage_path + ".avro";
-}
-
 bool canDumpIcebergStats(const Field & field, DataTypePtr type)
 {
     switch (type->getTypeId())
@@ -206,6 +196,17 @@ bool canWriteStatistics(
 
 }
 
+/// Replace the file extension of `path` with ".avro", or append ".avro" when there is none.
+String getIcebergExportPartSidecarStoragePath(const String & data_file_storage_path)
+{
+    static constexpr auto postfix = "clickhouse_export_part_sidecar.avro";
+    auto dot_pos = data_file_storage_path.rfind('.');
+    auto slash_pos = data_file_storage_path.rfind('/');
+    if (dot_pos != String::npos && (slash_pos == String::npos || dot_pos > slash_pos))
+        return data_file_storage_path.substr(0, dot_pos) + postfix;
+    return data_file_storage_path + postfix;
+}
+
 String removeEscapedSlashes(const String & json_str)
 {
     auto result = json_str;
@@ -283,7 +284,7 @@ void writeDataFileSidecar(
     const ContextPtr & context,
     std::optional<IcebergSerializedFileStats> column_stats)
 {
-    const String sidecar_path = sidecarStoragePath(data_file_storage_path);
+    const String sidecar_path = getIcebergExportPartSidecarStoragePath(data_file_storage_path);
     auto buf = object_storage->writeObject(
         StoredObject(sidecar_path), WriteMode::Rewrite, std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());
 

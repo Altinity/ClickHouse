@@ -122,6 +122,8 @@ void generateManifestList(
     Iceberg::FileContentType content_type,
     bool use_previous_snapshots = true);
 
+std::string getIcebergExportPartSidecarStoragePath(const String & data_file_storage_path);
+
 class IcebergStorageSink : public SinkToStorage
 {
 public:

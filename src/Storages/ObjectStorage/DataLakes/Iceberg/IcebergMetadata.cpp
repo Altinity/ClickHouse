@@ -1389,17 +1389,6 @@ namespace FailPoints
 
 namespace
 {
-/// Replace the file extension of `path` with ".avro".
-/// E.g. "/table/data/data-uuid.parquet" -> "/table/data/data-uuid.avro".
-/// If the path has no extension (no '.' after the last '/') ".avro" is appended.
-String replaceFileExtensionWithAvro(const String & path)
-{
-    auto dot_pos = path.rfind('.');
-    auto slash_pos = path.rfind('/');
-    if (dot_pos != String::npos && (slash_pos == String::npos || dot_pos > slash_pos))
-        return path.substr(0, dot_pos) + ".avro";
-    return path + ".avro";
-}
 
 /// Find the partition spec object with the given spec-id inside a metadata JSON document.
 /// Throws BAD_ARGUMENTS if the spec is not found (indicates metadata/spec-id mismatch).
@@ -1818,10 +1807,11 @@ void IcebergMetadata::commitExportPartitionTransaction(
     per_file_stats.reserve(static_cast<size_t>(total_data_files));
     for (const auto & path : data_file_paths)
     {
-        const String sidecar_path = replaceFileExtensionWithAvro(path);
+        const auto sidecar_path = getIcebergExportPartSidecarStoragePath(path);
         auto sidecar = readDataFileSidecar(sidecar_path, object_storage, context);
-        total_rows        += static_cast<Int32>(sidecar.record_count);
+        total_rows += static_cast<Int32>(sidecar.record_count);
         total_chunks_size += static_cast<Int32>(sidecar.file_size_in_bytes);
+
         per_file_stats.push_back(std::move(sidecar.column_stats));
     }
 
