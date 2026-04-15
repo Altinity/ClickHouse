@@ -5164,6 +5164,14 @@ Possible values:
 - 0 - Disabled
 - 1 - Enabled
 )", 0) \
+    DECLARE(Bool, use_parquet_metadata_cache, true, R"(
+If turned on, parquet format may utilize the parquet metadata cache.
+
+Possible values:
+
+- 0 - Disabled
+- 1 - Enabled
+)", 0) \
     DECLARE(UInt64, iceberg_metadata_staleness_ms, 0, R"(
 If non-zero, skip fetching iceberg metadata from remote catalog if there is a cached metadata snapshot, more recent than the given staleness window. Zero means to always fetch the latest metadata version from the remote catalog. Setting this a non-zero trades staleness to a lower latency of read operations.
 )", 0) \
@@ -7519,7 +7527,23 @@ Allow to create database with Engine=MaterializedPostgreSQL(...).
     \
     DECLARE(Bool, allow_experimental_nullable_tuple_type, false, R"(
 Allows creation of [Nullable](../../sql-reference/data-types/nullable) [Tuple](../../sql-reference/data-types/tuple.md) columns in tables.
+
+This setting does not control whether extracted tuple subcolumns can be `Nullable` (for example, from Dynamic, Variant, JSON, or Tuple columns).
+Use `allow_nullable_tuple_in_extracted_subcolumns` to control whether extracted tuple subcolumns can be `Nullable`.
 )", EXPERIMENTAL) \
+    DECLARE(Bool, allow_nullable_tuple_in_extracted_subcolumns, false, R"(
+Controls whether extracted subcolumns of type `Tuple(...)` can be typed as `Nullable(Tuple(...))`.
+
+- `false`: Return `Tuple(...)` and use default tuple values for rows where the subcolumn is missing.
+- `true`: Return `Nullable(Tuple(...))` and use `NULL` for rows where the subcolumn is missing.
+
+This setting controls extracted subcolumn behavior only.
+It does not control whether `Nullable(Tuple(...))` columns can be created in tables; that is controlled by `allow_experimental_nullable_tuple_type`.
+
+ClickHouse uses the value for this setting loaded at server startup.
+Changes made with `SET` or query-level `SETTINGS` do not change extracted subcolumn behavior.
+To change extracted subcolumn behavior, update `allow_nullable_tuple_in_extracted_subcolumns` in startup profile configuration (for example, users.xml) and restart the server.
+)", 0) \
     \
     /** Experimental feature for moving data between shards. */ \
     DECLARE(Bool, allow_experimental_query_deduplication, false, R"(
@@ -7642,6 +7666,9 @@ Rewrite expressions like 'x IN subquery' to JOIN. This might be useful for optim
 )", EXPERIMENTAL) \
     DECLARE(Bool, object_storage_remote_initiator, false, R"(
 Execute request to object storage as remote on one of object_storage_cluster nodes.
+)", EXPERIMENTAL) \
+    DECLARE(String, object_storage_remote_initiator_cluster, "", R"(
+Cluster to choose remote initiator, when `object_storage_remote_initiator` is true. When empty, `object_storage_cluster` is used.
 )", EXPERIMENTAL) \
     DECLARE(Bool, allow_experimental_iceberg_read_optimization, true, R"(
 Allow Iceberg read optimization based on Iceberg metadata.

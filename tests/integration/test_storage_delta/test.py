@@ -110,7 +110,6 @@ def started_cluster():
             user_configs=[
                 "configs/users.d/users.xml",
                 "configs/users.d/enable_writes.xml",
-                "configs/users.d/disable_parquet_metadata_caching.xml",
             ],
             env_variables={
                 "RUST_BACKTRACE": "1",
@@ -132,7 +131,6 @@ def started_cluster():
             user_configs=[
                 "configs/users.d/users.xml",
                 "configs/users.d/enable_writes.xml",
-                "configs/users.d/disable_parquet_metadata_caching.xml",
             ],
             with_minio=True,
             stay_alive=True,
@@ -183,7 +181,6 @@ def started_cluster():
             user_configs=[
                 "configs/users.d/users.xml",
                 "configs/users.d/disabled_delta_kernel.xml",
-                "configs/users.d/disable_parquet_metadata_caching.xml",
             ],
             with_minio=True,
             with_azurite=True,
@@ -1386,7 +1383,7 @@ def test_session_token(started_cluster):
     parquet_data_path = create_initial_data_file(
         started_cluster,
         instance,
-        "SELECT toUInt64(number), toString(number) FROM numbers(100) SETTINGS input_format_parquet_use_metadata_cache=0",
+        "SELECT toUInt64(number), toString(number) FROM numbers(100)",
         TABLE_NAME,
         node_name=node_name,
     )
@@ -1399,7 +1396,7 @@ def test_session_token(started_cluster):
             f"""
     SELECT count() FROM deltaLake(
         'http://{started_cluster.minio_host}:{started_cluster.minio_port}/{started_cluster.minio_bucket}/{TABLE_NAME}/',
-        SETTINGS allow_experimental_delta_kernel_rs=1, input_format_parquet_use_metadata_cache=0)
+        SETTINGS allow_experimental_delta_kernel_rs=1)
     """
         )
     )
@@ -2336,7 +2333,7 @@ def test_column_pruning(started_cluster):
     query_id = f"query_{TABLE_NAME}_2"
     assert sum == int(
         instance.query(
-            f"SELECT sum(id) FROM {table_function} SETTINGS enable_filesystem_cache=0, max_read_buffer_size_remote_fs=100, remote_read_min_bytes_for_seek=1, input_format_parquet_use_native_reader_v3=1",
+            f"SELECT sum(id) FROM {table_function} SETTINGS enable_filesystem_cache=0, max_read_buffer_size_remote_fs=100, remote_read_min_bytes_for_seek=1, input_format_parquet_use_native_reader_v3=1, use_parquet_metadata_cache=0",
             query_id=query_id,
         )
     )

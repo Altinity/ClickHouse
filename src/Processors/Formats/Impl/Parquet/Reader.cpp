@@ -307,7 +307,7 @@ void Reader::prefilterAndInitRowGroups(const std::optional<std::unordered_set<UI
     auto add_prewhere_outputs = [&](const ActionsDAG & actions)
     {
         for (const auto * node : actions.getOutputs())
-            if (sample_block->has(node->result_name))
+            if (node->type != ActionsDAG::ActionType::INPUT && sample_block->has(node->result_name))
                 schemer.external_columns.push_back(node->result_name);
     };
     if (row_level_filter)
@@ -688,7 +688,8 @@ void Reader::preparePrewhere()
             else
             {
                 if (!prewhere_output_column_idxs.contains(idx_in_output_block))
-                    throw Exception(ErrorCodes::LOGICAL_ERROR, "PREWHERE appears to use its own output as input");
+                    throw Exception(ErrorCodes::LOGICAL_ERROR, "PREWHERE appears to use its own output as input: column '{}' (idx {})",
+                        col.name, idx_in_output_block);
             }
             step.input_idxs.push_back(idx_in_output_block);
         }
@@ -2063,7 +2064,7 @@ void Reader::applyPrewhere(RowSubgroup & row_subgroup, const RowGroup & row_grou
             const ColumnWithTypeAndName & col = extended_sample_block.getByPosition(idx_in_output_block);
             block.insert({getOrFormOutputColumn(row_subgroup, idx_in_output_block), col.type, col.name});
         }
-        addDummyColumnWithRowCount(block, row_subgroup.filter.rows_total);
+        addDummyColumnWithRowCount(block, row_subgroup.filter.rows_pass);
 
         step.actions.execute(block);
 

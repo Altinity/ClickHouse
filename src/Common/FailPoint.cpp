@@ -120,6 +120,8 @@ static struct InitFiu
     REGULAR(slowdown_parallel_replicas_local_plan_read) \
     ONCE(iceberg_writes_cleanup) \
     ONCE(backup_add_empty_memory_table) \
+    PAUSEABLE_ONCE(backup_pause_on_start) \
+    PAUSEABLE_ONCE(restore_pause_on_start) \
     PAUSEABLE(sc_state_application_pause) \
     PAUSEABLE(sc_state_application_pause_after_fetch) \
     REGULAR(sc_intentions_commit_fail) \
@@ -138,6 +140,7 @@ static struct InitFiu
     REGULAR(rmt_delay_execute_drop_range) \
     REGULAR(rmt_delay_commit_part) \
     ONCE(local_object_storage_network_error_during_remove) \
+    REGULAR(patch_parts_reverse_column_order) \
     ONCE(parallel_replicas_check_read_mode_always)\
     REGULAR(lightweight_show_tables)
 

@@ -306,6 +306,11 @@ public:
         return false;
     }
 
+    virtual bool supportsPrewhere() const
+    {
+        return true;
+    }
+
     virtual void drop(ContextPtr) {}
 
     virtual bool isClusterSupported() const { return true; }
