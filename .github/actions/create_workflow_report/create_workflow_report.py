@@ -6,6 +6,9 @@ from itertools import combinations
 import json
 from datetime import datetime
 from functools import lru_cache
+from glob import glob
+import urllib.parse
+import re
 
 import pandas as pd
 from jinja2 import Environment, FileSystemLoader
@@ -13,43 +16,17 @@ import requests
 from clickhouse_driver import Client
 import boto3
 from botocore.exceptions import NoCredentialsError
+import yaml
+
 
 DATABASE_HOST_VAR = "CHECKS_DATABASE_HOST"
-DATABASE_USER_VAR = "CHECKS_DATABASE_USER"
-DATABASE_PASSWORD_VAR = "CHECKS_DATABASE_PASSWORD"
+DATABASE_USER_VAR = "CLICKHOUSE_TEST_STAT_LOGIN"
+DATABASE_PASSWORD_VAR = "CLICKHOUSE_TEST_STAT_PASSWORD"
 S3_BUCKET = "altinity-build-artifacts"
 GITHUB_REPO = "Altinity/ClickHouse"
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
 
-# Set up the Jinja2 environment
-template_dir = os.path.dirname(__file__)
-
-# Load the template
-template = Environment(loader=FileSystemLoader(template_dir)).get_template(
-    "ci_run_report.html.jinja"
-)
-
-
-@lru_cache
-def get_run_details(run_url: str) -> dict:
-    """
-    Fetch run details for a given run URL.
-    """
-    run_id = run_url.split("/")[-1]
-
-    headers = {
-        "Authorization": f"token {os.getenv('GITHUB_TOKEN')}",
-        "Accept": "application/vnd.github.v3+json",
-    }
-
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/actions/runs/{run_id}"
-    response = requests.get(url, headers=headers)
-
-    if response.status_code != 200:
-        raise Exception(
-            f"Failed to fetch run details: {response.status_code} {response.text}"
-        )
-
-    return response.json()
+CVE_SEVERITY_ORDER = {"critical": 1, "high": 2, "medium": 3, "low": 4, "negligible": 5}
 
 
 def get_commit_statuses(sha: str) -> pd.DataFrame:
@@ -64,7 +41,7 @@ def get_commit_statuses(sha: str) -> pd.DataFrame:
         pd.DataFrame: DataFrame containing all statuses.
     """
     headers = {
-        "Authorization": f"token {os.getenv('GITHUB_TOKEN')}",
+        "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
     }
 
@@ -133,7 +110,7 @@ def get_pr_info_from_number(pr_number: str) -> dict:
         dict: Dictionary containing PR information.
     """
     headers = {
-        "Authorization": f"token {os.getenv('GITHUB_TOKEN')}",
+        "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
     }
 
@@ -148,15 +125,12 @@ def get_pr_info_from_number(pr_number: str) -> dict:
     return response.json()
 
 
-@lru_cache
-def get_run_details(run_url: str) -> dict:
+def get_run_details(run_id: str) -> dict:
     """
     Fetch run details for a given run URL.
     """
-    run_id = run_url.split("/")[-1]
-
     headers = {
-        "Authorization": f"token {os.getenv('GITHUB_TOKEN')}",
+        "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github.v3+json",
     }
 
@@ -171,9 +145,9 @@ def get_run_details(run_url: str) -> dict:
     return response.json()
 
 
-def get_checks_fails(client: Client, job_url: str):
+def get_checks_fails(client: Client, commit_sha: str, branch_name: str):
     """
-    Get tests that did not succeed for the given job URL.
+    Get tests that did not succeed for the given commit and branch.
     Exclude checks that have status 'error' as they are counted in get_checks_errors.
     """
     query = f"""SELECT job_status, job_name, status as test_status, test_name, results_link
@@ -186,59 +160,116 @@ def get_checks_fails(client: Client, job_url: str):
                     report_url as results_link,
                     task_url
                 FROM `gh-data`.checks
+                WHERE commit_sha='{commit_sha}' AND head_ref='{branch_name}'
                 GROUP BY check_name, test_name, report_url, task_url
             )
-            WHERE task_url LIKE '{job_url}%'
-            AND test_status IN ('FAIL', 'ERROR')
+            WHERE test_status IN ('FAIL', 'ERROR')
             AND job_status!='error'
             ORDER BY job_name, test_name
             """
     return client.query_dataframe(query)
 
 
-def get_checks_known_fails(client: Client, job_url: str, known_fails: dict):
+def get_broken_tests_rules(broken_tests_file_path):
+    with open(broken_tests_file_path, "r", encoding="utf-8") as broken_tests_file:
+        broken_tests = yaml.safe_load(broken_tests_file)
+
+    compiled_rules = {"exact": {}, "pattern": {}}
+
+    for test in broken_tests:
+        regex = test.get("regex") is True
+        rule = {
+            "reason": test["reason"],
+        }
+
+        if test.get("check_types"):
+            rule["check_types"] = test["check_types"]
+
+        if regex:
+            rule["regex"] = True
+            compiled_rules["pattern"][re.compile(test["name"])] = rule
+        else:
+            compiled_rules["exact"][test["name"]] = rule
+
+    return compiled_rules
+
+
+def get_known_fail_reason(test_name: str, check_name: str, known_fails: dict):
     """
-    Get tests that are known to fail for the given job URL.
+    Returns the reason why a test is known to fail based on its name and build context.
+
+    - Exact-name rules are checked first.
+    - Pattern-name rules are checked next (first match wins).
+    - Message/not_message conditions are ignored.
+    """
+    # 1. Exact-name rules
+    rule_data = known_fails["exact"].get(test_name)
+    if rule_data:
+        check_types = rule_data.get("check_types", [])
+        if not check_types or any(
+            check_type in check_name for check_type in check_types
+        ):
+            return rule_data["reason"]
+
+    # 2. Pattern-name rules
+    for name_re, rule_data in known_fails["pattern"].items():
+        if name_re.fullmatch(test_name):
+            check_types = rule_data.get("check_types", [])
+            if not check_types or any(
+                check_type in check_name for check_type in check_types
+            ):
+                return rule_data["reason"]
+
+    return "No reason given"
+
+
+def get_checks_known_fails(
+    client: Client, commit_sha: str, branch_name: str, known_fails: dict
+):
+    """
+    Get tests that are known to fail for the given commit and branch.
     """
     if len(known_fails) == 0:
         return pd.DataFrame()
 
-    query = f"""SELECT job_status, job_name, status as test_status, test_name, results_link
+    query = f"""SELECT job_name, status as test_status, test_name, results_link
         FROM (
             SELECT
-                argMax(check_status, check_start_time) as job_status,
                 check_name as job_name,
                 argMax(test_status, check_start_time) as status,
                 test_name,
                 report_url as results_link,
                 task_url
             FROM `gh-data`.checks
+            WHERE commit_sha='{commit_sha}' AND head_ref='{branch_name}'
             GROUP BY check_name, test_name, report_url, task_url
         )
-        WHERE task_url LIKE '{job_url}%'
-        AND test_status='BROKEN'
-        AND test_name IN ({','.join(f"'{test}'" for test in known_fails.keys())})
+        WHERE test_status='BROKEN'
         ORDER BY job_name, test_name
         """
 
     df = client.query_dataframe(query)
 
+    if df.shape[0] == 0:
+        return df
+
     df.insert(
         len(df.columns) - 1,
         "reason",
-        df["test_name"]
-        .astype(str)
-        .apply(
-            lambda test_name: known_fails[test_name].get("reason", "No reason given")
+        df.apply(
+            lambda row: get_known_fail_reason(
+                row["test_name"], row["job_name"], known_fails
+            ),
+            axis=1,
         ),
     )
 
     return df
 
 
-def get_checks_errors(client: Client, job_url: str):
+def get_checks_errors(client: Client, commit_sha: str, branch_name: str):
     """
-    Get checks that have status 'error' for the given job URL.
+    Get checks that have status 'error' for the given commit and branch.
     """
     query = f"""SELECT job_status, job_name, status as test_status, test_name, results_link
             FROM (
@@ -250,10 +281,10 @@ def get_checks_errors(client: Client, job_url: str):
                     report_url as results_link,
                     task_url
                 FROM `gh-data`.checks
+                WHERE commit_sha='{commit_sha}' AND head_ref='{branch_name}'
                 GROUP BY check_name, test_name, report_url, task_url
             )
-            WHERE task_url LIKE '{job_url}%'
-            AND job_status=='error'
+            WHERE job_status=='error'
             ORDER BY job_name, test_name
             """
     return client.query_dataframe(query)
@@ -397,34 +428,102 @@ def get_new_fails_this_pr(
     return new_fails_df
 
 
-def get_cves(pr_number, commit_sha):
+@lru_cache
+def get_workflow_config() -> dict:
+
+    # 25.12+
+    if os.path.exists("./ci/tmp/workflow_status.json"):
+        with open("./ci/tmp/workflow_status.json", "r") as f:
+            data = json.load(f)["config_workflow"]["outputs"]["data"]
+            assert data is not None, "data is None"
+            if isinstance(data, str):
+                data = json.loads(data)
+            assert (
+                "WORKFLOW_CONFIG" in data.keys()
+            ), f"WORKFLOW_CONFIG not found in data: {data.keys()}"
+            return data["WORKFLOW_CONFIG"]
+
+    workflow_config_files = glob("./ci/tmp/workflow_config*.json")
+    if len(workflow_config_files) == 0:
+        raise Exception("No workflow config file found")
+    if len(workflow_config_files) > 1:
+        raise Exception("Multiple workflow config files found")
+    with open(workflow_config_files[0], "r") as f:
+        return json.load(f)
+
+
+def get_cached_job(job_name: str) -> dict:
+    workflow_config = get_workflow_config()
+    return workflow_config["cache_jobs"].get(job_name, {})
+
+
+def get_cves(pr_number, commit_sha, branch):
     """
     Fetch Grype results from S3.
 
     If no results are available for download, returns ... (Ellipsis).
     """
     s3_client = boto3.client("s3", endpoint_url=os.getenv("S3_URL"))
-    s3_prefix = f"{pr_number}/{commit_sha}/grype/"
+    prefixes_to_check = set()
 
-    results = []
+    def format_prefix(pr_number, commit_sha, branch):
+        if pr_number == 0:
+            return f"REFs/{branch}/{commit_sha}/grype/"
+        else:
+            return f"PRs/{pr_number}/{commit_sha}/grype/"
 
-    response = s3_client.list_objects_v2(
-        Bucket=S3_BUCKET, Prefix=s3_prefix, Delimiter="/"
-    )
-    grype_result_dirs = [
-        content["Prefix"] for content in response.get("CommonPrefixes", [])
-    ]
+    cached_server_job = get_cached_job("Docker server image")
+    if cached_server_job:
+        prefixes_to_check.add(
+            format_prefix(
+                cached_server_job["pr_number"],
+                cached_server_job["sha"],
+                cached_server_job["branch"],
+            )
+        )
+    cached_keeper_job = get_cached_job("Docker keeper image")
+    if cached_keeper_job:
+        prefixes_to_check.add(
+            format_prefix(
+                cached_keeper_job["pr_number"],
+                cached_keeper_job["sha"],
+                cached_keeper_job["branch"],
+            )
+        )
+
+    if not prefixes_to_check:
+        prefixes_to_check = {format_prefix(pr_number, commit_sha, branch)}
+
+    grype_result_dirs = []
+    for s3_prefix in prefixes_to_check:
+        try:
+            response = s3_client.list_objects_v2(
+                Bucket=S3_BUCKET, Prefix=s3_prefix, Delimiter="/"
+            )
+            grype_result_dirs.extend(
+                content["Prefix"]
+                for content in response.get("CommonPrefixes", [])
+                if isinstance(content, dict) and content.get("Prefix")
+            )
+        except Exception as e:
+            print(f"Error listing S3 objects at {s3_prefix}: {e}")
+            continue
 
     if len(grype_result_dirs) == 0:
         # We were asked to check the CVE data, but none was found,
         # maybe this is a preview report and grype results are not available yet
         return ...
 
+    results = []
     for path in grype_result_dirs:
         file_key = f"{path}result.json"
-        file_response = s3_client.get_object(Bucket=S3_BUCKET, Key=file_key)
-        content = file_response["Body"].read().decode("utf-8")
-        results.append(json.loads(content))
+        try:
+            file_response = s3_client.get_object(Bucket=S3_BUCKET, Key=file_key)
+            content = file_response["Body"].read().decode("utf-8")
+            results.append(json.loads(content))
+        except Exception as e:
+            print(f"Error getting S3 object at {file_key}: {e}")
+            continue
 
     rows = []
     for scan_result in results:
@@ -442,19 +541,20 @@ def get_cves(pr_number, commit_sha):
         return pd.DataFrame()
 
     df = pd.DataFrame(rows).drop_duplicates()
-    df = df.sort_values(
-        by="severity",
-        key=lambda col: col.str.lower().map(
-            {"critical": 1, "high": 2, "medium": 3, "low": 4, "negligible": 5}
-        ),
-    )
+
+    def _cve_sort_key(col):
+        if col.name == "severity":
+            return col.str.lower().map(CVE_SEVERITY_ORDER)
+        return col
+
+    df = df.sort_values(by=["severity", "docker_image"], key=_cve_sort_key)
     return df
 
 
 def url_to_html_link(url: str) -> str:
     if not url:
         return ""
-    text = url.split("/")[-1].replace("__", "_")
+    text = url.split("/")[-1].split("?")[0]
     if not text:
         text = "results"
     return f'<a href="{url}">{text}</a>'
@@ -467,11 +567,15 @@ def format_test_name_for_linewrap(text: str) -> str:
 
 def format_test_status(text: str) -> str:
     """Format the test status for better readability."""
-    color = (
-        "red"
-        if text.lower().startswith("fail")
-        else "orange" if text.lower() in ("error", "broken", "pending") else "green"
-    )
+    if text.lower().startswith("fail"):
+        color = "red"
+    elif text.lower() == "skipped":
+        color = "grey"
+    elif text.lower() in ("success", "ok", "passed", "pass"):
+        color = "green"
+    else:
+        color = "orange"
+
     return f'<span style="font-weight: bold; color: {color}">{text}</span>'
 
 
@@ -491,12 +595,112 @@ def format_results_as_html_table(results) -> str:
             "Identifier": lambda i: url_to_html_link(
                 "https://nvd.nist.gov/vuln/detail/" + i
             ),
+            "Severity": lambda s: (
+                f'<span data-sort="{CVE_SEVERITY_ORDER.get(str(s).lower(), 6)}">{s}</span>'
+            ),
         },
         escape=False,
         border=0,
         classes=["test-results-table"],
     )
     return html
+
+
+def backfill_skipped_statuses(
+    job_statuses: pd.DataFrame, pr_number: int, branch: str, commit_sha: str
+):
+    """
+    Fill in the job statuses for skipped jobs.
+    """
+
+    if pr_number == 0:
+        ref_param = f"REF={branch}"
+        workflow_name = "MasterCI"
+    else:
+        ref_param = f"PR={pr_number}"
+        workflow_name = "PR"
+
+    status_file = f"result_{workflow_name.lower()}.json"
+    s3_path = f"https://{S3_BUCKET}.s3.amazonaws.com/{ref_param.replace('=', 's/')}/{commit_sha}/{status_file}"
+    response = requests.get(s3_path)
+
+    if response.status_code != 200:
+        return job_statuses
+
+    status_data = response.json()
+    skipped_jobs = []
+    for job in status_data["results"]:
+        if job["status"] == "skipped" and len(job["links"]) > 0:
+            skipped_jobs.append(
+                {
+                    "job_name": job["name"],
+                    "job_status": job["status"],
+                    "message": job["info"],
+                    "results_link": job["links"][0],
+                }
+            )
+
+    return pd.concat([job_statuses, pd.DataFrame(skipped_jobs)], ignore_index=True)
+
+
+def get_build_report_links(
+    job_statuses: pd.DataFrame, pr_number: int, branch: str, commit_sha: str
+):
+    """
+    Get the build report links for the given PR number, branch, and commit SHA.
+
+    First checks if a build job submitted a success or skipped status.
+    If not available, it guesses the links.
+    """
+    build_job_names = [
+        "Build (amd_release)",
+        "Build (arm_release)",
+        "Docker server image",
+        "Docker keeper image",
+    ]
+    build_report_links = {}
+
+    for job in job_statuses.itertuples():
+        if (
+            job.job_name in build_job_names
+            and job.job_status
+            in (
+                "success",
+                "skipped",
+            )
+            and job.results_link
+        ):
+            build_report_links[job.job_name] = job.results_link
+
+    if 0 < len(build_report_links) < len(build_job_names):
+        # Only have some of the build jobs, guess the rest.
+        # (It was straightforward to force the build jobs to always appear in the cache,
+        # however doing the same for the docker image jobs is difficult.)
+        ref_job, ref_link = list(build_report_links.items())[0]
+        link_template = ref_link.replace(
+            urllib.parse.quote(ref_job, safe=""), "{job_name}"
+        )
+        for job in build_job_names:
+            if job not in build_report_links:
+                build_report_links[job] = link_template.format(job_name=job)
+
+    if len(build_report_links) > 0:
+        return build_report_links
+
+    # No cache or build result was found, guess the links
+    if pr_number == 0:
+        ref_param = f"REF={branch}"
+        workflow_name = "MasterCI"
+    else:
+        ref_param = f"PR={pr_number}"
+        workflow_name = "PR"
+
+    build_report_link_base = f"https://{S3_BUCKET}.s3.amazonaws.com/json.html?{ref_param}&sha={commit_sha}&name_0={urllib.parse.quote(workflow_name, safe='')}"
+    build_report_links = {
+        job_name: f"{build_report_link_base}&name_1={urllib.parse.quote(job_name, safe='')}"
+        for job_name in build_job_names
+    }
+    return build_report_links
 
 
 def parse_args() -> argparse.Namespace:
@@ -523,23 +727,47 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
+def create_workflow_report(
+    actions_run_url: str,
+    pr_number: int = None,
+    commit_sha: str = None,
+    no_upload: bool = False,
+    known_fails_file_path: str = None,
+    check_cves: bool = False,
+    mark_preview: bool = False,
+) -> str:
 
-    if args.pr_number is None or args.commit_sha is None:
-        run_details = get_run_details(args.actions_run_url)
-        if args.pr_number is None:
+    host = os.getenv(DATABASE_HOST_VAR)
+    if not host:
+        print(f"{DATABASE_HOST_VAR} is not set")
+    user = os.getenv(DATABASE_USER_VAR)
+    if not user:
+        print(f"{DATABASE_USER_VAR} is not set")
+    password = os.getenv(DATABASE_PASSWORD_VAR)
+    if not password:
+        print(f"{DATABASE_PASSWORD_VAR} is not set")
+    if not GITHUB_TOKEN:
+        print("GITHUB_TOKEN is not set")
+    if not all([host, user, password, GITHUB_TOKEN]):
+        raise Exception("Required environment variables are not set")
+
+    run_id = actions_run_url.split("/")[-1]
+
+    run_details = get_run_details(run_id)
+    branch_name = run_details.get("head_branch", "unknown branch")
+    if pr_number is None or commit_sha is None:
+        if pr_number is None:
             if len(run_details["pull_requests"]) > 0:
-                args.pr_number = run_details["pull_requests"][0]["number"]
+                pr_number = run_details["pull_requests"][0]["number"]
             else:
-                args.pr_number = 0
-        if args.commit_sha is None:
-            args.commit_sha = run_details["head_commit"]["id"]
+                pr_number = 0
+        if commit_sha is None:
+            commit_sha = run_details["head_commit"]["id"]
 
     db_client = Client(
-        host=os.getenv(DATABASE_HOST_VAR),
-        user=os.getenv(DATABASE_USER_VAR),
-        password=os.getenv(DATABASE_PASSWORD_VAR),
+        host=host,
+        user=user,
+        password=password,
         port=9440,
         secure="y",
         verify=False,
@@ -547,41 +775,41 @@ def main():
     )
 
     fail_results = {
-        "job_statuses": get_commit_statuses(args.commit_sha),
-        "checks_fails": get_checks_fails(db_client, args.actions_run_url),
+        "job_statuses": get_commit_statuses(commit_sha),
+        "checks_fails": get_checks_fails(db_client, commit_sha, branch_name),
         "checks_known_fails": [],
         "pr_new_fails": [],
-        "checks_errors": get_checks_errors(db_client, args.actions_run_url),
-        "regression_fails": get_regression_fails(db_client, args.actions_run_url),
-        "docker_images_cves": (
-            [] if not args.cves else get_cves(args.pr_number, args.commit_sha)
-        ),
+        "checks_errors": get_checks_errors(db_client, commit_sha, branch_name),
+        "regression_fails": get_regression_fails(db_client, actions_run_url),
+        "docker_images_cves": [],
     }
+
+    try:
+        fail_results["docker_images_cves"] = (
+            [] if not check_cves else get_cves(pr_number, commit_sha, branch_name)
+        )
+    except Exception as e:
+        print(f"Error in get_cves: {e}")
 
     # get_cves returns ... in the case where no Grype result files were found.
     # This might occur when run in preview mode.
-    cves_not_checked = not args.cves or fail_results["docker_images_cves"] is ...
+    cves_not_checked = not check_cves or fail_results["docker_images_cves"] is ...
 
-    if args.known_fails:
-        if not os.path.exists(args.known_fails):
-            print(f"Known fails file {args.known_fails} not found.")
-            exit(1)
+    if known_fails_file_path:
+        if not os.path.exists(known_fails_file_path):
+            print(f"WARNING:Known fails file {known_fails_file_path} not found.")
+        else:
+            known_fails = get_broken_tests_rules(known_fails_file_path)
 
-        with open(args.known_fails) as f:
-            known_fails = json.load(f)
-
-        if known_fails:
             fail_results["checks_known_fails"] = get_checks_known_fails(
-                db_client, args.actions_run_url, known_fails
+                db_client, commit_sha, branch_name, known_fails
             )
 
-    if args.pr_number == 0:
-        run_details = get_run_details(args.actions_run_url)
-        branch_name = run_details.get("head_branch", "unknown branch")
+    if pr_number == 0:
         pr_info_html = f"Release ({branch_name})"
     else:
         try:
-            pr_info = get_pr_info_from_number(args.pr_number)
+            pr_info = get_pr_info_from_number(pr_number)
             pr_info_html = f"""<a href="https://github.com/{GITHUB_REPO}/pull/{pr_info["number"]}">
                     #{pr_info.get("number")} ({pr_info.get("base", {}).get('ref')} <- {pr_info.get("head", {}).get('ref')})  {pr_info.get("title")}
                     </a>"""
@@ -593,6 +821,11 @@ def main():
             )
         except Exception as e:
             pr_info_html = e
+            pr_info = {}
+
+    fail_results["job_statuses"] = backfill_skipped_statuses(
+        fail_results["job_statuses"], pr_number, branch_name, commit_sha
+    )
 
     high_cve_count = 0
     if not cves_not_checked and len(fail_results["docker_images_cves"]) > 0:
@@ -603,31 +836,37 @@ def main():
             .sum()
         )
 
+    # Load the template
+    template = Environment(
+        loader=FileSystemLoader(os.path.dirname(__file__))
+    ).get_template("ci_run_report.html.jinja")
+
     # Define the context for rendering
     context = {
         "title": "ClickHouse® CI Workflow Run Report",
         "github_repo": GITHUB_REPO,
         "s3_bucket": S3_BUCKET,
         "pr_info_html": pr_info_html,
-        "pr_number": args.pr_number,
-        "workflow_id": args.actions_run_url.split("/")[-1],
-        "commit_sha": args.commit_sha,
-        "base_sha": "" if args.pr_number == 0 else pr_info.get("base", {}).get("sha"),
+        "pr_number": pr_number,
+        "workflow_id": run_id,
+        "commit_sha": commit_sha,
+        "base_sha": "" if pr_number == 0 else pr_info.get("base", {}).get("sha"),
         "date": f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC",
-        "is_preview": args.mark_preview,
+        "is_preview": mark_preview,
         "counts": {
-            "jobs_status": f"{sum(fail_results['job_statuses']['job_status'] != 'success')} fail/error/pending",
+            "jobs_status": f"{sum(fail_results['job_statuses']['job_status'].value_counts().get(x, 0) for x in ('failure', 'error'))} fail/error",
             "checks_errors": len(fail_results["checks_errors"]),
             "checks_new_fails": len(fail_results["checks_fails"]),
             "regression_new_fails": len(fail_results["regression_fails"]),
             "cves": "N/A" if cves_not_checked else f"{high_cve_count} high/critical",
             "checks_known_fails": (
-                "N/A"
-                if not args.known_fails
-                else len(fail_results["checks_known_fails"])
+                "N/A" if not known_fails else len(fail_results["checks_known_fails"])
             ),
             "pr_new_fails": len(fail_results["pr_new_fails"]),
         },
+        "build_report_links": get_build_report_links(
+            fail_results["job_statuses"], pr_number, branch_name, commit_sha
+        ),
         "ci_jobs_status_html": format_results_as_html_table(
             fail_results["job_statuses"]
         ),
@@ -645,7 +884,7 @@ def main():
         ),
         "checks_known_fails_html": (
             "<p>Not Checked</p>"
-            if not args.known_fails
+            if not known_fails
             else format_results_as_html_table(fail_results["checks_known_fails"])
         ),
         "new_fails_html": format_results_as_html_table(fail_results["pr_new_fails"]),
@@ -658,11 +897,16 @@ def main():
     report_path = Path(report_name)
     report_path.write_text(rendered_html, encoding="utf-8")
 
-    if args.no_upload:
+    if no_upload:
         print(f"Report saved to {report_path}")
         exit(0)
 
-    report_destination_key = f"{args.pr_number}/{args.commit_sha}/{report_name}"
+    if pr_number == 0:
+        report_destination_key = f"REFs/{branch_name}/{commit_sha}"
+    else:
+        report_destination_key = f"PRs/{pr_number}/{commit_sha}"
+
+    report_destination_key += f"/{run_id}/{report_name}"
 
     # Upload the report to S3
     s3_client = boto3.client("s3", endpoint_url=os.getenv("S3_URL"))
@@ -677,7 +921,23 @@ def main():
     except NoCredentialsError:
         print("Credentials not available for S3 upload.")
 
-    print(f"https://s3.amazonaws.com/{S3_BUCKET}/" + report_destination_key)
+    return f"https://s3.amazonaws.com/{S3_BUCKET}/" + report_destination_key
+
+
+def main():
+    args = parse_args()
+
+    report_url = create_workflow_report(
+        args.actions_run_url,
+        args.pr_number,
+        args.commit_sha,
+        args.no_upload,
+        args.known_fails,
+        args.cves,
+        args.mark_preview,
+    )
+
+    print(report_url)
 
 
 if __name__ == "__main__":
