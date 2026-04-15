@@ -1404,6 +1404,21 @@ Poco::JSON::Object::Ptr lookupPartitionSpec(const Poco::JSON::Object::Ptr & meta
     throw Exception(ErrorCodes::BAD_ARGUMENTS,
         "Partition spec with id {} not found in table metadata", spec_id);
 }
+
+Poco::JSON::Object::Ptr lookupSchema(const Poco::JSON::Object::Ptr & meta, Int64 schema_id)
+{
+    auto schemas = meta->getArray(Iceberg::f_schemas);
+    for (size_t i = 0; i < schemas->size(); ++i)
+    {
+        auto schema = schemas->getObject(static_cast<UInt32>(i));
+        if (schema->getValue<Int32>(Iceberg::f_schema_id) == schema_id)
+            return schema;
+    }
+
+    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+        "Schema with id {} not found in table metadata", schema_id);
+}
+
 }
 
 bool IcebergMetadata::commitImportPartitionTransactionImpl(
@@ -1722,56 +1737,15 @@ void IcebergMetadata::commitExportPartitionTransaction(
     /// Derive partition_columns and partition_types from the schema and partition spec.
     /// The IDs are validated equal above so derivation from the latest metadata yields
     /// the same result as from the original ZK-pinned snapshot.
-    std::vector<String> partition_columns;
-    std::vector<DataTypePtr> partition_types;
-    {
-        /// Build source-id → ClickHouse DataTypePtr from the schema that was current at export time.
-        std::unordered_map<Int32, DataTypePtr> source_id_to_type;
-        const auto schemas = metadata->getArray(Iceberg::f_schemas);
-        for (size_t i = 0; i < schemas->size(); ++i)
-        {
-            auto schema = schemas->getObject(static_cast<UInt32>(i));
-            if (schema->getValue<Int32>(Iceberg::f_schema_id) != static_cast<Int32>(original_schema_id))
-                continue;
-            auto fields = schema->getArray(Iceberg::f_fields);
-            for (size_t j = 0; j < fields->size(); ++j)
-            {
-                auto field = fields->getObject(static_cast<UInt32>(j));
-                Poco::Dynamic::Var type_var = field->get(Iceberg::f_type);
-                if (!type_var.isString())
-                    continue; /// complex types cannot be partition source columns
-                try
-                {
-                    source_id_to_type[field->getValue<Int32>(Iceberg::f_id)] =
-                        IcebergSchemaProcessor::getSimpleType(type_var.extract<String>(), context);
-                }
-                catch (...) {} /// ignore types unknown to this CH version
-            }
-            break;
-        }
 
-        /// Walk the partition spec to derive column names and post-transform result types.
-        const auto specs = metadata->getArray(Iceberg::f_partition_specs);
-        for (size_t i = 0; i < specs->size(); ++i)
-        {
-            auto spec = specs->getObject(static_cast<UInt32>(i));
-            if (spec->getValue<Int64>(Iceberg::f_spec_id) != partition_spec_id)
-                continue;
-            auto spec_fields = spec->getArray(Iceberg::f_fields);
-            for (size_t j = 0; j < spec_fields->size(); ++j)
-            {
-                auto sf = spec_fields->getObject(static_cast<UInt32>(j));
-                partition_columns.push_back(sf->getValue<String>(Iceberg::f_name));
-                Int32 source_id = sf->getValue<Int32>(Iceberg::f_source_id);
-                String transform = sf->getValue<String>(Iceberg::f_transform);
-                DataTypePtr src_type = source_id_to_type.count(source_id)
-                    ? source_id_to_type.at(source_id)
-                    : std::make_shared<DataTypeInt32>();
-                partition_types.push_back(Iceberg::getFunctionResultType(transform, src_type));
-            }
-            break;
-        }
-    }
+    const auto schema = lookupSchema(metadata, original_schema_id);
+
+    auto partition_spec = lookupPartitionSpec(metadata, partition_spec_id);
+
+    ChunkPartitioner partitioner(partition_spec->getArray(Iceberg::f_fields), schema, context, sample_block);
+
+    const auto partition_columns = partitioner.getColumns();
+    const auto partition_types = partitioner.getResultTypes();
 
     const auto metadata_compression_method = persistent_components.metadata_compression_method;
     auto config_path = persistent_components.table_path;
@@ -1795,9 +1769,6 @@ void IcebergMetadata::commitExportPartitionTransaction(
             bucket, config_path, (catalog != nullptr && catalog->isTransactional()), metadata_compression_method, write_format);
     }
     filename_generator.setVersion(updated_metadata_file_info.version + 1);
-
-    /// Resolve the partition spec once — if it is absent the export cannot proceed.
-    Poco::JSON::Object::Ptr partition_spec = lookupPartitionSpec(metadata, partition_spec_id);
 
     /// Load per-file sidecar stats, necessary to populate the manifest file stats
     std::vector<IcebergSerializedFileStats> per_file_stats;
