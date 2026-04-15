@@ -1,6 +1,6 @@
 # yamllint disable rule:comments-indentation
 name: ReleaseBranchCI
-run-name: ${{ github.event.inputs.workflow_name || format('{0} ({1})', github.workflow, github.ref_name) }}
+run-name: "${{ github.event.inputs.workflow_name || ' ' }}"
 
 env:
   # Force the stdout and stderr streams to be unbuffered
@@ -22,6 +22,7 @@ on: # yamllint disable-line rule:truthy
       - opened
     branches:
       - 'releases/*'
+      - 'stable-*'
   push:
     tags:
       - '*'
