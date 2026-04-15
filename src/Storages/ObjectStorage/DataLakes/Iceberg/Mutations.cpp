@@ -48,13 +48,6 @@ namespace DB::DataLakeStorageSetting
 extern const DataLakeStorageSettingsBool iceberg_use_version_hint;
 }
 
-namespace DB::Setting
-{
-extern const SettingsInt64 iceberg_expire_default_min_snapshots_to_keep;
-extern const SettingsInt64 iceberg_expire_default_max_snapshot_age_ms;
-extern const SettingsInt64 iceberg_expire_default_max_ref_age_ms;
-}
-
 namespace DB::FailPoints
 {
 extern const char iceberg_writes_cleanup[];
@@ -775,6 +768,7 @@ void alter(
         throw Exception(ErrorCodes::LIMIT_EXCEEDED, "Too many unsuccessed retries to alter iceberg table");
 }
 
+<<<<<<< HEAD
 /// Table-level snapshot retention policy read from Iceberg table properties.
 struct RetentionPolicy
 {
@@ -1444,6 +1438,8 @@ ExpireSnapshotsResult expireSnapshots(
     UNREACHABLE();
 }
 
+=======
+>>>>>>> d82e501b0e4 (Merge pull request #99127 from murphy-4o/murphy_issue_99030)
 #endif
 
 }
