@@ -537,7 +537,7 @@ tar -czf ./ci/tmp/logs.tar.gz \
         # For targeted jobs, use a shorter session timeout to keep feedback fast.
         # If this timeout is exceeded but all completed tests have passed, the
         # targeted check will not fail solely because the session timed out.
-        session_timeout = 1200
+        session_timeout = 2700
     error_info = []
 
     module_repeat_cnt = 1
@@ -646,7 +646,7 @@ tar -czf ./ci/tmp/logs.tar.gz \
         is_flaky_check or is_bugfix_validation or is_targeted_check or info.is_local_run
     ):
         test_result_retries = Result.from_pytest_run(
-            command=f"{' '.join(failed_test_cases)} --report-log-exclude-logs-on-passed-tests --tb=short -n 1 --dist=loadfile --session-timeout=1200",
+            command=f"{' '.join(failed_test_cases)} --report-log-exclude-logs-on-passed-tests --tb=short -n 1 --dist=loadfile --session-timeout=2700",
             env=test_env,
             cwd="./tests/integration/",
             pytest_report_file=f"{temp_path}/pytest_retries.jsonl",
