@@ -63,6 +63,7 @@ S3TablesCatalog::S3TablesCatalog(
     DB::ContextPtr context_)
     : RestCatalog(warehouse_, base_url_, "", "", false, namespaces_, context_)
     , region(region_)
+    , storage_endpoint(catalog_settings_.storage_endpoint)
     , signing_service("s3tables")
 {
     if (region.empty())
@@ -120,6 +121,8 @@ S3TablesCatalog::S3TablesCatalog(
     }
 }
 
+/// S3 Tables only supports a single level of namespaces (no nesting),
+/// so we use flat getNamespaces() instead of the base class's getNamespacesRecursive().
 DB::Names S3TablesCatalog::getTables() const
 {
     auto namespaces = getNamespaces("");
@@ -157,12 +160,12 @@ bool S3TablesCatalog::tryGetTableMetadata(
     if (!result.requiresCredentials())
         return true;
 
-    bool need_credentials = !result.hasStorageCredentials() || !result.getStorageCredentials();
-    if (!need_credentials)
+    bool need_credentials = true;
+    if (const auto storage_credentials = result.getStorageCredentials())
     {
-        auto creds = std::dynamic_pointer_cast<S3Credentials>(result.getStorageCredentials());
-        if (creds && creds->isEmpty())
-            need_credentials = true;
+        auto creds = std::dynamic_pointer_cast<S3Credentials>(storage_credentials);
+        if (creds && !creds->isEmpty())
+            need_credentials = false;
     }
 
     if (need_credentials)
@@ -170,33 +173,30 @@ bool S3TablesCatalog::tryGetTableMetadata(
         LOG_DEBUG(log, "S3 Tables: no vended credentials for {}.{}, injecting catalog IAM credentials", namespace_name, table_name);
         auto aws_creds = credentials_provider->GetAWSCredentials();
         result.setStorageCredentials(std::make_shared<S3Credentials>(
-            String(aws_creds.GetAWSAccessKeyId().c_str(), aws_creds.GetAWSAccessKeyId().size()),
-            String(aws_creds.GetAWSSecretKey().c_str(), aws_creds.GetAWSSecretKey().size()),
-            String(aws_creds.GetSessionToken().c_str(), aws_creds.GetSessionToken().size())));
+            aws_creds.GetAWSAccessKeyId(), aws_creds.GetAWSSecretKey(), aws_creds.GetSessionToken()));
     }
 
     if (result.getEndpoint().empty())
     {
-        String regional_endpoint = "https://s3." + region + ".amazonaws.com";
-        LOG_DEBUG(log, "S3 Tables: no s3.endpoint for {}.{}, injecting regional endpoint: {}", namespace_name, table_name, regional_endpoint);
-        result.setEndpoint(regional_endpoint);
+        String endpoint = storage_endpoint.empty()
+            ? "https://s3." + region + ".amazonaws.com"
+            : storage_endpoint;
+        LOG_DEBUG(log, "S3 Tables: no endpoint for {}.{}, injecting: {}", namespace_name, table_name, endpoint);
+        result.setEndpoint(endpoint);
     }
 
-    if (result.hasDataLakeSpecificProperties())
+    if (auto props = result.getDataLakeSpecificProperties();
+        props && !props->iceberg_metadata_file_location.empty())
     {
-        auto props = result.getDataLakeSpecificProperties();
-        if (props.has_value() && !props->iceberg_metadata_file_location.empty())
+        const String & loc = props->iceberg_metadata_file_location;
+        auto scheme_end = loc.find("://");
+        if (scheme_end != String::npos)
         {
-            const String & loc = props->iceberg_metadata_file_location;
-            auto scheme_end = loc.find("://");
-            if (scheme_end != String::npos)
-            {
-                auto path_start = loc.find('/', scheme_end + 3);
-                if (path_start != String::npos)
-                    props->iceberg_metadata_file_location = loc.substr(path_start + 1);
-            }
-            result.setDataLakeSpecificProperties(std::move(props));
+            auto path_start = loc.find('/', scheme_end + 3);
+            if (path_start != String::npos)
+                props->iceberg_metadata_file_location = loc.substr(path_start + 1);
         }
+        result.setDataLakeSpecificProperties(std::move(props));
     }
 
     return true;

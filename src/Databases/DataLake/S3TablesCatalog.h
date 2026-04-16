@@ -54,6 +54,7 @@ protected:
 
 private:
     const String region;
+    const String storage_endpoint;
     const String signing_service;
     std::shared_ptr<Aws::Auth::AWSCredentialsProvider> credentials_provider;
     std::unique_ptr<Aws::Client::AWSAuthV4Signer> signer;
