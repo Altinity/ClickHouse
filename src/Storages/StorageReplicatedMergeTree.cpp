@@ -8116,6 +8116,8 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     if (src_snapshot->getColumns().getReadable().sizeOfDifference(destination_snapshot->getColumns().getInsertable()))
         throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS, "Tables have different structure");
 
+    /// for data lakes this check is performed later. It is a bit more complex as we need to convert the iceberg partition spec
+    /// to the MergeTree partition spec and compare the two.
     if (!dest_storage->isDataLake())
     {
         if (query_to_string(src_snapshot->getPartitionKeyAST()) != query_to_string(destination_snapshot->getPartitionKeyAST()))
