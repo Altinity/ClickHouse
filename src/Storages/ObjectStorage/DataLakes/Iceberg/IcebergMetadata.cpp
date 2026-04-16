@@ -136,6 +136,51 @@ String dumpMetadataObjectToString(const Poco::JSON::Object::Ptr & metadata_objec
     Poco::JSON::Stringifier::stringify(metadata_object, oss);
     return removeEscapedSlashes(oss.str());
 }
+
+/// Check if a previous attempt already committed this transaction the snapshot
+/// (with our transaction_id embedded in its summary) is still present in the snapshots array
+/// unless an external engine ran expireSnapshots in the meantime. If found, skip re-committing.
+bool isExportPartitionTransactionAlreadyCommitted(const Poco::JSON::Object::Ptr & metadata, const String & transaction_id)
+{
+    const auto throw_error = [&](const std::string & missing_field_name)
+    {
+        throw Exception(
+            ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
+            "No {} found in metadata for iceberg file while trying to commit export partition transaction",
+            missing_field_name);
+    };
+
+    const auto snapshots = metadata->getArray(Iceberg::f_snapshots);
+
+    if (!snapshots)
+    {
+        throw_error(Iceberg::f_snapshots);
+    }
+
+    for (size_t i = 0; i < snapshots->size(); ++i)
+    {
+        const auto snap = snapshots->getObject(static_cast<UInt32>(i));
+        const auto summary = snap->getObject(Iceberg::f_summary);
+
+        if (!summary)
+        {
+            throw_error(Iceberg::f_summary);
+        }
+
+        if (summary->has(Iceberg::f_clickhouse_export_partition_transaction_id))
+        {
+            const auto tid = summary->getValue<String>(Iceberg::f_clickhouse_export_partition_transaction_id);
+
+            if (tid == transaction_id)
+            {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 }
 
 
@@ -1443,6 +1488,15 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
     const String & blob_storage_namespace_name,
     ContextPtr context)
 {
+    /// this check also exists here because the metadata might have been updated upon retry attempts.
+    if (isExportPartitionTransactionAlreadyCommitted(metadata, transaction_id))
+    {
+        LOG_INFO(log,
+            "Export transaction {} already committed, skipping re-commit",
+            transaction_id);
+        return true;
+    }
+
     CompressionMethod metadata_compression_method = persistent_components.metadata_compression_method;
 
     auto [metadata_name, storage_metadata_name] = filename_generator.generateMetadataName();
@@ -1693,29 +1747,12 @@ void IcebergMetadata::commitExportPartitionTransaction(
         updated_metadata_file_info.compression_method,
         persistent_components.table_uuid);
 
-    /// Idempotency check: if a previous attempt already committed this transaction the snapshot
-    /// (with our transaction_id embedded in its summary) is still present in the snapshots array
-    /// unless an external engine ran expireSnapshots in the meantime. If found, skip re-committing.
-    if (const auto snapshots = metadata->getArray(Iceberg::f_snapshots))
+    if (isExportPartitionTransactionAlreadyCommitted(metadata, transaction_id))
     {
-        for (size_t i = 0; i < snapshots->size(); ++i)
-        {
-            auto snap = snapshots->getObject(static_cast<UInt32>(i));
-            if (auto summary = snap->getObject(Iceberg::f_summary))
-            {
-                String tid;
-                if (summary->has(Iceberg::f_clickhouse_export_partition_transaction_id))
-                    tid = summary->getValue<String>(Iceberg::f_clickhouse_export_partition_transaction_id);
-                if (tid == transaction_id)
-                {
-                    LOG_INFO(log,
-                        "Export transaction {} already committed as snapshot {}, skipping re-commit",
-                        transaction_id,
-                        snap->getValue<Int64>(Iceberg::f_metadata_snapshot_id));
-                    return;
-                }
-            }
-        }
+        LOG_INFO(log,
+            "Export transaction {} already committed, skipping re-commit",
+            transaction_id);
+        return;
     }
 
     /// Fail fast if the table schema or partition spec changed between export-start and commit.
