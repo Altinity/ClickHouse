@@ -190,7 +190,7 @@ def _wait_for_export(node, source: str, dest: str, pid: str, timeout: int = 60):
     )
 
 
-def _run_accepted(export_cluster, spark_ddl, ch_schema, rmt_columns, rmt_partition_by, insert_values):
+def _run_accepted(export_cluster, label, spark_ddl, ch_schema, rmt_columns, rmt_partition_by, insert_values):
     """
     Create a Spark-created Iceberg table, attach ClickHouse to it, create the
     source RMT, export, wait, and return (node, source, iceberg, partition_id)
@@ -200,8 +200,8 @@ def _run_accepted(export_cluster, spark_ddl, ch_schema, rmt_columns, rmt_partiti
     spark = export_cluster.spark_session
 
     uid = str(uuid.uuid4()).replace("-", "_")
-    source = f"rmt_{uid}"
-    iceberg = f"spark_{uid}"
+    source = f"rmt_{label}_{uid}"
+    iceberg = f"spark_{label}_{uid}"
 
     _spark_iceberg(export_cluster, spark, iceberg, spark_ddl.format(TABLE=iceberg))
     _attach_ch_iceberg(node, iceberg, ch_schema, export_cluster)
@@ -215,7 +215,7 @@ def _run_accepted(export_cluster, spark_ddl, ch_schema, rmt_columns, rmt_partiti
     return node, source, iceberg, pid
 
 
-def _run_rejected(export_cluster, spark_ddl, ch_schema, rmt_columns, rmt_partition_by, insert_values):
+def _run_rejected(export_cluster, label, spark_ddl, ch_schema, rmt_columns, rmt_partition_by, insert_values):
     """
     Create a mismatched pair and assert that EXPORT PARTITION fails with BAD_ARGUMENTS.
     The check fires synchronously before any task is enqueued.
@@ -224,8 +224,8 @@ def _run_rejected(export_cluster, spark_ddl, ch_schema, rmt_columns, rmt_partiti
     spark = export_cluster.spark_session
 
     uid = str(uuid.uuid4()).replace("-", "_")
-    source = f"rmt_{uid}"
-    iceberg = f"spark_{uid}"
+    source = f"rmt_{label}_{uid}"
+    iceberg = f"spark_{label}_{uid}"
 
     _spark_iceberg(export_cluster, spark, iceberg, spark_ddl.format(TABLE=iceberg))
     _attach_ch_iceberg(node, iceberg, ch_schema, export_cluster)
@@ -306,6 +306,7 @@ def test_identity_transform(export_cluster):
     """Spark identity(year)  <->  PARTITION BY year."""
     node, _, iceberg, _ = _run_accepted(
         export_cluster,
+        "identity",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, year INT)"
                   " USING iceberg PARTITIONED BY (identity(year)) OPTIONS('format-version'='2')",
         ch_schema="id Int64, year Int32",
@@ -320,6 +321,7 @@ def test_year_transform(export_cluster):
     """Spark years(dt)  <->  PARTITION BY toYearNumSinceEpoch(dt)."""
     node, _, iceberg, _ = _run_accepted(
         export_cluster,
+        "year",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, dt DATE)"
                   " USING iceberg PARTITIONED BY (years(dt)) OPTIONS('format-version'='2')",
         ch_schema="id Int64, dt Date",
@@ -334,6 +336,7 @@ def test_month_transform(export_cluster):
     """Spark months(dt)  <->  PARTITION BY toMonthNumSinceEpoch(dt)."""
     node, _, iceberg, _ = _run_accepted(
         export_cluster,
+        "month",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, dt DATE)"
                   " USING iceberg PARTITIONED BY (months(dt)) OPTIONS('format-version'='2')",
         ch_schema="id Int64, dt Date",
@@ -348,6 +351,7 @@ def test_day_transform(export_cluster):
     """Spark days(dt)  <->  PARTITION BY toRelativeDayNum(dt)."""
     node, _, iceberg, _ = _run_accepted(
         export_cluster,
+        "day",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, dt DATE)"
                   " USING iceberg PARTITIONED BY (days(dt)) OPTIONS('format-version'='2')",
         ch_schema="id Int64, dt Date",
@@ -366,6 +370,7 @@ def test_hour_transform(export_cluster):
     """
     node, _, iceberg, _ = _run_accepted(
         export_cluster,
+        "hour",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, ts TIMESTAMP)"
                   " USING iceberg PARTITIONED BY (hours(ts)) OPTIONS('format-version'='2')",
         ch_schema="id Int64, ts DateTime64(6)",
@@ -384,6 +389,7 @@ def test_bucket_transform(export_cluster):
     """Spark bucket(8, user_id)  <->  PARTITION BY icebergBucket(8, user_id)."""
     node, _, iceberg, _ = _run_accepted(
         export_cluster,
+        "bucket",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, user_id BIGINT)"
                   " USING iceberg PARTITIONED BY (bucket(8, user_id)) OPTIONS('format-version'='2')",
         ch_schema="id Int64, user_id Int64",
@@ -399,6 +405,7 @@ def test_truncate_transform(export_cluster):
     """Spark truncate(4, category)  <->  PARTITION BY icebergTruncate(4, category)."""
     node, _, iceberg, _ = _run_accepted(
         export_cluster,
+        "truncate",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, category STRING)"
                   " USING iceberg PARTITIONED BY (truncate(4, category)) OPTIONS('format-version'='2')",
         ch_schema="id Int64, category String",
@@ -414,6 +421,7 @@ def test_compound_transform(export_cluster):
     """Spark (identity(year), identity(region))  <->  PARTITION BY (year, region)."""
     node, _, iceberg, _ = _run_accepted(
         export_cluster,
+        "compound",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, year INT, region STRING)"
                   " USING iceberg PARTITIONED BY (identity(year), identity(region))"
                   " OPTIONS('format-version'='2')",
@@ -434,6 +442,7 @@ def test_identity_int64(export_cluster):
     """
     node, _, iceberg, _ = _run_accepted(
         export_cluster,
+        "identity_int64",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, user_id BIGINT)"
                   " USING iceberg PARTITIONED BY (identity(user_id))"
                   " OPTIONS('format-version'='2')",
@@ -455,6 +464,7 @@ def test_identity_date(export_cluster):
     """
     node, _, iceberg, _ = _run_accepted(
         export_cluster,
+        "identity_date",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, event_date DATE)"
                   " USING iceberg PARTITIONED BY (identity(event_date))"
                   " OPTIONS('format-version'='2')",
@@ -476,6 +486,7 @@ def test_identity_string(export_cluster):
     """
     node, _, iceberg, _ = _run_accepted(
         export_cluster,
+        "identity_str",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, region STRING)"
                   " USING iceberg PARTITIONED BY (identity(region))"
                   " OPTIONS('format-version'='2')",
@@ -497,6 +508,7 @@ def test_truncate_int64(export_cluster):
     """
     node, _, iceberg, _ = _run_accepted(
         export_cluster,
+        "truncate_int64",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, amount BIGINT)"
                   " USING iceberg PARTITIONED BY (truncate(10, amount))"
                   " OPTIONS('format-version'='2')",
@@ -518,6 +530,7 @@ def test_bucket_string(export_cluster):
     """
     node, _, iceberg, _ = _run_accepted(
         export_cluster,
+        "bucket_str",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, name STRING)"
                   " USING iceberg PARTITIONED BY (bucket(8, name))"
                   " OPTIONS('format-version'='2')",
@@ -539,6 +552,7 @@ def test_year_transform_timestamp(export_cluster):
     """
     node, _, iceberg, _ = _run_accepted(
         export_cluster,
+        "year_ts",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, ts TIMESTAMP)"
                   " USING iceberg PARTITIONED BY (years(ts))"
                   " OPTIONS('format-version'='2')",
@@ -562,6 +576,7 @@ def test_month_transform_timestamp(export_cluster):
     """
     node, _, iceberg, _ = _run_accepted(
         export_cluster,
+        "month_ts",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, ts TIMESTAMP)"
                   " USING iceberg PARTITIONED BY (months(ts))"
                   " OPTIONS('format-version'='2')",
@@ -585,6 +600,7 @@ def test_day_transform_timestamp(export_cluster):
     """
     node, _, iceberg, _ = _run_accepted(
         export_cluster,
+        "day_ts",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, ts TIMESTAMP)"
                   " USING iceberg PARTITIONED BY (days(ts))"
                   " OPTIONS('format-version'='2')",
@@ -608,6 +624,7 @@ def test_rejected_column_mismatch(export_cluster):
     """Spark identity(year) — RMT PARTITION BY id: different column."""
     error = _run_rejected(
         export_cluster,
+        "rej_col_mismatch",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, year INT)"
                   " USING iceberg PARTITIONED BY (identity(year)) OPTIONS('format-version'='2')",
         ch_schema="id Int64, year Int32",
@@ -622,6 +639,7 @@ def test_rejected_transform_mismatch(export_cluster):
     """Spark years(dt) — RMT PARTITION BY dt (identity, not year-transform)."""
     error = _run_rejected(
         export_cluster,
+        "rej_xform_mismatch",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, dt DATE)"
                   " USING iceberg PARTITIONED BY (years(dt)) OPTIONS('format-version'='2')",
         ch_schema="id Int64, dt Date",
@@ -636,6 +654,7 @@ def test_rejected_bucket_count_mismatch(export_cluster):
     """Spark bucket(8, user_id) — RMT icebergBucket(16, user_id): wrong N."""
     error = _run_rejected(
         export_cluster,
+        "rej_bucket_n",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, user_id BIGINT)"
                   " USING iceberg PARTITIONED BY (bucket(8, user_id)) OPTIONS('format-version'='2')",
         ch_schema="id Int64, user_id Int64",
@@ -650,6 +669,7 @@ def test_rejected_truncate_width_mismatch(export_cluster):
     """Spark truncate(4, category) — RMT icebergTruncate(8, category): wrong width."""
     error = _run_rejected(
         export_cluster,
+        "rej_trunc_w",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, category STRING)"
                   " USING iceberg PARTITIONED BY (truncate(4, category)) OPTIONS('format-version'='2')",
         ch_schema="id Int64, category String",
@@ -664,6 +684,7 @@ def test_rejected_field_count_mismatch(export_cluster):
     """Spark 1-field identity(year) — RMT 2-field (year, region)."""
     error = _run_rejected(
         export_cluster,
+        "rej_field_n",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, year INT, region STRING)"
                   " USING iceberg PARTITIONED BY (identity(year)) OPTIONS('format-version'='2')",
         ch_schema="id Int64, year Int32, region String",
@@ -678,6 +699,7 @@ def test_rejected_compound_order_reversed(export_cluster):
     """Spark (identity(year), identity(region)) — RMT (region, year): reversed order."""
     error = _run_rejected(
         export_cluster,
+        "rej_compound_rev",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, year INT, region STRING)"
                   " USING iceberg PARTITIONED BY (identity(year), identity(region))"
                   " OPTIONS('format-version'='2')",
@@ -760,8 +782,8 @@ def test_export_initiated_from_replica2(export_cluster):
     Validates that any replica can start the export, not just the writer.
     """
     uid = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"rmt_{uid}"
-    iceberg_table = f"iceberg_{uid}"
+    mt_table = f"rmt_from_replica2_{uid}"
+    iceberg_table = f"iceberg_from_replica2_{uid}"
 
     _setup_replicas(export_cluster, mt_table, iceberg_table, ["replica1", "replica2"])
 
@@ -787,8 +809,8 @@ def test_concurrent_exports_different_partitions_across_replicas(export_cluster)
     equal the sum of all inserted rows.
     """
     uid = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"rmt_{uid}"
-    iceberg_table = f"iceberg_{uid}"
+    mt_table = f"rmt_concurrent_diff_parts_{uid}"
+    iceberg_table = f"iceberg_concurrent_diff_parts_{uid}"
 
     _setup_replicas(
         export_cluster, mt_table, iceberg_table,
@@ -882,8 +904,8 @@ def test_three_replica_concurrent_exports(export_cluster):
     All futures must complete successfully; total row count must be correct.
     """
     uid = str(uuid.uuid4()).replace("-", "_")
-    mt_table = f"rmt_{uid}"
-    iceberg_table = f"iceberg_{uid}"
+    mt_table = f"rmt_three_replicas_concurrent_{uid}"
+    iceberg_table = f"iceberg_three_replicas_concurrent_{uid}"
 
     _setup_replicas(
         export_cluster, mt_table, iceberg_table,

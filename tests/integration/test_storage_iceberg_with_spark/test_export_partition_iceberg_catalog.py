@@ -234,9 +234,9 @@ def test_catalog_basic_export(catalog_export_cluster):
     node = catalog_export_cluster.instances["node1"]
     catalog = _load_catalog(catalog_export_cluster)
 
-    ns = f"ns_{uuid.uuid4().hex[:8]}"
-    tbl = f"tbl_{uuid.uuid4().hex[:8]}"
-    source = f"rmt_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_basic_{uuid.uuid4().hex[:8]}"
+    tbl = f"tbl_basic_{uuid.uuid4().hex[:8]}"
+    source = f"rmt_basic_{uuid.uuid4().hex[:8]}"
 
     catalog.create_namespace((ns,))
     _create_iceberg_table(catalog, ns, tbl)
@@ -276,9 +276,9 @@ def test_catalog_concurrent_export(catalog_export_cluster):
     node = catalog_export_cluster.instances["node1"]
     catalog = _load_catalog(catalog_export_cluster)
 
-    ns = f"ns_{uuid.uuid4().hex[:8]}"
-    tbl = f"tbl_{uuid.uuid4().hex[:8]}"
-    source = f"rmt_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_concurrent_{uuid.uuid4().hex[:8]}"
+    tbl = f"tbl_concurrent_{uuid.uuid4().hex[:8]}"
+    source = f"rmt_concurrent_{uuid.uuid4().hex[:8]}"
 
     catalog.create_namespace((ns,))
     _create_iceberg_table(catalog, ns, tbl)
@@ -340,9 +340,9 @@ def test_catalog_idempotent_retry(catalog_export_cluster):
     node = catalog_export_cluster.instances["node1"]
     catalog = _load_catalog(catalog_export_cluster)
 
-    ns = f"ns_{uuid.uuid4().hex[:8]}"
-    tbl = f"tbl_{uuid.uuid4().hex[:8]}"
-    source = f"rmt_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_idempotent_{uuid.uuid4().hex[:8]}"
+    tbl = f"tbl_idempotent_{uuid.uuid4().hex[:8]}"
+    source = f"rmt_idempotent_{uuid.uuid4().hex[:8]}"
 
     catalog.create_namespace((ns,))
     _create_iceberg_table(catalog, ns, tbl)
@@ -400,9 +400,9 @@ def test_catalog_export_two_replicas_basic(catalog_export_cluster):
     """
     catalog = _load_catalog(catalog_export_cluster)
 
-    ns = f"ns_{uuid.uuid4().hex[:8]}"
-    tbl = f"tbl_{uuid.uuid4().hex[:8]}"
-    source = f"rmt_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_two_replicas_{uuid.uuid4().hex[:8]}"
+    tbl = f"tbl_two_replicas_{uuid.uuid4().hex[:8]}"
+    source = f"rmt_two_replicas_{uuid.uuid4().hex[:8]}"
 
     catalog.create_namespace((ns,))
     _create_iceberg_table(catalog, ns, tbl)
@@ -440,9 +440,9 @@ def test_catalog_concurrent_export_from_different_replicas(catalog_export_cluste
     """
     catalog = _load_catalog(catalog_export_cluster)
 
-    ns = f"ns_{uuid.uuid4().hex[:8]}"
-    tbl = f"tbl_{uuid.uuid4().hex[:8]}"
-    source = f"rmt_{uuid.uuid4().hex[:8]}"
+    ns = f"ns_conc_replicas_{uuid.uuid4().hex[:8]}"
+    tbl = f"tbl_conc_replicas_{uuid.uuid4().hex[:8]}"
+    source = f"rmt_conc_replicas_{uuid.uuid4().hex[:8]}"
 
     catalog.create_namespace((ns,))
     _create_iceberg_table(catalog, ns, tbl)
