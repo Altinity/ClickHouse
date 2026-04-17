@@ -30,8 +30,6 @@ RUN sed -i "s|http://archive.ubuntu.com|${apt_archive}|g" /etc/apt/sources.list 
     && busybox --install -s \
     && rm -rf /var/lib/apt/lists/* /var/cache/debconf /tmp/*
 
-RUN apk upgrade --no-cache libcrypto3 libssl3
-
 #docker-official-library:off
 # The part between `docker-official-library` tags is related to our builds
 
