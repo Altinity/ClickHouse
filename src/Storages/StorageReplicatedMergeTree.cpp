@@ -8462,7 +8462,18 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     Coordination::Error code = zookeeper->tryMulti(ops, responses);
 
     if (code != Coordination::Error::ZOK)
+    {
+        if (code == Coordination::Error::ZNODEEXISTS
+            && zkutil::getFailedOpIndex(code, responses) == 0)
+        {
+            /// Lost the race on the root export node. Current code already
+            /// validated (exists / expired / force) — so this is *always* a race.
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Export with key {} was created concurrently by another replica. Retry if needed",
+                export_key);
+        }
         throw zkutil::KeeperException::fromPath(code, partition_exports_path);
+    }
 }
 
 
