@@ -1800,7 +1800,7 @@ class ClickHouseCluster:
         self.with_keycloak = True
         env_variables["KEYCLOAK_EXTERNAL_PORT"] = str(self.keycloak_port)
         env_variables["KEYCLOAK_REALM_FILE"] = p.join(
-            p.dirname(instance.path),
+            self.base_dir,
             "keycloak",
             "realm-export.json",
         )
