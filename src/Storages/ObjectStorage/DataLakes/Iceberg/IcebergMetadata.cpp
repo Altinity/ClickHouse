@@ -1480,9 +1480,9 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
     SharedHeader sample_block,
     const std::vector<String> & data_file_paths,
     const std::vector<IcebergSerializedFileStats> & per_file_stats,
-    Int32 total_data_files,
-    Int32 total_rows,
-    Int32 total_chunks_size,
+    Int64 total_data_files,
+    Int64 total_rows,
+    Int64 total_chunks_size,
     std::shared_ptr<DataLake::ICatalog> catalog,
     const StorageID & table_id,
     const String & blob_storage_type_name,
@@ -1849,18 +1849,18 @@ void IcebergMetadata::commitExportPartitionTransaction(
     }
     filename_generator.setVersion(updated_metadata_file_info.version + 1);
 
-    /// Load per-file sidecar stats, necessary to populate the manifest file stats
+    /// Load per-file sidecar stats, necessary to populate the manifest file stats.
     std::vector<IcebergSerializedFileStats> per_file_stats;
-    const Int32 total_data_files = static_cast<Int32>(data_file_paths.size());
-    Int32 total_rows = 0;
-    Int32 total_chunks_size = 0;
-    per_file_stats.reserve(static_cast<size_t>(total_data_files));
+    const Int64 total_data_files = static_cast<Int64>(data_file_paths.size());
+    Int64 total_rows = 0;
+    Int64 total_chunks_size = 0;
+    per_file_stats.reserve(data_file_paths.size());
     for (const auto & path : data_file_paths)
     {
         const auto sidecar_path = getIcebergExportPartSidecarStoragePath(path);
         auto sidecar = readDataFileSidecar(sidecar_path, object_storage, context);
-        total_rows += static_cast<Int32>(sidecar.record_count);
-        total_chunks_size += static_cast<Int32>(sidecar.file_size_in_bytes);
+        total_rows += sidecar.record_count;
+        total_chunks_size += sidecar.file_size_in_bytes;
 
         per_file_stats.push_back(std::move(sidecar.column_stats));
     }
