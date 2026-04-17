@@ -27,6 +27,10 @@ from pyiceberg.types import LongType, NestedField, StringType
 
 from helpers.cluster import ClickHouseCluster
 from helpers.config_cluster import minio_access_key, minio_secret_key
+from helpers.export_partition_helpers import (
+    make_rmt,
+    wait_for_export_status,
+)
 
 
 GLUE_BASE_URL = "http://glue:3000"
@@ -95,7 +99,7 @@ def cleanup_tables(catalog_export_cluster):
 # ---------------------------------------------------------------------------
 
 
-def _load_catalog(cluster):
+def connect_catalog(cluster):
     """
     Connect to the Moto Glue mock from the test host via localhost:3000.
     MinIO is accessed via the container IP for S3 operations.
@@ -114,7 +118,7 @@ def _load_catalog(cluster):
     )
 
 
-def _setup_ch_catalog_db(node, db_name: str = CH_CATALOG_DB) -> None:
+def setup_ch_catalog_db(node, db_name: str = CH_CATALOG_DB) -> None:
     """Drop-and-recreate the ClickHouse DataLakeCatalog database pointing at Glue (Moto)."""
     node.query(f"DROP DATABASE IF EXISTS {db_name}")
     node.query(
@@ -131,39 +135,13 @@ def _setup_ch_catalog_db(node, db_name: str = CH_CATALOG_DB) -> None:
     )
 
 
-def _wait_for_export(node, source: str, pid: str, timeout: int = 120) -> None:
-    """Poll system.replicated_partition_exports until the task reaches COMPLETED."""
-    start = time.time()
-    last_status = None
-    while time.time() - start < timeout:
-        status = node.query(
-            f"SELECT status FROM system.replicated_partition_exports"
-            f" WHERE source_table = '{source}' AND partition_id = '{pid}'"
-        ).strip()
-        last_status = status
-        if status == "COMPLETED":
-            return
-        time.sleep(0.5)
-    raise TimeoutError(
-        f"Export {source}/{pid} did not reach COMPLETED within {timeout}s "
-        f"(last: {last_status!r})"
-    )
-
-
-def _make_rmt(node, name: str, replica_name: str = "r1") -> None:
+def create_catalog_rmt(node, name: str, replica_name: str = "r1") -> None:
     """Create an identity(region)-partitioned ReplicatedMergeTree source table."""
-    node.query(
-        f"""
-        CREATE TABLE {name} (id Int64, region String)
-        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{name}', '{replica_name}')
-        PARTITION BY region
-        ORDER BY id
-        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
-        """
-    )
+    make_rmt(node, name, "id Int64, region String", "region",
+             replica_name=replica_name, order_by="id")
 
 
-def _partition_id_for(node, table: str, region: str) -> str:
+def partition_id_for(node, table: str, region: str) -> str:
     return node.query(
         f"SELECT DISTINCT partition_id FROM system.parts"
         f" WHERE table = '{table}' AND active AND partition = '{region}'"
@@ -171,7 +149,7 @@ def _partition_id_for(node, table: str, region: str) -> str:
     ).strip()
 
 
-def _create_iceberg_table(catalog, ns: str, tbl: str) -> None:
+def create_catalog_iceberg_table(catalog, ns: str, tbl: str) -> None:
     """
     Create a simple identity(region)-partitioned Iceberg table in the catalog.
     Using format-version 2 and uncompressed metadata for test simplicity.
@@ -204,15 +182,15 @@ def _create_iceberg_table(catalog, ns: str, tbl: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _setup_catalog_replicas(cluster, source_table: str, replica_names: list) -> None:
+def setup_catalog_replicas(cluster, source_table: str, replica_names: list) -> None:
     """
     Create RMT on each named replica (each with its own replica_name so they share
     the same ZK path) and set up the DataLakeCatalog database on every node.
     No data is inserted here — callers manage their own test data.
     """
     for rname in replica_names:
-        _make_rmt(cluster.instances[rname], source_table, replica_name=rname)
-        _setup_ch_catalog_db(cluster.instances[rname])
+        create_catalog_rmt(cluster.instances[rname], source_table, replica_name=rname)
+        setup_ch_catalog_db(cluster.instances[rname])
 
 
 # ---------------------------------------------------------------------------
@@ -232,27 +210,27 @@ def test_catalog_basic_export(catalog_export_cluster):
         → catalog->updateMetadata(namespace, table, new_metadata_file, snapshot)
     """
     node = catalog_export_cluster.instances["node1"]
-    catalog = _load_catalog(catalog_export_cluster)
+    catalog = connect_catalog(catalog_export_cluster)
 
     ns = f"ns_basic_{uuid.uuid4().hex[:8]}"
     tbl = f"tbl_basic_{uuid.uuid4().hex[:8]}"
     source = f"rmt_basic_{uuid.uuid4().hex[:8]}"
 
     catalog.create_namespace((ns,))
-    _create_iceberg_table(catalog, ns, tbl)
-    _setup_ch_catalog_db(node)
-    _make_rmt(node, source)
+    create_catalog_iceberg_table(catalog, ns, tbl)
+    setup_ch_catalog_db(node)
+    create_catalog_rmt(node, source)
 
     node.query(f"INSERT INTO {source} VALUES (1, 'EU'), (2, 'EU'), (3, 'EU')")
 
-    pid = _partition_id_for(node, source, "EU")
+    pid = partition_id_for(node, source, "EU")
     dest_ch = f"`{CH_CATALOG_DB}`.`{ns}.{tbl}`"
 
     node.query(
         f"ALTER TABLE {source} EXPORT PARTITION ID '{pid}' TO TABLE {dest_ch}",
         settings={"write_full_path_in_iceberg_metadata": 1},
     )
-    _wait_for_export(node, source, pid)
+    wait_for_export_status(node, source, None, pid)
 
     count = int(node.query(f"SELECT count() FROM {dest_ch}").strip())
     assert count == 3, f"Expected 3 rows, got {count}"
@@ -274,22 +252,22 @@ def test_catalog_concurrent_export(catalog_export_cluster):
     - The catalog history contains at least two snapshots (one per partition).
     """
     node = catalog_export_cluster.instances["node1"]
-    catalog = _load_catalog(catalog_export_cluster)
+    catalog = connect_catalog(catalog_export_cluster)
 
     ns = f"ns_concurrent_{uuid.uuid4().hex[:8]}"
     tbl = f"tbl_concurrent_{uuid.uuid4().hex[:8]}"
     source = f"rmt_concurrent_{uuid.uuid4().hex[:8]}"
 
     catalog.create_namespace((ns,))
-    _create_iceberg_table(catalog, ns, tbl)
-    _setup_ch_catalog_db(node)
-    _make_rmt(node, source)
+    create_catalog_iceberg_table(catalog, ns, tbl)
+    setup_ch_catalog_db(node)
+    create_catalog_rmt(node, source)
 
     node.query(f"INSERT INTO {source} VALUES (1, 'EU'), (2, 'EU'), (3, 'EU')")
     node.query(f"INSERT INTO {source} VALUES (4, 'US'), (5, 'US'), (6, 'US')")
 
-    pid_eu = _partition_id_for(node, source, "EU")
-    pid_us = _partition_id_for(node, source, "US")
+    pid_eu = partition_id_for(node, source, "EU")
+    pid_us = partition_id_for(node, source, "US")
     dest_ch = f"`{CH_CATALOG_DB}`.`{ns}.{tbl}`"
 
     errors: list = []
@@ -300,7 +278,7 @@ def test_catalog_concurrent_export(catalog_export_cluster):
                 f"ALTER TABLE {source} EXPORT PARTITION ID '{pid}' TO TABLE {dest_ch}",
                 settings={"write_full_path_in_iceberg_metadata": 1},
             )
-            _wait_for_export(node, source, pid, timeout=120)
+            wait_for_export_status(node, source, None, pid, timeout=120)
         except Exception as exc:
             errors.append(exc)
 
@@ -338,20 +316,20 @@ def test_catalog_idempotent_retry(catalog_export_cluster):
     - Exactly 1 snapshot in the Glue catalog (the idempotent retry was a no-op).
     """
     node = catalog_export_cluster.instances["node1"]
-    catalog = _load_catalog(catalog_export_cluster)
+    catalog = connect_catalog(catalog_export_cluster)
 
     ns = f"ns_idempotent_{uuid.uuid4().hex[:8]}"
     tbl = f"tbl_idempotent_{uuid.uuid4().hex[:8]}"
     source = f"rmt_idempotent_{uuid.uuid4().hex[:8]}"
 
     catalog.create_namespace((ns,))
-    _create_iceberg_table(catalog, ns, tbl)
-    _setup_ch_catalog_db(node)
-    _make_rmt(node, source)
+    create_catalog_iceberg_table(catalog, ns, tbl)
+    setup_ch_catalog_db(node)
+    create_catalog_rmt(node, source)
 
     node.query(f"INSERT INTO {source} VALUES (1, 'EU'), (2, 'EU'), (3, 'EU')")
 
-    pid = _partition_id_for(node, source, "EU")
+    pid = partition_id_for(node, source, "EU")
     dest_ch = f"`{CH_CATALOG_DB}`.`{ns}.{tbl}`"
 
     # Enable the ONCE failpoint: after a successful catalog commit the process
@@ -369,12 +347,12 @@ def test_catalog_idempotent_retry(catalog_export_cluster):
 
     # ClickHouse persists database metadata to disk so the DataLakeCatalog database
     # survives the crash.  Recreate it anyway to make the test self-contained.
-    _setup_ch_catalog_db(node)
+    setup_ch_catalog_db(node)
 
     # The scheduler picks up the PENDING task and retries. commitExportPartitionTransaction
     # detects the transaction_id in the existing snapshot summary and skips the
     # re-commit, then marks the task COMPLETED in ZooKeeper.
-    _wait_for_export(node, source, pid, timeout=120)
+    wait_for_export_status(node, source, None, pid, timeout=120)
 
     count = int(node.query(f"SELECT count() FROM {dest_ch}").strip())
     assert count == 3, f"Expected 3 rows (no duplicates from idempotent retry), got {count}"
@@ -398,16 +376,16 @@ def test_catalog_export_two_replicas_basic(catalog_export_cluster):
     Export is initiated on replica1; row count is verified from replica2 via
     the DataLakeCatalog database to confirm the catalog commit was visible.
     """
-    catalog = _load_catalog(catalog_export_cluster)
+    catalog = connect_catalog(catalog_export_cluster)
 
     ns = f"ns_two_replicas_{uuid.uuid4().hex[:8]}"
     tbl = f"tbl_two_replicas_{uuid.uuid4().hex[:8]}"
     source = f"rmt_two_replicas_{uuid.uuid4().hex[:8]}"
 
     catalog.create_namespace((ns,))
-    _create_iceberg_table(catalog, ns, tbl)
+    create_catalog_iceberg_table(catalog, ns, tbl)
 
-    _setup_catalog_replicas(catalog_export_cluster, source, ["replica1", "replica2"])
+    setup_catalog_replicas(catalog_export_cluster, source, ["replica1", "replica2"])
 
     r1 = catalog_export_cluster.instances["replica1"]
     r2 = catalog_export_cluster.instances["replica2"]
@@ -415,14 +393,14 @@ def test_catalog_export_two_replicas_basic(catalog_export_cluster):
     r1.query(f"INSERT INTO {source} VALUES (1, 'EU'), (2, 'EU'), (3, 'EU')")
     r2.query(f"SYSTEM SYNC REPLICA {source}")
 
-    pid = _partition_id_for(r1, source, "EU")
+    pid = partition_id_for(r1, source, "EU")
     dest_ch = f"`{CH_CATALOG_DB}`.`{ns}.{tbl}`"
 
     r1.query(
         f"ALTER TABLE {source} EXPORT PARTITION ID '{pid}' TO TABLE {dest_ch}",
         settings={"write_full_path_in_iceberg_metadata": 1},
     )
-    _wait_for_export(r1, source, pid)
+    wait_for_export_status(r1, source, None, pid)
 
     iceberg_tbl = catalog.load_table(f"{ns}.{tbl}")
     assert iceberg_tbl.current_snapshot() is not None, \
@@ -438,16 +416,16 @@ def test_catalog_concurrent_export_from_different_replicas(catalog_export_cluste
     catalog-backed Iceberg table. Both catalog commits must succeed; total row count
     must equal 6 and Glue history must contain at least 2 snapshots.
     """
-    catalog = _load_catalog(catalog_export_cluster)
+    catalog = connect_catalog(catalog_export_cluster)
 
     ns = f"ns_conc_replicas_{uuid.uuid4().hex[:8]}"
     tbl = f"tbl_conc_replicas_{uuid.uuid4().hex[:8]}"
     source = f"rmt_conc_replicas_{uuid.uuid4().hex[:8]}"
 
     catalog.create_namespace((ns,))
-    _create_iceberg_table(catalog, ns, tbl)
+    create_catalog_iceberg_table(catalog, ns, tbl)
 
-    _setup_catalog_replicas(catalog_export_cluster, source, ["replica1", "replica2"])
+    setup_catalog_replicas(catalog_export_cluster, source, ["replica1", "replica2"])
 
     r1 = catalog_export_cluster.instances["replica1"]
     r2 = catalog_export_cluster.instances["replica2"]
@@ -456,8 +434,8 @@ def test_catalog_concurrent_export_from_different_replicas(catalog_export_cluste
     r1.query(f"INSERT INTO {source} VALUES (4, 'US'), (5, 'US'), (6, 'US')")
     r2.query(f"SYSTEM SYNC REPLICA {source}")
 
-    pid_eu = _partition_id_for(r1, source, "EU")
-    pid_us = _partition_id_for(r1, source, "US")
+    pid_eu = partition_id_for(r1, source, "EU")
+    pid_us = partition_id_for(r1, source, "US")
     dest_ch = f"`{CH_CATALOG_DB}`.`{ns}.{tbl}`"
 
     errors: list = []
@@ -468,7 +446,7 @@ def test_catalog_concurrent_export_from_different_replicas(catalog_export_cluste
                 f"ALTER TABLE {source} EXPORT PARTITION ID '{pid}' TO TABLE {dest_ch}",
                 settings={"write_full_path_in_iceberg_metadata": 1},
             )
-            _wait_for_export(node, source, pid, timeout=120)
+            wait_for_export_status(node, source, None, pid, timeout=120)
         except Exception as exc:
             errors.append(exc)
 
@@ -498,16 +476,16 @@ def test_catalog_concurrent_export_from_different_replicas(catalog_export_cluste
 # BAD_ARGUMENTS "already exported" (the winner commits before the loser's
 # exists() check). The test cannot reliably assert either error in isolation.
 # def test_catalog_idempotent_same_partition_two_replicas(catalog_export_cluster):
-#     catalog = _load_catalog(catalog_export_cluster)
+#     catalog = connect_catalog(catalog_export_cluster)
 #
 #     ns = f"ns_{uuid.uuid4().hex[:8]}"
 #     tbl = f"tbl_{uuid.uuid4().hex[:8]}"
 #     source = f"rmt_{uuid.uuid4().hex[:8]}"
 #
 #     catalog.create_namespace((ns,))
-#     _create_iceberg_table(catalog, ns, tbl)
+#     create_catalog_iceberg_table(catalog, ns, tbl)
 #
-#     _setup_catalog_replicas(catalog_export_cluster, source, ["replica1", "replica2"])
+#     setup_catalog_replicas(catalog_export_cluster, source, ["replica1", "replica2"])
 #
 #     r1 = catalog_export_cluster.instances["replica1"]
 #     r2 = catalog_export_cluster.instances["replica2"]
@@ -515,7 +493,7 @@ def test_catalog_concurrent_export_from_different_replicas(catalog_export_cluste
 #     r1.query(f"INSERT INTO {source} VALUES (1, 'EU'), (2, 'EU'), (3, 'EU')")
 #     r2.query(f"SYSTEM SYNC REPLICA {source}")
 #
-#     pid = _partition_id_for(r1, source, "EU")
+#     pid = partition_id_for(r1, source, "EU")
 #     dest_ch = f"`{CH_CATALOG_DB}`.`{ns}.{tbl}`"
 #
 #     errors: list = []
@@ -526,7 +504,7 @@ def test_catalog_concurrent_export_from_different_replicas(catalog_export_cluste
 #                 f"ALTER TABLE {source} EXPORT PARTITION ID '{pid}' TO TABLE {dest_ch}",
 #                 settings={"write_full_path_in_iceberg_metadata": 1},
 #             )
-#             _wait_for_export(node, source, pid, timeout=120)
+#             wait_for_export_status(node, source, None, pid, timeout=120)
 #         except Exception as exc:
 #             errors.append(exc)
 #

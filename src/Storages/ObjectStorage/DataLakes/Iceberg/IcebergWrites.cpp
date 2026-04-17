@@ -196,7 +196,6 @@ bool canWriteStatistics(
 
 }
 
-/// Replace the file extension of `path` with ".avro", or append ".avro" when there is none.
 String getIcebergExportPartSidecarStoragePath(const String & data_file_storage_path)
 {
     static constexpr auto postfix = "clickhouse_export_part_sidecar.avro";

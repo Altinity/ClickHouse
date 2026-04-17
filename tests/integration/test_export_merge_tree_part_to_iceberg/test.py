@@ -16,15 +16,16 @@ Coverage:
 
 import logging
 import time
-import uuid
 
 import pytest
 
 from helpers.cluster import ClickHouseCluster
-
-
-MINIO_USER = "minio"
-MINIO_PASS = "ClickHouse_Minio_P@ssw0rd"
+from helpers.export_partition_helpers import (
+    first_partition_id,
+    make_iceberg_s3,
+    make_mt,
+    unique_suffix,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -52,49 +53,7 @@ def cluster():
 # ---------------------------------------------------------------------------
 
 
-def _iceberg_url(name: str) -> str:
-    return f"http://minio1:9001/root/data/{name}/"
-
-
-def _make_mt(
-    node,
-    name: str,
-    columns: str,
-    partition_by: str,
-    order_by: str = "tuple()",
-) -> None:
-    node.query(
-        f"""
-        CREATE TABLE {name} ({columns})
-        ENGINE = MergeTree()
-        PARTITION BY {partition_by}
-        ORDER BY {order_by}
-        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
-        """
-    )
-
-
-def _make_iceberg(
-    node,
-    name: str,
-    columns: str,
-    partition_by: str = "",
-) -> None:
-    pclause = f"PARTITION BY {partition_by}" if partition_by else ""
-    node.query(
-        f"""
-        CREATE TABLE {name} ({columns})
-        ENGINE = IcebergS3(
-            '{_iceberg_url(name)}',
-            '{MINIO_USER}',
-            '{MINIO_PASS}'
-        )
-        {pclause} SETTINGS s3_retry_attempts = 1
-        """
-    )
-
-
-def _get_part(node, table: str, partition_id: str) -> str:
+def get_part(node, table: str, partition_id: str) -> str:
     """Return the name of the first active part of *table* in *partition_id*."""
     return node.query(
         f"SELECT name FROM system.parts "
@@ -104,23 +63,14 @@ def _get_part(node, table: str, partition_id: str) -> str:
     ).strip()
 
 
-def _get_any_partition_id(node, table: str) -> str:
-    """Return the partition_id of the first active part of *table*."""
-    return node.query(
-        f"SELECT partition_id FROM system.parts "
-        f"WHERE database = currentDatabase() AND table = '{table}' AND active "
-        f"ORDER BY name LIMIT 1"
-    ).strip()
-
-
-def _export_part(node, table: str, part: str, dest: str) -> None:
+def export_part(node, table: str, part: str, dest: str) -> None:
     node.query(
         f"ALTER TABLE {table} EXPORT PART '{part}' TO TABLE {dest} "
         f"SETTINGS allow_experimental_export_merge_tree_part = 1"
     )
 
 
-def _wait_for_export_part(
+def wait_for_export_part(
     node,
     table: str,
     part: str,
@@ -147,7 +97,7 @@ def _wait_for_export_part(
     )
 
 
-def _assert_part_log(node, table: str, part: str) -> None:
+def assert_part_log(node, table: str, part: str) -> None:
     """Assert that system.part_log contains at least one ExportPart entry."""
     log_count = int(
         node.query(
@@ -164,10 +114,6 @@ def _assert_part_log(node, table: str, part: str) -> None:
     )
 
 
-def _sfx() -> str:
-    return str(uuid.uuid4()).replace("-", "_")
-
-
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -179,18 +125,18 @@ def test_export_part_basic_to_iceberg(cluster):
     verify the row count, the content, and the system.part_log ExportPart entry.
     """
     node = cluster.instances["node1"]
-    sfx = _sfx()
+    sfx = unique_suffix()
     mt = f"mt_basic_{sfx}"
     iceberg = f"iceberg_basic_{sfx}"
 
-    _make_mt(node, mt, "id Int32, year Int32", "year")
-    _make_iceberg(node, iceberg, "id Int32, year Int32", "year")
+    make_mt(node, mt, "id Int32, year Int32", "year")
+    make_iceberg_s3(node, iceberg, "id Int32, year Int32", "year")
 
     node.query(f"INSERT INTO {mt} VALUES (1, 2020), (2, 2020), (3, 2020), (4, 2021)")
 
-    part_2020 = _get_part(node, mt, "2020")
-    _export_part(node, mt, part_2020, iceberg)
-    _wait_for_export_part(node, mt, part_2020)
+    part_2020 = get_part(node, mt, "2020")
+    export_part(node, mt, part_2020, iceberg)
+    wait_for_export_part(node, mt, part_2020)
 
     count = int(node.query(f"SELECT count() FROM {iceberg}").strip())
     assert count == 3, f"Expected 3 rows in Iceberg table after export, got {count}"
@@ -198,7 +144,7 @@ def test_export_part_basic_to_iceberg(cluster):
     result = node.query(f"SELECT id, year FROM {iceberg} ORDER BY id").strip()
     assert result == "1\t2020\n2\t2020\n3\t2020", f"Unexpected exported data:\n{result}"
 
-    _assert_part_log(node, mt, part_2020)
+    assert_part_log(node, mt, part_2020)
 
     node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
     node.query(f"DROP TABLE IF EXISTS {iceberg}")
@@ -227,7 +173,7 @@ def test_export_part_all_iceberg_types(cluster):
     and that system.part_log records the ExportPart event.
     """
     node = cluster.instances["node1"]
-    sfx = _sfx()
+    sfx = unique_suffix()
     mt = f"mt_types_{sfx}"
     iceberg = f"iceberg_types_{sfx}"
 
@@ -243,8 +189,8 @@ def test_export_part_all_iceberg_types(cluster):
         "year Int32"
     )
 
-    _make_mt(node, mt, columns, "year", order_by="id")
-    _make_iceberg(node, iceberg, columns, "year")
+    make_mt(node, mt, columns, "year", order_by="id")
+    make_iceberg_s3(node, iceberg, columns, "year")
 
     node.query(
         f"""
@@ -263,9 +209,9 @@ def test_export_part_all_iceberg_types(cluster):
         """
     )
 
-    part = _get_part(node, mt, "2024")
-    _export_part(node, mt, part, iceberg)
-    _wait_for_export_part(node, mt, part)
+    part = get_part(node, mt, "2024")
+    export_part(node, mt, part, iceberg)
+    wait_for_export_part(node, mt, part)
 
     count = int(node.query(f"SELECT count() FROM {iceberg}").strip())
     assert count == 1, f"Expected 1 row in Iceberg table, got {count}"
@@ -292,7 +238,7 @@ def test_export_part_all_iceberg_types(cluster):
         f"UUID round-trip failed: {uid_result!r}"
     )
 
-    _assert_part_log(node, mt, part)
+    assert_part_log(node, mt, part)
 
     node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
     node.query(f"DROP TABLE IF EXISTS {iceberg}")
@@ -305,25 +251,25 @@ def test_export_multiple_parts_to_iceberg(cluster):
     system.part_log must contain one ExportPart entry per exported part.
     """
     node = cluster.instances["node1"]
-    sfx = _sfx()
+    sfx = unique_suffix()
     mt = f"mt_multi_{sfx}"
     iceberg = f"iceberg_multi_{sfx}"
 
-    _make_mt(node, mt, "id Int32, year Int32", "year")
-    _make_iceberg(node, iceberg, "id Int32, year Int32", "year")
+    make_mt(node, mt, "id Int32, year Int32", "year")
+    make_iceberg_s3(node, iceberg, "id Int32, year Int32", "year")
 
     # Each INSERT creates a separate part per partition
     node.query(f"INSERT INTO {mt} VALUES (1, 2020), (2, 2020)")
     node.query(f"INSERT INTO {mt} VALUES (10, 2021), (11, 2021), (12, 2021)")
 
-    part_2020 = _get_part(node, mt, "2020")
-    part_2021 = _get_part(node, mt, "2021")
+    part_2020 = get_part(node, mt, "2020")
+    part_2021 = get_part(node, mt, "2021")
 
-    _export_part(node, mt, part_2020, iceberg)
-    _export_part(node, mt, part_2021, iceberg)
+    export_part(node, mt, part_2020, iceberg)
+    export_part(node, mt, part_2021, iceberg)
 
-    _wait_for_export_part(node, mt, part_2020)
-    _wait_for_export_part(node, mt, part_2021)
+    wait_for_export_part(node, mt, part_2020)
+    wait_for_export_part(node, mt, part_2021)
 
     total = int(node.query(f"SELECT count() FROM {iceberg}").strip())
     assert total == 5, f"Expected 5 rows total (2+3), got {total}"
@@ -343,8 +289,8 @@ def test_export_multiple_parts_to_iceberg(cluster):
     ).strip()
     assert result_2021 == "10\n11\n12", f"Unexpected 2021 rows: {result_2021}"
 
-    _assert_part_log(node, mt, part_2020)
-    _assert_part_log(node, mt, part_2021)
+    assert_part_log(node, mt, part_2020)
+    assert_part_log(node, mt, part_2021)
 
     node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
     node.query(f"DROP TABLE IF EXISTS {iceberg}")
@@ -359,26 +305,26 @@ def test_export_part_with_year_transform_partition(cluster):
     and that all rows survive the round-trip intact.
     """
     node = cluster.instances["node1"]
-    sfx = _sfx()
+    sfx = unique_suffix()
     mt = f"mt_year_tf_{sfx}"
     iceberg = f"iceberg_year_tf_{sfx}"
 
     cols = "id Int64, event_date Date"
     partition_by = "toYearNumSinceEpoch(event_date)"
 
-    _make_mt(node, mt, cols, partition_by, order_by="id")
-    _make_iceberg(node, iceberg, cols, partition_by)
+    make_mt(node, mt, cols, partition_by, order_by="id")
+    make_iceberg_s3(node, iceberg, cols, partition_by)
 
     node.query(
         f"INSERT INTO {mt} VALUES "
         f"(1, '2023-03-15'), (2, '2023-11-01'), (3, '2023-06-30')"
     )
 
-    pid = _get_any_partition_id(node, mt)
-    part = _get_part(node, mt, pid)
+    pid = first_partition_id(node, mt)
+    part = get_part(node, mt, pid)
 
-    _export_part(node, mt, part, iceberg)
-    _wait_for_export_part(node, mt, part)
+    export_part(node, mt, part, iceberg)
+    wait_for_export_part(node, mt, part)
 
     count = int(node.query(f"SELECT count() FROM {iceberg}").strip())
     assert count == 3, f"Expected 3 rows, got {count}"
@@ -390,7 +336,7 @@ def test_export_part_with_year_transform_partition(cluster):
     assert "2\t2023-11-01" in result, f"Row 2 missing or incorrect:\n{result}"
     assert "3\t2023-06-30" in result, f"Row 3 missing or incorrect:\n{result}"
 
-    _assert_part_log(node, mt, part)
+    assert_part_log(node, mt, part)
 
     node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
     node.query(f"DROP TABLE IF EXISTS {iceberg}")
@@ -405,24 +351,24 @@ def test_export_part_with_bucket_partition(cluster):
     that data lands correctly in the Iceberg bucket partition.
     """
     node = cluster.instances["node1"]
-    sfx = _sfx()
+    sfx = unique_suffix()
     mt = f"mt_bucket_{sfx}"
     iceberg = f"iceberg_bucket_{sfx}"
 
     cols = "id Int64, user_id Int64, value String"
     partition_by = "icebergBucket(8, user_id)"
 
-    _make_mt(node, mt, cols, partition_by)
-    _make_iceberg(node, iceberg, cols, partition_by)
+    make_mt(node, mt, cols, partition_by)
+    make_iceberg_s3(node, iceberg, cols, partition_by)
 
     # Both rows go to the same bucket (user_id=42 → bucket 2 for N=8)
     node.query(f"INSERT INTO {mt} VALUES (1, 42, 'hello'), (2, 42, 'world')")
 
-    pid = _get_any_partition_id(node, mt)
-    part = _get_part(node, mt, pid)
+    pid = first_partition_id(node, mt)
+    part = get_part(node, mt, pid)
 
-    _export_part(node, mt, part, iceberg)
-    _wait_for_export_part(node, mt, part)
+    export_part(node, mt, part, iceberg)
+    wait_for_export_part(node, mt, part)
 
     count = int(node.query(f"SELECT count() FROM {iceberg}").strip())
     assert count == 2, f"Expected 2 rows in Iceberg table, got {count}"
@@ -433,7 +379,7 @@ def test_export_part_with_bucket_partition(cluster):
     assert "1\t42\thello" in result, f"Row 1 missing or incorrect:\n{result}"
     assert "2\t42\tworld" in result, f"Row 2 missing or incorrect:\n{result}"
 
-    _assert_part_log(node, mt, part)
+    assert_part_log(node, mt, part)
 
     node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
     node.query(f"DROP TABLE IF EXISTS {iceberg}")

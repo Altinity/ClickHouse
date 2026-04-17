@@ -23,13 +23,19 @@ Transform coverage (ClickHouse → Iceberg):
 import logging
 import threading
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import pyspark
 
 from helpers.cluster import ClickHouseCluster
+from helpers.export_partition_helpers import (
+    first_partition_id,
+    make_iceberg_s3,
+    make_rmt,
+    unique_suffix,
+    wait_for_export_status,
+)
 from helpers.iceberg_utils import (
     create_iceberg_table,
     default_upload_directory,
@@ -41,7 +47,7 @@ from helpers.s3_tools import S3Uploader, prepare_s3_bucket
 # Spark session
 # ---------------------------------------------------------------------------
 
-def _get_spark():
+def get_spark():
     builder = (
         pyspark.sql.SparkSession.builder
         .appName("test_export_partition_spark_iceberg")
@@ -97,7 +103,7 @@ def export_cluster():
         logging.info("Starting export_cluster...")
         cluster.start()
         prepare_s3_bucket(cluster)
-        cluster.spark_session = _get_spark()
+        cluster.spark_session = get_spark()
         cluster.default_s3_uploader = S3Uploader(cluster.minio_client, cluster.minio_bucket)
         yield cluster
     finally:
@@ -125,7 +131,7 @@ def drop_tables(export_cluster):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _spark_iceberg(cluster, spark, iceberg_name: str, ddl: str):
+def spark_iceberg(cluster, spark, iceberg_name: str, ddl: str):
     """Execute a Spark DDL and upload the resulting Iceberg files to MinIO."""
     spark.sql(ddl)
     default_upload_directory(
@@ -136,7 +142,7 @@ def _spark_iceberg(cluster, spark, iceberg_name: str, ddl: str):
     )
 
 
-def _attach_ch_iceberg(node, iceberg_name: str, schema: str, cluster):
+def attach_ch_iceberg(node, iceberg_name: str, schema: str, cluster):
     """
     Attach a ClickHouse IcebergS3 table to an existing Spark-written Iceberg path.
     No PARTITION BY is specified — the spec is read from Spark's metadata.
@@ -151,46 +157,8 @@ def _attach_ch_iceberg(node, iceberg_name: str, schema: str, cluster):
     )
 
 
-def _make_rmt(node, name: str, columns: str, partition_by: str, replica_name: str = "r1"):
-    node.query(
-        f"""
-        CREATE TABLE {name} ({columns})
-        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{name}', '{replica_name}')
-        PARTITION BY {partition_by}
-        ORDER BY id
-        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
-        """
-    )
 
-
-def _first_partition_id(node, table: str) -> str:
-    return node.query(
-        f"SELECT partition_id FROM system.parts"
-        f" WHERE table = '{table}' AND database = currentDatabase() AND active"
-        f" LIMIT 1"
-    ).strip()
-
-
-def _wait_for_export(node, source: str, dest: str, pid: str, timeout: int = 60):
-    start = time.time()
-    last_status = None
-    while time.time() - start < timeout:
-        status = node.query(
-            f"SELECT status FROM system.replicated_partition_exports"
-            f" WHERE source_table = '{source}'"
-            f"   AND destination_table = '{dest}'"
-            f"   AND partition_id = '{pid}'"
-        ).strip()
-        last_status = status
-        if status == "COMPLETED":
-            return
-        time.sleep(0.5)
-    raise TimeoutError(
-        f"Export did not reach COMPLETED within {timeout}s (last: {last_status!r})"
-    )
-
-
-def _run_accepted(export_cluster, label, spark_ddl, ch_schema, rmt_columns, rmt_partition_by, insert_values):
+def run_accepted(export_cluster, label, spark_ddl, ch_schema, rmt_columns, rmt_partition_by, insert_values):
     """
     Create a Spark-created Iceberg table, attach ClickHouse to it, create the
     source RMT, export, wait, and return (node, source, iceberg, partition_id)
@@ -199,23 +167,23 @@ def _run_accepted(export_cluster, label, spark_ddl, ch_schema, rmt_columns, rmt_
     node = export_cluster.instances["node1"]
     spark = export_cluster.spark_session
 
-    uid = str(uuid.uuid4()).replace("-", "_")
+    uid = unique_suffix()
     source = f"rmt_{label}_{uid}"
     iceberg = f"spark_{label}_{uid}"
 
-    _spark_iceberg(export_cluster, spark, iceberg, spark_ddl.format(TABLE=iceberg))
-    _attach_ch_iceberg(node, iceberg, ch_schema, export_cluster)
-    _make_rmt(node, source, rmt_columns, rmt_partition_by)
+    spark_iceberg(export_cluster, spark, iceberg, spark_ddl.format(TABLE=iceberg))
+    attach_ch_iceberg(node, iceberg, ch_schema, export_cluster)
+    make_rmt(node, source, rmt_columns, rmt_partition_by, order_by="id")
     node.query(f"INSERT INTO {source} VALUES {insert_values}")
 
-    pid = _first_partition_id(node, source)
+    pid = first_partition_id(node, source)
     node.query(f"ALTER TABLE {source} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg}")
-    _wait_for_export(node, source, iceberg, pid)
+    wait_for_export_status(node, source, iceberg, pid)
 
     return node, source, iceberg, pid
 
 
-def _run_rejected(export_cluster, label, spark_ddl, ch_schema, rmt_columns, rmt_partition_by, insert_values):
+def run_rejected(export_cluster, label, spark_ddl, ch_schema, rmt_columns, rmt_partition_by, insert_values):
     """
     Create a mismatched pair and assert that EXPORT PARTITION fails with BAD_ARGUMENTS.
     The check fires synchronously before any task is enqueued.
@@ -223,16 +191,16 @@ def _run_rejected(export_cluster, label, spark_ddl, ch_schema, rmt_columns, rmt_
     node = export_cluster.instances["node1"]
     spark = export_cluster.spark_session
 
-    uid = str(uuid.uuid4()).replace("-", "_")
+    uid = unique_suffix()
     source = f"rmt_{label}_{uid}"
     iceberg = f"spark_{label}_{uid}"
 
-    _spark_iceberg(export_cluster, spark, iceberg, spark_ddl.format(TABLE=iceberg))
-    _attach_ch_iceberg(node, iceberg, ch_schema, export_cluster)
-    _make_rmt(node, source, rmt_columns, rmt_partition_by)
+    spark_iceberg(export_cluster, spark, iceberg, spark_ddl.format(TABLE=iceberg))
+    attach_ch_iceberg(node, iceberg, ch_schema, export_cluster)
+    make_rmt(node, source, rmt_columns, rmt_partition_by, order_by="id")
     node.query(f"INSERT INTO {source} VALUES {insert_values}")
 
-    pid = _first_partition_id(node, source)
+    pid = first_partition_id(node, source)
     error = node.query_and_get_error(
         f"ALTER TABLE {source} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg}"
     )
@@ -244,24 +212,15 @@ def _run_rejected(export_cluster, label, spark_ddl, ch_schema, rmt_columns, rmt_
 # ---------------------------------------------------------------------------
 
 
-def _create_iceberg_s3_table(node, iceberg_table: str, if_not_exists: bool = False):
+def create_iceberg_s3_table(node, iceberg_table: str, if_not_exists: bool = False):
     """Create (or attach to an existing) IcebergS3 table at a per-test MinIO prefix."""
-    ine = "IF NOT EXISTS " if if_not_exists else ""
-    node.query(
-        f"""
-        CREATE TABLE {ine}{iceberg_table}
-        (id Int64, year Int32)
-        ENGINE = IcebergS3(
-            'http://minio1:9001/root/data/{iceberg_table}/',
-            'minio',
-            'ClickHouse_Minio_P@ssw0rd'
-        )
-        PARTITION BY year SETTINGS s3_retry_attempts = 1
-        """
+    make_iceberg_s3(
+        node, iceberg_table, "id Int64, year Int32",
+        partition_by="year", if_not_exists=if_not_exists,
     )
 
 
-def _setup_replicas(cluster, mt_table: str, iceberg_table: str, replica_names: list):
+def setup_replicas(cluster, mt_table: str, iceberg_table: str, replica_names: list):
     """
     Create RMT on each replica with a per-replica replica_name so all instances share
     the same ZooKeeper path. Create IcebergS3 on the primary; attach with IF NOT EXISTS
@@ -271,31 +230,12 @@ def _setup_replicas(cluster, mt_table: str, iceberg_table: str, replica_names: l
     primary = instances[0]
 
     for rname, instance in zip(replica_names, instances):
-        _make_rmt(instance, mt_table, "id Int64, year Int32", "year", replica_name=rname)
+        make_rmt(instance, mt_table, "id Int64, year Int32", "year", replica_name=rname)
 
-    _create_iceberg_s3_table(primary, iceberg_table)
+    create_iceberg_s3_table(primary, iceberg_table)
     for instance in instances[1:]:
-        _create_iceberg_s3_table(instance, iceberg_table, if_not_exists=True)
+        create_iceberg_s3_table(instance, iceberg_table, if_not_exists=True)
 
-
-def _wait_for_export_r(node, source: str, dest: str, pid: str, timeout: int = 60):
-    """Poll system.replicated_partition_exports until the task reaches COMPLETED."""
-    start = time.time()
-    last_status = None
-    while time.time() - start < timeout:
-        status = node.query(
-            f"SELECT status FROM system.replicated_partition_exports"
-            f" WHERE source_table = '{source}'"
-            f"   AND destination_table = '{dest}'"
-            f"   AND partition_id = '{pid}'"
-        ).strip()
-        last_status = status
-        if status == "COMPLETED":
-            return
-        time.sleep(0.5)
-    raise TimeoutError(
-        f"Export did not reach COMPLETED within {timeout}s (last: {last_status!r})"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +244,7 @@ def _wait_for_export_r(node, source: str, dest: str, pid: str, timeout: int = 60
 
 def test_identity_transform(export_cluster):
     """Spark identity(year)  <->  PARTITION BY year."""
-    node, _, iceberg, _ = _run_accepted(
+    node, _, iceberg, _ = run_accepted(
         export_cluster,
         "identity",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, year INT)"
@@ -319,7 +259,7 @@ def test_identity_transform(export_cluster):
 
 def test_year_transform(export_cluster):
     """Spark years(dt)  <->  PARTITION BY toYearNumSinceEpoch(dt)."""
-    node, _, iceberg, _ = _run_accepted(
+    node, _, iceberg, _ = run_accepted(
         export_cluster,
         "year",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, dt DATE)"
@@ -334,7 +274,7 @@ def test_year_transform(export_cluster):
 
 def test_month_transform(export_cluster):
     """Spark months(dt)  <->  PARTITION BY toMonthNumSinceEpoch(dt)."""
-    node, _, iceberg, _ = _run_accepted(
+    node, _, iceberg, _ = run_accepted(
         export_cluster,
         "month",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, dt DATE)"
@@ -349,7 +289,7 @@ def test_month_transform(export_cluster):
 
 def test_day_transform(export_cluster):
     """Spark days(dt)  <->  PARTITION BY toRelativeDayNum(dt)."""
-    node, _, iceberg, _ = _run_accepted(
+    node, _, iceberg, _ = run_accepted(
         export_cluster,
         "day",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, dt DATE)"
@@ -368,7 +308,7 @@ def test_hour_transform(export_cluster):
     Spark TIMESTAMP maps to Iceberg 'timestamp' which ClickHouse reads as DateTime64(6).
     All three rows fall within the same hour so a single partition is exported.
     """
-    node, _, iceberg, _ = _run_accepted(
+    node, _, iceberg, _ = run_accepted(
         export_cluster,
         "hour",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, ts TIMESTAMP)"
@@ -387,7 +327,7 @@ def test_hour_transform(export_cluster):
 
 def test_bucket_transform(export_cluster):
     """Spark bucket(8, user_id)  <->  PARTITION BY icebergBucket(8, user_id)."""
-    node, _, iceberg, _ = _run_accepted(
+    node, _, iceberg, _ = run_accepted(
         export_cluster,
         "bucket",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, user_id BIGINT)"
@@ -403,7 +343,7 @@ def test_bucket_transform(export_cluster):
 
 def test_truncate_transform(export_cluster):
     """Spark truncate(4, category)  <->  PARTITION BY icebergTruncate(4, category)."""
-    node, _, iceberg, _ = _run_accepted(
+    node, _, iceberg, _ = run_accepted(
         export_cluster,
         "truncate",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, category STRING)"
@@ -419,7 +359,7 @@ def test_truncate_transform(export_cluster):
 
 def test_compound_transform(export_cluster):
     """Spark (identity(year), identity(region))  <->  PARTITION BY (year, region)."""
-    node, _, iceberg, _ = _run_accepted(
+    node, _, iceberg, _ = run_accepted(
         export_cluster,
         "compound",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, year INT, region STRING)"
@@ -440,7 +380,7 @@ def test_identity_int64(export_cluster):
     the identity transform on a 64-bit integer column, which is not covered by
     the existing test_identity_transform (which uses Int32).
     """
-    node, _, iceberg, _ = _run_accepted(
+    node, _, iceberg, _ = run_accepted(
         export_cluster,
         "identity_int64",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, user_id BIGINT)"
@@ -462,7 +402,7 @@ def test_identity_date(export_cluster):
     (test_year_transform, test_month_transform, etc.) use time-based transforms
     such as years() and months(), not identity().
     """
-    node, _, iceberg, _ = _run_accepted(
+    node, _, iceberg, _ = run_accepted(
         export_cluster,
         "identity_date",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, event_date DATE)"
@@ -484,7 +424,7 @@ def test_identity_string(export_cluster):
     test_compound_transform uses identity(region) only as part of a multi-field spec,
     so a standalone string identity partition was not previously exercised end-to-end.
     """
-    node, _, iceberg, _ = _run_accepted(
+    node, _, iceberg, _ = run_accepted(
         export_cluster,
         "identity_str",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, region STRING)"
@@ -506,7 +446,7 @@ def test_truncate_int64(export_cluster):
     String (which trims a character prefix). The existing test_truncate_transform uses
     String only, leaving the integer truncate path untested.
     """
-    node, _, iceberg, _ = _run_accepted(
+    node, _, iceberg, _ = run_accepted(
         export_cluster,
         "truncate_int64",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, amount BIGINT)"
@@ -528,7 +468,7 @@ def test_bucket_string(export_cluster):
     bucket on integers. All rows share the same name so they land in the same bucket.
     The existing test_bucket_transform uses BIGINT only, leaving string bucketing untested.
     """
-    node, _, iceberg, _ = _run_accepted(
+    node, _, iceberg, _ = run_accepted(
         export_cluster,
         "bucket_str",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, name STRING)"
@@ -550,7 +490,7 @@ def test_year_transform_timestamp(export_cluster):
     TIMESTAMP follows a different branch than on DATE (long vs int in Avro). The existing
     test_year_transform uses DATE only. All three rows fall within the same year.
     """
-    node, _, iceberg, _ = _run_accepted(
+    node, _, iceberg, _ = run_accepted(
         export_cluster,
         "year_ts",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, ts TIMESTAMP)"
@@ -574,7 +514,7 @@ def test_month_transform_timestamp(export_cluster):
     Analogous to test_year_transform_timestamp but for the month transform.
     All three rows fall within the same calendar month.
     """
-    node, _, iceberg, _ = _run_accepted(
+    node, _, iceberg, _ = run_accepted(
         export_cluster,
         "month_ts",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, ts TIMESTAMP)"
@@ -598,7 +538,7 @@ def test_day_transform_timestamp(export_cluster):
     Analogous to test_year_transform_timestamp but for the day transform.
     All three rows fall within the same calendar day.
     """
-    node, _, iceberg, _ = _run_accepted(
+    node, _, iceberg, _ = run_accepted(
         export_cluster,
         "day_ts",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, ts TIMESTAMP)"
@@ -622,7 +562,7 @@ def test_day_transform_timestamp(export_cluster):
 
 def test_rejected_column_mismatch(export_cluster):
     """Spark identity(year) — RMT PARTITION BY id: different column."""
-    error = _run_rejected(
+    error = run_rejected(
         export_cluster,
         "rej_col_mismatch",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, year INT)"
@@ -637,7 +577,7 @@ def test_rejected_column_mismatch(export_cluster):
 
 def test_rejected_transform_mismatch(export_cluster):
     """Spark years(dt) — RMT PARTITION BY dt (identity, not year-transform)."""
-    error = _run_rejected(
+    error = run_rejected(
         export_cluster,
         "rej_xform_mismatch",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, dt DATE)"
@@ -652,7 +592,7 @@ def test_rejected_transform_mismatch(export_cluster):
 
 def test_rejected_bucket_count_mismatch(export_cluster):
     """Spark bucket(8, user_id) — RMT icebergBucket(16, user_id): wrong N."""
-    error = _run_rejected(
+    error = run_rejected(
         export_cluster,
         "rej_bucket_n",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, user_id BIGINT)"
@@ -667,7 +607,7 @@ def test_rejected_bucket_count_mismatch(export_cluster):
 
 def test_rejected_truncate_width_mismatch(export_cluster):
     """Spark truncate(4, category) — RMT icebergTruncate(8, category): wrong width."""
-    error = _run_rejected(
+    error = run_rejected(
         export_cluster,
         "rej_trunc_w",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, category STRING)"
@@ -682,7 +622,7 @@ def test_rejected_truncate_width_mismatch(export_cluster):
 
 def test_rejected_field_count_mismatch(export_cluster):
     """Spark 1-field identity(year) — RMT 2-field (year, region)."""
-    error = _run_rejected(
+    error = run_rejected(
         export_cluster,
         "rej_field_n",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, year INT, region STRING)"
@@ -697,7 +637,7 @@ def test_rejected_field_count_mismatch(export_cluster):
 
 def test_rejected_compound_order_reversed(export_cluster):
     """Spark (identity(year), identity(region)) — RMT (region, year): reversed order."""
-    error = _run_rejected(
+    error = run_rejected(
         export_cluster,
         "rej_compound_rev",
         spark_ddl="CREATE TABLE {TABLE} (id BIGINT, year INT, region STRING)"
@@ -730,22 +670,22 @@ def test_rejected_compound_order_reversed(export_cluster):
 #     node = export_cluster.instances["node1"]
 #     spark = export_cluster.spark_session
 
-#     uid = str(uuid.uuid4()).replace("-", "_")
+#     uid = unique_suffix()
 #     source = f"rmt_{uid}"
 #     iceberg = f"spark_{uid}"
 
-#     _spark_iceberg(
+#     spark_iceberg(
 #         export_cluster,
 #         spark,
 #         iceberg,
 #         f"CREATE TABLE {iceberg} (id BIGINT, year INT)"
 #         f" USING iceberg PARTITIONED BY (identity(year)) OPTIONS('format-version'='2')",
 #     )
-#     _attach_ch_iceberg(node, iceberg, "id Int64, year Int32", export_cluster)
-#     _make_rmt(node, source, "id Int64, year Int32", "year")
+#     attach_ch_iceberg(node, iceberg, "id Int64, year Int32", export_cluster)
+#     make_rmt(node, source, "id Int64, year Int32", "year")
 #     node.query(f"INSERT INTO {source} VALUES (1, 2024), (2, 2024), (3, 2024)")
 
-#     pid = _first_partition_id(node, source)
+#     pid = first_partition_id(node, source)
 
 #     # Enable the ONCE failpoint. When the background scheduler thread reaches the
 #     # injection point (after a successful Iceberg commit), std::terminate() is called
@@ -764,7 +704,7 @@ def test_rejected_compound_order_reversed(export_cluster):
 #     # On restart the scheduler retries the commit. commitExportPartitionTransaction
 #     # detects the transaction_id in the existing Iceberg snapshot summary and returns
 #     # without re-writing any data, then sets ZK COMPLETED.
-#     _wait_for_export(node, source, iceberg, pid, timeout=60)
+#     wait_for_export_status(node, source, iceberg, pid, timeout=60)
 
 #     # Exactly 3 rows — no duplicates from the idempotent re-commit.
 #     count = int(node.query(f"SELECT count() FROM {iceberg}").strip())
@@ -781,11 +721,11 @@ def test_export_initiated_from_replica2(export_cluster):
     Export is initiated from replica2 (not the inserting replica).
     Validates that any replica can start the export, not just the writer.
     """
-    uid = str(uuid.uuid4()).replace("-", "_")
+    uid = unique_suffix()
     mt_table = f"rmt_from_replica2_{uid}"
     iceberg_table = f"iceberg_from_replica2_{uid}"
 
-    _setup_replicas(export_cluster, mt_table, iceberg_table, ["replica1", "replica2"])
+    setup_replicas(export_cluster, mt_table, iceberg_table, ["replica1", "replica2"])
 
     r1 = export_cluster.instances["replica1"]
     r2 = export_cluster.instances["replica2"]
@@ -794,7 +734,7 @@ def test_export_initiated_from_replica2(export_cluster):
     r2.query(f"SYSTEM SYNC REPLICA {mt_table}")
 
     r2.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}")
-    _wait_for_export_r(r2, mt_table, iceberg_table, "2020")
+    wait_for_export_status(r2, mt_table, iceberg_table, "2020")
 
     count_r1 = int(r1.query(f"SELECT count() FROM {iceberg_table}").strip())
     assert count_r1 == 3, f"Expected 3 rows from replica1, got {count_r1}"
@@ -808,11 +748,11 @@ def test_concurrent_exports_different_partitions_across_replicas(export_cluster)
     same IcebergS3 table. All three commits must succeed and the total row count must
     equal the sum of all inserted rows.
     """
-    uid = str(uuid.uuid4()).replace("-", "_")
+    uid = unique_suffix()
     mt_table = f"rmt_concurrent_diff_parts_{uid}"
     iceberg_table = f"iceberg_concurrent_diff_parts_{uid}"
 
-    _setup_replicas(
+    setup_replicas(
         export_cluster, mt_table, iceberg_table,
         ["replica1", "replica2", "replica3"],
     )
@@ -834,7 +774,7 @@ def test_concurrent_exports_different_partitions_across_replicas(export_cluster)
             node.query(
                 f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}"
             )
-            _wait_for_export_r(node, mt_table, iceberg_table, pid)
+            wait_for_export_status(node, mt_table, iceberg_table, pid)
         except Exception as exc:
             errors.append(exc)
 
@@ -861,11 +801,11 @@ def test_concurrent_exports_different_partitions_across_replicas(export_cluster)
 # BAD_ARGUMENTS "already exported" (the winner commits before the loser's
 # exists() check). The test cannot reliably assert either error in isolation.
 # def test_concurrent_same_partition_two_replicas_idempotent(export_cluster):
-#     uid = str(uuid.uuid4()).replace("-", "_")
+#     uid = unique_suffix()
 #     mt_table = f"rmt_{uid}"
 #     iceberg_table = f"iceberg_{uid}"
 #
-#     _setup_replicas(export_cluster, mt_table, iceberg_table, ["replica1", "replica2"])
+#     setup_replicas(export_cluster, mt_table, iceberg_table, ["replica1", "replica2"])
 #
 #     r1 = export_cluster.instances["replica1"]
 #     r2 = export_cluster.instances["replica2"]
@@ -880,7 +820,7 @@ def test_concurrent_exports_different_partitions_across_replicas(export_cluster)
 #             node.query(
 #                 f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
 #             )
-#             _wait_for_export_r(node, mt_table, iceberg_table, "2020")
+#             wait_for_export_status(node, mt_table, iceberg_table, "2020")
 #         except Exception as exc:
 #             errors.append(exc)
 #
@@ -903,11 +843,11 @@ def test_three_replica_concurrent_exports(export_cluster):
     ThreadPoolExecutor with 3 workers: each replica exports its own distinct partition.
     All futures must complete successfully; total row count must be correct.
     """
-    uid = str(uuid.uuid4()).replace("-", "_")
+    uid = unique_suffix()
     mt_table = f"rmt_three_replicas_concurrent_{uid}"
     iceberg_table = f"iceberg_three_replicas_concurrent_{uid}"
 
-    _setup_replicas(
+    setup_replicas(
         export_cluster, mt_table, iceberg_table,
         ["replica1", "replica2", "replica3"],
     )
@@ -927,7 +867,7 @@ def test_three_replica_concurrent_exports(export_cluster):
         node.query(
             f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}"
         )
-        _wait_for_export_r(node, mt_table, iceberg_table, pid)
+        wait_for_export_status(node, mt_table, iceberg_table, pid)
 
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = [

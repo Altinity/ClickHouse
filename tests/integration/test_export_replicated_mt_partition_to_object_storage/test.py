@@ -1,109 +1,17 @@
 import logging
-import pytest
-import random
-import string
 import time
-from typing import Optional
 import uuid
 
+import pytest
+
 from helpers.cluster import ClickHouseCluster
+from helpers.export_partition_helpers import (
+    wait_for_exception_count,
+    wait_for_export_status,
+    wait_for_export_to_start,
+)
 from helpers.network import PartitionManager
 
-
-def wait_for_export_status(
-    node,
-    mt_table: str,
-    s3_table: str,
-    partition_id: str,
-    expected_status: str = "COMPLETED",
-    timeout: int = 30,
-    poll_interval: float = 0.5,
-):
-    start_time = time.time()
-    last_status = None
-    while time.time() - start_time < timeout:
-        status = node.query(
-            f"""
-            SELECT status FROM system.replicated_partition_exports
-            WHERE source_table = '{mt_table}'
-                AND destination_table = '{s3_table}'
-                AND partition_id = '{partition_id}'
-            """
-        ).strip()
-
-        last_status = status
-
-        if status and status == expected_status:
-            return status
-
-        time.sleep(poll_interval)
-
-    raise TimeoutError(
-        f"Export status did not reach '{expected_status}' within {timeout}s. Last status: '{last_status}'")
-
-
-def wait_for_export_to_start(
-    node,
-    mt_table: str,
-    s3_table: str,
-    partition_id: str,
-    timeout: int = 10,
-    poll_interval: float = 0.2,
-):
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        count = node.query(
-            f"""
-            SELECT count() FROM system.replicated_partition_exports
-            WHERE source_table = '{mt_table}'
-              AND destination_table = '{s3_table}'
-              AND partition_id = '{partition_id}'
-            """
-        ).strip()
-
-        if count != '0':
-            return True
-
-        time.sleep(poll_interval)
-
-    raise TimeoutError(f"Export did not start within {timeout}s. ")
-
-
-def wait_for_exception_count(
-    node,
-    mt_table: str,
-    s3_table: str,
-    partition_id: str,
-    min_exception_count: int = 1,
-    timeout: int = 30,
-    poll_interval: float = 0.5,
-):
-    """Wait for exception_count to reach at least min_exception_count."""
-    start_time = time.time()
-    last_exception_count = None
-    while time.time() - start_time < timeout:
-        exception_count_str = node.query(
-            f"""
-            SELECT exception_count FROM system.replicated_partition_exports
-            WHERE source_table = '{mt_table}'
-              AND destination_table = '{s3_table}'
-              AND partition_id = '{partition_id}'
-              SETTINGS export_merge_tree_partition_system_table_prefer_remote_information = 1
-            """
-        ).strip()
-        
-        if exception_count_str:
-            exception_count = int(exception_count_str)
-            last_exception_count = exception_count
-            if exception_count >= min_exception_count:
-                return exception_count
-        
-        time.sleep(poll_interval)
-    
-    raise TimeoutError(
-        f"Exception count did not reach {min_exception_count} within {timeout}s. "
-        f"Last exception_count: {last_exception_count if last_exception_count is not None else 'N/A'}"
-    )
 
 
 def skip_if_remote_database_disk_enabled(cluster):
@@ -213,6 +121,7 @@ def create_s3_table(node, s3_table):
 
 def create_tables_and_insert_data(node, mt_table, s3_table, replica_name):
     node.query(f"DROP TABLE IF EXISTS {mt_table} SYNC")
+    # enable_block_number_column and enable_block_offset_column are needed for patch parts support
     node.query(f"CREATE TABLE {mt_table} (id UInt64, year UInt16) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', '{replica_name}') PARTITION BY year ORDER BY tuple() SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1")
     node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020), (3, 2020), (4, 2021)")
 

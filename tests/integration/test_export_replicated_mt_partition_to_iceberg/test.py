@@ -1,65 +1,18 @@
 import logging
 import time
-import uuid
 
 import pytest
 
 from helpers.cluster import ClickHouseCluster
+from helpers.export_partition_helpers import (
+    first_partition_id,
+    make_iceberg_s3,
+    make_rmt,
+    unique_suffix,
+    wait_for_export_status,
+    wait_for_export_to_start,
+)
 from helpers.network import PartitionManager
-
-
-def wait_for_export_status(
-    node,
-    mt_table: str,
-    iceberg_table: str,
-    partition_id: str,
-    expected_status: str = "COMPLETED",
-    timeout: int = 60,
-    poll_interval: float = 0.5,
-):
-    start_time = time.time()
-    last_status = None
-    while time.time() - start_time < timeout:
-        status = node.query(
-            f"""
-            SELECT status FROM system.replicated_partition_exports
-            WHERE source_table = '{mt_table}'
-                AND destination_table = '{iceberg_table}'
-                AND partition_id = '{partition_id}'
-            """
-        ).strip()
-        last_status = status
-        if status and status == expected_status:
-            return status
-        time.sleep(poll_interval)
-    raise TimeoutError(
-        f"Export status did not reach '{expected_status}' within {timeout}s. "
-        f"Last status: '{last_status}'"
-    )
-
-
-def wait_for_export_to_start(
-    node,
-    mt_table: str,
-    iceberg_table: str,
-    partition_id: str,
-    timeout: int = 10,
-    poll_interval: float = 0.2,
-):
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        count = node.query(
-            f"""
-            SELECT count() FROM system.replicated_partition_exports
-            WHERE source_table = '{mt_table}'
-              AND destination_table = '{iceberg_table}'
-              AND partition_id = '{partition_id}'
-            """
-        ).strip()
-        if count != "0":
-            return True
-        time.sleep(poll_interval)
-    raise TimeoutError(f"Export of partition {partition_id!r} did not start within {timeout}s.")
 
 
 @pytest.fixture(scope="module")
@@ -123,36 +76,22 @@ def drop_tables_after_test(cluster):
 # ---------------------------------------------------------------------------
 
 def create_replicated_mt(node, mt_table: str, replica_name: str):
-    node.query(
-        f"""
-        CREATE TABLE {mt_table}
-        (id Int64, year Int32)
-        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', '{replica_name}')
-        PARTITION BY year
-        ORDER BY tuple()
-        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
-        """
-    )
+    make_rmt(node, mt_table, "id Int64, year Int32", "year",
+             replica_name=replica_name)
 
 
-def create_iceberg_s3_table(node, iceberg_table: str, if_not_exists: bool = False):
+def create_iceberg_s3_table(node, iceberg_table: str, if_not_exists: bool = False,
+                            s3_retry_attempts: int = 3):
     """Create (or attach to an existing) IcebergS3 table at a per-test MinIO prefix."""
-    ine = "IF NOT EXISTS " if if_not_exists else ""
-    node.query(
-        f"""
-        CREATE TABLE {ine}{iceberg_table}
-        (id Int64, year Int32)
-        ENGINE = IcebergS3(
-            'http://minio1:9001/root/data/{iceberg_table}/',
-            'minio',
-            'ClickHouse_Minio_P@ssw0rd'
-        )
-        PARTITION BY year SETTINGS s3_retry_attempts = 1
-        """
+    make_iceberg_s3(
+        node, iceberg_table, "id Int64, year Int32",
+        partition_by="year", if_not_exists=if_not_exists,
+        s3_retry_attempts=s3_retry_attempts,
     )
 
 
-def setup_tables(cluster, mt_table: str, iceberg_table: str, nodes: list | None = None):
+def setup_tables(cluster, mt_table: str, iceberg_table: str, nodes: list | None = None,
+                 s3_retry_attempts: int = 3):
     """
     Create the ReplicatedMergeTree table on the given nodes, insert data on the first
     node, wait for replication, then create the Iceberg destination table on each node.
@@ -175,9 +114,10 @@ def setup_tables(cluster, mt_table: str, iceberg_table: str, nodes: list | None 
     for instance in instances[1:]:
         instance.query(f"SYSTEM SYNC REPLICA {mt_table}")
 
-    create_iceberg_s3_table(primary, iceberg_table)
+    create_iceberg_s3_table(primary, iceberg_table, s3_retry_attempts=s3_retry_attempts)
     for instance in instances[1:]:
-        create_iceberg_s3_table(instance, iceberg_table, if_not_exists=True)
+        create_iceberg_s3_table(instance, iceberg_table, if_not_exists=True,
+                                s3_retry_attempts=s3_retry_attempts)
 
 
 # ---------------------------------------------------------------------------
@@ -190,7 +130,7 @@ def test_export_partition_to_iceberg(cluster):
     """
     node = cluster.instances["replica1"]
 
-    uid = str(uuid.uuid4()).replace("-", "_")
+    uid = unique_suffix()
     mt_table = f"mt_{uid}"
     iceberg_table = f"iceberg_{uid}"
 
@@ -217,7 +157,7 @@ def test_export_two_partitions_to_iceberg(cluster):
     """
     node = cluster.instances["replica1"]
 
-    uid = str(uuid.uuid4()).replace("-", "_")
+    uid = unique_suffix()
     mt_table = f"mt_{uid}"
     iceberg_table = f"iceberg_{uid}"
 
@@ -250,11 +190,12 @@ def test_failure_is_logged_in_system_table(cluster):
     minio_ip = cluster.minio_ip
     minio_port = cluster.minio_port
 
-    uid = str(uuid.uuid4()).replace("-", "_")
+    uid = unique_suffix()
     mt_table = f"mt_{uid}"
     iceberg_table = f"iceberg_{uid}"
 
-    setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1"])
+    setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1"],
+                 s3_retry_attempts=1)
 
     node.query(f"SYSTEM STOP MOVES {mt_table}")
 
@@ -312,11 +253,12 @@ def test_inject_short_living_failures(cluster):
     minio_ip = cluster.minio_ip
     minio_port = cluster.minio_port
 
-    uid = str(uuid.uuid4()).replace("-", "_")
+    uid = unique_suffix()
     mt_table = f"mt_{uid}"
     iceberg_table = f"iceberg_{uid}"
 
-    setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1"])
+    setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1"],
+                 s3_retry_attempts=1)
 
     node.query(f"SYSTEM STOP MOVES {mt_table}")
 
@@ -381,7 +323,7 @@ def test_export_partition_scheduler_skipped_when_moves_stopped(cluster):
     """
     node = cluster.instances["replica1"]
 
-    uid = str(uuid.uuid4()).replace("-", "_")
+    uid = unique_suffix()
     mt_table = f"mt_{uid}"
     iceberg_table = f"iceberg_{uid}"
 
@@ -431,7 +373,7 @@ def test_export_partition_resumes_after_stop_moves(cluster):
     """
     node = cluster.instances["replica1"]
 
-    uid = str(uuid.uuid4()).replace("-", "_")
+    uid = unique_suffix()
     mt_table = f"mt_{uid}"
     iceberg_table = f"iceberg_{uid}"
 
@@ -476,7 +418,7 @@ def test_export_partition_resumes_after_stop_moves_during_export(cluster):
     minio_ip = cluster.minio_ip
     minio_port = cluster.minio_port
 
-    uid = str(uuid.uuid4()).replace("-", "_")
+    uid = unique_suffix()
     mt_table = f"mt_{uid}"
     iceberg_table = f"iceberg_{uid}"
 
@@ -528,43 +470,6 @@ def test_export_partition_resumes_after_stop_moves_during_export(cluster):
     assert count == 3, f"Expected 3 rows in Iceberg table after export completed, got {count}"
 
 
-def _make_iceberg_s3(node, name: str, columns: str, partition_by: str = "") -> None:
-    """Create an IcebergS3 table at a per-test MinIO prefix."""
-    pclause = f"PARTITION BY {partition_by}" if partition_by else ""
-    node.query(
-        f"""
-        CREATE TABLE {name} ({columns})
-        ENGINE = IcebergS3(
-            'http://minio1:9001/root/data/{name}/',
-            'minio',
-            'ClickHouse_Minio_P@ssw0rd'
-        )
-        {pclause} SETTINGS s3_retry_attempts = 1
-        """
-    )
-
-
-def _make_rmt(node, name: str, columns: str, partition_by: str) -> None:
-    """Create a single-replica ReplicatedMergeTree with the given partition key."""
-    node.query(
-        f"""
-        CREATE TABLE {name} ({columns})
-        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{name}', 'replica1')
-        PARTITION BY {partition_by} ORDER BY tuple()
-        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
-        """
-    )
-
-
-def _first_partition_id(node, table: str) -> str:
-    """Return the partition_id of the first active part of *table*."""
-    return node.query(
-        f"SELECT partition_id FROM system.parts"
-        f" WHERE table = '{table}' AND database = currentDatabase()"
-        f" AND active LIMIT 1"
-    ).strip()
-
-
 def test_partition_transform_compatibility_accepted(cluster):
     """
     Verify that EXPORT PARTITION is accepted (no BAD_ARGUMENTS) for every
@@ -579,10 +484,10 @@ def test_partition_transform_compatibility_accepted(cluster):
     6. Compound mixed  – (toYearNumSinceEpoch(event_date), icebergBucket(16, user_id))
     """
     node = cluster.instances["replica1"]
-    uid = str(uuid.uuid4()).replace("-", "_")
+    uid = unique_suffix()
 
     def check_accepted(mt, iceberg, description):
-        pid = _first_partition_id(node, mt)
+        pid = first_partition_id(node, mt)
         node.query(
             f"ALTER TABLE {mt} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg}"
         )
@@ -590,49 +495,49 @@ def test_partition_transform_compatibility_accepted(cluster):
     # 1. Compound identity: (year, region)
     cols = "id Int64, year Int32, region String"
     t = f"mt_acc_1_{uid}"; i = f"iceberg_acc_1_{uid}"
-    _make_rmt(node, t, cols, "(year, region)")
+    make_rmt(node, t, cols, "(year, region)")
     node.query(f"INSERT INTO {t} VALUES (1, 2023, 'EU')")
-    _make_iceberg_s3(node, i, cols, "(year, region)")
+    make_iceberg_s3(node, i, cols, "(year, region)")
     check_accepted(t, i, "compound identity (year, region)")
 
     # 2. Year transform
     cols = "id Int64, event_date Date"
     t = f"mt_acc_2_{uid}"; i = f"iceberg_acc_2_{uid}"
-    _make_rmt(node, t, cols, "toYearNumSinceEpoch(event_date)")
+    make_rmt(node, t, cols, "toYearNumSinceEpoch(event_date)")
     node.query(f"INSERT INTO {t} VALUES (1, '2020-06-15')")
-    _make_iceberg_s3(node, i, cols, "toYearNumSinceEpoch(event_date)")
+    make_iceberg_s3(node, i, cols, "toYearNumSinceEpoch(event_date)")
     check_accepted(t, i, "year transform")
 
     # 3. Month transform
     cols = "id Int64, event_date Date"
     t = f"mt_acc_3_{uid}"; i = f"iceberg_acc_3_{uid}"
-    _make_rmt(node, t, cols, "toMonthNumSinceEpoch(event_date)")
+    make_rmt(node, t, cols, "toMonthNumSinceEpoch(event_date)")
     node.query(f"INSERT INTO {t} VALUES (1, '2020-06-15')")
-    _make_iceberg_s3(node, i, cols, "toMonthNumSinceEpoch(event_date)")
+    make_iceberg_s3(node, i, cols, "toMonthNumSinceEpoch(event_date)")
     check_accepted(t, i, "month transform")
 
     # 4. truncate[4]
     cols = "id Int64, category String"
     t = f"mt_acc_4_{uid}"; i = f"iceberg_acc_4_{uid}"
-    _make_rmt(node, t, cols, "icebergTruncate(4, category)")
+    make_rmt(node, t, cols, "icebergTruncate(4, category)")
     node.query(f"INSERT INTO {t} VALUES (1, 'clickhouse')")
-    _make_iceberg_s3(node, i, cols, "icebergTruncate(4, category)")
+    make_iceberg_s3(node, i, cols, "icebergTruncate(4, category)")
     check_accepted(t, i, "truncate[4]")
 
     # 5. bucket[8]
     cols = "id Int64, user_id Int64"
     t = f"mt_acc_5_{uid}"; i = f"iceberg_acc_5_{uid}"
-    _make_rmt(node, t, cols, "icebergBucket(8, user_id)")
+    make_rmt(node, t, cols, "icebergBucket(8, user_id)")
     node.query(f"INSERT INTO {t} VALUES (1, 42)")
-    _make_iceberg_s3(node, i, cols, "icebergBucket(8, user_id)")
+    make_iceberg_s3(node, i, cols, "icebergBucket(8, user_id)")
     check_accepted(t, i, "bucket[8]")
 
     # 6. Compound mixed: year(event_date) + bucket[16](user_id)
     cols = "id Int64, event_date Date, user_id Int64"
     t = f"mt_acc_6_{uid}"; i = f"iceberg_acc_6_{uid}"
-    _make_rmt(node, t, cols, "(toYearNumSinceEpoch(event_date), icebergBucket(16, user_id))")
+    make_rmt(node, t, cols, "(toYearNumSinceEpoch(event_date), icebergBucket(16, user_id))")
     node.query(f"INSERT INTO {t} VALUES (1, '2021-03-01', 99)")
-    _make_iceberg_s3(node, i, cols, "(toYearNumSinceEpoch(event_date), icebergBucket(16, user_id))")
+    make_iceberg_s3(node, i, cols, "(toYearNumSinceEpoch(event_date), icebergBucket(16, user_id))")
     check_accepted(t, i, "compound year+bucket[16]")
 
 
@@ -649,11 +554,11 @@ def test_partition_transform_compatibility_rejected(cluster):
     6. Unsupported MergeTree expression (intDiv — not an Iceberg transform)
     """
     node = cluster.instances["replica1"]
-    uid = str(uuid.uuid4()).replace("-", "_")
+    uid = unique_suffix()
 
     def assert_rejected(mt, iceberg, description):
         # The compatibility check fires synchronously; any partition ID works here.
-        pid = _first_partition_id(node, mt)
+        pid = first_partition_id(node, mt)
         error = node.query_and_get_error(
             f"ALTER TABLE {mt} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg}"
         )
@@ -664,49 +569,49 @@ def test_partition_transform_compatibility_rejected(cluster):
     # 1. Compound field order reversed
     cols = "id Int64, year Int32, region String"
     t = f"mt_rej_1_{uid}"; i = f"iceberg_rej_1_{uid}"
-    _make_rmt(node, t, cols, "(year, region)")
+    make_rmt(node, t, cols, "(year, region)")
     node.query(f"INSERT INTO {t} VALUES (1, 2020, 'EU')")
-    _make_iceberg_s3(node, i, cols, "(region, year)")
+    make_iceberg_s3(node, i, cols, "(region, year)")
     assert_rejected(t, i, "compound field order reversed")
 
     # 2. Transform mismatch: MergeTree year-transform, Iceberg identity on same Date col
     cols = "id Int64, event_date Date"
     t = f"mt_rej_2_{uid}"; i = f"iceberg_rej_2_{uid}"
-    _make_rmt(node, t, cols, "toYearNumSinceEpoch(event_date)")
+    make_rmt(node, t, cols, "toYearNumSinceEpoch(event_date)")
     node.query(f"INSERT INTO {t} VALUES (1, '2020-01-01')")
-    _make_iceberg_s3(node, i, cols, "event_date")   # identity, not year-transform
+    make_iceberg_s3(node, i, cols, "event_date")   # identity, not year-transform
     assert_rejected(t, i, "year-transform vs identity on same column")
 
     # 3. Bucket count mismatch: bucket[8] vs bucket[16]
     cols = "id Int64, user_id Int64"
     t = f"mt_rej_3_{uid}"; i = f"iceberg_rej_3_{uid}"
-    _make_rmt(node, t, cols, "icebergBucket(8, user_id)")
+    make_rmt(node, t, cols, "icebergBucket(8, user_id)")
     node.query(f"INSERT INTO {t} VALUES (1, 42)")
-    _make_iceberg_s3(node, i, cols, "icebergBucket(16, user_id)")
+    make_iceberg_s3(node, i, cols, "icebergBucket(16, user_id)")
     assert_rejected(t, i, "bucket[8] vs bucket[16]")
 
     # 4. Truncate width mismatch: truncate[4] vs truncate[8]
     cols = "id Int64, category String"
     t = f"mt_rej_4_{uid}"; i = f"iceberg_rej_4_{uid}"
-    _make_rmt(node, t, cols, "icebergTruncate(4, category)")
+    make_rmt(node, t, cols, "icebergTruncate(4, category)")
     node.query(f"INSERT INTO {t} VALUES (1, 'clickhouse')")
-    _make_iceberg_s3(node, i, cols, "icebergTruncate(8, category)")
+    make_iceberg_s3(node, i, cols, "icebergTruncate(8, category)")
     assert_rejected(t, i, "truncate[4] vs truncate[8]")
 
     # 5. Field-count mismatch: MergeTree has 2 fields, Iceberg has 1
     cols = "id Int64, year Int32, region String"
     t = f"mt_rej_5_{uid}"; i = f"iceberg_rej_5_{uid}"
-    _make_rmt(node, t, cols, "(year, region)")
+    make_rmt(node, t, cols, "(year, region)")
     node.query(f"INSERT INTO {t} VALUES (1, 2020, 'EU')")
-    _make_iceberg_s3(node, i, cols, "year")
+    make_iceberg_s3(node, i, cols, "year")
     assert_rejected(t, i, "2-field MergeTree vs 1-field Iceberg")
 
     # 6. Unsupported MergeTree expression: intDiv(year, 100) is not an Iceberg transform
     cols = "id Int64, year Int32"
     t = f"mt_rej_6_{uid}"; i = f"iceberg_rej_6_{uid}"
-    _make_rmt(node, t, cols, "intDiv(year, 100)")
+    make_rmt(node, t, cols, "intDiv(year, 100)")
     node.query(f"INSERT INTO {t} VALUES (1, 2020)")
-    _make_iceberg_s3(node, i, cols, "year")
+    make_iceberg_s3(node, i, cols, "year")
     assert_rejected(t, i, "unsupported MergeTree expression intDiv")
 
 
@@ -723,7 +628,7 @@ def test_partition_key_compatibility_check(cluster):
     """
     node = cluster.instances["replica1"]
 
-    uid = str(uuid.uuid4()).replace("-", "_")
+    uid = unique_suffix()
     mt_table = f"mt_{uid}"
 
     create_replicated_mt(node, mt_table, "replica1")
@@ -741,7 +646,7 @@ def test_partition_key_compatibility_check(cluster):
             'minio',
             'ClickHouse_Minio_P@ssw0rd'
         )
-        PARTITION BY id SETTINGS s3_retry_attempts = 1
+        PARTITION BY id SETTINGS s3_retry_attempts = 3
         """
     )
     error = node.query_and_get_error(
@@ -762,7 +667,7 @@ def test_partition_key_compatibility_check(cluster):
             'minio',
             'ClickHouse_Minio_P@ssw0rd'
         )
-        SETTINGS s3_retry_attempts = 1
+        SETTINGS s3_retry_attempts = 3
         """
     )
     error = node.query_and_get_error(
@@ -783,7 +688,7 @@ def test_partition_key_compatibility_check(cluster):
             'minio',
             'ClickHouse_Minio_P@ssw0rd'
         )
-        PARTITION BY year SETTINGS s3_retry_attempts = 1
+        PARTITION BY year SETTINGS s3_retry_attempts = 3
         """
     )
     # Should not raise — the check passes so the export is accepted synchronously
@@ -800,7 +705,7 @@ def test_export_ttl(cluster):
     node = cluster.instances["replica1"]
     ttl_seconds = 3
 
-    uid = str(uuid.uuid4()).replace("-", "_")
+    uid = unique_suffix()
     mt_table = f"mt_{uid}"
     iceberg_table = f"iceberg_{uid}"
 
@@ -841,7 +746,7 @@ def test_export_data_files_are_not_cleaned_up_on_commit_failure(cluster):
     If the data files were cleaned up, a retry would commit a new snapshot that points to dangling references.
     """
     node = cluster.instances["replica1"]
-    uid = str(uuid.uuid4()).replace("-", "_")
+    uid = unique_suffix()
     mt_table = f"mt_{uid}"
     iceberg_table = f"iceberg_{uid}"
     setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1"])
