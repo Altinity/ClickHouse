@@ -383,16 +383,22 @@ void ExportPartitionTaskScheduler::handlePartExportSuccess(
     }
     catch (const Exception & e)
     {
-        const auto error_requests = getErrorRequests(export_path, storage.replica_name, zk, storage.log.load(), part_name, e);
-        
         LOG_INFO(storage.log, "ExportPartition scheduler task: Caught exception while committing export partition, {}", e.message());
 
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperMulti);
-        Coordination::Responses responses;
-        if (Coordination::Error::ZOK != zk->tryMulti(error_requests, responses))
+        /// Bump commit-attempts counter; transition to FAILED once the budget is exhausted.
+        /// Prevents the task from remaining stuck in PENDING if commit() fails persistently
+        /// (e.g. schema/spec mismatch, prolonged destination outage).
+        const bool became_failed = ExportPartitionUtils::handleCommitFailure(
+            zk,
+            export_path,
+            manifest.max_retries,
+            storage.log.load());
+
+        if (became_failed)
         {
-            LOG_INFO(storage.log, "ExportPartition scheduler task: Failed to update zookeeper with the commit exception");
+            LOG_WARNING(storage.log,
+                "ExportPartition scheduler task: Commit for {} transitioned to FAILED after exhausting max_retries={}",
+                export_path.string(), manifest.max_retries);
         }
     }
 }

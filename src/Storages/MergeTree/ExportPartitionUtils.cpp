@@ -16,6 +16,7 @@ namespace ProfileEvents
     extern const Event ExportPartitionZooKeeperGet;
     extern const Event ExportPartitionZooKeeperGetChildren;
     extern const Event ExportPartitionZooKeeperSet;
+    extern const Event ExportPartitionZooKeeperMulti;
 }
 
 namespace DB
@@ -30,6 +31,7 @@ namespace ErrorCodes
 namespace FailPoints
 {
     extern const char iceberg_export_after_commit_before_zk_completed[];
+    extern const char export_partition_commit_always_throw[];
 }
 
 namespace fs = std::filesystem;
@@ -144,6 +146,14 @@ namespace ExportPartitionUtils
         auto context = Context::createCopy(context_in);
         context->setSetting("write_full_path_in_iceberg_metadata", manifest.write_full_path_in_iceberg_metadata);
 
+        /// Failpoint used by integration tests to force persistent commit failure and exercise
+        /// the commit-attempts budget / FAILED state transition.
+        fiu_do_on(FailPoints::export_partition_commit_always_throw,
+        {
+            throw Exception(ErrorCodes::FAULT_INJECTED,
+                "Failpoint: export_partition_commit_always_throw");
+        });
+
         const auto exported_paths = ExportPartitionUtils::getExportedPaths(log, zk, entry_path);
 
         if (exported_paths.empty())
@@ -192,6 +202,120 @@ namespace ExportPartitionUtils
         {
             LOG_INFO(log, "ExportPartition: Failed to mark export as completed, will not try to fix it");
         }
+    }
+
+    bool handleCommitFailure(
+        const zkutil::ZooKeeperPtr & zk,
+        const std::string & entry_path,
+        size_t max_attempts,
+        const LoggerPtr & log)
+    {
+        const std::string status_path = fs::path(entry_path) / "status";
+
+        /// Read /status together with its stat so we can (a) bail early if another
+        /// replica has already moved the task out of PENDING and (b) use a
+        /// version-checked Set later to avoid clobbering a concurrent write
+        /// (e.g. a racing successful commit that marked the task COMPLETED between
+        /// our read and our tryMulti).
+        Coordination::Stat status_stat;
+        std::string current_status;
+
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
+        if (!zk->tryGet(status_path, current_status, &status_stat))
+        {
+            /// Task was removed (TTL cleanup or force-overwrite). Nothing to do.
+            LOG_INFO(log, "ExportPartition: /status missing for {}, skipping commit-failure bookkeeping", entry_path);
+            return false;
+        }
+
+        const auto status = magic_enum::enum_cast<ExportReplicatedMergeTreePartitionTaskEntry::Status>(current_status);
+        if (!status)
+        {
+            LOG_INFO(log, "ExportPartition: Invalid status {} for task {}, skipping commit-failure bookkeeping", current_status, entry_path);
+            return false;
+        }
+
+        if (status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
+        {
+            /// Another replica already reached a terminal state (COMPLETED or FAILED).
+            /// Do NOT overwrite — a successful commit by a peer must win.
+            LOG_INFO(log,
+                "ExportPartition: /status for {} is {} (not PENDING), skipping commit-failure bookkeeping",
+                entry_path, current_status);
+            return false;
+        }
+
+        Coordination::Requests ops;
+
+        /// Bump the global commit_attempts counter (shared across replicas).
+        /// Non-atomic get+set(-1), matching exceptions_per_replica/count semantics.
+        /// Under a race, two replicas may see the same value and write the same +1,
+        /// under-counting by one. FAILED then fires one retry later than the threshold,
+        /// which is acceptable (we always converge to FAILED, never "never").
+        const std::string commit_attempts_path = fs::path(entry_path) / "commit_attempts";
+
+        size_t attempts = 0;
+        std::string attempts_string;
+
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
+        if (zk->tryGet(commit_attempts_path, attempts_string))
+        {
+            try
+            {
+                attempts = parse<size_t>(attempts_string);
+            }
+            catch (...)
+            {
+                LOG_WARNING(log, "ExportPartition: commit_attempts value '{}' at {} is not a valid integer, treating as 0", attempts_string, commit_attempts_path);
+                attempts = 0;
+            }
+
+            attempts += 1;
+            ops.emplace_back(zkutil::makeSetRequest(commit_attempts_path, std::to_string(attempts), -1));
+        }
+        else
+        {
+            attempts = 1;
+            ops.emplace_back(zkutil::makeCreateRequest(commit_attempts_path, "1", zkutil::CreateMode::Persistent));
+        }
+
+        /// Transition to FAILED if the commit budget is exhausted.
+        /// Uses the same setting as per-part retries (manifest.max_retries) per user decision.
+        /// Version-checked Set: if /status has changed since we read it (e.g. a peer's
+        /// commit() succeeded and wrote COMPLETED), the whole multi aborts with
+        /// ZBADVERSION and we safely do nothing — the winning terminal state stands.
+        const bool exhausted = attempts >= max_attempts;
+        if (exhausted)
+        {
+            ops.emplace_back(zkutil::makeSetRequest(
+                status_path,
+                String(magic_enum::enum_name(ExportReplicatedMergeTreePartitionTaskEntry::Status::FAILED)).data(),
+                status_stat.version));
+        }
+
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperMulti);
+        Coordination::Responses responses;
+        const auto rc = zk->tryMulti(ops, responses);
+        if (rc != Coordination::Error::ZOK)
+        {
+            /// Any error here (ZBADVERSION on /status race or counter race, ZNODEEXISTS on
+            /// lazy-create race, ZNONODE if someone removed the task concurrently) is
+            /// non-fatal: the next attempt re-reads /status and either skips (terminal
+            /// state won) or retries the bookkeeping. Worst case we delay FAILED by one
+            /// poll cycle, which matches the best-effort property of the existing counters.
+            LOG_INFO(log, "ExportPartition: Failed to persist commit failure bookkeeping for {}: {}", entry_path, rc);
+            return false;
+        }
+
+        LOG_INFO(log,
+            "ExportPartition: Commit failure recorded for {} (attempt {}/{}){}",
+            entry_path, attempts, max_attempts,
+            exhausted ? ", task transitioned to FAILED" : "");
+
+        return exhausted;
     }
 }
 

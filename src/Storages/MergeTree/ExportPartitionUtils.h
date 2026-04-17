@@ -38,6 +38,24 @@ namespace ExportPartitionUtils
         const ContextPtr & context,
         MergeTreeData & source_storage
     );
+
+    /// Handles a commit-phase failure for a replicated partition export:
+    ///  - increments <entry_path>/commit_attempts (lazy-created)
+    ///  - sets <entry_path>/status to FAILED once attempts >= max_attempts
+    ///
+    /// The counter is a best-effort, non-atomic get+set(-1), matching
+    /// exceptions_per_replica/count. Concurrent failing commits may under-count by one
+    /// (FAILED may fire one retry later than the threshold), which is acceptable.
+    ///
+    /// `replica_name` and `exception` are currently unused and reserved for future
+    /// integration with per-replica diagnostics.
+    ///
+    /// Returns true if this call transitioned the task to FAILED.
+    bool handleCommitFailure(
+        const zkutil::ZooKeeperPtr & zk,
+        const std::string & entry_path,
+        size_t max_attempts,
+        const LoggerPtr & log);
 }
 
 }

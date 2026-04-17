@@ -106,6 +106,28 @@ namespace
                         "ExportPartition Manifest Updating Task: "
                         "Caught exception while committing export for {}: {}",
                         entry_path, e.message());
+
+                    /// Bump commit-attempts counter; transition to FAILED once the budget is exhausted.
+                    /// This is the primary retry path for the commit phase — handlePartExportSuccess
+                    /// only fires once (on the last part's completion); subsequent retries come from here.
+                    const bool became_failed = ExportPartitionUtils::handleCommitFailure(
+                        zk,
+                        entry_path,
+                        metadata.max_retries,
+                        log);
+
+                    if (became_failed)
+                    {
+                        LOG_WARNING(log,
+                            "ExportPartition Manifest Updating Task: "
+                            "Commit for {} transitioned to FAILED after exhausting max_retries={}",
+                            entry_path, metadata.max_retries);
+                    }
+
+                    /// Return false so the next poll re-enters the cleanup path:
+                    ///  - if FAILED: status != PENDING on re-read, cleanup is a no-op
+                    ///    until the entry expires (handled by the first tryCleanup branch).
+                    ///  - if still PENDING: next poll increments the counter again.
                     return false;
                 }
 
