@@ -758,3 +758,49 @@ def test_export_data_files_are_not_cleaned_up_on_commit_failure(cluster):
 
     count = int(node.query(f"SELECT count() FROM {iceberg_table} WHERE year = 2020").strip())
     assert count == 3, f"Expected 3 rows after first export, got {count}"
+
+
+def test_post_publish_exception_preserves_snapshot(cluster):
+    """
+    Regression test for the post-publish exception-safety bug in
+    commitImportPartitionTransactionImpl.
+
+    Before the fix, any exception thrown after the Iceberg snapshot was published
+    (e.g. from metadata-cache invalidation) would fall through to the outer
+    `catch (...)` and invoke `cleanup(false)`, which unconditionally removed the
+    manifest entry and manifest list referenced by the just-published snapshot.
+    A subsequent read would then fail because the live snapshot points to deleted
+    files.
+
+    The failpoint `iceberg_writes_post_publish_throw` is placed inside the
+    post-publish region (after both the metadata file is written and
+    `published = true` is set). With the fix in place:
+      - the commit stays durable (snapshot is readable, manifests are intact);
+      - the export is marked COMPLETED because the idempotency check on retry
+        detects that the transaction is already committed and returns success;
+      - all exported rows are visible through the Iceberg table.
+    """
+    node = cluster.instances["replica1"]
+    uid = unique_suffix()
+    mt_table = f"mt_{uid}"
+    iceberg_table = f"iceberg_{uid}"
+    setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1"])
+
+    node.query("SYSTEM ENABLE FAILPOINT iceberg_writes_post_publish_throw")
+
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}")
+    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table} WHERE year = 2020").strip())
+    assert count == 3, (
+        f"Snapshot must remain readable after a post-publish exception, "
+        f"expected 3 rows but got {count} (manifest files likely deleted by "
+        f"over-broad cleanup)"
+    )
+
+    result = node.query(
+        f"SELECT id, year FROM {iceberg_table} WHERE year = 2020 ORDER BY id"
+    ).strip()
+    assert result == "1\t2020\n2\t2020\n3\t2020", (
+        f"Unexpected data after post-publish exception recovery:\n{result}"
+    )

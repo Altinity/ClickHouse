@@ -1430,6 +1430,7 @@ namespace FailPoints
 {
     extern const char iceberg_writes_cleanup[];
     extern const char iceberg_writes_non_retry_cleanup[];
+    extern const char iceberg_writes_post_publish_throw[];
 }
 
 namespace
@@ -1517,6 +1518,14 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
     String manifest_entry_name;
     String storage_manifest_entry_name;
     Int32 manifest_lengths = 0;
+
+    /// Tracks whether the snapshot has become visible to readers.
+    /// For the file-based layout that happens as soon as writeMetadataFileAndVersionHint
+    /// succeeds; for a catalog layout it happens when catalog->updateMetadata succeeds.
+    /// Once published, the manifest entry / manifest list are referenced by the live
+    /// snapshot and must NOT be deleted by the outer failure cleanup, otherwise the
+    /// already-published snapshot becomes unreadable.
+    bool published = false;
 
     auto cleanup = [&](bool retry_because_of_metadata_conflict)
     {
@@ -1691,8 +1700,28 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
                     cleanup(true);
                     return false;
                 }
+
+                /// Catalog has accepted the commit - the new snapshot is now live and references
+                /// storage_manifest_entry_name / storage_manifest_list_name. From here on, any
+                /// failure must NOT delete those files.
+                published = true;
+            }
+            else
+            {
+                /// File-based layout: the snapshot becomes visible via the metadata file and
+                /// version hint that were just written above. From here on, any failure must
+                /// NOT delete manifest entry / manifest list.
+                published = true;
             }
         }
+
+        /// Fault-injection hook that simulates an exception in the trailing post-publish
+        /// region (e.g. failure in metadata-cache invalidation). Must be placed AFTER
+        /// `published = true` to exercise the exception-safety guard in the outer catch.
+        fiu_do_on(FailPoints::iceberg_writes_post_publish_throw,
+        {
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Failpoint iceberg_writes_post_publish_throw enabled");
+        });
 
         if (persistent_components.metadata_cache)
         {
@@ -1706,6 +1735,19 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
     }
     catch (...)
     {
+        if (published)
+        {
+            /// Commit has already become visible to readers. The failure is in trailing
+            /// post-publish work (e.g. metadata-cache invalidation). Running cleanup()
+            /// here would delete manifest files referenced by the published snapshot
+            /// and corrupt it. Log and swallow - any transient state (stale cache)
+            /// is self-healing on subsequent reads.
+            tryLogCurrentException(log,
+                "Post-publish work failed after Iceberg snapshot was committed; "
+                "skipping manifest cleanup to preserve published snapshot");
+            return true;
+        }
+
         LOG_ERROR(log, "Failed to commit import partition transaction: {}", getCurrentExceptionMessage(false));
         cleanup(false);
         throw;
