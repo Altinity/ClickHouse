@@ -15,6 +15,7 @@
 #include <IO/ConnectionTimeouts.h>
 #include <IO/ReadWriteBufferFromHTTP.h>
 #include <IO/S3/Client.h>
+#include <IO/S3/URI.h>
 #include <IO/ReadHelpers.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergWrites.h>
 #include <Poco/JSON/Object.h>
@@ -179,7 +180,7 @@ bool S3TablesCatalog::tryGetTableMetadata(
     if (result.getEndpoint().empty())
     {
         String endpoint = storage_endpoint.empty()
-            ? "https://s3." + region + ".amazonaws.com"
+            ? DB::S3::resolveS3Endpoint(region)
             : storage_endpoint;
         LOG_DEBUG(log, "S3 Tables: no endpoint for {}.{}, injecting: {}", namespace_name, table_name, endpoint);
         result.setEndpoint(endpoint);

@@ -50,6 +50,10 @@ struct URI
     static bool isAWSRegion(std::string_view region);
 };
 
+/// Resolve the S3 endpoint URL for a given AWS region using the SDK's
+/// Smithy endpoint rules (handles all partitions: standard, China, GovCloud, etc.).
+std::string resolveS3Endpoint(const std::string & region);
+
 }
 
 #endif
