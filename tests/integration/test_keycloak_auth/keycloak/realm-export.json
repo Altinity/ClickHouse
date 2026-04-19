@@ -24,6 +24,11 @@
     {
       "username": "alice",
       "enabled": true,
+      "emailVerified": true,
+      "email": "alice@example.com",
+      "firstName": "Alice",
+      "lastName": "Tester",
+      "requiredActions": [],
       "credentials": [
         {
           "type": "password",
@@ -31,6 +36,7 @@
           "temporary": false
         }
       ],
+      "realmRoles": ["offline_access", "uma_authorization", "default-roles-clickhouse-test"],
       "groups": ["analysts"]
     }
   ],
@@ -38,35 +44,5 @@
     {
       "name": "analysts"
     }
-  ],
-  "clientScopes": [
-    {
-      "name": "groups",
-      "protocol": "openid-connect",
-      "attributes": {
-        "include.in.token.scope": "true"
-      },
-      "protocolMappers": [
-        {
-          "name": "groups",
-          "protocol": "openid-connect",
-          "protocolMapper": "oidc-group-membership-mapper",
-          "config": {
-            "full.path": "false",
-            "id.token.claim": "true",
-            "access.token.claim": "true",
-            "claim.name": "groups",
-            "userinfo.token.claim": "true"
-          }
-        }
-      ]
-    }
-  ],
-  "defaultDefaultClientScopes": [
-    "profile",
-    "email",
-    "roles",
-    "web-origins",
-    "groups"
   ]
 }

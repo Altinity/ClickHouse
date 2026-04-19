@@ -218,12 +218,60 @@ def _approve_device_code_via_browser(
 
     s = requests.Session()
 
-    def get_form(html):
-        """Return (action_url, field_dict) for the first <form> in *html*."""
+    def _strip_secure_flag(session):
+        """Keycloak >= 25 emits Set-Cookie with Secure;SameSite=None on every
+        response, but the integration tests reach Keycloak over plain HTTP.
+        ``requests`` honors the Secure flag and refuses to resend those cookies
+        on the next HTTP hop, which causes Keycloak to lose its session and
+        return ``cookie_not_found``.  Clear the flag after every response so the
+        cookies are sent on subsequent HTTP requests."""
+        for cookie in session.cookies:
+            if getattr(cookie, "secure", False):
+                cookie.secure = False
+
+    def _follow(method, url, **kw):
+        """Manually walk redirects so we can strip the Secure flag between
+        hops; ``requests`` follows redirects internally before our hook can
+        run, which is too late once the chain has dropped a Secure cookie."""
+        kw.setdefault("timeout", 30)
+        kw["allow_redirects"] = False
+        for _ in range(20):
+            r = s.request(method, url, **kw)
+            _strip_secure_flag(s)
+            if r.status_code not in (301, 302, 303, 307, 308):
+                return r
+            loc = r.headers.get("Location")
+            if not loc:
+                return r
+            if loc.startswith("/"):
+                from urllib.parse import urlparse
+                parsed = urlparse(url)
+                url = f"{parsed.scheme}://{parsed.netloc}{loc}"
+            else:
+                url = loc
+            method = "GET"
+            kw.pop("data", None)
+            kw.pop("json", None)
+            kw.pop("params", None)
+        raise RuntimeError("Too many redirects")
+
+    def get(url, **kw):
+        return _follow("GET", url, **kw)
+
+    def post(url, **kw):
+        return _follow("POST", url, **kw)
+
+    def get_form(html, base_url=None):
+        """Return (action_url, field_dict) for the first <form> in *html*.
+
+        Resolves relative ``action`` URLs against *base_url* when provided."""
         m = re.search(r'<form\b[^>]*\baction="([^"]+)"', html)
         if not m:
             return None, {}
         action_url = html_unescape(m.group(1))
+        if base_url and not re.match(r"^https?://", action_url):
+            from urllib.parse import urljoin
+            action_url = urljoin(base_url, action_url)
         fields = {}
         for inp in re.findall(r"<input\b[^>]+>", html):
             n = re.search(r'\bname="([^"]+)"', inp)
@@ -235,40 +283,38 @@ def _approve_device_code_via_browser(
 
     # Step 1: Navigate to the device endpoint.  Keycloak redirects to a login
     # page when the user_code query parameter is provided and valid.
-    r = s.get(
+    r = get(
         f"{keycloak_base_url}/realms/{realm}/device",
         params={"user_code": user_code},
-        allow_redirects=True,
-        timeout=30,
     )
     r.raise_for_status()
 
     # Step 1a: If Keycloak shows a user-code entry form first (no user_code
     # in the redirect), fill it in and submit.
     if 'name="device_user_code"' in r.text or 'name="user_code"' in r.text:
-        action, fields = get_form(r.text)
+        action, fields = get_form(r.text, base_url=r.url)
         fields["device_user_code"] = user_code
         fields["user_code"] = user_code
-        r = s.post(action, data=fields, allow_redirects=True, timeout=30)
+        r = post(action, data=fields)
         r.raise_for_status()
 
     # Step 2: We should now be on the login page.  Submit credentials.
     assert 'type="password"' in r.text, (
         f"Expected Keycloak login page, got:\n{r.text[:800]}"
     )
-    action, fields = get_form(r.text)
+    action, fields = get_form(r.text, base_url=r.url)
     fields["username"] = username
     fields["password"] = password
-    r = s.post(action, data=fields, allow_redirects=True, timeout=30)
+    r = post(action, data=fields)
     r.raise_for_status()
 
     # Step 3: Submit the device consent / grant form.  Keycloak renders a
     # "Do you want to grant access?" page with an `accept` submit button.
-    action, fields = get_form(r.text)
+    action, fields = get_form(r.text, base_url=r.url)
     if action:
         if "accept" not in fields:
             fields["accept"] = ""
-        s.post(action, data=fields, allow_redirects=True, timeout=30)
+        post(action, data=fields)
 
 
 def test_device_flow_initiation(started_cluster):
