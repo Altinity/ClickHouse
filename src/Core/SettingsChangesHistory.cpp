@@ -94,6 +94,10 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"variant_throw_on_type_mismatch", true, true, "New setting to control type mismatch behavior in default Variant implementation"},
             {"dynamic_throw_on_type_mismatch", true, true, "New setting to control type mismatch behavior in default Dynamic implementation"},
         });
+        addSettingsChanges(settings_changes_history, "26.3.10.20001.altinityantalya",
+        {
+            // {"export_merge_tree_partition_task_timeout_seconds", "3600", "86400", "Increase default value to make it more realistic"},
+        });
         addSettingsChanges(settings_changes_history, "26.3",
         {
             {"allow_experimental_polyglot_dialect", false, false, "New setting to enable the polyglot SQL transpiler dialect."},
@@ -159,6 +163,13 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"jemalloc_profile_text_collapsed_use_count", false, false, "New setting to aggregate by allocation count instead of bytes in the collapsed jemalloc heap profile format"},
             {"opentelemetry_start_keeper_trace_probability", "auto", "auto", "New setting"},
             {"functions_h3_default_if_invalid", true, false, "A new setting for legacy behaviour to allow invalid inputs to h3 functions"},
+        });
+        addSettingsChanges(settings_changes_history, "26.1.3.20001.altinityantalya",
+        {
+            // {"iceberg_partition_timezone", "", "", "New setting."},
+            // {"s3_propagate_credentials_to_other_storages", false, false, "New setting"},
+            // {"export_merge_tree_part_filename_pattern", "", "{part_name}_{checksum}", "New setting"},
+            // {"input_format_parquet_use_metadata_cache", true, false, "Obsolete. No-op"}, // https://github.com/Altinity/ClickHouse/pull/586
         });
         addSettingsChanges(settings_changes_history, "26.1",
         {
@@ -340,6 +351,39 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"os_threads_nice_value_query", 0, 0, "New setting."},
             {"os_threads_nice_value_materialized_view", 0, 0, "New setting."},
             {"os_thread_priority", 0, 0, "Alias for os_threads_nice_value_query."},
+        });
+        addSettingsChanges(settings_changes_history, "25.8.16.20001.altinityantalya",
+        {
+            // {"allow_experimental_database_iceberg", false, true, "Turned ON by default for Antalya."},
+            // {"allow_experimental_database_unity_catalog", false, true, "Turned ON by default for Antalya."},
+            // {"allow_experimental_database_glue_catalog", false, true, "Turned ON by default for Antalya."},
+            // {"allow_database_iceberg", false, true, "Turned ON by default for Antalya (alias)."},
+            // {"allow_database_unity_catalog", false, true, "Turned ON by default for Antalya (alias)."},
+            // {"allow_database_glue_catalog", false, true, "Turned ON by default for Antalya (alias)."},
+            // {"input_format_parquet_use_metadata_cache", true, true, "New setting, turned ON by default"}, // https://github.com/Altinity/ClickHouse/pull/586
+            // {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."},
+            // {"object_storage_remote_initiator", false, false, "New setting."},
+            // {"allow_experimental_iceberg_read_optimization", true, true, "New setting."},
+            // {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
+            // {"lock_object_storage_task_distribution_ms", 500, 500, "New setting."},
+            // {"allow_retries_in_cluster_requests", false, false, "New setting"},
+            // {"allow_experimental_export_merge_tree_part", false, true, "Turned ON by default for Antalya."},
+            // {"export_merge_tree_part_overwrite_file_if_exists", false, false, "New setting."},
+            // {"export_merge_tree_partition_force_export", false, false, "New setting."},
+            // {"export_merge_tree_partition_max_retries", 3, 3, "New setting."},
+            // {"export_merge_tree_partition_manifest_ttl", 180, 180, "New setting."},
+            // {"export_merge_tree_part_file_already_exists_policy", "skip", "skip", "New setting."},
+            // {"hybrid_table_auto_cast_columns", true, true, "New setting to automatically cast Hybrid table columns when segments disagree on types. Default enabled."},
+            // {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},
+            // {"enable_alias_marker", true, true, "New setting."},
+            // {"export_merge_tree_part_max_bytes_per_file", 0, 0, "New setting."},
+            // {"export_merge_tree_part_max_rows_per_file", 0, 0, "New setting."},
+            // {"export_merge_tree_partition_lock_inside_the_task", false, false, "New setting."},
+            // {"export_merge_tree_partition_system_table_prefer_remote_information", true, true, "New setting."},
+            // {"export_merge_tree_part_throw_on_pending_mutations", true, true, "New setting."},
+            // {"export_merge_tree_part_throw_on_pending_patch_parts", true, true, "New setting."},
+            // {"object_storage_cluster", "", "", "Antalya: New setting"},
+            // {"object_storage_max_nodes", 0, 0, "Antalya: New setting"},
         });
         addSettingsChanges(settings_changes_history, "25.8",
         {
