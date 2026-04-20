@@ -111,6 +111,7 @@ struct ExportReplicatedMergeTreePartitionManifest
     time_t create_time;
     size_t max_retries;
     size_t ttl_seconds;
+    size_t task_timeout_seconds;
     size_t max_threads;
     bool parallel_formatting;
     bool parquet_parallel_encoding;
@@ -152,6 +153,7 @@ struct ExportReplicatedMergeTreePartitionManifest
         json.set("create_time", create_time);
         json.set("max_retries", max_retries);
         json.set("ttl_seconds", ttl_seconds);
+        json.set("task_timeout_seconds", task_timeout_seconds);
         json.set("lock_inside_the_task", lock_inside_the_task);
         json.set("write_full_path_in_iceberg_metadata", write_full_path_in_iceberg_metadata);
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
@@ -187,6 +189,7 @@ struct ExportReplicatedMergeTreePartitionManifest
         
         manifest.create_time = json->getValue<time_t>("create_time");
         manifest.ttl_seconds = json->getValue<size_t>("ttl_seconds");
+        manifest.task_timeout_seconds = json->getValue<size_t>("task_timeout_seconds");
         manifest.max_threads = json->getValue<size_t>("max_threads");
         manifest.parallel_formatting = json->getValue<bool>("parallel_formatting");
         manifest.parquet_parallel_encoding = json->getValue<bool>("parquet_parallel_encoding");

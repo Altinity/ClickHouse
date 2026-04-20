@@ -1,7 +1,12 @@
+import io
+import json
 import logging
+import re
 import time
 
 import pytest
+from avro.datafile import DataFileReader
+from avro.io import DatumReader
 
 from helpers.cluster import ClickHouseCluster
 from helpers.export_partition_helpers import (
@@ -804,3 +809,61 @@ def test_post_publish_exception_preserves_snapshot(cluster):
     assert result == "1\t2020\n2\t2020\n3\t2020", (
         f"Unexpected data after post-publish exception recovery:\n{result}"
     )
+
+
+def test_export_task_timeout_kills_stuck_pending_task(cluster):
+    """
+    Verify that export_merge_tree_partition_task_timeout_seconds auto-kills a task
+    that remains PENDING past the deadline, transitioning it to KILLED with a
+    descriptive last_exception.
+
+    The export_partition_commit_always_throw failpoint wedges the task in the
+    commit retry loop (REGULAR failpoint, fires on every commit attempt). A very
+    large max_retries budget prevents the commit-attempts path from transitioning
+    to FAILED before the timeout fires, so the timeout branch in tryCleanup is
+    the actual mechanism under test.
+    """
+    node = cluster.instances["replica1"]
+    uid = unique_suffix()
+    mt_table = f"mt_{uid}"
+    iceberg_table = f"iceberg_{uid}"
+    setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1"])
+
+    node.query("SYSTEM ENABLE FAILPOINT export_partition_commit_always_throw")
+
+    try:
+        node.query(
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
+            f" SETTINGS export_merge_tree_partition_task_timeout_seconds = 5,"
+            f"          export_merge_tree_partition_max_retries = 1000000,"
+            f"          export_merge_tree_partition_manifest_ttl = 3600"
+        )
+
+        # Timeout budget must cover: the 5s task timeout + one manifest-updating
+        # poll cycle (~30s) + watch propagation. 90s is safe.
+        wait_for_export_status(
+            node, mt_table, iceberg_table, "2020",
+            expected_status="KILLED",
+            timeout=90,
+        )
+
+        # TODO: system.replicated_partition_exports does not currently surface
+        # last_exception / exception_count reliably (the engine's aggregation
+        # from exceptions_per_replica is incomplete). Read the raw znode via
+        # system.zookeeper until that is fixed.
+        export_key = f"2020_default.{iceberg_table}"
+        last_exception_path = (
+            f"/clickhouse/tables/{mt_table}/exports/{export_key}"
+            f"/exceptions_per_replica/replica1/last_exception"
+        )
+        last_exception = node.query(
+            f"""
+            SELECT value FROM system.zookeeper
+            WHERE path = '{last_exception_path}' AND name = 'exception'
+            """
+        ).strip()
+        assert "timed out" in last_exception, (
+            f"Expected last_exception znode to mention the timeout reason, got: {last_exception!r}"
+        )
+    finally:
+        node.query("SYSTEM DISABLE FAILPOINT export_partition_commit_always_throw")

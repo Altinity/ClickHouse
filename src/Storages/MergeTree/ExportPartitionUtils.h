@@ -1,5 +1,6 @@
 #pragma once
 
+#include <filesystem>
 #include <vector>
 #include <string>
 #include <Core/Field.h>
@@ -55,6 +56,27 @@ namespace ExportPartitionUtils
         const zkutil::ZooKeeperPtr & zk,
         const std::string & entry_path,
         size_t max_attempts,
+        const LoggerPtr & log);
+
+    /// Appends ZK ops to `ops` that record a per-replica exception under
+    ///   <entry_path>/exceptions_per_replica/<replica_name>/last_exception/{exception,part}
+    /// and increment <entry_path>/exceptions_per_replica/<replica_name>/count,
+    /// creating the subtree if absent.
+    ///
+    /// The count increment is non-atomic (synchronous tryGet + set with version -1).
+    /// Concurrent failing writers may under-count by one, which is accepted in this
+    /// subsystem and matches the pre-existing behaviour.
+    ///
+    /// Intended to be combined with additional ops (for example a version-guarded
+    /// status set) and executed as a single `tryMulti` so the exception record and
+    /// the accompanying state transition commit atomically.
+    void appendExceptionOps(
+        Coordination::Requests & ops,
+        const zkutil::ZooKeeperPtr & zk,
+        const std::filesystem::path & entry_path,
+        const std::string & replica_name,
+        const std::string & part_name,
+        const std::string & exception_message,
         const LoggerPtr & log);
 }
 

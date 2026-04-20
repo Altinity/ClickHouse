@@ -8,6 +8,7 @@
 #include <Common/ProfileEvents.h>
 #include <Common/FailPoint.h>
 #include <Interpreters/DatabaseCatalog.h>
+#include <fmt/format.h>
 
 namespace ProfileEvents
 {
@@ -57,6 +58,10 @@ namespace
     {
         bool has_expired = metadata.create_time < now - static_cast<time_t>(metadata.ttl_seconds);
 
+        bool task_timed_out = is_pending
+            && metadata.task_timeout_seconds > 0
+            && metadata.create_time + static_cast<time_t>(metadata.task_timeout_seconds) < now;
+
         if (has_expired && !is_pending)
         {
             zk->tryRemoveRecursive(fs::path(entry_path));
@@ -68,6 +73,69 @@ namespace
             LOG_INFO(log, "ExportPartition Manifest Updating Task: Removed {}: expired", key);
 
             return true;
+        }
+        else if (task_timed_out)
+        {
+            const std::string status_path = (fs::path(entry_path) / "status").string();
+
+            Coordination::Stat status_stat;
+            std::string status_string;
+
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
+            if (!zk->tryGet(status_path, status_string, &status_stat))
+            {
+                LOG_INFO(log, "ExportPartition Manifest Updating Task: Failed to read status for {} while enforcing task timeout, skipping", entry_path);
+                return false;
+            }
+
+            const auto current_status = magic_enum::enum_cast<ExportReplicatedMergeTreePartitionTaskEntry::Status>(status_string);
+            if (!current_status || *current_status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
+            {
+                LOG_INFO(log, "ExportPartition Manifest Updating Task: Task {} is not PENDING, can't set to KILLED, skipping", entry_path);
+                return false;
+            }
+
+            const auto timeout_message = fmt::format(
+                "Export partition task timed out: exceeded export_merge_tree_partition_task_timeout_seconds={} (created at {}, now {})",
+                metadata.task_timeout_seconds, metadata.create_time, now);
+
+            const auto killed_name = String(magic_enum::enum_name(ExportReplicatedMergeTreePartitionTaskEntry::Status::KILLED));
+
+            Coordination::Requests ops;
+            ExportPartitionUtils::appendExceptionOps(
+                ops, zk, fs::path(entry_path), storage.getReplicaName(),
+                /*part_name=*/"", timeout_message, log);
+
+            ops.emplace_back(zkutil::makeSetRequest(status_path, killed_name, status_stat.version));
+
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperMulti);
+
+            Coordination::Responses responses;
+            const auto rc = zk->tryMulti(ops, responses);
+
+            if (rc == Coordination::Error::ZOK)
+            {
+                LOG_WARNING(log,
+                    "ExportPartition Manifest Updating Task: task {} exceeded task_timeout_seconds={}s, "
+                    "transitioned PENDING -> KILLED (atomic with exception record)",
+                    entry_path, metadata.task_timeout_seconds);
+            }
+            else
+            {
+                /// ZBADVERSION (status changed), ZNODEEXISTS (lazy-create race with the scheduler),
+                /// counter race, or ZNONODE (entry concurrently removed). In all cases the batch
+                /// was rolled back atomically and the task will be re-evaluated on the next poll.
+                LOG_INFO(log,
+                    "ExportPartition Manifest Updating Task: atomic kill for {} failed (rc={}); "
+                    "status was concurrently updated or a ZK op conflicted, will retry on next poll",
+                    entry_path, rc);
+            }
+
+            /// Return false so the entry remains in entries_by_key; the status watch will drive
+            /// handleStatusChanges -> killExportPart on every replica, mirroring user-initiated KILL.
+            return false;
         }
         else if (is_pending)
         {
