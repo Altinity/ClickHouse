@@ -3793,10 +3793,10 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_RELEASE
+      - name: Download artifact CH_AMD_RELEASE_STRIPPED
         uses: actions/download-artifact@v4
         with:
-          name: CH_AMD_RELEASE
+          name: CH_AMD_RELEASE_STRIPPED
           path: ./ci/tmp
 
 
@@ -3867,10 +3867,10 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_ARM_RELEASE
+      - name: Download artifact CH_ARM_RELEASE_STRIPPED
         uses: actions/download-artifact@v4
         with:
-          name: CH_ARM_RELEASE
+          name: CH_ARM_RELEASE_STRIPPED
           path: ./ci/tmp
 
 
