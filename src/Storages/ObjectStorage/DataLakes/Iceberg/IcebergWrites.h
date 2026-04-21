@@ -46,37 +46,20 @@ namespace DB
 
 String removeEscapedSlashes(const String & json_str);
 
-/// Metadata stored in a data-file sidecar Avro file.
-/// The sidecar lives next to the data file and carries the fields that
-/// IcebergDataFileEntry records but that cannot be inferred cheaply from the
-/// data file itself (row count, byte size, and column statistics).
-struct DataFileSidecarMetadata
-{
-    Int64 record_count = 0;
-    Int64 file_size_in_bytes = 0;
-    /// Column statistics in Iceberg wire format.
-    /// Vectors are empty when the sidecar predates column-stats support or when the
-    /// writer could not collect statistics for a particular field.
-    IcebergSerializedFileStats column_stats;
-};
-
-/// Read a data-file sidecar and return its metadata.
-/// Supports both the old two-field format (no column stats) and the new six-field format.
-DataFileSidecarMetadata readDataFileSidecar(
+/// Read a data-file sidecar and return its contents in Iceberg wire format.
+/// The returned struct carries the row count, byte size, and per-column statistics.
+IcebergSerializedFileStats readDataFileSidecar(
     const String & sidecar_storage_path,
     const ObjectStoragePtr & object_storage,
     const ContextPtr & context);
 
 /// Write a sidecar Avro file alongside a data file.
-/// When column_stats is provided all six fields are written; otherwise only the two
-/// basic counters are written (backward-compatible format).
+/// All six fields are written; empty stat vectors are valid when statistics are unavailable.
 void writeDataFileSidecar(
     const String & data_file_storage_path,
-    Int64 record_count,
-    Int64 file_size_in_bytes,
+    const IcebergSerializedFileStats & stats,
     const ObjectStoragePtr & object_storage,
-    const ContextPtr & context,
-    std::optional<IcebergSerializedFileStats> column_stats = std::nullopt);
+    const ContextPtr & context);
 
 /// Convert in-memory DataFileStatistics (ClickHouse-internal) to the Iceberg wire format.
 /// Bounds are serialized to bytes using the same encoding used in the manifest file,

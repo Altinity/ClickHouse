@@ -17,6 +17,10 @@ from helpers.export_partition_helpers import (
     wait_for_export_status,
     wait_for_export_to_start,
 )
+from helpers.iceberg_export_stats import (
+    assert_exported_stats,
+    fetch_manifest_entries,
+)
 from helpers.network import PartitionManager
 
 
@@ -26,7 +30,10 @@ def cluster():
         cluster = ClickHouseCluster(__file__)
         cluster.add_instance(
             "replica1",
-            main_configs=["configs/allow_experimental_export_partition.xml"],
+            main_configs=[
+                "configs/allow_experimental_export_partition.xml",
+                "configs/config.d/metadata_log.xml",
+            ],
             user_configs=["configs/users.d/profile.xml"],
             with_minio=True,
             stay_alive=True,
@@ -35,7 +42,10 @@ def cluster():
         )
         cluster.add_instance(
             "replica2",
-            main_configs=["configs/allow_experimental_export_partition.xml"],
+            main_configs=[
+                "configs/allow_experimental_export_partition.xml",
+                "configs/config.d/metadata_log.xml",
+            ],
             user_configs=["configs/users.d/profile.xml"],
             with_minio=True,
             stay_alive=True,
@@ -867,3 +877,58 @@ def test_export_task_timeout_kills_stuck_pending_task(cluster):
         )
     finally:
         node.query("SYSTEM DISABLE FAILPOINT export_partition_commit_always_throw")
+
+
+def setup_stats_tables(node, mt_table: str, iceberg_table: str):
+    """Local variant of setup_tables using the wider schema with a Nullable column."""
+    columns = "id Int32, name String, tag Nullable(String), year Int32"
+
+    make_rmt(
+        node, mt_table, columns, "year",
+        order_by="id", replica_name="replica1",
+    )
+    node.query(
+        f"""
+        INSERT INTO {mt_table} (id, name, tag, year) VALUES
+            (1, 'aaa', 'x',  2020),
+            (2, 'mmm', NULL, 2020),
+            (3, 'zzz', 'y',  2020),
+            (4, 'kkk', 'z',  2021)
+        """
+    )
+
+    make_iceberg_s3(node, iceberg_table, columns, partition_by="year")
+
+
+def test_export_partition_writes_column_statistics(cluster):
+    """
+    Export a whole partition (EXPORT PARTITION ID '2020') that contains one NULL
+    and verify that the resulting Iceberg manifest entry carries accurate per-file
+    column statistics: record_count, file_size_in_bytes, column_sizes,
+    null_value_counts, and lower/upper bounds.
+    """
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_stats_{uid}"
+    iceberg_table = f"iceberg_stats_{uid}"
+
+    setup_stats_tables(node, mt_table, iceberg_table)
+
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
+    )
+    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 3, f"Expected 3 rows in Iceberg table after export, got {count}"
+
+    query_id = f"stats_partition_{uid}"
+    node.query(
+        f"SELECT * FROM {iceberg_table} ORDER BY id",
+        query_id=query_id,
+        settings={"iceberg_metadata_log_level": "manifest_file_entry"},
+    )
+
+    entries = fetch_manifest_entries(node, query_id)
+    assert_exported_stats(entries)

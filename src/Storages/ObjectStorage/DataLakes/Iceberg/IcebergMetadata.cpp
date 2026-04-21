@@ -1858,11 +1858,11 @@ void IcebergMetadata::commitExportPartitionTransaction(
     for (const auto & path : data_file_paths)
     {
         const auto sidecar_path = getIcebergExportPartSidecarStoragePath(path);
-        auto sidecar = readDataFileSidecar(sidecar_path, object_storage, context);
-        total_rows += sidecar.record_count;
-        total_chunks_size += sidecar.file_size_in_bytes;
+        auto stats = readDataFileSidecar(sidecar_path, object_storage, context);
+        total_rows += stats.record_count;
+        total_chunks_size += stats.file_size_in_bytes;
 
-        per_file_stats.push_back(std::move(sidecar.column_stats));
+        per_file_stats.push_back(std::move(stats));
     }
 
     size_t attempt = 0;

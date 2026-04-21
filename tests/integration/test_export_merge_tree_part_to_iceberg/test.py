@@ -27,6 +27,10 @@ from helpers.export_partition_helpers import (
     make_mt,
     unique_suffix,
 )
+from helpers.iceberg_export_stats import (
+    assert_exported_stats,
+    fetch_manifest_entries,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +44,7 @@ def cluster():
         cluster = ClickHouseCluster(__file__)
         cluster.add_instance(
             "node1",
+            main_configs=["configs/config.d/metadata_log.xml"],
             with_minio=True,
         )
         logging.info("Starting cluster...")
@@ -421,6 +426,54 @@ def test_export_part_with_bucket_partition(cluster):
     assert "2\t42\tworld" in result, f"Row 2 missing or incorrect:\n{result}"
 
     assert_part_log(node, mt, part)
+
+    node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
+    node.query(f"DROP TABLE IF EXISTS {iceberg}")
+
+
+def test_export_part_writes_column_statistics(cluster):
+    """
+    Export a MergeTree part that contains one NULL and verify that the resulting
+    Iceberg manifest entry carries accurate per-file column statistics:
+    record_count, file_size_in_bytes, column_sizes, null_value_counts,
+    and lower/upper bounds (Int32 + String + Nullable(String) mix).
+    """
+    node = cluster.instances["node1"]
+    sfx = unique_suffix()
+    mt = f"mt_stats_{sfx}"
+    iceberg = f"iceberg_stats_{sfx}"
+
+    columns = "id Int32, name String, tag Nullable(String), year Int32"
+
+    make_mt(node, mt, columns, "year", order_by="id")
+    make_iceberg_s3(node, iceberg, columns, "year")
+
+    node.query(
+        f"""
+        INSERT INTO {mt} (id, name, tag, year) VALUES
+            (1, 'aaa', 'x',  2020),
+            (2, 'mmm', NULL, 2020),
+            (3, 'zzz', 'y',  2020),
+            (4, 'kkk', 'z',  2021)
+        """
+    )
+
+    part_2020 = get_part(node, mt, "2020")
+    export_part(node, mt, part_2020, iceberg)
+    wait_for_export_part(node, mt, part_2020)
+
+    count = int(node.query(f"SELECT count() FROM {iceberg}").strip())
+    assert count == 3, f"Expected 3 rows after export, got {count}"
+
+    query_id = f"stats_part_{sfx}"
+    node.query(
+        f"SELECT * FROM {iceberg} ORDER BY id",
+        query_id=query_id,
+        settings={"iceberg_metadata_log_level": "manifest_file_entry"},
+    )
+
+    entries = fetch_manifest_entries(node, query_id)
+    assert_exported_stats(entries)
 
     node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
     node.query(f"DROP TABLE IF EXISTS {iceberg}")
