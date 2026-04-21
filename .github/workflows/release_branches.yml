@@ -237,6 +237,12 @@ jobs:
             python3 -m praktika run 'Build (amd_debug)' --workflow "ReleaseBranchCI" --ci |& tee ./ci/tmp/job.log
           fi
 
+      - name: Upload artifact CH_AMD_DEBUG_GH
+        uses: actions/upload-artifact@v4
+        with:
+          name: CH_AMD_DEBUG_GH
+          path: ci/tmp/build/programs/self-extracting/clickhouse
+
   build_amd_asan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
@@ -377,6 +383,12 @@ jobs:
           else
             python3 -m praktika run 'Build (amd_msan)' --workflow "ReleaseBranchCI" --ci |& tee ./ci/tmp/job.log
           fi
+
+      - name: Upload artifact CH_AMD_MSAN_GH
+        uses: actions/upload-artifact@v4
+        with:
+          name: CH_AMD_MSAN_GH
+          path: ci/tmp/build/programs/self-extracting/clickhouse
 
   build_amd_ubsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]

@@ -334,6 +334,12 @@ jobs:
             python3 -m praktika run 'Build (amd_debug)' --workflow "PR" --ci |& tee ./ci/tmp/job.log
           fi
 
+      - name: Upload artifact CH_AMD_DEBUG_GH
+        uses: actions/upload-artifact@v4
+        with:
+          name: CH_AMD_DEBUG_GH
+          path: ci/tmp/build/programs/self-extracting/clickhouse
+
   build_amd_asan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest, fast_test]
@@ -475,6 +481,12 @@ jobs:
             python3 -m praktika run 'Build (amd_msan)' --workflow "PR" --ci |& tee ./ci/tmp/job.log
           fi
 
+      - name: Upload artifact CH_AMD_MSAN_GH
+        uses: actions/upload-artifact@v4
+        with:
+          name: CH_AMD_MSAN_GH
+          path: ci/tmp/build/programs/self-extracting/clickhouse
+
   build_amd_ubsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest, fast_test]
@@ -568,6 +580,12 @@ jobs:
           else
             python3 -m praktika run 'Build (amd_binary)' --workflow "PR" --ci |& tee ./ci/tmp/job.log
           fi
+
+      - name: Upload artifact CH_AMD_BINARY_GH
+        uses: actions/upload-artifact@v4
+        with:
+          name: CH_AMD_BINARY_GH
+          path: ci/tmp/build/programs/self-extracting/clickhouse
 
   build_arm_asan:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
@@ -839,6 +857,12 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_DEBUG_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_DEBUG_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -1122,6 +1146,12 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_BINARY_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_BINARY_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -1168,6 +1198,12 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_BINARY_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_BINARY_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -1216,6 +1252,12 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_BINARY_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_BINARY_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -1262,6 +1304,12 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_BINARY_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_BINARY_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -1310,6 +1358,12 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_DEBUG_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_DEBUG_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -1356,6 +1410,12 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_DEBUG_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_DEBUG_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -1404,6 +1464,12 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_DEBUG_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_DEBUG_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -1450,6 +1516,12 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_DEBUG_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_DEBUG_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -1686,6 +1758,12 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_MSAN_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_MSAN_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -1732,6 +1810,12 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_MSAN_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_MSAN_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -1780,6 +1864,12 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_MSAN_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_MSAN_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -1826,6 +1916,12 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_MSAN_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_MSAN_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -1968,6 +2064,12 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_DEBUG_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_DEBUG_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -2014,6 +2116,12 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_DEBUG_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_DEBUG_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -2626,6 +2734,12 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_BINARY_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_BINARY_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -2672,6 +2786,12 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_BINARY_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_BINARY_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -2720,6 +2840,12 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_BINARY_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_BINARY_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -2767,6 +2893,12 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_BINARY_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_BINARY_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -2813,6 +2945,12 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_BINARY_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_BINARY_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -4083,6 +4221,12 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_DEBUG_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_DEBUG_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -4224,6 +4368,12 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_MSAN_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_MSAN_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -4317,6 +4467,12 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_DEBUG_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_DEBUG_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -4458,6 +4614,12 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_MSAN_GH
+        uses: actions/download-artifact@v4
+        with:
+          name: CH_AMD_MSAN_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run

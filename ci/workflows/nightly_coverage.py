@@ -17,6 +17,7 @@ workflow = Workflow.Config(
     secrets=SECRETS,
     artifacts=[
         *ArtifactConfigs.clickhouse_binaries,
+        *ArtifactConfigs.clickhouse_binaries_gh,
     ],
     enable_cache=True,
     enable_report=True,

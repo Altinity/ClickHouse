@@ -187,6 +187,13 @@ jobs:
           path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
+      - name: Upload artifact CH_AMD_DEBUG_GH
+        uses: actions/upload-artifact@v4
+        with:
+          name: CH_AMD_DEBUG_GH
+          path: ci/tmp/build/programs/self-extracting/clickhouse
+
+
       - name: Upload artifact DEB_AMD_DEBUG
         uses: actions/upload-artifact@v4
         with:
@@ -388,6 +395,13 @@ jobs:
           path: ci/tmp/build/programs/self-extracting/clickhouse
 
 
+      - name: Upload artifact CH_AMD_MSAN_GH
+        uses: actions/upload-artifact@v4
+        with:
+          name: CH_AMD_MSAN_GH
+          path: ci/tmp/build/programs/self-extracting/clickhouse
+
+
       - name: Upload artifact DEB_AMD_MSAM
         uses: actions/upload-artifact@v4
         with:
@@ -512,6 +526,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: CH_AMD_BINARY
+          path: ci/tmp/build/programs/self-extracting/clickhouse
+
+
+      - name: Upload artifact CH_AMD_BINARY_GH
+        uses: actions/upload-artifact@v4
+        with:
+          name: CH_AMD_BINARY_GH
           path: ci/tmp/build/programs/self-extracting/clickhouse
 
   build_arm_asan:
@@ -878,10 +899,10 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_DEBUG
+      - name: Download artifact CH_AMD_DEBUG_GH
         uses: actions/download-artifact@v4
         with:
-          name: CH_AMD_DEBUG
+          name: CH_AMD_DEBUG_GH
           path: ./ci/tmp
 
       - name: Run
@@ -1090,10 +1111,10 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_BINARY
+      - name: Download artifact CH_AMD_BINARY_GH
         uses: actions/download-artifact@v4
         with:
-          name: CH_AMD_BINARY
+          name: CH_AMD_BINARY_GH
           path: ./ci/tmp
 
       - name: Run
@@ -1143,10 +1164,10 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_BINARY
+      - name: Download artifact CH_AMD_BINARY_GH
         uses: actions/download-artifact@v4
         with:
-          name: CH_AMD_BINARY
+          name: CH_AMD_BINARY_GH
           path: ./ci/tmp
 
       - name: Run
@@ -1196,10 +1217,10 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_BINARY
+      - name: Download artifact CH_AMD_BINARY_GH
         uses: actions/download-artifact@v4
         with:
-          name: CH_AMD_BINARY
+          name: CH_AMD_BINARY_GH
           path: ./ci/tmp
 
       - name: Run
@@ -1249,10 +1270,10 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_BINARY
+      - name: Download artifact CH_AMD_BINARY_GH
         uses: actions/download-artifact@v4
         with:
-          name: CH_AMD_BINARY
+          name: CH_AMD_BINARY_GH
           path: ./ci/tmp
 
       - name: Run
@@ -1302,10 +1323,10 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_DEBUG
+      - name: Download artifact CH_AMD_DEBUG_GH
         uses: actions/download-artifact@v4
         with:
-          name: CH_AMD_DEBUG
+          name: CH_AMD_DEBUG_GH
           path: ./ci/tmp
 
       - name: Run
@@ -1355,10 +1376,10 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_DEBUG
+      - name: Download artifact CH_AMD_DEBUG_GH
         uses: actions/download-artifact@v4
         with:
-          name: CH_AMD_DEBUG
+          name: CH_AMD_DEBUG_GH
           path: ./ci/tmp
 
       - name: Run
@@ -1408,10 +1429,10 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_DEBUG
+      - name: Download artifact CH_AMD_DEBUG_GH
         uses: actions/download-artifact@v4
         with:
-          name: CH_AMD_DEBUG
+          name: CH_AMD_DEBUG_GH
           path: ./ci/tmp
 
       - name: Run
@@ -1461,10 +1482,10 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_DEBUG
+      - name: Download artifact CH_AMD_DEBUG_GH
         uses: actions/download-artifact@v4
         with:
-          name: CH_AMD_DEBUG
+          name: CH_AMD_DEBUG_GH
           path: ./ci/tmp
 
       - name: Run
@@ -1726,10 +1747,10 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_MSAN
+      - name: Download artifact CH_AMD_MSAN_GH
         uses: actions/download-artifact@v4
         with:
-          name: CH_AMD_MSAN
+          name: CH_AMD_MSAN_GH
           path: ./ci/tmp
 
       - name: Run
@@ -1779,10 +1800,10 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_MSAN
+      - name: Download artifact CH_AMD_MSAN_GH
         uses: actions/download-artifact@v4
         with:
-          name: CH_AMD_MSAN
+          name: CH_AMD_MSAN_GH
           path: ./ci/tmp
 
       - name: Run
@@ -1832,10 +1853,10 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_MSAN
+      - name: Download artifact CH_AMD_MSAN_GH
         uses: actions/download-artifact@v4
         with:
-          name: CH_AMD_MSAN
+          name: CH_AMD_MSAN_GH
           path: ./ci/tmp
 
       - name: Run
@@ -1885,10 +1906,10 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_MSAN
+      - name: Download artifact CH_AMD_MSAN_GH
         uses: actions/download-artifact@v4
         with:
-          name: CH_AMD_MSAN
+          name: CH_AMD_MSAN_GH
           path: ./ci/tmp
 
       - name: Run
@@ -2044,10 +2065,10 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_DEBUG
+      - name: Download artifact CH_AMD_DEBUG_GH
         uses: actions/download-artifact@v4
         with:
-          name: CH_AMD_DEBUG
+          name: CH_AMD_DEBUG_GH
           path: ./ci/tmp
 
       - name: Run
@@ -2097,10 +2118,10 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_DEBUG
+      - name: Download artifact CH_AMD_DEBUG_GH
         uses: actions/download-artifact@v4
         with:
-          name: CH_AMD_DEBUG
+          name: CH_AMD_DEBUG_GH
           path: ./ci/tmp
 
       - name: Run
@@ -2786,10 +2807,10 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_BINARY
+      - name: Download artifact CH_AMD_BINARY_GH
         uses: actions/download-artifact@v4
         with:
-          name: CH_AMD_BINARY
+          name: CH_AMD_BINARY_GH
           path: ./ci/tmp
 
       - name: Run
@@ -2839,10 +2860,10 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_BINARY
+      - name: Download artifact CH_AMD_BINARY_GH
         uses: actions/download-artifact@v4
         with:
-          name: CH_AMD_BINARY
+          name: CH_AMD_BINARY_GH
           path: ./ci/tmp
 
       - name: Run
@@ -2892,10 +2913,10 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_BINARY
+      - name: Download artifact CH_AMD_BINARY_GH
         uses: actions/download-artifact@v4
         with:
-          name: CH_AMD_BINARY
+          name: CH_AMD_BINARY_GH
           path: ./ci/tmp
 
       - name: Run
@@ -2945,10 +2966,10 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_BINARY
+      - name: Download artifact CH_AMD_BINARY_GH
         uses: actions/download-artifact@v4
         with:
-          name: CH_AMD_BINARY
+          name: CH_AMD_BINARY_GH
           path: ./ci/tmp
 
       - name: Run
@@ -2998,10 +3019,10 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_BINARY
+      - name: Download artifact CH_AMD_BINARY_GH
         uses: actions/download-artifact@v4
         with:
-          name: CH_AMD_BINARY
+          name: CH_AMD_BINARY_GH
           path: ./ci/tmp
 
       - name: Run

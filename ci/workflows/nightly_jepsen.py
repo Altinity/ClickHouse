@@ -27,6 +27,7 @@ workflow = Workflow.Config(
     ],
     artifacts=[
         *ArtifactConfigs.clickhouse_binaries,
+        *ArtifactConfigs.clickhouse_binaries_gh,
     ],
     dockers=DOCKERS,
     secrets=SECRETS,

@@ -275,6 +275,12 @@ jobs:
             python3 -m praktika run 'Build (amd_binary)' --workflow "MergeQueueCI" --ci |& tee ./ci/tmp/job.log
           fi
 
+      - name: Upload artifact CH_AMD_BINARY_GH
+        uses: actions/upload-artifact@v4
+        with:
+          name: CH_AMD_BINARY_GH
+          path: ci/tmp/build/programs/self-extracting/clickhouse
+
   finish_workflow:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, fast_test, build_amd_binary]

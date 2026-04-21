@@ -23,6 +23,7 @@ workflow = Workflow.Config(
         ArtifactConfigs.fuzzers,
         ArtifactConfigs.fuzzers_corpus,
         *ArtifactConfigs.clickhouse_binaries,
+        *ArtifactConfigs.clickhouse_binaries_gh,
     ],
     enable_cache=True,
     enable_report=True,
