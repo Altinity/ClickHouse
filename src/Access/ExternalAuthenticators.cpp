@@ -675,13 +675,23 @@ bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & cred
     if (token_processors.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Token authentication is not configured");
 
-    /// Per-user claims restriction applies only to JWT processors; opaque/access token processors ignore it.
+    /// Per-user claims restriction is binding: when a user is configured with `jwt_claims`,
+    /// authentication is only allowed via processors that can actually evaluate those claims
+    /// (i.e. JWT processors). If the resolving processor cannot enforce the restriction we
+    /// must deny -- silently treating it as "no restriction" would let an opaque/access-token
+    /// processor authenticate a token that fails the user's per-user policy.
     auto check_claims_if_required = [&](const ITokenProcessor & processor) -> bool
     {
         if (jwt_claims.empty())
             return true;
         if (!processor.supportsJwtClaimsRestriction())
-            return true;
+        {
+            LOG_TRACE(getLogger("AccessTokenAuthentication"),
+                      "Processor {} does not support per-user JWT claims restriction; "
+                      "denying authentication that requires claims to be checked",
+                      processor.getProcessorName());
+            return false;
+        }
         return processor.checkClaims(credentials, jwt_claims);
     };
 
@@ -708,8 +718,10 @@ bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & cred
             LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} found, using it to authenticate", cached_entry_iter->second.user_name);
             if (!jwt_claims.empty())
             {
-                /// processor_name is guaranteed non-empty here and matches the cached processor.
-                const auto it = token_processors.find(processor_name);
+                /// Evaluate per-user claims against the processor that actually produced this
+                /// cache entry. If that processor cannot enforce JWT claims (opaque), the
+                /// claims requirement cannot be satisfied and authentication must be denied.
+                const auto it = token_processors.find(cached_entry_iter->second.processor_name);
                 if (it == token_processors.end() || !check_claims_if_required(*it->second))
                     return false;
             }
@@ -728,6 +740,15 @@ bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & cred
     {
         for (const auto & it : token_processors)
         {
+            /// When the user has a per-user claims restriction but no pinned processor,
+            /// only consider processors that can enforce JWT claims.
+            if (!jwt_claims.empty() && !it.second->supportsJwtClaimsRestriction())
+            {
+                LOG_TRACE(getLogger("AccessTokenAuthentication"),
+                          "Skipping processor {} during auto-discovery: it cannot enforce per-user JWT claims",
+                          it.second->getProcessorName());
+                continue;
+            }
             if (checkCredentialsAgainstProcessor(*it.second, const_cast<TokenCredentials &>(credentials)))
                 return check_claims_if_required(*it.second);
         }
@@ -735,7 +756,18 @@ bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & cred
     else
     {
         const auto it = token_processors.find(processor_name);
-        if (it != token_processors.end() && checkCredentialsAgainstProcessor(*it->second, const_cast<TokenCredentials &>(credentials)))
+        if (it == token_processors.end())
+            return false;
+        /// Reject early when the pinned processor cannot enforce a configured per-user
+        /// claims restriction.
+        if (!jwt_claims.empty() && !it->second->supportsJwtClaimsRestriction())
+        {
+            LOG_TRACE(getLogger("AccessTokenAuthentication"),
+                      "Pinned processor {} cannot enforce per-user JWT claims; denying authentication",
+                      it->second->getProcessorName());
+            return false;
+        }
+        if (checkCredentialsAgainstProcessor(*it->second, const_cast<TokenCredentials &>(credentials)))
             return check_claims_if_required(*it->second);
     }
 
