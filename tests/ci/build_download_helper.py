@@ -11,7 +11,6 @@ from typing import Any, Callable, List, Optional, Union
 import requests
 
 from ci_config import CI
-from env_helper import REPO_COPY
 
 try:
     # A work around for scripts using this downloading module without required deps
@@ -124,6 +123,8 @@ def get_gh_api(
 
 
 def read_build_urls(build_name: str, reports_path: Union[Path, str]) -> List[str]:
+    from env_helper import REPO_COPY  # pylint: disable=import-outside-toplevel
+
     artifact_report = Path(REPO_COPY) / "ci" / "tmp" / BUILD_TO_REPORT[build_name]
     if artifact_report.is_file():
         with open(artifact_report, "r", encoding="utf-8") as f:

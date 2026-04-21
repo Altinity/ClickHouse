@@ -3,6 +3,8 @@ import sys
 import os
 import logging
 import subprocess
+import base64
+import binascii
 from env_helper import TEMP_PATH, REPO_COPY, REPORT_PATH
 from s3_helper import S3Helper
 from pr_info import PRInfo
@@ -11,12 +13,18 @@ from report import FAIL, OK, FAILURE, SUCCESS, JobReport, TestResult
 from stopwatch import Stopwatch
 import hashlib
 from pathlib import Path
+from tempfile import NamedTemporaryFile
+from typing import Tuple
 
 GPG_BINARY_SIGNING_KEY = os.getenv("GPG_BINARY_SIGNING_KEY")
 GPG_BINARY_SIGNING_PASSPHRASE = os.getenv("GPG_BINARY_SIGNING_PASSPHRASE")
 
 CHECK_NAME = os.getenv("CHECK_NAME", "Sign release")
 SIGNING_PUBLIC_KEY_FILE = "signing_pubkey.asc"
+KEY_FORMAT_GUIDANCE = (
+    "GPG_BINARY_SIGNING_KEY must be either an ASCII-armored OpenPGP private key "
+    "(-----BEGIN PGP ...) or base64-encoded key payload (armored text or binary key bytes)."
+)
 
 def hash_file(file_path):
     BLOCK_SIZE = 65536 # The size of each read from the file
@@ -36,15 +44,63 @@ def hash_file(file_path):
 
     return hash_file_path
 
+def _normalize_private_key_material(raw_key: str) -> Tuple[bytes, str]:
+    if raw_key is None or not raw_key.strip():
+        raise ValueError(
+            "GPG_BINARY_SIGNING_KEY is missing or empty. "
+            + KEY_FORMAT_GUIDANCE
+        )
+
+    stripped_key = raw_key.strip()
+    if "-----BEGIN PGP " in stripped_key:
+        return stripped_key.encode("utf-8"), "armored"
+
+    key_no_whitespace = "".join(stripped_key.split())
+    try:
+        decoded_key = base64.b64decode(key_no_whitespace, validate=True)
+    except (binascii.Error, ValueError) as ex:
+        raise ValueError(
+            "Failed to parse GPG_BINARY_SIGNING_KEY as armored or base64 data. "
+            + KEY_FORMAT_GUIDANCE
+        ) from ex
+
+    if not decoded_key:
+        raise ValueError("Decoded GPG_BINARY_SIGNING_KEY is empty. " + KEY_FORMAT_GUIDANCE)
+
+    try:
+        decoded_text = decoded_key.decode("utf-8")
+    except UnicodeDecodeError:
+        return decoded_key, "base64->binary"
+
+    if "-----BEGIN PGP " in decoded_text:
+        return decoded_text.strip().encode("utf-8"), "base64->armored"
+
+    return decoded_key, "base64->binary"
+
+
 def import_private_signing_key():
-    priv_key_file_path = 'priv.key'
-    with open(priv_key_file_path, 'w') as f:
-        f.write(GPG_BINARY_SIGNING_KEY)
+    if GPG_BINARY_SIGNING_PASSPHRASE is None or GPG_BINARY_SIGNING_PASSPHRASE == "":
+        raise ValueError("GPG_BINARY_SIGNING_PASSPHRASE is missing or empty")
+
+    private_key_bytes, key_mode = _normalize_private_key_material(GPG_BINARY_SIGNING_KEY)
+    logging.info("Detected signing key format: %s", key_mode)
+
+    with NamedTemporaryFile("wb", delete=False, suffix=".key") as key_file:
+        key_file.write(private_key_bytes)
+        priv_key_file_path = key_file.name
 
     try:
         subprocess.run(
-            f'echo {GPG_BINARY_SIGNING_PASSPHRASE} | gpg --batch --import {priv_key_file_path}',
-            shell=True,
+            [
+                "gpg",
+                "--batch",
+                "--yes",
+                "--pinentry-mode=loopback",
+                "--passphrase",
+                GPG_BINARY_SIGNING_PASSPHRASE,
+                "--import",
+                priv_key_file_path,
+            ],
             check=True,
         )
     finally:
@@ -54,8 +110,18 @@ def import_private_signing_key():
 def sign_file(file_path):
     out_file_path = f'{file_path}.gpg'
     subprocess.run(
-        f'gpg -o {out_file_path} --pinentry-mode=loopback --batch --yes --passphrase {GPG_BINARY_SIGNING_PASSPHRASE} --sign {file_path}',
-        shell=True,
+        [
+            "gpg",
+            "-o",
+            out_file_path,
+            "--pinentry-mode=loopback",
+            "--batch",
+            "--yes",
+            "--passphrase",
+            GPG_BINARY_SIGNING_PASSPHRASE,
+            "--sign",
+            file_path,
+        ],
         check=True,
     )
     print(f"Signed {file_path}")
@@ -65,8 +131,7 @@ def sign_file(file_path):
 
 def export_public_signing_key(out_file_path: Path):
     subprocess.run(
-        f"gpg --armor --output {out_file_path} --export",
-        shell=True,
+        ["gpg", "--armor", "--output", str(out_file_path), "--export"],
         check=True,
     )
     print(f"Exported signing public key to {out_file_path}")
