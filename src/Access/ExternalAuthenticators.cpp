@@ -624,6 +624,7 @@ bool ExternalAuthenticators::checkCredentialsAgainstProcessor(const ITokenProces
         TokenCacheEntry cache_entry;
         cache_entry.user_name = credentials.getUserName();
         cache_entry.external_roles = credentials.getGroups();
+        cache_entry.processor_name = processor.getProcessorName();
 
         auto default_expiration_ts = std::chrono::system_clock::now()
                                      + std::chrono::seconds(processor.getTokenCacheLifetime());
@@ -695,7 +696,11 @@ bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & cred
             access_token_to_username_cache.erase(cached_entry_iter);
             username_to_access_token_cache.erase(expired_user_name);
         }
-        else
+        /// Enforce the per-user processor pin even on cache hit. A cache entry produced by
+        /// processor A must NOT be used to satisfy an authentication request that is pinned
+        /// to a different processor B.When the caller did not pin a processor (processor_name is
+        /// empty) any cached entry is acceptable.
+        else if (processor_name.empty() || processor_name == cached_entry_iter->second.processor_name)
         {
             const auto & user_data = cached_entry_iter->second;
             const_cast<TokenCredentials &>(credentials).setUserName(user_data.user_name);
@@ -703,13 +708,19 @@ bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & cred
             LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} found, using it to authenticate", cached_entry_iter->second.user_name);
             if (!jwt_claims.empty())
             {
-                if (processor_name.empty())
-                    return false;
+                /// processor_name is guaranteed non-empty here and matches the cached processor.
                 const auto it = token_processors.find(processor_name);
                 if (it == token_processors.end() || !check_claims_if_required(*it->second))
                     return false;
             }
             return true;
+        }
+        else
+        {
+            LOG_TRACE(getLogger("AccessTokenAuthentication"),
+                      "Cached token entry was produced by processor {}, but authentication is pinned to {}; "
+                      "ignoring cache and re-authenticating via the pinned processor",
+                      cached_entry_iter->second.processor_name, processor_name);
         }
     }
 
