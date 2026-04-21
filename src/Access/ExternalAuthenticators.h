@@ -79,6 +79,8 @@ private:
         std::chrono::system_clock::time_point expires_at;
         String user_name;
         std::set<String> external_roles;
+        /// Name of the token processor that produced this cache entry.
+        String processor_name;
     };
 
     /// Home-made simple bi-mapping, needed to effectively clean up cache from old tokens.
