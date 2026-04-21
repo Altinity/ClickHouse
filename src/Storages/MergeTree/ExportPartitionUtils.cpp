@@ -32,6 +32,7 @@ namespace ErrorCodes
 {
     extern const int FAULT_INJECTED;
     extern const int BAD_ARGUMENTS;
+    extern const int NO_SUCH_DATA_PART;
 }
 
 namespace FailPoints
@@ -53,7 +54,7 @@ namespace ExportPartitionUtils
         
         /// todo arthur: bad arguments for now, pick a better one
         if (parts.empty())
-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            throw Exception(ErrorCodes::NO_SUCH_DATA_PART,
                 "Cannot find active part for partition_id '{}' to derive Iceberg partition "
                 "values. Edge case: the partition may have been dropped after export started, "
                 "or this replica has not yet received any part for this partition. "
