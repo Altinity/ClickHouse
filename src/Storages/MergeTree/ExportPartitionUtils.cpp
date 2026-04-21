@@ -10,6 +10,11 @@
 #include <thread>
 #include <Interpreters/Context.h>
 
+#if USE_AVRO
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
+#endif
+
 namespace ProfileEvents
 {
     extern const Event ExportPartitionZooKeeperRequests;
@@ -365,6 +370,126 @@ namespace ExportPartitionUtils
             ops.emplace_back(zkutil::makeCreateRequest(last_exception_path / "exception", exception_message, zkutil::CreateMode::Persistent));
         }
     }
+
+#if USE_AVRO
+    void verifyIcebergPartitionCompatibility(
+        const Poco::JSON::Object::Ptr & metadata_object,
+        const ASTPtr & partition_key_ast)
+    {
+        const auto original_schema_id = metadata_object->getValue<Int64>(Iceberg::f_current_schema_id);
+        const auto partition_spec_id  = metadata_object->getValue<Int64>(Iceberg::f_default_spec_id);
+
+        Poco::JSON::Object::Ptr current_schema_json;
+        {
+            const auto schemas = metadata_object->getArray(Iceberg::f_schemas);
+            for (size_t i = 0; i < schemas->size(); ++i)
+            {
+                auto s = schemas->getObject(static_cast<UInt32>(i));
+                if (s->getValue<Int32>(Iceberg::f_schema_id) == static_cast<Int32>(original_schema_id))
+                {
+                    current_schema_json = s;
+                    break;
+                }
+            }
+        }
+
+        Poco::JSON::Object::Ptr partition_spec_json;
+        {
+            const auto specs = metadata_object->getArray(Iceberg::f_partition_specs);
+            for (size_t i = 0; i < specs->size(); ++i)
+            {
+                auto s = specs->getObject(static_cast<UInt32>(i));
+                if (s->getValue<Int64>(Iceberg::f_spec_id) == partition_spec_id)
+                {
+                    partition_spec_json = s;
+                    break;
+                }
+            }
+        }
+
+        if (!current_schema_json || !partition_spec_json)
+            return;
+
+        /// Build column_name → Iceberg source-id from the destination schema (and the inverse).
+        std::unordered_map<String, Int32> column_name_to_source_id;
+        std::unordered_map<Int32, String> source_id_to_column_name;
+        {
+            const auto schema_fields = current_schema_json->getArray(Iceberg::f_fields);
+            for (size_t i = 0; i < schema_fields->size(); ++i)
+            {
+                auto f = schema_fields->getObject(static_cast<UInt32>(i));
+                const auto col_name  = f->getValue<String>(Iceberg::f_name);
+                const auto source_id = f->getValue<Int32>(Iceberg::f_id);
+                column_name_to_source_id[col_name]  = source_id;
+                source_id_to_column_name[source_id] = col_name;
+            }
+        }
+
+        auto source_id_to_name = [&](Int32 id) -> String
+        {
+            auto it = source_id_to_column_name.find(id);
+            return it != source_id_to_column_name.end() ? it->second : fmt::format("<unknown source_id={}>", id);
+        };
+
+        /// Convert the MergeTree PARTITION BY AST into the equivalent Iceberg spec.
+        Poco::JSON::Array::Ptr expected_fields;
+        try
+        {
+            const auto expected_spec = Iceberg::getPartitionSpec(
+                partition_key_ast, column_name_to_source_id).first;
+            expected_fields = expected_spec->getArray(Iceberg::f_fields);
+        }
+        catch (const Exception & e)
+        {
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Cannot export partition to Iceberg table: the source MergeTree partition "
+                "key cannot be represented as an Iceberg partition spec: {}", e.message());
+        }
+
+        const auto actual_fields = partition_spec_json->getArray(Iceberg::f_fields);
+        const size_t expected_size = expected_fields ? expected_fields->size() : 0;
+        const size_t actual_size   = actual_fields   ? actual_fields->size()   : 0;
+
+        if (expected_size != actual_size)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Cannot export partition to Iceberg table: partition scheme mismatch. "
+                "Source MergeTree has {} partition field(s), destination Iceberg table has {}.",
+                expected_size, actual_size);
+
+        for (size_t i = 0; i < expected_size; ++i)
+        {
+            auto ef = expected_fields->getObject(static_cast<UInt32>(i));
+            auto af = actual_fields->getObject(static_cast<UInt32>(i));
+
+            const auto expected_source_id = ef->getValue<Int32>(Iceberg::f_source_id);
+            const auto actual_source_id   = af->getValue<Int32>(Iceberg::f_source_id);
+            const auto expected_transform = ef->getValue<String>(Iceberg::f_transform);
+            const auto actual_transform   = af->getValue<String>(Iceberg::f_transform);
+
+            /// Normalize both transform names through parseTransformAndArgument so that
+            /// equivalent aliases ("day"/"days", "hour"/"hours", "year"/"years", etc.)
+            /// produced by different writers (ClickHouse vs Spark/Trino) compare equal.
+            /// Comparison is on {function_name, argument}; time_zone is writer-specific
+            /// and not part of the partition spec identity.
+            const auto expected_canonical = Iceberg::parseTransformAndArgument(expected_transform, "");
+            const auto actual_canonical   = Iceberg::parseTransformAndArgument(actual_transform, "");
+            const bool transforms_match =
+                (expected_canonical && actual_canonical)
+                    ? (expected_canonical->transform_name == actual_canonical->transform_name
+                       && expected_canonical->argument    == actual_canonical->argument)
+                    : (expected_transform == actual_transform);
+
+            if (expected_source_id != actual_source_id || !transforms_match)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export partition to Iceberg table: partition field {} mismatch. "
+                    "Source MergeTree maps to column '{}' (source_id={}) transform='{}', "
+                    "but destination Iceberg has column '{}' (source_id={}) transform='{}'.",
+                    i,
+                    source_id_to_name(expected_source_id), expected_source_id, expected_transform,
+                    source_id_to_name(actual_source_id),   actual_source_id,   actual_transform);
+        }
+    }
+#endif
 }
 
 }

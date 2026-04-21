@@ -7,11 +7,12 @@ IcebergS3 table using the single-part export operation:
     ALTER TABLE <mt> EXPORT PART '<part>' TO TABLE <iceberg>
 
 Coverage:
-    test_export_part_basic_to_iceberg              – simple (id, year) schema; data + part_log checks
-    test_export_part_all_iceberg_types             – schema covering all major Iceberg data types
-    test_export_multiple_parts_to_iceberg          – two parts from different partitions land together
-    test_export_part_with_year_transform_partition – toYearNumSinceEpoch() partition expression
-    test_export_part_with_bucket_partition         – icebergBucket(N, col) partition expression
+    test_export_part_basic_to_iceberg                     – simple (id, year) schema; data + part_log checks
+    test_export_part_all_iceberg_types                    – schema covering all major Iceberg data types
+    test_export_multiple_parts_to_iceberg                 – two parts from different partitions land together
+    test_export_part_with_year_transform_partition        – toYearNumSinceEpoch() partition expression
+    test_export_part_with_bucket_partition                – icebergBucket(N, col) partition expression
+    test_export_part_partition_key_mismatch_is_rejected   – mismatched partition spec rejected synchronously
 """
 
 import logging
@@ -337,6 +338,46 @@ def test_export_part_with_year_transform_partition(cluster):
     assert "3\t2023-06-30" in result, f"Row 3 missing or incorrect:\n{result}"
 
     assert_part_log(node, mt, part)
+
+    node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
+    node.query(f"DROP TABLE IF EXISTS {iceberg}")
+
+
+def test_export_part_partition_key_mismatch_is_rejected(cluster):
+    """
+    EXPORT PART must synchronously reject (BAD_ARGUMENTS) when the source
+    MergeTree partition key does not match the destination Iceberg partition
+    spec. Export does not repartition data, so the two specs must agree on
+    every field (same source column by Iceberg field-id and same transform,
+    in the same order).
+
+    Failing case: MergeTree PARTITION BY year, Iceberg PARTITION BY id.
+    The part must NOT land in the Iceberg table.
+    """
+    node = cluster.instances["node1"]
+    sfx = unique_suffix()
+    mt = f"mt_pkey_mismatch_{sfx}"
+    iceberg = f"iceberg_pkey_mismatch_{sfx}"
+
+    make_mt(node, mt, "id Int32, year Int32", "year")
+    make_iceberg_s3(node, iceberg, "id Int32, year Int32", "id")
+
+    node.query(f"INSERT INTO {mt} VALUES (1, 2020), (2, 2020), (3, 2020)")
+
+    part_2020 = get_part(node, mt, "2020")
+
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt} EXPORT PART '{part_2020}' TO TABLE {iceberg} "
+        f"SETTINGS allow_experimental_export_merge_tree_part = 1"
+    )
+    assert "BAD_ARGUMENTS" in error, (
+        f"Expected BAD_ARGUMENTS for partition key mismatch, got: {error!r}"
+    )
+
+    count = int(node.query(f"SELECT count() FROM {iceberg}").strip())
+    assert count == 0, (
+        f"Expected 0 rows in Iceberg table after rejected export, got {count}"
+    )
 
     node.query(f"DROP TABLE IF EXISTS {mt} SYNC")
     node.query(f"DROP TABLE IF EXISTS {iceberg}")

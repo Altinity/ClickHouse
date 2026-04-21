@@ -7,6 +7,12 @@
 #include <Common/Logger.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include "Storages/IStorage.h"
+#include <config.h>
+
+#if USE_AVRO
+#include <Parsers/IAST.h>
+#include <Poco/JSON/Object.h>
+#endif
 
 namespace DB
 {
@@ -78,6 +84,15 @@ namespace ExportPartitionUtils
         const std::string & part_name,
         const std::string & exception_message,
         const LoggerPtr & log);
+
+#if USE_AVRO
+    /// Verifies that the source MergeTree partition key is compatible with the
+    /// destination Iceberg partition spec by comparing field source-ids and
+    /// transforms in order. Throws BAD_ARGUMENTS if they do not match.
+    void verifyIcebergPartitionCompatibility(
+        const Poco::JSON::Object::Ptr & metadata_object,
+        const ASTPtr & partition_key_ast);
+#endif
 }
 
 }

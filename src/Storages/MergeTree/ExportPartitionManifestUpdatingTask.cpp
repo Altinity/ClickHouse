@@ -76,7 +76,7 @@ namespace
         }
         else if (task_timed_out)
         {
-            const std::string status_path = (fs::path(entry_path) / "status").string();
+            const std::string status_path = fs::path(entry_path) / "status";
 
             Coordination::Stat status_stat;
             std::string status_string;

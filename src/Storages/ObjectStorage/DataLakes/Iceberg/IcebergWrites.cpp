@@ -198,7 +198,7 @@ bool canWriteStatistics(
 
 String getIcebergExportPartSidecarStoragePath(const String & data_file_storage_path)
 {
-    static constexpr auto postfix = "clickhouse_export_part_sidecar.avro";
+    static constexpr auto postfix = "_clickhouse_export_part_sidecar.avro";
     auto dot_pos = data_file_storage_path.rfind('.');
     auto slash_pos = data_file_storage_path.rfind('/');
     if (dot_pos != String::npos && (slash_pos == String::npos || dot_pos > slash_pos))

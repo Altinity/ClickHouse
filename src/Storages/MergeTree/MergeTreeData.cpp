@@ -25,7 +25,8 @@
 #include <Common/quoteString.h>
 #include <Common/typeid_cast.h>
 #include <Common/thread_local_rng.h>
-#include "Storages/MergeTree/ExportPartTask.h"
+#include <Storages/MergeTree/ExportPartTask.h>
+#include <Storages/MergeTree/ExportPartitionUtils.h>
 #include <Processors/Executors/CompletedPipelineExecutor.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
 #include <Storages/MergeTree/MergeTreeSequentialSource.h>
@@ -6520,8 +6521,15 @@ void MergeTreeData::exportPartToTable(
     if (!dest_storage->supportsImport(query_context))
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Destination storage {} does not support MergeTree parts or uses unsupported partitioning", dest_storage->getName());
 
-    std::string iceberg_metadata_json;
+    auto query_to_string = [] (const ASTPtr & ast)
+    {
+        return ast ? ast->formatWithSecretsOneLine() : "";
+    };
 
+    auto source_metadata_ptr = getInMemoryMetadataPtr();
+    auto destination_metadata_ptr = dest_storage->getInMemoryMetadataPtr();
+
+    std::string iceberg_metadata_json;
 
     if (dest_storage->isDataLake())
     {
@@ -6552,20 +6560,14 @@ void MergeTreeData::exportPartToTable(
             std::ostringstream oss;
             metadata_object->stringify(oss);
             iceberg_metadata_json = oss.str();
+
+            ExportPartitionUtils::verifyIcebergPartitionCompatibility(metadata_object, source_metadata_ptr->getPartitionKeyAST());
         }
 #else
         (void)iceberg_metadata_json_;
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Data lake export requires Avro support");
 #endif
     }
-
-    auto query_to_string = [] (const ASTPtr & ast)
-    {
-        return ast ? ast->formatWithSecretsOneLine() : "";
-    };
-
-    auto source_metadata_ptr = getInMemoryMetadataPtr();
-    auto destination_metadata_ptr = dest_storage->getInMemoryMetadataPtr();
 
     const auto & source_columns = source_metadata_ptr->getColumns();
 
@@ -6576,7 +6578,7 @@ void MergeTreeData::exportPartToTable(
     if (source_columns.getReadable().sizeOfDifference(destination_columns.getInsertable()))
         throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS, "Tables have different structure");
 
-    /// for data lakes this check is performed later. It is a bit more complex as we need to convert the iceberg partition spec
+    /// for data lakes this check is performed differently. It is a bit more complex as we need to convert the iceberg partition spec
     /// to the MergeTree partition spec and compare the two.
     if (!dest_storage->isDataLake())
     {
