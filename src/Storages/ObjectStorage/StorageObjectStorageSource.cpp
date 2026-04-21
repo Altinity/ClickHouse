@@ -21,6 +21,8 @@
 #include <Interpreters/Context.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Interpreters/convertFieldToType.h>
+#include <Parsers/ExpressionListParsers.h>
+#include <Parsers/parseQuery.h>
 #include <Processors/Executors/PullingPipelineExecutor.h>
 #include <Processors/Formats/Impl/ParquetMetadataCache.h>
 #include <Processors/Sources/ConstChunkGenerator.h>
@@ -772,6 +774,12 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                     continue;
 
                 if (!column.second.second.type->isNullable())
+                    continue;
+
+                /// With View over Iceberg table we have someting like 'materialize(time)' as column_name
+                ParserExpression parser;
+                ASTPtr expr = parseQuery(parser, column_name, 0, DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
+                if (expr->as<ASTFunction>())
                     continue;
 
                 /// Skip columns produced by prewhere or row-level filter expressions —
