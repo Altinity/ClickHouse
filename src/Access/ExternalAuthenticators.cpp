@@ -644,6 +644,10 @@ bool ExternalAuthenticators::checkCredentialsAgainstProcessor(const ITokenProces
             cache_entry.expires_at = default_expiration_ts;
         }
 
+        /// Propagate the effective expiry back to the credentials so that long-lived
+        /// sessions are bound to the actual token lifetime
+        credentials.setExpiresAt(cache_entry.expires_at);
+
         LOG_DEBUG(getLogger("AccessTokenAuthentication"), "Authenticated user {} with access token by {}", credentials.getUserName(), processor.getProcessorName());
 
         // CHeck if a cache entry for the same user but with another token exists -- old cache entry is considered outdated and removed
@@ -715,6 +719,9 @@ bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & cred
             const auto & user_data = cached_entry_iter->second;
             const_cast<TokenCredentials &>(credentials).setUserName(user_data.user_name);
             const_cast<TokenCredentials &>(credentials).setGroups(user_data.external_roles);
+            /// Surface the cached token expiry on the credentials so the upper layers
+            /// (Session) can bind the resulting session lifetime to the token lifetime.
+            const_cast<TokenCredentials &>(credentials).setExpiresAt(user_data.expires_at);
             LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} found, using it to authenticate", cached_entry_iter->second.user_name);
             if (!jwt_claims.empty())
             {

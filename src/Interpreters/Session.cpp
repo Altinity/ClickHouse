@@ -385,6 +385,13 @@ void Session::authenticate(const Credentials & credentials_, const Poco::Net::So
         user_id = auth_result.user_id;
         user_authenticated_with = auth_result.authentication_data;
         settings_from_auth_server = auth_result.settings;
+
+        /// Bind the session lifetime to the access-token lifetime when applicable.
+        if (const auto * token_credentials = typeid_cast<const TokenCredentials *>(&credentials_))
+            auth_token_expires_at = token_credentials->getExpiresAt();
+        else
+            auth_token_expires_at.reset();
+
         LOG_DEBUG(log, "{} Authenticated with global context as user {}",
                 toString(auth_id), toString(*user_id));
 
@@ -411,13 +418,17 @@ void Session::authenticate(const Credentials & credentials_, const Poco::Net::So
 
 void Session::checkIfUserIsStillValid()
 {
+    const auto now = std::chrono::system_clock::now();
+
     if (const auto valid_until = user_authenticated_with.getValidUntil())
     {
-        const time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-
-        if (now > valid_until)
+        if (std::chrono::system_clock::to_time_t(now) > valid_until)
             throw Exception(ErrorCodes::USER_EXPIRED, "Authentication method used has expired");
     }
+
+    /// For sessions established via a bearer/access token (JWT or opaque), enforce token expiry.
+    if (auth_token_expires_at.has_value() && now >= *auth_token_expires_at)
+        throw Exception(ErrorCodes::USER_EXPIRED, "Access token used to authenticate the session has expired");
 }
 
 void Session::onAuthenticationFailure(const std::optional<String> & user_name, const Poco::Net::SocketAddress & address_, const Exception & e)
