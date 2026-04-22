@@ -137,7 +137,25 @@ TokenAccessStorage::TokenAccessStorage(const String & storage_name_, AccessContr
     const String prefix_str = (prefix.empty() ? "" : prefix + ".");
 
     if (config.has(prefix_str + "roles_filter"))
-        roles_filter.emplace(config.getString(prefix_str + "roles_filter"));
+    {
+        const String filter_pattern = config.getString(prefix_str + "roles_filter");
+        roles_filter.emplace(filter_pattern);
+
+        /// Fail closed on invalid regex. RE2 does not throw on bad patterns -- it
+        /// constructs an object with ok()==false and silently fails every match.
+        /// Reject the configuration up front so the
+        /// storage cannot be instantiated in a permissive state.
+        if (!roles_filter->ok())
+        {
+            const String error = roles_filter->error();
+            roles_filter.reset();
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                            "Invalid 'roles_filter' regex for Token user directory '{}': {}. "
+                            "Refusing to start with a misconfigured filter to avoid granting "
+                            "all token groups as roles.",
+                            storage_name_, error);
+        }
+    }
 
     if (config.has(prefix_str + "roles_transform"))
     {
@@ -526,20 +544,35 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
         throwAddressNotAllowed(address);
 
     std::set<String> external_roles;
-    if (roles_filter.has_value() && roles_filter.value().ok())
+    if (roles_filter.has_value())
     {
-        LOG_TRACE(getLogger(), "{}: External role filter found, applying only matching groups", getStorageName());
-        for (const auto & group: token_credentials.getGroups()) {
-            if (RE2::FullMatch(group, roles_filter.value()))
-            {
-                String transformed_group = group;
-                if (roles_transform_pattern.has_value() && roles_transform_replacement.has_value())
+        /// Defensive: a broken regex must NEVER cause a fall-through to the
+        /// permissive "grant all groups" branch. Parse-time validation in the
+        /// constructor already rejects invalid patterns; this guard ensures the
+        /// invariant still holds if any future code path constructs the filter
+        /// without the parse-time check (e.g. config reload).
+        if (!roles_filter->ok())
+        {
+            LOG_ERROR(getLogger(),
+                      "{}: Configured 'roles_filter' is invalid ('{}'); refusing to map any "
+                      "external roles for user '{}' to avoid granting all token groups.",
+                      getStorageName(), roles_filter->error(), credentials.getUserName());
+        }
+        else
+        {
+            LOG_TRACE(getLogger(), "{}: External role filter found, applying only matching groups", getStorageName());
+            for (const auto & group: token_credentials.getGroups()) {
+                if (RE2::FullMatch(group, roles_filter.value()))
                 {
-                    transformed_group = applyTransform(group, roles_transform_pattern.value(), roles_transform_replacement.value(), roles_transform_global);
-                    LOG_TRACE(getLogger(), "{}: Transformed group '{}' to '{}'", getStorageName(), group, transformed_group);
+                    String transformed_group = group;
+                    if (roles_transform_pattern.has_value() && roles_transform_replacement.has_value())
+                    {
+                        transformed_group = applyTransform(group, roles_transform_pattern.value(), roles_transform_replacement.value(), roles_transform_global);
+                        LOG_TRACE(getLogger(), "{}: Transformed group '{}' to '{}'", getStorageName(), group, transformed_group);
+                    }
+                    external_roles.insert(transformed_group);
+                    LOG_TRACE(getLogger(), "{}: Granted role (group) {} to user", getStorageName(), transformed_group);
                 }
-                external_roles.insert(transformed_group);
-                LOG_TRACE(getLogger(), "{}: Granted role (group) {} to user", getStorageName(), transformed_group);
             }
         }
     }
