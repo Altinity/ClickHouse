@@ -737,51 +737,50 @@ void alter(
         LOG_INFO(log, "Iceberg alter: writing metadata to '{}', latest version was {}", storage_metadata_name, last_version);
 
         auto hint = filename_generator.generateVersionHint();
-        if (writeMetadataFileAndVersionHint(
-                storage_metadata_name,
-                json_representation,
-                hint.path_in_storage,
-                storage_metadata_name,
-                object_storage,
-                context,
-                compression_method,
-                data_lake_settings[DataLakeStorageSetting::iceberg_use_version_hint]))
-        {
-            if (catalog)
-            {
-                String catalog_filename = metadata_name;
-                if (!catalog_filename.starts_with(blob_storage_type_name))
-                    catalog_filename = blob_storage_type_name + "://" + blob_storage_namespace_name + "/" + metadata_name;
+        const bool wrote_ok = writeMetadataFileAndVersionHint(
+            storage_metadata_name,
+            json_representation,
+            hint.path_in_storage,
+            storage_metadata_name,
+            object_storage,
+            context,
+            compression_method,
+            data_lake_settings[DataLakeStorageSetting::iceberg_use_version_hint]);
 
-                const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
-                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, metadata))
-                {
-                    throw Exception(
-                        ErrorCodes::DATALAKE_DATABASE_ERROR,
-                        "Iceberg alter: catalog commit failed for '{}' after metadata file was written successfully",
-                        catalog_filename);
-                }
-            }
-            return;
+        // If the write helper reported failure but the metadata file nonetheless landed on
+        // storage (e.g. PUT succeeded but the response was lost, or the version-hint write
+        // failed after the metadata write), prefer adopting the orphan over writing a new
+        // version, because the orphan may already be observable to concurrent readers.
+        const bool file_exists = wrote_ok || object_storage->exists(StoredObject(storage_metadata_name));
+
+        if (!wrote_ok)
+        {
+            LOG_WARNING(log, "Iceberg alter: failed to write metadata to '{}' (attempt {}, file exists: {})",
+                storage_metadata_name, i + 1, file_exists);
+            if (!file_exists)
+                continue;
         }
 
-        bool file_exists = object_storage->exists(StoredObject(storage_metadata_name));
-        LOG_WARNING(log, "Iceberg alter: failed to write metadata to '{}' (attempt {}, file exists: {})",
-            storage_metadata_name, i + 1, file_exists);
-
-        if (file_exists && catalog)
+        if (catalog)
         {
             String catalog_filename = metadata_name;
             if (!catalog_filename.starts_with(blob_storage_type_name))
                 catalog_filename = blob_storage_type_name + "://" + blob_storage_namespace_name + "/" + metadata_name;
 
             const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
-            if (catalog->updateMetadata(namespace_name, table_name, catalog_filename, metadata))
+            if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, metadata))
             {
-                LOG_INFO(log, "Iceberg alter: adopted existing metadata file '{}' and updated catalog", storage_metadata_name);
-                return;
+                if (wrote_ok)
+                    throw Exception(
+                        ErrorCodes::DATALAKE_DATABASE_ERROR,
+                        "Iceberg alter: catalog commit failed for '{}' after metadata file was written successfully",
+                        catalog_filename);
+                continue;
             }
+            if (!wrote_ok)
+                LOG_INFO(log, "Iceberg alter: adopted existing metadata file '{}' and updated catalog", storage_metadata_name);
         }
+        return;
     }
 
     throw Exception(ErrorCodes::LIMIT_EXCEEDED, "Too many unsuccessful retries to alter iceberg table");

@@ -131,16 +131,11 @@ Poco::JSON::Object::Ptr cloneJsonObject(const Poco::JSON::Object::Ptr & obj)
 }
 }
 
-UpdateMetadataRequestBodyResult buildUpdateMetadataRequestBody(
+Poco::JSON::Object::Ptr buildUpdateMetadataRequestBody(
     const String & namespace_name, const String & table_name, Poco::JSON::Object::Ptr new_snapshot)
 {
-    UpdateMetadataRequestBodyResult result;
-
-    if (!new_snapshot) // If new_snapshot is nullptr, return Skip
-    {
-        result.status = UpdateMetadataRequestBodyResult::Status::Skip;
-        return result;
-    }
+    if (!new_snapshot)
+        return nullptr;
 
     Poco::JSON::Object::Ptr request_body = new Poco::JSON::Object;
     {
@@ -153,45 +148,20 @@ UpdateMetadataRequestBodyResult buildUpdateMetadataRequestBody(
         request_body->set("identifier", identifier);
     }
 
-    // If the metadata has a schemas field, we need to update the schema
+    // Schema-change commit path (ALTER TABLE add/drop/modify/rename column).
     if (new_snapshot->has(DB::Iceberg::f_schemas))
     {
         if (!new_snapshot->has(DB::Iceberg::f_current_schema_id))
-        {
-            result.status = UpdateMetadataRequestBodyResult::Status::Error;
-            return result;
-        }
+            throw DB::Exception(
+                DB::ErrorCodes::DATALAKE_DATABASE_ERROR,
+                "Iceberg update-metadata for {}.{} is missing '{}' field",
+                namespace_name, table_name, DB::Iceberg::f_current_schema_id);
 
-        // Extract the new schema id and the old schema id
         const Int32 new_schema_id = new_snapshot->getValue<Int32>(DB::Iceberg::f_current_schema_id);
+        // old_schema_id = new_schema_id - 1 is the ClickHouse-writer convention; old_schema_id >= 0
+        // means "there is a previous schema, emit assert-current-schema-id as precondition".
         const Int32 old_schema_id = new_schema_id - 1;
 
-        // schemas is a JSON array of schema objects, we need to find the schema object with the new schema id
-        //     "schemas" : [
-        // {
-        //     "fields" : [
-        //         {
-        //             "name" : "id",
-        //             "type" : "int",
-        //             "id" : 1
-        //         }
-        //     ],            
-        //     "schema-id" : 0,
-        //     "type" : "struct"
-        // },
-        // ...
-        //    "fields" : [
-        //         {
-        //             "name" : "id2", // id renamed from id to id2
-        //             "type" : "int",
-        //             "id" : 1
-        //         }
-        //     ],            
-        //     "schema-id" : 1 // new_schema_id,
-        //     "type" : "struct"
-        // },
-
-        // Find the schema object with the new schema id
         Poco::JSON::Object::Ptr new_schema_obj;
         auto schemas = new_snapshot->getArray(DB::Iceberg::f_schemas);
         for (UInt32 i = 0; i < schemas->size(); ++i)
@@ -203,12 +173,11 @@ UpdateMetadataRequestBodyResult buildUpdateMetadataRequestBody(
                 break;
             }
         }
-        // if we don't find the schema object with the new schema id, return an error
         if (!new_schema_obj)
-        {
-            result.status = UpdateMetadataRequestBodyResult::Status::Error;
-            return result;
-        }
+            throw DB::Exception(
+                DB::ErrorCodes::DATALAKE_DATABASE_ERROR,
+                "Iceberg update-metadata for {}.{}: no schema object matching current-schema-id={}",
+                namespace_name, table_name, new_schema_id);
 
         Poco::JSON::Object::Ptr schema_for_rest = cloneJsonObject(new_schema_obj);
         if (!schema_for_rest->has("identifier-field-ids"))
@@ -244,14 +213,7 @@ UpdateMetadataRequestBodyResult buildUpdateMetadataRequestBody(
     }
     else
     {
-        // If the metadata has a parent-snapshot-id field, we need to update the parent-snapshot-id
-        //     "parent-snapshot-id" : 1,
-        //     "snapshot-id" : 2,
-        //     "timestamp-ms" : 1717334400000,
-        //     "schema-id" : 1,
-        //     "operation" : "replace",
-        //     "summary" : "replace snapshot 1 with snapshot 2"
-        // }
+        // Snapshot-append commit path (INSERT / position-delete mutation).
         if (new_snapshot->has("parent-snapshot-id"))
         {
             auto parent_snapshot_id = new_snapshot->getValue<Int64>("parent-snapshot-id");
@@ -264,38 +226,29 @@ UpdateMetadataRequestBodyResult buildUpdateMetadataRequestBody(
 
                 Poco::JSON::Array::Ptr requirements = new Poco::JSON::Array;
                 requirements->add(requirement);
-
                 request_body->set("requirements", requirements);
             }
         }
 
-        // If the metadata has a snapshot-id field, we need to update the snapshot-id
+        Poco::JSON::Array::Ptr updates = new Poco::JSON::Array;
         {
-            Poco::JSON::Array::Ptr updates = new Poco::JSON::Array;
-
-            {
-                Poco::JSON::Object::Ptr add_snapshot = new Poco::JSON::Object;
-                add_snapshot->set("action", "add-snapshot");
-                add_snapshot->set("snapshot", new_snapshot);
-                updates->add(add_snapshot);
-            }
-
-            {
-                Poco::JSON::Object::Ptr set_snapshot = new Poco::JSON::Object;
-                set_snapshot->set("action", "set-snapshot-ref");
-                set_snapshot->set("ref-name", "main");
-                set_snapshot->set("type", "branch");
-                set_snapshot->set("snapshot-id", new_snapshot->getValue<Int64>("snapshot-id"));
-
-                updates->add(set_snapshot);
-            }
-            request_body->set("updates", updates);
+            Poco::JSON::Object::Ptr add_snapshot = new Poco::JSON::Object;
+            add_snapshot->set("action", "add-snapshot");
+            add_snapshot->set("snapshot", new_snapshot);
+            updates->add(add_snapshot);
         }
+        {
+            Poco::JSON::Object::Ptr set_snapshot = new Poco::JSON::Object;
+            set_snapshot->set("action", "set-snapshot-ref");
+            set_snapshot->set("ref-name", "main");
+            set_snapshot->set("type", "branch");
+            set_snapshot->set("snapshot-id", new_snapshot->getValue<Int64>("snapshot-id"));
+            updates->add(set_snapshot);
+        }
+        request_body->set("updates", updates);
     }
 
-    result.status = UpdateMetadataRequestBodyResult::Status::Ok;
-    result.request_body = request_body;
-    return result;
+    return request_body;
 }
 
 std::string RestCatalog::Config::toString() const
@@ -1476,18 +1429,19 @@ bool RestCatalog::updateMetadata(const String & namespace_name, const String & t
 {
     const std::string endpoint = fmt::format("{}/namespaces/{}/tables/{}", base_url, namespace_name, table_name);
 
-    const auto built = buildUpdateMetadataRequestBody(namespace_name, table_name, new_snapshot);
-    if (built.status == UpdateMetadataRequestBodyResult::Status::Skip)
-        return true;
-    if (built.status == UpdateMetadataRequestBodyResult::Status::Error)
-        return false;
+    // Throws DB::Exception(DATALAKE_DATABASE_ERROR) on malformed metadata (programming error).
+    auto request_body = buildUpdateMetadataRequestBody(namespace_name, table_name, new_snapshot);
+    if (!request_body)
+        return true; // nothing to commit
 
     try
     {
-        sendRequest(endpoint, built.request_body);
+        sendRequest(endpoint, request_body);
     }
-    catch (const DB::HTTPException &)
+    catch (const DB::HTTPException & ex)
     {
+        LOG_WARNING(log, "Iceberg REST updateMetadata for {}.{} failed: {}",
+            namespace_name, table_name, ex.displayText());
         return false;
     }
     return true;
