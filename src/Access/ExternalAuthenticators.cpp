@@ -300,6 +300,10 @@ void ExternalAuthenticators::reset()
     resetImpl();
 }
 
+/// Parse all token processors as an all-or-nothing operation.
+///
+/// Throws if ANY processor fails to parse. The caller is expected to react by
+/// disabling token authentication for this configuration cycle (fail-closed).
 void parseTokenProcessors(std::unordered_map<String, std::unique_ptr<ITokenProcessor>> & token_processors,
                         const Poco::Util::AbstractConfiguration & config,
                         const String & token_processors_config,
@@ -308,20 +312,25 @@ void parseTokenProcessors(std::unordered_map<String, std::unique_ptr<ITokenProce
     Poco::Util::AbstractConfiguration::Keys token_processors_keys;
     config.keys(token_processors_config, token_processors_keys);
 
-    token_processors.clear();
+    /// Build into a local map first so the live set is never observed in a partially-constructed state
+    std::unordered_map<String, std::unique_ptr<ITokenProcessor>> parsed;
 
     for (const auto & processor : token_processors_keys)
     {
         String prefix = fmt::format("{}.{}", token_processors_config, processor);
         try
         {
-            token_processors[processor] = ITokenProcessor::parseTokenProcessor(config, prefix, processor);
+            parsed[processor] = ITokenProcessor::parseTokenProcessor(config, prefix, processor);
         }
         catch (...)
         {
-            tryLogCurrentException(log, "Could not parse token processor" + backQuote(processor));
+            tryLogCurrentException(log, "Could not parse token processor " + backQuote(processor));
+            /// Re-throw so the caller fails.
+            throw;
         }
     }
+
+    token_processors = std::move(parsed);
 }
 
 bool ExternalAuthenticators::isTokenAuthEnabled() const
@@ -435,7 +444,22 @@ void ExternalAuthenticators::setConfiguration(const Poco::Util::AbstractConfigur
     }
 
     if (token_auth_enabled)
-        parseTokenProcessors(token_processors, config, token_processors_config, log);
+    {
+        try
+        {
+            parseTokenProcessors(token_processors, config, token_processors_config, log);
+        }
+        catch (...)
+        {
+            /// Fail closed: if any token processor failed to parse, refuse to
+            /// activate token auth at all for this config cycle.
+            tryLogCurrentException(log,
+                "One or more token processors failed to parse; "
+                "disabling token authentication entirely until the configuration is fixed");
+            token_processors.clear();
+            token_auth_enabled = false;
+        }
+    }
     else
         LOG_INFO(log, "Token authentication is disabled, skipping token processors configuration");
 }
