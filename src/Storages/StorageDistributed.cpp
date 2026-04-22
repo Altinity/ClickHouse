@@ -1241,9 +1241,22 @@ void StorageDistributed::read(
         {
             if (auto * func = node->as<ASTFunction>(); func && func->name == "hybridParam")
             {
-                auto * arg_list = func->arguments->as<ASTExpressionList>();
-                const auto & param_name = arg_list->children[0]->as<ASTLiteral>()->value.safeGet<String>();
-                const auto & type_name = arg_list->children[1]->as<ASTLiteral>()->value.safeGet<String>();
+                auto * arg_list = func->arguments ? func->arguments->as<ASTExpressionList>() : nullptr;
+                if (!arg_list || arg_list->children.size() != 2)
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "hybridParam() requires exactly 2 arguments: (name, type)");
+
+                auto * name_lit = arg_list->children[0]->as<ASTLiteral>();
+                auto * type_lit = arg_list->children[1]->as<ASTLiteral>();
+                if (!name_lit || name_lit->value.getType() != Field::Types::String)
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "hybridParam() first argument (name) must be a string literal");
+                if (!type_lit || type_lit->value.getType() != Field::Types::String)
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "hybridParam() second argument (type) must be a string literal");
+
+                const auto & param_name = name_lit->value.safeGet<String>();
+                const auto & type_name = type_lit->value.safeGet<String>();
 
                 if (!watermark_snapshot)
                     throw Exception(ErrorCodes::BAD_ARGUMENTS,
@@ -1759,13 +1772,20 @@ static std::unordered_map<String, String> collectHybridParamTypes(
         if (auto * func = node->as<ASTFunction>(); func && func->name == "hybridParam")
         {
             auto * arg_list = func->arguments ? func->arguments->as<ASTExpressionList>() : nullptr;
-            if (arg_list && arg_list->children.size() >= 2)
-            {
-                auto * name_lit = arg_list->children[0]->as<ASTLiteral>();
-                auto * type_lit = arg_list->children[1]->as<ASTLiteral>();
-                if (name_lit && type_lit)
-                    result.emplace(name_lit->value.safeGet<String>(), type_lit->value.safeGet<String>());
-            }
+            if (!arg_list || arg_list->children.size() != 2)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "hybridParam() requires exactly 2 arguments: (name, type)");
+
+            auto * name_lit = arg_list->children[0]->as<ASTLiteral>();
+            auto * type_lit = arg_list->children[1]->as<ASTLiteral>();
+            if (!name_lit || name_lit->value.getType() != Field::Types::String)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "hybridParam() first argument (name) must be a string literal");
+            if (!type_lit || type_lit->value.getType() != Field::Types::String)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "hybridParam() second argument (type) must be a string literal");
+
+            result.emplace(name_lit->value.safeGet<String>(), type_lit->value.safeGet<String>());
             return;
         }
         for (const auto & child : node->children)
