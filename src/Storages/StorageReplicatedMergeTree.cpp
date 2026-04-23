@@ -226,6 +226,8 @@ namespace Setting
     extern const SettingsString export_merge_tree_part_filename_pattern;
     extern const SettingsBool write_full_path_in_iceberg_metadata;
     extern const SettingsBool allow_experimental_insert_into_iceberg;
+    extern const SettingsUInt64 iceberg_insert_max_bytes_in_data_file;
+    extern const SettingsUInt64 iceberg_insert_max_rows_in_data_file;
 }
 
 namespace MergeTreeSetting
@@ -8293,14 +8295,17 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
         }
 
         const auto metadata_object = iceberg_metadata->getMetadataJSON(query_context);
-            
+
+        ExportPartitionUtils::verifyIcebergPartitionCompatibility(
+            metadata_object, src_snapshot->getPartitionKeyAST());
+
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
         metadata_object->stringify(oss);
         manifest.iceberg_metadata_json = oss.str();
 
-        ExportPartitionUtils::verifyIcebergPartitionCompatibility(
-            metadata_object, src_snapshot->getPartitionKeyAST());
+        manifest.max_bytes_per_file = query_context->getSettingsRef()[Setting::iceberg_insert_max_bytes_in_data_file];
+        manifest.max_rows_per_file = query_context->getSettingsRef()[Setting::iceberg_insert_max_rows_in_data_file];
 
 #else
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Data lake export requires Avro support");
