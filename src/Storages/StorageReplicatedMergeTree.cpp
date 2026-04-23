@@ -225,6 +225,7 @@ namespace Setting
     extern const SettingsBool export_merge_tree_partition_lock_inside_the_task;
     extern const SettingsString export_merge_tree_part_filename_pattern;
     extern const SettingsBool write_full_path_in_iceberg_metadata;
+    extern const SettingsBool allow_experimental_insert_into_iceberg;
 }
 
 namespace MergeTreeSetting
@@ -8282,6 +8283,13 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
         if (!iceberg_metadata)
         {
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Destination storage {} is a data lake but not an iceberg table", dest_storage->getName());
+        }
+
+        if (!query_context->getSettingsRef()[Setting::allow_experimental_insert_into_iceberg])
+        {
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+                "Iceberg writes are experimental. "
+                "To allow its usage, enable the setting allow_experimental_insert_into_iceberg");
         }
 
         const auto metadata_object = iceberg_metadata->getMetadataJSON(query_context);

@@ -224,6 +224,7 @@ namespace Setting
     extern const SettingsBool output_format_parquet_parallel_encoding;
     extern const SettingsBool export_merge_tree_part_throw_on_pending_mutations;
     extern const SettingsBool export_merge_tree_part_throw_on_pending_patch_parts;
+    extern const SettingsBool allow_experimental_insert_into_iceberg;
 }
 
 namespace MergeTreeSetting
@@ -6533,6 +6534,13 @@ void MergeTreeData::exportPartToTable(
 
     if (dest_storage->isDataLake())
     {
+        if (!query_context->getSettingsRef()[Setting::allow_experimental_insert_into_iceberg])
+        {
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+                "Iceberg writes are experimental. "
+                "To allow its usage, enable the setting allow_experimental_insert_into_iceberg");
+        }
+
 #if USE_AVRO
         if (iceberg_metadata_json_)
         {
