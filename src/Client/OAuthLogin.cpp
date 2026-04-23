@@ -13,10 +13,16 @@
 #include <Poco/JSON/Parser.h>
 #include <Poco/JSON/Stringifier.h>
 
+#include <cerrno>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <system_error>
+
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 namespace DB
 {
@@ -81,7 +87,53 @@ std::string readCachedRefreshTokenImpl(const std::string & client_id)
 
 }
 
-void writeCachedRefreshToken(const std::string & client_id, const std::string & refresh_token)
+namespace
+{
+
+/// RAII close + unlock for a POSIX fd used as an advisory lock. close(2)
+/// implicitly releases the lock; we unlock first only to keep the intent
+/// explicit at the close site.
+class ScopedFlockFd
+{
+public:
+    explicit ScopedFlockFd(int fd_) : fd(fd_) {}
+    ~ScopedFlockFd()
+    {
+        if (fd >= 0)
+        {
+            ::flock(fd, LOCK_UN);
+            ::close(fd);
+        }
+    }
+    ScopedFlockFd(const ScopedFlockFd &) = delete;
+    ScopedFlockFd & operator=(const ScopedFlockFd &) = delete;
+    int get() const { return fd; }
+
+private:
+    int fd;
+};
+
+void warnSyscall(const char * what, const std::string & path)
+{
+    /// generic_category().message is the thread-safe equivalent of
+    /// std::strerror, which is flagged by clang-tidy.
+    std::cerr << "Warning: OAuth token cache: " << what << " '" << path
+              << "' failed: " << std::generic_category().message(errno) << "\n";
+}
+
+}
+
+namespace
+{
+
+/// Run `mutator` against the on-disk OAuth refresh-token cache as a single
+/// atomic read-modify-write under an advisory exclusive flock. Both the writer
+/// (cache a new refresh token) and the evictor (drop a rejected one) go
+/// through this helper so they share the crash-safe rename and the
+/// concurrency lock — using two different paths for the two operations would
+/// reintroduce the lost-update race that M1 fixed.
+template <typename Mutator>
+void mutateRefreshTokenCache(Mutator && mutator)
 {
     const std::string path = cacheFilePath();
     if (path.empty())
@@ -89,8 +141,39 @@ void writeCachedRefreshToken(const std::string & client_id, const std::string & 
 
     namespace fs = std::filesystem;
     const fs::path cache_path(path);
-    fs::create_directories(cache_path.parent_path());
+    const fs::path cache_dir = cache_path.parent_path();
 
+    std::error_code ec;
+    fs::create_directories(cache_dir, ec);
+    if (ec)
+    {
+        std::cerr << "Warning: OAuth token cache: failed to create directory '"
+                  << cache_dir.string() << "': " << ec.message() << "\n";
+        return;
+    }
+
+    /// Serialize concurrent writers via an advisory exclusive lock on a
+    /// dedicated sibling file. cache_path itself cannot be locked because the
+    /// rename(2) below swaps its inode; the .lock file is never renamed, so
+    /// the lock survives the whole read-modify-write. Readers don't take this
+    /// lock — rename(2) is atomic on POSIX, so a concurrent reader observes
+    /// either the previous or the new cache, never a torn file.
+    const fs::path lock_path = cache_dir / ".oauth_cache.lock";
+    int raw_lock_fd = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (raw_lock_fd < 0)
+    {
+        warnSyscall("open lock file", lock_path.string());
+        return;
+    }
+    ScopedFlockFd lock_fd(raw_lock_fd);
+    if (::flock(lock_fd.get(), LOCK_EX) != 0)
+    {
+        warnSyscall("flock", lock_path.string());
+        return;
+    }
+
+    /// Read existing entries under the lock so the read-modify-write is
+    /// atomic with respect to other concurrent writers (lost-update fix).
     Poco::JSON::Object obj;
     {
         std::ifstream f(path);
@@ -113,19 +196,62 @@ void writeCachedRefreshToken(const std::string & client_id, const std::string & 
         }
     }
 
-    obj.set(cacheKey(client_id), refresh_token);
+    mutator(obj);
 
-    const std::string tmp_path = path + ".tmp";
+    /// mkstemp gives a process- and thread-unique path with O_EXCL semantics,
+    /// so concurrent invocations can no longer race on a fixed `.tmp` name and
+    /// corrupt each other's writes. POSIX requires mkstemp to create the file
+    /// 0600, so the refresh token is never on disk in a wider mode. The
+    /// template lives in the cache directory so rename(2) is same-FS and
+    /// atomic. We close the fd immediately and reopen via std::ofstream so
+    /// the existing serialization path stays unchanged; the random suffix
+    /// plus the held flock guarantee no other writer can interfere with the
+    /// reopen.
+    std::string tmpl = (cache_dir / "oauth_cache.XXXXXX").string();
+    int tmp_fd = ::mkstemp(tmpl.data());
+    if (tmp_fd < 0)
     {
-        std::ofstream out(tmp_path, std::ios::trunc);
+        warnSyscall("mkstemp", tmpl);
+        return;
+    }
+    ::close(tmp_fd);
+
+    {
+        std::ofstream out(tmpl, std::ios::trunc | std::ios::binary);
         if (!out.is_open())
+        {
+            warnSyscall("open for write", tmpl);
+            ::unlink(tmpl.c_str());
             return;
+        }
         Poco::JSON::Stringifier::stringify(obj, out);
+        out.close();
+        if (out.fail())
+        {
+            std::cerr << "Warning: OAuth token cache: failed to write '" << tmpl << "'\n";
+            ::unlink(tmpl.c_str());
+            return;
+        }
     }
 
-    std::error_code ec;
-    fs::permissions(tmp_path, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, ec);
-    fs::rename(tmp_path, cache_path, ec);
+    if (::rename(tmpl.c_str(), path.c_str()) != 0)
+    {
+        warnSyscall("rename to", path);
+        ::unlink(tmpl.c_str());
+        return;
+    }
+}
+
+void removeCachedRefreshToken(const std::string & client_id)
+{
+    mutateRefreshTokenCache([&](Poco::JSON::Object & obj) { obj.remove(cacheKey(client_id)); });
+}
+
+}
+
+void writeCachedRefreshToken(const std::string & client_id, const std::string & refresh_token)
+{
+    mutateRefreshTokenCache([&](Poco::JSON::Object & obj) { obj.set(cacheKey(client_id), refresh_token); });
 }
 
 namespace
@@ -144,9 +270,15 @@ std::string tryRefreshToken(const OAuthCredentials & creds, const std::string & 
         auto resp = postOAuthForm(creds.token_uri, body);
         if (resp->has("error"))
         {
-            std::cerr << "Note: cached refresh token was rejected ("
-                      << resp->getValue<std::string>("error")
-                      << "); re-authenticating.\n";
+            const std::string err = resp->getValue<std::string>("error");
+            std::cerr << "Note: cached refresh token was rejected (" << err << "); re-authenticating.\n";
+            /// RFC 6749 §5.2: invalid_grant means the refresh token itself is
+            /// no longer usable (revoked / expired / mismatched redirect).
+            /// Evict it so subsequent invocations skip the doomed round-trip.
+            /// Other error codes (invalid_client, invalid_request, ...) mean
+            /// our request was wrong, not the token, so we keep the cache.
+            if (err == "invalid_grant")
+                removeCachedRefreshToken(creds.client_id);
             return "";
         }
         if (resp->has("refresh_token"))

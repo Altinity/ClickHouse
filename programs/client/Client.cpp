@@ -893,8 +893,6 @@ void Client::processOptions(
         config().setBool("no-server-client-version-message", true);
     if (options.contains("fake-drop"))
         config().setString("ignore_drop_queries_probability", "1");
-    if (options.count("jwt") && options.count("login"))
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "--jwt and --login cannot both be specified");
     if (options.contains("jwt"))
     {
         if (!options["user"].defaulted())
@@ -909,6 +907,17 @@ void Client::processOptions(
 
     if (options.count("login"))
     {
+        /// Reject mixed JWT + --login from any source. The --login branch below
+        /// ends up calling config().setString("jwt", jwt_provider->getJWT()),
+        /// which would silently overwrite a JWT supplied via --jwt or via the
+        /// XML config file. config().has("jwt") covers both: CLI --jwt was
+        /// already copied into config() above, and a <jwt> element in
+        /// ~/.clickhouse-client/config.xml is loaded into config() at startup.
+        if (config().has("jwt"))
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "--login cannot be combined with a JWT (provided via --jwt or in the config file)");
+
         const std::string login_mode = options["login"].as<std::string>();
         if (!login_mode.empty() && login_mode != "browser" && login_mode != "device")
             throw Exception(

@@ -25,12 +25,12 @@
 #include <Poco/Net/HTTPSClientSession.h>
 #include <Poco/Net/SSLManager.h>
 #include <Poco/Net/ServerSocket.h>
-#include <Poco/StreamCopier.h>
 #include <Poco/Timespan.h>
 #include <Poco/URI.h>
 
 #include <openssl/rand.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <iostream>
@@ -57,6 +57,73 @@ namespace
 {
 
 constexpr int HTTP_TIMEOUT_SECONDS = 30;
+
+/// Hard cap on the size of an OAuth2 token / device-authorization response
+/// body. Real responses are a few hundred bytes; we accept up to 1 MiB so a
+/// hostile or compromised endpoint cannot stream gigabytes into a std::string
+/// (memory-exhaustion DoS of clickhouse-client). Anything larger is treated
+/// as a protocol error.
+constexpr size_t OAUTH_MAX_RESPONSE_BYTES = 1 * 1024 * 1024;
+
+/// Bounds for RFC 8628 device-flow timing values. The client treats the device
+/// authorization endpoint as untrusted: a hostile or misconfigured server must
+/// not be able to push the client into a tight poll loop (interval <= 0), an
+/// uninterruptible multi-hour sleep (interval huge), or an effectively
+/// unbounded polling window (expires_in huge). Out-of-range values are treated
+/// as a protocol error; in-range values are additionally clamped so that a
+/// single sleep_for() never exceeds DEVICE_FLOW_MAX_INTERVAL_SECONDS, which
+/// also caps how long Ctrl-C remains unresponsive.
+constexpr int DEVICE_FLOW_MIN_INTERVAL_SECONDS = 1;
+constexpr int DEVICE_FLOW_MAX_INTERVAL_SECONDS = 60;
+constexpr int DEVICE_FLOW_INTERVAL_HARD_LIMIT_SECONDS = 3600;
+constexpr int DEVICE_FLOW_DEFAULT_INTERVAL_SECONDS = 5;
+
+constexpr int DEVICE_FLOW_MIN_EXPIRES_IN_SECONDS = 60;
+constexpr int DEVICE_FLOW_MAX_EXPIRES_IN_SECONDS = 1800;
+constexpr int DEVICE_FLOW_EXPIRES_IN_HARD_LIMIT_SECONDS = 86400;
+constexpr int DEVICE_FLOW_DEFAULT_EXPIRES_IN_SECONDS = 300;
+
+constexpr int DEVICE_FLOW_SLOW_DOWN_INCREMENT_SECONDS = 5;
+
+int extractDeviceFlowInt(const Poco::JSON::Object::Ptr & resp, const std::string & key, int default_value)
+{
+    if (!resp->has(key))
+        return default_value;
+    try
+    {
+        return resp->getValue<int>(key);
+    }
+    catch (const Poco::Exception &)
+    {
+        throw Exception(
+            ErrorCodes::AUTHENTICATION_FAILED,
+            "Device authorization response value '{}' is not a valid integer",
+            key);
+    }
+}
+
+/// Read up to max_bytes from `in` into `out`. Throws AUTHENTICATION_FAILED if
+/// the stream contains more than max_bytes. Used to bound response sizes from
+/// untrusted OAuth endpoints.
+void copyStreamWithLimit(std::istream & in, std::string & out, size_t max_bytes)
+{
+    constexpr size_t buf_size = 8192;
+    char buffer[buf_size];
+    out.clear();
+    while (in)
+    {
+        in.read(buffer, static_cast<std::streamsize>(buf_size));
+        const auto got = static_cast<size_t>(in.gcount());
+        if (got == 0)
+            break;
+        if (out.size() + got > max_bytes)
+            throw Exception(
+                ErrorCodes::AUTHENTICATION_FAILED,
+                "OAuth2 endpoint response exceeds size limit of {} bytes",
+                max_bytes);
+        out.append(buffer, got);
+    }
+}
 
 std::string htmlEscape(const std::string & s)
 {
@@ -113,8 +180,25 @@ void openBrowser(const std::string & url)
 #    endif
     const char * argv[] = {cmd, url.c_str(), nullptr};
     pid_t pid;
-    if (posix_spawnp(&pid, cmd, nullptr, nullptr, const_cast<char * const *>(argv), nullptr) == 0)
-        waitpid(pid, nullptr, 0);
+    /// posix_spawnp returns the error number directly (not via errno); a
+    /// nonzero return means we never got to exec the helper at all (e.g.
+    /// xdg-open is not installed on a headless host). A zero return followed
+    /// by a nonzero waitpid exit status means the helper ran but failed to
+    /// launch a browser (xdg-open exits 3 when no handler is registered).
+    /// Without the diagnostic below, the caller would silently block in the
+    /// 120s callback wait, which is the L2 hazard.
+    if (posix_spawnp(&pid, cmd, nullptr, nullptr, const_cast<char * const *>(argv), nullptr) != 0)
+    {
+        std::cerr << "Unable to launch '" << cmd << "'; please copy the URL above into a browser manually.\n";
+        return;
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        std::cerr << "Unable to launch a browser via '" << cmd
+                  << "'; please copy the URL above into a browser manually.\n";
+#else
+    std::cerr << "Automatic browser launch is not supported on this platform; "
+                 "please copy the URL above into a browser manually.\n";
 #endif
 }
 
@@ -126,6 +210,13 @@ struct AuthCodeState
     std::string error;
     std::string received_state;
     bool done = false;
+
+    /// Pre-loaded before the server starts so that the loopback server can
+    /// serve the auth URL via a 302 redirect on /start. The browser helper is
+    /// then launched with only the loopback URL on its argv, keeping the CSRF
+    /// state and PKCE challenge out of /proc/<pid>/cmdline of the helper.
+    /// Read-only after server.start(); never mutated by the handler.
+    std::string auth_url;
 };
 
 class AuthCodeHandler : public Poco::Net::HTTPRequestHandler
@@ -136,6 +227,57 @@ public:
     void handleRequest(Poco::Net::HTTPServerRequest & request, Poco::Net::HTTPServerResponse & response) override
     {
         Poco::URI uri("http://localhost" + request.getURI());
+
+        /// RFC 8252 §7.3: native-app loopback redirects must be accepted only
+        /// at the registered redirect URI, and the OAuth2 redirect is always a
+        /// GET. Any other method or path is either a stray request from the
+        /// browser (e.g. /favicon.ico) or a local attacker probing the
+        /// ephemeral port; in both cases we must respond with an error and
+        /// must not unblock the main thread, otherwise the legitimate IdP
+        /// redirect can be pre-empted (causing either a DoS of the flow or,
+        /// if the attacker has obtained the CSRF state via /proc/<pid>/cmdline
+        /// of the spawned browser helper, a code-injection race).
+        if (request.getMethod() != Poco::Net::HTTPRequest::HTTP_GET)
+        {
+            response.setStatus(Poco::Net::HTTPResponse::HTTP_METHOD_NOT_ALLOWED);
+            response.setContentType("text/plain");
+            response.send() << "Method Not Allowed";
+            return;
+        }
+
+        const std::string & path = uri.getPath();
+
+        /// The browser helper is launched against /start instead of the full
+        /// auth URL so the CSRF state and PKCE challenge do not appear in any
+        /// process argv. We hand the URL to the browser via a same-origin 302
+        /// served by this loopback server. /start does not mutate auth state,
+        /// so it is safe to serve it more than once.
+        if (path == "/start")
+        {
+            std::string target;
+            {
+                std::lock_guard<std::mutex> lock(state.mtx);
+                target = state.auth_url;
+            }
+            if (target.empty())
+            {
+                response.setStatus(Poco::Net::HTTPResponse::HTTP_NOT_FOUND);
+                response.setContentType("text/plain");
+                response.send() << "Not Found";
+                return;
+            }
+            response.redirect(target, Poco::Net::HTTPResponse::HTTP_FOUND);
+            return;
+        }
+
+        if (path != "/callback")
+        {
+            response.setStatus(Poco::Net::HTTPResponse::HTTP_NOT_FOUND);
+            response.setContentType("text/plain");
+            response.send() << "Not Found";
+            return;
+        }
+
         const auto params = uri.getQueryParameters();
 
         std::string code;
@@ -161,6 +303,12 @@ public:
         out.flush();
 
         std::lock_guard<std::mutex> lock(state.mtx);
+        /// Only the first valid /callback delivery wins; subsequent requests
+        /// (e.g. an attacker racing the IdP after the legitimate redirect has
+        /// already been recorded) are ignored so they cannot overwrite a
+        /// previously-validated code/state pair.
+        if (state.done)
+            return;
         state.code = code;
         state.error = error;
         state.received_state = received_state;
@@ -213,7 +361,7 @@ Poco::JSON::Object::Ptr postOAuthForm(const std::string & url, const std::string
         auto & req_stream = session.sendRequest(request);
         req_stream << body;
         auto & resp_stream = session.receiveResponse(response);
-        Poco::StreamCopier::copyToString(resp_stream, response_body);
+        copyStreamWithLimit(resp_stream, response_body, OAUTH_MAX_RESPONSE_BYTES);
     }
     else
     {
@@ -222,7 +370,7 @@ Poco::JSON::Object::Ptr postOAuthForm(const std::string & url, const std::string
         auto & req_stream = session.sendRequest(request);
         req_stream << body;
         auto & resp_stream = session.receiveResponse(response);
-        Poco::StreamCopier::copyToString(resp_stream, response_body);
+        copyStreamWithLimit(resp_stream, response_body, OAUTH_MAX_RESPONSE_BYTES);
     }
 
     Poco::Dynamic::Var parsed;
@@ -276,13 +424,6 @@ std::string runOAuthAuthCodeFlow(const OAuthCredentials & creds)
     const uint16_t port = server_socket.address().port();
     const std::string redirect_uri = "http://localhost:" + std::to_string(port) + "/callback";
 
-    AuthCodeState state;
-    auto params = Poco::AutoPtr<Poco::Net::HTTPServerParams>(new Poco::Net::HTTPServerParams());
-    params->setMaxQueued(1);
-    params->setMaxThreads(1);
-    Poco::Net::HTTPServer server(new AuthCodeHandlerFactory(state), server_socket, params);
-    server.start();
-
     std::string auth_url
         = creds.auth_uri
         + "?response_type=code"
@@ -295,7 +436,28 @@ std::string runOAuthAuthCodeFlow(const OAuthCredentials & creds)
     if (provider_policy->useAccessTypeOfflineForAuthCode())
         auth_url += "&access_type=offline";
 
-    openBrowser(auth_url);
+    AuthCodeState state;
+    /// Publish the auth URL to the loopback server before it starts so /start
+    /// can immediately redirect to it. This is set under the mutex for
+    /// happens-before with the handler thread; in practice it is only ever
+    /// read after server.start() but we keep the synchronization explicit.
+    {
+        std::lock_guard<std::mutex> lock(state.mtx);
+        state.auth_url = auth_url;
+    }
+    auto params = Poco::AutoPtr<Poco::Net::HTTPServerParams>(new Poco::Net::HTTPServerParams());
+    params->setMaxQueued(1);
+    params->setMaxThreads(1);
+    Poco::Net::HTTPServer server(new AuthCodeHandlerFactory(state), server_socket, params);
+    server.start();
+
+    /// Launch the browser against the loopback /start endpoint instead of the
+    /// real auth URL. The full auth URL (including CSRF state and PKCE
+    /// challenge) therefore never appears in any process's argv, closing the
+    /// /proc/<pid>/cmdline disclosure path that local same-UID attackers
+    /// previously had against the spawned xdg-open / open helper.
+    const std::string browser_entry_url = "http://127.0.0.1:" + std::to_string(port) + "/start";
+    openBrowser(browser_entry_url);
 
     bool timed_out = false;
     std::string received_code;
@@ -389,10 +551,39 @@ std::string runOAuthDeviceFlow(OAuthCredentials creds)
                 ? device_resp->getValue<std::string>("verification_url")
                 : throw Exception(
                     ErrorCodes::AUTHENTICATION_FAILED,
-                    "Device authorization response missing verification_uri / verification_url");
+                    "Device authorization response from '{}' is missing verification_uri / "
+                    "verification_uri_complete / verification_url. Response: {}",
+                    creds.device_auth_uri,
+                    [&]
+                    {
+                        std::ostringstream ss;
+                        device_resp->stringify(ss);
+                        return ss.str();
+                    }());
 
-    int interval = device_resp->has("interval") ? device_resp->getValue<int>("interval") : 5;
-    int expires_in = device_resp->has("expires_in") ? device_resp->getValue<int>("expires_in") : 300;
+    int interval = extractDeviceFlowInt(device_resp, "interval", DEVICE_FLOW_DEFAULT_INTERVAL_SECONDS);
+    int expires_in = extractDeviceFlowInt(device_resp, "expires_in", DEVICE_FLOW_DEFAULT_EXPIRES_IN_SECONDS);
+
+    /// Reject values that are non-positive or wildly out of spec: a hostile or
+    /// misconfigured device endpoint must not be able to coerce the client
+    /// into a tight poll loop, a multi-hour uninterruptible sleep, or an
+    /// effectively unbounded polling window.
+    if (interval <= 0 || interval > DEVICE_FLOW_INTERVAL_HARD_LIMIT_SECONDS)
+        throw Exception(
+            ErrorCodes::AUTHENTICATION_FAILED,
+            "Device authorization response specified an out-of-range polling interval: {} seconds",
+            interval);
+    if (expires_in <= 0 || expires_in > DEVICE_FLOW_EXPIRES_IN_HARD_LIMIT_SECONDS)
+        throw Exception(
+            ErrorCodes::AUTHENTICATION_FAILED,
+            "Device authorization response specified an out-of-range expires_in: {} seconds",
+            expires_in);
+
+    /// Clamp into a sensible operational window. The interval upper bound also
+    /// bounds how long a single sleep_for() blocks, which is the time window
+    /// during which Ctrl-C cannot interrupt the flow.
+    interval = std::clamp(interval, DEVICE_FLOW_MIN_INTERVAL_SECONDS, DEVICE_FLOW_MAX_INTERVAL_SECONDS);
+    expires_in = std::clamp(expires_in, DEVICE_FLOW_MIN_EXPIRES_IN_SECONDS, DEVICE_FLOW_MAX_EXPIRES_IN_SECONDS);
 
     std::cerr << "\nTo authenticate, visit:\n  " << verification_uri << "\nAnd enter code: " << user_code << "\n\n";
 
@@ -415,7 +606,12 @@ std::string runOAuthDeviceFlow(OAuthCredentials creds)
                 continue;
             if (err == "slow_down")
             {
-                interval += 5;
+                /// Per RFC 8628 the client must increase its polling interval,
+                /// but the new value still has to stay inside our operational
+                /// bound so a server cannot ratchet the interval up indefinitely.
+                interval = std::min(
+                    interval + DEVICE_FLOW_SLOW_DOWN_INCREMENT_SECONDS,
+                    DEVICE_FLOW_MAX_INTERVAL_SECONDS);
                 continue;
             }
             const std::string desc = resp->has("error_description") ? resp->getValue<std::string>("error_description") : err;
