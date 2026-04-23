@@ -8,10 +8,10 @@
 
 ---
 
-## 1. Requirements
+## 1. Problem Definition
 
 ### Motivation
-What problem does this feature solve? Why now? Quote user reports, incidents, or concrete
+What problem does this feature solve for users? Why now? Quote user reports, incidents, or concrete
 workloads where possible — avoid generic statements like "users want X".
 
 ### Requirements

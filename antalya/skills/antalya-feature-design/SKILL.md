@@ -42,6 +42,9 @@ path, then populate each section based on the conversation. Leave a section mark
 pointed question rather than inventing content — a visible gap is more useful than a plausible
 fabrication.
 
+The default location for designs is antalya/docs/design. Create a new directory for the design 
+and place the .md file within it. 
+
 ### 3. Conventions to apply while writing
 
 These match the project `CLAUDE.md` and make the design consistent with the rest of the codebase:
@@ -54,13 +57,18 @@ These match the project `CLAUDE.md` and make the design consistent with the rest
 - Cite files as `path/to/file.cpp:line` so reviewers can jump directly.
 - Prefer one-line statements of intent over prose padding.
 
+Avoid long examples or deep specification detail in the design. Where
+such detail is require, such as end-to-end examples or output formats,
+put these in files of the form `annex-<name>.md` and reference them with
+markdown links.
+
 ### 4. Push back on weak spots as you write
 
 Drafting is also a review — don't wait for section 4 to think. In particular:
 
 - If the **Motivation** reduces to "users want X" with no concrete workload, ask for one.
-- If **Goals** are not measurable, say so and suggest a measurable form.
-- If there are no **Non-goals**, propose a few. The absence of non-goals is the single biggest
+- If **Requirements** are not measurable, say so and suggest a measurable form.
+- If there are no **Non-requirements**, propose a few. The absence of non-goals is the single biggest
   source of scope creep.
 - If **Alternatives considered** is empty, press for at least one rejected approach. A design with
   no alternatives considered usually means the author has a solution looking for a problem.
@@ -74,12 +82,18 @@ severity: **blocking** (must fix before implementation), **should-address** (fix
 **nit** (optional). Quote the exact text you're critiquing so the author can find it fast.
 
 ### Requirements
+- The requirements section define the user problem. The problem should be stated in terms of needed 
+  features, performance goals, delivery deadlines, plus topics we do not need to consider or solve. 
 - Motivation cites a concrete workload, incident, or user report — not a generic assertion.
 - Requirements are measurable. "Faster" is not a requirement; "query `Q` drops from 5s to <500ms on dataset `D`"
   is.
 - Non-requirements are listed. Missing non-requirement almost always produce scope creep in review.
+- Requirements should be generic. Put user-visible product behavior such as SQL commands in the Functional 
+  Specification. Put internal (non-visible behavior) in the Implementation section. 
 
 ### Functional specification
+- The functional specification defines user visible product behavior including SQL commands, system tables, 
+  settings, and error messages. 
 - Every new/changed SQL syntax has at least one concrete example.
 - Every new setting has scope (server / user / query), default, and valid range.
 - Default-value changes that alter behavior for existing workloads are called out explicitly.
@@ -90,6 +104,7 @@ severity: **blocking** (must fix before implementation), **should-address** (fix
 - Formatting convention: inline code blocks around SQL identifiers, engine names, settings.
 
 ### Implementation
+- The implementation section covers internal design that is not visible to the user. 
 - Architecture section names the subsystems touched (parser / analyzer / planner / executor /
   storage / replication / keeper). If it touches many, that's a design smell worth flagging.
 - New abstractions pull their weight. If an interface has one implementation and no foreseeable
@@ -103,15 +118,13 @@ severity: **blocking** (must fix before implementation), **should-address** (fix
   internal code that already trusts its callers.
 
 ### Test plan
-- Golden path, edge cases, and error cases are all enumerated — not just "add tests".
+- The test plan defines happy path, edge cases, and error cases.
+- Test case definitions should be specific, falsifiable propositions about feature behavior. 
+- Test case definitions should not contain implementation code, except as necessary 
+  to describe the feature being tested. 
 - Tests use `tests/queries/0_stateless` for functional coverage and `tests/integration` for
   anything touching replication, keeper, distributed queries, S3, auth, or Kafka.
-- No `no-*` tags (especially `no-parallel`) unless there's a stated reason they're necessary.
-- New tests are proposed as new files, not extensions of existing ones.
-- Integration-test invocation is specified:
-  `python -m ci.praktika run "integration" --test <selectors>`.
-- Performance tests exist if the feature is in the hot path.
-- Rollout section names the specific risk and whether a feature flag (and default) is warranted.
+- Performance should be specified if the feature is in the hot path, i.e., affects response or resource usage. 
 
 ### Cross-cutting red flags
 - Feature flags or backwards-compatibility shims added "just in case" — per project `CLAUDE.md`,
