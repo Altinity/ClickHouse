@@ -33,6 +33,8 @@ namespace ErrorCodes
     extern const int FAULT_INJECTED;
     extern const int BAD_ARGUMENTS;
     extern const int NO_SUCH_DATA_PART;
+    extern const int CORRUPTED_DATA;
+    extern const int NETWORK_ERROR;
 }
 
 namespace FailPoints
@@ -167,15 +169,13 @@ namespace ExportPartitionUtils
 
         if (exported_paths.empty())
         {
-            LOG_WARNING(log, "ExportPartition: No exported paths found, will not commit export. This might be a bug");
-            return;
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "ExportPartition: No exported paths found, will not commit export. This might be a bug");
         }
 
         //// not checking for an exact match because a single part might generate multiple files
         if (exported_paths.size() < manifest.parts.size())
         {
-            LOG_WARNING(log, "ExportPartition: Reached the commit phase, but exported paths size is less than the number of parts, will not commit export. This might be a bug");
-            return;
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "ExportPartition: Reached the commit phase, but exported paths size is less than the number of parts, will not commit export. This might be a bug");
         }
 
         IStorage::IcebergCommitExportPartitionArguments iceberg_args;
@@ -209,7 +209,7 @@ namespace ExportPartitionUtils
         }
         else
         {
-            LOG_INFO(log, "ExportPartition: Failed to mark export as completed, will not try to fix it");
+            throw Exception(ErrorCodes::NETWORK_ERROR, "ExportPartition: Failed to mark export as completed, will not try to fix it");
         }
     }
 
