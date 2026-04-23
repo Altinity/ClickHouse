@@ -316,6 +316,49 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
     if (!openid_config.contains("userinfo_endpoint") || !openid_config.contains("introspection_endpoint"))
         throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "{}: Cannot extract userinfo_endpoint or introspection_endpoint from OIDC configuration, consider manual configuration.", processor_name);
 
+    /// Anchor the discovery document to a known issuer when one is configured.
+    ///
+    /// OIDC Discovery 1.0 §4.3 / RFC 8414 §3.3 require the metadata's "issuer"
+    /// to be tied to the URL used to fetch it. Without this anchor a poisoned
+    /// or misdirected discovery response can redirect the entire trust chain
+    /// (jwks_uri, userinfo_endpoint, introspection_endpoint) to URLs the
+    /// operator never approved -- and because the embedded JWT verifier only
+    /// enforces the `iss` claim when expected_issuer is non-empty, JWTs signed
+    /// by the attacker's keys would be silently accepted at runtime.
+    ///
+    /// Policy:
+    ///   - expected_issuer configured => discovery's "issuer" MUST match it
+    ///                                   (refuse to construct on mismatch or
+    ///                                   absence). Verifier is pinned to it.
+    ///   - expected_issuer empty      => log a warning so the gap is visible
+    ///                                   in operator logs, then proceed with
+    ///                                   the historical (lax) behavior. The
+    ///                                   verifier is left without an issuer
+    ///                                   pin to preserve compatibility.
+    const auto issuer_from_discovery = getValueByKey<std::string, false>(openid_config, "issuer").value_or("");
+
+    if (!expected_issuer_.empty())
+    {
+        if (issuer_from_discovery.empty())
+            throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
+                            "{}: OIDC discovery document at '{}' does not advertise an 'issuer'; "
+                            "cannot verify it against the configured 'expected_issuer' '{}'.",
+                            processor_name, openid_config_endpoint_, expected_issuer_);
+
+        if (issuer_from_discovery != expected_issuer_)
+            throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
+                            "{}: OIDC discovery 'issuer' mismatch: configured 'expected_issuer' is '{}' "
+                            "but discovery document at '{}' returned issuer '{}'. Refusing to load the "
+                            "processor to avoid trusting metadata that belongs to a different issuer.",
+                            processor_name, expected_issuer_, openid_config_endpoint_, issuer_from_discovery);
+    }
+    else
+    {
+        LOG_WARNING(getLogger("TokenAuthentication"),
+                    "{}: 'expected_issuer' is not configured for OIDC discovery at '{}'. "
+                    "The JWT 'iss' claim will NOT be enforced.", processor_name, openid_config_endpoint_);
+    }
+
     userinfo_endpoint = Poco::URI(getValueByKey(openid_config, "userinfo_endpoint").value());
     token_introspection_endpoint = Poco::URI(getValueByKey(openid_config, "introspection_endpoint").value());
 
