@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <string>
 #include <string_view>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/FileNamesGenerator.h>
@@ -116,6 +117,11 @@ enum class FileCategory : uint8_t
 FileCategory inspectFileCategory(const String & relative_path);
 
 KeyDescription getSortingKeyDescriptionFromMetadata(
+    Poco::JSON::Object::Ptr metadata_object, const NamesAndTypesList & ch_schema, ContextPtr local_context);
+/// Returns Iceberg/Spark-style display string for sort order, e.g. "id desc, hour(ts) asc".
+std::optional<String> getSortingKeyDisplayStringFromMetadata(
+    Poco::JSON::Object::Ptr metadata_object, const NamesAndTypesList & ch_schema);
+std::optional<String> getPartitionKeyStringFromMetadata(
     Poco::JSON::Object::Ptr metadata_object, const NamesAndTypesList & ch_schema, ContextPtr local_context);
 void sortBlockByKeyDescription(Block & block, const KeyDescription & sort_description, ContextPtr context);
 
