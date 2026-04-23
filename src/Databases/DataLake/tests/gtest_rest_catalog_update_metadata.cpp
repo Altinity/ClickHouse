@@ -9,6 +9,7 @@
 #include <Poco/JSON/Array.h>
 #include <Poco/JSON/Object.h>
 #include <base/types.h>
+#include <sstream>
 
 using namespace DB;
 
@@ -85,6 +86,28 @@ TEST(RestCatalogUpdateMetadataBody, SchemaUpdateCurrentIdZeroNoRequirement)
     auto body = DataLake::buildUpdateMetadataRequestBody("ns", "t", snapshot);
     ASSERT_TRUE(body);
     EXPECT_FALSE(body->has("requirements"));
+}
+
+TEST(RestCatalogUpdateMetadataBody, SchemaUpdateBodyIsStringifiable)
+{
+    Poco::JSON::Object::Ptr snapshot = new Poco::JSON::Object;
+    Poco::JSON::Array::Ptr schemas = new Poco::JSON::Array;
+    Poco::JSON::Object::Ptr schema = new Poco::JSON::Object;
+    schema->set(Iceberg::f_schema_id, 1);
+    schema->set(Iceberg::f_type, "struct");
+    schema->set(Iceberg::f_fields, Poco::JSON::Array::Ptr(new Poco::JSON::Array));
+    // deliberately no "identifier-field-ids" so the builder must inject an empty array
+    schemas->add(schema);
+    snapshot->set(Iceberg::f_schemas, schemas);
+    snapshot->set(Iceberg::f_current_schema_id, 1);
+
+    auto body = DataLake::buildUpdateMetadataRequestBody("ns", "t", snapshot);
+    ASSERT_TRUE(body);
+
+    std::ostringstream oss; // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+    ASSERT_NO_THROW(body->stringify(oss));
+    EXPECT_NE(oss.str().find("\"identifier-field-ids\""), std::string::npos);
+    EXPECT_NE(oss.str().find("\"add-schema\""), std::string::npos);
 }
 
 TEST(RestCatalogUpdateMetadataBody, SchemaUpdateMissingCurrentSchemaIdThrows)

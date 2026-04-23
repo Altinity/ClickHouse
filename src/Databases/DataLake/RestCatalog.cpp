@@ -181,7 +181,10 @@ Poco::JSON::Object::Ptr buildUpdateMetadataRequestBody(
 
         Poco::JSON::Object::Ptr schema_for_rest = cloneJsonObject(new_schema_obj);
         if (!schema_for_rest->has("identifier-field-ids"))
-            schema_for_rest->set("identifier-field-ids", new Poco::JSON::Array);
+        {
+            Poco::JSON::Array::Ptr empty_identifier_field_ids = new Poco::JSON::Array;
+            schema_for_rest->set("identifier-field-ids", empty_identifier_field_ids);
+        }
 
         if (old_schema_id >= 0)
         {
