@@ -153,10 +153,10 @@ StoragePtr TableFunctionObjectStorageClusterFallback<Definition, Base>::executeI
 template <typename Definition, typename Base>
 void TableFunctionObjectStorageClusterFallback<Definition, Base>::validateUseToCreateTable() const
 {
-    if (is_cluster_function)
+    if (is_cluster_function || is_remote)
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
-            "Table function '{}' cannot be used to create a table in cluster mode",
+            "Table function '{}' cannot be used to create a table in cluster mode or with remote initiator",
             getName());
 }
 

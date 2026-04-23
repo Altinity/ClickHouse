@@ -441,14 +441,14 @@ IStorageCluster::RemoteCallVariables IStorageCluster::convertToRemote(
 
     auto host_addresses = cluster->getShardsAddresses();
     if (host_addresses.empty())
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "Empty cluster {}", cluster_name_from_settings);
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Empty cluster {}", cluster_name_from_settings);
 
     static pcg64 rng(randomSeed());
     size_t shard_num = rng() % host_addresses.size();
     auto shard_addresses = host_addresses[shard_num];
     /// After getClusterImpl each shard must have exactly 1 replica
     if (shard_addresses.size() != 1)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "Size of shard {} in cluster {} is not equal 1", shard_num, cluster_name_from_settings);
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Size of shard {} in cluster {} is not equal 1", shard_num, cluster_name_from_settings);
     std::string host_name;
     Poco::URI::decode(shard_addresses[0].toString(), host_name);
 
