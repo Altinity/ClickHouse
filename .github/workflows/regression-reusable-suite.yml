@@ -190,3 +190,4 @@ jobs:
         with:
           name: ${{ format('{0}{1}-artifacts-{2}{3}', inputs.job_name != '' && inputs.job_name || inputs.suite_name, inputs.part != '' && format('_{0}', inputs.part) || '', inputs.runner_arch, contains(inputs.extra_args, '--use-keeper') && '_keeper' || '_zookeeper') }}
           path: ${{ env.artifact_paths }}
+
