@@ -385,7 +385,15 @@ Authentication::CredentialsCheckResult Authentication::areCredentialsValid(
         if (authentication_method.getType() != AuthenticationType::JWT)
             return CredentialsCheckResult::Fail;
 
+<<<<<<< HEAD
         return external_authenticators.checkTokenCredentials(*token_credentials) ? CredentialsCheckResult::Success : CredentialsCheckResult::Fail;
+=======
+        return external_authenticators.checkTokenCredentials(
+            *token_credentials,
+            authentication_method.getTokenProcessorName(),
+            authentication_method.getJWTClaims()) ?
+            CredentialsCheckResult::Success : CredentialsCheckResult::Fail;
+>>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
     }
 
     if ([[maybe_unused]] const auto * always_allow_credentials = typeid_cast<const AlwaysAllowCredentials *>(&credentials))

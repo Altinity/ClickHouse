@@ -49,7 +49,11 @@ public:
     bool checkKerberosCredentials(const String & realm, const GSSAcceptorContext & credentials) const;
     bool checkHTTPBasicCredentials(const String & server, const BasicCredentials & credentials, const ClientInfo & client_info, SettingsChanges & settings) const;
 
+<<<<<<< HEAD
     bool checkTokenCredentials(const TokenCredentials & credentials, const String & processor_name = "") const;
+=======
+    bool checkTokenCredentials(const TokenCredentials & credentials, const String & processor_name = "", const String & jwt_claims = "") const;
+>>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
 
     GSSAcceptorContext::Params getKerberosParams() const;
 

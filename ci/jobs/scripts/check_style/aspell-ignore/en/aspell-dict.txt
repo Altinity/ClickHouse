@@ -653,7 +653,10 @@ JoinStrictness
 Jpan
 JumpConsistentHash
 Jupyter
+<<<<<<< HEAD
 Jurc
+=======
+>>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
 jwks
 JWKS
 KDevelop
@@ -3807,7 +3810,10 @@ uuids
 uuidv
 vCPU
 validators
+<<<<<<< HEAD
 vLLM
+=======
+>>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
 varPop
 varPopStable
 varSamp

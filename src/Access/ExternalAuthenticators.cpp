@@ -626,15 +626,26 @@ bool ExternalAuthenticators::checkCredentialsAgainstProcessor(const ITokenProces
         cache_entry.external_roles = credentials.getGroups();
 
         auto default_expiration_ts = std::chrono::system_clock::now()
+<<<<<<< HEAD
                                      + std::chrono::minutes(processor.getTokenCacheLifetime());
+=======
+                                     + std::chrono::seconds(processor.getTokenCacheLifetime());
+>>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
 
         if (credentials.getExpiresAt().has_value())
         {
             if (credentials.getExpiresAt().value() < default_expiration_ts)
                 cache_entry.expires_at = credentials.getExpiresAt().value();
             else
+<<<<<<< HEAD
                 LOG_TRACE(getLogger("AccessTokenAuthentication"), "Attempt to authenticate user {} with expired access token by {}", credentials.getUserName(), processor.getProcessorName());
 
+=======
+            {
+                LOG_TRACE(getLogger("AccessTokenAuthentication"), "Token for user {} expires after default cache lifetime; using default TTL by {}", credentials.getUserName(), processor.getProcessorName());
+                cache_entry.expires_at = default_expiration_ts;
+            }
+>>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
         }
         else
         {
@@ -662,7 +673,11 @@ bool ExternalAuthenticators::checkCredentialsAgainstProcessor(const ITokenProces
     return false;
 }
 
+<<<<<<< HEAD
 bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & credentials, const String & processor_name) const
+=======
+bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & credentials, const String & processor_name, const String & jwt_claims) const
+>>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
 {
     std::lock_guard lock{mutex};
 
@@ -672,15 +687,35 @@ bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & cred
     if (token_processors.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Token authentication is not configured");
 
+<<<<<<< HEAD
+=======
+    /// Per-user claims restriction applies only to JWT processors; opaque/access token processors ignore it.
+    auto check_claims_if_required = [&](const ITokenProcessor & processor) -> bool
+    {
+        if (jwt_claims.empty())
+            return true;
+        if (!processor.supportsJwtClaimsRestriction())
+            return true;
+        return processor.checkClaims(credentials, jwt_claims);
+    };
+
+>>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
     /// lookup token in local cache if not expired.
     auto cached_entry_iter = access_token_to_username_cache.find(credentials.getToken());
     if (cached_entry_iter != access_token_to_username_cache.end())
     {
         if (cached_entry_iter->second.expires_at <= std::chrono::system_clock::now()) // Token found in cache, but already outdated -- need to remove it.
         {
+<<<<<<< HEAD
             LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} expired, removing", cached_entry_iter->second.user_name);
             access_token_to_username_cache.erase(cached_entry_iter);
             username_to_access_token_cache.erase(cached_entry_iter->second.user_name);
+=======
+            const auto expired_user_name = cached_entry_iter->second.user_name;
+            LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} expired, removing", expired_user_name);
+            access_token_to_username_cache.erase(cached_entry_iter);
+            username_to_access_token_cache.erase(expired_user_name);
+>>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
         }
         else
         {
@@ -688,12 +723,24 @@ bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & cred
             const_cast<TokenCredentials &>(credentials).setUserName(user_data.user_name);
             const_cast<TokenCredentials &>(credentials).setGroups(user_data.external_roles);
             LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} found, using it to authenticate", cached_entry_iter->second.user_name);
+<<<<<<< HEAD
+=======
+            if (!jwt_claims.empty())
+            {
+                if (processor_name.empty())
+                    return false;
+                const auto it = token_processors.find(processor_name);
+                if (it == token_processors.end() || !check_claims_if_required(*it->second))
+                    return false;
+            }
+>>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
             return true;
         }
     }
 
     if (processor_name.empty())
     {
+<<<<<<< HEAD
         for (const auto & it: token_processors)
         {
             if (checkCredentialsAgainstProcessor(*it.second, const_cast<TokenCredentials &>(credentials)))
@@ -702,6 +749,20 @@ bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & cred
     }
     else
         return token_processors.contains(processor_name) && checkCredentialsAgainstProcessor(*token_processors[processor_name], const_cast<TokenCredentials &>(credentials));
+=======
+        for (const auto & it : token_processors)
+        {
+            if (checkCredentialsAgainstProcessor(*it.second, const_cast<TokenCredentials &>(credentials)))
+                return check_claims_if_required(*it.second);
+        }
+    }
+    else
+    {
+        const auto it = token_processors.find(processor_name);
+        if (it != token_processors.end() && checkCredentialsAgainstProcessor(*it->second, const_cast<TokenCredentials &>(credentials)))
+            return check_claims_if_required(*it->second);
+    }
+>>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
 
     return false;
 }

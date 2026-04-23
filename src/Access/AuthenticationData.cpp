@@ -38,7 +38,6 @@ namespace CurrentMetrics
     extern const Metric BcryptCacheSize;
 }
 
-
 namespace DB
 {
 

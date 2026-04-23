@@ -2,6 +2,10 @@
 
 #if USE_JWT_CPP
 #include <Common/Exception.h>
+<<<<<<< HEAD
+=======
+#include <mutex>
+>>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
 #include <Poco/Net/HTTPRequest.h>
 #include <Poco/Net/HTTPResponse.h>
 #include <Poco/Net/HTTPSClientSession.h>
@@ -20,11 +24,25 @@ namespace ErrorCodes
 
 JWKSType JWKSClient::getJWKS()
 {
+<<<<<<< HEAD
     std::shared_lock lock(mutex);
 
     auto now = std::chrono::high_resolution_clock::now();
     auto diff = std::chrono::duration<double>(now - last_request_send).count();
 
+=======
+    {
+        std::shared_lock lock(mutex);
+        auto now = std::chrono::high_resolution_clock::now();
+        auto diff = std::chrono::duration<double>(now - last_request_send).count();
+        if (diff < static_cast<double>(refresh_timeout) && cached_jwks.has_value())
+            return cached_jwks.value();
+    }
+
+    std::unique_lock lock(mutex);
+    auto now = std::chrono::high_resolution_clock::now();
+    auto diff = std::chrono::duration<double>(now - last_request_send).count();
+>>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
     if (diff < static_cast<double>(refresh_timeout) && cached_jwks.has_value())
         return cached_jwks.value();
 
