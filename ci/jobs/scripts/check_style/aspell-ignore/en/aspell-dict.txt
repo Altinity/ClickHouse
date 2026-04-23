@@ -398,6 +398,8 @@ Dresseler
 DuckDB
 Duployan
 Durre
+ECDSA
+EdDSA
 ECMA
 EDAC
 ETag
@@ -731,7 +733,12 @@ JoinStrictness
 Jpan
 JumpConsistentHash
 Jupyter
+<<<<<<< HEAD
 Jurc
+=======
+jwks
+JWKS
+>>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
 KDevelop
 KafkaAssignedPartitions
 KafkaBackgroundReads
@@ -4099,7 +4106,11 @@ uuid
 uuids
 uuidv
 vCPU
+<<<<<<< HEAD
 vLLM
+=======
+validators
+>>>>>>> ad5b91c853d (Merge pull request #1658 from Altinity/feature/antalya-26.3/pr-1430-1596)
 varPop
 varPopStable
 varSamp
@@ -4117,6 +4128,8 @@ vectorscan
 vendoring
 verificationDepth
 verificationMode
+verifier
+verifiers
 versionedcollapsingmergetree
 vhost
 virtualized
