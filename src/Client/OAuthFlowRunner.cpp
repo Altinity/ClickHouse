@@ -85,6 +85,18 @@ constexpr int DEVICE_FLOW_DEFAULT_EXPIRES_IN_SECONDS = 300;
 
 constexpr int DEVICE_FLOW_SLOW_DOWN_INCREMENT_SECONDS = 5;
 
+/// Cadence at which the device-flow polling loop emits a heartbeat to stderr.
+/// Without this the client prints the URL/user_code once and then stays
+/// completely silent (sometimes for the full 1800s expires_in clamp) while it
+/// internally polls the token endpoint, leaving the user unable to tell
+/// "still waiting for me to approve in the browser" apart from "the process
+/// is wedged on a network call". 30s is short enough to give a perceptible
+/// pulse for the default 300s window, and long enough that a 1800s window
+/// produces ~60 lines of scrollback, not 360. The cadence is real-time, not
+/// per-poll, so a server-driven slow_down ratchet doesn't silently stretch
+/// the perceived gap between updates.
+constexpr int DEVICE_FLOW_STATUS_INTERVAL_SECONDS = 30;
+
 int extractDeviceFlowInt(const Poco::JSON::Object::Ptr & resp, const std::string & key, int default_value)
 {
     if (!resp->has(key))
@@ -422,7 +434,18 @@ std::string runOAuthAuthCodeFlow(const OAuthCredentials & creds)
     server_socket.bind(Poco::Net::SocketAddress("127.0.0.1", 0), /*reuse_address=*/true);
     server_socket.listen(1);
     const uint16_t port = server_socket.address().port();
-    const std::string redirect_uri = "http://localhost:" + std::to_string(port) + "/callback";
+
+    /// RFC 8252 §7.3 recommends the loopback IP literal over the hostname
+    /// "localhost" for native-app redirect URIs. We bind only to 127.0.0.1, but
+    /// "localhost" can resolve to ::1 first on dual-stack hosts (RFC 6724
+    /// default ordering, /etc/hosts, or NSS/AAAA preference): in that case the
+    /// browser's GET on the redirect lands on the IPv6 loopback where nothing
+    /// is listening, the auth code is silently dropped, and the main thread
+    /// hits the 120s wait_for() timeout even though the user successfully
+    /// completed the login. Using the IP literal keeps the redirect target
+    /// aligned with the bound socket regardless of resolver behaviour, and
+    /// matches the host already used for the /start browser entry URL below.
+    const std::string redirect_uri = "http://127.0.0.1:" + std::to_string(port) + "/callback";
 
     std::string auth_url
         = creds.auth_uri
@@ -481,13 +504,17 @@ std::string runOAuthAuthCodeFlow(const OAuthCredentials & creds)
     if (received_state != csrf_state)
         throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "OAuth2 CSRF check failed: unexpected state in callback");
 
-    const std::string body
+    std::string body
         = "grant_type=authorization_code"
           "&code=" + urlEncodeOAuth(received_code)
         + "&redirect_uri=" + urlEncodeOAuth(redirect_uri)
         + "&client_id=" + urlEncodeOAuth(creds.client_id)
-        + "&client_secret=" + urlEncodeOAuth(creds.client_secret)
         + "&code_verifier=" + urlEncodeOAuth(pkce.verifier);
+    /// Confidential clients append the registered secret; public clients
+    /// (PKCE-only) must omit the parameter entirely. An empty value is not
+    /// equivalent to omission and is rejected by several IdPs as invalid_client.
+    if (!creds.client_secret.empty())
+        body += "&client_secret=" + urlEncodeOAuth(creds.client_secret);
 
     auto resp = postOAuthForm(creds.token_uri, body);
     if (resp->has("error"))
@@ -586,32 +613,63 @@ std::string runOAuthDeviceFlow(OAuthCredentials creds)
     expires_in = std::clamp(expires_in, DEVICE_FLOW_MIN_EXPIRES_IN_SECONDS, DEVICE_FLOW_MAX_EXPIRES_IN_SECONDS);
 
     std::cerr << "\nTo authenticate, visit:\n  " << verification_uri << "\nAnd enter code: " << user_code << "\n\n";
+    std::cerr << "Waiting for authorization (this code expires in " << expires_in << " seconds)...\n";
 
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(expires_in);
+    const auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + std::chrono::seconds(expires_in);
+    /// Real-time gate for the heartbeat below. Initialised to `start` rather
+    /// than to "after the first poll" so the first heartbeat fires ~30s after
+    /// the URL/code line, regardless of how long the first network round-trip
+    /// takes.
+    auto last_status = start;
     while (std::chrono::steady_clock::now() < deadline)
     {
         std::this_thread::sleep_for(std::chrono::seconds(interval));
 
-        const std::string poll_body
+        std::string poll_body
             = "grant_type=urn:ietf:params:oauth:grant-type:device_code"
               "&device_code=" + urlEncodeOAuth(device_code)
-            + "&client_id=" + urlEncodeOAuth(creds.client_id)
-            + "&client_secret=" + urlEncodeOAuth(creds.client_secret);
+            + "&client_id=" + urlEncodeOAuth(creds.client_id);
+        /// See runOAuthAuthCodeFlow() above: omit, do not send empty.
+        if (!creds.client_secret.empty())
+            poll_body += "&client_secret=" + urlEncodeOAuth(creds.client_secret);
 
         auto resp = postOAuthForm(creds.token_uri, poll_body);
         if (resp->has("error"))
         {
             const std::string err = resp->getValue<std::string>("error");
-            if (err == "authorization_pending")
-                continue;
-            if (err == "slow_down")
+            if (err == "authorization_pending" || err == "slow_down")
             {
-                /// Per RFC 8628 the client must increase its polling interval,
-                /// but the new value still has to stay inside our operational
-                /// bound so a server cannot ratchet the interval up indefinitely.
-                interval = std::min(
-                    interval + DEVICE_FLOW_SLOW_DOWN_INCREMENT_SECONDS,
-                    DEVICE_FLOW_MAX_INTERVAL_SECONDS);
+                if (err == "slow_down")
+                {
+                    /// Per RFC 8628 the client must increase its polling
+                    /// interval, but the new value still has to stay inside
+                    /// our operational bound so a server cannot ratchet the
+                    /// interval up indefinitely. Surface the change as a
+                    /// one-shot line — slow_down is rare in practice, and a
+                    /// silent ratchet would be confusing if the user is
+                    /// timing the flow against the deadline they were just
+                    /// shown. Reset last_status so the next heartbeat doesn't
+                    /// fire immediately afterwards.
+                    interval = std::min(
+                        interval + DEVICE_FLOW_SLOW_DOWN_INCREMENT_SECONDS,
+                        DEVICE_FLOW_MAX_INTERVAL_SECONDS);
+                    std::cerr << "Server requested slower polling; new interval is " << interval << "s.\n";
+                    last_status = std::chrono::steady_clock::now();
+                }
+
+                /// Heartbeat: keep the user oriented during the (potentially
+                /// very long) wait between issuing the user_code and the user
+                /// completing approval in their browser. Gated on real time
+                /// rather than poll count so the cadence is stable across
+                /// interval changes (default, slow_down, clamping).
+                const auto now = std::chrono::steady_clock::now();
+                if (now - last_status >= std::chrono::seconds(DEVICE_FLOW_STATUS_INTERVAL_SECONDS))
+                {
+                    const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(deadline - now).count();
+                    std::cerr << "Still waiting for authorization... (" << remaining << "s remaining)\n";
+                    last_status = now;
+                }
                 continue;
             }
             const std::string desc = resp->has("error_description") ? resp->getValue<std::string>("error_description") : err;
@@ -624,6 +682,7 @@ std::string runOAuthDeviceFlow(OAuthCredentials creds)
         if (resp->has("refresh_token"))
             writeCachedRefreshToken(creds.client_id, resp->getValue<std::string>("refresh_token"));
 
+        std::cerr << "Authentication successful.\n";
         return resp->getValue<std::string>("id_token");
     }
 

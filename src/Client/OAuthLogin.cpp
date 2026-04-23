@@ -113,14 +113,6 @@ private:
     int fd;
 };
 
-void warnSyscall(const char * what, const std::string & path)
-{
-    /// generic_category().message is the thread-safe equivalent of
-    /// std::strerror, which is flagged by clang-tidy.
-    std::cerr << "Warning: OAuth token cache: " << what << " '" << path
-              << "' failed: " << std::generic_category().message(errno) << "\n";
-}
-
 }
 
 namespace
@@ -132,12 +124,61 @@ namespace
 /// through this helper so they share the crash-safe rename and the
 /// concurrency lock — using two different paths for the two operations would
 /// reintroduce the lost-update race that M1 fixed.
+///
+/// `warn_on_failure` controls the user-facing diagnostic policy:
+///   - true  (writers): a failed FS operation triggers a single warning that
+///     names both the underlying cause (syscall + errno or fs error) AND the
+///     user-visible consequence ("you will be prompted to log in again on the
+///     next invocation"). Without naming the consequence, the syscall warning
+///     alone is too cryptic for users to connect to the symptom they later
+///     observe (unexpected re-auth on the next run), so they cannot act on
+///     it; this is the bug we are fixing here.
+///   - false (evictors): failures are silent. Eviction is best-effort cleanup
+///     after the IdP has rejected a cached refresh token; if the cache file
+///     is unwritable, the next interactive auth's writer attempt will produce
+///     exactly the same warning anyway, and that is the message users
+///     actually need (because it tells them caching is broken going forward,
+///     not just that an already-dead token couldn't be deleted).
 template <typename Mutator>
-void mutateRefreshTokenCache(Mutator && mutator)
+void mutateRefreshTokenCache(Mutator && mutator, bool warn_on_failure)
 {
+    /// Two-part diagnostic: first a one-line headline that names the
+    /// user-visible consequence (so the message is actionable even for users
+    /// who don't recognise the underlying syscall), then a second line with
+    /// the technical cause for operators / bug reports. Captured by reference
+    /// so each error path is one line at the call site.
+    auto fail = [&](const std::string & cause)
+    {
+        if (!warn_on_failure)
+            return;
+        std::cerr
+            << "Warning: OAuth refresh token will NOT be persisted to disk; "
+               "you may be prompted to log in again on the next invocation.\n"
+            << "  Cause: " << cause << "\n";
+    };
+    /// errno-flavoured variant. Snapshot errno immediately on entry — the
+    /// global is fragile across any intervening allocation/IO.
+    auto fail_errno = [&](const char * what, const std::string & arg)
+    {
+        const int e = errno;
+        if (!warn_on_failure)
+            return;
+        /// generic_category().message is the thread-safe equivalent of
+        /// std::strerror, which is flagged by clang-tidy.
+        fail(std::string(what) + " '" + arg + "' failed: " + std::generic_category().message(e));
+    };
+
     const std::string path = cacheFilePath();
     if (path.empty())
+    {
+        /// Pre-fix this branch returned silently, so users running without
+        /// $HOME (cron, systemd units without `User=`, sandboxed containers)
+        /// would re-auth on every invocation with no diagnostic at all. Now
+        /// we surface the cause on writes; reads still no-op silently because
+        /// "no HOME" on first run is indistinguishable from "no cache yet".
+        fail("cannot determine cache file path: HOME environment variable is unset");
         return;
+    }
 
     namespace fs = std::filesystem;
     const fs::path cache_path(path);
@@ -147,8 +188,7 @@ void mutateRefreshTokenCache(Mutator && mutator)
     fs::create_directories(cache_dir, ec);
     if (ec)
     {
-        std::cerr << "Warning: OAuth token cache: failed to create directory '"
-                  << cache_dir.string() << "': " << ec.message() << "\n";
+        fail("failed to create directory '" + cache_dir.string() + "': " + ec.message());
         return;
     }
 
@@ -162,13 +202,13 @@ void mutateRefreshTokenCache(Mutator && mutator)
     int raw_lock_fd = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (raw_lock_fd < 0)
     {
-        warnSyscall("open lock file", lock_path.string());
+        fail_errno("open lock file", lock_path.string());
         return;
     }
     ScopedFlockFd lock_fd(raw_lock_fd);
     if (::flock(lock_fd.get(), LOCK_EX) != 0)
     {
-        warnSyscall("flock", lock_path.string());
+        fail_errno("flock", lock_path.string());
         return;
     }
 
@@ -211,7 +251,7 @@ void mutateRefreshTokenCache(Mutator && mutator)
     int tmp_fd = ::mkstemp(tmpl.data());
     if (tmp_fd < 0)
     {
-        warnSyscall("mkstemp", tmpl);
+        fail_errno("mkstemp", tmpl);
         return;
     }
     ::close(tmp_fd);
@@ -220,7 +260,7 @@ void mutateRefreshTokenCache(Mutator && mutator)
         std::ofstream out(tmpl, std::ios::trunc | std::ios::binary);
         if (!out.is_open())
         {
-            warnSyscall("open for write", tmpl);
+            fail_errno("open for write", tmpl);
             ::unlink(tmpl.c_str());
             return;
         }
@@ -228,7 +268,10 @@ void mutateRefreshTokenCache(Mutator && mutator)
         out.close();
         if (out.fail())
         {
-            std::cerr << "Warning: OAuth token cache: failed to write '" << tmpl << "'\n";
+            /// iostreams don't reliably surface errno through fail(); we
+            /// can't blame a specific syscall, but the consequence message
+            /// is still the actionable part for the user.
+            fail("failed to serialize JSON to '" + tmpl + "'");
             ::unlink(tmpl.c_str());
             return;
         }
@@ -236,7 +279,7 @@ void mutateRefreshTokenCache(Mutator && mutator)
 
     if (::rename(tmpl.c_str(), path.c_str()) != 0)
     {
-        warnSyscall("rename to", path);
+        fail_errno("rename to", path);
         ::unlink(tmpl.c_str());
         return;
     }
@@ -244,14 +287,18 @@ void mutateRefreshTokenCache(Mutator && mutator)
 
 void removeCachedRefreshToken(const std::string & client_id)
 {
-    mutateRefreshTokenCache([&](Poco::JSON::Object & obj) { obj.remove(cacheKey(client_id)); });
+    mutateRefreshTokenCache(
+        [&](Poco::JSON::Object & obj) { obj.remove(cacheKey(client_id)); },
+        /*warn_on_failure=*/false);
 }
 
 }
 
 void writeCachedRefreshToken(const std::string & client_id, const std::string & refresh_token)
 {
-    mutateRefreshTokenCache([&](Poco::JSON::Object & obj) { obj.set(cacheKey(client_id), refresh_token); });
+    mutateRefreshTokenCache(
+        [&](Poco::JSON::Object & obj) { obj.set(cacheKey(client_id), refresh_token); },
+        /*warn_on_failure=*/true);
 }
 
 namespace
@@ -261,11 +308,14 @@ std::string tryRefreshToken(const OAuthCredentials & creds, const std::string & 
 {
     try
     {
-        const std::string body
+        std::string body
             = "grant_type=refresh_token"
               "&client_id=" + urlEncodeOAuth(creds.client_id)
-            + "&client_secret=" + urlEncodeOAuth(creds.client_secret)
             + "&refresh_token=" + urlEncodeOAuth(refresh_token);
+        /// Public clients (no registered secret) must omit the parameter
+        /// entirely; see loadOAuthCredentials() for the rationale.
+        if (!creds.client_secret.empty())
+            body += "&client_secret=" + urlEncodeOAuth(creds.client_secret);
 
         auto resp = postOAuthForm(creds.token_uri, body);
         if (resp->has("error"))
@@ -346,9 +396,21 @@ OAuthCredentials loadOAuthCredentials(const std::string & path)
 
     OAuthCredentials creds;
     creds.client_id = require("client_id");
-    creds.client_secret = require("client_secret");
     creds.auth_uri = require("auth_uri");
     creds.token_uri = require("token_uri");
+
+    /// client_secret is optional: per RFC 6749 §2.1 / RFC 8252 §8.4, native
+    /// OIDC clients are typically registered as "public" and have no secret;
+    /// PKCE (always used in the auth-code flow here) and the device_code
+    /// itself (in the device flow) provide the client-binding guarantee that a
+    /// secret would otherwise carry. An absent or empty value here causes the
+    /// downstream POST bodies to omit the client_secret form parameter
+    /// entirely — sending it with an empty value is treated by Auth0, Entra
+    /// ID, Keycloak and others as a malformed confidential-client credential
+    /// and rejected with invalid_client, so omission is required, not just
+    /// preferred.
+    if (app->has("client_secret"))
+        creds.client_secret = app->getValue<std::string>("client_secret");
 
     if (app->has("device_authorization_uri"))
         creds.device_auth_uri = app->getValue<std::string>("device_authorization_uri");

@@ -863,15 +863,16 @@ When using `--login=browser` or `--login=device` with a custom OpenID Connect pr
     "client_secret": "YOUR_CLIENT_SECRET",
     "auth_uri": "https://accounts.google.com/o/oauth2/auth",
     "token_uri": "https://oauth2.googleapis.com/token",
-    "redirect_uris": ["http://localhost"]
+    "redirect_uris": ["http://127.0.0.1"]
   }
 }
 ```
 
-The top-level key can be `installed` (desktop/CLI apps) or `web`. Required fields: `client_id`, `client_secret`, `auth_uri`, `token_uri`. Optional fields:
+The top-level key can be `installed` (desktop/CLI apps) or `web`. Required fields: `client_id`, `auth_uri`, `token_uri`. Optional fields:
 
 | Field | Description |
 |---|---|
+| `client_secret` | Confidential-client secret. Omit (or leave empty) for OIDC public clients — the auth-code flow is always protected by PKCE and the device flow by the device code, so a secret is not required by the protocol. When the field is absent the client never sends a `client_secret` form parameter, which is the form public-client registrations require (Auth0, Microsoft Entra ID, Keycloak, Okta and others reject empty secrets with `invalid_client`). |
 | `device_authorization_uri` | Device authorization endpoint. Discovered automatically via OIDC Discovery if absent. |
 | `issuer` | OIDC issuer URL (e.g. `https://accounts.google.com`). Used to locate the discovery document when `device_authorization_uri` is not set. |
 

@@ -126,6 +126,62 @@ TEST(OAuthLogin, MissingTopLevelKey)
 }
 
 // ---------------------------------------------------------------------------
+// loadOAuthCredentials — public-client config (no client_secret) loads OK
+//
+// Per RFC 6749 §2.1 / RFC 8252 §8.4 native OIDC clients are typically
+// registered as public clients with no secret; the flow is protected by PKCE
+// (auth-code) or the device_code (device flow). The credential loader must
+// not hard-require client_secret, otherwise valid public-client registrations
+// cannot be used. This is the regression guard for that policy: the absence
+// of the field is silently accepted, and the in-memory secret stays empty so
+// the downstream POST builders omit the parameter rather than sending an
+// empty value (which several IdPs reject as invalid_client).
+// ---------------------------------------------------------------------------
+
+TEST(OAuthLogin, LoadPublicClientNoSecret)
+{
+    const std::string json = R"({
+        "installed": {
+            "client_id": "public-client-id",
+            "auth_uri": "https://auth.example.com/auth",
+            "token_uri": "https://auth.example.com/token"
+        }
+    })";
+
+    auto path = writeTempFile(json);
+    SCOPE_EXIT({ fs::remove(path); });
+
+    auto creds = loadOAuthCredentials(path);
+    EXPECT_EQ(creds.client_id, "public-client-id");
+    EXPECT_TRUE(creds.client_secret.empty());
+    EXPECT_EQ(creds.auth_uri, "https://auth.example.com/auth");
+    EXPECT_EQ(creds.token_uri, "https://auth.example.com/token");
+}
+
+// Empty-string client_secret is treated identically to an absent field: load
+// succeeds and the in-memory value is empty, so the downstream POST bodies
+// omit the form parameter. Without this property a credential file written
+// by a tool that defaults the field to "" would produce invalid_client at
+// the IdP rather than a working public-client request.
+TEST(OAuthLogin, LoadPublicClientEmptySecret)
+{
+    const std::string json = R"({
+        "installed": {
+            "client_id": "public-client-id",
+            "client_secret": "",
+            "auth_uri": "https://auth.example.com/auth",
+            "token_uri": "https://auth.example.com/token"
+        }
+    })";
+
+    auto path = writeTempFile(json);
+    SCOPE_EXIT({ fs::remove(path); });
+
+    auto creds = loadOAuthCredentials(path);
+    EXPECT_TRUE(creds.client_secret.empty());
+}
+
+// ---------------------------------------------------------------------------
 // loadOAuthCredentials — missing required field throws BAD_ARGUMENTS
 // ---------------------------------------------------------------------------
 
