@@ -140,7 +140,7 @@ def started_cluster():
 
         yield cluster
     finally:
-        shutil.rmtree(os.path.join(SCRIPT_DIR, "data/generated/"))
+        shutil.rmtree(os.path.join(SCRIPT_DIR, "data/generated/"), ignore_errors=True)
         cluster.shutdown()
 
 
@@ -1171,7 +1171,8 @@ def test_hive_partitioning(started_cluster, allow_experimental_analyzer):
     node.query("SET allow_experimental_analyzer = DEFAULT")
 
 
-def test_joins(started_cluster):
+@pytest.mark.parametrize("join_mode", ["local", "global"])
+def test_joins(started_cluster, join_mode):
     node = started_cluster.instances["s0_0_0"]
 
     # Table join_table only exists on the node 's0_0_0'.
@@ -1205,7 +1206,7 @@ def test_joins(started_cluster):
             join_table AS t2
         ON t1.value = t2.id
         ORDER BY t1.name
-        SETTINGS object_storage_cluster_join_mode='local';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}';
         """
     )
 
@@ -1228,7 +1229,7 @@ def test_joins(started_cluster):
                 'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') AS t1
         ON t1.value = t2.id
         ORDER BY t1.name
-        SETTINGS object_storage_cluster_join_mode='local';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}';
         """
     )
 
@@ -1246,7 +1247,7 @@ def test_joins(started_cluster):
         ON t1.value = t2.id
         WHERE (t1.value % 2)
         ORDER BY t1.name
-        SETTINGS object_storage_cluster_join_mode='local';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}';
         """
     )
 
@@ -1265,7 +1266,7 @@ def test_joins(started_cluster):
         ON t1.value = t2.id
         WHERE (t2.id % 2)
         ORDER BY t1.name
-        SETTINGS object_storage_cluster_join_mode='local';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}';
         """
     )
 
@@ -1283,27 +1284,29 @@ def test_joins(started_cluster):
         ON t1.value = t2.id
         WHERE (t1.value % 2) AND ((t2.id % 3) == 2)
         ORDER BY t1.name
-        SETTINGS object_storage_cluster_join_mode='local';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}';
         """
     )
 
     res = list(map(str.split, result5.splitlines()))
     assert len(res) == 6
 
+    # With WHERE clause with global subquery
     result6 = node.query(
         f"""
         SELECT name FROM
             s3Cluster('cluster_simple',
                 'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
                 'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
-        WHERE value IN (SELECT id FROM join_table)
+        WHERE value GLOBAL IN (SELECT id FROM join_table)
         ORDER BY name
-        SETTINGS object_storage_cluster_join_mode='local';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}';
         """
     )
     res = list(map(str.split, result6.splitlines()))
     assert len(res) == 25
 
+    # With WHERE clause without columns in condition
     result7 = node.query(
         f"""
         SELECT count() FROM
@@ -1314,11 +1317,12 @@ def test_joins(started_cluster):
             join_table AS t2
         ON 1
         GROUP BY ALL
-        SETTINGS object_storage_cluster_join_mode='local';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}';
         """
     )
     assert result7.strip() == "625"
 
+    # With WHERE clause without columns in condition and with local column in SELECT
     result8 = node.query(
         f"""
         SELECT count(), t2.id FROM
@@ -1329,7 +1333,7 @@ def test_joins(started_cluster):
             join_table AS t2
         ON 1
         GROUP BY ALL
-        SETTINGS object_storage_cluster_join_mode='local';
+        SETTINGS object_storage_cluster_join_mode='{join_mode}';
         """
     )
     res = list(map(str.split, result8.splitlines()))
