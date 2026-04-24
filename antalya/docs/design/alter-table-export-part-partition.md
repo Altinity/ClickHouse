@@ -519,8 +519,7 @@ NOTE 1: EXPORT should also observe the following existing settings for export to
   `src/Common/ErrorCodes.cpp`).
 - Destination schema mismatch (columns / types / order; source `EPHEMERAL` column present in
   destination): `INCOMPATIBLE_COLUMNS`.
-- Destination engine doesn't support exports (e.g. `url`, non-hive `partition_strategy`, unknown
-  engine): `NOT_IMPLEMENTED`.
+- Destination engine doesn't support exports (e.g. `url`, unknown engine): `NOT_IMPLEMENTED`.
 - Destination is an unknown table function: `UNKNOWN_FUNCTION`.
 - Pending mutations or patch parts when the guard is enabled: `BAD_ARGUMENTS` (TBD — confirm).
 - Part not found on any replica: `NO_SUCH_DATA_PART` (TBD — confirm).
