@@ -72,7 +72,8 @@ def get_part(node, table: str, partition_id: str) -> str:
 def export_part(node, table: str, part: str, dest: str) -> None:
     node.query(
         f"ALTER TABLE {table} EXPORT PART '{part}' TO TABLE {dest} "
-        f"SETTINGS allow_experimental_export_merge_tree_part = 1"
+        f"SETTINGS allow_experimental_export_merge_tree_part = 1, "
+        f"allow_experimental_insert_into_iceberg = 1"
     )
 
 
@@ -373,7 +374,8 @@ def test_export_part_partition_key_mismatch_is_rejected(cluster):
 
     error = node.query_and_get_error(
         f"ALTER TABLE {mt} EXPORT PART '{part_2020}' TO TABLE {iceberg} "
-        f"SETTINGS allow_experimental_export_merge_tree_part = 1"
+        f"SETTINGS allow_experimental_export_merge_tree_part = 1, "
+        f"allow_experimental_insert_into_iceberg = 1"
     )
     assert "BAD_ARGUMENTS" in error, (
         f"Expected BAD_ARGUMENTS for partition key mismatch, got: {error!r}"
