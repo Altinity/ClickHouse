@@ -62,6 +62,9 @@ def catalog_export_cluster():
                 main_configs=[
                     "configs/config.d/allow_export_partition.xml",
                 ],
+                user_configs=[
+                    "configs/users.d/allow_export_partition.xml",
+                ],
                 stay_alive=True,
                 with_zookeeper=True,
                 keeper_required_feature_flags=["multi_read"],
