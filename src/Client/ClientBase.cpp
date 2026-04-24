@@ -2916,7 +2916,9 @@ bool ClientBase::processQueryText(const String & text)
 
 String ClientBase::getPrompt() const
 {
-    return prompt;
+    String result = prompt;
+    boost::replace_all(result, "{database}", default_database.empty() ? "default" : default_database);
+    return result;
 }
 
 
@@ -3127,6 +3129,22 @@ std::string ClientBase::executeQueryForSingleString(const std::string & query)
     catch (...)
     {
         return "";
+    }
+}
+
+void ClientBase::syncDefaultDatabase()
+{
+    try
+    {
+        const auto db = executeQueryForSingleString("SELECT currentDatabase()");
+        if (!db.empty())
+            default_database = db;
+        else
+            LOG_WARNING(getLogger("ClientBase"), "syncDefaultDatabase: server returned empty result for SELECT currentDatabase()");
+    }
+    catch (...)
+    {
+        LOG_WARNING(getLogger("ClientBase"), "syncDefaultDatabase: failed to query current database from server: {}", getCurrentExceptionMessage(false));
     }
 }
 
