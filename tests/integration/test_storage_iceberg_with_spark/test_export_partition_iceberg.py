@@ -84,6 +84,9 @@ def export_cluster():
                 "configs/config.d/named_collections.xml",
                 "configs/config.d/allow_export_partition.xml",
             ],
+            user_configs=[
+                "configs/users.d/allow_export_partition.xml",
+            ],
             with_minio=True,
             stay_alive=True,
             with_zookeeper=True,
@@ -95,6 +98,9 @@ def export_cluster():
                 main_configs=[
                     "configs/config.d/named_collections.xml",
                     "configs/config.d/allow_export_partition.xml",
+                ],
+                user_configs=[
+                    "configs/users.d/allow_export_partition.xml",
                 ],
                 stay_alive=True,
                 with_zookeeper=True,

@@ -47,7 +47,7 @@ TO TABLE [destination_database.]destination_table
 
 ### Server Settings
 
-#### `enable_experimental_export_merge_tree_partition_feature` (Required)
+#### `allow_experimental_export_merge_tree_partition` (Required)
 
 - **Type**: `Bool`
 - **Default**: `false`

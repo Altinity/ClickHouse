@@ -339,7 +339,7 @@ namespace ErrorCodes
 
 namespace ServerSetting
 {
-    extern const ServerSettingsBool enable_experimental_export_merge_tree_partition_feature;
+    extern const ServerSettingsBool allow_experimental_export_merge_tree_partition;
 }
 
 namespace ActionLocks
@@ -515,7 +515,7 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
     /// Will be activated by restarting thread.
     mutations_finalizing_task->deactivate();
 
-    if (getContext()->getServerSettings()[ServerSetting::enable_experimental_export_merge_tree_partition_feature])
+    if (getContext()->getServerSettings()[ServerSetting::allow_experimental_export_merge_tree_partition])
     {
         export_merge_tree_partition_manifest_updater = std::make_shared<ExportPartitionManifestUpdatingTask>(*this);
 
@@ -5909,7 +5909,7 @@ void StorageReplicatedMergeTree::partialShutdown()
     mutations_updating_task->deactivate();
     mutations_finalizing_task->deactivate();
 
-    if (getContext()->getServerSettings()[ServerSetting::enable_experimental_export_merge_tree_partition_feature])
+    if (getContext()->getServerSettings()[ServerSetting::allow_experimental_export_merge_tree_partition])
     {
         export_merge_tree_partition_updating_task->deactivate();
         export_merge_tree_partition_select_task->deactivate();
@@ -8089,10 +8089,10 @@ void StorageReplicatedMergeTree::fetchPartition(
 
 void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand & command, ContextPtr query_context)
 {
-    if (!query_context->getServerSettings()[ServerSetting::enable_experimental_export_merge_tree_partition_feature])
+    if (!query_context->getServerSettings()[ServerSetting::allow_experimental_export_merge_tree_partition])
     {
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
-            "Exporting merge tree partition is experimental. Set the server setting `enable_experimental_export_merge_tree_partition_feature` to enable it");
+            "Exporting merge tree partition is experimental. Set the server setting `allow_experimental_export_merge_tree_partition` to enable it");
     }
 
     const auto dest_database = query_context->resolveDatabase(command.to_database);
