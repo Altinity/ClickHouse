@@ -46,7 +46,7 @@ Both commands accept two destination families:
 2. **Apache Iceberg tables, with or without a catalog** (`Iceberg*`
    engines, `iceberg*` table functions, `DatabaseIceberg`). Output is
    Parquet data files plus per-file Avro *statistics sidecars*; on
-   commit the initiating replica assembles a new Iceberg manifest,
+   commit the EXPORT process assembles a new Iceberg manifest,
    writes a new `metadata.json`, and swaps the catalog pointer (or the
    warehouse `metadata.json` pointer when catalog-less). Atomicity is
    native — the snapshot either exists or it does not.
@@ -55,9 +55,7 @@ These commands replace `INSERT INTO ... SELECT FROM` pipelines that
 select rows and write them out to one or more Parquet files. That
 approach uses resources for sorting, does not coordinate across replicas,
 and does not take advantage of existing partitioning and sorting in
-`MergeTree`. `EXPORT PART` and `EXPORT PARTITION` write parts directly
-to the destination from the source replica(s), preserving the source
-sort order and cutting out the `SELECT` pipeline.
+`MergeTree`. 
 
 ### Requirements
 
@@ -124,12 +122,16 @@ sort order and cutting out the `SELECT` pipeline.
    The command should be idempotent and must throw a clear exception on failure
    rather than hanging. 
 
-### Future requirements 
+### Open questions and future requirements
 
-The design should accomodate the following extensions in the near future. 
+The design should address the following topics in the near future. 
 
 - EXPORT PARTITION for MergeTree tables. Must work without Keeper installation. 
 - Export history. Provide a system table to track the history of part exports. 
+- Flexible casting that addresses issues like the following. 
+  - Handling potentially lossy casts like INSERT SELECT: int64 -> int32. 
+  - Export to tables that are missing columns. 
+  - How to map column names--by position or by name? (e.g, is id, name, age compatible with id, age, name)?
 
 ### Out of scope requirements
 
@@ -137,7 +139,7 @@ The design should accomodate the following extensions in the near future.
   iterations may add new output file formats. 
 - Exporting to arbitrary table functions. Only those backed by an object-storage engine that
   supports exports (e.g. `s3`, `azure`) are valid; others throw `NOT_IMPLEMENTED`.
-- Iceberg schema or partition-spec evolution at commit time. Not supported. The source 
+- Non-matching Iceberg schema, sorting or partitioning. Not supported. The source 
   `MergeTree` schema and partition keys must be compatible with the destination 
   Iceberg table's current `schema-id` and `partition-spec-id`. Destination partition values 
   are derived directly from the source part's partition key; we do not recompute them 
@@ -157,7 +159,7 @@ The design should accomodate the following extensions in the near future.
   when reading multiple fields. 
   governed by the destination table's Iceberg partition spec instead.
 - No change to `MergeTree` on-disk part format; only the Keeper schema under the table's
-  replication path is extended.
+  replication path is extended. The extension is tranparent to users. 
 
 ### References
 
@@ -188,7 +190,9 @@ Output shape depends on the destination family:
 
 - **Plain object storage.** One Parquet data file per part (or per chunk when split by
   size/rows) plus one commit file per transaction — `<dest>/<partition>/<part>_<checksum>.<N>.parquet`
-  and `<dest>/commit_<...>`. Readers that want atomicity filter by commit.
+  and `<dest>/commit_<...>`. Readers that want atomicity filter by commit. This is the default path, 
+  but it can be customized to handle sharding, which is not covered by the default case. See the
+  ``
 
 - **Iceberg destination.** One Parquet data file per part (or per chunk) plus a sibling
   Avro statistics sidecar `<data_file>_clickhouse_export_part_sidecar.avro` carrying
@@ -255,7 +259,10 @@ SETTINGS allow_experimental_export_merge_tree_part = 1,
 -- (See note on settings below. Iceberg table engine now has built-in
 -- settings for Parquet files.) 
 
--- Partition export across a Replicated cluster
+-- Partition export across a Replicated cluster. This currently
+-- selects the parts on the replica that receives the plan. This 
+-- means the result may vary if new parts are arriving on other 
+-- replicas. 
 ALTER TABLE rmt_table EXPORT PARTITION ID '2020' TO TABLE s3_table;
 
 -- Cancel by filter. The WHERE uses the same filter used to read from `system.replicated_partition_exports`.
@@ -347,6 +354,8 @@ registration step. The example uses `IcebergS3` without a catalog;
 swap in `DatabaseIceberg` or an `iceberg(...)` catalog-backed table
 function to route through REST / Glue / Unity.
 
+**Open Issue** We need to specify how to commit via a catalog. 
+
 ```sql
 -- 1. Destination: an Iceberg table backed by S3. No catalog required
 --    for this form; the warehouse metadata.json pointer is managed
@@ -363,7 +372,7 @@ PARTITION BY year;
 -- 2. Export the 2024 partition. Returns immediately; runs in the background.
 ALTER TABLE events EXPORT PARTITION ID '2024' TO TABLE events_iceberg;
 
--- 3. Watch progress.
+-- 3. Watch progress. You can use the system.exports table for this. 
 SELECT status, parts_count, parts_to_do, last_exception
 FROM system.replicated_partition_exports
 WHERE source_table = 'events' AND partition_id = '2024';
@@ -416,7 +425,9 @@ The following notes expand on expected behavior of commands.
 4. Re-issuing the same `EXPORT PARTITION` within
    `export_merge_tree_partition_manifest_ttl` is a no-op (no
    duplicate files) unless `export_merge_tree_partition_force_export = 1`. This
-   behavior avoids accidentally exporting the same data twice. 
+   behavior avoids accidentally exporting the same data twice. Note, however
+   that forcing the operation is dangerous if ClickHouse can't clean up the
+   previous operation. In this case you'll potentially commit files twice. 
 
 5. Killing an in-flight partition export via `KILL EXPORT PARTITION`
    transitions status to `KILLED` and stops all replicas' contributions.
@@ -472,7 +483,7 @@ The following notes expand on expected behavior of commands.
 | `export_merge_tree_partition_max_retries` | query | `3` | `UInt64` | `EXPORT PARTITION` | Retry budget applied to both per-part export attempts and per-task commit attempts (Iceberg). The task fails terminally if commit retries alone exceed the budget. |
 | `export_merge_tree_partition_manifest_ttl` | query | `180` (seconds) | `UInt64` | `EXPORT PARTITION` | Live-manifest TTL; acts as the idempotency window. Does not interrupt in-flight tasks. Keep this greater than `export_merge_tree_partition_task_timeout_seconds` if you want the `KILLED` entry to remain visible in `system.replicated_partition_exports` after the timeout fires. |
 | `export_merge_tree_partition_task_timeout_seconds` | query | `3600` (seconds) | `UInt64` (`0`=disable) | `EXPORT PARTITION` | Wall-clock cap for `PENDING` tasks; on expiry transitions to `KILLED` with a timeout reason. Measured from manifest `create_time`. Enforcement latency ≈ one manifest-updater poll cycle (~30s) plus Keeper watch propagation. |
-| `export_merge_tree_partition_system_table_prefer_remote_information` | query | `false` | `Bool` | `EXPORT PARTITION` | When `true`, `system.replicated_partition_exports` fetches fresh state from Keeper (requires the `MULTI_READ` feature flag); when `false`, uses local cached state. **Default flipped from `true` to `false` in this release** — Keeper round-trips were more expensive than warranted for the typical observability workload. |
+| `export_merge_tree_partition_system_table_prefer_remote_information` | query | `false` | `Bool` | `EXPORT PARTITION` | When `true`, `system.replicated_partition_exports` fetches fresh state from Keeper (requires the `MULTI_READ` feature flag); when `false`, uses local cached state. **Default flipped from `true` to `false` in this release** — Keeper round-trips were more expensive than warranted for the typical observability workload. (See NOTE 2.)|
 | `export_merge_tree_part_file_already_exists_policy` | query | `skip` | `skip` / `error` / `overwrite` | `EXPORT PARTITION` | Per-file policy during partition export. |
 
 Default-value impact: all new settings default to "off" or to
@@ -484,14 +495,20 @@ now serves local cached state by default instead of querying Keeper.
 Users who relied on always-fresh results must set it back to `true`
 explicitly.
 
-NOTE 1: EXPORT should also observe the following existing settings for export to Iceberg / Parquet:
-- `iceberg_insert_max_bytes_in_data_file` (superseded by `export_merge_tree_part_max_bytes_per_file` if specified)
+**NOTE 1:** `export_merge_tree_part_max_bytes_per_file` overrides `iceberg_insert_max_bytes_in_data_file` or 
+other more specific file size parameters. 
+
+EXPORT should also observe the following existing settings for export to Iceberg / Parquet:
+- `iceberg_insert_max_bytes_in_data_file` (as above, overridden by `export_merge_tree_part_max_bytes_per_file` if specified)
 - `iceberg_insert_max_rows_in_data_file`
 - `output_format_parquet_row_group_size`
 - `output_format_parquet_row_group_size_bytes`
 - `output_format_parquet_data_page_size`
 - `output_format_parquet_compression_method`
 - `output_format_parquet_version`
+
+**NOTE 2:** `export_merge_tree_partition_system_table_prefer_remote_information` may be dropped. 
+Querying Keeper from the user path is complex and has side effects. 
 
 ### System tables / metrics / log messages / observability
 
@@ -557,236 +574,8 @@ task row; they do not crash the server.
 
 ## 3. Implementation
 
-### Architecture overview
-Parser adds two new `ASTAlterCommand` variants (`EXPORT_PART`, `EXPORT_PARTITION`) plus
-`KILL EXPORT PARTITION`. The interpreter side routes `EXPORT PART` into a new per-part export
-task scheduled on the background export pool; `EXPORT PARTITION` is routed through Keeper for
-coordination and expands into N per-part tasks across the replicas that host each part.
-
-Part-level pipeline: reuse the existing Parquet output stack (`StorageS3Sink` / Parquet writer)
-fed by a source that streams a single part in primary-key order, with no post-read sort or merge
-pass.
-
-Partition coordination: Keeper nodes under `<table_zk>/partition_exports/<tx_id>/` hold the
-manifest (parts list, policy), per-part assignment, per-replica progress, and the kill flag.
-Each replica watches `partition_exports` and picks up parts it holds locally.
-
-For Iceberg destinations the part-level pipeline writes a Parquet data file plus a sibling
-Avro statistics sidecar through `IcebergMetadata::MultipleFileWriter` (extended to compute
-per-file stats: `record_count`, `file_size_in_bytes`, `column_sizes`, `null_value_counts`,
-Iceberg-serialized lower/upper bounds). The per-part task does not touch any Iceberg
-metadata. On the final commit step — once per transaction, on the initiating replica for
-partition exports; at end-of-part for single-part exports — the coordinator calls the new
-`IDataLakeMetadata::commitExportPartitionTransaction`, which reads every sidecar,
-assembles a manifest and manifest list, writes a new `metadata.json`, and CAS-swaps the
-catalog pointer (or the warehouse `metadata.json` pointer when catalog-less). The Iceberg
-`metadata.json` snapshot the transaction was opened against is stashed in the Keeper
-manifest so any surviving replica can complete the commit.
-
-### Key design decisions
-
-1. **Separate AST nodes for each command.** `EXPORT PART` and `EXPORT PARTITION` get distinct
-   `ASTAlterCommand::Type` variants; `KILL EXPORT PARTITION` is its own `ASTKillExportPartitionQuery`.
-   The part primitive and the cluster-coordinated partition command do materially different work
-   and should not share a single code path.
-
-2. **Reuse the existing object-storage sink.** Export rides on the destination engine's existing
-   Parquet writer (`StorageS3` / `StorageAzureBlob` sink). No new encoder. The sink is extended
-   to accept an already-ordered stream and a target filename derived from
-   `export_merge_tree_part_filename_pattern`. Iceberg destinations route through the same
-   Parquet writer but via `IcebergMetadata::MultipleFileWriter`, which layers per-file
-   statistics collection on top. Commit is the Iceberg-specific part — it does not reuse the
-   object-storage sink's commit-file path and goes through
-   `IDataLakeMetadata::commitExportPartitionTransaction` instead (see decision #9).
-
-3. **Stream parts in primary-key order, no re-`SELECT`.** The per-part reader walks the part in
-   its on-disk order and feeds the Parquet writer directly, skipping the analyzer / planner /
-   executor decode and sort path that `INSERT INTO ... SELECT` would take. This is the central
-   performance claim.
-
-4. **Coordinate partition exports via a dedicated Keeper subtree.** New path
-   `<table_zk>/partition_exports/<tx_id>/` holds the manifest, per-part assignment, per-replica
-   progress, and the kill flag — separate from the replication log. The replication log is for
-   data mutations that must apply on every replica; partition exports are a distributed
-   side-effect whose assignment depends on which replica holds which part, so they warrant their
-   own subtree.
-
-5. **Atomicity depends on destination family.**
-   - *Plain object storage:* each transaction emits one
-     `commit_<part>_<checksum>` (part level) or
-     `commit_<partition_id>_<tx_id>` (partition level) file listing
-     every data file written. Readers wanting atomicity filter by
-     commit; this avoids on-target renames or multipart-transaction
-     protocols on object storage.
-   - *Iceberg destinations:* atomicity is native. The commit writes a
-     new Iceberg snapshot whose manifest summary embeds
-     `clickhouse.export-partition-transaction-id`. The pointer swap is
-     CAS-atomic at the catalog (or warehouse) level, so readers see
-     the snapshot in its entirety or not at all. The transaction id is
-     re-read before every commit attempt (see decision #11).
-
-6. **Async model with three observability surfaces.** Commands return immediately. In-flight
-   progress lives in `system.exports` (local, dropped on completion);
-   `system.replicated_partition_exports` (Keeper-backed — querying is a Keeper round-trip, use
-   sparingly); and `system.part_log` gains an `ExportPart` `event_type` for completed per-part
-   exports. Four `ProfileEvents` (`PartsExports`, `PartsExportFailures`, `PartsExportDuplicated`,
-   `PartsExportTotalMilliseconds`) expose aggregate counters.
-
-7. **Idempotency enforced in Keeper.** Duplicate `(source, destination, partition_id)` submissions
-   are refused while the manifest is live. The manifest TTL
-   (`export_merge_tree_partition_manifest_ttl`, default 180s) defines the idempotency window; it
-   does NOT terminate in-flight tasks. `export_merge_tree_partition_force_export = 1` overrides.
-
-8. **Two experimental gates, asymmetric scope.** `EXPORT PART` is gated query-level
-   (`allow_experimental_export_merge_tree_part`) — individual users can try it. `EXPORT PARTITION`
-   is gated server-level (`allow_experimental_export_merge_tree_partition_feature`) because it
-   writes to Keeper and engages cluster coordination — rollout is an operator decision, not a
-   per-query one.
-
-9. **One commit abstraction for data-lake destinations.** `IDataLakeMetadata` gains a
-   `commitExportPartitionTransaction` virtual (default implementation throws
-   `NOT_IMPLEMENTED`; `IcebergMetadata` overrides). Callers pass catalog, table id,
-   transaction id, schema id, partition-spec id, partition values, and the list of data
-   file paths. Sidecars are discovered by filename convention relative to each data file
-   path. Future data-lake backends (Delta, Hudi) can override; non-overriding backends
-   short-circuit to the plain-object-storage commit-file path at the caller.
-
-10. **Per-file Iceberg statistics live in object-storage sidecars, not in Keeper or memory.**
-    A partition export is long-running and must survive node restarts. Column stats computed
-    during write cannot be recovered cheaply at commit time (would require re-reading every
-    Parquet file), and Keeper is not sized for one-znode-per-file with a stats payload. The
-    sidecar (`<data_file>_clickhouse_export_part_sidecar.avro`, schema
-    `data_file_sidecar_schema` in `AvroSchema.h`) is the persistence mechanism: each
-    per-part task writes one sidecar next to its data file; the commit step reads all
-    sidecars in one pass. ClickHouse does not reap sidecars; users may delete them after
-    `COMPLETED`.
-
-11. **Two layers of commit idempotency for Iceberg destinations.** Layer 1 (existing,
-    Keeper): duplicate `(source, destination, partition_id)` submissions are refused while
-    the manifest is live. Layer 2 (new, Iceberg manifest): the transaction id is written
-    into every commit as the `clickhouse.export-partition-transaction-id` summary field and
-    re-checked before the next commit attempt. Layer 1 prevents two concurrent submissions
-    from racing; Layer 2 protects a single task across its own crash-retry boundary (a
-    post-commit / pre-Keeper-status-update crash would otherwise double-commit when the
-    recovered initiator retries).
-
-### Concurrency / locking
-
-- Per-part export holds the part's `DataPartStorage` lock for the duration of the read (same
-  guarantees as a merge/mutation read).
-- Partition-export coordinator uses Keeper multi-transactions to (a) claim a part, (b) record
-  progress, (c) decrement `parts_to_do`, (d) transition status.
-- No server-wide lock. Background export pool size is bounded (reuse the existing
-  `background_pool_size` knob or add a dedicated one — TBD).
-- Idempotency against duplicate submission is enforced at the Keeper manifest level (unique
-  `(source, destination, partition_id)` while manifest is live).
-- Commit-attempt counter for Iceberg destinations is a Keeper znode
-  (`<task>/commit_attempts`) and shares the `export_merge_tree_partition_max_retries`
-  budget with per-part retries. Exhausting either path terminates the task.
-- Manifest-updater status-drain invariant: the status queue is drained holding the status
-  lock only, never nested inside the export-partition lock. The earlier nested-lock pattern
-  caused a race window where a replica could miss status transitions for a sibling task;
-  this invariant is load-bearing for `system.replicated_partition_exports` freshness and
-  for `KILL EXPORT PARTITION` propagation.
-
-### Storage format changes
-
-- **On-disk parts:** unchanged.
-- **Keeper:** adds `<table_zk>/partition_exports/` subtree. The per-task manifest carries
-  the parts list, policy, per-replica progress, kill flag, `task_timeout_seconds`,
-  `commit_attempts`, and — for Iceberg destinations — the source `metadata.json` snapshot
-  the transaction was opened against plus the `write_full_path_in_iceberg_metadata` flag,
-  so any surviving replica can complete the commit without re-reading catalog state. Older
-  servers ignore unknown Keeper children; no schema version bump required but coordinator
-  code MUST be tolerant of concurrent removal by another version (TBD — verify).
-- **Object-storage layout (plain OS):**
-  `<dest_path>/<hive_partition>/<filename>.<N>.<format>` plus
-  `<dest_path>/commit_<filename>` (part-level) or
-  `<dest_path>/commit_<partition_id>_<tx_id>` (partition-level). Readers that don't
-  understand commit files will see the data files directly — callers wanting atomicity
-  MUST filter by commit.
-- **Object-storage layout (Iceberg):**
-  `<dest_path>/data/<partition>/<filename>.<N>.parquet` plus a sibling
-  `<dest_path>/data/<partition>/<filename>.<N>.parquet_clickhouse_export_part_sidecar.avro`,
-  plus the standard Iceberg `<dest_path>/metadata/v<N>.metadata.json`,
-  `<dest_path>/metadata/snap-*.avro`, and `<dest_path>/metadata/<manifest_uuid>.avro`.
-  Sidecars are unreferenced from any Iceberg manifest and are ClickHouse-private.
-
-### Performance
-
-- Hot path: Parquet encoding of a single part. No extra `SELECT` / sort / merge pass vs.
-  `INSERT ... SELECT` baseline — that is the expected win.
-- Memory: one Parquet writer per concurrent export; row-group buffering bounded by
-  `output_format_parquet_row_group_size_bytes`.
-- I/O: one network write stream per output file; chunked when
-  `export_merge_tree_part_max_bytes_per_file` / `_max_rows_per_file` set.
-- Benchmark coverage: TBD — propose a `tests/performance/export_merge_tree_part.xml` comparing
-  `EXPORT PART` vs. `INSERT INTO s3_t SELECT FROM mt_t WHERE _part = ...` over a ~1 GB part.
-- Commit cost for Iceberg destinations: linear in the number of data files. One sidecar
-  read + one Avro manifest write + one `metadata.json` write + one catalog CAS. For a
-  partition with thousands of parts, this is seconds of extra work on top of the per-part
-  write phase — bounded, not per-row.
-- No extra commit cost for plain-object-storage destinations beyond the single commit-file
-  write.
-
-### Alternatives considered
-
-1. `INSERT INTO s3_t SELECT FROM mt_t WHERE _part = 'p'` — today's workaround. Rejected
-   because it runs the full `SELECT` pipeline (decode, potential re-sort, distribute) per export,
-   has no cross-replica coordination, and no native commit-file atomicity.
-2. **Synchronous `ALTER ... EXPORT PART` that blocks the client** — rejected; partition exports
-   can run for hours and the HTTP / native session would time out. Async + system tables mirrors
-   `ALTER ... MUTATE` and is already familiar.
-3. **Non-replicated `EXPORT PARTITION` (per-replica, uncoordinated)** — rejected because
-   duplicates and split-brain are the default outcome when every replica independently exports
-   the parts it holds.
-4. **Queue the partition export in the existing replication log** — rejected; the replication
-   log is for *data* mutations that must apply on every replica, whereas partition exports are
-   a distributed *side-effect* whose assignment depends on which replica holds which part.
-   Separate Keeper subtree is cleaner.
-5. **Non-Keeper coordination (leader replica drives everything)** — rejected; would require a
-   new leader-election path and wouldn't survive leader restart without a Keeper-backed manifest
-   anyway.
-6. **Per-file Iceberg stats in Keeper** — rejected. One znode per data file with a stats
-   payload inflates Keeper state by the size of the dataset being exported; Keeper is not
-   object storage.
-7. **Commit each Iceberg part individually as its own snapshot** — rejected. Iceberg
-   best-practice is one snapshot per logical transaction; per-part snapshots produce
-   snapshot-log churn and make every reader's planning scan O(parts) instead of O(1).
-
-### Open questions
-
-- Exact error codes for each failure class above — confirm names in
-  `src/Common/ErrorCodes.cpp` during prototype.
-- Whether `EXPORT PART` should refuse to run against `Replicated*MergeTree` (forcing users to
-  `EXPORT PARTITION`) or remain allowed as the primitive it clearly is. Current tests allow
-  both; this should be documented explicitly.
-- Dedicated background pool for exports vs. reuse of existing `background_move_pool_size` /
-  similar — TBD.
-- Behaviour of `EXPORT PARTITION` when initiating replica dies mid-task: the manifest persists
-  in Keeper, but does a surviving replica take over as "source replica"? Current docs say "task
-  is persistent" — clarify recovery semantics.
-- Is the manifest TTL enforced by the initiator or by a cluster-wide cleanup job? Affects what
-  happens when the initiator is offline.
-- `EXPORT PART` currently runs its commit step inline (per-part), whereas `EXPORT PARTITION`
-  defers commit to the coordinator. The PR author flagged this asymmetry for rethinking —
-  should single-part export be a degenerate 1-part partition export internally, sharing the
-  commit primitive? Would simplify `IcebergMetadata` but adds a Keeper dependency to the
-  part-level path.
-- `export_merge_tree_part_max_bytes_per_file` vs. `iceberg_insert_max_bytes_in_data_file`:
-  remove the former for Iceberg destinations in favor of the Iceberg-native setting, or
-  keep both for per-destination-family control?
-- `IcebergImportSink` is introduced alongside the export path in this PR — is
-  `INSERT INTO iceberg_t` (regular write, not `ALTER TABLE EXPORT`) in scope for this
-  design or a sibling one?
-- Should non-Iceberg data-lake backends (Delta, Hudi) fall back to the plain-object-storage
-  commit-file path when they do not override `commitExportPartitionTransaction`, or throw
-  `NOT_IMPLEMENTED`? Current default throws; falling back would mean exported data is
-  usable but not registered as a lake-format snapshot.
-
----
-
-## 4. Test plan
+This design only covers user visible behavior. It does not internal implementatation 
+details. The implementation section is omitted. 
 
 ### Functional tests — `tests/queries/0_stateless`
 

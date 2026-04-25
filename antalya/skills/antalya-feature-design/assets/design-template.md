@@ -79,6 +79,14 @@ Highlight compatibility issues, for example:
 
 ## 3. Implementation
 
+This section may be omitted by the user. In this case the section should left empty
+and replaced with a messsage like the following. 
+
+"The specification only covers user-visible behavior, hence this section is omitted."
+
+Optionally, also include references to other documents, GitHub issues, or code if 
+available and relevant. 
+
 ### Architecture overview
 One paragraph, plus a diagram if it helps. Where does the feature live in the codebase, and how
 does it connect to existing subsystems (parser → analyzer → planner → executor → storage)?
