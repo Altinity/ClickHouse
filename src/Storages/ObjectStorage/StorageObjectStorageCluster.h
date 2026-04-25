@@ -171,7 +171,8 @@ private:
     void updateQueryToSendIfNeeded(
         ASTPtr & query,
         const StorageSnapshotPtr & storage_snapshot,
-        const ContextPtr & context) override;
+        const ContextPtr & context,
+        bool make_cluster_function) override;
 
     bool isClusterSupported() const override;
 
@@ -205,7 +206,7 @@ private:
     SELECT * FROM s3(...) SETTINGS object_storage_cluster='cluster'
     to make distributed request over cluster 'cluster'.
     */
-    void updateQueryForDistributedEngineIfNeeded(ASTPtr & query, ContextPtr context);
+    void updateQueryForDistributedEngineIfNeeded(ASTPtr & query, ContextPtr context, bool make_cluster_function);
 
     const String engine_name;
     StorageObjectStorageConfigurationPtr configuration;
