@@ -577,6 +577,8 @@ task row; they do not crash the server.
 This design only covers user visible behavior. It does not internal implementatation 
 details. The implementation section is omitted. 
 
+## 4. Test plan
+
 ### Functional tests — `tests/queries/0_stateless`
 
 Existing coverage to retain:
