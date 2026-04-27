@@ -307,3 +307,477 @@ RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExten
 
 }
 
+<<<<<<< HEAD
+=======
+void StorageObjectStorageCluster::readFallBackToPure(
+    QueryPlan & query_plan,
+    const Names & column_names,
+    const StorageSnapshotPtr & storage_snapshot,
+    SelectQueryInfo & query_info,
+    ContextPtr context,
+    QueryProcessingStage::Enum processed_stage,
+    size_t max_block_size,
+    size_t num_streams)
+{
+    pure_storage->read(query_plan, column_names, storage_snapshot, query_info, context, processed_stage, max_block_size, num_streams);
+}
+
+bool StorageObjectStorageCluster::isClusterSupported() const
+{
+    return configuration->isClusterSupported();
+}
+
+SinkToStoragePtr StorageObjectStorageCluster::writeFallBackToPure(
+    const ASTPtr & query,
+    const StorageMetadataPtr & metadata_snapshot,
+    ContextPtr context,
+    bool async_insert)
+{
+    return pure_storage->write(query, metadata_snapshot, context, async_insert);
+}
+
+String StorageObjectStorageCluster::getClusterName(ContextPtr context) const
+{
+    /// StorageObjectStorageCluster is always created for cluster or non-cluster variants.
+    /// User can specify cluster name in table definition or in setting `object_storage_cluster`
+    /// only for several queries. When it specified in both places, priority is given to the query setting.
+    /// When it is empty, non-cluster realization is used.
+
+    if (!isClusterSupported())
+        return "";
+
+    auto cluster_name_from_settings = context->getSettingsRef()[Setting::object_storage_cluster].value;
+    if (cluster_name_from_settings.empty())
+        cluster_name_from_settings = getOriginalClusterName();
+    return cluster_name_from_settings;
+}
+
+QueryProcessingStage::Enum StorageObjectStorageCluster::getQueryProcessingStage(
+    ContextPtr context, QueryProcessingStage::Enum to_stage, const StorageSnapshotPtr & storage_snapshot, SelectQueryInfo & query_info) const
+{
+    /// Full query if fall back to pure storage.
+    if (getClusterName(context).empty())
+        return QueryProcessingStage::Enum::FetchColumns;
+
+    /// Distributed storage.
+    return IStorageCluster::getQueryProcessingStage(context, to_stage, storage_snapshot, query_info);
+}
+
+std::optional<QueryPipeline> StorageObjectStorageCluster::distributedWrite(
+    const ASTInsertQuery & query,
+    ContextPtr context)
+{
+    if (getClusterName(context).empty())
+        return pure_storage->distributedWrite(query, context);
+    return IStorageCluster::distributedWrite(query, context);
+}
+
+void StorageObjectStorageCluster::drop()
+{
+    if (pure_storage)
+    {
+        pure_storage->drop();
+        return;
+    }
+    IStorageCluster::drop();
+}
+
+void StorageObjectStorageCluster::dropInnerTableIfAny(bool sync, ContextPtr context)
+{
+    if (getClusterName(context).empty())
+    {
+        pure_storage->dropInnerTableIfAny(sync, context);
+        return;
+    }
+    IStorageCluster::dropInnerTableIfAny(sync, context);
+}
+
+void StorageObjectStorageCluster::truncate(
+    const ASTPtr & query,
+    const StorageMetadataPtr & metadata_snapshot,
+    ContextPtr local_context,
+    TableExclusiveLockHolder & lock_holder)
+{
+    /// Full query if fall back to pure storage.
+    if (getClusterName(local_context).empty())
+    {
+        pure_storage->truncate(query, metadata_snapshot, local_context, lock_holder);
+        return;
+    }
+
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Truncate is not supported by storage {}", getName());
+}
+
+void StorageObjectStorageCluster::checkTableCanBeRenamed(const StorageID & new_name) const
+{
+    if (pure_storage)
+    {
+        pure_storage->checkTableCanBeRenamed(new_name);
+        return;
+    }
+    IStorageCluster::checkTableCanBeRenamed(new_name);
+}
+
+void StorageObjectStorageCluster::rename(const String & new_path_to_table_data, const StorageID & new_table_id)
+{
+    if (pure_storage)
+    {
+        pure_storage->rename(new_path_to_table_data, new_table_id);
+        return;
+    }
+    IStorageCluster::rename(new_path_to_table_data, new_table_id);
+}
+
+void StorageObjectStorageCluster::renameInMemory(const StorageID & new_table_id)
+{
+    if (pure_storage)
+    {
+        pure_storage->renameInMemory(new_table_id);
+        return;
+    }
+    IStorageCluster::renameInMemory(new_table_id);
+}
+
+void StorageObjectStorageCluster::alter(const AlterCommands & params, ContextPtr context, AlterLockHolder & alter_lock_holder)
+{
+    if (getClusterName(context).empty())
+    {
+        pure_storage->alter(params, context, alter_lock_holder);
+        setInMemoryMetadata(pure_storage->getInMemoryMetadata());
+        return;
+    }
+    IStorageCluster::alter(params, context, alter_lock_holder);
+    pure_storage->setInMemoryMetadata(IStorageCluster::getInMemoryMetadata());
+}
+
+void StorageObjectStorageCluster::addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const
+{
+    configuration->addStructureAndFormatToArgsIfNeeded(args, "", configuration->getFormat(), context, /*with_structure=*/false);
+}
+
+StorageMetadataPtr StorageObjectStorageCluster::getInMemoryMetadataPtr(bool bypass_metadata_cache) const
+{
+    if (pure_storage)
+        return pure_storage->getInMemoryMetadataPtr(bypass_metadata_cache);
+    return IStorageCluster::getInMemoryMetadataPtr(bypass_metadata_cache);
+}
+
+IDataLakeMetadata * StorageObjectStorageCluster::getExternalMetadata(ContextPtr query_context)
+{
+    if (getClusterName(query_context).empty())
+        return pure_storage->getExternalMetadata(query_context);
+
+    configuration->update(
+        object_storage,
+        query_context,
+        /* if_not_updated_before */false);
+
+    return configuration->getExternalMetadata();
+}
+
+void StorageObjectStorageCluster::checkAlterIsPossible(const AlterCommands & commands, ContextPtr context) const
+{
+    if (getClusterName(context).empty())
+    {
+        pure_storage->checkAlterIsPossible(commands, context);
+        return;
+    }
+    IStorageCluster::checkAlterIsPossible(commands, context);
+}
+
+void StorageObjectStorageCluster::checkMutationIsPossible(const MutationCommands & commands, const Settings & settings) const
+{
+    if (pure_storage)
+    {
+        pure_storage->checkMutationIsPossible(commands, settings);
+        return;
+    }
+    IStorageCluster::checkMutationIsPossible(commands, settings);
+}
+
+Pipe StorageObjectStorageCluster::alterPartition(
+    const StorageMetadataPtr & metadata_snapshot,
+    const PartitionCommands & commands,
+    ContextPtr context)
+{
+    if (getClusterName(context).empty())
+        return pure_storage->alterPartition(metadata_snapshot, commands, context);
+    return IStorageCluster::alterPartition(metadata_snapshot, commands, context);
+}
+
+void StorageObjectStorageCluster::checkAlterPartitionIsPossible(
+    const PartitionCommands & commands,
+    const StorageMetadataPtr & metadata_snapshot,
+    const Settings & settings,
+    ContextPtr context) const
+{
+    if (getClusterName(context).empty())
+    {
+        pure_storage->checkAlterPartitionIsPossible(commands, metadata_snapshot, settings, context);
+        return;
+    }
+    IStorageCluster::checkAlterPartitionIsPossible(commands, metadata_snapshot, settings, context);
+}
+
+bool StorageObjectStorageCluster::optimize(
+    const ASTPtr & query,
+    const StorageMetadataPtr & metadata_snapshot,
+    const ASTPtr & partition,
+    bool final,
+    bool deduplicate,
+    const Names & deduplicate_by_columns,
+    bool cleanup,
+    ContextPtr context)
+{
+    if (getClusterName(context).empty())
+        return pure_storage->optimize(query, metadata_snapshot, partition, final, deduplicate, deduplicate_by_columns, cleanup, context);
+    return IStorageCluster::optimize(query, metadata_snapshot, partition, final, deduplicate, deduplicate_by_columns, cleanup, context);
+}
+
+QueryPipeline StorageObjectStorageCluster::updateLightweight(const MutationCommands & commands, ContextPtr context)
+{
+    if (getClusterName(context).empty())
+        return pure_storage->updateLightweight(commands, context);
+    return IStorageCluster::updateLightweight(commands, context);
+}
+
+void StorageObjectStorageCluster::mutate(const MutationCommands & commands, ContextPtr context)
+{
+    if (getClusterName(context).empty())
+    {
+        pure_storage->mutate(commands, context);
+        return;
+    }
+    IStorageCluster::mutate(commands, context);
+}
+
+CancellationCode StorageObjectStorageCluster::killMutation(const String & mutation_id)
+{
+    if (pure_storage)
+        return pure_storage->killMutation(mutation_id);
+    return IStorageCluster::killMutation(mutation_id);
+}
+
+void StorageObjectStorageCluster::waitForMutation(const String & mutation_id, bool wait_for_another_mutation)
+{
+    if (pure_storage)
+    {
+        pure_storage->waitForMutation(mutation_id, wait_for_another_mutation);
+        return;
+    }
+    IStorageCluster::waitForMutation(mutation_id, wait_for_another_mutation);
+}
+
+void StorageObjectStorageCluster::setMutationCSN(const String & mutation_id, UInt64 csn)
+{
+    if (pure_storage)
+    {
+        pure_storage->setMutationCSN(mutation_id, csn);
+        return;
+    }
+    IStorageCluster::setMutationCSN(mutation_id, csn);
+}
+
+CancellationCode StorageObjectStorageCluster::killPartMoveToShard(const UUID & task_uuid)
+{
+    if (pure_storage)
+        return pure_storage->killPartMoveToShard(task_uuid);
+    return IStorageCluster::killPartMoveToShard(task_uuid);
+}
+
+void StorageObjectStorageCluster::startup()
+{
+    if (pure_storage)
+    {
+        pure_storage->startup();
+        return;
+    }
+    IStorageCluster::startup();
+}
+
+void StorageObjectStorageCluster::shutdown(bool is_drop)
+{
+    if (pure_storage)
+    {
+        pure_storage->shutdown(is_drop);
+        return;
+    }
+    IStorageCluster::shutdown(is_drop);
+}
+
+void StorageObjectStorageCluster::flushAndPrepareForShutdown()
+{
+    if (pure_storage)
+    {
+        pure_storage->flushAndPrepareForShutdown();
+        return;
+    }
+    IStorageCluster::flushAndPrepareForShutdown();
+}
+
+ActionLock StorageObjectStorageCluster::getActionLock(StorageActionBlockType action_type)
+{
+    if (pure_storage)
+        return pure_storage->getActionLock(action_type);
+    return IStorageCluster::getActionLock(action_type);
+}
+
+void StorageObjectStorageCluster::onActionLockRemove(StorageActionBlockType action_type)
+{
+    if (pure_storage)
+    {
+        pure_storage->onActionLockRemove(action_type);
+        return;
+    }
+    IStorageCluster::onActionLockRemove(action_type);
+}
+
+bool StorageObjectStorageCluster::supportsDelete() const
+{
+    if (pure_storage)
+        return pure_storage->supportsDelete();
+    return IStorageCluster::supportsDelete();
+}
+
+bool StorageObjectStorageCluster::supportsParallelInsert() const
+{
+    if (pure_storage)
+        return pure_storage->supportsParallelInsert();
+    return IStorageCluster::supportsParallelInsert();
+}
+
+bool StorageObjectStorageCluster::prefersLargeBlocks() const
+{
+    if (pure_storage)
+        return pure_storage->prefersLargeBlocks();
+    return IStorageCluster::prefersLargeBlocks();
+}
+
+bool StorageObjectStorageCluster::supportsPartitionBy() const
+{
+    if (pure_storage)
+        return pure_storage->supportsPartitionBy();
+    return IStorageCluster::supportsPartitionBy();
+}
+
+bool StorageObjectStorageCluster::supportsSubcolumns() const
+{
+    if (pure_storage)
+        return pure_storage->supportsSubcolumns();
+    return IStorageCluster::supportsSubcolumns();
+}
+
+bool StorageObjectStorageCluster::supportsDynamicSubcolumns() const
+{
+    if (pure_storage)
+        return pure_storage->supportsDynamicSubcolumns();
+    return IStorageCluster::supportsDynamicSubcolumns();
+}
+
+bool StorageObjectStorageCluster::supportsTrivialCountOptimization(const StorageSnapshotPtr & snapshot, ContextPtr context) const
+{
+    if (pure_storage)
+        return pure_storage->supportsTrivialCountOptimization(snapshot, context);
+    return IStorageCluster::supportsTrivialCountOptimization(snapshot, context);
+}
+
+bool StorageObjectStorageCluster::supportsPrewhere() const
+{
+    if (pure_storage)
+        return pure_storage->supportsPrewhere();
+    return IStorageCluster::supportsPrewhere();
+}
+
+bool StorageObjectStorageCluster::canMoveConditionsToPrewhere() const
+{
+    if (pure_storage)
+        return pure_storage->canMoveConditionsToPrewhere();
+    return IStorageCluster::canMoveConditionsToPrewhere();
+}
+
+std::optional<NameSet> StorageObjectStorageCluster::supportedPrewhereColumns() const
+{
+    if (pure_storage)
+        return pure_storage->supportedPrewhereColumns();
+    return IStorageCluster::supportedPrewhereColumns();
+}
+
+IStorageCluster::ColumnSizeByName StorageObjectStorageCluster::getColumnSizes() const
+{
+    if (pure_storage)
+        return pure_storage->getColumnSizes();
+    return IStorageCluster::getColumnSizes();
+}
+
+bool StorageObjectStorageCluster::parallelizeOutputAfterReading(ContextPtr context) const
+{
+    if (pure_storage)
+        return pure_storage->parallelizeOutputAfterReading(context);
+    return IStorageCluster::parallelizeOutputAfterReading(context);
+}
+
+bool StorageObjectStorageCluster::supportsImport(ContextPtr context) const
+{
+    if (pure_storage)
+        return pure_storage->supportsImport(context);
+    return IStorageCluster::supportsImport(context);
+}
+
+SinkToStoragePtr StorageObjectStorageCluster::import(
+    const std::string & file_name,
+    Block & block_with_partition_values,
+    const std::function<void(const std::string &)> & new_file_path_callback,
+    bool overwrite_if_exists,
+    std::size_t max_bytes_per_file,
+    std::size_t max_rows_per_file,
+    const std::optional<std::string> & iceberg_metadata_json_string,
+    const std::optional<FormatSettings> & format_settings_,
+    ContextPtr context)
+{
+    if (pure_storage)
+        return pure_storage->import(
+            file_name,
+            block_with_partition_values,
+            new_file_path_callback,
+            overwrite_if_exists,
+            max_bytes_per_file,
+            max_rows_per_file,
+            iceberg_metadata_json_string,
+            format_settings_,
+            context);
+    return IStorageCluster::import(
+        file_name,
+        block_with_partition_values,
+        new_file_path_callback,
+        overwrite_if_exists,
+        max_bytes_per_file,
+        max_rows_per_file,
+        iceberg_metadata_json_string,
+        format_settings_,
+        context);
+}
+
+bool StorageObjectStorageCluster::isDataLake() const
+{
+    if (pure_storage)
+        return pure_storage->isDataLake();
+    return IStorageCluster::isDataLake();
+}
+
+void StorageObjectStorageCluster::commitExportPartitionTransaction(
+    const String & transaction_id,
+    const String & partition_id,
+    const Strings & exported_paths,
+    const IcebergCommitExportPartitionArguments & iceberg_commit_export_partition_arguments,
+    ContextPtr local_context)
+{
+    if (pure_storage)
+    {
+        pure_storage->commitExportPartitionTransaction(transaction_id, partition_id, exported_paths, iceberg_commit_export_partition_arguments, local_context);
+        return;
+    }
+    IStorageCluster::commitExportPartitionTransaction(transaction_id, partition_id, exported_paths, iceberg_commit_export_partition_arguments, local_context);
+}
+
+}
+>>>>>>> 981a2d92cd0 (Merge pull request #1618 from Altinity/export_partition_iceberg)

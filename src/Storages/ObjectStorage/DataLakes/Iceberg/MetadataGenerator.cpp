@@ -145,7 +145,21 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateNextMetadata(
 
     auto parent_snapshot = getParentSnapshot(parent_snapshot_id);
     Poco::JSON::Object::Ptr summary = new Poco::JSON::Object;
+<<<<<<< HEAD
     if (num_deleted_rows == 0)
+=======
+    if (is_truncate)
+    {
+        summary->set(Iceberg::f_operation, Iceberg::f_overwrite);
+
+        Int64 prev_total_records = parent_snapshot && parent_snapshot->has(Iceberg::f_summary) && parent_snapshot->getObject(Iceberg::f_summary)->has(Iceberg::f_total_records) ? std::stoll(parent_snapshot->getObject(Iceberg::f_summary)->getValue<String>(Iceberg::f_total_records)) : 0;
+        Int64 prev_total_data_files = parent_snapshot && parent_snapshot->has(Iceberg::f_summary) && parent_snapshot->getObject(Iceberg::f_summary)->has(Iceberg::f_total_data_files) ? std::stoll(parent_snapshot->getObject(Iceberg::f_summary)->getValue<String>(Iceberg::f_total_data_files)) : 0;
+
+        summary->set(Iceberg::f_deleted_records, std::to_string(prev_total_records));
+        summary->set(Iceberg::f_deleted_data_files, std::to_string(prev_total_data_files));
+    }
+    else if (num_deleted_rows == 0)
+>>>>>>> 981a2d92cd0 (Merge pull request #1618 from Altinity/export_partition_iceberg)
     {
         summary->set(Iceberg::f_operation, Iceberg::f_append);
         summary->set(Iceberg::f_added_data_files, std::to_string(added_files));
@@ -165,7 +179,16 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateNextMetadata(
 
     auto sum_with_parent_snapshot = [&](const char * field_name, Int64 snapshot_value)
     {
+<<<<<<< HEAD
         Int64 prev_value = parent_snapshot ? parse<Int64>(parent_snapshot->getObject(Iceberg::f_summary)->getValue<String>(field_name)) : 0;
+=======
+        if (is_truncate)
+        {
+            summary->set(field_name, std::to_string(0));
+            return;
+        }
+        Int64 prev_value = parent_snapshot && parent_snapshot->has(Iceberg::f_summary) && parent_snapshot->getObject(Iceberg::f_summary)->has(field_name) ? std::stoll(parent_snapshot->getObject(Iceberg::f_summary)->getValue<String>(field_name)) : 0;
+>>>>>>> 981a2d92cd0 (Merge pull request #1618 from Altinity/export_partition_iceberg)
         summary->set(field_name, std::to_string(prev_value + snapshot_value));
     };
 
@@ -194,7 +217,7 @@ MetadataGenerator::NextMetadataResult MetadataGenerator::generateNextMetadata(
     metadata_object->set(Iceberg::f_current_snapshot_id, snapshot_id);
 
     if (!metadata_object->has(Iceberg::f_refs))
-        metadata_object->set(Iceberg::f_refs, new Poco::JSON::Object);
+        metadata_object->set(Iceberg::f_refs, Poco::JSON::Object::Ptr(new Poco::JSON::Object));
 
     if (!metadata_object->getObject(Iceberg::f_refs)->has(Iceberg::f_main))
     {
