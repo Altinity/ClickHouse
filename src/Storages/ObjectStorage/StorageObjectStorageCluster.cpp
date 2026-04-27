@@ -301,5 +301,11 @@ RemoteQueryExecutor::Extension StorageObjectStorageCluster::getTaskIteratorExten
     return RemoteQueryExecutor::Extension{ .task_iterator = std::move(callback) };
 }
 
+IDataLakeMetadata * StorageObjectStorageCluster::getExternalMetadata(ContextPtr query_context)
+{
+    configuration->update(object_storage, query_context);
+    return configuration->getExternalMetadata();
+}
+
 }
 
