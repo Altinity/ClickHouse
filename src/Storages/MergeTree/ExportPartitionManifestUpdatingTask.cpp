@@ -5,6 +5,7 @@
 #include "Common/logger_useful.h"
 #include <Common/ZooKeeper/Types.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
+#include <Common/ZooKeeper/ZooKeeperCommon.h>
 #include <Interpreters/DatabaseCatalog.h>
 
 namespace DB
@@ -81,6 +82,8 @@ ExportPartitionManifestUpdatingTask::ExportPartitionManifestUpdatingTask(Storage
 
 void ExportPartitionManifestUpdatingTask::poll()
 {
+    auto component_guard = Coordination::setCurrentComponent("ExportPartitionManifestUpdatingTask::poll");
+
     std::lock_guard lock(storage.export_merge_tree_partition_mutex);
 
     LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Polling for new entries for table {}. Current number of entries: {}", storage.getStorageID().getNameForLogs(), storage.export_merge_tree_partition_task_entries_by_key.size());
@@ -257,6 +260,8 @@ void ExportPartitionManifestUpdatingTask::addStatusChange(const std::string & ke
 
 void ExportPartitionManifestUpdatingTask::handleStatusChanges()
 {
+    auto component_guard = Coordination::setCurrentComponent("ExportPartitionManifestUpdatingTask::handleStatusChanges");
+
     std::lock_guard lock(status_changes_mutex);
     std::lock_guard task_entries_lock(storage.export_merge_tree_partition_mutex);
     auto zk = storage.getZooKeeper();

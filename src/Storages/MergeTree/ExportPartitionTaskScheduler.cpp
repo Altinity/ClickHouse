@@ -4,6 +4,7 @@
 #include <Interpreters/DatabaseCatalog.h>
 #include <Common/Exception.h>
 #include <Common/ZooKeeper/Types.h>
+#include <Common/ZooKeeper/ZooKeeperCommon.h>
 #include "Storages/MergeTree/ExportPartitionUtils.h"
 #include "Storages/MergeTree/MergeTreePartExportManifest.h"
 
@@ -46,6 +47,8 @@ ExportPartitionTaskScheduler::ExportPartitionTaskScheduler(StorageReplicatedMerg
 
 void ExportPartitionTaskScheduler::run()
 {
+    auto component_guard = Coordination::setCurrentComponent("ExportPartitionTaskScheduler::run");
+
     std::lock_guard lock(storage.export_merge_tree_partition_mutex);
 
     auto zk = storage.getZooKeeper();
