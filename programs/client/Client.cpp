@@ -451,7 +451,14 @@ catch (...)
 #if USE_JWT_CPP && USE_SSL
 void Client::login()
 {
-    std::string host = hosts_and_ports.front().host;
+    /// hosts_and_ports is populated only from explicit --host. When the host
+    /// came from --connection or top-level <host> in config, it stays empty,
+    /// and hosts_and_ports.front() dereferences a null vector slot → SIGSEGV
+    /// in Client::main (upstream issue #103603). Fall back to the
+    /// config-derived value, which always exists by this point.
+    std::string host = !hosts_and_ports.empty()
+        ? hosts_and_ports.front().host
+        : getClientConfiguration().getString("host", "");
     std::string auth_url = getClientConfiguration().getString("oauth-url", "");
     std::string client_id = getClientConfiguration().getString("oauth-client-id", "");
     std::string audience = getClientConfiguration().getString("oauth-audience", "");
