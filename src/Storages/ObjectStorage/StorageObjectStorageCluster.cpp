@@ -1053,11 +1053,11 @@ bool StorageObjectStorageCluster::parallelizeOutputAfterReading(ContextPtr conte
     return IStorageCluster::parallelizeOutputAfterReading(context);
 }
 
-bool StorageObjectStorageCluster::supportsImport() const
+bool StorageObjectStorageCluster::supportsImport(ContextPtr context) const
 {
     if (pure_storage)
-        return pure_storage->supportsImport();
-    return IStorageCluster::supportsImport();
+        return pure_storage->supportsImport(context);
+    return IStorageCluster::supportsImport(context);
 }
 
 SinkToStoragePtr StorageObjectStorageCluster::import(
@@ -1067,6 +1067,7 @@ SinkToStoragePtr StorageObjectStorageCluster::import(
     bool overwrite_if_exists,
     std::size_t max_bytes_per_file,
     std::size_t max_rows_per_file,
+    const std::optional<std::string> & iceberg_metadata_json_string,
     const std::optional<FormatSettings> & format_settings_,
     ContextPtr context)
 {
@@ -1078,6 +1079,7 @@ SinkToStoragePtr StorageObjectStorageCluster::import(
             overwrite_if_exists,
             max_bytes_per_file,
             max_rows_per_file,
+            iceberg_metadata_json_string,
             format_settings_,
             context);
     return IStorageCluster::import(
@@ -1087,22 +1089,31 @@ SinkToStoragePtr StorageObjectStorageCluster::import(
         overwrite_if_exists,
         max_bytes_per_file,
         max_rows_per_file,
+        iceberg_metadata_json_string,
         format_settings_,
         context);
+}
+
+bool StorageObjectStorageCluster::isDataLake() const
+{
+    if (pure_storage)
+        return pure_storage->isDataLake();
+    return IStorageCluster::isDataLake();
 }
 
 void StorageObjectStorageCluster::commitExportPartitionTransaction(
     const String & transaction_id,
     const String & partition_id,
     const Strings & exported_paths,
+    const IcebergCommitExportPartitionArguments & iceberg_commit_export_partition_arguments,
     ContextPtr local_context)
 {
     if (pure_storage)
     {
-        pure_storage->commitExportPartitionTransaction(transaction_id, partition_id, exported_paths, local_context);
+        pure_storage->commitExportPartitionTransaction(transaction_id, partition_id, exported_paths, iceberg_commit_export_partition_arguments, local_context);
         return;
     }
-    IStorageCluster::commitExportPartitionTransaction(transaction_id, partition_id, exported_paths, local_context);
+    IStorageCluster::commitExportPartitionTransaction(transaction_id, partition_id, exported_paths, iceberg_commit_export_partition_arguments, local_context);
 }
 
 }

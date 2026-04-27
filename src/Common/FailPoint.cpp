@@ -119,6 +119,11 @@ static struct InitFiu
     ONCE(disk_object_storage_fail_precommit_metadata_transaction) \
     REGULAR(slowdown_parallel_replicas_local_plan_read) \
     ONCE(iceberg_writes_cleanup) \
+    ONCE(iceberg_writes_non_retry_cleanup) \
+    ONCE(iceberg_writes_post_publish_throw) \
+    ONCE(iceberg_export_after_commit_before_zk_completed) \
+    REGULAR(export_partition_commit_always_throw) \
+    ONCE(export_partition_status_change_throw) \
     ONCE(backup_add_empty_memory_table) \
     PAUSEABLE_ONCE(backup_pause_on_start) \
     PAUSEABLE_ONCE(restore_pause_on_start) \
