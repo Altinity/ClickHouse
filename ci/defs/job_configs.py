@@ -152,6 +152,20 @@ common_integration_test_job_config = Job.Config(
     run_in_docker=f"altinityinfra/integration-tests-runner+root+--memory={LIMITED_MEM}+--privileged+--dns-search='.'+--security-opt seccomp=unconfined+--cap-add=SYS_PTRACE+{docker_sock_mount}+--volume=clickhouse_integration_tests_volume:/var/lib/docker+--cgroupns=host+--env=CLICKHOUSE_TEST_STAT_URL=$CLICKHOUSE_TEST_STAT_URL+--env=CLICKHOUSE_TEST_STAT_LOGIN=$CLICKHOUSE_TEST_STAT_LOGIN+--env=CLICKHOUSE_TEST_STAT_PASSWORD=$CLICKHOUSE_TEST_STAT_PASSWORD",
 )
 
+BINARY_DOCKER_COMMAND_SANITIZER = (
+    BINARY_DOCKER_COMMAND + "+--security-opt seccomp=unconfined"
+)
+
+# NOTE (strtgbb): TSan and MSan builds require --security-opt seccomp=unconfined
+common_sanitizer_build_job_config = Job.Config(
+    name=JobNames.BUILD,
+    runs_on=[],  # from parametrize()
+    requires=[],
+    command='python3 ./ci/jobs/build_clickhouse.py --build-type "{PARAMETER}"',
+    run_in_docker=BINARY_DOCKER_COMMAND_SANITIZER,
+    timeout=3600 * 4,
+    digest_config=build_digest_config,
+)
 
 class JobConfigs:
     style_check = Job.Config(
@@ -251,24 +265,6 @@ class JobConfigs:
             runs_on=RunnerLabels.BUILDER_AMD,
         ),
         Job.ParamSet(
-            parameter=BuildTypes.AMD_TSAN,
-            provides=[
-                ArtifactNames.CH_AMD_TSAN,
-                ArtifactNames.DEB_AMD_TSAN,
-                ArtifactNames.UNITTEST_AMD_TSAN,
-            ],
-            runs_on=RunnerLabels.BUILDER_AMD,
-        ),
-        Job.ParamSet(
-            parameter=BuildTypes.AMD_MSAN,
-            provides=[
-                ArtifactNames.CH_AMD_MSAN,
-                ArtifactNames.DEB_AMD_MSAN,
-                ArtifactNames.UNITTEST_AMD_MSAN,
-            ],
-            runs_on=RunnerLabels.BUILDER_AMD,
-        ),
-        Job.ParamSet(
             parameter=BuildTypes.AMD_UBSAN,
             provides=[
                 ArtifactNames.CH_AMD_UBSAN,
@@ -295,6 +291,30 @@ class JobConfigs:
             provides=[
                 ArtifactNames.CH_ARM_BINARY,
                 ArtifactNames.PARSER_MEMORY_PROFILER,
+            ],
+            runs_on=RunnerLabels.BUILDER_AMD,
+        ),
+    ) + common_sanitizer_build_job_config.set_post_hooks(
+        post_hooks=[
+            "python3 ./ci/jobs/scripts/job_hooks/build_master_head_hook.py",
+            # "python3 ./ci/jobs/scripts/job_hooks/build_profile_hook.py",
+        ],
+    ).parametrize(
+        Job.ParamSet(
+            parameter=BuildTypes.AMD_TSAN,
+            provides=[
+                ArtifactNames.CH_AMD_TSAN,
+                ArtifactNames.DEB_AMD_TSAN,
+                ArtifactNames.UNITTEST_AMD_TSAN,
+            ],
+            runs_on=RunnerLabels.BUILDER_AMD,
+        ),
+        Job.ParamSet(
+            parameter=BuildTypes.AMD_MSAN,
+            provides=[
+                ArtifactNames.CH_AMD_MSAN,
+                ArtifactNames.DEB_AMD_MSAN,
+                ArtifactNames.UNITTEST_AMD_MSAN,
             ],
             runs_on=RunnerLabels.BUILDER_AMD,
         ),
