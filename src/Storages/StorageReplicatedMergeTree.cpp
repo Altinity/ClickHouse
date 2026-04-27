@@ -4594,6 +4594,8 @@ void StorageReplicatedMergeTree::exportMergeTreePartitionStatusHandlingTask()
 
 std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartitionExportsInfo() const
 {
+    auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::getPartitionExportsInfo");
+
     std::vector<ReplicatedPartitionExportInfo> infos;
 
     const auto zk = getZooKeeper();
@@ -9992,6 +9994,8 @@ CancellationCode StorageReplicatedMergeTree::killPartMoveToShard(const UUID & ta
 
 CancellationCode StorageReplicatedMergeTree::killExportPartition(const String & transaction_id)
 {
+    auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::killExportPartition");
+
     auto try_set_status_to_killed = [this](const zkutil::ZooKeeperPtr & zk, const std::string & status_path)
     {
         Coordination::Stat stat;

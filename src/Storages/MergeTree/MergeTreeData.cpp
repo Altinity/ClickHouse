@@ -9892,6 +9892,11 @@ bool MergeTreeData::scheduleDataMovingJob(BackgroundJobsAssignee & assignee)
         }
     }
 
+    /// Export-partition tasks share the moves blocker with regular moves, so skip
+    /// scheduling new exports when SYSTEM STOP MOVES is in effect.
+    if (parts_mover.moves_blocker.isCancelled())
+        return false;
+
     std::lock_guard lock(export_manifests_mutex);
 
     for (auto & manifest : export_manifests)
