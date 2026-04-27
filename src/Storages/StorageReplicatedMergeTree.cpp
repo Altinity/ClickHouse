@@ -8332,6 +8332,8 @@ void StorageReplicatedMergeTree::fetchPartition(
 
 void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand & command, ContextPtr query_context)
 {
+    auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::exportPartitionToTable");
+
     if (!query_context->getServerSettings()[ServerSetting::enable_experimental_export_merge_tree_partition_feature])
     {
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,

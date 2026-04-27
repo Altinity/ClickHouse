@@ -179,6 +179,8 @@ void ExportPartitionTaskScheduler::handlePartExportCompletion(
     const StoragePtr & destination_storage,
     const MergeTreePartExportManifest::CompletionCallbackResult & result)
 {
+    auto component_guard = Coordination::setCurrentComponent("ExportPartitionTaskScheduler::handlePartExportCompletion");
+
     const auto export_path = fs::path(storage.zookeeper_path) / "exports" / export_key;
     const auto processing_parts_path = export_path / "processing";
     const auto processed_part_path = export_path / "processed" / part_name;
