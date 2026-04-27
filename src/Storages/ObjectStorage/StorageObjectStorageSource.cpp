@@ -884,7 +884,11 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
         InputFormatPtr input_format;
         if (context_->getSettingsRef()[Setting::use_parquet_metadata_cache] && use_native_reader_v3
+<<<<<<< HEAD
             && (object_info->getFileFormat().value_or(configuration->format) == "Parquet")
+=======
+            && (Poco::toLower(object_info->getFileFormat().value_or(configuration->getFormat())) == "parquet")
+>>>>>>> ba1e4f5f6dd (Merge pull request #1631 from Altinity/arthurpassos-patch-11)
             && !object_info->getObjectMetadata()->etag.empty())
         {
             const std::optional<RelativePathWithMetadata> object_with_metadata = object_info->relative_path_with_metadata;
