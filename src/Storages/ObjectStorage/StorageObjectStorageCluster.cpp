@@ -109,7 +109,8 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
 
     auto log_ = getLogger("StorageObjectStorageCluster");
 
-    if (!columns_in_table_or_function_definition.empty()
+    if (!is_table_function
+        && !columns_in_table_or_function_definition.empty()
         && !is_datalake_query
         && mode_ == LoadingStrictnessLevel::CREATE)
     {

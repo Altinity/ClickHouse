@@ -1432,3 +1432,31 @@ def test_object_storage_remote_initiator(started_cluster):
     assert users[1:] == ["s0_0_0\tdefault",
                      "s0_0_1\tfoo",
                      "s0_1_0\tfoo"]
+
+    # Random host from 'cluster_with_dots' for remote query, without type and structure
+    query_id = uuid.uuid4().hex
+
+    result = node.query(
+        f"""
+        SELECT * from s3(
+            'http://minio1:9001/root/data/clickhouse/*', 'minio', '{minio_secret_key}')
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_cluster='cluster_with_dots'
+        """,
+        query_id = query_id,
+    )
+
+    assert result is not None
+
+    node.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster_all'")
+    queries = node.query(
+        f"""
+        SELECT count()
+            FROM clusterAllReplicas('cluster_all', system.query_log)
+            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
+            FORMAT TSV
+        """
+    ).splitlines()
+
+    assert queries == ["5"]
