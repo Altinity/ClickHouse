@@ -285,6 +285,8 @@ void Client::initialize(Poco::Util::Application & self)
             configuration.setString("oauth-audience", overrides.oauth_audience.value());
         if (overrides.oauth_client_secret.has_value())
             configuration.setString("oauth-client-secret", overrides.oauth_client_secret.value());
+        if (overrides.oauth_callback_port.has_value())
+            configuration.setUInt("oauth-callback-port", overrides.oauth_callback_port.value());
 
         config().add(loaded_config.configuration);
 
