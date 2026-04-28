@@ -146,7 +146,32 @@ void JWTProvider::deviceCodeLogin()
         std::istream & token_rs = token_session->receiveResponse(token_response);
         std::string response_body;
         Poco::StreamCopier::copyToString(token_rs, response_body);
-        Poco::JSON::Object::Ptr token_object = Poco::JSON::Parser().parse(response_body).extract<Poco::JSON::Object::Ptr>();
+
+        /// The bare extract<Object::Ptr>() pattern threw std::bad_cast whenever
+        /// the IdP returned a non-JSON or non-object body (HTML error page from
+        /// a CDN, empty response on transient failure, etc.), aborting the
+        /// whole login with no useful diagnostic. Treat parse failure as
+        /// "transient — keep polling": the device flow is by design tolerant
+        /// of intermittent token-endpoint errors, and the loop's outer
+        /// expires_in clamp bounds the total retry window.
+        Poco::JSON::Object::Ptr token_object;
+        try
+        {
+            auto parsed = Poco::JSON::Parser().parse(response_body);
+            token_object = parsed.extract<Poco::JSON::Object::Ptr>();
+        }
+        catch (const std::exception & e)
+        {
+            error_stream << "Warning: token endpoint returned non-JSON response (status "
+                         << static_cast<int>(token_response.getStatus()) << ", " << e.what()
+                         << "); will retry. Body: " << response_body.substr(0, 256) << "\n";
+            continue;
+        }
+        if (!token_object)
+        {
+            error_stream << "Warning: token endpoint returned non-object JSON; will retry.\n";
+            continue;
+        }
 
         if (token_response.getStatus() == Poco::Net::HTTPResponse::HTTP_OK)
         {
