@@ -29,7 +29,7 @@ namespace
 
 constexpr int HTTP_TIMEOUT_SECONDS = 30;
 
-std::string fetchDeviceEndpointFromIssuer(const std::string & issuer)
+Poco::JSON::Object::Ptr fetchOIDCDiscoveryDocument(const std::string & issuer)
 {
     const std::string discovery_url = issuer + "/.well-known/openid-configuration";
     Poco::URI disc_uri(discovery_url);
@@ -66,13 +66,18 @@ std::string fetchDeviceEndpointFromIssuer(const std::string & issuer)
 
     Poco::JSON::Parser parser;
     auto result = parser.parse(body);
-    const auto & obj = result.extract<Poco::JSON::Object::Ptr>();
+    return result.extract<Poco::JSON::Object::Ptr>();
+}
+
+std::string fetchDeviceEndpointFromIssuer(const std::string & issuer)
+{
+    const auto obj = fetchOIDCDiscoveryDocument(issuer);
 
     if (!obj->has("device_authorization_endpoint"))
         throw Exception(
             ErrorCodes::AUTHENTICATION_FAILED,
-            "OIDC discovery document at '{}' does not contain device_authorization_endpoint",
-            discovery_url);
+            "OIDC discovery document at '{}/.well-known/openid-configuration' does not contain device_authorization_endpoint",
+            issuer);
 
     return obj->getValue<std::string>("device_authorization_endpoint");
 }
@@ -95,6 +100,22 @@ std::string inferIssuerFromTokenUri(const std::string & token_uri)
     return issuer;
 }
 
+}
+
+void populateEndpointsFromOIDCDiscovery(OAuthCredentials & creds)
+{
+    if (creds.issuer.empty())
+        throw Exception(
+            ErrorCodes::AUTHENTICATION_FAILED,
+            "Cannot populate OAuth endpoints from OIDC discovery: issuer is not set");
+
+    const auto obj = fetchOIDCDiscoveryDocument(creds.issuer);
+    if (creds.auth_uri.empty() && obj->has("authorization_endpoint"))
+        creds.auth_uri = obj->getValue<std::string>("authorization_endpoint");
+    if (creds.token_uri.empty() && obj->has("token_endpoint"))
+        creds.token_uri = obj->getValue<std::string>("token_endpoint");
+    if (creds.device_auth_uri.empty() && obj->has("device_authorization_endpoint"))
+        creds.device_auth_uri = obj->getValue<std::string>("device_authorization_endpoint");
 }
 
 std::unique_ptr<IOAuthProviderPolicy> IOAuthProviderPolicy::create(const OAuthCredentials & creds)

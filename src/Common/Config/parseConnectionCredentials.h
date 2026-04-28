@@ -22,6 +22,12 @@ struct ConnectionsCredentials
     std::optional<UInt32> history_max_entries;
     std::optional<bool> accept_invalid_certificate;
     std::optional<std::string> prompt;
+    std::optional<std::string> login;
+    std::optional<std::string> oauth_url;
+    std::optional<std::string> oauth_client_id;
+    std::optional<std::string> oauth_audience;
+    std::optional<std::string> oauth_client_secret;
+    std::optional<UInt16> oauth_callback_port;
 };
 
 /// Parse <connections_credentials> section from client config.

@@ -306,12 +306,56 @@ public:
         }
 
         response.setStatus(Poco::Net::HTTPResponse::HTTP_OK);
-        response.setContentType("text/html");
+        response.setContentType("text/html; charset=utf-8");
         auto & out = response.send();
-        if (!code.empty())
-            out << "<html><body>Authentication successful. You may close this tab.</body></html>";
+        const bool ok = !code.empty();
+        out << R"HTML(<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>)HTML" << (ok ? "Authenticated" : "Authentication failed") << R"HTML(</title>
+<style>
+:root { color-scheme: light dark; }
+html, body { height: 100%; margin: 0; }
+body {
+    display: flex; align-items: center; justify-content: center;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #fafafa; color: #1a1a1a;
+}
+@media (prefers-color-scheme: dark) {
+    body { background: #111; color: #eaeaea; }
+    .card { background: #1c1c1c; border-color: #333; }
+}
+.card {
+    background: #fff; border: 1px solid #e5e5e5; border-radius: 12px;
+    padding: 2.5rem 3rem; max-width: 28rem; text-align: center;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.06);
+}
+.dot { width: 56px; height: 56px; border-radius: 50%; margin: 0 auto 1rem; display: flex; align-items: center; justify-content: center; font-size: 28px; font-weight: bold; color: #fff; }
+.ok  { background: #f7c948; color: #1a1a1a; }
+.bad { background: #d64545; }
+h1 { font-size: 1.25rem; margin: 0.5rem 0 0.25rem; }
+p  { margin: 0.5rem 0 0; color: #666; font-size: 0.95rem; }
+.brand { margin-top: 1.5rem; font-size: 0.8rem; color: #888; letter-spacing: 0.06em; text-transform: uppercase; }
+code { background: rgba(127,127,127,0.15); padding: 0.1em 0.35em; border-radius: 4px; font-size: 0.9em; }
+</style></head><body>
+<div class="card">
+)HTML";
+        if (ok)
+        {
+            out << R"HTML(<div class="dot ok">A</div>
+<h1>Authenticated</h1>
+<p>You can close this tab and return to your terminal.</p>
+)HTML";
+        }
         else
-            out << "<html><body>Authentication failed: " << htmlEscape(error) << "</body></html>";
+        {
+            out << R"HTML(<div class="dot bad">!</div>
+<h1>Authentication failed</h1>
+<p><code>)HTML" << htmlEscape(error) << R"HTML(</code></p>
+<p>Return to your terminal for details.</p>
+)HTML";
+        }
+        out << R"HTML(<div class="brand">Antalya ClickHouse client</div>
+</div></body></html>)HTML";
         out.flush();
 
         std::lock_guard<std::mutex> lock(state.mtx);
@@ -431,7 +475,7 @@ std::string runOAuthAuthCodeFlow(const OAuthCredentials & creds)
     }
 
     Poco::Net::ServerSocket server_socket;
-    server_socket.bind(Poco::Net::SocketAddress("127.0.0.1", 0), /*reuse_address=*/true);
+    server_socket.bind(Poco::Net::SocketAddress("127.0.0.1", creds.loopback_port), /*reuse_address=*/true);
     server_socket.listen(1);
     const uint16_t port = server_socket.address().port();
 
