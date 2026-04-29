@@ -1195,7 +1195,7 @@ def test_joins(started_cluster):
     assert len(res) == 25
 
 
-def _test_graceful_shutdown(started_cluster):
+def test_graceful_shutdown(started_cluster):
     node = started_cluster.instances["s0_0_0"]
     node_to_shutdown = started_cluster.instances["s0_1_0"]
 
