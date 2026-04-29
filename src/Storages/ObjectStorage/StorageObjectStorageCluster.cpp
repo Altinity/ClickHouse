@@ -40,6 +40,7 @@ namespace Setting
     extern const SettingsInt64 delta_lake_snapshot_end_version;
     extern const SettingsUInt64 lock_object_storage_task_distribution_ms;
     extern const SettingsBool allow_experimental_iceberg_read_optimization;
+    extern const SettingsBool object_storage_remote_initiator;
 }
 
 namespace ErrorCodes
@@ -110,8 +111,11 @@ StorageObjectStorageCluster::StorageObjectStorageCluster(
 {
     configuration->initPartitionStrategy(partition_by, columns_in_table_or_function_definition, context_);
 
-    const bool need_resolve_columns_or_format = columns_in_table_or_function_definition.empty() || (configuration->getFormat() == "auto");
-    const bool do_lazy_init = lazy_init && !need_resolve_columns_or_format && (!configuration->needsUpdateForSchemaConsistency() || catalog);
+    const bool need_resolve_columns_or_format = (columns_in_table_or_function_definition.empty() || (configuration->getFormat() == "auto"));
+    const bool do_lazy_init =
+        (context_->getSettingsRef()[Setting::object_storage_remote_initiator] || lazy_init)
+        && !need_resolve_columns_or_format
+        && (!configuration->needsUpdateForSchemaConsistency() || catalog);
 
     auto log_ = getLogger("StorageObjectStorageCluster");
 
@@ -517,6 +521,9 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
 
 void StorageObjectStorageCluster::updateExternalDynamicMetadataIfExists(ContextPtr query_context)
 {
+    if (query_context->getSettingsRef()[Setting::object_storage_remote_initiator])
+        return;
+
     configuration->update(
         object_storage,
         query_context,
