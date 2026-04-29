@@ -18,6 +18,7 @@
 #include <Common/ConcurrentBoundedQueue.h>
 
 #include <optional>
+#include <future>
 #include <base/defines.h>
 
 #include <Core/BackgroundSchedulePool.h>
@@ -54,6 +55,8 @@ public:
     ~SingleThreadIcebergKeysIterator();
 
 private:
+    void initParallelPrefetch();
+
     ObjectStoragePtr object_storage;
     std::shared_ptr<const ActionsDAG> filter_dag;
     ContextPtr local_context;
@@ -66,7 +69,7 @@ private:
     LoggerPtr log;
     std::shared_ptr<SecondaryStorages> secondary_storages;
 
-    // By Iceberg design it is difficult to avoid storing position deletes in memory.
+    /// Serial iteration state (used when parallel_loading_threads == 1)
     size_t manifest_file_index = 0;
     size_t internal_data_index = 0;
     Iceberg::ManifestFilePtr current_manifest_file_content;
@@ -77,6 +80,18 @@ private:
 
     size_t min_max_index_pruned_files = 0;
     size_t partition_pruned_files = 0;
+
+    /// Parallel prefetch state (used when parallel_loading_threads > 1)
+    UInt64 parallel_loading_threads = 1;
+
+    struct PrefetchEntry
+    {
+        size_t manifest_list_index;
+        std::future<Iceberg::ManifestFilePtr> future;
+    };
+    std::vector<PrefetchEntry> prefetch_entries;
+    size_t prefetch_consume_pos = 0;
+    bool prefetch_initialized = false;
 };
 
 }
