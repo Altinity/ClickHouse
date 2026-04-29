@@ -39,7 +39,11 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         /// controls new feature and it's 'true' by default, use 'false' as previous_value).
         /// It's used to implement `compatibility` setting (see https://github.com/ClickHouse/ClickHouse/issues/35972)
         /// Note: please check if the key already exists to prevent duplicate entries.
-        addSettingsChanges(settings_changes_history, "25.8.13.10000",
+        addSettingsChanges(settings_changes_history, "25.8.16.10002",
+        {
+           {"allow_local_data_lakes", false, false, "New setting to guard local data lake engines and table functions"},
+        });
+        addSettingsChanges(settings_changes_history, "25.8.13.10001",
         {
            {"show_data_lake_catalogs_in_system_tables", false, true, "Disable catalogs in system tables by default"},
 

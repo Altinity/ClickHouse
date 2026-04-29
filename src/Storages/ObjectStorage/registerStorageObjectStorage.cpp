@@ -23,10 +23,12 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int SUPPORT_IS_DISABLED;
 }
 
 namespace Setting
 {
+    extern const SettingsBool allow_local_data_lakes;
     extern const SettingsBool write_full_path_in_iceberg_metadata;
 }
 
@@ -269,6 +271,11 @@ void registerStorageIceberg(StorageFactory & factory)
         IcebergLocalDefinition::storage_engine_name,
         [&](const StorageFactory::Arguments & args)
         {
+            if (!args.getLocalContext()->getSettingsRef()[Setting::allow_local_data_lakes])
+                throw Exception(
+                    ErrorCodes::SUPPORT_IS_DISABLED,
+                    "IcebergLocal is disabled. Set `allow_local_data_lakes` to enable it");
+
             const auto storage_settings = getDataLakeStorageSettings(*args.storage_def);
             auto configuration = std::make_shared<StorageLocalIcebergConfiguration>(storage_settings);
             return createStorageObjectStorage(args, configuration);
@@ -338,6 +345,11 @@ void registerStorageDeltaLake(StorageFactory & factory)
         DeltaLakeLocalDefinition::storage_engine_name,
         [&](const StorageFactory::Arguments & args)
         {
+            if (!args.getLocalContext()->getSettingsRef()[Setting::allow_local_data_lakes])
+                throw Exception(
+                    ErrorCodes::SUPPORT_IS_DISABLED,
+                    "DeltaLakeLocal is disabled. Set `allow_local_data_lakes` to enable it");
+
             const auto storage_settings = getDataLakeStorageSettings(*args.storage_def);
             auto configuration = std::make_shared<StorageLocalDeltaLakeConfiguration>(storage_settings);
             return createStorageObjectStorage(args, configuration);

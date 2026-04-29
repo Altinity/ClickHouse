@@ -6858,6 +6858,9 @@ Use roaring bitmap for iceberg positional deletes.
     DECLARE(Bool, serialize_string_in_memory_with_zero_byte, true, R"(
 Serialize String values during aggregation with zero byte at the end. Enable to keep compatibility when querying cluster of incompatible versions.
 )", 0) \
+    DECLARE(Bool, allow_local_data_lakes, false, R"(
+Allow using local data lake engines and table functions (IcebergLocal, DeltaLakeLocal, etc.).
+)", 0) \
     \
     /* ####################################################### */ \
     /* ########### START OF EXPERIMENTAL FEATURES ############ */ \
