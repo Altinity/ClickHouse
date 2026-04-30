@@ -1234,12 +1234,14 @@ void DDLWorker::runMainThread()
             }
 
             if (host_ids_updated.exchange(false))
-                markReplicasActive(/*reinitialized=*/false);
+                markReplicasActive(/*reinitialized=*/false, /*should_create_dirs=*/true);
 
             cleanup_event->set();
             try
             {
-                markReplicasActive(reinitialized);
+                /// On per-tick invocations (i.e. not reinitialized), do NOT recreate
+                /// the host_id dirs - that races with external recursive cleanup.
+                markReplicasActive(reinitialized, /*should_create_dirs=*/reinitialized);
             }
             catch (...)
             {
@@ -1314,7 +1316,7 @@ void DDLWorker::createReplicaDirs(const ZooKeeperPtr & zookeeper, const NameSet 
     }
 }
 
-void DDLWorker::markReplicasActive(bool reinitialized)
+void DDLWorker::markReplicasActive(bool reinitialized, bool should_create_dirs)
 {
     auto zookeeper = getZooKeeper();
 
@@ -1356,7 +1358,13 @@ void DDLWorker::markReplicasActive(bool reinitialized)
         LOG_INFO(log, "Unable to get interserver IO address, error {}", e.what());
     }
 
-    createReplicaDirs(zookeeper, all_host_ids);
+    /// Only (re)create the host_id dirs on real events (initialization, reconnect,
+    /// or a freshly-observed host ID). Doing it on every main-loop tick races
+    /// against external recursive cleanup of /clickhouse and breaks
+    /// test_replication_without_zookeeper::test_startup_without_zookeeper.
+    /// See Altinity/ClickHouse#1711.
+    if (should_create_dirs)
+        createReplicaDirs(zookeeper, all_host_ids);
 
     if (reinitialized)
     {

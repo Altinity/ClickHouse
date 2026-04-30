@@ -257,7 +257,7 @@ void DatabaseReplicatedDDLWorker::initializeReplication()
     active_node_holder = zkutil::EphemeralNodeHolder::existing(active_path, *active_node_holder_zookeeper);
 }
 
-void DatabaseReplicatedDDLWorker::markReplicasActive(bool reinitialized)
+void DatabaseReplicatedDDLWorker::markReplicasActive(bool reinitialized, bool /*should_create_dirs*/)
 {
     if (reinitialized || !active_node_holder_zookeeper || active_node_holder_zookeeper->expired())
     {
