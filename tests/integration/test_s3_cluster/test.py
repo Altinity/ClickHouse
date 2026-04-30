@@ -1493,7 +1493,7 @@ def test_object_storage_remote_initiator_without_cluster_function(started_cluste
             'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') ORDER BY (name, value, polygon)
         SETTINGS
             object_storage_remote_initiator=1,
-            object_storage_remote_initiator_cluster='cluster_with_dots_and_user'
+            object_storage_remote_initiator_cluster='cluster_with_dots'
         """,
         query_id = query_id,
     )
