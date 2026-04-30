@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-import sys
-import os
-import logging
-import subprocess
-from env_helper import TEMP_PATH, REPO_COPY, REPORT_PATH
-from s3_helper import S3Helper
-from pr_info import PRInfo
-from build_download_helper import download_builds_filter
-from report import FAIL, OK, FAILURE, SUCCESS, JobReport, TestResult
-from stopwatch import Stopwatch
 import hashlib
+import logging
+import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
+
+from build_download_helper import download_builds_filter
+from env_helper import TEMP_PATH, REPO_COPY, REPORT_PATH
+from pr_info import PRInfo
+from report import FAIL, OK, FAILURE, SUCCESS, JobReport, TestResult
+from s3_helper import S3Helper
+from stopwatch import Stopwatch
 
 GPG_BINARY_SIGNING_KEY = os.getenv("GPG_BINARY_SIGNING_KEY")
 GPG_BINARY_SIGNING_PASSPHRASE = os.getenv("GPG_BINARY_SIGNING_PASSPHRASE")
 
 CHECK_NAME = os.getenv("CHECK_NAME", "Sign release")
-SIGNING_PUBLIC_KEY_FILE = "signing_pubkey.asc"
+GPG_HOME_PATH = Path(TEMP_PATH) / "gpg_home"
+SIGNING_PUBKEY_PATH = Path(TEMP_PATH) / "signing_pubkey.asc"
+
 
 def hash_file(file_path):
     BLOCK_SIZE = 65536 # The size of each read from the file
@@ -36,26 +40,52 @@ def hash_file(file_path):
 
     return hash_file_path
 
-def import_private_signing_key():
-    priv_key_file_path = 'priv.key'
-    with open(priv_key_file_path, 'w') as f:
-        f.write(GPG_BINARY_SIGNING_KEY)
 
-    try:
+def import_signing_key(gpg_home_path):
+    if not GPG_BINARY_SIGNING_KEY:
+        raise RuntimeError("GPG_BINARY_SIGNING_KEY is not set")
+    if not GPG_BINARY_SIGNING_PASSPHRASE:
+        raise RuntimeError("GPG_BINARY_SIGNING_PASSPHRASE is not set")
+
+    gpg_home_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    gpg_home_path.chmod(0o700)
+    subprocess.run(
+        ["gpg", "--homedir", str(gpg_home_path), "--batch", "--import"],
+        input=GPG_BINARY_SIGNING_KEY.encode(),
+        check=True,
+    )
+
+
+def export_public_key(gpg_home_path, out_file_path):
+    with open(out_file_path, "wb") as out_file:
         subprocess.run(
-            f'echo {GPG_BINARY_SIGNING_PASSPHRASE} | gpg --batch --import {priv_key_file_path}',
-            shell=True,
+            ["gpg", "--homedir", str(gpg_home_path), "--armor", "--export"],
+            stdout=out_file,
             check=True,
         )
-    finally:
-        os.remove(priv_key_file_path)
+    print(f"Exported signing public key to {out_file_path}")
 
 
-def sign_file(file_path):
+def sign_file(file_path, gpg_home_path):
+
     out_file_path = f'{file_path}.gpg'
+
     subprocess.run(
-        f'gpg -o {out_file_path} --pinentry-mode=loopback --batch --yes --passphrase {GPG_BINARY_SIGNING_PASSPHRASE} --sign {file_path}',
-        shell=True,
+        [
+            "gpg",
+            "--homedir",
+            str(gpg_home_path),
+            "-o",
+            out_file_path,
+            "--pinentry-mode=loopback",
+            "--batch",
+            "--yes",
+            "--passphrase-fd",
+            "0",
+            "--sign",
+            file_path,
+        ],
+        input=f"{GPG_BINARY_SIGNING_PASSPHRASE}\n".encode(),
         check=True,
     )
     print(f"Signed {file_path}")
@@ -63,13 +93,11 @@ def sign_file(file_path):
     return out_file_path
 
 
-def export_public_signing_key(out_file_path: Path):
-    subprocess.run(
-        f"gpg --armor --output {out_file_path} --export",
-        shell=True,
-        check=True,
-    )
-    print(f"Exported signing public key to {out_file_path}")
+def upload_file_to_s3(s3_helper, file_path, s3_path_prefix):
+    s3_path = s3_path_prefix / os.path.basename(file_path)
+    s3_helper.upload_build_file_to_s3(Path(file_path), str(s3_path))
+    print(f'Uploaded file {file_path} to {s3_path}')
+
 
 def main():
     stopwatch = Stopwatch()
@@ -95,28 +123,26 @@ def main():
     download_builds_filter(CHECK_NAME, reports_path, Path(TEMP_PATH))
 
     try:
-        import_private_signing_key()
+        import_signing_key(GPG_HOME_PATH)
+
         for f in os.listdir(TEMP_PATH):
             full_path = os.path.join(TEMP_PATH, f)
             if os.path.isdir(full_path):
                 continue
             hashed_file_path = hash_file(full_path)
-            signed_file_path = sign_file(hashed_file_path)
-            s3_path = s3_path_prefix / os.path.basename(signed_file_path)
-            s3_helper.upload_build_file_to_s3(Path(signed_file_path), str(s3_path))
-            print(f'Uploaded file {signed_file_path} to {s3_path}')
+            signed_file_path = sign_file(hashed_file_path, GPG_HOME_PATH)
+            upload_file_to_s3(s3_helper, signed_file_path, s3_path_prefix)
             test_results.append(TestResult(name=os.path.basename(full_path), status=OK))
 
-        public_key_path = Path(TEMP_PATH) / SIGNING_PUBLIC_KEY_FILE
-        export_public_signing_key(public_key_path)
-        s3_helper.upload_build_file_to_s3(
-            public_key_path, str(s3_path_prefix / SIGNING_PUBLIC_KEY_FILE)
-        )
-        test_results.append(TestResult(name=SIGNING_PUBLIC_KEY_FILE, status=OK))
+        export_public_key(GPG_HOME_PATH, SIGNING_PUBKEY_PATH)
+        upload_file_to_s3(s3_helper, SIGNING_PUBKEY_PATH, s3_path_prefix)
+        test_results.append(TestResult(name=SIGNING_PUBKEY_PATH.name, status=OK))
     except Exception as ex:
         state = FAILURE
         description = f"Failed to sign release artifacts: {ex}"
         test_results.append(TestResult(name=CHECK_NAME, status=FAIL, raw_logs=str(ex)))
+    finally:
+        shutil.rmtree(GPG_HOME_PATH, ignore_errors=True)
 
     # Signed hashes are:
     # clickhouse-client_22.3.15.2.altinitystable_amd64.deb.sha512.gpg              clickhouse-keeper_22.3.15.2.altinitystable_x86_64.apk.sha512.gpg
