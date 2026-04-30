@@ -74,6 +74,7 @@ jobs:
       SUITE_EXECUTABLE: ${{ inputs.suite_executable }}
       STORAGE: ${{ inputs.storage_path }}
       PART: ${{ inputs.part }}
+      REPORT_JOB_NAME: ${{ format('{0}{1}', inputs.job_name != '' && inputs.job_name || inputs.suite_name, inputs.part != '' && format('_{0}', inputs.part) || '') }}
       # AWS credentials
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -98,7 +99,7 @@ jobs:
         --local
         --collect-service-logs
         --output ${{ inputs.output_format }}
-        --attr project="${GITHUB_REPOSITORY}" project.id="${GITHUB_REPOSITORY_ID}" user.name="${GITHUB_ACTOR}" version="${{ fromJson(inputs.workflow_config).custom_data.version.string }}" package="$clickhouse_path" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name=$GITHUB_JOB job.retry=$GITHUB_RUN_ATTEMPT job.url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" arch="$(uname -i)"
+        --attr project="${GITHUB_REPOSITORY}" project.id="${GITHUB_REPOSITORY_ID}" user.name="${GITHUB_ACTOR}" version="${{ fromJson(inputs.workflow_config).custom_data.version.string }}" package="$clickhouse_path" repository="https://github.com/Altinity/clickhouse-regression" commit.hash="$(git rev-parse HEAD)" job.name="$REPORT_JOB_NAME" job.retry=$GITHUB_RUN_ATTEMPT job.url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" arch="$(uname -i)"
         --cicd
         --log raw.log
         ${{ inputs.flags != 'none' && inputs.flags || ''}}
@@ -168,7 +169,7 @@ jobs:
           exit $EXITCODE
 
       - name: 📊 Set Commit Status
-        if: always() && inputs.set_commit_status       
+        if: ${{ !cancelled() && inputs.set_commit_status }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           JOB_OUTCOME: ${{ steps.run_suite.outcome }}
@@ -176,16 +177,16 @@ jobs:
         run: python3 .github/set_builds_status.py
 
       - name: 📝 Create and upload logs
-        if: always()
+        if: ${{ !cancelled() }}
         run: .github/create_and_upload_logs.sh 1
 
       - name: 📤 Upload logs to results database
-        if: always()
+        if: ${{ !cancelled() }}
         timeout-minutes: 20
         run: .github/upload_results_to_database.sh 1
 
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: ${{ !cancelled() }}
         with:
           name: ${{ format('{0}{1}-artifacts-{2}{3}', inputs.job_name != '' && inputs.job_name || inputs.suite_name, inputs.part != '' && format('_{0}', inputs.part) || '', inputs.runner_arch, contains(inputs.extra_args, '--use-keeper') && '_keeper' || '_zookeeper') }}
           path: ${{ env.artifact_paths }}

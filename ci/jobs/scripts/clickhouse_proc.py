@@ -790,7 +790,7 @@ clickhouse-client --query "SELECT count() FROM test.visits"
         results.append(
             Result.from_commands_run(
                 name="Logical error thrown (in clickhouse-server.log or clickhouse-server.err.log)",
-                command=f"cd {self.log_dir} && ! grep -a -A10 'Code: 49. DB::Exception: ' clickhouse-server*.log | head -n100 | tee /dev/stderr | grep -q .",
+                command=f"cd {self.log_dir} && ! grep -a -A10 -e 'Code: 49. DB::Exception: ' -e '<Fatal> : Logical error:' clickhouse-server*.log | head -n100 | tee /dev/stderr | grep -q .",
             )
         )
         results.append(
