@@ -12,7 +12,7 @@ RUN arch=${TARGETARCH:-amd64} \
     && ln -s "${rarch}-linux-gnu" /lib/linux-gnu
 
 
-FROM alpine:3.21.6
+FROM alpine:3.21.7
 
 ENV LANG=en_US.UTF-8 \
     LANGUAGE=en_US:en \
