@@ -42,6 +42,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         addSettingsChanges(settings_changes_history, "25.8.16.20002",
         {
             {"allow_local_data_lakes", false, false, "New setting."},
+            {"object_storage_remote_initiator_cluster", "", "", "New setting."},
         });
         addSettingsChanges(settings_changes_history, "25.8.9.2000",
         {
