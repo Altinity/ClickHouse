@@ -10,6 +10,8 @@ namespace DB
 namespace Setting
 {
     extern const SettingsString object_storage_cluster;
+    extern const SettingsBool object_storage_remote_initiator;
+    extern const SettingsString object_storage_remote_initiator_cluster;
 }
 
 namespace ErrorCodes
@@ -115,9 +117,11 @@ void TableFunctionObjectStorageClusterFallback<Definition, Base>::parseArguments
     const auto & settings = context->getSettingsRef();
 
     is_cluster_function = !settings[Setting::object_storage_cluster].value.empty();
+    is_remote = settings[Setting::object_storage_remote_initiator];
 
     if (is_cluster_function)
     {
+        /// Name may be empty, but cluster workaround may be used in remote initiator case
         ASTPtr cluster_name_arg = std::make_shared<ASTLiteral>(settings[Setting::object_storage_cluster].value);
         args.insert(args.begin(), cluster_name_arg);
         BaseCluster::parseArgumentsImpl(args, context);
@@ -135,7 +139,7 @@ StoragePtr TableFunctionObjectStorageClusterFallback<Definition, Base>::executeI
     ColumnsDescription cached_columns,
     bool is_insert_query) const
 {
-    if (is_cluster_function)
+    if (is_cluster_function || is_remote)
     {
         auto result = BaseCluster::executeImpl(ast_function, context, table_name, cached_columns, is_insert_query);
         if (auto storage = typeid_cast<std::shared_ptr<StorageObjectStorageCluster>>(result))

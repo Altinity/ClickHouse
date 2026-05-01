@@ -35,7 +35,11 @@ public:
         ClusterPtr) const override;
 
 private:
-    void updateQueryToSendIfNeeded(ASTPtr & query, const StorageSnapshotPtr & storage_snapshot, const ContextPtr & context) override;
+    void updateQueryToSendIfNeeded(
+        ASTPtr & query,
+        const StorageSnapshotPtr & storage_snapshot,
+        const ContextPtr & context,
+        bool /*make_cluster_function*/) override;
 
     Strings paths;
     String filename;
