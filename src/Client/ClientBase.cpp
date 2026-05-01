@@ -3060,6 +3060,7 @@ void ClientBase::initAIProvider()
         LOG_DEBUG(logger, "Failed to initialize AI SQL generator: {}", e.what());
     }
 }
+#endif
 
 std::string ClientBase::executeQueryForSingleString(const std::string & query)
 {
@@ -3148,6 +3149,7 @@ void ClientBase::syncDefaultDatabase()
     }
 }
 
+#if USE_CLIENT_AI
 bool ClientBase::checkAIProviderAcknowledgment()
 {
     // If API key came from environment and user hasn't acknowledged yet, ask for confirmation
