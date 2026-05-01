@@ -173,7 +173,11 @@ protected:
     virtual void initializeReplication();
 
     virtual void createReplicaDirs(const ZooKeeperPtr & zookeeper, const NameSet & host_ids);
-    virtual void markReplicasActive(bool reinitialized);
+    /// `should_create_dirs` controls whether `createReplicaDirs` is called.
+    /// We only create dirs on (re)initialization or when host IDs were just updated -
+    /// not on every main-loop tick, otherwise it races with external recursive deletion
+    /// of the DDL queue path (see Altinity/ClickHouse#1711).
+    virtual void markReplicasActive(bool reinitialized, bool should_create_dirs);
 
     void runMainThread();
     void runCleanupThread();
