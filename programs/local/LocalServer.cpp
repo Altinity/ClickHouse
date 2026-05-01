@@ -1149,6 +1149,10 @@ void LocalServer::processConfig()
         DatabaseCatalog::instance().startupBackgroundTasks();
     }
 
+    /// Always wire the manager, even without --path, so getNamedScalar
+    /// / system.named_scalars work.
+    global_context->initializeNamedScalars();
+
     std::string default_database = getClientConfiguration().getString("database", server_default_database);
     if (default_database.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "default_database cannot be empty");
