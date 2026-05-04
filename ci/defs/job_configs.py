@@ -73,6 +73,7 @@ class JobConfigs:
                 "./tests/queries/0_stateless/",
                 "./tests/config/",
                 "./tests/clickhouse-test",
+                "./tests/integration/",  # NOTE (strtgbb): integration tests are gated by fast test, so need to include them
                 "./src",
                 "./contrib/",
                 "./CMakeLists.txt",
