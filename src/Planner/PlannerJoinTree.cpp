@@ -2363,6 +2363,11 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
 
     size_t joins_count = 0;
     bool is_full_join = false;
+    bool is_global_join = false;
+    bool is_right_join_with_remote_table = false;
+    int first_join_pos = -1;
+    int last_right_join_pos = -1;
+    bool is_cross_join = false;
     /// For each table, table function, query, union table expressions prepare before query plan build
     for (size_t i = 0; i < table_expressions_stack_size; ++i)
     {
@@ -2374,6 +2379,7 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
         if (table_expression_type == QueryTreeNodeType::CROSS_JOIN)
         {
             joins_count += table_expression->as<const CrossJoinNode &>().getTableExpressions().size() - 1;
+            is_cross_join = true;
             continue;
         }
 
@@ -2381,8 +2387,29 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
         {
             ++joins_count;
             const auto & join_node = table_expression->as<const JoinNode &>();
-            if (join_node.getKind() == JoinKind::Full)
+            const auto join_kind = join_node.getKind();
+
+            if (join_kind == JoinKind::Full)
                 is_full_join = true;
+
+            if (join_node.getLocality() == JoinLocality::Global)
+                is_global_join = true;
+
+            // save join positions for later check
+            if (first_join_pos < 0 && (join_kind == JoinKind::Left || join_kind == JoinKind::Inner || join_kind == JoinKind::Right))
+                first_join_pos = static_cast<int>(i);
+            if (join_kind == JoinKind::Right)
+                last_right_join_pos = static_cast<int>(i);
+
+            /// For RIGHT JOIN with a distributed table on the right side, disable parallel replicas.
+            /// The distributed table on the right side would be wrapped into a subquery,
+            /// causing parallel replicas to incorrectly choose the left table for parallel reading.
+            /// Each replica would then independently read the full distributed table, resulting in duplicate data.
+            if (join_kind == JoinKind::Right)
+            {
+                const auto & right_expression_data = planner_context->getTableExpressionDataOrThrow(join_node.getRightTableExpression());
+                is_right_join_with_remote_table = right_expression_data.isRemote();
+            }
 
             continue;
         }
@@ -2390,9 +2417,27 @@ JoinTreeQueryPlan buildJoinTreeQueryPlan(const QueryTreeNodePtr & query_node,
         prepareBuildQueryPlanForTableExpression(table_expression, planner_context);
     }
 
-    /// disable parallel replicas for n-way join with FULL JOIN involved
-    if (joins_count > 1 && is_full_join)
+    auto should_disable_parallel_replicas = [&]() -> bool
+    {
+        /// n-way join like LEFT/INNER/RIGHT ... RIGHT ...
+        /// if last RIGHT join position is after LEFT/INNER/RIGHT(another) join then the left side of the RIGHT join can't be parallelized
+        if (first_join_pos >= 0 && last_right_join_pos >= 0 && first_join_pos < last_right_join_pos)
+            return true;
+
+        /// for n-way join with FULL JOIN or GLOBAL JOINS or CROSS JOIN
+        if (joins_count > 1 && (is_full_join || is_global_join || is_cross_join))
+            return true;
+
+        /// For RIGHT JOIN with distributed table on the right side
+        if (is_right_join_with_remote_table)
+            return true;
+
+        return false;
+    };
+
+    if (should_disable_parallel_replicas())
         planner_context->getMutableQueryContext()->setSetting("enable_parallel_replicas", Field{0});
+
 
     // in case of n-way JOINs the table expression stack contains several join nodes
     // so, we need to find right parent node for a table expression to pass into buildQueryPlanForTableExpression()
