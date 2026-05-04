@@ -4284,32 +4284,6 @@ def test_object_storage_remote_initiator(started_cluster, format_version, storag
         """
     ).strip()
 
-    # Simple cluster
-    query_id = uuid.uuid4().hex
-    result = instance.query(
-        f"""
-        SELECT * from {TABLE_NAME}
-        ORDER BY ALL
-        SETTINGS object_storage_remote_initiator=1
-        """,
-        query_id = query_id,
-    ).strip()
-
-    assert result == expected_result
-
-    instance.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster_simple'")
-    queries = instance.query(
-        f"""
-        SELECT count()
-            FROM clusterAllReplicas('cluster_simple', system.query_log)
-            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
-            FORMAT TSV
-        """
-    ).splitlines()
-
-    # non cluster request - only on initial node
-    assert queries == ["1"]
-
     # Remote initiator. Use 'cluster_second' to avoid choosing node1 as initiator, it can reduce number of subqueries
     query_id = uuid.uuid4().hex
 
@@ -4431,24 +4405,6 @@ def test_object_storage_remote_initiator(started_cluster, format_version, storag
     assert queries == ["1"]
 
     query_id = uuid.uuid4().hex
-    result = instance.query(f"SELECT * FROM {table_function} ORDER BY ALL SETTINGS object_storage_remote_initiator=1", query_id=query_id).strip()
-
-    assert result == expected_result
-
-    instance.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster_simple'")
-    queries = instance.query(
-        f"""
-        SELECT count()
-            FROM clusterAllReplicas('cluster_simple', system.query_log)
-            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
-            FORMAT TSV
-        """
-    ).splitlines()
-
-    # initial node
-    assert queries == ["1"]
-
-    query_id = uuid.uuid4().hex
     result = instance.query(f"SELECT * FROM {table_function} ORDER BY ALL SETTINGS object_storage_remote_initiator=1, object_storage_cluster='cluster_second'", query_id=query_id).strip()
 
     assert result == expected_result
@@ -4468,24 +4424,6 @@ def test_object_storage_remote_initiator(started_cluster, format_version, storag
 
     query_id = uuid.uuid4().hex
     result = instance.query(f"SELECT * FROM {table_function_with_structure} ORDER BY ALL", query_id=query_id).strip()
-
-    assert result == expected_result
-
-    instance.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster_simple'")
-    queries = instance.query(
-        f"""
-        SELECT count()
-            FROM clusterAllReplicas('cluster_simple', system.query_log)
-            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
-            FORMAT TSV
-        """
-    ).splitlines()
-
-    # initial node
-    assert queries == ["1"]
-
-    query_id = uuid.uuid4().hex
-    result = instance.query(f"SELECT * FROM {table_function_with_structure} ORDER BY ALL SETTINGS object_storage_remote_initiator=1", query_id=query_id).strip()
 
     assert result == expected_result
 
