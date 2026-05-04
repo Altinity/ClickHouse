@@ -202,6 +202,14 @@
 - name: test_async_load_databases/test.py::test_materialized_views_replicated
   reason: 'KNOWN: Flaky upstream test. Fixed in upstream PR #88573 but not backported to 25.8.'
   message: 'DATABASE_ALREADY_EXISTS'
+- name: test_storage_iceberg/test.py::test_object_storage_remote_initiator[azure-1]
+  reason: 'KNOWN: Broken test'
+- name: test_storage_iceberg/test.py::test_object_storage_remote_initiator[azure-2]
+  reason: 'KNOWN: Broken test'
+- name: test_storage_iceberg/test.py::test_object_storage_remote_initiator[s3-1]
+  reason: 'KNOWN: Broken test'
+- name: test_storage_iceberg/test.py::test_object_storage_remote_initiator[s3-2]
+  reason: 'KNOWN: Broken test'
 
 # Regex rules should be ordered from most specific to least specific.
 # regex: true applies to name, message, and not_message fields, but not to reason or check_types fields.

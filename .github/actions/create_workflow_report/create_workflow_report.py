@@ -281,7 +281,7 @@ def get_checks_errors(client: Client, commit_sha: str, branch_name: str):
                 WHERE commit_sha='{commit_sha}' AND head_ref='{branch_name}'
                 GROUP BY check_name, test_name, report_url, task_url
             )
-            WHERE job_status=='error'
+            WHERE job_status=='error' AND test_status NOT IN ('OK', 'SKIPPED')
             ORDER BY job_name, test_name
             """
     return client.query_dataframe(query)
