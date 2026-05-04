@@ -7,6 +7,7 @@
 #include <Common/logger_useful.h>
 #include <Common/ZooKeeper/KeeperException.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
+#include <Common/ZooKeeper/ZooKeeperCommon.h>
 
 #include <Interpreters/Context.h>
 #include <base/getFQDNOrHostName.h>
@@ -93,6 +94,7 @@ String NamedScalarValueBackendShared::lockPath(const String & value_key) const
 
 void NamedScalarValueBackendShared::createRootNodesIfNeeded()
 {
+    auto component_guard = Coordination::setCurrentComponent("NamedScalarValueBackendShared::createRootNodesIfNeeded");
     auto [zookeeper, _] = zookeeper_getter.getZooKeeper();
     zookeeper->createAncestors(zookeeper_root);
     zookeeper->createIfNotExists(zookeeper_root, "");
@@ -101,6 +103,7 @@ void NamedScalarValueBackendShared::createRootNodesIfNeeded()
 
 std::optional<String> NamedScalarValueBackendShared::readValueBlob(const String & value_key)
 {
+    auto component_guard = Coordination::setCurrentComponent("NamedScalarValueBackendShared::readValueBlob");
     auto zookeeper = getZooKeeper();
     const auto path = valuePath(value_key);
     String data;
@@ -114,6 +117,7 @@ bool NamedScalarValueBackendShared::readValueWithDataWatch(
     String & out,
     std::function<void()> on_change)
 {
+    auto component_guard = Coordination::setCurrentComponent("NamedScalarValueBackendShared::readValueWithDataWatch");
     auto zookeeper = getZooKeeper();
     const String path = valuePath(value_key);
 
@@ -149,6 +153,7 @@ std::optional<String> NamedScalarValueBackendShared::readValueBlobAndWatch(
 
 void NamedScalarValueBackendShared::removeValue(const String & value_key)
 {
+    auto component_guard = Coordination::setCurrentComponent("NamedScalarValueBackendShared::removeValue");
     auto zookeeper = getZooKeeper();
     const auto path = valueGroupPath(value_key);
     auto code = zookeeper->tryRemoveRecursive(path);
@@ -160,6 +165,7 @@ std::unique_ptr<NamedScalarValueBackendShared::RefreshReservation> NamedScalarVa
     const String & value_key,
     const String & lock_holder_message)
 {
+    auto component_guard = Coordination::setCurrentComponent("NamedScalarValueBackendShared::tryReserveRefresh");
     auto zookeeper = getZooKeeper();
     const String path = lockPath(value_key);
     zookeeper->createAncestors(path);
@@ -190,6 +196,7 @@ RefreshPublishResult NamedScalarValueBackendShared::publishRefreshValue(
     fiu_do_on(FailPoints::shared_named_scalars_store_value_fail_once,
         throw Exception(ErrorCodes::KEEPER_EXCEPTION, "Injected failure while storing shared scalar '{}'", name););
 
+    auto component_guard = Coordination::setCurrentComponent("NamedScalarValueBackendShared::publishRefreshValue");
     auto zookeeper = reservation.zookeeper;
     const auto path = valuePath(value_key);
 

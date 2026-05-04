@@ -5,6 +5,7 @@
 #include <Common/logger_useful.h>
 #include <Common/setThreadName.h>
 #include <Common/ZooKeeper/IKeeper.h>
+#include <Common/ZooKeeper/ZooKeeperCommon.h>
 
 #include <Interpreters/NamedScalars/NamedScalar.h>
 #include <Interpreters/NamedScalars/NamedScalarsManager.h>
@@ -127,6 +128,7 @@ void SharedNamedScalarsWatcher::watchLoop()
 
 void SharedNamedScalarsWatcher::initialLoad()
 {
+    auto component_guard = Coordination::setCurrentComponent("SharedNamedScalarsWatcher::initialLoad");
     Strings names = readDefinitionsAndInstallChildrenWatch();
     for (const auto & name : names)
         reconcileScalar(name);
@@ -134,6 +136,7 @@ void SharedNamedScalarsWatcher::initialLoad()
 
 void SharedNamedScalarsWatcher::resyncAll()
 {
+    auto component_guard = Coordination::setCurrentComponent("SharedNamedScalarsWatcher::resyncAll");
     Strings names = readDefinitionsAndInstallChildrenWatch();
     std::unordered_set<String> present(names.begin(), names.end());
 
@@ -150,6 +153,7 @@ void SharedNamedScalarsWatcher::resyncAll()
 
 void SharedNamedScalarsWatcher::reconcileScalar(const String & name)
 {
+    auto component_guard = Coordination::setCurrentComponent("SharedNamedScalarsWatcher::reconcileScalar");
     String definition_blob;
     if (!readDefinitionData(name, definition_blob))
     {

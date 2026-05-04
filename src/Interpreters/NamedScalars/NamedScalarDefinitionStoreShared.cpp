@@ -7,6 +7,7 @@
 #include <Common/logger_useful.h>
 #include <Common/ZooKeeper/KeeperException.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
+#include <Common/ZooKeeper/ZooKeeperCommon.h>
 
 #include <Interpreters/Context.h>
 
@@ -82,6 +83,7 @@ String NamedScalarDefinitionStoreShared::definitionPath(const String & name) con
 
 void NamedScalarDefinitionStoreShared::createRootNodesIfNeeded()
 {
+    auto component_guard = Coordination::setCurrentComponent("NamedScalarDefinitionStoreShared::createRootNodesIfNeeded");
     auto [zookeeper, _] = zookeeper_getter.getZooKeeper();
     zookeeper->createAncestors(zookeeper_root);
     zookeeper->createIfNotExists(zookeeper_root, "");
@@ -90,18 +92,21 @@ void NamedScalarDefinitionStoreShared::createRootNodesIfNeeded()
 
 bool NamedScalarDefinitionStoreShared::definitionExists(const String & name)
 {
+    auto component_guard = Coordination::setCurrentComponent("NamedScalarDefinitionStoreShared::definitionExists");
     auto zookeeper = getZooKeeper();
     return zookeeper->exists(definitionPath(name));
 }
 
 size_t NamedScalarDefinitionStoreShared::definitionCount()
 {
+    auto component_guard = Coordination::setCurrentComponent("NamedScalarDefinitionStoreShared::definitionCount");
     auto zookeeper = getZooKeeper();
     return zookeeper->getChildren(definitionsRootPath()).size();
 }
 
 bool NamedScalarDefinitionStoreShared::removeDefinition(const String & name, bool throw_if_not_exists)
 {
+    auto component_guard = Coordination::setCurrentComponent("NamedScalarDefinitionStoreShared::removeDefinition");
     auto zookeeper = getZooKeeper();
     const auto def_path = definitionPath(name);
     Coordination::Error code = zookeeper->tryRemoveRecursive(def_path);
@@ -126,6 +131,7 @@ bool NamedScalarDefinitionStoreShared::publishDefinition(
     fiu_do_on(FailPoints::shared_named_scalars_store_value_fail_once,
         throw Exception(ErrorCodes::KEEPER_EXCEPTION, "Injected failure while storing shared scalar '{}'", name););
 
+    auto component_guard = Coordination::setCurrentComponent("NamedScalarDefinitionStoreShared::publishDefinition");
     auto zookeeper = getZooKeeper();
     const auto def_path = definitionPath(name);
 
@@ -168,6 +174,7 @@ bool NamedScalarDefinitionStoreShared::publishDefinition(
 
 std::vector<LoadedNamedScalarDefinition> NamedScalarDefinitionStoreShared::loadAll()
 {
+    auto component_guard = Coordination::setCurrentComponent("NamedScalarDefinitionStoreShared::loadAll");
     auto zookeeper = getZooKeeper();
     Strings children = zookeeper->getChildren(definitionsRootPath());
 
@@ -190,6 +197,7 @@ std::vector<LoadedNamedScalarDefinition> NamedScalarDefinitionStoreShared::loadA
 
 Strings NamedScalarDefinitionStoreShared::listDefinitionsWithChildrenWatch(std::function<void()> on_change)
 {
+    auto component_guard = Coordination::setCurrentComponent("NamedScalarDefinitionStoreShared::listDefinitionsWithChildrenWatch");
     auto zookeeper = getZooKeeper();
     auto watcher = zookeeper->createWatchFromRawCallback(
         fmt::format("SharedNamedScalarsWatcher(named_scalars/)"),
@@ -214,6 +222,7 @@ Strings NamedScalarDefinitionStoreShared::listDefinitionsWithChildrenWatch(std::
 
 bool NamedScalarDefinitionStoreShared::readDefinition(const String & name, String & out)
 {
+    auto component_guard = Coordination::setCurrentComponent("NamedScalarDefinitionStoreShared::readDefinition");
     auto zookeeper = getZooKeeper();
     return zookeeper->tryGet(definitionPath(name), out);
 }
@@ -223,6 +232,7 @@ bool NamedScalarDefinitionStoreShared::readDefinitionWithDataWatch(
     String & out,
     std::function<void()> on_change)
 {
+    auto component_guard = Coordination::setCurrentComponent("NamedScalarDefinitionStoreShared::readDefinitionWithDataWatch");
     auto zookeeper = getZooKeeper();
     auto watcher = zookeeper->createWatchFromRawCallback(
         fmt::format("NamedScalar(definition/{})", name),
