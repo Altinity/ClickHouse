@@ -174002,3 +174002,7 @@ select5.test:3397
 select5.test:3413
 select5.test:3429
 select5.test:3445
+random/expr/slt_good_11.test:39558
+random/expr/slt_good_117.test:62898
+random/expr/slt_good_46.test:49107
+random/expr/slt_good_9.test:77346
