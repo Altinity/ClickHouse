@@ -185,10 +185,15 @@ RemoteQueryExecutor::RemoteQueryExecutor(
     const Tables & external_tables_,
     QueryProcessingStage::Enum stage_,
     std::shared_ptr<const QueryPlan> query_plan_,
-    std::optional<Extension> extension_)
+    std::optional<Extension> extension_,
+    ConnectionPoolWithFailoverPtr pool)
     : RemoteQueryExecutor(query_, header_, context_, scalars_, external_tables_, stage_, std::move(query_plan_), extension_)
 {
-    create_connections = [this, connections_, throttler, extension_](AsyncCallback) mutable
+    /// Capture `pool` in the lambda to prevent the connection pool from being destroyed
+    /// while entries are still in use. The Entry objects hold raw references (via PoolEntryHelper)
+    /// back to the pool's internal PooledObject and PoolBase structures, so the pool must
+    /// outlive all Entry objects.
+    create_connections = [this, connections_, throttler, extension_, pool](AsyncCallback) mutable
     {
         auto res = std::make_unique<MultiplexedConnections>(std::move(connections_), context, throttler);
         if (extension_ && extension_->replica_info)
@@ -657,7 +662,11 @@ RemoteQueryExecutor::ReadResult RemoteQueryExecutor::processPacket(Packet packet
             /// We can actually return it, and the first call to RemoteQueryExecutor::read
             /// will return earlier. We should consider doing it.
             if (!packet.block.empty() && (packet.block.rows() > 0))
+            {
+                if (extension && extension->replica_info)
+                    replica_has_processed_data.insert(extension->replica_info->number_of_current_replica);
                 return ReadResult(adaptBlockStructure(packet.block, *header));
+            }
             break;  /// If the block is empty - we will receive other packets before EndOfStream.
 
         case Protocol::Server::Exception:
@@ -717,6 +726,19 @@ RemoteQueryExecutor::ReadResult RemoteQueryExecutor::processPacket(Packet packet
             break;
 
         case Protocol::Server::TimezoneUpdate:
+            break;
+
+        case Protocol::Server::ConnectionLost:
+            if (extension && extension->task_iterator && extension->task_iterator->supportRerunTask() && extension->replica_info)
+            {
+                if (!replica_has_processed_data.contains(extension->replica_info->number_of_current_replica))
+                {
+                    finished = true;
+                    extension->task_iterator->rescheduleTasksFromReplica(extension->replica_info->number_of_current_replica);
+                    return ReadResult(Block{});
+                }
+            }
+            packet.exception->rethrow();
             break;
 
         default:
@@ -998,6 +1020,11 @@ void RemoteQueryExecutor::setProfileInfoCallback(ProfileInfoCallback callback)
 {
     LockAndBlocker guard(was_cancelled_mutex);
     profile_info_callback = std::move(callback);
+}
+
+bool RemoteQueryExecutor::skipUnavailableShards() const
+{
+    return context->getSettingsRef()[Setting::skip_unavailable_shards];
 }
 
 bool RemoteQueryExecutor::needToSkipUnavailableShard()
