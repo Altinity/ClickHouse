@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import time
 from pathlib import Path
 from itertools import combinations
 import json
@@ -11,6 +12,7 @@ import pandas as pd
 from jinja2 import Environment, FileSystemLoader
 import requests
 from clickhouse_driver import Client
+from clickhouse_driver.errors import ServerException
 import boto3
 from botocore.exceptions import NoCredentialsError
 
@@ -50,6 +52,30 @@ def get_run_details(run_url: str) -> dict:
         )
 
     return response.json()
+
+
+def _is_clickhouse_memory_limit_error(exc: BaseException) -> bool:
+    if isinstance(exc, ServerException) and getattr(exc, "code", None) == 241:
+        return True
+    msg = str(exc).lower()
+    return "memory limit" in msg or "memory_limit" in msg
+
+
+def query_dataframe_with_retry(
+    client: Client,
+    query: str,
+    *,
+    max_attempts: int = 5,
+    backoff_seconds: float = 3.0,
+) -> pd.DataFrame:
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return client.query_dataframe(query)
+        except Exception as e:
+            if not _is_clickhouse_memory_limit_error(e) or attempt >= max_attempts:
+                raise
+            wait = backoff_seconds * attempt
+            time.sleep(wait)
 
 
 def get_commit_statuses(sha: str) -> pd.DataFrame:
@@ -171,29 +197,63 @@ def get_run_details(run_url: str) -> dict:
     return response.json()
 
 
+def _checks_latest_test_status_cte(job_url: str) -> str:
+    """
+    Shared filtering for gh-data.checks: anchor time excludes stateless teardown checks
+    (Stateless% + test_name not matching ^[0-9]{5}); keep rows with check_start_time
+    >= anchor so main + teardown phases are included.
+    """
+    return f"""WITH checks_with_anchor AS (
+            SELECT
+                check_name,
+                test_name,
+                report_url,
+                check_status,
+                test_status,
+                check_start_time,
+                maxIf(
+                    check_start_time,
+                    NOT (check_name LIKE 'Stateless%' AND NOT match(test_name, '^[0-9]{{5}}'))
+                ) OVER (PARTITION BY check_name) AS latest_check_start_time
+            FROM `gh-data`.checks
+            WHERE task_url LIKE '{job_url}%'
+        ),
+        rows_from_latest_check_run AS (
+            SELECT
+                check_name,
+                test_name,
+                report_url,
+                check_status,
+                test_status,
+                check_start_time
+            FROM checks_with_anchor
+            WHERE check_start_time >= latest_check_start_time
+        ),
+        latest_test_status AS (
+            SELECT
+                argMax(check_status, check_start_time) AS job_status,
+                check_name AS job_name,
+                argMax(test_status, check_start_time) AS status,
+                test_name,
+                report_url AS results_link
+            FROM rows_from_latest_check_run
+            GROUP BY check_name, test_name, report_url
+        )"""
+
+
 def get_checks_fails(client: Client, job_url: str):
     """
     Get tests that did not succeed for the given job URL.
     Exclude checks that have status 'error' as they are counted in get_checks_errors.
     """
-    query = f"""SELECT job_status, job_name, status as test_status, test_name, results_link
-            FROM (
-                SELECT
-                    argMax(check_status, check_start_time) as job_status,
-                    check_name as job_name,
-                    argMax(test_status, check_start_time) as status,
-                    test_name,
-                    report_url as results_link,
-                    task_url
-                FROM `gh-data`.checks
-                GROUP BY check_name, test_name, report_url, task_url
-            )
-            WHERE task_url LIKE '{job_url}%'
-            AND test_status IN ('FAIL', 'ERROR')
-            AND job_status!='error'
-            ORDER BY job_name, test_name
-            """
-    return client.query_dataframe(query)
+    query = f"""{_checks_latest_test_status_cte(job_url)}
+        SELECT job_status, job_name, status AS test_status, test_name, results_link
+        FROM latest_test_status
+        WHERE test_status IN ('FAIL', 'ERROR')
+        AND job_status != 'error'
+        ORDER BY job_name, test_name
+        """
+    return query_dataframe_with_retry(client, query)
 
 
 def get_checks_known_fails(client: Client, job_url: str, known_fails: dict):
@@ -203,25 +263,18 @@ def get_checks_known_fails(client: Client, job_url: str, known_fails: dict):
     if len(known_fails) == 0:
         return pd.DataFrame()
 
-    query = f"""SELECT job_status, job_name, status as test_status, test_name, results_link
-        FROM (
-            SELECT
-                argMax(check_status, check_start_time) as job_status,
-                check_name as job_name,
-                argMax(test_status, check_start_time) as status,
-                test_name,
-                report_url as results_link,
-                task_url
-            FROM `gh-data`.checks
-            GROUP BY check_name, test_name, report_url, task_url
-        )
-        WHERE task_url LIKE '{job_url}%'
-        AND test_status='BROKEN'
+    query = f"""{_checks_latest_test_status_cte(job_url)}
+        SELECT job_name, status AS test_status, test_name, results_link
+        FROM latest_test_status
+        WHERE status = 'BROKEN'
         AND test_name IN ({','.join(f"'{test}'" for test in known_fails.keys())})
         ORDER BY job_name, test_name
         """
 
-    df = client.query_dataframe(query)
+    df = query_dataframe_with_retry(client, query)
+
+    if df.shape[0] == 0:
+        return df
 
     df.insert(
         len(df.columns) - 1,
@@ -240,23 +293,13 @@ def get_checks_errors(client: Client, job_url: str):
     """
     Get checks that have status 'error' for the given job URL.
     """
-    query = f"""SELECT job_status, job_name, status as test_status, test_name, results_link
-            FROM (
-                SELECT
-                    argMax(check_status, check_start_time) as job_status,
-                    check_name as job_name,
-                    argMax(test_status, check_start_time) as status,
-                    test_name,
-                    report_url as results_link,
-                    task_url
-                FROM `gh-data`.checks
-                GROUP BY check_name, test_name, report_url, task_url
-            )
-            WHERE task_url LIKE '{job_url}%'
-            AND job_status=='error'
-            ORDER BY job_name, test_name
-            """
-    return client.query_dataframe(query)
+    query = f"""{_checks_latest_test_status_cte(job_url)}
+        SELECT job_status, job_name, status AS test_status, test_name, results_link
+        FROM latest_test_status
+        WHERE job_status = 'error' AND test_status NOT IN ('OK', 'SKIPPED')
+        ORDER BY job_name, test_name
+        """
+    return query_dataframe_with_retry(client, query)
 
 
 def drop_prefix_rows(df, column_to_clean):
@@ -298,7 +341,7 @@ def get_regression_fails(client: Client, job_url: str):
             WHERE job_url LIKE '{job_url}%'
             AND status IN ('Fail', 'Error')
             """
-    df = client.query_dataframe(query)
+    df = query_dataframe_with_retry(client, query)
     df = drop_prefix_rows(df, "test_name")
     df["job_name"] = df["job_name"].str.title()
     return df
@@ -352,7 +395,7 @@ def get_new_fails_this_pr(
             WHERE test_status NOT IN ('FAIL', 'ERROR')
             ORDER BY job_name, test_name
             """
-    base_checks = client.query_dataframe(base_checks_query)
+    base_checks = query_dataframe_with_retry(client, base_checks_query)
 
     # Get regression results from base branch that didn't fail
     base_regression_query = f"""SELECT arch, job_name, status, test_name, results_link
@@ -371,7 +414,7 @@ def get_new_fails_this_pr(
             )
             WHERE status NOT IN ('Fail', 'Error')
             """
-    base_regression = client.query_dataframe(base_regression_query)
+    base_regression = query_dataframe_with_retry(client, base_regression_query)
     if len(base_regression) > 0:
         base_regression["job_name"] = base_regression.apply(
             lambda row: f"{row['arch']} {row['job_name']}".strip(), axis=1
