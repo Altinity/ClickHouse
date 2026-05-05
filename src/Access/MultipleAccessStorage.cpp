@@ -17,6 +17,7 @@ namespace ErrorCodes
     extern const int ACCESS_ENTITY_ALREADY_EXISTS;
     extern const int ACCESS_STORAGE_FOR_INSERTION_NOT_FOUND;
     extern const int ACCESS_ENTITY_NOT_FOUND;
+    extern const int WRONG_PASSWORD;
 }
 
 using Storage = IAccessStorage;
@@ -466,25 +467,58 @@ MultipleAccessStorage::authenticateImpl(const Credentials & credentials, const P
                                         bool allow_no_password, bool allow_plaintext_password) const
 {
     auto storages = getStoragesInternal();
-    for (size_t i = 0; i != storages->size(); ++i)
+
+    /// Don't let a username match in an earlier storage shadow a valid match in a
+    /// later one when the credentials don't fit the earlier storage's auth methods.
+    ///
+    /// `LDAPAccessStorage` and `TokenAccessStorage` already return nullopt on
+    /// auth failure with the explicit comment that they want later storages to
+    /// keep trying. The default `IAccessStorage::authenticateImpl` (used by the
+    /// users.xml-backed storage and the SQL-managed storages) instead throws
+    /// `WRONG_PASSWORD` whenever it finds the username but no auth method
+    /// matches. Without this catch, a user listed in users.xml with a local
+    /// password can never be authenticated via an LDAP/Token directory entry of
+    /// the same name -- the chain dies on the first storage. That contradicts
+    /// the contract every chain-aware storage already implements.
+    ///
+    /// Catch `WRONG_PASSWORD` mid-chain, remember the latest one, and keep
+    /// iterating. If no storage authenticates, re-throw the saved exception so
+    /// callers see "wrong password" (not "user not found") whenever the user
+    /// did exist somewhere in the chain -- preserving the original error
+    /// semantics of the single-storage path.
+    std::exception_ptr saved_wrong_password;
+
+    for (const auto & storage : *storages)
     {
-        const auto & storage = (*storages)[i];
-        bool is_last_storage = (i == storages->size() - 1);
-        auto auth_result = storage->authenticate(credentials, address, external_authenticators, client_info,
-                                        (throw_if_user_not_exists && is_last_storage),
-                                        allow_no_password, allow_plaintext_password);
-        if (auth_result)
+        try
         {
-            std::lock_guard lock{mutex};
-            ids_cache.set(auth_result->user_id, storage);
-            return auth_result;
+            auto auth_result = storage->authenticate(credentials, address, external_authenticators, client_info,
+                                            /* throw_if_user_not_exists = */ false,
+                                            allow_no_password, allow_plaintext_password);
+            if (auth_result)
+            {
+                std::lock_guard lock{mutex};
+                ids_cache.set(auth_result->user_id, storage);
+                return auth_result;
+            }
+        }
+        catch (const Exception & e)
+        {
+            if (e.code() == ErrorCodes::WRONG_PASSWORD)
+            {
+                saved_wrong_password = std::current_exception();
+                continue;
+            }
+            throw;
         }
     }
 
+    if (saved_wrong_password)
+        std::rethrow_exception(saved_wrong_password);
+
     if (throw_if_user_not_exists)
         throwNotFound(AccessEntityType::USER, credentials.getUserName(), getStorageName());
-    else
-        return std::nullopt;
+    return std::nullopt;
 }
 
 
