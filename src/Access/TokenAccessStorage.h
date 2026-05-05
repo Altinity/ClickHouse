@@ -49,7 +49,14 @@ private:
 
     String provider_name;
     std::optional<re2::RE2> roles_filter = std::nullopt;
-    std::optional<String> roles_transform_pattern = std::nullopt;
+    /// `roles_transform` regex compiled once at construction. Storing the
+    /// compiled `re2::RE2` (instead of the pattern string) avoids per-call
+    /// recompilation and -- more importantly -- makes parse-time validation
+    /// possible: an invalid regex now fails the storage construction loudly
+    /// rather than silently no-op'ing every transform at runtime (which would
+    /// admit ungroomed role names; symmetric with the `roles_filter` fail-
+    /// closed handling).
+    std::optional<re2::RE2> roles_transform_pattern = std::nullopt;
     std::optional<String> roles_transform_replacement = std::nullopt;
     bool roles_transform_global = false;
 
