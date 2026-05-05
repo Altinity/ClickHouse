@@ -106,9 +106,17 @@ private:
 
     bool token_auth_enabled TSA_GUARDED_BY(mutex) = true;
 
+    /// Validates the credentials with the given processor. On success, mutates
+    /// `credentials` (user name, groups, effective expires_at) and returns true.
+    /// Does NOT write the token cache -- caching is the responsibility of the
+    /// caller, after the per-user `jwt_claims` policy has been evaluated.
     bool checkCredentialsAgainstProcessor(const ITokenProcessor & processor,
-                                          TokenCredentials & credentials,
-                                          bool prime_cache_on_success) const TSA_REQUIRES(mutex);
+                                          TokenCredentials & credentials) const TSA_REQUIRES(mutex);
+
+    /// Writes the per-token cache entry. Must be called only after both processor
+    /// validation AND any per-user `jwt_claims` policy have accepted the token.
+    void primeTokenCache(const ITokenProcessor & processor,
+                         const TokenCredentials & credentials) const TSA_REQUIRES(mutex);
 
     void resetImpl() TSA_REQUIRES(mutex);
 };
