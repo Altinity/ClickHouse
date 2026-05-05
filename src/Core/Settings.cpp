@@ -7547,10 +7547,6 @@ Throw an error if there are pending patch parts when exporting a merge tree part
 Only lock a part when the task is already running. This might help with busy waiting where the scheduler locks a part, but the task ends in the pending list.
 On the other hand, there is a chance once the task executes that part has already been locked by another replica and the task will simply early exit.
 )", 0) \
-    DECLARE(Bool, export_merge_tree_partition_system_table_prefer_remote_information, false, R"(
-Controls whether the system.replicated_partition_exports will prefer to query ZooKeeper to get the most up to date information or use the local information.
-Querying ZooKeeper is expensive, and only available if the ZooKeeper feature flag MULTI_READ is enabled.
-)", 0) \
     DECLARE(String, export_merge_tree_part_filename_pattern, "{part_name}_{checksum}", R"(
 Pattern for the filename of the exported merge tree part. The `part_name` and `checksum` are calculated and replaced on the fly. Additional macros are supported.
 )", 0) \
