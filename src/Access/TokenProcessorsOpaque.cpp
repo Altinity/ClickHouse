@@ -451,12 +451,18 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
     if (!jwks_uri_.empty())
     {
         LOG_TRACE(getLogger("TokenAuthentication"), "{}: JWKS URI set, local JWT processing will be attempted", processor_name_);
+        /// `expected_typ` is left empty here: OpenID's JWT-fastpath inherits no
+        /// `typ` enforcement from the operator config (the parser doesn't surface
+        /// `expected_typ` for the `openid` processor type yet). Operators who
+        /// want strict `typ` enforcement should use `jwt_static_jwks` /
+        /// `jwt_dynamic_jwks` directly instead of `openid`.
         jwt_validator.emplace(processor_name_ + "jwks_val",
                               token_cache_lifetime_,
                               username_claim_,
                               groups_claim_,
                               expected_issuer_,
                               expected_audience_,
+                              /*expected_typ=*/"",
                               allow_no_expiration_,
                               "",
                               verifier_leeway_,
@@ -619,12 +625,14 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
     if (openid_config.contains("jwks_uri"))
     {
         LOG_TRACE(getLogger("TokenAuthentication"), "{}: JWKS URI set, local JWT processing will be attempted", processor_name_);
+        /// `expected_typ` empty for the same reason as the manual constructor.
         jwt_validator.emplace(processor_name_ + "jwks_val",
                               token_cache_lifetime_,
                               username_claim_,
                               groups_claim_,
                               expected_issuer_,
                               expected_audience_,
+                              /*expected_typ=*/"",
                               allow_no_expiration_,
                               "",
                               verifier_leeway_,
