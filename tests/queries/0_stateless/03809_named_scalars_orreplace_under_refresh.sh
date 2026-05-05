@@ -75,9 +75,16 @@ for _ in $(seq 1 30); do
 done
 echo "$gauge"
 
-# Assertion 3: the slot's bookkeeping isn't stuck mid-flight. After the
-# settle window above no in-flight window should remain.
-${CLICKHOUSE_CLIENT} --query "
-SELECT refresh_in_flight, has_value, current_value_is_valid
-FROM system.named_scalars
-WHERE kind = 'local' AND name = '${NAME}'"
+# Assertion 3: the slot's bookkeeping isn't stuck mid-flight. Poll for
+# refresh_in_flight == 0 to avoid catching a tick that fired between
+# the metric poll above and this read.
+state="1\t1\t1"
+for _ in $(seq 1 30); do
+    state=$(${CLICKHOUSE_CLIENT} --query "
+        SELECT refresh_in_flight, has_value, current_value_is_valid
+        FROM system.named_scalars
+        WHERE kind = 'local' AND name = '${NAME}'")
+    [ "$(printf %s "$state" | cut -f1)" = "0" ] && break
+    sleep 0.5
+done
+printf '%s\n' "$state"
