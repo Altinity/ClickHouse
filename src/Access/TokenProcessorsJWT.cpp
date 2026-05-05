@@ -22,8 +22,18 @@ namespace ErrorCodes
 namespace
 {
 
-bool check_claims(const picojson::value & claims, const picojson::value & payload, const String & path);
-bool check_claims(const picojson::value::object & claims, const picojson::value::object & payload, const String & path)
+/// Depth budget for `check_claims` recursion.
+///
+/// `picojson::DEFAULT_MAX_DEPTHS = 100` rejects deeply-nested JSON at parse
+/// time, which already prevents the stack-exhaustion variant. We carry a
+/// smaller budget here as defense in depth: if a future contrib bump or
+/// PICOJSON_USE_RVALUE change widens the parse-time limit, this bound still
+/// caps recursion. 32 is well above any realistic operator-configured claim
+/// shape but keeps the worst-case stack frame count modest.
+constexpr int kMaxClaimsRecursionDepth = 32;
+
+bool check_claims(const picojson::value & claims, const picojson::value & payload, const String & path, int depth_remaining);
+bool check_claims(const picojson::value::object & claims, const picojson::value::object & payload, const String & path, int depth_remaining)
 {
     for (const auto & it : claims)
     {
@@ -33,7 +43,7 @@ bool check_claims(const picojson::value::object & claims, const picojson::value:
             LOG_TRACE(getLogger("TokenAuthentication"), "Key '{}.{}' not found in JWT payload", path, it.first);
             return false;
         }
-        if (!check_claims(it.second, payload_it->second, path + "." + it.first))
+        if (!check_claims(it.second, payload_it->second, path + "." + it.first, depth_remaining))
         {
             return false;
         }
@@ -41,7 +51,7 @@ bool check_claims(const picojson::value::object & claims, const picojson::value:
     return true;
 }
 
-bool check_claims(const picojson::value::array & claims, const picojson::value::array & payload, const String & path)
+bool check_claims(const picojson::value::array & claims, const picojson::value::array & payload, const String & path, int depth_remaining)
 {
     if (claims.size() > payload.size())
     {
@@ -54,9 +64,18 @@ bool check_claims(const picojson::value::array & claims, const picojson::value::
         const auto & claims_val = claims.at(claims_i);
         for (const auto & payload_val : payload)
         {
-            if (!check_claims(claims_val, payload_val, path + "[" + std::to_string(claims_i) + "]"))
-                continue;
-            found = true;
+            /// Break on the first match. Without this, the inner loop kept
+            /// scanning the rest of the payload even after finding a match,
+            /// turning the worst case into O(|claims_array| * |payload_array|)
+            /// even when matches are easy. Combined with `kMaxClaimsRecursionDepth`,
+            /// this caps CPU per `check_claims` call so a crafted token cannot
+            /// stall the global `ExternalAuthenticators::mutex` (H-19) for an
+            /// unbounded time.
+            if (check_claims(claims_val, payload_val, path + "[" + std::to_string(claims_i) + "]", depth_remaining))
+            {
+                found = true;
+                break;
+            }
         }
         if (!found)
         {
@@ -67,8 +86,18 @@ bool check_claims(const picojson::value::array & claims, const picojson::value::
     return true;
 }
 
-bool check_claims(const picojson::value & claims, const picojson::value & payload, const String & path)
+bool check_claims(const picojson::value & claims, const picojson::value & payload, const String & path, int depth_remaining)
 {
+    if (depth_remaining <= 0)
+    {
+        LOG_ERROR(getLogger("TokenAuthentication"),
+                  "JWT claims comparison exceeded the maximum recursion depth ({}) at '{}'; "
+                  "rejecting to bound CPU under the auth mutex.",
+                  kMaxClaimsRecursionDepth, path);
+        return false;
+    }
+    --depth_remaining;
+
     if (claims.is<picojson::array>())
     {
         if (!payload.is<picojson::array>())
@@ -76,7 +105,7 @@ bool check_claims(const picojson::value & claims, const picojson::value & payloa
             LOG_TRACE(getLogger("TokenAuthentication"), "JWT payload does not match key type 'array' in claims '{}'", path);
             return false;
         }
-        return check_claims(claims.get<picojson::array>(), payload.get<picojson::array>(), path);
+        return check_claims(claims.get<picojson::array>(), payload.get<picojson::array>(), path, depth_remaining);
     }
     if (claims.is<picojson::object>())
     {
@@ -85,7 +114,7 @@ bool check_claims(const picojson::value & claims, const picojson::value & payloa
             LOG_TRACE(getLogger("TokenAuthentication"), "JWT payload does not match key type 'object' in claims '{}'", path);
             return false;
         }
-        return check_claims(claims.get<picojson::object>(), payload.get<picojson::object>(), path);
+        return check_claims(claims.get<picojson::object>(), payload.get<picojson::object>(), path, depth_remaining);
     }
     if (claims.is<bool>())
     {
@@ -159,7 +188,7 @@ bool check_claims(const String & claims, const picojson::value::object & payload
         throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Bad JWT claims: {}", errors);
     if (!json.is<picojson::object>())
         throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Bad JWT claims: is not an object");
-    return check_claims(json.get<picojson::value::object>(), payload, "");
+    return check_claims(json.get<picojson::value::object>(), payload, "", kMaxClaimsRecursionDepth);
 }
 
 std::string create_public_key_from_ec_components(const std::string & x, const std::string & y, int curve_nid)
