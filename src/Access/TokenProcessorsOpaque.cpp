@@ -60,6 +60,26 @@ namespace
         return value.get<ValueType>();
     }
 
+    /// Bound every IdP-bound HTTP call (OIDC discovery, userinfo, introspection)
+    /// to a known limit. Without this, Poco's default `HTTPSession` timeout of
+    /// 60 seconds applies, and because `ExternalAuthenticators::mutex` is held
+    /// for the entire duration of `checkTokenCredentials` -- including the
+    /// outbound call this function makes -- a single slow or hung IdP would
+    /// stall the whole auth subsystem (LDAP, Kerberos, HTTP basic, every other
+    /// token auth) for up to a full minute per request.
+    ///
+    /// 10 seconds is a deliberately conservative cap: well above any healthy
+    /// IdP latency, well below the default. Operators who need a different
+    /// value would have to expose this via per-processor config; for now it
+    /// is hard-coded so deployments inherit the bounded behavior automatically.
+    constexpr int kIdpHttpTimeoutSeconds = 10;
+
+    void applyIdpSessionTimeouts(Poco::Net::HTTPClientSession & session)
+    {
+        const Poco::Timespan timeout(kIdpHttpTimeoutSeconds, 0);
+        session.setTimeout(timeout, timeout, timeout);
+    }
+
     picojson::object getObjectFromURI(const Poco::URI & uri, const String & token = "")
     {
         Poco::Net::HTTPResponse response;
@@ -71,12 +91,14 @@ namespace
 
         if (uri.getScheme() == "https") {
             Poco::Net::HTTPSClientSession session(uri.getHost(), uri.getPort());
+            applyIdpSessionTimeouts(session);
             session.sendRequest(request);
             Poco::StreamCopier::copyStream(session.receiveResponse(response), responseString);
         }
         else
         {
             Poco::Net::HTTPClientSession session(uri.getHost(), uri.getPort());
+            applyIdpSessionTimeouts(session);
             session.sendRequest(request);
             Poco::StreamCopier::copyStream(session.receiveResponse(response), responseString);
         }
