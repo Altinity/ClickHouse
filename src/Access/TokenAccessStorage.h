@@ -48,7 +48,6 @@ private:
     const String & prefix;
 
     String provider_name;
-    std::optional<re2::RE2> users_filter = std::nullopt;
     std::optional<re2::RE2> roles_filter = std::nullopt;
     std::optional<String> roles_transform_pattern = std::nullopt;
     std::optional<String> roles_transform_replacement = std::nullopt;
