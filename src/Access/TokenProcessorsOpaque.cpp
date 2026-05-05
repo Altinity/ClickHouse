@@ -475,11 +475,36 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
     /// any returned URL is outside <remote_url_allow_hosts>; this prevents the
     /// server from reaching out to attacker-controlled endpoints during token
     /// validation.
+    ///
+    /// Additionally, refuse non-HTTPS schemes on discovery-returned URLs.
+    /// Without this, an attacker who can MITM the discovery fetch (operator
+    /// typed an `http://` configuration_endpoint, or any TLS interception path)
+    /// can substitute a discovery doc whose `jwks_uri` is `http://169.254.169.254/...`
+    /// (cloud metadata), `http://127.0.0.1:...` (local admin ports), or
+    /// `http://kubernetes.default.svc:...` -- and the server issues a one-shot
+    /// HTTP GET under its own process identity. `<remote_url_allow_hosts>` is
+    /// the primary defense, but not every deployment configures it; an
+    /// HTTPS-only rule on returned URLs is a cheap, orthogonal layer that
+    /// blocks all three of those targets independently. Operators who run an
+    /// IdP over plain HTTP intentionally can wire the trust chain manually
+    /// (`userinfo_endpoint`/`token_introspection_endpoint`/`jwks_uri` directly)
+    /// instead of relying on discovery.
     auto require_allowed_discovery_url = [&](const std::string & url, const char * field)
     {
+        Poco::URI parsed_uri(url);
+        if (parsed_uri.getScheme() != "https")
+            throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
+                            "{}: OIDC discovery at '{}' returned non-HTTPS '{}' URL '{}' (scheme '{}'). "
+                            "The trust-chain URLs from discovery must use HTTPS so a poisoned discovery "
+                            "document cannot redirect token validation through internal endpoints "
+                            "(cloud metadata, localhost, in-cluster service IPs). If the IdP genuinely "
+                            "runs over plain HTTP, configure the trust chain manually instead of using "
+                            "'configuration_endpoint'.",
+                            processor_name, openid_config_endpoint_, field, url, parsed_uri.getScheme());
+
         try
         {
-            remote_host_filter_.checkURL(Poco::URI(url));
+            remote_host_filter_.checkURL(parsed_uri);
         }
         catch (const Exception & e)
         {
