@@ -12,6 +12,8 @@
 namespace DB
 {
 
+class RemoteHostFilter;
+
 namespace ErrorCodes
 {
 extern const int NOT_IMPLEMENTED;
@@ -214,7 +216,8 @@ public:
                          bool allow_no_expiration_,
                          const String & openid_config_endpoint_,
                          UInt64 verifier_leeway_,
-                         UInt64 jwks_cache_lifetime_);
+                         UInt64 jwks_cache_lifetime_,
+                         const RemoteHostFilter & remote_host_filter_);
 
     bool resolveAndValidate(TokenCredentials & credentials) const override;
 private:

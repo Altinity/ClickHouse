@@ -1,6 +1,7 @@
 #include "TokenProcessors.h"
 
 #if USE_JWT_CPP
+#include <Common/RemoteHostFilter.h>
 #include <Common/logger_useful.h>
 #include <Poco/StreamCopier.h>
 #include <Poco/Net/HTTPSClientSession.h>
@@ -308,13 +309,55 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
                                            bool allow_no_expiration_,
                                            const String & openid_config_endpoint_,
                                            UInt64 verifier_leeway_,
-                                           UInt64 jwks_cache_lifetime_)
+                                           UInt64 jwks_cache_lifetime_,
+                                           const RemoteHostFilter & remote_host_filter_)
     : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_)
 {
+    /// Defense in depth: the discovery endpoint itself was already validated by
+    /// the parser, but re-check here in case this constructor is reached via a
+    /// future code path that bypasses parseTokenProcessor.
+    try
+    {
+        remote_host_filter_.checkURL(Poco::URI(openid_config_endpoint_));
+    }
+    catch (const Exception & e)
+    {
+        throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
+                        "{}: 'configuration_endpoint' URL '{}' is not in <remote_url_allow_hosts>: {}",
+                        processor_name, openid_config_endpoint_, e.message());
+    }
+
     const picojson::object openid_config = getObjectFromURI(Poco::URI(openid_config_endpoint_));
 
     if (!openid_config.contains("userinfo_endpoint") || !openid_config.contains("introspection_endpoint"))
         throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "{}: Cannot extract userinfo_endpoint or introspection_endpoint from OIDC configuration, consider manual configuration.", processor_name);
+
+    /// The discovery document is untrusted: even with the issuer-anchor check
+    /// below (H-08), a poisoned or misdirected response can still try to point
+    /// trust-chain endpoints (jwks_uri, userinfo_endpoint, introspection_endpoint)
+    /// at hosts the operator never approved. Refuse to load the processor when
+    /// any returned URL is outside <remote_url_allow_hosts>; this prevents the
+    /// server from reaching out to attacker-controlled endpoints during token
+    /// validation.
+    auto require_allowed_discovery_url = [&](const std::string & url, const char * field)
+    {
+        try
+        {
+            remote_host_filter_.checkURL(Poco::URI(url));
+        }
+        catch (const Exception & e)
+        {
+            throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
+                            "{}: OIDC discovery at '{}' returned '{}' URL '{}' which is not in "
+                            "<remote_url_allow_hosts>: {}",
+                            processor_name, openid_config_endpoint_, field, url, e.message());
+        }
+    };
+
+    require_allowed_discovery_url(getValueByKey(openid_config, "userinfo_endpoint").value(), "userinfo_endpoint");
+    require_allowed_discovery_url(getValueByKey(openid_config, "introspection_endpoint").value(), "introspection_endpoint");
+    if (openid_config.contains("jwks_uri"))
+        require_allowed_discovery_url(getValueByKey(openid_config, "jwks_uri").value(), "jwks_uri");
 
     /// Anchor the discovery document to a known issuer when one is configured.
     ///
