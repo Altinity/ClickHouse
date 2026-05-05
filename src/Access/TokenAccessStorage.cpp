@@ -107,24 +107,17 @@ namespace
         return result;
     }
 
-    String applyTransform(const String & input, const String & pattern, const String & replacement, bool global)
+    String applyTransform(const String & input, const re2::RE2 & re, const String & replacement, bool global)
     {
-        if (pattern.empty())
-            return input;
-
-        re2::RE2 re(pattern);
-        if (!re.ok())
-            return input;
-
+        /// `re` is precompiled at storage construction (the constructor refuses
+        /// to load with an invalid pattern, so by the time we get here the
+        /// regex is guaranteed to be `ok()`). No per-call recompilation; no
+        /// silent no-op on a bad pattern.
         String result = input;
         if (global)
-        {
             RE2::GlobalReplace(&result, re, replacement);
-        }
         else
-        {
             RE2::Replace(&result, re, replacement);
-        }
         return result;
     }
 }
@@ -162,7 +155,27 @@ TokenAccessStorage::TokenAccessStorage(const String & storage_name_, AccessContr
     {
         String transform = config.getString(prefix_str + "roles_transform");
         ParsedTransform parsed = parseSedTransform(transform);
-        roles_transform_pattern = parsed.pattern;
+
+        /// Compile and validate the regex up front. If we deferred compilation
+        /// to runtime (the previous behavior), an invalid regex would silently
+        /// return the input unchanged on every call -- meaning every role name
+        /// from the IdP would flow into role-mapping ungroomed, defeating the
+        /// purpose of `roles_transform`. Fail loudly at construction so the
+        /// misconfiguration is visible at startup.
+        if (!parsed.pattern.empty())
+        {
+            roles_transform_pattern.emplace(parsed.pattern);
+            if (!roles_transform_pattern->ok())
+            {
+                const String error = roles_transform_pattern->error();
+                roles_transform_pattern.reset();
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                                "Invalid 'roles_transform' regex for Token user directory '{}': {}. "
+                                "Refusing to start with a misconfigured transform to avoid admitting "
+                                "ungroomed role names from the IdP.",
+                                storage_name_, error);
+            }
+        }
         roles_transform_replacement = parsed.replacement;
         roles_transform_global = parsed.global;
     }
