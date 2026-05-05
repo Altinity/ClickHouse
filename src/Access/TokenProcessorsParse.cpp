@@ -29,6 +29,14 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
     auto groups_claim = config.getString(prefix + ".groups_claim", "groups");
     auto expected_issuer = config.getString(prefix + ".expected_issuer", "");
     auto expected_audience = config.getString(prefix + ".expected_audience", "");
+    /// `expected_typ` is the JWT header `typ` to require. RFC 8725 §3.11 and
+    /// RFC 9068 recommend type discrimination to prevent cross-token-class
+    /// substitution -- e.g. accepting an ID token (intended for client login)
+    /// where an access token (intended for resource access) is expected.
+    /// Common values: "at+jwt" (RFC 9068 access tokens), "JWT" (generic).
+    /// Empty (the default) means no `typ` enforcement; the JWT processors warn
+    /// at startup when this is left empty so the gap is visible.
+    auto expected_typ = config.getString(prefix + ".expected_typ", "");
     auto allow_no_expiration = config.getBool(prefix + ".allow_no_expiration", false);
 
     /// Constrain every OIDC/JWT trust-chain fetch (discovery, userinfo,
@@ -136,7 +144,7 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
                                      config.getString(prefix + ".public_key_password", ""),
                                      config.getString(prefix + ".private_key_password", ""),
                                      config.getString(prefix + ".claims", "")};
-        return std::make_unique<StaticKeyJwtProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim, expected_issuer, expected_audience, allow_no_expiration, params);
+        return std::make_unique<StaticKeyJwtProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim, expected_issuer, expected_audience, expected_typ, allow_no_expiration, params);
     }
     else if (provider_type == "jwt_static_jwks")
     {
@@ -155,7 +163,7 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
             config.getString(prefix + ".static_jwks_file", "")
         };
         return std::make_unique<JwksJwtProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim,
-                                                  expected_issuer, expected_audience, allow_no_expiration,
+                                                  expected_issuer, expected_audience, expected_typ, allow_no_expiration,
                                                   config.getString(prefix + ".claims", ""),
                                                   config.getUInt64(prefix + ".verifier_leeway", 0),
                                                   std::make_shared<StaticJWKS>(params));
@@ -170,7 +178,7 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
         const auto jwks_uri = config.getString(prefix + ".jwks_uri");
         require_allowed_url(jwks_uri, "jwks_uri");
         return std::make_unique<JwksJwtProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim,
-                                                  expected_issuer, expected_audience, allow_no_expiration,
+                                                  expected_issuer, expected_audience, expected_typ, allow_no_expiration,
                                                   config.getString(prefix + ".claims", ""),
                                                   config.getUInt64(prefix + ".verifier_leeway", 0),
                                                   jwks_uri,

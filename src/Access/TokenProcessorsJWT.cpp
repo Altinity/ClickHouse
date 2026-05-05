@@ -292,7 +292,8 @@ namespace
 /// just silently skips the check when the pin is empty.
 void warnIfBindingsNotPinned(const String & processor_name,
                              const String & expected_issuer,
-                             const String & expected_audience)
+                             const String & expected_audience,
+                             const String & expected_typ)
 {
     if (expected_audience.empty())
         LOG_WARNING(getLogger("TokenAuthentication"),
@@ -307,6 +308,43 @@ void warnIfBindingsNotPinned(const String & processor_name,
                     "any token signed by a key in this processor's JWKS will be accepted regardless of "
                     "issuer. Set 'expected_issuer' to bind tokens to a specific IdP.",
                     processor_name);
+    if (expected_typ.empty())
+        LOG_WARNING(getLogger("TokenAuthentication"),
+                    "{}: 'expected_typ' is not configured. The JWT 'typ' header will not be enforced; "
+                    "ID tokens / refresh JWTs / internal-profile JWTs from the same IdP can be presented "
+                    "as access tokens. RFC 8725 §3.11 / RFC 9068 recommend setting 'expected_typ' "
+                    "(commonly 'at+jwt' for OAuth 2.0 access tokens) to prevent cross-token-class substitution.",
+                    processor_name);
+}
+
+/// Verify the JWT header `typ` matches the operator-configured pin.
+/// Returns false (with a TRACE log) on mismatch; true if no pin or match.
+/// Comparison is case-insensitive per RFC 7519 §5.1 ("JWT" and "jwt" both valid).
+bool checkJwtTyp(const String & processor_name,
+                 const String & expected_typ,
+                 const jwt::decoded_jwt<jwt::traits::kazuho_picojson> & decoded)
+{
+    if (expected_typ.empty())
+        return true;
+
+    if (!decoded.has_type())
+    {
+        LOG_TRACE(getLogger("TokenAuthentication"),
+                  "{}: Token has no 'typ' header but 'expected_typ' is configured to '{}'; rejecting.",
+                  processor_name, expected_typ);
+        return false;
+    }
+
+    const String actual_typ = decoded.get_type();
+    if (Poco::toLower(actual_typ) != Poco::toLower(expected_typ))
+    {
+        LOG_TRACE(getLogger("TokenAuthentication"),
+                  "{}: Token 'typ' header '{}' does not match 'expected_typ' '{}'; rejecting.",
+                  processor_name, actual_typ, expected_typ);
+        return false;
+    }
+
+    return true;
 }
 }
 
@@ -316,13 +354,15 @@ StaticKeyJwtProcessor::StaticKeyJwtProcessor(const String & processor_name_,
                                              const String & groups_claim_,
                                              const String & expected_issuer_,
                                              const String & expected_audience_,
+                                             const String & expected_typ_,
                                              bool allow_no_expiration_,
                                              const StaticKeyJwtParams & params)
                                              : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_),
                                              claims(params.claims), expected_issuer(expected_issuer_), expected_audience(expected_audience_),
+                                             expected_typ(expected_typ_),
                                              allow_no_expiration(allow_no_expiration_)
 {
-    warnIfBindingsNotPinned(processor_name, expected_issuer, expected_audience);
+    warnIfBindingsNotPinned(processor_name, expected_issuer, expected_audience, expected_typ);
 
     const String & algo = params.algo;
     const String & static_key = params.static_key;
@@ -440,6 +480,9 @@ bool StaticKeyJwtProcessor::resolveAndValidate(TokenCredentials & credentials) c
         auto decoded_jwt = jwt::decode(credentials.getToken());
         verifier.verify(decoded_jwt);
 
+        if (!checkJwtTyp(processor_name, expected_typ, decoded_jwt))
+            return false;
+
         if (!allow_no_expiration && !decoded_jwt.has_expires_at())
         {
             LOG_TRACE(getLogger("TokenAuthentication"), "{}: Token missing 'exp' claim, rejecting", processor_name);
@@ -477,15 +520,17 @@ JwksJwtProcessor::JwksJwtProcessor(const String & processor_name_,
                                    const String & groups_claim_,
                                    const String & expected_issuer_,
                                    const String & expected_audience_,
+                                   const String & expected_typ_,
                                    bool allow_no_expiration_,
                                    const String & claims_,
                                    size_t verifier_leeway_,
                                    std::shared_ptr<IJWKSProvider> provider_)
     : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_),
       claims(claims_), expected_issuer(expected_issuer_), expected_audience(expected_audience_),
+      expected_typ(expected_typ_),
       allow_no_expiration(allow_no_expiration_), provider(provider_), verifier_leeway(verifier_leeway_)
 {
-    warnIfBindingsNotPinned(processor_name, expected_issuer, expected_audience);
+    warnIfBindingsNotPinned(processor_name, expected_issuer, expected_audience, expected_typ);
 }
 
 bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
@@ -506,6 +551,9 @@ bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
     try
     {
         auto decoded_jwt = jwt::decode(credentials.getToken());
+
+        if (!checkJwtTyp(processor_name, expected_typ, decoded_jwt))
+            return false;
 
         if (!allow_no_expiration && !decoded_jwt.has_expires_at())
         {

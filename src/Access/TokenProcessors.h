@@ -94,6 +94,7 @@ public:
                                    const String & groups_claim_,
                                    const String & expected_issuer_,
                                    const String & expected_audience_,
+                                   const String & expected_typ_,
                                    bool allow_no_expiration_,
                                    const StaticKeyJwtParams & params);
 
@@ -105,6 +106,8 @@ private:
     const String claims;
     const String expected_issuer;
     const String expected_audience;
+    /// Required JWT `typ` header (RFC 8725 §3.11). Empty = no enforcement.
+    const String expected_typ;
     const bool allow_no_expiration;
     jwt::verifier<jwt::default_clock, jwt::traits::kazuho_picojson> verifier = jwt::verify();
 };
@@ -119,6 +122,7 @@ public:
                               const String & groups_claim_,
                               const String & expected_issuer_,
                               const String & expected_audience_,
+                              const String & expected_typ_,
                               bool allow_no_expiration_,
                               const String & claims_,
                               size_t verifier_leeway_,
@@ -130,6 +134,7 @@ public:
                               const String & groups_claim_,
                               const String & expected_issuer_,
                               const String & expected_audience_,
+                              const String & expected_typ_,
                               bool allow_no_expiration_,
                               const String & claims_,
                               size_t verifier_leeway_,
@@ -141,6 +146,7 @@ public:
                                                  groups_claim_,
                                                  expected_issuer_,
                                                  expected_audience_,
+                                                 expected_typ_,
                                                  allow_no_expiration_,
                                                  claims_,
                                                  verifier_leeway_,
@@ -154,6 +160,8 @@ private:
     const String claims;
     const String expected_issuer;
     const String expected_audience;
+    /// Required JWT `typ` header (RFC 8725 §3.11). Empty = no enforcement.
+    const String expected_typ;
     const bool allow_no_expiration;
     mutable jwt::verifier<jwt::default_clock, jwt::traits::kazuho_picojson> verifier = jwt::verify();
     std::shared_ptr<IJWKSProvider> provider;
