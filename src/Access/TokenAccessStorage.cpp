@@ -136,6 +136,45 @@ TokenAccessStorage::TokenAccessStorage(const String & storage_name_, AccessContr
 
     const String prefix_str = (prefix.empty() ? "" : prefix + ".");
 
+    /// Mandatory population restrictor.
+    ///
+    /// Without an explicit limit on which token-authenticated identities are
+    /// allowed to be auto-created here, this storage trusts the IdP to be the
+    /// only gate -- so any identity the IdP can mint a valid token for becomes
+    /// a ClickHouse user (with at least the configured `common_roles`). That
+    /// silently widens the trust boundary from "users we approved" to "any
+    /// identity in the IdP", which is rarely what the operator wants.
+    ///
+    /// Require the operator to declare a restrictor: `users_filter` is a regex
+    /// that the resolved username MUST fully match for auto-population. To
+    /// intentionally allow every authenticated identity, the operator sets it
+    /// to `.*` -- that way the decision to be permissive is explicit and
+    /// auditable in the configuration, not a silent default.
+    if (!config.has(prefix_str + "users_filter"))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "Missing required 'users_filter' for Token user directory '{}'. "
+                        "Set 'users_filter' to a RE2 regex that the resolved username must fully match. "
+                        "To allow every authenticated identity, set 'users_filter' to '.*' explicitly.",
+                        storage_name_);
+
+    {
+        const String users_filter_pattern = config.getString(prefix_str + "users_filter");
+        users_filter.emplace(users_filter_pattern);
+
+        /// Fail closed on invalid regex: RE2 does not throw on bad patterns -- it
+        /// constructs an object with `ok`==false and silently fails every match,
+        /// which would mean *no* user is allowed and the directory is effectively
+        /// dead. Reject up front so misconfiguration is visible at startup.
+        if (!users_filter->ok())
+        {
+            const String error = users_filter->error();
+            users_filter.reset();
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                            "Invalid 'users_filter' regex for Token user directory '{}': {}.",
+                            storage_name_, error);
+        }
+    }
+
     if (config.has(prefix_str + "roles_filter"))
     {
         const String filter_pattern = config.getString(prefix_str + "roles_filter");
@@ -527,6 +566,39 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
         if (throw_if_user_not_exists)
             throwNotFound(AccessEntityType::USER, credentials.getUserName(), getStorageName());
 
+        return {};
+    }
+
+    /// Apply the mandatory population restrictor against the username the IdP
+    /// resolved (only safe to read after `checkTokenCredentials` succeeded; that
+    /// call sets the validated username on the credentials).
+    ///
+    /// This must run BEFORE auto-creation so an identity rejected by the filter
+    /// is never inserted into memory_storage. It also runs even when a matching
+    /// in-memory user already exists, so tightening the filter takes effect on
+    /// subsequent authentications without requiring a restart-driven cache wipe.
+    ///
+    /// Defensive: re-check `ok` even though parse-time validation already
+    /// rejects bad patterns -- guarantees we never fall through to a permissive
+    /// path if a future code path constructs the storage without the parse-time
+    /// check.
+    if (!users_filter.has_value() || !users_filter->ok())
+    {
+        LOG_ERROR(getLogger(),
+                  "{}: 'users_filter' is missing or invalid; refusing to auto-populate user '{}' "
+                  "to avoid silently widening trust to every IdP identity.",
+                  getStorageName(), credentials.getUserName());
+        if (throw_if_user_not_exists)
+            throwNotFound(AccessEntityType::USER, credentials.getUserName(), getStorageName());
+        return {};
+    }
+    if (!RE2::FullMatch(credentials.getUserName(), *users_filter))
+    {
+        LOG_TRACE(getLogger(),
+                  "{}: User '{}' does not match configured 'users_filter'; rejecting auto-population.",
+                  getStorageName(), credentials.getUserName());
+        if (throw_if_user_not_exists)
+            throwNotFound(AccessEntityType::USER, credentials.getUserName(), getStorageName());
         return {};
     }
 
