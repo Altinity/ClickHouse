@@ -45,6 +45,13 @@ private:
         zkutil::EphemeralNodeHolderPtr holder;
         String path;
         std::optional<Int32> value_version;
+
+        /// EphemeralNodeHolder's destructor calls tryRemove on Keeper, which
+        /// requires a current component to be set in this thread. Wrap the
+        /// holder release in a guard so the cleanup path (lease dropped
+        /// without publish, eval threw between acquire and publish, etc.)
+        /// doesn't trip the LOGICAL_ERROR check.
+        ~RefreshReservation();
     };
 
     /// Lazily creates `<root>/values`.

@@ -92,6 +92,14 @@ String NamedScalarValueBackendShared::lockPath(const String & value_key) const
     return valueGroupPath(value_key) + "/lock";
 }
 
+NamedScalarValueBackendShared::RefreshReservation::~RefreshReservation()
+{
+    if (!holder)
+        return;
+    auto component_guard = Coordination::setCurrentComponent("NamedScalarValueBackendShared::RefreshReservation::~RefreshReservation");
+    holder.reset();
+}
+
 void NamedScalarValueBackendShared::createRootNodesIfNeeded()
 {
     auto component_guard = Coordination::setCurrentComponent("NamedScalarValueBackendShared::createRootNodesIfNeeded");
