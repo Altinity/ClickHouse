@@ -352,14 +352,34 @@ bool AzureTokenProcessor::resolveAndValidate(TokenCredentials & credentials) con
             }
 
             auto group_data = group.get<picojson::object>();
-            if (!group_data.contains("displayName"))
+
+            /// Use the immutable `id` (GUID), not the mutable `displayName`,
+            /// for role-mapping. `displayName` can be renamed by an Azure AD
+            /// admin -- and on rename, every ClickHouse role-mapping regex
+            /// that referenced the old name silently stops matching, while
+            /// every regex that matches the new name silently starts. Two
+            /// distinct AAD groups can also share a display name and merge
+            /// into a single ClickHouse group; deleting and recreating a
+            /// group with the same name silently inherits the old grants.
+            /// `id` is a GUID assigned by AAD at group creation; it never
+            /// changes, never collides, and is never reused.
+            ///
+            /// Operators upgrading from a build that emitted `displayName`
+            /// must update their `roles_filter` / `roles_transform` regex
+            /// to reference the GUIDs Azure AD assigns to the groups they
+            /// want to map. The role identifier is not human-friendly --
+            /// that is the cost of using an immutable handle.
+            if (!group_data.contains("id"))
                 continue;
 
-            String group_name = getValueByKey<std::string, false>(group_data, "displayName").value_or("");
+            String group_name = getValueByKey<std::string, false>(group_data, "id").value_or("");
             if (!group_name.empty())
             {
                 external_groups_names.insert(group_name);
-                LOG_TRACE(getLogger("TokenAuthentication"), "{}: User {}: new external group {}", processor_name, credentials.getUserName(), group_name);
+                String display_name = getValueByKey<std::string, false>(group_data, "displayName").value_or("<unknown>");
+                LOG_TRACE(getLogger("TokenAuthentication"),
+                          "{}: User {}: new external group id={} (displayName='{}')",
+                          processor_name, credentials.getUserName(), group_name, display_name);
             }
         }
     }
