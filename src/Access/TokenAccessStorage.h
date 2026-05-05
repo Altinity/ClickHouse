@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Access/MemoryAccessStorage.h>
+#include <Access/Common/AllowedClientHosts.h>
 #include <Access/Credentials.h>
 #include <Access/SettingsProfile.h>
 #include <Common/re2.h>
@@ -62,6 +63,12 @@ private:
 
     std::set<String> common_role_names;                         // role name that should be granted to all users at all times
     String default_profile_name;                                // settings profile name that should be assigned to all users
+    /// Optional IP allowlist applied to auto-provisioned users at creation
+    /// time. When unset, auto-created users inherit the default `AnyHostTag`
+    /// (current behavior, no breakage). When set, only clients whose source
+    /// address matches this allowlist can authenticate as a token-auto-created
+    /// user, regardless of the IdP's verdict on the token.
+    std::optional<AllowedClientHosts> auto_user_allowed_hosts;
     mutable std::map<String, std::set<String>> user_external_roles;
     mutable std::map<String, std::set<String>> users_per_roles; // role name -> user names (...it should be granted to; may but don't have to exist for common roles)
     mutable std::map<String, std::set<String>> roles_per_users; // user name -> role names (...that should be granted to it; may but don't have to include common roles)
