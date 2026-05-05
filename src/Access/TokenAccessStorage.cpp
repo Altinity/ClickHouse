@@ -517,10 +517,28 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
         bool /* allow_plaintext_password */) const
 {
     std::lock_guard lock(mutex);
+
+    /// Reject mismatched credential types BEFORE the typeid_cast that would
+    /// throw a `LOGICAL_ERROR`. The reference-form `typeid_cast` is fatal on
+    /// mismatch, and `MultipleAccessStorage::authenticateImpl` does not catch
+    /// per-storage exceptions -- so a single Basic / SSL-cert / Kerberos / SSH
+    /// login attempt would propagate that exception out of the chain and abort
+    /// authentication for every later storage in `user_directories`. Concretely,
+    /// listing `<token>` ahead of `<users.xml>` would lock out every Basic-auth
+    /// user. Return nullopt cleanly, matching the LDAP-side idiom in
+    /// `LDAPAccessStorage::areLDAPCredentialsValidNoLock`.
+    const auto * token_credentials_ptr = dynamic_cast<const TokenCredentials *>(&credentials);
+    if (!token_credentials_ptr)
+    {
+        if (throw_if_user_not_exists)
+            throwNotFound(AccessEntityType::USER, credentials.getUserName(), getStorageName());
+        return {};
+    }
+
     auto id = memory_storage.find<User>(credentials.getUserName());
     UserPtr user = id ? memory_storage.read<User>(*id) : nullptr;
 
-    const auto & token_credentials = typeid_cast<const TokenCredentials &>(credentials);
+    const auto & token_credentials = *token_credentials_ptr;
 
     if (!external_authenticators.checkTokenCredentials(token_credentials, provider_name))
     {
