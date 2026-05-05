@@ -147,13 +147,23 @@ void ClientInfo::write(WriteBuffer & out, UInt64 server_protocol_revision) const
 
     if (server_protocol_revision >= DBMS_MIN_REVISON_WITH_JWT_IN_INTERSERVER)
     {
-        if (!jwt.empty())
-        {
-            writeBinary(static_cast<UInt8>(1), out);
-            writeBinary(jwt, out);
-        }
-        else
-            writeBinary(static_cast<UInt8>(0), out);
+        /// Never serialize the bearer token over the interserver wire.
+        ///
+        /// Distributed queries use this `ClientInfo` to fan out to remote shards
+        /// and replicas. Interserver transport is plaintext by default
+        /// (`interserver_http_port` vs `interserver_https_port`), so writing the
+        /// raw JWT here exposes session credentials on the internal network for
+        /// every distributed query whenever the operator hasn't opted into TLS
+        /// for interserver -- and no code on the receiving side currently reads
+        /// `client_info.jwt`, so the transmission is pure leakage with no
+        /// functional benefit.
+        ///
+        /// The protocol-revision byte is still emitted (always `0` = "no JWT")
+        /// to preserve wire compatibility with peers that expect this field at
+        /// this offset; receivers will read it as "no JWT present" and skip
+        /// the body. The `jwt` member of `ClientInfo` is retained for any
+        /// in-process use within the same node.
+        writeBinary(static_cast<UInt8>(0), out);
     }
 }
 
