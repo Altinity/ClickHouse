@@ -641,68 +641,70 @@ HTTPAuthClientParams ExternalAuthenticators::getHTTPAuthenticationParams(const S
 }
 
 bool ExternalAuthenticators::checkCredentialsAgainstProcessor(const ITokenProcessor & processor,
-                                                              TokenCredentials & credentials,
-                                                              bool prime_cache_on_success) const
+                                                              TokenCredentials & credentials) const
 {
-    if (processor.resolveAndValidate(credentials))
+    if (!processor.resolveAndValidate(credentials))
     {
-        TokenCacheEntry cache_entry;
-        cache_entry.user_name = credentials.getUserName();
-        cache_entry.external_roles = credentials.getGroups();
-        cache_entry.processor_name = processor.getProcessorName();
-
-        auto default_expiration_ts = std::chrono::system_clock::now()
-                                     + std::chrono::seconds(processor.getTokenCacheLifetime());
-
-        if (credentials.getExpiresAt().has_value())
-        {
-            if (credentials.getExpiresAt().value() < default_expiration_ts)
-                cache_entry.expires_at = credentials.getExpiresAt().value();
-            else
-            {
-                LOG_TRACE(getLogger("AccessTokenAuthentication"), "Token for user {} expires after default cache lifetime; using default TTL by {}", credentials.getUserName(), processor.getProcessorName());
-                cache_entry.expires_at = default_expiration_ts;
-            }
-        }
-        else
-        {
-            cache_entry.expires_at = default_expiration_ts;
-        }
-
-        /// Propagate the effective expiry back to the credentials so that long-lived
-        /// sessions are bound to the actual token lifetime
-        credentials.setExpiresAt(cache_entry.expires_at);
-
-        LOG_DEBUG(getLogger("AccessTokenAuthentication"), "Authenticated user {} with access token by {}", credentials.getUserName(), processor.getProcessorName());
-
-        if (prime_cache_on_success)
-        {
-            // CHeck if a cache entry for the same user but with another token exists -- old cache entry is considered outdated and removed
-            auto old_token_iter = username_to_access_token_cache.find(cache_entry.user_name);
-            if (old_token_iter != username_to_access_token_cache.end())
-            {
-                access_token_to_username_cache.erase(old_token_iter->second);
-                username_to_access_token_cache.erase(old_token_iter);
-            }
-
-            access_token_to_username_cache[credentials.getToken()] = cache_entry;
-            username_to_access_token_cache[cache_entry.user_name] = credentials.getToken();
-            LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} added", cache_entry.user_name);
-        }
-        else
-        {
-            LOG_TRACE(getLogger("AccessTokenAuthentication"),
-                      "Cache entry for user {} NOT primed: caller is performing pre-user-lookup token validation; "
-                      "the per-user authentication path will be the one to populate the cache after applying the "
-                      "user's pinned processor and JWT claim restrictions.",
-                      cache_entry.user_name);
-        }
-
-        return true;
+        LOG_TRACE(getLogger("AccessTokenAuthentication"), "Failed authentication with access token by {}", processor.getProcessorName());
+        return false;
     }
-    LOG_TRACE(getLogger("AccessTokenAuthentication"), "Failed authentication with access token by {}", processor.getProcessorName());
 
-    return false;
+    /// Clamp the credentials' expires_at to the processor's cache lifetime so
+    /// upper layers (notably `Session`) bind their lifetime to whichever is
+    /// shorter -- the token's own expiry or the operator-configured TTL. This
+    /// is a *post-validation finalization* of the credentials, not a cache
+    /// write; the actual token-cache entry is written by `primeTokenCache`,
+    /// and only after any per-user `jwt_claims` policy has also accepted the
+    /// token (see `checkTokenCredentials`).
+    auto default_expiration_ts = std::chrono::system_clock::now()
+                                 + std::chrono::seconds(processor.getTokenCacheLifetime());
+
+    if (credentials.getExpiresAt().has_value())
+    {
+        if (credentials.getExpiresAt().value() >= default_expiration_ts)
+        {
+            LOG_TRACE(getLogger("AccessTokenAuthentication"), "Token for user {} expires after default cache lifetime; using default TTL by {}", credentials.getUserName(), processor.getProcessorName());
+            credentials.setExpiresAt(default_expiration_ts);
+        }
+    }
+    else
+    {
+        credentials.setExpiresAt(default_expiration_ts);
+    }
+
+    LOG_DEBUG(getLogger("AccessTokenAuthentication"), "Authenticated user {} with access token by {}", credentials.getUserName(), processor.getProcessorName());
+    return true;
+}
+
+void ExternalAuthenticators::primeTokenCache(const ITokenProcessor & processor,
+                                             const TokenCredentials & credentials) const
+{
+    /// Build a cache entry from the credentials state that
+    /// `checkCredentialsAgainstProcessor` finalized. The caller is responsible
+    /// for invoking this only after both processor validation AND the per-user
+    /// `jwt_claims` policy have accepted the token -- caching before claims
+    /// have been evaluated would let later unconstrained lookups (e.g. the
+    /// HTTP/TCP pre-user-lookup call which passes empty `jwt_claims`) hit a
+    /// cache entry that never actually satisfied the user's policy.
+    TokenCacheEntry cache_entry;
+    cache_entry.user_name = credentials.getUserName();
+    cache_entry.external_roles = credentials.getGroups();
+    cache_entry.processor_name = processor.getProcessorName();
+    cache_entry.expires_at = credentials.getExpiresAt().value_or(
+        std::chrono::system_clock::now() + std::chrono::seconds(processor.getTokenCacheLifetime()));
+
+    /// If a previous entry exists for the same user under a different token,
+    /// drop it -- the user has rotated tokens and the old one is now stale.
+    auto old_token_iter = username_to_access_token_cache.find(cache_entry.user_name);
+    if (old_token_iter != username_to_access_token_cache.end())
+    {
+        access_token_to_username_cache.erase(old_token_iter->second);
+        username_to_access_token_cache.erase(old_token_iter);
+    }
+
+    access_token_to_username_cache[credentials.getToken()] = cache_entry;
+    username_to_access_token_cache[cache_entry.user_name] = credentials.getToken();
+    LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} added", cache_entry.user_name);
 }
 
 bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & credentials,
@@ -755,13 +757,15 @@ bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & cred
         /// empty) any cached entry is acceptable.
         else if (processor_name.empty() || processor_name == cached_entry_iter->second.processor_name)
         {
-            const auto & user_data = cached_entry_iter->second;
-            const_cast<TokenCredentials &>(credentials).setUserName(user_data.user_name);
-            const_cast<TokenCredentials &>(credentials).setGroups(user_data.external_roles);
-            /// Surface the cached token expiry on the credentials so the upper layers
-            /// (Session) can bind the resulting session lifetime to the token lifetime.
-            const_cast<TokenCredentials &>(credentials).setExpiresAt(user_data.expires_at);
-            LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} found, using it to authenticate", cached_entry_iter->second.user_name);
+            /// Evaluate per-user claims FIRST, before mutating the outer
+            /// `TokenCredentials`. The `const_cast`-ed `setUserName`/`setGroups`/
+            /// `setExpiresAt` writes below would otherwise leak the cached
+            /// identity into the caller's credentials object even on rejection
+            /// -- a future caller that read `credentials.getUserName()` after a
+            /// failed authentication would see an attacker-influenceable name.
+            ///
+            /// `checkClaims` only reads `credentials.getToken()`, which is
+            /// already set by the caller, so the order is safe.
             if (!jwt_claims.empty())
             {
                 /// Evaluate per-user claims against the processor that actually produced this
@@ -771,6 +775,15 @@ bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & cred
                 if (it == token_processors.end() || !check_claims_if_required(*it->second))
                     return false;
             }
+
+            /// Claims (if any) accepted -- it is now safe to publish the cached identity.
+            const auto & user_data = cached_entry_iter->second;
+            const_cast<TokenCredentials &>(credentials).setUserName(user_data.user_name);
+            const_cast<TokenCredentials &>(credentials).setGroups(user_data.external_roles);
+            /// Surface the cached token expiry on the credentials so the upper layers
+            /// (Session) can bind the resulting session lifetime to the token lifetime.
+            const_cast<TokenCredentials &>(credentials).setExpiresAt(user_data.expires_at);
+            LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} found, using it to authenticate", user_data.user_name);
             return true;
         }
         else
@@ -782,6 +795,11 @@ bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & cred
         }
     }
 
+    /// Run any per-user `jwt_claims` policy, and only if THAT also passes
+    /// write the cache entry. Writing the cache before the claims check would
+    /// leave a post-rejection cache entry that later unconstrained lookups
+    /// (e.g. the HTTP/TCP pre-user-lookup call which passes empty `jwt_claims`)
+    /// would happily hit -- composing with H-14's pre-user-lookup window.
     if (processor_name.empty())
     {
         for (const auto & it : token_processors)
@@ -795,8 +813,14 @@ bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & cred
                           it.second->getProcessorName());
                 continue;
             }
-            if (checkCredentialsAgainstProcessor(*it.second, const_cast<TokenCredentials &>(credentials), prime_cache_on_success))
-                return check_claims_if_required(*it.second);
+            if (checkCredentialsAgainstProcessor(*it.second, const_cast<TokenCredentials &>(credentials)))
+            {
+                if (!check_claims_if_required(*it.second))
+                    return false;
+                if (prime_cache_on_success)
+                    primeTokenCache(*it.second, credentials);
+                return true;
+            }
         }
     }
     else
@@ -813,8 +837,14 @@ bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & cred
                       it->second->getProcessorName());
             return false;
         }
-        if (checkCredentialsAgainstProcessor(*it->second, const_cast<TokenCredentials &>(credentials), prime_cache_on_success))
-            return check_claims_if_required(*it->second);
+        if (checkCredentialsAgainstProcessor(*it->second, const_cast<TokenCredentials &>(credentials)))
+        {
+            if (!check_claims_if_required(*it->second))
+                return false;
+            if (prime_cache_on_success)
+                primeTokenCache(*it->second, credentials);
+            return true;
+        }
     }
 
     return false;
