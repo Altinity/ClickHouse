@@ -412,154 +412,205 @@ bool StaticKeyJwtProcessor::resolveAndValidate(TokenCredentials & credentials) c
 
 bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
 {
-    auto decoded_jwt = jwt::decode(credentials.getToken());
-
-    if (!allow_no_expiration && !decoded_jwt.has_expires_at())
-    {
-        LOG_TRACE(getLogger("TokenAuthentication"), "{}: Token missing 'exp' claim, rejecting", processor_name);
-        return false;
-    }
-
-    if (!decoded_jwt.has_payload_claim(username_claim))
-    {
-        LOG_ERROR(getLogger("TokenAuthentication"), "{}: Specified username_claim not found in token", processor_name);
-        return false;
-    }
-
-    if (!decoded_jwt.has_key_id())
-    {
-        LOG_ERROR(getLogger("TokenAuthentication"), "{}: 'kid' (key ID) claim not found in token", processor_name);
-        return false;
-    }
-
-    if (!provider->getJWKS().has_jwk(decoded_jwt.get_key_id()))
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWKS error: no JWK found for JWT");
-
-    auto jwk = provider->getJWKS().get_jwk(decoded_jwt.get_key_id());
-    auto username = decoded_jwt.get_payload_claim(username_claim).as_string();
-
-    if (!decoded_jwt.has_algorithm())
-    {
-        LOG_ERROR(getLogger("TokenAuthentication"), "{}: Algorithm not specified in token", processor_name);
-        return false;
-    }
-    auto algo = Poco::toLower(decoded_jwt.get_algorithm());
-
-
-    String public_key;
-
+    /// Whole-body try/catch mirrors `StaticKeyJwtProcessor::resolveAndValidate`.
+    ///
+    /// In the auto-discovery path inside `ExternalAuthenticators::checkTokenCredentials`,
+    /// processors are tried in turn and any exception out of one aborts the entire
+    /// loop -- later processors are never consulted. That is fine for "the token is
+    /// definitively bad", but the failures in this body are also raised when the
+    /// token simply belongs to a different processor (e.g. its `kid` is not in
+    /// THIS processor's JWKS, or its `alg` is one this JWKS does not know about,
+    /// or the JWK lacks the components this code path needs). In a multi-processor
+    /// deployment, raising in those cases denies a perfectly good token just
+    /// because a sibling processor happened to be iterated first. Convert every
+    /// such failure into a `false` return so the iterator can move on -- consistent
+    /// with how `StaticKeyJwtProcessor` already handles its own validation errors.
     try
     {
-        auto x5c = jwk.get_x5c_key_value();
+        auto decoded_jwt = jwt::decode(credentials.getToken());
 
-        if (!x5c.empty())
+        if (!allow_no_expiration && !decoded_jwt.has_expires_at())
         {
-            LOG_TRACE(getLogger("TokenAuthentication"), "{}: Verifying {} with 'x5c' key", processor_name, username);
-            public_key = jwt::helper::convert_base64_der_to_pem(x5c);
+            LOG_TRACE(getLogger("TokenAuthentication"), "{}: Token missing 'exp' claim, rejecting", processor_name);
+            return false;
         }
-    }
-    catch (const jwt::error::claim_not_present_exception &)
-    {
-        LOG_TRACE(getLogger("TokenAuthentication"), "{}: x5c was not specified in JWK, will try RSA components", processor_name);
-    }
-    catch (const std::bad_cast &)
-    {
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: invalid claim value type found, claims must be strings");
-    }
 
-    if (public_key.empty())
-    {
-        const auto key_type = jwk.get_key_type();
-        if (key_type == "EC")
+        if (!decoded_jwt.has_payload_claim(username_claim))
         {
-            if (!(jwk.has_jwk_claim("x") && jwk.has_jwk_claim("y")))
-                throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "{}: invalid JWK: missing 'x'/'y' claims for EC key type", processor_name);
-
-            int curve_nid = NID_undef;
-            std::optional<String> expected_crv;
-            if (algo == "es256")
-            {
-                curve_nid = NID_X9_62_prime256v1;
-                expected_crv = "P-256";
-            }
-            else if (algo == "es384")
-            {
-                curve_nid = NID_secp384r1;
-                expected_crv = "P-384";
-            }
-            else if (algo == "es512")
-            {
-                curve_nid = NID_secp521r1;
-                expected_crv = "P-521";
-            }
-
-            if (curve_nid == NID_undef)
-                throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: unknown algorithm {}", algo);
-
-            if (jwk.has_jwk_claim("crv"))
-            {
-                const auto crv = jwk.get_jwk_claim("crv").as_string();
-                if (expected_crv.has_value() && crv != expected_crv.value())
-                    throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: `crv` in JWK does not match JWT algorithm");
-            }
-
-            LOG_TRACE(getLogger("TokenAuthentication"), "{}: `x5c` not present, verifying {} with EC components", processor_name, username);
-            const auto x = jwk.get_jwk_claim("x").as_string();
-            const auto y = jwk.get_jwk_claim("y").as_string();
-            public_key = create_public_key_from_ec_components(x, y, curve_nid);
+            LOG_ERROR(getLogger("TokenAuthentication"), "{}: Specified username_claim not found in token", processor_name);
+            return false;
         }
-        else if (key_type == "RSA")
+
+        if (!decoded_jwt.has_key_id())
         {
-            if (!(jwk.has_jwk_claim("n") && jwk.has_jwk_claim("e")))
-                throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "{}: invalid JWK: missing 'n'/'e' claims for RSA key type", processor_name);
-            LOG_TRACE(getLogger("TokenAuthentication"), "{}: `issuer` or `x5c` not present, verifying {} with RSA components", processor_name, username);
-            const auto modulus = jwk.get_jwk_claim("n").as_string();
-            const auto exponent = jwk.get_jwk_claim("e").as_string();
-            public_key = jwt::helper::create_public_key_from_rsa_components(modulus, exponent);
+            LOG_ERROR(getLogger("TokenAuthentication"), "{}: 'kid' (key ID) claim not found in token", processor_name);
+            return false;
         }
+
+        if (!provider->getJWKS().has_jwk(decoded_jwt.get_key_id()))
+        {
+            LOG_TRACE(getLogger("TokenAuthentication"),
+                      "{}: No JWK matching token 'kid' '{}' in this processor's JWKS; rejecting (a sibling processor may still accept it).",
+                      processor_name, decoded_jwt.get_key_id());
+            return false;
+        }
+
+        auto jwk = provider->getJWKS().get_jwk(decoded_jwt.get_key_id());
+        auto username = decoded_jwt.get_payload_claim(username_claim).as_string();
+
+        if (!decoded_jwt.has_algorithm())
+        {
+            LOG_ERROR(getLogger("TokenAuthentication"), "{}: Algorithm not specified in token", processor_name);
+            return false;
+        }
+        auto algo = Poco::toLower(decoded_jwt.get_algorithm());
+
+
+        String public_key;
+
+        try
+        {
+            auto x5c = jwk.get_x5c_key_value();
+
+            if (!x5c.empty())
+            {
+                LOG_TRACE(getLogger("TokenAuthentication"), "{}: Verifying {} with 'x5c' key", processor_name, username);
+                public_key = jwt::helper::convert_base64_der_to_pem(x5c);
+            }
+        }
+        catch (const jwt::error::claim_not_present_exception &)
+        {
+            LOG_TRACE(getLogger("TokenAuthentication"), "{}: x5c was not specified in JWK, will try RSA components", processor_name);
+        }
+
+        if (public_key.empty())
+        {
+            const auto key_type = jwk.get_key_type();
+            if (key_type == "EC")
+            {
+                if (!(jwk.has_jwk_claim("x") && jwk.has_jwk_claim("y")))
+                {
+                    LOG_TRACE(getLogger("TokenAuthentication"),
+                              "{}: JWK for token 'kid' is missing 'x'/'y' for EC key type; rejecting.", processor_name);
+                    return false;
+                }
+
+                int curve_nid = NID_undef;
+                std::optional<String> expected_crv;
+                if (algo == "es256")
+                {
+                    curve_nid = NID_X9_62_prime256v1;
+                    expected_crv = "P-256";
+                }
+                else if (algo == "es384")
+                {
+                    curve_nid = NID_secp384r1;
+                    expected_crv = "P-384";
+                }
+                else if (algo == "es512")
+                {
+                    curve_nid = NID_secp521r1;
+                    expected_crv = "P-521";
+                }
+
+                if (curve_nid == NID_undef)
+                {
+                    LOG_TRACE(getLogger("TokenAuthentication"),
+                              "{}: Unknown algorithm '{}' for EC key; rejecting.", processor_name, algo);
+                    return false;
+                }
+
+                if (jwk.has_jwk_claim("crv"))
+                {
+                    const auto crv = jwk.get_jwk_claim("crv").as_string();
+                    if (expected_crv.has_value() && crv != expected_crv.value())
+                    {
+                        LOG_TRACE(getLogger("TokenAuthentication"),
+                                  "{}: JWK 'crv' '{}' does not match JWT algorithm '{}'; rejecting.",
+                                  processor_name, crv, algo);
+                        return false;
+                    }
+                }
+
+                LOG_TRACE(getLogger("TokenAuthentication"), "{}: `x5c` not present, verifying {} with EC components", processor_name, username);
+                const auto x = jwk.get_jwk_claim("x").as_string();
+                const auto y = jwk.get_jwk_claim("y").as_string();
+                public_key = create_public_key_from_ec_components(x, y, curve_nid);
+            }
+            else if (key_type == "RSA")
+            {
+                if (!(jwk.has_jwk_claim("n") && jwk.has_jwk_claim("e")))
+                {
+                    LOG_TRACE(getLogger("TokenAuthentication"),
+                              "{}: JWK is missing 'n'/'e' for RSA key type; rejecting.", processor_name);
+                    return false;
+                }
+                LOG_TRACE(getLogger("TokenAuthentication"), "{}: `issuer` or `x5c` not present, verifying {} with RSA components", processor_name, username);
+                const auto modulus = jwk.get_jwk_claim("n").as_string();
+                const auto exponent = jwk.get_jwk_claim("e").as_string();
+                public_key = jwt::helper::create_public_key_from_rsa_components(modulus, exponent);
+            }
+            else
+            {
+                LOG_TRACE(getLogger("TokenAuthentication"),
+                          "{}: Unsupported JWK key type '{}'; rejecting.", processor_name, key_type);
+                return false;
+            }
+        }
+
+        if (jwk.has_algorithm() && Poco::toLower(jwk.get_algorithm()) != algo)
+        {
+            LOG_TRACE(getLogger("TokenAuthentication"),
+                      "{}: JWK 'alg' does not match JWT algorithm '{}'; rejecting.", processor_name, algo);
+            return false;
+        }
+
+        if (algo == "rs256")
+            verifier = verifier.allow_algorithm(jwt::algorithm::rs256(public_key, "", "", ""));
+        else if (algo == "rs384")
+            verifier = verifier.allow_algorithm(jwt::algorithm::rs384(public_key, "", "", ""));
+        else if (algo == "rs512")
+            verifier = verifier.allow_algorithm(jwt::algorithm::rs512(public_key, "", "", ""));
+        else if (algo == "es256")
+            verifier = verifier.allow_algorithm(jwt::algorithm::es256(public_key, "", "", ""));
+        else if (algo == "es384")
+            verifier = verifier.allow_algorithm(jwt::algorithm::es384(public_key, "", "", ""));
+        else if (algo == "es512")
+            verifier = verifier.allow_algorithm(jwt::algorithm::es512(public_key, "", "", ""));
         else
-            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "{}: invalid JWK key type '{}'", processor_name, key_type);
+        {
+            LOG_TRACE(getLogger("TokenAuthentication"),
+                      "{}: Unknown JWT algorithm '{}'; rejecting.", processor_name, algo);
+            return false;
+        }
+
+        verifier = verifier.leeway(verifier_leeway);
+
+        if (!expected_issuer.empty())
+            verifier = verifier.with_issuer(expected_issuer);
+
+        if (!expected_audience.empty())
+            verifier = verifier.with_audience(expected_audience);
+
+        verifier.verify(decoded_jwt);
+
+        if (!claims.empty() && !check_claims(claims, decoded_jwt.get_payload_json()))
+            return false;
+
+        credentials.setUserName(decoded_jwt.get_payload_claim(username_claim).as_string());
+
+        if (decoded_jwt.has_payload_claim(groups_claim))
+            credentials.setGroups(parseGroupsFromJsonArray(decoded_jwt.get_payload_claim(groups_claim).as_array()));
+        else
+            LOG_TRACE(getLogger("TokenAuthentication"), "{}: Specified groups_claim {} not found in token, no external roles will be mapped", processor_name, groups_claim);
+
+        return true;
     }
-
-    if (jwk.has_algorithm() && Poco::toLower(jwk.get_algorithm()) != algo)
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT validation error: `alg` in JWK does not match the algorithm used in JWT");
-
-    if (algo == "rs256")
-        verifier = verifier.allow_algorithm(jwt::algorithm::rs256(public_key, "", "", ""));
-    else if (algo == "rs384")
-        verifier = verifier.allow_algorithm(jwt::algorithm::rs384(public_key, "", "", ""));
-    else if (algo == "rs512")
-        verifier = verifier.allow_algorithm(jwt::algorithm::rs512(public_key, "", "", ""));
-    else if (algo == "es256")
-        verifier = verifier.allow_algorithm(jwt::algorithm::es256(public_key, "", "", ""));
-    else if (algo == "es384")
-        verifier = verifier.allow_algorithm(jwt::algorithm::es384(public_key, "", "", ""));
-    else if (algo == "es512")
-        verifier = verifier.allow_algorithm(jwt::algorithm::es512(public_key, "", "", ""));
-    else
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "JWT cannot be validated: unknown algorithm {}", algo);
-
-    verifier = verifier.leeway(verifier_leeway);
-
-    if (!expected_issuer.empty())
-        verifier = verifier.with_issuer(expected_issuer);
-
-    if (!expected_audience.empty())
-        verifier = verifier.with_audience(expected_audience);
-
-    verifier.verify(decoded_jwt);
-
-    if (!claims.empty() && !check_claims(claims, decoded_jwt.get_payload_json()))
+    catch (const std::exception & ex)
+    {
+        LOG_TRACE(getLogger("TokenAuthentication"), "{}: Failed to validate JWT: {}", processor_name, ex.what());
         return false;
-
-    credentials.setUserName(decoded_jwt.get_payload_claim(username_claim).as_string());
-
-    if (decoded_jwt.has_payload_claim(groups_claim))
-        credentials.setGroups(parseGroupsFromJsonArray(decoded_jwt.get_payload_claim(groups_claim).as_array()));
-    else
-        LOG_TRACE(getLogger("TokenAuthentication"), "{}: Specified groups_claim {} not found in token, no external roles will be mapped", processor_name, groups_claim);
-
-    return true;
+    }
 }
 
 }
