@@ -1054,8 +1054,7 @@ def test_cluster_joins(started_cluster):
     assert res == "Jack\tBlack\nJack\tSilver\nJohn\tBlack\nJohn\tSilver\n"
 
 
-@pytest.mark.parametrize("storage_type", ["s3"])
-def test_partitioning_by_time(started_cluster, storage_type):
+def test_partitioning_by_time(started_cluster):
     node = started_cluster.instances["node1"]
 
     test_ref = f"test_partitioning_by_time_{uuid.uuid4()}"
@@ -1103,8 +1102,7 @@ def test_partitioning_by_time(started_cluster, storage_type):
     assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{namespace}.{table_name}` WHERE key <= '13:00:00.000000' ORDER BY key") == "12:00:00.000000\ttest1\n13:00:00.000000\ttest2\n"
 
 
-@pytest.mark.parametrize("storage_type", ["s3"])
-def test_partitioning_by_string(started_cluster, storage_type):
+def test_partitioning_by_string(started_cluster):
     node = started_cluster.instances["node1"]
 
     test_ref = f"test_partitioning_by_string_{uuid.uuid4()}"
