@@ -1,7 +1,9 @@
 #include "TokenProcessors.h"
 
+#include <Common/RemoteHostFilter.h>
 #include <Common/logger_useful.h>
 #include <Poco/String.h>
+#include <Poco/URI.h>
 
 namespace DB {
 
@@ -29,6 +31,41 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
     auto expected_audience = config.getString(prefix + ".expected_audience", "");
     auto allow_no_expiration = config.getBool(prefix + ".allow_no_expiration", false);
 
+    /// Constrain every OIDC/JWT trust-chain fetch (discovery, userinfo,
+    /// introspection, JWKS) to the operator-approved <remote_url_allow_hosts>.
+    ///
+    /// Without this gate, any URL the operator pastes into the processor config
+    /// -- and any URL returned by an OIDC discovery document -- is fetched
+    /// blindly. A misconfigured or attacker-influenced discovery response can
+    /// then redirect token validation through hosts the operator never approved.
+    ///
+    /// We pre-validate every URL the operator typed into the processor config
+    /// here, at parse time, so a bad config fails fast at startup rather than
+    /// at first authentication. Discovery-derived URLs (jwks_uri etc.) are
+    /// validated separately, after the discovery fetch, inside the processor.
+    ///
+    /// If <remote_url_allow_hosts> is absent the filter degrades to its
+    /// historical permissive behavior: this matches every other ClickHouse
+    /// outbound URL site and avoids breaking existing deployments.
+    RemoteHostFilter remote_host_filter;
+    remote_host_filter.setValuesFromConfig(config);
+
+    auto require_allowed_url = [&](const String & raw_url, const char * param_name)
+    {
+        if (raw_url.empty())
+            return;
+        try
+        {
+            remote_host_filter.checkURL(Poco::URI(raw_url));
+        }
+        catch (const Exception & e)
+        {
+            throw DB::Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
+                                "Token processor '{}': '{}' URL '{}' is not in <remote_url_allow_hosts>: {}",
+                                processor_name, param_name, raw_url, e.message());
+        }
+    };
+
     if (provider_type == "google")
     {
         return std::make_unique<GoogleTokenProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim);
@@ -47,20 +84,29 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
 
         if (externally_configured && ! locally_configured)
         {
+            const auto configuration_endpoint = config.getString(prefix + ".configuration_endpoint");
+            require_allowed_url(configuration_endpoint, "configuration_endpoint");
             return std::make_unique<OpenIdTokenProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim,
                                                           expected_issuer, expected_audience, allow_no_expiration,
-                                                          config.getString(prefix + ".configuration_endpoint"),
+                                                          configuration_endpoint,
                                                           verifier_leeway,
-                                                          jwks_cache_lifetime);
+                                                          jwks_cache_lifetime,
+                                                          remote_host_filter);
         }
         else if (locally_configured && !externally_configured)
         {
+            const auto userinfo_endpoint = config.getString(prefix + ".userinfo_endpoint");
+            const auto token_introspection_endpoint = config.getString(prefix + ".token_introspection_endpoint");
+            const auto jwks_uri = config.getString(prefix + ".jwks_uri", "");
+            require_allowed_url(userinfo_endpoint, "userinfo_endpoint");
+            require_allowed_url(token_introspection_endpoint, "token_introspection_endpoint");
+            require_allowed_url(jwks_uri, "jwks_uri");
             return std::make_unique<OpenIdTokenProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim,
                                                           expected_issuer, expected_audience, allow_no_expiration,
-                                                          config.getString(prefix + ".userinfo_endpoint"),
-                                                          config.getString(prefix + ".token_introspection_endpoint"),
+                                                          userinfo_endpoint,
+                                                          token_introspection_endpoint,
                                                           verifier_leeway,
-                                                          config.getString(prefix + ".jwks_uri", ""),
+                                                          jwks_uri,
                                                           jwks_cache_lifetime);
         }
 
@@ -113,11 +159,13 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
         if (!config.hasProperty(prefix + ".jwks_uri"))
             throw DB::Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "'jwks_uri' must be specified for 'jwt_dynamic_jwks' processor");
 
+        const auto jwks_uri = config.getString(prefix + ".jwks_uri");
+        require_allowed_url(jwks_uri, "jwks_uri");
         return std::make_unique<JwksJwtProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim,
                                                   expected_issuer, expected_audience, allow_no_expiration,
                                                   config.getString(prefix + ".claims", ""),
                                                   config.getUInt64(prefix + ".verifier_leeway", 0),
-                                                  config.getString(prefix + ".jwks_uri"),
+                                                  jwks_uri,
                                                   config.getUInt(prefix + ".jwks_cache_lifetime", 3600));
     }
     else
