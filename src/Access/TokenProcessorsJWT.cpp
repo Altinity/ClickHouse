@@ -251,6 +251,36 @@ std::set<String> parseGroupsFromJsonArray(picojson::array groups_array)
 }
 }
 
+namespace
+{
+/// Warn at construction time when a JWT processor is left without an
+/// `expected_audience` (and/or `expected_issuer`) pin. Without `aud`,
+/// the same token is replayable on any other deployment that trusts
+/// the same IdP -- a token minted for cluster X authenticates on
+/// cluster Y as well, because nothing ties a JWT to "this specific
+/// relying party". Same shape as the Google/Azure warnings (H-10);
+/// the warning is the only signal operators get since the verifier
+/// just silently skips the check when the pin is empty.
+void warnIfBindingsNotPinned(const String & processor_name,
+                             const String & expected_issuer,
+                             const String & expected_audience)
+{
+    if (expected_audience.empty())
+        LOG_WARNING(getLogger("TokenAuthentication"),
+                    "{}: 'expected_audience' is not configured. Tokens issued by the same IdP for "
+                    "any other relying party will be accepted here, including tokens minted for a "
+                    "different ClickHouse deployment. Set 'expected_audience' to this deployment's "
+                    "audience to prevent cross-cluster replay.",
+                    processor_name);
+    if (expected_issuer.empty())
+        LOG_WARNING(getLogger("TokenAuthentication"),
+                    "{}: 'expected_issuer' is not configured. The JWT 'iss' claim will not be enforced; "
+                    "any token signed by a key in this processor's JWKS will be accepted regardless of "
+                    "issuer. Set 'expected_issuer' to bind tokens to a specific IdP.",
+                    processor_name);
+}
+}
+
 StaticKeyJwtProcessor::StaticKeyJwtProcessor(const String & processor_name_,
                                              UInt64 token_cache_lifetime_,
                                              const String & username_claim_,
@@ -263,6 +293,8 @@ StaticKeyJwtProcessor::StaticKeyJwtProcessor(const String & processor_name_,
                                              claims(params.claims), expected_issuer(expected_issuer_), expected_audience(expected_audience_),
                                              allow_no_expiration(allow_no_expiration_)
 {
+    warnIfBindingsNotPinned(processor_name, expected_issuer, expected_audience);
+
     const String & algo = params.algo;
     const String & static_key = params.static_key;
     bool static_key_in_base64 = params.static_key_in_base64;
@@ -408,6 +440,23 @@ bool StaticKeyJwtProcessor::resolveAndValidate(TokenCredentials & credentials) c
         LOG_TRACE(getLogger("TokenAuthentication"), "{}: Failed to validate JWT: {}", processor_name, ex.what());
         return false;
     }
+}
+
+JwksJwtProcessor::JwksJwtProcessor(const String & processor_name_,
+                                   UInt64 token_cache_lifetime_,
+                                   const String & username_claim_,
+                                   const String & groups_claim_,
+                                   const String & expected_issuer_,
+                                   const String & expected_audience_,
+                                   bool allow_no_expiration_,
+                                   const String & claims_,
+                                   size_t verifier_leeway_,
+                                   std::shared_ptr<IJWKSProvider> provider_)
+    : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_),
+      claims(claims_), expected_issuer(expected_issuer_), expected_audience(expected_audience_),
+      allow_no_expiration(allow_no_expiration_), provider(provider_), verifier_leeway(verifier_leeway_)
+{
+    warnIfBindingsNotPinned(processor_name, expected_issuer, expected_audience);
 }
 
 bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const

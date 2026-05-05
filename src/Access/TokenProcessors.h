@@ -122,10 +122,7 @@ public:
                               bool allow_no_expiration_,
                               const String & claims_,
                               size_t verifier_leeway_,
-                              std::shared_ptr<IJWKSProvider> provider_)
-                              : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_),
-                                claims(claims_), expected_issuer(expected_issuer_), expected_audience(expected_audience_),
-                                allow_no_expiration(allow_no_expiration_), provider(provider_), verifier_leeway(verifier_leeway_) {}
+                              std::shared_ptr<IJWKSProvider> provider_);
 
     explicit JwksJwtProcessor(const String & processor_name_,
                               UInt64 token_cache_lifetime_,
