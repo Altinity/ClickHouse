@@ -49,7 +49,21 @@ public:
     bool checkKerberosCredentials(const String & realm, const GSSAcceptorContext & credentials) const;
     bool checkHTTPBasicCredentials(const String & server, const BasicCredentials & credentials, const ClientInfo & client_info, SettingsChanges & settings) const;
 
-    bool checkTokenCredentials(const TokenCredentials & credentials, const String & processor_name = "", const String & jwt_claims = "") const;
+    /// `prime_cache_on_success` controls whether a successful validation populates the
+    /// token cache. Per-user authentication paths (the chain reached from
+    /// `Session::authenticate`) leave this at the default `true` -- their result is
+    /// gated by the user's pinned processor and per-user JWT claims, so the cache
+    /// entry it produces is safe to consult on subsequent requests. The HTTP and TCP
+    /// bearer entry points authenticate the token *before* the user is known
+    /// (they need the username from the token to drive user lookup) and so call
+    /// this with `false`: their decision is made under no processor pin and no
+    /// claims constraint, and a cache entry written from that context would be
+    /// trusted by a later per-user call whose `processor_name` is empty -- bypassing
+    /// the per-user processor and claim selection that would otherwise occur.
+    bool checkTokenCredentials(const TokenCredentials & credentials,
+                               const String & processor_name = "",
+                               const String & jwt_claims = "",
+                               bool prime_cache_on_success = true) const;
 
     GSSAcceptorContext::Params getKerberosParams() const;
 
@@ -93,7 +107,8 @@ private:
     bool token_auth_enabled TSA_GUARDED_BY(mutex) = true;
 
     bool checkCredentialsAgainstProcessor(const ITokenProcessor & processor,
-                                          TokenCredentials & credentials) const TSA_REQUIRES(mutex);
+                                          TokenCredentials & credentials,
+                                          bool prime_cache_on_success) const TSA_REQUIRES(mutex);
 
     void resetImpl() TSA_REQUIRES(mutex);
 };

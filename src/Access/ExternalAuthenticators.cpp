@@ -641,7 +641,8 @@ HTTPAuthClientParams ExternalAuthenticators::getHTTPAuthenticationParams(const S
 }
 
 bool ExternalAuthenticators::checkCredentialsAgainstProcessor(const ITokenProcessor & processor,
-                                                              TokenCredentials & credentials) const
+                                                              TokenCredentials & credentials,
+                                                              bool prime_cache_on_success) const
 {
     if (processor.resolveAndValidate(credentials))
     {
@@ -674,17 +675,28 @@ bool ExternalAuthenticators::checkCredentialsAgainstProcessor(const ITokenProces
 
         LOG_DEBUG(getLogger("AccessTokenAuthentication"), "Authenticated user {} with access token by {}", credentials.getUserName(), processor.getProcessorName());
 
-        // CHeck if a cache entry for the same user but with another token exists -- old cache entry is considered outdated and removed
-        auto old_token_iter = username_to_access_token_cache.find(cache_entry.user_name);
-        if (old_token_iter != username_to_access_token_cache.end())
+        if (prime_cache_on_success)
         {
-            access_token_to_username_cache.erase(old_token_iter->second);
-            username_to_access_token_cache.erase(old_token_iter);
-        }
+            // CHeck if a cache entry for the same user but with another token exists -- old cache entry is considered outdated and removed
+            auto old_token_iter = username_to_access_token_cache.find(cache_entry.user_name);
+            if (old_token_iter != username_to_access_token_cache.end())
+            {
+                access_token_to_username_cache.erase(old_token_iter->second);
+                username_to_access_token_cache.erase(old_token_iter);
+            }
 
-        access_token_to_username_cache[credentials.getToken()] = cache_entry;
-        username_to_access_token_cache[cache_entry.user_name] = credentials.getToken();
-        LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} added", cache_entry.user_name);
+            access_token_to_username_cache[credentials.getToken()] = cache_entry;
+            username_to_access_token_cache[cache_entry.user_name] = credentials.getToken();
+            LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} added", cache_entry.user_name);
+        }
+        else
+        {
+            LOG_TRACE(getLogger("AccessTokenAuthentication"),
+                      "Cache entry for user {} NOT primed: caller is performing pre-user-lookup token validation; "
+                      "the per-user authentication path will be the one to populate the cache after applying the "
+                      "user's pinned processor and JWT claim restrictions.",
+                      cache_entry.user_name);
+        }
 
         return true;
     }
@@ -693,7 +705,10 @@ bool ExternalAuthenticators::checkCredentialsAgainstProcessor(const ITokenProces
     return false;
 }
 
-bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & credentials, const String & processor_name, const String & jwt_claims) const
+bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & credentials,
+                                                   const String & processor_name,
+                                                   const String & jwt_claims,
+                                                   bool prime_cache_on_success) const
 {
     std::lock_guard lock{mutex};
 
@@ -780,7 +795,7 @@ bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & cred
                           it.second->getProcessorName());
                 continue;
             }
-            if (checkCredentialsAgainstProcessor(*it.second, const_cast<TokenCredentials &>(credentials)))
+            if (checkCredentialsAgainstProcessor(*it.second, const_cast<TokenCredentials &>(credentials), prime_cache_on_success))
                 return check_claims_if_required(*it.second);
         }
     }
@@ -798,7 +813,7 @@ bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & cred
                       it->second->getProcessorName());
             return false;
         }
-        if (checkCredentialsAgainstProcessor(*it->second, const_cast<TokenCredentials &>(credentials)))
+        if (checkCredentialsAgainstProcessor(*it->second, const_cast<TokenCredentials &>(credentials), prime_cache_on_success))
             return check_claims_if_required(*it->second);
     }
 
