@@ -368,6 +368,20 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
         : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_),
           userinfo_endpoint(userinfo_endpoint_), token_introspection_endpoint(token_introspection_endpoint_)
 {
+    /// Without `jwks_uri`, no `jwt_validator` is created and so `expected_issuer`
+    /// / `expected_audience` cannot be enforced anywhere on the validation path
+    /// -- the runtime falls straight to the userinfo endpoint, which only
+    /// answers "the IdP describes this user", not "the token's `iss`/`aud`
+    /// match what this deployment pinned". Refuse to load with that combination
+    /// rather than silently dropping the operator's bindings.
+    if (jwks_uri_.empty() && (!expected_issuer_.empty() || !expected_audience_.empty()))
+        throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
+                        "{}: 'expected_issuer' / 'expected_audience' are configured but no 'jwks_uri' is provided. "
+                        "These bindings can only be enforced via local JWT validation against a JWKS; the userinfo "
+                        "fallback alone cannot enforce them. Configure 'jwks_uri' (or, if you intentionally want "
+                        "userinfo-only validation, clear 'expected_issuer'/'expected_audience').",
+                        processor_name);
+
     if (!jwks_uri_.empty())
     {
         LOG_TRACE(getLogger("TokenAuthentication"), "{}: JWKS URI set, local JWT processing will be attempted", processor_name_);
@@ -490,6 +504,18 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
     userinfo_endpoint = Poco::URI(getValueByKey(openid_config, "userinfo_endpoint").value());
     token_introspection_endpoint = Poco::URI(getValueByKey(openid_config, "introspection_endpoint").value());
 
+    /// See manual-constructor comment: `expected_issuer` / `expected_audience`
+    /// can only be enforced via local JWT validation. If the discovery document
+    /// does not advertise a `jwks_uri`, no `jwt_validator` will be created and
+    /// the userinfo fallback alone cannot enforce these bindings. Refuse the
+    /// configuration rather than silently dropping them.
+    if (!openid_config.contains("jwks_uri") && (!expected_issuer_.empty() || !expected_audience_.empty()))
+        throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
+                        "{}: OIDC discovery at '{}' did not advertise a 'jwks_uri', but 'expected_issuer' / "
+                        "'expected_audience' are configured. These bindings can only be enforced via local JWT "
+                        "validation against a JWKS; userinfo cannot enforce them. Refusing to load.",
+                        processor_name, openid_config_endpoint_);
+
     if (openid_config.contains("jwks_uri"))
     {
         LOG_TRACE(getLogger("TokenAuthentication"), "{}: JWKS URI set, local JWT processing will be attempted", processor_name_);
@@ -513,8 +539,28 @@ bool OpenIdTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
     String username;
     picojson::object user_info_json;
 
-    if (jwt_validator.has_value() && jwt_validator.value().resolveAndValidate(credentials))
+    if (jwt_validator.has_value())
     {
+        /// When a `jwt_validator` is configured, it owns the operator's
+        /// `expected_issuer` / `expected_audience` / `allow_no_expiration`
+        /// bindings. If it rejects the token we MUST NOT fall back to the
+        /// userinfo endpoint: userinfo only confirms "the IdP describes this
+        /// user", it has no notion of the operator-pinned audience or issuer
+        /// and does not enforce the local expiration policy. Falling back here
+        /// would silently bypass exactly the bindings the operator opted into,
+        /// e.g. a JWT with the wrong `aud` would still authenticate because
+        /// the IdP's own userinfo accepts it for itself.
+        if (!jwt_validator.value().resolveAndValidate(credentials))
+        {
+            LOG_TRACE(getLogger("TokenAuthentication"),
+                      "{}: Local JWT validation rejected the token. Refusing to fall back to "
+                      "userinfo: the operator-configured bindings (expected_issuer / expected_audience / "
+                      "allow_no_expiration) cannot be enforced by userinfo, and a fallback would silently "
+                      "bypass them.",
+                      processor_name);
+            return false;
+        }
+
         try
         {
             auto decoded_token = jwt::decode(token);
@@ -531,7 +577,13 @@ bool OpenIdTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
         }
     }
 
-    /// If username or user info is empty -- local validation failed, trying introspection via provider
+    /// Userinfo path: only reachable when no `jwt_validator` is configured
+    /// (the constructor guarantees that combination is incompatible with any
+    /// `expected_issuer` / `expected_audience` pin), or when local JWT validation
+    /// passed but extracting the username/payload from the decoded token failed
+    /// for an unrelated reason -- in which case the bindings have already been
+    /// enforced by `jwt_validator` and userinfo is just being asked for the user
+    /// identity.
     if (username.empty() || user_info_json.empty())
     {
         try
