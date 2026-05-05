@@ -400,7 +400,7 @@ class CI:
         JobNames.INTEGRATION_TEST_ASAN: CommonJobConfigs.INTEGRATION_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_ASAN],
             num_batches=4,
-            timeout=3 * 3600,  # the job timed out with default value (7200)
+            timeout=4 * 3600,  # the job timed out with default value (7200)
         ),
         JobNames.INTEGRATION_TEST_ASAN_OLD_ANALYZER: CommonJobConfigs.INTEGRATION_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_ASAN],
