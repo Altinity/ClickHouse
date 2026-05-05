@@ -86,7 +86,17 @@ private:
     mutable LDAPCaches ldap_caches TSA_GUARDED_BY(mutex) ;
     std::optional<GSSAcceptorContext::Params> kerberos_params TSA_GUARDED_BY(mutex) ;
     std::unordered_map<String, HTTPAuthClientParams> http_auth_servers TSA_GUARDED_BY(mutex) ;
-    mutable std::unordered_map<String, std::unique_ptr<ITokenProcessor>> token_processors TSA_GUARDED_BY(mutex) ;
+    /// Ordered (std::map, not unordered_map) so that the auto-discovery
+    /// dispatch order in `checkTokenCredentials` is deterministic across
+    /// process runs. Without an ordering, the iteration order of
+    /// `unordered_map` is implementation-defined and may differ run-to-run
+    /// or after rehashing -- which means the same unpinned token can be
+    /// validated by processor A in one run and processor B in another,
+    /// producing different cached identities, different role mappings (each
+    /// processor has its own `groups_claim`), and surprising debugging
+    /// outcomes. Alphabetical-by-name order makes "first to succeed wins"
+    /// stable and predictable from configuration alone.
+    mutable std::map<String, std::unique_ptr<ITokenProcessor>> token_processors TSA_GUARDED_BY(mutex) ;
 
     struct TokenCacheEntry
     {
