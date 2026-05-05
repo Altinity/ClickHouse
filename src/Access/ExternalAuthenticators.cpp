@@ -300,7 +300,7 @@ void ExternalAuthenticators::reset()
 ///
 /// Throws if ANY processor fails to parse. The caller is expected to react by
 /// disabling token authentication for this configuration cycle (fail-closed).
-void parseTokenProcessors(std::unordered_map<String, std::unique_ptr<ITokenProcessor>> & token_processors,
+void parseTokenProcessors(std::map<String, std::unique_ptr<ITokenProcessor>> & token_processors,
                         const Poco::Util::AbstractConfiguration & config,
                         const String & token_processors_config,
                         LoggerPtr log)
@@ -308,8 +308,9 @@ void parseTokenProcessors(std::unordered_map<String, std::unique_ptr<ITokenProce
     Poco::Util::AbstractConfiguration::Keys token_processors_keys;
     config.keys(token_processors_config, token_processors_keys);
 
-    /// Build into a local map first so the live set is never observed in a partially-constructed state
-    std::unordered_map<String, std::unique_ptr<ITokenProcessor>> parsed;
+    /// Build into a local map first so the live set is never observed in a partially-constructed state.
+    /// Ordered so the auto-discovery iteration order in `checkTokenCredentials` is stable.
+    std::map<String, std::unique_ptr<ITokenProcessor>> parsed;
 
     for (const auto & processor : token_processors_keys)
     {
