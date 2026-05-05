@@ -4,6 +4,7 @@
 #include <base/types.h>
 #include <jwt-cpp/jwt.h>
 #include <jwt-cpp/traits/kazuho-picojson/traits.h>
+#include <filesystem>
 #include <shared_mutex>
 
 #include <Poco/URI.h>
@@ -60,12 +61,25 @@ class StaticJWKS : public IJWKSProvider
 public:
     explicit StaticJWKS(const StaticJWKSParams &params);
 
-private:
-    JWKSType getJWKS() override
-    {
-        return jwks;
-    }
+    /// Reload the JWKS from disk if `static_jwks_file` was specified and the
+    /// file's mtime has advanced since the last load. Inline `static_jwks`
+    /// (no file path) is returned from the in-memory copy without I/O.
+    /// Without this, rotating the underlying file did NOT refresh the
+    /// in-memory keys -- admins had to trigger a full
+    /// `setExternalAuthenticatorsConfig` reload to pick up the new file.
+    JWKSType getJWKS() override;
 
+private:
+    void reloadFromFileIfChangedNoLock();
+
+    /// Source path -- empty when JWKS came from inline `<static_jwks>` config.
+    String static_jwks_file;
+    /// `mtime` of the file at the most recent successful load. Used to detect
+    /// rotation. `file_time_type::min()` means "not loaded from a file" or
+    /// "never seen the file yet".
+    std::filesystem::file_time_type last_loaded_mtime = std::filesystem::file_time_type::min();
+
+    mutable std::shared_mutex mutex;
     JWKSType jwks;
 };
 
