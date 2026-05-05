@@ -667,7 +667,13 @@ bool OpenIdTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
         /// the IdP's own userinfo accepts it for itself.
         if (!jwt_validator.value().resolveAndValidate(credentials))
         {
-            LOG_TRACE(getLogger("TokenAuthentication"),
+            /// DEBUG, not TRACE: this is the binding-rejection path. Operators
+            /// running with DEBUG enabled will see a clear signal that the
+            /// JWT-fastpath (which enforces `expected_issuer` / `expected_audience`
+            /// / `allow_no_expiration`) rejected a token. The auth failure itself
+            /// is also visible to the client, but the log line tells the operator
+            /// *why* it was rejected on the local side.
+            LOG_DEBUG(getLogger("TokenAuthentication"),
                       "{}: Local JWT validation rejected the token. Refusing to fall back to "
                       "userinfo: the operator-configured bindings (expected_issuer / expected_audience / "
                       "allow_no_expiration) cannot be enforced by userinfo, and a fallback would silently "
@@ -688,7 +694,22 @@ bool OpenIdTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
         }
         catch (const std::exception & ex)
         {
-            LOG_TRACE(getLogger("TokenAuthentication"), "{}: Failed to process token as JWT: {}", processor_name, ex.what());
+            /// WARNING: validation passed but extracting the payload locally
+            /// failed -- a genuinely rare condition (the same token was just
+            /// successfully verified, so its bytes ARE a valid JWT). The
+            /// processor is about to fall back to userinfo for username
+            /// extraction. Bindings were already enforced by `jwt_validator`,
+            /// so this fallback is safe -- but the underlying mismatch
+            /// (decode failure on a verified token) usually means an IdP
+            /// behavioral change, a clock skew, or a payload-format drift,
+            /// and operators should know about it loudly.
+            LOG_WARNING(getLogger("TokenAuthentication"),
+                        "{}: JWT validation succeeded but payload extraction failed: {}. "
+                        "Falling back to userinfo for username; the operator-configured "
+                        "bindings have ALREADY been enforced by JWT validation, so this "
+                        "fallback is safe -- but the decode failure indicates an unexpected "
+                        "JWT shape from the IdP.",
+                        processor_name, ex.what());
         }
     }
 
