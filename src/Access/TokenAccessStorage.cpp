@@ -197,6 +197,35 @@ TokenAccessStorage::TokenAccessStorage(const String & storage_name_, AccessContr
     if (config.has(prefix_str + "default_profile"))
         default_profile_name = config.getString(prefix_str + "default_profile");
 
+    /// Optional IP allowlist for auto-provisioned users. Mirrors the
+    /// `users.xml` `<networks>` shape: `<ip>SUBNET</ip>` /
+    /// `<host>NAME</host>` / `<host_regexp>REGEX</host_regexp>` children.
+    /// Without this, every auto-created token user defaults to `AnyHost` and
+    /// admins have no way to restrict token-auth by network through standard
+    /// access-control config.
+    const auto networks_config_path = prefix_str + "networks";
+    if (config.has(networks_config_path))
+    {
+        AllowedClientHosts hosts;
+        Poco::Util::AbstractConfiguration::Keys network_keys;
+        config.keys(networks_config_path, network_keys);
+        for (const String & key : network_keys)
+        {
+            const String value = config.getString(networks_config_path + "." + key);
+            if (key.starts_with("ip"))
+                hosts.addSubnet(value);
+            else if (key.starts_with("host_regexp"))
+                hosts.addNameRegexp(value);
+            else if (key.starts_with("host"))
+                hosts.addName(value);
+            else
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                                "Token user directory '{}': unknown <networks> entry '{}'; expected 'ip', 'host', or 'host_regexp'.",
+                                storage_name_, key);
+        }
+        auto_user_allowed_hosts = std::move(hosts);
+    }
+
     user_external_roles.clear();
     users_per_roles.clear();
     roles_per_users.clear();
@@ -569,6 +598,12 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
         new_user = std::make_shared<User>();
         new_user->setName(credentials.getUserName());
         new_user->authentication_methods.emplace_back(AuthenticationType::JWT);
+        /// If the operator configured a network allowlist for this storage,
+        /// stamp it onto the auto-created user so `isAddressAllowed` checks it
+        /// below. Without this, every auto-provisioned token user inherits
+        /// `AnyHostTag` and there is no way to restrict token auth by network.
+        if (auto_user_allowed_hosts.has_value())
+            new_user->allowed_client_hosts = *auto_user_allowed_hosts;
         user = new_user;
     }
 
