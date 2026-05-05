@@ -465,8 +465,15 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
 
     const picojson::object openid_config = getObjectFromURI(Poco::URI(openid_config_endpoint_));
 
-    if (!openid_config.contains("userinfo_endpoint") || !openid_config.contains("introspection_endpoint"))
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "{}: Cannot extract userinfo_endpoint or introspection_endpoint from OIDC configuration, consider manual configuration.", processor_name);
+    /// Only `userinfo_endpoint` is mandatory: it backs the runtime userinfo
+    /// fallback (and is the sole user-info source when no JWKS is configured).
+    /// `introspection_endpoint` is currently unused at runtime -- it's plumbed
+    /// for a future RFC 7662 introspection feature -- so a discovery document
+    /// that omits it should not block processor construction.
+    if (!openid_config.contains("userinfo_endpoint"))
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED,
+                        "{}: Cannot extract userinfo_endpoint from OIDC configuration at '{}'; consider manual configuration.",
+                        processor_name, openid_config_endpoint_);
 
     /// The discovery document is untrusted: even with the issuer-anchor check
     /// below (H-08), a poisoned or misdirected response can still try to point
@@ -516,7 +523,8 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
     };
 
     require_allowed_discovery_url(getValueByKey(openid_config, "userinfo_endpoint").value(), "userinfo_endpoint");
-    require_allowed_discovery_url(getValueByKey(openid_config, "introspection_endpoint").value(), "introspection_endpoint");
+    if (openid_config.contains("introspection_endpoint"))
+        require_allowed_discovery_url(getValueByKey(openid_config, "introspection_endpoint").value(), "introspection_endpoint");
     if (openid_config.contains("jwks_uri"))
         require_allowed_discovery_url(getValueByKey(openid_config, "jwks_uri").value(), "jwks_uri");
 
@@ -564,7 +572,8 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
     }
 
     userinfo_endpoint = Poco::URI(getValueByKey(openid_config, "userinfo_endpoint").value());
-    token_introspection_endpoint = Poco::URI(getValueByKey(openid_config, "introspection_endpoint").value());
+    if (openid_config.contains("introspection_endpoint"))
+        token_introspection_endpoint = Poco::URI(getValueByKey(openid_config, "introspection_endpoint").value());
 
     /// See manual-constructor comment: `expected_issuer` / `expected_audience`
     /// can only be enforced via local JWT validation. If the discovery document
