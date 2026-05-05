@@ -710,3 +710,132 @@ def test_drop_while_discovery_in_flight(started_cluster, cleanup):
     assert_eq_with_retry(
         node2, "SELECT getNamedScalar('batch_post')", "1\n"
     )
+
+
+# -------- LOCAL persistence (replaces stateless 03802 / 03807 / 03810) --------
+# These properties used to live in stateless tests driven by clickhouse-local,
+# but timing-coupled assertions against a short-lived local instance are
+# fragile under CI load. Real stop_clickhouse() / start_clickhouse() with
+# assert_eq_with_retry is the proper harness.
+
+
+def _drop_all_local_named_scalars(node):
+    rows = node.query(
+        "SELECT name FROM system.named_scalars WHERE kind = 'local'"
+    ).strip()
+    for name in [r for r in rows.splitlines() if r]:
+        node.query(f"DROP NAMED SCALAR IF EXISTS {name}")
+
+
+@pytest.fixture
+def cleanup_local():
+    yield
+    try:
+        _drop_all_local_named_scalars(node1)
+    except Exception:
+        pass
+
+
+def test_local_restart_reloads_state(started_cluster, cleanup_local):
+    """LOCAL scalar definitions and last-good values are loaded synchronously
+    during server startup, and the refresh task resumes ticking afterwards."""
+
+    node1.query("DROP NAMED SCALAR IF EXISTS lr_cv")
+    node1.query("DROP TABLE IF EXISTS default.lr_src SYNC")
+    node1.query("CREATE TABLE default.lr_src (x UInt64) ENGINE=MergeTree() ORDER BY x")
+    node1.query("INSERT INTO default.lr_src VALUES (123)")
+    node1.query(
+        "CREATE NAMED SCALAR lr_cv REFRESH EVERY 1 SECOND "
+        "AS (SELECT max(x) FROM default.lr_src)"
+    )
+    assert node1.query("SELECT getNamedScalar('lr_cv')").strip() == "123"
+
+    node1.stop_clickhouse()
+    node1.start_clickhouse()
+
+    # Reload is sync: definition + last-good value visible immediately.
+    assert node1.query("SELECT getNamedScalar('lr_cv')").strip() == "123"
+
+    # Refresh task resumes; advance the value and observe the new one.
+    node1.query("INSERT INTO default.lr_src VALUES (200)")
+    assert_eq_with_retry(
+        node1, "SELECT getNamedScalar('lr_cv')", "200\n",
+        retry_count=60, sleep_time=0.25,
+    )
+
+    node1.query("DROP TABLE default.lr_src SYNC")
+
+
+def test_persistent_cadence_resumes_schedule(started_cluster, cleanup_local):
+    """Refresh schedule resumes from the persisted last_successful_update_time
+    instead of the restart moment. Without the fix, EVERY 1 HOUR would defer
+    the next tick by ~1 hour even if it was almost due."""
+
+    node1.query("DROP NAMED SCALAR IF EXISTS pc_cv")
+    node1.query(
+        "CREATE NAMED SCALAR pc_cv REFRESH EVERY 1 HOUR AS SELECT toUInt64(1)"
+    )
+
+    node1.stop_clickhouse()
+
+    # Rewrite the persisted timestamps to "3570 seconds ago" so the next tick
+    # under EVERY 1 HOUR should land ~30 s after restart.
+    rewrite_script = (
+        "import os, re, time\n"
+        "root = '/var/lib/clickhouse/named_scalars_cache'\n"
+        "for f in os.listdir(root):\n"
+        "    p = os.path.join(root, f)\n"
+        "    t = open(p).read()\n"
+        "    target = int(time.time()) - 3570\n"
+        "    t = re.sub(r'^last_update_time: \\d+$', "
+        "f'last_update_time: {target}', t, count=1, flags=re.MULTILINE)\n"
+        "    t = re.sub(r'^last_successful_update_time: \\d+$', "
+        "f'last_successful_update_time: {target}', t, count=1, flags=re.MULTILINE)\n"
+        "    open(p, 'w').write(t)\n"
+    )
+    node1.exec_in_container(["python3", "-c", rewrite_script], user="root")
+
+    node1.start_clickhouse()
+
+    # Next refresh should land within ~5 minutes; anything close to 3600
+    # would mean the schedule reset to "now".
+    next_in = int(node1.query(
+        "SELECT toInt64(next_refresh_time) - toInt64(now()) "
+        "FROM system.named_scalars WHERE name = 'pc_cv' AND kind = 'local'"
+    ).strip())
+    assert next_in < 300, f"next_refresh_time is {next_in} s away (expected < 300)"
+
+
+def test_creator_database_normalization(started_cluster, cleanup_local):
+    """Unqualified table refs in the CREATE NAMED SCALAR body are rewritten
+    with the creator's current database. After restart, SYSTEM REFRESH from a
+    process whose default database is `default` still resolves correctly."""
+
+    node1.query("DROP NAMED SCALAR IF EXISTS cd_cv")
+    node1.query("DROP DATABASE IF EXISTS cd_db SYNC")
+    node1.query("CREATE DATABASE cd_db")
+    node1.query("CREATE TABLE cd_db.t (x UInt64) ENGINE=MergeTree() ORDER BY x")
+    node1.query("INSERT INTO cd_db.t VALUES (10), (20), (30)")
+
+    # CREATE in cd_db; refer to `t` unqualified.
+    node1.query(
+        "CREATE NAMED SCALAR cd_cv REFRESH EVERY 36500 DAYS AS (SELECT sum(x) FROM t)",
+        database="cd_db",
+    )
+    assert node1.query("SELECT getNamedScalar('cd_cv')").strip() == "60"
+
+    node1.stop_clickhouse()
+    node1.start_clickhouse()
+
+    # SYSTEM REFRESH from default database; without normalization this would
+    # try to resolve `t` against `default` and fail with UNKNOWN_TABLE.
+    node1.query("SYSTEM REFRESH NAMED SCALAR cd_cv")
+    assert_eq_with_retry(
+        node1,
+        "SELECT current_value_is_valid, coalesce(exception, '') = '' "
+        "FROM system.named_scalars WHERE name = 'cd_cv'",
+        "1\t1\n",
+        retry_count=60, sleep_time=0.25,
+    )
+
+    node1.query("DROP DATABASE cd_db SYNC")
