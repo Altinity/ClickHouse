@@ -224,7 +224,26 @@ bool GoogleTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
                 }
 
                 auto group_data = group.get<picojson::object>();
-                String group_name = getValueByKey<std::string, false>(group_data["groupKey"].get<picojson::object>(), "id").value_or("");
+
+                /// Guard against a missing or non-object `groupKey`. Without
+                /// these checks `group_data["groupKey"].get<picojson::object>()`
+                /// would auto-insert a null `picojson::value` (because picojson
+                /// objects are `std::map<string, picojson::value>` and `[]`
+                /// default-constructs on a missing key) and then throw
+                /// `std::bad_cast` on the `.get<picojson::object>()` call --
+                /// which the `catch (const Exception &)` below does NOT
+                /// catch (`std::bad_cast` is `std::exception`-derived, not
+                /// `DB::Exception`-derived). The uncaught exception used to
+                /// propagate out of `resolveAndValidate` and abort auth.
+                auto group_key_it = group_data.find("groupKey");
+                if (group_key_it == group_data.end() || !group_key_it->second.is<picojson::object>())
+                {
+                    LOG_TRACE(getLogger("TokenAuthentication"),
+                              "{}: Group entry without a 'groupKey' object; skipping", processor_name);
+                    continue;
+                }
+
+                String group_name = getValueByKey<std::string, false>(group_key_it->second.get<picojson::object>(), "id").value_or("");
                 if (!group_name.empty())
                 {
                     external_groups_names.insert(group_name);
@@ -235,9 +254,12 @@ bool GoogleTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
 
             credentials.setGroups(external_groups_names);
         }
-        catch (const Exception & e)
+        catch (const std::exception & e)
         {
-            /// Could not get groups info. Log it and skip it.
+            /// Defense in depth: catch `std::exception` (not just `DB::Exception`)
+            /// so picojson's `std::bad_cast` and `std::runtime_error` -- and any
+            /// other future deviation -- degrade to "no roles mapped" rather
+            /// than aborting the whole authentication.
             LOG_TRACE(getLogger("TokenAuthentication"),
                       "{}: Failed to get Google groups, no external roles will be mapped. reason: {}", processor_name, e.what());
             return true;
@@ -398,9 +420,11 @@ bool AzureTokenProcessor::resolveAndValidate(TokenCredentials & credentials) con
             }
         }
     }
-    catch (const Exception & e)
+    catch (const std::exception & e)
     {
-        /// Could not get groups info. Log it and skip it.
+        /// Defense in depth (M-10 sibling): broadened to `std::exception` so a
+        /// picojson `std::bad_cast` from a malformed response degrades to "no
+        /// roles mapped" rather than aborting the whole authentication.
         LOG_TRACE(getLogger("TokenAuthentication"),
                   "{}: Failed to get Azure groups, no external roles will be mapped. reason: {}", processor_name, e.what());
         return true;
