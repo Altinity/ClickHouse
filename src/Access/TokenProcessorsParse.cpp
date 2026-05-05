@@ -79,8 +79,14 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
         auto verifier_leeway = config.getUInt64(prefix + ".verifier_leeway", 60);
         auto jwks_cache_lifetime = config.getUInt64(prefix + ".jwks_cache_lifetime", 3600);
 
+        /// `token_introspection_endpoint` is currently unused at runtime: the
+        /// processor relies on JWT-local validation (when JWKS is configured)
+        /// or on userinfo, never on RFC 7662 introspection. Don't require it
+        /// for "locally configured" mode -- forcing operators to set a value
+        /// that does nothing is a footgun. If introspection is wired up later,
+        /// the field is already plumbed and can become required at that point.
         bool externally_configured = config.hasProperty(prefix + ".configuration_endpoint") && !config.hasProperty(prefix + ".jwks_uri");
-        bool locally_configured = config.hasProperty(prefix + ".userinfo_endpoint") && config.hasProperty(prefix + ".token_introspection_endpoint");
+        bool locally_configured = config.hasProperty(prefix + ".userinfo_endpoint");
 
         if (externally_configured && ! locally_configured)
         {
@@ -96,7 +102,7 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
         else if (locally_configured && !externally_configured)
         {
             const auto userinfo_endpoint = config.getString(prefix + ".userinfo_endpoint");
-            const auto token_introspection_endpoint = config.getString(prefix + ".token_introspection_endpoint");
+            const auto token_introspection_endpoint = config.getString(prefix + ".token_introspection_endpoint", "");
             const auto jwks_uri = config.getString(prefix + ".jwks_uri", "");
             require_allowed_url(userinfo_endpoint, "userinfo_endpoint");
             require_allowed_url(token_introspection_endpoint, "token_introspection_endpoint");
@@ -110,7 +116,9 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
                                                           jwks_cache_lifetime);
         }
 
-        throw DB::Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "Either 'configuration_endpoint' or both 'userinfo_endpoint' and 'token_introspection_endpoint' (and, optionally, 'jwks_uri') must be specified for 'openid' processor");
+        throw DB::Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
+                            "Either 'configuration_endpoint' or 'userinfo_endpoint' "
+                            "(and, optionally, 'token_introspection_endpoint' / 'jwks_uri') must be specified for 'openid' processor");
     }
     else if (provider_type == "jwt_static_key")
     {
