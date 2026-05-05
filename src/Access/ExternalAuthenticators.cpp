@@ -689,6 +689,25 @@ void ExternalAuthenticators::primeTokenCache(const ITokenProcessor & processor,
     cache_entry.expires_at = credentials.getExpiresAt().value_or(
         std::chrono::system_clock::now() + std::chrono::seconds(processor.getTokenCacheLifetime()));
 
+    /// If the same token already has a forward entry that maps to a DIFFERENT
+    /// user_name, clean up the stale reverse entry for that other user before
+    /// we overwrite the forward entry. This happens when two processors extract
+    /// different `username_claim` values from the same token (e.g. processor X
+    /// uses `sub`, processor Y uses `email`): without this, the rotation step
+    /// below would not see the old user's entry in the reverse map and the
+    /// bi-map would diverge -- forward saying token -> new_user while a stale
+    /// reverse says old_user -> token, surfacing later as a dangling reverse
+    /// pointer that breaks the single-token-per-user invariant.
+    auto existing_forward = access_token_to_username_cache.find(credentials.getToken());
+    if (existing_forward != access_token_to_username_cache.end()
+        && existing_forward->second.user_name != cache_entry.user_name)
+    {
+        auto stale_reverse = username_to_access_token_cache.find(existing_forward->second.user_name);
+        if (stale_reverse != username_to_access_token_cache.end()
+            && stale_reverse->second == credentials.getToken())
+            username_to_access_token_cache.erase(stale_reverse);
+    }
+
     /// If a previous entry exists for the same user under a different token,
     /// drop it -- the user has rotated tokens and the old one is now stale.
     auto old_token_iter = username_to_access_token_cache.find(cache_entry.user_name);
@@ -743,9 +762,21 @@ bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & cred
         if (cached_entry_iter->second.expires_at <= std::chrono::system_clock::now()) // Token found in cache, but already outdated -- need to remove it.
         {
             const auto expired_user_name = cached_entry_iter->second.user_name;
+            const auto expired_token = cached_entry_iter->first;
             LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} expired, removing", expired_user_name);
             access_token_to_username_cache.erase(cached_entry_iter);
-            username_to_access_token_cache.erase(expired_user_name);
+
+            /// Only unlink the reverse mapping if it currently points at the token
+            /// we just evicted. The bi-map invariant is maintained by
+            /// `primeTokenCache`, but if a reverse entry is somehow stale (or if a
+            /// concurrent rotation under the same mutex hold has already pointed
+            /// the user's reverse mapping at a fresh, still-valid token), erasing
+            /// blindly here would unlink that fresh token's reverse entry --
+            /// silently breaking the single-token-per-user invariant and extending
+            /// the stale token's effective retention.
+            auto reverse_it = username_to_access_token_cache.find(expired_user_name);
+            if (reverse_it != username_to_access_token_cache.end() && reverse_it->second == expired_token)
+                username_to_access_token_cache.erase(reverse_it);
         }
         /// Enforce the per-user processor pin even on cache hit. A cache entry produced by
         /// processor A must NOT be used to satisfy an authentication request that is pinned
