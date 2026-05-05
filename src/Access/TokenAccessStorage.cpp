@@ -1,4 +1,5 @@
 #include <Access/TokenAccessStorage.h>
+#include <Access/AccessChangesNotifier.h>
 #include <Access/AccessControl.h>
 #include <Access/ExternalAuthenticators.h>
 #include <Access/User.h>
@@ -614,6 +615,26 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
             return entity_;
         });
     }
+
+    /// Flush queued user-entity events from this storage's `memory_storage` so
+    /// subscribers observe the freshly-resolved roles and profile right away.
+    ///
+    /// `memory_storage.insert` / `update` only enqueue `onEntityAdded` /
+    /// `onEntityUpdated` on the shared `AccessChangesNotifier`; without an
+    /// explicit `sendNotifications` they sit on the queue until some unrelated
+    /// access mutation (a SQL DDL on access entities, a config reload, a
+    /// replicated-storage sync) happens to trigger a drain. During that window
+    /// any existing `ContextAccess` bound to this user UUID keeps serving its
+    /// previously-cached authorization state -- a freshly-revoked role appears
+    /// "still granted" until the next unrelated trigger.
+    ///
+    /// Note: `applyRoleChangeNoLock` (the storage's other mutation site) does
+    /// NOT need an explicit flush -- it only runs inside `processRoleChange`,
+    /// which is itself dispatched from a `sendNotifications` drain; the events
+    /// it queues are picked up by the very loop that called it. Only
+    /// `authenticateImpl` runs outside of any drain and so is the one site
+    /// that has to flush explicitly.
+    access_control.getChangesNotifier().sendNotifications();
 
     if (id)
         return AuthResult{ .user_id = *id, .authentication_data = AuthenticationData(AuthenticationType::JWT), .user_name = user->getName() };
