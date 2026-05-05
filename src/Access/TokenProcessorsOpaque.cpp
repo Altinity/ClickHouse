@@ -94,6 +94,28 @@ namespace
     }
 }
 
+GoogleTokenProcessor::GoogleTokenProcessor(const String & processor_name_,
+                                           UInt64 token_cache_lifetime_,
+                                           const String & username_claim_,
+                                           const String & groups_claim_,
+                                           const String & expected_audience_)
+    : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_)
+    , expected_audience(expected_audience_)
+{
+    /// Without an audience pin, this processor accepts any Google access token
+    /// that authenticates the user against Google -- including tokens minted for
+    /// completely unrelated OAuth clients (a classic confused-deputy scenario).
+    /// Operators who actually want token-based auth almost always want it bound
+    /// to their own client_id; surface this gap loudly at startup so it can't
+    /// stay silently un-enforced.
+    if (expected_audience.empty())
+        LOG_WARNING(getLogger("TokenAuthentication"),
+                    "{}: 'expected_audience' is not configured for Google token processor. "
+                    "Any valid Google access token (regardless of issuing client) will be accepted; "
+                    "set 'expected_audience' to the OAuth client_id this processor should accept.",
+                    processor_name);
+}
+
 bool GoogleTokenProcessor::resolveAndValidate(TokenCredentials & credentials) const
 {
     const String & token = credentials.getToken();
@@ -111,9 +133,29 @@ bool GoogleTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
 
     String user_name = user_info[username_claim];
 
+    auto token_info = getObjectFromURI(Poco::URI("https://www.googleapis.com/oauth2/v3/tokeninfo"), token);
+
+    /// Audience binding (H-10): the Google /tokeninfo endpoint authoritatively
+    /// reports the OAuth client_id the access token was issued for in its 'aud'
+    /// field. Without this check, a token minted for any other Google OAuth
+    /// client (the user's mobile app, a third-party tool) would authenticate
+    /// here too -- because Google /userinfo will happily honor any valid token.
+    /// Refusing tokens whose 'aud' does not match the configured client pin is
+    /// what makes the binding strict.
+    if (!expected_audience.empty())
+    {
+        const auto aud = getValueByKey<std::string, false>(token_info, "aud").value_or("");
+        if (aud != expected_audience)
+        {
+            LOG_TRACE(getLogger("TokenAuthentication"),
+                      "{}: Google access token audience '{}' does not match configured 'expected_audience' '{}'; rejecting",
+                      processor_name, aud, expected_audience);
+            return false;
+        }
+    }
+
     credentials.setUserName(user_name);
 
-    auto token_info = getObjectFromURI(Poco::URI("https://www.googleapis.com/oauth2/v3/tokeninfo"), token);
     if (token_info.contains("exp"))
         credentials.setExpiresAt(std::chrono::system_clock::from_time_t((getValueByKey<time_t>(token_info, "exp").value())));
 
@@ -168,6 +210,27 @@ bool GoogleTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
     return true;
 }
 
+AzureTokenProcessor::AzureTokenProcessor(const String & processor_name_,
+                                         UInt64 token_cache_lifetime_,
+                                         const String & username_claim_,
+                                         const String & groups_claim_,
+                                         const String & expected_audience_)
+    : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_)
+    , expected_audience(expected_audience_)
+{
+    /// Without an audience pin, this processor accepts any Azure AD access token
+    /// that Microsoft Graph happens to honor -- which includes tokens minted for
+    /// other applications inside the same tenant. Surface the gap so operators
+    /// can lock the processor to their own application's audience.
+    if (expected_audience.empty())
+        LOG_WARNING(getLogger("TokenAuthentication"),
+                    "{}: 'expected_audience' is not configured for Azure token processor. "
+                    "Any Azure access token Microsoft Graph accepts will authenticate here, "
+                    "regardless of which application it was issued for; set 'expected_audience' "
+                    "to the audience this processor should accept.",
+                    processor_name);
+}
+
 bool AzureTokenProcessor::resolveAndValidate(TokenCredentials & credentials) const
 {
     /// Token is a JWT in this case, but we cannot directly verify it against Azure AD JWKS.
@@ -178,21 +241,58 @@ bool AzureTokenProcessor::resolveAndValidate(TokenCredentials & credentials) con
 
     const String & token = credentials.getToken();
 
+    String username;
     try
     {
         picojson::object user_info_json = getObjectFromURI(Poco::URI("https://graph.microsoft.com/oidc/userinfo"), token);
-        String username = getValueByKey(user_info_json, username_claim).value();
-
-        if (!username.empty())
-            credentials.setUserName(username);
-        else
-            LOG_TRACE(getLogger("TokenAuthentication"), "{}: Failed to get username with token", processor_name);
-
+        username = getValueByKey(user_info_json, username_claim).value();
     }
     catch (...)
     {
         return false;
     }
+
+    /// Audience binding (H-10): only after Microsoft Graph has accepted the
+    /// token (proving it is a real, signed Azure AD token) do we trust its
+    /// claims. We then enforce that the 'aud' claim matches the operator-pinned
+    /// audience -- without this check, *any* token issued for *any* application
+    /// in the tenant that has Graph access would authenticate. With the check,
+    /// tokens minted for other applications are rejected even though Graph
+    /// itself would honor them.
+    if (!expected_audience.empty())
+    {
+        try
+        {
+            auto decoded_token = jwt::decode(token);
+            if (!decoded_token.has_audience())
+            {
+                LOG_TRACE(getLogger("TokenAuthentication"),
+                          "{}: Azure access token has no 'aud' claim; cannot enforce 'expected_audience' '{}'; rejecting",
+                          processor_name, expected_audience);
+                return false;
+            }
+            const auto auds = decoded_token.get_audience();
+            if (auds.find(expected_audience) == auds.end())
+            {
+                LOG_TRACE(getLogger("TokenAuthentication"),
+                          "{}: Azure access token audience does not contain configured 'expected_audience' '{}'; rejecting",
+                          processor_name, expected_audience);
+                return false;
+            }
+        }
+        catch (const std::exception & e)
+        {
+            LOG_TRACE(getLogger("TokenAuthentication"),
+                      "{}: Failed to decode Azure access token while enforcing 'expected_audience': {}; rejecting",
+                      processor_name, e.what());
+            return false;
+        }
+    }
+
+    if (!username.empty())
+        credentials.setUserName(username);
+    else
+        LOG_TRACE(getLogger("TokenAuthentication"), "{}: Failed to get username with token", processor_name);
 
     try
     {

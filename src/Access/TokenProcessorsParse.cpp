@@ -68,11 +68,11 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
 
     if (provider_type == "google")
     {
-        return std::make_unique<GoogleTokenProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim);
+        return std::make_unique<GoogleTokenProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim, expected_audience);
     }
     else if (provider_type == "azure")
     {
-        return std::make_unique<AzureTokenProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim);
+        return std::make_unique<AzureTokenProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim, expected_audience);
     }
     else if (provider_type == "openid")
     {

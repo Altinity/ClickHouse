@@ -171,10 +171,13 @@ public:
     GoogleTokenProcessor(const String & processor_name_,
                          UInt64 token_cache_lifetime_,
                          const String & username_claim_,
-                         const String & groups_claim_)
-            : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_) {}
+                         const String & groups_claim_,
+                         const String & expected_audience_);
 
     bool resolveAndValidate(TokenCredentials & credentials) const override;
+
+private:
+    const String expected_audience;
 };
 
 class AzureTokenProcessor : public ITokenProcessor
@@ -183,10 +186,13 @@ public:
     AzureTokenProcessor(const String & processor_name_,
                         UInt64 token_cache_lifetime_,
                         const String & username_claim_,
-                        const String & groups_claim_)
-            : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_) {}
+                        const String & groups_claim_,
+                        const String & expected_audience_);
 
     bool resolveAndValidate(TokenCredentials & credentials) const override;
+
+private:
+    const String expected_audience;
 };
 
 class OpenIdTokenProcessor : public ITokenProcessor
