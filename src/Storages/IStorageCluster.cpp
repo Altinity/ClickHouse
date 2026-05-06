@@ -23,8 +23,8 @@
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Storages/IStorage.h>
 #include <Storages/SelectQueryInfo.h>
-<<<<<<< HEAD
 #include <Storages/extractTableFunctionFromSelectQuery.h>
+#include <Storages/StorageDistributed.h>
 #include <Planner/Utils.h>
 #include <Analyzer/QueryTreeBuilder.h>
 #include <Analyzer/QueryNode.h>
@@ -33,12 +33,8 @@
 #include <Analyzer/JoinNode.h>
 #include <Analyzer/InDepthQueryTreeVisitor.h>
 #include <Analyzer/Utils.h>
-=======
-#include <Storages/StorageDistributed.h>
-#include <Storages/extractTableFunctionFromSelectQuery.h>
 #include <TableFunctions/TableFunctionFactory.h>
 #include <Poco/URI.h>
->>>>>>> 926498e8dcf (Merge 5822bc25b2d4170ba272d2b148303e0c7e6de343 into 1236100237a81c9cb9d903429a2ae6df53020b9f)
 
 #include <algorithm>
 #include <memory>
@@ -54,18 +50,15 @@ namespace Setting
     extern const SettingsBool async_socket_for_remote;
     extern const SettingsBool skip_unavailable_shards;
     extern const SettingsNonZeroUInt64 max_parallel_replicas;
-<<<<<<< HEAD
     extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode;
+    extern const SettingsUInt64 object_storage_max_nodes;
+    extern const SettingsBool object_storage_remote_initiator;
+    extern const SettingsString object_storage_remote_initiator_cluster;
 }
 
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
-=======
-    extern const SettingsUInt64 object_storage_max_nodes;
-    extern const SettingsBool object_storage_remote_initiator;
-    extern const SettingsString object_storage_remote_initiator_cluster;
->>>>>>> 926498e8dcf (Merge 5822bc25b2d4170ba272d2b148303e0c7e6de343 into 1236100237a81c9cb9d903429a2ae6df53020b9f)
 }
 
 namespace ErrorCodes
@@ -339,13 +332,9 @@ void IStorageCluster::read(
     SharedHeader sample_block;
     ASTPtr query_to_send = query_info.query;
 
-<<<<<<< HEAD
     updateQueryWithJoinToSendIfNeeded(query_to_send, query_info.query_tree, context);
 
-    if (context->getSettingsRef()[Setting::allow_experimental_analyzer])
-=======
     if (settings[Setting::allow_experimental_analyzer])
->>>>>>> 926498e8dcf (Merge 5822bc25b2d4170ba272d2b148303e0c7e6de343 into 1236100237a81c9cb9d903429a2ae6df53020b9f)
     {
         sample_block = InterpreterSelectQueryAnalyzer::getSampleBlock(query_to_send, context, SelectQueryOptions(processed_stage));
     }

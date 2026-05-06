@@ -3,10 +3,7 @@ import logging
 import os
 import shutil
 import uuid
-<<<<<<< HEAD
-=======
 
->>>>>>> 926498e8dcf (Merge 5822bc25b2d4170ba272d2b148303e0c7e6de343 into 1236100237a81c9cb9d903429a2ae6df53020b9f)
 import threading
 import time
 from email.errors import HeaderParseError

@@ -147,24 +147,20 @@ void StorageObjectStorageConfiguration::initialize(
     else
         FormatFactory::instance().checkFormatName(format);
 
-    if (configuration_to_initialize.partition_strategy_type == PartitionStrategyFactory::StrategyType::HIVE)
+    if (getPartitionStrategyType() == PartitionStrategyFactory::StrategyType::HIVE)
     {
-        configuration_to_initialize.file_path_generator = std::make_shared<ObjectStorageAppendFilePathGenerator>(
-            configuration_to_initialize.getRawPath().path,
-            configuration_to_initialize.format);
+        file_path_generator = std::make_shared<ObjectStorageAppendFilePathGenerator>(
+            getRawPath().path,
+            format);
     }
     else
     {
-        configuration_to_initialize.file_path_generator = std::make_shared<ObjectStorageWildcardFilePathGenerator>(configuration_to_initialize.getRawPath().path);
+        file_path_generator = std::make_shared<ObjectStorageWildcardFilePathGenerator>(getRawPath().path);
     }
 
     /// We shouldn't set path for disk setup because path prefix is already set in used object_storage.
     if (disk_name.empty())
-<<<<<<< HEAD
-        configuration_to_initialize.read_path = configuration_to_initialize.file_path_generator->getPathForRead();
-=======
-        read_path = getRawPath();
->>>>>>> 926498e8dcf (Merge 5822bc25b2d4170ba272d2b148303e0c7e6de343 into 1236100237a81c9cb9d903429a2ae6df53020b9f)
+        read_path = file_path_generator->getPathForRead();
 
     initialized = true;
 }

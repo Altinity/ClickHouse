@@ -847,7 +847,6 @@ def test_gcs(started_cluster):
         assert "Google cloud storage converts to S3" in str(err.value)
 
 
-<<<<<<< HEAD
 # TODO - turn on after merge alternative syntax
 def _test_cluster_joins(started_cluster):
     node = started_cluster.instances["node1"]
@@ -987,7 +986,8 @@ def _test_cluster_joins(started_cluster):
     )
 
     assert res == "Jack\tBlack\nJack\tSilver\nJohn\tBlack\nJohn\tSilver\n"
-=======
+
+
 def test_namespace_filter(started_cluster):
     node = started_cluster.instances["node1"]
 
@@ -1052,4 +1052,3 @@ def test_namespace_filter(started_cluster):
     node.query(f"DROP TABLE {CATALOG_NAME}.`{namespace_prefix}alpha.{table_name}`")
     node.query(f"DROP TABLE {CATALOG_NAME}.`{namespace_prefix}alpha.a1.{table_name}`")
     assert "is filtered by `namespaces` database parameter." in node.query_and_get_error(f"DROP TABLE {CATALOG_NAME}.`{namespace_prefix}alpha.a2.{table_name}`")
->>>>>>> 926498e8dcf (Merge 5822bc25b2d4170ba272d2b148303e0c7e6de343 into 1236100237a81c9cb9d903429a2ae6df53020b9f)

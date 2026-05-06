@@ -108,17 +108,11 @@ public:
     /// Raw URI, specified by a user. Used in permission check.
     virtual const String & getRawURI() const = 0;
 
-<<<<<<< HEAD
-    const Path & getPathForRead() const;
+    virtual const Path & getPathForRead() const;
 
     // Path used for writing, it should not be globbed and might contain a partition key
-    Path getPathForWrite(const std::string & partition_id = "") const;
-    Path getPathForWrite(const std::string & partition_id, const std::string & filename_override) const;
-=======
-    virtual const Path & getPathForRead() const;
-    // Path used for writing, it should not be globbed and might contain a partition key
     virtual Path getPathForWrite(const std::string & partition_id = "") const;
->>>>>>> 926498e8dcf (Merge 5822bc25b2d4170ba272d2b148303e0c7e6de343 into 1236100237a81c9cb9d903429a2ae6df53020b9f)
+    Path getPathForWrite(const std::string & partition_id, const std::string & filename_override) const;
 
     virtual void setPathForRead(const Path & path)
     {

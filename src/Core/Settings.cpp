@@ -7501,7 +7501,6 @@ Always ignore ON CLUSTER clause for DDL queries with replicated databases.
 )", 0) \
     DECLARE(UInt64, archive_adaptive_buffer_max_size_bytes, 8 * DBMS_DEFAULT_BUFFER_SIZE, R"(
 Limits the maximum size of the adaptive buffer used when writing to archive files (for example, tar archives)", 0) \
-<<<<<<< HEAD
     DECLARE(Bool, export_merge_tree_part_overwrite_file_if_exists, false, R"(
 Overwrite file if it already exists when exporting a merge tree part
 )", 0) \
@@ -7554,7 +7553,7 @@ Querying ZooKeeper is expensive, and only available if the ZooKeeper feature fla
 )", 0) \
     DECLARE(String, export_merge_tree_part_filename_pattern, "{part_name}_{checksum}", R"(
 Pattern for the filename of the exported merge tree part. The `part_name` and `checksum` are calculated and replaced on the fly. Additional macros are supported.
-=======
+)", 0) \
     DECLARE(Timezone, iceberg_timezone_for_timestamptz, "UTC", R"(
 Timezone for Iceberg timestamptz field.
 
@@ -7573,7 +7572,6 @@ Possible values:
 - `` (empty value) - use server or session timezone
 
 Default value is empty.
->>>>>>> 926498e8dcf (Merge 5822bc25b2d4170ba272d2b148303e0c7e6de343 into 1236100237a81c9cb9d903429a2ae6df53020b9f)
 )", 0) \
     \
     /* ####################################################### */ \
