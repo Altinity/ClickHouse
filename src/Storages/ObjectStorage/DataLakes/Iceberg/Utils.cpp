@@ -67,6 +67,7 @@ namespace DB::ErrorCodes
 extern const int FILE_DOESNT_EXIST;
 extern const int BAD_ARGUMENTS;
 extern const int ICEBERG_SPECIFICATION_VIOLATION;
+extern const int PATH_ACCESS_DENIED;
 extern const int LOGICAL_ERROR;
 }
 
@@ -119,11 +120,14 @@ static CompressionMethod getCompressionMethodFromMetadataFile(const String & pat
 
 static bool isTemporaryMetadataFile(const String & file_name)
 {
-    String substring = String(file_name.begin(), file_name.begin() + file_name.find_first_of('.'));
+    auto string_position = file_name.find_first_of('.');
+    if (string_position == String::npos)
+        return true;
+    String substring = String(file_name.begin(), file_name.begin() + string_position);
     return Poco::UUID{}.tryParse(substring);
 }
 
-static Iceberg::MetadataFileWithInfo getMetadataFileAndVersion(const std::string & path)
+Iceberg::MetadataFileWithInfo getMetadataFileAndVersion(const std::string & path)
 {
     String file_name = std::filesystem::path(path).filename();
     if (isTemporaryMetadataFile(file_name))
@@ -386,6 +390,8 @@ std::pair<Poco::Dynamic::Var, bool> getIcebergType(DataTypePtr type, Int32 & ite
 {
     switch (type->getTypeId())
     {
+        case TypeIndex::UInt16:
+        case TypeIndex::Int16:
         case TypeIndex::UInt32:
         case TypeIndex::Int32:
             return {"int", true};
@@ -477,6 +483,7 @@ Poco::Dynamic::Var getAvroType(DataTypePtr type)
 {
     switch (type->getTypeId())
     {
+        case TypeIndex::UInt16:
         case TypeIndex::UInt32:
         case TypeIndex::Int32:
         case TypeIndex::Date:
@@ -1080,6 +1087,25 @@ static MetadataFileWithInfo getLatestMetadataFileAndVersion(
     return load_fn();
 }
 
+static String resolveContained(const std::filesystem::path & base, const std::filesystem::path & relative)
+{
+    auto norm_base = base.lexically_normal();
+    auto combined = (norm_base / relative).lexically_normal();
+
+    auto rel = combined.lexically_relative(norm_base);
+
+    if (rel.empty() || rel.begin()->string() == "..")
+    {
+        throw Exception(
+            ErrorCodes::PATH_ACCESS_DENIED,
+            "Explicit metadata file path `{}` should be in the table path directory : `{}`",
+            relative.string(),
+            base.string());
+    }
+
+    return combined.string();
+}
+
 MetadataFileWithInfo getLatestOrExplicitMetadataFileAndVersion(
     const ObjectStoragePtr & object_storage,
     const String & table_path,
@@ -1093,24 +1119,16 @@ MetadataFileWithInfo getLatestOrExplicitMetadataFileAndVersion(
     if (data_lake_settings[DataLakeStorageSetting::iceberg_metadata_file_path].changed)
     {
         auto explicit_metadata_path = data_lake_settings[DataLakeStorageSetting::iceberg_metadata_file_path].value;
-        try
+        LOG_TEST(log, "Explicit metadata file path is specified {}, will read from this metadata file", explicit_metadata_path);
+        std::filesystem::path p(explicit_metadata_path);
+        auto it = p.begin();
+        if (it != p.end())
         {
-            LOG_TEST(log, "Explicit metadata file path is specified {}, will read from this metadata file", explicit_metadata_path);
-            std::filesystem::path p(explicit_metadata_path);
-            auto it = p.begin();
-            if (it != p.end())
-            {
-                if (*it == "." || *it == "..")
-                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Relative paths are not allowed");
-            }
-            if (!explicit_metadata_path.starts_with(table_path))
-                explicit_metadata_path = std::filesystem::path(table_path) / explicit_metadata_path;
-            return getMetadataFileAndVersion(explicit_metadata_path);
+            if (*it == "." || *it == "..")
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Relative paths are not allowed");
         }
-        catch (const std::exception & ex)
-        {
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Invalid path {} specified for iceberg_metadata_file_path: '{}'", explicit_metadata_path, ex.what());
-        }
+        String resolved_path = resolveContained(table_path, explicit_metadata_path);
+        return getMetadataFileAndVersion(resolved_path);
     }
     else if (data_lake_settings[DataLakeStorageSetting::iceberg_metadata_table_uuid].changed)
     {

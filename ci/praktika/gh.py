@@ -558,6 +558,8 @@ class GH:
             return Result.Status.PENDING
         elif status in Result.Status.DROPPED:
             return Result.Status.ERROR
+        elif status in Result.Status.SKIPPED:
+            return Result.Status.SUCCESS
         else:
             assert (
                 False

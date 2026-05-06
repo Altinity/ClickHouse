@@ -48,6 +48,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"input_format_parquet_use_metadata_cache", true, false, "Obsolete. No-op"}, // https://github.com/Altinity/ClickHouse/pull/586
             {"object_storage_remote_initiator_cluster", "", "", "New setting."},
             {"iceberg_metadata_staleness_ms", 0, 0, "New setting allowing using cached metadata version at READ operations to prevent fetching from remote catalog"},
+            {"export_merge_tree_partition_task_timeout_seconds", 0, 3600, "New setting to control the timeout for export partition tasks."},
+            {"export_merge_tree_partition_manifest_ttl", 180, 86400, "Reasonable default for real usage"},
         });
         addSettingsChanges(settings_changes_history, "26.1",
         {
