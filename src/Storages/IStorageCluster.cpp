@@ -54,10 +54,6 @@ namespace Setting
     extern const SettingsUInt64 object_storage_max_nodes;
     extern const SettingsBool object_storage_remote_initiator;
     extern const SettingsString object_storage_remote_initiator_cluster;
-<<<<<<< HEAD
-=======
-    extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode;
->>>>>>> f036d399211 (Merge pull request #1577 from Altinity/feature/antalya-26.1/remote_initiator_improvements)
 }
 
 namespace ErrorCodes

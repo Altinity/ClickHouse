@@ -1342,22 +1342,7 @@ def test_graceful_shutdown(started_cluster):
     node = started_cluster.instances["s0_0_0"]
     node_to_shutdown = started_cluster.instances["s0_1_0"]
 
-<<<<<<< HEAD
     expected = TSV("64\tBar\t8\n56\tFoo\t8\n")
-=======
-    # Simple cluster
-    query_id = uuid.uuid4().hex
-    result = node.query(
-        f"""
-        SELECT * from s3Cluster(
-            'cluster_remote',
-            'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
-            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') ORDER BY (name, value, polygon)
-        SETTINGS object_storage_remote_initiator=1
-        """,
-        query_id = query_id,
-    )
->>>>>>> f036d399211 (Merge pull request #1577 from Altinity/feature/antalya-26.1/remote_initiator_improvements)
 
     num_lock = threading.Lock()
     errors = 0
@@ -1390,32 +1375,16 @@ def test_graceful_shutdown(started_cluster):
 
     threads = []
 
-<<<<<<< HEAD
     for _ in range(10):
         thread = threading.Thread(target=query_cycle)
         thread.start()
         threads.append(thread)
         time.sleep(0.2)
-=======
-    # Cluster with dots in the host names
-    query_id = uuid.uuid4().hex
-    result = node.query(
-        f"""
-        SELECT * from s3Cluster(
-            'cluster_with_dots',
-            'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
-            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') ORDER BY (name, value, polygon)
-        SETTINGS object_storage_remote_initiator=1
-        """,
-        query_id = query_id,
-    )
->>>>>>> f036d399211 (Merge pull request #1577 from Altinity/feature/antalya-26.1/remote_initiator_improvements)
 
     time.sleep(3)
 
     node_to_shutdown.query("SYSTEM STOP SWARM MODE")
 
-<<<<<<< HEAD
     # enough time to complete processing of objects, started before "SYSTEM STOP SWARM MODE"
     time.sleep(3)
 
@@ -1427,126 +1396,3 @@ def test_graceful_shutdown(started_cluster):
     node_to_shutdown.start_clickhouse()
 
     assert errors == 0
-=======
-    # initial node + describe table + remote initiator + 2 subqueries on replicas
-    assert queries == ["5"]
-
-    users = node.query(
-        f"""
-        SELECT DISTINCT hostname, user
-            FROM clusterAllReplicas('cluster_all', system.query_log)
-            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
-            ORDER BY ALL
-            FORMAT TSV
-        """
-    ).splitlines()
-
-    assert users == ["c2.s0_0_0\tdefault",
-                     "c2.s0_0_1\tdefault",
-                     "s0_0_0\tdefault"]
-
-    # Cluster with user and password
-    query_id = uuid.uuid4().hex
-    result = node.query(
-        f"""
-        SELECT * from s3Cluster(
-            'cluster_with_username_and_password',
-            'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
-            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') ORDER BY (name, value, polygon)
-        SETTINGS object_storage_remote_initiator=1
-        """,
-        query_id = query_id,
-    )
-
-    assert result is not None
-
-    node.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster_all'")
-    queries = node.query(
-        f"""
-        SELECT count()
-            FROM clusterAllReplicas('cluster_all', system.query_log)
-            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
-            FORMAT TSV
-        """
-    ).splitlines()
-
-    # initial node + describe table + remote initiator + 2 subqueries on replicas
-    assert queries == ["5"]
-
-    users = node.query(
-        f"""
-        SELECT DISTINCT hostname, user
-            FROM clusterAllReplicas('cluster_all', system.query_log)
-            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
-            ORDER BY ALL
-            FORMAT TSV
-        """
-    ).splitlines()
-
-    assert users == ["s0_0_0\tdefault",
-                     "s0_0_1\tfoo",
-                     "s0_1_0\tfoo"]
-
-    # Cluster with secret
-    query_id = uuid.uuid4().hex
-    result = node.query_and_get_error(
-        f"""
-        SELECT * from s3Cluster(
-            'cluster_with_secret',
-            'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
-            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') ORDER BY (name, value, polygon)
-        SETTINGS object_storage_remote_initiator=1
-        """,
-        query_id = query_id,
-    )
-
-    assert "Can't convert query to remote when cluster uses secret" in result
-
-    # Different cluster for remote initiator and query execution
-    # with `hidden_cluster_with_username_and_password` existed only in `cluster_with_dots` nodes
-    query_id = uuid.uuid4().hex
-
-    result = node.query(
-        f"""
-        SELECT * from s3(
-            'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
-            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') ORDER BY (name, value, polygon)
-        SETTINGS
-            object_storage_remote_initiator=1,
-            object_storage_cluster='hidden_cluster_with_username_and_password',
-            object_storage_remote_initiator_cluster='cluster_with_dots'
-        """,
-        query_id = query_id,
-    )
-
-    assert result is not None
-
-    node.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster_all'")
-    queries = node.query(
-        f"""
-        SELECT count()
-            FROM clusterAllReplicas('cluster_all', system.query_log)
-            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
-            FORMAT TSV
-        """
-    ).splitlines()
-
-    # initial node + describe table + remote initiator + 2 subqueries on replicas
-    assert queries == ["5"]
-
-    users = node.query(
-        f"""
-        SELECT DISTINCT hostname, user
-            FROM clusterAllReplicas('cluster_all', system.query_log)
-            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
-            ORDER BY ALL
-            FORMAT TSV
-        """
-    ).splitlines()
-
-    # Random host from 'cluster_with_dots' for remote query
-    assert users[0] in ["c2.s0_0_0\tdefault", "c2.s0_0_1\tdefault"]
-    assert users[1:] == ["s0_0_0\tdefault",
-                     "s0_0_1\tfoo",
-                     "s0_1_0\tfoo"]
->>>>>>> f036d399211 (Merge pull request #1577 from Altinity/feature/antalya-26.1/remote_initiator_improvements)
