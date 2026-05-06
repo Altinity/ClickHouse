@@ -163,7 +163,10 @@ private:
     /// Required JWT `typ` header (RFC 8725 §3.11). Empty = no enforcement.
     const String expected_typ;
     const bool allow_no_expiration;
-    mutable jwt::verifier<jwt::default_clock, jwt::traits::kazuho_picojson> verifier = jwt::verify();
+    /// Verifier is built fresh per call inside `resolveAndValidate` (it depends
+    /// on the current JWT's `kid` -> JWKS-resolved key, which can rotate). A
+    /// local-per-call verifier also makes the function thread-safe so callers
+    /// can invoke it without holding the global `ExternalAuthenticators::mutex`.
     std::shared_ptr<IJWKSProvider> provider;
     const size_t verifier_leeway;
 };
