@@ -485,6 +485,11 @@ bool StaticKeyJwtProcessor::resolveAndValidate(TokenCredentials & credentials) c
     try
     {
         auto decoded_jwt = jwt::decode(credentials.getToken());
+
+        /// RFC 7515 §4.1.11: an unrecognized `crit` extension MUST cause rejection.
+        if (decoded_jwt.has_header_claim("crit"))
+            return false;
+
         verifier.verify(decoded_jwt);
 
         if (!checkJwtTyp(processor_name, expected_typ, decoded_jwt))
@@ -569,6 +574,10 @@ bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
     try
     {
         auto decoded_jwt = jwt::decode(credentials.getToken());
+
+        /// RFC 7515 §4.1.11: an unrecognized `crit` extension MUST cause rejection.
+        if (decoded_jwt.has_header_claim("crit"))
+            return false;
 
         if (!checkJwtTyp(processor_name, expected_typ, decoded_jwt))
             return false;
