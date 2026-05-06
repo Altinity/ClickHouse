@@ -527,28 +527,6 @@ void TokenAccessStorage::assignProfileNoLock(User & user) const
     }
 }
 
-void TokenAccessStorage::updateAssignedRolesNoLock(const UUID & id, const String & user_name, const std::set<String> & external_roles) const
-{
-    // Map and grant the roles from scratch only if the list of external role has changed.
-    const auto it = user_external_roles.find(user_name);
-    if (it != user_external_roles.end() && it->second == external_roles)
-        return;
-
-    auto update_func = [this, &external_roles] (const AccessEntityPtr & entity_, const UUID &) -> AccessEntityPtr
-    {
-        if (auto user = typeid_cast<std::shared_ptr<const User>>(entity_))
-        {
-            auto changed_user = typeid_cast<std::shared_ptr<User>>(user->clone());
-            assignRolesNoLock(*changed_user, external_roles);
-            return changed_user;
-        }
-        return entity_;
-    };
-
-    memory_storage.update(id, update_func);
-}
-
-
 std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
         const Credentials & credentials,
         const Poco::Net::IPAddress & address,
@@ -671,20 +649,53 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
     }
     else
     {
-        // Just in case external_roles are changed.
-        updateAssignedRolesNoLock(*id, user->getName(), external_roles);
-
-        // Also update profile if needed
-        memory_storage.update(*id, [this] (const AccessEntityPtr & entity_, const UUID &) -> AccessEntityPtr
+        /// Apply role-set and profile changes atomically under a single
+        /// `memory_storage.update`. Splitting them into two separate updates
+        /// (the prior shape) opened a reader-observable window between
+        /// "new roles, old profile" and "new roles, new profile" -- a query
+        /// from another thread that read the user via `AccessControl::read`
+        /// would observe a mid-state, since `MemoryAccessStorage`'s lock is
+        /// independent of `TokenAccessStorage::mutex` (M-31).
+        ///
+        /// Preserve the existing early-return optimization: skip the update
+        /// when external_roles haven't changed AND the profile is already
+        /// assigned. The `assignRolesNoLock` cleanup still has to run if
+        /// the role set changes, so it lives inside the update lambda.
+        const bool roles_changed = [&]
         {
-            if (auto user_entity = typeid_cast<std::shared_ptr<const User>>(entity_))
+            const auto it = user_external_roles.find(user->getName());
+            return it == user_external_roles.end() || it->second != external_roles;
+        }();
+
+        if (roles_changed)
+        {
+            memory_storage.update(*id, [this, &external_roles] (const AccessEntityPtr & entity_, const UUID &) -> AccessEntityPtr
             {
-                auto changed_user = typeid_cast<std::shared_ptr<User>>(user_entity->clone());
-                assignProfileNoLock(*changed_user);
-                return changed_user;
-            }
-            return entity_;
-        });
+                if (auto user_entity = typeid_cast<std::shared_ptr<const User>>(entity_))
+                {
+                    auto changed_user = typeid_cast<std::shared_ptr<User>>(user_entity->clone());
+                    assignRolesNoLock(*changed_user, external_roles);
+                    assignProfileNoLock(*changed_user);
+                    return changed_user;
+                }
+                return entity_;
+            });
+        }
+        else
+        {
+            /// Roles are stable; just refresh the profile in case it was
+            /// added/changed in config since the last auth.
+            memory_storage.update(*id, [this] (const AccessEntityPtr & entity_, const UUID &) -> AccessEntityPtr
+            {
+                if (auto user_entity = typeid_cast<std::shared_ptr<const User>>(entity_))
+                {
+                    auto changed_user = typeid_cast<std::shared_ptr<User>>(user_entity->clone());
+                    assignProfileNoLock(*changed_user);
+                    return changed_user;
+                }
+                return entity_;
+            });
+        }
     }
 
     /// Flush queued user-entity events from this storage's `memory_storage` so
