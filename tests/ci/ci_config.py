@@ -321,16 +321,24 @@ class CI:
             timeout=3600,
         ),
         JobNames.STATELESS_TEST_ASAN: CommonJobConfigs.STATELESS_TEST.with_properties(
-            required_builds=[BuildNames.PACKAGE_ASAN], num_batches=2
+            required_builds=[BuildNames.PACKAGE_ASAN],
+            num_batches=2,
+            timeout=3 * 3600,  # the job timed out with default value (7200)
         ),
         JobNames.STATELESS_TEST_TSAN: CommonJobConfigs.STATELESS_TEST.with_properties(
-            required_builds=[BuildNames.PACKAGE_TSAN], num_batches=4
+            required_builds=[BuildNames.PACKAGE_TSAN],
+            num_batches=4,
+            timeout=3 * 3600,  # the job timed out with default value (7200)
         ),
         JobNames.STATELESS_TEST_MSAN: CommonJobConfigs.STATELESS_TEST.with_properties(
-            required_builds=[BuildNames.PACKAGE_MSAN], num_batches=4
+            required_builds=[BuildNames.PACKAGE_MSAN],
+            num_batches=4,
+            timeout=3 * 3600,  # the job timed out with default value (7200)
         ),
         JobNames.STATELESS_TEST_UBSAN: CommonJobConfigs.STATELESS_TEST.with_properties(
-            required_builds=[BuildNames.PACKAGE_UBSAN], num_batches=2
+            required_builds=[BuildNames.PACKAGE_UBSAN],
+            num_batches=2,
+            timeout=3 * 3600,  # the job timed out with default value (7200)
         ),
         JobNames.STATELESS_TEST_DEBUG: CommonJobConfigs.STATELESS_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_DEBUG], num_batches=2
