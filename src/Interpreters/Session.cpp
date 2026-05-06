@@ -4,6 +4,7 @@
 #include <Access/AccessControl.h>
 #include <Access/Credentials.h>
 #include <Access/ContextAccess.h>
+#include <Access/ExternalAuthenticators.h>
 #include <Access/User.h>
 #include <Access/Role.h>
 #include <Common/logger_useful.h>
@@ -428,6 +429,22 @@ void Session::checkIfUserIsStillValid()
     /// For sessions established via a bearer/access token (JWT or opaque), enforce token expiry.
     if (auth_token_expires_at.has_value() && now >= *auth_token_expires_at)
         throw Exception(ErrorCodes::USER_EXPIRED, "Access token used to authenticate the session has expired");
+
+    /// For JWT/token sessions, also re-validate that the authenticating
+    /// processor is still configured. Without this, an admin removing a
+    /// processor (or disabling token auth entirely) would NOT terminate
+    /// active sessions until each session's token expired naturally -- a
+    /// gap of up to one token TTL (~1h for typical IdPs) between the
+    /// admin's "stop accepting tokens from this IdP" intent and actual
+    /// session termination (M-28).
+    if (user_authenticated_with.getType() == AuthenticationType::JWT)
+    {
+        const auto & processor_name = user_authenticated_with.getTokenProcessorName();
+        if (!global_context->getAccessControl().getExternalAuthenticators().hasTokenProcessor(processor_name))
+            throw Exception(ErrorCodes::USER_EXPIRED,
+                            "Token processor '{}' that authenticated this session is no longer configured",
+                            processor_name.empty() ? "<unpinned>" : processor_name);
+    }
 }
 
 void Session::onAuthenticationFailure(const std::optional<String> & user_name, const Poco::Net::SocketAddress & address_, const Exception & e)
