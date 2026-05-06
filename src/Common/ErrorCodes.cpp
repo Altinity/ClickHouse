@@ -664,6 +664,8 @@
     M(1003, SSH_EXCEPTION) \
     M(1004, STARTUP_SCRIPTS_ERROR) \
     M(1005, PENDING_MUTATIONS_NOT_ALLOWED) \
+    M(1006, EXPORT_PARTITION_ALREADY_EXPORTED) \
+    M(1007, PARTITION_EXPORT_FAILED) \
     /* See END */
 
 #ifdef APPLY_FOR_EXTERNAL_ERROR_CODES
@@ -680,7 +682,7 @@ namespace ErrorCodes
     APPLY_FOR_ERROR_CODES(M)
 #undef M
 
-    constexpr ErrorCode END = 1005;
+    constexpr ErrorCode END = 1007;
     ErrorPairHolder values[END + 1]{};
 
     struct ErrorCodesNames
