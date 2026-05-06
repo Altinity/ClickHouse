@@ -96,7 +96,13 @@ private:
     /// processor has its own `groups_claim`), and surprising debugging
     /// outcomes. Alphabetical-by-name order makes "first to succeed wins"
     /// stable and predictable from configuration alone.
-    mutable std::map<String, std::unique_ptr<ITokenProcessor>> token_processors TSA_GUARDED_BY(mutex) ;
+    ///
+    /// `shared_ptr` so callers can snapshot the relevant processor pointer
+    /// (or the whole map) under the mutex, RELEASE the mutex, and run the
+    /// expensive crypto verify without serializing the entire auth
+    /// subsystem behind a single attacker-driven RSA verify (M-20). Cheap:
+    /// processor count is tiny, snapshot is shared_ptr copies.
+    mutable std::map<String, std::shared_ptr<ITokenProcessor>> token_processors TSA_GUARDED_BY(mutex) ;
 
     struct TokenCacheEntry
     {
@@ -120,8 +126,12 @@ private:
     /// `credentials` (user name, groups, effective expires_at) and returns true.
     /// Does NOT write the token cache -- caching is the responsibility of the
     /// caller, after the per-user `jwt_claims` policy has been evaluated.
+    ///
+    /// MUST be called WITHOUT holding `mutex`: this is the expensive crypto
+    /// path (M-20). The processor must be passed by `shared_ptr` so it
+    /// outlives a concurrent config reload that resets `token_processors`.
     bool checkCredentialsAgainstProcessor(const ITokenProcessor & processor,
-                                          TokenCredentials & credentials) const TSA_REQUIRES(mutex);
+                                          TokenCredentials & credentials) const;
 
     /// Writes the per-token cache entry. Must be called only after both processor
     /// validation AND any per-user `jwt_claims` policy have accepted the token.

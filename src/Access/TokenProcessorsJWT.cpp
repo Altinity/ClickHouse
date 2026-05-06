@@ -691,6 +691,10 @@ bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
             return false;
         }
 
+        /// Build the verifier locally (was a `mutable` member; making it local
+        /// makes `resolveAndValidate` thread-safe so the caller can drop the
+        /// global auth mutex around the expensive crypto verify).
+        auto verifier = jwt::verify();
         if (algo == "rs256")
             verifier = verifier.allow_algorithm(jwt::algorithm::rs256(public_key, "", "", ""));
         else if (algo == "rs384")
