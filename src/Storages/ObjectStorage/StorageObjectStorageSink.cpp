@@ -149,7 +149,12 @@ PartitionedStorageObjectStorageSink::PartitionedStorageObjectStorageSink(
     std::optional<FormatSettings> format_settings_,
     SharedHeader sample_block_,
     ContextPtr context_)
+<<<<<<< HEAD
     : object_storage(object_storage_)
+=======
+    : PartitionedSink(configuration_->getPartitionStrategy(), context_, sample_block_)
+    , object_storage(object_storage_)
+>>>>>>> 926498e8dcf (Merge 5822bc25b2d4170ba272d2b148303e0c7e6de343 into 1236100237a81c9cb9d903429a2ae6df53020b9f)
     , configuration(configuration_)
     , query_settings(configuration_->getQuerySettings(context_))
     , format_settings(format_settings_)
@@ -183,9 +188,14 @@ SinkPtr PartitionedStorageObjectStorageSink::createSinkForPartition(const String
         format_settings,
         std::make_shared<Block>(configuration->partition_strategy->getFormatHeader()),
         context,
+<<<<<<< HEAD
         configuration->format,
         configuration->compression_method
     );
+=======
+        configuration->getFormat(),
+        configuration->getCompressionMethod());
+>>>>>>> 926498e8dcf (Merge 5822bc25b2d4170ba272d2b148303e0c7e6de343 into 1236100237a81c9cb9d903429a2ae6df53020b9f)
 }
 
 }

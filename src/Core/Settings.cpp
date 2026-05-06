@@ -7501,6 +7501,7 @@ Always ignore ON CLUSTER clause for DDL queries with replicated databases.
 )", 0) \
     DECLARE(UInt64, archive_adaptive_buffer_max_size_bytes, 8 * DBMS_DEFAULT_BUFFER_SIZE, R"(
 Limits the maximum size of the adaptive buffer used when writing to archive files (for example, tar archives)", 0) \
+<<<<<<< HEAD
     DECLARE(Bool, export_merge_tree_part_overwrite_file_if_exists, false, R"(
 Overwrite file if it already exists when exporting a merge tree part
 )", 0) \
@@ -7553,6 +7554,26 @@ Querying ZooKeeper is expensive, and only available if the ZooKeeper feature fla
 )", 0) \
     DECLARE(String, export_merge_tree_part_filename_pattern, "{part_name}_{checksum}", R"(
 Pattern for the filename of the exported merge tree part. The `part_name` and `checksum` are calculated and replaced on the fly. Additional macros are supported.
+=======
+    DECLARE(Timezone, iceberg_timezone_for_timestamptz, "UTC", R"(
+Timezone for Iceberg timestamptz field.
+
+Possible values:
+
+- Any valid timezone, e.g. `Europe/Berlin`, `UTC` or `Zulu`
+- `` (empty value) - use session timezone
+
+Default value is `UTC`.
+)", 0) \
+    DECLARE(Timezone, iceberg_partition_timezone, "", R"(
+Time zone by which partitioning of Iceberg tables was performed.
+Possible values:
+
+- Any valid timezone, e.g. `Europe/Berlin`, `UTC` or `Zulu`
+- `` (empty value) - use server or session timezone
+
+Default value is empty.
+>>>>>>> 926498e8dcf (Merge 5822bc25b2d4170ba272d2b148303e0c7e6de343 into 1236100237a81c9cb9d903429a2ae6df53020b9f)
 )", 0) \
     \
     /* ####################################################### */ \
@@ -7712,6 +7733,15 @@ Source SQL dialect for the polyglot transpiler (e.g. 'sqlite', 'mysql', 'postgre
     DECLARE(Bool, enable_adaptive_memory_spill_scheduler, false, R"(
 Trigger processor to spill data into external storage adpatively. grace join is supported at present.
 )", EXPERIMENTAL) \
+    DECLARE(String, object_storage_cluster, "", R"(
+Cluster to make distributed requests to object storages with alternative syntax.
+)", EXPERIMENTAL) \
+    DECLARE(UInt64, object_storage_max_nodes, 0, R"(
+Limit for hosts used for request in object storage cluster table functions - azureBlobStorageCluster, s3Cluster, hdfsCluster, etc.
+Possible values:
+- Positive integer.
+- 0 — All hosts in cluster.
+)", EXPERIMENTAL) \
     DECLARE(Bool, allow_experimental_delta_kernel_rs, true, R"(
 Allow experimental delta-kernel-rs implementation.
 )", BETA) \
@@ -7808,6 +7838,12 @@ If the number of set bits in a runtime bloom filter exceeds this ratio the filte
 )", EXPERIMENTAL) \
     DECLARE(Bool, rewrite_in_to_join, false, R"(
 Rewrite expressions like 'x IN subquery' to JOIN. This might be useful for optimizing the whole query with join reordering.
+)", EXPERIMENTAL) \
+    DECLARE(Bool, object_storage_remote_initiator, false, R"(
+Execute request to object storage as remote on one of object_storage_cluster nodes.
+)", EXPERIMENTAL) \
+    DECLARE(String, object_storage_remote_initiator_cluster, "", R"(
+Cluster to choose remote initiator, when `object_storage_remote_initiator` is true. When empty, `object_storage_cluster` is used.
 )", EXPERIMENTAL) \
     DECLARE(Bool, allow_experimental_iceberg_read_optimization, true, R"(
 Allow Iceberg read optimization based on Iceberg metadata.
