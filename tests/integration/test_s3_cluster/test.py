@@ -985,7 +985,6 @@ def _test_object_storage_remote_initiator(started_cluster):
                      "s0_1_0\tfoo"]
 
 
-<<<<<<< HEAD
 def test_remote_hedged(started_cluster):
     node = started_cluster.instances["s0_0_0"]
     pure_s3 = node.query(
@@ -1397,7 +1396,8 @@ def test_graceful_shutdown(started_cluster):
     node_to_shutdown.start_clickhouse()
 
     assert errors == 0
-=======
+
+
 def test_object_storage_remote_initiator_without_cluster_function(started_cluster):
     node = started_cluster.instances["s0_0_0"]
 
@@ -1492,4 +1492,3 @@ def test_object_storage_remote_initiator_without_cluster_function(started_cluste
     assert users[1:] == ["s0_0_0\tdefault",
                      "s0_0_1\tfoo",
                      "s0_1_0\tfoo"]
->>>>>>> 05a600cb237 (Merge pull request #1608 from Altinity/feature/antalya-26.1/remote_initiator_improvements_2)

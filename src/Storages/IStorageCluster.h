@@ -62,17 +62,12 @@ public:
     virtual String getClusterName(ContextPtr /* context */) const { return getOriginalClusterName(); }
 
 protected:
-<<<<<<< HEAD
-    virtual void updateQueryToSendIfNeeded(ASTPtr & /*query*/, const StorageSnapshotPtr & /*storage_snapshot*/, const ContextPtr & /*context*/) {}
-    void updateQueryWithJoinToSendIfNeeded(ASTPtr & query_to_send, QueryTreeNodePtr query_tree, const ContextPtr & context);
-=======
     virtual void updateQueryToSendIfNeeded(
         ASTPtr & /*query*/,
         const StorageSnapshotPtr & /*storage_snapshot*/,
         const ContextPtr & /*context*/,
         bool /*make_cluster_function*/) {}
-    void updateQueryWithJoinToSendIfNeeded(ASTPtr & query_to_send, SelectQueryInfo query_info, const ContextPtr & context);
->>>>>>> 05a600cb237 (Merge pull request #1608 from Altinity/feature/antalya-26.1/remote_initiator_improvements_2)
+    void updateQueryWithJoinToSendIfNeeded(ASTPtr & query_to_send, QueryTreeNodePtr query_tree, const ContextPtr & context);
 
     virtual void updateConfigurationIfNeeded(ContextPtr /* context */) {}
 

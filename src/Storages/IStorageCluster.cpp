@@ -331,7 +331,7 @@ void IStorageCluster::read(
             /// rewrite query to execute `remote('remote_host', s3(...))`
             /// remote_host can execute query itself or make on-cluster query depends on own `object_storage_cluster` setting
             updateConfigurationIfNeeded(context);
-            updateQueryWithJoinToSendIfNeeded(query_to_send, query_info, context);
+            updateQueryWithJoinToSendIfNeeded(query_to_send, query_info.query_tree, context);
             updateQueryToSendIfNeeded(query_to_send, storage_snapshot, context, /*make_cluster_function*/ false);
 
             auto remote_initiator_cluster_name = settings[Setting::object_storage_remote_initiator_cluster].value;
