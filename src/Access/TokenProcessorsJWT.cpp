@@ -498,7 +498,18 @@ bool StaticKeyJwtProcessor::resolveAndValidate(TokenCredentials & credentials) c
             return false;
         }
 
-        credentials.setUserName(decoded_jwt.get_payload_claim(username_claim).as_string());
+        /// Reject empty `username_claim` value (M-27): a present-but-empty
+        /// claim would set user_name="" with `is_ready=false`, which the
+        /// cache would happily accept and collapse every empty-username
+        /// token into one dynamic user.
+        const auto user_name = decoded_jwt.get_payload_claim(username_claim).as_string();
+        if (user_name.empty())
+        {
+            LOG_TRACE(getLogger("TokenAuthentication"),
+                      "{}: Resolved username from claim '{}' is empty; rejecting", processor_name, username_claim);
+            return false;
+        }
+        credentials.setUserName(user_name);
 
         if (decoded_jwt.has_payload_claim(groups_claim))
             credentials.setGroups(parseGroupsFromJsonArray(decoded_jwt.get_payload_claim(groups_claim).as_array()));
@@ -727,7 +738,16 @@ bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
         if (!claims.empty() && !check_claims(claims, decoded_jwt.get_payload_json()))
             return false;
 
-        credentials.setUserName(decoded_jwt.get_payload_claim(username_claim).as_string());
+        /// Reject empty resolved username (M-27); see the
+        /// `StaticKeyJwtProcessor` peer for rationale.
+        const auto user_name = decoded_jwt.get_payload_claim(username_claim).as_string();
+        if (user_name.empty())
+        {
+            LOG_TRACE(getLogger("TokenAuthentication"),
+                      "{}: Resolved username from claim '{}' is empty; rejecting", processor_name, username_claim);
+            return false;
+        }
+        credentials.setUserName(user_name);
 
         if (decoded_jwt.has_payload_claim(groups_claim))
             credentials.setGroups(parseGroupsFromJsonArray(decoded_jwt.get_payload_claim(groups_claim).as_array()));
