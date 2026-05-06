@@ -341,7 +341,9 @@ class CI:
             timeout=3 * 3600,  # the job timed out with default value (7200)
         ),
         JobNames.STATELESS_TEST_DEBUG: CommonJobConfigs.STATELESS_TEST.with_properties(
-            required_builds=[BuildNames.PACKAGE_DEBUG], num_batches=2
+            required_builds=[BuildNames.PACKAGE_DEBUG], 
+            num_batches=2,
+            timeout=3 * 3600,  # the job timed out with default value (7200)
         ),
         JobNames.STATELESS_TEST_RELEASE: CommonJobConfigs.STATELESS_TEST.with_properties(
             required_builds=[BuildNames.PACKAGE_RELEASE],
