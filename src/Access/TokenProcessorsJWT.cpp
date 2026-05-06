@@ -12,6 +12,11 @@
 #include <openssl/pem.h>
 #include <cstring>
 
+/// Ensure picojson's parse-depth ceiling stays in line with H-28's claims-recursion bound.
+/// If a future picojson bump removes or raises this, we'd silently re-expose stack-exhaustion.
+static_assert(picojson::DEFAULT_MAX_DEPTHS <= 100,
+              "picojson::DEFAULT_MAX_DEPTHS bumped above 100; revisit JWT parse-depth safety");
+
 namespace DB {
 
 namespace ErrorCodes
