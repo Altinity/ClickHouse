@@ -176,6 +176,18 @@ bool GoogleTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
         }
     }
 
+    /// Reject empty resolved username (M-27). `TokenCredentials::setUserName`
+    /// leaves `is_ready=false` for empty input but the function would still
+    /// return true; the cache would then accept an entry under user_name "",
+    /// collapsing every empty-username token across all IdPs into the same
+    /// dynamic ClickHouse user.
+    if (user_name.empty())
+    {
+        LOG_TRACE(getLogger("TokenAuthentication"),
+                  "{}: Resolved username from token is empty; rejecting", processor_name);
+        return false;
+    }
+
     credentials.setUserName(user_name);
 
     if (token_info.contains("exp"))
@@ -333,10 +345,17 @@ bool AzureTokenProcessor::resolveAndValidate(TokenCredentials & credentials) con
         }
     }
 
-    if (!username.empty())
-        credentials.setUserName(username);
-    else
-        LOG_TRACE(getLogger("TokenAuthentication"), "{}: Failed to get username with token", processor_name);
+    /// Reject empty resolved username (M-27). Previously this branch only
+    /// logged the gap and proceeded to return true at the end of the function,
+    /// which would cache an entry under user_name "" and collapse every
+    /// empty-username token across all IdPs into the same dynamic user.
+    if (username.empty())
+    {
+        LOG_TRACE(getLogger("TokenAuthentication"),
+                  "{}: Resolved username from token is empty; rejecting", processor_name);
+        return false;
+    }
+    credentials.setUserName(username);
 
     try
     {
