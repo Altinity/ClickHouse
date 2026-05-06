@@ -36,7 +36,7 @@ JWKSType JWKSClient::getJWKS()
 
     {
         std::shared_lock lock(mutex);
-        auto now = std::chrono::high_resolution_clock::now();
+        auto now = std::chrono::steady_clock::now();
         auto diff = std::chrono::duration<double>(now - last_request_send).count();
         if (diff < static_cast<double>(refresh_timeout))
         {

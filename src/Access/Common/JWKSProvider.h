@@ -45,7 +45,9 @@ private:
 
     std::shared_mutex mutex;
     std::optional<JWKSType> cached_jwks;
-    std::chrono::time_point<std::chrono::high_resolution_clock> last_request_send;
+    /// `steady_clock` (not `system_clock`): refresh-cooldown is an elapsed-time
+    /// measurement; a wall-clock jump must not skip or freeze it.
+    std::chrono::time_point<std::chrono::steady_clock> last_request_send;
 };
 
 struct StaticJWKSParams
