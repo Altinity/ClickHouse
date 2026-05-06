@@ -442,6 +442,12 @@ StaticKeyJwtProcessor::StaticKeyJwtProcessor(const String & processor_name_,
     else
         throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "{}: Invalid token processor definition, unknown algorithm {}", processor_name, algo);
 
+    /// Apply clock-drift tolerance. jwt-cpp's default is 0, which rejects
+    /// tokens whose `exp`/`nbf` straddles even sub-second client/server skew.
+    /// Operators who set `verifier_leeway` in config get that value;
+    /// otherwise the parser-side default (60s) kicks in.
+    verifier = verifier.leeway(params.verifier_leeway);
+
     if (!expected_issuer.empty())
         verifier = verifier.with_issuer(expected_issuer);
 

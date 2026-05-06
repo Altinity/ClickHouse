@@ -143,7 +143,8 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
                                      config.getString(prefix + ".private_key", ""),
                                      config.getString(prefix + ".public_key_password", ""),
                                      config.getString(prefix + ".private_key_password", ""),
-                                     config.getString(prefix + ".claims", "")};
+                                     config.getString(prefix + ".claims", ""),
+                                     config.getUInt64(prefix + ".verifier_leeway", 60)};
         return std::make_unique<StaticKeyJwtProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim, expected_issuer, expected_audience, expected_typ, allow_no_expiration, params);
     }
     else if (provider_type == "jwt_static_jwks")
@@ -165,7 +166,7 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
         return std::make_unique<JwksJwtProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim,
                                                   expected_issuer, expected_audience, expected_typ, allow_no_expiration,
                                                   config.getString(prefix + ".claims", ""),
-                                                  config.getUInt64(prefix + ".verifier_leeway", 0),
+                                                  config.getUInt64(prefix + ".verifier_leeway", 60),
                                                   std::make_shared<StaticJWKS>(params));
     }
     if (provider_type == "jwt_dynamic_jwks")
@@ -180,7 +181,7 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
         return std::make_unique<JwksJwtProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim,
                                                   expected_issuer, expected_audience, expected_typ, allow_no_expiration,
                                                   config.getString(prefix + ".claims", ""),
-                                                  config.getUInt64(prefix + ".verifier_leeway", 0),
+                                                  config.getUInt64(prefix + ".verifier_leeway", 60),
                                                   jwks_uri,
                                                   config.getUInt(prefix + ".jwks_cache_lifetime", 3600));
     }

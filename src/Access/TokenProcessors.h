@@ -83,6 +83,12 @@ struct StaticKeyJwtParams
 
     /// JWT claims to validate (optional)
     String claims;
+
+    /// Clock-drift tolerance for `exp`/`nbf`/`iat` checks, in seconds.
+    /// jwt-cpp's default is 0, which rejects tokens on any client/server skew.
+    /// 60 seconds matches the OpenID processor's default and standard
+    /// industry practice (RFC 7519 §4.1.4 hints at "small leeway").
+    UInt64 verifier_leeway = 60;
 };
 
 class StaticKeyJwtProcessor : public ITokenProcessor
