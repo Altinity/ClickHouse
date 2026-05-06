@@ -84,7 +84,6 @@ private:
     void applyRoleChangeNoLock(bool grant, const UUID & role_id, const String & role_name);
     void assignRolesNoLock(User & user, const std::set<String> & external_roles) const;
     void assignProfileNoLock(User & user) const;
-    void updateAssignedRolesNoLock(const UUID & id, const String & user_name, const std::set<String> & external_roles) const;
 
 protected:
     std::optional<UUID> findImpl(AccessEntityType type, const String & name) const override;
