@@ -665,7 +665,11 @@
     M(1002, UNKNOWN_EXCEPTION) \
     M(1003, SSH_EXCEPTION) \
     M(1004, STARTUP_SCRIPTS_ERROR) \
+<<<<<<< HEAD
     M(1005, STALE_VERSION) \
+=======
+    M(1005, PENDING_MUTATIONS_NOT_ALLOWED) \
+>>>>>>> 9a9645c97cc (Merge pull request #1718 from Altinity/feature/antalya-26.3/apassos-3)
     /* See END */
 
 #ifdef APPLY_FOR_EXTERNAL_ERROR_CODES

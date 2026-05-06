@@ -134,6 +134,7 @@ namespace ErrorCodes
     extern const int TOO_MANY_PARTS;
     extern const int PART_IS_LOCKED;
     extern const int PART_IS_TEMPORARILY_LOCKED;
+    extern const int INCOMPATIBLE_COLUMNS;
 }
 
 namespace ActionLocks
@@ -233,7 +234,7 @@ void StorageMergeTree::startup()
     {
         cleanup_thread.start();
         background_operations_assignee.start();
-        startBackgroundMovesIfNeeded();
+        startBackgroundMoves();
         startOutdatedAndUnexpectedDataPartsLoadingTask();
         startStatisticsCache();
     }
@@ -297,6 +298,11 @@ void StorageMergeTree::shutdown(bool)
 
     if (deduplication_log)
         deduplication_log->shutdown();
+
+    {
+        std::lock_guard lock(export_manifests_mutex);
+        export_manifests.clear();
+    }
 }
 
 
@@ -3077,12 +3083,6 @@ MutationCounters StorageMergeTree::getMutationCounters() const
 {
     std::lock_guard lock(currently_processing_in_background_mutex);
     return mutation_counters;
-}
-
-void StorageMergeTree::startBackgroundMovesIfNeeded()
-{
-    if (areBackgroundMovesNeeded())
-        background_moves_assignee.start();
 }
 
 std::unique_ptr<MergeTreeSettings> StorageMergeTree::getDefaultSettings() const
