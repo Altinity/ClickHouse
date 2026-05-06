@@ -25,19 +25,46 @@ namespace ErrorCodes
 
 JWKSType JWKSClient::getJWKS()
 {
+    /// `last_request_send` semantics: timestamp of the most recent fetch
+    /// *attempt*, success or failure. Updated unconditionally before the
+    /// HTTP call so a failed fetch doesn't leave the timestamp stale and
+    /// invite every concurrent thread to re-hammer a failing endpoint
+    /// (L-02). Within `refresh_timeout` of an attempt:
+    ///   - if a previously-successful JWKS is cached, serve it.
+    ///   - otherwise, throw a "fetch in cooldown" exception so callers
+    ///     don't queue up new attempts during the back-off window.
+
     {
         std::shared_lock lock(mutex);
         auto now = std::chrono::high_resolution_clock::now();
         auto diff = std::chrono::duration<double>(now - last_request_send).count();
-        if (diff < static_cast<double>(refresh_timeout) && cached_jwks.has_value())
-            return cached_jwks.value();
+        if (diff < static_cast<double>(refresh_timeout))
+        {
+            if (cached_jwks.has_value())
+                return cached_jwks.value();
+            throw Exception(ErrorCodes::AUTHENTICATION_FAILED,
+                            "JWKS endpoint at '{}' is in cooldown after a recent failed fetch; will retry after the cache lifetime elapses",
+                            jwks_uri.toString());
+        }
     }
 
     std::unique_lock lock(mutex);
     auto now = std::chrono::high_resolution_clock::now();
     auto diff = std::chrono::duration<double>(now - last_request_send).count();
-    if (diff < static_cast<double>(refresh_timeout) && cached_jwks.has_value())
-        return cached_jwks.value();
+    if (diff < static_cast<double>(refresh_timeout))
+    {
+        if (cached_jwks.has_value())
+            return cached_jwks.value();
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED,
+                        "JWKS endpoint at '{}' is in cooldown after a recent failed fetch; will retry after the cache lifetime elapses",
+                        jwks_uri.toString());
+    }
+
+    /// Mark the attempt before issuing the network call so that even if the
+    /// fetch throws, subsequent waiters on this mutex see an updated
+    /// `last_request_send` and short-circuit via the cooldown branches above
+    /// instead of repeating the failing fetch back-to-back.
+    last_request_send = now;
 
     Poco::Net::HTTPResponse response;
     std::string response_string;
@@ -75,8 +102,6 @@ JWKSType JWKSClient::getJWKS()
             throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Failed to get user info by access token, code: {}, reason: {}", response.getStatus(), response.getReason());
         Poco::StreamCopier::copyToString(response_stream, response_string);
     }
-
-    last_request_send = std::chrono::high_resolution_clock::now();
 
     JWKSType parsed_jwks;
 
