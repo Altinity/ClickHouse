@@ -3,6 +3,7 @@
 #if USE_JWT_CPP
 #include <Common/Base64.h>
 #include <Common/logger_useful.h>
+#include <Common/quoteString.h>
 #include <Poco/String.h>
 #include <openssl/bio.h>
 #include <openssl/core_names.h>
@@ -587,8 +588,8 @@ bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
         if (!provider->getJWKS().has_jwk(decoded_jwt.get_key_id()))
         {
             LOG_TRACE(getLogger("TokenAuthentication"),
-                      "{}: No JWK matching token 'kid' '{}' in this processor's JWKS; rejecting (a sibling processor may still accept it).",
-                      processor_name, decoded_jwt.get_key_id());
+                      "{}: No JWK matching token 'kid' {} in this processor's JWKS; rejecting (a sibling processor may still accept it).",
+                      processor_name, quoteString(decoded_jwt.get_key_id()));
             return false;
         }
 
@@ -611,7 +612,7 @@ bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
 
             if (!x5c.empty())
             {
-                LOG_TRACE(getLogger("TokenAuthentication"), "{}: Verifying {} with 'x5c' key", processor_name, username);
+                LOG_TRACE(getLogger("TokenAuthentication"), "{}: Verifying {} with 'x5c' key", processor_name, quoteString(username));
                 public_key = jwt::helper::convert_base64_der_to_pem(x5c);
             }
         }
@@ -653,7 +654,7 @@ bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
                 if (curve_nid == NID_undef)
                 {
                     LOG_TRACE(getLogger("TokenAuthentication"),
-                              "{}: Unknown algorithm '{}' for EC key; rejecting.", processor_name, algo);
+                              "{}: Unknown algorithm {} for EC key; rejecting.", processor_name, quoteString(algo));
                     return false;
                 }
 
@@ -663,13 +664,13 @@ bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
                     if (expected_crv.has_value() && crv != expected_crv.value())
                     {
                         LOG_TRACE(getLogger("TokenAuthentication"),
-                                  "{}: JWK 'crv' '{}' does not match JWT algorithm '{}'; rejecting.",
-                                  processor_name, crv, algo);
+                                  "{}: JWK 'crv' {} does not match JWT algorithm {}; rejecting.",
+                                  processor_name, quoteString(crv), quoteString(algo));
                         return false;
                     }
                 }
 
-                LOG_TRACE(getLogger("TokenAuthentication"), "{}: `x5c` not present, verifying {} with EC components", processor_name, username);
+                LOG_TRACE(getLogger("TokenAuthentication"), "{}: `x5c` not present, verifying {} with EC components", processor_name, quoteString(username));
                 const auto x = jwk.get_jwk_claim("x").as_string();
                 const auto y = jwk.get_jwk_claim("y").as_string();
                 public_key = create_public_key_from_ec_components(x, y, curve_nid);
@@ -682,7 +683,7 @@ bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
                               "{}: JWK is missing 'n'/'e' for RSA key type; rejecting.", processor_name);
                     return false;
                 }
-                LOG_TRACE(getLogger("TokenAuthentication"), "{}: `issuer` or `x5c` not present, verifying {} with RSA components", processor_name, username);
+                LOG_TRACE(getLogger("TokenAuthentication"), "{}: `issuer` or `x5c` not present, verifying {} with RSA components", processor_name, quoteString(username));
                 const auto modulus = jwk.get_jwk_claim("n").as_string();
                 const auto exponent = jwk.get_jwk_claim("e").as_string();
                 public_key = jwt::helper::create_public_key_from_rsa_components(modulus, exponent);
@@ -690,7 +691,7 @@ bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
             else
             {
                 LOG_TRACE(getLogger("TokenAuthentication"),
-                          "{}: Unsupported JWK key type '{}'; rejecting.", processor_name, key_type);
+                          "{}: Unsupported JWK key type {}; rejecting.", processor_name, quoteString(key_type));
                 return false;
             }
         }
@@ -698,7 +699,7 @@ bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
         if (jwk.has_algorithm() && Poco::toLower(jwk.get_algorithm()) != algo)
         {
             LOG_TRACE(getLogger("TokenAuthentication"),
-                      "{}: JWK 'alg' does not match JWT algorithm '{}'; rejecting.", processor_name, algo);
+                      "{}: JWK 'alg' does not match JWT algorithm {}; rejecting.", processor_name, quoteString(algo));
             return false;
         }
 
@@ -721,7 +722,7 @@ bool JwksJwtProcessor::resolveAndValidate(TokenCredentials & credentials) const
         else
         {
             LOG_TRACE(getLogger("TokenAuthentication"),
-                      "{}: Unknown JWT algorithm '{}'; rejecting.", processor_name, algo);
+                      "{}: Unknown JWT algorithm {}; rejecting.", processor_name, quoteString(algo));
             return false;
         }
 

@@ -3,6 +3,7 @@
 #if USE_JWT_CPP
 #include <Common/RemoteHostFilter.h>
 #include <Common/logger_useful.h>
+#include <Common/quoteString.h>
 #include <Poco/StreamCopier.h>
 #include <Poco/Net/HTTPSClientSession.h>
 #include <Poco/Net/HTTPRequest.h>
@@ -260,7 +261,8 @@ bool GoogleTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
                 {
                     external_groups_names.insert(group_name);
                     LOG_TRACE(getLogger("TokenAuthentication"),
-                              "{}: User {}: new external group {}", processor_name, user_name, group_name);
+                              "{}: User {}: new external group {}",
+                              processor_name, quoteString(user_name), quoteString(group_name));
                 }
             }
 
@@ -434,8 +436,9 @@ bool AzureTokenProcessor::resolveAndValidate(TokenCredentials & credentials) con
                 external_groups_names.insert(group_name);
                 String display_name = getValueByKey<std::string, false>(group_data, "displayName").value_or("<unknown>");
                 LOG_TRACE(getLogger("TokenAuthentication"),
-                          "{}: User {}: new external group id={} (displayName='{}')",
-                          processor_name, credentials.getUserName(), group_name, display_name);
+                          "{}: User {}: new external group id={} (displayName={})",
+                          processor_name, quoteString(credentials.getUserName()),
+                          quoteString(group_name), quoteString(display_name));
             }
         }
     }

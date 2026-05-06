@@ -683,7 +683,7 @@ bool ExternalAuthenticators::checkCredentialsAgainstProcessor(const ITokenProces
         credentials.setExpiresAt(default_expiration_ts);
     }
 
-    LOG_DEBUG(getLogger("AccessTokenAuthentication"), "Authenticated user {} with access token by {}", credentials.getUserName(), processor.getProcessorName());
+    LOG_DEBUG(getLogger("AccessTokenAuthentication"), "Authenticated user {} with access token by {}", quoteString(credentials.getUserName()), processor.getProcessorName());
     return true;
 }
 
@@ -734,7 +734,7 @@ void ExternalAuthenticators::primeTokenCache(const ITokenProcessor & processor,
 
     access_token_to_username_cache[credentials.getToken()] = cache_entry;
     username_to_access_token_cache[cache_entry.user_name] = credentials.getToken();
-    LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} added", cache_entry.user_name);
+    LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} added", quoteString(cache_entry.user_name));
 }
 
 bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & credentials,
@@ -785,7 +785,7 @@ bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & cred
             {
                 const auto expired_user_name = cached_entry_iter->second.user_name;
                 const auto expired_token = cached_entry_iter->first;
-                LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} expired, removing", expired_user_name);
+                LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} expired, removing", quoteString(expired_user_name));
                 access_token_to_username_cache.erase(cached_entry_iter);
 
                 /// Only unlink the reverse mapping if it currently points at the token
@@ -821,7 +821,7 @@ bool ExternalAuthenticators::checkTokenCredentials(const TokenCredentials & cred
                 const_cast<TokenCredentials &>(credentials).setUserName(user_data.user_name);
                 const_cast<TokenCredentials &>(credentials).setGroups(user_data.external_roles);
                 const_cast<TokenCredentials &>(credentials).setExpiresAt(user_data.expires_at);
-                LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} found, using it to authenticate", user_data.user_name);
+                LOG_TRACE(getLogger("AccessTokenAuthentication"), "Cache entry for user {} found, using it to authenticate", quoteString(user_data.user_name));
                 return true;
             }
             else
