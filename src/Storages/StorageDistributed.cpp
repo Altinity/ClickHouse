@@ -1178,6 +1178,43 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
 
 }
 
+std::optional<std::pair<String, String>> tryGetParamTypeAndName(const ASTPtr & node)
+{
+    if (auto * func = node->as<ASTFunction>(); func && func->name == "hybridParam")
+    {
+        auto * arg_list = func->arguments ? func->arguments->as<ASTExpressionList>() : nullptr;
+        if (!arg_list || arg_list->children.size() != 2)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "hybridParam() requires exactly 2 arguments: (name, type)");
+
+        auto * name_lit = arg_list->children[0]->as<ASTLiteral>();
+        auto * type_lit = arg_list->children[1]->as<ASTLiteral>();
+        if (!name_lit || name_lit->value.getType() != Field::Types::String)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "hybridParam() first argument (name) must be a string literal");
+        if (!type_lit || type_lit->value.getType() != Field::Types::String)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "hybridParam() second argument (type) must be a string literal");
+
+        const auto & param_name = name_lit->value.safeGet<String>();
+        const auto & type_name = type_lit->value.safeGet<String>();
+        return {{param_name, type_name}};
+    }
+    return std::nullopt;
+}
+
+template <typename ASTPtrType, typename Visitor>
+void visitHybridParams(ASTPtrType & node, Visitor & visitor)
+{
+    if (!node)
+        return;
+
+    if (auto param_type_and_name = tryGetParamTypeAndName(node); param_type_and_name.has_value())
+    {
+        visitor(node, *param_type_and_name);
+        return;
+    }
+
+    for (auto & child : node->children)
+        visitHybridParams(child, visitor);
+}
 }
 
 void StorageDistributed::read(
@@ -1238,50 +1275,28 @@ void StorageDistributed::read(
             return predicate_ast;
         predicate_ast = predicate_ast->clone();
 
-        std::function<void(ASTPtr &)> replace_hybrid_params = [&](ASTPtr & node)
+        auto replace_hybrid_params = [&](ASTPtr & node, const std::pair<String, String> & param_type_and_name)
         {
-            if (auto * func = node->as<ASTFunction>(); func && func->name == "hybridParam")
-            {
-                auto * arg_list = func->arguments ? func->arguments->as<ASTExpressionList>() : nullptr;
-                if (!arg_list || arg_list->children.size() != 2)
-                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                        "hybridParam() requires exactly 2 arguments: (name, type)");
+            const auto & [param_name, type_name] = param_type_and_name;
 
-                auto * name_lit = arg_list->children[0]->as<ASTLiteral>();
-                auto * type_lit = arg_list->children[1]->as<ASTLiteral>();
-                if (!name_lit || name_lit->value.getType() != Field::Types::String)
-                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                        "hybridParam() first argument (name) must be a string literal");
-                if (!type_lit || type_lit->value.getType() != Field::Types::String)
-                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                        "hybridParam() second argument (type) must be a string literal");
+            if (!watermark_snapshot)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Hybrid watermark '{}' has no value; use ALTER TABLE ... MODIFY SETTING {} = '...' to set it",
+                    param_name, param_name);
 
-                const auto & param_name = name_lit->value.safeGet<String>();
-                const auto & type_name = type_lit->value.safeGet<String>();
+            auto it = watermark_snapshot->find(param_name);
+            if (it == watermark_snapshot->end())
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Hybrid watermark '{}' has no value; use ALTER TABLE ... MODIFY SETTING {} = '...' to set it",
+                    param_name, param_name);
 
-                if (!watermark_snapshot)
-                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                        "Hybrid watermark '{}' has no value; use ALTER TABLE ... MODIFY SETTING {} = '...' to set it",
-                        param_name, param_name);
-
-                auto it = watermark_snapshot->find(param_name);
-                if (it == watermark_snapshot->end())
-                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                        "Hybrid watermark '{}' has no value; use ALTER TABLE ... MODIFY SETTING {} = '...' to set it",
-                        param_name, param_name);
-
-                auto data_type = DataTypeFactory::instance().get(type_name);
-                auto col = data_type->createColumn();
-                ReadBufferFromString buf(it->second);
-                data_type->getDefaultSerialization()->deserializeWholeText(*col, buf, FormatSettings{});
-                node = make_intrusive<ASTLiteral>((*col)[0]);
-                return;
-            }
-
-            for (auto & child : node->children)
-                replace_hybrid_params(child);
+            auto data_type = DataTypeFactory::instance().get(type_name);
+            auto col = data_type->createColumn();
+            ReadBufferFromString buf(it->second);
+            data_type->getDefaultSerialization()->deserializeWholeText(*col, buf, FormatSettings{});
+            node = make_intrusive<ASTLiteral>((*col)[0]);
         };
-        replace_hybrid_params(predicate_ast);
+        visitHybridParams(predicate_ast, replace_hybrid_params);
         return predicate_ast;
     };
 
@@ -1780,34 +1795,13 @@ static std::unordered_map<String, String> collectHybridParamTypes(
     const ASTPtr & base_predicate, const std::vector<StorageDistributed::HybridSegment> & segs)
 {
     std::unordered_map<String, String> result;
-    std::function<void(const ASTPtr &)> walk = [&](const ASTPtr & node)
+    auto collect_hybrid_param = [&](const ASTPtr &, const std::pair<String, String> & param_type_and_name)
     {
-        if (!node) return;
-        if (auto * func = node->as<ASTFunction>(); func && func->name == "hybridParam")
-        {
-            auto * arg_list = func->arguments ? func->arguments->as<ASTExpressionList>() : nullptr;
-            if (!arg_list || arg_list->children.size() != 2)
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "hybridParam() requires exactly 2 arguments: (name, type)");
-
-            auto * name_lit = arg_list->children[0]->as<ASTLiteral>();
-            auto * type_lit = arg_list->children[1]->as<ASTLiteral>();
-            if (!name_lit || name_lit->value.getType() != Field::Types::String)
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "hybridParam() first argument (name) must be a string literal");
-            if (!type_lit || type_lit->value.getType() != Field::Types::String)
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "hybridParam() second argument (type) must be a string literal");
-
-            result.emplace(name_lit->value.safeGet<String>(), type_lit->value.safeGet<String>());
-            return;
-        }
-        for (const auto & child : node->children)
-            walk(child);
+        result.emplace(param_type_and_name);
     };
-    walk(base_predicate);
+    visitHybridParams(base_predicate, collect_hybrid_param);
     for (const auto & seg : segs)
-        walk(seg.predicate_ast);
+        visitHybridParams(seg.predicate_ast, collect_hybrid_param);
     return result;
 }
 
@@ -2785,26 +2779,11 @@ void registerStorageHybrid(StorageFactory & factory)
         std::unordered_map<String, String> effective_watermark_values;
 
         /// First pass: collect declared hybridParam() names and types from a predicate AST.
-        std::function<void(const ASTPtr &)> collect_hybrid_params = [&](const ASTPtr & node)
+        auto collect_hybrid_params = [&](const ASTPtr & node)
         {
-            if (auto * func = node->as<ASTFunction>(); func && func->name == "hybridParam")
+            auto collect_hybrid_param = [&](const ASTPtr &, const std::pair<String, String> & param_type_and_name)
             {
-                auto * arg_list = func->arguments ? func->arguments->as<ASTExpressionList>() : nullptr;
-                if (!arg_list || arg_list->children.size() != 2)
-                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                        "hybridParam() requires exactly 2 arguments: (name, type)");
-
-                auto * name_lit = arg_list->children[0]->as<ASTLiteral>();
-                auto * type_lit = arg_list->children[1]->as<ASTLiteral>();
-                if (!name_lit || name_lit->value.getType() != Field::Types::String)
-                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                        "hybridParam() first argument (name) must be a string literal");
-                if (!type_lit || type_lit->value.getType() != Field::Types::String)
-                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                        "hybridParam() second argument (type) must be a string literal");
-
-                const auto & param_name = name_lit->value.safeGet<String>();
-                const auto & type_name = type_lit->value.safeGet<String>();
+                const auto & [param_name, type_name] = param_type_and_name;
 
                 if (!param_name.starts_with(StorageDistributed::HYBRID_WATERMARK_PREFIX))
                     throw Exception(ErrorCodes::BAD_ARGUMENTS,
@@ -2818,11 +2797,8 @@ void registerStorageHybrid(StorageFactory & factory)
                         "hybridParam() type conflict for '{}': "
                         "'{}' vs '{}'; all occurrences must declare the same type",
                         param_name, it->second, type_name);
-                return;
-            }
-
-            for (const auto & child : node->children)
-                collect_hybrid_params(child);
+            };
+            visitHybridParams(node, collect_hybrid_param);
         };
 
         /// Second pass: substitute hybridParam() with effective values and run ExpressionAnalyzer.
@@ -2830,36 +2806,27 @@ void registerStorageHybrid(StorageFactory & factory)
         {
             ASTPtr predicate_for_validation = predicate->clone();
 
-            std::function<void(ASTPtr &)> substitute_params = [&](ASTPtr & node)
+            auto substitute_param = [&](ASTPtr & node, const std::pair<String, String> & param_type_and_name)
             {
-                if (auto * func = node->as<ASTFunction>(); func && func->name == "hybridParam")
+                const auto & [param_name, type_name] = param_type_and_name;
+
+                auto data_type = DataTypeFactory::instance().get(type_name);
+                auto val_it = effective_watermark_values.find(param_name);
+                if (val_it != effective_watermark_values.end())
                 {
-                    auto * arg_list = func->arguments->as<ASTExpressionList>();
-                    const auto & param_name = arg_list->children[0]->as<ASTLiteral>()->value.safeGet<String>();
-                    const auto & type_name = arg_list->children[1]->as<ASTLiteral>()->value.safeGet<String>();
-
-                    auto data_type = DataTypeFactory::instance().get(type_name);
-                    auto val_it = effective_watermark_values.find(param_name);
-                    if (val_it != effective_watermark_values.end())
-                    {
-                        auto col = data_type->createColumn();
-                        ReadBufferFromString buf(val_it->second);
-                        data_type->getDefaultSerialization()->deserializeWholeText(*col, buf, FormatSettings{});
-                        node = make_intrusive<ASTLiteral>((*col)[0]);
-                    }
-                    else
-                    {
-                        auto col = data_type->createColumn();
-                        col->insertDefault();
-                        node = make_intrusive<ASTLiteral>((*col)[0]);
-                    }
-                    return;
+                    auto col = data_type->createColumn();
+                    ReadBufferFromString buf(val_it->second);
+                    data_type->getDefaultSerialization()->deserializeWholeText(*col, buf, FormatSettings{});
+                    node = make_intrusive<ASTLiteral>((*col)[0]);
                 }
-
-                for (auto & child : node->children)
-                    substitute_params(child);
+                else
+                {
+                    auto col = data_type->createColumn();
+                    col->insertDefault();
+                    node = make_intrusive<ASTLiteral>((*col)[0]);
+                }
             };
-            substitute_params(predicate_for_validation);
+            visitHybridParams(predicate_for_validation, substitute_param);
 
             try
             {
