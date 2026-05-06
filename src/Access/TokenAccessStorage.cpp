@@ -598,6 +598,11 @@ std::optional<AuthResult> TokenAccessStorage::authenticateImpl(
         new_user = std::make_shared<User>();
         new_user->setName(credentials.getUserName());
         new_user->authentication_methods.emplace_back(AuthenticationType::JWT);
+        /// Stamp the storage's pinned processor onto the auth method so the
+        /// per-request validity check (`Session::checkIfUserIsStillValid`)
+        /// can detect when an admin removes that processor and terminate
+        /// active sessions whose tokens were issued through it (M-28).
+        new_user->authentication_methods.back().setTokenProcessorName(provider_name);
         /// If the operator configured a network allowlist for this storage,
         /// stamp it onto the auto-created user so `isAddressAllowed` checks it
         /// below. Without this, every auto-provisioned token user inherits
