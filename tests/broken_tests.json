@@ -25,5 +25,29 @@
     },
     "02490_benchmark_max_consecutive_errors": {
         "reason": "INVESTIGATE: Unstable on msan"
+    },
+    "01782_field_oom": {
+        "reason": "KNOWN: timeout with sanitizer",
+        "check_types": ["tsan", "asan", "msan", "ubsan"]
+    },
+    "02389_analyzer_nested_lambda": {
+        "reason": "KNOWN: timeout with sanitizer",
+        "check_types": ["tsan", "asan", "msan", "ubsan"]
+    },
+    "00312_position_case_insensitive_utf8": {
+        "reason": "KNOWN: timeout with sanitizer",
+        "check_types": ["tsan", "asan", "msan", "ubsan"]
+    },
+    "01037_polygon_dicts_correctness_fast": {
+        "reason": "KNOWN: timeout with sanitizer",
+        "check_types": ["tsan", "asan", "msan", "ubsan"]
+    },
+    "01655_plan_optimizations_optimize_read_in_window_order_long": {
+        "reason": "KNOWN: timeout with sanitizer",
+        "check_types": ["tsan", "asan", "msan", "ubsan"]
+    },
+    "02098_hashed_array_dictionary_simple_key": {
+        "reason": "KNOWN: timeout with sanitizer",
+        "check_types": ["tsan", "asan", "msan", "ubsan"]
     }
 }
