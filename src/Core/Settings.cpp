@@ -7559,15 +7559,6 @@ Possible values:
 - `skip_conflicts` - silently skip partitions that are already exported / being exported (errors with code EXPORT_PARTITION_ALREADY_EXPORTED); fail-fast on every other error.
 Has no effect on `EXPORT PARTITION <id>` (single-partition export).
 )", 0) \
-    DECLARE(Timezone, iceberg_partition_timezone, "", R"(
-Time zone by which partitioning of Iceberg tables was performed.
-Possible values:
-
-- Any valid timezone, e.g. `Europe/Berlin`, `UTC` or `Zulu`
-- `` (empty value) - use server or session timezone
-
-Default value is empty.
-)", 0) \
     DECLARE(String, export_merge_tree_part_filename_pattern, "{part_name}_{checksum}", R"(
 Pattern for the filename of the exported merge tree part. The `part_name` and `checksum` are calculated and replaced on the fly. Additional macros are supported.
 )", 0) \
