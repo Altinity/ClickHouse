@@ -758,3 +758,55 @@ If the view is in a Replicated or Shared database, and refresh is running on ano
 ```sql
 SYSTEM WAIT VIEW [db.]name
 ```
+
+## Managing Named Scalars {#named-scalars}
+
+Commands to control background tasks performed by
+[Named Scalars](../../sql-reference/statements/create/named-scalar.md).
+
+Keep an eye on [`system.named_scalars`](../../operations/system-tables/named_scalars.md)
+while using them. `SYSTEM REFRESH NAMED SCALAR` requires the
+`SYSTEM REFRESH NAMED SCALAR` privilege; `SYSTEM START NAMED SCALAR REFRESHES`
+and `SYSTEM STOP NAMED SCALAR REFRESHES` require the
+`SYSTEM NAMED SCALAR REFRESHES` privilege.
+
+### SYSTEM REFRESH NAMED SCALAR {#refresh-named-scalar}
+
+Trigger an immediate out-of-schedule refresh of a given named scalar.
+For scalars without a `REFRESH` clause (static scalars), this throws
+`NAMED_SCALAR_NOT_REFRESHABLE`.
+
+The command is asynchronous: it schedules the refresh and returns immediately.
+Use `system.named_scalars` to observe `refresh_in_flight` and `last_update`.
+
+```sql
+SYSTEM REFRESH NAMED SCALAR name
+```
+
+### SYSTEM STOP NAMED SCALAR REFRESHES {#stop-named-scalar-refreshes}
+
+Pause periodic refreshing of named scalars on the **current server only**.
+With a name argument, only that scalar is paused; without a name, every
+named scalar on the server is paused. Any in-progress refresh is allowed
+to complete.
+
+:::note
+The paused state is not propagated to peer servers and is not persisted across
+server restarts. After a restart the scalar will resume its configured refresh
+schedule.
+:::
+
+```sql
+SYSTEM STOP NAMED SCALAR REFRESHES [name]
+```
+
+### SYSTEM START NAMED SCALAR REFRESHES {#start-named-scalar-refreshes}
+
+Resume periodic refreshing for named scalars that were previously stopped
+with `SYSTEM STOP NAMED SCALAR REFRESHES`. With a name argument, only that
+scalar is resumed; without a name, every named scalar on the server is
+resumed. No immediate refresh is triggered.
+
+```sql
+SYSTEM START NAMED SCALAR REFRESHES [name]
+```

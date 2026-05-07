@@ -88,6 +88,7 @@ class EmbeddedDictionaries;
 class ExternalDictionariesLoader;
 class ExternalUserDefinedExecutableFunctionsLoader;
 class IUserDefinedSQLObjectsStorage;
+class NamedScalarsManager;
 class IWorkloadEntityStorage;
 class InterserverCredentials;
 using InterserverCredentialsPtr = std::shared_ptr<const InterserverCredentials>;
@@ -1126,6 +1127,10 @@ public:
     IUserDefinedSQLObjectsStorage & getUserDefinedSQLObjectsStorage();
     void loadOrReloadUserDefinedExecutableFunctions(const Poco::Util::AbstractConfiguration & config);
 
+    NamedScalarsManager & getNamedScalarsManager() const;
+    /// Called once at server start.
+    void initializeNamedScalars();
+
     IWorkloadEntityStorage & getWorkloadEntityStorage() const;
 
     bool hasWasmModuleManager() const;
@@ -1468,6 +1473,8 @@ public:
     BackgroundSchedulePool & getMessageBrokerSchedulePool() const;
     BackgroundSchedulePool & getDistributedSchedulePool() const;
     BackgroundSchedulePool & getIcebergSchedulePool() const;
+    /// Dedicated pool isolated from getSchedulePool(); lazily created.
+    BackgroundSchedulePool & getNamedScalarRefreshPool() const;
 
     /// Has distributed_ddl configuration or not.
     bool hasDistributedDDL() const;

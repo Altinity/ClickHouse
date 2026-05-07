@@ -112,6 +112,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         });
         addSettingsChanges(settings_changes_history, "26.1.3.20001.altinityantalya",
         {
+            {"allow_experimental_named_scalars", false, false, "Experimental gate for CREATE NAMED SCALAR."},
             // {"iceberg_partition_timezone", "", "", "New setting."},
             // {"s3_propagate_credentials_to_other_storages", false, false, "New setting"},
             {"export_merge_tree_part_filename_pattern", "", "{part_name}_{checksum}", "New setting"},

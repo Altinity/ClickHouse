@@ -2,6 +2,7 @@
 #include <Parsers/ASTBackupQuery.h>
 #include <Parsers/ASTCheckQuery.h>
 #include <Parsers/ASTCreateQuery.h>
+#include <Parsers/ASTNamedScalarDDLQuery.h>
 #include <Parsers/ASTCreateWorkloadQuery.h>
 #include <Parsers/ASTCreateResourceQuery.h>
 #include <Parsers/ASTCreateSQLFunctionQuery.h>
@@ -346,6 +347,10 @@ InterpreterFactory::InterpreterPtr InterpreterFactory::get(ASTPtr & query, Conte
     else if (query->as<ASTCreateSQLFunctionQuery>() || query->as<ASTCreateWasmFunctionQuery>())
     {
         interpreter_name = "InterpreterCreateFunctionQuery";
+    }
+    else if (query->as<ASTNamedScalarDDLQuery>())
+    {
+        interpreter_name = "InterpreterNamedScalarDDLQuery";
     }
     else if (query->as<ASTDropFunctionQuery>())
     {
