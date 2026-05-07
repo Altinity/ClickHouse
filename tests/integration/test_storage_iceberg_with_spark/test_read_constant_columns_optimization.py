@@ -197,16 +197,10 @@ def test_read_constant_columns_optimization(started_cluster_iceberg_with_spark, 
             """)
         # Weird, but looks like ReadFileMetadata does not used local file cache in 26.1
         # metadata.json always downloaded in 26.1, once per query or subquery
-<<<<<<< HEAD
-        # In 25.8 count was equal to expected, in 26.1 it is expected * 2 + 1 for Local case
-        # expected * 2 + 4 for Cluster case, because each subquery loads metadata.json
-        assert int(res) == expected * 2 + (4 if is_cluster else 1)
-=======
         # In 25.8 count was equal to expected, in 26.1 it is expected * N + 1 for Local
         # case and expected * N + 4 for Cluster case (each subquery loads metadata.json).
         # N = per_file_gets (see comment above the function).
         assert int(res) == expected * per_file_gets + (4 if is_cluster else 1)
->>>>>>> ba1e4f5f6dd (Merge pull request #1631 from Altinity/arthurpassos-patch-11)
 
     event = "S3GetObject" if storage_type == "s3" else "AzureGetObject"
 
