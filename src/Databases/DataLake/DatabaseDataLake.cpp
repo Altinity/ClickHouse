@@ -672,7 +672,28 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
 
     const auto is_secondary_query = context_->getClientInfo().query_kind == ClientInfo::QueryKind::SECONDARY_QUERY;
 
+<<<<<<< HEAD
     std::string cluster_name = configuration->isClusterSupported() ? settings[DatabaseDataLakeSetting::object_storage_cluster].value : "";
+=======
+    const auto catalog_uuid = table_metadata.getTableUUID();
+    const UUID table_uuid = catalog_uuid ? parseFromString<UUID>(*catalog_uuid) : UUIDHelpers::Nil;
+
+    if (can_use_parallel_replicas && !is_secondary_query)
+    {
+        auto storage_id = StorageID(getDatabaseName(), name, table_uuid);
+        auto storage_cluster = std::make_shared<StorageObjectStorageCluster>(
+            parallel_replicas_cluster_name,
+            configuration,
+            configuration->createObjectStorage(context_copy, /* is_readonly */ false, catalog->getCredentialsConfigurationCallback(storage_id)),
+            storage_id,
+            columns,
+            ConstraintsDescription{},
+            nullptr,
+            context_,
+            /// Use is_table_function = true,
+            /// because this table is actually stateless like a table function.
+            /* is_table_function */true);
+>>>>>>> 69167ef25d2 (Merge pull request #102115 from scanhex12/iceberg_qcc)
 
     if (cluster_name.empty() && can_use_parallel_replicas && !is_secondary_query)
         cluster_name = parallel_replicas_cluster_name;
@@ -680,8 +701,14 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
     auto storage_cluster = std::make_shared<StorageObjectStorageCluster>(
         cluster_name,
         configuration,
+<<<<<<< HEAD
         configuration->createObjectStorage(context_copy, /* is_readonly */ false, catalog->getCredentialsConfigurationCallback(StorageID(getDatabaseName(), name))),
         StorageID(getDatabaseName(), name),
+=======
+        configuration->createObjectStorage(context_copy, /* is_readonly */ false, catalog->getCredentialsConfigurationCallback(StorageID(getDatabaseName(), name, table_uuid))),
+        context_copy,
+        StorageID(getDatabaseName(), name, table_uuid),
+>>>>>>> 69167ef25d2 (Merge pull request #102115 from scanhex12/iceberg_qcc)
         /* columns */columns,
         /* constraints */ConstraintsDescription{},
         /* partition_by */nullptr,
