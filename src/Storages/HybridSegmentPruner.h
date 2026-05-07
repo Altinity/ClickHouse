@@ -3,35 +3,43 @@
 #include <Core/NamesAndTypes.h>
 #include <Interpreters/Context_fwd.h>
 #include <Parsers/IAST_fwd.h>
+#include <Storages/KeyDescription.h>
+#include <Storages/MergeTree/KeyCondition.h>
 
 namespace DB
 {
 
-/// Conservative satisfiability check for Hybrid segment pruning.
+/// Hybrid-segment pruner, modeled after PartitionPruner / Iceberg::ManifestFilesPruner /
+/// Paimon::PartitionPruner.
 ///
-/// Combines (PREWHERE AND WHERE AND segment_predicate), restricted to atoms over
-/// columns of the Hybrid table, normalizes via top-level AND/OR walking, and tries
-/// to prove the resulting condition unsatisfiable through bounded DNF expansion
-/// plus per-column typed range/IN intersection.
+/// Build one KeyCondition over the user filter (PREWHERE+WHERE represented as an
+/// ActionsDAG) using all comparable Hybrid columns as the key. For each segment, parse
+/// its (already watermark-substituted) predicate AST into a Hyperrectangle and ask
+/// `KeyCondition::checkInHyperrectangle(rect, types).can_be_true`. The segment can be
+/// pruned iff the answer is false.
 ///
-/// Returns true only when the conjunction is provably empty (the segment can be
-/// pruned). Returns false in all other cases — including unsupported predicates,
-/// constant-folding failures, type-coercion ambiguity, and exceptions — so the
-/// caller can fall back to scanning the segment normally.
-///
-/// Inputs:
-/// - prewhere, where, segment_predicate: ASTs (any may be null).
-///   The caller is responsible for removing JOIN-side predicates and for
-///   substituting hybridParam(...) literals before invoking this function.
-/// - hybrid_columns: column names and types from the Hybrid storage snapshot.
-///   Atoms referencing columns not in this list are treated as unsupported and
-///   keep the segment.
-/// - context: used for constant-expression evaluation.
-bool canPruneHybridSegment(
-    const ASTPtr & prewhere,
-    const ASTPtr & where,
-    const ASTPtr & segment_predicate,
-    const NamesAndTypesList & hybrid_columns,
-    const ContextPtr & context);
+/// canBePruned() returns true only when (user_filter AND segment_predicate) is provably
+/// empty. It returns false in all other cases — unsupported segment shapes, missing user
+/// filter, exceptions — so the caller falls back to scanning the segment normally.
+class HybridSegmentPruner
+{
+public:
+    HybridSegmentPruner(
+        const ActionsDAGWithInversionPushDown & filter_dag,
+        const NamesAndTypesList & hybrid_columns,
+        ContextPtr context);
+
+    bool canBePruned(const ASTPtr & substituted_segment_predicate) const;
+
+    /// True if the user filter is unrecognizable / always-true on the Hybrid key columns:
+    /// no segment can ever be pruned, so callers can short-circuit.
+    bool isUseless() const { return useless; }
+
+private:
+    KeyDescription identity_key;
+    KeyCondition user_condition;
+    ContextPtr context;
+    bool useless = false;
+};
 
 }

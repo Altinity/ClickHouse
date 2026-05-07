@@ -49,7 +49,6 @@
 #include <Parsers/ASTInsertQuery.h>
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTSelectQuery.h>
-#include <Parsers/ASTTablesInSelectQuery.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/IAST.h>
 #include <Parsers/IdentifierQuotingStyle.h>
@@ -1300,50 +1299,26 @@ StorageDistributed::HybridPruningVerdict StorageDistributed::computeHybridPrunin
     else
         verdict.watermark_snapshot = hybrid_watermark_params.get();
 
-    /// Extract Hybrid-owned WHERE/PREWHERE from the user query. JOINs are conservatively
-    /// excluded — when a JOIN is present, leave both null so the pruner can never claim
-    /// unsatisfiability based on a joined table's predicate.
+    /// Without a materialized user filter (legacy non-analyzer path, or a query before
+    /// filter actions are computed) we can't prune. Fail open — same precedent as
+    /// `skipUnusedShardsWithAnalyzer()`. The DAG is per-table-expression, so JOIN-side
+    /// predicates are already excluded; no JOIN guard needed.
+    if (!query_info.filter_actions_dag)
+        return verdict;
+
     NamesAndTypesList hybrid_columns = storage_snapshot->metadata->getColumns().getAll();
-    ASTPtr prunable_where;
-    ASTPtr prunable_prewhere;
-    ASTSelectQuery * select_for_pruning = nullptr;
-    if (query_info.query)
-    {
-        if (auto * select = query_info.query->as<ASTSelectQuery>())
-            select_for_pruning = select;
-        else if (auto * union_query = query_info.query->as<ASTSelectWithUnionQuery>();
-                 union_query && union_query->list_of_selects && !union_query->list_of_selects->children.empty())
-            select_for_pruning = union_query->list_of_selects->children.front()->as<ASTSelectQuery>();
-    }
-    if (select_for_pruning)
-    {
-        bool has_join = false;
-        if (auto tables = select_for_pruning->tables())
-        {
-            for (const auto & child : tables->children)
-            {
-                if (auto * elem = child->as<ASTTablesInSelectQueryElement>(); elem && elem->table_join)
-                {
-                    has_join = true;
-                    break;
-                }
-            }
-        }
-        if (!has_join)
-        {
-            prunable_where = select_for_pruning->where();
-            prunable_prewhere = select_for_pruning->prewhere();
-        }
-    }
+    ActionsDAGWithInversionPushDown inverted_dag(
+        query_info.filter_actions_dag->getOutputs().at(0), local_context);
+    HybridSegmentPruner pruner(inverted_dag, hybrid_columns, local_context);
+    if (pruner.isUseless())
+        return verdict;
 
     auto check = [&](const ASTPtr & predicate_ast) -> bool
     {
         if (!predicate_ast)
             return false;
-        ASTPtr substituted = substituteHybridWatermarks(predicate_ast, verdict.watermark_snapshot);
-        return canPruneHybridSegment(
-            prunable_prewhere, prunable_where, substituted,
-            hybrid_columns, local_context);
+        return pruner.canBePruned(
+            substituteHybridWatermarks(predicate_ast, verdict.watermark_snapshot));
     };
 
     if (base_segment_predicate)
