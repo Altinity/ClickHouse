@@ -1,6 +1,7 @@
 | Feature                                                                    |                                          Altinity PR                                           | First Altinity Release | upstream PR | First upstream Release |
 |----------------------------------------------------------------------------|:----------------------------------------------------------------------------------------------:|:----------------------:| :---: | :---: |
 |:arrow_forward:  SECURITY|                                                                                                |                        ||
+|Add OAuth2 login flow to `clickhouse-client`|https://github.com/Altinity/ClickHouse/pull/1606|26.1.11||
 |Add support for EC JWT validation|https://github.com/Altinity/ClickHouse/pull/1596|26.1.6||
 |Add setting `allow_local_data_lakes`, turned off by default|https://github.com/Altinity/ClickHouse/pull/1531|25.8.16||
 | Token-based authentication and authorization                               |https://github.com/Altinity/ClickHouse/pull/1078|        25.8.12         ||
@@ -17,6 +18,8 @@
 | Parquet file metadata caching: turn cache on by default                    |https://github.com/Altinity/ClickHouse/pull/669, https://github.com/Altinity/ClickHouse/pull/674|        24.12.2         ||
 | ---                                                                        |
 |:arrow_forward:  SWARMS|                                                                                                |                        ||
+|Use `object_storage_remote_initiator` without `object_storage_cluster` on initial node|https://github.com/Altinity/ClickHouse/pull/1608|26.1.11||
+|Cluster Joins part 2 - global mode|https://github.com/Altinity/ClickHouse/pull/1527|26.1.11||
 |Improvement for locking Iceberg iterator|https://github.com/Altinity/ClickHouse/pull/1436|25.8.16||
 |Profile events for task distribution in ObjectStorageCluster requests|https://github.com/Altinity/ClickHouse/pull/1172|25.8.12||
 | SYSTEM STOP SWARM MODE command for graceful shutdown of swarm node|https://github.com/Altinity/ClickHouse/pull/1014|25.6.5||
@@ -49,6 +52,8 @@
 | RBAC for S3                                                                |                        https://github.com/Altinity/ClickHouse/pull/688                         |         25.2.2         ||
 | ---                                                                        |
 |:arrow_forward:  TIERED STORAGE|                                                                                                |                        ||
+|Add support for moving Hybrid table watermarks|https://github.com/Altinity/ClickHouse/pull/1659|26.1.11||
+|Make changes to the export partition background engine and support experimental exports to Apache Iceberg|https://github.com/Altinity/ClickHouse/pull/1618|26.1.11||
 |Add TRUNCATE TABLE support for the Iceberg database engine|https://github.com/Altinity/ClickHouse/pull/1529|26.1.6||
 |Add setting to define filename pattern for part exports|https://github.com/Altinity/ClickHouse/pull/1490|26.1.6||
 |Add setting to define filename pattern for part exports|https://github.com/Altinity/ClickHouse/pull/1512|25.8.16||
@@ -65,8 +70,7 @@
 |`Engine=hybrid` implementation|https://github.com/Altinity/ClickHouse/pull/1071|25.8.9||
 |Add observability for EXPORT PART|https://github.com/Altinity/ClickHouse/pull/1017|25.6.5||
 | Simple MergeTree part export to object storage|https://github.com/Altinity/ClickHouse/pull/1009|25.6.5||
-| s3Cluster hive partitioning for old analyzer                               |                        https://github.com/Altinity/ClickHouse/pull/703                         |         25.2.2         |https://github.com/ClickHouse/ClickHouse/pull/93284|
-| s3Cluster hive partitioning                                                |                        https://github.com/Altinity/ClickHouse/pull/584                         |        24.12.2         |https://github.com/ClickHouse/ClickHouse/pull/73910|
+| s3Cluster hive partitioning for old analyzer                               |                        https://github.com/Altinity/ClickHouse/pull/703                         |         25.2.2         |https://github.com/ClickHouse/ClickHouse/pull/93284|26.4.1|
 | ---                                                                        |
 |:left_right_arrow:  Feature parity in the latest Antalya release  :left_right_arrow:|||       
 | ---                                                                        |
