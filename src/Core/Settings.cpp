@@ -1930,7 +1930,7 @@ Restrictions:
 Possible values:
 
 - `local` — Replaces the database and table in the subquery with local ones for the destination server (shard), leaving the normal `IN`/`JOIN.`
-- `global` — Unsupported for now. Replaces the `IN`/`JOIN` query with `GLOBAL IN`/`GLOBAL JOIN.`
+- `global` — Replaces the `IN`/`JOIN` query with `GLOBAL IN`/`GLOBAL JOIN.` Right table executes first and is added to the secondary query as temporay table.
 - `allow` — Default value. Allows the use of these types of subqueries.
 )", 0) \
     \
@@ -7368,9 +7368,18 @@ Ignore existing partition export and overwrite the zookeeper entry
     DECLARE(UInt64, export_merge_tree_partition_max_retries, 3, R"(
 Maximum number of retries for exporting a merge tree part in an export partition task
 )", 0) \
-    DECLARE(UInt64, export_merge_tree_partition_manifest_ttl, 180, R"(
+    DECLARE(UInt64, export_merge_tree_partition_manifest_ttl, 86400, R"(
 Determines how long the manifest will live in ZooKeeper. It prevents the same partition from being exported twice to the same destination.
 This setting does not affect / delete in progress tasks. It'll only cleanup the completed ones.
+)", 0) \
+    DECLARE(UInt64, export_merge_tree_partition_task_timeout_seconds, 3600, R"(
+Maximum wall-clock duration (in seconds) an export partition task is allowed to remain in the PENDING state before it is auto-killed by the background cleanup loop.
+The timeout is measured from the manifest's create_time. Set to 0 to disable the timeout.
+When the timeout is exceeded the task transitions to KILLED (same terminal state as `KILL QUERY ... EXPORT PARTITION`), and `last_exception` is populated with a timeout reason.
+
+Notes:
+- Enforcement is best-effort: actual kill latency is bounded by one manifest-updater poll cycle (~30s) plus ZooKeeper watch propagation.
+- Since both this timeout and `export_merge_tree_partition_manifest_ttl` are measured from `create_time`, keep `export_merge_tree_partition_manifest_ttl` greater than `export_merge_tree_partition_task_timeout_seconds` if you want the KILLED entry to remain visible in `system.replicated_partition_exports` after the timeout fires.
 )", 0) \
     DECLARE(MergeTreePartExportFileAlreadyExistsPolicy, export_merge_tree_part_file_already_exists_policy, MergeTreePartExportFileAlreadyExistsPolicy::skip, R"(
 Possible values:
@@ -7396,7 +7405,7 @@ Throw an error if there are pending patch parts when exporting a merge tree part
 Only lock a part when the task is already running. This might help with busy waiting where the scheduler locks a part, but the task ends in the pending list.
 On the other hand, there is a chance once the task executes that part has already been locked by another replica and the task will simply early exit.
 )", 0) \
-    DECLARE(Bool, export_merge_tree_partition_system_table_prefer_remote_information, true, R"(
+    DECLARE(Bool, export_merge_tree_partition_system_table_prefer_remote_information, false, R"(
 Controls whether the system.replicated_partition_exports will prefer to query ZooKeeper to get the most up to date information or use the local information.
 Querying ZooKeeper is expensive, and only available if the ZooKeeper feature flag MULTI_READ is enabled.
 )", 0) \

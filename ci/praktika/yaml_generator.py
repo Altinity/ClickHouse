@@ -220,7 +220,7 @@ jobs:
 
         TEMPLATE_GH_UPLOAD = """
       - name: Upload artifact {NAME}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: {NAME}
           path: {PATH}
@@ -229,7 +229,7 @@ jobs:
 
         TEMPLATE_GH_DOWNLOAD = """
       - name: Download artifact {NAME}
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: {NAME}

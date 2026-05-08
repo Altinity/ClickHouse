@@ -52,7 +52,7 @@ public:
         const ASTInsertQuery & query,
         ContextPtr context) override;
 
-    bool supportsImport() const override;
+    bool supportsImport(ContextPtr context) const override;
 
     SinkToStoragePtr import(
         const std::string & file_name,
@@ -61,13 +61,18 @@ public:
         bool overwrite_if_exists,
         std::size_t max_bytes_per_file,
         std::size_t max_rows_per_file,
+        const std::optional<std::string> & iceberg_metadata_json_string,
         const std::optional<FormatSettings> & format_settings_,
         ContextPtr context) override;
+
+
+    bool isDataLake() const override;
 
     void commitExportPartitionTransaction(
         const String & transaction_id,
         const String & partition_id,
         const Strings & exported_paths,
+        const IcebergCommitExportPartitionArguments & iceberg_commit_export_partition_arguments,
         ContextPtr local_context) override;
 
     void drop() override;
@@ -171,7 +176,8 @@ private:
     void updateQueryToSendIfNeeded(
         ASTPtr & query,
         const StorageSnapshotPtr & storage_snapshot,
-        const ContextPtr & context) override;
+        const ContextPtr & context,
+        bool make_cluster_function) override;
 
     bool isClusterSupported() const override;
 
@@ -205,7 +211,7 @@ private:
     SELECT * FROM s3(...) SETTINGS object_storage_cluster='cluster'
     to make distributed request over cluster 'cluster'.
     */
-    void updateQueryForDistributedEngineIfNeeded(ASTPtr & query, ContextPtr context);
+    void updateQueryForDistributedEngineIfNeeded(ASTPtr & query, ContextPtr context, bool make_cluster_function);
 
     const String engine_name;
     StorageObjectStorageConfigurationPtr configuration;

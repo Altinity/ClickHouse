@@ -1035,7 +1035,7 @@ def get_optimal_test_batch(
     # Compute group durations as sum of known test durations within the group
     # TODO: fix in private
     #   ERROR: Failed to get secret [PRIVATE_CI_DB_URL]
-    if info and not info.is_local_run:
+    if info and not info.is_local_run and not info.is_community_pr:
         durations = get_tests_execution_time(info, job_options)
         if not durations:
             print("WARNING: CIDB durations not found, using static TEST_DURATIONS")

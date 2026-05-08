@@ -181,7 +181,7 @@ jobs:
           fi
 
       - name: Upload artifact CH_AMD_DEBUG
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_AMD_DEBUG
           path: ci/tmp/build/programs/self-extracting/clickhouse
@@ -197,7 +197,7 @@ jobs:
 
 
       - name: Upload artifact DEB_AMD_DEBUG
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: DEB_AMD_DEBUG
           path: ci/tmp/*.deb
@@ -251,7 +251,7 @@ jobs:
           fi
 
       - name: Upload artifact UNITTEST_AMD_ASAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: UNITTEST_AMD_ASAN
           path: ci/tmp/build/src/unit_tests_dbms
@@ -259,7 +259,7 @@ jobs:
 
 
       - name: Upload artifact CH_AMD_ASAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_AMD_ASAN
           path: ci/tmp/build/programs/self-extracting/clickhouse
@@ -267,7 +267,7 @@ jobs:
 
 
       - name: Upload artifact DEB_AMD_ASAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: DEB_AMD_ASAN
           path: ci/tmp/*.deb
@@ -321,7 +321,7 @@ jobs:
           fi
 
       - name: Upload artifact UNITTEST_AMD_TSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: UNITTEST_AMD_TSAN
           path: ci/tmp/build/src/unit_tests_dbms
@@ -329,7 +329,7 @@ jobs:
 
 
       - name: Upload artifact CH_AMD_TSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_AMD_TSAN
           path: ci/tmp/build/programs/self-extracting/clickhouse
@@ -337,7 +337,7 @@ jobs:
 
 
       - name: Upload artifact DEB_AMD_TSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: DEB_AMD_TSAN
           path: ci/tmp/*.deb
@@ -391,7 +391,7 @@ jobs:
           fi
 
       - name: Upload artifact UNITTEST_AMD_MSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: UNITTEST_AMD_MSAN
           path: ci/tmp/build/src/unit_tests_dbms
@@ -399,7 +399,7 @@ jobs:
 
 
       - name: Upload artifact CH_AMD_MSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_AMD_MSAN
           path: ci/tmp/build/programs/self-extracting/clickhouse
@@ -415,7 +415,7 @@ jobs:
 
 
       - name: Upload artifact DEB_AMD_MSAM
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: DEB_AMD_MSAM
           path: ci/tmp/*.deb
@@ -469,7 +469,7 @@ jobs:
           fi
 
       - name: Upload artifact UNITTEST_AMD_UBSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: UNITTEST_AMD_UBSAN
           path: ci/tmp/build/src/unit_tests_dbms
@@ -477,7 +477,7 @@ jobs:
 
 
       - name: Upload artifact CH_AMD_UBSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_AMD_UBSAN
           path: ci/tmp/build/programs/self-extracting/clickhouse
@@ -485,7 +485,7 @@ jobs:
 
 
       - name: Upload artifact DEB_AMD_UBSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: DEB_AMD_UBSAN
           path: ci/tmp/*.deb
@@ -539,7 +539,7 @@ jobs:
           fi
 
       - name: Upload artifact CH_AMD_BINARY
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_AMD_BINARY
           path: ci/tmp/build/programs/self-extracting/clickhouse
@@ -601,7 +601,7 @@ jobs:
           fi
 
       - name: Upload artifact CH_ARM_ASAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_ARM_ASAN
           path: ci/tmp/build/programs/self-extracting/clickhouse
@@ -609,7 +609,7 @@ jobs:
 
 
       - name: Upload artifact DEB_ARM_ASAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: DEB_ARM_ASAN
           path: ci/tmp/*.deb
@@ -663,7 +663,7 @@ jobs:
           fi
 
       - name: Upload artifact CH_ARM_BIN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_ARM_BIN
           path: ci/tmp/build/programs/self-extracting/clickhouse
@@ -717,7 +717,7 @@ jobs:
           fi
 
       - name: Upload artifact CH_ARM_TSAN
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_ARM_TSAN
           path: ci/tmp/build/programs/self-extracting/clickhouse
@@ -771,7 +771,7 @@ jobs:
           fi
 
       - name: Upload artifact CH_AMD_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_AMD_RELEASE
           path: ci/tmp/build/programs/self-extracting/clickhouse
@@ -779,7 +779,7 @@ jobs:
 
 
       - name: Upload artifact CH_AMD_RELEASE_STRIPPED
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_AMD_RELEASE_STRIPPED
           path: ci/tmp/build/programs/self-extracting/clickhouse-stripped
@@ -787,7 +787,7 @@ jobs:
 
 
       - name: Upload artifact DEB_AMD_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: DEB_AMD_RELEASE
           path: ci/tmp/*.deb
@@ -795,7 +795,7 @@ jobs:
 
 
       - name: Upload artifact RPM_AMD_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: RPM_AMD_RELEASE
           path: ci/tmp/*.rpm
@@ -803,7 +803,7 @@ jobs:
 
 
       - name: Upload artifact TGZ_AMD_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: TGZ_AMD_RELEASE
           path: ci/tmp/*64.tgz*
@@ -857,7 +857,7 @@ jobs:
           fi
 
       - name: Upload artifact CH_ARM_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_ARM_RELEASE
           path: ci/tmp/build/programs/self-extracting/clickhouse
@@ -865,7 +865,7 @@ jobs:
 
 
       - name: Upload artifact CH_ARM_RELEASE_STRIPPED
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_ARM_RELEASE_STRIPPED
           path: ci/tmp/build/programs/self-extracting/clickhouse-stripped
@@ -873,7 +873,7 @@ jobs:
 
 
       - name: Upload artifact DEB_ARM_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: DEB_ARM_RELEASE
           path: ci/tmp/*.deb
@@ -881,7 +881,7 @@ jobs:
 
 
       - name: Upload artifact RPM_ARM_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: RPM_ARM_RELEASE
           path: ci/tmp/*.rpm
@@ -889,7 +889,7 @@ jobs:
 
 
       - name: Upload artifact TGZ_ARM_RELEASE
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: TGZ_ARM_RELEASE
           path: ci/tmp/*64.tgz*

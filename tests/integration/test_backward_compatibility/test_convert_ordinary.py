@@ -74,17 +74,21 @@ def check_convert_system_db_to_atomic():
         == node.query("SELECT name FROM system.databases ORDER BY name")
     )
 
-    errors_count = node.count_in_log("<Error>")
-    assert "0\n" == errors_count or (
-        "1\n" == errors_count
-        and "1\n" == node.count_in_log("Can't receive Netlink response")
+    # NOTE (strtgbb): "Can't receive Netlink response" and the cgroups error are
+    # known-benign messages that occur in our environment but are unrelated to
+    # the Ordinary -> Atomic conversion under test.
+    allowed_errors_count = int(
+        node.count_in_log("Can't receive Netlink response")
+    ) + int(
+        node.count_in_log(
+            "CgroupsReader: Cannot find 'kernel' in '/sys/fs/cgroup/memory.stat'"
+        )
     )
+    errors_count = int(node.count_in_log("<Error>"))
+    assert errors_count <= allowed_errors_count
     assert "0\n" == node.count_in_log("<Warning> Database")
-    errors_count = node.count_in_log("always include the lines below")
-    assert "0\n" == errors_count or (
-        "1\n" == errors_count
-        and "1\n" == node.count_in_log("Can't receive Netlink response")
-    )
+    errors_count = int(node.count_in_log("always include the lines below"))
+    assert errors_count <= allowed_errors_count
 
     node.query("DROP DATABASE default2")
 
