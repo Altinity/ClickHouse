@@ -82,6 +82,10 @@ struct ManifestFileEntry : public boost::noncopyable
     DB::Row partition_key_value;
     PartitionSpecification common_partition_specification;
     std::unordered_map<Int32, ColumnInfo> columns_infos;
+    // True when at least one of value_counts, column_sizes, null_value_counts was
+    // present in the manifest Avro writer schema.  Forwarded to DataFileMetaInfo so
+    // the absent-NULL optimization can be suppressed when stats are absent entirely.
+    bool any_stats_field_present = false;
 
     String file_format;
     std::optional<String> lower_reference_data_file_path; // For position delete files only.
@@ -104,6 +108,7 @@ struct ManifestFileEntry : public boost::noncopyable
         DB::Row& partition_key_value_,
         PartitionSpecification& common_partition_specification_,
         std::unordered_map<Int32, ColumnInfo>& columns_infos_,
+        bool any_stats_field_present_,
         const String& file_format_,
         std::optional<String> lower_reference_data_file_path_,
         std::optional<String> upper_reference_data_file_path_,
@@ -119,6 +124,7 @@ struct ManifestFileEntry : public boost::noncopyable
         , partition_key_value(std::move(partition_key_value_))
         , common_partition_specification(common_partition_specification_)
         , columns_infos(std::move(columns_infos_))
+        , any_stats_field_present(any_stats_field_present_)
         , file_format(file_format_)
         , lower_reference_data_file_path(lower_reference_data_file_path_)
         , upper_reference_data_file_path(upper_reference_data_file_path_)

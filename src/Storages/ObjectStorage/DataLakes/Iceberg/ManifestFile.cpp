@@ -321,11 +321,13 @@ ManifestFileContent::ManifestFileContent(
             partition_key_value.emplace_back(value);
 
         std::unordered_map<Int32, ColumnInfo> columns_infos;
+        bool any_stats_field_present = false;
 
         for (const auto & path : {c_data_file_value_counts, c_data_file_column_sizes, c_data_file_null_value_counts})
         {
             if (manifest_file_deserializer.hasPath(path))
             {
+                any_stats_field_present = true;
                 Field values_count = manifest_file_deserializer.getValueFromRowByName(i, path);
                 for (const auto & column_stats : values_count.safeGet<Array>())
                 {
@@ -454,6 +456,7 @@ ManifestFileContent::ManifestFileContent(
                     partition_key_value,
                     common_partition_specification,
                     columns_infos,
+                    any_stats_field_present,
                     file_format,
                     /*lower_reference_data_file_path_ = */ std::nullopt,
                     /*upper_reference_data_file_path_ = */ std::nullopt,
@@ -500,6 +503,7 @@ ManifestFileContent::ManifestFileContent(
                         partition_key_value,
                         common_partition_specification,
                         columns_infos,
+                        any_stats_field_present,
                         file_format,
                         lower_reference_data_file_path,
                         upper_reference_data_file_path,
@@ -532,6 +536,7 @@ ManifestFileContent::ManifestFileContent(
                         partition_key_value,
                         common_partition_specification,
                         columns_infos,
+                        any_stats_field_present,
                         file_format,
                         /*lower_reference_data_file_path_ = */ std::nullopt,
                         /*upper_reference_data_file_path_ = */ std::nullopt,

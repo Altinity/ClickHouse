@@ -56,11 +56,18 @@ public:
         std::optional<DB::Range> hyperrectangle;
     };
 
-    // Extract metadata from Iceberg structure
+    // Extract metadata from Iceberg structure.
+    // any_stats_field_present must be true when at least one of the three per-column
+    // stats fields (value_counts, column_sizes, null_value_counts) was present in the
+    // manifest Avro writer schema.  When false, the absent-NULL optimization is
+    // suppressed: we cannot distinguish a schema-evolution absent column from a column
+    // that merely has no stats written, so letting Parquet handle it is the only safe
+    // choice.
     explicit DataFileMetaInfo(
         const Iceberg::IcebergSchemaProcessor & schema_processor,
         Int32 schema_id,
-        const std::unordered_map<Int32, Iceberg::ColumnInfo> & columns_info_);
+        const std::unordered_map<Int32, Iceberg::ColumnInfo> & columns_info_,
+        bool any_stats_field_present);
 
     void serialize(WriteBuffer & out) const;
     static DataFileMetaInfo deserialize(ReadBuffer & in);
@@ -68,6 +75,16 @@ public:
     bool empty() const { return columns_info.empty(); }
 
     std::unordered_map<std::string, ColumnInfo> columns_info;
+
+    // True when the manifest Avro schema included at least one of value_counts,
+    // column_sizes, or null_value_counts.  columns_info is authoritative only when
+    // this is true: a column absent from columns_info was not written to the data
+    // file and may be substituted with constant NULL.
+    //
+    // Serialization note: old nodes do not write this field.  On deserialization of
+    // a missing field (JSON or binary), default to false so that the absent-NULL
+    // optimization is skipped entirely — safe fallback, minor optimization loss only.
+    bool stats_were_read = false;
 };
 
 using DataFileMetaInfoPtr = std::shared_ptr<DataFileMetaInfo>;

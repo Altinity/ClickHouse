@@ -100,7 +100,9 @@ ReadFromFormatInfo IDataLakeMetadata::prepareReadingFromFormat(
 DataFileMetaInfo::DataFileMetaInfo(
     const Iceberg::IcebergSchemaProcessor & schema_processor,
     Int32 schema_id,
-    const std::unordered_map<Int32, Iceberg::ColumnInfo> & columns_info_)
+    const std::unordered_map<Int32, Iceberg::ColumnInfo> & columns_info_,
+    bool any_stats_field_present)
+    : stats_were_read(any_stats_field_present)
 {
 
     std::vector<Int32> column_ids;
@@ -133,6 +135,10 @@ DataFileMetaInfo::DataFileMetaInfo(Poco::JSON::Object::Ptr file_info)
         return;
 
     auto log = getLogger("DataFileMetaInfo");
+
+    // Missing field means old coordinator — default to false (safe: no absent-NULL).
+    if (file_info->has("stats_were_read"))
+        stats_were_read = static_cast<bool>(file_info->get("stats_were_read").convert<bool>());
 
     if (file_info->has("columns"))
     {
@@ -179,6 +185,8 @@ Poco::JSON::Object::Ptr DataFileMetaInfo::toJson() const
 {
     Poco::JSON::Object::Ptr file_info = new Poco::JSON::Object();
 
+    file_info->set("stats_were_read", stats_were_read);
+
     if (!columns_info.empty())
     {
         Poco::JSON::Array::Ptr columns = new Poco::JSON::Array();
@@ -210,6 +218,7 @@ constexpr size_t FIELD_MASK_ALL = 0x7;
 
 void DataFileMetaInfo::serialize(WriteBuffer & out) const
 {
+    writeIntBinary(static_cast<UInt8>(stats_were_read), out);
     auto size = columns_info.size();
     writeIntBinary(size, out);
     for (const auto & column : columns_info)
@@ -239,6 +248,10 @@ void DataFileMetaInfo::serialize(WriteBuffer & out) const
 DataFileMetaInfo DataFileMetaInfo::deserialize(ReadBuffer & in)
 {
     DataFileMetaInfo result;
+
+    UInt8 stats_were_read_uint;
+    readIntBinary(stats_were_read_uint, in);
+    result.stats_were_read = static_cast<bool>(stats_were_read_uint);
 
     size_t size;
     readIntBinary(size, in);
