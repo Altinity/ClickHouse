@@ -224,11 +224,13 @@ jobs:
         with:
           name: {NAME}
           path: {PATH}
+          retention-days: 1
 """
 
         TEMPLATE_GH_DOWNLOAD = """
       - name: Download artifact {NAME}
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: {NAME}
           path: {PATH}

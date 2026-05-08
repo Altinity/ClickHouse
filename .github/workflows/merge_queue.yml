@@ -280,6 +280,7 @@ jobs:
         with:
           name: CH_AMD_BINARY_GH
           path: ci/tmp/build/programs/self-extracting/clickhouse
+          retention-days: 1
 
   finish_workflow:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]

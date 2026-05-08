@@ -244,6 +244,7 @@ jobs:
         with:
           name: CH_AMD_DEBUG_GH
           path: ci/tmp/build/programs/self-extracting/clickhouse
+          retention-days: 1
 
   build_amd_asan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]

@@ -339,6 +339,7 @@ jobs:
         with:
           name: CH_AMD_DEBUG_GH
           path: ci/tmp/build/programs/self-extracting/clickhouse
+          retention-days: 1
 
   build_amd_asan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
@@ -486,6 +487,7 @@ jobs:
         with:
           name: CH_AMD_MSAN_GH
           path: ci/tmp/build/programs/self-extracting/clickhouse
+          retention-days: 1
 
   build_amd_ubsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
@@ -586,6 +588,7 @@ jobs:
         with:
           name: CH_AMD_BINARY_GH
           path: ci/tmp/build/programs/self-extracting/clickhouse
+          retention-days: 1
 
   build_arm_asan:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
@@ -860,6 +863,7 @@ jobs:
 
       - name: Download artifact CH_AMD_DEBUG_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_DEBUG_GH
           path: ./ci/tmp
@@ -1148,6 +1152,7 @@ jobs:
 
       - name: Download artifact CH_AMD_BINARY_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_BINARY_GH
           path: ./ci/tmp
@@ -1201,6 +1206,7 @@ jobs:
 
       - name: Download artifact CH_AMD_BINARY_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_BINARY_GH
           path: ./ci/tmp
@@ -1254,6 +1260,7 @@ jobs:
 
       - name: Download artifact CH_AMD_BINARY_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_BINARY_GH
           path: ./ci/tmp
@@ -1307,6 +1314,7 @@ jobs:
 
       - name: Download artifact CH_AMD_BINARY_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_BINARY_GH
           path: ./ci/tmp
@@ -1360,6 +1368,7 @@ jobs:
 
       - name: Download artifact CH_AMD_DEBUG_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_DEBUG_GH
           path: ./ci/tmp
@@ -1413,6 +1422,7 @@ jobs:
 
       - name: Download artifact CH_AMD_DEBUG_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_DEBUG_GH
           path: ./ci/tmp
@@ -1466,6 +1476,7 @@ jobs:
 
       - name: Download artifact CH_AMD_DEBUG_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_DEBUG_GH
           path: ./ci/tmp
@@ -1519,6 +1530,7 @@ jobs:
 
       - name: Download artifact CH_AMD_DEBUG_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_DEBUG_GH
           path: ./ci/tmp
@@ -1760,6 +1772,7 @@ jobs:
 
       - name: Download artifact CH_AMD_MSAN_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_MSAN_GH
           path: ./ci/tmp
@@ -1813,6 +1826,7 @@ jobs:
 
       - name: Download artifact CH_AMD_MSAN_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_MSAN_GH
           path: ./ci/tmp
@@ -1866,6 +1880,7 @@ jobs:
 
       - name: Download artifact CH_AMD_MSAN_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_MSAN_GH
           path: ./ci/tmp
@@ -1919,6 +1934,7 @@ jobs:
 
       - name: Download artifact CH_AMD_MSAN_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_MSAN_GH
           path: ./ci/tmp
@@ -2066,6 +2082,7 @@ jobs:
 
       - name: Download artifact CH_AMD_DEBUG_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_DEBUG_GH
           path: ./ci/tmp
@@ -2119,6 +2136,7 @@ jobs:
 
       - name: Download artifact CH_AMD_DEBUG_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_DEBUG_GH
           path: ./ci/tmp
@@ -2736,6 +2754,7 @@ jobs:
 
       - name: Download artifact CH_AMD_BINARY_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_BINARY_GH
           path: ./ci/tmp
@@ -2789,6 +2808,7 @@ jobs:
 
       - name: Download artifact CH_AMD_BINARY_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_BINARY_GH
           path: ./ci/tmp
@@ -2842,6 +2862,7 @@ jobs:
 
       - name: Download artifact CH_AMD_BINARY_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_BINARY_GH
           path: ./ci/tmp
@@ -2895,6 +2916,7 @@ jobs:
 
       - name: Download artifact CH_AMD_BINARY_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_BINARY_GH
           path: ./ci/tmp
@@ -2948,6 +2970,7 @@ jobs:
 
       - name: Download artifact CH_AMD_BINARY_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_BINARY_GH
           path: ./ci/tmp
@@ -4223,6 +4246,7 @@ jobs:
 
       - name: Download artifact CH_AMD_DEBUG_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_DEBUG_GH
           path: ./ci/tmp
@@ -4370,6 +4394,7 @@ jobs:
 
       - name: Download artifact CH_AMD_MSAN_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_MSAN_GH
           path: ./ci/tmp
@@ -4470,6 +4495,7 @@ jobs:
 
       - name: Download artifact CH_AMD_DEBUG_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_DEBUG_GH
           path: ./ci/tmp
@@ -4617,6 +4643,7 @@ jobs:
 
       - name: Download artifact CH_AMD_MSAN_GH
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: CH_AMD_MSAN_GH
           path: ./ci/tmp
