@@ -199,6 +199,11 @@ public:
     /// TODO handle the cases when generate RPN.
     bool extractPlainRanges(Ranges & ranges) const;
 
+    /// Same stack algorithm as extractPlainRanges, but for a multi-column key: logical ops apply
+    /// as usual, while atoms that constrain other key columns become the universe for `column_index`.
+    /// Returns false if the RPN contains unsupported atoms for this extraction (same as extractPlainRanges).
+    bool extractPlainRangesForColumn(size_t column_index, Ranges & ranges) const;
+
     /// The expression is stored as Reverse Polish Notation.
     struct RPNElement
     {

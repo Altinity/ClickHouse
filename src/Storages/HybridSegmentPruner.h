@@ -13,8 +13,10 @@ namespace DB
 /// Paimon::PartitionPruner.
 ///
 /// Build one KeyCondition over the user filter (PREWHERE+WHERE represented as an
-/// ActionsDAG) using all comparable Hybrid columns as the key. For each segment, parse
-/// its (already watermark-substituted) predicate AST into a Hyperrectangle and ask
+/// ActionsDAG) using all comparable Hybrid columns as the key. For each segment, build
+/// a second KeyCondition from its (already watermark-substituted) predicate AST and
+/// use `KeyCondition::extractPlainRangesForColumn` to obtain a Hyperrectangle (fail-open
+/// to whole-universe per column when extraction is ambiguous). Then ask
 /// `KeyCondition::checkInHyperrectangle(rect, types).can_be_true`. The segment can be
 /// pruned iff the answer is false.
 ///
