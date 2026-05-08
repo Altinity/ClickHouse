@@ -285,7 +285,7 @@ jobs:
           fi
 
       - name: Upload artifact CH_AMD_DEBUG_GH
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_AMD_DEBUG_GH
           path: ci/tmp/build/programs/self-extracting/clickhouse
@@ -433,7 +433,7 @@ jobs:
           fi
 
       - name: Upload artifact CH_AMD_MSAN_GH
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_AMD_MSAN_GH
           path: ci/tmp/build/programs/self-extracting/clickhouse
@@ -534,7 +534,7 @@ jobs:
           fi
 
       - name: Upload artifact CH_AMD_BINARY_GH
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_AMD_BINARY_GH
           path: ci/tmp/build/programs/self-extracting/clickhouse
@@ -1423,7 +1423,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY_GH
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: CH_AMD_BINARY_GH
@@ -1477,7 +1477,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY_GH
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: CH_AMD_BINARY_GH
@@ -1531,7 +1531,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY_GH
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: CH_AMD_BINARY_GH
@@ -1585,7 +1585,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY_GH
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: CH_AMD_BINARY_GH
@@ -1639,7 +1639,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_DEBUG_GH
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: CH_AMD_DEBUG_GH
@@ -1693,7 +1693,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_DEBUG_GH
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: CH_AMD_DEBUG_GH
@@ -1747,7 +1747,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_DEBUG_GH
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: CH_AMD_DEBUG_GH
@@ -1801,7 +1801,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_DEBUG_GH
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: CH_AMD_DEBUG_GH
@@ -2043,7 +2043,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_MSAN_GH
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: CH_AMD_MSAN_GH
@@ -2097,7 +2097,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_MSAN_GH
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: CH_AMD_MSAN_GH
@@ -2151,7 +2151,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_MSAN_GH
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: CH_AMD_MSAN_GH
@@ -2205,7 +2205,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_MSAN_GH
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: CH_AMD_MSAN_GH
@@ -2353,7 +2353,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_DEBUG_GH
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: CH_AMD_DEBUG_GH
@@ -2407,7 +2407,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_DEBUG_GH
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: CH_AMD_DEBUG_GH
@@ -3307,7 +3307,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY_GH
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: CH_AMD_BINARY_GH
@@ -3361,7 +3361,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY_GH
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: CH_AMD_BINARY_GH
@@ -3415,7 +3415,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY_GH
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: CH_AMD_BINARY_GH
@@ -3469,7 +3469,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY_GH
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: CH_AMD_BINARY_GH
@@ -3523,7 +3523,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_BINARY_GH
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: CH_AMD_BINARY_GH
@@ -4423,7 +4423,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_DEBUG_GH
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: CH_AMD_DEBUG_GH
@@ -4571,7 +4571,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_MSAN_GH
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: CH_AMD_MSAN_GH
@@ -4672,7 +4672,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_DEBUG_GH
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: CH_AMD_DEBUG_GH
@@ -4820,7 +4820,7 @@ jobs:
           ENV_SETUP_SCRIPT_EOF
 
       - name: Download artifact CH_AMD_MSAN_GH
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           name: CH_AMD_MSAN_GH

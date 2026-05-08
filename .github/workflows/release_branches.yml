@@ -238,7 +238,7 @@ jobs:
           fi
 
       - name: Upload artifact CH_AMD_DEBUG_GH
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_AMD_DEBUG_GH
           path: ci/tmp/build/programs/self-extracting/clickhouse
@@ -386,7 +386,7 @@ jobs:
           fi
 
       - name: Upload artifact CH_AMD_MSAN_GH
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: CH_AMD_MSAN_GH
           path: ci/tmp/build/programs/self-extracting/clickhouse
