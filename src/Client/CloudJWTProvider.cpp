@@ -132,7 +132,7 @@ void CloudJWTProvider::exchangeIdPTokenForClickHouseJWT(bool show_messages)
     if (!endpoints)
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
-            "Cannot determine token exchange endpoint from hostname {}. Please provide a ClickHouse Cloud hostname.",
+            "Cannot determine token exchange endpoint from hostname {}.",
             host_str);
 
     Poco::URI exchange_url = Poco::URI(endpoints->api_host + "/.api/auth/tokenExchange");
@@ -172,7 +172,7 @@ void CloudJWTProvider::exchangeIdPTokenForClickHouseJWT(bool show_messages)
     clickhouse_jwt_expires_at = Poco::Timestamp::fromEpochTime(jwt::decode(clickhouse_jwt).get_payload_claim("exp").as_integer());
 
     if (show_messages)
-        output_stream << "Authenticated with ClickHouse Cloud.\n" << std::endl;
+        output_stream << "Authenticated.\n" << std::endl;
 }
 
 }

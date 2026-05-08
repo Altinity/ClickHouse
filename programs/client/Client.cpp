@@ -460,8 +460,7 @@ void Client::login()
     {
         throw Exception(
             ErrorCodes::BAD_ARGUMENTS,
-            "Could not retrieve authentication endpoints for host '{}'. Please specify --oauth-url and --oauth-client-id if you are "
-            "not using ClickHouse Cloud.",
+            "Could not retrieve authentication endpoints for host '{}'. Please specify --oauth-url and --oauth-client-id.",
             host);
     }
 
@@ -732,8 +731,7 @@ void Client::addExtraOptions(OptionsDescription & options_description)
         ("login", po::value<std::string>()->implicit_value(""),
             "Authenticate via OAuth2. Optional mode: 'browser' (auth-code + PKCE, opens browser) "
             "or 'device' (device flow, prints URL + code). "
-            "Example: --login=browser or --login=device. "
-            "Bare --login uses the ClickHouse Cloud auto-login path.")
+            "Example: --login=browser or --login=device.")
         ("oauth-credentials", po::value<std::string>(),
             "Path to OAuth credentials JSON file "
             "(default: ~/.clickhouse-client/oauth_client.json)")
