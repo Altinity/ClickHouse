@@ -179,7 +179,12 @@ protected:
         TableMetadata & result) const;
 
     Config loadConfig();
-    virtual DB::HTTPHeaderEntries getAuthHeaders(bool update_token) const;
+    virtual DB::HTTPHeaderEntries getAuthHeaders(
+        bool update_token,
+        const String & method = {},
+        const Poco::URI & url = {},
+        const DB::HTTPHeaderEntries & extra_headers = {},
+        const String & body = {}) const;
     AccessToken retrieveAccessTokenOAuth() const;
     static void parseCatalogConfigurationSettings(const Poco::JSON::Object::Ptr & object, Config & result);
 
@@ -210,7 +215,12 @@ public:
         return DB::DatabaseDataLakeCatalogType::ICEBERG_ONELAKE;
     }
 
-    DB::HTTPHeaderEntries getAuthHeaders(bool update_token) const override;
+    DB::HTTPHeaderEntries getAuthHeaders(
+        bool update_token,
+        const String & method = {},
+        const Poco::URI & url = {},
+        const DB::HTTPHeaderEntries & extra_headers = {},
+        const String & body = {}) const override;
 
     String getTenantId() const { return tenant_id; }
 
@@ -241,7 +251,12 @@ public:
         return DB::DatabaseDataLakeCatalogType::ICEBERG_BIGLAKE;
     }
 
-    DB::HTTPHeaderEntries getAuthHeaders(bool update_token) const override;
+    DB::HTTPHeaderEntries getAuthHeaders(
+        bool update_token,
+        const String & method = {},
+        const Poco::URI & url = {},
+        const DB::HTTPHeaderEntries & extra_headers = {},
+        const String & body = {}) const override;
 
 private:
     const std::string google_project_id;
