@@ -85,7 +85,7 @@ std::unique_ptr<ReadBufferFromFileBase> CachedObjectStorage::readObject( /// NOL
             auto global_context = Context::getGlobalContextInstance();
             auto modified_read_settings = read_settings.withNestedBuffer();
 
-            auto read_buffer_creator = [=, this]()
+            auto read_buffer_creator = [this, object, read_settings, read_hint, file_size]()
             {
                 return object_storage->readObject(object, patchSettings(read_settings), read_hint, file_size);
             };

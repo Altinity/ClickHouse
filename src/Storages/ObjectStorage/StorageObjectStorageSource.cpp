@@ -378,6 +378,23 @@ Chunk StorageObjectStorageSource::generate()
             }
 #endif
 
+            /// Convert any Const columns to full columns before returning.
+            /// This is necessary because when chunks with different Const values (e.g., partition columns
+            /// from different files in DeltaLake) are squashed together during INSERT, the squashing code
+            /// doesn't properly handle merging Const columns with different constant values.
+            /// By converting to full columns here, we ensure the values are preserved correctly.
+            if (chunk.hasColumns())
+            {
+                size_t chunk_num_rows = chunk.getNumRows();
+                auto columns = chunk.detachColumns();
+                for (auto & column : columns)
+                {
+                    if (column->isConst())
+                        column = column->cloneResized(chunk_num_rows)->convertToFullColumnIfConst();
+                }
+                chunk.setColumns(std::move(columns), chunk_num_rows);
+            }
+
             return chunk;
         }
 
