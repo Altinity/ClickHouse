@@ -53,7 +53,7 @@ void MultipleFileWriter::startNewFile()
 
     data_file_names.push_back(metadata_path);
     if (new_file_path_callback)
-        new_file_path_callback(metadata_path);
+        new_file_path_callback(metadata_path.serialize());
 
     buffer = object_storage->writeObject(
         StoredObject(storage_path), WriteMode::Rewrite, std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());

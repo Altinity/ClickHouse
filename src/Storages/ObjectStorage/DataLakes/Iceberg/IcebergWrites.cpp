@@ -1326,25 +1326,9 @@ IcebergImportSink::IcebergImportSink(
 
     const auto metadata_compression_method = persistent_table_components.metadata_compression_method;
 
-    auto config_path = persistent_table_components.table_path;
-    if (config_path.empty() || config_path.back() != '/')
-        config_path += "/";
-    if (!config_path.starts_with('/'))
-        config_path = '/' + config_path;
-
-    if (!context_->getSettingsRef()[Setting::write_full_path_in_iceberg_metadata])
-    {
-        filename_generator = FileNamesGenerator(
-            config_path, config_path, (catalog != nullptr && catalog->isTransactional()), metadata_compression_method, write_format);
-    }
-    else
-    {
-        auto bucket = metadata_json->getValue<String>(Iceberg::f_location);
-        if (bucket.empty() || bucket.back() != '/')
-            bucket += "/";
-        filename_generator = FileNamesGenerator(
-            bucket, config_path, (catalog != nullptr && catalog->isTransactional()), metadata_compression_method, write_format);
-    }
+    filename_generator = FileNamesGenerator(
+        persistent_table_components.path_resolver.getTableLocation(),
+        (catalog != nullptr && catalog->isTransactional()), metadata_compression_method, write_format);
 
     const auto [last_version, unused_meta_path, unused_compression] = getLatestOrExplicitMetadataFileAndVersion(
         object_storage,
@@ -1353,7 +1337,8 @@ IcebergImportSink::IcebergImportSink(
         persistent_table_components.metadata_cache,
         context_,
         getLogger("IcebergWrites").get(),
-        persistent_table_components.table_uuid);
+        persistent_table_components.table_uuid,
+        persistent_table_components.metadata_compression_method);
     (void)unused_meta_path;
     (void)unused_compression;
 
@@ -1364,6 +1349,7 @@ IcebergImportSink::IcebergImportSink(
         context->getSettingsRef()[Setting::iceberg_insert_max_bytes_in_data_file],
         current_schema->getArray(Iceberg::f_fields),
         filename_generator,
+        persistent_table_components.path_resolver,
         object_storage,
         context,
         format_settings,
@@ -1408,7 +1394,7 @@ void IcebergImportSink::onFinish()
             serialized_stats.file_size_in_bytes = entry.file_size_in_bytes;
         }
 
-        writeDataFileSidecar(entry.path, serialized_stats, object_storage, context);
+        writeDataFileSidecar(entry.path.serialize(), serialized_stats, object_storage, context);
     }
 
     releaseBuffers();

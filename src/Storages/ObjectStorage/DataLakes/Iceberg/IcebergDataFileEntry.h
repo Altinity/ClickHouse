@@ -36,7 +36,7 @@ struct IcebergSerializedFileStats
 /// (column sizes, null counts, min/max bounds, record count, file size).
 struct IcebergDataFileEntry
 {
-    String path;
+    Iceberg::IcebergPathFromMetadata path;
     Int64 record_count = 0;
     Int64 file_size_in_bytes = 0;
 
