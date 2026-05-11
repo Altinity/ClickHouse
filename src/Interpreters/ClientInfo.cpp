@@ -356,16 +356,16 @@ void ClientInfo::setFromHTTPRequest(const Poco::Net::HTTPRequest & request)
     {
         /// These headers can contain authentication info and shouldn't be accessible by the user.
         ///
-        /// The standard HTTP authorization header is `Authorization` (RFC 7235 §4.2),
-        /// which lowercases to `authorization`. The previous filter compared against
-        /// `authentication` -- a real but distinct header (RFC 7615) that ClickHouse
-        /// does not use for credentials -- so the actual `Authorization: Basic ...`
-        /// or `Authorization: Bearer <JWT>` header was retained in `http_headers`
-        /// and exposed via `getClientHTTPHeader('Authorization')` and via
-        /// `<forward_headers>` on HTTP auth servers (which would relay the bearer
-        /// token meant for ClickHouse to a third-party auth server).
+        /// The standard HTTP authorization header is `Authorization` (RFC 7235 §4.2);
+        /// `Authentication` is a separate header (RFC 7615) that ClickHouse does not use
+        /// for credentials. Filter both: `Authorization` is the actual credential header
+        /// (Basic, Bearer, etc.) and must not be exposed via `getClientHTTPHeader` or
+        /// relayed through `<forward_headers>` on HTTP auth servers; `Authentication` is
+        /// filtered defensively to preserve prior behavior.
         String key_lowercase = Poco::toLower(header.first);
-        if (key_lowercase.starts_with("x-clickhouse") || key_lowercase == "authorization")
+        if (key_lowercase.starts_with("x-clickhouse")
+            || key_lowercase == "authorization"
+            || key_lowercase == "authentication")
             continue;
         http_headers[header.first] = header.second;
     }
