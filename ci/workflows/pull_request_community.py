@@ -30,7 +30,7 @@ PLAIN_FUNCTIONAL_TEST_JOB = [
 workflow = Workflow.Config(
     name="Community PR",
     event=Workflow.Event.PULL_REQUEST,
-    base_branches=[BASE_BRANCH, "releases/*", "antalya-*"],
+    base_branches=[BASE_BRANCH, "releases/*", "antalya-*", "stable-*"],
     if_condition="github.repository != github.event.pull_request.head.repo.full_name",
     jobs=[
         JobConfigs.fast_test,

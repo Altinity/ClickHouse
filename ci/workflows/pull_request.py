@@ -42,7 +42,7 @@ PLAIN_FUNCTIONAL_TEST_JOB = [
 workflow = Workflow.Config(
     name="PR",
     event=Workflow.Event.PULL_REQUEST,
-    base_branches=[BASE_BRANCH, "releases/*", "antalya-*"],
+    base_branches=[BASE_BRANCH, "releases/*", "antalya-*", "stable-*"],
     if_condition="github.repository == github.event.pull_request.head.repo.full_name || github.event_name == 'workflow_dispatch'",
     jobs=[
         # JobConfigs.style_check, # NOTE (strtgbb): we don't run style check
