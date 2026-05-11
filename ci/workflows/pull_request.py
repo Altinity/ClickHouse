@@ -23,7 +23,7 @@ REGULAR_BUILD_NAMES = [job.name for job in JobConfigs.build_jobs]
 workflow = Workflow.Config(
     name="PR",
     event=Workflow.Event.PULL_REQUEST,
-    base_branches=[BASE_BRANCH, "releases/*", "antalya-*"],
+    base_branches=[BASE_BRANCH, "releases/*", "antalya-*", "stable-*"],
     jobs=[
         # JobConfigs.style_check, # NOTE (strtgbb): we don't run style check
         # JobConfigs.docs_job, # NOTE (strtgbb): we don't build docs
