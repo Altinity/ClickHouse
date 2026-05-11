@@ -99,6 +99,31 @@ namespace
         }
     }
 
+    /// Mirrors `InterpreterInsertQuery::addInsertToSelectPipeline`: positional match,
+    /// destination header = `getSampleBlockNonMaterialized()`, all type bridging is done
+    /// by the CAST inside `makeConvertingActions`. No pre-validation, no per-column
+    /// lossy/non-lossy classification — restrictions are exactly what INSERT SELECT enforces.
+    void addExportConvertingActions(
+        QueryPlan & plan_for_part,
+        const IStorage & destination_storage,
+        const ContextPtr & local_context)
+    {
+        const auto destination_header
+            = destination_storage.getInMemoryMetadataPtr()->getSampleBlockNonMaterialized();
+
+        auto dag = ActionsDAG::makeConvertingActions(
+            plan_for_part.getCurrentHeader()->getColumnsWithTypeAndName(),
+            destination_header.getColumnsWithTypeAndName(),
+            ActionsDAG::MatchColumnsMode::Position,
+            local_context);
+
+        auto expression_step = std::make_unique<ExpressionStep>(
+            plan_for_part.getCurrentHeader(),
+            std::move(dag));
+        expression_step->setStepDescription("Convert source columns to destination types for export");
+        plan_for_part.addStep(std::move(expression_step));
+    }
+
     String buildDestinationFilename(
         const MergeTreePartExportManifest & manifest,
         const StorageID & storage_id,
@@ -238,6 +263,10 @@ bool ExportPartTask::executeStep()
         /// We need to support exporting materialized and alias columns to object storage. For some reason, object storage engines don't support them.
         /// This is a hack that materializes the columns before the export so they can be exported to tables that have matching columns
         materializeSpecialColumns(plan_for_part.getCurrentHeader(), metadata_snapshot, local_context, plan_for_part);
+
+        /// Align the pipeline header with the destination's non-materialized sample block,
+        /// using the same `makeConvertingActions(Position)` call INSERT SELECT performs.
+        addExportConvertingActions(plan_for_part, *destination_storage, local_context);
 
         QueryPlanOptimizationSettings optimization_settings(local_context);
         auto pipeline_settings = BuildQueryPipelineSettings(local_context);

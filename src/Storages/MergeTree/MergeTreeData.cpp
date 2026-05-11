@@ -29,6 +29,7 @@
 #include <Common/thread_local_rng.h>
 #include <Storages/MergeTree/ExportPartTask.h>
 #include <Storages/MergeTree/ExportPartitionUtils.h>
+#include <Interpreters/ActionsDAG.h>
 #include <Processors/Executors/CompletedPipelineExecutor.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
 #include <Storages/MergeTree/MergeTreeSequentialSource.h>
@@ -6741,14 +6742,24 @@ void MergeTreeData::exportPartToTable(
 #endif
     }
 
-    const auto & source_columns = source_metadata_ptr->getColumns();
+    /// Schema compatibility: use the same rules as `INSERT INTO dest SELECT * FROM src` —
+    /// positional matching with CAST. We surface structural mismatches synchronously at
+    /// ALTER TABLE time by building (and discarding) the same converting DAG the worker
+    /// will build later. Anything `makeConvertingActions` rejects (column-count mismatch,
+    /// untyped cast) fails here; anything it accepts will be CAST at runtime.
+    {
+        Block source_sample_block;
+        for (const auto & column : source_metadata_ptr->getColumns().getReadable())
+            source_sample_block.insert({column.type->createColumn(), column.type, column.name});
 
-    const auto & destination_columns = destination_metadata_ptr->getColumns();
+        const auto destination_sample_block = destination_metadata_ptr->getSampleBlockNonMaterialized();
 
-    /// compare all source readable columns with all destination insertable columns
-    /// this allows us to skip ephemeral columns
-    if (source_columns.getReadable().sizeOfDifference(destination_columns.getInsertable()))
-        throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS, "Tables have different structure");
+        (void) ActionsDAG::makeConvertingActions(
+            source_sample_block.getColumnsWithTypeAndName(),
+            destination_sample_block.getColumnsWithTypeAndName(),
+            ActionsDAG::MatchColumnsMode::Position,
+            query_context);
+    }
 
     /// for data lakes this check is performed differently. It is a bit more complex as we need to convert the iceberg partition spec
     /// to the MergeTree partition spec and compare the two.
