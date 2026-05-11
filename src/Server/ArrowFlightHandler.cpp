@@ -83,7 +83,15 @@ namespace
 
         void SendingHeaders(arrow::flight::AddCallHeaders * outgoing_headers) override
         {
-            outgoing_headers->AddHeader(AUTHORIZATION_HEADER, "Bearer " + token_);
+            /// Echo the original scheme. pyarrow's `authenticate_basic_token`
+            /// captures this header verbatim and reuses it on every subsequent
+            /// RPC, so if we always emit `Bearer` here a Basic-auth client
+            /// ends up sending `Bearer <base64(user:password)>` next time -- and
+            /// the Bearer path runs token validation, which fails when no
+            /// token processors are configured. Preserving the scheme keeps
+            /// Basic on the Basic path and Bearer on the token path.
+            const std::string & prefix = (scheme_ == Scheme::Bearer) ? "Bearer " : "Basic ";
+            outgoing_headers->AddHeader(AUTHORIZATION_HEADER, prefix + token_);
         }
 
         void CallCompleted(const arrow::Status & /*status*/) override { }
