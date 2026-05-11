@@ -932,3 +932,77 @@ def test_export_partition_writes_column_statistics(cluster):
 
     entries = fetch_manifest_entries(node, query_id)
     assert_exported_stats(entries)
+
+
+def test_export_50_partitions_in_single_alter_to_iceberg(cluster):
+    """
+    Single-statement export of 50 partitions to IcebergS3 (no catalog).
+
+    Creates a 5-column ReplicatedMergeTree table on two replicas, inserts 10M
+    rows into the first replica laid out as 50 partitions of 200k rows each,
+    then issues a single ALTER TABLE that bundles 50 EXPORT PARTITION clauses
+    pointing at the same IcebergS3 destination. Waits for every partition to
+    reach COMPLETED in system.replicated_partition_exports and asserts the
+    total row count round-trips end-to-end.
+    """
+    replica1 = cluster.instances["replica1"]
+    replica2 = cluster.instances["replica2"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_many_{uid}"
+    iceberg_table = f"iceberg_many_{uid}"
+
+    cols = "id Int64, name String, value Float64, event_dt Date, part_id Int32"
+
+    make_rmt(replica1, mt_table, cols, "part_id",
+             replica_name="replica1", order_by="id")
+    make_rmt(replica2, mt_table, cols, "part_id",
+             replica_name="replica2", order_by="id")
+
+    make_iceberg_s3(replica1, iceberg_table, cols, "part_id")
+    make_iceberg_s3(replica2, iceberg_table, cols, "part_id",
+                    if_not_exists=True)
+
+    num_partitions = 50
+    rows_per_partition = 200_000
+    total_rows = num_partitions * rows_per_partition
+
+    # Insert all rows on the first replica only. max_insert_block_size is set to
+    # the full row count so the writer accumulates one block before splitting it
+    # by partition, producing exactly one part per partition_id.
+    replica1.query(
+        f"""
+        INSERT INTO {mt_table}
+        SELECT
+            number                                AS id,
+            toString(number)                      AS name,
+            toFloat64(number) * 1.5               AS value,
+            toDate('2024-01-01') + (number % 365) AS event_dt,
+            toInt32(number % {num_partitions})    AS part_id
+        FROM numbers({total_rows})
+        SETTINGS max_insert_block_size = {total_rows},
+                 min_insert_block_size_rows = {total_rows}
+        """
+    )
+
+    inserted = int(replica1.query(f"SELECT count() FROM {mt_table}").strip())
+    assert inserted == total_rows, (
+        f"Expected {total_rows} rows in source MergeTree, got {inserted}"
+    )
+
+    export_clauses = ", ".join(
+        f"EXPORT PARTITION ID '{p}' TO TABLE {iceberg_table}"
+        for p in range(num_partitions)
+    )
+    replica1.query(f"ALTER TABLE {mt_table} {export_clauses}")
+
+    for p in range(num_partitions):
+        wait_for_export_status(
+            replica1, mt_table, iceberg_table, str(p),
+            expected_status="COMPLETED", timeout=600,
+        )
+
+    count = int(replica1.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == total_rows, (
+        f"Expected {total_rows} rows in Iceberg table after export, got {count}"
+    )
