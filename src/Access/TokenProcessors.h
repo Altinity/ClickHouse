@@ -237,7 +237,8 @@ public:
                          const String & openid_config_endpoint_,
                          UInt64 verifier_leeway_,
                          UInt64 jwks_cache_lifetime_,
-                         const RemoteHostFilter & remote_host_filter_);
+                         const RemoteHostFilter & remote_host_filter_,
+                         bool allow_http_discovery_urls_);
 
     bool resolveAndValidate(TokenCredentials & credentials) const override;
 private:

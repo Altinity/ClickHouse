@@ -112,8 +112,7 @@ def test_jwt_dynamic_jwks(started_cluster):
 
 
 def test_openid_discovery(started_cluster):
-    """Token validated by the `openid` processor (keycloak_discovery), wired
-    in manual trust-chain mode -- see `configs/validators.xml`."""
+    """Token validated via OIDC discovery document (keycloak_discovery processor)."""
     token = get_keycloak_token(started_cluster)
     result = query_with_token(node, token, "SELECT 1")
     assert result.strip() == "1"

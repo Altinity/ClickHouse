@@ -518,7 +518,8 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
                                            const String & openid_config_endpoint_,
                                            UInt64 verifier_leeway_,
                                            UInt64 jwks_cache_lifetime_,
-                                           const RemoteHostFilter & remote_host_filter_)
+                                           const RemoteHostFilter & remote_host_filter_,
+                                           bool allow_http_discovery_urls_)
     : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_)
 {
     /// Defense in depth: the discovery endpoint itself was already validated by
@@ -567,18 +568,27 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
     /// blocks all three of those targets independently. Operators who run an
     /// IdP over plain HTTP intentionally can wire the trust chain manually
     /// (`userinfo_endpoint`/`token_introspection_endpoint`/`jwks_uri` directly)
-    /// instead of relying on discovery.
+    /// instead of relying on discovery, or opt out of this check by setting
+    /// `<allow_http_discovery_urls>true</allow_http_discovery_urls>` on the
+    /// processor (false by default; <remote_url_allow_hosts> still applies).
+    if (allow_http_discovery_urls_)
+        LOG_WARNING(getLogger("TokenAuthentication"),
+                    "{}: 'allow_http_discovery_urls' is enabled; HTTPS check on URLs returned by OIDC discovery "
+                    "is suppressed. Make sure <remote_url_allow_hosts> restricts which targets the server may "
+                    "be redirected to via a poisoned discovery document.",
+                    processor_name);
     auto require_allowed_discovery_url = [&](const std::string & url, const char * field)
     {
         Poco::URI parsed_uri(url);
-        if (parsed_uri.getScheme() != "https")
+        if (!allow_http_discovery_urls_ && parsed_uri.getScheme() != "https")
             throw Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
                             "{}: OIDC discovery at '{}' returned non-HTTPS '{}' URL '{}' (scheme '{}'). "
                             "The trust-chain URLs from discovery must use HTTPS so a poisoned discovery "
                             "document cannot redirect token validation through internal endpoints "
                             "(cloud metadata, localhost, in-cluster service IPs). If the IdP genuinely "
-                            "runs over plain HTTP, configure the trust chain manually instead of using "
-                            "'configuration_endpoint'.",
+                            "runs over plain HTTP, either configure the trust chain manually instead of "
+                            "using 'configuration_endpoint', or set "
+                            "'<allow_http_discovery_urls>true</allow_http_discovery_urls>' on this processor.",
                             processor_name, openid_config_endpoint_, field, url, parsed_uri.getScheme());
 
         try

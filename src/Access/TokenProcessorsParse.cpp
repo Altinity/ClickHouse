@@ -100,12 +100,17 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
         {
             const auto configuration_endpoint = config.getString(prefix + ".configuration_endpoint");
             require_allowed_url(configuration_endpoint, "configuration_endpoint");
+            /// Opt-out for the HTTPS-on-discovery-returned-URLs check. False by
+            /// default; operators who knowingly run an IdP over plain HTTP can
+            /// enable it without falling back to manual trust-chain config.
+            const auto allow_http_discovery_urls = config.getBool(prefix + ".allow_http_discovery_urls", false);
             return std::make_unique<OpenIdTokenProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim,
                                                           expected_issuer, expected_audience, allow_no_expiration,
                                                           configuration_endpoint,
                                                           verifier_leeway,
                                                           jwks_cache_lifetime,
-                                                          remote_host_filter);
+                                                          remote_host_filter,
+                                                          allow_http_discovery_urls);
         }
         else if (locally_configured && !externally_configured)
         {
