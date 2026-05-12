@@ -45,6 +45,10 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         });
         addSettingsChanges(settings_changes_history, "26.3",
         {
+            {"http_max_fields", 1000000, 1000, "Reduce default to limit pre-authentication memory usage by HTTP connections."},
+            {"http_max_field_name_size", 131072, 4096, "Reduce default to limit pre-authentication memory usage by HTTP connections."},
+            {"http_max_request_header_size", 0, 10485760, "New setting to limit total HTTP request header size before authentication."},
+            {"http_headers_read_timeout", 0, 30, "New setting to limit total time for reading HTTP request headers, protecting against slowloris attacks."},
             {"allow_experimental_polyglot_dialect", false, false, "New setting to enable the polyglot SQL transpiler dialect."},
             {"polyglot_dialect", "", "", "New setting to specify the source SQL dialect for the polyglot transpiler."},
             {"output_format_trim_fixed_string", false, false, "New setting to trim trailing zero bytes from FixedString values in text output formats"},
@@ -71,7 +75,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"iceberg_expire_default_min_snapshots_to_keep", 1, 1, "New setting."},
             {"iceberg_expire_default_max_snapshot_age_ms", 432000000, 432000000, "New setting."},
             {"iceberg_expire_default_max_ref_age_ms", 9223372036854775807, 9223372036854775807, "New setting."},
-            {"functions_h3_default_if_invalid", true, false, "A new setting for legacy behaviour to allow invalid inputs to h3 functions"},
             {"max_skip_unavailable_shards_num", 0, 0, "New setting to limit the number of shards that can be silently skipped when skip_unavailable_shards is enabled."},
             {"max_skip_unavailable_shards_ratio", 0, 0, "New setting to limit the ratio of shards that can be silently skipped when skip_unavailable_shards is enabled."},
         });
@@ -112,12 +115,12 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         });
         addSettingsChanges(settings_changes_history, "26.1.3.20001.altinityantalya",
         {
-            // {"iceberg_partition_timezone", "", "", "New setting."},
+            {"iceberg_partition_timezone", "", "", "New setting."},
             // {"s3_propagate_credentials_to_other_storages", false, false, "New setting"},
             {"export_merge_tree_part_filename_pattern", "", "{part_name}_{checksum}", "New setting"},
             // {"use_parquet_metadata_cache", false, true, "Enables cache of parquet file metadata."},
             // {"input_format_parquet_use_metadata_cache", true, false, "Obsolete. No-op"}, // https://github.com/Altinity/ClickHouse/pull/586
-            // {"object_storage_remote_initiator_cluster", "", "", "New setting."},
+            {"object_storage_remote_initiator_cluster", "", "", "New setting."},
             // {"iceberg_metadata_staleness_ms", 0, 0, "New setting allowing using cached metadata version at READ operations to prevent fetching from remote catalog"},
             {"export_merge_tree_partition_task_timeout_seconds", 0, 3600, "New setting to control the timeout for export partition tasks."},
             {"export_merge_tree_partition_manifest_ttl", 180, 86400, "Reasonable default for real usage"},
@@ -206,7 +209,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"insert_select_deduplicate", Field{"auto"}, Field{"auto"}, "New setting"},
             {"output_format_pretty_named_tuples_as_json", false, true, "New setting to control whether named tuples in Pretty format are output as JSON objects"},
             {"deduplicate_insert_select", "enable_even_for_bad_queries", "enable_even_for_bad_queries", "New setting, replace insert_select_deduplicate"},
-
         });
         addSettingsChanges(settings_changes_history, "25.11",
         {
@@ -305,15 +307,15 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         });
         addSettingsChanges(settings_changes_history, "25.8.16.20001.altinityantalya",
         {
-            // {"allow_experimental_database_iceberg", false, true, "Turned ON by default for Antalya."},
-            // {"allow_experimental_database_unity_catalog", false, true, "Turned ON by default for Antalya."},
-            // {"allow_experimental_database_glue_catalog", false, true, "Turned ON by default for Antalya."},
-            // {"allow_database_iceberg", false, true, "Turned ON by default for Antalya (alias)."},
-            // {"allow_database_unity_catalog", false, true, "Turned ON by default for Antalya (alias)."},
-            // {"allow_database_glue_catalog", false, true, "Turned ON by default for Antalya (alias)."},
+            {"allow_experimental_database_iceberg", false, true, "Turned ON by default for Antalya."},
+            {"allow_experimental_database_unity_catalog", false, true, "Turned ON by default for Antalya."},
+            {"allow_experimental_database_glue_catalog", false, true, "Turned ON by default for Antalya."},
+            {"allow_database_iceberg", false, true, "Turned ON by default for Antalya (alias)."},
+            {"allow_database_unity_catalog", false, true, "Turned ON by default for Antalya (alias)."},
+            {"allow_database_glue_catalog", false, true, "Turned ON by default for Antalya (alias)."},
             // {"input_format_parquet_use_metadata_cache", true, true, "New setting, turned ON by default"}, // https://github.com/Altinity/ClickHouse/pull/586
-            // {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."},
-            // {"object_storage_remote_initiator", false, false, "New setting."},
+            {"iceberg_timezone_for_timestamptz", "UTC", "UTC", "New setting."},
+            {"object_storage_remote_initiator", false, false, "New setting."},
             {"allow_experimental_iceberg_read_optimization", true, true, "New setting."},
             // {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
             {"lock_object_storage_task_distribution_ms", 500, 500, "New setting."},
@@ -332,8 +334,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"export_merge_tree_partition_lock_inside_the_task", false, false, "New setting."},
             {"export_merge_tree_part_throw_on_pending_mutations", true, true, "New setting."},
             {"export_merge_tree_part_throw_on_pending_patch_parts", true, true, "New setting."},
-            // {"object_storage_cluster", "", "", "Antalya: New setting"},
-            // {"object_storage_max_nodes", 0, 0, "Antalya: New setting"},
+            {"object_storage_cluster", "", "", "Antalya: New setting"},
+            {"object_storage_max_nodes", 0, 0, "Antalya: New setting"},
             {"use_object_storage_list_objects_cache", false, false, "New setting."},
         });
         addSettingsChanges(settings_changes_history, "25.8",

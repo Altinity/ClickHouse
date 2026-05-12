@@ -134,6 +134,7 @@
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeLogEntry.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
+#include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
 #include <IO/SharedThreadPools.h>
 
 #include <base/types.h>
@@ -8401,7 +8402,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     MergeTreeData::IMutationsSnapshot::Params mutations_snapshot_params
     {
         .metadata_version = getInMemoryMetadataPtr()->getMetadataVersion(),
-        .min_part_metadata_version = MergeTreeData::getMinMetadataVersion(parts),
+        .min_part_metadata_version = MergeTreeData::getPartsSnapshotInfo(parts).min_metadata_version,
         .need_data_mutations = throw_on_pending_mutations,
         .need_alter_mutations = throw_on_pending_mutations || throw_on_pending_patch_parts,
         .need_patch_parts = throw_on_pending_patch_parts,
@@ -8465,14 +8466,19 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     {
 #if USE_AVRO
         auto * object_storage = dynamic_cast<StorageObjectStorage *>(dest_storage.get());
+        auto * object_storage_cluster = dynamic_cast<StorageObjectStorageCluster *>(dest_storage.get());
 
         /// in theory this should never happen, but just in case
-        if (!object_storage)
+        if (!object_storage && !object_storage_cluster)
         {
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Destination storage {} is not a StorageObjectStorage", dest_storage->getName());
         }
 
-        auto * iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage->getExternalMetadata(query_context));
+        IcebergMetadata * iceberg_metadata = nullptr;
+        if (object_storage)
+            iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage->getExternalMetadata(query_context));
+        else if (object_storage_cluster)
+            iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage_cluster->getExternalMetadata(query_context));
         if (!iceberg_metadata)
         {
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Destination storage {} is a data lake but not an iceberg table", dest_storage->getName());
@@ -8899,11 +8905,6 @@ QueryPipeline StorageReplicatedMergeTree::updateLightweight(const MutationComman
     chassert(!pipeline.completed());
     pipeline.complete(std::move(sink));
     return pipeline;
-}
-
-bool StorageReplicatedMergeTree::hasLightweightDeletedMask() const
-{
-    return has_lightweight_delete_parts.load(std::memory_order_relaxed);
 }
 
 size_t StorageReplicatedMergeTree::clearOldPartsAndRemoveFromZK()
