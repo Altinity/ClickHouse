@@ -132,7 +132,8 @@ def test_sql_create_jwt_user_with_processor_pin(started_cluster):
     )
 
     # Round-trip: SHOW CREATE USER must emit the PROCESSOR clause we just set.
-    show = instance.query("SHOW CREATE USER sql_jwt_user").strip()
+    # `TSVRaw` is used so single quotes in the SQL literal are not TSV-escaped.
+    show = instance.query("SHOW CREATE USER sql_jwt_user FORMAT TSVRaw").strip()
     assert "PROCESSOR 'single_key_processor'" in show, show
     assert "CLAIMS" not in show, show
 
@@ -170,7 +171,7 @@ def test_sql_create_jwt_user_with_claims(started_cluster):
         "CLAIMS '{\"role\":\"admin\"}'"
     )
 
-    show = instance.query("SHOW CREATE USER sql_jwt_claims_user").strip()
+    show = instance.query("SHOW CREATE USER sql_jwt_claims_user FORMAT TSVRaw").strip()
     assert "PROCESSOR 'single_key_processor'" in show, show
     assert "CLAIMS '{\"role\":\"admin\"}'" in show, show
 
@@ -196,7 +197,7 @@ def test_sql_jwt_user_no_pin_uses_auto_discovery(started_cluster):
 
     instance.query("CREATE USER OR REPLACE sql_jwt_unpinned IDENTIFIED WITH jwt")
 
-    show = instance.query("SHOW CREATE USER sql_jwt_unpinned").strip()
+    show = instance.query("SHOW CREATE USER sql_jwt_unpinned FORMAT TSVRaw").strip()
     assert "PROCESSOR" not in show, show
 
     # Both tokens (each valid against a different processor) authenticate the
