@@ -856,7 +856,7 @@ public:
     }
 };
 
-void rewriteInToGlobalIn(QueryTreeNodePtr query_tree_to_modify, ContextPtr context)
+void rewriteInToGlobalIn(QueryTreeNodePtr & query_tree_to_modify, ContextPtr context)
 {
     RewriteInToGlobalInVisitor visitor(context);
     visitor.visit(query_tree_to_modify);
