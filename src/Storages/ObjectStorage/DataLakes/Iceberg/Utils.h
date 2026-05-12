@@ -55,9 +55,14 @@ struct TransformAndArgument
 {
     String transform_name;
     std::optional<size_t> argument;
+    /// When Iceberg table is partitioned by time, splitting by partitions can be made using different timezone
+    /// (UTC in most cases). This timezone can be set with setting `iceberg_partition_timezone`, value is in this member.
+    /// When Iceberg partition condition converted to ClickHouse function in `parseTransformAndArgument` method
+    /// `time_zone` added as second argument to functions like `toRelativeDayNum`, `toYearNumSinceEpoch`, etc.
+    std::optional<String> time_zone;
 };
 
-std::optional<TransformAndArgument> parseTransformAndArgument(const String & transform_name_src);
+std::optional<TransformAndArgument> parseTransformAndArgument(const String & transform_name_src, const String & time_zone);
 
 Poco::JSON::Object::Ptr getMetadataJSONObject(
     const String & metadata_file_path,
@@ -98,7 +103,8 @@ MetadataFileWithInfo getLatestOrExplicitMetadataFileAndVersion(
     Poco::Logger * log,
     const std::optional<String> & table_uuid,
     CompressionMethod known_compression_method,
-    bool force_fetch_latest_metadata = true);
+    bool force_fetch_latest_metadata = true,
+    bool ignore_explicit_metadata_file_path = false);
 
 std::pair<Poco::JSON::Object::Ptr, Int32> parseTableSchemaV1Method(const Poco::JSON::Object::Ptr & metadata_object);
 std::pair<Poco::JSON::Object::Ptr, Int32> parseTableSchemaV2Method(const Poco::JSON::Object::Ptr & metadata_object);

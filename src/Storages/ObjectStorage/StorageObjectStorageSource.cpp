@@ -560,7 +560,7 @@ void StorageObjectStorageSource::addNumRowsToCache(const ObjectInfo & object_inf
 {
     const auto cache_key = getKeyForSchemaCache(
         getUniqueStoragePathIdentifier(*configuration, object_info),
-        object_info.getFileFormat().value_or(configuration->format),
+        object_info.getFileFormat().value_or(configuration->getFormat()),
         format_settings,
         read_context);
     schema_cache.addNumRows(cache_key, num_rows);
@@ -675,7 +675,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
         const auto cache_key = getKeyForSchemaCache(
             getUniqueStoragePathIdentifier(*configuration, *object_info),
-            object_info->getFileFormat().value_or(configuration->format),
+            object_info->getFileFormat().value_or(configuration->getFormat()),
             format_settings,
             context_);
 
@@ -782,6 +782,11 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                 if (!column.second.second.type->isNullable())
                     continue;
 
+                /// With View over Iceberg table we have someting like 'materialize(time)' as column_name
+                /// Simple cheap check
+                if (column_name.starts_with("materialize(") && column_name.ends_with(")"))
+                    continue;
+
                 /// Skip columns produced by prewhere or row-level filter expressions —
                 /// they are computed at read time, not stored in the file.
                 if (format_filter_info
@@ -844,13 +849,13 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         CompressionMethod compression_method;
         if (const auto * object_info_in_archive = dynamic_cast<const ArchiveIterator::ObjectInfoInArchive *>(object_info.get()))
         {
-            compression_method = chooseCompressionMethod(configuration->getPathInArchive(), configuration->compression_method);
+            compression_method = chooseCompressionMethod(configuration->getPathInArchive(), configuration->getCompressionMethod());
             const auto & archive_reader = object_info_in_archive->archive_reader;
             read_buf = archive_reader->readFile(object_info_in_archive->path_in_archive, /*throw_on_not_found=*/true);
         }
         else
         {
-            compression_method = chooseCompressionMethod(object_info->getFileName(), configuration->compression_method);
+            compression_method = chooseCompressionMethod(object_info->getFileName(), configuration->getCompressionMethod());
             read_buf = createReadBuffer(object_info->relative_path_with_metadata, object_storage, context_, log);
         }
 
@@ -884,7 +889,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             "Reading object '{}', size: {} bytes, with format: {}",
             object_info->getPath(),
             object_info->getObjectMetadata()->size_bytes,
-            object_info->getFileFormat().value_or(configuration->format));
+            object_info->getFileFormat().value_or(configuration->getFormat()));
 
         bool use_native_reader_v3 = format_settings.has_value()
             ? format_settings->parquet.use_native_reader_v3
@@ -892,12 +897,14 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
         InputFormatPtr input_format;
         if (context_->getSettingsRef()[Setting::use_parquet_metadata_cache] && use_native_reader_v3
-            && (object_info->getFileFormat().value_or(configuration->format) == "Parquet")
+            && (object_info->getFileFormat().value_or(configuration->getFormat()) == "Parquet")
             && !object_info->getObjectMetadata()->etag.empty())
         {
-            const std::optional<RelativePathWithMetadata> object_with_metadata = object_info->relative_path_with_metadata;
+            std::optional<RelativePathWithMetadata> object_with_metadata = object_info->relative_path_with_metadata;
+            if (object_info->isArchive())
+                object_with_metadata->relative_path = object_info->getPath();
             input_format = FormatFactory::instance().getInputWithMetadata(
-                object_info->getFileFormat().value_or(configuration->format),
+                object_info->getFileFormat().value_or(configuration->getFormat()),
                 *read_buf,
                 initial_header,
                 context_,
@@ -916,7 +923,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         else
         {
             input_format = FormatFactory::instance().getInput(
-            object_info->getFileFormat().value_or(configuration->format),
+            object_info->getFileFormat().value_or(configuration->getFormat()),
             *read_buf,
             initial_header,
             context_,
