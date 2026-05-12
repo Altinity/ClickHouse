@@ -6,8 +6,9 @@ from helpers.iceberg_utils import (
     execute_spark_query_general,
 )
 
+@pytest.mark.parametrize("join_mode", ["local", "global"])
 @pytest.mark.parametrize("storage_type", ["s3", "azure"])
-def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type):
+def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type, join_mode):
     instance = started_cluster_iceberg_with_spark.instances["node1"]
     spark = started_cluster_iceberg_with_spark.spark_session
     TABLE_NAME = "test_cluster_joins_" + storage_type + "_" + get_uuid_str()
@@ -81,7 +82,7 @@ def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type):
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='local'
+                object_storage_cluster_join_mode='{join_mode}'
         """
     )
 
@@ -91,14 +92,31 @@ def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type):
         f"""
             SELECT name
             FROM {creation_expression}
-            WHERE tag in (
+            WHERE tag IN (
                 SELECT id
                 FROM {creation_expression_2}
             )
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='local'
+                object_storage_cluster_join_mode='{join_mode}'
+        """
+    )
+
+    assert res == "jack\njohn\n"
+
+    res = instance.query(
+        f"""
+            SELECT name
+            FROM {creation_expression}
+            WHERE tag GLOBAL IN (
+                SELECT id
+                FROM {creation_expression_2}
+            )
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='{join_mode}'
         """
     )
 
@@ -114,7 +132,7 @@ def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type):
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='local'
+                object_storage_cluster_join_mode='{join_mode}'
         """
     )
 
@@ -124,14 +142,31 @@ def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type):
         f"""
             SELECT name
             FROM {creation_expression}
-            WHERE tag in (
+            WHERE tag IN (
                 SELECT id
                 FROM `{TABLE_NAME_LOCAL}`
             )
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='local'
+                object_storage_cluster_join_mode='{join_mode}'
+        """
+    )
+
+    assert res == "jack\njohn\n"
+
+    res = instance.query(
+        f"""
+            SELECT name
+            FROM {creation_expression}
+            WHERE tag GLOBAL IN (
+                SELECT id
+                FROM `{TABLE_NAME_LOCAL}`
+            )
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='{join_mode}'
         """
     )
 
@@ -146,7 +181,7 @@ def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type):
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='local'
+                object_storage_cluster_join_mode='{join_mode}'
         """
     )
 

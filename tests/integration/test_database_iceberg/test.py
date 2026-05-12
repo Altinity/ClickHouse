@@ -913,7 +913,8 @@ def test_namespace_filter(started_cluster):
     assert "is filtered by `namespaces` database parameter." in node.query_and_get_error(f"DROP TABLE {CATALOG_NAME}.`{namespace_prefix}alpha.a2.{table_name}`")
 
 
-def test_cluster_joins(started_cluster):
+@pytest.mark.parametrize("join_mode", ["local", "global"])
+def test_cluster_joins(started_cluster, join_mode):
     node = started_cluster.instances["node1"]
 
     test_ref = f"test_join_tables_{uuid.uuid4()}"
@@ -981,7 +982,7 @@ def test_cluster_joins(started_cluster):
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='local'
+                object_storage_cluster_join_mode='{join_mode}'
         """
     )
 
@@ -998,7 +999,7 @@ def test_cluster_joins(started_cluster):
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='local'
+                object_storage_cluster_join_mode='{join_mode}'
         """
     )
 
@@ -1014,7 +1015,7 @@ def test_cluster_joins(started_cluster):
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='local'
+                object_storage_cluster_join_mode='{join_mode}'
         """
     )
 
@@ -1031,7 +1032,7 @@ def test_cluster_joins(started_cluster):
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='local'
+                object_storage_cluster_join_mode='{join_mode}'
         """
     )
 
@@ -1046,7 +1047,7 @@ def test_cluster_joins(started_cluster):
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='local'
+                object_storage_cluster_join_mode='{join_mode}'
         """
     )
 

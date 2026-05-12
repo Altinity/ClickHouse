@@ -23,5 +23,6 @@ QueryTreeNodePtr buildQueryTreeForShard(
     bool find_cross_join = false);
 
 void rewriteJoinToGlobalJoin(QueryTreeNodePtr query_tree_to_modify, ContextPtr context);
+void rewriteInToGlobalIn(QueryTreeNodePtr query_tree_to_modify, ContextPtr context);
 
 }

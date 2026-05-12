@@ -320,6 +320,10 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
             auto modified_query_tree = query_info.query_tree->clone();
 
             rewriteJoinToGlobalJoin(modified_query_tree, context);
+
+            if (info.has_local_columns_in_where)
+                rewriteInToGlobalIn(modified_query_tree, context);
+
             modified_query_tree = buildQueryTreeForShard(
                 query_info.planner_context,
                 modified_query_tree,
