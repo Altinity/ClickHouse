@@ -145,10 +145,7 @@ def test_sql_create_jwt_user_with_processor_pin(started_cluster):
 
     # The other_secret-signed token validates fine against
     # `another_single_key_processor`, but the user is pinned to
-    # `single_key_processor` -- the pin must reject it. Check the
-    # `AUTHENTICATION_FAILED` marker rather than asserting the username is
-    # absent: CH's failure body embeds the username (`<user>: Authentication
-    # failed: ...`), so a substring-absence check would trip on the rejection.
+    # `single_key_processor` -- the pin must reject it.
     rejected = http_select_current_user(token_other)
     assert "AUTHENTICATION_FAILED" in rejected, rejected
 
@@ -179,9 +176,7 @@ def test_sql_create_jwt_user_with_claims(started_cluster):
     assert "CLAIMS '{\"role\":\"admin\"}'" in show, show
 
     # Token signed with the pinned processor's secret but no `role` claim:
-    # processor accepts, per-user CLAIMS rejects. See the note in
-    # `test_sql_create_jwt_user_with_processor_pin` on why we check the
-    # `AUTHENTICATION_FAILED` marker rather than username-absence.
+    # processor accepts, per-user CLAIMS rejects.
     token_no_claim = make_token({"sub": "sql_jwt_claims_user"}, "my_secret")
     rejected = http_select_current_user(token_no_claim)
     assert "AUTHENTICATION_FAILED" in rejected, rejected
