@@ -37,7 +37,25 @@ JWKSType JWKSClient::getJWKS()
     {
         std::shared_lock lock(mutex);
         auto now = std::chrono::steady_clock::now();
-        auto diff = std::chrono::duration<double>(now - last_request_send).count();
+        if (last_request_send.has_value())
+        {
+            auto diff = std::chrono::duration<double>(now - *last_request_send).count();
+            if (diff < static_cast<double>(refresh_timeout))
+            {
+                if (cached_jwks.has_value())
+                    return cached_jwks.value();
+                throw Exception(ErrorCodes::AUTHENTICATION_FAILED,
+                                "JWKS endpoint at '{}' is in cooldown after a recent failed fetch; will retry after the cache lifetime elapses",
+                                jwks_uri.toString());
+            }
+        }
+    }
+
+    std::unique_lock lock(mutex);
+    auto now = std::chrono::steady_clock::now();
+    if (last_request_send.has_value())
+    {
+        auto diff = std::chrono::duration<double>(now - *last_request_send).count();
         if (diff < static_cast<double>(refresh_timeout))
         {
             if (cached_jwks.has_value())
@@ -46,18 +64,6 @@ JWKSType JWKSClient::getJWKS()
                             "JWKS endpoint at '{}' is in cooldown after a recent failed fetch; will retry after the cache lifetime elapses",
                             jwks_uri.toString());
         }
-    }
-
-    std::unique_lock lock(mutex);
-    auto now = std::chrono::high_resolution_clock::now();
-    auto diff = std::chrono::duration<double>(now - last_request_send).count();
-    if (diff < static_cast<double>(refresh_timeout))
-    {
-        if (cached_jwks.has_value())
-            return cached_jwks.value();
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED,
-                        "JWKS endpoint at '{}' is in cooldown after a recent failed fetch; will retry after the cache lifetime elapses",
-                        jwks_uri.toString());
     }
 
     /// Mark the attempt before issuing the network call so that even if the

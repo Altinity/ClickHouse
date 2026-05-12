@@ -47,7 +47,12 @@ private:
     std::optional<JWKSType> cached_jwks;
     /// `steady_clock` (not `system_clock`): refresh-cooldown is an elapsed-time
     /// measurement; a wall-clock jump must not skip or freeze it.
-    std::chrono::time_point<std::chrono::steady_clock> last_request_send;
+    /// `std::nullopt` means "no fetch has ever been attempted" -- needed to
+    /// distinguish a never-attempted state from a recently-failed one, because
+    /// the steady-clock epoch may sit only a short distance in the past on
+    /// freshly-booted hosts / containers with isolated CLOCK_MONOTONIC, making
+    /// a zero-initialized time_point look like a "recent" attempt.
+    std::optional<std::chrono::time_point<std::chrono::steady_clock>> last_request_send;
 };
 
 struct StaticJWKSParams
