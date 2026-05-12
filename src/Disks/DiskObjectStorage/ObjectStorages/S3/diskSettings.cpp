@@ -224,6 +224,14 @@ getClient(const S3::URI & url, const S3Settings & settings, ContextPtr context, 
             LOG_DEBUG(getLogger("getClient"), "Got new access tokens {} {} {}", access_key_id, secret_access_key, session_token);
         }
     }
+<<<<<<< HEAD
+=======
+
+    context->getHTTPHeaderFilter().checkAndNormalizeHeaders(headers);
+
+    auto shared_cache = S3::ClientCacheRegistry::instance().getOrCreateCacheForKey(url.endpoint, url.bucket);
+
+>>>>>>> f47ddd43dea (Merge d0085a817dc69fd07ef02b4862f6340cc80e8a50 into 12f07ad59259375d15762137e1fd9b3f03e9f002)
     return S3::ClientFactory::instance().create(
         client_configuration,
         client_settings,
@@ -233,7 +241,8 @@ getClient(const S3::URI & url, const S3Settings & settings, ContextPtr context, 
         auth_settings.server_side_encryption_kms_config,
         auth_settings.getHeaders(),
         credentials_configuration,
-        session_token);
+        session_token,
+        shared_cache);
 }
 
 }
