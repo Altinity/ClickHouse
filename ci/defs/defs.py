@@ -19,49 +19,49 @@ class RunnerLabels:
     BUILDER_AMD = [
         "self-hosted",
         "altinity-aws-ec2-runners",
-        "altinity-builder",
+        "altinity-ec2-builder",
     ]
     BUILDER_ARM = [
         "self-hosted",
         "altinity-aws-ec2-runners",
-        "altinity-builder",
+        "altinity-ec2-builder",
     ]
     FUNC_TESTER_AMD = [
         "self-hosted",
         "altinity-aws-ec2-runners",
-        "altinity-func-tester",
+        "altinity-ec2-func-tester",
     ]
     FUNC_TESTER_ARM = [
         "self-hosted",
         "altinity-aws-ec2-runners",
-        "altinity-func-tester-aarch64",
+        "altinity-ec2-func-tester-aarch64",
     ]
-    AMD_LARGE = ["self-hosted", "altinity-aws-ec2-runners", "altinity-func-tester"]
-    ARM_LARGE = ["self-hosted", "altinity-aws-ec2-runners", "altinity-func-tester-aarch64"]
-    AMD_MEDIUM = ["self-hosted", "altinity-aws-ec2-runners", "altinity-func-tester"]
-    ARM_MEDIUM = ["self-hosted", "altinity-aws-ec2-runners", "altinity-func-tester-aarch64"]
-    AMD_MEDIUM_CPU = ["self-hosted", "altinity-aws-ec2-runners", "altinity-func-tester"]
+    AMD_LARGE = ["self-hosted", "altinity-aws-ec2-runners", "altinity-ec2-func-tester"]
+    ARM_LARGE = ["self-hosted", "altinity-aws-ec2-runners", "altinity-ec2-func-tester-aarch64"]
+    AMD_MEDIUM = ["self-hosted", "altinity-aws-ec2-runners", "altinity-ec2-func-tester"]
+    ARM_MEDIUM = ["self-hosted", "altinity-aws-ec2-runners", "altinity-ec2-func-tester-aarch64"]
+    AMD_MEDIUM_CPU = ["self-hosted", "altinity-aws-ec2-runners", "altinity-ec2-func-tester"]
     ARM_MEDIUM_CPU = [
         "self-hosted",
         "altinity-aws-ec2-runners",
-        "altinity-style-checker",
+        "altinity-ec2-style-checker",
     ]
-    AMD_MEDIUM_MEM = ["self-hosted", "altinity-aws-ec2-runners", "altinity-func-tester"]
+    AMD_MEDIUM_MEM = ["self-hosted", "altinity-aws-ec2-runners", "altinity-ec2-func-tester"]
     ARM_MEDIUM_MEM = [
         "self-hosted",
         "altinity-aws-ec2-runners",
-        "altinity-func-tester-aarch64",
+        "altinity-ec2-func-tester-aarch64",
     ]
-    AMD_SMALL = ["self-hosted", "altinity-aws-ec2-runners", "altinity-style-checker"]
-    ARM_SMALL = ["self-hosted", "altinity-aws-ec2-runners", "altinity-style-checker-aarch64"]
-    AMD_SMALL_MEM = ["self-hosted", "altinity-aws-ec2-runners", "altinity-style-checker"]
+    AMD_SMALL = ["self-hosted", "altinity-aws-ec2-runners", "altinity-ec2-style-checker"]
+    ARM_SMALL = ["self-hosted", "altinity-aws-ec2-runners", "altinity-ec2-style-checker-aarch64"]
+    AMD_SMALL_MEM = ["self-hosted", "altinity-aws-ec2-runners", "altinity-ec2- style-checker"]
     MACOS_ARM_SMALL = ["self-hosted", "arm_macos_small"]
     MACOS_AMD_SMALL = ["self-hosted", "amd_macos_m1"]
-    STYLE_CHECK_AMD = ["self-hosted", "altinity-aws-ec2-runners", "altinity-style-checker"]
+    STYLE_CHECK_AMD = ["self-hosted", "altinity-aws-ec2-runners", "altinity-ec2-style-checker"]
     STYLE_CHECK_ARM = [
         "self-hosted",
         "altinity-aws-ec2-runners",
-        "altinity-style-checker-aarch64",
+        "altinity-ec2-style-checker-aarch64",
     ]
 
 

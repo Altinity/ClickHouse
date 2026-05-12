@@ -16,7 +16,7 @@ env:
 jobs:
 
   config_workflow:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
     needs: []
     name: "Config Workflow"
     outputs:
@@ -122,7 +122,7 @@ jobs:
           fi
 
   dockers_build_arm:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
     needs: [config_workflow]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'RG9ja2VycyBCdWlsZCAoYXJtKQ==') }}
     name: "Dockers Build (arm)"
@@ -232,14 +232,14 @@ jobs:
 <<<<<<< HEAD
     runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker]
 ||||||| parent of cde255e227b (make jobs ec2 only)
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 =======
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 >>>>>>> cde255e227b (make jobs ec2 only)
 ||||||| parent of b36c4137d11 (remove altinity-aws-ec2-runners)
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 =======
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 >>>>>>> b36c4137d11 (remove altinity-aws-ec2-runners)
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_binary]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'Q2xpY2tIb3VzZSBLZWVwZXIgSmVwc2Vu') }}
@@ -287,7 +287,7 @@ jobs:
           fi
 
   finish_workflow:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_binary, clickhouse_keeper_jepsen]
     if: ${{ always() }}
     name: "Finish Workflow"

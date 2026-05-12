@@ -18,12 +18,18 @@ jobs:
 
   config_workflow:
 <<<<<<< HEAD
+<<<<<<< HEAD
     runs-on: [self-hosted, style-checker-aarch64]
 ||||||| parent of f905df4ff88 (make jobs ec2 only)
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
 =======
     runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
 >>>>>>> f905df4ff88 (make jobs ec2 only)
+||||||| parent of 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+=======
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
+>>>>>>> 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
     needs: []
     name: "Config Workflow"
     outputs:
@@ -104,12 +110,18 @@ jobs:
 
   dockers_build_arm:
 <<<<<<< HEAD
+<<<<<<< HEAD
     runs-on: [self-hosted, style-checker-aarch64]
 ||||||| parent of f905df4ff88 (make jobs ec2 only)
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
 =======
     runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
 >>>>>>> f905df4ff88 (make jobs ec2 only)
+||||||| parent of 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+=======
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
+>>>>>>> 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
     needs: [config_workflow]
     name: "Dockers Build (arm)"
     outputs:
@@ -190,12 +202,18 @@ jobs:
 
   finish_workflow:
 <<<<<<< HEAD
+<<<<<<< HEAD
     runs-on: [self-hosted, style-checker-aarch64]
 ||||||| parent of f905df4ff88 (make jobs ec2 only)
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
 =======
     runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
 >>>>>>> f905df4ff88 (make jobs ec2 only)
+||||||| parent of 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+=======
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
+>>>>>>> 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, vector_search_stress]
     if: ${{ always() }}
     name: "Finish Workflow"

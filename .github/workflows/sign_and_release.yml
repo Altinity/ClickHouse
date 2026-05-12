@@ -28,6 +28,7 @@ env:
 jobs:
   extract-package-info:
 <<<<<<< HEAD
+<<<<<<< HEAD
     runs-on: [altinity-style-checker-aarch64, altinity-on-demand]
 ||||||| parent of f905df4ff88 (make jobs ec2 only)
     runs-on: [altinity-style-checker-aarch64, altinity-on-demand]
@@ -38,6 +39,11 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 =======
     runs-on: [altinity-style-checker-aarch64, altinity-aws-ec2-runners]
+||||||| parent of 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
+    runs-on: [altinity-style-checker-aarch64, altinity-aws-ec2-runners]
+=======
+    runs-on: [altinity-ec2-style-checker-aarch64, altinity-aws-ec2-runners]
+>>>>>>> 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -408,7 +414,7 @@ jobs:
 
   copy-test-results:
     needs: extract-package-info
-    runs-on: [altinity-style-checker-aarch64, altinity-aws-ec2-runners]
+    runs-on: [altinity-ec2-style-checker-aarch64, altinity-aws-ec2-runners]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -550,7 +556,7 @@ jobs:
   copy-to-released:
     needs: [sign-and-publish]
     if: ${{ inputs.release_environment == 'production' }}
-    runs-on: [altinity-style-checker-aarch64, altinity-aws-ec2-runners]
+    runs-on: [altinity-ec2-style-checker-aarch64, altinity-aws-ec2-runners]
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}

@@ -17,7 +17,7 @@ env:
 jobs:
 
   config_workflow:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
     needs: []
     name: "Config Workflow"
     outputs:
@@ -77,7 +77,7 @@ jobs:
           fi
 
   collect_flaky_tests:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
     needs: [config_workflow]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'Q29sbGVjdCBmbGFreSB0ZXN0cw==') }}
     name: "Collect flaky tests"
@@ -124,7 +124,7 @@ jobs:
           fi
 
   autoassign_approvers:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
     needs: [config_workflow]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QXV0b2Fzc2lnbiBhcHByb3ZlcnM=') }}
     name: "Autoassign approvers"

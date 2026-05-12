@@ -9,7 +9,7 @@ class RunnerLabels:
     STYLE_CHECK_ARM = [
         "self-hosted",
         "altinity-aws-ec2-runners",
-        "altinity-style-checker-aarch64",
+        "altinity-ec2-style-checker-aarch64",
     ]
 
 

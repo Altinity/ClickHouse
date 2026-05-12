@@ -103,7 +103,7 @@ class AltinityWorkflowTemplates:
     secrets: inherit
     with:
       test_name: Sign aarch64
-      runner_type: altinity-style-checker-aarch64
+      runner_type: altinity-ec2-style-checker-aarch64
       data: ${{ needs.config_workflow.outputs.data }}
 """,
         "CIReport": r"""
@@ -111,7 +111,7 @@ class AltinityWorkflowTemplates:
     if: ${{ !cancelled() }}
     needs:
 {ALL_JOBS}
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
@@ -128,7 +128,7 @@ class AltinityWorkflowTemplates:
   SourceUpload:
     needs: [config_workflow, build_amd_release]
     if: ${{ !failure() && !cancelled() }}
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
     env:
         COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         PR_NUMBER: ${{ github.event.pull_request.number || 0 }}

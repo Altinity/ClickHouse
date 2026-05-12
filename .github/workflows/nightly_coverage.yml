@@ -17,7 +17,7 @@ env:
 jobs:
 
   config_workflow:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
     needs: []
     name: "Config Workflow"
     outputs:
@@ -124,7 +124,7 @@ jobs:
           fi
 
   dockers_build_arm:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
     needs: [config_workflow]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'RG9ja2VycyBCdWlsZCAoYXJtKQ==') }}
     name: "Dockers Build (arm)"
@@ -171,7 +171,7 @@ jobs:
           fi
 
   build_amd_coverage:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-builder]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9jb3ZlcmFnZSk=') }}
     name: "Build (amd_coverage)"
@@ -218,7 +218,7 @@ jobs:
           fi
 
   stateless_tests_amd_coverage_1_8:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_coverage]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfY292ZXJhZ2UsIDEvOCk=') }}
     name: "Stateless tests (amd_coverage, 1/8)"
@@ -265,7 +265,7 @@ jobs:
           fi
 
   stateless_tests_amd_coverage_2_8:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_coverage]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfY292ZXJhZ2UsIDIvOCk=') }}
     name: "Stateless tests (amd_coverage, 2/8)"
@@ -312,7 +312,7 @@ jobs:
           fi
 
   stateless_tests_amd_coverage_3_8:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_coverage]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfY292ZXJhZ2UsIDMvOCk=') }}
     name: "Stateless tests (amd_coverage, 3/8)"
@@ -359,7 +359,7 @@ jobs:
           fi
 
   stateless_tests_amd_coverage_4_8:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_coverage]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfY292ZXJhZ2UsIDQvOCk=') }}
     name: "Stateless tests (amd_coverage, 4/8)"
@@ -406,7 +406,7 @@ jobs:
           fi
 
   stateless_tests_amd_coverage_5_8:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_coverage]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfY292ZXJhZ2UsIDUvOCk=') }}
     name: "Stateless tests (amd_coverage, 5/8)"
@@ -453,7 +453,7 @@ jobs:
           fi
 
   stateless_tests_amd_coverage_6_8:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_coverage]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfY292ZXJhZ2UsIDYvOCk=') }}
     name: "Stateless tests (amd_coverage, 6/8)"
@@ -500,7 +500,7 @@ jobs:
           fi
 
   stateless_tests_amd_coverage_7_8:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_coverage]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfY292ZXJhZ2UsIDcvOCk=') }}
     name: "Stateless tests (amd_coverage, 7/8)"
@@ -547,7 +547,7 @@ jobs:
           fi
 
   stateless_tests_amd_coverage_8_8:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_coverage]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfY292ZXJhZ2UsIDgvOCk=') }}
     name: "Stateless tests (amd_coverage, 8/8)"
@@ -594,7 +594,7 @@ jobs:
           fi
 
   finish_workflow:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_coverage, stateless_tests_amd_coverage_1_8, stateless_tests_amd_coverage_2_8, stateless_tests_amd_coverage_3_8, stateless_tests_amd_coverage_4_8, stateless_tests_amd_coverage_5_8, stateless_tests_amd_coverage_6_8, stateless_tests_amd_coverage_7_8, stateless_tests_amd_coverage_8_8]
     if: ${{ always() }}
     name: "Finish Workflow"

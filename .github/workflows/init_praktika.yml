@@ -16,7 +16,7 @@ env:
 jobs:
 
   init_praktika:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
     name: "Init praktika"
     steps:
       - name: Checkout code

@@ -37,7 +37,7 @@ env:
 jobs:
 
   config_workflow:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
     needs: []
     name: "Config Workflow"
     outputs:
@@ -140,7 +140,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   dockers_build_arm:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
     needs: [config_workflow]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'RG9ja2VycyBCdWlsZCAoYXJtKQ==') }}
     name: "Dockers Build (arm)"
@@ -230,7 +230,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   build_amd_debug:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-builder]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9kZWJ1Zyk=') }}
     name: "Build (amd_debug)"
@@ -275,7 +275,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   build_amd_asan:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-builder]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9hc2FuKQ==') }}
     name: "Build (amd_asan)"
@@ -320,7 +320,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   build_amd_ubsan:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-builder]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF91YnNhbik=') }}
     name: "Build (amd_ubsan)"
@@ -365,7 +365,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   build_amd_binary:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-builder]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9iaW5hcnkp') }}
     name: "Build (amd_binary)"
@@ -410,7 +410,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   build_arm_asan:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFybV9hc2FuKQ==') }}
     name: "Build (arm_asan)"
@@ -455,7 +455,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   build_arm_binary:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-builder]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFybV9iaW5hcnkp') }}
     name: "Build (arm_binary)"
@@ -500,7 +500,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   build_amd_tsan:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-builder]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF90c2FuKQ==') }}
     name: "Build (amd_tsan)"
@@ -545,7 +545,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   build_amd_msan:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-builder]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9tc2FuKQ==') }}
     name: "Build (amd_msan)"
@@ -590,7 +590,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   build_amd_coverage:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-builder]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9jb3ZlcmFnZSk=') }}
     name: "Build (amd_coverage)"
@@ -635,7 +635,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   build_amd_release:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-builder]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFtZF9yZWxlYXNlKQ==') }}
     name: "Build (amd_release)"
@@ -680,7 +680,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   build_arm_release:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-builder]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnVpbGQgKGFybV9yZWxlYXNlKQ==') }}
     name: "Build (arm_release)"
@@ -725,7 +725,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   unit_tests_asan:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_asan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'VW5pdCB0ZXN0cyAoYXNhbik=') }}
     name: "Unit tests (asan)"
@@ -770,7 +770,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   unit_tests_tsan:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_tsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'VW5pdCB0ZXN0cyAodHNhbik=') }}
     name: "Unit tests (tsan)"
@@ -815,7 +815,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   unit_tests_msan:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_msan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'VW5pdCB0ZXN0cyAobXNhbik=') }}
     name: "Unit tests (msan)"
@@ -860,7 +860,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   unit_tests_ubsan:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_ubsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'VW5pdCB0ZXN0cyAodWJzYW4p') }}
     name: "Unit tests (ubsan)"
@@ -905,7 +905,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   docker_server_image:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker]
     needs: [build_amd_release, build_arm_release, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'RG9ja2VyIHNlcnZlciBpbWFnZQ==') }}
     name: "Docker server image"
@@ -950,7 +950,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   docker_keeper_image:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker]
     needs: [build_amd_release, build_arm_release, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'RG9ja2VyIGtlZXBlciBpbWFnZQ==') }}
     name: "Docker keeper image"
@@ -995,7 +995,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   install_packages_amd_release:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_release, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW5zdGFsbCBwYWNrYWdlcyAoYW1kX3JlbGVhc2Up') }}
     name: "Install packages (amd_release)"
@@ -1040,7 +1040,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   install_packages_arm_release:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester-aarch64]
     needs: [build_arm_release, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW5zdGFsbCBwYWNrYWdlcyAoYXJtX3JlbGVhc2Up') }}
     name: "Install packages (arm_release)"
@@ -1085,7 +1085,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   compatibility_check_amd_release:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker]
     needs: [build_amd_release, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'Q29tcGF0aWJpbGl0eSBjaGVjayAoYW1kX3JlbGVhc2Up') }}
     name: "Compatibility check (amd_release)"
@@ -1130,7 +1130,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   compatibility_check_arm_release:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
     needs: [build_arm_release, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'Q29tcGF0aWJpbGl0eSBjaGVjayAoYXJtX3JlbGVhc2Up') }}
     name: "Compatibility check (arm_release)"
@@ -1175,7 +1175,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_asan_distributed_plan_parallel_1_4:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_asan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfYXNhbiwgZGlzdHJpYnV0ZWQgcGxhbiwgcGFyYWxsZWwsIDEvNCk=') }}
     name: "Stateless tests (amd_asan, distributed plan, parallel, 1/4)"
@@ -1220,7 +1220,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_asan_distributed_plan_parallel_2_4:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_asan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfYXNhbiwgZGlzdHJpYnV0ZWQgcGxhbiwgcGFyYWxsZWwsIDIvNCk=') }}
     name: "Stateless tests (amd_asan, distributed plan, parallel, 2/4)"
@@ -1265,7 +1265,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_asan_distributed_plan_parallel_3_4:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_asan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfYXNhbiwgZGlzdHJpYnV0ZWQgcGxhbiwgcGFyYWxsZWwsIDMvNCk=') }}
     name: "Stateless tests (amd_asan, distributed plan, parallel, 3/4)"
@@ -1310,7 +1310,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_asan_distributed_plan_parallel_4_4:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_asan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfYXNhbiwgZGlzdHJpYnV0ZWQgcGxhbiwgcGFyYWxsZWwsIDQvNCk=') }}
     name: "Stateless tests (amd_asan, distributed plan, parallel, 4/4)"
@@ -1355,7 +1355,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_asan_db_disk_distributed_plan_sequential:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_asan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfYXNhbiwgZGIgZGlzaywgZGlzdHJpYnV0ZWQgcGxhbiwgc2VxdWVudGlhbCk=') }}
     name: "Stateless tests (amd_asan, db disk, distributed plan, sequential)"
@@ -1400,7 +1400,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_debug_parallel:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_debug, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfZGVidWcsIHBhcmFsbGVsKQ==') }}
     name: "Stateless tests (amd_debug, parallel)"
@@ -1445,7 +1445,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_debug_sequential:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_debug, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfZGVidWcsIHNlcXVlbnRpYWwp') }}
     name: "Stateless tests (amd_debug, sequential)"
@@ -1490,7 +1490,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_tsan_parallel_1_2:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_tsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfdHNhbiwgcGFyYWxsZWwsIDEvMik=') }}
     name: "Stateless tests (amd_tsan, parallel, 1/2)"
@@ -1535,7 +1535,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_tsan_parallel_2_2:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_tsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfdHNhbiwgcGFyYWxsZWwsIDIvMik=') }}
     name: "Stateless tests (amd_tsan, parallel, 2/2)"
@@ -1580,7 +1580,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_tsan_sequential_1_2:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_tsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfdHNhbiwgc2VxdWVudGlhbCwgMS8yKQ==') }}
     name: "Stateless tests (amd_tsan, sequential, 1/2)"
@@ -1625,7 +1625,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_tsan_sequential_2_2:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_tsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfdHNhbiwgc2VxdWVudGlhbCwgMi8yKQ==') }}
     name: "Stateless tests (amd_tsan, sequential, 2/2)"
@@ -1670,7 +1670,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_msan_wasmedge_parallel_1_4:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_msan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHBhcmFsbGVsLCAxLzQp') }}
     name: "Stateless tests (amd_msan, WasmEdge, parallel, 1/4)"
@@ -1715,7 +1715,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_msan_wasmedge_parallel_2_4:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_msan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHBhcmFsbGVsLCAyLzQp') }}
     name: "Stateless tests (amd_msan, WasmEdge, parallel, 2/4)"
@@ -1760,7 +1760,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_msan_wasmedge_parallel_3_4:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_msan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHBhcmFsbGVsLCAzLzQp') }}
     name: "Stateless tests (amd_msan, WasmEdge, parallel, 3/4)"
@@ -1805,7 +1805,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_msan_wasmedge_parallel_4_4:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_msan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHBhcmFsbGVsLCA0LzQp') }}
     name: "Stateless tests (amd_msan, WasmEdge, parallel, 4/4)"
@@ -1850,7 +1850,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_msan_wasmedge_sequential_1_2:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_msan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHNlcXVlbnRpYWwsIDEvMik=') }}
     name: "Stateless tests (amd_msan, WasmEdge, sequential, 1/2)"
@@ -1895,7 +1895,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_msan_wasmedge_sequential_2_2:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_msan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfbXNhbiwgV2FzbUVkZ2UsIHNlcXVlbnRpYWwsIDIvMik=') }}
     name: "Stateless tests (amd_msan, WasmEdge, sequential, 2/2)"
@@ -1940,7 +1940,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_ubsan_parallel:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_ubsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfdWJzYW4sIHBhcmFsbGVsKQ==') }}
     name: "Stateless tests (amd_ubsan, parallel)"
@@ -1985,7 +1985,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_ubsan_sequential:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_ubsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfdWJzYW4sIHNlcXVlbnRpYWwp') }}
     name: "Stateless tests (amd_ubsan, sequential)"
@@ -2030,7 +2030,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_debug_distributed_plan_s3_storage_parallel:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_debug, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfZGVidWcsIGRpc3RyaWJ1dGVkIHBsYW4sIHMzIHN0b3JhZ2UsIHBhcmFsbGVsKQ==') }}
     name: "Stateless tests (amd_debug, distributed plan, s3 storage, parallel)"
@@ -2075,7 +2075,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_debug_distributed_plan_s3_storage_sequential:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_debug, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfZGVidWcsIGRpc3RyaWJ1dGVkIHBsYW4sIHMzIHN0b3JhZ2UsIHNlcXVlbnRpYWwp') }}
     name: "Stateless tests (amd_debug, distributed plan, s3 storage, sequential)"
@@ -2120,7 +2120,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_tsan_s3_storage_parallel_1_2:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_tsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfdHNhbiwgczMgc3RvcmFnZSwgcGFyYWxsZWwsIDEvMik=') }}
     name: "Stateless tests (amd_tsan, s3 storage, parallel, 1/2)"
@@ -2165,7 +2165,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_tsan_s3_storage_parallel_2_2:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_tsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfdHNhbiwgczMgc3RvcmFnZSwgcGFyYWxsZWwsIDIvMik=') }}
     name: "Stateless tests (amd_tsan, s3 storage, parallel, 2/2)"
@@ -2210,7 +2210,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_tsan_s3_storage_sequential_1_2:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_tsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfdHNhbiwgczMgc3RvcmFnZSwgc2VxdWVudGlhbCwgMS8yKQ==') }}
     name: "Stateless tests (amd_tsan, s3 storage, sequential, 1/2)"
@@ -2255,7 +2255,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_tsan_s3_storage_sequential_2_2:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_tsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfdHNhbiwgczMgc3RvcmFnZSwgc2VxdWVudGlhbCwgMi8yKQ==') }}
     name: "Stateless tests (amd_tsan, s3 storage, sequential, 2/2)"
@@ -2300,7 +2300,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_arm_binary_parallel:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester-aarch64]
     needs: [build_arm_binary, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhcm1fYmluYXJ5LCBwYXJhbGxlbCk=') }}
     name: "Stateless tests (arm_binary, parallel)"
@@ -2345,7 +2345,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_arm_binary_sequential:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester-aarch64]
     needs: [build_arm_binary, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhcm1fYmluYXJ5LCBzZXF1ZW50aWFsKQ==') }}
     name: "Stateless tests (arm_binary, sequential)"
@@ -2390,7 +2390,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_arm_asan_azure_parallel_1_4:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester-aarch64]
     needs: [build_arm_asan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhcm1fYXNhbiwgYXp1cmUsIHBhcmFsbGVsLCAxLzQp') }}
     name: "Stateless tests (arm_asan, azure, parallel, 1/4)"
@@ -2435,7 +2435,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_arm_asan_azure_parallel_2_4:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester-aarch64]
     needs: [build_arm_asan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhcm1fYXNhbiwgYXp1cmUsIHBhcmFsbGVsLCAyLzQp') }}
     name: "Stateless tests (arm_asan, azure, parallel, 2/4)"
@@ -2480,7 +2480,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_arm_asan_azure_parallel_3_4:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester-aarch64]
     needs: [build_arm_asan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhcm1fYXNhbiwgYXp1cmUsIHBhcmFsbGVsLCAzLzQp') }}
     name: "Stateless tests (arm_asan, azure, parallel, 3/4)"
@@ -2525,7 +2525,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_arm_asan_azure_parallel_4_4:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester-aarch64]
     needs: [build_arm_asan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhcm1fYXNhbiwgYXp1cmUsIHBhcmFsbGVsLCA0LzQp') }}
     name: "Stateless tests (arm_asan, azure, parallel, 4/4)"
@@ -2570,7 +2570,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_arm_asan_azure_sequential_1_2:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester-aarch64]
     needs: [build_arm_asan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhcm1fYXNhbiwgYXp1cmUsIHNlcXVlbnRpYWwsIDEvMik=') }}
     name: "Stateless tests (arm_asan, azure, sequential, 1/2)"
@@ -2615,7 +2615,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_arm_asan_azure_sequential_2_2:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester-aarch64]
     needs: [build_arm_asan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhcm1fYXNhbiwgYXp1cmUsIHNlcXVlbnRpYWwsIDIvMik=') }}
     name: "Stateless tests (arm_asan, azure, sequential, 2/2)"
@@ -2660,7 +2660,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_amd_asan_db_disk_old_analyzer_1_6:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_asan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDEvNik=') }}
     name: "Integration tests (amd_asan, db disk, old analyzer, 1/6)"
@@ -2705,7 +2705,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_amd_asan_db_disk_old_analyzer_2_6:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_asan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDIvNik=') }}
     name: "Integration tests (amd_asan, db disk, old analyzer, 2/6)"
@@ -2750,7 +2750,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_amd_asan_db_disk_old_analyzer_3_6:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_asan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDMvNik=') }}
     name: "Integration tests (amd_asan, db disk, old analyzer, 3/6)"
@@ -2795,7 +2795,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_amd_asan_db_disk_old_analyzer_4_6:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_asan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDQvNik=') }}
     name: "Integration tests (amd_asan, db disk, old analyzer, 4/6)"
@@ -2840,7 +2840,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_amd_asan_db_disk_old_analyzer_5_6:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_asan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDUvNik=') }}
     name: "Integration tests (amd_asan, db disk, old analyzer, 5/6)"
@@ -2885,7 +2885,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_amd_asan_db_disk_old_analyzer_6_6:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_asan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9hc2FuLCBkYiBkaXNrLCBvbGQgYW5hbHl6ZXIsIDYvNik=') }}
     name: "Integration tests (amd_asan, db disk, old analyzer, 6/6)"
@@ -2930,7 +2930,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_amd_binary_1_5:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_binary, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9iaW5hcnksIDEvNSk=') }}
     name: "Integration tests (amd_binary, 1/5)"
@@ -2975,7 +2975,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_amd_binary_2_5:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_binary, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9iaW5hcnksIDIvNSk=') }}
     name: "Integration tests (amd_binary, 2/5)"
@@ -3020,7 +3020,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_amd_binary_3_5:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_binary, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9iaW5hcnksIDMvNSk=') }}
     name: "Integration tests (amd_binary, 3/5)"
@@ -3065,7 +3065,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_amd_binary_4_5:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_binary, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9iaW5hcnksIDQvNSk=') }}
     name: "Integration tests (amd_binary, 4/5)"
@@ -3110,7 +3110,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_amd_binary_5_5:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_binary, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9iaW5hcnksIDUvNSk=') }}
     name: "Integration tests (amd_binary, 5/5)"
@@ -3155,7 +3155,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_arm_binary_distributed_plan_1_4:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester-aarch64]
     needs: [build_arm_binary, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFybV9iaW5hcnksIGRpc3RyaWJ1dGVkIHBsYW4sIDEvNCk=') }}
     name: "Integration tests (arm_binary, distributed plan, 1/4)"
@@ -3200,7 +3200,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_arm_binary_distributed_plan_2_4:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester-aarch64]
     needs: [build_arm_binary, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFybV9iaW5hcnksIGRpc3RyaWJ1dGVkIHBsYW4sIDIvNCk=') }}
     name: "Integration tests (arm_binary, distributed plan, 2/4)"
@@ -3245,7 +3245,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_arm_binary_distributed_plan_3_4:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester-aarch64]
     needs: [build_arm_binary, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFybV9iaW5hcnksIGRpc3RyaWJ1dGVkIHBsYW4sIDMvNCk=') }}
     name: "Integration tests (arm_binary, distributed plan, 3/4)"
@@ -3290,7 +3290,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_arm_binary_distributed_plan_4_4:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester-aarch64]
     needs: [build_arm_binary, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFybV9iaW5hcnksIGRpc3RyaWJ1dGVkIHBsYW4sIDQvNCk=') }}
     name: "Integration tests (arm_binary, distributed plan, 4/4)"
@@ -3335,7 +3335,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_amd_tsan_1_6:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_tsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF90c2FuLCAxLzYp') }}
     name: "Integration tests (amd_tsan, 1/6)"
@@ -3380,7 +3380,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_amd_tsan_2_6:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_tsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF90c2FuLCAyLzYp') }}
     name: "Integration tests (amd_tsan, 2/6)"
@@ -3425,7 +3425,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_amd_tsan_3_6:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_tsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF90c2FuLCAzLzYp') }}
     name: "Integration tests (amd_tsan, 3/6)"
@@ -3470,7 +3470,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_amd_tsan_4_6:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_tsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF90c2FuLCA0LzYp') }}
     name: "Integration tests (amd_tsan, 4/6)"
@@ -3515,7 +3515,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_amd_tsan_5_6:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_tsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF90c2FuLCA1LzYp') }}
     name: "Integration tests (amd_tsan, 5/6)"
@@ -3560,7 +3560,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_amd_tsan_6_6:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_tsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF90c2FuLCA2LzYp') }}
     name: "Integration tests (amd_tsan, 6/6)"
@@ -3605,7 +3605,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_amd_msan_1_6:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_msan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9tc2FuLCAxLzYp') }}
     name: "Integration tests (amd_msan, 1/6)"
@@ -3650,7 +3650,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_amd_msan_2_6:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_msan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9tc2FuLCAyLzYp') }}
     name: "Integration tests (amd_msan, 2/6)"
@@ -3695,7 +3695,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_amd_msan_3_6:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_msan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9tc2FuLCAzLzYp') }}
     name: "Integration tests (amd_msan, 3/6)"
@@ -3740,7 +3740,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_amd_msan_4_6:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_msan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9tc2FuLCA0LzYp') }}
     name: "Integration tests (amd_msan, 4/6)"
@@ -3785,7 +3785,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_amd_msan_5_6:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_msan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9tc2FuLCA1LzYp') }}
     name: "Integration tests (amd_msan, 5/6)"
@@ -3830,7 +3830,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   integration_tests_amd_msan_6_6:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_msan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'SW50ZWdyYXRpb24gdGVzdHMgKGFtZF9tc2FuLCA2LzYp') }}
     name: "Integration tests (amd_msan, 6/6)"
@@ -3875,7 +3875,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stress_test_amd_release:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_release, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RyZXNzIHRlc3QgKGFtZF9yZWxlYXNlKQ==') }}
     name: "Stress test (amd_release)"
@@ -3920,7 +3920,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stress_test_amd_debug:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_debug, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RyZXNzIHRlc3QgKGFtZF9kZWJ1Zyk=') }}
     name: "Stress test (amd_debug)"
@@ -3965,7 +3965,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stress_test_amd_tsan:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_tsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RyZXNzIHRlc3QgKGFtZF90c2FuKQ==') }}
     name: "Stress test (amd_tsan)"
@@ -4010,7 +4010,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stress_test_arm_asan:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester-aarch64]
     needs: [build_arm_asan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RyZXNzIHRlc3QgKGFybV9hc2FuKQ==') }}
     name: "Stress test (arm_asan)"
@@ -4055,7 +4055,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stress_test_arm_asan_s3:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester-aarch64]
     needs: [build_arm_asan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RyZXNzIHRlc3QgKGFybV9hc2FuLCBzMyk=') }}
     name: "Stress test (arm_asan, s3)"
@@ -4100,7 +4100,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stress_test_amd_ubsan:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_ubsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RyZXNzIHRlc3QgKGFtZF91YnNhbik=') }}
     name: "Stress test (amd_ubsan)"
@@ -4145,7 +4145,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stress_test_amd_msan:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_msan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RyZXNzIHRlc3QgKGFtZF9tc2FuKQ==') }}
     name: "Stress test (amd_msan)"
@@ -4190,7 +4190,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stress_test_azure_amd_msan:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_msan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RyZXNzIHRlc3QgKGF6dXJlLCBhbWRfbXNhbik=') }}
     name: "Stress test (azure, amd_msan)"
@@ -4235,7 +4235,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stress_test_azure_amd_tsan:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_tsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RyZXNzIHRlc3QgKGF6dXJlLCBhbWRfdHNhbik=') }}
     name: "Stress test (azure, amd_tsan)"
@@ -4280,7 +4280,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   ast_fuzzer_amd_debug:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_debug, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QVNUIGZ1enplciAoYW1kX2RlYnVnKQ==') }}
     name: "AST fuzzer (amd_debug)"
@@ -4325,7 +4325,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   ast_fuzzer_arm_asan:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester-aarch64]
     needs: [build_arm_asan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QVNUIGZ1enplciAoYXJtX2FzYW4p') }}
     name: "AST fuzzer (arm_asan)"
@@ -4370,7 +4370,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   ast_fuzzer_amd_tsan:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_tsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QVNUIGZ1enplciAoYW1kX3RzYW4p') }}
     name: "AST fuzzer (amd_tsan)"
@@ -4415,7 +4415,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   ast_fuzzer_amd_msan:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_msan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QVNUIGZ1enplciAoYW1kX21zYW4p') }}
     name: "AST fuzzer (amd_msan)"
@@ -4460,7 +4460,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   ast_fuzzer_amd_ubsan:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_ubsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QVNUIGZ1enplciAoYW1kX3Vic2FuKQ==') }}
     name: "AST fuzzer (amd_ubsan)"
@@ -4505,7 +4505,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   buzzhouse_amd_debug:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_debug, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnV6ekhvdXNlIChhbWRfZGVidWcp') }}
     name: "BuzzHouse (amd_debug)"
@@ -4550,7 +4550,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   buzzhouse_arm_asan:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester-aarch64]
     needs: [build_arm_asan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnV6ekhvdXNlIChhcm1fYXNhbik=') }}
     name: "BuzzHouse (arm_asan)"
@@ -4595,7 +4595,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   buzzhouse_amd_tsan:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_tsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnV6ekhvdXNlIChhbWRfdHNhbik=') }}
     name: "BuzzHouse (amd_tsan)"
@@ -4640,7 +4640,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   buzzhouse_amd_msan:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_msan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnV6ekhvdXNlIChhbWRfbXNhbik=') }}
     name: "BuzzHouse (amd_msan)"
@@ -4685,7 +4685,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   buzzhouse_amd_ubsan:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_ubsan, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'QnV6ekhvdXNlIChhbWRfdWJzYW4p') }}
     name: "BuzzHouse (amd_ubsan)"
@@ -4730,7 +4730,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   clickbench_amd_release:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_release, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'Q2xpY2tCZW5jaCAoYW1kX3JlbGVhc2Up') }}
     name: "ClickBench (amd_release)"
@@ -4775,7 +4775,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   clickbench_arm_release:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester-aarch64]
     needs: [build_arm_release, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'Q2xpY2tCZW5jaCAoYXJtX3JlbGVhc2Up') }}
     name: "ClickBench (arm_release)"
@@ -4820,7 +4820,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   sqltest:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester-aarch64]
     needs: [build_arm_release, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U1FMVGVzdA==') }}
     name: "SQLTest"
@@ -4865,7 +4865,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   sqllogic_test:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester-aarch64]
     needs: [build_arm_release, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U1FMTG9naWMgdGVzdA==') }}
     name: "SQLLogic test"
@@ -4910,7 +4910,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_coverage_1_8:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_coverage, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfY292ZXJhZ2UsIDEvOCk=') }}
     name: "Stateless tests (amd_coverage, 1/8)"
@@ -4955,7 +4955,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_coverage_2_8:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_coverage, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfY292ZXJhZ2UsIDIvOCk=') }}
     name: "Stateless tests (amd_coverage, 2/8)"
@@ -5000,7 +5000,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_coverage_3_8:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_coverage, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfY292ZXJhZ2UsIDMvOCk=') }}
     name: "Stateless tests (amd_coverage, 3/8)"
@@ -5045,7 +5045,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_coverage_4_8:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_coverage, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfY292ZXJhZ2UsIDQvOCk=') }}
     name: "Stateless tests (amd_coverage, 4/8)"
@@ -5090,7 +5090,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_coverage_5_8:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_coverage, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfY292ZXJhZ2UsIDUvOCk=') }}
     name: "Stateless tests (amd_coverage, 5/8)"
@@ -5135,7 +5135,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_coverage_6_8:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_coverage, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfY292ZXJhZ2UsIDYvOCk=') }}
     name: "Stateless tests (amd_coverage, 6/8)"
@@ -5180,7 +5180,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_coverage_7_8:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_coverage, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfY292ZXJhZ2UsIDcvOCk=') }}
     name: "Stateless tests (amd_coverage, 7/8)"
@@ -5225,7 +5225,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_coverage_8_8:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-func-tester]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-func-tester]
     needs: [build_amd_coverage, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfY292ZXJhZ2UsIDgvOCk=') }}
     name: "Stateless tests (amd_coverage, 8/8)"
@@ -5270,7 +5270,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   finish_workflow:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
     needs: [ast_fuzzer_amd_debug, ast_fuzzer_amd_msan, ast_fuzzer_amd_tsan, ast_fuzzer_amd_ubsan, ast_fuzzer_arm_asan, build_amd_asan, build_amd_binary, build_amd_coverage, build_amd_debug, build_amd_msan, build_amd_release, build_amd_tsan, build_amd_ubsan, build_arm_asan, build_arm_binary, build_arm_release, buzzhouse_amd_debug, buzzhouse_amd_msan, buzzhouse_amd_tsan, buzzhouse_amd_ubsan, buzzhouse_arm_asan, clickbench_amd_release, clickbench_arm_release, compatibility_check_amd_release, compatibility_check_arm_release, config_workflow, docker_keeper_image, docker_server_image, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest, install_packages_amd_release, install_packages_arm_release, integration_tests_amd_asan_db_disk_old_analyzer_1_6, integration_tests_amd_asan_db_disk_old_analyzer_2_6, integration_tests_amd_asan_db_disk_old_analyzer_3_6, integration_tests_amd_asan_db_disk_old_analyzer_4_6, integration_tests_amd_asan_db_disk_old_analyzer_5_6, integration_tests_amd_asan_db_disk_old_analyzer_6_6, integration_tests_amd_binary_1_5, integration_tests_amd_binary_2_5, integration_tests_amd_binary_3_5, integration_tests_amd_binary_4_5, integration_tests_amd_binary_5_5, integration_tests_amd_msan_1_6, integration_tests_amd_msan_2_6, integration_tests_amd_msan_3_6, integration_tests_amd_msan_4_6, integration_tests_amd_msan_5_6, integration_tests_amd_msan_6_6, integration_tests_amd_tsan_1_6, integration_tests_amd_tsan_2_6, integration_tests_amd_tsan_3_6, integration_tests_amd_tsan_4_6, integration_tests_amd_tsan_5_6, integration_tests_amd_tsan_6_6, integration_tests_arm_binary_distributed_plan_1_4, integration_tests_arm_binary_distributed_plan_2_4, integration_tests_arm_binary_distributed_plan_3_4, integration_tests_arm_binary_distributed_plan_4_4, sqllogic_test, sqltest, stateless_tests_amd_asan_db_disk_distributed_plan_sequential, stateless_tests_amd_asan_distributed_plan_parallel_1_4, stateless_tests_amd_asan_distributed_plan_parallel_2_4, stateless_tests_amd_asan_distributed_plan_parallel_3_4, stateless_tests_amd_asan_distributed_plan_parallel_4_4, stateless_tests_amd_coverage_1_8, stateless_tests_amd_coverage_2_8, stateless_tests_amd_coverage_3_8, stateless_tests_amd_coverage_4_8, stateless_tests_amd_coverage_5_8, stateless_tests_amd_coverage_6_8, stateless_tests_amd_coverage_7_8, stateless_tests_amd_coverage_8_8, stateless_tests_amd_debug_distributed_plan_s3_storage_parallel, stateless_tests_amd_debug_distributed_plan_s3_storage_sequential, stateless_tests_amd_debug_parallel, stateless_tests_amd_debug_sequential, stateless_tests_amd_msan_wasmedge_parallel_1_4, stateless_tests_amd_msan_wasmedge_parallel_2_4, stateless_tests_amd_msan_wasmedge_parallel_3_4, stateless_tests_amd_msan_wasmedge_parallel_4_4, stateless_tests_amd_msan_wasmedge_sequential_1_2, stateless_tests_amd_msan_wasmedge_sequential_2_2, stateless_tests_amd_tsan_parallel_1_2, stateless_tests_amd_tsan_parallel_2_2, stateless_tests_amd_tsan_s3_storage_parallel_1_2, stateless_tests_amd_tsan_s3_storage_parallel_2_2, stateless_tests_amd_tsan_s3_storage_sequential_1_2, stateless_tests_amd_tsan_s3_storage_sequential_2_2, stateless_tests_amd_tsan_sequential_1_2, stateless_tests_amd_tsan_sequential_2_2, stateless_tests_amd_ubsan_parallel, stateless_tests_amd_ubsan_sequential, stateless_tests_arm_asan_azure_parallel_1_4, stateless_tests_arm_asan_azure_parallel_2_4, stateless_tests_arm_asan_azure_parallel_3_4, stateless_tests_arm_asan_azure_parallel_4_4, stateless_tests_arm_asan_azure_sequential_1_2, stateless_tests_arm_asan_azure_sequential_2_2, stateless_tests_arm_binary_parallel, stateless_tests_arm_binary_sequential, stress_test_amd_debug, stress_test_amd_msan, stress_test_amd_release, stress_test_amd_tsan, stress_test_amd_ubsan, stress_test_arm_asan, stress_test_arm_asan_s3, stress_test_azure_amd_msan, stress_test_azure_amd_tsan, unit_tests_asan, unit_tests_msan, unit_tests_tsan, unit_tests_ubsan]
     if: ${{ always() }}
     name: "Finish Workflow"
@@ -5381,7 +5381,7 @@ jobs:
     secrets: inherit
     with:
       test_name: Sign aarch64
-      runner_type: altinity-style-checker-aarch64
+      runner_type: altinity-ec2-style-checker-aarch64
       data: ${{ needs.config_workflow.outputs.data }}
 
   FinishCIReport:
@@ -5510,7 +5510,7 @@ jobs:
       - RegressionTestsAarch64
       - SignRelease
       - SignAarch64
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
     steps:
       - name: Check out repository code
         uses: Altinity/checkout@19599efdf36c4f3f30eb55d5bb388896faea69f6
@@ -5526,7 +5526,7 @@ jobs:
   SourceUpload:
     needs: [config_workflow, build_amd_release]
     if: ${{ !failure() && !cancelled() }}
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
     env:
         COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
