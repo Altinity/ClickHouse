@@ -1448,15 +1448,13 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
     const std::vector<String> & partition_columns,
     const std::vector<DataTypePtr> & partition_types,
     SharedHeader sample_block,
-    const std::vector<String> & data_file_paths,
+    const std::vector<Iceberg::IcebergPathFromMetadata> & data_file_paths_in_metadata,
     const std::vector<IcebergSerializedFileStats> & per_file_stats,
     Int64 total_data_files,
     Int64 total_rows,
     Int64 total_chunks_size,
     std::shared_ptr<DataLake::ICatalog> catalog,
     const StorageID & table_id,
-    const String & blob_storage_type_name,
-    const String & blob_storage_namespace_name,
     ContextPtr context)
 {
     /// this check also exists here because the metadata might have been updated upon retry attempts.
@@ -1470,14 +1468,24 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
 
     CompressionMethod metadata_compression_method = persistent_components.metadata_compression_method;
 
-    auto [metadata_name, storage_metadata_name] = filename_generator.generateMetadataName();
+    const auto & resolver = persistent_components.path_resolver;
+    auto metadata_info = filename_generator.generateMetadataPathWithInfo();
 
     Int64 parent_snapshot = -1;
     if (metadata->has(Iceberg::f_current_snapshot_id))
         parent_snapshot = metadata->getValue<Int64>(Iceberg::f_current_snapshot_id);
 
-    auto [new_snapshot, manifest_list_name, storage_manifest_list_name] = MetadataGenerator(metadata).generateNextMetadata(
-        filename_generator, metadata_name, parent_snapshot, total_data_files, total_rows, total_chunks_size, total_data_files, /* added_delete_files */0, /* num_deleted_rows */0);
+    auto [new_snapshot, manifest_list_path] = MetadataGenerator(metadata).generateNextMetadata(
+        filename_generator,
+        metadata_info.path,
+        parent_snapshot,
+        total_data_files,
+        total_rows,
+        total_chunks_size,
+        total_data_files,
+        /* added_delete_files */ 0,
+        /* num_deleted_rows */ 0);
+    auto storage_manifest_list_name = resolver.resolve(manifest_list_path);
 
     /// Embed the stable transaction identifier in the snapshot summary so that a retry after crash
     /// can detect the commit already happened by scanning the live snapshots array, without extra S3
@@ -1485,8 +1493,8 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
     new_snapshot->getObject(Iceberg::f_summary)->set(
         Iceberg::f_clickhouse_export_partition_transaction_id, transaction_id);
 
-    String manifest_entry_name;
-    String storage_manifest_entry_name;
+    Iceberg::IcebergPathFromMetadata manifest_entry_path;
+    String storage_manifest_entry_path;
     Int64 manifest_lengths = 0;
 
     /// Tracks whether the snapshot has become visible to readers.
@@ -1503,7 +1511,7 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
         /// because this replica or some other replica might attempt to commit the same transaction later
         /// todo arthur: in the future, we should consider failing the entire task if retry_because_of_metadata_conflict = true
 
-        object_storage->removeObjectIfExists(StoredObject(storage_manifest_entry_name));
+        object_storage->removeObjectIfExists(StoredObject(storage_manifest_entry_path));
         object_storage->removeObjectIfExists(StoredObject(storage_manifest_list_name));
 
         if (retry_because_of_metadata_conflict)
@@ -1534,6 +1542,7 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
                     context,
                     getLogger("IcebergWrites").get(),
                     persistent_components.table_uuid,
+                    metadata_compression_method,
                     true);
             }
 
@@ -1578,13 +1587,12 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
     try
     {
         {
-            auto result = filename_generator.generateManifestEntryName();
-            manifest_entry_name = result.path_in_metadata;
-            storage_manifest_entry_name = result.path_in_storage;
+            manifest_entry_path = filename_generator.generateManifestEntryName();
+            storage_manifest_entry_path = resolver.resolve(manifest_entry_path);
         }
 
         auto buffer_manifest_entry = object_storage->writeObject(
-            StoredObject(storage_manifest_entry_name), WriteMode::Rewrite, std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());
+            StoredObject(storage_manifest_entry_path), WriteMode::Rewrite, std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());
 
         try
         {
@@ -1598,7 +1606,7 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
                 partition_columns,
                 partition_values,
                 partition_types,
-                data_file_paths,
+                data_file_paths_in_metadata,
                 std::nullopt,  /// per_file_stats is filled, no need for the generic aggregate
                 sample_block,
                 new_snapshot,
@@ -1624,7 +1632,7 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
             try
             {
                 generateManifestList(
-                    filename_generator, metadata, object_storage, context, {manifest_entry_name}, new_snapshot, manifest_lengths, *buffer_manifest_list, Iceberg::FileContentType::DATA, true);
+                    persistent_components.path_resolver, metadata, object_storage, context, {manifest_entry_path}, new_snapshot, {manifest_lengths}, *buffer_manifest_list, Iceberg::FileContentType::DATA, true);
                 buffer_manifest_list->finalize();
             }
             catch (...)
@@ -1639,30 +1647,27 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
             Poco::JSON::Stringifier::stringify(metadata, oss, 4);
             std::string json_representation = removeEscapedSlashes(oss.str());
 
-            LOG_DEBUG(log, "Writing new metadata file {}", storage_metadata_name);
-            auto hint = filename_generator.generateVersionHint();
+            LOG_DEBUG(log, "Writing new metadata file {}", metadata_info.path);
+            auto hint_path = filename_generator.generateVersionHint();
             if (!writeMetadataFileAndVersionHint(
-                    storage_metadata_name,
+                    persistent_components.path_resolver,
+                    metadata_info,
                     json_representation,
-                    hint.path_in_storage,
-                    storage_metadata_name,
+                    hint_path,
                     object_storage,
                     context,
-                    metadata_compression_method,
                     data_lake_settings[DataLakeStorageSetting::iceberg_use_version_hint]))
             {
-                LOG_DEBUG(log, "Failed to write metadata {}, retrying", storage_metadata_name);
+                LOG_DEBUG(log, "Failed to write metadata {}, retrying", metadata_info.path);
                 cleanup(true);
                 return false;
             }
 
-            LOG_DEBUG(log, "Metadata file {} written", storage_metadata_name);
+            LOG_DEBUG(log, "Metadata file {} written", metadata_info.path);
 
             if (catalog)
             {
-                String catalog_filename = metadata_name;
-                if (!catalog_filename.starts_with(blob_storage_type_name))
-                    catalog_filename = blob_storage_type_name + "://" + blob_storage_namespace_name + "/" + metadata_name;
+                auto catalog_filename = resolver.resolveForCatalog(metadata_info.path);
 
                 const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
                 if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot))
@@ -1735,9 +1740,13 @@ void IcebergMetadata::commitExportPartitionTransaction(
     const std::vector<Field> & partition_values,
     SharedHeader sample_block,
     const std::vector<String> & data_file_paths,
-    StorageObjectStorageConfigurationPtr configuration,
     ContextPtr context)
 {
+    std::vector<Iceberg::IcebergPathFromMetadata> data_file_paths_in_metadata;
+    for (const auto & path : data_file_paths)
+    {
+        data_file_paths_in_metadata.push_back(Iceberg::IcebergPathFromMetadata::deserialize(path));
+    }
 
     MetadataFileWithInfo updated_metadata_file_info = getLatestOrExplicitMetadataFileAndVersion(
         object_storage,
@@ -1747,6 +1756,7 @@ void IcebergMetadata::commitExportPartitionTransaction(
         context,
         getLogger("IcebergMetadata").get(),
         persistent_components.table_uuid,
+        persistent_components.metadata_compression_method,
         true);
 
     /// Latest metadata is ALWAYS necessary to commit - but we abort in case schema or partition spec changed
@@ -1797,37 +1807,22 @@ void IcebergMetadata::commitExportPartitionTransaction(
     const auto partition_types = partitioner.getResultTypes();
 
     const auto metadata_compression_method = persistent_components.metadata_compression_method;
-    auto config_path = persistent_components.table_path;
-    if (config_path.empty() || config_path.back() != '/')
-        config_path += "/";
-    if (!config_path.starts_with('/'))
-        config_path = '/' + config_path;
 
-    FileNamesGenerator filename_generator;
-    if (!context->getSettingsRef()[Setting::write_full_path_in_iceberg_metadata])
-    {
-        filename_generator = FileNamesGenerator(
-            config_path, config_path, (catalog != nullptr && catalog->isTransactional()), metadata_compression_method, write_format);
-    }
-    else
-    {
-        auto bucket = metadata->getValue<String>(Iceberg::f_location);
-        if (bucket.empty() || bucket.back() != '/')
-            bucket += "/";
-        filename_generator = FileNamesGenerator(
-            bucket, config_path, (catalog != nullptr && catalog->isTransactional()), metadata_compression_method, write_format);
-    }
+    FileNamesGenerator filename_generator = FileNamesGenerator(
+        persistent_components.path_resolver.getTableLocation(),
+        (catalog != nullptr && catalog->isTransactional()), metadata_compression_method, write_format);
+
     filename_generator.setVersion(updated_metadata_file_info.version + 1);
 
     /// Load per-file sidecar stats, necessary to populate the manifest file stats.
     std::vector<IcebergSerializedFileStats> per_file_stats;
-    const Int64 total_data_files = static_cast<Int64>(data_file_paths.size());
+    const Int64 total_data_files = static_cast<Int64>(data_file_paths_in_metadata.size());
     Int64 total_rows = 0;
     Int64 total_chunks_size = 0;
-    per_file_stats.reserve(data_file_paths.size());
-    for (const auto & path : data_file_paths)
+    per_file_stats.reserve(data_file_paths_in_metadata.size());
+    for (const auto & path : data_file_paths_in_metadata)
     {
-        const auto sidecar_path = getIcebergExportPartSidecarStoragePath(path);
+        const auto sidecar_path = getIcebergExportPartSidecarStoragePath(persistent_components.path_resolver.resolve(path));
         auto stats = readDataFileSidecar(sidecar_path, object_storage, context);
         total_rows += stats.record_count;
         total_chunks_size += stats.file_size_in_bytes;
@@ -1849,15 +1844,13 @@ void IcebergMetadata::commitExportPartitionTransaction(
                 partition_columns,
                 partition_types,
                 sample_block,
-                data_file_paths,
+                data_file_paths_in_metadata,
                 per_file_stats,
                 total_data_files,
                 total_rows,
                 total_chunks_size,
                 catalog,
                 table_id,
-                configuration->getTypeName(),
-                configuration->getNamespace(),
                 context))
         {
             return;
