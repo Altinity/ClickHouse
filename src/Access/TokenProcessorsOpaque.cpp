@@ -313,11 +313,12 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
 {
     const picojson::object openid_config = getObjectFromURI(Poco::URI(openid_config_endpoint_));
 
-    if (!openid_config.contains("userinfo_endpoint") || !openid_config.contains("introspection_endpoint"))
-        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "{}: Cannot extract userinfo_endpoint or introspection_endpoint from OIDC configuration, consider manual configuration.", processor_name);
+    if (!openid_config.contains("userinfo_endpoint"))
+        throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "{}: Cannot extract userinfo_endpoint from OIDC configuration, consider manual configuration.", processor_name);
 
     userinfo_endpoint = Poco::URI(getValueByKey(openid_config, "userinfo_endpoint").value());
-    token_introspection_endpoint = Poco::URI(getValueByKey(openid_config, "introspection_endpoint").value());
+    if (openid_config.contains("introspection_endpoint"))
+        token_introspection_endpoint = Poco::URI(getValueByKey(openid_config, "introspection_endpoint").value());
 
     if (openid_config.contains("jwks_uri"))
     {

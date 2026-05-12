@@ -43,7 +43,7 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
         auto jwks_cache_lifetime = config.getUInt64(prefix + ".jwks_cache_lifetime", 3600);
 
         bool externally_configured = config.hasProperty(prefix + ".configuration_endpoint") && !config.hasProperty(prefix + ".jwks_uri");
-        bool locally_configured = config.hasProperty(prefix + ".userinfo_endpoint") && config.hasProperty(prefix + ".token_introspection_endpoint");
+        bool locally_configured = config.hasProperty(prefix + ".userinfo_endpoint");
 
         if (externally_configured && ! locally_configured)
         {
@@ -58,13 +58,53 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
             return std::make_unique<OpenIdTokenProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim,
                                                           expected_issuer, expected_audience, allow_no_expiration,
                                                           config.getString(prefix + ".userinfo_endpoint"),
-                                                          config.getString(prefix + ".token_introspection_endpoint"),
+                                                          config.getString(prefix + ".token_introspection_endpoint", ""),
                                                           verifier_leeway,
                                                           config.getString(prefix + ".jwks_uri", ""),
                                                           jwks_cache_lifetime);
         }
 
-        throw DB::Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "Either 'configuration_endpoint' or both 'userinfo_endpoint' and 'token_introspection_endpoint' (and, optionally, 'jwks_uri') must be specified for 'openid' processor");
+        throw DB::Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "Either 'configuration_endpoint' or 'userinfo_endpoint' (and, optionally, 'jwks_uri' and 'token_introspection_endpoint') must be specified for 'openid' processor");
+    }
+    else if (provider_type == "entra")
+    {
+        /// Preset for Microsoft Entra ID built on top of the OpenID Connect processor.
+        /// Derives the per-tenant OIDC discovery URL from `tenant_id` and lets `OpenIdTokenProcessor`
+        /// fetch `jwks_uri` (and, when published, `introspection_endpoint`) from it, so future
+        /// endpoint changes on the Entra side flow through without code changes here.
+        if (!config.hasProperty(prefix + ".tenant_id"))
+            throw DB::Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "'tenant_id' must be specified for 'entra' processor");
+
+        const String tenant_id = config.getString(prefix + ".tenant_id");
+
+        if (tenant_id.empty())
+            throw DB::Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "'tenant_id' must not be empty for 'entra' processor");
+
+        for (char c : tenant_id)
+        {
+            if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '.' && c != '_')
+                throw DB::Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
+                                    "'tenant_id' {} contains invalid characters", tenant_id);
+        }
+
+        /// Multi-tenant aliases require templated-issuer validation that the underlying JWKS JWT
+        /// validator does not implement (it does exact-match on `iss`). Reject explicitly rather
+        /// than silently failing issuer checks at token-validation time.
+        const String lower_tenant_id = Poco::toLower(tenant_id);
+        if (lower_tenant_id == "common" || lower_tenant_id == "organizations" || lower_tenant_id == "consumers")
+            throw DB::Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
+                                "Multi-tenant 'tenant_id' '{}' is not supported for 'entra' processor type: "
+                                "exact issuer validation requires a single tenant identifier (GUID or onmicrosoft.com domain).",
+                                tenant_id);
+
+        const String default_configuration_endpoint = "https://login.microsoftonline.com/" + tenant_id + "/v2.0/.well-known/openid-configuration";
+        const String configuration_endpoint = config.getString(prefix + ".configuration_endpoint", default_configuration_endpoint);
+
+        return std::make_unique<OpenIdTokenProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim,
+                                                      expected_issuer, expected_audience, allow_no_expiration,
+                                                      configuration_endpoint,
+                                                      config.getUInt64(prefix + ".verifier_leeway", 60),
+                                                      config.getUInt64(prefix + ".jwks_cache_lifetime", 3600));
     }
     else if (provider_type == "jwt_static_key")
     {
