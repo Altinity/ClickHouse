@@ -358,7 +358,7 @@ class JobConfigs:
             runs_on=RunnerLabels.BUILDER_AMD,
         ),
     )
-    extra_validation_build_jobs = common_build_job_config.set_post_hooks(
+    extra_validation_build_jobs = common_sanitizer_build_job_config.set_post_hooks(
         post_hooks=[
             # "python3 ./ci/jobs/scripts/job_hooks/build_master_head_hook.py",
             # "python3 ./ci/jobs/scripts/job_hooks/build_profile_hook.py",

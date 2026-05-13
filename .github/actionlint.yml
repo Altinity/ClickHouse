@@ -4,6 +4,6 @@ self-hosted-runner:
     - altinity-func-tester
     - altinity-func-tester-aarch64
     - fuzzer-unit-tester
-    - altinity-style-checker
+    - altinity-ec2-style-checker
     - altinity-ec2-style-checker-aarch64
     - release-maker

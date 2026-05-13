@@ -21,12 +21,12 @@ jobs:
 <<<<<<< HEAD
     runs-on: [self-hosted, style-checker-aarch64]
 ||||||| parent of f905df4ff88 (make jobs ec2 only)
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-ec2-style-checker-aarch64]
 =======
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 >>>>>>> f905df4ff88 (make jobs ec2 only)
 ||||||| parent of 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 =======
     runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 >>>>>>> 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
@@ -69,9 +69,9 @@ jobs:
 <<<<<<< HEAD
     runs-on: [self-hosted, style-checker]
 ||||||| parent of f905df4ff88 (make jobs ec2 only)
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
+    runs-on: [self-hosted, altinity-on-demand, altinity-ec2-style-checker]
 =======
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker]
 >>>>>>> f905df4ff88 (make jobs ec2 only)
     needs: [config_workflow]
     name: "Dockers Build (amd)"
@@ -113,12 +113,12 @@ jobs:
 <<<<<<< HEAD
     runs-on: [self-hosted, style-checker-aarch64]
 ||||||| parent of f905df4ff88 (make jobs ec2 only)
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-ec2-style-checker-aarch64]
 =======
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 >>>>>>> f905df4ff88 (make jobs ec2 only)
 ||||||| parent of 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 =======
     runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 >>>>>>> 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
@@ -205,12 +205,12 @@ jobs:
 <<<<<<< HEAD
     runs-on: [self-hosted, style-checker-aarch64]
 ||||||| parent of f905df4ff88 (make jobs ec2 only)
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-ec2-style-checker-aarch64]
 =======
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 >>>>>>> f905df4ff88 (make jobs ec2 only)
 ||||||| parent of 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 =======
     runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 >>>>>>> 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)

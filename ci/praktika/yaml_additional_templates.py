@@ -94,7 +94,7 @@ class AltinityWorkflowTemplates:
     secrets: inherit
     with:
       test_name: Sign release
-      runner_type: altinity-style-checker
+      runner_type: altinity-ec2-style-checker
       data: ${{ needs.config_workflow.outputs.data }}
   SignAarch64:
     needs: [config_workflow, build_arm_release]

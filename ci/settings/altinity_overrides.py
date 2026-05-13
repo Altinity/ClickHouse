@@ -7,7 +7,7 @@ S3_REPORT_BUCKET_HTTP_ENDPOINT = "altinity-build-artifacts.s3.amazonaws.com"
 
 
 class RunnerLabels:
-    STYLE_CHECK_AMD = ["self-hosted", "altinity-aws-ec2-runners", "altinity-style-checker"]
+    STYLE_CHECK_AMD = ["self-hosted", "altinity-aws-ec2-runners", "altinity-ec2-style-checker"]
     STYLE_CHECK_ARM = [
         "self-hosted",
         "altinity-aws-ec2-runners",

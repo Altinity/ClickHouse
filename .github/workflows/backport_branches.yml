@@ -23,12 +23,12 @@ jobs:
 <<<<<<< HEAD
     runs-on: [self-hosted, style-checker-aarch64]
 ||||||| parent of f905df4ff88 (make jobs ec2 only)
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-ec2-style-checker-aarch64]
 =======
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 >>>>>>> f905df4ff88 (make jobs ec2 only)
 ||||||| parent of 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 =======
     runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 >>>>>>> 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
@@ -71,9 +71,9 @@ jobs:
 <<<<<<< HEAD
     runs-on: [self-hosted, style-checker]
 ||||||| parent of f905df4ff88 (make jobs ec2 only)
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
+    runs-on: [self-hosted, altinity-on-demand, altinity-ec2-style-checker]
 =======
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker]
 >>>>>>> f905df4ff88 (make jobs ec2 only)
     needs: [config_workflow]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'RG9ja2VycyBCdWlsZCAoYW1kKQ==') }}
@@ -116,12 +116,12 @@ jobs:
 <<<<<<< HEAD
     runs-on: [self-hosted, style-checker-aarch64]
 ||||||| parent of f905df4ff88 (make jobs ec2 only)
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-ec2-style-checker-aarch64]
 =======
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 >>>>>>> f905df4ff88 (make jobs ec2 only)
 ||||||| parent of 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 =======
     runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 >>>>>>> 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
@@ -517,12 +517,12 @@ jobs:
     runs-on: [self-hosted, style-checker]
     needs: [build_amd_release, build_arm_release, config_workflow, dockers_build_amd, dockers_build_arm]
 ||||||| parent of f905df4ff88 (make jobs ec2 only)
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
+    runs-on: [self-hosted, altinity-on-demand, altinity-ec2-style-checker]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_release, build_arm_release]
 =======
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker]
 ||||||| parent of 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker]
 =======
     runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker]
 >>>>>>> 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
@@ -569,12 +569,12 @@ jobs:
     runs-on: [self-hosted, style-checker]
     needs: [build_amd_release, build_arm_release, config_workflow, dockers_build_amd, dockers_build_arm]
 ||||||| parent of f905df4ff88 (make jobs ec2 only)
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
+    runs-on: [self-hosted, altinity-on-demand, altinity-ec2-style-checker]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_release, build_arm_release]
 =======
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker]
 ||||||| parent of 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker]
 =======
     runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker]
 >>>>>>> 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
@@ -725,12 +725,12 @@ jobs:
     runs-on: [self-hosted, style-checker]
     needs: [build_amd_release, config_workflow, dockers_build_amd, dockers_build_arm]
 ||||||| parent of f905df4ff88 (make jobs ec2 only)
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
+    runs-on: [self-hosted, altinity-on-demand, altinity-ec2-style-checker]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_release]
 =======
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker]
 ||||||| parent of 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker]
 =======
     runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker]
 >>>>>>> 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
@@ -777,12 +777,12 @@ jobs:
     runs-on: [self-hosted, style-checker-aarch64]
     needs: [build_arm_release, config_workflow, dockers_build_amd, dockers_build_arm]
 ||||||| parent of f905df4ff88 (make jobs ec2 only)
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-ec2-style-checker-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_arm_release]
 =======
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 ||||||| parent of 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 =======
     runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 >>>>>>> 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
@@ -1661,12 +1661,12 @@ jobs:
     runs-on: [self-hosted, style-checker-aarch64]
     needs: [build_amd_asan, build_amd_darwin, build_amd_debug, build_amd_release, build_amd_tsan, build_arm_darwin, build_arm_release, compatibility_check_amd_release, compatibility_check_arm_release, config_workflow, docker_keeper_image, docker_server_image, dockers_build_amd, dockers_build_arm, install_packages_amd_release, install_packages_arm_release, integration_tests_amd_asan_db_disk_old_analyzer_1_6, integration_tests_amd_asan_db_disk_old_analyzer_2_6, integration_tests_amd_asan_db_disk_old_analyzer_3_6, integration_tests_amd_asan_db_disk_old_analyzer_4_6, integration_tests_amd_asan_db_disk_old_analyzer_5_6, integration_tests_amd_asan_db_disk_old_analyzer_6_6, integration_tests_amd_tsan_1_6, integration_tests_amd_tsan_2_6, integration_tests_amd_tsan_3_6, integration_tests_amd_tsan_4_6, integration_tests_amd_tsan_5_6, integration_tests_amd_tsan_6_6, stateless_tests_amd_asan_db_disk_distributed_plan_sequential, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stress_test_amd_tsan]
 ||||||| parent of f905df4ff88 (make jobs ec2 only)
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-ec2-style-checker-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_debug, build_amd_asan, build_amd_tsan, build_amd_release, build_arm_release, build_amd_darwin, build_arm_darwin, docker_server_image, docker_keeper_image, install_packages_amd_release, install_packages_arm_release, compatibility_check_amd_release, compatibility_check_arm_release, stateless_tests_amd_asan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_distributed_plan_parallel_2_2, stateless_tests_amd_asan_db_disk_distributed_plan_sequential, stress_test_amd_tsan, integration_tests_amd_asan_db_disk_old_analyzer_1_6, integration_tests_amd_asan_db_disk_old_analyzer_2_6, integration_tests_amd_asan_db_disk_old_analyzer_3_6, integration_tests_amd_asan_db_disk_old_analyzer_4_6, integration_tests_amd_asan_db_disk_old_analyzer_5_6, integration_tests_amd_asan_db_disk_old_analyzer_6_6, integration_tests_amd_tsan_1_6, integration_tests_amd_tsan_2_6, integration_tests_amd_tsan_3_6, integration_tests_amd_tsan_4_6, integration_tests_amd_tsan_5_6, integration_tests_amd_tsan_6_6]
 =======
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 ||||||| parent of 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker-aarch64]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 =======
     runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker-aarch64]
 >>>>>>> 2ca5f0e7a82 (fix jobs intended for ec2 getting stolen)

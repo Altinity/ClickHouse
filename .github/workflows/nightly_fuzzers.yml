@@ -77,7 +77,7 @@ jobs:
           fi
 
   dockers_build_amd:
-    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-style-checker]
+    runs-on: [self-hosted, altinity-aws-ec2-runners, altinity-ec2-style-checker]
     needs: [config_workflow]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'RG9ja2VycyBCdWlsZCAoYW1kKQ==') }}
     name: "Dockers Build (amd)"
