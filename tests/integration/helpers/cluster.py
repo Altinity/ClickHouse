@@ -656,6 +656,7 @@ class ClickHouseCluster:
         self.with_redis = False
         self.with_cassandra = False
         self.with_ldap = False
+        self.with_keycloak = False
         self.with_jdbc_bridge = False
         self.with_nginx = False
         self.with_hive = False
@@ -757,6 +758,11 @@ class ClickHouseCluster:
         self.ldap_container = None
         self.ldap_port = 1389
         self.ldap_id = self.get_instance_docker_id(self.ldap_host)
+
+        # available when with_keycloak == True
+        self.keycloak_host = "keycloak"
+        self.keycloak_port = 18080
+        self.base_keycloak_cmd = None
 
         # available when with_rabbitmq == True
         self.rabbitmq_host = "rabbitmq1"
@@ -1797,6 +1803,25 @@ class ClickHouseCluster:
         )
         return self.base_ldap_cmd
 
+    def setup_keycloak_cmd(self, instance, env_variables, docker_compose_yml_dir):
+        self.with_keycloak = True
+        env_variables["KEYCLOAK_EXTERNAL_PORT"] = str(self.keycloak_port)
+        env_variables["KEYCLOAK_REALM_FILE"] = p.join(
+            self.base_dir,
+            "keycloak",
+            "realm-export.json",
+        )
+        self.base_cmd.extend(
+            ["--file", p.join(docker_compose_yml_dir, "docker_compose_keycloak.yml")]
+        )
+        self.base_keycloak_cmd = self.compose_cmd(
+            "--env-file",
+            instance.env_file,
+            "--file",
+            p.join(docker_compose_yml_dir, "docker_compose_keycloak.yml"),
+        )
+        return self.base_keycloak_cmd
+
     def setup_jdbc_bridge_cmd(self, instance, env_variables, docker_compose_yml_dir):
         self.with_jdbc_bridge = True
         env_variables["JDBC_DRIVER_LOGS"] = self.jdbc_driver_logs_dir
@@ -1962,6 +1987,7 @@ class ClickHouseCluster:
         with_azurite=False,
         with_cassandra=False,
         with_ldap=False,
+        with_keycloak=False,
         with_jdbc_bridge=False,
         with_hive=False,
         with_coredns=False,
@@ -2104,6 +2130,7 @@ class ClickHouseCluster:
             with_coredns=with_coredns,
             with_cassandra=with_cassandra,
             with_ldap=with_ldap,
+            with_keycloak=with_keycloak,
             with_iceberg_catalog=with_iceberg_catalog,
             with_glue_catalog=with_glue_catalog,
             with_hms_catalog=with_hms_catalog,
@@ -2361,6 +2388,11 @@ class ClickHouseCluster:
         if with_ldap and not self.with_ldap:
             cmds.append(
                 self.setup_ldap_cmd(instance, env_variables, docker_compose_yml_dir)
+            )
+
+        if with_keycloak and not self.with_keycloak:
+            cmds.append(
+                self.setup_keycloak_cmd(instance, env_variables, docker_compose_yml_dir)
             )
 
         if with_jdbc_bridge and not self.with_jdbc_bridge:
@@ -3336,6 +3368,26 @@ class ClickHouseCluster:
 
         raise Exception("Can't wait LDAP to start")
 
+    def wait_keycloak_to_start(self, timeout=120):
+        discovery_url = (
+            f"http://localhost:{self.keycloak_port}"
+            f"/realms/clickhouse-test/.well-known/openid-configuration"
+        )
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                resp = requests.get(discovery_url, timeout=5)
+                if resp.status_code == 200:
+                    logging.info("Keycloak is online")
+                    return
+            except Exception as ex:
+                logging.warning("Waiting for Keycloak: %s", ex)
+            time.sleep(3)
+        raise Exception("Keycloak did not start in time")
+
+    def get_keycloak_url(self):
+        return f"http://localhost:{self.keycloak_port}"
+
     def wait_prometheus_to_start(self):
         if "writer" in self.prometheus_servers:
             self.prometheus_writer_ip = self.get_instance_ip(self.prometheus_writer_host)
@@ -3826,6 +3878,11 @@ class ClickHouseCluster:
                 self.up_called = True
                 self.wait_ldap_to_start()
 
+            if self.with_keycloak and self.base_keycloak_cmd:
+                subprocess_check_call(self.base_keycloak_cmd + ["up", "-d"])
+                self.up_called = True
+                self.wait_keycloak_to_start()
+
             if self.with_jdbc_bridge and self.base_jdbc_bridge_cmd:
                 os.makedirs(self.jdbc_driver_logs_dir)
                 os.chmod(self.jdbc_driver_logs_dir, stat.S_IRWXU | stat.S_IRWXO)
@@ -4310,6 +4367,7 @@ class ClickHouseInstance:
         with_coredns,
         with_cassandra,
         with_ldap,
+        with_keycloak,
         with_iceberg_catalog,
         with_glue_catalog,
         with_hms_catalog,
@@ -4433,6 +4491,7 @@ class ClickHouseInstance:
         self.with_azurite = with_azurite
         self.with_cassandra = with_cassandra
         self.with_ldap = with_ldap
+        self.with_keycloak = with_keycloak
         self.with_jdbc_bridge = with_jdbc_bridge
         self.with_hive = with_hive
         self.with_coredns = with_coredns
@@ -5517,7 +5576,7 @@ class ClickHouseInstance:
                         f.write(key + "=" + value + "\n")
 
     @contextmanager
-    def with_replace_config(self, path, replacement):
+    def with_replace_config(self, path, replacement, reload_before=False, reload_after=False):
         """Create a copy of existing config (if exists) and revert on leaving the context"""
         _directory, filename = os.path.split(path)
         basename, extension = os.path.splitext(filename)
@@ -5529,12 +5588,16 @@ class ClickHouseInstance:
         self.exec_in_container(
             ["bash", "-c", "echo '{}' > {}".format(replacement, path)]
         )
+        if reload_before:
+            self.query("SYSTEM RELOAD CONFIG")
         try:
             yield
         finally:
             self.exec_in_container(
                 ["bash", "-c", f"test ! -f {backup_path} || mv {backup_path} {path}"]
             )
+            if reload_after:
+                self.query("SYSTEM RELOAD CONFIG")
 
     def replace_config(self, path_to_config, replacement):
         self.exec_in_container(
@@ -5782,6 +5845,9 @@ class ClickHouseInstance:
 
         if self.with_ldap:
             depends_on.append("openldap")
+
+        if self.with_keycloak:
+            depends_on.append("keycloak")
 
         if self.with_rabbitmq:
             depends_on.append("rabbitmq1")
