@@ -55,8 +55,8 @@ namespace
 
         /// Basic constructor: `username:password` already split out of the
         /// base64-decoded `Basic <...>` header.
-        AuthMiddleware(const std::string & token, const std::string & username, const std::string & password)
-            : scheme_(Scheme::Basic), token_(token), username_(username), password_(password)
+        AuthMiddleware(const std::string & token, const std::string & username, const std::string & password, bool is_handshake)
+            : scheme_(Scheme::Basic), token_(token), username_(username), password_(password), is_handshake_(is_handshake)
         {
         }
 
@@ -66,8 +66,8 @@ namespace
         /// real JWT failed (no `:` after base64-decoding) -- the `Bearer`
         /// label was just a misleading alias for `Basic`.
         struct BearerTag {};
-        AuthMiddleware(BearerTag, const std::string & bearer_token)
-            : scheme_(Scheme::Bearer), token_(bearer_token)
+        AuthMiddleware(BearerTag, const std::string & bearer_token, bool is_handshake)
+            : scheme_(Scheme::Bearer), token_(bearer_token), is_handshake_(is_handshake)
         {
         }
 
@@ -83,13 +83,12 @@ namespace
 
         void SendingHeaders(arrow::flight::AddCallHeaders * outgoing_headers) override
         {
-            /// Echo the original scheme. pyarrow's `authenticate_basic_token`
-            /// captures this header verbatim and reuses it on every subsequent
-            /// RPC, so if we always emit `Bearer` here a Basic-auth client
-            /// ends up sending `Bearer <base64(user:password)>` next time -- and
-            /// the Bearer path runs token validation, which fails when no
-            /// token processors are configured. Preserving the scheme keeps
-            /// Basic on the Basic path and Bearer on the token path.
+            /// Only echo on Handshake -- that's where pyarrow's
+            /// `authenticate_basic_token` reads the token. Emitting an
+            /// `Authorization` header on other responses aborts pyarrow's
+            /// flight client on `DoPut` / `GetFlightInfo`.
+            if (!is_handshake_)
+                return;
             const std::string & prefix = (scheme_ == Scheme::Bearer) ? "Bearer " : "Basic ";
             outgoing_headers->AddHeader(AUTHORIZATION_HEADER, prefix + token_);
         }
@@ -103,13 +102,14 @@ namespace
         const std::string token_;
         const std::string username_;
         const std::string password_;
+        const bool is_handshake_;
     };
 
     class AuthMiddlewareFactory : public arrow::flight::ServerMiddlewareFactory
     {
     public:
         arrow::Status StartCall(
-            const arrow::flight::CallInfo & /*info*/,
+            const arrow::flight::CallInfo & info,
             const arrow::flight::ServerCallContext & context,
             std::shared_ptr<arrow::flight::ServerMiddleware> * middleware) override
         {
@@ -123,6 +123,8 @@ namespace
 
             const std::string prefix_basic = "Basic ";
             const std::string prefix_bearer = "Bearer ";
+
+            const bool is_handshake = info.method == arrow::flight::FlightMethod::Handshake;
 
             /// Bearer first: route it to a real JWT/token path, NOT through the
             /// base64 + ':' split that Basic uses. A real JWT is base64url-
@@ -138,7 +140,7 @@ namespace
                 if (bearer_token.empty())
                     return arrow::Status::IOError("Bearer token is empty");
 
-                *middleware = std::make_unique<AuthMiddleware>(AuthMiddleware::BearerTag{}, bearer_token);
+                *middleware = std::make_unique<AuthMiddleware>(AuthMiddleware::BearerTag{}, bearer_token, is_handshake);
                 return arrow::Status::OK();
             }
 
@@ -156,7 +158,7 @@ namespace
                 auto user = credentials.substr(0, pos);
                 auto password = credentials.substr(pos + 1);
 
-                *middleware = std::make_unique<AuthMiddleware>(token, user, password);
+                *middleware = std::make_unique<AuthMiddleware>(token, user, password, is_handshake);
                 return arrow::Status::OK();
             }
 
