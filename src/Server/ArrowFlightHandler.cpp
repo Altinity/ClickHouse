@@ -8,9 +8,6 @@
 #include <Common/logger_useful.h>
 #include <Common/setThreadName.h>
 #include <Common/quoteString.h>
-#include <Access/AccessControl.h>
-#include <Access/Credentials.h>
-#include <Access/ExternalAuthenticators.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/Session.h>
 #include <Interpreters/executeQuery.h>
@@ -38,7 +35,6 @@ namespace DB
 
 namespace ErrorCodes
 {
-    extern const int AUTHENTICATION_FAILED;
     extern const int LOGICAL_ERROR;
     extern const int UNKNOWN_EXCEPTION;
 }
@@ -51,23 +47,10 @@ namespace
     class AuthMiddleware : public arrow::flight::ServerMiddleware
     {
     public:
-        enum class Scheme { Basic, Bearer };
-
-        /// Basic constructor: `username:password` already split out of the
-        /// base64-decoded `Basic <...>` header.
-        AuthMiddleware(const std::string & token, const std::string & username, const std::string & password, bool is_handshake)
-            : scheme_(Scheme::Basic), token_(token), username_(username), password_(password), is_handshake_(is_handshake)
-        {
-        }
-
-        /// Bearer constructor: stores the raw JWT (or other opaque bearer
-        /// credential) verbatim. Previously the factory stuffed bearer tokens
-        /// through the same base64 + `:` split as Basic, which guaranteed any
-        /// real JWT failed (no `:` after base64-decoding) -- the `Bearer`
-        /// label was just a misleading alias for `Basic`.
-        struct BearerTag {};
-        AuthMiddleware(BearerTag, const std::string & bearer_token, bool is_handshake)
-            : scheme_(Scheme::Bearer), token_(bearer_token), is_handshake_(is_handshake)
+        explicit AuthMiddleware(const std::string & token, const std::string & username, const std::string & password)
+            : token_(token)
+            , username_(username)
+            , password_(password)
         {
         }
 
@@ -76,21 +59,12 @@ namespace
             return *static_cast<AuthMiddleware *>(context.GetMiddleware(AUTHORIZATION_MIDDLEWARE_NAME));
         }
 
-        Scheme scheme() const { return scheme_; }
         const std::string & username() const { return username_; }
         const std::string & password() const { return password_; }
-        const std::string & bearerToken() const { return token_; }
 
         void SendingHeaders(arrow::flight::AddCallHeaders * outgoing_headers) override
         {
-            /// Only echo on Handshake -- that's where pyarrow's
-            /// `authenticate_basic_token` reads the token. Emitting an
-            /// `Authorization` header on other responses aborts pyarrow's
-            /// flight client on `DoPut` / `GetFlightInfo`.
-            if (!is_handshake_)
-                return;
-            const std::string & prefix = (scheme_ == Scheme::Bearer) ? "Bearer " : "Basic ";
-            outgoing_headers->AddHeader(AUTHORIZATION_HEADER, prefix + token_);
+            outgoing_headers->AddHeader(AUTHORIZATION_HEADER, "Bearer " + token_);
         }
 
         void CallCompleted(const arrow::Status & /*status*/) override { }
@@ -98,18 +72,16 @@ namespace
         std::string name() const override { return AUTHORIZATION_MIDDLEWARE_NAME; }
 
     private:
-        const Scheme scheme_;
         const std::string token_;
         const std::string username_;
         const std::string password_;
-        const bool is_handshake_;
     };
 
     class AuthMiddlewareFactory : public arrow::flight::ServerMiddlewareFactory
     {
     public:
         arrow::Status StartCall(
-            const arrow::flight::CallInfo & info,
+            const arrow::flight::CallInfo & /*info*/,
             const arrow::flight::ServerCallContext & context,
             std::shared_ptr<arrow::flight::ServerMiddleware> * middleware) override
         {
@@ -121,79 +93,31 @@ namespace
 
             auto auth_header = std::string(it->second);
 
+            std::string token;
+
             const std::string prefix_basic = "Basic ";
-            const std::string prefix_bearer = "Bearer ";
-
-            const bool is_handshake = info.method == arrow::flight::FlightMethod::Handshake;
-
-            /// Bearer first: route it to a real JWT/token path, NOT through the
-            /// base64 + ':' split that Basic uses. A real JWT is base64url-
-            /// encoded JSON in three parts separated by '.', so base64-decoding
-            /// the whole header value yields binary garbage and never contains
-            /// ':' -- the previous code treated `Bearer` as a strict alias for
-            /// `Basic` and rejected every legitimate bearer token. Token
-            /// validation runs later in the per-call helper, after the
-            /// `Session` is constructed.
-            if (auth_header.starts_with(prefix_bearer))
-            {
-                auto bearer_token = auth_header.substr(prefix_bearer.size());
-                if (bearer_token.empty())
-                    return arrow::Status::IOError("Bearer token is empty");
-
-                *middleware = std::make_unique<AuthMiddleware>(AuthMiddleware::BearerTag{}, bearer_token, is_handshake);
-                return arrow::Status::OK();
-            }
-
             if (auth_header.starts_with(prefix_basic))
-            {
-                auto token = auth_header.substr(prefix_basic.size());
-                if (token.empty())
-                    return arrow::Status::IOError("Basic credentials are empty");
+                token = auth_header.substr(prefix_basic.size());
 
-                std::string credentials = base64Decode(token, true);
-                auto pos = credentials.find(':');
-                if (pos == std::string::npos)
-                    return arrow::Status::IOError("Malformed credentials");
+            const std::string prefix_bearer = "Bearer ";
+            if (auth_header.starts_with(prefix_bearer))
+                token = auth_header.substr(prefix_bearer.size());
 
-                auto user = credentials.substr(0, pos);
-                auto password = credentials.substr(pos + 1);
+            if (token.empty())
+                return arrow::Status::IOError("Expected Basic auth scheme");
 
-                *middleware = std::make_unique<AuthMiddleware>(token, user, password, is_handshake);
-                return arrow::Status::OK();
-            }
+            std::string credentials = base64Decode(token, true);
+            auto pos = credentials.find(':');
+            if (pos == std::string::npos)
+                return arrow::Status::IOError("Malformed credentials");
 
-            return arrow::Status::IOError("Expected Basic or Bearer auth scheme");
+            auto user = credentials.substr(0, pos);
+            auto password = credentials.substr(pos + 1);
+
+            *middleware = std::make_unique<AuthMiddleware>(token, user, password);
+            return arrow::Status::OK();
         }
     };
-
-    /// Dispatches `Session::authenticate` based on the auth scheme captured by
-    /// the middleware. Basic → standard `(user, password)` overload. Bearer →
-    /// pre-validate the token (no cache priming, mirroring HTTP/TCP H-14) so
-    /// the resolved username gets attached to the credentials, then run the
-    /// per-user authentication chain via the `(Credentials &)` overload.
-    void authenticateArrowFlightSession(
-        Session & session,
-        const AuthMiddleware & auth,
-        const Poco::Net::SocketAddress & address,
-        ContextPtr global_context)
-    {
-        if (auth.scheme() == AuthMiddleware::Scheme::Bearer)
-        {
-            const auto & access_control = global_context->getAccessControl();
-            if (!access_control.isTokenAuthEnabled())
-                throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Token authentication is disabled");
-
-            TokenCredentials token_credentials(auth.bearerToken());
-            if (!access_control.getExternalAuthenticators().checkTokenCredentials(
-                    token_credentials, /*processor_name=*/"", /*jwt_claims=*/"", /*prime_cache_on_success=*/false))
-                throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Invalid bearer token");
-
-            session.authenticate(token_credentials, address);
-            return;
-        }
-
-        session.authenticate(auth.username(), auth.password(), address);
-    }
 
     String readFile(const String & filepath)
     {
@@ -1025,7 +949,7 @@ arrow::Status ArrowFlightHandler::GetFlightInfo(
             Session session{server.context(), ClientInfo::Interface::ARROW_FLIGHT};
 
             const auto & auth = AuthMiddleware::get(context);
-            authenticateArrowFlightSession(session, auth, getClientAddress(context), server.context());
+            session.authenticate(auth.username(), auth.password(), getClientAddress(context));
 
             auto query_context = session.makeQueryContext();
             query_context->setCurrentQueryId(""); /// Empty string means the query id will be autogenerated.
@@ -1111,7 +1035,7 @@ arrow::Status ArrowFlightHandler::GetSchema(
             Session session{server.context(), ClientInfo::Interface::ARROW_FLIGHT};
 
             const auto & auth = AuthMiddleware::get(context);
-            authenticateArrowFlightSession(session, auth, getClientAddress(context), server.context());
+            session.authenticate(auth.username(), auth.password(), getClientAddress(context));
 
             auto query_context = session.makeQueryContext();
             query_context->setCurrentQueryId(""); /// Empty string means the query id will be autogenerated.
@@ -1171,7 +1095,7 @@ arrow::Status ArrowFlightHandler::PollFlightInfo(
             auto session = std::make_unique<Session>(server.context(), ClientInfo::Interface::ARROW_FLIGHT);
 
             const auto & auth = AuthMiddleware::get(context);
-            authenticateArrowFlightSession(*session, auth, getClientAddress(context), server.context());
+            session->authenticate(auth.username(), auth.password(), getClientAddress(context));
 
             auto query_context = session->makeQueryContext();
             query_context->setCurrentQueryId(""); /// Empty string means the query id will be autogenerated.
@@ -1349,7 +1273,7 @@ arrow::Status ArrowFlightHandler::DoGet(
             Session session{server.context(), ClientInfo::Interface::ARROW_FLIGHT};
 
             const auto & auth = AuthMiddleware::get(context);
-            authenticateArrowFlightSession(session, auth, getClientAddress(context), server.context());
+            session.authenticate(auth.username(), auth.password(), getClientAddress(context));
 
             auto query_context = session.makeQueryContext();
             query_context->setCurrentQueryId(""); /// Empty string means the query id will be autogenerated.
@@ -1414,7 +1338,7 @@ arrow::Status ArrowFlightHandler::DoPut(
         Session session{server.context(), ClientInfo::Interface::ARROW_FLIGHT};
 
         const auto & auth = AuthMiddleware::get(context);
-        authenticateArrowFlightSession(session, auth, getClientAddress(context), server.context());
+        session.authenticate(auth.username(), auth.password(), getClientAddress(context));
 
         auto query_context = session.makeQueryContext();
         query_context->setCurrentQueryId(""); /// Empty string means the query id will be autogenerated.
