@@ -275,6 +275,7 @@ void StorageMergeTree::shutdown(bool)
 
     background_operations_assignee.finish();
     background_moves_assignee.finish();
+    cleanup_thread.stop();
 
     if (deduplication_log)
         deduplication_log->shutdown();

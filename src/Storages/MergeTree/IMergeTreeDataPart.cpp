@@ -661,7 +661,7 @@ bool IMergeTreeDataPart::isMovingPart() const
     return part_directory_path.parent_path().filename() == "moving";
 }
 
-void IMergeTreeDataPart::clearCaches()
+void IMergeTreeDataPart::clearCaches() const
 {
     if (cleared_data_in_caches.exchange(true) || is_duplicate)
         return;
