@@ -11,7 +11,7 @@ on:
         type: boolean
         default: false
   push:
-    branches: ['antalya', 'releases/*', 'antalya-*']
+    branches: ['antalya', 'releases/*', 'antalya-*', 'stable-*']
     tags: ['*']
 
 env:
