@@ -3240,95 +3240,6 @@ bool KeyCondition::extractPlainRangesForColumn(size_t column_index, Ranges & ran
     /// All Ranges in rpn_stack are plain.
     std::stack<PlainRanges> rpn_stack;
 
-    auto push_range_atom = [&](const RPNElement & element, bool negate)
-    {
-        if (element.getKeyColumn() != column_index)
-            rpn_stack.push(PlainRanges::makeUniverse());
-        else if (negate)
-            rpn_stack.push(PlainRanges(element.range.invertRange()));
-        else
-            rpn_stack.push(PlainRanges(element.range));
-    };
-
-    auto find_tuple_index_for_column = [&](const RPNElement & element) -> std::optional<size_t>
-    {
-        chassert(element.set_index);
-        for (const auto & mapping : element.set_index->getIndexesMapping())
-            if (mapping.key_index == column_index)
-                return mapping.tuple_index;
-        return std::nullopt;
-    };
-
-    auto try_extract_set_ranges = [&](const RPNElement & element, bool negate, PlainRanges & out) -> bool
-    {
-        auto tuple_index = find_tuple_index_for_column(element);
-        if (!tuple_index)
-        {
-            out = PlainRanges::makeUniverse();
-            return true;
-        }
-
-        if (element.set_index->hasMonotonicFunctionsChain())
-            return false;
-
-        if (element.set_index->size() == 0)
-        {
-            out = negate ? PlainRanges::makeUniverse() : PlainRanges::makeBlank();
-            return true;
-        }
-
-        const auto & values = element.set_index->getOrderedSet();
-        if (*tuple_index >= values.size())
-            return false;
-
-        const auto & column_values = *values[*tuple_index];
-        const size_t values_size = element.set_index->size();
-        Ranges points_range;
-
-        if (!negate)
-        {
-            /// values in set_index are ordered and no duplication
-            for (size_t i = 0; i < values_size; ++i)
-            {
-                FieldRef value;
-                column_values.get(i, value);
-                if (value.isNull())
-                    return false;
-                points_range.push_back({value});
-            }
-        }
-        else
-        {
-            std::optional<FieldRef> previous;
-            for (size_t i = 0; i < values_size; ++i)
-            {
-                FieldRef current;
-                column_values.get(i, current);
-                if (current.isNull())
-                    return false;
-
-                if (previous)
-                {
-                    Range between(*previous, false, current, false);
-                    /// skip blank range
-                    if (!(between.left > between.right || (between.left == between.right && !between.left_included && !between.right_included)))
-                        points_range.push_back(between);
-                }
-                else
-                {
-                    points_range.push_back(Range::createRightBounded(current, false));
-                }
-
-                previous = current;
-            }
-
-            points_range.push_back(Range::createLeftBounded(*previous, false));
-        }
-
-        out = PlainRanges(points_range);
-        return true;
-    };
-
     for (const auto & element : rpn)
     {
         if (element.function == RPNElement::FUNCTION_AND)
@@ -3376,20 +3287,102 @@ bool KeyCondition::extractPlainRangesForColumn(size_t column_index, Ranges & ran
         else /// atom relational expression or constants
         {
             if (element.function == RPNElement::FUNCTION_IN_RANGE)
-                push_range_atom(element, /*negate=*/false);
+            {
+                if (element.getKeyColumn() != column_index)
+                    rpn_stack.push(PlainRanges::makeUniverse());
+                else
+                    rpn_stack.push(PlainRanges(element.range));
+            }
             else if (element.function == RPNElement::FUNCTION_NOT_IN_RANGE)
             {
-                push_range_atom(element, /*negate=*/true);
+                if (element.getKeyColumn() != column_index)
+                    rpn_stack.push(PlainRanges::makeUniverse());
+                else
+                    rpn_stack.push(PlainRanges(element.range.invertRange()));
             }
-            else if (element.function == RPNElement::FUNCTION_IN_SET || element.function == RPNElement::FUNCTION_NOT_IN_SET)
+            else if (element.function == RPNElement::FUNCTION_IN_SET)
             {
-                PlainRanges set_ranges = PlainRanges::makeUniverse();
-                if (!try_extract_set_ranges(
-                        element,
-                        /*negate=*/element.function == RPNElement::FUNCTION_NOT_IN_SET,
-                        set_ranges))
+                /// Only single-column set atoms are supported. For multi-column tuple-IN, bail out;
+                /// the caller falls back to "can't prune" (see `HybridSegmentPruner::canBePruned`).
+                const auto & mapping = element.set_index->getIndexesMapping();
+                if (mapping.size() != 1)
                     return false;
-                rpn_stack.push(std::move(set_ranges));
+                if (mapping[0].key_index != column_index)
+                {
+                    rpn_stack.push(PlainRanges::makeUniverse());
+                    continue;
+                }
+
+                if (element.set_index->hasMonotonicFunctionsChain())
+                    return false;
+
+                if (element.set_index->size() == 0)
+                {
+                    rpn_stack.push(PlainRanges::makeBlank()); /// skip blank range
+                    continue;
+                }
+
+                const auto & values = element.set_index->getOrderedSet();
+                Ranges points_range;
+
+                /// values in set_index are ordered and no duplication
+                for (size_t i = 0; i < element.set_index->size(); i++)
+                {
+                    FieldRef f;
+                    values[0]->get(i, f);
+                    if (f.isNull())
+                        return false;
+                    points_range.push_back({f});
+                }
+                rpn_stack.push(PlainRanges(points_range));
+            }
+            else if (element.function == RPNElement::FUNCTION_NOT_IN_SET)
+            {
+                const auto & mapping = element.set_index->getIndexesMapping();
+                if (mapping.size() != 1)
+                    return false;
+                if (mapping[0].key_index != column_index)
+                {
+                    rpn_stack.push(PlainRanges::makeUniverse());
+                    continue;
+                }
+
+                if (element.set_index->hasMonotonicFunctionsChain())
+                    return false;
+
+                if (element.set_index->size() == 0)
+                {
+                    rpn_stack.push(PlainRanges::makeUniverse());
+                    continue;
+                }
+
+                const auto & values = element.set_index->getOrderedSet();
+                Ranges points_range;
+
+                std::optional<FieldRef> pre;
+                for (size_t i=0; i<element.set_index->size(); i++)
+                {
+                    FieldRef cur;
+                    values[0]->get(i, cur);
+
+                    if (cur.isNull())
+                        return false;
+                    if (pre)
+                    {
+                        Range r(*pre, false, cur, false);
+                        /// skip blank range
+                        if (!(r.left > r.right || (r.left == r.right && !r.left_included && !r.right_included)))
+                            points_range.push_back(r);
+                    }
+                    else
+                    {
+                        points_range.push_back(Range::createRightBounded(cur, false));
+                    }
+                    pre = cur;
+                }
+
+                points_range.push_back(Range::createLeftBounded(*pre, false));
+                rpn_stack.push(PlainRanges(points_range));
             }
             else if (element.function == RPNElement::ALWAYS_FALSE)
             {
