@@ -313,3 +313,4 @@
   regex: true
   check_types:
   - coverage
+  - sanitize-coverage
