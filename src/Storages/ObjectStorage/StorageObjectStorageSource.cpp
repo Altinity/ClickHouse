@@ -774,6 +774,11 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                 if (!column.second.second.type->isNullable())
                     continue;
 
+                /// With View over Iceberg table we have someting like 'materialize(time)' as column_name
+                /// Simple cheap check
+                if (column_name.starts_with("materialize(") && column_name.ends_with(")"))
+                    continue;
+
                 /// Skip columns produced by prewhere or row-level filter expressions —
                 /// they are computed at read time, not stored in the file.
                 if (format_filter_info
@@ -887,7 +892,9 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             && (Poco::toLower(object_info->getFileFormat().value_or(configuration->getFormat())) == "parquet")
             && !object_info->getObjectMetadata()->etag.empty())
         {
-            const std::optional<RelativePathWithMetadata> object_with_metadata = object_info->relative_path_with_metadata;
+            std::optional<RelativePathWithMetadata> object_with_metadata = object_info->relative_path_with_metadata;
+            if (object_info->isArchive())
+                object_with_metadata->relative_path = object_info->getPath();
             input_format = FormatFactory::instance().getInputWithMetadata(
                 object_info->getFileFormat().value_or(configuration->getFormat()),
                 *read_buf,
