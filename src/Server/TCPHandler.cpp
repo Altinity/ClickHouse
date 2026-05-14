@@ -2049,6 +2049,31 @@ void TCPHandler::receiveHello()
     }
 #endif
 
+<<<<<<< HEAD
+=======
+    if (is_jwt_based_auth)
+    {
+        const auto & access_control = server.context()->getAccessControl();
+        if (!access_control.isTokenAuthEnabled())
+            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Token authentication is disabled");
+
+        auto credentials = TokenCredentials(password);
+
+        const auto & external_authenticators = access_control.getExternalAuthenticators();
+
+        /// Pre-user-lookup token validation. Pass `prime_cache_on_success=false`
+        /// so this unconstrained call (no processor pin, no JWT claims) does not
+        /// populate the token cache; the per-user authentication path is the only
+        /// site allowed to populate it, after applying the user's pinned processor
+        /// and per-user claims. See `ExternalAuthenticators::checkTokenCredentials`.
+        if (!external_authenticators.checkTokenCredentials(credentials, /*processor_name=*/"", /*jwt_claims=*/"", /*prime_cache_on_success=*/false))
+            throw Exception(ErrorCodes::AUTHENTICATION_FAILED, "Token is invalid");
+
+        session->authenticate(credentials, getClientAddress(client_info), socket().peerAddress());
+        return;
+    }
+
+>>>>>>> 52e87d75685 (Merge pull request #1777 from Altinity/fix/antalya-26.3/oauth-address-audit)
     session->authenticate(user, password, getClientAddress(client_info), socket().peerAddress());
 }
 
