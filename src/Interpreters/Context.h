@@ -96,6 +96,7 @@ class AsynchronousMetrics;
 class BackgroundSchedulePool;
 class MergeList;
 class MovesList;
+class ExportsList;
 class ReplicatedFetchList;
 class RefreshSet;
 class Cluster;
@@ -1249,6 +1250,7 @@ public:
     void makeQueryContext();
     void makeQueryContextForMerge(const MergeTreeSettings & merge_tree_settings);
     void makeQueryContextForMutate(const MergeTreeSettings & merge_tree_settings);
+    void makeQueryContextForExportPart();
     void makeSessionContext();
     void makeGlobalContext();
     void makeBackgroundContext(const Poco::Util::AbstractConfiguration & config);
@@ -1284,6 +1286,9 @@ public:
 
     MovesList & getMovesList();
     const MovesList & getMovesList() const;
+
+    ExportsList & getExportsList();
+    const ExportsList & getExportsList() const;
 
     ReplicatedFetchList & getReplicatedFetchList();
     const ReplicatedFetchList & getReplicatedFetchList() const;
@@ -1371,7 +1376,7 @@ public:
 
     void setIndexUncompressedCache(const String & cache_policy, size_t max_size_in_bytes, double size_ratio);
     void updateIndexUncompressedCacheConfiguration(const Poco::Util::AbstractConfiguration & config);
-    std::shared_ptr<UncompressedCache> getIndexUncompressedCache() const;
+    std::shared_ptr<UncompressedCache> getIndexUncompressedCache(bool only_if_enabled = true) const;
     void clearIndexUncompressedCache() const;
 
     void setIndexMarkCache(const String & cache_policy, size_t max_cache_size_in_bytes, double size_ratio);
@@ -1845,6 +1850,7 @@ public:
 
     ThrottlerPtr getMutationsThrottler() const;
     ThrottlerPtr getMergesThrottler() const;
+    ThrottlerPtr getExportsThrottler() const;
 
     ThrottlerPtr getDistributedCacheReadThrottler() const;
     ThrottlerPtr getDistributedCacheWriteThrottler() const;
@@ -1872,6 +1878,10 @@ struct HTTPContext : public IHTTPContext
     uint64_t getMaxFieldNameSize() const override;
 
     uint64_t getMaxFieldValueSize() const override;
+
+    uint64_t getMaxRequestHeaderSize() const override;
+
+    Poco::Timespan getHeadersReadTimeout() const override;
 
     Poco::Timespan getReceiveTimeout() const override;
 

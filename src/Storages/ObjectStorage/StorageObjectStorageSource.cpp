@@ -86,6 +86,7 @@ namespace Setting
     extern const SettingsBool use_parquet_metadata_cache;
     extern const SettingsBool input_format_parquet_use_native_reader_v3;
     extern const SettingsBool allow_experimental_iceberg_read_optimization;
+    extern const SettingsBool use_object_storage_list_objects_cache;
 }
 
 namespace ErrorCodes
@@ -216,18 +217,52 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
         // If paths contains a value, validate the extracted paths and use the key-based iterator
         // (even if the result is empty, indicating no scanning is required).
         if (!paths)
+        {
+            std::shared_ptr<IObjectStorageIterator> object_iterator = nullptr;
+            std::unique_ptr<GlobIterator::ListObjectsCacheWithKey> cache_ptr = nullptr;
+
+            if (local_context->getSettingsRef()[Setting::use_object_storage_list_objects_cache] && object_storage->supportsListObjectsCache())
+            {
+                auto & cache = ObjectStorageListObjectsCache::instance();
+                ObjectStorageListObjectsCache::Key cache_key {object_storage->getDescription(), configuration->getNamespace(), configuration->getRawPath().cutGlobs(configuration->supportsPartialPathPrefix()), with_tags};
+
+                if (auto objects_info = cache.get(cache_key, /*filter_by_prefix=*/ false))
+                {
+                    /// suboptimal because of the recent upstream changes to the ObjectInfo structure
+                    /// re-think this with more time and see if there is a more optimized approach
+                    RelativePathsWithMetadata relative_path_with_metadata;
+                    relative_path_with_metadata.reserve(objects_info->size());
+
+                    for (const auto & object_info : *objects_info)
+                    {
+                        relative_path_with_metadata.emplace_back(std::make_shared<RelativePathWithMetadata>(object_info->getPath(), object_info->getObjectMetadata()));
+                    }
+
+                    object_iterator = std::make_shared<ObjectStorageIteratorFromList>(std::move(relative_path_with_metadata));
+                }
+                else
+                {
+                    cache_ptr = std::make_unique<GlobIterator::ListObjectsCacheWithKey>(cache, cache_key);
+                    object_iterator = object_storage->iterate(configuration->getRawPath().cutGlobs(configuration->supportsPartialPathPrefix()), query_settings.list_object_keys_size, with_tags, std::nullopt);
+                }
+            }
+            else
+            {
+                object_iterator = object_storage->iterate(configuration->getRawPath().cutGlobs(configuration->supportsPartialPathPrefix()), query_settings.list_object_keys_size, with_tags, std::nullopt);
+            }
+            
             iterator = std::make_unique<GlobIterator>(
-                object_storage,
+                object_iterator,
                 configuration,
                 predicate,
                 virtual_columns,
                 hive_columns,
                 local_context,
                 is_archive ? nullptr : read_keys,
-                query_settings.list_object_keys_size,
                 query_settings.throw_on_zero_files_match,
-                with_tags,
-                file_progress_callback);
+                file_progress_callback,
+                std::move(cache_ptr));
+        }
         else
         {
             // Validate that extracted paths match the glob pattern to prevent scanning unallowed data
@@ -517,7 +552,7 @@ void StorageObjectStorageSource::addNumRowsToCache(const ObjectInfo & object_inf
 {
     const auto cache_key = getKeyForSchemaCache(
         getUniqueStoragePathIdentifier(*configuration, object_info),
-        object_info.getFileFormat().value_or(configuration->format),
+        object_info.getFileFormat().value_or(configuration->getFormat()),
         format_settings,
         read_context);
     schema_cache.addNumRows(cache_key, num_rows);
@@ -632,7 +667,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
         const auto cache_key = getKeyForSchemaCache(
             getUniqueStoragePathIdentifier(*configuration, *object_info),
-            object_info->getFileFormat().value_or(configuration->format),
+            object_info->getFileFormat().value_or(configuration->getFormat()),
             format_settings,
             context_);
 
@@ -739,6 +774,11 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                 if (!column.second.second.type->isNullable())
                     continue;
 
+                /// With View over Iceberg table we have someting like 'materialize(time)' as column_name
+                /// Simple cheap check
+                if (column_name.starts_with("materialize(") && column_name.ends_with(")"))
+                    continue;
+
                 /// Skip columns produced by prewhere or row-level filter expressions —
                 /// they are computed at read time, not stored in the file.
                 if (format_filter_info
@@ -801,13 +841,13 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         CompressionMethod compression_method;
         if (const auto * object_info_in_archive = dynamic_cast<const ArchiveIterator::ObjectInfoInArchive *>(object_info.get()))
         {
-            compression_method = chooseCompressionMethod(configuration->getPathInArchive(), configuration->compression_method);
+            compression_method = chooseCompressionMethod(configuration->getPathInArchive(), configuration->getCompressionMethod());
             const auto & archive_reader = object_info_in_archive->archive_reader;
             read_buf = archive_reader->readFile(object_info_in_archive->path_in_archive, /*throw_on_not_found=*/true);
         }
         else
         {
-            compression_method = chooseCompressionMethod(object_info->getFileName(), configuration->compression_method);
+            compression_method = chooseCompressionMethod(object_info->getFileName(), configuration->getCompressionMethod());
             read_buf = createReadBuffer(object_info->relative_path_with_metadata, object_storage, context_, log);
         }
 
@@ -841,7 +881,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             "Reading object '{}', size: {} bytes, with format: {}",
             object_info->getPath(),
             object_info->getObjectMetadata()->size_bytes,
-            object_info->getFileFormat().value_or(configuration->format));
+            object_info->getFileFormat().value_or(configuration->getFormat()));
 
         bool use_native_reader_v3 = format_settings.has_value()
             ? format_settings->parquet.use_native_reader_v3
@@ -849,12 +889,14 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
         InputFormatPtr input_format;
         if (context_->getSettingsRef()[Setting::use_parquet_metadata_cache] && use_native_reader_v3
-            && (object_info->getFileFormat().value_or(configuration->format) == "Parquet")
+            && (object_info->getFileFormat().value_or(configuration->getFormat()) == "Parquet")
             && !object_info->getObjectMetadata()->etag.empty())
         {
-            const std::optional<RelativePathWithMetadata> object_with_metadata = object_info->relative_path_with_metadata;
+            std::optional<RelativePathWithMetadata> object_with_metadata = object_info->relative_path_with_metadata;
+            if (object_info->isArchive())
+                object_with_metadata->relative_path = object_info->getPath();
             input_format = FormatFactory::instance().getInputWithMetadata(
-                object_info->getFileFormat().value_or(configuration->format),
+                object_info->getFileFormat().value_or(configuration->getFormat()),
                 *read_buf,
                 initial_header,
                 context_,
@@ -873,7 +915,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         else
         {
             input_format = FormatFactory::instance().getInput(
-            object_info->getFileFormat().value_or(configuration->format),
+            object_info->getFileFormat().value_or(configuration->getFormat()),
             *read_buf,
             initial_header,
             context_,
@@ -1180,19 +1222,18 @@ std::unique_ptr<ReadBufferFromFileBase> createReadBuffer(
 }
 
 StorageObjectStorageSource::GlobIterator::GlobIterator(
-    ObjectStoragePtr object_storage_,
-    StorageObjectStorageConfigurationPtr configuration_,
+    const ObjectStorageIteratorPtr & object_storage_iterator_,
+    ConfigurationPtr configuration_,
     const ActionsDAG::Node * predicate,
     const NamesAndTypesList & virtual_columns_,
     const NamesAndTypesList & hive_columns_,
     ContextPtr context_,
     ObjectInfos * read_keys_,
-    size_t list_object_keys_size,
     bool throw_on_zero_files_match_,
-    bool with_tags,
-    std::function<void(FileProgress)> file_progress_callback_)
+    std::function<void(FileProgress)> file_progress_callback_,
+    std::unique_ptr<ListObjectsCacheWithKey> list_cache_)
     : WithContext(context_)
-    , object_storage(object_storage_)
+    , object_storage_iterator(object_storage_iterator_)
     , configuration(configuration_)
     , virtual_columns(virtual_columns_)
     , hive_columns(hive_columns_)
@@ -1201,14 +1242,13 @@ StorageObjectStorageSource::GlobIterator::GlobIterator(
     , read_keys(read_keys_)
     , local_context(context_)
     , file_progress_callback(file_progress_callback_)
+    , list_cache(std::move(list_cache_))
 {
     const auto & reading_path = configuration->getPathForRead();
     if (reading_path.hasGlobs())
     {
         const auto & key_with_globs = reading_path;
         const auto key_prefix = reading_path.cutGlobs(configuration->supportsPartialPathPrefix());
-
-        object_storage_iterator = object_storage->iterate(key_prefix, list_object_keys_size, with_tags, std::nullopt);
 
         matcher = std::make_unique<re2::RE2>(makeRegexpPatternFromGlobs(key_with_globs.path));
         if (!matcher->ok())
@@ -1275,6 +1315,10 @@ ObjectInfoPtr StorageObjectStorageSource::GlobIterator::nextUnlocked(size_t /* p
             auto result = object_storage_iterator->getCurrentBatchAndScheduleNext();
             if (!result.has_value())
             {
+                if (list_cache)
+                {
+                    list_cache->set(std::move(object_list));
+                }
                 is_finished = true;
                 LOG_DEBUG(log, "Listing finished: total_listed={}, glob_filtered={}, predicate_filtered={}",
                     total_listed, total_glob_filtered, total_predicate_filtered);
@@ -1292,6 +1336,11 @@ ObjectInfoPtr StorageObjectStorageSource::GlobIterator::nextUnlocked(size_t /* p
             size_t after_filter = 0;
 
             listed_in_batch = new_batch.size();
+
+            if (list_cache)
+            {
+                object_list.insert(object_list.end(), new_batch.begin(), new_batch.end());
+            }
 
             for (auto it = new_batch.begin(); it != new_batch.end();)
             {
