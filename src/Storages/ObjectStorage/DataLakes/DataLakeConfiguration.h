@@ -176,15 +176,15 @@ public:
 
     void checkAlterIsPossible(const AlterCommands & commands) override
     {
-        assertInitializedDL();
-        current_metadata->checkAlterIsPossible(commands);
+        if(current_metadata)
+            current_metadata->checkAlterIsPossible(commands);
     }
 
-    void alter(const AlterCommands & params, ContextPtr context) override
+    void alter(const AlterCommands & params, ContextPtr context,
+        const StorageID & storage_id, std::shared_ptr<DataLake::ICatalog> catalog) override
     {
         assertInitializedDL();
-        current_metadata->alter(params, context);
-
+        current_metadata->alter(params, shared_from_this(), context, storage_id, catalog);
     }
 
     ObjectStoragePtr createObjectStorage(ContextPtr context, bool is_readonly, StorageObjectStorageConfiguration::CredentialsConfigurationCallback refresh_credentials_callback) override
@@ -478,7 +478,6 @@ private:
 
     void assertInitializedDL() const
     {
-        BaseStorageConfiguration::assertInitialized();
         if (!current_metadata)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Metadata is not initialized");
     }
@@ -708,7 +707,9 @@ public:
 
     void checkAlterIsPossible(const AlterCommands & commands) override { getImpl().checkAlterIsPossible(commands); }
 
-    void alter(const AlterCommands & params, ContextPtr context) override { getImpl().alter(params, context); }
+    void alter(const AlterCommands & params, ContextPtr context,
+        const StorageID & storage_id, std::shared_ptr<DataLake::ICatalog> catalog) override
+    { getImpl().alter(params, context, storage_id, catalog); }
 
     const DataLakeStorageSettings & getDataLakeSettings() const override { return getImpl().getDataLakeSettings(); }
 

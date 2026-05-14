@@ -31,6 +31,16 @@ struct AccessToken
     }
 };
 
+/// Builds the JSON body for `POST .../namespaces/{ns}/tables/{table}` (Iceberg REST update).
+///
+/// Returns `nullptr` when `new_snapshot` is null (nothing to commit). Throws
+/// `DB::Exception(DATALAKE_DATABASE_ERROR)` with a specific message when the metadata
+/// blob is malformed (e.g. missing `current-schema-id`, no schema object matching it).
+Poco::JSON::Object::Ptr buildUpdateMetadataRequestBody(
+    const String & namespace_name,
+    const String & table_name,
+    Poco::JSON::Object::Ptr new_snapshot);
+
 class RestCatalog : public ICatalog, public DB::WithContext
 {
 public:
