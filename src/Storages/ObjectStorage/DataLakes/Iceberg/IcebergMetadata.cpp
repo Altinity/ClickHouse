@@ -685,7 +685,12 @@ void IcebergMetadata::checkAlterIsPossible(const AlterCommands & commands)
     }
 }
 
-void IcebergMetadata::alter(const AlterCommands & params, ContextPtr context)
+void IcebergMetadata::alter(
+    const AlterCommands & params,
+    StorageObjectStorageConfigurationPtr configuration,
+    ContextPtr context,
+    const StorageID & storage_id,
+    std::shared_ptr<DataLake::ICatalog> catalog)
 {
     if (!context->getSettingsRef()[Setting::allow_insert_into_iceberg].value)
     {
@@ -695,7 +700,11 @@ void IcebergMetadata::alter(const AlterCommands & params, ContextPtr context)
             "To allow its usage, enable setting allow_insert_into_iceberg");
     }
 
-    Iceberg::alter(params, context, object_storage, data_lake_settings, persistent_components, write_format);
+    Iceberg::alter(
+        params, context, object_storage, data_lake_settings, persistent_components, write_format,
+        storage_id, catalog,
+        configuration ? configuration->getTypeName() : "",
+        configuration ? configuration->getNamespace() : "");
 }
 
 static Pipe expireSnapshotsResultToPipe(const Iceberg::ExpireSnapshotsResult & result)
