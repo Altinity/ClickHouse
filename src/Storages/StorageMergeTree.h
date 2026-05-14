@@ -96,8 +96,6 @@ public:
     void mutate(const MutationCommands & commands, ContextPtr context) override;
     QueryPipeline updateLightweight(const MutationCommands & commands, ContextPtr query_context) override;
 
-    bool hasLightweightDeletedMask() const override;
-
     /// Return introspection information about currently processing or recently processed mutations.
     std::vector<MergeTreeMutationStatus> getMutationsStatus() const override;
 
@@ -291,8 +289,6 @@ private:
 
     std::unique_ptr<PlainCommittingBlockHolder> fillNewPartName(MutableDataPartPtr & part, DataPartsLock & lock);
     std::unique_ptr<PlainCommittingBlockHolder> fillNewPartNameAndResetLevel(MutableDataPartPtr & part, DataPartsLock & lock);
-
-    void startBackgroundMovesIfNeeded() override;
 
     BackupEntries backupMutations(UInt64 version, const String & data_path_in_backup) const;
 

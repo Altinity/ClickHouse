@@ -297,17 +297,32 @@ Strings ClusterDiscovery::getNodeNames(zkutil::ZooKeeperPtr & zk,
         auto callback = get_nodes_callbacks.find(cluster_name);
         if (callback == get_nodes_callbacks.end())
         {
-            auto watch_dynamic_callback = std::make_shared<Coordination::WatchCallback>([
-                cluster_name,
-                my_clusters_to_update = clusters_to_update,
-                my_discovery_paths_need_update = multicluster_discovery_paths[zk_root_index - 1].need_update
-                ](auto)
-                {
-                    my_discovery_paths_need_update->store(true);
-                    my_clusters_to_update->set(cluster_name);
-                });
-            auto res = get_nodes_callbacks.insert(std::make_pair(cluster_name, watch_dynamic_callback));
-            callback = res.first;
+            if (zk_root_index > 0)
+            {
+                auto watch_dynamic_callback = std::make_shared<Coordination::WatchCallback>([
+                    cluster_name,
+                    my_clusters_to_update = clusters_to_update,
+                    my_discovery_paths_need_update = multicluster_discovery_paths[zk_root_index - 1].need_update
+                    ](auto)
+                    {
+                        my_discovery_paths_need_update->store(true);
+                        my_clusters_to_update->set(cluster_name);
+                    });
+                auto res = get_nodes_callbacks.insert(std::make_pair(cluster_name, watch_dynamic_callback));
+                callback = res.first;
+            }
+            else
+            { // zk_root_index == 0 for static clusters
+                auto watch_dynamic_callback = std::make_shared<Coordination::WatchCallback>([
+                    cluster_name,
+                    my_clusters_to_update = clusters_to_update
+                    ](auto)
+                    {
+                        my_clusters_to_update->set(cluster_name);
+                    });
+                auto res = get_nodes_callbacks.insert(std::make_pair(cluster_name, watch_dynamic_callback));
+                callback = res.first;
+            }
         }
         nodes = zk->getChildrenWatch(getShardsListPath(zk_root), &stat, callback->second);
     }
@@ -479,9 +494,7 @@ bool ClusterDiscovery::upsertCluster(ClusterInfo & cluster_info)
 
     if (nodes_info.empty())
     {
-        String name = cluster_info.name;
-        /// cluster_info removed inside removeCluster, can't use reference to name.
-        removeCluster(name);
+        removeCluster(cluster_info.name, /* is_dynamic_cluster */cluster_info.zk_root_index != 0);
         return true;
     }
 
@@ -492,15 +505,21 @@ bool ClusterDiscovery::upsertCluster(ClusterInfo & cluster_info)
     return true;
 }
 
-void ClusterDiscovery::removeCluster(const String & name)
+void ClusterDiscovery::removeCluster(const String & name, bool is_dynamic)
 {
     {
         std::lock_guard lock(mutex);
         cluster_impls.erase(name);
     }
-    clusters_to_update->remove(name);
-    get_nodes_callbacks.erase(name);
-    LOG_DEBUG(log, "Dynamic cluster '{}' removed successfully", name);
+    /// For static clusters (defined in config), `clusters_to_update` and `get_nodes_callbacks`
+    /// are initialized once at startup and must persist so the cluster can be re-registered after
+    /// a ZooKeeper session loss. Dynamic clusters own their entries and must clean them up.
+    if (is_dynamic)
+    {
+        clusters_to_update->remove(name);
+        get_nodes_callbacks.erase(name);
+        LOG_DEBUG(log, "Dynamic cluster '{}' removed successfully", name);
+    }
 }
 
 void ClusterDiscovery::registerInZk(zkutil::ZooKeeperPtr & zk, ClusterInfo & info)
@@ -758,7 +777,7 @@ bool ClusterDiscovery::runMainThread(std::function<void()> up_to_date_callback)
             clusters_to_insert.insert(cluster_name);
 
         for (const auto & cluster_name : clusters_to_remove)
-            removeCluster(cluster_name);
+            removeCluster(cluster_name, /* is_dynamic_cluster */true);
 
         clusters_info.merge(new_dynamic_clusters_info);
 

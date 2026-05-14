@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Core/Field.h>
 #include <Core/Names.h>
 #include <Core/QueryProcessingStage.h>
 #include <Databases/IDatabase.h>
@@ -20,6 +21,7 @@
 #include <Common/RWLock.h>
 #include <Common/TypePromotion.h>
 #include <DataTypes/Serializations/SerializationInfo.h>
+#include <Poco/JSON/Object.h>
 
 #include <expected>
 #include <optional>
@@ -70,6 +72,9 @@ class ConditionSelectivityEstimator;
 using ConditionSelectivityEstimatorPtr = std::shared_ptr<ConditionSelectivityEstimator>;
 
 struct RangesInDataParts;
+
+class IObjectStorage;
+using ObjectStoragePtr = std::shared_ptr<IObjectStorage>;
 
 class ActionsDAG;
 
@@ -272,9 +277,6 @@ public:
     /// is_restore_from_backup = true in StorageFactory::Arguments).
     virtual void finalizeRestoreFromBackup() {}
 
-    /// Return true if there is at least one part containing lightweight deleted mask.
-    virtual bool hasLightweightDeletedMask() const { return false; }
-
     /// Return true if storage can execute lightweight delete mutations.
     virtual bool supportsLightweightDelete() const { return false; }
 
@@ -434,6 +436,7 @@ private:
         size_t /*max_block_size*/,
         size_t /*num_streams*/);
 
+public:
     /// Should we process blocks of data returned by the storage in parallel
     /// even when the storage returned only one stream of data for reading?
     /// It is beneficial, for example, when you read from a file quickly,
@@ -444,7 +447,6 @@ private:
     /// useless).
     virtual bool parallelizeOutputAfterReading(ContextPtr) const { return !isSystemStorage(); }
 
-public:
     /// Other version of read which adds reading step to query plan.
     /// Default implementation creates ReadFromStorageStep and uses usual read.
     /// Can be called after `shutdown`, but not after `drop`.
@@ -474,6 +476,51 @@ public:
         const StorageMetadataPtr & /*metadata_snapshot*/,
         ContextPtr /*context*/,
         bool /*async_insert*/);
+
+    virtual bool supportsImport(ContextPtr) const
+    {
+      return false;
+    }
+
+    /*
+It is currently only implemented in StorageObjectStorage.
+      It is meant to be used to import merge tree data parts into object storage. It is similar to the write API,
+      but it won't re-partition the data and should allow the filename to be set by the caller.
+    */
+    virtual SinkToStoragePtr import(
+        const std::string & /* file_name */,
+        Block & /* block_with_partition_values */,
+        const std::function<void(const std::string &)> & /* new_file_path_callback */,
+        bool /* overwrite_if_exists */,
+        std::size_t /* max_bytes_per_file */,
+        std::size_t /* max_rows_per_file */,
+        const std::optional<std::string> & /* iceberg_metadata_json_string */,
+        const std::optional<FormatSettings> & /* format_settings */,
+        ContextPtr /* context */)
+    {
+      throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Import is not implemented for storage {}", getName());
+    }
+
+    struct IcebergCommitExportPartitionArguments
+    {
+      std::string metadata_json_string;
+      /// Partition column values (after transforms). Callers are responsible for
+      /// populating this: the partition-export path parses them from the persisted
+      /// JSON string, while the direct EXPORT PART path reads them from the part's
+      /// partition key.
+      std::vector<Field> partition_values;
+    };
+
+    virtual void commitExportPartitionTransaction(
+      const String & /* transaction_id */,
+      const String & /* partition_id */,
+      const Strings & /* exported_paths */,
+      const IcebergCommitExportPartitionArguments & /* iceberg_commit_export_partition_arguments */,
+      ContextPtr /* local_context */)
+  {
+      throw Exception(ErrorCodes::NOT_IMPLEMENTED, "commitExportPartitionTransaction is not implemented for storage type {}", getName());
+  }
+    
 
     /** Writes the data to a table in distributed manner.
       * It is supposed that implementation looks into SELECT part of the query and executes distributed
@@ -582,6 +629,9 @@ public:
     virtual void waitForMutation(const String & /*mutation_id*/, bool /*wait_for_another_mutation*/);
 
     virtual void setMutationCSN(const String & /*mutation_id*/, UInt64 /*csn*/);
+
+    /// Cancel a replicated partition export by transaction id.
+    virtual CancellationCode killExportPartition(const String & /*transaction_id*/);
 
     /// Cancel a part move to shard.
     virtual CancellationCode killPartMoveToShard(const UUID & /*task_uuid*/);

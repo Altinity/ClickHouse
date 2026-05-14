@@ -20,6 +20,7 @@
 #include <Common/Stopwatch.h>
 #include <Common/formatReadable.h>
 #include <Common/Throttler.h>
+#include <Common/ThrottlerArray.h>
 #include <Common/thread_local_rng.h>
 #include <Common/FieldVisitorToString.h>
 #include <Common/FieldVisitorHash.h>
@@ -44,6 +45,7 @@
 #include <Common/JemallocCacheArena.h>
 #include <Storages/MergeTree/MergeList.h>
 #include <Storages/MergeTree/MovesList.h>
+#include <Storages/MergeTree/ExportList.h>
 #include <Storages/MergeTree/ReplicatedFetchList.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
@@ -170,6 +172,8 @@ namespace ProfileEvents
     extern const Event BackupThrottlerSleepMicroseconds;
     extern const Event MergesThrottlerBytes;
     extern const Event MergesThrottlerSleepMicroseconds;
+    extern const Event ExportsThrottlerBytes;
+    extern const Event ExportsThrottlerSleepMicroseconds;
     extern const Event MutationsThrottlerBytes;
     extern const Event MutationsThrottlerSleepMicroseconds;
     extern const Event QueryLocalReadThrottlerBytes;
@@ -291,6 +295,8 @@ namespace Setting
     extern const SettingsUInt64 http_max_fields;
     extern const SettingsUInt64 http_max_field_name_size;
     extern const SettingsUInt64 http_max_field_value_size;
+    extern const SettingsUInt64 http_max_request_header_size;
+    extern const SettingsSeconds http_headers_read_timeout;
     extern const SettingsUInt64 http_max_tries;
     extern const SettingsUInt64 http_max_uri_size;
     extern const SettingsSeconds http_receive_timeout;
@@ -370,6 +376,7 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 max_local_write_bandwidth_for_server;
     extern const ServerSettingsUInt64 max_merges_bandwidth_for_server;
     extern const ServerSettingsUInt64 max_mutations_bandwidth_for_server;
+    extern const ServerSettingsUInt64 max_exports_bandwidth_for_server;
     extern const ServerSettingsUInt64 max_remote_read_network_bandwidth_for_server;
     extern const ServerSettingsUInt64 max_remote_write_network_bandwidth_for_server;
     extern const ServerSettingsUInt64 max_replicated_fetches_network_bandwidth_for_server;
@@ -549,6 +556,7 @@ struct ContextSharedPart : boost::noncopyable
     mutable OnceFlag build_vector_similarity_index_threadpool_initialized;
     mutable std::unique_ptr<ThreadPool> build_vector_similarity_index_threadpool; /// Threadpool for vector-similarity index creation.
     mutable UncompressedCachePtr index_uncompressed_cache TSA_GUARDED_BY(mutex);      /// The cache of decompressed blocks for MergeTree indices.
+    mutable bool index_uncompressed_cache_enabled TSA_GUARDED_BY(mutex) = false;      /// Whether index_uncompressed_cache should be used.
     mutable VectorSimilarityIndexCachePtr vector_similarity_index_cache TSA_GUARDED_BY(mutex);         /// Cache of deserialized secondary index granules.
     mutable TextIndexTokensCachePtr text_index_tokens_cache TSA_GUARDED_BY(mutex);  /// Cache of deserialized text index tokens.
     mutable TextIndexHeaderCachePtr text_index_header_cache TSA_GUARDED_BY(mutex);  /// Cache of deserialized text index headers.
@@ -570,6 +578,7 @@ struct ContextSharedPart : boost::noncopyable
     GlobalOvercommitTracker global_overcommit_tracker;
     MergeList merge_list;                                       /// The list of executable merge (for (Replicated)?MergeTree)
     MovesList moves_list;                                       /// The list of executing moves (for (Replicated)?MergeTree)
+    ExportsList exports_list;                                   /// The list of executing exports (for (Replicated)?MergeTree)
     ReplicatedFetchList replicated_fetch_list;
     RefreshSet refresh_set;                                 /// The list of active refreshes (for MaterializedView)
     ConfigurationPtr users_config TSA_GUARDED_BY(mutex);                              /// Config with the users, profiles and quotas sections.
@@ -615,6 +624,8 @@ struct ContextSharedPart : boost::noncopyable
 
     mutable ThrottlerPtr distributed_cache_read_throttler;  /// A server-wide throttler for distributed cache read
     mutable ThrottlerPtr distributed_cache_write_throttler; /// A server-wide throttler for distributed cache write
+
+    mutable ThrottlerPtr exports_throttler;                 /// A server-wide throttler for exports
 
     MultiVersion<Macros> macros;                            /// Substitutions extracted from config.
     std::unique_ptr<DDLWorker> ddl_worker TSA_GUARDED_BY(mutex); /// Process ddl commands from zk.
@@ -1168,6 +1179,9 @@ struct ContextSharedPart : boost::noncopyable
 
         if (auto bandwidth = server_settings[ServerSetting::max_merges_bandwidth_for_server])
             merges_throttler = std::make_shared<Throttler>(bandwidth, ProfileEvents::MergesThrottlerBytes, ProfileEvents::MergesThrottlerSleepMicroseconds);
+
+        if (auto bandwidth = server_settings[ServerSetting::max_exports_bandwidth_for_server])
+            exports_throttler = std::make_shared<Throttler>(bandwidth, ProfileEvents::ExportsThrottlerBytes, ProfileEvents::ExportsThrottlerSleepMicroseconds);
     }
 };
 
@@ -1328,6 +1342,8 @@ MergeList & Context::getMergeList() { return shared->merge_list; }
 const MergeList & Context::getMergeList() const { return shared->merge_list; }
 MovesList & Context::getMovesList() { return shared->moves_list; }
 const MovesList & Context::getMovesList() const { return shared->moves_list; }
+ExportsList & Context::getExportsList() { return shared->exports_list; }
+const ExportsList & Context::getExportsList() const { return shared->exports_list; }
 ReplicatedFetchList & Context::getReplicatedFetchList() { return shared->replicated_fetch_list; }
 const ReplicatedFetchList & Context::getReplicatedFetchList() const { return shared->replicated_fetch_list; }
 RefreshSet & Context::getRefreshSet() { return shared->refresh_set; }
@@ -3294,8 +3310,11 @@ void Context::setCurrentQueryId(const String & query_id)
 
     client_info.current_query_id = query_id_to_set;
 
-    if (client_info.query_kind == ClientInfo::QueryKind::INITIAL_QUERY)
+    if (client_info.query_kind == ClientInfo::QueryKind::INITIAL_QUERY
+        && (getApplicationType() != ApplicationType::SERVER || client_info.initial_query_id.empty()))
+    {
         client_info.initial_query_id = client_info.current_query_id;
+    }
 }
 
 void Context::killCurrentQuery() const
@@ -3436,6 +3455,13 @@ void Context::makeQueryContextForMutate(const MergeTreeSettings & merge_tree_set
     classifier.reset(); // It is assumed that there are no active queries running using this classifier, otherwise this will lead to crashes
     (*settings)[Setting::workload]
         = merge_tree_settings[MergeTreeSetting::mutation_workload].value.empty() ? getMutationWorkload() : merge_tree_settings[MergeTreeSetting::mutation_workload];
+}
+
+void Context::makeQueryContextForExportPart()
+{
+    makeQueryContext();
+    classifier.reset(); // It is assumed that there are no active queries running using this classifier, otherwise this will lead to crashes
+    // Export part operations don't have a specific workload setting, so we leave the default workload
 }
 
 void Context::makeSessionContext()
@@ -4039,6 +4065,7 @@ void Context::setIndexUncompressedCache(const String & cache_policy, size_t max_
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Index uncompressed cache has been already created.");
 
     shared->index_uncompressed_cache = std::make_shared<UncompressedCache>(cache_policy, CurrentMetrics::IndexUncompressedCacheBytes, CurrentMetrics::IndexUncompressedCacheCells, max_size_in_bytes, size_ratio);
+    shared->index_uncompressed_cache_enabled = shared->index_uncompressed_cache->maxSizeInBytes() != 0;
 }
 
 void Context::updateIndexUncompressedCacheConfiguration(const Poco::Util::AbstractConfiguration & config)
@@ -4050,11 +4077,14 @@ void Context::updateIndexUncompressedCacheConfiguration(const Poco::Util::Abstra
 
     size_t max_size_in_bytes = config.getUInt64("index_uncompressed_cache_size", DEFAULT_INDEX_UNCOMPRESSED_CACHE_MAX_SIZE);
     shared->index_uncompressed_cache->setMaxSizeInBytes(max_size_in_bytes);
+    shared->index_uncompressed_cache_enabled = shared->index_uncompressed_cache->maxSizeInBytes() != 0;
 }
 
-UncompressedCachePtr Context::getIndexUncompressedCache() const
+UncompressedCachePtr Context::getIndexUncompressedCache(bool only_if_enabled) const
 {
     SharedLockGuard lock(shared->mutex);
+    if (only_if_enabled && !shared->index_uncompressed_cache_enabled)
+        return nullptr;
     return shared->index_uncompressed_cache;
 }
 
@@ -4684,6 +4714,10 @@ ThrottlerPtr Context::getRemoteReadThrottler() const
         throttler = shared->remote_read_throttler;
     }
 
+    /// User-level throttler (`max_network_bandwidth_for_user` / `max_network_bandwidth_for_all_users`).
+    if (auto process_list_element = getProcessListElementSafe())
+        addThrottler(throttler, process_list_element->getUserNetworkThrottler());
+
     if (auto bandwidth = getSettingsRef()[Setting::max_remote_read_network_bandwidth])
     {
         std::lock_guard lock(mutex);
@@ -4701,6 +4735,10 @@ ThrottlerPtr Context::getRemoteWriteThrottler() const
         std::lock_guard lock(shared->mutex);
         throttler = shared->remote_write_throttler;
     }
+
+    /// User-level throttler (`max_network_bandwidth_for_user` / `max_network_bandwidth_for_all_users`).
+    if (auto process_list_element = getProcessListElementSafe())
+        addThrottler(throttler, process_list_element->getUserNetworkThrottler());
 
     if (auto bandwidth = getSettingsRef()[Setting::max_remote_write_network_bandwidth])
     {
@@ -4779,6 +4817,11 @@ ThrottlerPtr Context::getDistributedCacheReadThrottler() const
 ThrottlerPtr Context::getDistributedCacheWriteThrottler() const
 {
     return shared->distributed_cache_write_throttler;
+}
+
+ThrottlerPtr Context::getExportsThrottler() const
+{
+    return shared->exports_throttler;
 }
 
 void Context::reloadRemoteThrottlerConfig(size_t read_bandwidth, size_t write_bandwidth) const
@@ -7717,6 +7760,16 @@ uint64_t HTTPContext::getMaxFieldNameSize() const
 uint64_t HTTPContext::getMaxFieldValueSize() const
 {
     return context->getSettingsRef()[Setting::http_max_field_value_size];
+}
+
+uint64_t HTTPContext::getMaxRequestHeaderSize() const
+{
+    return context->getSettingsRef()[Setting::http_max_request_header_size];
+}
+
+Poco::Timespan HTTPContext::getHeadersReadTimeout() const
+{
+    return context->getSettingsRef()[Setting::http_headers_read_timeout];
 }
 
 Poco::Timespan HTTPContext::getReceiveTimeout() const
