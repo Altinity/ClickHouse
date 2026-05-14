@@ -135,10 +135,14 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
     }
     else if (provider_type == "entra")
     {
-        /// Preset for Microsoft Entra ID built on top of the OpenID Connect processor.
-        /// Derives the per-tenant OIDC discovery URL from `tenant_id` and lets `OpenIdTokenProcessor`
-        /// fetch `jwks_uri` (and, when published, `introspection_endpoint`) from it, so future
-        /// endpoint changes on the Entra side flow through without code changes here.
+        /// Preset for Microsoft Entra ID built on top of the pure-JWKS JWT processor.
+        /// Validation is fully local: signature against Entra's published JWKS plus the
+        /// operator-chosen iss/aud/typ/claims pins. No OIDC discovery fetch, no userinfo
+        /// endpoint, no Microsoft Graph URL stored on the processor. `groups_claim` and
+        /// `username_claim` are read directly from the JWT payload -- which requires the
+        /// access token's audience to be the operator's own app, not Microsoft Graph
+        /// (Graph-audience tokens are not JWKS-verifiable; see TokenProcessorsOpaque's
+        /// `azure` shortcut for that path).
         if (!config.hasProperty(prefix + ".tenant_id"))
             throw DB::Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "'tenant_id' must be specified for 'entra' processor");
 
@@ -154,9 +158,9 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
                                     "'tenant_id' {} contains invalid characters", tenant_id);
         }
 
-        /// Multi-tenant aliases require templated-issuer validation that the underlying JWKS JWT
-        /// validator does not implement (it does exact-match on `iss`). Reject explicitly rather
-        /// than silently failing issuer checks at token-validation time.
+        /// Multi-tenant aliases require templated-issuer validation that JwksJwtProcessor does not
+        /// implement (it does exact-match on `iss`). Reject explicitly rather than silently failing
+        /// issuer checks at token-validation time.
         const String lower_tenant_id = Poco::toLower(tenant_id);
         if (lower_tenant_id == "common" || lower_tenant_id == "organizations" || lower_tenant_id == "consumers")
             throw DB::Exception(ErrorCodes::INVALID_CONFIG_PARAMETER,
@@ -164,20 +168,16 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
                                 "exact issuer validation requires a single tenant identifier (GUID or onmicrosoft.com domain).",
                                 tenant_id);
 
-        const String default_configuration_endpoint = "https://login.microsoftonline.com/" + tenant_id + "/v2.0/.well-known/openid-configuration";
-        const String configuration_endpoint = config.getString(prefix + ".configuration_endpoint", default_configuration_endpoint);
-        require_allowed_url(configuration_endpoint, "configuration_endpoint");
+        const String default_jwks_uri = "https://login.microsoftonline.com/" + tenant_id + "/discovery/v2.0/keys";
+        const String jwks_uri = config.getString(prefix + ".jwks_uri", default_jwks_uri);
+        require_allowed_url(jwks_uri, "jwks_uri");
 
-        /// Symmetric with the 'openid' processor: operators who knowingly mock Entra over plain
-        /// HTTP (tests, sovereign-cloud reverse proxies) can opt out of the HTTPS-on-discovery
-        /// check. False by default since real Entra is always HTTPS.
-        const auto allow_http_discovery_urls = config.getBool(prefix + ".allow_http_discovery_urls", false);
-
-        if (expected_issuer.empty())
-            LOG_WARNING(getLogger("TokenAuthentication"),
-                        "{}: 'expected_issuer' is not set for 'entra' processor: the 'iss' claim will not be validated, "
-                        "so tokens issued by any tenant will be accepted as long as the signature is valid.",
-                        processor_name);
+        /// `expected_issuer` is auto-derived from `tenant_id` since the v2.0 issuer URL is fully
+        /// determined by the tenant. Users can still override -- typically for v1.0 tokens
+        /// ('https://sts.windows.net/{tenant_id}/') or for sovereign-cloud authorities
+        /// ('https://login.microsoftonline.us/{tenant_id}/v2.0' etc.).
+        const String default_issuer = "https://login.microsoftonline.com/" + tenant_id + "/v2.0";
+        const String issuer = config.getString(prefix + ".expected_issuer", default_issuer);
 
         if (expected_audience.empty())
             LOG_WARNING(getLogger("TokenAuthentication"),
@@ -185,13 +185,12 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
                         "so tokens issued for any application will be accepted as long as the signature is valid.",
                         processor_name);
 
-        return std::make_unique<OpenIdTokenProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim,
-                                                      expected_issuer, expected_audience, allow_no_expiration,
-                                                      configuration_endpoint,
-                                                      config.getUInt64(prefix + ".verifier_leeway", 60),
-                                                      config.getUInt64(prefix + ".jwks_cache_lifetime", 3600),
-                                                      remote_host_filter,
-                                                      allow_http_discovery_urls);
+        return std::make_unique<JwksJwtProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim,
+                                                  issuer, expected_audience, expected_typ, allow_no_expiration,
+                                                  config.getString(prefix + ".claims", ""),
+                                                  config.getUInt64(prefix + ".verifier_leeway", 60),
+                                                  jwks_uri,
+                                                  config.getUInt64(prefix + ".jwks_cache_lifetime", 3600));
     }
     else if (provider_type == "jwt_static_key")
     {
