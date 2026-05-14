@@ -146,6 +146,52 @@ Some tokens cannot be decoded and validated locally. External service is needed 
 
 No additional parameters are required.
 
+### Entra (Microsoft Entra ID, pure OIDC)
+
+Preset for Microsoft Entra ID that does **not** involve Microsoft Graph. Tokens are validated locally against Entra's per-tenant JWKS; `username_claim` and `groups_claim` are read directly from the JWT payload. Use this when the access token's `aud` is your own app (registered via Entra's "Expose an API"), not `https://graph.microsoft.com`.
+
+Minimum configuration — only `tenant_id` is required; all other parameters have sensible defaults:
+
+```xml
+<clickhouse>
+    <token_processors>
+        <entra_prod>
+          <type>entra</type>
+          <tenant_id>aaaabbbb-0000-cccc-1111-dddd2222eeee</tenant_id>
+        </entra_prod>
+    </token_processors>
+</clickhouse>
+```
+
+Example with common overrides (audience binding to a specific app, Entra-flavored username/groups claims):
+
+```xml
+<entra_prod>
+    <type>entra</type>
+    <tenant_id>aaaabbbb-0000-cccc-1111-dddd2222eeee</tenant_id>
+    <expected_audience>api://clickhouse</expected_audience>
+    <username_claim>preferred_username</username_claim>
+    <groups_claim>roles</groups_claim>
+</entra_prod>
+```
+
+**Parameters:**
+
+- `tenant_id` — Microsoft Entra tenant identifier (a GUID, or an `*.onmicrosoft.com` domain). **Mandatory.** Multi-tenant aliases (`common`, `organizations`, `consumers`) are rejected because `JwksJwtProcessor` does exact-match issuer validation.
+
+All remaining parameters are optional:
+
+- `jwks_uri` — Override for the JWKS endpoint. Default: `https://login.microsoftonline.com/{tenant_id}/discovery/v2.0/keys`. Override only for sovereign clouds (`login.microsoftonline.us`, `login.partner.microsoftonline.cn`).
+- `expected_issuer` — Expected value of the `iss` claim. Default: `https://login.microsoftonline.com/{tenant_id}/v2.0` (derived from `tenant_id`). Override for v1.0 tokens (`https://sts.windows.net/{tenant_id}/`) or sovereign clouds.
+- `expected_audience` — Expected value of the `aud` claim, normally your app's Application ID URI (e.g. `api://clickhouse`) or client ID. If unset, no audience check is performed (any signature-valid token from the tenant will authenticate); a warning is logged at startup so the gap is visible.
+- `username_claim` — JWT claim to use as the ClickHouse username. Default: `sub`. Common Entra alternatives: `preferred_username`, `upn`, `oid`.
+- `groups_claim` — JWT claim that carries the array of group identifiers. Default: `groups`. Set to `roles` if you use App Roles in Entra instead of security-group claims.
+- `expected_typ`, `verifier_leeway`, `jwks_cache_lifetime`, `claims`, `allow_no_expiration`, `token_cache_lifetime` — Same as for `jwt_dynamic_jwks`.
+
+:::note
+The `groups` claim must be enabled in the app registration's manifest (`"groupMembershipClaims": "ApplicationGroup"` is recommended) and exposed in access tokens via `optionalClaims.accessToken`. Group identifiers in the token are object IDs (GUIDs) by default; map them to ClickHouse roles via the user-directory's `roles_mapping` block (see [Identity Provider as an External User Directory](#idp-external-user-directory)).
+:::
+
 ### OpenID
 ```xml
 <clickhouse>
