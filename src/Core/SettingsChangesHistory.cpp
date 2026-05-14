@@ -121,7 +121,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             // {"iceberg_metadata_staleness_ms", 0, 0, "New setting allowing using cached metadata version at READ operations to prevent fetching from remote catalog"},
             {"export_merge_tree_partition_task_timeout_seconds", 0, 3600, "New setting to control the timeout for export partition tasks."},
             {"export_merge_tree_partition_manifest_ttl", 180, 86400, "Reasonable default for real usage"},
-            {"export_merge_tree_partition_lock_inside_the_task", false, false, "Obsolete. No-op."},
         });
         addSettingsChanges(settings_changes_history, "26.1",
         {
@@ -329,7 +328,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"enable_alias_marker", true, true, "New setting."},
             {"export_merge_tree_part_max_bytes_per_file", 0, 0, "New setting."},
             {"export_merge_tree_part_max_rows_per_file", 0, 0, "New setting."},
-            {"export_merge_tree_partition_lock_inside_the_task", false, false, "New setting."},
             {"export_merge_tree_partition_system_table_prefer_remote_information", true, true, "New setting."},
             {"export_merge_tree_part_throw_on_pending_mutations", true, true, "New setting."},
             {"export_merge_tree_part_throw_on_pending_patch_parts", true, true, "New setting."},
