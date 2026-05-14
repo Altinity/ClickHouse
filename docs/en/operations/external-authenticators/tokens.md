@@ -29,7 +29,7 @@ To use token-based authentication, add `token_processors` section to `config.xml
 Its contents are different for different token processor types.
 
 **Common parameters**
-- `type` -- type of token processor. Supported values: "jwt_static_key", "jwt_static_jwks", "jwt_dynamic_jwks", "azure", "openid". Mandatory. Case-insensitive.
+- `type` -- type of token processor. Supported values: `jwt_static_key`, `jwt_static_jwks`, `jwt_dynamic_jwks`, `entra` (`azure` is accepted as a back-compat alias and resolves to the same `entra` processor — see the [Entra](#entra) section), `openid`. Mandatory. Case-insensitive.
 - `token_cache_lifetime` -- maximum lifetime of cached token (in seconds). Optional, default: 3600.
 - `username_claim` -- name of claim (field) that will be treated as ClickHouse username. Optional, default: "sub".
 - `groups_claim` -- name of claim (field) that contains list of groups user belongs to. This claim will be looked up in the token itself (in case token is a valid JWT, e.g. in Keycloak) or in response from `/userinfo`. Optional, default: "groups".
@@ -129,26 +129,19 @@ For JWKS-based validators (`jwt_static_jwks` and `jwt_dynamic_jwks`), RS* and ES
 - `allow_no_expiration` - If `true`, tokens without the `exp` (expiration) claim are accepted. Otherwise they are rejected. Optional, default: `false`.
 
 
-## Processors with external providers
+## IdP-specific presets and generic external providers
 
-Some tokens cannot be decoded and validated locally. External service is needed in this case. "Azure" and "OpenID" (a generic type) are supported now.
+This section covers two related kinds of processor: per-IdP convenience presets built on top of the generic JWT processors (currently `entra`), and the generic `openid` processor that talks to an arbitrary OIDC-compliant identity provider.
 
-### Azure
-```xml
-<clickhouse>
-    <token_processors>
-        <azure_processor>
-          <type>azure</type>
-        </azure_processor>
-    </token_processors>
-</clickhouse>
-```
+### Entra (Microsoft Entra ID, pure OIDC) {#entra}
 
-No additional parameters are required.
+`<type>entra</type>` is a preset for Microsoft Entra ID built on top of `jwt_dynamic_jwks`. Tokens are validated **locally** against Entra's per-tenant JWKS — no Microsoft Graph call, no userinfo round trip, no OIDC discovery fetch. `username_claim` and `groups_claim` are read directly from the JWT payload. Use this when the access token's `aud` is your own app (registered via Entra's *Expose an API* blade), not `https://graph.microsoft.com`.
 
-### Entra (Microsoft Entra ID, pure OIDC)
+:::note Migrating from the legacy `azure` processor
+`<type>azure</type>` is now an **alias** for `<type>entra</type>` — at config-parse time the type string is rewritten and the rest of the pipeline is identical. The previous `azure` implementation (which round-tripped every token through Microsoft Graph's `/oidc/userinfo` and `/v1.0/me/memberOf` endpoints) has been removed entirely.
 
-Preset for Microsoft Entra ID that does **not** involve Microsoft Graph. Tokens are validated locally against Entra's per-tenant JWKS; `username_claim` and `groups_claim` are read directly from the JWT payload. Use this when the access token's `aud` is your own app (registered via Entra's "Expose an API"), not `https://graph.microsoft.com`.
+For operators upgrading: an `<type>azure</type>` block that previously had no other parameters will now fail to load with `'tenant_id' must be specified for 'entra' processor`. To migrate, add `<tenant_id>` (and ideally `<expected_audience>`) and make sure your application is configured to mint tokens whose `aud` is your own app, not Microsoft Graph. The setup recipe lives in `docs/entra-setup-draft.md`.
+:::
 
 Minimum configuration — only `tenant_id` is required; all other parameters have sensible defaults:
 
@@ -258,7 +251,7 @@ Example (goes into `users.xml`):
 Here, the JWT payload must contain `["view-profile"]` on path `resource_access.account.roles`, otherwise authentication will not succeed even with a valid JWT.
 
 :::note
-Per-user `claims` are enforced only when the token is a JWT (validated by a JWT processor such as `jwt_static_key` or `jwt_dynamic_jwks`). When the user authenticates with an opaque (access) token (e.g. via Azure, OpenID, or Google token processors), claims are not checked and authentication succeeds if the token is otherwise valid.
+Per-user `claims` are enforced only when the token is a JWT (validated by a JWT processor such as `jwt_static_key`, `jwt_dynamic_jwks`, or `entra`). When the user authenticates with an opaque (access) token (e.g. via OpenID or Google token processors), claims are not checked and authentication succeeds if the token is otherwise valid.
 :::
 
 ```

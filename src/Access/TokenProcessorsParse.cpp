@@ -24,6 +24,14 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
 
     auto provider_type = Poco::toLower(config.getString(prefix + ".type"));
 
+    /// `azure` is a back-compat alias for `entra`. The legacy `azure` processor
+    /// validated tokens by round-tripping through Microsoft Graph; the `entra`
+    /// processor does pure local JWKS validation, which is what every operator
+    /// actually wants. Treat both names as the same processor type so existing
+    /// configs continue to parse, just under stricter validation rules.
+    if (provider_type == "azure")
+        provider_type = "entra";
+
     auto token_cache_lifetime = config.getUInt64(prefix + ".token_cache_lifetime", 3600);
     auto username_claim = config.getString(prefix + ".username_claim", "sub");
     auto groups_claim = config.getString(prefix + ".groups_claim", "groups");
@@ -77,10 +85,6 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
     if (provider_type == "google")
     {
         return std::make_unique<GoogleTokenProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim, expected_audience);
-    }
-    else if (provider_type == "azure")
-    {
-        return std::make_unique<AzureTokenProcessor>(processor_name, token_cache_lifetime, username_claim, groups_claim, expected_audience);
     }
     else if (provider_type == "openid")
     {
@@ -141,8 +145,9 @@ std::unique_ptr<DB::ITokenProcessor> ITokenProcessor::parseTokenProcessor(
         /// endpoint, no Microsoft Graph URL stored on the processor. `groups_claim` and
         /// `username_claim` are read directly from the JWT payload -- which requires the
         /// access token's audience to be the operator's own app, not Microsoft Graph
-        /// (Graph-audience tokens are not JWKS-verifiable; see TokenProcessorsOpaque's
-        /// `azure` shortcut for that path).
+        /// (Graph-audience tokens are not JWKS-verifiable -- their signing keys are not
+        /// in the tenant JWKS and their headers carry a `nonce` that breaks third-party
+        /// validation; see `docs/entra-setup-draft.md` for how to mint app-audience tokens).
         if (!config.hasProperty(prefix + ".tenant_id"))
             throw DB::Exception(ErrorCodes::INVALID_CONFIG_PARAMETER, "'tenant_id' must be specified for 'entra' processor");
 
