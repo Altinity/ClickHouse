@@ -256,6 +256,16 @@ All this implies that the SQL-driven [Access Control and Account Management](/do
                 <token_test_role_1 />
             </common_roles>
             <default_profile>my_profile</default_profile>
+            <roles_mapping>
+                <map>
+                    <from>8a1b2c3d-4e5f-6789-abcd-ef0123456789</from>
+                    <to>ch_admin</to>
+                </map>
+                <map>
+                    <from>9f8e7d6c-5b4a-3210-fedc-ba0987654321</from>
+                    <to>ch_analyst</to>
+                </map>
+            </roles_mapping>
             <roles_filter>
                 \bclickhouse-[a-zA-Z0-9]+\b
             </roles_filter>
@@ -274,5 +284,8 @@ For now, no more than one `token` section can be defined inside `user_directorie
 - `processor` — Name of one of processors defined in `token_processors` config section described above. This parameter is mandatory and cannot be empty.
 - `common_roles` — Section with a list of locally defined roles that will be assigned to each user retrieved from the IdP. Optional.
 - `default_profile` — Name of a locally defined settings profile that will be assigned to each user retrieved from the IdP. If the profile does not exist, a warning will be logged and the user will be created without a profile. Optional.
-- `roles_filter` — Regex string for groups filtering. Only groups matching this regex will be mapped to roles. Optional.
-- `roles_transform` — Sed-style transform pattern to apply to group names before mapping to roles. Format: `s/pattern/replacement/flags`. The `g` flag applies the replacement globally (all occurrences). Example: `s/-/_/g` converts `clickhouse-grp-dba` to `clickhouse_grp_dba`. Optional.
+- `roles_mapping` — Explicit map from incoming group identifier (e.g. an Entra security-group object ID) to a ClickHouse role name. Each entry is a `<map>` element with `<from>` and `<to>` children. Applied **before** `roles_filter` and `roles_transform`; groups absent from the map pass through unchanged, so the filter stage can be used to drop unmapped entries. Optional.
+- `roles_filter` — Regex string for groups filtering. Only groups (after `roles_mapping` is applied) that match this regex will be considered. Optional.
+- `roles_transform` — Sed-style transform pattern applied to group names (after `roles_mapping` and `roles_filter`) before mapping to roles. Format: `s/pattern/replacement/flags`. The `g` flag applies the replacement globally (all occurrences). Example: `s/-/_/g` converts `clickhouse-grp-dba` to `clickhouse_grp_dba`. Optional.
+
+The three stages run in this order: `roles_mapping` → `roles_filter` → `roles_transform`. Stages are independent and any of them may be omitted.
