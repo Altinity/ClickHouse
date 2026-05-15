@@ -1555,7 +1555,7 @@ void StorageDistributed::read(
         {
             plans.emplace_back(createLocalPlan(
                 additional_query_info.query, header_block, local_context,
-                processed_stage, /*shard_num=*/0, /*shard_count=*/1, /*has_missing_objects=*/false, ""));
+                processed_stage, /*shard_num=*/0, /*shard_count=*/1, /*build_logical_plan=*/false, ""));
         }
 
         if (plans.size() == 1)
