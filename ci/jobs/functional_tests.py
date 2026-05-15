@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import re
 import random
 import subprocess
 from pathlib import Path
@@ -127,6 +128,7 @@ OPTIONS_TO_TEST_RUNNER_ARGUMENTS = {
     "azure": " --azure-blob-storage --no-random-settings --no-random-merge-tree-settings",  # azurite is slow, with randomization it can be super slow
     "parallel": "--no-sequential",
     "sequential": "--no-parallel",
+    "amd_tsan": " --timeout 1200",  # NOTE (strtgbb): tsan is slow, increase the timeout to avoid timeout errors
     "flaky check": "--flaky-check",
     "targeted": "--flaky-check --no-self-parallel",
 }
@@ -286,12 +288,20 @@ def main():
 
     if not info.is_local_run:
         # TODO: find a way to work with Azure secret so it's ok for local tests as well, for now keep azure disabled
-        azure_connection_string = Shell.get_output(
-            f"aws ssm get-parameter --region us-east-1 --name azure_connection_string --with-decryption --output text --query Parameter.Value",
-            verbose=True,
-            strict=True,
-        )
-        os.environ["AZURE_CONNECTION_STRING"] = azure_connection_string
+        # os.environ["AZURE_CONNECTION_STRING"] = Shell.get_output(
+        #     f"aws ssm get-parameter --region us-east-1 --name azure_connection_string --with-decryption --output text --query Parameter.Value",
+        #     verbose=True,
+        # )
+        # NOTE(strtgbb): We pass azure credentials through the docker command, not SSM.
+        # NOTE(strtgbb): Azure credentials don't exist in community workflow
+        if info.is_community_pr:
+            print(
+                "NOTE: No azure credentials provided for community PR - disable azure storage"
+            )
+            config_installs_args += " --no-azure"
+
+            # NOTE(strtgbb): With the above, some tests are still trying to use azure, try this:
+            os.environ["USE_AZURE_STORAGE_FOR_MERGE_TREE"] = "0"
     else:
         print("Disable azure for a local run")
         config_installs_args += " --no-azure"
@@ -451,12 +461,13 @@ def main():
 
     if res and JobStages.INSTALL_CLICKHOUSE in stages:
 
-        def configure_log_export():
-            if not info.is_local_run:
-                print("prepare log export config")
-                return CH.create_log_export_config()
-            else:
-                print("skip log export config for local run")
+        # NOTE (strtgbb): Disable log export throughout this file, it depends on aws ssm, which we don't have configured
+        # def configure_log_export():
+        #     if not info.is_local_run:
+        #         print("prepare log export config")
+        #         return CH.create_log_export_config()
+        #     else:
+        #         print("skip log export config for local run")
 
         commands = [
             f"rm -rf /etc/clickhouse-client/* /etc/clickhouse-server/* /etc/clickhouse-server1/* /etc/clickhouse-server2/*",
@@ -488,8 +499,8 @@ def main():
             f"prof_prefix:{temp_dir}/jemalloc_profiles/clickhouse.jemalloc"
         )
 
-        if not is_llvm_coverage:
-            commands.append(configure_log_export)
+        # if not is_coverage:
+        #     commands.append(configure_log_export)
 
         results.append(
             Result.from_commands_run(name="Install ClickHouse", command=commands)
@@ -513,13 +524,18 @@ def main():
                 if not CH.start_kafka():
                     print("WARNING: Failed to start Kafka")
 
-                if not Info().is_local_run:
-                    if not CH.start_log_exports(stop_watch.start_time):
-                        info.add_workflow_warning("Failed to start log export")
-                        print("Failed to start log export")
-                if not CH.create_minio_log_tables():
-                    info.add_workflow_warning("Failed to create minio log tables")
-                    print("Failed to create minio log tables")
+                # Note (strtgbb): We don't use this
+                # if not Info().is_local_run:
+                #     if not CH.start_log_exports(stop_watch.start_time):
+                #         info.add_workflow_report_message(
+                #             "WARNING: Failed to start log export"
+                #         )
+                #         print("Failed to start log export")
+                # if not CH.create_minio_log_tables():
+                #     info.add_workflow_report_message(
+                #         "WARNING: Failed to create minio log tables"
+                #     )
+                #     print("Failed to create minio log tables")
 
                 if has_stateful_tests:
                     res = (
@@ -541,13 +557,15 @@ def main():
         )
         res = results[-1].is_ok()
 
+    runner_options += f" --known-fails-file-path tests/broken_tests.yaml"
+
     test_result = None
     if res and JobStages.TEST in stages:
         stop_watch_ = Utils.Stopwatch()
         step_name = "Tests"
         print(step_name)
 
-        ft_res_processor = FTResultsProcessor(wd=temp_dir)
+        ft_res_processor = FTResultsProcessor(wd=temp_dir, test_options=test_options)
 
         global_time_limit = 0
         if is_flaky_check:
@@ -727,6 +745,7 @@ def main():
                     src=CH,
                     dest=cidb_cluster,
                     job_name=info.job_name,
+                    branch=info.git_branch,
                 ).do(),
             )
         )
@@ -804,6 +823,10 @@ def main():
 
     if test_result:
         test_result.sort()
+
+    broken_tests_handler_log = os.path.join(temp_dir, "broken_tests_handler.log")
+    if os.path.exists(broken_tests_handler_log):
+        debug_files.append(broken_tests_handler_log)
 
     R = Result.create_from(
         results=results,

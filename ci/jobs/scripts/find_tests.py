@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.append("./")
 
 from ci.praktika.cidb import CIDB
+from ci.jobs.scripts.cidb_cluster import CIDBCluster
 from ci.praktika.info import Info
 from ci.praktika.result import Result
 from ci.praktika.settings import Settings
@@ -53,8 +54,15 @@ class Targeting:
     INTEGRATION_JOB_TYPE = "Integration"
     STATELESS_JOB_TYPE = "Stateless"
 
-    def __init__(self, info: Info):
+    def __init__(self, info: Info, branch: str = ""):
         self.info = info
+        self.branch = branch or getattr(info, 'base_branch', '')
+        # NOTE (strtgbb): Read credentials from env directly to avoid
+        # a mutation bug in CIDBCluster's secret resolution path.
+        url = os.environ.get(Settings.SECRET_CI_DB_URL, "")
+        user = os.environ.get(Settings.SECRET_CI_DB_USER, "")
+        pwd = os.environ.get(Settings.SECRET_CI_DB_PASSWORD, "")
+        self.cidb = CIDBCluster(url=url, user=user, pwd=pwd)
         if "stateless" in info.job_name.lower():
             self.job_type = self.STATELESS_JOB_TYPE
         elif "integration" in info.job_name.lower():
@@ -104,16 +112,12 @@ class Targeting:
         return sorted(result)
 
     def get_previously_failed_tests(self):
-        from ci.praktika.cidb import CIDB
-        from ci.praktika.settings import Settings
-
         assert self.job_type, "Unsupported job type"
         assert (
             self.info.pr_number > 0
         ), "Find tests by previous failures applicable only for PRs"
 
         tests = []
-        cidb = CIDB(url=Settings.CI_DB_READ_URL, user="play", passwd="")
         if self.job_type == self.INTEGRATION_JOB_TYPE:
             test_name_pattern = "^test_"
         elif self.job_type == self.STATELESS_JOB_TYPE:
@@ -125,7 +129,11 @@ class Targeting:
             JOB_TYPE=self.job_type,
             TEST_NAME_PATTERN=test_name_pattern,
         )
-        query_result = cidb.query(query, log_level="") or ""
+        query_result = self.cidb.do_select_query(
+            query, db_name=Settings.CI_DB_DB_NAME, timeout=20
+        )
+        if not query_result:
+            return []
         # Parse test names from the query result
         for line in query_result.strip().split("\n"):
             if line.strip():

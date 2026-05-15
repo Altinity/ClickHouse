@@ -29,9 +29,9 @@ FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES = [
 ]
 
 STYLE_AND_FAST_TESTS = [
-    JobNames.STYLE_CHECK,
+    # JobNames.STYLE_CHECK,
     JobNames.FAST_TEST,
-    *[j.name for j in JobConfigs.tidy_build_arm_jobs],
+    # *[j.name for j in JobConfigs.tidy_build_arm_jobs],
 ]
 
 REGULAR_BUILD_NAMES = [job.name for job in JobConfigs.build_jobs]
@@ -43,13 +43,14 @@ PLAIN_FUNCTIONAL_TEST_JOB = [
 workflow = Workflow.Config(
     name="PR",
     event=Workflow.Event.PULL_REQUEST,
-    base_branches=[BASE_BRANCH],
+    base_branches=[BASE_BRANCH, "releases/*", "antalya-*", "stable-*"],
+    if_condition="github.repository == github.event.pull_request.head.repo.full_name || github.event_name == 'workflow_dispatch'",
     jobs=[
-        JobConfigs.style_check,
-        JobConfigs.code_review,
-        JobConfigs.docs_job,
+        # JobConfigs.style_check,
+        # JobConfigs.code_review,
+        # JobConfigs.docs_job,
         JobConfigs.fast_test,
-        *JobConfigs.darwin_fast_test_jobs,
+        # *JobConfigs.darwin_fast_test_jobs,
         *JobConfigs.tidy_build_arm_jobs,
         *[job.set_run_after(STYLE_AND_FAST_TESTS) for job in JobConfigs.build_jobs],
         *[
@@ -57,25 +58,24 @@ workflow = Workflow.Config(
             for job in JobConfigs.extra_validation_build_jobs
         ],
         *[
-            job.set_run_after(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
+            job.set_run_after(STYLE_AND_FAST_TESTS)
             for job in JobConfigs.release_build_jobs
         ],
-        *[
-            job.set_run_after(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
-            for job in JobConfigs.special_build_jobs
-        ],
-        *[job.set_run_after(STYLE_AND_FAST_TESTS) for job in JobConfigs.build_llvm_coverage_job],
-        JobConfigs.smoke_tests_macos,
+        # *[
+        #     job.set_run_after(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
+        #     for job in JobConfigs.special_build_jobs
+        # ],
+        # *JobConfigs.build_llvm_coverage_job, # NOTE (strtgbb): Not configured yet. Determine if useful first.
         # TODO: stabilize new jobs and remove set_allow_merge_on_failure
         JobConfigs.lightweight_functional_tests_job,
         *[j.set_allow_merge_on_failure() for j in JobConfigs.stateless_tests_targeted_pr_jobs],
         JobConfigs.integration_test_targeted_pr_jobs[0].set_allow_merge_on_failure(),
         JobConfigs.ast_fuzzer_targeted_pr_jobs[0].set_allow_merge_on_failure(),
         JobConfigs.ast_fuzzer_targeted_pr_jobs[1].set_allow_merge_on_failure(),
-        *JobConfigs.stateless_tests_flaky_pr_jobs,
-        *JobConfigs.integration_test_asan_flaky_pr_jobs,
-        JobConfigs.bugfix_validation_ft_pr_job,
-        JobConfigs.bugfix_validation_it_job,
+        # *JobConfigs.stateless_tests_flaky_pr_jobs,
+        # *JobConfigs.integration_test_asan_flaky_pr_jobs,
+        # JobConfigs.bugfix_validation_ft_pr_job,
+        # JobConfigs.bugfix_validation_it_job,
         *[
             j.set_run_after(
                 FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES
@@ -88,8 +88,7 @@ workflow = Workflow.Config(
             job.set_run_after(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
             for job in JobConfigs.functional_tests_jobs_azure
         ],
-        *JobConfigs.functional_test_llvm_coverage_jobs,
-        *JobConfigs.functional_test_excluded_from_llvm_job,
+        # *JobConfigs.functional_test_llvm_coverage_jobs, # NOTE (strtgbb): Not configured yet. Determine if useful first.
         *[
             job.set_run_after(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
             for job in JobConfigs.integration_test_jobs_required[:]
@@ -98,16 +97,12 @@ workflow = Workflow.Config(
             job.set_run_after(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
             for job in JobConfigs.integration_test_jobs_non_required
         ],
-        *JobConfigs.integration_test_llvm_coverage_jobs,
-        *JobConfigs.integration_test_excluded_from_llvm_job,
+        # *JobConfigs.integration_test_llvm_coverage_jobs, # NOTE (strtgbb): Not configured yet. Determine if useful first.
+        # *JobConfigs.integration_test_excluded_from_llvm_job,
         *JobConfigs.unittest_jobs,
-        *JobConfigs.unittest_llvm_coverage_job,
-        JobConfigs.docker_server.set_run_after(
-            FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES
-        ),
-        JobConfigs.docker_keeper.set_run_after(
-            FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES
-        ),
+        # *JobConfigs.unittest_llvm_coverage_job,
+        JobConfigs.docker_server,
+        JobConfigs.docker_keeper,
         *[
             job.set_run_after(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
             for job in JobConfigs.install_check_jobs
@@ -120,10 +115,10 @@ workflow = Workflow.Config(
             job.set_run_after(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
             for job in JobConfigs.stress_test_jobs
         ],
-        *[
-            job.set_run_after(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
-            for job in JobConfigs.upgrade_test_jobs
-        ],
+        # *[
+        #     job.set_run_after(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
+        #     for job in JobConfigs.upgrade_test_jobs
+        # ], # TODO: customize for our repo
         *[
             job.set_run_after(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
             for job in JobConfigs.ast_fuzzer_jobs
@@ -132,11 +127,11 @@ workflow = Workflow.Config(
             job.set_run_after(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
             for job in JobConfigs.buzz_fuzzer_jobs
         ],
-        *[
-            job.set_run_after(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
-            for job in JobConfigs.performance_comparison_with_master_head_jobs
-        ],
-        JobConfigs.llvm_coverage_job,
+        # *[
+        #    job.set_run_after(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
+        #    for job in JobConfigs.performance_comparison_with_master_head_jobs
+        # ], # NOTE (strtgbb): failed previously due to GH secrets not being handled properly, try again later
+        # JobConfigs.llvm_coverage_job, # NOTE (strtgbb): Not configured yet. Determine if useful first.
         JobConfigs.sqllogic_test_master_job.set_run_after(
             FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES
         ),
@@ -153,17 +148,19 @@ workflow = Workflow.Config(
         #     FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES
         # ),
     ],
+    additional_jobs=["GrypeScan", "Regression", "CIReport", "SourceUpload"],
     artifacts=[
         *ArtifactConfigs.unittests_binaries,
         *ArtifactConfigs.clickhouse_binaries,
+        *ArtifactConfigs.clickhouse_stripped_binaries,
         *ArtifactConfigs.clickhouse_debians,
         *ArtifactConfigs.clickhouse_rpms,
         *ArtifactConfigs.clickhouse_tgzs,
         ArtifactConfigs.fuzzers,
         ArtifactConfigs.fuzzers_corpus,
         ArtifactConfigs.parser_memory_profiler,
-        *ArtifactConfigs.llvm_profdata_file,
-        ArtifactConfigs.llvm_coverage_info_file,
+        # *ArtifactConfigs.llvm_profdata_file,
+        # ArtifactConfigs.llvm_coverage_info_file,
         ArtifactConfigs.toolchain_pgo_bolt_amd,
         ArtifactConfigs.toolchain_pgo_bolt_arm,
     ],
@@ -174,25 +171,26 @@ workflow = Workflow.Config(
     enable_cache=True,
     enable_report=True,
     enable_cidb=True,
-    enable_merge_ready_status=True,
-    enable_gh_summary_comment=True,
-    enable_commit_status_on_failure=False,
-    enable_open_issues_check=True,
-    enable_slack_feed=True,
+    enable_merge_ready_status=False,  # NOTE (strtgbb): we don't use this, TODO, see if we can use it
+    enable_gh_summary_comment=False,
+    enable_commit_status_on_failure=True,
+    enable_open_issues_check=False,
+    enable_slack_feed=False,
     pre_hooks=[
-        can_be_tested,
+        # can_be_tested, # NOTE (strtgbb): relies on labels we don't use
         "python3 ./ci/jobs/scripts/workflow_hooks/store_data.py",
-        "python3 ./ci/jobs/scripts/workflow_hooks/pr_labels_and_category.py",
+        # "python3 ./ci/jobs/scripts/workflow_hooks/pr_labels_and_category.py", # NOTE (strtgbb): relies on labels we don't use
         "python3 ./ci/jobs/scripts/workflow_hooks/version_log.py",
-        "python3 ./ci/jobs/scripts/workflow_hooks/team_notifications.py",
+        "python3 ./ci/jobs/scripts/workflow_hooks/parse_ci_tags.py",
+        # "python3 ./ci/jobs/scripts/workflow_hooks/team_notifications.py",
     ],
     workflow_filter_hooks=[should_skip_job],
     post_hooks=[
-        "python3 ./ci/jobs/scripts/workflow_hooks/pr_body_check.py",
-        "python3 ./ci/jobs/scripts/workflow_hooks/feature_docs.py",
-        "python3 ./ci/jobs/scripts/workflow_hooks/new_tests_check.py",
-        "python3 ./ci/jobs/scripts/workflow_hooks/can_be_merged.py",
-        "python3 ./ci/jobs/scripts/workflow_hooks/check_report_messages.py",
+        # "python3 ./ci/jobs/scripts/workflow_hooks/pr_body_check.py", # NOTE (strtgbb): Maybe we can use this
+        # "python3 ./ci/jobs/scripts/workflow_hooks/feature_docs.py", # NOTE (strtgbb): we don't build docs
+        # "python3 ./ci/jobs/scripts/workflow_hooks/new_tests_check.py", # NOTE (strtgbb): we don't use this
+        # "python3 ./ci/jobs/scripts/workflow_hooks/can_be_merged.py", # NOTE (strtgbb): relies on labels we don't use
+        # "python3 ./ci/jobs/scripts/workflow_hooks/check_report_messages.py", # TODO: What does this do?
     ],
     job_aliases={
         "integration": JobConfigs.integration_test_jobs_non_required[

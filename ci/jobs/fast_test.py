@@ -729,21 +729,23 @@ def main():
     os.environ["SCCACHE_ERROR_LOG"] = f"{build_dir}/sccache.log"
     os.environ["SCCACHE_LOG"] = "info"
     info = Info()
-    if info.is_local_run:
+    if info.is_local_run or info.is_community_pr:
         print("NOTE: It's a local run")
         if os.environ.get("SCCACHE_ENDPOINT"):
             print(f"NOTE: Using custom sccache endpoint: {os.environ['SCCACHE_ENDPOINT']}")
-        if os.environ.get("AWS_ACCESS_KEY_ID"):
+        if os.environ.get("AWS_ACCESS_KEY_ID") and not info.is_community_pr:
             print("NOTE: Using custom AWS credentials for sccache")
         else:
             os.environ["SCCACHE_S3_NO_CREDENTIALS"] = "true"
     else:
-        os.environ["CH_HOSTNAME"] = (
-            "https://build-cache.eu-west-1.aws.clickhouse-staging.com"
-        )
-        os.environ["CH_USER"] = "ci_builder"
-        os.environ["CH_PASSWORD"] = chcache_secret.get_value()
-        os.environ["CH_USE_LOCAL_CACHE"] = "false"
+        pass
+        # NOTE (strtgbb): Not used yet, but we should look into setting up the secrets for it
+        # os.environ["CH_HOSTNAME"] = (
+        #     "https://build-cache.eu-west-1.aws.clickhouse-staging.com"
+        # )
+        # os.environ["CH_USER"] = "ci_builder"
+        # os.environ["CH_PASSWORD"] = chcache_secret.get_value()
+        # os.environ["CH_USE_LOCAL_CACHE"] = "false"
 
     Utils.add_to_PATH(
         f"{os.path.dirname(clickhouse_bin_path)}:{current_directory}/tests"
@@ -873,7 +875,7 @@ def main():
 
         res = CH.run_test(fast_test_command)
 
-        test_results = FTResultsProcessor(wd=Settings.OUTPUT_DIR).run()
+        test_results = FTResultsProcessor(wd=Settings.OUTPUT_DIR, test_options=["fast"]).run()
         if not res:
             test_results.results.append(
                 Result.create_from(
