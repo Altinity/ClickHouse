@@ -1425,10 +1425,6 @@ static ColumnWithTypeAndName readColumnFromArrowColumn(
         arrow_column->type()->id() != arrow::Type::LARGE_LIST &&
         arrow_column->type()->id() != arrow::Type::FIXED_SIZE_LIST &&
         arrow_column->type()->id() != arrow::Type::MAP &&
-<<<<<<< HEAD
-        arrow_column->type()->id() != arrow::Type::STRUCT &&
-=======
->>>>>>> fc17de3cb80 (Merge pull request #101272 from nihalzp/support-arrow-orc-nullable-tuple)
         arrow_column->type()->id() != arrow::Type::DICTIONARY)
     {
         DataTypePtr nested_type_hint;
