@@ -133,6 +133,10 @@ For JWKS-based validators (`jwt_static_jwks` and `jwt_dynamic_jwks`), RS* and ES
 
 This section covers two related kinds of processor: per-IdP convenience presets built on top of the generic JWT processors (currently `entra`), and the generic `openid` processor that talks to an arbitrary OIDC-compliant identity provider.
 
+:::note
+If the IdP issues access tokens that follow [RFC 9068](https://datatracker.ietf.org/doc/html/rfc9068) (the *JSON Web Token Profile for OAuth 2.0 Access Tokens*), the access token is itself a verifiable JWT and is best handled by one of the JWT processors above (typically `jwt_dynamic_jwks`) — no `/userinfo` or `/tokeninfo` round-trip is needed. The processors in this section exist for IdPs whose access tokens are opaque (e.g. Google), or whose JWT access tokens you prefer to validate by asking the IdP rather than locally.
+:::
+
 ### Entra (Microsoft Entra ID, pure OIDC) {#entra}
 
 `<type>entra</type>` is a preset for Microsoft Entra ID built on top of `jwt_dynamic_jwks`. Tokens are validated **locally** against Entra's per-tenant JWKS — no Microsoft Graph call, no userinfo round trip, no OIDC discovery fetch. `username_claim` and `groups_claim` are read directly from the JWT payload. Use this when the access token's `aud` is your own app (registered via Entra's *Expose an API* blade), not `https://graph.microsoft.com`.
@@ -222,44 +226,74 @@ When switching from GUIDs to names, retune any `roles_filter` regex — for exam
 :::
 
 ### OpenID
+
+The `openid` processor speaks the OIDC protocol surface — `/userinfo` for identity, plus (when discovered or configured) the local JWT fast-path against the IdP's JWKS and RFC 7662 token introspection. Two mutually-exclusive configuration shapes:
+
+- **Discovery** — point `configuration_endpoint` at `.well-known/openid-configuration`. Endpoints and the issuer are resolved from the doc. When it advertises `jwks_uri`, JWT access tokens (RFC 9068) are validated locally. When it advertises `introspection_endpoint` and you supply `introspection_client_id`/`introspection_client_secret`, RFC 7662 introspection runs on each authentication — alongside the JWT fast-path if both are available, since JWT validates signature/`exp` while introspection adds the revocation check.
+
+- **Manual** — `userinfo_endpoint` is mandatory. For RFC 9068 JWT access tokens prefer `jwt_dynamic_jwks`. Add `token_introspection_endpoint` + `introspection_client_id` + `introspection_client_secret` for RFC 7662 liveness, expiry, and `iss`/`aud` enforcement; without them, manual mode is `/userinfo` only.
+
 ```xml
 <clickhouse>
     <token_processors>
-        <oid_processor_1>
+        <oid_discovery>
           <type>openid</type>
-          <configuration_endpoint>url/.well-known/openid-configuration</configuration_endpoint>
-          <verifier_leeway>60</verifier_leeway>
-          <jwks_cache_lifetime>3600</jwks_cache_lifetime>
-        </oid_processor_1>
-        <oid_processor_2>
+          <configuration_endpoint>https://idp.example.com/.well-known/openid-configuration</configuration_endpoint>
+          <expected_audience>my-clickhouse-client-id</expected_audience>
+          <introspection_client_id>clickhouse-rs</introspection_client_id>
+          <introspection_client_secret>...</introspection_client_secret>
+        </oid_discovery>
+
+        <oid_manual>
           <type>openid</type>
-          <userinfo_endpoint>url/userinfo</userinfo_endpoint>
-          <token_introspection_endpoint>url/tokeninfo</token_introspection_endpoint>
-          <jwks_uri>url/.well-known/jwks.json</jwks_uri>
-          <verifier_leeway>60</verifier_leeway>
-          <jwks_cache_lifetime>3600</jwks_cache_lifetime>
-        </oid_processor_2>
+          <userinfo_endpoint>https://idp.example.com/userinfo</userinfo_endpoint>
+          <token_introspection_endpoint>https://idp.example.com/introspect</token_introspection_endpoint>
+          <introspection_client_id>clickhouse-rs</introspection_client_id>
+          <introspection_client_secret>...</introspection_client_secret>
+          <expected_issuer>https://idp.example.com</expected_issuer>
+          <expected_audience>clickhouse-rs</expected_audience>
+        </oid_manual>
     </token_processors>
 </clickhouse>
 ```
 
-:::note
-Either `configuration_endpoint` or both `userinfo_endpoint` and `token_introspection_endpoint` (and, optionally, `jwks_uri`) shall be set. If none of them are set or all three are set, this is an invalid configuration that will not be parsed.
+:::note Parser rules
+- `configuration_endpoint` and `userinfo_endpoint` are mutually exclusive.
+- `jwks_uri` is rejected in both shapes — use `jwt_dynamic_jwks` for an explicit JWKS URL.
+- `introspection_client_id` and `introspection_client_secret` must be set together; both honor `from_env=` / `from_zk=` for secrets handling.
+- In manual mode, `expected_issuer` / `expected_audience` are accepted only when introspection is wired (`/userinfo` carries neither claim and so cannot enforce them).
 :::
 
-**Parameters:**
+#### Setting up the introspection client at your IdP
 
-- `configuration_endpoint` - URI of OpenID configuration (often ends with `.well-known/openid-configuration`);
-- `userinfo_endpoint` - URI of endpoint that returns user information in exchange for a valid token;
-- `token_introspection_endpoint` - URI of token introspection endpoint (returns information about a valid token);
-- `jwks_uri` - URI of OpenID configuration (often ends with `.well-known/jwks.json`)
-- `jwks_cache_lifetime` - Period for resend request for refreshing JWKS. Optional, default: 3600.
-- `verifier_leeway` - Clock skew tolerance (seconds). Useful for handling small differences in system clocks between ClickHouse and the token issuer. Optional, default: 60
-- `expected_issuer` - Expected value of the `iss` (issuer) claim in the JWT. If specified, tokens with a different issuer will be rejected. Optional.
-- `expected_audience` - Expected value of the `aud` (audience) claim in the JWT. If specified, tokens with a different audience will be rejected. Optional.
-- `allow_no_expiration` - If `true`, tokens without the `exp` (expiration) claim are accepted. Otherwise they are rejected. Optional, default: `false`.
+Introspection needs an OAuth client representing ClickHouse-as-resource-server — separate from any user-facing client app, with no redirect URIs.
 
-Sometimes a token is a valid JWT. In that case token will be decoded and validated locally if configuration endpoint returns JWKS URI (or `jwks_uri` is specified alongside `userinfo_endpoint` and `token_introspection_endpoint`).
+| IdP | RFC 7662 introspection | How to create the introspection client |
+|---|---|---|
+| **Keycloak** | Yes | Realm → Clients → confidential client with *Service Accounts* enabled; copy `client_id` and the secret from the *Credentials* tab |
+| **Okta** | Yes (Org AS + Custom AS) | Admin → Applications → Create App Integration → *API Services* |
+| **Auth0** | Not for opaque user tokens | Auth0 does not provide `/introspect` for the opaque tokens issued at the `/userinfo` audience; for custom-API JWT access tokens use `jwt_dynamic_jwks` instead |
+| **Google**, **GitHub**, **Microsoft Entra ID** (MS Graph) | No | No RFC 7662 endpoint — use the provider-specific processor (`google`) or JWT validation against your own API's tokens (`entra`, `jwt_dynamic_jwks`) |
+
+#### Parameters
+
+*Discovery mode:*
+- `configuration_endpoint` — URI of the OIDC configuration document. Mandatory.
+- `expected_issuer` — Expected `iss`. Enforced via the JWT fast-path or RFC 7662 introspection (whichever the discovery doc surfaces); also anchors the discovery doc's own `issuer` field. Optional.
+- `expected_audience` — Expected `aud`. Same enforcement scope as `expected_issuer`. Optional.
+- `introspection_client_id`, `introspection_client_secret` — `client_secret_basic` credentials for the introspection endpoint. Both must be set together. Optional; required only if you want introspection enabled.
+- `allow_no_expiration` — Accept JWTs without `exp` on the JWT fast-path. Optional, default `false`.
+- `verifier_leeway` — Clock-skew tolerance (seconds) for the JWT fast-path. Optional, default 60.
+- `jwks_cache_lifetime` — JWKS refresh interval. Optional, default 3600.
+- `allow_http_discovery_urls` — Allow non-HTTPS URLs returned by the discovery document. Optional, default `false`.
+
+*Manual mode:*
+- `userinfo_endpoint` — URI of the OIDC userinfo endpoint. Mandatory.
+- `token_introspection_endpoint` — URI of an RFC 7662 introspection endpoint. Optional; when set together with introspection credentials, enables liveness, `exp`, and `iss`/`aud` enforcement.
+- `introspection_client_id`, `introspection_client_secret` — As above. Required iff `token_introspection_endpoint` is set.
+- `expected_issuer`, `expected_audience` — Accepted only when introspection is wired; enforced against the introspection response. Optional.
+
+If the IdP issues access tokens that follow [RFC 9068](https://datatracker.ietf.org/doc/html/rfc9068), prefer `jwt_dynamic_jwks` for direct local validation. The `openid` processor is for opaque tokens (via userinfo and/or introspection) and for cases where you want to consult the IdP rather than validate locally.
 
 ### Tokens cache
 To reduce number of requests to IdP, tokens are cached internally for a maximum period of `token_cache_lifetime` seconds.
