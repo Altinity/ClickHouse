@@ -27,13 +27,13 @@ The three cases are mutually exclusive for a given `(database, table)`: you neve
 
 ## Scope
 
-Covers Hybrid tables visible to `getTablesIterator()` plus session-local temporary Hybrid tables — the same set that appears in `system.tables`. Temporary tables are emitted with `database = ''`, matching the `system.tables` convention.
+Covers Hybrid tables (`engine = Hybrid`) including session-local temporary tables. Temporary tables are emitted with `database = ''`, matching the `system.tables` convention.
 
 Out of scope:
 
 - **On-disk metadata that fails to load.** A `.sql` file that fails the factory-time validation of `hybridParam()` arity, literal types, or declared-type conflicts is rejected during startup and the table never attaches. Such failures surface in the server log, not in this table.
 - **Detached tables.** Re-`ATTACH` re-runs factory validation.
-- **Non-Hybrid `Distributed` tables.** Filtered out by `getName() == "Hybrid"`.
+- **Non-Hybrid `Distributed` tables.**.
 
 ## Access control
 
