@@ -29,6 +29,11 @@ public:
     static std::unique_ptr<IOAuthProviderPolicy> create(const OAuthCredentials & creds);
 };
 
+/// Populate auth_uri / token_uri / device_auth_uri on an OAuthCredentials by
+/// fetching the OIDC discovery document at <issuer>/.well-known/openid-configuration.
+/// `creds.issuer` must already be set; client_id / client_secret are not touched.
+void populateEndpointsFromOIDCDiscovery(OAuthCredentials & creds);
+
 class GoogleOAuthProviderPolicy final : public IOAuthProviderPolicy
 {
 public:

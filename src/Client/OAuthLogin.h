@@ -23,11 +23,12 @@ struct OAuthCredentials
     std::string token_uri;       // token_endpoint
     std::string device_auth_uri; // device_authorization_endpoint (discovered if empty)
     std::string issuer;          // OIDC issuer URL (optional; used to locate discovery document)
+    /// Loopback port for the auth-code flow's redirect_uri. 0 = let the kernel
+    /// pick (RFC 8252 §7.3 compliant; works with Google). Pin to a fixed value
+    /// for IdPs that don't accept arbitrary ports (Auth0) and register
+    /// http://127.0.0.1:<port>/callback in the IdP's allowed callbacks.
+    uint16_t loopback_port = 0;
 };
-
-/// Load from Google-format JSON credentials file.
-/// Throws if file not found or malformed.
-OAuthCredentials loadOAuthCredentials(const std::string & path);
 
 /// Run OAuth flow, return ID token. Throws on failure.
 std::string obtainIDToken(const OAuthCredentials & creds, OAuthFlowMode mode);

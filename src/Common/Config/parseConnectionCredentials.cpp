@@ -54,6 +54,18 @@ ConnectionsCredentials parseConnectionsCredentials(const Poco::Util::AbstractCon
             res.accept_invalid_certificate.emplace(config.getBool(prefix + ".accept-invalid-certificate"));
         if (config.has(prefix + ".prompt"))
             res.prompt.emplace(config.getString(prefix + ".prompt"));
+        if (config.has(prefix + ".login"))
+            res.login.emplace(config.getString(prefix + ".login"));
+        if (config.has(prefix + ".oauth-url"))
+            res.oauth_url.emplace(config.getString(prefix + ".oauth-url"));
+        if (config.has(prefix + ".oauth-client-id"))
+            res.oauth_client_id.emplace(config.getString(prefix + ".oauth-client-id"));
+        if (config.has(prefix + ".oauth-audience"))
+            res.oauth_audience.emplace(config.getString(prefix + ".oauth-audience"));
+        if (config.has(prefix + ".oauth-client-secret"))
+            res.oauth_client_secret.emplace(config.getString(prefix + ".oauth-client-secret"));
+        if (config.has(prefix + ".oauth-callback-port"))
+            res.oauth_callback_port.emplace(static_cast<UInt16>(config.getUInt(prefix + ".oauth-callback-port")));
     }
 
     if (connection_name.has_value() && !connection_found)

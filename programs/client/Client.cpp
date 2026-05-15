@@ -27,6 +27,7 @@
 #include <Client/JWTProvider.h>
 #include <Client/ClientBaseHelpers.h>
 #include <Client/OAuthLogin.h>
+#include <Client/OAuthProviderPolicy.h>
 
 #include <AggregateFunctions/registerAggregateFunctions.h>
 #include <Formats/FormatFactory.h>
@@ -274,6 +275,18 @@ void Client::initialize(Poco::Util::Application & self)
             configuration.setBool("accept-invalid-certificate", overrides.accept_invalid_certificate.value());
         if (overrides.prompt.has_value())
             configuration.setString("prompt", overrides.prompt.value());
+        if (overrides.login.has_value())
+            configuration.setString("login", overrides.login.value());
+        if (overrides.oauth_url.has_value())
+            configuration.setString("oauth-url", overrides.oauth_url.value());
+        if (overrides.oauth_client_id.has_value())
+            configuration.setString("oauth-client-id", overrides.oauth_client_id.value());
+        if (overrides.oauth_audience.has_value())
+            configuration.setString("oauth-audience", overrides.oauth_audience.value());
+        if (overrides.oauth_client_secret.has_value())
+            configuration.setString("oauth-client-secret", overrides.oauth_client_secret.value());
+        if (overrides.oauth_callback_port.has_value())
+            configuration.setUInt("oauth-callback-port", overrides.oauth_callback_port.value());
 
         config().add(loaded_config.configuration);
 
@@ -289,6 +302,57 @@ void Client::initialize(Poco::Util::Application & self)
     }
     else if (config().has("connection"))
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "--connection was specified, but config does not exist");
+
+#if USE_JWT_CPP && USE_SSL
+    /// OAuth login: unified across CLI flags and connection-block <oauth-*>
+    /// fields. Both sources are merged into config() by this point (CLI in the
+    /// top layer, connection block in the file-loaded layer with lower
+    /// priority), so reading config() gives CLI > connection-block precedence.
+    if (config().has("login") && !config().has("jwt") && !config().getBool("cloud_oauth_pending", false))
+    {
+        const std::string login_mode = config().getString("login");
+        if (!login_mode.empty() && login_mode != "browser" && login_mode != "device")
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "login value must be 'browser' or 'device', got '{}'",
+                login_mode);
+
+        const bool have_endpoints
+            = config().has("oauth-url")
+            && config().has("oauth-client-id");
+
+        if (login_mode.empty() && !have_endpoints)
+        {
+            /// Bare login (CLI --login or empty <login></login>) → cloud auto-detect.
+            config().setBool("cloud_oauth_pending", true);
+            config().setString("user", "");
+        }
+        else if (have_endpoints)
+        {
+            OAuthCredentials creds;
+            creds.client_id = config().getString("oauth-client-id");
+            creds.issuer = config().getString("oauth-url");
+            if (config().has("oauth-client-secret"))
+                creds.client_secret = config().getString("oauth-client-secret");
+            if (config().has("oauth-callback-port"))
+                creds.loopback_port = static_cast<uint16_t>(config().getUInt("oauth-callback-port"));
+            populateEndpointsFromOIDCDiscovery(creds);
+
+            const auto mode = (login_mode == "browser") ? OAuthFlowMode::AuthCode : OAuthFlowMode::Device;
+            jwt_provider = createOAuthJWTProvider(creds, mode);
+            config().setString("jwt", jwt_provider->getJWT());
+            config().setString("user", "");
+        }
+        else
+        {
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "login mode '{}' requires oauth-url and oauth-client-id (set via --oauth-url / "
+                "--oauth-client-id or <oauth-url> / <oauth-client-id> in the connection block)",
+                login_mode);
+        }
+    }
+#endif
 
     if (config().has("accept-invalid-certificate"))
     {
@@ -730,17 +794,16 @@ void Client::addExtraOptions(OptionsDescription & options_description)
         ("quota_key", po::value<std::string>(), "A string to differentiate quotas when the user have keyed quotas configured on server")
         ("jwt", po::value<std::string>(), "Use JWT for authentication")
         ("login", po::value<std::string>()->implicit_value(""),
-            "Authenticate via OAuth2. Optional mode: 'browser' (auth-code + PKCE, opens browser) "
-            "or 'device' (device flow, prints URL + code). "
-            "Example: --login=browser or --login=device. "
-            "Bare --login uses the ClickHouse Cloud auto-login path.")
-        ("oauth-credentials", po::value<std::string>(),
-            "Path to OAuth credentials JSON file "
-            "(default: ~/.clickhouse-client/oauth_client.json)")
+            "Authenticate via OAuth2. Bare --login (no =mode) uses the ClickHouse Cloud auto-login path. "
+            "--login=browser runs the Authorization Code + PKCE flow, --login=device runs the Device "
+            "Authorization flow. The non-bare modes require --oauth-url and --oauth-client-id (or the "
+            "equivalent <oauth-*> fields in the connection block).")
 #if USE_JWT_CPP && USE_SSL
-        ("oauth-url", po::value<std::string>(), "The base URL for the OAuth 2.0 authorization server")
-        ("oauth-client-id", po::value<std::string>(), "The client ID for the OAuth 2.0 application")
-        ("oauth-audience", po::value<std::string>(), "The audience for the OAuth 2.0 token")
+        ("oauth-url", po::value<std::string>(), "Base URL of the OAuth 2.0 authorization server (OIDC issuer)")
+        ("oauth-client-id", po::value<std::string>(), "Client ID for the OAuth 2.0 application")
+        ("oauth-audience", po::value<std::string>(), "Audience for the OAuth 2.0 access token")
+        ("oauth-client-secret", po::value<std::string>(), "Client secret. Omit for native/public clients (RFC 8252 §8.4); include for IdPs that require it (Google Desktop apps).")
+        ("oauth-callback-port", po::value<UInt16>(), "Pin the loopback port for the auth-code flow (browser mode). Default 0 = kernel-picks. Required for IdPs that don't support port wildcarding for loopback redirects (Auth0).")
 #endif
         ("max_client_network_bandwidth",
             po::value<int>(),
@@ -900,19 +963,8 @@ void Client::processOptions(
         config().setString("jwt", options["jwt"].as<std::string>());
         config().setString("user", "");
     }
-    if (options.count("oauth-credentials") && !options.count("login"))
-        throw Exception(
-            ErrorCodes::BAD_ARGUMENTS,
-            "--oauth-credentials requires --login=browser or --login=device");
-
     if (options.count("login"))
     {
-        /// Reject mixed JWT + --login from any source. The --login branch below
-        /// ends up calling config().setString("jwt", jwt_provider->getJWT()),
-        /// which would silently overwrite a JWT supplied via --jwt or via the
-        /// XML config file. config().has("jwt") covers both: CLI --jwt was
-        /// already copied into config() above, and a <jwt> element in
-        /// ~/.clickhouse-client/config.xml is loaded into config() at startup.
         if (config().has("jwt"))
             throw Exception(
                 ErrorCodes::BAD_ARGUMENTS,
@@ -922,50 +974,18 @@ void Client::processOptions(
         if (!login_mode.empty() && login_mode != "browser" && login_mode != "device")
             throw Exception(
                 ErrorCodes::BAD_ARGUMENTS,
-                "--login value must be 'browser' or 'device', got '{}'",
+                "--login value must be 'browser' or 'device' (or empty for ClickHouse Cloud auto-login), got '{}'",
                 login_mode);
 
 #if USE_JWT_CPP && USE_SSL
         if (!options["user"].defaulted())
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "--user and --login cannot both be specified");
 
-        // Bare --login (empty mode, including auto-added for *.clickhouse.cloud) → cloud path.
-        // Explicit --login=browser or --login=device (or --oauth-credentials) → credentials-file
-        // OIDC path. This prevents the credentials file from hijacking the cloud auto-login.
-        const bool use_credentials_file
-            = !login_mode.empty()
-            || options.count("oauth-credentials");
-
-        if (use_credentials_file)
-        {
-            const char * home_path_cstr = getenv("HOME"); // NOLINT(concurrency-mt-unsafe)
-            const std::string default_creds_path = home_path_cstr
-                ? std::string(home_path_cstr) + "/.clickhouse-client/oauth_client.json"
-                : "";
-
-            const std::string creds_path = options.count("oauth-credentials")
-                ? options["oauth-credentials"].as<std::string>()
-                : default_creds_path;
-
-            auto creds = loadOAuthCredentials(creds_path);
-            const auto mode = (login_mode == "device") ? OAuthFlowMode::Device : OAuthFlowMode::AuthCode;
-
-            // createOAuthJWTProvider runs the initial flow (trying the cached
-            // refresh token first) and returns a provider that Connection can
-            // call to refresh the id_token transparently during long sessions.
-            jwt_provider = createOAuthJWTProvider(creds, mode);
-            config().setString("jwt", jwt_provider->getJWT());
-            config().setString("user", "");
-        }
-        else
-        {
-            // Cloud-specific login path — bare --login, including auto-added for
-            // *.clickhouse.cloud endpoints. Use a separate config key so that
-            // argsToConfig() overwriting config["login"] with the raw string value
-            // cannot cause getBool("login") to throw in main().
-            config().setBool("cloud_oauth_pending", true);
-            config().setString("user", "");
-        }
+        /// Stash the mode in config(); the OAuth flow itself runs later in
+        /// initialize(), after the connection block has been layered in. CLI
+        /// values override connection-block values via Poco's layer priority.
+        config().setString("login", login_mode);
+        config().setString("user", "");
 #else
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "OAuth login requires a build with JWT and SSL support");
 #endif
@@ -977,6 +997,10 @@ void Client::processOptions(
         config().setString("oauth-client-id", options["oauth-client-id"].as<std::string>());
     if (options.contains("oauth-audience"))
         config().setString("oauth-audience", options["oauth-audience"].as<std::string>());
+    if (options.contains("oauth-client-secret"))
+        config().setString("oauth-client-secret", options["oauth-client-secret"].as<std::string>());
+    if (options.contains("oauth-callback-port"))
+        config().setUInt("oauth-callback-port", options["oauth-callback-port"].as<UInt16>());
 #endif
     if (options.contains("accept-invalid-certificate"))
     {
