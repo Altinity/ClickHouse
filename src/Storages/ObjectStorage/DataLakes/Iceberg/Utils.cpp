@@ -107,9 +107,6 @@ namespace DB::Iceberg
 {
 
 using namespace DB;
-<<<<<<< HEAD
-static CompressionMethod getCompressionMethodFromMetadataFile(const String & path)
-=======
 
 /// Best-effort heuristic based on ClickHouse naming conventions.
 /// Files produced by other engines (Spark, Flink, Trino) may use different
@@ -140,8 +137,7 @@ FileCategory inspectFileCategory(const String & relative_path)
     return FileCategory::DATA_FILE;
 }
 
-CompressionMethod getCompressionMethodFromMetadataFile(const String & path)
->>>>>>> d82e501b0e4 (Merge pull request #99127 from murphy-4o/murphy_issue_99030)
+static CompressionMethod getCompressionMethodFromMetadataFile(const String & path)
 {
     constexpr std::string_view metadata_suffix = ".metadata.json";
 

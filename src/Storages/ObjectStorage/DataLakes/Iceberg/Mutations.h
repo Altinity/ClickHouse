@@ -40,18 +40,6 @@ void alter(
     PersistentTableComponents & persistent_table_components,
     const String & write_format);
 
-<<<<<<< HEAD
-ExpireSnapshotsResult expireSnapshots(
-    const ExpireSnapshotsOptions & options,
-    ContextPtr context,
-    ObjectStoragePtr object_storage,
-    const DataLakeStorageSettings & data_lake_settings,
-    PersistentTableComponents & persistent_table_components,
-    const String & write_format,
-    std::shared_ptr<DataLake::ICatalog> catalog,
-    const String & table_name);
-=======
->>>>>>> d82e501b0e4 (Merge pull request #99127 from murphy-4o/murphy_issue_99030)
 }
 
 #endif
