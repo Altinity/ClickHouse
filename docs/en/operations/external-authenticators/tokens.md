@@ -178,11 +178,47 @@ All remaining parameters are optional:
 - `expected_issuer` — Expected value of the `iss` claim. Default: `https://login.microsoftonline.com/{tenant_id}/v2.0` (derived from `tenant_id`). Override for v1.0 tokens (`https://sts.windows.net/{tenant_id}/`) or sovereign clouds.
 - `expected_audience` — Expected value of the `aud` claim, normally your app's Application ID URI (e.g. `api://clickhouse`) or client ID. If unset, no audience check is performed (any signature-valid token from the tenant will authenticate); a warning is logged at startup so the gap is visible.
 - `username_claim` — JWT claim to use as the ClickHouse username. Default: `sub`. Common Entra alternatives: `preferred_username`, `upn`, `oid`.
-- `groups_claim` — JWT claim that carries the array of group identifiers. Default: `groups`. Set to `roles` if you use App Roles in Entra instead of security-group claims.
+- `groups_claim` — JWT claim that carries the array of group identifiers. Default: `groups`. Set to `roles` when using App Roles. See [Mapping groups to ClickHouse roles](#entra-group-mapping) for how to get human-readable values instead of GUIDs.
 - `expected_typ`, `verifier_leeway`, `jwks_cache_lifetime`, `claims`, `allow_no_expiration`, `token_cache_lifetime` — Same as for `jwt_dynamic_jwks`.
 
+#### Mapping groups to ClickHouse roles {#entra-group-mapping}
+
+By default the `groups` claim contains group **object IDs (GUIDs)**, not names. Three ways to surface human-readable identifiers, in order of preference:
+
+**Option A — App Roles** (recommended)
+
+Operator-chosen role strings in a separate `roles` claim. Compact even for users in many groups (no `hasgroups` overage indicator), and immune to Entra-side group renames.
+
+1. App registration → **App roles** → **Create app role**. Set `Value` to the string ClickHouse should receive (e.g. `ch_admin`); `Allowed member types` = `Users/Groups`.
+2. Enterprise application → **Properties** → `Assignment required` = **Yes**.
+3. Enterprise application → **Users and groups** → assign each user or security group to a role. Group assignment requires Entra ID P1/P2; free-tier tenants can only assign individual users here.
+4. On the processor: `<groups_claim>roles</groups_claim>`.
+
+**Option B — Format the `groups` claim**
+
+Names emitted in the existing `groups` claim. Works on free tier; useful when group membership is already maintained in Entra and a separate role-assignment surface is not wanted.
+
+Prerequisites in the app registration:
+
+- `"groupMembershipClaims": "ApplicationGroup"` (or `"SecurityGroup"` for tenant-wide).
+- `optionalClaims.accessToken` entry for `groups` with `additionalProperties` set to one or more of:
+
+| Value | Effect |
+|---|---|
+| `sam_account_name` | On-prem-synced groups emit as `sAMAccountName`. |
+| `dns_domain_and_sam_account_name` | On-prem-synced groups emit as `DOMAIN\sAMAccountName`. |
+| `cloud_displayname` | Cloud-only groups emit their `displayName`. |
+
+Entra picks per group; groups not covered by a chosen format still emit as GUIDs. Display names are mutable — a rename in Entra silently breaks the mapping until config is updated.
+
+Leave `<groups_claim>groups</groups_claim>` (the default).
+
+**Option C — `roles_mapping`**
+
+Keep GUIDs in the token and translate them in the user-directory config (see [Identity Provider as an External User Directory](#idp-external-user-directory)). Always works, including on free tier. Tedious for many groups but immune to renames.
+
 :::note
-The `groups` claim must be enabled in the app registration's manifest (`"groupMembershipClaims": "ApplicationGroup"` is recommended) and exposed in access tokens via `optionalClaims.accessToken`. Group identifiers in the token are object IDs (GUIDs) by default; map them to ClickHouse roles via the user-directory's `roles_mapping` block (see [Identity Provider as an External User Directory](#idp-external-user-directory)).
+When switching from GUIDs to names, retune any `roles_filter` regex — for example `\bclickhouse-[a-zA-Z0-9]+\b` will not match strings like `ch_admin`.
 :::
 
 ### OpenID
