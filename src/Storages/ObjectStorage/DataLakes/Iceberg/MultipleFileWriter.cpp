@@ -103,7 +103,7 @@ void MultipleFileWriter::finalize()
 
     per_file_record_counts.push_back(static_cast<Int64>(*current_file_num_rows));
     /// todo arthur fix the wrong counter for file bytes, probably by backporting something else
-    per_file_byte_sizes.push_back(static_cast<Int64>(buffer_bytes));
+    per_file_byte_sizes.push_back(static_cast<Int64>(total_bytes));
     per_file_stats_list.push_back(current_file_stats);
 }
 
