@@ -12,32 +12,6 @@
 namespace DB
 {
 
-<<<<<<< HEAD
-=======
-struct ParquetFileBucketInfo : public FileBucketInfo
-{
-    std::vector<size_t> row_group_ids;
-
-    ParquetFileBucketInfo() = default;
-    explicit ParquetFileBucketInfo(const std::vector<size_t> & row_group_ids_);
-    void serialize(WriteBuffer & buffer) override;
-    void deserialize(ReadBuffer & buffer) override;
-    String getIdentifier() const override;
-    String getFormatName() const override
-    {
-        return "Parquet";
-    }
-    std::shared_ptr<FileBucketInfo> filterByMatchingRowGroups(const std::vector<size_t> & matching_row_groups) const override;
-};
-using ParquetFileBucketInfoPtr = std::shared_ptr<ParquetFileBucketInfo>;
-
-struct ParquetBucketSplitter : public IBucketSplitter
-{
-    ParquetBucketSplitter() = default;
-    std::vector<FileBucketInfoPtr> splitToBuckets(size_t bucket_size, ReadBuffer & buf, const FormatSettings & format_settings_) override;
-};
-
->>>>>>> 69167ef25d2 (Merge pull request #102115 from scanhex12/iceberg_qcc)
 class ParquetV3BlockInputFormat : public IInputFormat
 {
 public:

@@ -39,11 +39,8 @@
 #include <Storages/ObjectStorage/Utils.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <boost/operators.hpp>
-<<<<<<< HEAD
-=======
 #include <Poco/String.h>
 #include <Common/Exception.h>
->>>>>>> 69167ef25d2 (Merge pull request #102115 from scanhex12/iceberg_qcc)
 #include <Common/SipHash.h>
 #include <Common/parseGlobs.h>
 #include <Storages/ObjectStorage/IObjectIterator.h>
@@ -664,19 +661,12 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
     ObjectInfoPtr object_info;
     auto query_settings = configuration->getQuerySettings(context_);
 
-<<<<<<< HEAD
-    bool not_a_path = false;
-
-    do
-=======
     QueryConditionCachePtr query_condition_cache;
     if (format_filter_info && format_filter_info->condition_hash)
         query_condition_cache = Context::getGlobalContextInstance()->getQueryConditionCache();
 
     while (true)
->>>>>>> 69167ef25d2 (Merge pull request #102115 from scanhex12/iceberg_qcc)
     {
-        not_a_path = false;
         object_info = file_iterator->next(processor);
 
         if (!object_info)
@@ -687,7 +677,6 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             auto retry_after_us = object_info->relative_path_with_metadata.getCommand().getRetryAfterUs();
             if (retry_after_us.has_value())
             {
-                not_a_path = true;
                 /// TODO: Make asyncronous waiting without sleep in thread
                 /// Now this sleep is on executor node in worker thread
                 /// Does not block query initiator
@@ -717,15 +706,6 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             else
                 object_info->setObjectMetadata(object_storage->getObjectMetadata(path, with_tags));
         }
-<<<<<<< HEAD
-    }
-    while (not_a_path
-           || (query_settings.skip_empty_files
-               && object_info->getObjectMetadata()->size_bytes == 0
-               && object_info->getObjectMetadata()->is_size_known));
-
-    ProfileEvents::increment(ProfileEvents::ObjectStorageClusterProcessedTasks);
-=======
 
         if (query_settings.skip_empty_files && object_info->getObjectMetadata()->size_bytes == 0
             && object_info->getObjectMetadata()->is_size_known)
@@ -756,7 +736,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                     continue;
 
                 auto file_bucket_info = FormatFactory::instance().getFileBucketInfo(
-                    object_info->getFileFormat().value_or(configuration->format));
+                    object_info->getFileFormat().value_or(configuration->getFormat()));
                 if (file_bucket_info)
                 {
                     auto filtered = file_bucket_info->filterByMatchingRowGroups(matching_row_groups);
@@ -768,7 +748,8 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
         }
         break;
     }
->>>>>>> 69167ef25d2 (Merge pull request #102115 from scanhex12/iceberg_qcc)
+
+    ProfileEvents::increment(ProfileEvents::ObjectStorageClusterProcessedTasks);
 
     QueryPipelineBuilder builder;
     std::shared_ptr<ISource> source;
