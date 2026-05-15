@@ -133,11 +133,7 @@ static bool isTemporaryMetadataFile(const String & file_name)
     return Poco::UUID{}.tryParse(substring);
 }
 
-<<<<<<< HEAD
 Iceberg::MetadataFileWithInfo getMetadataFileAndVersion(const std::string & path)
-=======
-static MetadataFileWithInfo getMetadataFileAndVersion(const std::string & path)
->>>>>>> 8268bbd46d2 (Merge pull request #100420 from ClickHouse/divanik/rerevert_spark_azure_fixes)
 {
     String file_name = std::filesystem::path(path).filename();
     if (isTemporaryMetadataFile(file_name))
@@ -1161,13 +1157,9 @@ MetadataFileWithInfo getLatestOrExplicitMetadataFileAndVersion(
     const ContextPtr & local_context,
     Poco::Logger * log,
     const std::optional<String> & table_uuid,
-<<<<<<< HEAD
+    CompressionMethod known_compression_method,
     bool force_fetch_latest_metadata,
     bool ignore_explicit_metadata_file_path)
-=======
-    CompressionMethod known_compression_method,
-    bool force_fetch_latest_metadata)
->>>>>>> 8268bbd46d2 (Merge pull request #100420 from ClickHouse/divanik/rerevert_spark_azure_fixes)
 {
     if (data_lake_settings[DataLakeStorageSetting::iceberg_metadata_file_path].changed && !ignore_explicit_metadata_file_path)
     {

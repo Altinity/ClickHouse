@@ -51,14 +51,10 @@ void MultipleFileWriter::startNewFile()
     auto metadata_path = filename_generator.generateDataFileName();
     auto storage_path = path_resolver.resolve(metadata_path);
 
-<<<<<<< HEAD
-    data_file_names.push_back(filename.path_in_storage);
-    if (new_file_path_callback)
-        new_file_path_callback(filename.path_in_storage);
-
-=======
     data_file_names.push_back(metadata_path);
->>>>>>> 8268bbd46d2 (Merge pull request #100420 from ClickHouse/divanik/rerevert_spark_azure_fixes)
+    if (new_file_path_callback)
+        new_file_path_callback(storage_path);
+
     buffer = object_storage->writeObject(
         StoredObject(storage_path), WriteMode::Rewrite, std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, context->getWriteSettings());
 
@@ -91,8 +87,14 @@ void MultipleFileWriter::finalize()
     output_format->flush();
     output_format->finalize();
     buffer->finalize();
-<<<<<<< HEAD
-    const UInt64 file_bytes = buffer->count();
+    UInt64 file_bytes = buffer->count();
+    if (file_bytes == 0 && !data_file_names.empty())
+    {
+        /// Some storage backends (e.g. Azure) don't track bytes in the write buffer.
+        /// Fall back to querying the actual object size.
+        auto metadata = object_storage->getObjectMetadata(path_resolver.resolve(data_file_names.back()), /*with_tags=*/false);
+        file_bytes = metadata.size_bytes;
+    }
     total_bytes += file_bytes;
     per_file_record_counts.push_back(static_cast<Int64>(*current_file_num_rows));
     per_file_byte_sizes.push_back(static_cast<Int64>(file_bytes));
@@ -109,26 +111,12 @@ std::vector<IcebergDataFileEntry> MultipleFileWriter::getDataFileEntries() const
 
     for (size_t i = 0; i < data_file_names.size(); ++i)
         entries.emplace_back(
-            data_file_names[i],
+            path_resolver.resolve(data_file_names[i]),
             per_file_record_counts[i],
             per_file_byte_sizes[i],
             per_file_stats_list[i]);
 
     return entries;
-=======
-    auto buffer_bytes = buffer->count();
-    if (buffer_bytes > 0)
-    {
-        total_bytes += buffer_bytes;
-    }
-    else if (!data_file_names.empty())
-    {
-        /// Some storage backends (e.g. Azure) don't track bytes in the write buffer.
-        /// Fall back to querying the actual object size.
-        auto metadata = object_storage->getObjectMetadata(path_resolver.resolve(data_file_names.back()), /*with_tags=*/false);
-        total_bytes += metadata.size_bytes;
-    }
->>>>>>> 8268bbd46d2 (Merge pull request #100420 from ClickHouse/divanik/rerevert_spark_azure_fixes)
 }
 
 void MultipleFileWriter::release()

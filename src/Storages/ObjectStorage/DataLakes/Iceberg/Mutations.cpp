@@ -591,12 +591,9 @@ void mutate(
             context,
             log.get(),
             persistent_table_components.table_uuid,
-<<<<<<< HEAD
+            persistent_table_components.metadata_compression_method,
             /* force_fetch_latest_metadata */ true,
             /* ignore_explicit_metadata_file_path */ true);
-=======
-            persistent_table_components.metadata_compression_method);
->>>>>>> 8268bbd46d2 (Merge pull request #100420 from ClickHouse/divanik/rerevert_spark_azure_fixes)
 
         FileNamesGenerator filename_generator(persistent_table_components.path_resolver.getTableLocation(), false, CompressionMethod::None, write_format);
         filename_generator.setVersion(last_version + 1);
@@ -724,12 +721,9 @@ void alter(
             context,
             log.get(),
             persistent_table_components.table_uuid,
-<<<<<<< HEAD
+            persistent_table_components.metadata_compression_method,
             /* force_fetch_latest_metadata */ true,
             /* ignore_explicit_metadata_file_path */ true);
-=======
-            persistent_table_components.metadata_compression_method);
->>>>>>> 8268bbd46d2 (Merge pull request #100420 from ClickHouse/divanik/rerevert_spark_azure_fixes)
 
         FileNamesGenerator filename_generator(persistent_table_components.path_resolver.getTableLocation(), false, CompressionMethod::None, write_format);
         filename_generator.setVersion(last_version + 1);
@@ -1315,12 +1309,9 @@ ExpireSnapshotsResult expireSnapshots(
             context,
             log.get(),
             persistent_table_components.table_uuid,
-<<<<<<< HEAD
+            persistent_table_components.metadata_compression_method,
             /* force_fetch_latest_metadata */ true,
             /* ignore_explicit_metadata_file_path */ true);
-=======
-            persistent_table_components.metadata_compression_method);
->>>>>>> 8268bbd46d2 (Merge pull request #100420 from ClickHouse/divanik/rerevert_spark_azure_fixes)
 
         filename_generator.setVersion(last_version + 1);
         filename_generator.setCompressionMethod(compression_method);

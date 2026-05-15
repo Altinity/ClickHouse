@@ -58,14 +58,10 @@ private:
     DataFileStatistics current_file_stats; /// accumulates for the current file only
     std::optional<size_t> current_file_num_rows = std::nullopt;
     std::optional<size_t> current_file_num_bytes = std::nullopt;
-<<<<<<< HEAD
-    std::vector<String> data_file_names;
+    std::vector<Iceberg::IcebergPathFromMetadata> data_file_names;
     std::vector<Int64> per_file_record_counts;
     std::vector<Int64> per_file_byte_sizes;
     std::vector<DataFileStatistics> per_file_stats_list;
-=======
-    std::vector<Iceberg::IcebergPathFromMetadata> data_file_names;
->>>>>>> 8268bbd46d2 (Merge pull request #100420 from ClickHouse/divanik/rerevert_spark_azure_fixes)
     std::unique_ptr<WriteBufferFromFileBase> buffer;
     OutputFormatPtr output_format;
     FileNamesGenerator & filename_generator;

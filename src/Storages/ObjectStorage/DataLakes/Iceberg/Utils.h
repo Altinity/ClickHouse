@@ -102,13 +102,9 @@ MetadataFileWithInfo getLatestOrExplicitMetadataFileAndVersion(
     const ContextPtr & local_context,
     Poco::Logger * log,
     const std::optional<String> & table_uuid,
-<<<<<<< HEAD
+    CompressionMethod known_compression_method,
     bool force_fetch_latest_metadata = true,
     bool ignore_explicit_metadata_file_path = false);
-=======
-    CompressionMethod known_compression_method,
-    bool force_fetch_latest_metadata = true);
->>>>>>> 8268bbd46d2 (Merge pull request #100420 from ClickHouse/divanik/rerevert_spark_azure_fixes)
 
 std::pair<Poco::JSON::Object::Ptr, Int32> parseTableSchemaV1Method(const Poco::JSON::Object::Ptr & metadata_object);
 std::pair<Poco::JSON::Object::Ptr, Int32> parseTableSchemaV2Method(const Poco::JSON::Object::Ptr & metadata_object);

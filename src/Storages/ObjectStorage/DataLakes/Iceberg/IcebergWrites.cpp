@@ -850,13 +850,7 @@ IcebergStorageSink::IcebergStorageSink(
     , table_id(table_id_)
     , persistent_table_components(persistent_table_components_)
     , data_lake_settings(configuration_->getDataLakeSettings())
-<<<<<<< HEAD
     , write_format(configuration_->getFormat())
-    , blob_storage_type_name(configuration_->getTypeName())
-    , blob_storage_namespace_name(configuration_->getNamespace())
-=======
-    , write_format(configuration_->format)
->>>>>>> 8268bbd46d2 (Merge pull request #100420 from ClickHouse/divanik/rerevert_spark_azure_fixes)
 {
     auto [last_version, metadata_path, compression_method] = getLatestOrExplicitMetadataFileAndVersion(
         object_storage,
@@ -1137,13 +1131,9 @@ bool IcebergStorageSink::initializeMetadata()
                 context,
                 getLogger("IcebergWrites").get(),
                 persistent_table_components.table_uuid,
-<<<<<<< HEAD
+                persistent_table_components.metadata_compression_method,
                 true,
                 /* ignore_explicit_metadata_file_path */ true);
-=======
-                persistent_table_components.metadata_compression_method,
-                true);
->>>>>>> 8268bbd46d2 (Merge pull request #100420 from ClickHouse/divanik/rerevert_spark_azure_fixes)
 
             LOG_DEBUG(log, "Rereading metadata file {} with version {}", metadata_path, last_version);
 
@@ -1342,25 +1332,9 @@ IcebergImportSink::IcebergImportSink(
 
     const auto metadata_compression_method = persistent_table_components.metadata_compression_method;
 
-    auto config_path = persistent_table_components.table_path;
-    if (config_path.empty() || config_path.back() != '/')
-        config_path += "/";
-    if (!config_path.starts_with('/'))
-        config_path = '/' + config_path;
-
-    if (!context_->getSettingsRef()[Setting::write_full_path_in_iceberg_metadata])
-    {
-        filename_generator = FileNamesGenerator(
-            config_path, config_path, (catalog != nullptr && catalog->isTransactional()), metadata_compression_method, write_format);
-    }
-    else
-    {
-        auto bucket = metadata_json->getValue<String>(Iceberg::f_location);
-        if (bucket.empty() || bucket.back() != '/')
-            bucket += "/";
-        filename_generator = FileNamesGenerator(
-            bucket, config_path, (catalog != nullptr && catalog->isTransactional()), metadata_compression_method, write_format);
-    }
+    filename_generator = FileNamesGenerator(
+        persistent_table_components.path_resolver.getTableLocation(),
+        (catalog != nullptr && catalog->isTransactional()), metadata_compression_method, write_format);
 
     const auto [last_version, unused_meta_path, unused_compression] = getLatestOrExplicitMetadataFileAndVersion(
         object_storage,
@@ -1369,7 +1343,8 @@ IcebergImportSink::IcebergImportSink(
         persistent_table_components.metadata_cache,
         context_,
         getLogger("IcebergWrites").get(),
-        persistent_table_components.table_uuid);
+        persistent_table_components.table_uuid,
+        persistent_table_components.metadata_compression_method);
     (void)unused_meta_path;
     (void)unused_compression;
 
@@ -1380,6 +1355,7 @@ IcebergImportSink::IcebergImportSink(
         context->getSettingsRef()[Setting::iceberg_insert_max_bytes_in_data_file],
         current_schema->getArray(Iceberg::f_fields),
         filename_generator,
+        persistent_table_components.path_resolver,
         object_storage,
         context,
         format_settings,

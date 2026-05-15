@@ -108,13 +108,8 @@ void insertRowToLogTable(
             .query_id = local_context->getCurrentQueryId(),
             .content_type = row_log_level,
             .table_path = table_path,
-<<<<<<< HEAD
-            .file_path = file_path,
-            .metadata_content = get_row(),
-=======
             .file_path = file_path.serialize(),
-            .metadata_content = row,
->>>>>>> 8268bbd46d2 (Merge pull request #100420 from ClickHouse/divanik/rerevert_spark_azure_fixes)
+            .metadata_content = get_row(),
             .row_in_file = row_in_file,
             .pruning_status = pruning_status});
 }
