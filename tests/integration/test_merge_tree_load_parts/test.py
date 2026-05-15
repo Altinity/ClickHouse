@@ -152,8 +152,14 @@ def test_merge_tree_load_parts_corrupted(started_cluster):
         look_behind_lines = 2000
         for min_block, max_block in loaded:
             part_name = f"{partition}_{min_block}_{max_block}"
-            assert node.wait_for_log_line(f"{table}.*Loading Active part {part_name}")
-            assert node.wait_for_log_line(f"{table}.*Finished loading Active part {part_name}")
+            assert node.wait_for_log_line(
+                f"{table}.*Loading Active part {part_name}",
+                look_behind_lines=look_behind_lines,
+            )
+            assert node.wait_for_log_line(
+                f"{table}.*Finished loading Active part {part_name}",
+                look_behind_lines=look_behind_lines,
+            )
 
         failed_part_names = []
         # Let's wait until there is some information about all expected parts, and only
@@ -161,7 +167,10 @@ def test_merge_tree_load_parts_corrupted(started_cluster):
         for min_block, max_block in failed:
             part_name = f"{partition}_{min_block}_{max_block}"
             failed_part_names.append(part_name)
-            assert node.wait_for_log_line(f"{table}.*Loading Active part {part_name}")
+            assert node.wait_for_log_line(
+                f"{table}.*Loading Active part {part_name}",
+                look_behind_lines=look_behind_lines,
+            )
 
         for failed_part_name in failed_part_names:
             assert not node.contains_in_log(f"{table}.*Finished loading Active part {failed_part_name}")
