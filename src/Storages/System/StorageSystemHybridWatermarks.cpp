@@ -186,13 +186,12 @@ void StorageSystemHybridWatermarks::fillData(
             continue;
         }
 
-        /// Row contract case 2: zero declared watermarks → emit zero rows.
+        /// Zero declared watermarks → emit zero rows.
         if (types.empty())
             continue;
 
-        /// Row contract case 3 (defense in depth): keyspace mismatch. CREATE
-        /// enforces declared-keys == snapshot-keys at [StorageDistributed.cpp]
-        /// lines 3043-3051, so this only triggers on unexpected runtime drift.
+        /// Keyspace mismatch. CREATE enforces declared-keys == snapshot-keys
+        /// at [StorageDistributed.cpp], so this only triggers on unexpected runtime drift.
         bool consistent = snapshot && snapshot->size() == types.size();
         if (consistent)
         {
@@ -214,21 +213,14 @@ void StorageSystemHybridWatermarks::fillData(
             continue;
         }
 
-        /// Row contract case 1: N healthy rows, sorted by name for reference-file stability.
-        std::vector<String> sorted_names;
-        sorted_names.reserve(types.size());
-        for (const auto & [name, _] : types)
-            sorted_names.push_back(name);
-        std::sort(sorted_names.begin(), sorted_names.end());
-
-        for (const auto & name : sorted_names)
+        for (const auto & [name, type] : types)
         {
             size_t c = 0;
             res_columns[c++]->insert(database);
             res_columns[c++]->insert(table);
             res_columns[c++]->insert(name);
             res_columns[c++]->insert(snapshot->at(name));
-            res_columns[c++]->insert(types.at(name));
+            res_columns[c++]->insert(type);
             res_columns[c++]->insertDefault(); /// last_exception
         }
     }
