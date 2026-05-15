@@ -175,6 +175,7 @@ public:
     bool resolveAndValidate(TokenCredentials & credentials) const override;
 };
 
+<<<<<<< HEAD
 class AzureTokenProcessor : public ITokenProcessor
 {
 public:
@@ -187,6 +188,8 @@ public:
     bool resolveAndValidate(TokenCredentials & credentials) const override;
 };
 
+=======
+>>>>>>> 59bfcc082dc (Merge pull request #1784 from Altinity/fix/antalya-26.3/oauth-fix-azure)
 class OpenIdTokenProcessor : public ITokenProcessor
 {
 public:

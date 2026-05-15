@@ -167,6 +167,7 @@ bool GoogleTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
     return true;
 }
 
+<<<<<<< HEAD
 bool AzureTokenProcessor::resolveAndValidate(TokenCredentials & credentials) const
 {
     /// Token is a JWT in this case, but we cannot directly verify it against Azure AD JWKS.
@@ -252,6 +253,8 @@ bool AzureTokenProcessor::resolveAndValidate(TokenCredentials & credentials) con
     return true;
 }
 
+=======
+>>>>>>> 59bfcc082dc (Merge pull request #1784 from Altinity/fix/antalya-26.3/oauth-fix-azure)
 OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
                                            UInt64 token_cache_lifetime_,
                                            const String & username_claim_,
