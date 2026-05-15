@@ -347,22 +347,6 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
     const auto schema_id_opt = schema_processor_ptr->tryGetSchemaIdForSnapshot(resolved_snapshot_id);
     if (!schema_id_opt.has_value())
     {
-<<<<<<< HEAD
-        /// Error logged but not thrown to avoid breaking whole query because of backward compatibility reasons.
-        /// That's actually an error because it can lead to incorrect query results, so we are creating an exception to put it to system.error_log.
-        try
-        {
-            throw Exception(
-                ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
-                "Cannot read Iceberg table: manifest file '{}' has entry with snapshot_id '{}' for which write file schema is unknown",
-                manifest_file_name,
-                resolved_snapshot_id);
-        }
-        catch (const Exception &)
-        {
-            tryLogCurrentException("ICEBERG_SPECIFICATION_VIOLATION", "", LogsLevel::error);
-        }
-=======
         /// This is expected when the referenced snapshot was expired by the catalog (snapshot expiry is a
         /// normal Iceberg housekeeping operation). For example, after a compaction ("replace" operation),
         /// the new snapshot's manifest list inherits manifests from the now-expired parent snapshot, and
@@ -376,7 +360,6 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
             path_to_manifest_file,
             resolved_snapshot_id,
             manifest_schema_id);
->>>>>>> 69167ef25d2 (Merge pull request #102115 from scanhex12/iceberg_qcc)
     }
     const auto resolved_schema_id = schema_id_opt.has_value() ? *schema_id_opt : manifest_schema_id;
 
