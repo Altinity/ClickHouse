@@ -350,45 +350,6 @@ public:
 
     std::shared_ptr<DataLake::ICatalog> getCatalog([[maybe_unused]] ContextPtr context, [[maybe_unused]] const StorageID & table_id) const override
     {
-<<<<<<< HEAD
-#if USE_AWS_S3 && USE_AVRO
-        if ((*settings)[DataLakeStorageSetting::storage_catalog_type].value == DatabaseDataLakeCatalogType::GLUE)
-        {
-            auto catalog_parameters = DataLake::CatalogSettings{
-                .storage_endpoint = (*settings)[DataLakeStorageSetting::object_storage_endpoint].value,
-                .aws_access_key_id = (*settings)[DataLakeStorageSetting::storage_aws_access_key_id].value,
-                .aws_secret_access_key = (*settings)[DataLakeStorageSetting::storage_aws_secret_access_key].value,
-                .region = (*settings)[DataLakeStorageSetting::storage_region].value,
-                .namespaces = catalog_namespaces,
-                .aws_role_arn = (*settings)[DataLakeStorageSetting::storage_aws_role_arn].value,
-                .aws_role_session_name = (*settings)[DataLakeStorageSetting::storage_aws_role_session_name].value
-            };
-
-            return std::make_shared<DataLake::GlueCatalog>(
-                (*settings)[DataLakeStorageSetting::storage_catalog_url].value,
-                context,
-                catalog_parameters,
-                /* table_engine_definition */nullptr
-            );
-        }
-        /// Attach condition is provided for compatibility.
-        if ((*settings)[DataLakeStorageSetting::storage_catalog_type].value == DatabaseDataLakeCatalogType::ICEBERG_REST ||
-            (is_attach && (*settings)[DataLakeStorageSetting::storage_catalog_type].value == DatabaseDataLakeCatalogType::NONE && !(*settings)[DataLakeStorageSetting::storage_catalog_url].value.empty()))
-        {
-            return std::make_shared<DataLake::RestCatalog>(
-                (*settings)[DataLakeStorageSetting::storage_warehouse].value,
-                (*settings)[DataLakeStorageSetting::storage_catalog_url].value,
-                (*settings)[DataLakeStorageSetting::storage_catalog_credential].value,
-                (*settings)[DataLakeStorageSetting::storage_auth_scope].value,
-                (*settings)[DataLakeStorageSetting::storage_auth_header],
-                (*settings)[DataLakeStorageSetting::storage_oauth_server_uri].value,
-                (*settings)[DataLakeStorageSetting::storage_oauth_server_use_request_body].value,
-                catalog_namespaces,
-                context);
-        }
-
-#endif
-=======
 #if USE_AVRO && USE_PARQUET
         if ((*settings)[DataLakeStorageSetting::storage_catalog_type].changed || (*settings)[DataLakeStorageSetting::storage_aws_access_key_id].changed)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Don't use deprecated settings storage_catalog_type and storage_catalog_url");
@@ -401,7 +362,6 @@ public:
             return nullptr;
         return datalake_database->getCatalog();
 #else
->>>>>>> 4f3766e352c (Merge pull request #100334 from ClickHouse/change_insert_interface)
         return nullptr;
 #endif
     }
@@ -846,8 +806,8 @@ public:
     ColumnMapperPtr getColumnMapperForCurrentSchema(StorageMetadataPtr storage_metadata_snapshot, ContextPtr context) const override
         { return getImpl().getColumnMapperForCurrentSchema(storage_metadata_snapshot, context); }
 
-    std::shared_ptr<DataLake::ICatalog> getCatalog(ContextPtr context, bool is_attach) const override
-        { return getImpl().getCatalog(context, is_attach); }
+    std::shared_ptr<DataLake::ICatalog> getCatalog(ContextPtr context, const StorageID & table_id) const override
+        { return getImpl().getCatalog(context, table_id); }
 
     bool optimize(const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & format_settings) override
         { return getImpl().optimize(metadata_snapshot, context, format_settings); }
