@@ -1320,7 +1320,7 @@ StorageDistributed::HybridPruningVerdict StorageDistributed::computeHybridPrunin
     if (!query_info.filter_actions_dag)
         return verdict;
 
-    NamesAndTypesList hybrid_columns = storage_snapshot->metadata->getColumns().getAll();
+    NamesAndTypesList hybrid_columns = storage_snapshot->metadata->getColumns().getAllPhysical();
     ActionsDAGWithInversionPushDown inverted_dag(
         query_info.filter_actions_dag->getOutputs().at(0), local_context);
     HybridSegmentPruner pruner(inverted_dag, hybrid_columns, local_context);
