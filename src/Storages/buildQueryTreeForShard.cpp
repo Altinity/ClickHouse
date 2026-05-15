@@ -822,23 +822,26 @@ public:
             auto * query = function_node->getArguments().getNodes()[1]->as<QueryNode>();
             if (!query)
                 return;
-            bool no_replace = true;
-            for (const auto & table_node : extractTableExpressions(query->getJoinTree(), false, true))
+            if (!rewrite_for_distributed)
             {
-                const StorageDistributed * storage_distributed = nullptr;
-                if (const TableNode * table_node_typed = table_node->as<TableNode>())
-                    storage_distributed = typeid_cast<const StorageDistributed *>(table_node_typed->getStorage().get());
-                else if (const TableFunctionNode * table_function_node_typed = table_node->as<TableFunctionNode>())
-                    storage_distributed = typeid_cast<const StorageDistributed *>(table_function_node_typed->getStorage().get());
-
-                if (!storage_distributed)
+                bool no_replace = true;
+                for (const auto & table_node : extractTableExpressions(query->getJoinTree(), false, true))
                 {
-                    no_replace = false;
-                    break;
+                    const StorageDistributed * storage_distributed = nullptr;
+                    if (const TableNode * table_node_typed = table_node->as<TableNode>())
+                        storage_distributed = typeid_cast<const StorageDistributed *>(table_node_typed->getStorage().get());
+                    else if (const TableFunctionNode * table_function_node_typed = table_node->as<TableFunctionNode>())
+                        storage_distributed = typeid_cast<const StorageDistributed *>(table_function_node_typed->getStorage().get());
+
+                    if (!storage_distributed)
+                    {
+                        no_replace = false;
+                        break;
+                    }
                 }
+                if (no_replace)
+                    return;
             }
-            if (no_replace)
-                return;
 
             auto result_function = std::make_shared<FunctionNode>(getGlobalInFunctionNameForLocalInFunctionName(function_node->getFunctionName()));
             result_function->getArguments().getNodes() = std::move(function_node->getArguments().getNodes());
@@ -854,11 +857,17 @@ public:
 
         return true;
     }
+
+    void setRewriteForDistributed(bool rewrite_for_distributed_) { rewrite_for_distributed = rewrite_for_distributed_; }
+
+private:
+    bool rewrite_for_distributed = false;
 };
 
-void rewriteInToGlobalIn(QueryTreeNodePtr & query_tree_to_modify, ContextPtr context)
+void rewriteInToGlobalIn(QueryTreeNodePtr & query_tree_to_modify, ContextPtr context, bool rewrite_for_distributed)
 {
     RewriteInToGlobalInVisitor visitor(context);
+    visitor.setRewriteForDistributed(rewrite_for_distributed);
     visitor.visit(query_tree_to_modify);
 }
 

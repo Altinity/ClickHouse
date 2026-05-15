@@ -322,7 +322,7 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
             rewriteJoinToGlobalJoin(modified_query_tree, context);
 
             if (info.has_local_columns_in_where)
-                rewriteInToGlobalIn(modified_query_tree, context);
+                rewriteInToGlobalIn(modified_query_tree, context, /*rewrite_for_distributed*/ true);
 
             modified_query_tree = buildQueryTreeForShard(
                 query_info.planner_context,

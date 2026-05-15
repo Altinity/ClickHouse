@@ -14,6 +14,8 @@ def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type, join_mo
     TABLE_NAME = "test_cluster_joins_" + storage_type + "_" + get_uuid_str()
     TABLE_NAME_2 = "test_cluster_joins_2_" + storage_type + "_" + get_uuid_str()
     TABLE_NAME_LOCAL = "test_cluster_joins_local_" + storage_type + "_" + get_uuid_str()
+    TABLE_NAME_SOURCE = "test_cluster_joins_source_" + storage_type + "_" + get_uuid_str()
+    TABLE_NAME_DISTRIBUTED = "test_cluster_joins_distributed_" + storage_type + "_" + get_uuid_str()
 
     def execute_spark_query(query: str, table_name):
         return execute_spark_query_general(
@@ -72,6 +74,10 @@ def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type, join_mo
 
     instance.query(f"CREATE TABLE `{TABLE_NAME_LOCAL}` (id Int64, second_name String) ENGINE = Memory()")
     instance.query(f"INSERT INTO `{TABLE_NAME_LOCAL}` VALUES (1, 'silver'), (2, 'black')")
+
+    instance.query(f"CREATE TABLE `{TABLE_NAME_SOURCE}` ON CLUSTER 'cluster_simple' (id Int64, second_name String) ENGINE = Memory()")
+    instance.query(f"CREATE TABLE `{TABLE_NAME_DISTRIBUTED}` (id Int64, second_name String) ENGINE = Distributed('cluster_simple', currentDatabase(), '{TABLE_NAME_SOURCE}')")
+    instance.query(f"INSERT INTO `{TABLE_NAME_DISTRIBUTED}` VALUES (1, 'smith'), (2, 'wesson')")
 
     res = instance.query(
         f"""
@@ -186,3 +192,52 @@ def test_cluster_joins(started_cluster_iceberg_with_spark, storage_type, join_mo
     )
 
     assert res == "jack\tblack\njack\tsilver\njohn\tblack\njohn\tsilver\n"
+
+    res = instance.query(
+        f"""
+            SELECT t1.name,t2.second_name
+            FROM {creation_expression} AS t1
+                JOIN `{TABLE_NAME_DISTRIBUTED}` AS t2
+                ON t1.tag=t2.id
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='{join_mode}'
+        """
+    )
+
+    assert res == "jack\twesson\njohn\tsmith\n"
+
+    res = instance.query(
+        f"""
+            SELECT name
+            FROM {creation_expression}
+            WHERE tag GLOBAL IN (
+                SELECT id
+                FROM `{TABLE_NAME_DISTRIBUTED}`
+            )
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='{join_mode}'
+        """
+    )
+
+    assert res == "jack\njohn\n"
+
+    res = instance.query(
+        f"""
+            SELECT name
+            FROM {creation_expression}
+            WHERE tag IN (
+                SELECT id
+                FROM `{TABLE_NAME_DISTRIBUTED}`
+            )
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='{join_mode}'
+        """
+    )
+
+    assert res == "jack\njohn\n"
