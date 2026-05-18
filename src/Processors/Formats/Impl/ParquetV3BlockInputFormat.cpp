@@ -126,8 +126,23 @@ Chunk ParquetV3BlockInputFormat::read()
         temp_prefetcher.init(in, read_options, parser_shared_resources);
         parquet::format::FileMetaData file_metadata = getFileMetadata(temp_prefetcher);
 
+        size_t num_rows = 0;
+        if (buckets_to_read)
+        {
+            /// Only count rows in the assigned row groups. Otherwise multiple sources
+            /// reading buckets of the same file would each report the file's total.
+            for (size_t rg : buckets_to_read->row_group_ids)
+            {
+                if (rg < file_metadata.row_groups.size())
+                    num_rows += size_t(file_metadata.row_groups[rg].num_rows);
+            }
+        }
+        else
+        {
+            num_rows = size_t(file_metadata.num_rows);
+        }
 
-        auto chunk = getChunkForCount(size_t(file_metadata.num_rows));
+        auto chunk = getChunkForCount(num_rows);
         chunk.getChunkInfos().add(std::make_shared<ChunkInfoRowNumbers>(0));
 
         reported_count = true;
@@ -139,6 +154,32 @@ Chunk ParquetV3BlockInputFormat::read()
     previous_block_missing_values = res.block_missing_values;
     previous_approx_bytes_read_for_chunk = res.virtual_bytes_read;
     return std::move(res.chunk);
+}
+
+std::optional<std::pair<std::vector<size_t>, size_t>> ParquetV3BlockInputFormat::getMatchedBuckets() const
+{
+    if (!reader)
+        return std::nullopt;
+    std::vector<size_t> matched;
+    for (const auto & row_group : reader->reader.row_groups)
+    {
+        if (!row_group.need_to_process)
+            continue;
+
+        bool produced_rows = false;
+        for (const auto & subgroup : row_group.subgroups)
+        {
+            if (subgroup.filter.rows_pass > 0)
+            {
+                produced_rows = true;
+                break;
+            }
+        }
+
+        if (produced_rows)
+            matched.push_back(row_group.row_group_idx);
+    }
+    return std::make_pair(std::move(matched), reader->reader.file_metadata.row_groups.size());
 }
 
 void ParquetV3BlockInputFormat::setBucketsToRead(const FileBucketInfoPtr & buckets_to_read_)
