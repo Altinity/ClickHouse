@@ -50,6 +50,7 @@
 #include <fmt/ranges.h>
 #include <Common/ProfileEvents.h>
 #include <Core/SettingsEnums.h>
+#include <Poco/String.h>
 
 namespace fs = std::filesystem;
 namespace ProfileEvents
