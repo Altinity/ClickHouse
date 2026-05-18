@@ -13,6 +13,7 @@ def _add_build_to_version_history():
     #     f"git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow --prune --no-recurse-submodules --filter=tree:0 origin {info.git_branch} ||:"
     # )
     # commit_parents = Shell.get_output("git log --format=%P -n 1").split(" ")
+    version = CHVersion.get_current_version_as_dict()
     # data = {
     #     "check_start_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     #     "pull_request_number": info.pr_number,
