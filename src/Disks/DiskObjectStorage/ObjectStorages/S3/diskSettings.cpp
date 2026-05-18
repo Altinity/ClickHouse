@@ -239,7 +239,12 @@ getClient(const S3::URI & url, const S3Settings & settings, ContextPtr context, 
             }
         }
     }
+<<<<<<< HEAD
     context->getHTTPHeaderFilter().checkAndNormalizeHeaders(headers);
+=======
+
+    auto shared_cache = S3::ClientCacheRegistry::instance().getOrCreateCacheForKey(url.endpoint, url.bucket);
+>>>>>>> d5682cc12a8 (Merge pull request #1807 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-96802)
 
     return S3::ClientFactory::instance().create(
         client_configuration,
@@ -250,7 +255,8 @@ getClient(const S3::URI & url, const S3Settings & settings, ContextPtr context, 
         auth_settings.server_side_encryption_kms_config,
         headers,
         credentials_configuration,
-        session_token);
+        session_token,
+        shared_cache);
 }
 
 }
