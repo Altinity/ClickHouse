@@ -255,67 +255,67 @@ DOCKERS = [
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/dotnet-client",
+        name="altinityinfra/dotnet-client",
         path="./ci/docker/integration/dotnet_client",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/mysql-php-client",
+        name="altinityinfra/mysql-php-client",
         path="./ci/docker/integration/mysql_php_client",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/nginx-dav",
+        name="altinityinfra/nginx-dav",
         path="./ci/docker/integration/nginx_dav",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/postgresql-java-client",
+        name="altinityinfra/postgresql-java-client",
         path="./ci/docker/integration/postgresql_java_client",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/python-bottle",
+        name="altinityinfra/python-bottle",
         path="./ci/docker/integration/resolver",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/s3-proxy",
+        name="altinityinfra/s3-proxy",
         path="./ci/docker/integration/s3_proxy",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/docs-builder",
+        name="altinityinfra/docs-builder",
         path="./ci/docker/docs-builder",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/install-deb-test",
+        name="altinityinfra/install-deb-test",
         path="./ci/docker/install/deb",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/install-rpm-test",
+        name="altinityinfra/install-rpm-test",
         path="./ci/docker/install/rpm",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/sqlancer-test",
+        name="altinityinfra/sqlancer-test",
         path="./ci/docker/sqlancer-test",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
     ),
     Docker.Config(
-        name="clickhouse/mysql_dotnet_client",
+        name="altinityinfra/mysql_dotnet_client",
         path="./ci/docker/integration/mysql_dotnet_client",
         platforms=Docker.Platforms.arm_amd,
         depends_on=[],
@@ -415,11 +415,13 @@ class ArtifactNames:
     LLVM_COVERAGE_FILE = "LLVM_COVERAGE_FILE"  # .profdata file
     LLVM_COVERAGE_INFO_FILE = "LLVM_COVERAGE_INFO_FILE"  # .info file generated from .profdata, used for debugging coverage results
     CH_AMD_RELEASE = "CH_AMD_RELEASE"
+    CH_AMD_RELEASE_STRIPPED = "CH_AMD_RELEASE_STRIPPED"
     CH_AMD_ASAN_UBSAN = "CH_AMD_ASAN_UBSAN"
     CH_AMD_TSAN = "CH_AMD_TSAN"
     CH_AMD_MSAN = "CH_AMD_MSAN"
     CH_AMD_BINARY = "CH_AMD_BINARY"
     CH_ARM_RELEASE = "CH_ARM_RELEASE"
+    CH_ARM_RELEASE_STRIPPED = "CH_ARM_RELEASE_STRIPPED"
     CH_ARM_DEBUG = "CH_ARM_DEBUG"
     CH_ARM_ASAN_UBSAN = "CH_ARM_ASAN_UBSAN"
     CH_ARM_TSAN = "CH_ARM_TSAN"
@@ -505,11 +507,13 @@ LLVM_ARTIFACTS_LIST = (
 BINARIES_WITH_LONG_RETENTION = [
     ArtifactNames.CH_AMD_DEBUG,
     ArtifactNames.CH_AMD_RELEASE,
+    ArtifactNames.CH_AMD_RELEASE_STRIPPED,
     ArtifactNames.CH_AMD_ASAN_UBSAN,
     ArtifactNames.CH_AMD_TSAN,
     ArtifactNames.CH_AMD_MSAN,
     ArtifactNames.CH_AMD_BINARY,
     ArtifactNames.CH_ARM_RELEASE,
+    ArtifactNames.CH_ARM_RELEASE_STRIPPED,
     ArtifactNames.CH_ARM_DEBUG,
     ArtifactNames.CH_ARM_ASAN_UBSAN,
     ArtifactNames.CH_ARM_TSAN,
@@ -552,6 +556,16 @@ class ArtifactConfigs:
             ArtifactNames.CH_RISCV64,
             ArtifactNames.CH_S390X,
             ArtifactNames.CH_LOONGARCH64,
+        ]
+    )
+    clickhouse_stripped_binaries = Artifact.Config(
+        name="...",
+        type=Artifact.Type.S3,
+        path=f"{TEMP_DIR}/build/programs/self-extracting/clickhouse-stripped",
+    ).parametrize(
+        names=[
+            ArtifactNames.CH_AMD_RELEASE_STRIPPED,
+            ArtifactNames.CH_ARM_RELEASE_STRIPPED,
         ]
     )
     llvm_profdata_file = Artifact.Config(
