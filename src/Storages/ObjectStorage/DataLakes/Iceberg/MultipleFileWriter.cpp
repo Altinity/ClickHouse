@@ -92,6 +92,7 @@ void MultipleFileWriter::finalize()
     if (buffer_bytes > 0)
     {
         total_bytes += buffer_bytes;
+        per_file_byte_sizes.push_back(static_cast<Int64>(buffer_bytes));
     }
     else if (!data_file_names.empty())
     {
@@ -99,11 +100,10 @@ void MultipleFileWriter::finalize()
         /// Fall back to querying the actual object size.
         auto metadata = object_storage->getObjectMetadata(path_resolver.resolve(data_file_names.back()), /*with_tags=*/false);
         total_bytes += metadata.size_bytes;
+        per_file_byte_sizes.push_back(static_cast<Int64>(metadata.size_bytes));
     }
 
     per_file_record_counts.push_back(static_cast<Int64>(*current_file_num_rows));
-    /// todo arthur fix the wrong counter for file bytes, probably by backporting something else
-    per_file_byte_sizes.push_back(static_cast<Int64>(total_bytes));
     per_file_stats_list.push_back(current_file_stats);
 }
 
