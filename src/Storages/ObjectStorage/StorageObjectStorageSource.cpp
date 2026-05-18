@@ -60,6 +60,7 @@
 #include <base/sleep.h>
 #include <Common/ProfileEvents.h>
 #include <Core/SettingsEnums.h>
+#include <Poco/String.h>
 
 #include <Storages/MergeTree/MarkRange.h>
 #include <Interpreters/Cache/QueryConditionCache.h>
