@@ -1,7 +1,10 @@
 #include <memory>
 #include <optional>
 #include <unordered_set>
+<<<<<<< HEAD
 #include <Columns/ColumnConst.h>
+=======
+>>>>>>> 5779b86fb2b (Merge pull request #1804 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-102115)
 #include <Common/CurrentThread.h>
 #include <AggregateFunctions/AggregateFunctionGroupBitmapData.h>
 #include <Core/Settings.h>
@@ -45,7 +48,10 @@
 #include <Storages/ObjectStorage/Utils.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <boost/operators.hpp>
+<<<<<<< HEAD
 #include <Common/FailPoint.h>
+=======
+>>>>>>> 5779b86fb2b (Merge pull request #1804 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-102115)
 #include <Poco/String.h>
 #include <Common/Exception.h>
 #include <Common/SipHash.h>
@@ -665,6 +671,28 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
         if (!object_info || object_info->getPath().empty())
             return {};
+<<<<<<< HEAD
+=======
+
+        if (object_info->relative_path_with_metadata.getCommand().isValid())
+        {
+            auto retry_after_us = object_info->relative_path_with_metadata.getCommand().getRetryAfterUs();
+            if (retry_after_us.has_value())
+            {
+                /// TODO: Make asyncronous waiting without sleep in thread
+                /// Now this sleep is on executor node in worker thread
+                /// Does not block query initiator
+                auto wait_time = std::min(Poco::Timestamp::TimeDiff(100000ul), retry_after_us.value());
+                ProfileEvents::increment(ProfileEvents::ObjectStorageClusterWaitingMicroseconds, wait_time);
+                sleepForMicroseconds(wait_time);
+                continue;
+            }
+            object_info->relative_path_with_metadata.setFileMetaInfo(object_info->relative_path_with_metadata.getCommand().getFileMetaInfo());
+        }
+
+        if (object_info->getPath().empty())
+            return {};
+>>>>>>> 5779b86fb2b (Merge pull request #1804 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-102115)
         if (!object_info->getObjectMetadata())
         {
             bool with_tags = read_from_format_info.requested_virtual_columns.contains("_tags");
@@ -681,6 +709,51 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             else
                 object_info->setObjectMetadata(object_storage->getObjectMetadata(path, with_tags));
         }
+<<<<<<< HEAD
+=======
+
+        if (query_settings.skip_empty_files && object_info->getObjectMetadata()->size_bytes == 0
+            && object_info->getObjectMetadata()->is_size_known)
+            continue;
+
+        if (query_condition_cache && !object_info->file_bucket_info)
+        {
+            auto matching_marks = query_condition_cache->read(
+                storage_id.uuid, object_info->getFileName(), *format_filter_info->condition_hash);
+            if (matching_marks.has_value())
+            {
+                const auto & marks = *matching_marks;
+                size_t total_row_groups = marks.size();
+                std::vector<size_t> matching_row_groups;
+                for (size_t i = 0; i < total_row_groups; ++i)
+                    if (marks[i])
+                        matching_row_groups.push_back(i);
+
+                size_t dropped_row_groups = total_row_groups - matching_row_groups.size();
+                LOG_DEBUG(log,
+                    "Query condition cache has dropped {}/{} row groups for condition {} in file {}.",
+                    dropped_row_groups,
+                    total_row_groups,
+                    format_filter_info->filter_actions_dag->dumpNames(),
+                    object_info->getFileName());
+
+                if (matching_row_groups.empty())
+                    continue;
+
+                auto file_bucket_info = FormatFactory::instance().getFileBucketInfo(
+                    object_info->getFileFormat().value_or(configuration->getFormat()));
+                if (file_bucket_info)
+                {
+                    auto filtered = file_bucket_info->filterByMatchingRowGroups(matching_row_groups);
+                    if (!filtered)
+                        continue;
+                    object_info->file_bucket_info = std::move(filtered);
+                }
+            }
+        }
+        break;
+    }
+>>>>>>> 5779b86fb2b (Merge pull request #1804 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-102115)
 
         if (query_settings.skip_empty_files && object_info->getObjectMetadata()->size_bytes == 0
             && object_info->getObjectMetadata()->is_size_known)

@@ -694,6 +694,11 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
 
     const auto catalog_uuid = table_metadata.getTableUUID();
     const UUID table_uuid = catalog_uuid ? parseFromString<UUID>(*catalog_uuid) : UUIDHelpers::Nil;
+<<<<<<< HEAD
+=======
+
+    std::string cluster_name = configuration->isClusterSupported() ? settings[DatabaseDataLakeSetting::object_storage_cluster].value : "";
+>>>>>>> 5779b86fb2b (Merge pull request #1804 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-102115)
 
     if (can_use_parallel_replicas && !is_secondary_query)
     {
@@ -730,7 +735,10 @@ StoragePtr DatabaseDataLake::tryGetTableImpl(const String & name, ContextPtr con
     auto result_storage = std::make_shared<StorageObjectStorage>(
         configuration,
         configuration->createObjectStorage(context_copy, /* is_readonly */ false, catalog->getCredentialsConfigurationCallback(StorageID(getDatabaseName(), name, table_uuid))),
+<<<<<<< HEAD
         context_copy,
+=======
+>>>>>>> 5779b86fb2b (Merge pull request #1804 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-102115)
         StorageID(getDatabaseName(), name, table_uuid),
         /* columns */columns,
         /* constraints */ConstraintsDescription{},
