@@ -889,7 +889,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
 
         InputFormatPtr input_format;
         if (context_->getSettingsRef()[Setting::use_parquet_metadata_cache] && use_native_reader_v3
-            && (object_info->getFileFormat().value_or(configuration->getFormat()) == "Parquet")
+            && (Poco::toLower(object_info->getFileFormat().value_or(configuration->getFormat())) == "parquet")
             && !object_info->getObjectMetadata()->etag.empty())
         {
             std::optional<RelativePathWithMetadata> object_with_metadata = object_info->relative_path_with_metadata;
