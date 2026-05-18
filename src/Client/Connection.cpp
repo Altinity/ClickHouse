@@ -146,6 +146,11 @@ void Connection::connect(const ConnectionTimeouts & timeouts)
     /// if connection was broken it is necessary to cancel it before reconnecting
     disconnect();
 
+#if USE_JWT_CPP && USE_SSL
+    if (jwt_provider)
+        jwt = jwt_provider->getJWT();
+#endif
+
     ProfileEvents::increment(ProfileEvents::DistributedConnectionConnectCount);
     try
     {
@@ -847,23 +852,6 @@ void Connection::sendQuery(
 
         client_info = &new_client_info;
     }
-
-#if USE_JWT_CPP && USE_SSL
-    if (jwt_provider && !jwt.empty())
-    {
-        if (JWTProvider::getJwtExpiry(jwt) < (Poco::Timestamp() + Poco::Timespan(30, 0)))
-        {
-            String new_jwt = jwt_provider->getJWT();
-            if (!new_jwt.empty())
-            {
-                jwt = new_jwt;
-                // We have a new token, so we need to reconnect.
-                // The current connection is still using the old token.
-                disconnect();
-            }
-        }
-    }
-#endif
 
     if (!connected)
         connect(timeouts);

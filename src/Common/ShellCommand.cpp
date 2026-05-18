@@ -27,6 +27,7 @@ namespace
         CANNOT_EXEC                 = 0x55555558,
         CANNOT_DUP_READ_DESCRIPTOR  = 0x55555559,
         CANNOT_DUP_WRITE_DESCRIPTOR = 0x55555560,
+        CANNOT_SETPGID              = 0x55555561,
     };
 }
 
@@ -218,6 +219,9 @@ std::unique_ptr<ShellCommand> ShellCommand::executeImpl(
         sigprocmask(0, nullptr, &mask); // NOLINT(concurrency-mt-unsafe)
         sigprocmask(SIG_UNBLOCK, &mask, nullptr); // NOLINT(concurrency-mt-unsafe)
 
+        if (config.new_process_group && setpgid(0, 0) != 0)
+            _exit(static_cast<int>(ReturnCodes::CANNOT_SETPGID));
+
         execv(filename, argv);
         /// If the process is running, then `execv` does not return here.
 
@@ -385,6 +389,8 @@ void ShellCommand::handleProcessRetcode(int retcode) const
                 throw Exception(ErrorCodes::CANNOT_CREATE_CHILD_PROCESS, "Cannot dup2 read descriptor of child process");
             case static_cast<int>(ReturnCodes::CANNOT_DUP_WRITE_DESCRIPTOR):
                 throw Exception(ErrorCodes::CANNOT_CREATE_CHILD_PROCESS, "Cannot dup2 write descriptor of child process");
+            case static_cast<int>(ReturnCodes::CANNOT_SETPGID):
+                throw Exception(ErrorCodes::CANNOT_CREATE_CHILD_PROCESS, "Cannot setpgid in child process");
             default:
                 throw Exception(ErrorCodes::CHILD_WAS_NOT_EXITED_NORMALLY, "Child process was exited with return code {}", toString(retcode));
         }

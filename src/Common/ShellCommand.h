@@ -65,6 +65,10 @@ public:
 
         bool pipe_stdin_only = false;
 
+        /// Put the child in its own process group, so that a single `kill(-pid, ...)`
+        /// from the parent terminates the entire subprocess tree.
+        bool new_process_group = false;
+
         DestructorStrategy terminate_in_destructor_strategy = DestructorStrategy(false, 0);
     };
 

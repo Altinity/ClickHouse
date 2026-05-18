@@ -26,6 +26,7 @@
 #include <Interpreters/Context.h>
 
 #include <Client/JWTProvider.h>
+#include <Client/CommandJWTProvider.h>
 #include <Client/ClientBaseHelpers.h>
 #include <Client/OAuthLogin.h>
 
@@ -374,6 +375,17 @@ try
     }
 
 #if USE_JWT_CPP && USE_SSL
+    if (config().has("jwt-command") && !config().has("jwt"))
+    {
+        int timeout = config().getInt("jwt-command-timeout", DEFAULT_JWT_COMMAND_TIMEOUT_SECONDS);
+        if (timeout <= 0)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "jwt-command-timeout must be positive, got {}", timeout);
+
+        auto provider = std::make_shared<CommandJWTProvider>(config().getString("jwt-command"), timeout);
+        config().setString("jwt", provider->getJWT());
+        jwt_provider = std::move(provider);
+    }
+
     if (config().getBool("cloud_oauth_pending", false) && !config().has("jwt"))
     {
         login();
@@ -742,6 +754,10 @@ void Client::printHelpMessage(const OptionsDescription & options_description)
 
 void Client::addExtraOptions(OptionsDescription & options_description)
 {
+    static const std::string jwt_command_timeout_help =
+        "Timeout in seconds for --jwt-command. Default: " + std::to_string(DEFAULT_JWT_COMMAND_TIMEOUT_SECONDS)
+        + ". Also configurable as <jwt-command-timeout> in the client config file.";
+
     /// Main commandline options related to client functionality and all parameters from Settings.
     options_description.main_description->add_options()
         ("config,c", po::value<std::string>(), "config-file path (another shorthand)")
@@ -756,6 +772,9 @@ void Client::addExtraOptions(OptionsDescription & options_description)
         ("ssh-key-passphrase", po::value<std::string>(), "Passphrase for the SSH private key specified by --ssh-key-file.")
         ("quota_key", po::value<std::string>(), "A string to differentiate quotas when the user have keyed quotas configured on server")
         ("jwt", po::value<std::string>(), "Use JWT for authentication")
+        ("jwt-command", po::value<std::string>(),
+            "Shell command whose stdout is used as the JWT. Invoked at startup and on every (re)connect.")
+        ("jwt-command-timeout", po::value<int>(), jwt_command_timeout_help.c_str())
         ("one-time-password", po::value<std::string>(), "Time-based one-time password (TOTP) for two-factor authentication")
         ("login", po::value<std::string>()->implicit_value(""),
             "Authenticate via OAuth2. Optional mode: 'browser' (auth-code + PKCE, opens browser) "
@@ -930,6 +949,27 @@ void Client::processOptions(
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "User and JWT flags can't be specified together");
         config().setString("jwt", options["jwt"].as<std::string>());
         config().setString("user", "");
+    }
+    if (options.contains("jwt-command-timeout"))
+        config().setInt("jwt-command-timeout", options["jwt-command-timeout"].as<int>());
+
+    if (options.contains("jwt-command"))
+    {
+#if USE_JWT_CPP && USE_SSL
+        if (options.contains("jwt"))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "--jwt-command and --jwt cannot both be specified");
+        if (options.contains("login"))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "--jwt-command and --login cannot both be specified");
+        if (!options["user"].defaulted())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "User and JWT flags can't be specified together");
+
+        /// Defer execution to Client::main, after processConfig has loaded the XML config.
+        /// Reading config().getInt("jwt-command-timeout", ...) here would miss the XML value.
+        config().setString("jwt-command", options["jwt-command"].as<std::string>());
+        config().setString("user", "");
+#else
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "JWT is disabled, because ClickHouse is built without JWT or SSL support");
+#endif
     }
     if (options.count("oauth-credentials") && !options.count("login"))
         throw Exception(
