@@ -22,6 +22,7 @@
 #include <Storages/getStructureOfRemoteTable.h>
 #include <Storages/checkAndGetLiteralArgument.h>
 #include <Storages/StorageDummy.h>
+#include <Storages/HybridSegmentPruner.h>
 #include <Storages/removeGroupingFunctionSpecializations.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 
@@ -97,7 +98,9 @@
 #include <Processors/QueryPlan/ReadFromPreparedSource.h>
 #include <Processors/QueryPlan/ExpressionStep.h>
 #include <Processors/QueryPlan/Optimizations/actionsDAGUtils.h>
+#include <Processors/QueryPlan/DistributedCreateLocalPlan.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
+#include <Processors/QueryPlan/UnionStep.h>
 #include <Processors/Sources/NullSource.h>
 #include <Processors/Sources/RemoteSource.h>
 #include <Processors/Sinks/EmptySink.h>
@@ -497,6 +500,26 @@ QueryProcessingStage::Enum StorageDistributed::getQueryProcessingStage(
         }
     }
 
+    /// Hybrid segment pruning: mirror the per-shard pruning above, but at the segment level.
+    /// When a segment's predicate is provably unsatisfiable with the user query, drop it from
+    /// the plan. The base segment is signalled to `read()` by emptying `optimized_cluster` —
+    /// the same idiom `optimize_skip_unused_shards` uses for empty shard sets — and `nodes` is
+    /// recomputed automatically from the empty cluster. The verdict is recomputed in `read()`
+    /// for per-segment skipping; both calls read the watermark snapshot frozen on
+    /// `storage_snapshot` (see `HybridSnapshotData`), so the two verdicts agree even under a
+    /// concurrent `ALTER MODIFY SETTING hybrid_watermark_*`.
+    HybridPruningVerdict pruning_verdict;
+    if (!segments.empty() || base_segment_predicate)
+    {
+        pruning_verdict = computeHybridPruningVerdict(query_info, storage_snapshot, local_context);
+        if (pruning_verdict.base_pruned)
+        {
+            query_info.optimized_cluster = cluster->getClusterWithMultipleShards({});
+            cluster = query_info.optimized_cluster;
+            nodes = getClusterQueriedNodes(settings, cluster);
+        }
+    }
+
     if (settings[Setting::distributed_group_by_no_merge])
     {
         if (settings[Setting::distributed_group_by_no_merge] == DISTRIBUTED_GROUP_BY_NO_MERGE_AFTER_AGGREGATION)
@@ -523,6 +546,19 @@ QueryProcessingStage::Enum StorageDistributed::getQueryProcessingStage(
     if (to_stage == QueryProcessingStage::WithMergeableState)
         return QueryProcessingStage::WithMergeableState;
 
+<<<<<<< HEAD
+=======
+    // TODO: check logic
+    if (!segments.empty())
+    {
+        size_t surviving_segments = segments.size();
+        for (bool is_pruned : pruning_verdict.segments_pruned)
+            if (is_pruned && surviving_segments > 0)
+                --surviving_segments;
+        nodes += surviving_segments;
+    }
+
+>>>>>>> 992ca2902cf (Merge pull request #1788 from Altinity/mkmkme/antalya-26.3/hybrid-segment-pruning)
     /// If there is only one node, the query can be fully processed by the
     /// shard, initiator will work as a proxy only.
     if (nodes == 1)
@@ -746,6 +782,25 @@ std::optional<QueryProcessingStage::Enum> StorageDistributed::getOptimizedQueryP
     return QueryProcessingStage::Complete;
 }
 
+<<<<<<< HEAD
+=======
+StorageSnapshotPtr StorageDistributed::getStorageSnapshot(const StorageMetadataPtr & metadata_snapshot, ContextPtr) const
+{
+    /// For Hybrid tables, freeze the watermark snapshot at snapshot acquisition time so
+    /// every later phase (`getQueryProcessingStage()`, `read()`) operates on the same
+    /// values. A concurrent `ALTER MODIFY SETTING hybrid_watermark_*` cannot change what
+    /// this query sees, which keeps the pruning verdict — and therefore the chosen
+    /// processing stage — consistent with the planned segment set.
+    if (!segments.empty() || base_segment_predicate)
+    {
+        auto data = std::make_unique<HybridSnapshotData>();
+        data->watermark_snapshot = hybrid_watermark_params.get();
+        return std::make_shared<StorageSnapshot>(*this, metadata_snapshot, std::move(data));
+    }
+    return std::make_shared<StorageSnapshot>(*this, metadata_snapshot);
+}
+
+>>>>>>> 992ca2902cf (Merge pull request #1788 from Altinity/mkmkme/antalya-26.3/hybrid-segment-pruning)
 namespace
 {
 
@@ -947,6 +1002,98 @@ QueryTreeNodePtr buildQueryTreeDistributed(SelectQueryInfo & query_info,
 
 }
 
+ASTPtr StorageDistributed::substituteHybridWatermarks(
+    ASTPtr predicate_ast,
+    const MultiVersion<WatermarkParams>::Version & watermarks)
+{
+    if (!predicate_ast)
+        return predicate_ast;
+    predicate_ast = predicate_ast->clone();
+
+    auto substitute = [&](ASTPtr & node, const std::pair<String, String> & param_type_and_name)
+    {
+        const auto & [param_name, type_name] = param_type_and_name;
+
+        if (!watermarks)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Hybrid watermark '{}' has no value; use ALTER TABLE ... MODIFY SETTING {} = '...' to set it",
+                param_name, param_name);
+
+        auto it = watermarks->find(param_name);
+        if (it == watermarks->end())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Hybrid watermark '{}' has no value; use ALTER TABLE ... MODIFY SETTING {} = '...' to set it",
+                param_name, param_name);
+
+        auto data_type = DataTypeFactory::instance().get(type_name);
+        auto col = data_type->createColumn();
+        ReadBufferFromString buf(it->second);
+        data_type->getDefaultSerialization()->deserializeWholeText(*col, buf, FormatSettings{});
+        node = make_intrusive<ASTLiteral>((*col)[0]);
+    };
+
+    visitHybridParams(predicate_ast, substitute);
+    return predicate_ast;
+}
+
+MultiVersion<StorageDistributed::WatermarkParams>::Version
+StorageDistributed::getHybridWatermarkSnapshot(const StorageSnapshotPtr & storage_snapshot) const
+{
+    if (const auto * hybrid_data = storage_snapshot->data
+            ? dynamic_cast<const HybridSnapshotData *>(storage_snapshot->data.get())
+            : nullptr)
+        return hybrid_data->watermark_snapshot;
+    return hybrid_watermark_params.get();
+}
+
+StorageDistributed::HybridPruningVerdict StorageDistributed::computeHybridPruningVerdict(
+    const SelectQueryInfo & query_info,
+    const StorageSnapshotPtr & storage_snapshot,
+    const ContextPtr & local_context) const
+{
+    StorageDistributed::HybridPruningVerdict verdict;
+    verdict.segments_pruned.assign(segments.size(), false);
+
+    if (segments.empty() && !base_segment_predicate)
+        return verdict;
+
+    /// Without a materialized user filter (legacy non-analyzer path, or a query before
+    /// filter actions are computed) we can't prune. Fail open — same precedent as
+    /// `skipUnusedShardsWithAnalyzer()`. The DAG is per-table-expression, so JOIN-side
+    /// predicates are already excluded; no JOIN guard needed.
+    if (!query_info.filter_actions_dag)
+        return verdict;
+
+    NamesAndTypesList hybrid_columns = storage_snapshot->metadata->getColumns().getAllPhysical();
+    ActionsDAGWithInversionPushDown inverted_dag(
+        query_info.filter_actions_dag->getOutputs().at(0), local_context);
+    HybridSegmentPruner pruner(inverted_dag, hybrid_columns, local_context);
+    if (pruner.isUseless())
+        return verdict;
+
+    /// Both `getQueryProcessingStage()` and `read()` reach this function with the same
+    /// `storage_snapshot`, so the watermark snapshot frozen by `getStorageSnapshot()`
+    /// makes the verdict identical across the two calls even under a concurrent
+    /// `ALTER MODIFY SETTING hybrid_watermark_*`.
+    auto watermarks = getHybridWatermarkSnapshot(storage_snapshot);
+
+    auto check = [&](const ASTPtr & predicate_ast) -> bool
+    {
+        if (!predicate_ast)
+            return false;
+        return pruner.canBePruned(
+            substituteHybridWatermarks(predicate_ast, watermarks));
+    };
+
+    if (base_segment_predicate)
+        verdict.base_pruned = check(base_segment_predicate);
+
+    for (size_t i = 0; i < segments.size(); ++i)
+        verdict.segments_pruned[i] = check(segments[i].predicate_ast);
+
+    return verdict;
+}
+
 void StorageDistributed::read(
     QueryPlan & query_plan,
     const Names &,
@@ -962,6 +1109,56 @@ void StorageDistributed::read(
     SelectQueryInfo modified_query_info = query_info;
 
     const auto & settings = local_context->getSettingsRef();
+<<<<<<< HEAD
+=======
+    auto metadata_ptr = getInMemoryMetadataPtr();
+
+    auto describe_segment_target = [&](const HybridSegment & segment) -> String
+    {
+        if (segment.storage_id)
+            return segment.storage_id->getNameForLogs();
+        if (segment.table_function_ast)
+            return segment.table_function_ast->formatForLogging();
+        chassert(false, "Hybrid segment is missing both storage_id and table_function_ast");
+        return String{"<unknown_segment>"};
+    };
+
+    auto describe_base_target = [&]() -> String
+    {
+       if (remote_table_function_ptr)
+          return remote_table_function_ptr->formatForLogging();
+       if (!remote_database.empty())
+          return remote_database + "." + remote_table;
+       return remote_table;
+    };
+
+    String base_target = describe_base_target();
+
+    const bool log_hybrid_query_rewrites = (!segments.empty() || base_segment_predicate);
+
+    auto log_rewritten_query = [&](const String & target, const ASTPtr & ast)
+    {
+        if (!log_hybrid_query_rewrites || !ast)
+            return;
+
+        LOG_TRACE(log, "rewriteSelectQuery (target: {}) -> {}", target, ast->formatForLogging());
+    };
+
+    /// Recompute the Hybrid pruning verdict for per-segment skipping. The watermark snapshot
+    /// it depends on was frozen at `getStorageSnapshot()` time and is reused via
+    /// `HybridSnapshotData`, so this verdict matches the one `getQueryProcessingStage()`
+    /// produced — both the surviving-segment set and the substitution of `hybridParam(...)`
+    /// literals stay consistent with the chosen processing stage even under a concurrent
+    /// `ALTER MODIFY SETTING hybrid_watermark_*`.
+    HybridPruningVerdict pruning_verdict;
+    if (!segments.empty() || base_segment_predicate)
+        pruning_verdict = computeHybridPruningVerdict(query_info, storage_snapshot, local_context);
+
+    auto watermark_snapshot = getHybridWatermarkSnapshot(storage_snapshot);
+
+    if (pruning_verdict.base_pruned)
+        LOG_TRACE(log, "Hybrid segment pruned (target: {})", base_target);
+>>>>>>> 992ca2902cf (Merge pull request #1788 from Altinity/mkmkme/antalya-26.3/hybrid-segment-pruning)
 
     if (settings[Setting::allow_experimental_analyzer])
     {
@@ -970,7 +1167,12 @@ void StorageDistributed::read(
         auto query_tree_distributed = buildQueryTreeDistributed(modified_query_info,
             query_info.initial_storage_snapshot ? query_info.initial_storage_snapshot : storage_snapshot,
             remote_storage_id,
+<<<<<<< HEAD
             remote_table_function_ptr);
+=======
+            remote_table_function_ptr,
+            substituteHybridWatermarks(base_segment_predicate, watermark_snapshot));
+>>>>>>> 992ca2902cf (Merge pull request #1788 from Altinity/mkmkme/antalya-26.3/hybrid-segment-pruning)
         Block block = *InterpreterSelectQueryAnalyzer::getSampleBlock(query_tree_distributed, local_context, SelectQueryOptions(processed_stage).analyze());
         /** For distributed tables we do not need constants in header, since we don't send them to remote servers.
           * Moreover, constants can break some functions like `hostName` that are constants only for local queries.
@@ -983,8 +1185,46 @@ void StorageDistributed::read(
 
         modified_query_info.query_tree = std::move(query_tree_distributed);
 
+<<<<<<< HEAD
         /// Return directly (with correct header) if no shard to query.
         if (modified_query_info.getCluster()->getShardsInfo().empty())
+=======
+        if (!segments.empty())
+        {
+            for (size_t segment_idx = 0; segment_idx < segments.size(); ++segment_idx)
+            {
+                const auto & segment = segments[segment_idx];
+                if (pruning_verdict.segments_pruned[segment_idx])
+                {
+                    LOG_TRACE(log, "Hybrid segment pruned (target: {})", describe_segment_target(segment));
+                    continue;
+                }
+
+                ASTPtr substituted_predicate = substituteHybridWatermarks(segment.predicate_ast, watermark_snapshot);
+
+                // Create a modified query info with the segment predicate
+                SelectQueryInfo additional_query_info = query_info;
+
+                auto additional_query_tree = buildQueryTreeDistributed(additional_query_info,
+                    query_info.initial_storage_snapshot ? query_info.initial_storage_snapshot : storage_snapshot,
+                    segment.storage_id ? *segment.storage_id : StorageID::createEmpty(),
+                    segment.storage_id ? nullptr :  segment.table_function_ast,
+                    substituted_predicate);
+
+                additional_query_info.query = queryNodeToDistributedSelectQuery(additional_query_tree);
+                additional_query_info.query_tree = std::move(additional_query_tree);
+                log_rewritten_query(describe_segment_target(segment), additional_query_info.query);
+
+                additional_query_infos.push_back(std::move(additional_query_info));
+            }
+        }
+
+        /// Empty cluster + nothing else to plan: take the same path Distributed already uses
+        /// when `optimize_skip_unused_shards` filters every shard. For Hybrid this is the
+        /// "all segments pruned" case (base pruned via empty `optimized_cluster`, every
+        /// additional pruned via the segments loop above).
+        if (modified_query_info.getCluster()->getShardsInfo().empty() && additional_query_infos.empty())
+>>>>>>> 992ca2902cf (Merge pull request #1788 from Altinity/mkmkme/antalya-26.3/hybrid-segment-pruning)
             return;
     }
     else
@@ -993,9 +1233,56 @@ void StorageDistributed::read(
 
         modified_query_info.query = ClusterProxy::rewriteSelectQuery(
             local_context, modified_query_info.query,
+<<<<<<< HEAD
             remote_database, remote_table, remote_table_function_ptr);
 
         if (modified_query_info.getCluster()->getShardsInfo().empty())
+=======
+            remote_database, remote_table, remote_table_function_ptr,
+            substituteHybridWatermarks(base_segment_predicate, watermark_snapshot));
+        log_rewritten_query(base_target, modified_query_info.query);
+
+        if (!segments.empty())
+        {
+            for (size_t segment_idx = 0; segment_idx < segments.size(); ++segment_idx)
+            {
+                const auto & segment = segments[segment_idx];
+                if (pruning_verdict.segments_pruned[segment_idx])
+                {
+                    LOG_TRACE(log, "Hybrid segment pruned (target: {})", describe_segment_target(segment));
+                    continue;
+                }
+
+                ASTPtr resolved_predicate = substituteHybridWatermarks(segment.predicate_ast, watermark_snapshot);
+                SelectQueryInfo additional_query_info = query_info;
+
+                if (segment.storage_id)
+                {
+                    additional_query_info.query = ClusterProxy::rewriteSelectQuery(
+                        local_context, additional_query_info.query,
+                        segment.storage_id->database_name, segment.storage_id->table_name,
+                        nullptr,
+                        resolved_predicate);
+                }
+                else
+                {
+                    additional_query_info.query = ClusterProxy::rewriteSelectQuery(
+                        local_context, additional_query_info.query,
+                        "", "", segment.table_function_ast,
+                        resolved_predicate);
+                }
+
+                log_rewritten_query(describe_segment_target(segment), additional_query_info.query);
+                additional_query_infos.push_back(std::move(additional_query_info));
+            }
+        }
+
+        /// Empty cluster + nothing else to plan: take the same path Distributed already uses
+        /// when `optimize_skip_unused_shards` filters every shard. For Hybrid this is the
+        /// "all segments pruned" case (base pruned via empty `optimized_cluster`, every
+        /// additional pruned via the segments loop above).
+        if (modified_query_info.getCluster()->getShardsInfo().empty() && additional_query_infos.empty())
+>>>>>>> 992ca2902cf (Merge pull request #1788 from Altinity/mkmkme/antalya-26.3/hybrid-segment-pruning)
         {
             Pipe pipe(std::make_shared<NullSource>(header));
             auto read_from_pipe = std::make_unique<ReadFromPreparedSource>(std::move(pipe));
@@ -1006,8 +1293,63 @@ void StorageDistributed::read(
         }
     }
 
+<<<<<<< HEAD
     ClusterProxy::SelectStreamFactory select_stream_factory =
         ClusterProxy::SelectStreamFactory(
+=======
+    /// Hybrid case 2: base pruned (cluster empty via `getQueryProcessingStage`'s empty
+    /// `optimized_cluster`) and at least one additional segment survives. The all-pruned
+    /// subcase is already handled by the existing empty-cluster early-returns above. We
+    /// can't call `ClusterProxy::executeQuery` with an empty cluster (its
+    /// `updateSettingsAndClientInfoForCluster` dereferences `getShardsAddresses().front()`
+    /// when `is_remote_function=true`), so build the local plans directly. The block below
+    /// is the same shape as the `additional_query_infos` block in `ClusterProxy::executeQuery`
+    /// — that block uses the original context (not `new_context`), so we don't depend on the
+    /// shared distributed-context setup.
+    if (modified_query_info.getCluster()->getShardsInfo().empty() && !additional_query_infos.empty())
+    {
+        const Block & header_block = *header;
+        std::vector<QueryPlanPtr> plans;
+        plans.reserve(additional_query_infos.size());
+        for (const auto & additional_query_info : additional_query_infos)
+        {
+            plans.emplace_back(createLocalPlan(
+                additional_query_info.query, header_block, local_context,
+                processed_stage, /*shard_num=*/0, /*shard_count=*/1, /*build_logical_plan=*/false, ""));
+        }
+
+        if (plans.size() == 1)
+        {
+            query_plan = std::move(*plans.front());
+        }
+        else
+        {
+            SharedHeaders input_headers;
+            input_headers.reserve(plans.size());
+            for (auto & plan : plans)
+                input_headers.emplace_back(plan->getCurrentHeader());
+
+            auto union_step = std::make_unique<UnionStep>(std::move(input_headers));
+            union_step->setStepDescription("Hybrid");
+            query_plan.unitePlans(std::move(union_step), std::move(plans));
+        }
+        return;
+    }
+
+    if (!modified_query_info.getCluster()->getShardsInfo().empty() || !additional_query_infos.empty())
+    {
+        ClusterProxy::SelectStreamFactory select_stream_factory =
+            ClusterProxy::SelectStreamFactory(
+                header,
+                storage_snapshot,
+                processed_stage);
+
+        auto shard_filter_generator = ClusterProxy::getShardFilterGeneratorForCustomKey(
+            *modified_query_info.getCluster(), local_context, metadata_ptr->columns);
+
+        ClusterProxy::executeQuery(
+            query_plan,
+>>>>>>> 992ca2902cf (Merge pull request #1788 from Altinity/mkmkme/antalya-26.3/hybrid-segment-pruning)
             header,
             storage_snapshot,
             processed_stage);
