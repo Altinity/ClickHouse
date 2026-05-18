@@ -196,8 +196,8 @@ def _enrich_prs_in_release_merge_prs(df: pd.DataFrame, repo: str) -> pd.DataFram
         label_names = [l["name"] for l in pr.get("labels", [])]
         rows.append(
             {
-                "pr_number": pr_number,
                 "pr_name": pr.get("title", ""),
+                "pr_number": pr_number,
                 "pr_labels": ", ".join(sorted(label_names)),
             }
         )
