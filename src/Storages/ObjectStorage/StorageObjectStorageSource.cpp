@@ -1,7 +1,10 @@
 #include <memory>
 #include <optional>
 #include <unordered_set>
+<<<<<<< HEAD
 #include <Columns/ColumnConst.h>
+=======
+>>>>>>> 5779b86fb2b (Merge pull request #1804 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-102115)
 #include <Common/CurrentThread.h>
 #include <AggregateFunctions/AggregateFunctionGroupBitmapData.h>
 #include <Core/Settings.h>
@@ -46,7 +49,10 @@
 #include <Storages/ObjectStorage/Utils.h>
 #include <Storages/VirtualColumnUtils.h>
 #include <boost/operators.hpp>
+<<<<<<< HEAD
 #include <Common/FailPoint.h>
+=======
+>>>>>>> 5779b86fb2b (Merge pull request #1804 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-102115)
 #include <Poco/String.h>
 #include <Common/Exception.h>
 #include <Common/SipHash.h>
@@ -744,7 +750,11 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
                     continue;
 
                 auto file_bucket_info = FormatFactory::instance().getFileBucketInfo(
+<<<<<<< HEAD
                     object_info->getFileFormat().value_or(configuration->format));
+=======
+                    object_info->getFileFormat().value_or(configuration->getFormat()));
+>>>>>>> 5779b86fb2b (Merge pull request #1804 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-102115)
                 if (file_bucket_info)
                 {
                     auto filtered = file_bucket_info->filterByMatchingRowGroups(matching_row_groups);
