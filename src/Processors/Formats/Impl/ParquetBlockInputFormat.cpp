@@ -638,6 +638,22 @@ ParquetFileBucketInfo::ParquetFileBucketInfo(const std::vector<size_t> & row_gro
 {
 }
 
+std::shared_ptr<FileBucketInfo> ParquetFileBucketInfo::filterByMatchingRowGroups(const std::vector<size_t> & matching_row_groups) const
+{
+    if (matching_row_groups.empty())
+        return nullptr;
+    if (row_group_ids.empty())
+        return std::make_shared<ParquetFileBucketInfo>(matching_row_groups);
+    std::unordered_set<size_t> matching_set(matching_row_groups.begin(), matching_row_groups.end());
+    std::vector<size_t> filtered;
+    for (size_t rg : row_group_ids)
+        if (matching_set.contains(rg))
+            filtered.push_back(rg);
+    if (filtered.empty())
+        return nullptr;
+    return std::make_shared<ParquetFileBucketInfo>(std::move(filtered));
+}
+
 void registerParquetFileBucketInfo(std::unordered_map<String, FileBucketInfoPtr> & instances)
 {
     instances.emplace("Parquet", std::make_shared<ParquetFileBucketInfo>());

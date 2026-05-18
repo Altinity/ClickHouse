@@ -141,6 +141,32 @@ Chunk ParquetV3BlockInputFormat::read()
     return std::move(res.chunk);
 }
 
+std::optional<std::pair<std::vector<size_t>, size_t>> ParquetV3BlockInputFormat::getMatchedBuckets() const
+{
+    if (!reader)
+        return std::nullopt;
+    std::vector<size_t> matched;
+    for (const auto & row_group : reader->reader.row_groups)
+    {
+        if (!row_group.need_to_process)
+            continue;
+
+        bool produced_rows = false;
+        for (const auto & subgroup : row_group.subgroups)
+        {
+            if (subgroup.filter.rows_pass > 0)
+            {
+                produced_rows = true;
+                break;
+            }
+        }
+
+        if (produced_rows)
+            matched.push_back(row_group.row_group_idx);
+    }
+    return std::make_pair(std::move(matched), reader->reader.file_metadata.row_groups.size());
+}
+
 void ParquetV3BlockInputFormat::setBucketsToRead(const FileBucketInfoPtr & buckets_to_read_)
 {
     if (reader)
