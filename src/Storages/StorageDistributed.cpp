@@ -1982,6 +1982,13 @@ static std::unordered_map<String, String> collectHybridParamTypes(
     return result;
 }
 
+std::unordered_map<String, String> StorageDistributed::getDeclaredHybridParamTypes() const
+{
+    if (getName() != "Hybrid")
+        return {};
+    return collectHybridParamTypes(base_segment_predicate, segments);
+}
+
 void StorageDistributed::checkAlterIsPossible(const AlterCommands & commands, ContextPtr local_context) const
 {
     std::optional<NameDependencies> name_deps{};
