@@ -34,17 +34,17 @@ workflow = Workflow.Config(
     if_condition="github.repository != github.event.pull_request.head.repo.full_name",
     jobs=[
         JobConfigs.fast_test,
-        *[job.set_dependency(STYLE_AND_FAST_TESTS) for job in JobConfigs.build_jobs],
+        *[job.set_run_after(STYLE_AND_FAST_TESTS) for job in JobConfigs.build_jobs],
         *[
-            job.set_dependency(STYLE_AND_FAST_TESTS)
+            job.set_run_after(STYLE_AND_FAST_TESTS)
             for job in JobConfigs.extra_validation_build_jobs
         ],
         *[
-            job.set_dependency(STYLE_AND_FAST_TESTS)
+            job.set_run_after(STYLE_AND_FAST_TESTS)
             for job in JobConfigs.release_build_jobs
         ],
         # *[
-        #     job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
+        #     job.set_run_after(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
         #     for job in JobConfigs.special_build_jobs
         # ],
         # TODO: stabilize new jobs and remove set_allow_merge_on_failure
@@ -56,7 +56,7 @@ workflow = Workflow.Config(
         # JobConfigs.bugfix_validation_ft_pr_job,
         # JobConfigs.bugfix_validation_it_job,
         *[
-            j.set_dependency(
+            j.set_run_after(
                 FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES
                 if j.name not in FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES
                 else []
@@ -64,28 +64,28 @@ workflow = Workflow.Config(
             for j in JobConfigs.functional_tests_jobs
         ],
         *[
-            job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
+            job.set_run_after(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
             for job in JobConfigs.integration_test_jobs_required[:]
         ],
         *[
-            job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
+            job.set_run_after(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
             for job in JobConfigs.integration_test_jobs_non_required
         ],
         *JobConfigs.unittest_jobs,
         *[
-            job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
+            job.set_run_after(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
             for job in JobConfigs.install_check_jobs
         ],
         *[
-            job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
+            job.set_run_after(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
             for job in JobConfigs.compatibility_test_jobs
         ],
         # *[
-        #     job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
+        #     job.set_run_after(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
         #     for job in JobConfigs.stress_test_jobs
         # ], # NOTE (strtgbb): Does not support github artifacts
         # *[
-        #     job.set_dependency(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
+        #     job.set_run_after(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)
         #     for job in JobConfigs.upgrade_test_jobs
         # ], # TODO: customize for our repo
     ],

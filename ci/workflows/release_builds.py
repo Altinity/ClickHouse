@@ -30,7 +30,7 @@ workflow = Workflow.Config(
     event=Workflow.Event.DISPATCH,
     jobs=[
         *[
-            job.set_dependency(
+            job.set_run_after(
                 BLOCKING_BUILD_JOBS
                 if job.name not in BLOCKING_BUILD_JOBS and "release" not in job.name
                 else []
