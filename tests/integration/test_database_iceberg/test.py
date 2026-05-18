@@ -136,7 +136,11 @@ def create_clickhouse_iceberg_database(
     node.query(
         f"""
 DROP DATABASE IF EXISTS {name};
+<<<<<<< HEAD
 CREATE DATABASE {name} ENGINE = DataLakeCatalog('{BASE_URL}', 'minio', '{minio_secret_key}')
+=======
+CREATE DATABASE {name} ENGINE = {engine}('{BASE_URL}', 'minio', '{minio_secret_key}')
+>>>>>>> cf7ae691c5b (Merge pull request #1800 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-100334)
 SETTINGS {",".join((k+"="+repr(v) for k, v in settings.items()))}
     """,
         settings={
