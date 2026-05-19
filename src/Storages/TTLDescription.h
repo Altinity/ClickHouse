@@ -131,15 +131,29 @@ struct TTLTableDescription
 
     TTLDescriptions group_by_ttl;
 
+    /// Per-partition export TTLs (`TTL ... EXPORT TO db.table`).
+    TTLDescriptions export_ttl;
+
     TTLTableDescription() = default;
     TTLTableDescription(const TTLTableDescription & other);
     TTLTableDescription & operator=(const TTLTableDescription & other);
 
     static TTLTableDescription getTTLForTableFromAST(
-        const ASTPtr & definition_ast, const ColumnsDescription & columns, ContextPtr context, const KeyDescription & primary_key, bool is_attach);
+        const ASTPtr & definition_ast,
+        const ColumnsDescription & columns,
+        ContextPtr context,
+        const KeyDescription & primary_key,
+        const KeyDescription & partition_key,
+        bool is_attach);
 
     /// Parse description from string
-    static TTLTableDescription parse(const String & str, const ColumnsDescription & columns, ContextPtr context, const KeyDescription & primary_key, bool is_attach);
+    static TTLTableDescription parse(
+        const String & str,
+        const ColumnsDescription & columns,
+        ContextPtr context,
+        const KeyDescription & primary_key,
+        const KeyDescription & partition_key,
+        bool is_attach);
 };
 
 }

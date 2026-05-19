@@ -354,6 +354,17 @@ TTLDescription TTLDescription::getTTLFromAST(
     }
 
     checkTTLExpression(expression, result.result_column, is_attach || context->getSettingsRef()[Setting::allow_suspicious_ttl_expressions]);
+
+    if (result.mode == TTLMode::EXPORT)
+    {
+        /// The TTL expression's natural result column name is derived from the expression text and
+        /// is therefore identical across multiple EXPORT TTLs that share the same expression but
+        /// target different destinations. Override it with a destination-specific name so it can be
+        /// used as a stable key into `MergeTreeDataPartTTLInfos::export_ttl`. The override must
+        /// happen after `checkTTLExpression`, which looks the column up in the sample block.
+        result.result_column = "_export_" + result.destination_name;
+    }
+
     return result;
 }
 
@@ -365,6 +376,7 @@ TTLTableDescription::TTLTableDescription(const TTLTableDescription & other)
  , move_ttl(other.move_ttl)
  , recompression_ttl(other.recompression_ttl)
  , group_by_ttl(other.group_by_ttl)
+ , export_ttl(other.export_ttl)
 {
 }
 
@@ -383,6 +395,7 @@ TTLTableDescription & TTLTableDescription::operator=(const TTLTableDescription &
     move_ttl = other.move_ttl;
     recompression_ttl = other.recompression_ttl;
     group_by_ttl = other.group_by_ttl;
+    export_ttl = other.export_ttl;
 
     return *this;
 }
@@ -392,6 +405,7 @@ TTLTableDescription TTLTableDescription::getTTLForTableFromAST(
     const ColumnsDescription & columns,
     ContextPtr context,
     const KeyDescription & primary_key,
+    const KeyDescription & partition_key,
     bool is_attach)
 {
     TTLTableDescription result;
@@ -427,6 +441,21 @@ TTLTableDescription TTLTableDescription::getTTLForTableFromAST(
         {
             result.group_by_ttl.emplace_back(std::move(ttl));
         }
+        else if (ttl.mode == TTLMode::EXPORT)
+        {
+            if (partition_key.column_names.empty())
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "TTL EXPORT TO {} requires the table to have a partition key", ttl.destination_name);
+
+            for (const auto & existing : result.export_ttl)
+            {
+                if (existing.destination_name == ttl.destination_name)
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "Two TTL EXPORT clauses target the same destination {}", ttl.destination_name);
+            }
+
+            result.export_ttl.emplace_back(std::move(ttl));
+        }
         else
         {
             result.move_ttl.emplace_back(std::move(ttl));
@@ -436,7 +465,12 @@ TTLTableDescription TTLTableDescription::getTTLForTableFromAST(
 }
 
 TTLTableDescription TTLTableDescription::parse(
-    const String & str, const ColumnsDescription & columns, ContextPtr context, const KeyDescription & primary_key, bool is_attach)
+    const String & str,
+    const ColumnsDescription & columns,
+    ContextPtr context,
+    const KeyDescription & primary_key,
+    const KeyDescription & partition_key,
+    bool is_attach)
 {
     TTLTableDescription result;
     if (str.empty())
@@ -446,7 +480,7 @@ TTLTableDescription TTLTableDescription::parse(
     ASTPtr ast = parseQuery(parser, str, 0, DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
     FunctionNameNormalizer::visit(ast.get());
 
-    return getTTLForTableFromAST(ast, columns, context, primary_key, is_attach);
+    return getTTLForTableFromAST(ast, columns, context, primary_key, partition_key, is_attach);
 }
 
 }

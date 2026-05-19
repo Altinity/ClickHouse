@@ -44,6 +44,7 @@
 #include <Parsers/ExpressionElementParsers.h>
 #include <Parsers/ParserCreateQuery.h>
 #include <Parsers/ParserExplainQuery.h>
+#include <Parsers/parseDatabaseAndTableName.h>
 
 #include <Interpreters/StorageID.h>
 
@@ -2449,6 +2450,7 @@ bool ParserTTLElement::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     ParserKeyword s_set(Keyword::SET);
     ParserKeyword s_recompress(Keyword::RECOMPRESS);
     ParserKeyword s_codec(Keyword::CODEC);
+    ParserKeyword s_export_to(Keyword::EXPORT_TO);
     ParserKeyword s_materialize_ttl(Keyword::MATERIALIZE_TTL);
     ParserKeyword s_remove_ttl(Keyword::REMOVE_TTL);
     ParserKeyword s_modify_ttl(Keyword::MODIFY_TTL);
@@ -2495,6 +2497,11 @@ bool ParserTTLElement::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     else if (s_recompress.ignore(pos, expected))
     {
         mode = TTLMode::RECOMPRESS;
+    }
+    else if (s_export_to.ignore(pos, expected))
+    {
+        mode = TTLMode::EXPORT;
+        destination_type = DataDestinationType::TABLE;
     }
     else
     {
@@ -2546,6 +2553,15 @@ bool ParserTTLElement::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 
         if (!parser_codec.parse(pos, recompression_codec, expected))
             return false;
+    }
+    else if (mode == TTLMode::EXPORT)
+    {
+        String dst_database;
+        String dst_table;
+        if (!parseDatabaseAndTableName(pos, expected, dst_database, dst_table))
+            return false;
+
+        destination_name = dst_database.empty() ? dst_table : dst_database + "." + dst_table;
     }
 
     auto ttl_element = make_intrusive<ASTTTLElement>(mode, destination_type, destination_name, if_exists);

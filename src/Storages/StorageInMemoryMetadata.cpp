@@ -358,6 +358,16 @@ bool StorageInMemoryMetadata::hasAnyGroupByTTL() const
     return !table_ttl.group_by_ttl.empty();
 }
 
+TTLDescriptions StorageInMemoryMetadata::getExportTTLs() const
+{
+    return table_ttl.export_ttl;
+}
+
+bool StorageInMemoryMetadata::hasAnyExportTTL() const
+{
+    return !table_ttl.export_ttl.empty();
+}
+
 ColumnDependencies StorageInMemoryMetadata::getColumnDependencies(
     const NameSet & updated_columns,
     bool include_ttl_target,

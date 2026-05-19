@@ -129,12 +129,13 @@ void validateCreateQuery(const ASTCreateQuery & query, ContextPtr context)
         primary_key = KeyDescription::getKeyFromAST(storage.order_by->ptr(), columns_desc, context);
     if (storage.primary_key)
         primary_key = KeyDescription::getKeyFromAST(storage.primary_key->ptr(), columns_desc, context);
+    KeyDescription partition_key;
     if (storage.partition_by)
-        KeyDescription::getKeyFromAST(storage.partition_by->ptr(), columns_desc, context);
+        partition_key = KeyDescription::getKeyFromAST(storage.partition_by->ptr(), columns_desc, context);
     if (storage.sample_by)
         KeyDescription::getKeyFromAST(storage.sample_by->ptr(), columns_desc, context);
     if (storage.ttl_table && primary_key.has_value())
-        TTLTableDescription::getTTLForTableFromAST(storage.ttl_table->ptr(), columns_desc, context, *primary_key, true);
+        TTLTableDescription::getTTLForTableFromAST(storage.ttl_table->ptr(), columns_desc, context, *primary_key, partition_key, true);
 }
 }
 

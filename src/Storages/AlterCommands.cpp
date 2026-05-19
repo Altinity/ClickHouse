@@ -870,7 +870,8 @@ void AlterCommand::apply(StorageInMemoryMetadata & metadata, ContextPtr context)
     else if (type == MODIFY_TTL)
     {
         metadata.table_ttl = TTLTableDescription::getTTLForTableFromAST(
-            ttl, metadata.columns, context, metadata.primary_key, context->getSettingsRef()[Setting::allow_suspicious_ttl_expressions]);
+            ttl, metadata.columns, context, metadata.primary_key, metadata.partition_key,
+            context->getSettingsRef()[Setting::allow_suspicious_ttl_expressions]);
     }
     else if (type == REMOVE_TTL)
     {
@@ -1393,6 +1394,7 @@ void AlterCommands::apply(StorageInMemoryMetadata & metadata, ContextPtr context
             metadata_copy.columns,
             context,
             metadata_copy.primary_key,
+            metadata_copy.partition_key,
             context->getSettingsRef()[Setting::allow_suspicious_ttl_expressions]);
 
     metadata = std::move(metadata_copy);

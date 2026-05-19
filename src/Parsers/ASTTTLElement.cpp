@@ -79,6 +79,22 @@ void ASTTTLElement::formatImpl(WriteBuffer & ostr, const FormatSettings & settin
         ostr << " RECOMPRESS ";
         recompression_codec->format(ostr, settings, state, frame);
     }
+    else if (mode == TTLMode::EXPORT)
+    {
+        if (destination_type != DataDestinationType::TABLE)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "Unsupported destination type {} for TTL EXPORT",
+                    magic_enum::enum_name(destination_type));
+
+        ostr << " EXPORT TO ";
+        auto dot_pos = destination_name.find('.');
+        if (dot_pos == String::npos)
+            ostr << backQuoteIfNeed(destination_name);
+        else
+            ostr << backQuoteIfNeed(std::string_view(destination_name).substr(0, dot_pos))
+                 << '.'
+                 << backQuoteIfNeed(std::string_view(destination_name).substr(dot_pos + 1));
+    }
     else if (mode == TTLMode::DELETE)
     {
         /// It would be better to output "DELETE" here but that will break compatibility with earlier versions.
