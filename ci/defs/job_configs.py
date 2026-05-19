@@ -583,7 +583,7 @@ class JobConfigs:
         ],
         Job.ParamSet(
             parameter="amd_asan_ubsan, db disk, distributed plan, sequential",
-            runs_on=RunnerLabels.AMD_SMALL_MEM,
+            runs_on=RunnerLabels.FUNC_TESTER_AMD,
             requires=[ArtifactNames.CH_AMD_ASAN_UBSAN],
         ),
         # Job.ParamSet( # NOTE (strtgbb): llvm cov jobs not configured yet. Determine if useful first.

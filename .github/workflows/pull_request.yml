@@ -1223,7 +1223,7 @@ jobs:
           for line in sys.stdin: sys.stdout.write(prefix() + " " + line); sys.stdout.flush()' | tee ./ci/tmp/job.log
 
   stateless_tests_amd_asan_ubsan_db_disk_distributed_plan_sequential:
-    runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [build_amd_asan_ubsan, build_amd_debug, build_amd_tsan, build_arm_binary, config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest, fast_test, stateless_tests_amd_asan_ubsan_distributed_plan_parallel_1_2, stateless_tests_amd_asan_ubsan_distributed_plan_parallel_2_2, stateless_tests_amd_debug_parallel, stateless_tests_amd_tsan_parallel_1_2, stateless_tests_amd_tsan_parallel_2_2, stateless_tests_arm_binary_parallel]
     if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhbWRfYXNhbl91YnNhbiwgZGIgZGlzaywgZGlzdHJpYnV0ZWQgcGxhbiwgc2VxdWVudGlhbCk=') }}
     name: "Stateless tests (amd_asan_ubsan, db disk, distributed plan, sequential)"

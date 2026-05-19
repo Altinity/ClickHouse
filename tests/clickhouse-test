@@ -1206,6 +1206,7 @@ class TestStatus(enum.Enum):
     OK = "OK"
     SKIPPED = "SKIPPED"
     NOT_FAILED = "NOT_FAILED"
+    BROKEN = "BROKEN"
 
 
 class FailureReason(enum.Enum):

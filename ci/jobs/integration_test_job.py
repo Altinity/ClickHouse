@@ -1106,7 +1106,7 @@ tar -czf ./ci/tmp/logs.tar.gz \
 
     broken_tests_rules = get_broken_tests_rules("tests/broken_tests.yaml")
     for result in test_results:
-        if result.status == Result.StatusExtended.FAIL:
+        if result.status == Result.Status.FAIL:
             try:
                 known_fail_reason = test_is_known_fail(
                     broken_tests_rules,
@@ -1120,7 +1120,7 @@ tar -czf ./ci/tmp/logs.tar.gz \
             else:
                 if not known_fail_reason:
                     continue
-                result.status = Result.StatusExtended.BROKEN
+                result.status = Result.Status.BROKEN
                 result.info += f"\nMarked as broken: {known_fail_reason}"
 
     if os.path.exists(f"{temp_path}/broken_tests_handler.log"):
