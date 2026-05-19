@@ -293,6 +293,13 @@ jobs:
             python3 -m praktika run 'Build (amd_asan)' --workflow "BackportPR" --ci |& tee ./ci/tmp/job.log
           fi
 
+      - name: Upload artifact CH_AMD_ASAN_GH
+        uses: actions/upload-artifact@v7
+        with:
+          name: CH_AMD_ASAN_GH
+          path: ci/tmp/build/programs/self-extracting/clickhouse
+          retention-days: 1
+
   build_amd_tsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
@@ -339,6 +346,13 @@ jobs:
           else
             python3 -m praktika run 'Build (amd_tsan)' --workflow "BackportPR" --ci |& tee ./ci/tmp/job.log
           fi
+
+      - name: Upload artifact CH_AMD_TSAN_GH
+        uses: actions/upload-artifact@v7
+        with:
+          name: CH_AMD_TSAN_GH
+          path: ci/tmp/build/programs/self-extracting/clickhouse
+          retention-days: 1
 
   build_amd_release:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]

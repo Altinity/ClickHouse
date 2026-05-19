@@ -291,6 +291,13 @@ jobs:
             python3 -m praktika run 'Build (amd_asan)' --workflow "ReleaseBranchCI" --ci |& tee ./ci/tmp/job.log
           fi
 
+      - name: Upload artifact CH_AMD_ASAN_GH
+        uses: actions/upload-artifact@v7
+        with:
+          name: CH_AMD_ASAN_GH
+          path: ci/tmp/build/programs/self-extracting/clickhouse
+          retention-days: 1
+
   build_amd_tsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
@@ -337,6 +344,13 @@ jobs:
           else
             python3 -m praktika run 'Build (amd_tsan)' --workflow "ReleaseBranchCI" --ci |& tee ./ci/tmp/job.log
           fi
+
+      - name: Upload artifact CH_AMD_TSAN_GH
+        uses: actions/upload-artifact@v7
+        with:
+          name: CH_AMD_TSAN_GH
+          path: ci/tmp/build/programs/self-extracting/clickhouse
+          retention-days: 1
 
   build_amd_msan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
@@ -439,6 +453,13 @@ jobs:
             python3 -m praktika run 'Build (amd_ubsan)' --workflow "ReleaseBranchCI" --ci |& tee ./ci/tmp/job.log
           fi
 
+      - name: Upload artifact CH_AMD_UBSAN_GH
+        uses: actions/upload-artifact@v7
+        with:
+          name: CH_AMD_UBSAN_GH
+          path: ci/tmp/build/programs/self-extracting/clickhouse
+          retention-days: 1
+
   build_arm_asan:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
@@ -485,6 +506,13 @@ jobs:
           else
             python3 -m praktika run 'Build (arm_asan)' --workflow "ReleaseBranchCI" --ci |& tee ./ci/tmp/job.log
           fi
+
+      - name: Upload artifact CH_ARM_ASAN_GH
+        uses: actions/upload-artifact@v7
+        with:
+          name: CH_ARM_ASAN_GH
+          path: ci/tmp/build/programs/self-extracting/clickhouse
+          retention-days: 1
 
   build_amd_release:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]

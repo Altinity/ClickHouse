@@ -185,15 +185,6 @@ jobs:
         with:
           name: CH_AMD_DEBUG
           path: ci/tmp/build/programs/self-extracting/clickhouse
-          retention-days: 1
-
-
-      - name: Upload artifact CH_AMD_DEBUG_GH
-        uses: actions/upload-artifact@v7
-        with:
-          name: CH_AMD_DEBUG_GH
-          path: ci/tmp/build/programs/self-extracting/clickhouse
-          retention-days: 1
 
 
       - name: Upload artifact DEB_AMD_DEBUG
@@ -201,7 +192,6 @@ jobs:
         with:
           name: DEB_AMD_DEBUG
           path: ci/tmp/*.deb
-          retention-days: 1
 
   build_amd_asan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
@@ -255,7 +245,6 @@ jobs:
         with:
           name: UNITTEST_AMD_ASAN
           path: ci/tmp/build/src/unit_tests_dbms
-          retention-days: 1
 
 
       - name: Upload artifact CH_AMD_ASAN
@@ -263,7 +252,6 @@ jobs:
         with:
           name: CH_AMD_ASAN
           path: ci/tmp/build/programs/self-extracting/clickhouse
-          retention-days: 1
 
 
       - name: Upload artifact DEB_AMD_ASAN
@@ -271,7 +259,6 @@ jobs:
         with:
           name: DEB_AMD_ASAN
           path: ci/tmp/*.deb
-          retention-days: 1
 
   build_amd_tsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
@@ -325,7 +312,6 @@ jobs:
         with:
           name: UNITTEST_AMD_TSAN
           path: ci/tmp/build/src/unit_tests_dbms
-          retention-days: 1
 
 
       - name: Upload artifact CH_AMD_TSAN
@@ -333,7 +319,6 @@ jobs:
         with:
           name: CH_AMD_TSAN
           path: ci/tmp/build/programs/self-extracting/clickhouse
-          retention-days: 1
 
 
       - name: Upload artifact DEB_AMD_TSAN
@@ -341,7 +326,6 @@ jobs:
         with:
           name: DEB_AMD_TSAN
           path: ci/tmp/*.deb
-          retention-days: 1
 
   build_amd_msan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
@@ -395,7 +379,6 @@ jobs:
         with:
           name: UNITTEST_AMD_MSAN
           path: ci/tmp/build/src/unit_tests_dbms
-          retention-days: 1
 
 
       - name: Upload artifact CH_AMD_MSAN
@@ -403,15 +386,6 @@ jobs:
         with:
           name: CH_AMD_MSAN
           path: ci/tmp/build/programs/self-extracting/clickhouse
-          retention-days: 1
-
-
-      - name: Upload artifact CH_AMD_MSAN_GH
-        uses: actions/upload-artifact@v7
-        with:
-          name: CH_AMD_MSAN_GH
-          path: ci/tmp/build/programs/self-extracting/clickhouse
-          retention-days: 1
 
 
       - name: Upload artifact DEB_AMD_MSAM
@@ -419,7 +393,6 @@ jobs:
         with:
           name: DEB_AMD_MSAM
           path: ci/tmp/*.deb
-          retention-days: 1
 
   build_amd_ubsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
@@ -473,7 +446,6 @@ jobs:
         with:
           name: UNITTEST_AMD_UBSAN
           path: ci/tmp/build/src/unit_tests_dbms
-          retention-days: 1
 
 
       - name: Upload artifact CH_AMD_UBSAN
@@ -481,7 +453,6 @@ jobs:
         with:
           name: CH_AMD_UBSAN
           path: ci/tmp/build/programs/self-extracting/clickhouse
-          retention-days: 1
 
 
       - name: Upload artifact DEB_AMD_UBSAN
@@ -489,7 +460,6 @@ jobs:
         with:
           name: DEB_AMD_UBSAN
           path: ci/tmp/*.deb
-          retention-days: 1
 
   build_amd_binary:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
@@ -543,15 +513,6 @@ jobs:
         with:
           name: CH_AMD_BINARY
           path: ci/tmp/build/programs/self-extracting/clickhouse
-          retention-days: 1
-
-
-      - name: Upload artifact CH_AMD_BINARY_GH
-        uses: actions/upload-artifact@v7
-        with:
-          name: CH_AMD_BINARY_GH
-          path: ci/tmp/build/programs/self-extracting/clickhouse
-          retention-days: 1
 
   build_arm_asan:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
@@ -605,7 +566,6 @@ jobs:
         with:
           name: CH_ARM_ASAN
           path: ci/tmp/build/programs/self-extracting/clickhouse
-          retention-days: 1
 
 
       - name: Upload artifact DEB_ARM_ASAN
@@ -613,7 +573,6 @@ jobs:
         with:
           name: DEB_ARM_ASAN
           path: ci/tmp/*.deb
-          retention-days: 1
 
   build_arm_binary:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
@@ -667,7 +626,6 @@ jobs:
         with:
           name: CH_ARM_BIN
           path: ci/tmp/build/programs/self-extracting/clickhouse
-          retention-days: 1
 
   build_arm_tsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
@@ -721,7 +679,6 @@ jobs:
         with:
           name: CH_ARM_TSAN
           path: ci/tmp/build/programs/self-extracting/clickhouse
-          retention-days: 1
 
   build_amd_release:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
@@ -775,7 +732,6 @@ jobs:
         with:
           name: CH_AMD_RELEASE
           path: ci/tmp/build/programs/self-extracting/clickhouse
-          retention-days: 1
 
 
       - name: Upload artifact CH_AMD_RELEASE_STRIPPED
@@ -783,7 +739,6 @@ jobs:
         with:
           name: CH_AMD_RELEASE_STRIPPED
           path: ci/tmp/build/programs/self-extracting/clickhouse-stripped
-          retention-days: 1
 
 
       - name: Upload artifact DEB_AMD_RELEASE
@@ -791,7 +746,6 @@ jobs:
         with:
           name: DEB_AMD_RELEASE
           path: ci/tmp/*.deb
-          retention-days: 1
 
 
       - name: Upload artifact RPM_AMD_RELEASE
@@ -799,7 +753,6 @@ jobs:
         with:
           name: RPM_AMD_RELEASE
           path: ci/tmp/*.rpm
-          retention-days: 1
 
 
       - name: Upload artifact TGZ_AMD_RELEASE
@@ -807,7 +760,6 @@ jobs:
         with:
           name: TGZ_AMD_RELEASE
           path: ci/tmp/*64.tgz*
-          retention-days: 1
 
   build_arm_release:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
@@ -861,7 +813,6 @@ jobs:
         with:
           name: CH_ARM_RELEASE
           path: ci/tmp/build/programs/self-extracting/clickhouse
-          retention-days: 1
 
 
       - name: Upload artifact CH_ARM_RELEASE_STRIPPED
@@ -869,7 +820,6 @@ jobs:
         with:
           name: CH_ARM_RELEASE_STRIPPED
           path: ci/tmp/build/programs/self-extracting/clickhouse-stripped
-          retention-days: 1
 
 
       - name: Upload artifact DEB_ARM_RELEASE
@@ -877,7 +827,6 @@ jobs:
         with:
           name: DEB_ARM_RELEASE
           path: ci/tmp/*.deb
-          retention-days: 1
 
 
       - name: Upload artifact RPM_ARM_RELEASE
@@ -885,7 +834,6 @@ jobs:
         with:
           name: RPM_ARM_RELEASE
           path: ci/tmp/*.rpm
-          retention-days: 1
 
 
       - name: Upload artifact TGZ_ARM_RELEASE
@@ -893,7 +841,6 @@ jobs:
         with:
           name: TGZ_ARM_RELEASE
           path: ci/tmp/*64.tgz*
-          retention-days: 1
 
   quick_functional_tests:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker]
@@ -931,11 +878,11 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_DEBUG_GH
+      - name: Download artifact CH_AMD_DEBUG
         uses: actions/download-artifact@v8
         continue-on-error: true
         with:
-          name: CH_AMD_DEBUG_GH
+          name: CH_AMD_DEBUG
           path: ./ci/tmp
 
       - name: Run
@@ -1147,11 +1094,11 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_BINARY_GH
+      - name: Download artifact CH_AMD_BINARY
         uses: actions/download-artifact@v8
         continue-on-error: true
         with:
-          name: CH_AMD_BINARY_GH
+          name: CH_AMD_BINARY
           path: ./ci/tmp
 
       - name: Run
@@ -1201,11 +1148,11 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_BINARY_GH
+      - name: Download artifact CH_AMD_BINARY
         uses: actions/download-artifact@v8
         continue-on-error: true
         with:
-          name: CH_AMD_BINARY_GH
+          name: CH_AMD_BINARY
           path: ./ci/tmp
 
       - name: Run
@@ -1255,11 +1202,11 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_BINARY_GH
+      - name: Download artifact CH_AMD_BINARY
         uses: actions/download-artifact@v8
         continue-on-error: true
         with:
-          name: CH_AMD_BINARY_GH
+          name: CH_AMD_BINARY
           path: ./ci/tmp
 
       - name: Run
@@ -1309,11 +1256,11 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_BINARY_GH
+      - name: Download artifact CH_AMD_BINARY
         uses: actions/download-artifact@v8
         continue-on-error: true
         with:
-          name: CH_AMD_BINARY_GH
+          name: CH_AMD_BINARY
           path: ./ci/tmp
 
       - name: Run
@@ -1363,11 +1310,11 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_DEBUG_GH
+      - name: Download artifact CH_AMD_DEBUG
         uses: actions/download-artifact@v8
         continue-on-error: true
         with:
-          name: CH_AMD_DEBUG_GH
+          name: CH_AMD_DEBUG
           path: ./ci/tmp
 
       - name: Run
@@ -1417,11 +1364,11 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_DEBUG_GH
+      - name: Download artifact CH_AMD_DEBUG
         uses: actions/download-artifact@v8
         continue-on-error: true
         with:
-          name: CH_AMD_DEBUG_GH
+          name: CH_AMD_DEBUG
           path: ./ci/tmp
 
       - name: Run
@@ -1471,11 +1418,11 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_DEBUG_GH
+      - name: Download artifact CH_AMD_DEBUG
         uses: actions/download-artifact@v8
         continue-on-error: true
         with:
-          name: CH_AMD_DEBUG_GH
+          name: CH_AMD_DEBUG
           path: ./ci/tmp
 
       - name: Run
@@ -1525,11 +1472,11 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_DEBUG_GH
+      - name: Download artifact CH_AMD_DEBUG
         uses: actions/download-artifact@v8
         continue-on-error: true
         with:
-          name: CH_AMD_DEBUG_GH
+          name: CH_AMD_DEBUG
           path: ./ci/tmp
 
       - name: Run
@@ -1795,11 +1742,11 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_MSAN_GH
+      - name: Download artifact CH_AMD_MSAN
         uses: actions/download-artifact@v8
         continue-on-error: true
         with:
-          name: CH_AMD_MSAN_GH
+          name: CH_AMD_MSAN
           path: ./ci/tmp
 
       - name: Run
@@ -1849,11 +1796,11 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_MSAN_GH
+      - name: Download artifact CH_AMD_MSAN
         uses: actions/download-artifact@v8
         continue-on-error: true
         with:
-          name: CH_AMD_MSAN_GH
+          name: CH_AMD_MSAN
           path: ./ci/tmp
 
       - name: Run
@@ -1903,11 +1850,11 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_MSAN_GH
+      - name: Download artifact CH_AMD_MSAN
         uses: actions/download-artifact@v8
         continue-on-error: true
         with:
-          name: CH_AMD_MSAN_GH
+          name: CH_AMD_MSAN
           path: ./ci/tmp
 
       - name: Run
@@ -1957,11 +1904,11 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_MSAN_GH
+      - name: Download artifact CH_AMD_MSAN
         uses: actions/download-artifact@v8
         continue-on-error: true
         with:
-          name: CH_AMD_MSAN_GH
+          name: CH_AMD_MSAN
           path: ./ci/tmp
 
       - name: Run
@@ -2119,11 +2066,11 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_DEBUG_GH
+      - name: Download artifact CH_AMD_DEBUG
         uses: actions/download-artifact@v8
         continue-on-error: true
         with:
-          name: CH_AMD_DEBUG_GH
+          name: CH_AMD_DEBUG
           path: ./ci/tmp
 
       - name: Run
@@ -2173,11 +2120,11 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_DEBUG_GH
+      - name: Download artifact CH_AMD_DEBUG
         uses: actions/download-artifact@v8
         continue-on-error: true
         with:
-          name: CH_AMD_DEBUG_GH
+          name: CH_AMD_DEBUG
           path: ./ci/tmp
 
       - name: Run
@@ -2875,11 +2822,11 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_BINARY_GH
+      - name: Download artifact CH_AMD_BINARY
         uses: actions/download-artifact@v8
         continue-on-error: true
         with:
-          name: CH_AMD_BINARY_GH
+          name: CH_AMD_BINARY
           path: ./ci/tmp
 
       - name: Run
@@ -2929,11 +2876,11 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_BINARY_GH
+      - name: Download artifact CH_AMD_BINARY
         uses: actions/download-artifact@v8
         continue-on-error: true
         with:
-          name: CH_AMD_BINARY_GH
+          name: CH_AMD_BINARY
           path: ./ci/tmp
 
       - name: Run
@@ -2983,11 +2930,11 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_BINARY_GH
+      - name: Download artifact CH_AMD_BINARY
         uses: actions/download-artifact@v8
         continue-on-error: true
         with:
-          name: CH_AMD_BINARY_GH
+          name: CH_AMD_BINARY
           path: ./ci/tmp
 
       - name: Run
@@ -3037,11 +2984,11 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_BINARY_GH
+      - name: Download artifact CH_AMD_BINARY
         uses: actions/download-artifact@v8
         continue-on-error: true
         with:
-          name: CH_AMD_BINARY_GH
+          name: CH_AMD_BINARY
           path: ./ci/tmp
 
       - name: Run
@@ -3091,11 +3038,11 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_BINARY_GH
+      - name: Download artifact CH_AMD_BINARY
         uses: actions/download-artifact@v8
         continue-on-error: true
         with:
-          name: CH_AMD_BINARY_GH
+          name: CH_AMD_BINARY
           path: ./ci/tmp
 
       - name: Run

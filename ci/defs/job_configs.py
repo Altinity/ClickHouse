@@ -194,6 +194,7 @@ class JobConfigs:
             parameter=BuildTypes.AMD_ASAN,
             provides=[
                 ArtifactNames.CH_AMD_ASAN,
+                ArtifactNames.CH_AMD_ASAN_GH,
                 ArtifactNames.DEB_AMD_ASAN,
                 ArtifactNames.UNITTEST_AMD_ASAN,
             ],
@@ -203,6 +204,7 @@ class JobConfigs:
             parameter=BuildTypes.AMD_TSAN,
             provides=[
                 ArtifactNames.CH_AMD_TSAN,
+                ArtifactNames.CH_AMD_TSAN_GH,
                 ArtifactNames.DEB_AMD_TSAN,
                 ArtifactNames.UNITTEST_AMD_TSAN,
             ],
@@ -222,6 +224,7 @@ class JobConfigs:
             parameter=BuildTypes.AMD_UBSAN,
             provides=[
                 ArtifactNames.CH_AMD_UBSAN,
+                ArtifactNames.CH_AMD_UBSAN_GH,
                 ArtifactNames.DEB_AMD_UBSAN,
                 ArtifactNames.UNITTEST_AMD_UBSAN,
             ],
@@ -236,6 +239,7 @@ class JobConfigs:
             parameter=BuildTypes.ARM_ASAN,
             provides=[
                 ArtifactNames.CH_ARM_ASAN,
+                ArtifactNames.CH_ARM_ASAN_GH,
                 ArtifactNames.DEB_ARM_ASAN,
             ],
             runs_on=RunnerLabels.ARM_LARGE,
@@ -295,6 +299,7 @@ class JobConfigs:
             parameter=BuildTypes.ARM_TSAN,
             provides=[
                 ArtifactNames.CH_ARM_TSAN,
+                ArtifactNames.CH_ARM_TSAN_GH,
             ],
             runs_on=RunnerLabels.BUILDER_AMD,
         ),

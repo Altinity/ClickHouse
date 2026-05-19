@@ -418,7 +418,12 @@ class ArtifactNames:
     CH_LOONGARCH64 = "CH_LOONGARCH64_BIN"
     CH_AMD_DEBUG_GH = "CH_AMD_DEBUG_GH"
     CH_AMD_BINARY_GH = "CH_AMD_BINARY_GH"
+    CH_AMD_ASAN_GH = "CH_AMD_ASAN_GH"
+    CH_AMD_TSAN_GH = "CH_AMD_TSAN_GH"
     CH_AMD_MSAN_GH = "CH_AMD_MSAN_GH"
+    CH_AMD_UBSAN_GH = "CH_AMD_UBSAN_GH"
+    CH_ARM_ASAN_GH = "CH_ARM_ASAN_GH"
+    CH_ARM_TSAN_GH = "CH_ARM_TSAN_GH"
 
     FAST_TEST = "FAST_TEST"
     UNITTEST_AMD_ASAN = "UNITTEST_AMD_ASAN"
@@ -485,7 +490,12 @@ class ArtifactConfigs:
         names=[
             ArtifactNames.CH_AMD_DEBUG_GH,
             ArtifactNames.CH_AMD_BINARY_GH,
+            ArtifactNames.CH_AMD_ASAN_GH,
+            ArtifactNames.CH_AMD_TSAN_GH,
             ArtifactNames.CH_AMD_MSAN_GH,
+            ArtifactNames.CH_AMD_UBSAN_GH,
+            ArtifactNames.CH_ARM_ASAN_GH,
+            ArtifactNames.CH_ARM_TSAN_GH,
         ]
     )
     clickhouse_stripped_binaries = Artifact.Config(

@@ -227,6 +227,14 @@ jobs:
           retention-days: 1
 """
 
+        TEMPLATE_GH_UPLOAD_NO_RETENTION = """
+      - name: Upload artifact {NAME}
+        uses: actions/upload-artifact@v7
+        with:
+          name: {NAME}
+          path: {PATH}
+"""
+
         TEMPLATE_GH_DOWNLOAD = """
       - name: Download artifact {NAME}
         uses: actions/download-artifact@v8
@@ -306,8 +314,13 @@ class PullRequestPushYamlGen:
                     )
             uploads_github = []
             for artifact in job.artifacts_gh_provides:
+                upload_template = YamlGenerator.Templates.TEMPLATE_GH_UPLOAD
+                if self.workflow_config.name == "Community PR":
+                    upload_template = (
+                        YamlGenerator.Templates.TEMPLATE_GH_UPLOAD_NO_RETENTION
+                    )
                 uploads_github.append(
-                    YamlGenerator.Templates.TEMPLATE_GH_UPLOAD.format(
+                    upload_template.format(
                         NAME=artifact.name,
                         PATH=os.path.relpath(artifact.path, os.getcwd()),
                     )
