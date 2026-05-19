@@ -224,7 +224,6 @@ namespace Setting
     extern const SettingsUInt64 export_merge_tree_part_max_rows_per_file;
     extern const SettingsBool export_merge_tree_part_throw_on_pending_mutations;
     extern const SettingsBool export_merge_tree_part_throw_on_pending_patch_parts;
-    extern const SettingsBool export_merge_tree_partition_lock_inside_the_task;
     extern const SettingsString export_merge_tree_part_filename_pattern;
     extern const SettingsBool write_full_path_in_iceberg_metadata;
     extern const SettingsBool allow_insert_into_iceberg;
@@ -8410,7 +8409,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     MergeTreeData::IMutationsSnapshot::Params mutations_snapshot_params
     {
         .metadata_version = getInMemoryMetadataPtr()->getMetadataVersion(),
-        .min_part_metadata_version = MergeTreeData::getMinMetadataVersion(parts),
+        .min_part_metadata_version = MergeTreeData::getPartsSnapshotInfo(parts).min_metadata_version,
         .need_data_mutations = throw_on_pending_mutations,
         .need_alter_mutations = throw_on_pending_mutations || throw_on_pending_patch_parts,
         .need_patch_parts = throw_on_pending_patch_parts,
@@ -8464,7 +8463,6 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     manifest.parquet_parallel_encoding = query_context->getSettingsRef()[Setting::output_format_parquet_parallel_encoding];
     manifest.max_bytes_per_file = query_context->getSettingsRef()[Setting::export_merge_tree_part_max_bytes_per_file];
     manifest.max_rows_per_file = query_context->getSettingsRef()[Setting::export_merge_tree_part_max_rows_per_file];
-    manifest.lock_inside_the_task = query_context->getSettingsRef()[Setting::export_merge_tree_partition_lock_inside_the_task];
 
     manifest.file_already_exists_policy = query_context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value;
     manifest.filename_pattern = query_context->getSettingsRef()[Setting::export_merge_tree_part_filename_pattern].value;
@@ -8911,11 +8909,6 @@ QueryPipeline StorageReplicatedMergeTree::updateLightweight(const MutationComman
     chassert(!pipeline.completed());
     pipeline.complete(std::move(sink));
     return pipeline;
-}
-
-bool StorageReplicatedMergeTree::hasLightweightDeletedMask() const
-{
-    return has_lightweight_delete_parts.load(std::memory_order_relaxed);
 }
 
 size_t StorageReplicatedMergeTree::clearOldPartsAndRemoveFromZK()

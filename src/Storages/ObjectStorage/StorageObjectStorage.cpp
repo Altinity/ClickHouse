@@ -507,6 +507,7 @@ void StorageObjectStorage::read(
     configuration->modifyFormatSettings(modified_format_settings.value(), *local_context);
 
     auto read_step = std::make_unique<ReadFromObjectStorageStep>(
+        storage_id,
         object_storage,
         configuration,
         column_names,
@@ -723,7 +724,7 @@ void StorageObjectStorage::commitExportPartitionTransaction(
 void StorageObjectStorage::truncate(
     const ASTPtr & /* query */,
     const StorageMetadataPtr & /* metadata_snapshot */,
-    ContextPtr /* context */,
+    ContextPtr local_context,
     TableExclusiveLockHolder & /* table_holder */)
 {
     const auto path = configuration->getRawPath();
@@ -737,8 +738,12 @@ void StorageObjectStorage::truncate(
 
     if (configuration->isDataLakeConfiguration())
     {
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-                        "Truncate is not supported for data lake engine");
+        auto * data_lake_metadata = getExternalMetadata(local_context);
+        if (!data_lake_metadata || !data_lake_metadata->supportsTruncate())
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Truncate is not supported for this data lake engine");
+
+        data_lake_metadata->truncate(local_context, catalog, getStorageID());
+        return;
     }
 
     if (path.hasGlobsIgnorePlaceholders())
@@ -882,6 +887,14 @@ SchemaCache & StorageObjectStorage::getSchemaCache(const ContextPtr & context, c
 
 void StorageObjectStorage::mutate([[maybe_unused]] const MutationCommands & commands, [[maybe_unused]] ContextPtr context_)
 {
+    /// For datalake tables (e.g. Iceberg), refresh external metadata so that the
+    /// storage snapshot contains the `datalake_table_state`. Without this the mutation
+    /// pipeline will hit a `LOGICAL_ERROR` exception in `iterate` when building the read side.
+    /// Normally `updateExternalDynamicMetadataIfExists` is called by the
+    /// analyzer/interpreter for `SELECT` and `INSERT` queries, but `InterpreterAlterQuery`
+    /// does not call it before invoking `mutate`.
+    updateExternalDynamicMetadataIfExists(context_);
+
     auto metadata_snapshot = getInMemoryMetadataPtr();
     auto storage = getStorageID();
     configuration->mutate(commands, context_, storage, metadata_snapshot, catalog, format_settings);

@@ -526,7 +526,7 @@ namespace DB
         /// Convert dictionary values to arrow array.
         auto value_type = assert_cast<arrow::DictionaryType *>(builder->type().get())->value_type();
         std::unique_ptr<arrow::ArrayBuilder> values_builder;
-        arrow::Status status = MakeBuilder(arrow::default_memory_pool(), value_type, &values_builder);
+        arrow::Status status = MakeBuilder(ArrowMemoryPool::instance(), value_type, &values_builder);
         checkStatus(status, column->getName(), format_name);
 
         auto dict_column = dynamic_cast<IColumnUnique &>(*dict_values).getNestedNotNullableColumn();
