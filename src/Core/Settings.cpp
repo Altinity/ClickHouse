@@ -2536,14 +2536,20 @@ Possible values:
 
 - Positive integer.
 )", 0) \
-    DECLARE(UInt64, http_max_fields, 1000000, R"(
+    DECLARE(UInt64, http_max_fields, 1000, R"(
 Maximum number of fields in HTTP header
 )", 0) \
-    DECLARE(UInt64, http_max_field_name_size, 128 * 1024, R"(
+    DECLARE(UInt64, http_max_field_name_size, 4 * 1024, R"(
 Maximum length of field name in HTTP header
 )", 0) \
     DECLARE(UInt64, http_max_field_value_size, 128 * 1024, R"(
 Maximum length of field value in HTTP header
+)", 0) \
+    DECLARE(UInt64, http_max_request_header_size, 10 * 1024 * 1024, R"(
+Maximum total size of all HTTP request headers (names and values combined) in bytes.
+)", 0) \
+    DECLARE(Seconds, http_headers_read_timeout, 30, R"(
+Maximum time in seconds to read all HTTP request headers. This is a total deadline for the entire header parsing phase, not a per-read timeout. Protects against slowloris-style attacks where a client trickles header data slowly to hold connections open.
 )", 0) \
     DECLARE(Bool, http_skip_not_found_url_for_globs, true, R"(
 Skip URLs for globs with HTTP_NOT_FOUND error
@@ -7561,10 +7567,6 @@ Throw an error if there are pending mutations when exporting a merge tree part.
 )", 0) \
     DECLARE(Bool, export_merge_tree_part_throw_on_pending_patch_parts, true, R"(
 Throw an error if there are pending patch parts when exporting a merge tree part.
-)", 0) \
-    DECLARE(Bool, export_merge_tree_partition_lock_inside_the_task, false, R"(
-Only lock a part when the task is already running. This might help with busy waiting where the scheduler locks a part, but the task ends in the pending list.
-On the other hand, there is a chance once the task executes that part has already been locked by another replica and the task will simply early exit.
 )", 0) \
     DECLARE(Bool, export_merge_tree_partition_system_table_prefer_remote_information, false, R"(
 Controls whether the system.replicated_partition_exports will prefer to query ZooKeeper to get the most up to date information or use the local information.

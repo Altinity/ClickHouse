@@ -646,6 +646,13 @@ void RestCatalog::getNamespacesRecursive(
     {
         chassert(current_namespace.starts_with(base_namespace));
 
+        /// Protection from subnamepsaces with empty names
+        if (current_namespace == base_namespace)
+        {
+            LOG_WARNING(log, "Namespace {} has a subnamespace with empty name. This is an error in catalog implementation.", base_namespace);
+            continue;
+        }
+
         if (stop_condition && stop_condition(current_namespace))
             break;
 
@@ -960,6 +967,9 @@ bool RestCatalog::getTableMetadataImpl(
             result.setDataLakeSpecificProperties(DataLakeSpecificProperties{ .iceberg_metadata_file_location = metadata_location });
         }
     }
+
+    if (metadata_object->has("table-uuid"))
+        result.setTableUUID(metadata_object->get("table-uuid").extract<String>());
 
     return true;
 }

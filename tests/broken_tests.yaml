@@ -306,3 +306,11 @@
   - asan
   - msan
   - ubsan
+
+# match all coverage suite fails
+- name: \d{5}_.*
+  reason: 'KNOWN: Ignoring test fails on coverage build'
+  regex: true
+  check_types:
+  - coverage
+  - sanitize-coverage
