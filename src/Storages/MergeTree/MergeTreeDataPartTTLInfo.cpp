@@ -6,6 +6,7 @@
 #include <Parsers/ExpressionListParsers.h>
 #include <Parsers/IAST.h>
 #include <Parsers/parseQuery.h>
+#include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Storages/TTLDescription.h>
 
 #include <base/JSON.h>
@@ -58,6 +59,9 @@ void MergeTreeDataPartTTLInfos::update(const MergeTreeDataPartTTLInfos & other_i
 
     for (const auto & [expression, ttl_info] : other_infos.moves_ttl)
         moves_ttl[expression].update(ttl_info);
+
+    for (const auto & [name, ttl_info] : other_infos.export_ttl)
+        export_ttl[name].update(ttl_info);
 
     table_ttl.update(other_infos.table_ttl);
     updatePartMinMaxTTL(table_ttl.min, table_ttl.max);
@@ -139,6 +143,11 @@ void MergeTreeDataPartTTLInfos::read(ReadBuffer & in)
     {
         const JSON & rows_where = json["rows_where"];
         fill_ttl_info_map(rows_where, rows_where_ttl, true);
+    }
+    if (json.has("export"))
+    {
+        const JSON & export_part = json["export"];
+        fill_ttl_info_map(export_part, export_ttl, false);
     }
 }
 
@@ -225,7 +234,13 @@ void MergeTreeDataPartTTLInfos::write(WriteBuffer & out) const
     }
 
     if (!rows_where_ttl.empty())
+    {
         write_infos(rows_where_ttl, "rows_where", is_first);
+        is_first = false;
+    }
+
+    if (!export_ttl.empty())
+        write_infos(export_ttl, "export", is_first);
 
     writeString("}", out);
 }
@@ -271,6 +286,9 @@ bool MergeTreeDataPartTTLInfos::hasAnyNonFinishedTTLs() const
         return true;
 
     if (has_non_finished_ttl(group_by_ttl))
+        return true;
+
+    if (has_non_finished_ttl(export_ttl))
         return true;
 
     return false;
@@ -331,6 +349,40 @@ std::optional<TTLDescription> selectTTLDescriptionForTTLInfos(const TTLDescripti
     }
 
     return best_ttl_time ? *best_entry_it : std::optional<TTLDescription>();
+}
+
+std::optional<time_t> getPartitionExportTTLMax(
+    const TTLDescription & desc,
+    const DataPartsVector & parts_in_partition,
+    std::vector<String> * missing_parts_out)
+{
+    if (parts_in_partition.empty())
+        return std::nullopt;
+
+    time_t result = 0;
+    bool any_missing = false;
+    for (const auto & part : parts_in_partition)
+    {
+        const auto & map = part->ttl_infos.export_ttl;
+        auto it = map.find(desc.destination_name);
+        if (it == map.end())
+        {
+            any_missing = true;
+            if (missing_parts_out)
+                missing_parts_out->push_back(part->name);
+            else
+                return std::nullopt;
+            continue;
+        }
+
+        if (it->second.max > result)
+            result = it->second.max;
+    }
+
+    if (any_missing)
+        return std::nullopt;
+
+    return result;
 }
 
 

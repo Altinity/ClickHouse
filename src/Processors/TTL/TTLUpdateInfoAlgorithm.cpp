@@ -60,6 +60,10 @@ void TTLUpdateInfoAlgorithm::finalize(const MutableDataPartPtr & data_part) cons
         data_part->ttl_infos.columns_ttl[ttl_update_key] = new_ttl_info;
         data_part->ttl_infos.updatePartMinMaxTTL(new_ttl_info.min, new_ttl_info.max);
     }
+    else if (ttl_update_field == TTLUpdateField::EXPORT_TTL)
+    {
+        data_part->ttl_infos.export_ttl[ttl_update_key] = new_ttl_info;
+    }
 
 }
 

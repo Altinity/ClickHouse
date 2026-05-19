@@ -289,12 +289,12 @@ TTLTableDescription StorageInMemoryMetadata::getTableTTLs() const
 
 bool StorageInMemoryMetadata::hasAnyTableTTL() const
 {
-    return hasAnyMoveTTL() || hasRowsTTL() || hasAnyRecompressionTTL() || hasAnyGroupByTTL() || hasAnyRowsWhereTTL();
+    return hasAnyMoveTTL() || hasRowsTTL() || hasAnyRecompressionTTL() || hasAnyGroupByTTL() || hasAnyRowsWhereTTL() || hasAnyExportTTL();
 }
 
 bool StorageInMemoryMetadata::hasOnlyRowsTTL() const
 {
-    bool has_any_other_ttl = hasAnyMoveTTL() || hasAnyRecompressionTTL() || hasAnyGroupByTTL() || hasAnyRowsWhereTTL() || hasAnyColumnTTL();
+    bool has_any_other_ttl = hasAnyMoveTTL() || hasAnyRecompressionTTL() || hasAnyGroupByTTL() || hasAnyRowsWhereTTL() || hasAnyColumnTTL() || hasAnyExportTTL();
     return hasRowsTTL() && !has_any_other_ttl;
 }
 
@@ -445,6 +445,9 @@ ColumnDependencies StorageInMemoryMetadata::getColumnDependencies(
     }
 
     for (const auto & entry : getMoveTTLs())
+        add_dependent_columns(entry.expression_columns.getNames(), required_ttl_columns);
+
+    for (const auto & entry : getExportTTLs())
         add_dependent_columns(entry.expression_columns.getNames(), required_ttl_columns);
 
     //TODO what about rows_where_ttl and group_by_ttl ??

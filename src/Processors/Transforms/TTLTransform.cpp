@@ -146,6 +146,11 @@ TTLTransform::TTLTransform(
         algorithms.emplace_back(std::make_unique<TTLUpdateInfoAlgorithm>(
             getExpressions(recompression_ttl, subqueries_for_sets, context), recompression_ttl,
             TTLUpdateField::RECOMPRESSION_TTL, recompression_ttl.result_column, old_ttl_infos.recompression_ttl[recompression_ttl.result_column], current_time_, force_));
+
+    for (const auto & export_ttl : metadata_snapshot_->getExportTTLs())
+        algorithms.emplace_back(std::make_unique<TTLUpdateInfoAlgorithm>(
+            getExpressions(export_ttl, subqueries_for_sets, context), export_ttl,
+            TTLUpdateField::EXPORT_TTL, export_ttl.destination_name, old_ttl_infos.export_ttl[export_ttl.destination_name], current_time_, force_));
 }
 
 Block reorderColumns(Block block, const Block & header)

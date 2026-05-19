@@ -354,17 +354,6 @@ TTLDescription TTLDescription::getTTLFromAST(
     }
 
     checkTTLExpression(expression, result.result_column, is_attach || context->getSettingsRef()[Setting::allow_suspicious_ttl_expressions]);
-
-    if (result.mode == TTLMode::EXPORT)
-    {
-        /// The TTL expression's natural result column name is derived from the expression text and
-        /// is therefore identical across multiple EXPORT TTLs that share the same expression but
-        /// target different destinations. Override it with a destination-specific name so it can be
-        /// used as a stable key into `MergeTreeDataPartTTLInfos::export_ttl`. The override must
-        /// happen after `checkTTLExpression`, which looks the column up in the sample block.
-        result.result_column = "_export_" + result.destination_name;
-    }
-
     return result;
 }
 

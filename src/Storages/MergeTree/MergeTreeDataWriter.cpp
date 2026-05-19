@@ -873,6 +873,9 @@ MergeTreeTemporaryPartPtr MergeTreeDataWriter::writeTempPartImpl(
     for (const auto & ttl_entry : recompression_ttl_entries)
         updateTTL(context, ttl_entry, new_data_part->ttl_infos, new_data_part->ttl_infos.recompression_ttl[ttl_entry.result_column], block, false);
 
+    for (const auto & ttl_entry : metadata_snapshot->getExportTTLs())
+        updateTTL(context, ttl_entry, new_data_part->ttl_infos, new_data_part->ttl_infos.export_ttl[ttl_entry.destination_name], block, false);
+
     new_data_part->ttl_infos.update(move_ttl_infos);
 
     /// This effectively chooses minimal compression method:
