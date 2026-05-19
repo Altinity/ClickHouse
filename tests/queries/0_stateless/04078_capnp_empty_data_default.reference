@@ -1,0 +1,7 @@
+Test 1: flat struct, missing Data fields get defaults
+hello	42	0	0	0	0.00
+Test 2: nested struct (Tuple), missing Data field inside Tuple gets default
+test	inner_val	32	59	0
+Test 3: all fields populated, no regression
+world	100	200	300	-400	5.55
+Test 4: wrong non-zero Data size still errors
