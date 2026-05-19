@@ -1,0 +1,6 @@
+---- after first export, destination row count
+2
+---- after second export, destination row count
+3
+---- partition 2000 has no duplicate rows in destination
+2

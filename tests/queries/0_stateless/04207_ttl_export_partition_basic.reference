@@ -1,0 +1,13 @@
+---- destination contents
+1	2000-01-01
+2	2000-01-02
+3	2000-01-03
+4	2001-01-01
+5	2001-01-02
+---- source still has the data (EXPORT does not drop locally)
+6
+---- not-yet-expired partition 2100 is absent from destination and from history
+0
+0
+---- no BAD_ARGUMENTS attributed to the scheduler
+0
