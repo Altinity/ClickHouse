@@ -29,6 +29,9 @@
 - name: 03441_deltalake_clickhouse_virtual_columns
   reason: INVESTIGATE - S3 sometimes unreachable
   message: 'Error interacting with object store: Generic S3 error: Error performing GET'
+- name: 04103_deltalake_parquet_metadata_cache
+  reason: INVESTIGATE - S3 sometimes unreachable
+  message: 'Error interacting with object store: Generic S3 error: Error performing GET'
 - name: 00167_read_bytes_from_fs
   reason: INVESTIGATE - Memory limit exceeded
   message: 'DB::Exception: (total) memory limit exceeded:'
