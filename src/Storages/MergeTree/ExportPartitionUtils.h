@@ -6,22 +6,37 @@
 #include <Core/Field.h>
 #include <Common/Logger.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
+#include <Parsers/IAST_fwd.h>
 #include "Storages/IStorage.h"
 #include <config.h>
 
 #if USE_AVRO
-#include <Parsers/IAST.h>
 #include <Poco/JSON/Object.h>
 #endif
 
 namespace DB
 {
 
+class ColumnsDescription;
 class MergeTreeData;
+struct StorageInMemoryMetadata;
 struct ExportReplicatedMergeTreePartitionManifest;
 
 namespace ExportPartitionUtils
 {
+    /// Verifies that the destination table is structurally compatible with the source so that
+    /// `EXPORT PARTITION` (manual or TTL-driven) can succeed:
+    ///   - source readable columns must equal destination insertable columns (ephemeral columns excluded);
+    ///   - for non-data-lake destinations, the partition key ASTs must match;
+    ///   - for data-lake destinations, partition-key compatibility is verified later at submission time
+    ///     by `verifyIcebergPartitionCompatibility` (it needs the runtime iceberg metadata).
+    /// Throws `INCOMPATIBLE_COLUMNS` or `BAD_ARGUMENTS` on mismatch.
+    void verifyExportDestinationCompatibility(
+        const ColumnsDescription & src_columns,
+        const ASTPtr & src_partition_key_ast,
+        const StorageInMemoryMetadata & dest_metadata,
+        const IStorage & dest_storage);
+
     std::vector<std::string> getExportedPaths(const LoggerPtr & log, const zkutil::ZooKeeperPtr & zk, const std::string & export_path);
 
     ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ExportReplicatedMergeTreePartitionManifest & manifest);

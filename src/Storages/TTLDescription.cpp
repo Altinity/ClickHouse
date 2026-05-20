@@ -2,8 +2,10 @@
 
 #include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <Compression/CompressionFactory.h>
+#include <Core/QualifiedTableName.h>
 #include <Core/Settings.h>
 #include <Functions/IFunction.h>
+#include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/ExpressionAnalyzer.h>
 #include <Interpreters/ExpressionActions.h>
 #include <Interpreters/TreeRewriter.h>
@@ -15,6 +17,8 @@
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTAssignment.h>
 #include <Storages/ColumnsDescription.h>
+#include <Storages/MergeTree/ExportPartitionUtils.h>
+#include <Storages/StorageInMemoryMetadata.h>
 #include <Interpreters/Context.h>
 
 #include <DataTypes/DataTypeDate.h>
@@ -441,6 +445,20 @@ TTLTableDescription TTLTableDescription::getTTLForTableFromAST(
                 if (existing.destination_name == ttl.destination_name)
                     throw Exception(ErrorCodes::BAD_ARGUMENTS,
                         "Two TTL EXPORT clauses target the same destination {}", ttl.destination_name);
+            }
+
+            /// Skip on ATTACH because the destination table may not yet be loaded at startup.
+            /// Submission-time validation in `exportPartitionToTable` still covers this path.
+            if (!is_attach)
+            {
+                const auto qualified = QualifiedTableName::parseFromString(ttl.destination_name);
+                const auto dest_database = context->resolveDatabase(qualified.database);
+                auto dest_storage = DatabaseCatalog::instance().getTable({dest_database, qualified.table}, context);
+                ExportPartitionUtils::verifyExportDestinationCompatibility(
+                    columns,
+                    partition_key.definition_ast,
+                    *dest_storage->getInMemoryMetadataPtr(),
+                    *dest_storage);
             }
 
             result.export_ttl.emplace_back(std::move(ttl));

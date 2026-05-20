@@ -8309,27 +8309,15 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     if (!dest_storage->supportsImport(query_context))
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Destination storage {} does not support MergeTree parts or uses unsupported partitioning", dest_storage->getName());
 
-    auto query_to_string = [] (const ASTPtr & ast)
-    {
-        return ast ? ast->formatWithSecretsOneLine() : "";
-    };
-
     auto src_snapshot = getInMemoryMetadataPtr();
     auto destination_snapshot = dest_storage->getInMemoryMetadataPtr();
 
-    /// compare all source readable columns with all destination insertable columns
-    /// this allows us to skip ephemeral columns
-    if (src_snapshot->getColumns().getReadable().sizeOfDifference(destination_snapshot->getColumns().getInsertable()))
-        throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS, "Tables have different structure");
+    ExportPartitionUtils::verifyExportDestinationCompatibility(
+        src_snapshot->getColumns(),
+        src_snapshot->getPartitionKeyAST(),
+        *destination_snapshot,
+        *dest_storage);
 
-    /// for data lakes this check is performed later. It is a bit more complex as we need to convert the iceberg partition spec
-    /// to the MergeTree partition spec and compare the two.
-    if (!dest_storage->isDataLake())
-    {
-        if (query_to_string(src_snapshot->getPartitionKeyAST()) != query_to_string(destination_snapshot->getPartitionKeyAST()))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
-    }
-    
 
     zkutil::ZooKeeperPtr zookeeper = getZooKeeperAndAssertNotReadonly();
 

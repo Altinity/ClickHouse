@@ -3,8 +3,11 @@
 #include <Common/ProfileEvents.h>
 #include <Common/FailPoint.h>
 #include <Common/logger_useful.h>
+#include <Parsers/IAST.h>
+#include "Storages/ColumnsDescription.h"
 #include "Storages/ExportReplicatedMergeTreePartitionManifest.h"
 #include "Storages/ExportReplicatedMergeTreePartitionTaskEntry.h"
+#include "Storages/StorageInMemoryMetadata.h"
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <filesystem>
 #include <thread>
@@ -32,6 +35,7 @@ namespace ErrorCodes
 {
     extern const int FAULT_INJECTED;
     extern const int BAD_ARGUMENTS;
+    extern const int INCOMPATIBLE_COLUMNS;
     extern const int NO_SUCH_DATA_PART;
     extern const int CORRUPTED_DATA;
     extern const int NETWORK_ERROR;
@@ -47,6 +51,27 @@ namespace fs = std::filesystem;
 
 namespace ExportPartitionUtils
 {
+    void verifyExportDestinationCompatibility(
+        const ColumnsDescription & src_columns,
+        const ASTPtr & src_partition_key_ast,
+        const StorageInMemoryMetadata & dest_metadata,
+        const IStorage & dest_storage)
+    {
+        if (src_columns.getReadable().sizeOfDifference(dest_metadata.getColumns().getInsertable()))
+            throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS, "Tables have different structure");
+
+        if (dest_storage.isDataLake())
+            return;
+
+        const auto ast_to_string = [](const ASTPtr & ast) -> String
+        {
+            return ast ? ast->formatWithSecretsOneLine() : "";
+        };
+
+        if (ast_to_string(src_partition_key_ast) != ast_to_string(dest_metadata.getPartitionKeyAST()))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
+    }
+
     std::vector<Field> getPartitionValuesForIcebergCommit(
         MergeTreeData & storage, const String & partition_id)
     {
