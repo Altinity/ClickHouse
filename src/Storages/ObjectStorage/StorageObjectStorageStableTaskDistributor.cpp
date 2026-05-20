@@ -1,4 +1,6 @@
 #include <Storages/ObjectStorage/StorageObjectStorageStableTaskDistributor.h>
+#include <Storages/ObjectStorage/Utils.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Common/SipHash.h>
 #include <consistent_hashing.h>
 #include <optional>
@@ -275,6 +277,7 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(s
             ++it;
         }
 
+
         LOG_TRACE(
             log,
             "No unprocessed file for replica {}, need to retry after {} us",
@@ -342,6 +345,11 @@ String StorageObjectStorageStableTaskDistributor::getFileIdentifier(ObjectInfoPt
         }
         return file_identifier;
     }
+    /// For Iceberg data files, the same data file can be referenced by different keys depending
+    /// on which storage actually holds it. Use the metadata path (as written in the manifest) as
+    /// the stable identifier so the same file consistently maps to the same replica.
+    if (auto metadata_path = getMetadataPathFromObjectInfo(file_object); metadata_path.has_value())
+        return *metadata_path;
     return file_object->getIdentifier();
 }
 
