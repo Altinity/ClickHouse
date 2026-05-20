@@ -880,7 +880,6 @@ jobs:
 
       - name: Download artifact CH_AMD_DEBUG
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_DEBUG
           path: ./ci/tmp
@@ -934,7 +933,6 @@ jobs:
 
       - name: Download artifact CH_AMD_ASAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -988,7 +986,6 @@ jobs:
 
       - name: Download artifact CH_AMD_ASAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -1042,7 +1039,6 @@ jobs:
 
       - name: Download artifact CH_AMD_ASAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -1096,7 +1092,6 @@ jobs:
 
       - name: Download artifact CH_AMD_BINARY
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -1150,7 +1145,6 @@ jobs:
 
       - name: Download artifact CH_AMD_BINARY
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -1204,7 +1198,6 @@ jobs:
 
       - name: Download artifact CH_AMD_BINARY
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -1258,7 +1251,6 @@ jobs:
 
       - name: Download artifact CH_AMD_BINARY
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -1312,7 +1304,6 @@ jobs:
 
       - name: Download artifact CH_AMD_DEBUG
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_DEBUG
           path: ./ci/tmp
@@ -1366,7 +1357,6 @@ jobs:
 
       - name: Download artifact CH_AMD_DEBUG
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_DEBUG
           path: ./ci/tmp
@@ -1420,7 +1410,6 @@ jobs:
 
       - name: Download artifact CH_AMD_DEBUG
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_DEBUG
           path: ./ci/tmp
@@ -1474,7 +1463,6 @@ jobs:
 
       - name: Download artifact CH_AMD_DEBUG
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_DEBUG
           path: ./ci/tmp
@@ -1528,7 +1516,6 @@ jobs:
 
       - name: Download artifact CH_AMD_TSAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -1582,7 +1569,6 @@ jobs:
 
       - name: Download artifact CH_AMD_TSAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -1636,7 +1622,6 @@ jobs:
 
       - name: Download artifact CH_AMD_TSAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -1690,7 +1675,6 @@ jobs:
 
       - name: Download artifact CH_AMD_TSAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -1744,7 +1728,6 @@ jobs:
 
       - name: Download artifact CH_AMD_MSAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_MSAN
           path: ./ci/tmp
@@ -1798,7 +1781,6 @@ jobs:
 
       - name: Download artifact CH_AMD_MSAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_MSAN
           path: ./ci/tmp
@@ -1852,7 +1834,6 @@ jobs:
 
       - name: Download artifact CH_AMD_MSAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_MSAN
           path: ./ci/tmp
@@ -1906,7 +1887,6 @@ jobs:
 
       - name: Download artifact CH_AMD_MSAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_MSAN
           path: ./ci/tmp
@@ -1960,7 +1940,6 @@ jobs:
 
       - name: Download artifact CH_AMD_UBSAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_UBSAN
           path: ./ci/tmp
@@ -2014,7 +1993,6 @@ jobs:
 
       - name: Download artifact CH_AMD_UBSAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_UBSAN
           path: ./ci/tmp
@@ -2068,7 +2046,6 @@ jobs:
 
       - name: Download artifact CH_AMD_DEBUG
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_DEBUG
           path: ./ci/tmp
@@ -2122,7 +2099,6 @@ jobs:
 
       - name: Download artifact CH_AMD_DEBUG
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_DEBUG
           path: ./ci/tmp
@@ -2176,7 +2152,6 @@ jobs:
 
       - name: Download artifact CH_AMD_TSAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -2230,7 +2205,6 @@ jobs:
 
       - name: Download artifact CH_AMD_TSAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -2284,7 +2258,6 @@ jobs:
 
       - name: Download artifact CH_AMD_TSAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -2338,7 +2311,6 @@ jobs:
 
       - name: Download artifact CH_AMD_TSAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -2392,7 +2364,6 @@ jobs:
 
       - name: Download artifact CH_ARM_BIN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_ARM_BIN
           path: ./ci/tmp
@@ -2446,7 +2417,6 @@ jobs:
 
       - name: Download artifact CH_ARM_BIN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_ARM_BIN
           path: ./ci/tmp
@@ -2500,7 +2470,6 @@ jobs:
 
       - name: Download artifact CH_AMD_ASAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -2554,7 +2523,6 @@ jobs:
 
       - name: Download artifact CH_AMD_ASAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -2608,7 +2576,6 @@ jobs:
 
       - name: Download artifact CH_AMD_ASAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -2662,7 +2629,6 @@ jobs:
 
       - name: Download artifact CH_AMD_ASAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -2716,7 +2682,6 @@ jobs:
 
       - name: Download artifact CH_AMD_ASAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -2770,7 +2735,6 @@ jobs:
 
       - name: Download artifact CH_AMD_ASAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_ASAN
           path: ./ci/tmp
@@ -2824,7 +2788,6 @@ jobs:
 
       - name: Download artifact CH_AMD_BINARY
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -2878,7 +2841,6 @@ jobs:
 
       - name: Download artifact CH_AMD_BINARY
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -2932,7 +2894,6 @@ jobs:
 
       - name: Download artifact CH_AMD_BINARY
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -2986,7 +2947,6 @@ jobs:
 
       - name: Download artifact CH_AMD_BINARY
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -3040,7 +3000,6 @@ jobs:
 
       - name: Download artifact CH_AMD_BINARY
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_BINARY
           path: ./ci/tmp
@@ -3094,7 +3053,6 @@ jobs:
 
       - name: Download artifact CH_ARM_BIN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_ARM_BIN
           path: ./ci/tmp
@@ -3148,7 +3106,6 @@ jobs:
 
       - name: Download artifact CH_ARM_BIN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_ARM_BIN
           path: ./ci/tmp
@@ -3202,7 +3159,6 @@ jobs:
 
       - name: Download artifact CH_ARM_BIN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_ARM_BIN
           path: ./ci/tmp
@@ -3256,7 +3212,6 @@ jobs:
 
       - name: Download artifact CH_ARM_BIN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_ARM_BIN
           path: ./ci/tmp
@@ -3310,7 +3265,6 @@ jobs:
 
       - name: Download artifact CH_AMD_TSAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -3364,7 +3318,6 @@ jobs:
 
       - name: Download artifact CH_AMD_TSAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -3418,7 +3371,6 @@ jobs:
 
       - name: Download artifact CH_AMD_TSAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -3472,7 +3424,6 @@ jobs:
 
       - name: Download artifact CH_AMD_TSAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -3526,7 +3477,6 @@ jobs:
 
       - name: Download artifact CH_AMD_TSAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -3580,7 +3530,6 @@ jobs:
 
       - name: Download artifact CH_AMD_TSAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: CH_AMD_TSAN
           path: ./ci/tmp
@@ -3634,7 +3583,6 @@ jobs:
 
       - name: Download artifact UNITTEST_AMD_ASAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: UNITTEST_AMD_ASAN
           path: ./ci/tmp
@@ -3688,7 +3636,6 @@ jobs:
 
       - name: Download artifact UNITTEST_AMD_TSAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: UNITTEST_AMD_TSAN
           path: ./ci/tmp
@@ -3742,7 +3689,6 @@ jobs:
 
       - name: Download artifact UNITTEST_AMD_MSAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: UNITTEST_AMD_MSAN
           path: ./ci/tmp
@@ -3796,7 +3742,6 @@ jobs:
 
       - name: Download artifact UNITTEST_AMD_UBSAN
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: UNITTEST_AMD_UBSAN
           path: ./ci/tmp
@@ -3848,17 +3793,15 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_AMD_RELEASE_STRIPPED
+      - name: Download artifact CH_AMD_RELEASE
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
-          name: CH_AMD_RELEASE_STRIPPED
+          name: CH_AMD_RELEASE
           path: ./ci/tmp
 
 
       - name: Download artifact DEB_AMD_RELEASE
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: DEB_AMD_RELEASE
           path: ./ci/tmp
@@ -3866,7 +3809,6 @@ jobs:
 
       - name: Download artifact RPM_AMD_RELEASE
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: RPM_AMD_RELEASE
           path: ./ci/tmp
@@ -3874,7 +3816,6 @@ jobs:
 
       - name: Download artifact TGZ_AMD_RELEASE
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: TGZ_AMD_RELEASE
           path: ./ci/tmp
@@ -3926,17 +3867,15 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
-      - name: Download artifact CH_ARM_RELEASE_STRIPPED
+      - name: Download artifact CH_ARM_RELEASE
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
-          name: CH_ARM_RELEASE_STRIPPED
+          name: CH_ARM_RELEASE
           path: ./ci/tmp
 
 
       - name: Download artifact DEB_ARM_RELEASE
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: DEB_ARM_RELEASE
           path: ./ci/tmp
@@ -3944,7 +3883,6 @@ jobs:
 
       - name: Download artifact RPM_ARM_RELEASE
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: RPM_ARM_RELEASE
           path: ./ci/tmp
@@ -3952,7 +3890,6 @@ jobs:
 
       - name: Download artifact TGZ_ARM_RELEASE
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: TGZ_ARM_RELEASE
           path: ./ci/tmp
@@ -4006,7 +3943,6 @@ jobs:
 
       - name: Download artifact DEB_AMD_RELEASE
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: DEB_AMD_RELEASE
           path: ./ci/tmp
@@ -4060,7 +3996,6 @@ jobs:
 
       - name: Download artifact DEB_ARM_RELEASE
         uses: actions/download-artifact@v8
-        continue-on-error: true
         with:
           name: DEB_ARM_RELEASE
           path: ./ci/tmp

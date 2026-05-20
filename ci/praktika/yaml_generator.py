@@ -220,11 +220,16 @@ jobs:
 
         TEMPLATE_GH_UPLOAD = """
       - name: Upload artifact {NAME}
+        id: upload_{NAME}
         uses: actions/upload-artifact@v7
+        continue-on-error: true
         with:
           name: {NAME}
           path: {PATH}
           retention-days: 1
+      - name: Warn on failed upload of {NAME}
+        if: steps.upload_{NAME}.outcome == 'failure'
+        run: echo "::warning title=GH artifact upload failed::Failed to upload [{NAME}] to GitHub artifacts (e.g. quota/rate limit). Downstream consumers will fall back to S3."
 """
 
         TEMPLATE_GH_UPLOAD_NO_RETENTION = """
@@ -239,6 +244,14 @@ jobs:
       - name: Download artifact {NAME}
         uses: actions/download-artifact@v8
         continue-on-error: true
+        with:
+          name: {NAME}
+          path: {PATH}
+"""
+
+        TEMPLATE_GH_DOWNLOAD_STRICT = """
+      - name: Download artifact {NAME}
+        uses: actions/download-artifact@v8
         with:
           name: {NAME}
           path: {PATH}
@@ -327,8 +340,13 @@ class PullRequestPushYamlGen:
                 )
             downloads_github = []
             for artifact in job.artifacts_gh_requires:
+                download_template = YamlGenerator.Templates.TEMPLATE_GH_DOWNLOAD
+                if self.workflow_config.name == "Community PR":
+                    download_template = (
+                        YamlGenerator.Templates.TEMPLATE_GH_DOWNLOAD_STRICT
+                    )
                 downloads_github.append(
-                    YamlGenerator.Templates.TEMPLATE_GH_DOWNLOAD.format(
+                    download_template.format(
                         NAME=artifact.name, PATH=Settings.INPUT_DIR
                     )
                 )
@@ -341,7 +359,7 @@ class PullRequestPushYamlGen:
             # NOTE (strtgbb): We still want the cache logic, we use it for skipping based on PR config
             if (
                 # self.workflow_config.config.enable_cache
-                # and 
+                # and
                 job_name_normalized != config_job_name_normalized
             ):
                 if_expression = YamlGenerator.Templates.TEMPLATE_IF_EXPRESSION.format(

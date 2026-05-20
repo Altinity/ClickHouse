@@ -335,11 +335,16 @@ jobs:
           fi
 
       - name: Upload artifact CH_AMD_DEBUG_GH
+        id: upload_CH_AMD_DEBUG_GH
         uses: actions/upload-artifact@v7
+        continue-on-error: true
         with:
           name: CH_AMD_DEBUG_GH
           path: ci/tmp/build/programs/self-extracting/clickhouse
           retention-days: 1
+      - name: Warn on failed upload of CH_AMD_DEBUG_GH
+        if: steps.upload_CH_AMD_DEBUG_GH.outcome == 'failure'
+        run: echo "::warning title=GH artifact upload failed::Failed to upload [CH_AMD_DEBUG_GH] to GitHub artifacts (e.g. quota/rate limit). Downstream consumers will fall back to S3."
 
   build_amd_asan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
@@ -389,11 +394,16 @@ jobs:
           fi
 
       - name: Upload artifact CH_AMD_ASAN_GH
+        id: upload_CH_AMD_ASAN_GH
         uses: actions/upload-artifact@v7
+        continue-on-error: true
         with:
           name: CH_AMD_ASAN_GH
           path: ci/tmp/build/programs/self-extracting/clickhouse
           retention-days: 1
+      - name: Warn on failed upload of CH_AMD_ASAN_GH
+        if: steps.upload_CH_AMD_ASAN_GH.outcome == 'failure'
+        run: echo "::warning title=GH artifact upload failed::Failed to upload [CH_AMD_ASAN_GH] to GitHub artifacts (e.g. quota/rate limit). Downstream consumers will fall back to S3."
 
   build_amd_tsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
@@ -443,11 +453,16 @@ jobs:
           fi
 
       - name: Upload artifact CH_AMD_TSAN_GH
+        id: upload_CH_AMD_TSAN_GH
         uses: actions/upload-artifact@v7
+        continue-on-error: true
         with:
           name: CH_AMD_TSAN_GH
           path: ci/tmp/build/programs/self-extracting/clickhouse
           retention-days: 1
+      - name: Warn on failed upload of CH_AMD_TSAN_GH
+        if: steps.upload_CH_AMD_TSAN_GH.outcome == 'failure'
+        run: echo "::warning title=GH artifact upload failed::Failed to upload [CH_AMD_TSAN_GH] to GitHub artifacts (e.g. quota/rate limit). Downstream consumers will fall back to S3."
 
   build_amd_msan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
@@ -497,11 +512,16 @@ jobs:
           fi
 
       - name: Upload artifact CH_AMD_MSAN_GH
+        id: upload_CH_AMD_MSAN_GH
         uses: actions/upload-artifact@v7
+        continue-on-error: true
         with:
           name: CH_AMD_MSAN_GH
           path: ci/tmp/build/programs/self-extracting/clickhouse
           retention-days: 1
+      - name: Warn on failed upload of CH_AMD_MSAN_GH
+        if: steps.upload_CH_AMD_MSAN_GH.outcome == 'failure'
+        run: echo "::warning title=GH artifact upload failed::Failed to upload [CH_AMD_MSAN_GH] to GitHub artifacts (e.g. quota/rate limit). Downstream consumers will fall back to S3."
 
   build_amd_ubsan:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
@@ -551,11 +571,16 @@ jobs:
           fi
 
       - name: Upload artifact CH_AMD_UBSAN_GH
+        id: upload_CH_AMD_UBSAN_GH
         uses: actions/upload-artifact@v7
+        continue-on-error: true
         with:
           name: CH_AMD_UBSAN_GH
           path: ci/tmp/build/programs/self-extracting/clickhouse
           retention-days: 1
+      - name: Warn on failed upload of CH_AMD_UBSAN_GH
+        if: steps.upload_CH_AMD_UBSAN_GH.outcome == 'failure'
+        run: echo "::warning title=GH artifact upload failed::Failed to upload [CH_AMD_UBSAN_GH] to GitHub artifacts (e.g. quota/rate limit). Downstream consumers will fall back to S3."
 
   build_amd_binary:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
@@ -605,11 +630,16 @@ jobs:
           fi
 
       - name: Upload artifact CH_AMD_BINARY_GH
+        id: upload_CH_AMD_BINARY_GH
         uses: actions/upload-artifact@v7
+        continue-on-error: true
         with:
           name: CH_AMD_BINARY_GH
           path: ci/tmp/build/programs/self-extracting/clickhouse
           retention-days: 1
+      - name: Warn on failed upload of CH_AMD_BINARY_GH
+        if: steps.upload_CH_AMD_BINARY_GH.outcome == 'failure'
+        run: echo "::warning title=GH artifact upload failed::Failed to upload [CH_AMD_BINARY_GH] to GitHub artifacts (e.g. quota/rate limit). Downstream consumers will fall back to S3."
 
   build_arm_asan:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
@@ -659,11 +689,16 @@ jobs:
           fi
 
       - name: Upload artifact CH_ARM_ASAN_GH
+        id: upload_CH_ARM_ASAN_GH
         uses: actions/upload-artifact@v7
+        continue-on-error: true
         with:
           name: CH_ARM_ASAN_GH
           path: ci/tmp/build/programs/self-extracting/clickhouse
           retention-days: 1
+      - name: Warn on failed upload of CH_ARM_ASAN_GH
+        if: steps.upload_CH_ARM_ASAN_GH.outcome == 'failure'
+        run: echo "::warning title=GH artifact upload failed::Failed to upload [CH_ARM_ASAN_GH] to GitHub artifacts (e.g. quota/rate limit). Downstream consumers will fall back to S3."
 
   build_arm_binary:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
@@ -760,11 +795,16 @@ jobs:
           fi
 
       - name: Upload artifact CH_ARM_TSAN_GH
+        id: upload_CH_ARM_TSAN_GH
         uses: actions/upload-artifact@v7
+        continue-on-error: true
         with:
           name: CH_ARM_TSAN_GH
           path: ci/tmp/build/programs/self-extracting/clickhouse
           retention-days: 1
+      - name: Warn on failed upload of CH_ARM_TSAN_GH
+        if: steps.upload_CH_ARM_TSAN_GH.outcome == 'failure'
+        run: echo "::warning title=GH artifact upload failed::Failed to upload [CH_ARM_TSAN_GH] to GitHub artifacts (e.g. quota/rate limit). Downstream consumers will fall back to S3."
 
   build_amd_release:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
@@ -950,6 +990,13 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_ARM_ASAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_ARM_ASAN_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -996,6 +1043,13 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_ASAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_ASAN_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -1044,6 +1098,13 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_ASAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_ASAN_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -1091,6 +1152,13 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_ASAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_ASAN_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -1137,6 +1205,13 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_ASAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_ASAN_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -1617,6 +1692,13 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_TSAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_TSAN_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -1663,6 +1745,13 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_TSAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_TSAN_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -1711,6 +1800,13 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_TSAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_TSAN_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -1757,6 +1853,13 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_TSAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_TSAN_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -2021,6 +2124,13 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_UBSAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_UBSAN_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -2067,6 +2177,13 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_UBSAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_UBSAN_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -2223,6 +2340,13 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_TSAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_TSAN_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -2269,6 +2393,13 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_TSAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_TSAN_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -2317,6 +2448,13 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_TSAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_TSAN_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -2363,6 +2501,13 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_TSAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_TSAN_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -2505,6 +2650,13 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_ASAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_ASAN_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -2551,6 +2703,13 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_ASAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_ASAN_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -2599,6 +2758,13 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_ASAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_ASAN_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -2645,6 +2811,13 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_ASAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_ASAN_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -2693,6 +2866,13 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_ASAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_ASAN_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -2739,6 +2919,13 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_ASAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_ASAN_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -3245,6 +3432,13 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_TSAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_TSAN_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -3291,6 +3485,13 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_TSAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_TSAN_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -3339,6 +3540,13 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_TSAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_TSAN_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -3385,6 +3593,13 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_TSAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_TSAN_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -3433,6 +3648,13 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_TSAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_TSAN_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -3479,6 +3701,13 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_TSAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_TSAN_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -4333,6 +4562,13 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_ARM_ASAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_ARM_ASAN_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -4379,6 +4615,13 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_TSAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_TSAN_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -4481,6 +4724,13 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_AMD_UBSAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_UBSAN_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -4582,6 +4832,13 @@ jobs:
           EOF
           ENV_SETUP_SCRIPT_EOF
 
+      - name: Download artifact CH_ARM_ASAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_ARM_ASAN_GH
+          path: ./ci/tmp
+
       - name: Run
         id: run
         run: |
@@ -4628,6 +4885,13 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_TSAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_TSAN_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
@@ -4729,6 +4993,13 @@ jobs:
           ${{ toJson(needs) }}
           EOF
           ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_AMD_UBSAN_GH
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: CH_AMD_UBSAN_GH
+          path: ./ci/tmp
 
       - name: Run
         id: run
