@@ -25,6 +25,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PositionDeleteTransform.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/StatelessMetadataFileGetter.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
+#include <Storages/ObjectStorage/Utils.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSource.h>
 #include <Storages/VirtualColumnUtils.h>
@@ -1013,15 +1014,16 @@ static void collectRetainedFiles(
         String storage_manifest_list_path = getProperFilePathFromMetadataInfo(
             manifest_list_path, persistent_table_components.table_path, persistent_table_components.table_location);
 
+        SecondaryStorages local_secondary_storages;
         auto manifest_keys = getManifestList(
-            object_storage, persistent_table_components, context, storage_manifest_list_path, log);
+            object_storage, persistent_table_components, context, storage_manifest_list_path, log, local_secondary_storages);
 
         for (const auto & mf_key : manifest_keys)
         {
             retained_manifest_paths.insert(mf_key.manifest_file_path);
             auto entries_handle = getManifestFileEntriesHandle(
                 object_storage, persistent_table_components, context, log,
-                mf_key, current_schema_id);
+                mf_key, current_schema_id, local_secondary_storages);
             collectAllFilePaths(entries_handle, retained_data_file_paths);
         }
     }
@@ -1064,10 +1066,11 @@ static ExpiredFiles collectExpiredFiles(
             ml_path, persistent_table_components.table_path, persistent_table_components.table_location);
 
         ManifestFileCacheKeys manifest_keys;
+        SecondaryStorages local_secondary_storages;
         try
         {
             manifest_keys = getManifestList(
-                object_storage, persistent_table_components, context, storage_ml_path, log);
+                object_storage, persistent_table_components, context, storage_ml_path, log, local_secondary_storages);
         }
         catch (...)
         {
@@ -1087,7 +1090,7 @@ static ExpiredFiles collectExpiredFiles(
             {
                 auto entries_handle = getManifestFileEntriesHandle(
                     object_storage, persistent_table_components, context, log,
-                    mf_key, current_schema_id);
+                    mf_key, current_schema_id, local_secondary_storages);
 
                 for (const auto & entry : entries_handle.getFilesWithoutDeleted(FileContentType::DATA))
                     if (!retained_data_file_paths.contains(entry->file_path))
