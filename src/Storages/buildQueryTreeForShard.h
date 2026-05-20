@@ -22,7 +22,7 @@ QueryTreeNodePtr buildQueryTreeForShard(
     bool allow_global_join_for_right_table,
     bool find_cross_join = false);
 
-void rewriteJoinToGlobalJoin(QueryTreeNodePtr query_tree_to_modify, ContextPtr context);
+void rewriteJoinToGlobalJoin(QueryTreeNodePtr query_tree_to_modify, ContextPtr context, bool force_prefer_global_join = false);
 void rewriteInToGlobalIn(QueryTreeNodePtr & query_tree_to_modify, ContextPtr context, bool rewrite_for_distributed = false);
 
 }

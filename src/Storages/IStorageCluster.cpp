@@ -319,7 +319,7 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
         {
             auto modified_query_tree = query_info.query_tree->clone();
 
-            rewriteJoinToGlobalJoin(modified_query_tree, context);
+            rewriteJoinToGlobalJoin(modified_query_tree, context, /*force_prefer_global_join*/ true);
 
             if (info.has_local_columns_in_where)
                 rewriteInToGlobalIn(modified_query_tree, context, /*rewrite_for_distributed*/ true);

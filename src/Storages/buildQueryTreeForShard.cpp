@@ -785,8 +785,7 @@ public:
     {
         if (auto * join_node = node->as<JoinNode>())
         {
-            bool prefer_local_join = getContext()->getSettingsRef()[Setting::parallel_replicas_prefer_local_join]
-                && getContext()->getSettingsRef()[Setting::object_storage_cluster_join_mode] != ObjectStorageClusterJoinMode::GLOBAL;
+            bool prefer_local_join = !force_prefer_local_join && getContext()->getSettingsRef()[Setting::parallel_replicas_prefer_local_join];
             bool should_use_global_join = !prefer_local_join || !allStoragesAreMergeTree(join_node->getRightTableExpression());
             if (should_use_global_join)
                 join_node->setLocality(JoinLocality::Global);
@@ -801,11 +800,17 @@ public:
 
         return true;
     }
+
+    void setForcePreferLocalJoin(bool force_prefer_local_join_) { force_prefer_local_join = force_prefer_local_join_; }
+
+private:
+    bool force_prefer_local_join = false;
 };
 
-void rewriteJoinToGlobalJoin(QueryTreeNodePtr query_tree_to_modify, ContextPtr context)
+void rewriteJoinToGlobalJoin(QueryTreeNodePtr query_tree_to_modify, ContextPtr context, bool force_prefer_local_join)
 {
     RewriteJoinToGlobalJoinVisitor visitor(context);
+    visitor.setForcePreferLocalJoin(force_prefer_local_join);
     visitor.visit(query_tree_to_modify);
 }
 
