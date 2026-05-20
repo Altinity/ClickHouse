@@ -42,6 +42,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         addSettingsChanges(settings_changes_history, "26.3.1.20001.altinityantalya",
         {
             {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
+            {"export_merge_tree_partition_mark_as_ttl", false, false, "New setting."},
         });
         addSettingsChanges(settings_changes_history, "26.3",
         {
@@ -1151,6 +1152,9 @@ const VersionToSettingsChangesMap & getMergeTreeSettingsChangesHistory()
     {
         addSettingsChanges(merge_tree_settings_changes_history, "26.3",
         {
+            {"export_merge_tree_partition_ttl_poll_interval_seconds", 5, 5, "New setting for the TTL EXPORT scheduler poll interval."},
+            {"export_merge_tree_partition_ttl_min_backoff_seconds", 1, 1, "New setting for the TTL EXPORT scheduler minimum backoff."},
+            {"export_merge_tree_partition_ttl_max_backoff_seconds", 60, 60, "New setting for the TTL EXPORT scheduler maximum backoff."},
             {"vertical_merge_optimize_ttl_delete", false, true, "Allow vertical merge algorithm for merges that need to remove rows expired by TTL"},
             {"shared_merge_tree_replica_set_max_lifetime_seconds", 300, 300, "New setting"},
             {"auto_statistics_types", "", "minmax, uniq", "Enable auto statistics by default"},
