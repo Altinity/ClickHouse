@@ -8366,35 +8366,24 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     /// collisions are handled by the block below.
     if (new_export_origin == ExportOrigin::ttl)
     {
-        const auto dest_suffix = "_" + dest_full_name;
-        std::vector<std::string> sibling_children;
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildren);
-        zookeeper->tryGetChildren(exports_path, sibling_children);
-
         std::optional<String> existing_ttl_partition_id;
         fs::path existing_ttl_marker_path;
-        for (const auto & child : sibling_children)
         {
-            if (!child.ends_with(dest_suffix))
-                continue;
-            const String child_partition_id = child.substr(0, child.size() - dest_suffix.size());
-            if (child_partition_id == partition_id)
-                continue;
+            std::lock_guard task_entries_lock(export_merge_tree_partition_mutex);
+            for (const auto & entry : export_merge_tree_partition_task_entries_by_key)
+            {
+                if (entry.manifest.export_origin != ExportOrigin::ttl)
+                    continue;
+                if (entry.manifest.destination_database != dest_database
+                    || entry.manifest.destination_table != dest_table)
+                    continue;
+                if (entry.manifest.partition_id == partition_id)
+                    continue;
 
-            std::string metadata_json;
-            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
-            if (!zookeeper->tryGet(fs::path(exports_path) / child / "metadata.json", metadata_json))
-                continue;
-
-            const auto sibling = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
-            if (sibling.export_origin != ExportOrigin::ttl)
-                continue;
-
-            existing_ttl_partition_id = child_partition_id;
-            existing_ttl_marker_path = fs::path(exports_path) / child;
-            break;
+                existing_ttl_partition_id = entry.manifest.partition_id;
+                existing_ttl_marker_path = fs::path(exports_path) / entry.getCompositeKey();
+                break;
+            }
         }
 
         if (existing_ttl_partition_id)

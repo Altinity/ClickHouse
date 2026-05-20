@@ -8,29 +8,19 @@
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTPartition.h>
 #include <Storages/ExportReplicatedMergeTreePartitionManifest.h>
+#include <Storages/ExportReplicatedMergeTreePartitionTaskEntry.h>
 #include <Storages/MergeTree/MergeTreeDataPartTTLInfo.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/PartitionCommands.h>
 #include <Storages/StorageInMemoryMetadata.h>
 #include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/TTLDescription.h>
-#include <Common/ProfileEvents.h>
 #include <Common/ZooKeeper/KeeperException.h>
-#include <Common/ZooKeeper/ZooKeeper.h>
-#include <Common/ZooKeeper/ZooKeeperCommon.h>
 #include <Common/logger_useful.h>
 
-#include <filesystem>
+#include <magic_enum.hpp>
+
 #include <random>
-
-namespace fs = std::filesystem;
-
-namespace ProfileEvents
-{
-    extern const Event ExportPartitionZooKeeperRequests;
-    extern const Event ExportPartitionZooKeeperGet;
-    extern const Event ExportPartitionZooKeeperGetChildren;
-}
 
 namespace DB
 {
@@ -85,8 +75,6 @@ TTLExportScheduler::TTLExportScheduler(StorageReplicatedMergeTree & storage_)
 
 void TTLExportScheduler::run()
 {
-    auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::ttl_export_task");
-
     /// Early returns intentionally skip the reschedule at the bottom:
     ///   - shutdown_called: the task will be deactivated by `partialShutdown`.
     ///   - is_readonly: `ReplicatedMergeTreeRestartingThread` deactivates and reactivates these
@@ -129,38 +117,25 @@ void TTLExportScheduler::run()
 std::optional<TTLExportScheduler::TtlMarker> TTLExportScheduler::findTtlMarker(
     const String & dest_database, const String & dest_table)
 {
-    auto zk = storage.getZooKeeper();
-    const auto exports_path = fs::path(storage.zookeeper_path) / "exports";
-    const String dest_full = dest_database + "." + dest_table;
-    const String dest_suffix = "_" + dest_full;
-
-    std::vector<std::string> children;
-    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-    ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildren);
-    zk->tryGetChildren(exports_path.string(), children);
+    std::lock_guard lock(storage.export_merge_tree_partition_mutex);
 
     std::optional<TtlMarker> latest;
-    for (const auto & child : children)
+    for (const auto & entry : storage.export_merge_tree_partition_task_entries_by_key)
     {
-        if (!child.ends_with(dest_suffix))
+        if (entry.manifest.export_origin != ExportOrigin::ttl)
             continue;
-        const auto child_path = exports_path / child;
-
-        std::string metadata_json;
-        std::string status_str;
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests, 2);
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet, 2);
-        if (!zk->tryGet((child_path / "metadata.json").string(), metadata_json))
-            continue;
-        if (!zk->tryGet((child_path / "status").string(), status_str))
+        if (entry.manifest.destination_database != dest_database
+            || entry.manifest.destination_table != dest_table)
             continue;
 
-        const auto manifest = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
-        if (manifest.export_origin != ExportOrigin::ttl)
-            continue;
-
-        if (!latest || manifest.create_time > latest->create_time)
-            latest = TtlMarker{manifest.partition_id, status_str, manifest.create_time};
+        if (!latest || entry.manifest.create_time > latest->create_time)
+        {
+            latest = TtlMarker{
+                entry.manifest.partition_id,
+                String(magic_enum::enum_name(entry.status)),
+                entry.manifest.create_time
+            };
+        }
     }
     return latest;
 }
