@@ -403,6 +403,7 @@ private:
     friend class ReplicatedMergeMutateTaskBase;
     friend class ExportPartitionManifestUpdatingTask;
     friend class ExportPartitionTaskScheduler;
+    friend class TTLExportScheduler;
 
     using MergeStrategyPicker = ReplicatedMergeTreeMergeStrategyPicker;
     using LogEntry = ReplicatedMergeTreeLogEntry;

@@ -1657,6 +1657,19 @@ namespace ErrorCodes
     DECLARE(Bool, materialize_ttl_recalculate_only, false, R"(
     Only recalculate ttl info when MATERIALIZE TTL
     )", 0) \
+    DECLARE(UInt64, export_merge_tree_partition_ttl_poll_interval_seconds, 5, R"(
+    Base interval (in seconds) at which the TTL export scheduler ticks for tables with
+    `TTL ... EXPORT TO TABLE ...`. The actual reschedule delay applies ±25% jitter on top.
+    )", 0) \
+    DECLARE(UInt64, export_merge_tree_partition_ttl_min_backoff_seconds, 1, R"(
+    Initial backoff (in seconds) after a TTL-driven partition export reports `FAILED`. The
+    scheduler retries the same partition after the backoff elapses. The delay doubles on
+    each subsequent failure up to `export_merge_tree_partition_ttl_max_backoff_seconds`.
+    )", 0) \
+    DECLARE(UInt64, export_merge_tree_partition_ttl_max_backoff_seconds, 60, R"(
+    Upper bound (in seconds) on the per-partition backoff used by the TTL export scheduler
+    after a `FAILED` manifest. See `export_merge_tree_partition_ttl_min_backoff_seconds`.
+    )", 0) \
     DECLARE(Bool, enable_mixed_granularity_parts, true, R"(
     Enables or disables transitioning to control the granule size with the
     `index_granularity_bytes` setting. Before version 19.11, there was only the
