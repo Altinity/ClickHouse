@@ -8,10 +8,10 @@ ENV CXX=clang++-${LLVM_VERSION}
 #non-functional change
 
 # If the cctools is updated, then first build it in the CI, then update here in a different commit
-COPY --from=altinityinfra/cctools:c0aae9395f33405b6e2b /cctools /cctools
+COPY --from=altinityinfra/cctools:d38a61541bb223c497aa /cctools /cctools
 
 # We need OpenSSL FIPS in permissive mode for build on MasterCI
-COPY --from=altinityinfra/cctools:c0aae9395f33405b6e2b \
+COPY --from=altinityinfra/cctools:d38a61541bb223c497aa \
   /opt/openssl-fips/openssl.cnf \
   /opt/openssl-fips/fipsmodule.cnf \
   /opt/openssl-fips/fips.so \

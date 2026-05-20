@@ -71,10 +71,10 @@ maxClientCnxns=80' > /opt/zookeeper/conf/zoo.cfg && \
 ENV TZ=Etc/UTC
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-COPY --from=altinityinfra/cctools:7c093c1cde57d744be57 /opt/gdb /opt/gdb
+COPY --from=altinityinfra/cctools:d38a61541bb223c497aa /opt/gdb /opt/gdb
 ENV PATH="/opt/gdb/bin:${PATH}"
 
-COPY --from=altinityinfra/cctools:7c093c1cde57d744be57 \
+COPY --from=altinityinfra/cctools:d38a61541bb223c497aa \
   /opt/openssl-fips/openssl.cnf \
   /opt/openssl-fips/fipsmodule.cnf \
   /opt/openssl-fips/fips.so \
