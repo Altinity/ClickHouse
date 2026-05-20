@@ -32,6 +32,7 @@
 #include <Storages/HivePartitioningUtils.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeConfiguration.h>
 #include <Storages/ObjectStorage/DataLakes/DeletionVectorTransform.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergDataObjectInfo.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSource.h>
 #include <Storages/ObjectStorage/StorageObjectStorageStableTaskDistributor.h>
@@ -95,6 +96,23 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int LOGICAL_ERROR;
     extern const int FILE_DOESNT_EXIST;
+}
+
+void logIcebergFileStats(const ObjectInfoPtr & object_info, const LoggerPtr & log)
+{
+#if USE_AVRO
+    if (auto iceberg_object = std::dynamic_pointer_cast<IcebergDataObjectInfo>(object_info))
+    {
+        const auto & info = iceberg_object->info;
+        if (info.record_count.has_value())
+            LOG_TEST(log, "Iceberg record_count for '{}': {}", object_info->getPath(), *info.record_count);
+        if (info.file_size_in_bytes.has_value())
+            LOG_TEST(log, "Iceberg file_size_in_bytes for '{}': {}", object_info->getPath(), *info.file_size_in_bytes);
+    }
+#else
+    UNUSED(object_info);
+    UNUSED(log);
+#endif
 }
 
 StorageObjectStorageSource::StorageObjectStorageSource(
@@ -883,13 +901,15 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             object_info->getObjectMetadata()->size_bytes,
             object_info->getFileFormat().value_or(configuration->getFormat()));
 
+        logIcebergFileStats(object_info, log);
+
         bool use_native_reader_v3 = format_settings.has_value()
             ? format_settings->parquet.use_native_reader_v3
             : context_->getSettingsRef()[Setting::input_format_parquet_use_native_reader_v3];
 
         InputFormatPtr input_format;
         if (context_->getSettingsRef()[Setting::use_parquet_metadata_cache] && use_native_reader_v3
-            && (object_info->getFileFormat().value_or(configuration->getFormat()) == "Parquet")
+            && (Poco::toLower(object_info->getFileFormat().value_or(configuration->getFormat())) == "parquet")
             && !object_info->getObjectMetadata()->etag.empty())
         {
             std::optional<RelativePathWithMetadata> object_with_metadata = object_info->relative_path_with_metadata;
