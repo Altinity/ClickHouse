@@ -191,6 +191,7 @@ bool ReplicatedMergeTreeRestartingThread::runImpl()
         storage.export_merge_tree_partition_updating_task->activateAndSchedule();
         storage.export_merge_tree_partition_select_task->activateAndSchedule();
         storage.export_merge_tree_partition_status_handling_task->activateAndSchedule();
+        storage.ttl_export_task->activateAndSchedule();
     }
 
     storage.cleanup_thread.start();

@@ -17,6 +17,7 @@
 #include <Common/ProfileEvents.h>
 #include <Common/ZooKeeper/KeeperException.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
+#include <Common/ZooKeeper/ZooKeeperCommon.h>
 #include <Common/logger_useful.h>
 
 #include <filesystem>
@@ -41,6 +42,7 @@ namespace ServerSetting
 
 namespace MergeTreeSetting
 {
+    extern const MergeTreeSettingsUInt64 export_merge_tree_partition_ttl_poll_interval_seconds;
     extern const MergeTreeSettingsUInt64 export_merge_tree_partition_ttl_min_backoff_seconds;
     extern const MergeTreeSettingsUInt64 export_merge_tree_partition_ttl_max_backoff_seconds;
 }
@@ -83,7 +85,15 @@ TTLExportScheduler::TTLExportScheduler(StorageReplicatedMergeTree & storage_)
 
 void TTLExportScheduler::run()
 {
-    if (storage.is_readonly || storage.shutdown_called)
+    auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::ttl_export_task");
+
+    /// Early returns intentionally skip the reschedule at the bottom:
+    ///   - shutdown_called: the task will be deactivated by `partialShutdown`.
+    ///   - is_readonly: `ReplicatedMergeTreeRestartingThread` deactivates and reactivates these
+    ///     tasks across readonly transitions.
+    ///   - no export TTL: the `alter` path calls `schedule()` when a TTL is added.
+    ///   - experimental gate off: not toggleable at runtime in practice.
+    if (storage.shutdown_called || storage.is_readonly)
         return;
 
     auto metadata = storage.getInMemoryMetadataPtr();
@@ -109,6 +119,11 @@ void TTLExportScheduler::run()
             tryLogCurrentException(log, "Unhandled exception while processing TTL export");
         }
     }
+
+    const auto settings = storage.getSettings();
+    const UInt64 poll_seconds = (*settings)[MergeTreeSetting::export_merge_tree_partition_ttl_poll_interval_seconds];
+    const auto delay_ms = static_cast<size_t>(static_cast<double>(poll_seconds) * 1000.0 * jitter25());
+    storage.ttl_export_task->scheduleAfter(delay_ms);
 }
 
 std::optional<TTLExportScheduler::TtlMarker> TTLExportScheduler::findTtlMarker(

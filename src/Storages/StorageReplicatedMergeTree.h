@@ -14,6 +14,7 @@
 #include <Storages/MergeTree/EphemeralLockInZooKeeper.h>
 #include <Storages/MergeTree/ExportPartitionManifestUpdatingTask.h>
 #include <Storages/MergeTree/ExportPartitionTaskScheduler.h>
+#include <Storages/MergeTree/TTLExportScheduler.h>
 #include <Storages/ExportReplicatedMergeTreePartitionTaskEntry.h>
 #include <Storages/MergeTree/FutureMergedMutatedPart.h>
 #include <Storages/MergeTree/MergeFromLogEntryTask.h>
@@ -529,6 +530,9 @@ private:
     std::mutex export_merge_tree_partition_mutex;
 
     BackgroundSchedulePoolTaskHolder export_merge_tree_partition_select_task;
+
+    std::unique_ptr<TTLExportScheduler> ttl_export_scheduler;
+    BackgroundSchedulePoolTaskHolder ttl_export_task;
 
     ExportPartitionTaskEntriesContainer export_merge_tree_partition_task_entries;
     

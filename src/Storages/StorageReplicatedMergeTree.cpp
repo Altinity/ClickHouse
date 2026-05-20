@@ -544,6 +544,23 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
             getStorageID(), getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_select_task)", [this] { selectPartsToExport(); });
 
         export_merge_tree_partition_select_task->deactivate();
+
+        ttl_export_scheduler = std::make_unique<TTLExportScheduler>(*this);
+
+        ttl_export_task = getContext()->getSchedulePool().createTask(
+            getStorageID(), getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::ttl_export_task)", [this]
+            {
+                try
+                {
+                    ttl_export_scheduler->run();
+                }
+                catch (...)
+                {
+                    tryLogCurrentException(log);
+                }
+            });
+
+        ttl_export_task->deactivate();
     }
 
 
@@ -6061,6 +6078,7 @@ void StorageReplicatedMergeTree::partialShutdown()
         export_merge_tree_partition_updating_task->deactivate();
         export_merge_tree_partition_select_task->deactivate();
         export_merge_tree_partition_status_handling_task->deactivate();
+        ttl_export_task->deactivate();
     }
 
     cleanup_thread.stop();
@@ -7115,6 +7133,14 @@ void StorageReplicatedMergeTree::alter(
         merge_selecting_task->schedule();
         waitMutation(*mutation_znode, query_settings[Setting::alter_sync]);
         LOG_DEBUG(log, "Data changes applied.");
+    }
+
+    if (ttl_export_task)
+    {
+        const bool ttl_changed = std::any_of(commands.begin(), commands.end(),
+            [](const AlterCommand & c) { return c.type == AlterCommand::MODIFY_TTL; });
+        if (ttl_changed)
+            ttl_export_task->schedule();
     }
 }
 
