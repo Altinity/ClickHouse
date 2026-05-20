@@ -2450,7 +2450,7 @@ bool ParserTTLElement::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     ParserKeyword s_set(Keyword::SET);
     ParserKeyword s_recompress(Keyword::RECOMPRESS);
     ParserKeyword s_codec(Keyword::CODEC);
-    ParserKeyword s_export_to(Keyword::EXPORT_TO);
+    ParserKeyword s_export_to_table(Keyword::EXPORT_TO_TABLE);
     ParserKeyword s_materialize_ttl(Keyword::MATERIALIZE_TTL);
     ParserKeyword s_remove_ttl(Keyword::REMOVE_TTL);
     ParserKeyword s_modify_ttl(Keyword::MODIFY_TTL);
@@ -2498,7 +2498,7 @@ bool ParserTTLElement::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     {
         mode = TTLMode::RECOMPRESS;
     }
-    else if (s_export_to.ignore(pos, expected))
+    else if (s_export_to_table.ignore(pos, expected))
     {
         mode = TTLMode::EXPORT;
         destination_type = DataDestinationType::TABLE;

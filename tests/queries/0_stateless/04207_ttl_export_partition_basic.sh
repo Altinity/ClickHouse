@@ -37,7 +37,7 @@ query "CREATE TABLE $dst (event_date Date, id UInt64, year UInt16) ENGINE = S3(s
 query "CREATE TABLE $src (event_date Date, id UInt64, year UInt16)
        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{database}/$src', 'r1')
        PARTITION BY year ORDER BY id
-       TTL event_date + INTERVAL 1 DAY EXPORT TO $dst"
+       TTL event_date + INTERVAL 1 DAY EXPORT TO TABLE $dst"
 
 query "INSERT INTO $src VALUES (toDate('2000-01-01'), 1, 2000), (toDate('2000-01-02'), 2, 2000), (toDate('2000-01-03'), 3, 2000)"
 query "INSERT INTO $src VALUES (toDate('2001-01-01'), 4, 2001), (toDate('2001-01-02'), 5, 2001)"

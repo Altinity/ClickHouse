@@ -1,4 +1,4 @@
-"""Integration tests for `TTL ... EXPORT TO db.table`.
+"""Integration tests for `TTL ... EXPORT TO TABLE db.table`.
 
 The stateless suite covers parser, single-replica happy path and skip-already-exported.
 This suite covers what can only be observed on a multi-replica cluster: ZK race,
@@ -87,7 +87,7 @@ def create_rmt_with_export_ttl(node, name, dst, interval="INTERVAL 1 DAY"):
         CREATE TABLE {name} (event_date Date, id UInt64, year UInt16)
         ENGINE = ReplicatedMergeTree('/clickhouse/tables/{{database}}/{name}', '{node.name}')
         PARTITION BY year ORDER BY id
-        TTL event_date + {interval} EXPORT TO {dst}
+        TTL event_date + {interval} EXPORT TO TABLE {dst}
         """
     )
 
@@ -323,7 +323,7 @@ def test_modify_ttl_picks_up_with_materialize(cluster):
     # Disable the implicit materialise so we can demonstrate the explicit `MATERIALIZE TTL`
     # back-fill below — otherwise `MODIFY TTL` populates the per-part info itself.
     node.query(
-        f"ALTER TABLE {src} MODIFY TTL event_date + INTERVAL 1 DAY EXPORT TO {dst}",
+        f"ALTER TABLE {src} MODIFY TTL event_date + INTERVAL 1 DAY EXPORT TO TABLE {dst}",
         settings={"materialize_ttl_after_modify": 0},
     )
 

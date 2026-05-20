@@ -86,7 +86,7 @@ void ASTTTLElement::formatImpl(WriteBuffer & ostr, const FormatSettings & settin
                 "Unsupported destination type {} for TTL EXPORT",
                     magic_enum::enum_name(destination_type));
 
-        ostr << " EXPORT TO ";
+        ostr << " EXPORT TO TABLE ";
         auto dot_pos = destination_name.find('.');
         if (dot_pos == String::npos)
             ostr << backQuoteIfNeed(destination_name);

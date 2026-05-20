@@ -1,2 +1,2 @@
-TTL event_date + toIntervalDay(7) EXPORT TO ttl_export_dst
-TTL event_date + toIntervalDay(7) EXPORT TO ttl_export_dst, event_date + toIntervalDay(30)
+TTL event_date + toIntervalDay(7) EXPORT TO TABLE ttl_export_dst
+TTL event_date + toIntervalDay(7) EXPORT TO TABLE ttl_export_dst, event_date + toIntervalDay(30)

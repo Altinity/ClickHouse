@@ -131,7 +131,7 @@ struct TTLTableDescription
 
     TTLDescriptions group_by_ttl;
 
-    /// Per-partition export TTLs (`TTL ... EXPORT TO db.table`).
+    /// Per-partition export TTLs (`TTL ... EXPORT TO TABLE db.table`).
     TTLDescriptions export_ttl;
 
     TTLTableDescription() = default;

@@ -434,7 +434,7 @@ TTLTableDescription TTLTableDescription::getTTLForTableFromAST(
         {
             if (partition_key.column_names.empty())
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "TTL EXPORT TO {} requires the table to have a partition key", ttl.destination_name);
+                    "TTL EXPORT TO TABLE {} requires the table to have a partition key", ttl.destination_name);
 
             for (const auto & existing : result.export_ttl)
             {
