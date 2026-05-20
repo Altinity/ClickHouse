@@ -33,7 +33,8 @@ public:
         const String & endpoint,
         DB::ContextPtr context_,
         const CatalogSettings & settings_,
-        DB::ASTPtr table_engine_definition_);
+        DB::ASTPtr table_engine_definition_,
+        bool skip_non_iceberg_tables_);
 
     ~GlueCatalog() override;
 
@@ -81,6 +82,7 @@ private:
     CatalogSettings settings;
     DB::ASTPtr table_engine_definition;
     std::unordered_set<std::string> allowed_namespaces;
+    bool skip_non_iceberg_tables = false;
 
     bool isNamespaceAllowed(const std::string & namespace_) const;
 

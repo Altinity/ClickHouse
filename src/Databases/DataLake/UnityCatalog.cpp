@@ -37,6 +37,23 @@ static const auto TEMPORARY_CREDENTIALS_ENDPOINT = "temporary-table-credentials"
 static const std::unordered_set<std::string> READABLE_TABLES = {"TABLE_DELTA", "TABLE_DELTA_EXTERNAL"};
 static const auto READABLE_DATA_SOURCE_FORMAT = "DELTA";
 
+bool isReadableDeltaTable(const Poco::JSON::Object::Ptr & table_json)
+{
+    bool has_securable_kind = hasValueAndItsNotNone("securable_kind", table_json);
+    bool has_data_source_format = hasValueAndItsNotNone("data_source_format", table_json);
+
+    if (has_securable_kind && !READABLE_TABLES.contains(table_json->get("securable_kind").extract<String>()))
+        return false;
+
+    if (has_data_source_format && table_json->get("data_source_format").extract<String>() != READABLE_DATA_SOURCE_FORMAT)
+        return false;
+
+    if (!has_data_source_format && !has_securable_kind)
+        return false;
+
+    return true;
+}
+
 struct UnityCatalogFullSchemaName
 {
     std::string catalog_name;
@@ -206,7 +223,7 @@ bool UnityCatalog::tryGetTableMetadata(
             {
                 result.setTableIsNotReadable(fmt::format("Cannot read table `{}` because it has unsupported data_source_format '{}'. " \
                     "It means that it's unreadable with Unity catalog in ClickHouse, readable tables must have data_source_format == '{}'",
-                    full_table_name, object->get("securable_kind").extract<String>(), READABLE_DATA_SOURCE_FORMAT));
+                    full_table_name, object->get("data_source_format").extract<String>(), READABLE_DATA_SOURCE_FORMAT));
             }
 
             if (!has_data_source_format && !has_securable_kind)
@@ -340,6 +357,9 @@ DB::Names UnityCatalog::getTablesForSchema(const std::string & schema, size_t li
                 const auto current_table_json = tables_object->get(static_cast<int>(i)).extract<Poco::JSON::Object::Ptr>();
                 const auto table_name = current_table_json->get("name").extract<String>();
 
+                if (skip_non_iceberg_tables && !isReadableDeltaTable(current_table_json))
+                    continue;
+
                 tables.push_back(schema + "." + table_name);
                 if (limit && tables.size() >= limit)
                     break;
@@ -445,12 +465,14 @@ UnityCatalog::UnityCatalog(
     const std::string & base_url_,
     const std::string & catalog_credential_,
     const std::string & namespaces_,
-    DB::ContextPtr context_)
+    DB::ContextPtr context_,
+    bool skip_non_iceberg_tables_)
     : ICatalog(catalog_)
     , DB::WithContext(context_)
     , base_url(base_url_)
     , log(getLogger("UnityCatalog(" + catalog_ + ")"))
     , auth_header("Authorization", "Bearer " + catalog_credential_)
+    , skip_non_iceberg_tables(skip_non_iceberg_tables_)
 {
     boost::split(allowed_namespaces, namespaces_, boost::is_any_of(", "), boost::token_compress_on);
 }
