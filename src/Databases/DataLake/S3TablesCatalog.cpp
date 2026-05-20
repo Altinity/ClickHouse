@@ -173,6 +173,12 @@ bool S3TablesCatalog::tryGetTableMetadata(
     {
         LOG_DEBUG(log, "S3 Tables: no vended credentials for {}.{}, injecting catalog IAM credentials", namespace_name, table_name);
         auto aws_creds = credentials_provider->GetAWSCredentials();
+        if (aws_creds.GetAWSAccessKeyId().empty() || aws_creds.GetAWSSecretKey().empty())
+            throw DB::Exception(
+                DB::ErrorCodes::BAD_ARGUMENTS,
+                "S3 Tables: catalog IAM credentials are empty for {}.{}, "
+                "check AWS credentials configuration",
+                namespace_name, table_name);
         result.setStorageCredentials(std::make_shared<S3Credentials>(
             aws_creds.GetAWSAccessKeyId(), aws_creds.GetAWSSecretKey(), aws_creds.GetSessionToken()));
     }
