@@ -363,7 +363,11 @@ def main():
         if not has_stateful:
             has_stateful_tests = False
 
-    targeter = Targeting(info=info)
+    if not info.is_community_pr:
+        targeter = Targeting(info=info)
+    else:
+        targeter = None
+
     if is_flaky_check or is_bugfix_validation:
         if info.is_local_run:
             assert (
