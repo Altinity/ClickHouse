@@ -128,10 +128,10 @@ def test_basic_to_iceberg(cluster):
 
     # Iceberg only accepts its own partition transforms (`toYearNumSinceEpoch`, not `toYear`)
     # and only signed integer types, so source and destination must be created inline to match.
-    make_iceberg_s3(node, dst, "event_date Date, id Int64", partition_by="toYearNumSinceEpoch(event_date)")
+    make_iceberg_s3(node, dst, "event_date Date, id Int64, year Int32", partition_by="toYearNumSinceEpoch(event_date)")
     node.query(
         f"""
-        CREATE TABLE {src} (event_date Date, id Int64)
+        CREATE TABLE {src} (event_date Date, id Int64, year Int32)
         ENGINE = ReplicatedMergeTree('/clickhouse/tables/{{database}}/{src}', '{node.name}')
         PARTITION BY toYearNumSinceEpoch(event_date) ORDER BY id
         TTL event_date + INTERVAL 1 DAY EXPORT TO TABLE {dst}
