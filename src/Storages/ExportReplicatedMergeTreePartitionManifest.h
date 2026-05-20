@@ -11,6 +11,15 @@
 namespace DB
 {
 
+/// Distinguishes manifests submitted by manual `ALTER ... EXPORT PARTITION` from those
+/// submitted by the TTL scheduler. Persisted in the manifest body and surfaced through
+/// `system.replicated_partition_exports.export_origin`.
+enum class ExportOrigin : int8_t
+{
+    alter = 0,
+    ttl = 1,
+};
+
 struct ExportReplicatedMergeTreePartitionProcessingPartEntry
 {
 
@@ -121,6 +130,7 @@ struct ExportReplicatedMergeTreePartitionManifest
     String filename_pattern;
     bool write_full_path_in_iceberg_metadata = false;
     String iceberg_metadata_json;
+    ExportOrigin export_origin = ExportOrigin::alter;
 
     std::string toJsonString() const
     {
@@ -154,6 +164,7 @@ struct ExportReplicatedMergeTreePartitionManifest
         json.set("ttl_seconds", ttl_seconds);
         json.set("task_timeout_seconds", task_timeout_seconds);
         json.set("write_full_path_in_iceberg_metadata", write_full_path_in_iceberg_metadata);
+        json.set("export_origin", String(magic_enum::enum_name(export_origin)));
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
         Poco::JSON::Stringifier::stringify(json, oss);
@@ -207,6 +218,13 @@ struct ExportReplicatedMergeTreePartitionManifest
         }
 
         manifest.write_full_path_in_iceberg_metadata = json->getValue<bool>("write_full_path_in_iceberg_metadata");
+
+        /// Manifests written before this field existed default to `alter`.
+        if (json->has("export_origin"))
+        {
+            if (auto parsed = magic_enum::enum_cast<ExportOrigin>(json->getValue<String>("export_origin")))
+                manifest.export_origin = *parsed;
+        }
 
         return manifest;
     }

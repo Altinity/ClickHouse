@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Storages/ExportReplicatedMergeTreePartitionManifest.h>
 #include <Storages/System/IStorageSystemOneBlock.h>
 
 namespace DB
@@ -24,6 +25,7 @@ struct ReplicatedPartitionExportInfo
     std::string last_exception;
     std::string exception_part;
     size_t exception_count = 0;
+    ExportOrigin export_origin = ExportOrigin::alter;
 };
 
 class StorageSystemReplicatedPartitionExports final : public IStorageSystemOneBlock

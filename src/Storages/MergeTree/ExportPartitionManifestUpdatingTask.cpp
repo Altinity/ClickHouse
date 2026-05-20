@@ -56,7 +56,10 @@ namespace
         auto & entries_by_key
     )
     {
-        bool has_expired = metadata.create_time < now - static_cast<time_t>(metadata.ttl_seconds);
+        /// Manifests submitted by the TTL scheduler are durable by design: the scheduler relies on the
+        /// last manifest for `(src, dest)` to know where to resume, so manifest-TTL eviction must skip them.
+        bool has_expired = metadata.export_origin != ExportOrigin::ttl
+            && metadata.create_time < now - static_cast<time_t>(metadata.ttl_seconds);
 
         bool task_timed_out = is_pending
             && metadata.task_timeout_seconds > 0
@@ -545,6 +548,7 @@ std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::
         info.last_exception = last_exception;
         info.exception_part = exception_part;
         info.exception_count = exception_count;
+        info.export_origin = metadata.export_origin;
         infos.emplace_back(std::move(info));
     }
 
@@ -572,6 +576,7 @@ std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::
         info.parts_to_do = entry.manifest.parts.size();
         info.parts = entry.manifest.parts;
         info.status = magic_enum::enum_name(entry.status);
+        info.export_origin = entry.manifest.export_origin;
 
         infos.emplace_back(std::move(info));
     }

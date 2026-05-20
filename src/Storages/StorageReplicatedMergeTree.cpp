@@ -8365,7 +8365,9 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 
                 LOG_INFO(log, "Export with key {} has expiration time {}, now is {}", export_key, expiration_time, now);
 
-                if (static_cast<time_t>(expiration_time) < now)
+                /// TTL-origin manifests are never considered expired here — only `export_merge_tree_partition_force_export`
+                /// can overwrite them. Conflict semantics for the alter-vs-ttl interplay are handled separately.
+                if (manifest.export_origin != ExportOrigin::ttl && static_cast<time_t>(expiration_time) < now)
                 {
                     has_expired = true;
                 }

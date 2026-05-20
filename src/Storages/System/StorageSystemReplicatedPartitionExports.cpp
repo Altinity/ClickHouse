@@ -6,6 +6,7 @@
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeDateTime.h>
+#include <DataTypes/DataTypeEnum.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Storages/StorageReplicatedMergeTree.h>
 #include "Columns/ColumnString.h"
@@ -42,6 +43,12 @@ ColumnsDescription StorageSystemReplicatedPartitionExports::getColumnsDescriptio
         {"last_exception", std::make_shared<DataTypeString>(), "Last exception message of any part (not necessarily the last global exception)"},
         {"exception_part", std::make_shared<DataTypeString>(), "Part that caused the last exception"},
         {"exception_count", std::make_shared<DataTypeUInt64>(), "Number of global exceptions"},
+        {"export_origin",
+            std::make_shared<DataTypeEnum8>(DataTypeEnum8::Values{
+                {String(magic_enum::enum_name(ExportOrigin::alter)), static_cast<Int8>(ExportOrigin::alter)},
+                {String(magic_enum::enum_name(ExportOrigin::ttl)), static_cast<Int8>(ExportOrigin::ttl)},
+            }),
+            "Submitter of the manifest: `alter` for `ALTER ... EXPORT PARTITION`, `ttl` for the TTL scheduler."},
     };
 }
 
@@ -144,6 +151,7 @@ void StorageSystemReplicatedPartitionExports::fillData(MutableColumns & res_colu
             res_columns[i++]->insert(info.last_exception);
             res_columns[i++]->insert(info.exception_part);
             res_columns[i++]->insert(info.exception_count);
+            res_columns[i++]->insert(static_cast<Int8>(info.export_origin));
         }
     }
 }
