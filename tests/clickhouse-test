@@ -3556,6 +3556,19 @@ class TestCase:
             if result.status == TestStatus.FAIL:
                 result.description = self.add_info_about_settings(result.description)
 
+                if args.known_fails_file_path:
+                    known_fail_reason = test_is_known_fail(
+                        self.name,
+                        f"Reason: {result.reason.value} {result.description}",
+                        args.build_flags,
+                        args.known_fails_file_path,
+                    )
+                    if known_fail_reason:
+                        result.status = TestStatus.BROKEN
+                        result.description = result.description.replace(
+                            "\n", f"\nMarked as broken: {known_fail_reason}\n", 1
+                        )
+
             if args.cloud and result.status == TestStatus.FAIL:
                 # If error is in list of skipped errors, mark this test as SKIPPED
                 for skip_error in self.suite.cloud_skip_errors_list:
