@@ -8360,14 +8360,18 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
         ? ExportOrigin::ttl : ExportOrigin::alter;
     const bool force_export = query_context->getSettingsRef()[Setting::export_merge_tree_partition_force_export];
 
-    /// Maintain the "at most one ttl-origin manifest per (src, dest)" invariant: when submitting a ttl-origin
-    /// manifest, locate the current ttl marker (if any) at a different partition_id and either reject
-    /// (back-fill without force) or best-effort remove it before creating the new manifest. Same-partition
-    /// collisions are handled by the block below.
+    /// Cross-partition ttl-marker invariant. When submitting a ttl-origin manifest, collect every
+    /// existing ttl-origin marker at a different partition_id from the in-memory cache. The latest
+    /// (by create_time) is the current marker; the new partition must not move it backwards unless
+    /// `force_export` is set. Stale markers are recorded for best-effort removal AFTER the new
+    /// manifest is durably created — deleting before would risk losing the scheduler's high-water
+    /// mark if a subsequent step throws. Recording all stale markers (not just one) is the
+    /// self-healing path for any stragglers a previous post-multi cleanup left behind.
+    std::vector<fs::path> stale_ttl_marker_paths;
     if (new_export_origin == ExportOrigin::ttl)
     {
         std::optional<String> existing_ttl_partition_id;
-        fs::path existing_ttl_marker_path;
+        time_t existing_ttl_create_time = 0;
         {
             std::lock_guard task_entries_lock(export_merge_tree_partition_mutex);
             for (const auto & entry : export_merge_tree_partition_task_entries_by_key)
@@ -8380,30 +8384,29 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
                 if (entry.manifest.partition_id == partition_id)
                     continue;
 
-                existing_ttl_partition_id = entry.manifest.partition_id;
-                existing_ttl_marker_path = fs::path(exports_path) / entry.getCompositeKey();
-                break;
+                stale_ttl_marker_paths.push_back(fs::path(exports_path) / entry.getCompositeKey());
+                if (!existing_ttl_partition_id || entry.manifest.create_time > existing_ttl_create_time)
+                {
+                    existing_ttl_partition_id = entry.manifest.partition_id;
+                    existing_ttl_create_time = entry.manifest.create_time;
+                }
             }
+        }
+
+        if (existing_ttl_partition_id && partition_id < *existing_ttl_partition_id && !force_export)
+        {
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "TTL-origin export of partition {} to {} would move the ttl marker backwards "
+                "(current marker is at partition {}). "
+                "Set `export_merge_tree_partition_force_export` to allow this.",
+                partition_id, dest_full_name, *existing_ttl_partition_id);
         }
 
         if (existing_ttl_partition_id)
         {
-            if (partition_id < *existing_ttl_partition_id && !force_export)
-            {
-                throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "TTL-origin export of partition {} to {} would move the ttl marker backwards "
-                    "(current marker is at partition {}). "
-                    "Set `export_merge_tree_partition_force_export` to allow this.",
-                    partition_id, dest_full_name, *existing_ttl_partition_id);
-            }
-
             LOG_INFO(log,
                 "Replacing ttl-origin marker for {} (partition {} -> {})",
                 dest_full_name, *existing_ttl_partition_id, partition_id);
-
-            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRemoveRecursive);
-            zookeeper->tryRemoveRecursive(existing_ttl_marker_path);
         }
     }
 
@@ -8646,6 +8649,16 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
                 export_key);
         }
         throw zkutil::KeeperException::fromPath(code, partition_exports_path);
+    }
+
+    /// Best-effort cleanup of stale ttl-origin markers (cross-partition replacement). The new
+    /// manifest is durable; failures here at worst leave dead nodes that the next ttl submission
+    /// will reap. We deliberately do not throw if this fails.
+    for (const auto & stale_path : stale_ttl_marker_paths)
+    {
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRemoveRecursive);
+        zookeeper->tryRemoveRecursive(stale_path);
     }
 }
 
