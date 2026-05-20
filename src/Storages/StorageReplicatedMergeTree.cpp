@@ -213,6 +213,7 @@ namespace Setting
     extern const SettingsBool update_sequential_consistency;
     extern const SettingsBool allow_experimental_export_merge_tree_part;
     extern const SettingsBool export_merge_tree_partition_force_export;
+    extern const SettingsBool export_merge_tree_partition_mark_as_ttl;
     extern const SettingsUInt64 export_merge_tree_partition_max_retries;
     extern const SettingsUInt64 export_merge_tree_partition_manifest_ttl;
     extern const SettingsUInt64 export_merge_tree_partition_task_timeout_seconds;
@@ -8336,9 +8337,72 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     
     const auto exports_path = fs::path(zookeeper_path) / "exports";
 
-    const auto export_key = partition_id + "_" + dest_storage_id.getQualifiedName().getFullName();
+    const auto dest_full_name = dest_storage_id.getQualifiedName().getFullName();
+    const auto export_key = partition_id + "_" + dest_full_name;
 
     const auto partition_exports_path = fs::path(exports_path) / export_key;
+
+    const auto new_export_origin = query_context->getSettingsRef()[Setting::export_merge_tree_partition_mark_as_ttl]
+        ? ExportOrigin::ttl : ExportOrigin::alter;
+    const bool force_export = query_context->getSettingsRef()[Setting::export_merge_tree_partition_force_export];
+
+    /// Maintain the "at most one ttl-origin manifest per (src, dest)" invariant: when submitting a ttl-origin
+    /// manifest, locate the current ttl marker (if any) at a different partition_id and either reject
+    /// (back-fill without force) or best-effort remove it before creating the new manifest. Same-partition
+    /// collisions are handled by the block below.
+    if (new_export_origin == ExportOrigin::ttl)
+    {
+        const auto dest_suffix = "_" + dest_full_name;
+        std::vector<std::string> sibling_children;
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildren);
+        zookeeper->tryGetChildren(exports_path, sibling_children);
+
+        std::optional<String> existing_ttl_partition_id;
+        fs::path existing_ttl_marker_path;
+        for (const auto & child : sibling_children)
+        {
+            if (!child.ends_with(dest_suffix))
+                continue;
+            const String child_partition_id = child.substr(0, child.size() - dest_suffix.size());
+            if (child_partition_id == partition_id)
+                continue;
+
+            std::string metadata_json;
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
+            if (!zookeeper->tryGet(fs::path(exports_path) / child / "metadata.json", metadata_json))
+                continue;
+
+            const auto sibling = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
+            if (sibling.export_origin != ExportOrigin::ttl)
+                continue;
+
+            existing_ttl_partition_id = child_partition_id;
+            existing_ttl_marker_path = fs::path(exports_path) / child;
+            break;
+        }
+
+        if (existing_ttl_partition_id)
+        {
+            if (partition_id < *existing_ttl_partition_id && !force_export)
+            {
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "TTL-origin export of partition {} to {} would move the ttl marker backwards "
+                    "(current marker is at partition {}). "
+                    "Set `export_merge_tree_partition_force_export` to allow this.",
+                    partition_id, dest_full_name, *existing_ttl_partition_id);
+            }
+
+            LOG_INFO(log,
+                "Replacing ttl-origin marker for {} (partition {} -> {})",
+                dest_full_name, *existing_ttl_partition_id, partition_id);
+
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRemoveRecursive);
+            zookeeper->tryRemoveRecursive(existing_ttl_marker_path);
+        }
+    }
 
     /// check if entry already exists
     ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
@@ -8469,6 +8533,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     manifest.file_already_exists_policy = query_context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value;
     manifest.filename_pattern = query_context->getSettingsRef()[Setting::export_merge_tree_part_filename_pattern].value;
     manifest.write_full_path_in_iceberg_metadata = query_context->getSettingsRef()[Setting::write_full_path_in_iceberg_metadata];
+    manifest.export_origin = new_export_origin;
 
     if (dest_storage->isDataLake())
     {

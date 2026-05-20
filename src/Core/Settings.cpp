@@ -7532,6 +7532,9 @@ Overwrite file if it already exists when exporting a merge tree part
     DECLARE(Bool, export_merge_tree_partition_force_export, false, R"(
 Ignore existing partition export and overwrite the zookeeper entry
 )", 0) \
+    DECLARE(Bool, export_merge_tree_partition_mark_as_ttl, false, R"(
+When set on `ALTER ... EXPORT PARTITION`, marks the manifest with `export_origin = 'ttl'` so it is treated as if submitted by the TTL scheduler: it is exempt from manifest-TTL eviction and participates in the cross-partition ordering check against other ttl-origin manifests. The TTL scheduler always sets this implicitly when it submits.
+)", 0) \
     DECLARE(UInt64, export_merge_tree_partition_max_retries, 3, R"(
 Maximum number of retries for exporting a merge tree part in an export partition task
 )", 0) \
