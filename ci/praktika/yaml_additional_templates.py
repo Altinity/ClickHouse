@@ -108,7 +108,7 @@ class AltinityWorkflowTemplates:
 """,
         "CIReport": r"""
   FinishCIReport:
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && needs.config_workflow.outputs.pipeline_status != '' }}
     needs:
 {ALL_JOBS}
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
