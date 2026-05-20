@@ -603,26 +603,34 @@ std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::
 void ExportPartitionManifestUpdatingTask::poll()
 {
     /// Commit-recovery work collected while the storage-wide mutex is held.
-    /// Executed AFTER the lock is released - committing to Iceberg/REST-catalog can take
+    /// Executed AFTER the mutex is released - committing to Iceberg/REST-catalog can take
     /// many seconds (up to MAX_TRANSACTION_RETRIES=100 catalog round-trips) and blocking
     /// `system.replicated_partition_exports` for that long is what we are fixing here.
     std::vector<CommitRecoveryWork> deferred_commits;
 
     auto zk = storage.getZooKeeper();
 
+    const std::string exports_path = fs::path(storage.zookeeper_path) / "exports";
+    const std::string cleanup_lock_path = fs::path(storage.zookeeper_path) / "exports_cleanup_lock";
+
+    /// The `exports_cleanup_lock` is an ephemeral ZK node that serializes cleanup work
+    /// across replicas: only the replica holding it walks `tryCleanup` (entry expiry +
+    /// commit recovery). It MUST outlive the deferred-commit loop below; otherwise a peer
+    /// replica's next poll() could acquire it and race us on the same commit-recovery work,
+    /// duplicating REST-catalog round-trips and snapshot writes. The EphemeralNodeHolder
+    /// destructor removes the node, so we declare it at function scope and let it die
+    /// at the end of poll() - after all deferred commits have completed.
+    /// Acquired here (no mutex needed - it is just a ZK ephemeral create).
+    auto cleanup_lock = zkutil::EphemeralNodeHolder::tryCreate(cleanup_lock_path, *zk, storage.replica_name);
+    if (cleanup_lock)
+    {
+        LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Cleanup lock acquired, will remove stale entries");
+    }
+
     {
         std::lock_guard lock(storage.export_merge_tree_partition_mutex);
 
         LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Polling for new entries for table {}. Current number of entries: {}", storage.getStorageID().getNameForLogs(), storage.export_merge_tree_partition_task_entries_by_key.size());
-
-        const std::string exports_path = fs::path(storage.zookeeper_path) / "exports";
-        const std::string cleanup_lock_path = fs::path(storage.zookeeper_path) / "exports_cleanup_lock";
-
-        auto cleanup_lock = zkutil::EphemeralNodeHolder::tryCreate(cleanup_lock_path, *zk, storage.replica_name);
-        if (cleanup_lock)
-        {
-            LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Cleanup lock acquired, will remove stale entries");
-        }
 
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildrenWatch);
@@ -732,6 +740,11 @@ void ExportPartitionManifestUpdatingTask::poll()
     /// so concurrent readers of `system.replicated_partition_exports` and other writers are
     /// not blocked by the (potentially slow) catalog round-trips below.
     ///
+    /// `cleanup_lock` (the ZK ephemeral node) is INTENTIONALLY still held here and is only
+    /// destructed at end of function. This preserves the existing cross-replica invariant:
+    /// at any moment only one replica is performing commit recovery for a given table, so
+    /// peer replicas will not race us on the same `commit()` calls below.
+    ///
     /// Shutdown safety: this function runs on a BackgroundSchedulePool task that
     /// `StorageReplicatedMergeTree::shutdown()` deactivates before clearing the entry
     /// container. Deactivation waits for the currently-running invocation (this very call)
@@ -744,9 +757,6 @@ void ExportPartitionManifestUpdatingTask::poll()
         const auto log_ptr = storage.log.load();
 
         /// A replica exported the last part but the commit never landed. Try to fix it.
-        /// `commit()` is idempotent across replicas (transaction id is embedded in the
-        /// Iceberg snapshot summary; the /status write is version-checked), so racing
-        /// with another replica's commit or with a KILL transition is safe.
         try
         {
             ExportPartitionUtils::commit(work.metadata, work.destination_storage, zk, log_ptr, work.entry_path, work.context, storage);
@@ -774,10 +784,6 @@ void ExportPartitionManifestUpdatingTask::poll()
                     "Commit for {} transitioned to FAILED after exhausting max_retries={}",
                     work.entry_path, work.metadata.max_retries);
             }
-
-            /// Swallow: the next poll re-enters the cleanup path. If FAILED, the cleanup is
-            /// a no-op until the entry expires. If still PENDING, the next poll increments
-            /// the counter again. Throwing here would skip the scheduling kick below.
         }
     }
 
