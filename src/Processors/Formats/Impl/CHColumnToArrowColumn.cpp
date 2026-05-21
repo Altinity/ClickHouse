@@ -575,9 +575,14 @@ namespace DB
             /// Do not propagate the struct-level null_bytemap to child fields.
             /// In Arrow, struct-level nulls and child-level nulls are independent;
             /// child values at null struct positions are undefined.
+<<<<<<< HEAD
             auto name = column_name + "." + nested_names[i];
             std::shared_ptr<arrow::Array> nested_arrow_array = fillArrowArray(
                 name,
+=======
+            fillArrowArray(
+                column_name + "." + nested_names[i],
+>>>>>>> 57b8b335336 (Merge pull request #1802 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-101272)
                 nested_column, nested_types[i], nullptr,
                 builder.field_builder(static_cast<int>(i)),
                 format_name,
@@ -588,8 +593,16 @@ namespace DB
             children.push_back(nested_arrow_array);
         }
 
+<<<<<<< HEAD
         auto null_bitmap = nullBytemapToArrowBitmap(null_bytemap, column_name, format_name, start, end);
         return checkResult(arrow::StructArray::Make(children, builder.type()->fields(), null_bitmap), column_name, format_name);
+=======
+        for (size_t i = start; i != end; ++i)
+        {
+            auto status = (null_bytemap && (*null_bytemap)[i]) ? builder.AppendNull() : builder.Append();
+            checkStatus(status, column->getName(), format_name);
+        }
+>>>>>>> 57b8b335336 (Merge pull request #1802 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-101272)
     }
 
     template<typename From, typename To>
