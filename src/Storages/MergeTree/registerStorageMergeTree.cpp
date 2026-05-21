@@ -74,6 +74,7 @@ namespace ErrorCodes
     extern const int UNKNOWN_STORAGE;
     extern const int NO_REPLICA_NAME_GIVEN;
     extern const int CANNOT_EXTRACT_TABLE_STRUCTURE;
+    extern const int NOT_IMPLEMENTED;
     extern const int SUPPORT_IS_DISABLED;
 }
 
@@ -713,6 +714,10 @@ static StoragePtr create(const StorageFactory::Arguments & args)
             /// destination resolution needs to honour `EXPORT TO TABLE <unqualified_name>`.
             metadata.table_ttl = TTLTableDescription::getTTLForTableFromAST(
                 args.storage_def->ttl_table->ptr(), metadata.columns, args.getLocalContext(), metadata.primary_key, metadata.partition_key, allow_suspicious_ttl);
+
+            if (!replicated && !metadata.table_ttl.export_ttl.empty())
+                throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                    "TTL ... EXPORT TO TABLE is only supported on ReplicatedMergeTree tables");
         }
 
         storage_settings->loadFromQuery(*args.storage_def, context, LoadingStrictnessLevel::ATTACH <= args.mode);

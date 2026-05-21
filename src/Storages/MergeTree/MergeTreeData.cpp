@@ -4657,6 +4657,10 @@ void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, Context
     checkProperties(new_metadata, old_metadata, false, false, allow_reverse_key, allow_nullable_key, local_context);
     checkTTLExpressions(new_metadata, old_metadata);
 
+    if (!new_metadata.table_ttl.export_ttl.empty() && !supportsReplication())
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "TTL ... EXPORT TO TABLE is only supported on ReplicatedMergeTree tables");
+
     if (!columns_to_check_conversion.empty())
     {
         auto old_header = old_metadata.getSampleBlock();
