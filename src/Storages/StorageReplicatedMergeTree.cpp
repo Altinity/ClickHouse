@@ -8402,8 +8402,11 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
             /// no such TTL exists (orphaned marker after the TTL was dropped) or if either
             /// partition's parts are gone (DELETE TTL already cleaned them up).
             const auto metadata_snapshot = getInMemoryMetadataPtr();
+            /// `getExportTTLs` returns by value; hoist into a local so the container
+            /// outlives the `matching_ttl` pointer below.
+            const auto export_ttls = metadata_snapshot->getExportTTLs();
             const TTLDescription * matching_ttl = nullptr;
-            for (const auto & export_ttl : metadata_snapshot->getExportTTLs())
+            for (const auto & export_ttl : export_ttls)
             {
                 const auto ttl_db = export_ttl.destination_database.empty()
                     ? getStorageID().getDatabaseName()
