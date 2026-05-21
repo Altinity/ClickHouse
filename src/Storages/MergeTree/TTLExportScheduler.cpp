@@ -221,7 +221,12 @@ void TTLExportScheduler::processExportTTL(const TTLDescription & export_ttl)
 {
     const auto context = storage.getContext();
     const auto qualified = QualifiedTableName::parseFromString(export_ttl.destination_name);
-    const auto dest_database = context->resolveDatabase(qualified.database);
+    /// Unqualified destination names resolve against the source's database (where the TTL was
+    /// declared), not the scheduler context's `current_database`, which is the global server
+    /// context's default.
+    const auto dest_database = qualified.database.empty()
+        ? storage.getStorageID().getDatabaseName()
+        : qualified.database;
     const auto & dest_table = qualified.table;
     const String dest_full = dest_database + "." + dest_table;
 
