@@ -151,16 +151,29 @@ std::optional<String> TTLExportScheduler::pickPartition(
     for (const auto & part : active_parts)
         by_partition[part->info.getPartitionId()].push_back(part);
 
+    /// Forward-walk in expiration-max order, not partition_id order: partition IDs are
+    /// arbitrary strings derived from the partition expression, so lex comparison can
+    /// permanently strand newer partitions when widths differ (e.g. "10" < "9").
+    /// The floor's expiration max is recomputed from the source's current parts.
+    std::optional<time_t> floor_max;
+    if (floor)
+    {
+        if (auto it = by_partition.find(*floor); it != by_partition.end())
+            floor_max = getPartitionExportTTLMax(export_ttl, it->second);
+    }
+
     const auto now = time(nullptr);
     std::optional<String> best;
     std::optional<time_t> best_max;
 
     for (const auto & [pid, parts] : by_partition)
     {
-        if (floor && pid <= *floor)
+        if (floor && pid == *floor)
             continue;
         const auto max_ttl = getPartitionExportTTLMax(export_ttl, parts);
         if (!max_ttl || *max_ttl >= now)
+            continue;
+        if (floor_max && *max_ttl < *floor_max)
             continue;
         if (!best_max || *max_ttl < *best_max)
         {
