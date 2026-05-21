@@ -8361,87 +8361,37 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
         ? ExportOrigin::ttl : ExportOrigin::alter;
     const bool force_export = query_context->getSettingsRef()[Setting::export_merge_tree_partition_force_export];
 
-    /// Cross-partition ttl-marker invariant. When submitting a ttl-origin manifest, collect every
+    /// Cross-partition ttl-marker bookkeeping. When submitting a ttl-origin manifest, collect every
     /// existing ttl-origin marker at a different partition_id from the in-memory cache. The latest
-    /// (by create_time) is the current marker; the new partition must not move it backwards unless
-    /// `force_export` is set. Stale markers are recorded for best-effort removal AFTER the new
-    /// manifest is durably created — deleting before would risk losing the scheduler's high-water
-    /// mark if a subsequent step throws. Recording all stale markers (not just one) is the
-    /// self-healing path for any stragglers a previous post-multi cleanup left behind.
+    /// (by create_time) is the current marker, and its stored watermark feeds the backward-marker
+    /// guard further down (after the new manifest's watermark is computed). Stale markers are
+    /// recorded for best-effort removal AFTER the new manifest is durably created — deleting before
+    /// would risk losing the scheduler's high-water mark if a subsequent step throws. Recording all
+    /// stale markers (not just one) self-heals any stragglers a previous post-multi cleanup left
+    /// behind.
     std::vector<fs::path> stale_ttl_marker_paths;
+    std::optional<String> existing_ttl_partition_id;
+    time_t existing_ttl_max = 0;
     if (new_export_origin == ExportOrigin::ttl)
     {
-        std::optional<String> existing_ttl_partition_id;
         time_t existing_ttl_create_time = 0;
+        std::lock_guard task_entries_lock(export_merge_tree_partition_mutex);
+        for (const auto & entry : export_merge_tree_partition_task_entries_by_key)
         {
-            std::lock_guard task_entries_lock(export_merge_tree_partition_mutex);
-            for (const auto & entry : export_merge_tree_partition_task_entries_by_key)
+            if (entry.manifest.export_origin != ExportOrigin::ttl)
+                continue;
+            if (entry.manifest.destination_database != dest_database
+                || entry.manifest.destination_table != dest_table)
+                continue;
+            if (entry.manifest.partition_id == partition_id)
+                continue;
+
+            stale_ttl_marker_paths.push_back(fs::path(exports_path) / entry.getCompositeKey());
+            if (!existing_ttl_partition_id || entry.manifest.create_time > existing_ttl_create_time)
             {
-                if (entry.manifest.export_origin != ExportOrigin::ttl)
-                    continue;
-                if (entry.manifest.destination_database != dest_database
-                    || entry.manifest.destination_table != dest_table)
-                    continue;
-                if (entry.manifest.partition_id == partition_id)
-                    continue;
-
-                stale_ttl_marker_paths.push_back(fs::path(exports_path) / entry.getCompositeKey());
-                if (!existing_ttl_partition_id || entry.manifest.create_time > existing_ttl_create_time)
-                {
-                    existing_ttl_partition_id = entry.manifest.partition_id;
-                    existing_ttl_create_time = entry.manifest.create_time;
-                }
-            }
-        }
-
-        if (existing_ttl_partition_id && !force_export)
-        {
-            /// Compare by expiration max, not partition_id lex order: partition IDs are
-            /// arbitrary strings and lex compare can flip the natural order (e.g. "10" < "9").
-            /// Only the EXPORT TTL targeting this destination is relevant; skip the guard if
-            /// no such TTL exists (orphaned marker after the TTL was dropped) or if either
-            /// partition's parts are gone (DELETE TTL already cleaned them up).
-            const auto metadata_snapshot = getInMemoryMetadataPtr();
-            /// `getExportTTLs` returns by value; hoist into a local so the container
-            /// outlives the `matching_ttl` pointer below.
-            const auto export_ttls = metadata_snapshot->getExportTTLs();
-            const TTLDescription * matching_ttl = nullptr;
-            for (const auto & export_ttl : export_ttls)
-            {
-                const auto ttl_db = export_ttl.destination_database.empty()
-                    ? getStorageID().getDatabaseName()
-                    : export_ttl.destination_database;
-                if (ttl_db == dest_database && export_ttl.destination_name == dest_table)
-                {
-                    matching_ttl = &export_ttl;
-                    break;
-                }
-            }
-
-            if (matching_ttl)
-            {
-                DataPartsVector new_parts;
-                DataPartsVector old_parts;
-                for (const auto & part : getDataPartsVectorForInternalUsage())
-                {
-                    const auto & pid = part->info.getPartitionId();
-                    if (pid == partition_id)
-                        new_parts.push_back(part);
-                    else if (pid == *existing_ttl_partition_id)
-                        old_parts.push_back(part);
-                }
-
-                const auto new_max = getPartitionExportTTLMax(*matching_ttl, new_parts);
-                const auto old_max = getPartitionExportTTLMax(*matching_ttl, old_parts);
-
-                if (new_max && old_max && *new_max < *old_max)
-                {
-                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                        "TTL-origin export of partition {} to {} would move the ttl marker backwards "
-                        "(current marker is at partition {} with later expiration). "
-                        "Set `export_merge_tree_partition_force_export` to allow this.",
-                        partition_id, dest_full_name, *existing_ttl_partition_id);
-                }
+                existing_ttl_partition_id = entry.manifest.partition_id;
+                existing_ttl_create_time = entry.manifest.create_time;
+                existing_ttl_max = entry.manifest.export_ttl_max;
             }
         }
 
@@ -8583,6 +8533,61 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     manifest.filename_pattern = query_context->getSettingsRef()[Setting::export_merge_tree_part_filename_pattern].value;
     manifest.write_full_path_in_iceberg_metadata = query_context->getSettingsRef()[Setting::write_full_path_in_iceberg_metadata];
     manifest.export_origin = new_export_origin;
+
+    /// For ttl-origin submissions, persist the partition-wide expiration max of the matching
+    /// EXPORT TTL clause. This is the scheduler's high-water mark — readers consult it on
+    /// COMPLETED markers without depending on the source still carrying the partition's parts
+    /// (which the paired DELETE TTL is expected to drop).
+    if (new_export_origin == ExportOrigin::ttl)
+    {
+        const auto metadata_snapshot = getInMemoryMetadataPtr();
+        const auto export_ttls = metadata_snapshot->getExportTTLs();
+        const TTLDescription * matching_ttl = nullptr;
+        for (const auto & export_ttl : export_ttls)
+        {
+            const auto ttl_db = export_ttl.destination_database.empty()
+                ? getStorageID().getDatabaseName()
+                : export_ttl.destination_database;
+            if (ttl_db == dest_database && export_ttl.destination_name == dest_table)
+            {
+                matching_ttl = &export_ttl;
+                break;
+            }
+        }
+
+        if (!matching_ttl)
+        {
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "`export_merge_tree_partition_mark_as_ttl=1` requires a matching `EXPORT TTL` clause "
+                "for destination {}; none was found on {}.",
+                dest_full_name, getStorageID().getNameForLogs());
+        }
+
+        const auto ttl_max = getPartitionExportTTLMax(*matching_ttl, parts);
+        if (!ttl_max)
+        {
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Cannot compute the EXPORT TTL high-water mark for partition {} of {}: some parts "
+                "lack the export TTL info (they pre-date the TTL clause). "
+                "Run `ALTER TABLE {} MATERIALIZE TTL` and retry.",
+                partition_id, getStorageID().getNameForLogs(), getStorageID().getFullTableName());
+        }
+
+        manifest.export_ttl_max = *ttl_max;
+
+        /// Backward-marker guard. Compare expiration maxes, not partition_id lex order: partition IDs
+        /// are arbitrary strings and lex compare can flip the natural order (e.g. "10" < "9"). The
+        /// existing marker's max comes from its stored watermark, so this works even if the source
+        /// no longer carries that partition's parts (typical when the paired DELETE TTL has run).
+        if (existing_ttl_partition_id && !force_export && existing_ttl_max > manifest.export_ttl_max)
+        {
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "TTL-origin export of partition {} to {} would move the ttl marker backwards "
+                "(current marker is at partition {} with later expiration). "
+                "Set `export_merge_tree_partition_force_export` to allow this.",
+                partition_id, dest_full_name, *existing_ttl_partition_id);
+        }
+    }
 
     if (dest_storage->isDataLake())
     {

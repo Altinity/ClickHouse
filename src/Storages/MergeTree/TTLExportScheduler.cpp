@@ -132,7 +132,8 @@ std::optional<TTLExportScheduler::TtlMarker> TTLExportScheduler::findTtlMarker(
             latest = TtlMarker{
                 entry.manifest.partition_id,
                 String(magic_enum::enum_name(entry.status)),
-                entry.manifest.create_time
+                entry.manifest.create_time,
+                entry.manifest.export_ttl_max,
             };
         }
     }
@@ -140,7 +141,7 @@ std::optional<TTLExportScheduler::TtlMarker> TTLExportScheduler::findTtlMarker(
 }
 
 std::optional<String> TTLExportScheduler::pickPartition(
-    const TTLDescription & export_ttl, const std::optional<String> & floor)
+    const TTLDescription & export_ttl, const std::optional<TtlMarker> & floor)
 {
     const auto active_parts = storage.getDataPartsVectorForInternalUsage();
     if (active_parts.empty())
@@ -153,26 +154,20 @@ std::optional<String> TTLExportScheduler::pickPartition(
     /// Forward-walk in expiration-max order, not partition_id order: partition IDs are
     /// arbitrary strings derived from the partition expression, so lex comparison can
     /// permanently strand newer partitions when widths differ (e.g. "10" < "9").
-    /// The floor's expiration max is recomputed from the source's current parts.
-    std::optional<time_t> floor_max;
-    if (floor)
-    {
-        if (auto it = by_partition.find(*floor); it != by_partition.end())
-            floor_max = getPartitionExportTTLMax(export_ttl, it->second);
-    }
-
+    /// The floor's expiration max comes from the stored watermark on the marker, so this
+    /// works even when the floor's partition has been dropped from the source.
     const auto now = time(nullptr);
     std::optional<String> best;
     std::optional<time_t> best_max;
 
     for (const auto & [pid, parts] : by_partition)
     {
-        if (floor && pid == *floor)
+        if (floor && pid == floor->partition_id)
             continue;
         const auto max_ttl = getPartitionExportTTLMax(export_ttl, parts);
         if (!max_ttl || *max_ttl >= now)
             continue;
-        if (floor_max && *max_ttl < *floor_max)
+        if (floor && *max_ttl < floor->expiration_max)
             continue;
         if (!best_max || *max_ttl < *best_max)
         {
@@ -261,7 +256,7 @@ void TTLExportScheduler::processExportTTL(const TTLDescription & export_ttl)
 
     if (marker->status == "COMPLETED")
     {
-        if (auto pid = pickPartition(export_ttl, marker->partition_id))
+        if (auto pid = pickPartition(export_ttl, marker))
             (void)submit(dest_database, dest_table, *pid, /* force = */ false);
         return;
     }

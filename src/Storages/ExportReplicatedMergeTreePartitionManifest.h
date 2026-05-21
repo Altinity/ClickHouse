@@ -131,6 +131,10 @@ struct ExportReplicatedMergeTreePartitionManifest
     bool write_full_path_in_iceberg_metadata = false;
     String iceberg_metadata_json;
     ExportOrigin export_origin = ExportOrigin::alter;
+    /// Partition-wide max of the EXPORT TTL expression at submission time.
+    /// Populated only when `export_origin == ttl`; together with `status = COMPLETED`
+    /// it is the scheduler's durable high-water mark (see `TTLExportScheduler`).
+    time_t export_ttl_max = 0;
 
     std::string toJsonString() const
     {
@@ -165,6 +169,8 @@ struct ExportReplicatedMergeTreePartitionManifest
         json.set("task_timeout_seconds", task_timeout_seconds);
         json.set("write_full_path_in_iceberg_metadata", write_full_path_in_iceberg_metadata);
         json.set("export_origin", String(magic_enum::enum_name(export_origin)));
+        if (export_origin == ExportOrigin::ttl)
+            json.set("export_ttl_max", export_ttl_max);
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
         Poco::JSON::Stringifier::stringify(json, oss);
@@ -225,6 +231,9 @@ struct ExportReplicatedMergeTreePartitionManifest
             if (auto parsed = magic_enum::enum_cast<ExportOrigin>(json->getValue<String>("export_origin")))
                 manifest.export_origin = *parsed;
         }
+
+        if (json->has("export_ttl_max"))
+            manifest.export_ttl_max = json->getValue<time_t>("export_ttl_max");
 
         return manifest;
     }

@@ -401,3 +401,48 @@ def test_dedup_after_restart(cluster):
     # Destination has rows from all three partitions, no duplicates.
     rows = int(node.query(f"SELECT count() FROM {dst}").strip())
     assert rows == 3
+
+
+def test_no_replay_after_drop_partition(cluster):
+    """Reviewer concern: after the marker's partition is dropped from the source (paired
+    DELETE TTL, ALTER ... DROP PARTITION, retention cleanup), the scheduler must not
+    replay older partitions that still have parts. The stored watermark on the ttl-origin
+    manifest is what keeps ordering durable across the drop.
+    """
+    node = cluster.instances["replica1"]
+    uid = unique_suffix()
+    src = f"src_{uid}"
+    dst = f"dst_{uid}"
+
+    create_s3_dst(node, dst)
+    create_rmt_with_export_ttl(node, src, dst)
+
+    insert_expired_partition(node, src, 2000, [1])
+    insert_expired_partition(node, src, 2001, [2])
+
+    # Only the trailing partition is guaranteed to be observable as COMPLETED; the 2000
+    # ttl marker is pruned when 2001 is submitted.
+    wait_for_export_status(node, src, dst, "2001", "COMPLETED", timeout=60)
+    assert int(node.query(f"SELECT count() FROM {dst}").strip()) == 2
+
+    # Drop the partition the marker points to. The marker's stored watermark survives
+    # in ZK (and in the in-memory cache); the source's per-part TTL info does not.
+    node.query(f"ALTER TABLE {src} DROP PARTITION '2001'")
+    assert int(node.query(f"SELECT count() FROM {src} WHERE year = 2001").strip()) == 0
+
+    # 2000 still has parts on the source and is still past its EXPORT TTL. Pre-fix,
+    # `pickPartition` would treat it as eligible (the floor's parts are gone, so the
+    # ordering filter was skipped) and the scheduler would replay it. Wait for several
+    # ticks (poll = 5s, jitter ±25 %).
+    time.sleep(20)
+
+    # No new manifest for the older partition. The 2001 marker is still the latest;
+    # any replay would show up as a fresh row for partition_id = '2000'.
+    n_2000 = int(node.query(
+        f"SELECT count() FROM system.replicated_partition_exports"
+        f" WHERE source_table = '{src}' AND destination_table = '{dst}' AND partition_id = '2000'"
+    ).strip())
+    assert n_2000 == 0, f"partition 2000 was replayed: {n_2000} manifest(s) present"
+
+    # Destination row count unchanged — no duplicate writes.
+    assert int(node.query(f"SELECT count() FROM {dst}").strip()) == 2
