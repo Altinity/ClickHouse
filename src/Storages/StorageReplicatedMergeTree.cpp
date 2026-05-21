@@ -1858,6 +1858,13 @@ void StorageReplicatedMergeTree::setTableStructure(const StorageID & table_id, c
         setProperties(old_metadata, new_metadata);
         throw;
     }
+
+    /// Wake the TTL EXPORT scheduler on replicas that just received the first EXPORT TTL via
+    /// replicated metadata. The local `alter` path also schedules the task explicitly, but
+    /// replicas that did not initiate the ALTER never enter that path; without this hook
+    /// `TTLExportScheduler::run` stays dormant on them after the initial startup tick.
+    if (ttl_export_task && !old_metadata.hasAnyExportTTL() && new_metadata.hasAnyExportTTL())
+        ttl_export_task->schedule();
 }
 
 
