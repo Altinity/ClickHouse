@@ -14,7 +14,7 @@ PARTITION BY toYear(event_date)
 ORDER BY id
 TTL event_date + INTERVAL 7 DAY EXPORT TO TABLE ttl_export_dst;
 
-SELECT replaceRegexpOne(extract(create_table_query, 'TTL [^\n]+'), ' SETTINGS .*$', '') FROM system.tables
+SELECT replace(replaceRegexpOne(extract(create_table_query, 'TTL [^\n]+'), ' SETTINGS .*$', ''), concat(currentDatabase(), '.'), '') FROM system.tables
 WHERE database = currentDatabase() AND name = 'ttl_export_src';
 
 DROP TABLE ttl_export_src SYNC;
@@ -29,7 +29,7 @@ ALTER TABLE ttl_export_src MODIFY TTL
     event_date + INTERVAL 7 DAY EXPORT TO TABLE ttl_export_dst,
     event_date + INTERVAL 30 DAY DELETE;
 
-SELECT replaceRegexpOne(extract(create_table_query, 'TTL [^\n]+'), ' SETTINGS .*$', '') FROM system.tables
+SELECT replace(replaceRegexpOne(extract(create_table_query, 'TTL [^\n]+'), ' SETTINGS .*$', ''), concat(currentDatabase(), '.'), '') FROM system.tables
 WHERE database = currentDatabase() AND name = 'ttl_export_src';
 
 DROP TABLE ttl_export_src SYNC;

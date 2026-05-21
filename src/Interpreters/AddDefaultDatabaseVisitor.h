@@ -65,7 +65,8 @@ public:
         if (!tryVisitDynamicCast<ASTAlterQuery>(parent, ast) &&
             !tryVisitDynamicCast<ASTQueryWithTableAndOutput>(parent, ast) &&
             !tryVisitDynamicCast<ASTRenameQuery>(parent, ast) &&
-            !tryVisitDynamicCast<ASTFunction>(parent, ast))
+            !tryVisitDynamicCast<ASTFunction>(parent, ast) &&
+            !tryVisitDynamicCast<ASTTTLElement>(parent, ast))
         {}
     }
 
@@ -312,6 +313,15 @@ private:
             if (command_ast->to_database.empty())
                 command_ast->to_database = database_name;
         }
+    }
+
+    void visitDDL(ASTPtr & /* parent */, ASTTTLElement & node, ASTPtr & /* ast */) const
+    {
+        if (only_replace_current_database_function)
+            return;
+
+        if (node.mode == TTLMode::EXPORT && node.destination_database.empty())
+            node.destination_database = database_name;
     }
 
     void visitDDL(ASTPtr & parent, ASTFunction & function, ASTPtr & node) const

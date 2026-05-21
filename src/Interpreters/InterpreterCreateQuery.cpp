@@ -1663,6 +1663,13 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
         visitor.visit(*create.refresh_strategy);
     }
 
+    if (create.storage && create.storage->ttl_table)
+    {
+        ASTPtr ttl_table_ptr = create.storage->ttl_table->ptr();
+        AddDefaultDatabaseVisitor visitor(getContext(), current_database);
+        visitor.visitDDL(ttl_table_ptr);
+    }
+
     if (create.columns_list)
     {
         AddDefaultDatabaseVisitor visitor(getContext(), current_database);
