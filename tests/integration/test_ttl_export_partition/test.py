@@ -446,3 +446,53 @@ def test_no_replay_after_drop_partition(cluster):
 
     # Destination row count unchanged — no duplicate writes.
     assert int(node.query(f"SELECT count() FROM {dst}").strip()) == 2
+
+
+def test_no_pingpong_on_equal_expiration_max(cluster):
+    """Two partitions sharing the same partition-wide expiration_max — happens whenever
+    the EXPORT TTL expression is not monotonic by partition key (e.g. `PARTITION BY
+    user_id`, hash partitioning, or here: same `event_date` in two partitions keyed by
+    an unrelated column). Pre-fix the scheduler used `<` on the expiration_max alone,
+    so after exporting A it would still see B as eligible (`T < T` false), submit B,
+    then ping-pong back to A on the next tick — and so on, replaying data each cycle.
+    The `(expiration_max, partition_id)` tuple comparison terminates the walk after
+    each partition exports exactly once.
+    """
+    node = cluster.instances["replica1"]
+    uid = unique_suffix()
+    src = f"src_{uid}"
+    dst = f"dst_{uid}"
+
+    create_s3_dst(node, dst)
+    create_rmt_with_export_ttl(node, src, dst)
+
+    # Partitions "2000" and "2001" (keyed by `year`) sharing the same `event_date`, so
+    # `event_date + INTERVAL 1 DAY` yields identical expiration_max for both partitions.
+    node.query(
+        f"INSERT INTO {src} VALUES"
+        f" (toDate('2000-01-01'), 1, 2000),"
+        f" (toDate('2000-01-01'), 2, 2001)"
+    )
+
+    # The lex-larger partition_id is the trailing marker under the new tie-break; the
+    # lex-smaller marker is pruned when the larger one is submitted.
+    wait_for_export_status(node, src, dst, "2001", "COMPLETED", timeout=60)
+
+    # Let several scheduler ticks pass. Pre-fix each tick would resubmit a partition.
+    time.sleep(20)
+
+    n_2000 = int(node.query(
+        f"SELECT count() FROM system.replicated_partition_exports"
+        f" WHERE source_table = '{src}' AND destination_table = '{dst}' AND partition_id = '2000'"
+    ).strip())
+    n_2001 = int(node.query(
+        f"SELECT count() FROM system.replicated_partition_exports"
+        f" WHERE source_table = '{src}' AND destination_table = '{dst}' AND partition_id = '2001'"
+    ).strip())
+    assert n_2000 == 0 and n_2001 == 1, (
+        f"ping-pong detected: 2000={n_2000} manifests, 2001={n_2001} manifests"
+    )
+
+    # Destination has exactly one row per partition — no replay.
+    rows = int(node.query(f"SELECT count() FROM {dst}").strip())
+    assert rows == 2, f"destination row count {rows} (expected 2 — replay happened)"

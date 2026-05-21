@@ -151,11 +151,12 @@ std::optional<String> TTLExportScheduler::pickPartition(
     for (const auto & part : active_parts)
         by_partition[part->info.getPartitionId()].push_back(part);
 
-    /// Forward-walk in expiration-max order, not partition_id order: partition IDs are
-    /// arbitrary strings derived from the partition expression, so lex comparison can
-    /// permanently strand newer partitions when widths differ (e.g. "10" < "9").
-    /// The floor's expiration max comes from the stored watermark on the marker, so this
-    /// works even when the floor's partition has been dropped from the source.
+    /// Forward-walk in `(expiration_max, partition_id)` order. The primary key is the stored
+    /// watermark on the marker — partition IDs alone are arbitrary strings (e.g. "10" < "9"
+    /// lex), so they only serve as a deterministic tie-breaker when two partitions share the
+    /// same expiration max (common with non-monotonic partition keys like `PARTITION BY id`
+    /// or hash). Without the tie-breaker, the scheduler would ping-pong between equal-max
+    /// partitions, replaying data each cycle.
     const auto now = time(nullptr);
     std::optional<String> best;
     std::optional<time_t> best_max;
@@ -167,9 +168,16 @@ std::optional<String> TTLExportScheduler::pickPartition(
         const auto max_ttl = getPartitionExportTTLMax(export_ttl, parts);
         if (!max_ttl || *max_ttl >= now)
             continue;
-        if (floor && *max_ttl < floor->expiration_max)
-            continue;
-        if (!best_max || *max_ttl < *best_max)
+        if (floor)
+        {
+            if (*max_ttl < floor->expiration_max)
+                continue;
+            if (*max_ttl == floor->expiration_max && pid < floor->partition_id)
+                continue;
+        }
+        if (!best_max
+            || *max_ttl < *best_max
+            || (*max_ttl == *best_max && pid < *best))
         {
             best = pid;
             best_max = max_ttl;

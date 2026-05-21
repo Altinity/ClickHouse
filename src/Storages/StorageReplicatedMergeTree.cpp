@@ -8575,17 +8575,25 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 
         manifest.export_ttl_max = *ttl_max;
 
-        /// Backward-marker guard. Compare expiration maxes, not partition_id lex order: partition IDs
-        /// are arbitrary strings and lex compare can flip the natural order (e.g. "10" < "9"). The
-        /// existing marker's max comes from its stored watermark, so this works even if the source
-        /// no longer carries that partition's parts (typical when the paired DELETE TTL has run).
-        if (existing_ttl_partition_id && !force_export && existing_ttl_max > manifest.export_ttl_max)
+        /// Backward-marker guard. The forward order is the tuple `(expiration_max, partition_id)`:
+        /// expiration_max is the primary key (stored watermark, robust to the marker's partition
+        /// being dropped), and partition_id is a deterministic tie-breaker for partitions that
+        /// share the same expiration max (common with non-monotonic partition keys). The matching
+        /// tuple order is also what the scheduler's `pickPartition` walks, so a successful submit
+        /// here cannot reverse the scheduler's forward progress.
+        if (existing_ttl_partition_id && !force_export)
         {
-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "TTL-origin export of partition {} to {} would move the ttl marker backwards "
-                "(current marker is at partition {} with later expiration). "
-                "Set `export_merge_tree_partition_force_export` to allow this.",
-                partition_id, dest_full_name, *existing_ttl_partition_id);
+            const bool backward = manifest.export_ttl_max < existing_ttl_max
+                || (manifest.export_ttl_max == existing_ttl_max
+                    && partition_id < *existing_ttl_partition_id);
+            if (backward)
+            {
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "TTL-origin export of partition {} to {} would move the ttl marker backwards "
+                    "(current marker is at partition {}). "
+                    "Set `export_merge_tree_partition_force_export` to allow this.",
+                    partition_id, dest_full_name, *existing_ttl_partition_id);
+            }
         }
     }
 
