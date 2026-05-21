@@ -1,6 +1,5 @@
 #include <Storages/MergeTree/TTLExportScheduler.h>
 
-#include <Core/QualifiedTableName.h>
 #include <Core/ServerSettings.h>
 #include <Core/Settings.h>
 #include <Interpreters/Context.h>
@@ -233,14 +232,13 @@ TTLExportScheduler::SubmitResult TTLExportScheduler::submit(
 void TTLExportScheduler::processExportTTL(const TTLDescription & export_ttl)
 {
     const auto context = storage.getContext();
-    const auto qualified = QualifiedTableName::parseFromString(export_ttl.destination_name);
     /// Unqualified destination names resolve against the source's database (where the TTL was
     /// declared), not the scheduler context's `current_database`, which is the global server
     /// context's default.
-    const auto dest_database = qualified.database.empty()
+    const auto dest_database = export_ttl.destination_database.empty()
         ? storage.getStorageID().getDatabaseName()
-        : qualified.database;
-    const auto & dest_table = qualified.table;
+        : export_ttl.destination_database;
+    const auto & dest_table = export_ttl.destination_name;
     const String dest_full = dest_database + "." + dest_table;
 
     if (!DatabaseCatalog::instance().tryGetTable({dest_database, dest_table}, context))

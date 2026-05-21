@@ -88,8 +88,17 @@ struct TTLDescription
     /// For example DISK or VOLUME
     DataDestinationType destination_type;
 
-    /// Name of destination disk or volume
+    /// For TTLMode::EXPORT: the destination database; empty if the user wrote an unqualified
+    /// table name. For other modes, unused.
+    String destination_database;
+
+    /// For TTLMode::EXPORT: just the destination table name (never the joined `db.table` form).
+    /// For TTLMode::MOVE: the disk or volume name.
     String destination_name;
+
+    /// Deterministic key into the per-part `export_ttl` map (writer/reader use this so that
+    /// `(db, table)` pairs are distinguishable from a single table name that contains a dot).
+    String getExportKey() const;
 
     /// If true, do nothing if DISK or VOLUME doesn't exist .
     /// Only valid for table MOVE TTLs.

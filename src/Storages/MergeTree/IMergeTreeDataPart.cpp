@@ -2876,7 +2876,7 @@ bool IMergeTreeDataPart::checkAllTTLCalculated(const StorageMetadataPtr & metada
 
     for (const auto & export_desc : metadata_snapshot->getExportTTLs())
     {
-        if (!ttl_infos.export_ttl.contains(export_desc.destination_name))
+        if (!ttl_infos.export_ttl.contains(export_desc.getExportKey()))
             return false;
     }
 

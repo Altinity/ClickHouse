@@ -15,6 +15,12 @@ class ASTTTLElement : public IAST
 public:
     TTLMode mode;
     DataDestinationType destination_type;
+    /// For TTLMode::EXPORT: the destination database; empty if the user wrote an unqualified
+    /// table name. For other modes (MOVE), unused.
+    String destination_database;
+    /// For TTLMode::EXPORT: just the destination table name. Never the joined `db.table` form,
+    /// so quoted table names that legitimately contain dots round-trip losslessly.
+    /// For TTLMode::MOVE: the disk or volume name.
     String destination_name;
     bool if_exists = false;
 
@@ -23,9 +29,15 @@ public:
 
     ASTPtr recompression_codec;
 
-    ASTTTLElement(TTLMode mode_, DataDestinationType destination_type_, const String & destination_name_, bool if_exists_)
+    ASTTTLElement(
+        TTLMode mode_,
+        DataDestinationType destination_type_,
+        const String & destination_database_,
+        const String & destination_name_,
+        bool if_exists_)
         : mode(mode_)
         , destination_type(destination_type_)
+        , destination_database(destination_database_)
         , destination_name(destination_name_)
         , if_exists(if_exists_)
         , ttl_expr_pos(-1)

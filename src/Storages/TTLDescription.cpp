@@ -1,8 +1,8 @@
 #include <Storages/TTLDescription.h>
 
+#include <Common/quoteString.h>
 #include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <Compression/CompressionFactory.h>
-#include <Core/QualifiedTableName.h>
 #include <Core/Settings.h>
 #include <Functions/IFunction.h>
 #include <Interpreters/DatabaseCatalog.h>
@@ -137,6 +137,7 @@ TTLDescription::TTLDescription(const TTLDescription & other)
     , set_parts(other.set_parts)
     , aggregate_descriptions(other.aggregate_descriptions)
     , destination_type(other.destination_type)
+    , destination_database(other.destination_database)
     , destination_name(other.destination_name)
     , if_exists(other.if_exists)
     , recompression_codec(other.recompression_codec)
@@ -168,6 +169,7 @@ TTLDescription & TTLDescription::operator=(const TTLDescription & other)
     set_parts = other.set_parts;
     aggregate_descriptions = other.aggregate_descriptions;
     destination_type = other.destination_type;
+    destination_database = other.destination_database;
     destination_name = other.destination_name;
     if_exists = other.if_exists;
 
@@ -177,6 +179,13 @@ TTLDescription & TTLDescription::operator=(const TTLDescription & other)
         recompression_codec.reset();
 
     return * this;
+}
+
+String TTLDescription::getExportKey() const
+{
+    if (destination_database.empty())
+        return backQuoteIfNeed(destination_name);
+    return backQuoteIfNeed(destination_database) + "." + backQuoteIfNeed(destination_name);
 }
 
 static ExpressionAndSets buildExpressionAndSets(ASTPtr & ast, const NamesAndTypesList & columns, const ContextPtr & context)
@@ -252,6 +261,7 @@ TTLDescription TTLDescription::getTTLFromAST(
     {
         result.mode = ttl_element->mode;
         result.destination_type = ttl_element->destination_type;
+        result.destination_database = ttl_element->destination_database;
         result.destination_name = ttl_element->destination_name;
         result.if_exists = ttl_element->if_exists;
 
@@ -438,22 +448,22 @@ TTLTableDescription TTLTableDescription::getTTLForTableFromAST(
         {
             if (partition_key.column_names.empty())
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "TTL EXPORT TO TABLE {} requires the table to have a partition key", ttl.destination_name);
+                    "TTL EXPORT TO TABLE {} requires the table to have a partition key", ttl.getExportKey());
 
             for (const auto & existing : result.export_ttl)
             {
-                if (existing.destination_name == ttl.destination_name)
+                if (existing.destination_database == ttl.destination_database
+                    && existing.destination_name == ttl.destination_name)
                     throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                        "Two TTL EXPORT clauses target the same destination {}", ttl.destination_name);
+                        "Two TTL EXPORT clauses target the same destination {}", ttl.getExportKey());
             }
 
             /// Skip on ATTACH because the destination table may not yet be loaded at startup.
             /// Submission-time validation in `exportPartitionToTable` still covers this path.
             if (!is_attach)
             {
-                const auto qualified = QualifiedTableName::parseFromString(ttl.destination_name);
-                const auto dest_database = context->resolveDatabase(qualified.database);
-                auto dest_storage = DatabaseCatalog::instance().getTable({dest_database, qualified.table}, context);
+                const auto dest_database = context->resolveDatabase(ttl.destination_database);
+                auto dest_storage = DatabaseCatalog::instance().getTable({dest_database, ttl.destination_name}, context);
                 ExportPartitionUtils::verifyExportDestinationCompatibility(
                     columns,
                     partition_key.definition_ast,

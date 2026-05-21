@@ -53,9 +53,9 @@ struct MergeTreeDataPartTTLInfos
 
     TTLInfoMap group_by_ttl;
 
-    /// Per-partition export TTL info; keyed by `TTLDescription::destination_name`.
+    /// Per-partition export TTL info; keyed by `TTLDescription::getExportKey()`.
     /// Two EXPORT TTLs sharing the same expression but targeting different destinations
-    /// would alias under `result_column`, so `destination_name` is used instead.
+    /// would alias under `result_column`, so a destination-derived key is used instead.
     TTLInfoMap export_ttl;
 
     /// Return the smallest max recompression TTL value
@@ -88,7 +88,7 @@ struct MergeTreeDataPartTTLInfos
 std::optional<TTLDescription> selectTTLDescriptionForTTLInfos(const TTLDescriptions & descriptions, const TTLInfoMap & ttl_info_map, time_t current_time, bool use_max);
 
 /// Returns the partition-wide max EXPORT TTL across all parts. Returns nullopt if any part lacks
-/// an entry for `desc.destination_name` — such parts predate the TTL and require `ALTER TABLE ...
+/// an entry for `desc.getExportKey()` — such parts predate the TTL and require `ALTER TABLE ...
 /// MATERIALIZE TTL` before the partition can be exported. Names of those parts are appended to
 /// `missing_parts_out` (if non-null) so the caller can log them.
 class IMergeTreeDataPart;

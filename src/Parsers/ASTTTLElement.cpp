@@ -87,13 +87,9 @@ void ASTTTLElement::formatImpl(WriteBuffer & ostr, const FormatSettings & settin
                     magic_enum::enum_name(destination_type));
 
         ostr << " EXPORT TO TABLE ";
-        auto dot_pos = destination_name.find('.');
-        if (dot_pos == String::npos)
-            ostr << backQuoteIfNeed(destination_name);
-        else
-            ostr << backQuoteIfNeed(std::string_view(destination_name).substr(0, dot_pos))
-                 << '.'
-                 << backQuoteIfNeed(std::string_view(destination_name).substr(dot_pos + 1));
+        if (!destination_database.empty())
+            ostr << backQuoteIfNeed(destination_database) << '.';
+        ostr << backQuoteIfNeed(destination_name);
     }
     else if (mode == TTLMode::DELETE)
     {

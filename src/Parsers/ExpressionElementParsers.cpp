@@ -2478,6 +2478,7 @@ bool ParserTTLElement::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 
     TTLMode mode;
     DataDestinationType destination_type = DataDestinationType::DELETE;
+    String destination_database;
     String destination_name;
 
     if (s_to_disk.ignore(pos, expected))
@@ -2556,15 +2557,11 @@ bool ParserTTLElement::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
     }
     else if (mode == TTLMode::EXPORT)
     {
-        String dst_database;
-        String dst_table;
-        if (!parseDatabaseAndTableName(pos, expected, dst_database, dst_table))
+        if (!parseDatabaseAndTableName(pos, expected, destination_database, destination_name))
             return false;
-
-        destination_name = dst_database.empty() ? dst_table : dst_database + "." + dst_table;
     }
 
-    auto ttl_element = make_intrusive<ASTTTLElement>(mode, destination_type, destination_name, if_exists);
+    auto ttl_element = make_intrusive<ASTTTLElement>(mode, destination_type, destination_database, destination_name, if_exists);
     ttl_element->setTTL(std::move(ttl_expr));
     if (where_expr)
         ttl_element->setWhere(std::move(where_expr));
