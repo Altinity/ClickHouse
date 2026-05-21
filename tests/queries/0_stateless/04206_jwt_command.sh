@@ -105,13 +105,15 @@ fi
 rm -f "$CFG"
 
 echo "Test 11: stdin-reading script completes promptly (stdin is closed)"
-start=$SECONDS
-$CLICKHOUSE_CLIENT_BINARY --jwt-command "read X; echo $SAMPLE_JWT" --jwt-command-timeout 10 --host nonexistent.invalid --query "SELECT 1" > /dev/null 2>&1
-elapsed=$((SECONDS - start))
-if [ "$elapsed" -lt 5 ]; then
-    echo "OK"
+# If the child's stdin is closed by the parent, 'read X' returns immediately on EOF and
+# the JWT is echoed before the 1s watchdog fires. If stdin were left open, 'read X' would
+# block and the watchdog would surface 'timed out after 1 seconds'. We assert on that
+# message rather than wall-clock time so the test is not flaky under loaded CI runs.
+output=$($CLICKHOUSE_CLIENT_BINARY --jwt-command "read X; echo $SAMPLE_JWT" --jwt-command-timeout 1 --host nonexistent.invalid --query "SELECT 1" 2>&1)
+if echo "$output" | grep -qi "timed out"; then
+    echo "FAILED: jwt-command child's stdin was not closed (got: $output)"
 else
-    echo "FAILED: stdin-reading script took ${elapsed}s, expected <5s (child stdin should be closed)"
+    echo "OK"
 fi
 
 echo "Test 12: CLI --jwt-command-timeout overrides XML config"
