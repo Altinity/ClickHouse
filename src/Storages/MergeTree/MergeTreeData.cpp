@@ -17,6 +17,7 @@
 #include <Common/Config/ConfigHelper.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/Increment.h>
+#include <Common/MemoryTracker.h>
 #include <Common/ProfileEventsScope.h>
 #include <Common/Stopwatch.h>
 #include <Common/StringUtils.h>
@@ -178,6 +179,7 @@ namespace ProfileEvents
     extern const Event PartsExportTotalMilliseconds;
     extern const Event PartsExportFailures;
     extern const Event PartsExportDuplicated;
+    extern const Event ExportPartsRejectedByMemoryLimit;
 }
 
 namespace CurrentMetrics
@@ -6809,6 +6811,17 @@ void MergeTreeData::exportPartToTable(
     }
 
     {
+        if (!canEnqueueBackgroundTask())
+        {
+            ProfileEvents::increment(ProfileEvents::ExportPartsRejectedByMemoryLimit);
+            throw Exception(ErrorCodes::ABORTED,
+                "Failed to schedule export part task for data part '{}'. "
+                "Reached memory limit for the background tasks ({}). Current background tasks memory usage: {}.",
+                part_name,
+                formatReadableSizeWithBinarySuffix(background_memory_tracker.getSoftLimit()),
+                formatReadableSizeWithBinarySuffix(background_memory_tracker.get()));
+        }
+
         MergeTreePartExportManifest manifest(
             dest_storage,
             part,
