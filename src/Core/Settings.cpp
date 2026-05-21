@@ -7568,6 +7568,14 @@ Throw an error if there are pending mutations when exporting a merge tree part.
     DECLARE(Bool, export_merge_tree_part_throw_on_pending_patch_parts, true, R"(
 Throw an error if there are pending patch parts when exporting a merge tree part.
 )", 0) \
+    DECLARE(ExportPartitionAllOnError, export_merge_tree_partition_all_on_error, ExportPartitionAllOnError::throw_first, R"(
+Failure handling for `ALTER TABLE ... EXPORT PARTITION ALL ...`.
+Possible values:
+- `throw_first` (default) - stop at the first failed partition; partitions already scheduled remain scheduled.
+- `collect` - try every partition and throw a single aggregated exception at the end if any failed; partitions that succeeded remain scheduled.
+- `skip_conflicts` - silently skip partitions that are already exported / being exported (errors with code EXPORT_PARTITION_ALREADY_EXPORTED); fail-fast on every other error.
+Has no effect on `EXPORT PARTITION <id>` (single-partition export).
+)", 0) \
     DECLARE(String, export_merge_tree_part_filename_pattern, "{part_name}_{checksum}", R"(
 Pattern for the filename of the exported merge tree part. The `part_name` and `checksum` are calculated and replaced on the fly. Additional macros are supported.
 )", 0) \
