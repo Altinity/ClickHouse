@@ -48,6 +48,7 @@
 #include <Storages/MergeTree/MergeFromLogEntryTask.h>
 #include <Storages/MergeTree/MergeTreeBackgroundExecutor.h>
 #include <Storages/MergeTree/MergeTreeDataFormatVersion.h>
+#include <Storages/MergeTree/MergeTreeDataPartTTLInfo.h>
 #include <Storages/MergeTree/MergeTreePartInfo.h>
 #include <Storages/MergeTree/MergeTreeReaderCompact.h>
 #include <Storages/MergeTree/MergeTreeMutationStatus.h>
@@ -8393,13 +8394,49 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
             }
         }
 
-        if (existing_ttl_partition_id && partition_id < *existing_ttl_partition_id && !force_export)
+        if (existing_ttl_partition_id && !force_export)
         {
-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "TTL-origin export of partition {} to {} would move the ttl marker backwards "
-                "(current marker is at partition {}). "
-                "Set `export_merge_tree_partition_force_export` to allow this.",
-                partition_id, dest_full_name, *existing_ttl_partition_id);
+            /// Compare by expiration max, not partition_id lex order: partition IDs are
+            /// arbitrary strings and lex compare can flip the natural order (e.g. "10" < "9").
+            /// Only the EXPORT TTL targeting this destination is relevant; skip the guard if
+            /// no such TTL exists (orphaned marker after the TTL was dropped) or if either
+            /// partition's parts are gone (DELETE TTL already cleaned them up).
+            const auto metadata_snapshot = getInMemoryMetadataPtr();
+            const TTLDescription * matching_ttl = nullptr;
+            for (const auto & export_ttl : metadata_snapshot->getExportTTLs())
+            {
+                const auto ttl_db = export_ttl.destination_database.empty()
+                    ? getStorageID().getDatabaseName()
+                    : export_ttl.destination_database;
+                if (ttl_db == dest_database && export_ttl.destination_name == dest_table)
+                {
+                    matching_ttl = &export_ttl;
+                    break;
+                }
+            }
+
+            if (matching_ttl)
+            {
+                std::map<String, DataPartsVector> by_partition;
+                for (const auto & part : getDataPartsVectorForInternalUsage())
+                    by_partition[part->info.getPartitionId()].push_back(part);
+
+                std::optional<time_t> new_max;
+                std::optional<time_t> old_max;
+                if (auto it = by_partition.find(partition_id); it != by_partition.end())
+                    new_max = getPartitionExportTTLMax(*matching_ttl, it->second);
+                if (auto it = by_partition.find(*existing_ttl_partition_id); it != by_partition.end())
+                    old_max = getPartitionExportTTLMax(*matching_ttl, it->second);
+
+                if (new_max && old_max && *new_max < *old_max)
+                {
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "TTL-origin export of partition {} to {} would move the ttl marker backwards "
+                        "(current marker is at partition {} with later expiration). "
+                        "Set `export_merge_tree_partition_force_export` to allow this.",
+                        partition_id, dest_full_name, *existing_ttl_partition_id);
+                }
+            }
         }
 
         if (existing_ttl_partition_id)
