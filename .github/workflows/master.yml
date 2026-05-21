@@ -697,6 +697,18 @@ jobs:
             python3 -m praktika run 'Build (arm_binary)' --workflow "MasterCI" --ci |& tee ./ci/tmp/job.log
           fi
 
+      - name: Upload artifact CH_ARM_BIN_GH
+        id: upload_CH_ARM_BIN_GH
+        uses: actions/upload-artifact@v7
+        continue-on-error: true
+        with:
+          name: CH_ARM_BIN_GH
+          path: ci/tmp/build/programs/self-extracting/clickhouse
+          retention-days: 1
+      - name: Warn on failed upload of CH_ARM_BIN_GH
+        if: steps.upload_CH_ARM_BIN_GH.outcome == 'failure'
+        run: echo "::warning title=GH artifact upload failed::Failed to upload [CH_ARM_BIN_GH] to GitHub artifacts (e.g. quota/rate limit). Downstream consumers will fall back to S3."
+
   build_amd_release:
     runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, dockers_build_multiplatform_manifest]

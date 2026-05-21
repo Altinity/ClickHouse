@@ -12,6 +12,32 @@ REPO_PATH = Utils.cwd()
 TEMP_PATH = Path(f"{REPO_PATH}/ci/tmp/")
 
 
+def prepare_clickhouse_binary() -> Path:
+    clickhouse_binary = TEMP_PATH / "clickhouse"
+    clickhouse_stripped_binary = TEMP_PATH / "clickhouse-stripped"
+
+    if clickhouse_binary.is_file():
+        Shell.check(f"chmod +x {clickhouse_binary}", verbose=True, strict=True)
+        return clickhouse_binary
+
+    if clickhouse_stripped_binary.is_file():
+        Shell.check(f"chmod +x {clickhouse_stripped_binary}", verbose=True, strict=True)
+        # install scripts expect /packages/clickhouse
+        Shell.check(
+            f"ln -sf {clickhouse_stripped_binary.name} {clickhouse_binary.name}",
+            strict=True,
+            verbose=True,
+            cwd=TEMP_PATH,
+        )
+        return clickhouse_binary
+
+    listing = Shell.get_output(f"ls -la {TEMP_PATH}", verbose=True, strict=False)
+    raise RuntimeError(
+        "Neither clickhouse nor clickhouse-stripped binary was found in ci/tmp.\n"
+        f"Directory listing:\n{listing}"
+    )
+
+
 def prepare_test_scripts():
     server_test = r"""#!/bin/bash
 set -e
@@ -233,7 +259,8 @@ def main():
     deb_image = DockerImage.get_docker_image(DEB_IMAGE).pull_image()
     rpm_image = DockerImage.get_docker_image(RPM_IMAGE).pull_image()
 
-    Shell.check(f"chmod +x {Utils.cwd()}/ci/tmp/clickhouse", verbose=True, strict=True)
+    binary_path = prepare_clickhouse_binary()
+    print(f"Using ClickHouse binary for install checks: [{binary_path}]")
 
     prepare_test_scripts()
 

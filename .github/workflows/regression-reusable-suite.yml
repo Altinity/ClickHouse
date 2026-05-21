@@ -93,6 +93,7 @@ jobs:
       build_sha: ${{ inputs.build_sha }}
       pr_number: ${{ github.event.number }}
       artifacts: builds
+      GH_BINARY_ARTIFACT_NAME: ${{ inputs.runner_arch == 'aarch64' && 'CH_ARM_BIN_GH' || 'CH_AMD_BINARY_GH' }}
       # Args
       args: --test-to-end
         --no-colors
@@ -115,6 +116,12 @@ jobs:
         ./*/*/_instances/*.log
 
     steps:
+      - name: 🔧 Fix workspace ownership
+        run: |
+          if command -v sudo >/dev/null 2>&1; then
+            sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE" || true
+          fi
+
       - name: ⤵️ Checkout
         uses: actions/checkout@v4
         with:
@@ -132,7 +139,7 @@ jobs:
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
-          name: CH_AMD_BINARY_GH
+          name: ${{ env.GH_BINARY_ARTIFACT_NAME }}
           path: ${{ runner.temp }}/gh_binary
 
       - name: 🔎 Resolve binary source
