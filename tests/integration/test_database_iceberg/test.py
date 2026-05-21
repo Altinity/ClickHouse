@@ -5,7 +5,7 @@ import os
 import random
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 
 import pyarrow as pa
 import pytest
@@ -25,7 +25,8 @@ from pyiceberg.types import (
     StringType,
     StructType,
     TimestampType,
-    TimestamptzType
+    TimestamptzType,
+    TimeType,
 )
 
 from helpers.cluster import ClickHouseCluster, ClickHouseInstance
@@ -972,9 +973,179 @@ def test_invalid_auth_header_format(started_cluster):
             CREATE DATABASE {CATALOG_NAME}
             ENGINE = DataLakeCatalog('{BASE_URL}', 'minio', 'dummy')
             SETTINGS
+<<<<<<< HEAD
                 catalog_type = 'rest',
                 warehouse = 'demo',
                 auth_header = 'wrong.header'
             """
         )
     assert "Invalid auth header format" in str(err.value)
+=======
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
+        """
+    )
+
+    assert res == "Jack\tSparrow\nJohn\tDow\n"
+
+    res = node.query(
+        f"""
+            SELECT name
+            FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`
+            WHERE tag in (
+                SELECT id
+                FROM {CATALOG_NAME}.`{root_namespace}.{table_name_2}`
+            )
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
+        """
+    )
+
+    assert res == "Jack\nJohn\n"
+
+    res = node.query(
+        f"""
+            SELECT t1.name,t2.second_name
+            FROM {CATALOG_NAME}.`{root_namespace}.{table_name}` AS t1
+                JOIN `{table_name_local}` AS t2
+                ON t1.tag=t2.id
+            WHERE t1.tag < 10 AND t2.id < 20
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
+        """
+    )
+
+    assert res == "Jack\tBlack\nJohn\tSilver\n"
+
+    res = node.query(
+        f"""
+            SELECT name
+            FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`
+            WHERE tag in (
+                SELECT id
+                FROM `{table_name_local}`
+            )
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
+        """
+    )
+
+    assert res == "Jack\nJohn\n"
+
+    res = node.query(
+        f"""
+            SELECT t1.name,t2.second_name
+            FROM {CATALOG_NAME}.`{root_namespace}.{table_name}` AS t1
+                CROSS JOIN `{table_name_local}` AS t2
+            WHERE t1.tag < 10 AND t2.id < 20
+            ORDER BY ALL
+            SETTINGS
+                object_storage_cluster='cluster_simple',
+                object_storage_cluster_join_mode='local'
+        """
+    )
+
+    assert res == "Jack\tBlack\nJack\tSilver\nJohn\tBlack\nJohn\tSilver\n"
+
+
+def test_partitioning_by_time(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_partitioning_by_time_{uuid.uuid4()}"
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+
+    namespace = f"{root_namespace}.A"
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+
+    schema = Schema(
+        NestedField(
+            field_id=1,
+            name="key",
+            field_type=TimeType(),
+            required=False
+        ),
+        NestedField(
+            field_id=2,
+            name="value",
+            field_type=StringType(),
+            required=False,
+        ),
+    )
+
+    partition_spec = PartitionSpec(
+        PartitionField(
+            source_id=1, field_id=1000, transform=IdentityTransform(), name="partition_key"
+        )
+    )
+
+    table = create_table(catalog, namespace, table_name, schema=schema, partition_spec=partition_spec)
+    data = [{"key": dtime(12,0,0), "value": "test1"},
+            {"key": dtime(13,0,0), "value": "test2"},
+            {"key": dtime(14,0,0), "value": "test3"},
+            ]
+    df = pa.Table.from_pylist(data)
+    table.append(df)
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+
+    assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{namespace}.{table_name}` ORDER BY key") == "12:00:00.000000\ttest1\n13:00:00.000000\ttest2\n14:00:00.000000\ttest3\n"
+    assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{namespace}.{table_name}` WHERE key = '13:00:00.000000' ORDER BY key") == "13:00:00.000000\ttest2\n"
+    assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{namespace}.{table_name}` WHERE key >= '13:00:00.000000' ORDER BY key") == "13:00:00.000000\ttest2\n14:00:00.000000\ttest3\n"
+    assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{namespace}.{table_name}` WHERE key <= '13:00:00.000000' ORDER BY key") == "12:00:00.000000\ttest1\n13:00:00.000000\ttest2\n"
+
+
+def test_partitioning_by_string(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_partitioning_by_string_{uuid.uuid4()}"
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+
+    namespace = f"{root_namespace}.A"
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+
+    schema = Schema(
+        NestedField(
+            field_id=1,
+            name="key",
+            field_type=StringType(),
+            required=False
+        ),
+        NestedField(
+            field_id=2,
+            name="value",
+            field_type=StringType(),
+            required=False,
+        ),
+        NestedField(
+            field_id=3,
+            name="time_value",
+            field_type=TimeType(),
+            required=False,
+        ),
+    )
+
+    partition_spec = PartitionSpec(
+        PartitionField(
+            source_id=1, field_id=1000, transform=IdentityTransform(), name="partition_key"
+        )
+    )
+
+    table = create_table(catalog, namespace, table_name, schema=schema, partition_spec=partition_spec)
+    data = [{"key": "a:b,c[d=e/f%g?h", "value": "test", "time_value": dtime(12,0,0)}]
+    df = pa.Table.from_pylist(data)
+    table.append(df)
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+
+    assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{namespace}.{table_name}`") == "a:b,c[d=e/f%g?h\ttest\t12:00:00.000000\n"
+>>>>>>> b51229ea981 (Merge pull request #1761 from Altinity/bugfix/antalya-26.3/1535_time_type_write_support)
