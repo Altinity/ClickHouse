@@ -404,11 +404,8 @@ bool MsgPackVisitor::start_array(size_t size) // NOLINT
     }
     else if (isTuple(removeNullable(info_stack.top().type)))
     {
-        const auto & tuple_type = assert_cast<const DataTypeTuple &>(*removeNullable(info_stack.top().type));
-        const auto & nested_types = tuple_type.getElements();
-        if (size != nested_types.size())
-            throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Cannot insert MessagePack array with size {} into Tuple column with {} elements", size, nested_types.size());
-
+<<<<<<< HEAD
+=======
         /// If the type is Nullable, reaching start_array means the value
         /// is non-null (for nulls, the parser calls visit_nil instead).
         /// So we can safely unwrap the Nullable to work with the inner
@@ -421,6 +418,27 @@ bool MsgPackVisitor::start_array(size_t size) // NOLINT
             column_ptr = &nullable_column.getNestedColumn();
         }
 
+>>>>>>> 57b8b335336 (Merge pull request #1802 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-101272)
+        const auto & tuple_type = assert_cast<const DataTypeTuple &>(*removeNullable(info_stack.top().type));
+        const auto & nested_types = tuple_type.getElements();
+        if (size != nested_types.size())
+            throw Exception(ErrorCodes::ILLEGAL_COLUMN, "Cannot insert MessagePack array with size {} into Tuple column with {} elements", size, nested_types.size());
+
+<<<<<<< HEAD
+        /// If the type is Nullable, reaching start_array means the value
+        /// is non-null (for nulls, the parser calls visit_nil instead).
+        /// So we can safely unwrap the Nullable to work with the inner
+        /// ColumnTuple directly.
+        IColumn * column_ptr = &info_stack.top().column;
+        if (info_stack.top().type->isNullable())
+        {
+            auto & nullable_column = assert_cast<ColumnNullable &>(*column_ptr);
+            nullable_column.getNullMapColumn().insertValue(0);
+            column_ptr = &nullable_column.getNestedColumn();
+        }
+
+=======
+>>>>>>> 57b8b335336 (Merge pull request #1802 from Altinity/feature/antalya-26.3/ClickHouse-ClickHouse-pr-101272)
         ColumnTuple & column_tuple = assert_cast<ColumnTuple &>(*column_ptr);
         /// Push nested columns into stack in reverse order.
         for (ssize_t i = static_cast<ssize_t>(nested_types.size()) - 1; i >= 0; --i)
