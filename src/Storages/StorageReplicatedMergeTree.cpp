@@ -8417,16 +8417,19 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 
             if (matching_ttl)
             {
-                std::map<String, DataPartsVector> by_partition;
+                DataPartsVector new_parts;
+                DataPartsVector old_parts;
                 for (const auto & part : getDataPartsVectorForInternalUsage())
-                    by_partition[part->info.getPartitionId()].push_back(part);
+                {
+                    const auto & pid = part->info.getPartitionId();
+                    if (pid == partition_id)
+                        new_parts.push_back(part);
+                    else if (pid == *existing_ttl_partition_id)
+                        old_parts.push_back(part);
+                }
 
-                std::optional<time_t> new_max;
-                std::optional<time_t> old_max;
-                if (auto it = by_partition.find(partition_id); it != by_partition.end())
-                    new_max = getPartitionExportTTLMax(*matching_ttl, it->second);
-                if (auto it = by_partition.find(*existing_ttl_partition_id); it != by_partition.end())
-                    old_max = getPartitionExportTTLMax(*matching_ttl, it->second);
+                const auto new_max = getPartitionExportTTLMax(*matching_ttl, new_parts);
+                const auto old_max = getPartitionExportTTLMax(*matching_ttl, old_parts);
 
                 if (new_max && old_max && *new_max < *old_max)
                 {
