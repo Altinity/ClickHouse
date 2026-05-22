@@ -746,6 +746,72 @@ def test_partition_key_compatibility_check(cluster):
     )
 
 
+def test_export_partition_partition_column_type_mismatch_is_rejected(cluster):
+    """
+    EXPORT PARTITION must synchronously reject (BAD_ARGUMENTS) when a
+    partition column has a different (even castable) type on the source
+    MergeTree and the destination Iceberg table.
+
+    The Iceberg destination's partition path is derived from the SOURCE
+    part's minmax block in ExportPartTask::executeStep, and the Iceberg
+    manifest's partition values come from the SOURCE-typed
+    `manifest.data_part->partition.value` Fields. Letting a castable type
+    mismatch through would mean the manifest/path computation and the row
+    data (which IS cast by addExportConvertingActions) disagree — not
+    equivalent to INSERT SELECT.
+
+    Failing case: source `year Int32` -> destination `year Int64`, both
+    PARTITION BY year (identity transform). Both are valid Iceberg primitives
+    so verifyIcebergPartitionCompatibility accepts the spec; only the new
+    exact-type check rejects.
+    """
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_pcol_type_mismatch_{uid}"
+    iceberg_table = f"iceberg_pcol_type_mismatch_{uid}"
+
+    # Source uses year Int32; destination Iceberg uses year Int64.
+    make_rmt(node, mt_table, "id Int64, year Int32", "year", replica_name="replica1")
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020), (2, 2020), (3, 2020)")
+
+    make_iceberg_s3(
+        node, iceberg_table, "id Int64, year Int64",
+        partition_by="year", s3_retry_attempts=3,
+    )
+
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
+    )
+    assert "BAD_ARGUMENTS" in error, (
+        f"Expected BAD_ARGUMENTS for partition-column type mismatch, "
+        f"got: {error!r}"
+    )
+    assert "partition key column 'year'" in error, (
+        f"Expected the error message to identify the offending partition "
+        f"column 'year', got: {error!r}"
+    )
+
+    # No async work scheduled.
+    rows_in_system_view = node.query(
+        f"SELECT count() FROM system.replicated_partition_exports "
+        f"WHERE source_table = '{mt_table}' "
+        f"  AND destination_table = '{iceberg_table}' "
+        f"  AND partition_id = '2020'"
+    ).strip()
+    assert rows_in_system_view == "0", (
+        f"Expected no row in system.replicated_partition_exports after a "
+        f"synchronously-rejected export, got {rows_in_system_view}."
+    )
+
+    # Destination must remain empty.
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 0, (
+        f"Expected 0 rows in Iceberg destination after rejected export, "
+        f"got {count}"
+    )
+
+
 def test_export_ttl(cluster):
     """
     After a manifest TTL expires the same partition can be re-exported, and the

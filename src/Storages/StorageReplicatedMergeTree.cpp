@@ -8407,14 +8407,24 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
             query_context);
     }
 
-    /// for data lakes this check is performed later. It is a bit more complex as we need to convert the iceberg partition spec
-    /// to the MergeTree partition spec and compare the two.
+    /// For data lakes (Iceberg) the partition-key checks — both spec/transform
+    /// compatibility and ClickHouse partition-column exact-type equality — are
+    /// performed inside `verifyIcebergPartitionCompatibility` below (per partition).
+    /// For non-data-lake destinations we do the AST equivalence check here and
+    /// then run the partition-column exact-type check directly.
     if (!dest_storage->isDataLake())
     {
         if (query_to_string(src_snapshot->getPartitionKeyAST()) != query_to_string(destination_snapshot->getPartitionKeyAST()))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
+
+        /// EXPORT does not re-evaluate the partition key against the destination's schema:
+        /// the hive partition path is derived from the SOURCE part's minmax block in
+        /// `ExportPartTask::executeStep`, while the row data is CAST to destination types
+        /// by `addExportConvertingActions`. Reject castable type differences on
+        /// partition-key columns synchronously so the path and the row data cannot disagree.
+        ExportPartitionUtils::verifyPartitionColumnsExactTypeMatch(
+            src_snapshot, destination_snapshot, dest_storage->getStorageID());
     }
-    
 
     zkutil::ZooKeeperPtr zookeeper = getZooKeeperAndAssertNotReadonly();
 
@@ -8586,7 +8596,11 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
         const auto metadata_object = iceberg_metadata->getMetadataJSON(query_context);
 
         ExportPartitionUtils::verifyIcebergPartitionCompatibility(
-            metadata_object, src_snapshot->getPartitionKeyAST());
+            metadata_object,
+            src_snapshot->getPartitionKeyAST(),
+            src_snapshot,
+            destination_snapshot,
+            dest_storage->getStorageID());
 
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
