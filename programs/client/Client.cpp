@@ -375,21 +375,26 @@ try
     }
 
 #if USE_JWT_CPP && USE_SSL
-    if (config().has("jwt-command") && !config().has("jwt"))
+    if (config().has("jwt-command") && config().has("jwt"))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "jwt-command and jwt cannot both be specified");
+
+    if (config().has("jwt-command"))
     {
         int timeout = config().getInt("jwt-command-timeout", DEFAULT_JWT_COMMAND_TIMEOUT_SECONDS);
         if (timeout <= 0)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "jwt-command-timeout must be positive, got {}", timeout);
 
-        auto provider = std::make_shared<CommandJWTProvider>(config().getString("jwt-command"), timeout);
-        config().setString("jwt", provider->getJWT());
-        jwt_provider = std::move(provider);
+        jwt_provider = std::make_shared<CommandJWTProvider>(config().getString("jwt-command"), timeout);
+        config().setString("jwt", "");
     }
 
     if (config().getBool("cloud_oauth_pending", false) && !config().has("jwt"))
     {
         login();
     }
+#else
+    if (config().has("jwt-command") || config().has("jwt"))
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "JWT is disabled, because ClickHouse is built without JWT or SSL support");
 #endif
 
     bool asked_password = false;
