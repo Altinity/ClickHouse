@@ -353,35 +353,23 @@ std::optional<TTLDescription> selectTTLDescriptionForTTLInfos(const TTLDescripti
 
 std::optional<time_t> getPartitionExportTTLMax(
     const TTLDescription & desc,
-    const DataPartsVector & parts_in_partition,
-    std::vector<String> * missing_parts_out)
+    const DataPartsVector & parts_in_partition)
 {
     if (parts_in_partition.empty())
         return std::nullopt;
 
     time_t result = 0;
-    bool any_missing = false;
     const auto key = desc.getExportKey();
     for (const auto & part : parts_in_partition)
     {
         const auto & map = part->ttl_infos.export_ttl;
         auto it = map.find(key);
         if (it == map.end())
-        {
-            any_missing = true;
-            if (missing_parts_out)
-                missing_parts_out->push_back(part->name);
-            else
-                return std::nullopt;
-            continue;
-        }
+            return std::nullopt;
 
         if (it->second.max > result)
             result = it->second.max;
     }
-
-    if (any_missing)
-        return std::nullopt;
 
     return result;
 }

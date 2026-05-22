@@ -89,15 +89,13 @@ std::optional<TTLDescription> selectTTLDescriptionForTTLInfos(const TTLDescripti
 
 /// Returns the partition-wide max EXPORT TTL across all parts. Returns nullopt if any part lacks
 /// an entry for `desc.getExportKey()` — such parts predate the TTL and require `ALTER TABLE ...
-/// MATERIALIZE TTL` before the partition can be exported. Names of those parts are appended to
-/// `missing_parts_out` (if non-null) so the caller can log them.
+/// MATERIALIZE TTL` before the partition can be exported.
 class IMergeTreeDataPart;
 using DataPartPtr = std::shared_ptr<const IMergeTreeDataPart>;
 using DataPartsVector = std::vector<DataPartPtr>;
 
 std::optional<time_t> getPartitionExportTTLMax(
     const TTLDescription & desc,
-    const DataPartsVector & parts_in_partition,
-    std::vector<String> * missing_parts_out = nullptr);
+    const DataPartsVector & parts_in_partition);
 
 }
