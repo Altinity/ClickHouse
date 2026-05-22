@@ -15,7 +15,10 @@
 
 #if USE_AVRO
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
+#include <Storages/ObjectStorage/StorageObjectStorage.h>
+#include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
 #endif
 
 namespace ProfileEvents
@@ -39,6 +42,7 @@ namespace ErrorCodes
     extern const int NO_SUCH_DATA_PART;
     extern const int CORRUPTED_DATA;
     extern const int NETWORK_ERROR;
+    extern const int NOT_IMPLEMENTED;
 }
 
 namespace FailPoints
@@ -70,6 +74,34 @@ namespace ExportPartitionUtils
 
         if (ast_to_string(src_partition_key_ast) != ast_to_string(dest_metadata.getPartitionKeyAST()))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
+    }
+
+    void verifyIcebergPartitionCompatibilityAtDestination(
+        [[maybe_unused]] IStorage & dest_storage,
+        [[maybe_unused]] ContextPtr context,
+        [[maybe_unused]] const ASTPtr & src_partition_key_ast)
+    {
+#if USE_AVRO
+        auto * object_storage = dynamic_cast<StorageObjectStorage *>(&dest_storage);
+        auto * object_storage_cluster = dynamic_cast<StorageObjectStorageCluster *>(&dest_storage);
+        if (!object_storage && !object_storage_cluster)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Destination storage {} is not a StorageObjectStorage", dest_storage.getName());
+
+        IcebergMetadata * iceberg_metadata = nullptr;
+        if (object_storage)
+            iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage->getExternalMetadata(context));
+        else
+            iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage_cluster->getExternalMetadata(context));
+        if (!iceberg_metadata)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Destination storage {} is a data lake but not an iceberg table", dest_storage.getName());
+
+        const auto metadata_object = iceberg_metadata->getMetadataJSON(context);
+        verifyIcebergPartitionCompatibility(metadata_object, src_partition_key_ast);
+#else
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Data lake export requires Avro support");
+#endif
     }
 
     std::vector<Field> getPartitionValuesForIcebergCommit(

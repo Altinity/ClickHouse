@@ -27,15 +27,26 @@ namespace ExportPartitionUtils
     /// Verifies that the destination table is structurally compatible with the source so that
     /// `EXPORT PARTITION` (manual or TTL-driven) can succeed:
     ///   - source readable columns must equal destination insertable columns (ephemeral columns excluded);
-    ///   - for non-data-lake destinations, the partition key ASTs must match;
-    ///   - for data-lake destinations, partition-key compatibility is verified later at submission time
-    ///     by `verifyIcebergPartitionCompatibility` (it needs the runtime iceberg metadata).
+    ///   - for non-data-lake destinations, the partition key ASTs must match.
+    /// Iceberg partition-spec compatibility is NOT checked here — call
+    /// `verifyIcebergPartitionCompatibilityAtDestination` for that (it needs runtime iceberg metadata).
     /// Throws `INCOMPATIBLE_COLUMNS` or `BAD_ARGUMENTS` on mismatch.
     void verifyExportDestinationCompatibility(
         const ColumnsDescription & src_columns,
         const ASTPtr & src_partition_key_ast,
         const StorageInMemoryMetadata & dest_metadata,
         const IStorage & dest_storage);
+
+    /// Resolve the destination's Iceberg metadata at runtime and verify partition spec compatibility
+    /// with the source MergeTree partition key. Used at TTL DDL time to fast-fail before any data is
+    /// written; the submission paths keep their own inline verify against fresh metadata as a
+    /// moving-target defense (the iceberg spec can evolve between DDL and submit).
+    /// Throws `BAD_ARGUMENTS` if the destination is not iceberg or the spec doesn't align,
+    /// `NOT_IMPLEMENTED` when built without Avro.
+    void verifyIcebergPartitionCompatibilityAtDestination(
+        IStorage & dest_storage,
+        ContextPtr context,
+        const ASTPtr & src_partition_key_ast);
 
     std::vector<std::string> getExportedPaths(const LoggerPtr & log, const zkutil::ZooKeeperPtr & zk, const std::string & export_path);
 

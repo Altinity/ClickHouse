@@ -469,6 +469,9 @@ TTLTableDescription TTLTableDescription::getTTLForTableFromAST(
                     partition_key.definition_ast,
                     *dest_storage->getInMemoryMetadataPtr(),
                     *dest_storage);
+                if (dest_storage->isDataLake())
+                    ExportPartitionUtils::verifyIcebergPartitionCompatibilityAtDestination(
+                        *dest_storage, context, partition_key.definition_ast);
             }
 
             result.export_ttl.emplace_back(std::move(ttl));
