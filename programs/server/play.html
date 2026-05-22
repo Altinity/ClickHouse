@@ -563,6 +563,16 @@
             }
         }
 
+        /* Show keyboard focus clearly for download controls. */
+        #download-div:focus-visible,
+        #download-format:focus-visible,
+        #download-format-other:focus-visible,
+        #download-button:focus-visible
+        {
+            outline: 2px solid var(--border-color-selected);
+            outline-offset: 2px;
+        }
+
         #theme
         {
             grid-area: theme;
