@@ -723,7 +723,7 @@
             </a>
             <a id="cloud-logo" href="https://altinity.cloud/">&#9729;</a>
         </p>
-        <div id="download-dropdown">
+        <div id="download-dropdown" role="dialog" aria-label="Download query result">
             <div>
                 <div class="download-option">
                     <label for="download-format">Format:</label>
@@ -2969,6 +2969,8 @@ document.getElementById('download-div').addEventListener('click', function(e) {
 
         dropdown.style.top = (button_rect.top - context_rect.top) + 'px';
         dropdown.style.left = (button_rect.left - context_rect.left + button_rect.width - dropdown_rect.width) + 'px';
+
+        document.getElementById('download-format').focus();
     }
 });
 
@@ -2977,10 +2979,44 @@ document.getElementById('download-dropdown').addEventListener('click', function(
     e.stopPropagation();
 });
 
+// Keyboard handling inside the download dialog: focus trap + Escape to close
+document.getElementById('download-dropdown').addEventListener('keydown', function(e) {
+    const dropdown = document.getElementById('download-dropdown');
+    if (!dropdown.classList.contains('show')) return;
+
+    if (e.key === 'Escape') {
+        e.preventDefault();
+        dropdown.classList.remove('show');
+        document.getElementById('download-div').focus();
+        return;
+    }
+
+    if (e.key === 'Tab') {
+        const focusable = dropdown.querySelectorAll(
+            'select, input:not([type=hidden]), button, [tabindex]:not([tabindex="-1"])'
+        );
+        const visible = Array.from(focusable).filter(el => el.offsetParent !== null);
+        if (visible.length === 0) return;
+
+        const first = visible[0];
+        const last = visible[visible.length - 1];
+
+        if (e.shiftKey && document.activeElement === first) {
+            e.preventDefault();
+            last.focus();
+        } else if (!e.shiftKey && document.activeElement === last) {
+            e.preventDefault();
+            first.focus();
+        }
+    }
+});
+
 // Close dropdown when clicking outside
 document.addEventListener('click', function() {
     const dropdown = document.getElementById('download-dropdown');
-    dropdown.classList.remove('show');
+    if (dropdown.classList.contains('show')) {
+        dropdown.classList.remove('show');
+    }
 });
 
 // Handle "Other" format selection
@@ -3051,6 +3087,7 @@ document.getElementById('download-button').addEventListener('click', async funct
 
     // Close dropdown
     document.getElementById('download-dropdown').classList.remove('show');
+    document.getElementById('download-div').focus();
 });
 </script>
 </html>
