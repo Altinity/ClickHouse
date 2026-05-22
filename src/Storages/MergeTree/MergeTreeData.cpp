@@ -6743,7 +6743,12 @@ void MergeTreeData::exportPartToTable(
             metadata_object->stringify(oss);
             iceberg_metadata_json = oss.str();
 
-            ExportPartitionUtils::verifyIcebergPartitionCompatibility(metadata_object, source_metadata_ptr->getPartitionKeyAST());
+            ExportPartitionUtils::verifyIcebergPartitionCompatibility(
+                metadata_object,
+                source_metadata_ptr->getPartitionKeyAST(),
+                source_metadata_ptr,
+                destination_metadata_ptr,
+                dest_storage->getStorageID());
         }
 #else
         (void)iceberg_metadata_json_;
@@ -6770,12 +6775,23 @@ void MergeTreeData::exportPartToTable(
             query_context);
     }
 
-    /// for data lakes this check is performed differently. It is a bit more complex as we need to convert the iceberg partition spec
-    /// to the MergeTree partition spec and compare the two.
+    /// For data lakes (Iceberg) the partition-key checks — both spec/transform
+    /// compatibility and ClickHouse partition-column exact-type equality — are
+    /// performed inside `verifyIcebergPartitionCompatibility` above.
+    /// For non-data-lake destinations we do the AST equivalence check here and
+    /// then run the partition-column exact-type check directly.
     if (!dest_storage->isDataLake())
     {
         if (query_to_string(source_metadata_ptr->getPartitionKeyAST()) != query_to_string(destination_metadata_ptr->getPartitionKeyAST()))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
+
+        /// EXPORT does not re-evaluate the partition key against the destination's schema:
+        /// the hive partition path is derived from the SOURCE part's minmax block in
+        /// `ExportPartTask::executeStep`, while the row data is CAST to destination types
+        /// by `addExportConvertingActions`. Reject castable type differences on
+        /// partition-key columns synchronously so the path and the row data cannot disagree.
+        ExportPartitionUtils::verifyPartitionColumnsExactTypeMatch(
+            source_metadata_ptr, destination_metadata_ptr, dest_storage->getStorageID());
     }
 
     auto part = getPartIfExists(part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});

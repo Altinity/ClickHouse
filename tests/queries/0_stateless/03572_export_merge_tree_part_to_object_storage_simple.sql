@@ -1,6 +1,6 @@
 -- Tags: no-parallel, no-fasttest
 
-DROP TABLE IF EXISTS 03572_mt_table, 03572_invalid_schema_table, 03572_ephemeral_mt_table, 03572_matching_ephemeral_s3_table;
+DROP TABLE IF EXISTS 03572_mt_table, 03572_invalid_schema_table, 03572_ephemeral_mt_table, 03572_matching_ephemeral_s3_table, 03572_partition_type_mismatch_mt, 03572_partition_type_mismatch_s3;
 
 SET allow_experimental_export_merge_tree_part=1;
 
@@ -39,4 +39,16 @@ INSERT INTO 03572_ephemeral_mt_table (id, year, name) VALUES (1, 2020, 'alice');
 
 ALTER TABLE 03572_ephemeral_mt_table EXPORT PART '2020_1_1_0' TO TABLE 03572_matching_ephemeral_s3_table; -- {serverError NUMBER_OF_COLUMNS_DOESNT_MATCH}
 
-DROP TABLE IF EXISTS 03572_mt_table, 03572_invalid_schema_table, 03572_ephemeral_mt_table, 03572_matching_ephemeral_s3_table;
+-- Castable but non-equal partition-column types must be rejected synchronously.
+-- The partition path is computed from the source part's minmax block (SOURCE types)
+-- BEFORE row data is CAST to destination types — letting String -> UInt16 through
+-- would cause silent divergence between partition path and row values.
+CREATE TABLE 03572_partition_type_mismatch_mt (id UInt64, year String) ENGINE = MergeTree() PARTITION BY year ORDER BY tuple();
+CREATE TABLE 03572_partition_type_mismatch_s3 (id UInt64, year UInt16) ENGINE = S3(s3_conn, filename='03572_partition_type_mismatch_s3', format='Parquet', partition_strategy='hive') PARTITION BY year;
+
+-- Partition-column type mismatch is checked synchronously BEFORE the part lookup,
+-- so we don't need to insert data nor use a real part name to provoke it.
+ALTER TABLE 03572_partition_type_mismatch_mt EXPORT PART 'any_part_name' TO TABLE 03572_partition_type_mismatch_s3
+SETTINGS allow_experimental_export_merge_tree_part = 1; -- {serverError BAD_ARGUMENTS}
+
+DROP TABLE IF EXISTS 03572_mt_table, 03572_invalid_schema_table, 03572_ephemeral_mt_table, 03572_matching_ephemeral_s3_table, 03572_partition_type_mismatch_mt, 03572_partition_type_mismatch_s3;

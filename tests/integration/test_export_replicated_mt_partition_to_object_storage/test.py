@@ -1532,6 +1532,119 @@ def test_export_partition_all(cluster):
     assert row_count == 3, f"Expected 3 rows in S3 after EXPORT PARTITION ALL, got {row_count}"
 
 
+def test_export_partition_partition_column_castable_type_mismatch(cluster):
+    """
+    Post-fix contract: EXPORT PARTITION must reject castable but non-equal
+    partition-column types synchronously.
+
+    Setup
+    -----
+        * Source (ReplicatedMergeTree): ``id UInt64, year String``,
+          ``PARTITION BY year``
+        * Destination (S3, partition_strategy='hive'): ``id UInt64,
+          year UInt16``, ``PARTITION BY year``
+
+    Why the synchronous rejection is required
+    -----------------------------------------
+    ``makeConvertingActions(Position)`` accepts ``String -> UInt16`` and the
+    PARTITION BY ASTs are textually identical, so the schema/AST validators
+    would let this through.  But EXPORT does not re-evaluate the partition
+    key against the destination's schema: in ``ExportPartTask::executeStep``
+    the block fed to ``destination_storage->import`` is built from the
+    source part's minmax index (SOURCE types).  If we let the export proceed
+    the hive partition path is computed from the un-cast SOURCE value while
+    the row data is the CAST value — silent divergence from INSERT SELECT.
+    The exact-type partition-column check in
+    ``ExportPartitionUtils::verifyPartitionColumnsExactTypeMatch`` rejects
+    this pairing at ALTER time.
+
+    Assertions
+    ----------
+        * ``ALTER ... EXPORT PARTITION ID '<id>' TO TABLE ...`` raises a
+          ``BAD_ARGUMENTS`` exception whose text references the partition
+          column type mismatch.
+        * No row is created in ``system.replicated_partition_exports`` for
+          this (source_table, destination_table, partition_id) — nothing
+          was ever scheduled.
+        * No parquet file is written under any ``year=*/`` prefix in S3.
+    """
+    skip_if_remote_database_disk_enabled(cluster)
+    node = cluster.instances["replica1"]
+
+    postfix = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"pkey_cast_mismatch_partition_mt_{postfix}"
+    s3_table = f"pkey_cast_mismatch_partition_s3_{postfix}"
+
+    # Source: year String; destination: year UInt16. PARTITION BY year on
+    # both sides — same AST text — to defeat the AST equivalence check.
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, year String) "
+        f"ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1') "
+        f"PARTITION BY year "
+        f"ORDER BY tuple()"
+    )
+    node.query(
+        f"CREATE TABLE {s3_table} (id UInt64, year UInt16) "
+        f"ENGINE = S3(s3_conn, filename='{s3_table}', "
+        f"format=Parquet, partition_strategy='hive') "
+        f"PARTITION BY year"
+    )
+
+    node.query(
+        f"INSERT INTO {mt_table} VALUES (1, '2020'), (2, '2020'), (3, '2020')"
+    )
+
+    # With a String partition column the partition_id is the SipHash of the
+    # value rather than the textual representation — look it up so we can
+    # reference the partition explicitly in EXPORT PARTITION ID and in
+    # subsequent system.replicated_partition_exports queries.
+    partition_id = node.query(
+        f"SELECT partition_id FROM system.parts "
+        f"WHERE database = currentDatabase() AND table = '{mt_table}' "
+        f"  AND active "
+        f"ORDER BY name LIMIT 1"
+    ).strip()
+    assert partition_id, (
+        "Expected one active part on the source table after INSERT; "
+        "system.parts returned nothing."
+    )
+
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{partition_id}' "
+        f"TO TABLE {s3_table}"
+    )
+    assert "BAD_ARGUMENTS" in error, (
+        f"Expected BAD_ARGUMENTS for partition-column type mismatch, "
+        f"got: {error!r}"
+    )
+    assert "partition key column 'year'" in error, (
+        f"Expected the error message to identify the offending partition "
+        f"column 'year', got: {error!r}"
+    )
+
+    # Nothing scheduled: no row in system.replicated_partition_exports.
+    rows_in_system_view = node.query(
+        f"SELECT count() FROM system.replicated_partition_exports "
+        f"WHERE source_table = '{mt_table}' "
+        f"  AND destination_table = '{s3_table}' "
+        f"  AND partition_id = '{partition_id}'"
+    ).strip()
+    assert rows_in_system_view == "0", (
+        f"Expected no row in system.replicated_partition_exports after a "
+        f"synchronously-rejected export, got {rows_in_system_view}."
+    )
+
+    # Nothing written: no parquet file under any year=*/ partition prefix.
+    files_in_s3 = node.query(
+        f"SELECT count() FROM s3(s3_conn, "
+        f"filename='{s3_table}/year=*/*.parquet', format='One')"
+    ).strip()
+    assert files_in_s3 == "0", (
+        f"Expected no Parquet files in S3 after a synchronously-rejected "
+        f"export, found {files_in_s3}."
+    )
+
+
 def test_export_partition_all_failure_modes(cluster):
     """Cover the three values of `export_merge_tree_partition_all_on_error`.
 

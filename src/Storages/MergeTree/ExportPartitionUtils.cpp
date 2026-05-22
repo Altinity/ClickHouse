@@ -403,8 +403,18 @@ namespace ExportPartitionUtils
 #if USE_AVRO
     void verifyIcebergPartitionCompatibility(
         const Poco::JSON::Object::Ptr & metadata_object,
-        const ASTPtr & partition_key_ast)
+        const ASTPtr & partition_key_ast,
+        const StorageMetadataPtr & source_metadata,
+        const StorageMetadataPtr & destination_metadata,
+        const StorageID & destination_storage_id)
     {
+        /// The Iceberg manifest's partition values are derived from the SOURCE
+        /// part's minmax block (see `IcebergMetadata::commitExportPartitionTransaction`)
+        /// while the row data is CAST to the destination Iceberg schema by
+        /// `addExportConvertingActions`. Reject castable type differences on
+        /// partition-key columns up front so the two cannot disagree.
+        verifyPartitionColumnsExactTypeMatch(source_metadata, destination_metadata, destination_storage_id);
+
         const auto original_schema_id = metadata_object->getValue<Int64>(Iceberg::f_current_schema_id);
         const auto partition_spec_id  = metadata_object->getValue<Int64>(Iceberg::f_default_spec_id);
 
@@ -519,6 +529,54 @@ namespace ExportPartitionUtils
         }
     }
 #endif
+
+    void verifyPartitionColumnsExactTypeMatch(
+        const StorageMetadataPtr & source_metadata,
+        const StorageMetadataPtr & destination_metadata,
+        const StorageID & destination_storage_id)
+    {
+        if (!source_metadata->hasPartitionKey())
+            return;
+
+        /// Use the partition expression's required columns (the ones that flow
+        /// into the destination's partition strategy via
+        /// `minmax_idx->getBlock(storage)`), not the partition expression's
+        /// sample-block output columns.  This catches both identity
+        /// partitioning (`PARTITION BY year`) and computed partitioning
+        /// (`PARTITION BY toYearNumSinceEpoch(event_date)` — required column
+        /// is `event_date`).
+        const auto required_columns
+            = source_metadata->getPartitionKey().expression->getRequiredColumnsWithTypes();
+
+        const auto & destination_columns = destination_metadata->getColumns();
+
+        for (const auto & source_column : required_columns)
+        {
+            if (!destination_columns.has(source_column.name))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export partition: source partition key references column '{}' "
+                    "which does not exist on the destination table {}. "
+                    "EXPORT does not re-evaluate the partition key against the destination's schema, "
+                    "so every column the source partition expression depends on must be present "
+                    "on the destination with the same type.",
+                    source_column.name, destination_storage_id.getFullTableName());
+
+            const auto destination_type
+                = destination_columns.getPhysical(source_column.name).type;
+            if (!source_column.type->equals(*destination_type))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export partition: partition key column '{}' has type {} on the source "
+                    "but {} on the destination table {}. "
+                    "EXPORT does not re-evaluate the partition key against the destination's schema, "
+                    "so castable type differences are not allowed for partition columns "
+                    "(the partition path and any Iceberg partition values are derived from the "
+                    "source-typed minmax block, while the row data is CAST to the destination type).",
+                    source_column.name,
+                    source_column.type->getName(),
+                    destination_type->getName(),
+                    destination_storage_id.getFullTableName());
+        }
+    }
 }
 
 }
