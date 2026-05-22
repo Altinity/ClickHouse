@@ -496,3 +496,53 @@ def test_no_pingpong_on_equal_expiration_max(cluster):
     # Destination has exactly one row per partition — no replay.
     rows = int(node.query(f"SELECT count() FROM {dst}").strip())
     assert rows == 2, f"destination row count {rows} (expected 2 — replay happened)"
+
+
+def test_destination_schema_incompatible_blocks_export(cluster):
+    """If the destination's schema becomes incompatible between TTL DDL and the first
+    scheduler submission (here: dropped and recreated with an extra column), the
+    submission-time `verifyExportDestinationCompatibility` rejects the attempt before
+    any manifest is created. No data is written, the server stays healthy across
+    repeated rejected ticks, and the failure surfaces in the server log under the
+    scheduler's named logger (`<src> (TTLExport)`).
+    """
+    node = cluster.instances["replica1"]
+    uid = unique_suffix()
+    src = f"src_{uid}"
+    dst = f"dst_{uid}"
+
+    create_s3_dst(node, dst)
+    create_rmt_with_export_ttl(node, src, dst)
+
+    # Drop and recreate the destination with an extra column. The source's TTL still
+    # references `dst` by name but the schemas no longer match.
+    node.query(f"DROP TABLE {dst} SYNC")
+    node.query(
+        f"""
+        CREATE TABLE {dst} (event_date Date, id UInt64, year UInt16, extra String)
+        ENGINE = S3(s3_conn, filename='{dst}', format=Parquet, partition_strategy='hive')
+        PARTITION BY year
+        """
+    )
+
+    insert_expired_partition(node, src, 2000, [1, 2])
+
+    # Operator-visible signal: the scheduler logs the submission failure under its named
+    # logger. The logger name embeds the table UUID between the table name and `(TTLExport)`,
+    # so use a regex that bridges it. `wait_for_log_line` returns once the message appears
+    # (which also proves the scheduler ticked at least once and the verify rejected the submit).
+    assert node.wait_for_log_line(
+        rf"{src}.*\(TTLExport\): TTL export submission failed",
+        timeout=30,
+    )
+
+    # No manifest was created — the throw at `verifyExportDestinationCompatibility` fires
+    # before any ZK write in `exportPartitionToTable`.
+    n = int(node.query(
+        f"SELECT count() FROM system.replicated_partition_exports"
+        f" WHERE source_table = '{src}' AND destination_table = '{dst}'"
+    ).strip())
+    assert n == 0, f"export created {n} manifest(s) despite incompatible destination"
+
+    # Sanity: server still alive after repeated rejected submissions.
+    assert node.query("SELECT 1").strip() == "1"
