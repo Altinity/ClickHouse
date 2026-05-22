@@ -75,7 +75,7 @@ def test_log_family_s3(cluster, log_engine, files_overhead, files_overhead_per_i
         node.query("TRUNCATE TABLE s3_test")
         wait_blobs_count_synchronization(cluster.minio_client, 0)
     finally:
-        node.query("DROP TABLE s3_test")
+        node.query("DROP TABLE s3_test SYNC")
 
 
 # Imitate case when error occurs while inserting into table.
@@ -111,4 +111,4 @@ def test_stripe_log_truncate(cluster):
     node.query("DETACH TABLE stripe_table")
     node.query("ATTACH TABLE stripe_table")
 
-    assert node.query("DROP TABLE stripe_table") == ""
+    assert node.query("DROP TABLE stripe_table SYNC") == ""

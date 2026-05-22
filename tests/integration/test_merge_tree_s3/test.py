@@ -668,6 +668,7 @@ def test_freeze_system_unfreeze(cluster, node_name):
 @pytest.mark.parametrize("node_name", ["node"])
 def test_s3_disk_apply_new_settings(cluster, node_name):
     node = cluster.instances[node_name]
+    check_no_objects_after_drop(cluster)
     create_table(node, "s3_test")
 
     config_path = os.path.join(
