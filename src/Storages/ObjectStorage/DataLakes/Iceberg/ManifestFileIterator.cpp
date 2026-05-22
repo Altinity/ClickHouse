@@ -6,6 +6,7 @@
 #include <compare>
 #include <optional>
 
+#include <Interpreters/Context.h>
 #include <Interpreters/IcebergMetadataLog.h>
 
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
@@ -15,6 +16,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PositionDeleteTransform.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 
+#include <Core/Settings.h>
 #include <Core/TypeId.h>
 #include <DataTypes/DataTypesDecimal.h>
 #include <Poco/JSON/Parser.h>
@@ -33,6 +35,11 @@ namespace DB::ErrorCodes
     extern const int ICEBERG_SPECIFICATION_VIOLATION;
     extern const int LOGICAL_ERROR;
     extern const int BAD_ARGUMENTS;
+}
+
+namespace DB::Setting
+{
+    extern const SettingsTimezone iceberg_partition_timezone;
 }
 
 namespace ProfileEvents
@@ -152,9 +159,10 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
     std::shared_ptr<const ActionsDAG> filter_dag_,
     Int32 table_snapshot_schema_id_)
 {
+    auto dump_metadata = [&]()->String { return manifest_file_deserializer_->getMetadataContent(); };
     insertRowToLogTable(
         context_,
-        manifest_file_deserializer_->getMetadataContent(),
+        dump_metadata,
         DB::IcebergMetadataLogLevel::ManifestFileMetadata,
         common_path_,
         path_to_manifest_file_,
@@ -199,7 +207,7 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
     const Poco::JSON::Object::Ptr & schema_object = json.extract<Poco::JSON::Object::Ptr>();
     Int32 manifest_schema_id = schema_object->getValue<int>(f_schema_id);
 
-    schema_processor.addIcebergTableSchema(schema_object);
+    schema_processor.addIcebergTableSchema(schema_object, context_);
 
     PartitionSpecification partition_spec_vec;
     for (size_t i = 0; i != partition_specification->size(); ++i)
@@ -217,7 +225,7 @@ std::shared_ptr<ManifestFileIterator> ManifestFileIterator::create(
         auto transform_name = partition_specification_field->getValue<String>(f_partition_transform);
         auto partition_name = partition_specification_field->getValue<String>(f_partition_name);
         partition_spec_vec.emplace_back(source_id, transform_name, partition_name);
-        auto partition_ast = getASTFromTransform(transform_name, numeric_column_name);
+        auto partition_ast = getASTFromTransform(transform_name, numeric_column_name, context_->getSettingsRef()[Setting::iceberg_partition_timezone]);
         /// Unsupported partition key expression
         if (partition_ast == nullptr)
             continue;
@@ -304,9 +312,10 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
 
     if (parsed_entry->status == ManifestEntryStatus::DELETED)
     {
+        auto dump_metadata = [&]()->String { return manifest_file_deserializer->getContent(row_index); };
         insertRowToLogTable(
             context,
-            manifest_file_deserializer->getContent(row_index),
+            dump_metadata,
             DB::IcebergMetadataLogLevel::ManifestFileEntry,
             common_path,
             path_to_manifest_file,
@@ -338,20 +347,19 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
     const auto schema_id_opt = schema_processor_ptr->tryGetSchemaIdForSnapshot(resolved_snapshot_id);
     if (!schema_id_opt.has_value())
     {
-        /// Error logged but not thrown to avoid breaking whole query because of backward compatibility reasons.
-        /// That's actually an error because it can lead to incorrect query results, so we are creating an exception to put it to system.error_log.
-        try
-        {
-            throw Exception(
-                ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION,
-                "Cannot read Iceberg table: manifest file '{}' has entry with snapshot_id '{}' for which write file schema is unknown",
-                manifest_file_name,
-                resolved_snapshot_id);
-        }
-        catch (const Exception &)
-        {
-            tryLogCurrentException("ICEBERG_SPECIFICATION_VIOLATION", "", LogsLevel::error);
-        }
+        /// This is expected when the referenced snapshot was expired by the catalog (snapshot expiry is a
+        /// normal Iceberg housekeeping operation). For example, after a compaction ("replace" operation),
+        /// the new snapshot's manifest list inherits manifests from the now-expired parent snapshot, and
+        /// those manifests still carry the original snapshot_id. The manifest file's own Avro header
+        /// records the correct schema_id for the data files it describes, so falling back to
+        /// manifest_schema_id is safe and correct in this case.
+        LOG_DEBUG(
+            getLogger("ManifestFileIterator"),
+            "Manifest file '{}' has entry with snapshot_id '{}' whose snapshot metadata is not present "
+            "(snapshot may have been expired by the catalog). Falling back to manifest schema_id {}.",
+            path_to_manifest_file,
+            resolved_snapshot_id,
+            manifest_schema_id);
     }
     const auto resolved_schema_id = schema_id_opt.has_value() ? *schema_id_opt : manifest_schema_id;
 
@@ -418,9 +426,10 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
         const ManifestFilesPruner * current_pruner = getOrCreatePruner(entry->resolved_schema_id);
         pruning_status = current_pruner->canBePruned(entry, hyperrectangles);
     }
+    auto dump_metadata = [&]()->String { return manifest_file_deserializer->getContent(row_index); };
     insertRowToLogTable(
         context,
-        manifest_file_deserializer->getContent(row_index),
+        dump_metadata,
         DB::IcebergMetadataLogLevel::ManifestFileEntry,
         common_path,
         path_to_manifest_file,

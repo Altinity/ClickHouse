@@ -135,6 +135,7 @@
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/ReplicatedMergeTreeLogEntry.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
+#include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
 #include <IO/SharedThreadPools.h>
 
 #include <base/types.h>
@@ -224,7 +225,7 @@ namespace Setting
     extern const SettingsUInt64 export_merge_tree_part_max_rows_per_file;
     extern const SettingsBool export_merge_tree_part_throw_on_pending_mutations;
     extern const SettingsBool export_merge_tree_part_throw_on_pending_patch_parts;
-    extern const SettingsBool export_merge_tree_partition_lock_inside_the_task;
+    extern const SettingsExportPartitionAllOnError export_merge_tree_partition_all_on_error;
     extern const SettingsString export_merge_tree_part_filename_pattern;
     extern const SettingsBool write_full_path_in_iceberg_metadata;
     extern const SettingsBool allow_insert_into_iceberg;
@@ -341,6 +342,8 @@ namespace ErrorCodes
     extern const int TIMEOUT_EXCEEDED;
     extern const int INVALID_SETTING_VALUE;
     extern const int PENDING_MUTATIONS_NOT_ALLOWED;
+    extern const int EXPORT_PARTITION_ALREADY_EXPORTED;
+    extern const int PARTITION_EXPORT_FAILED;
 }
 
 namespace ServerSetting
@@ -4649,17 +4652,9 @@ void StorageReplicatedMergeTree::exportMergeTreePartitionStatusHandlingTask()
     }
 }
 
-std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartitionExportsInfo(bool prefer_remote_information) const
+std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartitionExportsInfo() const
 {
-    /// Called from a query thread (system.replicated_partition_exports), which does not have a component set.
-    auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::getPartitionExportsInfo");
-
-    if (prefer_remote_information && getZooKeeper()->isFeatureEnabled(DB::KeeperFeatureFlag::MULTI_READ))
-    {
-        return export_merge_tree_partition_manifest_updater->getPartitionExportsInfo();
-    }
-
-    return export_merge_tree_partition_manifest_updater->getPartitionExportsInfoLocal();
+    return export_merge_tree_partition_manifest_updater->getPartitionExportsInfo();
 }
 
 StorageReplicatedMergeTree::CreateMergeEntryResult StorageReplicatedMergeTree::createLogEntryToMergeParts(
@@ -8296,6 +8291,82 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
             "If you are exporting to an Apache Iceberg table, you also need to enable the setting `allow_experimental_insert_into_iceberg` on all replicas. The same goes for `allow_experimental_export_merge_tree_part`");
     }
 
+    /// EXPORT PARTITION ALL: expand into one sub-call per active partition id.
+    /// Failure handling is controlled by `export_merge_tree_partition_all_on_error`.
+    if (const auto * partition_ast = command.partition->as<ASTPartition>(); partition_ast && partition_ast->all)
+    {
+        auto partition_id_set = getAllPartitionIds();
+        if (partition_id_set.empty())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                            "Table {} has no active partitions to export",
+                            getStorageID().getNameForLogs());
+
+        /// Sort for deterministic ordering (so failure messages and tests are stable).
+        std::vector<String> partition_ids(partition_id_set.begin(), partition_id_set.end());
+        std::sort(partition_ids.begin(), partition_ids.end());
+
+        const auto & on_error_setting = query_context->getSettingsRef()[Setting::export_merge_tree_partition_all_on_error];
+        const ExportPartitionAllOnError on_error = on_error_setting.value;
+
+        LOG_INFO(log, "EXPORT PARTITION ALL: scheduling export for {} partitions, on_error={}",
+                 partition_ids.size(), on_error_setting.toString());
+
+        std::vector<std::pair<String, String>> failures; /// (partition_id, message)
+        size_t skipped_conflicts = 0;
+
+        for (const auto & partition_id : partition_ids)
+        {
+            PartitionCommand sub = command;
+            auto synthetic = make_intrusive<ASTPartition>();
+            synthetic->setPartitionID(make_intrusive<ASTLiteral>(partition_id));
+            sub.partition = synthetic;
+
+            try
+            {
+                exportPartitionToTable(sub, query_context);
+            }
+            catch (const Exception & e)
+            {
+                switch (on_error)
+                {
+                    case ExportPartitionAllOnError::throw_first:
+                        throw;
+                    case ExportPartitionAllOnError::skip_conflicts:
+                        if (e.code() == ErrorCodes::EXPORT_PARTITION_ALREADY_EXPORTED)
+                        {
+                            ++skipped_conflicts;
+                            LOG_INFO(log,
+                                     "EXPORT PARTITION ALL: skipping partition {} (already exported / concurrent): {}",
+                                     partition_id, e.message());
+                            break;
+                        }
+                        throw;
+                    case ExportPartitionAllOnError::collect:
+                        LOG_WARNING(log, "EXPORT PARTITION ALL: partition {} failed: {}",
+                                    partition_id, e.message());
+                        failures.emplace_back(partition_id, e.message());
+                        break;
+                }
+            }
+        }
+
+        if (!failures.empty())
+        {
+            String aggregated = fmt::format(
+                "EXPORT PARTITION ALL: {}/{} partitions failed to schedule. Per-partition errors:",
+                failures.size(), partition_ids.size());
+            for (const auto & [pid, msg] : failures)
+                aggregated += fmt::format("\n  {}: {}", pid, msg);
+            throw Exception(ErrorCodes::PARTITION_EXPORT_FAILED, "{}", aggregated);
+        }
+
+        if (skipped_conflicts > 0)
+            LOG_INFO(log, "EXPORT PARTITION ALL: skipped {} partitions due to existing exports",
+                     skipped_conflicts);
+
+        return;
+    }
+
     const auto dest_database = query_context->resolveDatabase(command.to_database);
     const auto dest_table = command.to_table;
     const auto dest_storage_id = StorageID(dest_database, dest_table);
@@ -8389,7 +8460,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 
         if (!has_expired && !query_context->getSettingsRef()[Setting::export_merge_tree_partition_force_export])
         {
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Export with key {} already exported or it is being exported, and it has not expired. Set `export_merge_tree_partition_force_export` to overwrite it.", export_key);
+            throw Exception(ErrorCodes::EXPORT_PARTITION_ALREADY_EXPORTED, "Export with key {} already exported or it is being exported, and it has not expired. Set `export_merge_tree_partition_force_export` to overwrite it.", export_key);
         }
 
         LOG_INFO(log, "Overwriting export with key {}", export_key);
@@ -8424,7 +8495,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     MergeTreeData::IMutationsSnapshot::Params mutations_snapshot_params
     {
         .metadata_version = getInMemoryMetadataPtr()->getMetadataVersion(),
-        .min_part_metadata_version = MergeTreeData::getMinMetadataVersion(parts),
+        .min_part_metadata_version = MergeTreeData::getPartsSnapshotInfo(parts).min_metadata_version,
         .need_data_mutations = throw_on_pending_mutations,
         .need_alter_mutations = throw_on_pending_mutations || throw_on_pending_patch_parts,
         .need_patch_parts = throw_on_pending_patch_parts,
@@ -8478,7 +8549,6 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     manifest.parquet_parallel_encoding = query_context->getSettingsRef()[Setting::output_format_parquet_parallel_encoding];
     manifest.max_bytes_per_file = query_context->getSettingsRef()[Setting::export_merge_tree_part_max_bytes_per_file];
     manifest.max_rows_per_file = query_context->getSettingsRef()[Setting::export_merge_tree_part_max_rows_per_file];
-    manifest.lock_inside_the_task = query_context->getSettingsRef()[Setting::export_merge_tree_partition_lock_inside_the_task];
 
     manifest.file_already_exists_policy = query_context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value;
     manifest.filename_pattern = query_context->getSettingsRef()[Setting::export_merge_tree_part_filename_pattern].value;
@@ -8488,14 +8558,19 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     {
 #if USE_AVRO
         auto * object_storage = dynamic_cast<StorageObjectStorage *>(dest_storage.get());
+        auto * object_storage_cluster = dynamic_cast<StorageObjectStorageCluster *>(dest_storage.get());
 
         /// in theory this should never happen, but just in case
-        if (!object_storage)
+        if (!object_storage && !object_storage_cluster)
         {
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Destination storage {} is not a StorageObjectStorage", dest_storage->getName());
         }
 
-        auto * iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage->getExternalMetadata(query_context));
+        IcebergMetadata * iceberg_metadata = nullptr;
+        if (object_storage)
+            iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage->getExternalMetadata(query_context));
+        else if (object_storage_cluster)
+            iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage_cluster->getExternalMetadata(query_context));
         if (!iceberg_metadata)
         {
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Destination storage {} is a data lake but not an iceberg table", dest_storage->getName());
@@ -8531,9 +8606,11 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
         manifest.toJsonString(), 
         zkutil::CreateMode::Persistent));
 
+    /// Container for per-replica last_exception leaves; children are created lazily by the
+    /// first writer per replica (see ExportPartitionUtils::appendExceptionOps).
     ops.emplace_back(zkutil::makeCreateRequest(
-        fs::path(partition_exports_path) / "exceptions_per_replica", 
-        "", 
+        fs::path(partition_exports_path) / "last_exception",
+        "",
         zkutil::CreateMode::Persistent));
 
     ops.emplace_back(zkutil::makeCreateRequest(
@@ -8582,7 +8659,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
         {
             /// Lost the race on the root export node. Current code already
             /// validated (exists / expired / force) — so this is *always* a race.
-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            throw Exception(ErrorCodes::EXPORT_PARTITION_ALREADY_EXPORTED,
                 "Export with key {} was created concurrently by another replica. Retry if needed",
                 export_key);
         }
@@ -8920,11 +8997,6 @@ QueryPipeline StorageReplicatedMergeTree::updateLightweight(const MutationComman
     chassert(!pipeline.completed());
     pipeline.complete(std::move(sink));
     return pipeline;
-}
-
-bool StorageReplicatedMergeTree::hasLightweightDeletedMask() const
-{
-    return has_lightweight_delete_parts.load(std::memory_order_relaxed);
 }
 
 size_t StorageReplicatedMergeTree::clearOldPartsAndRemoveFromZK()

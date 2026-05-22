@@ -200,8 +200,6 @@ public:
     bool haveCommittingOps(const CommittingBlocks & committing_blocks, PartitionIdToMaxBlockPtr partitions, std::set<CommittingBlock::Op> ops) const;
     void waitForCommittingOpsToFinish(zkutil::ZooKeeperPtr zookeeper, PartitionIdToMaxBlockPtr partitions, std::set<CommittingBlock::Op> ops, size_t backoff_ms, size_t sync_timeout_ms);
 
-    bool hasLightweightDeletedMask() const override;
-
     /** Removes a replica from ZooKeeper. If there are no other replicas, it deletes the entire table from ZooKeeper.
       */
     void drop() override;
@@ -377,7 +375,7 @@ public:
     using ShutdownDeadline = std::chrono::time_point<std::chrono::system_clock>;
     void waitForUniquePartsToBeFetchedByOtherReplicas(ShutdownDeadline shutdown_deadline);
 
-    std::vector<ReplicatedPartitionExportInfo> getPartitionExportsInfo(bool prefer_remote_information) const;
+    std::vector<ReplicatedPartitionExportInfo> getPartitionExportsInfo() const;
 
 private:
     std::atomic_bool are_restoring_replica {false};
@@ -405,7 +403,6 @@ private:
     friend class ReplicatedMergeMutateTaskBase;
     friend class ExportPartitionManifestUpdatingTask;
     friend class ExportPartitionTaskScheduler;
-    friend class ExportPartFromPartitionExportTask;
 
     using MergeStrategyPicker = ReplicatedMergeTreeMergeStrategyPicker;
     using LogEntry = ReplicatedMergeTreeLogEntry;

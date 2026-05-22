@@ -63,6 +63,7 @@ public:
         const String & name,
         bool /*sync*/) override;
 
+    std::shared_ptr<DataLake::ICatalog> getCatalog() const;
 protected:
     ASTPtr getCreateDatabaseQueryImpl() const override TSA_REQUIRES(mutex);
     ASTPtr getCreateTableQueryImpl(const String & table_name, ContextPtr context, bool throw_on_error) const override;
@@ -82,9 +83,8 @@ private:
     mutable std::shared_ptr<DataLake::ICatalog> catalog_impl;
 
     void validateSettings();
-    std::shared_ptr<DataLake::ICatalog> getCatalog() const;
 
-    std::shared_ptr<StorageObjectStorageConfiguration> getConfiguration(
+    StorageObjectStorageConfigurationPtr getConfiguration(
         DatabaseDataLakeStorageType type,
         DataLakeStorageSettingsPtr storage_settings) const;
 

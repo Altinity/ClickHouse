@@ -16,6 +16,7 @@ from pyiceberg.schema import Schema
 from pyiceberg.table.sorting import SortField, SortOrder
 from pyiceberg.transforms import DayTransform, IdentityTransform
 from helpers.config_cluster import minio_access_key, minio_secret_key
+from helpers.test_tools import TSV
 import decimal
 from pyiceberg.types import (
     DoubleType,
@@ -209,33 +210,29 @@ def create_clickhouse_glue_database(
     node.query(
         f"""
 DROP DATABASE IF EXISTS {name};
-SET allow_database_glue_catalog=true;
-SET write_full_path_in_iceberg_metadata=true;
 CREATE DATABASE {name} ENGINE = DataLakeCatalog('{BASE_URL}'{credential_args})
 SETTINGS {",".join((k+"="+repr(v) for k, v in settings.items()))}
-    """
+    """,
+        settings={
+            "allow_database_glue_catalog": 1,
+            "write_full_path_in_iceberg_metadata": 1,
+        },
     )
 
 def create_clickhouse_glue_table(
     started_cluster, node, database_name, table_name, schema, additional_settings={}
 ):
-    settings = {
-        "storage_catalog_type": "glue",
-        "storage_warehouse": "test",
-        "object_storage_endpoint": "http://minio:9000/warehouse-glue",
-        "storage_region": "us-east-1",
-        "storage_catalog_url" : BASE_URL
-    }
-
-    settings.update(additional_settings)
+    settings_suffix = "" if len(additional_settings) == 0 else f"SETTINGS {",".join((k+"="+repr(v) for k, v in additional_settings.items()))}"
 
     node.query(
         f"""
-SET allow_experimental_database_glue_catalog=true;
-SET write_full_path_in_iceberg_metadata=true;
 CREATE TABLE {CATALOG_NAME}.`{database_name}.{table_name}` {schema} ENGINE = IcebergS3('http://minio:9000/warehouse-glue/{table_name}/', '{minio_access_key}', '{minio_secret_key}')
-SETTINGS {",".join((k+"="+repr(v) for k, v in settings.items()))}
-    """
+{settings_suffix}
+""",
+        settings={
+            "allow_experimental_database_glue_catalog": 1,
+            "write_full_path_in_iceberg_metadata": 1,
+        },
     )
 
     show_result = node.query(f"SHOW DATABASE {CATALOG_NAME}")
@@ -789,6 +786,44 @@ def test_table_without_metadata_location(started_cluster):
     node.query(f"DROP DATABASE IF EXISTS {db_name} SYNC")
 
 
+def test_namespace_filter(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    # Use the same table name in all namespaces
+    table_name = f"table_{uuid.uuid4()}"
+    table2_name = f"table2_{uuid.uuid4()}"
+    namespace_prefix = f"namespace_{uuid.uuid4()}_"
+
+    catalog = load_catalog_impl(started_cluster)
+
+    def create_namespace(suffix):
+        namespace = f"{namespace_prefix}{suffix}"
+        catalog.create_namespace(namespace)
+        create_table(catalog, namespace, table_name, DEFAULT_SCHEMA, PartitionSpec(), DEFAULT_SORT_ORDER)
+
+    create_namespace("alpha");
+    create_namespace("bravo");
+
+    create_clickhouse_glue_database(started_cluster, node, CATALOG_NAME,
+                                    additional_settings={
+                                        "namespaces": f"{namespace_prefix}alpha"
+                                    })
+
+    assert node.query(f"SELECT name FROM system.tables WHERE database='{CATALOG_NAME}' ORDER BY name", settings={"show_data_lake_catalogs_in_system_tables": 1}) == TSV(
+        [
+            [f"{namespace_prefix}alpha.{table_name}"],
+        ])
+
+    assert node.query(f"SELECT count() FROM {CATALOG_NAME}.`{namespace_prefix}alpha.{table_name}`") == "0\n"
+    assert "is filtered by `namespaces` database parameter." in node.query_and_get_error(f"SELECT count() FROM {CATALOG_NAME}.`{namespace_prefix}bravo.{table_name}`")
+
+    node.query(f"CREATE TABLE {CATALOG_NAME}.`{namespace_prefix}alpha.{table2_name}` (x String) ENGINE = IcebergS3('http://minio:9000/warehouse-glue/{namespace_prefix}alpha/a1/{table2_name}/', '{minio_access_key}', '{minio_secret_key}')")
+    assert "is filtered by `namespaces` database parameter." in node.query_and_get_error(f"CREATE TABLE {CATALOG_NAME}.`{namespace_prefix}bravo.{table2_name}` (x String) ENGINE = IcebergS3('http://minio:9000/warehouse-glue/{namespace_prefix}bravo/{table2_name}/', '{minio_access_key}', '{minio_secret_key}')")
+
+    node.query(f"DROP TABLE {CATALOG_NAME}.`{namespace_prefix}alpha.{table_name}`")
+    assert "is filtered by `namespaces` database parameter." in node.query_and_get_error(f"DROP TABLE {CATALOG_NAME}.`{namespace_prefix}bravo.{table_name}`")
+
+    
 def test_sts_smoke(started_cluster):
     """Test that STS authentication works with Glue catalog using role_arn and role_session_name"""
     node = started_cluster.instances["node1"]

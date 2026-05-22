@@ -10,6 +10,14 @@
 #include <Databases/DataLake/DatabaseDataLakeStorageType.h>
 #include <Poco/JSON/Object.h>
 
+namespace DB
+{
+
+class Context;
+using ContextPtr = std::shared_ptr<const Context>;
+
+}
+
 namespace DataLake
 {
 
@@ -59,6 +67,9 @@ public:
 
     void setDataLakeSpecificProperties(std::optional<DataLakeSpecificProperties> && metadata);
     std::optional<DataLakeSpecificProperties> getDataLakeSpecificProperties() const;
+
+    void setTableUUID(const std::string & uuid_) { table_uuid = uuid_; }
+    std::optional<std::string> getTableUUID() const { return table_uuid; }
 
     bool requiresLocation() const { return with_location; }
     bool requiresSchema() const { return with_schema; }
@@ -118,6 +129,7 @@ private:
     std::optional<DataLakeSpecificProperties> data_lake_specific_metadata;
 
     std::string reason_why_table_is_not_readable;
+    std::optional<std::string> table_uuid;
 
     bool is_default_readable_table = true;
 
@@ -136,6 +148,7 @@ struct CatalogSettings
     String aws_access_key_id;
     String aws_secret_access_key;
     String region;
+    String namespaces;
     String aws_role_arn;
     String aws_role_session_name;
 
@@ -172,6 +185,7 @@ public:
     virtual void getTableMetadata(
         const std::string & namespace_name,
         const std::string & table_name,
+        DB::ContextPtr context,
         TableMetadata & result) const = 0;
 
     /// Get table metadata in the given namespace.
@@ -179,6 +193,7 @@ public:
     virtual bool tryGetTableMetadata(
         const std::string & namespace_name,
         const std::string & table_name,
+        DB::ContextPtr context,
         TableMetadata & result) const = 0;
 
     /// Get storage type, where Iceberg tables' data is stored.
