@@ -7,23 +7,28 @@
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeDateTime.h>
 #include <DataTypes/DataTypeEnum.h>
+#include <DataTypes/DataTypeTuple.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Storages/StorageReplicatedMergeTree.h>
 #include "Columns/ColumnString.h"
 #include "Storages/VirtualColumnUtils.h"
-#include <Core/Settings.h>
 
 
 namespace DB
 {
 
-namespace Setting
-{
-    extern const SettingsBool export_merge_tree_partition_system_table_prefer_remote_information;
-}
-
 ColumnsDescription StorageSystemReplicatedPartitionExports::getColumnsDescription()
 {
+    auto last_exception_tuple = std::make_shared<DataTypeTuple>(
+        DataTypes{
+            std::make_shared<DataTypeString>(),
+            std::make_shared<DataTypeString>(),
+            std::make_shared<DataTypeString>(),
+            std::make_shared<DataTypeDateTime>(),
+            std::make_shared<DataTypeUInt64>(),
+        },
+        Names{"replica", "message", "part", "time", "count"});
+
     return ColumnsDescription
     {
         {"source_database", std::make_shared<DataTypeString>(), "Name of the source database."},
@@ -39,10 +44,10 @@ ColumnsDescription StorageSystemReplicatedPartitionExports::getColumnsDescriptio
         {"parts_count", std::make_shared<DataTypeUInt64>(), "Number of parts in the export."},
         {"parts_to_do", std::make_shared<DataTypeUInt64>(), "Number of parts pending to be exported."},
         {"status", std::make_shared<DataTypeString>(), "Status of the export."},
-        {"exception_replica", std::make_shared<DataTypeString>(), "Replica that caused the last exception"},
-        {"last_exception", std::make_shared<DataTypeString>(), "Last exception message of any part (not necessarily the last global exception)"},
-        {"exception_part", std::make_shared<DataTypeString>(), "Part that caused the last exception"},
-        {"exception_count", std::make_shared<DataTypeUInt64>(), "Number of global exceptions"},
+        {"last_exception_per_replica", std::make_shared<DataTypeArray>(last_exception_tuple),
+            "Per-replica last exception entries. Each tuple records the most recent exception observed by that replica plus a best-effort within-replica count. Empty array if no replica has reported an exception for this task."},
+        {"exception_count", std::make_shared<DataTypeUInt64>(),
+            "Sum of per-replica exception counts. Each replica owns its own count, so the sum is exact w.r.t. the in-memory snapshot; within-replica updates remain best-effort and may under-count by one under concurrent failures."},
         {"export_origin",
             std::make_shared<DataTypeEnum8>(DataTypeEnum8::Values{
                 {String(magic_enum::enum_name(ExportOrigin::alter)), static_cast<Int8>(ExportOrigin::alter)},
@@ -124,7 +129,7 @@ void StorageSystemReplicatedPartitionExports::fillData(MutableColumns & res_colu
         {
             const IStorage * storage = replicated_merge_tree_tables[database][table].get();
             if (const auto * replicated_merge_tree = dynamic_cast<const StorageReplicatedMergeTree *>(storage))
-                partition_exports_info = replicated_merge_tree->getPartitionExportsInfo(context->getSettingsRef()[Setting::export_merge_tree_partition_system_table_prefer_remote_information]);
+                partition_exports_info = replicated_merge_tree->getPartitionExportsInfo();
         }
 
         for (const ReplicatedPartitionExportInfo & info : partition_exports_info)
@@ -142,14 +147,17 @@ void StorageSystemReplicatedPartitionExports::fillData(MutableColumns & res_colu
             Array parts_array;
             parts_array.reserve(info.parts.size());
             for (const auto & part : info.parts)
-                parts_array.push_back(part); 
+                parts_array.push_back(part);
             res_columns[i++]->insert(parts_array);
             res_columns[i++]->insert(info.parts_count);
             res_columns[i++]->insert(info.parts_to_do);
             res_columns[i++]->insert(info.status);
-            res_columns[i++]->insert(info.exception_replica);
-            res_columns[i++]->insert(info.last_exception);
-            res_columns[i++]->insert(info.exception_part);
+
+            Array per_replica;
+            per_replica.reserve(info.last_exception_per_replica.size());
+            for (const auto & ex : info.last_exception_per_replica)
+                per_replica.push_back(Tuple{ex.replica, ex.message, ex.part, ex.time, ex.count});
+            res_columns[i++]->insert(per_replica);
             res_columns[i++]->insert(info.exception_count);
             res_columns[i++]->insert(static_cast<Int8>(info.export_origin));
         }

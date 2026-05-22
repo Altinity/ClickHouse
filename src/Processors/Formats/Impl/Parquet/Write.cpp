@@ -356,16 +356,17 @@ struct ConverterNumeric
     }
 };
 
-struct ConverterDateTime64WithMultiplier
+template <typename TYPE>
+struct ConverterTimeType64WithMultiplierImpl
 {
     using Statistics = StatisticsNumeric<Int64, Int64>;
 
-    using Col = ColumnDecimal<DateTime64>;
+    using Col = ColumnDecimal<TYPE>;
     const Col & column;
     Int64 multiplier;
     PODArray<Int64> buf;
 
-    ConverterDateTime64WithMultiplier(const ColumnPtr & c, Int64 multiplier_) : column(assert_cast<const Col &>(*c)), multiplier(multiplier_) {}
+    ConverterTimeType64WithMultiplierImpl(const ColumnPtr & c, Int64 multiplier_) : column(assert_cast<const Col &>(*c)), multiplier(multiplier_) {}
 
     const Int64 * getBatch(size_t offset, size_t count)
     {
@@ -383,6 +384,9 @@ struct ConverterDateTime64WithMultiplier
     }
 };
 
+using ConverterDateTime64WithMultiplier = ConverterTimeType64WithMultiplierImpl<DateTime64>;
+using ConverterTime64WithMultiplier = ConverterTimeType64WithMultiplierImpl<Time64>;
+
 /// Multiply DateTime by 1000 to get milliseconds (because Parquet doesn't support seconds).
 struct ConverterDateTime
 {
@@ -399,6 +403,26 @@ struct ConverterDateTime
         buf.resize(count);
         for (size_t i = 0; i < count; ++i)
             buf[i] = static_cast<Int64>(column.getData()[offset + i]) * 1000;
+        return buf.data();
+    }
+};
+
+struct ConverterTime
+{
+    using Statistics = StatisticsNumeric<Int64, Int64>;
+
+    using Col = ColumnVector<Int32>;
+    const Col & column;
+    PODArray<Int64> buf;
+    Int64 multiplier;
+
+    ConverterTime(const ColumnPtr & c, Int64 multiplier_) : column(assert_cast<const Col &>(*c)), multiplier(multiplier_) {}
+
+    const Int64 * getBatch(size_t offset, size_t count)
+    {
+        buf.resize(count);
+        for (size_t i = 0; i < count; ++i)
+            buf[i] = static_cast<Int64>(column.getData()[offset + i]) * multiplier;
         return buf.data();
     }
 };
@@ -450,6 +474,45 @@ struct ConverterEnumAsString
         }
         return buf.data();
     }
+};
+
+struct ConverterUUID
+{
+    using Statistics = StatisticsFixedStringRef;
+
+    const ColumnVector<UUID> & column;
+    PODArray<parquet::FixedLenByteArray> buf;
+    PODArray<UUID> swapped_buf;
+
+    explicit ConverterUUID(const ColumnPtr & c) : column(assert_cast<const ColumnVector<UUID> &>(*c)) {}
+
+    const parquet::FixedLenByteArray * getBatch(size_t offset, size_t count)
+    {
+        buf.resize(count);
+        swapped_buf.resize(count);
+
+        for (size_t i = 0; i < count; ++i)
+        {
+            UUID res = column.getData()[offset + i];
+            auto * bytes = reinterpret_cast<uint8_t *>(&res);
+
+            if constexpr (std::endian::native == std::endian::little)
+            {
+                std::reverse(bytes, bytes + 8);
+                std::reverse(bytes + 8, bytes + 16);
+            }
+            else
+            {
+                std::swap_ranges(bytes, bytes + 8, bytes + 8);
+            }
+
+            swapped_buf[i] = res;
+            buf[i].ptr = reinterpret_cast<const uint8_t *>(&swapped_buf[i]);
+        }
+        return buf.data();
+    }
+
+    size_t fixedStringSize() { return 16; }
 };
 
 struct ConverterFixedString
@@ -1171,7 +1234,12 @@ void writeColumnChunkBody(
                 N(Int16, Int32Type);
             break;
         }
-        case TypeIndex::Int32  : N(Int32,  Int32Type); break;
+        case TypeIndex::Int32:
+            if (s.type->getTypeId() == TypeIndex::Time)
+                writeColumnImpl<parquet::Int64Type>(s, options, out, ConverterTime(s.primitive_column, s.datetime_multiplier));
+            else
+                N(Int32,  Int32Type);
+            break;
         case TypeIndex::Int64  : N(Int64,  Int64Type); break;
 
         case TypeIndex::UInt32:
@@ -1184,7 +1252,6 @@ void writeColumnChunkBody(
                 writeColumnImpl<parquet::Int64Type>(s, options, out, ConverterDateTime(s.primitive_column));
             }
             break;
-
         #undef N
 
         case TypeIndex::Float32:
@@ -1241,8 +1308,14 @@ void writeColumnChunkBody(
         case TypeIndex::Int128:  F(Int128); break;
         case TypeIndex::Int256:  F(Int256); break;
         case TypeIndex::IPv6:    F(IPv6); break;
-        case TypeIndex::UUID:    F(UUID); break;
         #undef F
+
+        case TypeIndex::UUID:
+            writeColumnImpl<parquet::FLBAType>(s,
+                options,
+                out,
+                ConverterUUID(s.primitive_column));
+        break;
 
         #define D(source_type) \
             writeColumnImpl<parquet::FLBAType>( \
@@ -1252,6 +1325,17 @@ void writeColumnChunkBody(
         case TypeIndex::Decimal128: D(Decimal128); break;
         case TypeIndex::Decimal256: D(Decimal256); break;
         #undef D
+
+        case TypeIndex::Time64:
+            if (s.datetime_multiplier == 1)
+                writeColumnImpl<parquet::Int64Type>(
+                    s, options, out, ConverterNumeric<ColumnDecimal<Time64>, Int64, Int64>(
+                        s.primitive_column));
+            else
+                writeColumnImpl<parquet::Int64Type>(
+                    s, options, out, ConverterTime64WithMultiplier(
+                        s.primitive_column, s.datetime_multiplier));
+            break;
 
         default:
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected column type: {}", s.primitive_column->getFamilyName());
