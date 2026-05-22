@@ -32,8 +32,6 @@ namespace ServerSetting
 namespace MergeTreeSetting
 {
     extern const MergeTreeSettingsUInt64 export_merge_tree_partition_ttl_poll_interval_seconds;
-    extern const MergeTreeSettingsUInt64 export_merge_tree_partition_ttl_min_backoff_seconds;
-    extern const MergeTreeSettingsUInt64 export_merge_tree_partition_ttl_max_backoff_seconds;
 }
 
 namespace ErrorCodes
@@ -50,18 +48,6 @@ double jitter25()
     thread_local std::mt19937 rng{std::random_device{}()};
     std::uniform_real_distribution<double> dist(0.75, 1.25);
     return dist(rng);
-}
-
-time_t computeBackoffDelay(size_t tries, UInt64 min_seconds, UInt64 max_seconds)
-{
-    if (tries == 0)
-        tries = 1;
-    /// Cap the shift to avoid UB; anything past 63 saturates to max anyway.
-    const size_t shift = std::min<size_t>(tries - 1, 63);
-    UInt64 base = min_seconds << shift;
-    if (base == 0 || base > max_seconds)
-        base = max_seconds;
-    return static_cast<time_t>(static_cast<double>(base) * jitter25());
 }
 
 }
@@ -186,7 +172,7 @@ std::optional<String> TTLExportScheduler::pickPartition(
     return best;
 }
 
-TTLExportScheduler::SubmitResult TTLExportScheduler::submit(
+void TTLExportScheduler::submit(
     const String & dest_database, const String & dest_table, const String & partition_id, bool force)
 {
     auto cmd_context = Context::createCopy(storage.getContext());
@@ -207,12 +193,10 @@ TTLExportScheduler::SubmitResult TTLExportScheduler::submit(
         storage.exportPartitionToTable(cmd, cmd_context);
         LOG_INFO(log, "Submitted TTL export of partition {} to {}.{} (force={})",
             partition_id, dest_database, dest_table, force);
-        return SubmitResult::Submitted;
     }
     catch (const Coordination::Exception &)
     {
         tryLogCurrentException(log, "ZK race while submitting TTL export");
-        return SubmitResult::Transient;
     }
     catch (const Exception & e)
     {
@@ -220,15 +204,15 @@ TTLExportScheduler::SubmitResult TTLExportScheduler::submit(
         {
             LOG_WARNING(log, "TTL EXPORT destination {}.{} disappeared at submit time: {}",
                 dest_database, dest_table, e.message());
-            return SubmitResult::Transient;
         }
-        tryLogCurrentException(log, "TTL export submission failed");
-        return SubmitResult::Failure;
+        else
+        {
+            tryLogCurrentException(log, "TTL export submission failed");
+        }
     }
     catch (...)
     {
         tryLogCurrentException(log, "TTL export submission failed");
-        return SubmitResult::Failure;
     }
 }
 
@@ -255,7 +239,7 @@ void TTLExportScheduler::processExportTTL(const TTLDescription & export_ttl)
     if (!marker)
     {
         if (auto pid = pickPartition(export_ttl, std::nullopt))
-            (void)submit(dest_database, dest_table, *pid, /* force = */ false);
+            submit(dest_database, dest_table, *pid, /* force = */ false);
         return;
     }
 
@@ -265,34 +249,13 @@ void TTLExportScheduler::processExportTTL(const TTLDescription & export_ttl)
     if (marker->status == "COMPLETED")
     {
         if (auto pid = pickPartition(export_ttl, marker))
-            (void)submit(dest_database, dest_table, *pid, /* force = */ false);
+            submit(dest_database, dest_table, *pid, /* force = */ false);
         return;
     }
 
     if (marker->status == "FAILED")
     {
-        const BackoffKey key{marker->partition_id, dest_database, dest_table};
-        const auto now = time(nullptr);
-        auto & state = backoff[key];
-        if (now < state.next_attempt_at)
-            return;
-
-        const auto result = submit(dest_database, dest_table, marker->partition_id, /* force = */ true);
-        if (result == SubmitResult::Submitted)
-        {
-            backoff.erase(key);
-        }
-        else if (result == SubmitResult::Failure)
-        {
-            const auto settings = storage.getSettings();
-            const auto min_s = (*settings)[MergeTreeSetting::export_merge_tree_partition_ttl_min_backoff_seconds];
-            const auto max_s = (*settings)[MergeTreeSetting::export_merge_tree_partition_ttl_max_backoff_seconds];
-            state.tries += 1;
-            const auto delay = computeBackoffDelay(state.tries, min_s, max_s);
-            state.next_attempt_at = now + delay;
-            LOG_INFO(log, "TTL export of partition {} to {} failed (try {}); next attempt in {}s",
-                marker->partition_id, dest_full, state.tries, delay);
-        }
+        submit(dest_database, dest_table, marker->partition_id, /* force = */ true);
         return;
     }
 

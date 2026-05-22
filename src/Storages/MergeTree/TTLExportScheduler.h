@@ -3,9 +3,7 @@
 #include <Common/Logger.h>
 #include <base/types.h>
 #include <ctime>
-#include <map>
 #include <optional>
-#include <tuple>
 
 namespace DB
 {
@@ -15,8 +13,7 @@ struct TTLDescription;
 /// Drives automatic partition exports for `TTL ... EXPORT TO TABLE db.table` clauses.
 /// One instance per `StorageReplicatedMergeTree`; the background task pool calls `run`
 /// on each tick. The scheduler is stateless across restarts — the manifest in ZooKeeper
-/// is the source of truth and per-tick state is rebuilt from it. Only the per-partition
-/// retry backoff is held in memory.
+/// is the source of truth and per-tick state is rebuilt from it.
 class TTLExportScheduler
 {
 public:
@@ -29,25 +26,16 @@ public:
     ///   - COMPLETED      → walk forward, submit the next eligible partition whose expiration max
     ///                       exceeds the marker's stored watermark (or equals it but with a
     ///                       different partition_id);
-    ///   - FAILED         → respect per-partition in-memory backoff; on elapse resubmit the
-    ///                       same partition with `force_export=1` to overwrite the failed manifest;
+    ///   - FAILED         → resubmit the same partition with `force_export=1` to overwrite the
+    ///                       failed manifest;
     ///   - KILLED         → idle; log a recovery recipe. The operator either retries the killed
     ///                       partition with `force_export=1` or steps past it by exporting a newer
     ///                       partition with `mark_as_ttl=1`.
-    /// Exceptions surface as either transient (ZK race → next tick retries without bumping
-    /// backoff) or terminal (logged; backoff bumped if applicable). `UNKNOWN_TABLE` at submit
-    /// time is a soft failure — the destination disappeared post-DDL.
+    /// All exceptions from `submit` are logged and swallowed — the next tick retries.
+    /// `UNKNOWN_TABLE` at submit time is a soft failure — the destination disappeared post-DDL.
     void run();
 
 private:
-    struct BackoffState
-    {
-        size_t tries = 0;
-        time_t next_attempt_at = 0;
-    };
-
-    using BackoffKey = std::tuple<String, String, String>; /// (partition_id, dest_db, dest_table)
-
     struct TtlMarker
     {
         String partition_id;
@@ -61,7 +49,6 @@ private:
 
     StorageReplicatedMergeTree & storage;
     LoggerPtr log;
-    std::map<BackoffKey, BackoffState> backoff;
 
     void processExportTTL(const TTLDescription & export_ttl);
 
@@ -76,18 +63,9 @@ private:
     /// is the durable watermark; no source-parts lookup needed for the floor itself.
     std::optional<String> pickPartition(const TTLDescription & export_ttl, const std::optional<TtlMarker> & floor);
 
-    enum class SubmitResult
-    {
-        Submitted,    /// Manifest was created; backoff (if any) should be reset.
-        Transient,    /// Lost a ZK race or destination missing at submit time — neither failure
-                      /// nor success; let the next tick retry without bumping backoff.
-        Failure,      /// Any other exception. Caller should bump backoff if it tracks one.
-    };
-
-    /// Submit a TTL-driven export via `exportPartitionToTable`. Catches and classifies the
-    /// outcome; the caller decides whether to bump backoff. Diagnostics are logged here so
-    /// each call site stays focused on state transitions.
-    SubmitResult submit(const String & dest_database, const String & dest_table, const String & partition_id, bool force);
+    /// Submit a TTL-driven export via `exportPartitionToTable`. Exceptions are caught and logged;
+    /// the next tick retries.
+    void submit(const String & dest_database, const String & dest_table, const String & partition_id, bool force);
 };
 
 }
