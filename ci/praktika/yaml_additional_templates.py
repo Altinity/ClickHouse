@@ -108,7 +108,7 @@ class AltinityWorkflowTemplates:
 """,
         "CIReport": r"""
   FinishCIReport:
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && needs.config_workflow.outputs.pipeline_status != '' }}
     needs:
 {ALL_JOBS}
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
@@ -127,7 +127,7 @@ class AltinityWorkflowTemplates:
         "SourceUpload": r"""
   SourceUpload:
     needs: [config_workflow, build_amd_release]
-    if: ${{ !failure() && !cancelled() }}
+    if: ${{ !cancelled() && needs.config_workflow.outputs.pipeline_status != '' && !contains(needs.*.outputs.pipeline_status, 'failure') }}
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     env:
         COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
