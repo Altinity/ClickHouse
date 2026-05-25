@@ -61,7 +61,7 @@ workflow = Workflow.Config(
                 if j.name not in FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES
                 else []
             )
-            for j in JobConfigs.functional_tests_jobs
+            for j in JobConfigs.functional_tests_jobs if 'coverage' not in j.name
         ],
         *[
             job.set_run_after(FUNCTIONAL_TESTS_PARALLEL_BLOCKING_JOB_NAMES)

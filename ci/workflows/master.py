@@ -25,8 +25,7 @@ workflow = Workflow.Config(
     jobs=[
         # *JobConfigs.tidy_build_arm_jobs,
         *JobConfigs.build_jobs,
-        # *JobConfigs.build_llvm_coverage_job, # NOTE (strtgbb): Not configured yet. Determine if useful first.
-        *JobConfigs.coverage_build_jobs,
+        *JobConfigs.build_llvm_coverage_job,
         *JobConfigs.release_build_jobs,
         # *[ # NOTE (strtgbb): we don't run special build jobs
         #     job.set_dependency(
@@ -36,18 +35,18 @@ workflow = Workflow.Config(
         # ],
         # JobConfigs.smoke_tests_macos,
         *JobConfigs.unittest_jobs,
-        # *JobConfigs.unittest_llvm_coverage_job, # NOTE (strtgbb): Not configured yet. Determine if useful first.
+        *JobConfigs.unittest_llvm_coverage_job,
         JobConfigs.docker_server,
         JobConfigs.docker_keeper,
         *JobConfigs.install_check_master_jobs,
         *JobConfigs.compatibility_test_jobs,
         *JobConfigs.functional_tests_jobs,
-        # *JobConfigs.functional_test_llvm_coverage_jobs, # NOTE (strtgbb): Not configured yet. Determine if useful first.
+        *JobConfigs.functional_test_llvm_coverage_jobs,
         *JobConfigs.functional_test_excluded_from_llvm_job,
         *JobConfigs.functional_tests_jobs_azure,
         *JobConfigs.integration_test_jobs_required,
         *JobConfigs.integration_test_jobs_non_required,
-        # *JobConfigs.integration_test_llvm_coverage_jobs, # NOTE (strtgbb): Not configured yet. Determine if useful first.
+        *JobConfigs.integration_test_llvm_coverage_jobs,
         *JobConfigs.integration_test_excluded_from_llvm_job,
         *JobConfigs.stress_test_jobs,
         *JobConfigs.stress_test_azure_jobs,
@@ -63,8 +62,7 @@ workflow = Workflow.Config(
         # *JobConfigs.sqlancer_master_jobs,
         JobConfigs.sqltest_master_job,
         JobConfigs.sqllogic_test_master_job,
-        # JobConfigs.llvm_coverage_job, # NOTE (strtgbb): Not configured yet. Determine if useful first.
-        *JobConfigs.functional_tests_jobs_coverage,
+        JobConfigs.llvm_coverage_job,
     ],
     additional_jobs=[
         "GrypeScan",
@@ -82,8 +80,8 @@ workflow = Workflow.Config(
         ArtifactConfigs.fuzzers,
         ArtifactConfigs.fuzzers_corpus,
         ArtifactConfigs.parser_memory_profiler,
-        # *ArtifactConfigs.llvm_profdata_file,
-        # ArtifactConfigs.llvm_coverage_info_file,
+        *ArtifactConfigs.llvm_profdata_file,
+        ArtifactConfigs.llvm_coverage_info_file,
     ],
     dockers=DOCKERS,
     enable_dockers_manifest_merge=True,
