@@ -117,6 +117,107 @@ namespace
         return out;
     }
 
+    /// Fetch all per-part processed leaves under <entry_path>/processed and build a
+    /// fresh map keyed by part_name. Returns the destination file paths recorded for
+    /// each finished part.
+    ///
+    /// Same lenient semantics as readLastExceptionPerReplica: an empty result means
+    /// "nothing actionable" (transient ZK error, no children yet, or all leaves
+    /// concurrently removed) and callers MUST skip the assignment to preserve the
+    /// in-memory mirror across glitches. Safe because processed/<part> leaves are
+    /// written once on per-part success and never rewritten — the entire entry path
+    /// is wiped recursively at task cleanup, handled separately.
+    std::map<String, std::vector<String>> readDestinationFilePathsPerPart(
+        const zkutil::ZooKeeperPtr & zk,
+        const std::filesystem::path & entry_path,
+        const std::string & log_key,
+        const LoggerPtr & log)
+    {
+        std::map<String, std::vector<String>> out;
+
+        const auto container_path = entry_path / "processed";
+
+        Strings children;
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildren);
+        if (Coordination::Error::ZOK != zk->tryGetChildren(container_path, children))
+        {
+            LOG_INFO(log, "ExportPartition Manifest Updating Task: failed to list processed leaves for {}, leaving in-memory copy untouched", log_key);
+            return out;
+        }
+
+        if (children.empty())
+            return out;
+
+        std::vector<std::string> paths;
+        paths.reserve(children.size());
+        for (const auto & child : children)
+            paths.emplace_back(container_path / child);
+
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet, paths.size());
+        auto responses = zk->tryGet(paths);
+        responses.waitForResponses();
+
+        for (size_t i = 0; i < paths.size(); ++i)
+        {
+            Coordination::GetResponse response;
+            try
+            {
+                response = responses[i];
+            }
+            catch (...)
+            {
+                LOG_WARNING(log, "ExportPartition Manifest Updating Task: ZK error fetching processed leaf {} for {}, skipping", children[i], log_key);
+                continue;
+            }
+
+            if (response.error != Coordination::Error::ZOK)
+                continue;
+
+            try
+            {
+                auto entry = ExportReplicatedMergeTreePartitionProcessedPartEntry::fromJsonString(response.data);
+                out.emplace(std::move(entry.part_name), std::move(entry.paths_in_destination));
+            }
+            catch (...)
+            {
+                LOG_WARNING(log, "ExportPartition Manifest Updating Task: malformed processed JSON for {} (leaf {}), ignoring", log_key, children[i]);
+            }
+        }
+
+        return out;
+    }
+
+    /// Read the optional <entry_path>/commit_info znode and return the parsed entry.
+    /// Returns nullopt when the znode is absent (task has not committed yet, peer
+    /// crashed before writing it, or transient ZK error). Callers should treat
+    /// nullopt as "leave the in-memory copy untouched".
+    std::optional<ExportReplicatedMergeTreePartitionCommitInfoEntry> readCommitInfo(
+        const zkutil::ZooKeeperPtr & zk,
+        const std::filesystem::path & entry_path,
+        const std::string & log_key,
+        const LoggerPtr & log)
+    {
+        const auto commit_info_path = entry_path / "commit_info";
+
+        std::string data;
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
+        if (!zk->tryGet(commit_info_path, data))
+            return std::nullopt;
+
+        try
+        {
+            return ExportReplicatedMergeTreePartitionCommitInfoEntry::fromJsonString(data);
+        }
+        catch (...)
+        {
+            LOG_WARNING(log, "ExportPartition Manifest Updating Task: malformed commit_info JSON for {}, ignoring", log_key);
+            return std::nullopt;
+        }
+    }
+
     /*
         Remove expired entries and fix non-committed exports that have already exported all parts.
 
@@ -331,6 +432,16 @@ std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::
         }
         info.exception_count = total_exception_count;
 
+        info.destination_file_paths_per_part = entry.destination_file_paths_per_part;
+
+        if (entry.commit_info)
+        {
+            info.committed_metadata_file = entry.commit_info->iceberg_metadata_file;
+            info.committed_manifest_list = entry.commit_info->iceberg_manifest_list;
+            info.committed_manifest_file = entry.commit_info->iceberg_manifest_file;
+            info.committed_marker_file = entry.commit_info->commit_marker_file;
+        }
+
         infos.emplace_back(std::move(info));
     }
 
@@ -392,6 +503,17 @@ void ExportPartitionManifestUpdatingTask::poll()
         auto last_exception_per_replica = readLastExceptionPerReplica(
             zk, fs::path(entry_path), key, storage.log.load());
 
+        /// Mirror per-part destination file paths from <entry_path>/processed/<part>.
+        /// Same lenient pattern: empty result = leave in-memory copy untouched.
+        auto destination_file_paths_per_part = readDestinationFilePathsPerPart(
+            zk, fs::path(entry_path), key, storage.log.load());
+
+        /// Mirror commit_info znode (present only after a successful commit). nullopt
+        /// means the znode does not exist yet (or transient ZK error); leave the
+        /// in-memory copy untouched in that case.
+        auto commit_info = readCommitInfo(
+            zk, fs::path(entry_path), key, storage.log.load());
+
         const auto local_entry = entries_by_key.find(key);
 
         /// If the zk entry has been replaced with export_merge_tree_partition_force_export, checking only for the export key is not enough
@@ -407,6 +529,10 @@ void ExportPartitionManifestUpdatingTask::poll()
         {
             if (!last_exception_per_replica.empty())
                 local_entry->last_exception_per_replica = std::move(last_exception_per_replica);
+            if (!destination_file_paths_per_part.empty())
+                local_entry->destination_file_paths_per_part = std::move(destination_file_paths_per_part);
+            if (commit_info)
+                local_entry->commit_info = std::move(commit_info);
             continue;
         }
 
@@ -465,11 +591,15 @@ void ExportPartitionManifestUpdatingTask::poll()
             /// holding the cleanup lock (cleanup did not consume the entry).
             if (!last_exception_per_replica.empty())
                 local_entry->last_exception_per_replica = std::move(last_exception_per_replica);
+            if (!destination_file_paths_per_part.empty())
+                local_entry->destination_file_paths_per_part = std::move(destination_file_paths_per_part);
+            if (commit_info)
+                local_entry->commit_info = std::move(commit_info);
             LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Skipping {}: already exists", key);
             continue;
         }
 
-        addTask(metadata, *status, std::move(last_exception_per_replica), key, entries_by_key);
+        addTask(metadata, *status, std::move(last_exception_per_replica), std::move(destination_file_paths_per_part), std::move(commit_info), key, entries_by_key);
     }
 
     /// Remove entries that were deleted by someone else
@@ -484,6 +614,8 @@ void ExportPartitionManifestUpdatingTask::addTask(
     const ExportReplicatedMergeTreePartitionManifest & metadata,
     ExportReplicatedMergeTreePartitionTaskEntry::Status status,
     std::map<String, LastExceptionEntry> last_exception_per_replica,
+    std::map<String, std::vector<String>> destination_file_paths_per_part,
+    std::optional<ExportReplicatedMergeTreePartitionCommitInfoEntry> commit_info,
     const std::string & key,
     auto & entries_by_key
 )
@@ -506,7 +638,13 @@ void ExportPartitionManifestUpdatingTask::addTask(
     }
 
     /// Insert or update entry. The multi_index container automatically maintains both indexes.
-    ExportReplicatedMergeTreePartitionTaskEntry entry {metadata, status, std::move(part_references), std::move(last_exception_per_replica)};
+    ExportReplicatedMergeTreePartitionTaskEntry entry {
+        metadata,
+        status,
+        std::move(part_references),
+        std::move(last_exception_per_replica),
+        std::move(destination_file_paths_per_part),
+        std::move(commit_info)};
     auto it = entries_by_key.find(key);
     if (it != entries_by_key.end())
         entries_by_key.replace(it, entry);
@@ -616,6 +754,22 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
                 !fetched.empty())
             {
                 it->last_exception_per_replica = std::move(fetched);
+            }
+
+            /// Refresh per-part destination paths and commit_info on the status flip too,
+            /// so the system table observes the COMPLETED state and the committed file
+            /// paths in the same poll cycle.
+            if (auto fetched = readDestinationFilePathsPerPart(
+                    zk, fs::path(storage.zookeeper_path) / "exports" / key, key, storage.log.load());
+                !fetched.empty())
+            {
+                it->destination_file_paths_per_part = std::move(fetched);
+            }
+
+            if (auto fetched_commit_info = readCommitInfo(
+                    zk, fs::path(storage.zookeeper_path) / "exports" / key, key, storage.log.load()))
+            {
+                it->commit_info = std::move(fetched_commit_info);
             }
 
             /// If status changed to KILLED, cancel local export operations

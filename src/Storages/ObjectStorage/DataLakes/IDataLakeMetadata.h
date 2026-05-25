@@ -16,6 +16,7 @@
 #include <Processors/ISimpleTransform.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Storages/AlterCommands.h>
+#include <Storages/IStorage.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeTableStateSnapshot.h>
 #include <Storages/MutationCommands.h>
 #include <Storages/prepareReadingFromFormat.h>
@@ -217,7 +218,7 @@ public:
         throwNotImplemented("import");
     }
 
-    virtual void commitExportPartitionTransaction(
+    virtual IStorage::ExportPartitionCommitInfo commitExportPartitionTransaction(
         std::shared_ptr<DataLake::ICatalog> /* catalog */,
         const StorageID & /* table_id */,
         const String & /* transaction_id */,

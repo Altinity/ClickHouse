@@ -511,7 +511,30 @@ It is currently only implemented in StorageObjectStorage.
       std::vector<Field> partition_values;
     };
 
-    virtual void commitExportPartitionTransaction(
+    /// Paths produced by the destination storage during commit. Surfaced via
+    /// system.replicated_partition_exports for debugging. Empty for commits
+    /// that short-circuit on idempotency.
+    struct ExportPartitionCommitInfo
+    {
+      /// Iceberg destinations only.
+      String iceberg_metadata_file;
+      String iceberg_manifest_list;
+      String iceberg_manifest_file;
+
+      /// Plain object storage destinations only: path of the commit marker file
+      /// written/observed by StorageObjectStorage::commitExportPartitionTransaction.
+      String commit_marker_file;
+
+      bool empty() const
+      {
+          return iceberg_metadata_file.empty()
+              && iceberg_manifest_list.empty()
+              && iceberg_manifest_file.empty()
+              && commit_marker_file.empty();
+      }
+    };
+
+    virtual ExportPartitionCommitInfo commitExportPartitionTransaction(
       const String & /* transaction_id */,
       const String & /* partition_id */,
       const Strings & /* exported_paths */,

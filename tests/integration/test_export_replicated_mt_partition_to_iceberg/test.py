@@ -843,6 +843,21 @@ def test_post_publish_exception_preserves_snapshot(cluster):
         f"Unexpected data after post-publish exception recovery:\n{result}"
     )
 
+    # The recovery path goes through the isExportPartitionTransactionAlreadyCommitted
+    # short-circuit on retry, which surfaces a sentinel note in committed_metadata_file
+    # (the original committer's manifest paths are not recoverable from inside the impl).
+    committed_metadata_file = node.query(
+        f"""
+        SELECT committed_metadata_file FROM system.replicated_partition_exports
+        WHERE source_table = '{mt_table}'
+          AND destination_table = '{iceberg_table}'
+          AND partition_id = '2020'
+        """
+    ).strip()
+    assert committed_metadata_file == "<committed in a previous run, paths unavailable>", (
+        f"Expected sentinel in committed_metadata_file for already-committed retry, got: {committed_metadata_file!r}"
+    )
+
 
 def test_export_task_timeout_kills_stuck_pending_task(cluster):
     """

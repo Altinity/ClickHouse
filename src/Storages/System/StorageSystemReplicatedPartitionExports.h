@@ -29,6 +29,19 @@ struct ReplicatedPartitionExportInfo
     /// single replica the count is best-effort (concurrent failing writers may under-
     /// count by one), matching the documented column semantics.
     size_t exception_count = 0;
+    /// Per-part destination file paths, keyed by part name. Mirrors the
+    /// <export-entry>/processed/<part>/paths_in_destination data from ZooKeeper.
+    /// Empty until parts complete; partial during PENDING.
+    std::map<String, std::vector<String>> destination_file_paths_per_part;
+    /// Iceberg commit-time paths surfaced from <export-entry>/commit_info.
+    /// All empty for non-Iceberg destinations or before commit lands.
+    String committed_metadata_file;
+    String committed_manifest_list;
+    String committed_manifest_file;
+    /// Plain object storage commit marker file surfaced from
+    /// <export-entry>/commit_info. Empty for Iceberg destinations or before
+    /// commit lands.
+    String committed_marker_file;
 };
 
 class StorageSystemReplicatedPartitionExports final : public IStorageSystemOneBlock
