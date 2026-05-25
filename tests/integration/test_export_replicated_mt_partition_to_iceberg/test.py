@@ -814,8 +814,9 @@ def test_post_publish_exception_preserves_snapshot(cluster):
     post-publish region (after both the metadata file is written and
     `published = true` is set). With the fix in place:
       - the commit stays durable (snapshot is readable, manifests are intact);
-      - the export is marked COMPLETED because the idempotency check on retry
-        detects that the transaction is already committed and returns success;
+      - the export is marked COMPLETED because the outer `catch (...)` sees
+        `published == true` and returns the populated commit info with the real
+        paths produced by this attempt (no retry needed);
       - all exported rows are visible through the Iceberg table.
     """
     node = cluster.instances["replica1"]
@@ -843,9 +844,10 @@ def test_post_publish_exception_preserves_snapshot(cluster):
         f"Unexpected data after post-publish exception recovery:\n{result}"
     )
 
-    # The recovery path goes through the isExportPartitionTransactionAlreadyCommitted
-    # short-circuit on retry, which surfaces a sentinel note in committed_metadata_file
-    # (the original committer's manifest paths are not recoverable from inside the impl).
+    # After a post-publish exception the catch handler with published==true returns
+    # the populated commit info (real metadata / manifest list / manifest file paths).
+    # ExportPartitionUtils::commit persists it to the commit_info znode, so the system
+    # table should show a real metadata path here, not the already-committed sentinel.
     committed_metadata_file = node.query(
         f"""
         SELECT committed_metadata_file FROM system.replicated_partition_exports
@@ -854,8 +856,14 @@ def test_post_publish_exception_preserves_snapshot(cluster):
           AND partition_id = '2020'
         """
     ).strip()
-    assert committed_metadata_file == "<committed in a previous run, paths unavailable>", (
-        f"Expected sentinel in committed_metadata_file for already-committed retry, got: {committed_metadata_file!r}"
+    assert committed_metadata_file, (
+        "committed_metadata_file should be populated after a successful post-publish-catch return"
+    )
+    assert not committed_metadata_file.startswith("<"), (
+        f"committed_metadata_file should be a real metadata path, got the already-committed sentinel: {committed_metadata_file!r}"
+    )
+    assert committed_metadata_file.endswith(".metadata.json"), (
+        f"Expected a *.metadata.json path in committed_metadata_file, got: {committed_metadata_file!r}"
     )
 
 

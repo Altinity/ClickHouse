@@ -1900,11 +1900,9 @@ IStorage::ExportPartitionCommitInfo IcebergMetadata::commitExportPartitionTransa
         LOG_INFO(log,
             "Export transaction {} already committed, skipping re-commit",
             transaction_id);
-        /// Empty commit info: paths produced by the original commit are not recoverable
-        /// here without re-reading the snapshot. ExportPartitionUtils::commit only
-        /// writes the commit_info znode when this struct is non-empty, so the original
-        /// committer's record (if any) is preserved.
-        return {};
+        IStorage::ExportPartitionCommitInfo already_committed_info;
+        already_committed_info.iceberg_metadata_file = "<committed in a previous run, paths unavailable>";
+        return already_committed_info;
     }
 
     /// Fail fast if the table schema or partition spec changed between export-start and commit.
