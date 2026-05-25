@@ -316,4 +316,4 @@
   regex: true
   check_types:
   - coverage
-  - sanitize-coverage
+  - with-coverage

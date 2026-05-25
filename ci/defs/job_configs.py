@@ -999,7 +999,7 @@ class JobConfigs:
         runs_on=RunnerLabels.ARM_LARGE,
         command="python3 ./ci/jobs/keeper_stress_job.py",
         run_in_docker=(
-            f"clickhouse/integration-tests-runner+root+--memory={KEEPER_DIND_MEM}+--privileged+--dns-search='.'+"
+            f"altinityinfra/integration-tests-runner+root+--memory={KEEPER_DIND_MEM}+--privileged+--dns-search='.'+"
             f"--security-opt seccomp=unconfined+--cap-add=SYS_PTRACE+{docker_sock_mount}+--volume=clickhouse_integration_tests_volume:/var/lib/docker+--ulimit nofile=262144:262144"
         ),
         digest_config=Job.CacheDigestConfig(
