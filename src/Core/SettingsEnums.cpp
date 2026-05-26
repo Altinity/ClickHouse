@@ -482,4 +482,6 @@ IMPLEMENT_SETTING_ENUM(JemallocProfileFormat, ErrorCodes::BAD_ARGUMENTS,
 
 IMPLEMENT_SETTING_AUTO_ENUM(MergeTreePartExportFileAlreadyExistsPolicy, ErrorCodes::BAD_ARGUMENTS);
 
+IMPLEMENT_SETTING_AUTO_ENUM(ExportPartitionAllOnError, ErrorCodes::BAD_ARGUMENTS);
+
 }

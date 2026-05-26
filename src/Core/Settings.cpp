@@ -7568,13 +7568,13 @@ Throw an error if there are pending mutations when exporting a merge tree part.
     DECLARE(Bool, export_merge_tree_part_throw_on_pending_patch_parts, true, R"(
 Throw an error if there are pending patch parts when exporting a merge tree part.
 )", 0) \
-    DECLARE(Bool, export_merge_tree_partition_lock_inside_the_task, false, R"(
-Only lock a part when the task is already running. This might help with busy waiting where the scheduler locks a part, but the task ends in the pending list.
-On the other hand, there is a chance once the task executes that part has already been locked by another replica and the task will simply early exit.
-)", 0) \
-    DECLARE(Bool, export_merge_tree_partition_system_table_prefer_remote_information, false, R"(
-Controls whether the system.replicated_partition_exports will prefer to query ZooKeeper to get the most up to date information or use the local information.
-Querying ZooKeeper is expensive, and only available if the ZooKeeper feature flag MULTI_READ is enabled.
+    DECLARE(ExportPartitionAllOnError, export_merge_tree_partition_all_on_error, ExportPartitionAllOnError::throw_first, R"(
+Failure handling for `ALTER TABLE ... EXPORT PARTITION ALL ...`.
+Possible values:
+- `throw_first` (default) - stop at the first failed partition; partitions already scheduled remain scheduled.
+- `collect` - try every partition and throw a single aggregated exception at the end if any failed; partitions that succeeded remain scheduled.
+- `skip_conflicts` - silently skip partitions that are already exported / being exported (errors with code EXPORT_PARTITION_ALREADY_EXPORTED); fail-fast on every other error.
+Has no effect on `EXPORT PARTITION <id>` (single-partition export).
 )", 0) \
     DECLARE(String, export_merge_tree_part_filename_pattern, "{part_name}_{checksum}", R"(
 Pattern for the filename of the exported merge tree part. The `part_name` and `checksum` are calculated and replaced on the fly. Additional macros are supported.
