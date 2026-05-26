@@ -1540,9 +1540,54 @@ void ReadFromMerge::convertAndFilterSourceStream(
 
     if (local_context->getSettingsRef()[Setting::allow_experimental_analyzer])
     {
+        /// The Merge table expects its columns under analyzer identifiers (e.g. `__table1.a`),
+        /// while an alias expression is keyed by its plain logical name (e.g. `a`). Map each plain
+        /// logical name to the unambiguous target-header identifier so the alias output below is
+        /// emitted under the identifier the downstream reconciliation matches by name.
+        std::unordered_map<String, String> logical_name_to_header_name;
+        std::unordered_set<String> ambiguous_logical_names;
+        for (const auto & column : header)
+        {
+            auto last_dot_pos = column.name.rfind('.');
+            String logical_name = (last_dot_pos == String::npos || last_dot_pos + 1 >= column.name.size())
+                ? column.name
+                : column.name.substr(last_dot_pos + 1);
+            if (!logical_name_to_header_name.emplace(logical_name, column.name).second)
+                ambiguous_logical_names.insert(logical_name);
+        }
+        for (const auto & ambiguous : ambiguous_logical_names)
+            logical_name_to_header_name.erase(ambiguous);
+
         for (const auto & alias : aliases)
         {
             ActionsDAG actions_dag(pipe_columns);
+            std::unordered_map<String, const ActionsDAG::Node *> short_name_to_node;
+            std::unordered_set<String> ambiguous_short_names;
+            std::unordered_set<String> existing_input_names;
+            for (const auto * input : actions_dag.getInputs())
+            {
+                existing_input_names.insert(input->result_name);
+
+                const auto & input_name = input->result_name;
+                auto last_dot_pos = input_name.rfind('.');
+                if (last_dot_pos == String::npos || last_dot_pos + 1 >= input_name.size())
+                    continue;
+
+                auto short_name = input_name.substr(last_dot_pos + 1);
+                if (!short_name_to_node.emplace(short_name, input).second)
+                    ambiguous_short_names.insert(short_name);
+            }
+
+            for (const auto & ambiguous_short_name : ambiguous_short_names)
+                short_name_to_node.erase(ambiguous_short_name);
+
+            for (const auto & [short_name, input] : short_name_to_node)
+            {
+                if (existing_input_names.contains(short_name))
+                    continue;
+
+                actions_dag.addAlias(*input, short_name);
+            }
 
             QueryTreeNodePtr query_tree = buildQueryTree(alias.expression, local_context);
             query_tree->setAlias(alias.name);
@@ -1551,13 +1596,15 @@ void ReadFromMerge::convertAndFilterSourceStream(
             query_analysis_pass.run(query_tree, local_context);
 
             ColumnNodePtrWithHashSet empty_correlated_columns_set;
-            PlannerActionsVisitor actions_visitor(modified_query_info.planner_context, empty_correlated_columns_set, false /*use_column_identifier_as_action_node_name*/);
+            PlannerActionsVisitor actions_visitor(modified_query_info.planner_context, empty_correlated_columns_set, true /*use_column_identifier_as_action_node_name*/);
             const auto & [nodes, _] = actions_visitor.visit(actions_dag, query_tree);
 
             if (nodes.size() != 1)
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected to have 1 output but got {}", nodes.size());
 
-            actions_dag.addOrReplaceInOutputs(actions_dag.addAlias(*nodes.front(), alias.name));
+            auto output_name_it = logical_name_to_header_name.find(alias.name);
+            const String & output_name = output_name_it != logical_name_to_header_name.end() ? output_name_it->second : alias.name;
+            actions_dag.addOrReplaceInOutputs(actions_dag.addAlias(*nodes.front(), output_name));
             auto expression_step = std::make_unique<ExpressionStep>(child.plan.getCurrentHeader(), std::move(actions_dag));
             child.plan.addStep(std::move(expression_step));
         }
@@ -1607,9 +1654,48 @@ void ReadFromMerge::convertAndFilterSourceStream(
     };
 
     String smallest_column_name = ExpressionActions::getSmallestColumn(snapshot->metadata->getColumns().getAllPhysical()).name;
+    auto get_short_name = [](std::string_view full_name) -> std::string_view
+    {
+        auto pos = full_name.find_last_of('.');
+        if (pos == std::string_view::npos || pos + 1 >= full_name.size())
+            return {};
+        return full_name.substr(pos + 1);
+    };
+
+    std::unordered_map<std::string_view, size_t> short_name_count;
+    short_name_count.reserve(header.columns());
+    for (const auto & column : header)
+    {
+        auto short_name = get_short_name(column.name);
+        if (!short_name.empty())
+            ++short_name_count[short_name];
+    }
+
+    auto find_header_column = [&](const ColumnWithTypeAndName & source_elem) -> std::optional<ColumnWithTypeAndName>
+    {
+        if (header.has(source_elem.name))
+            return header.getByName(source_elem.name);
+
+        auto short_name = get_short_name(source_elem.name);
+        if (!short_name.empty() && short_name_count[short_name] == 1)
+        {
+            std::string short_name_str(short_name);
+            if (header.has(short_name_str))
+                return header.getByName(short_name_str);
+        }
+
+        return std::nullopt;
+    };
+
     for (size_t i = 0; i < size; ++i)
     {
         const auto & source_elem = current_step_columns[i];
+        auto header_column_opt = find_header_column(source_elem);
+        if (header_column_opt)
+        {
+            converted_columns.push_back(materializeIfSourceIsNotConst(*header_column_opt, source_elem));
+            continue;
+        }
         if (header.has(source_elem.name))
         {
             converted_columns.push_back(materializeIfSourceIsNotConst(header.getByName(source_elem.name), source_elem));
@@ -1631,11 +1717,14 @@ void ReadFromMerge::convertAndFilterSourceStream(
         }
     }
 
-    auto convert_actions_dag = ActionsDAG::makeConvertingActions(
+    auto convert_actions_dag = makeConvertingActionsPreferNameThenPosition(
         current_step_columns,
         converted_columns,
-        ActionsDAG::MatchColumnsMode::Position,
-        local_context);
+        local_context,
+        "StorageMerge",
+        false /*ignore_constant_values*/,
+        false /*add_cast_columns*/,
+        nullptr /*new_names*/);
 
     auto expression_step = std::make_unique<ExpressionStep>(child.plan.getCurrentHeader(), std::move(convert_actions_dag));
     child.plan.addStep(std::move(expression_step));
