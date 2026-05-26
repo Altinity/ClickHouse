@@ -1654,48 +1654,10 @@ void ReadFromMerge::convertAndFilterSourceStream(
     };
 
     String smallest_column_name = ExpressionActions::getSmallestColumn(snapshot->metadata->getColumns().getAllPhysical()).name;
-    auto get_short_name = [](std::string_view full_name) -> std::string_view
-    {
-        auto pos = full_name.find_last_of('.');
-        if (pos == std::string_view::npos || pos + 1 >= full_name.size())
-            return {};
-        return full_name.substr(pos + 1);
-    };
-
-    std::unordered_map<std::string_view, size_t> short_name_count;
-    short_name_count.reserve(header.columns());
-    for (const auto & column : header)
-    {
-        auto short_name = get_short_name(column.name);
-        if (!short_name.empty())
-            ++short_name_count[short_name];
-    }
-
-    auto find_header_column = [&](const ColumnWithTypeAndName & source_elem) -> std::optional<ColumnWithTypeAndName>
-    {
-        if (header.has(source_elem.name))
-            return header.getByName(source_elem.name);
-
-        auto short_name = get_short_name(source_elem.name);
-        if (!short_name.empty() && short_name_count[short_name] == 1)
-        {
-            std::string short_name_str(short_name);
-            if (header.has(short_name_str))
-                return header.getByName(short_name_str);
-        }
-
-        return std::nullopt;
-    };
 
     for (size_t i = 0; i < size; ++i)
     {
         const auto & source_elem = current_step_columns[i];
-        auto header_column_opt = find_header_column(source_elem);
-        if (header_column_opt)
-        {
-            converted_columns.push_back(materializeIfSourceIsNotConst(*header_column_opt, source_elem));
-            continue;
-        }
         if (header.has(source_elem.name))
         {
             converted_columns.push_back(materializeIfSourceIsNotConst(header.getByName(source_elem.name), source_elem));
