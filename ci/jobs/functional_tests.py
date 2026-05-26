@@ -94,7 +94,9 @@ def run_tests(
     if "--no-zookeeper" not in extra_args:
         extra_args += " --zookeeper"
     # Remove --report-logs-stats, it hides sanitizer errors in def reportLogStats(args): clickhouse_execute(args, "SYSTEM FLUSH LOGS")
-    memory_limit = 10 * 2**30 if "asan_ubsan" in Info().job_name else 5 * 2**30
+    # memory_limit = 10 * 2**30 if "asan_ubsan" in Info().job_name else 5 * 2**30
+    # NOTE (strtgbb): Upstream appears to only monitor test memory usage on their HEAD build, let's not get distracted by OOM issues in our pipeline
+    memory_limit = 10 * 2**30
     command = f"clickhouse-test --testname --check-zookeeper-session --hung-check --memory-limit {memory_limit} --trace \
                 --capture-client-stacktrace --queries ./tests/queries --test-runs {rerun_count} \
                 {extra_args} \

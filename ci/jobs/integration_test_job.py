@@ -1080,7 +1080,7 @@ tar -czf ./ci/tmp/logs.tar.gz \
             for test_case in test_results:
                 if test_case.name in successful_retries:
                     test_case.set_label(Result.Label.OK_ON_RETRY)
-                    test_case.set_status(Result.StatusExtended.OK)
+                    test_case.set_status(Result.Status.OK)
                 elif test_case.name in failed_retries:
                     test_case.set_label(Result.Label.FAILED_ON_RETRY)
 
