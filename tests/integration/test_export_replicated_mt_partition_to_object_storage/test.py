@@ -703,10 +703,17 @@ def test_export_partition_file_already_exists_policy(cluster):
           AND partition_id = '2020'
         """
     ).strip()
-    assert committed_marker_file.startswith(f"{s3_table}/commit_2020_"), \
+    # `committed_marker_file` is the absolute key in the bucket (same convention as
+    # `destination_file_paths`); it may carry the s3_conn URL's in-bucket prefix on
+    # top of the table's `filename` argument, so use a "contains" check that does
+    # not depend on knowing that prefix.
+    assert f"{s3_table}/commit_2020_" in committed_marker_file, \
         f"Expected committed_marker_file under {s3_table}/, got: {committed_marker_file!r}"
+    # Path relative to the `s3_conn` URL, derived from the absolute key without
+    # assuming a particular URL prefix.
+    marker_relative_path = committed_marker_file[committed_marker_file.index(f"{s3_table}/"):]
     assert node.query(
-        f"SELECT count() FROM s3(s3_conn, filename='{committed_marker_file}', format=LineAsString)"
+        f"SELECT count() FROM s3(s3_conn, filename='{marker_relative_path}', format=LineAsString)"
     ) == '1\n', f"Commit marker file does not exist at {committed_marker_file!r}"
 
     # try to export the partition
