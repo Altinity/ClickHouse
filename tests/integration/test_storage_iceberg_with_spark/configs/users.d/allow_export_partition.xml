@@ -1,7 +1,8 @@
 <clickhouse>
+    <!-- NOTE (strtgbb): allow_insert_into_iceberg is now passed at query level via SETTINGS,
+         to exercise the path where only the initiator has the setting set. -->
     <profiles>
         <default>
-            <allow_experimental_insert_into_iceberg>1</allow_experimental_insert_into_iceberg>
         </default>
     </profiles>
 </clickhouse>
