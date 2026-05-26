@@ -1,0 +1,32 @@
+local
+2	3
+3	4
+11	12
+merge_prefer0
+2	3
+2	3
+3	4
+3	4
+11	12
+11	12
+merge_prefer1
+2	3
+2	3
+3	4
+3	4
+11	12
+11	12
+merge_prefer0_plan
+2	3
+2	3
+3	4
+3	4
+11	12
+11	12
+merge_prefer1_plan
+2	3
+2	3
+3	4
+3	4
+11	12
+11	12
