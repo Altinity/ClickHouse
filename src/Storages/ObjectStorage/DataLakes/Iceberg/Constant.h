@@ -41,6 +41,7 @@ DEFINE_ICEBERG_FIELD(time);
 DEFINE_ICEBERG_FIELD(timestamp);
 DEFINE_ICEBERG_FIELD(timestamptz);
 DEFINE_ICEBERG_FIELD(type)
+DEFINE_ICEBERG_FIELD(logicalType); /// this field has a camelCase name
 DEFINE_ICEBERG_FIELD(transform);
 DEFINE_ICEBERG_FIELD(direction);
 
@@ -113,7 +114,9 @@ DEFINE_ICEBERG_FIELD_ALIAS(partition_spec, partition-spec);
 DEFINE_ICEBERG_FIELD_ALIAS(partition_specs, partition-specs);
 DEFINE_ICEBERG_FIELD_ALIAS(spec_id, spec-id);
 DEFINE_ICEBERG_FIELD_ALIAS(added_records, added-records);
+DEFINE_ICEBERG_FIELD_ALIAS(deleted_records, deleted-records);
 DEFINE_ICEBERG_FIELD_ALIAS(added_data_files, added-data-files);
+DEFINE_ICEBERG_FIELD_ALIAS(deleted_data_files, deleted-data-files);
 DEFINE_ICEBERG_FIELD_ALIAS(added_delete_files, added-delete-files);
 DEFINE_ICEBERG_FIELD_ALIAS(added_position_delete_files, added-position-delete-files);
 DEFINE_ICEBERG_FIELD_ALIAS(added_position_deletes, added-position-deletes);
@@ -149,6 +152,8 @@ DEFINE_ICEBERG_FIELD_COMPOUND(data_file, lower_bounds);
 DEFINE_ICEBERG_FIELD_COMPOUND(data_file, upper_bounds);
 DEFINE_ICEBERG_FIELD_COMPOUND(data_file, referenced_data_file);
 DEFINE_ICEBERG_FIELD_COMPOUND(data_file, sort_order_id);
+DEFINE_ICEBERG_FIELD_COMPOUND(data_file, record_count);
+DEFINE_ICEBERG_FIELD_COMPOUND(data_file, file_size_in_bytes);
 
 /// Fallback defaults for snapshot retention policy when table properties are absent.
 /// These values follow the Java reference implementation; the Iceberg spec does not

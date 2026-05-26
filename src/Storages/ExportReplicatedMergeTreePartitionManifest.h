@@ -60,6 +60,60 @@ struct ExportReplicatedMergeTreePartitionProcessingPartEntry
     }
 };
 
+/// Per-task "last exception" record persisted at <export-entry>/last_exception.
+///
+/// Single znode per export task. Updated atomically with the surrounding state
+/// transition (status flip / lock release / retry counter bump) via a single
+/// `tryMulti` Set op. The `count` field is best-effort and non-atomic: writers
+/// `tryGet` the current value and write `count + 1` back without a version
+/// check, so concurrent writers may under-count. This matches the semantics
+/// used by `commit_attempts` and is documented in the system table.
+struct LastExceptionEntry
+{
+    String message;
+    String part;     /// empty for task-level exceptions (commit failure, timeout)
+    String replica;
+    time_t time = 0;
+    size_t count = 0;
+
+    std::string toJsonString() const
+    {
+        Poco::JSON::Object json;
+        json.set("message", message);
+        json.set("part", part);
+        json.set("replica", replica);
+        json.set("time", time);
+        json.set("count", count);
+        std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+        oss.exceptions(std::ios::failbit);
+        Poco::JSON::Stringifier::stringify(json, oss);
+        return oss.str();
+    }
+
+    static LastExceptionEntry fromJsonString(const std::string & json_string)
+    {
+        LastExceptionEntry entry;
+        if (json_string.empty())
+            return entry;
+
+        Poco::JSON::Parser parser;
+        auto json = parser.parse(json_string).extract<Poco::JSON::Object::Ptr>();
+        chassert(json);
+
+        if (json->has("message"))
+            entry.message = json->getValue<String>("message");
+        if (json->has("part"))
+            entry.part = json->getValue<String>("part");
+        if (json->has("replica"))
+            entry.replica = json->getValue<String>("replica");
+        if (json->has("time"))
+            entry.time = json->getValue<time_t>("time");
+        if (json->has("count"))
+            entry.count = json->getValue<size_t>("count");
+        return entry;
+    }
+};
+
 struct ExportReplicatedMergeTreePartitionProcessedPartEntry
 {
     String part_name;
@@ -119,7 +173,6 @@ struct ExportReplicatedMergeTreePartitionManifest
     size_t max_rows_per_file;
     MergeTreePartExportManifest::FileAlreadyExistsPolicy file_already_exists_policy;
     String filename_pattern;
-    bool lock_inside_the_task; /// todo temporary
     bool write_full_path_in_iceberg_metadata = false;
     String iceberg_metadata_json;
 
@@ -154,7 +207,6 @@ struct ExportReplicatedMergeTreePartitionManifest
         json.set("max_retries", max_retries);
         json.set("ttl_seconds", ttl_seconds);
         json.set("task_timeout_seconds", task_timeout_seconds);
-        json.set("lock_inside_the_task", lock_inside_the_task);
         json.set("write_full_path_in_iceberg_metadata", write_full_path_in_iceberg_metadata);
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
@@ -207,8 +259,6 @@ struct ExportReplicatedMergeTreePartitionManifest
 
             /// what to do if it's not a valid value?
         }
-
-        manifest.lock_inside_the_task = json->getValue<bool>("lock_inside_the_task");
 
         manifest.write_full_path_in_iceberg_metadata = json->getValue<bool>("write_full_path_in_iceberg_metadata");
 
