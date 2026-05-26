@@ -47,6 +47,7 @@ extern const int LIMIT_EXCEEDED;
 namespace DB::DataLakeStorageSetting
 {
 extern const DataLakeStorageSettingsBool iceberg_use_version_hint;
+extern const DataLakeStorageSettingsString iceberg_metadata_file_path;
 }
 
 namespace DB::Setting
@@ -713,7 +714,7 @@ void alter(
     const AlterCommands & params,
     ContextPtr context,
     ObjectStoragePtr object_storage,
-    const DataLakeStorageSettings & data_lake_settings,
+    DataLakeStorageSettings & data_lake_settings,
     PersistentTableComponents & persistent_table_components,
     const String & write_format,
     StorageID storage_id,
@@ -806,15 +807,36 @@ void alter(
             if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, metadata))
             {
                 if (wrote_ok)
+                {
+                    try
+                    {
+                        object_storage->removeObjectIfExists(StoredObject(storage_metadata_name));
+                    }
+                    catch (...)
+                    {
+                        tryLogCurrentException(log, "Iceberg alter: failed to remove orphan metadata file after catalog commit failure");
+                    }
                     throw Exception(
                         ErrorCodes::DATALAKE_DATABASE_ERROR,
                         "Iceberg alter: catalog commit failed for '{}' after metadata file was written successfully",
                         catalog_filename);
+                }
                 continue;
             }
             if (!wrote_ok)
                 LOG_INFO(log, "Iceberg alter: adopted existing metadata file '{}' and updated catalog", storage_metadata_name);
         }
+
+        if (data_lake_settings[DataLakeStorageSetting::iceberg_metadata_file_path].changed)
+            data_lake_settings[DataLakeStorageSetting::iceberg_metadata_file_path] = metadata_name;
+
+        if (persistent_table_components.metadata_cache)
+        {
+            persistent_table_components.metadata_cache->remove(persistent_table_components.table_path);
+            if (persistent_table_components.table_uuid)
+                persistent_table_components.metadata_cache->remove(*persistent_table_components.table_uuid);
+        }
+
         return;
     }
 

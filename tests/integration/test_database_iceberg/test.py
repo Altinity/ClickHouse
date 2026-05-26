@@ -1051,3 +1051,105 @@ def test_cluster_joins(started_cluster):
     )
 
     assert res == "Jack\tBlack\nJack\tSilver\nJohn\tBlack\nJohn\tSilver\n"
+
+
+def test_alter_drop_column_without_reload(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_alter_drop_column_{uuid.uuid4()}"
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+
+    schema = Schema(
+        NestedField(field_id=1, name="x", field_type=StringType(), required=False),
+        NestedField(field_id=2, name="y", field_type=StringType(), required=False),
+    )
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(root_namespace)
+    create_table(catalog, root_namespace, table_name, schema, PartitionSpec(), DEFAULT_SORT_ORDER)
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+    node.query(
+        f"INSERT INTO {CATALOG_NAME}.`{root_namespace}.{table_name}` VALUES ('a', 'b');",
+        settings={"allow_insert_into_iceberg": 1, "write_full_path_in_iceberg_metadata": 1},
+    )
+    assert (
+        node.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`")
+        == "a\tb\n"
+    )
+
+    node.query(
+        f"ALTER TABLE {CATALOG_NAME}.`{root_namespace}.{table_name}` DROP COLUMN y;",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    assert (
+        node.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`")
+        == "a\n"
+    )
+    assert "`y`" not in node.query(
+        f"SHOW CREATE TABLE {CATALOG_NAME}.`{root_namespace}.{table_name}`"
+    )
+
+
+def test_alter_orphan_metadata_cleanup_on_catalog_failure(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_alter_orphan_cleanup_{uuid.uuid4()}"
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+
+    schema = Schema(
+        NestedField(field_id=1, name="x", field_type=StringType(), required=False),
+        NestedField(field_id=2, name="y", field_type=StringType(), required=False),
+    )
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(root_namespace)
+    create_table(catalog, root_namespace, table_name, schema, PartitionSpec(), DEFAULT_SORT_ORDER)
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+    node.query(
+        f"INSERT INTO {CATALOG_NAME}.`{root_namespace}.{table_name}` VALUES ('a', 'b');",
+        settings={"allow_insert_into_iceberg": 1, "write_full_path_in_iceberg_metadata": 1},
+    )
+
+    iceberg_table = catalog.load_table(f"{root_namespace}.{table_name}")
+    metadata_location_before = iceberg_table.metadata_location()
+    metadata_prefix = metadata_location_before.replace("s3://warehouse-rest/", "").rsplit("/", 1)[0] + "/"
+
+    minio_client = Minio(
+        f"{started_cluster.get_instance_ip('minio')}:9000",
+        access_key=minio_access_key,
+        secret_key=minio_secret_key,
+        secure=False,
+    )
+
+    def count_metadata_files():
+        return len(
+            [
+                f
+                for f in list_s3_objects(minio_client, "warehouse-rest", prefix=metadata_prefix)
+                if f.endswith(".metadata.json")
+            ]
+        )
+
+    metadata_files_before = count_metadata_files()
+
+    node.query("SYSTEM ENABLE FAILPOINT iceberg_alter_catalog_update_metadata_fail")
+    try:
+        with pytest.raises(QueryRuntimeException, match="catalog commit failed"):
+            node.query(
+                f"ALTER TABLE {CATALOG_NAME}.`{root_namespace}.{table_name}` DROP COLUMN y;",
+                settings={"allow_insert_into_iceberg": 1},
+            )
+    finally:
+        node.query("SYSTEM DISABLE FAILPOINT iceberg_alter_catalog_update_metadata_fail")
+
+    assert count_metadata_files() == metadata_files_before
+    catalog.load_table(f"{root_namespace}.{table_name}")
+    assert catalog.load_table(f"{root_namespace}.{table_name}").metadata_location() == metadata_location_before
+    assert (
+        node.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`")
+        == "a\tb\n"
+    )
