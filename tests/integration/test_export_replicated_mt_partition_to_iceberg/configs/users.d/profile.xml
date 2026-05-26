@@ -1,6 +1,4 @@
 <clickhouse>
-    <!-- NOTE (strtgbb): allow_insert_into_iceberg is now passed at query level via SETTINGS,
-         to exercise the path where only the initiator has the setting set. -->
     <profiles>
         <default>
             <s3_retry_attempts>3</s3_retry_attempts>
