@@ -416,6 +416,15 @@ class ArtifactNames:
     CH_RISCV64 = "CH_RISCV64_BIN"
     CH_S390X = "CH_S390X_BIN"
     CH_LOONGARCH64 = "CH_LOONGARCH64_BIN"
+    CH_AMD_DEBUG_GH = "CH_AMD_DEBUG_GH"
+    CH_AMD_BINARY_GH = "CH_AMD_BINARY_GH"
+    CH_ARM_BINARY_GH = "CH_ARM_BIN_GH"
+    CH_AMD_ASAN_GH = "CH_AMD_ASAN_GH"
+    CH_AMD_TSAN_GH = "CH_AMD_TSAN_GH"
+    CH_AMD_MSAN_GH = "CH_AMD_MSAN_GH"
+    CH_AMD_UBSAN_GH = "CH_AMD_UBSAN_GH"
+    CH_ARM_ASAN_GH = "CH_ARM_ASAN_GH"
+    CH_ARM_TSAN_GH = "CH_ARM_TSAN_GH"
 
     FAST_TEST = "FAST_TEST"
     UNITTEST_AMD_ASAN = "UNITTEST_AMD_ASAN"
@@ -472,6 +481,23 @@ class ArtifactConfigs:
             ArtifactNames.CH_RISCV64,
             ArtifactNames.CH_S390X,
             ArtifactNames.CH_LOONGARCH64,
+        ]
+    )
+    clickhouse_binaries_gh = Artifact.Config(
+        name="...",
+        type=Artifact.Type.GH,
+        path=f"{TEMP_DIR}/build/programs/self-extracting/clickhouse",
+    ).parametrize(
+        names=[
+            ArtifactNames.CH_AMD_DEBUG_GH,
+            ArtifactNames.CH_AMD_BINARY_GH,
+            ArtifactNames.CH_ARM_BINARY_GH,
+            ArtifactNames.CH_AMD_ASAN_GH,
+            ArtifactNames.CH_AMD_TSAN_GH,
+            ArtifactNames.CH_AMD_MSAN_GH,
+            ArtifactNames.CH_AMD_UBSAN_GH,
+            ArtifactNames.CH_ARM_ASAN_GH,
+            ArtifactNames.CH_ARM_TSAN_GH,
         ]
     )
     clickhouse_stripped_binaries = Artifact.Config(

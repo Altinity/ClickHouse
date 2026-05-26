@@ -17,6 +17,11 @@ workflow = Workflow.Config(
             for a in ArtifactConfigs.clickhouse_binaries
             if a.name == ArtifactNames.CH_AMD_BINARY
         ],
+        *[
+            a
+            for a in ArtifactConfigs.clickhouse_binaries_gh
+            if a.name == ArtifactNames.CH_AMD_BINARY_GH
+        ],
     ],
     dockers=DOCKERS,
     secrets=SECRETS,

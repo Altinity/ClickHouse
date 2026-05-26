@@ -275,6 +275,18 @@ jobs:
             python3 -m praktika run 'Build (amd_binary)' --workflow "MergeQueueCI" --ci |& tee ./ci/tmp/job.log
           fi
 
+      - name: Upload artifact CH_AMD_BINARY_GH
+        id: upload_CH_AMD_BINARY_GH
+        uses: actions/upload-artifact@v7
+        continue-on-error: true
+        with:
+          name: CH_AMD_BINARY_GH
+          path: ci/tmp/build/programs/self-extracting/clickhouse
+          retention-days: 1
+      - name: Warn on failed upload of CH_AMD_BINARY_GH
+        if: steps.upload_CH_AMD_BINARY_GH.outcome == 'failure'
+        run: echo "::warning title=GH artifact upload failed::Failed to upload [CH_AMD_BINARY_GH] to GitHub artifacts (e.g. quota/rate limit). Downstream consumers will fall back to S3."
+
   finish_workflow:
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, fast_test, build_amd_binary]
