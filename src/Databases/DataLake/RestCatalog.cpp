@@ -57,6 +57,11 @@ namespace DB::ErrorCodes
     extern const int CATALOG_NAMESPACE_DISABLED;
 }
 
+namespace DB::FailPoints
+{
+    extern const char iceberg_alter_catalog_update_metadata_fail[];
+}
+
 namespace DataLake
 {
 
