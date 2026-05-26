@@ -143,7 +143,7 @@
          This interface is also used by ODBC and JDBC drivers (DataGrip, Dbeaver, ...)
          and by most of the web interfaces (embedded UI, Grafana, Redash, ...).
       -->
-    <!-- <http_port>8123</http_port> -->
+    <http_port>8123</http_port>
 
     <!-- Port for interaction by native protocol with:
          - clickhouse-client and other native ClickHouse tools (clickhouse-benchmark);
@@ -204,7 +204,7 @@
          Data transferred over connections to this port should not go through untrusted networks.
          See also 'interserver_https_port'.
       -->
-    <!-- <interserver_http_port>9009</interserver_http_port> -->
+    <interserver_http_port>9009</interserver_http_port>
 
     <!-- Port for communication between replicas with TLS.
          You have to configure certificate to enable this interface.
