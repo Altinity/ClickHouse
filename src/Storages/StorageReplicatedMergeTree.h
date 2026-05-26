@@ -375,7 +375,7 @@ public:
     using ShutdownDeadline = std::chrono::time_point<std::chrono::system_clock>;
     void waitForUniquePartsToBeFetchedByOtherReplicas(ShutdownDeadline shutdown_deadline);
 
-    std::vector<ReplicatedPartitionExportInfo> getPartitionExportsInfo(bool prefer_remote_information) const;
+    std::vector<ReplicatedPartitionExportInfo> getPartitionExportsInfo() const;
 
 private:
     std::atomic_bool are_restoring_replica {false};
@@ -403,7 +403,6 @@ private:
     friend class ReplicatedMergeMutateTaskBase;
     friend class ExportPartitionManifestUpdatingTask;
     friend class ExportPartitionTaskScheduler;
-    friend class ExportPartFromPartitionExportTask;
 
     using MergeStrategyPicker = ReplicatedMergeTreeMergeStrategyPicker;
     using LogEntry = ReplicatedMergeTreeLogEntry;

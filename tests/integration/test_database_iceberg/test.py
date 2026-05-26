@@ -5,7 +5,7 @@ import os
 import random
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 
 import pyarrow as pa
 import pytest
@@ -26,7 +26,8 @@ from pyiceberg.types import (
     StringType,
     StructType,
     TimestampType,
-    TimestamptzType
+    TimestamptzType,
+    TimeType,
 )
 from pyiceberg.table.sorting import UNSORTED_SORT_ORDER
 
@@ -141,11 +142,13 @@ def create_clickhouse_iceberg_database(
     node.query(
         f"""
 DROP DATABASE IF EXISTS {name};
-SET allow_database_iceberg=true;
-SET write_full_path_in_iceberg_metadata=1;
 CREATE DATABASE {name} ENGINE = {engine}('{BASE_URL}', 'minio', '{minio_secret_key}')
 SETTINGS {",".join((k+"="+repr(v) for k, v in settings.items()))}
-    """
+    """,
+        settings={
+            "allow_database_iceberg": 1,
+            "write_full_path_in_iceberg_metadata": 1,
+        },
     )
     show_result = node.query(f"SHOW DATABASE {name}")
     assert minio_secret_key not in show_result
@@ -154,23 +157,16 @@ SETTINGS {",".join((k+"="+repr(v) for k, v in settings.items()))}
 def create_clickhouse_iceberg_table(
     started_cluster, node, database_name, table_name, schema, additional_settings={}
 ):
-    settings = {
-        "storage_catalog_type": "rest",
-        "storage_warehouse": "demo",
-        "object_storage_endpoint": "http://minio:9000/warehouse-rest",
-        "storage_region": "us-east-1",
-        "storage_catalog_url" : BASE_URL,
-    }
-
-    settings.update(additional_settings)
-
+    settings_suffix = "" if len(additional_settings) == 0 else f"SETTINGS {",".join((k+"="+repr(v) for k, v in additional_settings.items()))}"
     node.query(
         f"""
-SET allow_experimental_database_iceberg=true;
-SET write_full_path_in_iceberg_metadata=1;
 CREATE TABLE {CATALOG_NAME}.`{database_name}.{table_name}` {schema} ENGINE = IcebergS3('http://minio:9000/warehouse-rest/{table_name}/', '{minio_access_key}', '{minio_secret_key}')
-SETTINGS {",".join((k+"="+repr(v) for k, v in settings.items()))}
-    """
+{settings_suffix}
+    """,
+        settings={
+            "allow_experimental_database_iceberg": 1,
+            "write_full_path_in_iceberg_metadata": 1,
+        },
     )
 
 def drop_clickhouse_iceberg_table(
@@ -679,6 +675,50 @@ def test_table_with_slash(started_cluster):
     assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_encoded_name}`") == "\\N\tAAPL\t193.24\t193.31\t('bot')\n"
 
 
+def test_partition_value_with_slash(started_cluster):
+    """Partition value containing '/' produces object keys with %2F; reading must preserve encoding."""
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_partition_slash_{uuid.uuid4()}"
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+
+    partition_spec = PartitionSpec(
+        PartitionField(
+            source_id=2, field_id=1000, transform=IdentityTransform(), name="symbol"
+        )
+    )
+    schema = DEFAULT_SCHEMA
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(root_namespace)
+
+    table = create_table(
+        catalog,
+        root_namespace,
+        table_name,
+        schema,
+        partition_spec=partition_spec,
+        sort_order=DEFAULT_SORT_ORDER,
+    )
+
+    data = [
+        {
+            "datetime": datetime.now(),
+            "symbol": "us/west",
+            "bid": 100.0,
+            "ask": 101.0,
+            "details": {"created_by": "test"},
+        }
+    ]
+    df = pa.Table.from_pylist(data)
+    table.append(df)
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+    assert 1 == int(node.query(f"SELECT count() FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`"))
+    assert "us/west" in node.query(f"SELECT symbol FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`")
+
+
 def test_cluster_select(started_cluster):
     node1 = started_cluster.instances["node1"]
     node2 = started_cluster.instances["node2"]
@@ -730,11 +770,13 @@ def test_not_specified_catalog_type(started_cluster):
     node.query(
         f"""
     DROP DATABASE IF EXISTS {CATALOG_NAME};
-    SET allow_database_iceberg=true;
-    SET write_full_path_in_iceberg_metadata=1;
     CREATE DATABASE {CATALOG_NAME} ENGINE = DataLakeCatalog('{BASE_URL}', 'minio', '{minio_secret_key}')
     SETTINGS {",".join((k+"="+repr(v) for k, v in settings.items()))}
-    """
+    """,
+        settings={
+            "allow_database_iceberg": 1,
+            "write_full_path_in_iceberg_metadata": 1,
+        },
     )
     assert "" == node.query(f"SHOW TABLES FROM {CATALOG_NAME}")
 
@@ -827,12 +869,7 @@ def test_gcs(started_cluster):
     node = started_cluster.instances["node1"]
 
     node.query("SYSTEM ENABLE FAILPOINT database_iceberg_gcs")
-    node.query(
-        f"""
-        DROP DATABASE IF EXISTS {CATALOG_NAME};
-        SET allow_database_iceberg = 1;
-        """
-    )
+    node.query(f"DROP DATABASE IF EXISTS {CATALOG_NAME};")
 
     with pytest.raises(Exception) as err:
         node.query(
@@ -842,7 +879,8 @@ def test_gcs(started_cluster):
             SETTINGS
                 catalog_type = 'rest',
                 warehouse = 'demo',
-            """
+            """,
+            settings={"allow_database_iceberg": 1},
         )
         assert "Google cloud storage converts to S3" in str(err.value)
 
@@ -1153,3 +1191,97 @@ def test_alter_orphan_metadata_cleanup_on_catalog_failure(started_cluster):
         node.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`")
         == "a\tb\n"
     )
+def test_partitioning_by_time(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_partitioning_by_time_{uuid.uuid4()}"
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+
+    namespace = f"{root_namespace}.A"
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+
+    schema = Schema(
+        NestedField(
+            field_id=1,
+            name="key",
+            field_type=TimeType(),
+            required=False
+        ),
+        NestedField(
+            field_id=2,
+            name="value",
+            field_type=StringType(),
+            required=False,
+        ),
+    )
+
+    partition_spec = PartitionSpec(
+        PartitionField(
+            source_id=1, field_id=1000, transform=IdentityTransform(), name="partition_key"
+        )
+    )
+
+    table = create_table(catalog, namespace, table_name, schema=schema, partition_spec=partition_spec)
+    data = [{"key": dtime(12,0,0), "value": "test1"},
+            {"key": dtime(13,0,0), "value": "test2"},
+            {"key": dtime(14,0,0), "value": "test3"},
+            ]
+    df = pa.Table.from_pylist(data)
+    table.append(df)
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+
+    assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{namespace}.{table_name}` ORDER BY key") == "12:00:00.000000\ttest1\n13:00:00.000000\ttest2\n14:00:00.000000\ttest3\n"
+    assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{namespace}.{table_name}` WHERE key = '13:00:00.000000' ORDER BY key") == "13:00:00.000000\ttest2\n"
+    assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{namespace}.{table_name}` WHERE key >= '13:00:00.000000' ORDER BY key") == "13:00:00.000000\ttest2\n14:00:00.000000\ttest3\n"
+    assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{namespace}.{table_name}` WHERE key <= '13:00:00.000000' ORDER BY key") == "12:00:00.000000\ttest1\n13:00:00.000000\ttest2\n"
+
+
+def test_partitioning_by_string(started_cluster):
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_partitioning_by_string_{uuid.uuid4()}"
+    table_name = f"{test_ref}_table"
+    root_namespace = f"{test_ref}_namespace"
+
+    namespace = f"{root_namespace}.A"
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(namespace)
+
+    schema = Schema(
+        NestedField(
+            field_id=1,
+            name="key",
+            field_type=StringType(),
+            required=False
+        ),
+        NestedField(
+            field_id=2,
+            name="value",
+            field_type=StringType(),
+            required=False,
+        ),
+        NestedField(
+            field_id=3,
+            name="time_value",
+            field_type=TimeType(),
+            required=False,
+        ),
+    )
+
+    partition_spec = PartitionSpec(
+        PartitionField(
+            source_id=1, field_id=1000, transform=IdentityTransform(), name="partition_key"
+        )
+    )
+
+    table = create_table(catalog, namespace, table_name, schema=schema, partition_spec=partition_spec)
+    data = [{"key": "a:b,c[d=e/f%g?h", "value": "test", "time_value": dtime(12,0,0)}]
+    df = pa.Table.from_pylist(data)
+    table.append(df)
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+
+    assert node.query(f"SELECT * FROM {CATALOG_NAME}.`{namespace}.{table_name}`") == "a:b,c[d=e/f%g?h\ttest\t12:00:00.000000\n"

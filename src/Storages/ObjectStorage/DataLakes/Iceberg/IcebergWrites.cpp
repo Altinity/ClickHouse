@@ -12,6 +12,7 @@
 #include <Core/TypeId.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypeTime64.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/IDataType.h>
 #include <Databases/DataLake/Common.h>
@@ -129,6 +130,8 @@ bool canDumpIcebergStats(const Field & field, DataTypePtr type)
         case TypeIndex::Date32:
         case TypeIndex::Int64:
         case TypeIndex::DateTime64:
+        case TypeIndex::Time:
+        case TypeIndex::Time64:
         case TypeIndex::String:
             return true;
         default:
@@ -144,6 +147,46 @@ std::vector<uint8_t> dumpValue(T value)
     return bytes;
 }
 
+DataTypePtr getTimeTypeOrNull(DataTypePtr type)
+{
+    if (type->isNullable())
+        return getTimeTypeOrNull(assert_cast<const DataTypeNullable *>(type.get())->getNestedType());
+
+    const WhichDataType which(type);
+    if (which.isTime() || which.isTime64())
+        return type;
+
+    return nullptr;
+}
+
+Int64 getTimeValueInMicroseconds(const Field & field, DataTypePtr type)
+{
+    if (type->isNullable())
+        return getTimeValueInMicroseconds(field, assert_cast<const DataTypeNullable *>(type.get())->getNestedType());
+
+    const WhichDataType which(type);
+    if (which.isTime())
+    {
+        if (field.getType() == Field::Types::Int64)
+            return field.safeGet<Int64>() * 1'000'000;
+        if (field.getType() == Field::Types::UInt64)
+            return static_cast<Int64>(field.safeGet<UInt64>()) * 1'000'000;
+        return static_cast<Int64>(field.safeGet<Int32>()) * 1'000'000;
+    }
+
+    if (which.isTime64())
+    {
+        const auto scale = getDecimalScale(*type);
+        if (scale > 6)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unsupported type for iceberg {}", type->getName());
+
+        const auto value = field.safeGet<Decimal64>().getValue().value;
+        return value * DataTypeTime64::getScaleMultiplier(6 - scale).value;
+    }
+
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "Expected Time or Time64, got {}", type->getName());
+}
+
 std::vector<uint8_t> dumpFieldToBytes(const Field & field, DataTypePtr type)
 {
     switch (type->getTypeId())
@@ -154,8 +197,12 @@ std::vector<uint8_t> dumpFieldToBytes(const Field & field, DataTypePtr type)
         case TypeIndex::Date:
         case TypeIndex::Date32:
             return dumpValue(field.safeGet<Int32>());
+        case TypeIndex::Time:
+            return dumpValue(getTimeValueInMicroseconds(field, type));
         case TypeIndex::Int64:
             return dumpValue(field.safeGet<Int64>());
+        case TypeIndex::Time64:
+            return dumpValue(getTimeValueInMicroseconds(field, type));
         case TypeIndex::DateTime64:
             return dumpValue(field.safeGet<Decimal64>().getValue().value);
         case TypeIndex::String:
@@ -383,7 +430,16 @@ void extendSchemaForPartitions(
         Poco::JSON::Object::Ptr field = new Poco::JSON::Object;
         field->set(Iceberg::f_field_id, 1000 + i);
         field->set(Iceberg::f_name, partition_columns[i]);
-        field->set(Iceberg::f_type, getAvroType(partition_types[i]));
+        auto logical_type = getAvroLogicalType(partition_types[i]);
+        if (!logical_type.isEmpty())
+        {
+            Poco::JSON::Object::Ptr type_field = new Poco::JSON::Object;
+            type_field->set(Iceberg::f_type, getAvroType(partition_types[i]));
+            type_field->set(Iceberg::f_logicalType, logical_type);
+            field->set(Iceberg::f_type, type_field);
+        }
+        else
+            field->set(Iceberg::f_type, getAvroType(partition_types[i]));
         partition_fields->add(field);
     }
 
@@ -602,6 +658,14 @@ void generateManifestFile(
         avro::GenericRecord & partition_record = data_file.field("partition").value<avro::GenericRecord>();
         for (size_t i = 0; i < partition_columns.size(); ++i)
         {
+            auto partition_time_type = getTimeTypeOrNull(partition_types[i]);
+            if (!partition_values[i].isNull() && partition_time_type)
+            {
+                partition_record.field(partition_columns[i]) =
+                    avro::GenericDatum(getTimeValueInMicroseconds(partition_values[i], partition_types[i]));
+                continue;
+            }
+
             switch (partition_values[i].getType())
             {
                 case Field::Types::Int64:
@@ -629,7 +693,6 @@ void generateManifestFile(
                     partition_record.field(partition_columns[i]) =
                         avro::GenericDatum(partition_values[i].safeGet<Decimal64>().getValue());
                     break;
-
                 case Field::Types::Null:
                     break;
 
@@ -645,6 +708,31 @@ void generateManifestFile(
         writer.write(manifest_datum);
     }
     writer.close();
+}
+
+// Avro uses zigzag encoding for integers to efficiently represent small negative
+// numbers. Positive n maps to 2n, negative n maps to 2(-n)-1, keeping small
+// magnitudes compact regardless of sign. The value is then serialized as a
+// variable-length base-128 integer (little-endian), where the high bit of each
+// byte signals whether more bytes follow.
+// See: https://avro.apache.org/docs/1.11.1/specification/#binary-encoding
+static void writeAvroLong(WriteBuffer & out, int64_t val)
+{
+    uint64_t n = (static_cast<uint64_t>(val) << 1) ^ static_cast<uint64_t>(val >> 63);
+    while (n & ~0x7fULL)
+    {
+        char c = static_cast<char>((n & 0x7f) | 0x80);
+        out.write(&c, 1);
+        n >>= 7;
+    }
+    char c = static_cast<char>(n);
+    out.write(&c, 1);
+}
+
+static void writeAvroBytes(WriteBuffer & out, const String & s)
+{
+    writeAvroLong(out, static_cast<int64_t>(s.size()));
+    out.write(s.data(), s.size());
 }
 
 void generateManifestList(
@@ -667,6 +755,38 @@ void generateManifestList(
         schema_representation = manifest_list_v2_schema;
     else
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unknown iceberg version {}", version);
+
+    // For empty manifest list (e.g. TRUNCATE), write a valid Avro container
+    // file manually so we can embed the full schema JSON with field-ids intact,
+    // without triggering the DataFileWriter constructor's eager writeHeader()
+    // which commits encoder state before we can override avro.schema.
+    if (manifest_entry_names.empty() && !use_previous_snapshots)
+    {
+        // For an empty manifest list (e.g. after TRUNCATE), we write a minimal valid
+        // Avro Object Container File manually rather than using avro::DataFileWriter.
+        // The reason: DataFileWriter calls writeHeader() eagerly in its constructor,
+        // committing the binary encoder state. Post-construction setMetadata() calls
+        // corrupt StreamWriter::next_ causing a NULL dereference on close(). Writing
+        // the OCF header directly ensures the full schema JSON (with Iceberg field-ids)
+        // is embedded intact — the Avro C++ library strips unknown field properties
+        // like field-id during schema node serialization.
+        // Avro OCF format: [magic(4)] [metadata_map] [sync_marker(16)] [no data blocks]
+        buf.write("Obj\x01", 4);
+
+        writeAvroLong(buf, 2);  // 2 metadata entries
+        writeAvroBytes(buf, "avro.codec");
+        writeAvroBytes(buf, "null");
+        writeAvroBytes(buf, "avro.schema");
+        writeAvroBytes(buf, schema_representation);  // full JSON with field-ids intact
+
+        writeAvroLong(buf, 0);  // end of metadata map
+
+        static const char sync_marker[16] = {};
+        buf.write(sync_marker, 16);
+
+        buf.finalize();
+        return;
+    }
 
     auto schema = avro::compileJsonSchemaFromString(schema_representation); // NOLINT
 
