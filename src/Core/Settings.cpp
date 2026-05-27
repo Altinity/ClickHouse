@@ -7539,7 +7539,7 @@ Maximum number of retries for exporting a merge tree part in an export partition
 Determines how long the manifest will live in ZooKeeper. It prevents the same partition from being exported twice to the same destination.
 This setting does not affect / delete in progress tasks. It'll only cleanup the completed ones.
 )", 0) \
-    DECLARE(UInt64, export_merge_tree_partition_task_timeout_seconds, 3600, R"(
+    DECLARE(UInt64, export_merge_tree_partition_task_timeout_seconds, 28800, R"(
 Maximum wall-clock duration (in seconds) an export partition task is allowed to remain in the PENDING state before it is auto-killed by the background cleanup loop.
 The timeout is measured from the manifest's create_time. Set to 0 to disable the timeout.
 When the timeout is exceeded the task transitions to KILLED (same terminal state as `KILL QUERY ... EXPORT PARTITION`), and `last_exception` is populated with a timeout reason.
