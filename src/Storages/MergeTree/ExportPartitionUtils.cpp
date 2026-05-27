@@ -169,10 +169,7 @@ namespace ExportPartitionUtils
         /// Per-task ephemeral lock that serializes the commit phase across replicas.
         /// Without it, `handlePartExportSuccess` (post-last-part path) and `tryCleanup`
         /// (poll/recovery path) can drive `commitExportPartitionTransaction` concurrently
-        /// for the same task. The Iceberg metadata-file CAS (`If-None-Match: *`) plus the
-        /// `clickhouse.export-partition-transaction-id` summary check remain in place as
-        /// defense in depth for the residual case where the Keeper session expires while
-        /// the holder is still inside the Iceberg write.
+        /// for the same task.
         const auto commit_lock_path = fs::path(entry_path) / "commit_lock";
         auto commit_lock = zkutil::EphemeralNodeHolder::tryCreate(commit_lock_path, *zk, replica_name);
         if (!commit_lock)
