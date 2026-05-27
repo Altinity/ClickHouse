@@ -203,19 +203,11 @@ namespace ExportPartitionUtils
 
         LOG_INFO(log, "ExportPartition: Committed export, mark as completed");
 
-        /// Mirror the destination commit paths into a dedicated znode so peers can
-        /// surface them via system.replicated_partition_exports. Wrapped in the same
-        /// `tryMulti` as the COMPLETED status flip whenever non-empty so the two
-        /// observations land together; if the destination call short-circuited on
-        /// idempotency (empty struct), we fall back to the original single trySet
-        /// and leave whatever commit_info a peer may have already written intact.
-        ///
-        /// Best-effort caveat: if this replica crashes between writing the Iceberg
-        /// files and reaching this point, the task still completes via the recovery
-        /// path but commit_info will be absent. Recovering commit_info from the
-        /// live Iceberg snapshot in that case is a possible future enhancement.
         const std::string status_path = fs::path(entry_path) / "status";
         const std::string completed_name = String(magic_enum::enum_name(ExportReplicatedMergeTreePartitionTaskEntry::Status::COMPLETED)).data();
+
+        Coordination::Requests ops;
+        ops.emplace_back(zkutil::makeSetRequest(status_path, completed_name, -1));
 
         if (!destination_commit_info.empty())
         {
@@ -226,44 +218,29 @@ namespace ExportPartitionUtils
                 destination_commit_info.commit_marker_file};
 
             const std::string commit_info_path = fs::path(entry_path) / "commit_info";
-
-            Coordination::Requests ops;
             ops.emplace_back(zkutil::makeCreateRequest(commit_info_path, commit_info_entry.toJsonString(), zkutil::CreateMode::Persistent));
-            ops.emplace_back(zkutil::makeSetRequest(status_path, completed_name, -1));
-
-            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperMulti);
-
-            Coordination::Responses responses;
-            const auto rc = zk->tryMulti(ops, responses);
-            if (rc == Coordination::Error::ZOK)
-            {
-                LOG_INFO(log, "ExportPartition: Marked export as completed and persisted commit_info");
-                return;
-            }
-
-            /// ZNODEEXISTS on commit_info: a peer already wrote it; their record
-            /// stands. Fall through to set the status only.
-            if (rc == Coordination::Error::ZNODEEXISTS)
-            {
-                LOG_INFO(log, "ExportPartition: commit_info already present (peer wrote it first); marking status COMPLETED only");
-            }
-            else
-            {
-                LOG_WARNING(log, "ExportPartition: Failed to persist commit_info atomically with COMPLETED (rc={}); falling back to status-only set", rc);
-            }
         }
 
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperSet);
-        if (Coordination::Error::ZOK == zk->trySet(status_path, completed_name, -1))
+        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperMulti);
+
+        Coordination::Responses responses;
+        const auto rc = zk->tryMulti(ops, responses);
+
+        if (rc == Coordination::Error::ZOK)
         {
-            LOG_INFO(log, "ExportPartition: Marked export as completed");
+            LOG_INFO(log, "ExportPartition: Marked export as completed{}",
+                destination_commit_info.empty() ? "" : " and persisted commit_info");
+            return;
         }
-        else
+
+        if (rc == Coordination::Error::ZNODEEXISTS)
         {
-            throw Exception(ErrorCodes::NETWORK_ERROR, "ExportPartition: Failed to mark export as completed, will not try to fix it");
+            LOG_INFO(log, "ExportPartition: commit_info already present (peer wrote it first); task already COMPLETED");
+            return;
         }
+
+        throw Exception(ErrorCodes::NETWORK_ERROR, "ExportPartition: Failed to mark export as completed (rc={}), will not try to fix it", rc);
     }
 
     bool handleCommitFailure(
