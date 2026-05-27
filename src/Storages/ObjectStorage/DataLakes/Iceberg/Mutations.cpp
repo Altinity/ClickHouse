@@ -250,9 +250,14 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
                     Field cur_value;
                     col_data_filename.column->get(i, cur_value);
 
-                    String path_without_namespace;
-                    if (cur_value.safeGet<String>().starts_with(blob_storage_namespace_name))
-                        path_without_namespace = cur_value.safeGet<String>().substr(blob_storage_namespace_name.size());
+                    /// The path stored in the position-delete file must match
+                    /// `data_object_file_path_key` (the raw path from the data manifest)
+                    /// at read time. Start from the original `_path` value and only
+                    /// strip a leading bucket/container prefix if it's actually there —
+                    /// otherwise the entry would be silently overwritten with just "/".
+                    String path_without_namespace = cur_value.safeGet<String>();
+                    if (path_without_namespace.starts_with(blob_storage_namespace_name))
+                        path_without_namespace = path_without_namespace.substr(blob_storage_namespace_name.size());
 
                     if (!path_without_namespace.starts_with('/'))
                         path_without_namespace = "/" + path_without_namespace;
