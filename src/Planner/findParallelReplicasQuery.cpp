@@ -547,7 +547,8 @@ JoinTreeQueryPlan buildQueryPlanForParallelReplicas(
     /// initial_header is a header expected by initial query.
     /// header is a header which is returned by the follower.
     /// They are different because tables will have different aliases (e.g. _table1 or _table5).
-    /// Here we just rename columns by position, with the hope the types would match.
+    /// Reconcile by name first (matching the initiator's column identifiers) and fall back to
+    /// position only when name matching is not possible.
     auto step = std::make_unique<ExpressionStep>(query_plan.getCurrentHeader(), std::move(converting));
     step->setStepDescription("Convert distributed names");
     query_plan.addStep(std::move(step));

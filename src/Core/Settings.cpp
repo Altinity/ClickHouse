@@ -2302,8 +2302,10 @@ Maximum length of step description in EXPLAIN PLAN.
 )", 0) \
     \
     DECLARE(Bool, enable_alias_marker, true, R"(
-Enable __aliasMarker injection for ALIAS column expressions when using the analyzer.
-This stabilizes action node names across planner/analyzer stages without changing query semantics.
+Enable __aliasMarker injection for ALIAS column expressions when reading a Distributed table with the analyzer.
+The marker preserves the identity of an inlined ALIAS expression across the initiator/shard boundary so columns are
+reconciled by name instead of by position. This is a correctness fix: with it disabled, distributed queries over
+ALIAS columns (especially distributed-over-distributed) can return swapped columns or fail with a type-mismatch error.
 )", 0) \
     \
     DECLARE(UInt64, preferred_block_size_bytes, 1000000, R"(

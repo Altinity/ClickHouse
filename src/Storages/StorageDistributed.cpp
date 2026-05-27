@@ -203,7 +203,6 @@ namespace Setting
     extern const SettingsBool prefer_localhost_replica;
     extern const SettingsUInt64 allow_experimental_parallel_reading_from_replicas;
     extern const SettingsBool prefer_global_in_and_join;
-    extern const SettingsBool serialize_query_plan;
     extern const SettingsBool enable_global_with_statement;
     extern const SettingsBool allow_experimental_hybrid_table;
     extern const SettingsBool enable_alias_marker;
@@ -829,7 +828,9 @@ class ReplaseAliasColumnsVisitor : public InDepthQueryTreeVisitor<ReplaseAliasCo
         /// Preserve the original column reference in arg2 so normal analyzer passes
         /// (alias/source uniquification) can still transform it consistently.
         /// Before query is sent to shard this ColumnNode is materialized to String ConstantNode.
-        arguments.emplace_back(std::move(column_expression));
+        /// Clone the expression before mutating its alias below: getExpression() may return a node
+        /// shared elsewhere in the tree, and removeAlias() would otherwise be a side effect on it.
+        arguments.emplace_back(column_expression->clone());
         arguments.emplace_back(std::make_shared<ColumnNode>(column_node->getColumn(), column_source));
 
         auto alias_marker_node = std::make_shared<FunctionNode>("__aliasMarker");

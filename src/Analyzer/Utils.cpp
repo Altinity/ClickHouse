@@ -49,7 +49,6 @@
 
 #include <Analyzer/Resolve/IdentifierResolveScope.h>
 
-#include <base/hex.h>
 
 #include <ranges>
 namespace DB
@@ -995,8 +994,16 @@ public:
         return false;
     }
 
-    static bool needChildVisit(const QueryTreeNodePtr &, const QueryTreeNodePtr &)
+    static bool needChildVisit(const QueryTreeNodePtr & parent, const QueryTreeNodePtr &)
     {
+        /// Do not descend into lambda bodies. A marker inside a lambda (e.g. a user-written
+        /// `arrayMap(x -> __aliasMarker(x, x), ...)`) is a per-row identity computation, not a
+        /// distributed-serialization-boundary column; its argument column resolves to the lambda
+        /// parameter which has no table source to materialize. Visiting it would otherwise hit the
+        /// "unnamed source" path below and raise a user-triggerable LOGICAL_ERROR (see 03933).
+        if (parent && parent->getNodeType() == QueryTreeNodeType::LAMBDA)
+            return false;
+
         /// Keep traversing marker payload recursively so nested chains are preserved
         /// and each marker can materialize its own arg2 when needed.
         return true;
@@ -1036,6 +1043,11 @@ public:
             return;
         }
 
+        /// arg2 was neither a column with a source alias nor an already-materialized String id
+        /// (e.g. a user-supplied marker with an arbitrary second argument). Leave it untouched -
+        /// the function is a pass-through identity, so no materialization is the safe, non-throwing
+        /// behavior. Our own injected markers always carry an aliased column source, so this path
+        /// is not reachable for them.
         if (alias_id.empty())
             return;
 

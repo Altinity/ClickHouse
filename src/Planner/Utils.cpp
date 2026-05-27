@@ -83,6 +83,8 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
     extern const int UNION_ALL_RESULT_STRUCTURES_MISMATCH;
     extern const int INTERSECT_OR_EXCEPT_RESULT_STRUCTURES_MISMATCH;
+    extern const int THERE_IS_NO_COLUMN;
+    extern const int NUMBER_OF_COLUMNS_DOESNT_MATCH;
 }
 
 String dumpQueryPlan(const QueryPlan & query_plan)
@@ -698,13 +700,17 @@ QueryPlanStepPtr projectOnlyUsedColumns(
     return step;
 }
 
-void logPositionConversionMismatch(
+static void logPositionConversionMismatch(
     const ColumnsWithTypeAndName & source_columns,
     const ColumnsWithTypeAndName & result_columns,
     const ContextPtr & context,
     std::string_view location)
 {
     static auto log = getLogger("PositionConversion");
+
+    /// Everything below is purely diagnostic; skip the work when TRACE is disabled.
+    if (!log->is(Poco::Message::PRIO_TRACE))
+        return;
 
     if (source_columns.size() != result_columns.size())
     {
@@ -777,9 +783,19 @@ ActionsDAG makeConvertingActionsPreferNameThenPosition(
     }
     catch (const Exception & e)
     {
+        /// Only fall back to positional matching for the cases name-matching legitimately
+        /// cannot handle (a column absent by name, or a differing column count - e.g. a remote
+        /// shard emitting an aggregate state column matched by ordinal). Any other error from
+        /// name-mode conversion is a genuine schema/type problem and must propagate rather than
+        /// be silently masked into a wrong-column association.
+        if (e.code() != ErrorCodes::THERE_IS_NO_COLUMN && e.code() != ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH)
+            throw;
+
+        /// Positional fallback is a normal, expected path here (e.g. a remote shard emitting an
+        /// aggregate-state column matched by ordinal), so this stays at TRACE to avoid noise.
         LOG_TRACE(
             log,
-            "Name conversion is not possible at {}. query_id={} reason={}",
+            "Name conversion is not possible at {}, falling back to positional matching. query_id={} reason={}",
             location,
             context ? context->getCurrentQueryId() : "",
             e.message());
