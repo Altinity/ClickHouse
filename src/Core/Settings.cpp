@@ -2358,6 +2358,10 @@ Enable __aliasMarker injection for ALIAS column expressions when reading a Distr
 The marker preserves the identity of an inlined ALIAS expression across the initiator/shard boundary so columns are
 reconciled by name instead of by position. This is a correctness fix: with it disabled, distributed queries over
 ALIAS columns (especially distributed-over-distributed) can return swapped columns or fail with a type-mismatch error.
+
+The marker is sent to shards as the `__aliasMarker` function in the distributed SQL. On a mixed-version cluster whose
+shards do not understand `__aliasMarker`, set this setting to `false` on the initiator: that disables marker injection
+and falls back to the previous behavior (no negotiation/version handshake is performed).
 )", 0) \
     \
     DECLARE(UInt64, preferred_block_size_bytes, 1000000, R"(
