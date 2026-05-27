@@ -1153,7 +1153,7 @@ def test_alter_orphan_metadata_cleanup_on_catalog_failure(started_cluster):
     )
 
     iceberg_table = catalog.load_table(f"{root_namespace}.{table_name}")
-    metadata_location_before = iceberg_table.metadata_location()
+    metadata_location_before = iceberg_table.metadata_location
     metadata_prefix = metadata_location_before.replace("s3://warehouse-rest/", "").rsplit("/", 1)[0] + "/"
 
     minio_client = Minio(
@@ -1186,7 +1186,7 @@ def test_alter_orphan_metadata_cleanup_on_catalog_failure(started_cluster):
 
     assert count_metadata_files() == metadata_files_before
     catalog.load_table(f"{root_namespace}.{table_name}")
-    assert catalog.load_table(f"{root_namespace}.{table_name}").metadata_location() == metadata_location_before
+    assert catalog.load_table(f"{root_namespace}.{table_name}").metadata_location == metadata_location_before
     assert (
         node.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_name}`")
         == "a\tb\n"
