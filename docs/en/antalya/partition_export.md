@@ -158,41 +158,49 @@ Query id: 9efc271a-a501-44d1-834f-bc4d20156164
 
 Row 1:
 ──────
-source_database:      default
-source_table:         replicated_source
-destination_database: default
-destination_table:    replicated_destination
-create_time:          2025-11-21 18:21:51
-partition_id:         2022
-transaction_id:       7397746091717128192
-source_replica:       r1
-parts:                ['2022_0_0_0','2022_1_1_0','2022_2_2_0']
-parts_count:          3
-parts_to_do:          0
-status:               COMPLETED
-exception_replica:    
-last_exception:       
-exception_part:       
-exception_count:      0
+source_database:            default
+source_table:               replicated_source
+destination_database:       default
+destination_table:          s3_destination
+create_time:                2025-11-21 18:21:51
+partition_id:               2022
+transaction_id:             7397746091717128192
+query_id:                   3fa3c8d3-7d6b-4f8b-9aa2-2c1f1ad0a111
+source_replica:             r1
+parts:                      ['2022_0_0_0','2022_1_1_0','2022_2_2_0']
+parts_count:                3
+parts_to_do:                0
+status:                     COMPLETED
+last_exception_per_replica: []
+exception_count:            0
+destination_file_paths:     {'2022_0_0_0':['s3://bucket/db/t/year=2022/2022_0_0_0_<hash>.parquet'],'2022_1_1_0':['s3://bucket/db/t/year=2022/2022_1_1_0_<hash>.parquet'],'2022_2_2_0':['s3://bucket/db/t/year=2022/2022_2_2_0_<hash>.parquet']}
+committed_metadata_file:
+committed_manifest_list:
+committed_manifest_file:
+committed_marker_file:      s3://bucket/db/t/commit_2022_7397746091717128192
 
 Row 2:
 ──────
-source_database:      default
-source_table:         replicated_source
-destination_database: default
-destination_table:    replicated_destination
-create_time:          2025-11-21 18:20:35
-partition_id:         2021
-transaction_id:       7397745772618674176
-source_replica:       r1
-parts:                ['2021_0_0_0']
-parts_count:          1
-parts_to_do:          0
-status:               COMPLETED
-exception_replica:    
-last_exception:       
-exception_part:       
-exception_count:      0
+source_database:            default
+source_table:               replicated_source
+destination_database:       default
+destination_table:          iceberg_destination
+create_time:                2025-11-21 18:20:35
+partition_id:               2021
+transaction_id:             7397745772618674176
+query_id:                   1c8e0fd0-6a3a-4d6e-9bd6-bdf64adfe118
+source_replica:             r2
+parts:                      ['2021_0_0_0']
+parts_count:                1
+parts_to_do:                0
+status:                     COMPLETED
+last_exception_per_replica: [('r1','Code: 999. Coordination::Exception: Session expired','2021_0_0_0','2025-11-21 18:20:42',1)]
+exception_count:            1
+destination_file_paths:     {'2021_0_0_0':['s3://lake/db/t/data/year=2021/2021_0_0_0_<hash>.parquet']}
+committed_metadata_file:    s3://lake/db/t/metadata/v3.metadata.json
+committed_manifest_list:    s3://lake/db/t/metadata/snap-7397745772618674176-1-<uuid>.avro
+committed_manifest_file:    s3://lake/db/t/metadata/<uuid>-m0.avro
+committed_marker_file:
 
 2 rows in set. Elapsed: 0.019 sec. 
 
@@ -209,6 +217,10 @@ Status values include:
 
 - `last_exception_per_replica` is an `Array(Tuple(replica String, message String, part String, time DateTime, count UInt64))`. Each tuple is the most recent exception observed by a single replica plus a best-effort within-replica `count`. Replicas that have never reported an exception are omitted.
 - `exception_count` is the sum of every `count` in `last_exception_per_replica`. Each replica owns its own counter, so cross-replica updates do not race; the sum is exact w.r.t. the snapshot returned. Within a single replica concurrent failing writers may under-count by one.
+
+### Per-part destination file paths
+
+- `destination_file_paths` is a `Map(String, Array(String))` keyed by source part name. Each value is the list of file paths written to the destination object storage when that part was exported (a single part can produce multiple files depending on `max_bytes` / `max_rows`). The map is rebuilt from ZooKeeper on every poll, so it grows as parts complete during `PENDING` and becomes the full picture once the task reaches `COMPLETED`.
 
 ### Commit info columns
 
