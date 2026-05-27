@@ -82,8 +82,9 @@ class CoverageExporter:
 
         if not self.to_file:
             query = (
-                f"INSERT INTO FUNCTION remoteSecure('{self.dest.url.removeprefix('https://')}', 'default.checks_coverage_lines', '{self.dest.user}', '{self.dest.pwd}') "
-                "SELECT file, line_start, line_end, "
+                f"INSERT INTO FUNCTION remoteSecure('{self.dest.url.removeprefix('https://').split(':')[0]}', '{Settings.CI_DB_DB_NAME}.checks_coverage_lines', '{self.dest.user}', '{self.dest.pwd}') "
+                "(branch, file, line_start, line_end, check_start_time, check_name, test_name, min_depth, branch_flag) "
+                f"SELECT '{self.branch}' AS branch, file, line_start, line_end, "
                 f"toStartOfHour(toDateTime('{self.check_start_time}')) AS check_start_time, "
                 f"'{self.job_name}' AS check_name, "
                 "test_name, min_depth, branch_flag "
@@ -133,8 +134,9 @@ class CoverageExporter:
 
             if ic_count > 0:
                 ic_query = (
-                    f"INSERT INTO FUNCTION remoteSecure('{self.dest.url.removeprefix('https://')}', 'default.checks_coverage_indirect_calls', '{self.dest.user}', '{self.dest.pwd}') "
-                    f"SELECT toStartOfHour(toDateTime('{self.check_start_time}')) AS check_start_time, "
+                    f"INSERT INTO FUNCTION remoteSecure('{self.dest.url.removeprefix('https://').split(':')[0]}', '{Settings.CI_DB_DB_NAME}.checks_coverage_indirect_calls', '{self.dest.user}', '{self.dest.pwd}') "
+                    "(branch, check_start_time, check_name, test_name, caller_name_hash, caller_func_hash, callee_offset, call_count) "
+                    f"SELECT '{self.branch}' AS branch, toStartOfHour(toDateTime('{self.check_start_time}')) AS check_start_time, "
                     f"'{self.job_name}' AS check_name, "
                     "test_name, caller_name_hash, caller_func_hash, callee_offset, call_count "
                     "FROM system.coverage_indirect_calls FINAL "

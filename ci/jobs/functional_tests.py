@@ -8,7 +8,7 @@ from pathlib import Path
 
 from ci.jobs.scripts.cidb_cluster import CIDBCluster
 from ci.jobs.scripts.clickhouse_proc import ClickHouseProc
-from ci.jobs.scripts.find_tests import Targeting
+from ci.jobs.scripts.find_tests import Targeting, resolve_workflow_branch
 from ci.jobs.scripts.functional_tests.export_coverage import CoverageExporter
 from ci.jobs.scripts.functional_tests_results import FTResultsProcessor
 from ci.jobs.scripts.workflow_hooks.pr_labels_and_category import Labels
@@ -747,7 +747,7 @@ def main():
                     src=CH,
                     dest=cidb_cluster,
                     job_name=info.job_name,
-                    branch=info.git_branch,
+                    branch=resolve_workflow_branch(info),
                 ).do(),
             )
         )
