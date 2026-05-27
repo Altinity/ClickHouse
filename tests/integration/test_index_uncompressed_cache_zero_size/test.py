@@ -1,3 +1,5 @@
+import uuid
+
 import pytest
 
 from helpers.cluster import ClickHouseCluster
@@ -66,10 +68,15 @@ def get_cache_events(query_id):
 
 
 def test_index_uncompressed_cache_runtime_toggle():
+    # Suffix the query_ids so re-runs in the same cluster session (e.g.
+    # under pytest --count) don't collide in system.query_log.
+    run_id = uuid.uuid4().hex[:8]
+
     # Phase 1: cache disabled (size=0 from initial config). The skip-index read
     # path must bypass the cache entirely - no profile events should fire.
-    run_skip_index_query("phase1_disabled")
-    hits, misses, weight_lost = get_cache_events("phase1_disabled")
+    qid = f"phase1_disabled_{run_id}"
+    run_skip_index_query(qid)
+    hits, misses, weight_lost = get_cache_events(qid)
     assert (hits, misses, weight_lost) == (0, 0, 0), (
         f"Expected zero index-uncompressed-cache events when the cache is "
         f"disabled, got hits={hits}, misses={misses}, weight_lost={weight_lost}"
@@ -85,8 +92,9 @@ def test_index_uncompressed_cache_runtime_toggle():
     ):
         node.query("SYSTEM DROP INDEX UNCOMPRESSED CACHE")
 
-        run_skip_index_query("phase2_first")
-        hits, misses, weight_lost = get_cache_events("phase2_first")
+        qid = f"phase2_first_{run_id}"
+        run_skip_index_query(qid)
+        hits, misses, weight_lost = get_cache_events(qid)
         assert misses > 0, (
             f"Expected misses with the cache enabled, "
             f"got hits={hits}, misses={misses}, weight_lost={weight_lost}"
@@ -96,8 +104,9 @@ def test_index_uncompressed_cache_runtime_toggle():
             f"got hits={hits}"
         )
 
-        run_skip_index_query("phase2_second")
-        hits, misses, weight_lost = get_cache_events("phase2_second")
+        qid = f"phase2_second_{run_id}"
+        run_skip_index_query(qid)
+        hits, misses, weight_lost = get_cache_events(qid)
         assert hits > 0, (
             f"Expected hits on the repeated query, "
             f"got hits={hits}, misses={misses}, weight_lost={weight_lost}"
@@ -105,8 +114,9 @@ def test_index_uncompressed_cache_runtime_toggle():
 
     # Phase 3: original config restored and reloaded by `reload_after=True`.
     # Disabling the cache at runtime must again bypass it for new queries.
-    run_skip_index_query("phase3_redisabled")
-    hits, misses, weight_lost = get_cache_events("phase3_redisabled")
+    qid = f"phase3_redisabled_{run_id}"
+    run_skip_index_query(qid)
+    hits, misses, weight_lost = get_cache_events(qid)
     assert (hits, misses, weight_lost) == (0, 0, 0), (
         f"Expected zero index-uncompressed-cache events after re-disabling at "
         f"runtime, got hits={hits}, misses={misses}, weight_lost={weight_lost}"

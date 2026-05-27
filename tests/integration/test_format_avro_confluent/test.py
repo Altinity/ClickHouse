@@ -74,6 +74,7 @@ def test_select(started_cluster):
         started_cluster.schema_registry_host, started_cluster.schema_registry_port
     )
 
+    run_query(instance, "drop table if exists avro_data")
     run_query(instance, "create table avro_data(value Int64) engine = Memory()")
     settings = {"format_avro_schema_registry_url": schema_registry_url}
     run_query(instance, "insert into avro_data format AvroConfluent", data, settings)
@@ -113,6 +114,7 @@ def test_select_skip_symbolic(started_cluster):
         started_cluster.schema_registry_host, started_cluster.schema_registry_port
     )
     settings = {"format_avro_schema_registry_url": schema_registry_url}
+    run_query(instance, "drop table if exists avro_data_skip_symbolic")
     run_query(
         instance,
         "create table avro_data_skip_symbolic(value Int64) engine = Memory()",
@@ -163,6 +165,7 @@ def test_select_auth(started_cluster):
         started_cluster.schema_registry_auth_port,
     )
 
+    run_query(instance, "drop table if exists avro_data_auth")
     run_query(instance, "create table avro_data_auth(value Int64) engine = Memory()")
     settings = {"format_avro_schema_registry_url": schema_registry_url}
     run_query(
@@ -213,6 +216,7 @@ def test_select_auth_encoded(started_cluster):
         started_cluster.schema_registry_auth_port,
     )
 
+    run_query(instance, "drop table if exists avro_data_auth_encoded")
     run_query(
         instance, "create table avro_data_auth_encoded(value Int64) engine = Memory()"
     )
@@ -268,6 +272,7 @@ def test_select_auth_encoded_complex(started_cluster):
         started_cluster.schema_registry_auth_port,
     )
 
+    run_query(instance, "drop table if exists avro_data_auth_encoded_complex")
     run_query(
         instance,
         "create table avro_data_auth_encoded_complex(value Int64) engine = Memory()",
