@@ -1,6 +1,11 @@
 SET allow_experimental_hybrid_table = 1,
     enable_analyzer = 1,
-    prefer_localhost_replica = 0;
+    prefer_localhost_replica = 0,
+    -- AST-path regression test for unknown-table issues #1208/#1209/#1422. Pin
+    -- serialize_query_plan=0 so the "distributed plan" CI flavor (which forces it on) does not
+    -- route these hybrid + IN-subquery queries through the plan path, which has a separate,
+    -- unrelated header-reconciliation gap.
+    serialize_query_plan = 0;
 
 DROP TABLE IF EXISTS test_hybrid_issue_1208_1209_1422;
 DROP TABLE IF EXISTS test_hybrid_issue_1208_1209_1422_left;
