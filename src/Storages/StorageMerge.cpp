@@ -15,6 +15,7 @@
 #include <Core/Settings.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeString.h>
+#include <DataTypes/NestedUtils.h>
 #include <DataTypes/getLeastSupertype.h>
 #include <DataTypes/IDataType.h>
 #include <Interpreters/Context.h>
@@ -1548,10 +1549,10 @@ void ReadFromMerge::convertAndFilterSourceStream(
         std::unordered_set<String> ambiguous_logical_names;
         for (const auto & column : header)
         {
-            auto last_dot_pos = column.name.rfind('.');
-            String logical_name = (last_dot_pos == String::npos || last_dot_pos + 1 >= column.name.size())
-                ? column.name
-                : column.name.substr(last_dot_pos + 1);
+            /// Strip the `__tableN.` analyzer prefix to get the logical column name.
+            auto logical_name = Nested::splitName(column.name, /*reverse=*/ true).second;
+            if (logical_name.empty())
+                logical_name = column.name;
             if (!logical_name_to_header_name.emplace(logical_name, column.name).second)
                 ambiguous_logical_names.insert(logical_name);
         }
@@ -1561,6 +1562,11 @@ void ReadFromMerge::convertAndFilterSourceStream(
         for (const auto & alias : aliases)
         {
             ActionsDAG actions_dag(pipe_columns);
+            /// Alias expressions reference columns by their plain logical name (e.g. `a`), while the
+            /// child stream exposes analyzer identifiers (e.g. `__table1.a`). Add an unambiguous
+            /// short-name alias for each identifier input so buildQueryTree(alias.expression) can
+            /// resolve those references. (Required: removing this breaks alias-of-alias resolution,
+            /// e.g. `b ALIAS a + 1` in 03928.)
             std::unordered_map<String, const ActionsDAG::Node *> short_name_to_node;
             std::unordered_set<String> ambiguous_short_names;
             std::unordered_set<String> existing_input_names;
@@ -1568,12 +1574,10 @@ void ReadFromMerge::convertAndFilterSourceStream(
             {
                 existing_input_names.insert(input->result_name);
 
-                const auto & input_name = input->result_name;
-                auto last_dot_pos = input_name.rfind('.');
-                if (last_dot_pos == String::npos || last_dot_pos + 1 >= input_name.size())
+                auto short_name = Nested::splitName(input->result_name, /*reverse=*/ true).second;
+                if (short_name.empty())
                     continue;
 
-                auto short_name = input_name.substr(last_dot_pos + 1);
                 if (!short_name_to_node.emplace(short_name, input).second)
                     ambiguous_short_names.insert(short_name);
             }
