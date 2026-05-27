@@ -86,6 +86,9 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int EMPTY_DATA_PASSED;
     extern const int LOGICAL_ERROR;
+#if USE_JWT_CPP && USE_SSL
+    extern const int AUTHENTICATION_FAILED;
+#endif
 }
 
 Connection::~Connection()
@@ -147,11 +150,30 @@ void Connection::connect(const ConnectionTimeouts & timeouts)
     disconnect();
 
 #if USE_JWT_CPP && USE_SSL
-    if (jwt_provider)
+    /// Fetch a JWT only when needed: no token yet, or current token parses as a JWT
+    /// with a known `exp` claim that is at/near expiry. Opaque (non-JWT) tokens and
+    /// JWTs whose `exp` we cannot extract are kept as-is and only refreshed
+    /// reactively below if the server rejects them.
+    if (jwt_provider && jwt.empty())
+    {
         jwt = jwt_provider->getJWT();
+    }
+    else if (jwt_provider && JWTProvider::isJWT(jwt))
+    {
+        const Poco::Timestamp expiry = JWTProvider::getJwtExpiry(jwt);
+        const Poco::Timestamp refresh_threshold = Poco::Timestamp() + Poco::Timespan(30, 0);
+        if (expiry > Poco::Timestamp(0) && expiry < refresh_threshold)
+            jwt = jwt_provider->getJWT();
+    }
+
+    bool jwt_retried_on_rejection = false;
 #endif
 
     ProfileEvents::increment(ProfileEvents::DistributedConnectionConnectCount);
+
+#if USE_JWT_CPP && USE_SSL
+retry_handshake_with_fresh_jwt:
+#endif
     try
     {
         LOG_TRACE(log_wrapper.get(), "Connecting. Database: {}. User: {}{}{}. Bind_Host: {}",
@@ -364,6 +386,25 @@ void Connection::connect(const ConnectionTimeouts & timeouts)
         e.addMessage("({})", getDescription(/*with_extra*/ true));
         throw;
     }
+#if USE_JWT_CPP && USE_SSL
+    catch (DB::Exception & e)
+    {
+        disconnect();
+
+        /// If the server rejected the JWT (e.g., it just expired), ask the provider for a fresh
+        /// one and retry the handshake once. Only happens for JWT-authenticated connections.
+        if (e.code() == ErrorCodes::AUTHENTICATION_FAILED && jwt_provider && !jwt_retried_on_rejection)
+        {
+            LOG_DEBUG(log_wrapper.get(),
+                "Server rejected JWT during handshake, fetching a fresh token and retrying once");
+            jwt_retried_on_rejection = true;
+            jwt = jwt_provider->getJWT();
+            goto retry_handshake_with_fresh_jwt;
+        }
+
+        throw;
+    }
+#endif
     catch (Poco::Net::NetException & e)
     {
         disconnect();

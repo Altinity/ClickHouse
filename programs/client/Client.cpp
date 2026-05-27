@@ -375,10 +375,15 @@ try
     }
 
 #if USE_JWT_CPP && USE_SSL
-    if (config().has("jwt-command") && config().has("jwt"))
+    /// `config().has(k)` is true even for empty XML elements like `<jwt-command></jwt-command>`,
+    /// so use a non-empty-value check to ignore inert placeholders.
+    const bool has_jwt_command_value = !config().getString("jwt-command", "").empty();
+    const bool has_jwt_value = !config().getString("jwt", "").empty();
+
+    if (has_jwt_command_value && has_jwt_value)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "jwt-command and jwt cannot both be specified");
 
-    if (config().has("jwt-command"))
+    if (has_jwt_command_value)
     {
         int timeout = config().getInt("jwt-command-timeout", DEFAULT_JWT_COMMAND_TIMEOUT_SECONDS);
         if (timeout <= 0)
@@ -388,12 +393,12 @@ try
         config().setString("jwt", "");
     }
 
-    if (config().getBool("cloud_oauth_pending", false) && !config().has("jwt"))
+    if (config().getBool("cloud_oauth_pending", false) && !has_jwt_value && !has_jwt_command_value)
     {
         login();
     }
 #else
-    if (config().has("jwt-command") || config().has("jwt"))
+    if (!config().getString("jwt-command", "").empty() || !config().getString("jwt", "").empty())
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "JWT is disabled, because ClickHouse is built without JWT or SSL support");
 #endif
 
@@ -410,10 +415,18 @@ try
         {
             auto code = e.code();
 
+            /// JWT-authenticated runs (--jwt, --jwt-command, --login) should never fall
+            /// back to a password prompt on AUTHENTICATION_FAILED — the failure is about
+            /// the JWT, not a missing password.
+            const bool jwt_auth_in_use =
+                !config().getString("jwt", "").empty()
+                || !config().getString("jwt-command", "").empty();
+
             bool should_ask_password = !asked_password && is_interactive &&
                 (code == ErrorCodes::AUTHENTICATION_FAILED || code == ErrorCodes::REQUIRED_PASSWORD) &&
                 !config().has("password") && !config().getBool("ask-password", false) &&
-                !config().has("ssh-key-file");
+                !config().has("ssh-key-file") &&
+                !jwt_auth_in_use;
 
             if (should_ask_password)
             {
@@ -778,7 +791,9 @@ void Client::addExtraOptions(OptionsDescription & options_description)
         ("quota_key", po::value<std::string>(), "A string to differentiate quotas when the user have keyed quotas configured on server")
         ("jwt", po::value<std::string>(), "Use JWT for authentication")
         ("jwt-command", po::value<std::string>(),
-            "Shell command whose stdout is used as the JWT. Invoked at startup and on every (re)connect.")
+            "Shell command whose stdout is used as the JWT. Invoked on the first connect, "
+            "before reconnects when the cached JWT is near expiry, and after the server "
+            "rejects the cached token with an authentication failure.")
         ("jwt-command-timeout", po::value<int>(), jwt_command_timeout_help.c_str())
         ("one-time-password", po::value<std::string>(), "Time-based one-time password (TOTP) for two-factor authentication")
         ("login", po::value<std::string>()->implicit_value(""),
@@ -985,14 +1000,33 @@ void Client::processOptions(
     {
         /// Reject mixed JWT + --login from any source. The --login branch below
         /// ends up calling config().setString("jwt", jwt_provider->getJWT()),
-        /// which would silently overwrite a JWT supplied via --jwt or via the
-        /// XML config file. config().has("jwt") covers both: CLI --jwt was
-        /// already copied into config() above, and a <jwt> element in
-        /// ~/.clickhouse-client/config.xml is loaded into config() at startup.
-        if (config().has("jwt"))
+        /// which would silently overwrite a JWT supplied via --jwt, --jwt-command,
+        /// or the XML config file. Both `--jwt` and `--jwt-command` from CLI were
+        /// already copied into config() above; `<jwt>` / `<jwt-command>` from
+        /// ~/.clickhouse-client/config.xml are loaded into config() at startup.
+        /// Use the same non-empty-value check as `Client::main` to ignore inert
+        /// XML placeholders like `<jwt-command></jwt-command>`.
+        const bool jwt_already_configured
+            = !config().getString("jwt", "").empty()
+            || !config().getString("jwt-command", "").empty();
+
+        if (jwt_already_configured)
+        {
+            /// If `--login` was auto-added for a `*.clickhouse.cloud` endpoint (no CLI
+            /// auth was given), don't surface an error that names a flag the user never
+            /// typed — silently defer to the JWT source they did configure.
+            if (login_was_auto_added)
+            {
+                login_was_auto_added = false;
+                /// Fall through past the --login handling below by jumping out of
+                /// `if (options.count("login"))`.
+                goto skip_login_branch;
+            }
+
             throw Exception(
                 ErrorCodes::BAD_ARGUMENTS,
-                "--login cannot be combined with a JWT (provided via --jwt or in the config file)");
+                "--login cannot be combined with a JWT (provided via --jwt, --jwt-command, or in the config file)");
+        }
 
         const std::string login_mode = options["login"].as<std::string>();
         if (!login_mode.empty() && login_mode != "browser" && login_mode != "device")
@@ -1046,6 +1080,7 @@ void Client::processOptions(
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "OAuth login requires a build with JWT and SSL support");
 #endif
     }
+skip_login_branch:
 #if USE_JWT_CPP && USE_SSL
     if (options.contains("oauth-url"))
         config().setString("oauth-url", options["oauth-url"].as<std::string>());
