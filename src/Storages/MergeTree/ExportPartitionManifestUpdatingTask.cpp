@@ -247,7 +247,7 @@ namespace
                 /// it sounds like a replica exported the last part, but was not able to commit the export. Try to fix it
                 try
                 {
-                    ExportPartitionUtils::commit(metadata, destination_storage, zk, log, entry_path, context, storage);
+                    ExportPartitionUtils::commit(metadata, destination_storage, zk, log, entry_path, context, storage, storage.getReplicaName());
                 }
                 catch (const Exception & e)
                 {
