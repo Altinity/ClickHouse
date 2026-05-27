@@ -152,6 +152,15 @@ struct ExportReplicatedMergeTreePartitionProcessedPartEntry
     }
 };
 
+/// Provenance of an export partition manifest.
+///   - ALTER: scheduled by `ALTER TABLE ... EXPORT PARTITION ID ...`.
+///   - TTL:   scheduled by the background TTL EXPORT task.
+enum class ExportReplicatedMergeTreePartitionOrigin : uint8_t
+{
+    ALTER,
+    TTL,
+};
+
 struct ExportReplicatedMergeTreePartitionManifest
 {
     String transaction_id;
@@ -164,7 +173,6 @@ struct ExportReplicatedMergeTreePartitionManifest
     std::vector<String> parts;
     time_t create_time;
     size_t max_retries;
-    size_t ttl_seconds;
     size_t task_timeout_seconds;
     size_t max_threads;
     bool parallel_formatting;
@@ -175,6 +183,7 @@ struct ExportReplicatedMergeTreePartitionManifest
     String filename_pattern;
     bool write_full_path_in_iceberg_metadata = false;
     String iceberg_metadata_json;
+    ExportReplicatedMergeTreePartitionOrigin origin = ExportReplicatedMergeTreePartitionOrigin::ALTER;
 
     std::string toJsonString() const
     {
@@ -205,9 +214,9 @@ struct ExportReplicatedMergeTreePartitionManifest
         json.set("filename_pattern", filename_pattern);
         json.set("create_time", create_time);
         json.set("max_retries", max_retries);
-        json.set("ttl_seconds", ttl_seconds);
         json.set("task_timeout_seconds", task_timeout_seconds);
         json.set("write_full_path_in_iceberg_metadata", write_full_path_in_iceberg_metadata);
+        json.set("origin", String(magic_enum::enum_name(origin)));
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
         Poco::JSON::Stringifier::stringify(json, oss);
@@ -240,7 +249,6 @@ struct ExportReplicatedMergeTreePartitionManifest
             manifest.parts.push_back(parts_array->getElement<String>(static_cast<unsigned int>(i)));
         
         manifest.create_time = json->getValue<time_t>("create_time");
-        manifest.ttl_seconds = json->getValue<size_t>("ttl_seconds");
         manifest.task_timeout_seconds = json->getValue<size_t>("task_timeout_seconds");
         manifest.max_threads = json->getValue<size_t>("max_threads");
         manifest.parallel_formatting = json->getValue<bool>("parallel_formatting");
@@ -261,6 +269,14 @@ struct ExportReplicatedMergeTreePartitionManifest
         }
 
         manifest.write_full_path_in_iceberg_metadata = json->getValue<bool>("write_full_path_in_iceberg_metadata");
+
+        if (json->has("origin"))
+        {
+            auto parsed = magic_enum::enum_cast<ExportReplicatedMergeTreePartitionOrigin>(json->getValue<String>("origin"));
+            if (parsed.has_value())
+                manifest.origin = parsed.value();
+            /// Older nodes have no `origin` field; default ALTER is the right legacy behavior.
+        }
 
         return manifest;
     }

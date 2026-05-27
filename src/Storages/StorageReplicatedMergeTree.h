@@ -14,6 +14,7 @@
 #include <Storages/MergeTree/EphemeralLockInZooKeeper.h>
 #include <Storages/MergeTree/ExportPartitionManifestUpdatingTask.h>
 #include <Storages/MergeTree/ExportPartitionTaskScheduler.h>
+#include <Storages/MergeTree/ExportPartitionTTLTask.h>
 #include <Storages/ExportReplicatedMergeTreePartitionTaskEntry.h>
 #include <Storages/MergeTree/FutureMergedMutatedPart.h>
 #include <Storages/MergeTree/MergeFromLogEntryTask.h>
@@ -403,6 +404,7 @@ private:
     friend class ReplicatedMergeMutateTaskBase;
     friend class ExportPartitionManifestUpdatingTask;
     friend class ExportPartitionTaskScheduler;
+    friend class ExportPartitionTTLTask;
 
     using MergeStrategyPicker = ReplicatedMergeTreeMergeStrategyPicker;
     using LogEntry = ReplicatedMergeTreeLogEntry;
@@ -525,7 +527,7 @@ private:
 
     Coordination::WatchCallbackPtr export_merge_tree_partition_watch_callback;
 
-    std::mutex export_merge_tree_partition_mutex;
+    mutable std::mutex export_merge_tree_partition_mutex;
 
     BackgroundSchedulePoolTaskHolder export_merge_tree_partition_select_task;
 
@@ -535,6 +537,26 @@ private:
     ExportPartitionTaskEntriesContainer::index<ExportPartitionTaskEntryTagByCompositeKey>::type & export_merge_tree_partition_task_entries_by_key;
     ExportPartitionTaskEntriesContainer::index<ExportPartitionTaskEntryTagByTransactionId>::type & export_merge_tree_partition_task_entries_by_transaction_id;
     ExportPartitionTaskEntriesContainer::index<ExportPartitionTaskEntryTagByCreateTime>::type & export_merge_tree_partition_task_entries_by_create_time;
+
+    /// Compute the "TTL export marker" for a destination on demand by scanning the manifest cache.
+    /// The marker is the highest partition_id (numerically, per the curated partition expression)
+    /// of any `origin=TTL` entry, regardless of status. Returns an empty string when no such entry
+    /// exists. Caller must hold `export_merge_tree_partition_mutex`.
+    ///
+    /// "Any status" is intentional:
+    ///  - Inserts older than the marker must be rejected even if the corresponding TTL export was
+    ///    KILLED/FAILED (those entries persist forever in the append-only history; the user must
+    ///    explicitly `force_export` to retry, and the marker stays put until then).
+    ///  - The TTL task uses the marker to skip past already-attempted partitions.
+    std::string computeTTLExportMarkerLocked(const QualifiedTableName & destination) const;
+
+    /// Background task that translates `TTL EXPORT` rules in the metadata into export entries.
+    /// Created unconditionally (not gated by `allow_experimental_export_merge_tree_partition`).
+    /// When the experimental flag is off, the task's call to `exportPartitionToTable` throws
+    /// and is caught/logged inside the task. When the flag is on, it goes through the same
+    /// pipeline as `ALTER ... EXPORT PARTITION`.
+    std::shared_ptr<ExportPartitionTTLTask> export_merge_tree_partition_ttl_task;
+    BackgroundSchedulePoolTaskHolder export_merge_tree_partition_ttl_schedule;
     /// A thread that removes old parts, log entries, and blocks.
     ReplicatedMergeTreeCleanupThread cleanup_thread;
 
@@ -775,6 +797,10 @@ private:
     /// handle status changes for export partition tasks
     void exportMergeTreePartitionStatusHandlingTask();
 
+    /// Drive `ExportPartitionTTLTask` and reschedule it. Always active; tolerates the
+    /// experimental flag being off (the task itself catches the gating exception).
+    void runExportPartitionTTLTask();
+
     /** Write the selected parts to merge into the log,
       * Call when merge_selecting_mutex is locked.
       * Returns false if any part is not in ZK.
@@ -967,6 +993,34 @@ private:
     void forgetPartition(const ASTPtr & partition, ContextPtr query_context) override;
     
     void exportPartitionToTable(const PartitionCommand &, ContextPtr) override;
+
+    /// Schedule an export partition entry with an explicit `origin`. Public override above
+    /// delegates here with `ALTER`. The TTL background task calls this directly with `TTL`.
+    void exportPartitionToTableWithOrigin(
+        const PartitionCommand & command,
+        ContextPtr query_context,
+        ExportReplicatedMergeTreePartitionOrigin origin);
+
+public:
+    /// Returns true when destructive TTL merges (TTL DROP / TTL DELETE / MATERIALIZE TTL drops)
+    /// are allowed to proceed for the given partition_id. False when there is at least one TTL
+    /// EXPORT destination that has not yet COMPLETED an export of this partition. Used by the
+    /// merge selectors to defer destructive TTL until export ownership has transferred.
+    bool isPartitionAllowedForTTLDropDelete(const String & partition_id) const;
+
+    /// Best-effort schema validation for TTL EXPORT destinations. Throws on hard mismatches
+    /// (column structure, partition key) when the destination is currently reachable. When the
+    /// destination does not yet exist or cannot be inspected (e.g. external storage offline),
+    /// the check is deferred to the runtime path inside `exportPartitionToTable`.
+    void validateExportTTLDestinations(const StorageInMemoryMetadata & metadata, ContextPtr query_context) const;
+
+    /// Throws `EXPORT_PARTITION_BACKFILL_NOT_ALLOWED` when `partition_id` is at or below the TTL
+    /// EXPORT marker of any destination. Used by `MergeTreeDataWriter` to reject backfills into
+    /// partitions whose data ownership has been transferred to a destination storage. No-op when
+    /// the table has no TTL EXPORT rules or when `allow_inserts_into_exported_partition` is set.
+    void checkInsertAllowedByExportTTLMarker(const String & partition_id) const;
+
+private:
 
     /// NOTE: there are no guarantees for concurrent merges. Dropping part can
     /// be concurrently merged into some covering part and dropPart will do

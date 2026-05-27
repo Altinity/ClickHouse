@@ -123,7 +123,8 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"object_storage_remote_initiator_cluster", "", "", "New setting."},
             // {"iceberg_metadata_staleness_ms", 0, 0, "New setting allowing using cached metadata version at READ operations to prevent fetching from remote catalog"},
             {"export_merge_tree_partition_task_timeout_seconds", 0, 3600, "New setting to control the timeout for export partition tasks."},
-            {"export_merge_tree_partition_manifest_ttl", 180, 86400, "Reasonable default for real usage"},
+            /// `export_merge_tree_partition_manifest_ttl` was removed: `system.replicated_partition_exports` is
+            /// now an append-only history table (entries never expire). See TTL EXPORT support.
         });
         addSettingsChanges(settings_changes_history, "26.1",
         {
@@ -324,7 +325,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"export_merge_tree_part_overwrite_file_if_exists", false, false, "New setting."},
             {"export_merge_tree_partition_force_export", false, false, "New setting."},
             {"export_merge_tree_partition_max_retries", 3, 3, "New setting."},
-            {"export_merge_tree_partition_manifest_ttl", 180, 180, "New setting."},
+            /// `export_merge_tree_partition_manifest_ttl` removed in later versions (entries never expire).
             {"export_merge_tree_part_file_already_exists_policy", "skip", "skip", "New setting."},
             {"hybrid_table_auto_cast_columns", true, true, "New setting to automatically cast Hybrid table columns when segments disagree on types. Default enabled."},
             {"allow_experimental_hybrid_table", false, false, "Added new setting to allow the Hybrid table engine."},

@@ -49,6 +49,7 @@
 #include <Storages/MergeTree/MergeTreeBackgroundExecutor.h>
 #include <Storages/MergeTree/MergeTreeDataFormatVersion.h>
 #include <Storages/MergeTree/MergeTreePartInfo.h>
+#include <Storages/MergeTree/MergeTreePartitionTopBoundary.h>
 #include <Storages/MergeTree/MergeTreeReaderCompact.h>
 #include <Storages/MergeTree/MergeTreeMutationStatus.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
@@ -214,7 +215,6 @@ namespace Setting
     extern const SettingsBool allow_experimental_export_merge_tree_part;
     extern const SettingsBool export_merge_tree_partition_force_export;
     extern const SettingsUInt64 export_merge_tree_partition_max_retries;
-    extern const SettingsUInt64 export_merge_tree_partition_manifest_ttl;
     extern const SettingsUInt64 export_merge_tree_partition_task_timeout_seconds;
     extern const SettingsBool output_format_parallel_formatting;
     extern const SettingsBool output_format_parquet_parallel_encoding;
@@ -236,6 +236,7 @@ namespace Setting
 namespace MergeTreeSetting
 {
     extern const MergeTreeSettingsBool allow_experimental_replacing_merge_with_cleanup;
+    extern const MergeTreeSettingsBool allow_inserts_into_exported_partition;
     extern const MergeTreeSettingsBool allow_remote_fs_zero_copy_replication;
     extern const MergeTreeSettingsBool always_use_copy_instead_of_hardlinks;
     extern const MergeTreeSettingsBool assign_part_uuids;
@@ -343,6 +344,7 @@ namespace ErrorCodes
     extern const int PENDING_MUTATIONS_NOT_ALLOWED;
     extern const int EXPORT_PARTITION_ALREADY_EXPORTED;
     extern const int PARTITION_EXPORT_FAILED;
+    extern const int EXPORT_PARTITION_BACKFILL_NOT_ALLOWED;
 }
 
 namespace ServerSetting
@@ -547,6 +549,17 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
 
         export_merge_tree_partition_select_task->deactivate();
     }
+
+    /// TTL EXPORT task is created unconditionally so that `TTL EXPORT` rules in the metadata are
+    /// always honored: the parser, metadata, system-table column, and marker cache are always
+    /// available. When `allow_experimental_export_merge_tree_partition` is OFF the task simply
+    /// catches the SUPPORT_IS_DISABLED exception from `exportPartitionToTable` and reschedules.
+    export_merge_tree_partition_ttl_task = std::make_shared<ExportPartitionTTLTask>(*this);
+    export_merge_tree_partition_ttl_schedule = getContext()->getSchedulePool().createTask(
+        getStorageID(),
+        getStorageID().getFullTableName() + " (StorageReplicatedMergeTree::export_merge_tree_partition_ttl_task)",
+        [this] { runExportPartitionTTLTask(); });
+    export_merge_tree_partition_ttl_schedule->deactivate();
 
 
     bool has_zookeeper = getContext()->hasZooKeeper() || getContext()->hasAuxiliaryZooKeeper(zookeeper_info.zookeeper_name);
@@ -4383,7 +4396,9 @@ void StorageReplicatedMergeTree::mergeSelectingTask()
                     /*merge_constraints=*/{{max_source_parts_bytes_for_merge, max_result_part_rows}},
                     /*merge_with_ttl_allowed=*/merge_with_ttl_allowed,
                     /*aggressive_=*/false,
-                    /*range_filter_=*/nullptr
+                    /*range_filter_=*/nullptr,
+                    /*ttl_drop_delete_partition_filter_=*/
+                        [this](const String & pid) { return isPartitionAllowedForTTLDropDelete(pid); }
                 ));
 
             if (partitions_to_merge_in.empty())
@@ -4402,7 +4417,9 @@ void StorageReplicatedMergeTree::mergeSelectingTask()
                     /*merge_constraints=*/{{max_source_parts_bytes_for_merge, max_result_part_rows}},
                     /*merge_with_ttl_allowed=*/merge_with_ttl_allowed,
                     /*aggressive_=*/false,
-                    /*range_filter_=*/nullptr
+                    /*range_filter_=*/nullptr,
+                    /*ttl_drop_delete_partition_filter_=*/
+                        [this](const String & pid) { return isPartitionAllowedForTTLDropDelete(pid); }
                 ),
                 partitions_to_merge_in);
 
@@ -4654,6 +4671,192 @@ void StorageReplicatedMergeTree::exportMergeTreePartitionStatusHandlingTask()
 std::vector<ReplicatedPartitionExportInfo> StorageReplicatedMergeTree::getPartitionExportsInfo() const
 {
     return export_merge_tree_partition_manifest_updater->getPartitionExportsInfo();
+}
+
+void StorageReplicatedMergeTree::runExportPartitionTTLTask()
+{
+    auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::runExportPartitionTTLTask");
+    std::chrono::milliseconds delay{60'000};
+    try
+    {
+        if (export_merge_tree_partition_ttl_task)
+            delay = export_merge_tree_partition_ttl_task->run();
+    }
+    catch (...)
+    {
+        tryLogCurrentException(log, __PRETTY_FUNCTION__);
+    }
+
+    export_merge_tree_partition_ttl_schedule->scheduleAfter(static_cast<size_t>(delay.count()));
+}
+
+std::string StorageReplicatedMergeTree::computeTTLExportMarkerLocked(const QualifiedTableName & destination) const
+{
+    /// Caller holds `export_merge_tree_partition_mutex`. Linear scan over the entries
+    /// container, which is bounded by the number of in-flight + historical export tasks
+    /// for this storage (a small number in practice).
+    std::string max_pid;
+    const auto & partition_key = getInMemoryMetadataPtr()->getPartitionKey();
+    const bool can_compare = MergeTreePartitionTopBoundary::isPartitionExpressionSupported(partition_key);
+    for (const auto & entry : export_merge_tree_partition_task_entries_by_key)
+    {
+        if (entry.manifest.origin != ExportReplicatedMergeTreePartitionOrigin::TTL)
+            continue;
+        if (entry.manifest.destination_database != destination.database
+            || entry.manifest.destination_table != destination.table)
+            continue;
+        if (max_pid.empty())
+        {
+            max_pid = entry.manifest.partition_id;
+            continue;
+        }
+        if (can_compare
+            && MergeTreePartitionTopBoundary::comparePartitionIds(partition_key, entry.manifest.partition_id, max_pid) > 0)
+        {
+            max_pid = entry.manifest.partition_id;
+        }
+    }
+    return max_pid;
+}
+
+bool StorageReplicatedMergeTree::isPartitionAllowedForTTLDropDelete(const String & partition_id) const
+{
+    /// Fast-path: no TTL EXPORT rules at all → drop / delete proceeds freely.
+    auto metadata = getInMemoryMetadataPtr();
+    if (!metadata->hasAnyExportTTL())
+        return true;
+
+    const auto & export_ttls = metadata->getExportTTLs();
+
+    std::lock_guard lock(export_merge_tree_partition_mutex);
+    /// For every TTL EXPORT destination there must be a COMPLETED entry for `partition_id`,
+    /// otherwise this partition is "owned by ClickHouse" pending export and we must defer the
+    /// destructive TTL merge. Failed / killed entries do NOT satisfy the requirement — the user
+    /// must explicitly resolve them (force_export) before TTL DROP can proceed.
+    for (const auto & rule : export_ttls)
+    {
+        QualifiedTableName destination{rule.destination_database, rule.destination_name};
+        const auto composite_key = partition_id + "_" + destination.getFullName();
+        auto it = export_merge_tree_partition_task_entries_by_key.find(composite_key);
+        if (it == export_merge_tree_partition_task_entries_by_key.end())
+            return false;
+        if (it->status != ExportReplicatedMergeTreePartitionTaskEntry::Status::COMPLETED)
+            return false;
+    }
+    return true;
+}
+
+void StorageReplicatedMergeTree::validateExportTTLDestinations(const StorageInMemoryMetadata & metadata, ContextPtr query_context) const
+{
+    if (!metadata.hasAnyExportTTL())
+        return;
+
+    /// The PARTITION BY whitelist is enforced at `registerStorageMergeTree` time, but we re-check
+    /// here so MODIFY TTL on a table whose partition key was somehow already incompatible still
+    /// fails loudly rather than silently breaking the scheduler.
+    MergeTreePartitionTopBoundary::checkPartitionExpressionSupported(metadata.getPartitionKey());
+
+    auto query_to_string = [](const ASTPtr & ast)
+    {
+        return ast ? ast->formatWithSecretsOneLine() : "";
+    };
+
+    const auto src_partition_ast = metadata.getPartitionKeyAST();
+    const auto & src_columns = metadata.getColumns();
+
+    for (const auto & rule : metadata.getExportTTLs())
+    {
+        const String & dest_database = rule.destination_database.empty()
+            ? query_context->getCurrentDatabase()
+            : rule.destination_database;
+        const String & dest_table = rule.destination_name;
+
+        StoragePtr dest_storage;
+        try
+        {
+            dest_storage = DatabaseCatalog::instance().tryGetTable({dest_database, dest_table}, query_context);
+        }
+        catch (...)
+        {
+            /// Destination database / catalog not available right now — defer to runtime.
+            LOG_INFO(log.load(), "Skipping TTL EXPORT destination validation for {}.{}: catalog unavailable. Will re-check at runtime.",
+                dest_database, dest_table);
+            continue;
+        }
+
+        if (!dest_storage)
+        {
+            LOG_INFO(log.load(), "TTL EXPORT destination {}.{} does not exist yet; deferring schema validation to runtime.",
+                dest_database, dest_table);
+            continue;
+        }
+
+        if (dest_storage->getStorageID() == this->getStorageID())
+        {
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "TTL EXPORT destination must differ from the source table ({}.{})",
+                dest_database, dest_table);
+        }
+
+        if (!dest_storage->supportsImport(query_context))
+        {
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                "TTL EXPORT destination {}.{} (engine {}) does not support MergeTree parts import",
+                dest_database, dest_table, dest_storage->getName());
+        }
+
+        auto dest_snapshot = dest_storage->getInMemoryMetadataPtr();
+        if (src_columns.getReadable().sizeOfDifference(dest_snapshot->getColumns().getInsertable()))
+        {
+            throw Exception(ErrorCodes::INCOMPATIBLE_COLUMNS,
+                "TTL EXPORT source and destination {}.{} have different structure",
+                dest_database, dest_table);
+        }
+
+        /// Iceberg-spec partitioning is verified at runtime by `verifyIcebergPartitionCompatibility`
+        /// which requires loading Iceberg metadata; we only do the cheap AST compare here.
+        if (!dest_storage->isDataLake())
+        {
+            if (query_to_string(src_partition_ast) != query_to_string(dest_snapshot->getPartitionKeyAST()))
+            {
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "TTL EXPORT source and destination {}.{} have different partition keys",
+                    dest_database, dest_table);
+            }
+        }
+    }
+}
+
+void StorageReplicatedMergeTree::checkInsertAllowedByExportTTLMarker(const String & partition_id) const
+{
+    auto metadata = getInMemoryMetadataPtr();
+    if (!metadata->hasAnyExportTTL())
+        return;
+    if ((*getSettings())[MergeTreeSetting::allow_inserts_into_exported_partition])
+        return;
+
+    const auto & partition_key = metadata->getPartitionKey();
+    if (!MergeTreePartitionTopBoundary::isPartitionExpressionSupported(partition_key))
+        return;
+
+    /// Derive the marker for every TTL EXPORT destination on demand from the manifest cache.
+    /// The cache size is bounded by the number of in-flight + historical export tasks.
+    std::lock_guard lock(export_merge_tree_partition_mutex);
+    for (const auto & rule : metadata->getExportTTLs())
+    {
+        QualifiedTableName destination{rule.destination_database, rule.destination_name};
+        const auto marker = computeTTLExportMarkerLocked(destination);
+        if (marker.empty())
+            continue;
+        if (MergeTreePartitionTopBoundary::comparePartitionIds(partition_key, partition_id, marker) <= 0)
+        {
+            throw Exception(ErrorCodes::EXPORT_PARTITION_BACKFILL_NOT_ALLOWED,
+                "Cannot insert into partition_id '{}': it is at or below the TTL EXPORT marker '{}' "
+                "for destination {}.{}. The partition is owned by the destination storage. "
+                "To override, set `allow_inserts_into_exported_partition = 1`.",
+                partition_id, marker, destination.database, destination.table);
+        }
+    }
 }
 
 StorageReplicatedMergeTree::CreateMergeEntryResult StorageReplicatedMergeTree::createLogEntryToMergeParts(
@@ -6056,6 +6259,9 @@ void StorageReplicatedMergeTree::partialShutdown()
         export_merge_tree_partition_select_task->deactivate();
         export_merge_tree_partition_status_handling_task->deactivate();
     }
+
+    if (export_merge_tree_partition_ttl_schedule)
+        export_merge_tree_partition_ttl_schedule->deactivate();
 
     cleanup_thread.stop();
     deduplication_hashes_cache.stop();
@@ -8282,6 +8488,15 @@ void StorageReplicatedMergeTree::fetchPartition(
 
 void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand & command, ContextPtr query_context)
 {
+    /// Public override: ALTER-originated entry.
+    exportPartitionToTableWithOrigin(command, query_context, ExportReplicatedMergeTreePartitionOrigin::ALTER);
+}
+
+void StorageReplicatedMergeTree::exportPartitionToTableWithOrigin(
+    const PartitionCommand & command,
+    ContextPtr query_context,
+    ExportReplicatedMergeTreePartitionOrigin origin)
+{
     auto component_guard = Coordination::setCurrentComponent("StorageReplicatedMergeTree::exportPartitionToTable");
     if (!query_context->getServerSettings()[ServerSetting::allow_experimental_export_merge_tree_partition])
     {
@@ -8322,7 +8537,7 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 
             try
             {
-                exportPartitionToTable(sub, query_context);
+                exportPartitionToTableWithOrigin(sub, query_context, origin);
             }
             catch (const Exception & e)
             {
@@ -8416,36 +8631,13 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperExists);
     if (zookeeper->exists(partition_exports_path))
     {
-        LOG_INFO(log, "Export with key {} is already exported or it is being exported. Checking if it has expired so that we can overwrite it", export_key);
-
-        bool has_expired = false;
-
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-        ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperExists);
-        if (zookeeper->exists(fs::path(partition_exports_path) / "metadata.json"))
+        /// `system.replicated_partition_exports` is an append-only history; entries never expire.
+        /// The only way to overwrite an existing entry is `export_merge_tree_partition_force_export`.
+        if (!query_context->getSettingsRef()[Setting::export_merge_tree_partition_force_export])
         {
-            std::string metadata_json;
-            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
-            if (zookeeper->tryGet(fs::path(partition_exports_path) / "metadata.json", metadata_json))
-            {
-                const auto manifest = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
-
-                const auto now = time(nullptr);
-                const auto expiration_time = manifest.create_time + manifest.ttl_seconds;
-
-                LOG_INFO(log, "Export with key {} has expiration time {}, now is {}", export_key, expiration_time, now);
-
-                if (static_cast<time_t>(expiration_time) < now)
-                {
-                    has_expired = true;
-                }
-            }
-        }
-
-        if (!has_expired && !query_context->getSettingsRef()[Setting::export_merge_tree_partition_force_export])
-        {
-            throw Exception(ErrorCodes::EXPORT_PARTITION_ALREADY_EXPORTED, "Export with key {} already exported or it is being exported, and it has not expired. Set `export_merge_tree_partition_force_export` to overwrite it.", export_key);
+            throw Exception(ErrorCodes::EXPORT_PARTITION_ALREADY_EXPORTED,
+                "Export with key {} already exists (history is append-only). Set `export_merge_tree_partition_force_export` to overwrite it.",
+                export_key);
         }
 
         LOG_INFO(log, "Overwriting export with key {}", export_key);
@@ -8527,8 +8719,8 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     manifest.parts = part_names;
     manifest.create_time = time(nullptr);
     manifest.max_retries = query_context->getSettingsRef()[Setting::export_merge_tree_partition_max_retries];
-    manifest.ttl_seconds = query_context->getSettingsRef()[Setting::export_merge_tree_partition_manifest_ttl];
     manifest.task_timeout_seconds = query_context->getSettingsRef()[Setting::export_merge_tree_partition_task_timeout_seconds];
+    manifest.origin = origin;
     manifest.max_threads = query_context->getSettingsRef()[Setting::max_threads];
     manifest.parallel_formatting = query_context->getSettingsRef()[Setting::output_format_parallel_formatting];
     manifest.parquet_parallel_encoding = query_context->getSettingsRef()[Setting::output_format_parquet_parallel_encoding];

@@ -48,6 +48,7 @@ struct ChooseContext
     const PartitionIdToTTLs & next_recompress_times;
     const time_t current_time;
     const bool aggressive;
+    const TTLDropDeletePartitionFilter & ttl_drop_delete_partition_filter;
 };
 
 MergeSelectorChoices pack(const ChooseContext & ctx, PartsRanges && ranges, MergeType type)
@@ -70,6 +71,23 @@ MergeSelectorChoices pack(const ChooseContext & ctx, PartsRanges && ranges, Merg
 
 MergeSelectorChoices tryChooseTTLMerge(const ChooseContext & ctx)
 {
+    /// Build a filtered ranges view for TTL DROP / TTL DELETE that excludes partitions whose
+    /// destructive TTL is deferred (e.g. still awaiting TTL EXPORT completion). All parts of a
+    /// single range share the same partition_id so we can decide on the first part.
+    PartsRanges ttl_ranges_storage;
+    const PartsRanges * ttl_ranges_ptr = &ctx.ranges;
+    if (ctx.ttl_drop_delete_partition_filter)
+    {
+        ttl_ranges_storage.reserve(ctx.ranges.size());
+        for (const auto & range : ctx.ranges)
+        {
+            if (range.empty() || ctx.ttl_drop_delete_partition_filter(range.front().info.getPartitionId()))
+                ttl_ranges_storage.push_back(range);
+        }
+        ttl_ranges_ptr = &ttl_ranges_storage;
+    }
+    const PartsRanges & ttl_ranges = *ttl_ranges_ptr;
+
     /// Drop parts - 1 priority
     if (!ctx.merge_constraints.empty())
     {
@@ -77,7 +95,7 @@ MergeSelectorChoices tryChooseTTLMerge(const ChooseContext & ctx)
         std::vector<MergeConstraint> ttl_constraints(ctx.merge_constraints.size(), {std::numeric_limits<size_t>::max(), std::numeric_limits<size_t>::max()});
         TTLPartDropMergeSelector drop_ttl_selector(ctx.current_time, ctx.merge_tree_settings[MergeTreeSetting::max_parts_to_merge_at_once]);
 
-        if (auto merge_ranges = drop_ttl_selector.select(ctx.ranges, ttl_constraints, ctx.range_filter); !merge_ranges.empty())
+        if (auto merge_ranges = drop_ttl_selector.select(ttl_ranges, ttl_constraints, ctx.range_filter); !merge_ranges.empty())
             return pack(ctx, std::move(merge_ranges), MergeType::TTLDrop);
     }
 
@@ -86,7 +104,7 @@ MergeSelectorChoices tryChooseTTLMerge(const ChooseContext & ctx)
     {
         TTLRowDeleteMergeSelector delete_ttl_selector(ctx.next_delete_times, ctx.current_time);
 
-        if (auto merge_ranges = delete_ttl_selector.select(ctx.ranges, ctx.merge_constraints, ctx.range_filter); !merge_ranges.empty())
+        if (auto merge_ranges = delete_ttl_selector.select(ttl_ranges, ctx.merge_constraints, ctx.range_filter); !merge_ranges.empty())
             return pack(ctx, std::move(merge_ranges), MergeType::TTLDelete);
     }
 
@@ -167,11 +185,13 @@ MergeSelectorApplier::MergeSelectorApplier(
     std::vector<MergeConstraint> && merge_constraints_,
     bool merge_with_ttl_allowed_,
     bool aggressive_,
-    IMergeSelector::RangeFilter range_filter_)
+    IMergeSelector::RangeFilter range_filter_,
+    TTLDropDeletePartitionFilter ttl_drop_delete_partition_filter_)
     : merge_constraints(std::move(merge_constraints_))
     , merge_with_ttl_allowed(merge_with_ttl_allowed_)
     , aggressive(aggressive_)
     , range_filter(std::move(range_filter_))
+    , ttl_drop_delete_partition_filter(std::move(ttl_drop_delete_partition_filter_))
 {
     chassert(!merge_constraints.empty(), "At least one merge constraint should be passed");
 
@@ -204,6 +224,7 @@ MergeSelectorChoices MergeSelectorApplier::chooseMergesFrom(
         .next_recompress_times = next_recompress_times,
         .current_time = current_time,
         .aggressive = aggressive,
+        .ttl_drop_delete_partition_filter = ttl_drop_delete_partition_filter,
     };
 
     if (metadata_snapshot->hasAnyTTL() && merge_with_ttl_allowed && can_use_ttl_merges)

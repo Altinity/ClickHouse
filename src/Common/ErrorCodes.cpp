@@ -667,6 +667,7 @@
     M(1005, PENDING_MUTATIONS_NOT_ALLOWED) \
     M(1006, EXPORT_PARTITION_ALREADY_EXPORTED) \
     M(1007, PARTITION_EXPORT_FAILED) \
+    M(1008, EXPORT_PARTITION_BACKFILL_NOT_ALLOWED) \
     /* See END */
 
 #ifdef APPLY_FOR_EXTERNAL_ERROR_CODES
@@ -683,7 +684,7 @@ namespace ErrorCodes
     APPLY_FOR_ERROR_CODES(M)
 #undef M
 
-    constexpr ErrorCode END = 1007;
+    constexpr ErrorCode END = 1008;
     ErrorPairHolder values[END + 1]{};
 
     struct ErrorCodesNames

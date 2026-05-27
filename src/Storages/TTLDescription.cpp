@@ -21,7 +21,9 @@
 #include <DataTypes/DataTypeDate32.h>
 #include <DataTypes/DataTypeDateTime.h>
 #include <DataTypes/DataTypeDateTime64.h>
+#include <DataTypes/DataTypeInterval.h>
 #include <Interpreters/FunctionNameNormalizer.h>
+#include <Interpreters/evaluateConstantExpression.h>
 #include <Parsers/ExpressionListParsers.h>
 #include <Parsers/parseQuery.h>
 
@@ -133,9 +135,12 @@ TTLDescription::TTLDescription(const TTLDescription & other)
     , set_parts(other.set_parts)
     , aggregate_descriptions(other.aggregate_descriptions)
     , destination_type(other.destination_type)
+    , destination_database(other.destination_database)
     , destination_name(other.destination_name)
     , if_exists(other.if_exists)
     , recompression_codec(other.recompression_codec)
+    , export_interval_kind(other.export_interval_kind)
+    , export_interval_count(other.export_interval_count)
 {
 }
 
@@ -164,8 +169,11 @@ TTLDescription & TTLDescription::operator=(const TTLDescription & other)
     set_parts = other.set_parts;
     aggregate_descriptions = other.aggregate_descriptions;
     destination_type = other.destination_type;
+    destination_database = other.destination_database;
     destination_name = other.destination_name;
     if_exists = other.if_exists;
+    export_interval_kind = other.export_interval_kind;
+    export_interval_count = other.export_interval_count;
 
     if (other.recompression_codec)
         recompression_codec = other.recompression_codec->clone();
@@ -222,6 +230,50 @@ TTLDescription TTLDescription::getTTLFromAST(
 {
     TTLDescription result;
     const auto * ttl_element = definition_ast->as<ASTTTLElement>();
+
+    /// EXPORT TTLs are partition-level and column-less. The "expression" stored on the AST is
+    /// an interval (e.g. `INTERVAL 30 DAY`), not a date-typed expression over row columns, so it
+    /// must skip the usual `checkTTLExpression` pipeline that demands a Date-typed result column.
+    if (ttl_element != nullptr && ttl_element->mode == TTLMode::EXPORT)
+    {
+        result.mode = ttl_element->mode;
+        result.destination_type = ttl_element->destination_type;
+        result.destination_database = ttl_element->destination_database;
+        result.destination_name = ttl_element->destination_name;
+        result.expression_ast = ttl_element->children.front()->clone();
+
+        checkExpressionDoesntContainSubqueries(*result.expression_ast);
+
+        auto interval_ast = result.expression_ast->clone();
+        EvaluateConstantExpressionResult eval_result;
+        try
+        {
+            eval_result = evaluateConstantExpression(interval_ast, context);
+        }
+        catch (...)
+        {
+            throw Exception(ErrorCodes::BAD_TTL_EXPRESSION,
+                "EXPORT TTL interval must be a constant interval expression (e.g. `INTERVAL 30 DAY`)");
+        }
+
+        const auto * interval_type = typeid_cast<const DataTypeInterval *>(eval_result.second.get());
+        if (!interval_type)
+            throw Exception(ErrorCodes::BAD_TTL_EXPRESSION,
+                "EXPORT TTL expression must have Interval type, got {}", eval_result.second->getName());
+
+        const Int64 value = eval_result.first.safeGet<Int64>();
+        if (value <= 0)
+            throw Exception(ErrorCodes::BAD_TTL_EXPRESSION,
+                "EXPORT TTL interval must be positive, got {}", value);
+
+        result.export_interval_kind = interval_type->getKind();
+        result.export_interval_count = value;
+
+        /// Partition-key compatibility and destination-table validation are deferred to the storage layer
+        /// (StorageReplicatedMergeTree), which has access to `metadata.partition_key` and can resolve the
+        /// destination via DatabaseCatalog.
+        return result;
+    }
 
     /// First child is expression: `TTL expr TO DISK`
     if (ttl_element != nullptr)
@@ -365,6 +417,7 @@ TTLTableDescription::TTLTableDescription(const TTLTableDescription & other)
  , move_ttl(other.move_ttl)
  , recompression_ttl(other.recompression_ttl)
  , group_by_ttl(other.group_by_ttl)
+ , export_ttl(other.export_ttl)
 {
 }
 
@@ -383,6 +436,7 @@ TTLTableDescription & TTLTableDescription::operator=(const TTLTableDescription &
     move_ttl = other.move_ttl;
     recompression_ttl = other.recompression_ttl;
     group_by_ttl = other.group_by_ttl;
+    export_ttl = other.export_ttl;
 
     return *this;
 }
@@ -426,6 +480,21 @@ TTLTableDescription TTLTableDescription::getTTLForTableFromAST(
         else if (ttl.mode == TTLMode::GROUP_BY)
         {
             result.group_by_ttl.emplace_back(std::move(ttl));
+        }
+        else if (ttl.mode == TTLMode::EXPORT)
+        {
+            /// Disallow duplicate EXPORT rules with the same destination — the marker is per (src, dst).
+            for (const auto & existing : result.export_ttl)
+            {
+                if (existing.destination_database == ttl.destination_database
+                    && existing.destination_name == ttl.destination_name)
+                {
+                    throw Exception(ErrorCodes::BAD_TTL_EXPRESSION,
+                        "Duplicate EXPORT TTL clause for destination {}.{}",
+                        ttl.destination_database, ttl.destination_name);
+                }
+            }
+            result.export_ttl.emplace_back(std::move(ttl));
         }
         else
         {

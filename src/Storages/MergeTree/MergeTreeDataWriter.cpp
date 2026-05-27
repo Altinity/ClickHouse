@@ -19,6 +19,7 @@
 #include <Storages/MergeTree/MergeTreeDataWriter.h>
 #include <Storages/MergeTree/MergeTreeMarksLoader.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
+#include <Storages/StorageReplicatedMergeTree.h>
 #include <Storages/MergeTree/MergedBlockOutputStream.h>
 #include <Storages/MergeTree/RowOrderOptimizer.h>
 #include <Common/ColumnsHashing.h>
@@ -605,6 +606,16 @@ MergeTreeTemporaryPartPtr MergeTreeDataWriter::writeTempPartImpl(
     ContextPtr context,
     UInt64 block_number)
 {
+    /// Backfill rejection: once a partition has been TTL-exported (`origin=TTL`) for any destination,
+    /// inserts targeting that partition or any older partition for the same destination are rejected
+    /// unless the operator explicitly enables `allow_inserts_into_exported_partition`. This guards
+    /// against silent duplication: exported partitions are owned by the destination storage.
+    if (auto * replicated = dynamic_cast<StorageReplicatedMergeTree *>(&data);
+        replicated && !isPatchPartitionId(partition_id))
+    {
+        replicated->checkInsertAllowedByExportTTLMarker(partition_id);
+    }
+
     auto temp_part = std::make_unique<MergeTreeTemporaryPart>();
     Block & block = *block_with_partition.block;
     MergeTreePartition & partition = block_with_partition.partition;

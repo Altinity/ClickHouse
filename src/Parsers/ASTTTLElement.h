@@ -15,6 +15,7 @@ class ASTTTLElement : public IAST
 public:
     TTLMode mode;
     DataDestinationType destination_type;
+    String destination_database;
     String destination_name;
     bool if_exists = false;
 

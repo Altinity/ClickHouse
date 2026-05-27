@@ -193,6 +193,13 @@ bool ReplicatedMergeTreeRestartingThread::runImpl()
         storage.export_merge_tree_partition_status_handling_task->activateAndSchedule();
     }
 
+    /// TTL EXPORT task is *not* gated by the experimental flag: it is always activated so that
+    /// `TTL EXPORT` configuration is honored as soon as the metadata says so. If the experimental
+    /// flag is off the task simply fails to schedule each tick and reschedules with the
+    /// SUPPORT_IS_DISABLED reason logged.
+    if (storage.export_merge_tree_partition_ttl_schedule)
+        storage.export_merge_tree_partition_ttl_schedule->activateAndSchedule();
+
     storage.cleanup_thread.start();
     storage.async_block_ids_cache.start();
     storage.part_check_thread.start();

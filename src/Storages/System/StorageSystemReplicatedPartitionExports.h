@@ -21,6 +21,8 @@ struct ReplicatedPartitionExportInfo
     size_t parts_to_do;
     std::vector<String> parts;
     String status;
+    /// Provenance: 'ALTER' (user-issued) or 'TTL' (background TTL task).
+    String origin;
     /// One entry per replica that has recorded at least one exception for this task.
     /// Sourced verbatim from the in-memory mirror; no ZooKeeper traffic.
     std::vector<LastExceptionEntry> last_exception_per_replica;

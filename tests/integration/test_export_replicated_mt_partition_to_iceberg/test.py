@@ -735,13 +735,12 @@ def test_partition_key_compatibility_check(cluster):
     )
 
 
-def test_export_ttl(cluster):
+def test_export_force_overwrite(cluster):
     """
-    After a manifest TTL expires the same partition can be re-exported, and the
-    new data is appended to (or replaces) what is in the Iceberg table.
+    `system.replicated_partition_exports` is append-only history. A second export to the same
+    destination requires `export_merge_tree_partition_force_export` to overwrite the existing entry.
     """
     node = cluster.instances["replica1"]
-    ttl_seconds = 3
 
     uid = unique_suffix()
     mt_table = f"mt_{uid}"
@@ -751,27 +750,23 @@ def test_export_ttl(cluster):
 
     # First export.
     node.query(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table} "
-        f"SETTINGS export_merge_tree_partition_manifest_ttl = {ttl_seconds}"
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
     )
+    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
 
-    # A second export before the TTL expires must be rejected.
+    # A second export without force must be rejected.
     error = node.query_and_get_error(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
     )
-    assert "Export with key" in error, f"Expected duplicate-export error before TTL, got: {error}"
-
-    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
+    assert "Export with key" in error, f"Expected duplicate-export error, got: {error}"
 
     count_after_first = int(node.query(f"SELECT count() FROM {iceberg_table} WHERE year = 2020").strip())
     assert count_after_first == 3, f"Expected 3 rows after first export, got {count_after_first}"
 
-    # Wait for the manifest TTL to expire.
-    time.sleep(ttl_seconds * 2)
-
-    # Second export must be accepted now.
+    # Second export must be accepted with force.
     node.query(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table} "
+        f"SETTINGS export_merge_tree_partition_force_export = 1"
     )
     wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
 
@@ -868,8 +863,7 @@ def test_export_task_timeout_kills_stuck_pending_task(cluster):
         node.query(
             f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
             f" SETTINGS export_merge_tree_partition_task_timeout_seconds = 5,"
-            f"          export_merge_tree_partition_max_retries = 1000000,"
-            f"          export_merge_tree_partition_manifest_ttl = 3600"
+            f"          export_merge_tree_partition_max_retries = 1000000"
         )
 
         # Timeout budget must cover: the 5s task timeout + one manifest-updating

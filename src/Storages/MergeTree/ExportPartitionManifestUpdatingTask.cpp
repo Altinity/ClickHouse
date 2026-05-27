@@ -118,7 +118,11 @@ namespace
     }
 
     /*
-        Remove expired entries and fix non-committed exports that have already exported all parts.
+        Fix non-committed exports that have already exported all parts, and enforce task timeouts.
+
+        Note: terminal entries (COMPLETED / FAILED / KILLED) are *not* expired here. The
+        `system.replicated_partition_exports` table is an append-only history that doubles as the
+        marker source for TTL EXPORT — entries must remain visible forever.
 
         Return values:
         - true: the cleanup was successful, the entry is removed from the entries_by_key container and the function returns true. Proceed to the next entry.
@@ -130,32 +134,16 @@ namespace
         const LoggerPtr & log,
         const ContextPtr & storage_context,
         StorageReplicatedMergeTree & storage,
-        const std::string & key,
         const ExportReplicatedMergeTreePartitionManifest & metadata,
         const time_t now,
-        const bool is_pending,
-        auto & entries_by_key
+        const bool is_pending
     )
     {
-        bool has_expired = metadata.create_time < now - static_cast<time_t>(metadata.ttl_seconds);
-
         bool task_timed_out = is_pending
             && metadata.task_timeout_seconds > 0
             && metadata.create_time + static_cast<time_t>(metadata.task_timeout_seconds) < now;
 
-        if (has_expired && !is_pending)
-        {
-            zk->tryRemoveRecursive(fs::path(entry_path));
-            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
-            ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRemoveRecursive);
-            auto it = entries_by_key.find(key);
-            if (it != entries_by_key.end())
-                entries_by_key.erase(it);
-            LOG_INFO(log, "ExportPartition Manifest Updating Task: Removed {}: expired", key);
-
-            return true;
-        }
-        else if (task_timed_out)
+        if (task_timed_out)
         {
             const std::string status_path = fs::path(entry_path) / "status";
 
@@ -277,8 +265,8 @@ namespace
                     }
 
                     /// Return false so the next poll re-enters the cleanup path:
-                    ///  - if FAILED: status != PENDING on re-read, cleanup is a no-op
-                    ///    until the entry expires (handled by the first tryCleanup branch).
+                    ///  - if FAILED: status != PENDING on re-read, cleanup is a no-op (terminal entries
+                    ///    persist forever in history).
                     ///  - if still PENDING: next poll increments the counter again.
                     return false;
                 }
@@ -321,6 +309,7 @@ std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::
         info.parts_to_do = entry.manifest.parts.size();
         info.parts = entry.manifest.parts;
         info.status = magic_enum::enum_name(entry.status);
+        info.origin = magic_enum::enum_name(entry.manifest.origin);
 
         info.last_exception_per_replica.reserve(entry.last_exception_per_replica.size());
         size_t total_exception_count = 0;
@@ -449,11 +438,9 @@ void ExportPartitionManifestUpdatingTask::poll()
                 storage.log.load(),
                 storage.getContext(),
                 storage,
-                key,
                 metadata,
                 now,
-                *status == ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING,
-                entries_by_key);
+                *status == ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING);
 
             if (cleanup_successful)
                 continue;

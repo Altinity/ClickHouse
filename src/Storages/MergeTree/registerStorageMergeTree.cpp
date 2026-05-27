@@ -1,6 +1,7 @@
 #include <Databases/DatabaseReplicatedHelpers.h>
 #include <Storages/MergeTree/MergeTreeIndexMinMax.h>
 #include <Storages/MergeTree/MergeTreeIndices.h>
+#include <Storages/MergeTree/MergeTreePartitionTopBoundary.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/extractZooKeeperPathFromReplicatedTableDef.h>
 #include <Storages/StorageFactory.h>
@@ -75,6 +76,7 @@ namespace ErrorCodes
     extern const int NO_REPLICA_NAME_GIVEN;
     extern const int CANNOT_EXTRACT_TABLE_STRUCTURE;
     extern const int SUPPORT_IS_DISABLED;
+    extern const int NOT_IMPLEMENTED;
 }
 
 
@@ -711,6 +713,19 @@ static StoragePtr create(const StorageFactory::Arguments & args)
         {
             metadata.table_ttl = TTLTableDescription::getTTLForTableFromAST(
                 args.storage_def->ttl_table->ptr(), metadata.columns, context, metadata.primary_key, allow_suspicious_ttl);
+
+            if (metadata.table_ttl.export_ttl.empty())
+            {
+                /// EXPORT TTL relies on the ALTER ... EXPORT PARTITION pipeline, which is only
+                /// available for Replicated*MergeTree.
+                if (!replicated)
+                {
+                    throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                        "TTL EXPORT is only supported for Replicated*MergeTree, got {}", args.engine_name);
+                }
+
+                MergeTreePartitionTopBoundary::checkPartitionExpressionSupported(metadata.partition_key);
+            }
         }
 
         storage_settings->loadFromQuery(*args.storage_def, context, LoadingStrictnessLevel::ATTACH <= args.mode);
