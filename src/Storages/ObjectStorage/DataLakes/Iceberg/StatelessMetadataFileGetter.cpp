@@ -189,8 +189,10 @@ ManifestFileCacheKeys getManifestList(
         {
             const std::string file_path
                 = manifest_list_deserializer.getValueFromRowByName(i, f_manifest_path, TypeIndex::String).safeGet<std::string>();
-            const auto manifest_file_name = getProperFilePathFromMetadataInfo(
-                file_path, persistent_table_components.table_path, persistent_table_components.table_location);
+            /// Preserve the original (possibly cross-storage) URI of the manifest file. Stripping
+            /// the scheme here would force `getManifestFile` to read it from the base storage,
+            /// breaking Iceberg tables whose manifests live in a different storage than the table.
+            const auto manifest_file_name = makeAbsolutePath(persistent_table_components.table_location, file_path);
             Int64 added_sequence_number = 0;
             auto added_snapshot_id = manifest_list_deserializer.getValueFromRowByName(i, f_added_snapshot_id);
             if (added_snapshot_id.isNull())

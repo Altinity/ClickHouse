@@ -462,8 +462,7 @@ IcebergDataSnapshotPtr IcebergMetadata::createIcebergDataSnapshotFromSnapshotJSO
             object_storage,
             persistent_components,
             local_context,
-            getProperFilePathFromMetadataInfo(
-                manifest_list_file_path, persistent_components.table_path, persistent_components.table_location),
+            makeAbsolutePath(persistent_components.table_location, manifest_list_file_path),
             log,
             *secondary_storages),
         snapshot_id,

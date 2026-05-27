@@ -1011,8 +1011,7 @@ static void collectRetainedFiles(
         String manifest_list_path = snapshot->getValue<String>(Iceberg::f_manifest_list);
         retained_manifest_list_paths.insert(manifest_list_path);
 
-        String storage_manifest_list_path = getProperFilePathFromMetadataInfo(
-            manifest_list_path, persistent_table_components.table_path, persistent_table_components.table_location);
+        String storage_manifest_list_path = makeAbsolutePath(persistent_table_components.table_location, manifest_list_path);
 
         SecondaryStorages local_secondary_storages;
         auto manifest_keys = getManifestList(
@@ -1062,8 +1061,7 @@ static ExpiredFiles collectExpiredFiles(
         if (seen_expired_manifest_list_paths.contains(ml_path))
             continue;
 
-        String storage_ml_path = getProperFilePathFromMetadataInfo(
-            ml_path, persistent_table_components.table_path, persistent_table_components.table_location);
+        String storage_ml_path = makeAbsolutePath(persistent_table_components.table_location, ml_path);
 
         ManifestFileCacheKeys manifest_keys;
         SecondaryStorages local_secondary_storages;
