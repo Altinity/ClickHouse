@@ -25,6 +25,7 @@
 #include <Storages/SelectQueryInfo.h>
 #include <Storages/StorageDistributed.h>
 #include <TableFunctions/TableFunctionFactory.h>
+#include <TableFunctions/TableFunctionRemote.h>
 #include <Poco/URI.h>
 #include <Storages/extractTableFunctionFromSelectQuery.h>
 #include <Planner/Utils.h>
@@ -499,6 +500,10 @@ IStorageCluster::RemoteCallVariables IStorageCluster::convertToRemote(
     table_expression->table_function = remote_query;
 
     auto remote_function = TableFunctionFactory::instance().get(remote_query, new_context);
+
+    std::shared_ptr<TableFunctionRemote> remote_table_function = std::dynamic_pointer_cast<TableFunctionRemote>(remote_function);
+    if (remote_table_function)
+        remote_table_function->setActualTableStructure(getInMemoryMetadata().columns);
 
     auto storage = remote_function->execute(query_to_send, new_context, remote_function_name);
 
