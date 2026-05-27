@@ -264,7 +264,7 @@ IcebergMetadata::IcebergMetadata(
     : log(getLogger("IcebergMetadata"))
     , object_storage(std::move(object_storage_))
     , persistent_components(initializePersistentTableComponents(configuration_, cache_ptr, context_))
-    , data_lake_settings(configuration_->getDataLakeSettings())
+    , data_lake_settings(const_cast<DataLakeStorageSettings &>(configuration_->getDataLakeSettings()))
     , write_format(configuration_->getFormat())
 {
     /// TODO: for now it's okay to start/stop the task via constructor/destructor. Once refactored, we'd need to plumb startup/shutdown and schedule the task from there
@@ -783,7 +783,12 @@ void IcebergMetadata::checkAlterIsPossible(const AlterCommands & commands)
     }
 }
 
-void IcebergMetadata::alter(const AlterCommands & params, ContextPtr context)
+void IcebergMetadata::alter(
+    const AlterCommands & params,
+    StorageObjectStorageConfigurationPtr configuration,
+    ContextPtr context,
+    const StorageID & storage_id,
+    std::shared_ptr<DataLake::ICatalog> catalog)
 {
     if (!context->getSettingsRef()[Setting::allow_insert_into_iceberg].value)
     {
@@ -793,7 +798,11 @@ void IcebergMetadata::alter(const AlterCommands & params, ContextPtr context)
             "To allow its usage, enable setting allow_insert_into_iceberg");
     }
 
-    Iceberg::alter(params, context, object_storage, data_lake_settings, persistent_components, write_format);
+    Iceberg::alter(
+        params, context, object_storage, data_lake_settings, persistent_components, write_format,
+        storage_id, catalog,
+        configuration ? configuration->getTypeName() : "",
+        configuration ? configuration->getNamespace() : "");
 }
 
 static Pipe expireSnapshotsResultToPipe(const Iceberg::ExpireSnapshotsResult & result)

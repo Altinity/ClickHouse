@@ -39,9 +39,13 @@ void alter(
     const AlterCommands & params,
     ContextPtr context,
     ObjectStoragePtr object_storage,
-    const DataLakeStorageSettings & data_lake_settings,
+    DataLakeStorageSettings & data_lake_settings,
     PersistentTableComponents & persistent_table_components,
-    const String & write_format);
+    const String & write_format,
+    StorageID storage_id,
+    std::shared_ptr<DataLake::ICatalog> catalog,
+    const String & blob_storage_type_name,
+    const String & blob_storage_namespace_name);
 
 ExpireSnapshotsResult expireSnapshots(
     const ExpireSnapshotsOptions & options,

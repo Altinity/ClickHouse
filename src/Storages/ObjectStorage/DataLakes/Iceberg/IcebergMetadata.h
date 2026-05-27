@@ -164,7 +164,12 @@ public:
     void modifyFormatSettings(FormatSettings & format_settings, const Context & local_context) const override;
     void addDeleteTransformers(ObjectInfoPtr object_info, QueryPipelineBuilder & builder, const std::optional<FormatSettings> & format_settings, FormatParserSharedResourcesPtr parser_shared_resources, ContextPtr local_context) const override;
     void checkAlterIsPossible(const AlterCommands & commands) override;
-    void alter(const AlterCommands & params, ContextPtr context) override;
+    void alter(
+        const AlterCommands & params,
+        StorageObjectStorageConfigurationPtr configuration,
+        ContextPtr context,
+        const StorageID & storage_id,
+        std::shared_ptr<DataLake::ICatalog> catalog) override;
 
     Pipe executeCommand(
         const String & command_name,
@@ -233,7 +238,7 @@ private:
     LoggerPtr log;
     const ObjectStoragePtr object_storage;
     DB::Iceberg::PersistentTableComponents persistent_components;
-    const DataLakeStorageSettings & data_lake_settings;
+    DataLakeStorageSettings & data_lake_settings;
     const String write_format;
     BackgroundSchedulePoolTaskHolder background_metadata_prefetch_task;
 
