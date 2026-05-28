@@ -40,8 +40,13 @@ print(json.dumps(m))
 
 # Disable iceberg metadata cache as a client-level setting so the modified metadata
 # file is actually re-read (not served from cache populated during CREATE TABLE above).
-# Before the fix this would crash with std::out_of_range in IcebergPathResolver::resolve.
-# After the fix it returns a proper BAD_ARGUMENTS error about unresolvable path.
+#
+# The point of this regression test is that querying mismatched metadata must not crash
+# with `std::out_of_range`. Any well-typed exception is acceptable. On antalya-26.3 the
+# manifest-list path goes through `makeAbsolutePath` (PR 90740 cherry-pick), which builds
+# `s3://some-bucket/.../snap-XXX.avro` and surfaces the missing-bucket as `S3_ERROR`
+# instead of the upstream `BAD_ARGUMENTS` from the prefix-mismatch check in
+# `getProperFilePathFromMetadataInfo` — both are graceful rejections.
 ${CLICKHOUSE_CLIENT} --use_iceberg_metadata_files_cache 0 -q "
     SELECT * FROM icebergS3(s3_conn, filename='${TABLE_PATH}');
-" 2>&1 | grep -o "BAD_ARGUMENTS" | head -1
+" 2>&1 | grep -oE "BAD_ARGUMENTS|S3_ERROR" | head -1
