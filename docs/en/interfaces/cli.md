@@ -884,7 +884,7 @@ After a successful login the obtained refresh token is cached in `~/.clickhouse-
 
 ### `--jwt-command` details {#jwt-command-details}
 
-The command is executed via `/bin/sh -c` and stdout is taken as the JWT (one trailing newline is stripped). Stderr is forwarded to the client's stderr; stdin is closed.
+The command is executed via `/bin/sh -c`. Stdout is taken as the JWT (one trailing newline stripped); any human-facing output (prompts, URLs, device codes) must go to stderr — it is forwarded unbuffered to the client's stderr. Stdin is closed.
 
 The command runs on the first connect to obtain the initial token. On subsequent (re)connects the client reuses the cached token; it re-invokes the command only when (a) the cached token parses as a JWT whose `exp` claim is within 30 seconds, or (b) the server rejects the cached token with an authentication failure, in which case the client refetches the token and retries the handshake once. Opaque tokens (anything that does not parse as a JWT) and JWTs without a usable `exp` claim are reused until the server rejects them — caching/refresh in those cases is the script's responsibility.
 

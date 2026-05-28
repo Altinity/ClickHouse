@@ -72,11 +72,12 @@ std::string CommandJWTProvider::getJWT()
     });
 
     /// Drain stderr on a separate thread so the child doesn't block on a full pipe.
+    /// 1-byte buffer flushes each byte so interactive prompts (e.g. device-flow URL) surface live.
     stderr_forwarder = std::thread([&child]()
     {
         try
         {
-            WriteBufferFromOStream wb(std::cerr);
+            WriteBufferFromOStream wb(std::cerr, /*size=*/1);
             copyData(child->err, wb);
             wb.finalize();
         }

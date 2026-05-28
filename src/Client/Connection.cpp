@@ -150,10 +150,8 @@ void Connection::connect(const ConnectionTimeouts & timeouts)
     disconnect();
 
 #if USE_JWT_CPP && USE_SSL
-    /// Fetch a JWT only when needed: no token yet, or current token parses as a JWT
-    /// with a known `exp` claim that is at/near expiry. Opaque (non-JWT) tokens and
-    /// JWTs whose `exp` we cannot extract are kept as-is and only refreshed
-    /// reactively below if the server rejects them.
+    /// Skip fetch when current JWT is still usable; opaque tokens and JWTs without
+    /// a usable `exp` claim are refreshed reactively on rejection below.
     if (jwt_provider && jwt.empty())
     {
         jwt = jwt_provider->getJWT();
@@ -391,8 +389,6 @@ retry_handshake_with_fresh_jwt:
     {
         disconnect();
 
-        /// If the server rejected the JWT (e.g., it just expired), ask the provider for a fresh
-        /// one and retry the handshake once. Only happens for JWT-authenticated connections.
         if (e.code() == ErrorCodes::AUTHENTICATION_FAILED && jwt_provider && !jwt_retried_on_rejection)
         {
             LOG_DEBUG(log_wrapper.get(),
