@@ -714,7 +714,7 @@ static StoragePtr create(const StorageFactory::Arguments & args)
             metadata.table_ttl = TTLTableDescription::getTTLForTableFromAST(
                 args.storage_def->ttl_table->ptr(), metadata.columns, context, metadata.primary_key, allow_suspicious_ttl);
 
-            if (metadata.table_ttl.export_ttl.empty())
+            if (!metadata.table_ttl.export_ttl.empty())
             {
                 /// EXPORT TTL relies on the ALTER ... EXPORT PARTITION pipeline, which is only
                 /// available for Replicated*MergeTree.
