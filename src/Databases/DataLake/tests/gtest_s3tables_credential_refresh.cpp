@@ -47,7 +47,7 @@ TEST(S3TablesCredentialRefresh, FallsBackToCatalogIAMWhenVendedCredentialsMissin
         Aws::Auth::AWSCredentials("access_key_2", "secret_key_2", "session_token_2"),
     });
 
-    ICatalog::CredentialsRefreshCallback base_callback = []() -> std::shared_ptr<DataLake::IStorageCredentials>
+    DataLake::ICatalog::CredentialsRefreshCallback base_callback = []() -> std::shared_ptr<DataLake::IStorageCredentials>
     {
         return nullptr;
     };
@@ -75,7 +75,7 @@ TEST(S3TablesCredentialRefresh, PrefersVendedCredentialsWhenPresent)
         Aws::Auth::AWSCredentials("catalog_access", "catalog_secret", "catalog_token"),
     });
 
-    ICatalog::CredentialsRefreshCallback base_callback = []() -> std::shared_ptr<DataLake::IStorageCredentials>
+    DataLake::ICatalog::CredentialsRefreshCallback base_callback = []() -> std::shared_ptr<DataLake::IStorageCredentials>
     {
         return std::make_shared<DataLake::S3Credentials>("vended_access", "vended_secret", "vended_token");
     };
@@ -95,7 +95,7 @@ TEST(S3TablesCredentialRefresh, FallsBackWhenVendedCredentialsEmpty)
         Aws::Auth::AWSCredentials("catalog_access", "catalog_secret", "catalog_token"),
     });
 
-    ICatalog::CredentialsRefreshCallback base_callback = []() -> std::shared_ptr<DataLake::IStorageCredentials>
+    DataLake::ICatalog::CredentialsRefreshCallback base_callback = []() -> std::shared_ptr<DataLake::IStorageCredentials>
     {
         return std::make_shared<DataLake::S3Credentials>("", "", "");
     };
