@@ -39,7 +39,7 @@ class ExternalAuthenticators
 {
 public:
     void reset();
-    void setConfiguration(const Poco::Util::AbstractConfiguration & config, LoggerPtr log, bool token_auth_enabled = true);
+    void setConfiguration(const Poco::Util::AbstractConfiguration & config, LoggerPtr log, const ConnectionTimeouts & token_http_timeouts, bool token_auth_enabled = true);
 
     bool isTokenAuthEnabled() const;
 
