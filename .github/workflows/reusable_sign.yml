@@ -160,7 +160,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{inputs.test_name}} signed-hashes
-          path: ${{ env.TEMP_PATH }}/*.gpg
+          path: |
+            ${{ runner.temp }}/signed/*.gpg
+            ${{ runner.temp }}/signed/signing_pubkey.asc
       - name: Clean
         if: always()
         uses: ./.github/actions/clean

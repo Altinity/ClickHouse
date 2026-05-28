@@ -1,5 +1,6 @@
 # yamllint disable rule:comments-indentation
 name: ReleaseBranchCI
+run-name: "${{ github.event.inputs.workflow_name || ' ' }}"
 
 env:
   # Force the stdout and stderr streams to be unbuffered
@@ -21,9 +22,8 @@ on: # yamllint disable-line rule:truthy
       - opened
     branches:
       - 'releases/*'
+      - 'stable-*'
   push:
-    branches:
-      - 'releases/*'
     tags:
       - '*'
   workflow_dispatch:
@@ -443,22 +443,22 @@ jobs:
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
-      runner_type: altinity-on-demand, altinity-regression-tester
-      commit: b8e6b17fdd6f6c0db1234c23eca5294c9400a196
+      runner_type: altinity-regression-tester
+      commit: release
       arch: release
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      timeout_minutes: 300
+      timeout_minutes: 210
   RegressionTestsAarch64:
     needs: [RunConfig, BuilderDebAarch64]
     if: ${{ !failure() && !cancelled() && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'regression') && !contains(fromJson(needs.RunConfig.outputs.data).ci_settings.exclude_keywords, 'aarch64')}}
     uses: ./.github/workflows/regression.yml
     secrets: inherit
     with:
-      runner_type: altinity-on-demand, altinity-regression-tester-aarch64
-      commit: b8e6b17fdd6f6c0db1234c23eca5294c9400a196
+      runner_type: altinity-regression-tester-aarch64
+      commit: release
       arch: aarch64
       build_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      timeout_minutes: 300
+      timeout_minutes: 210
   SignRelease:
     needs: [RunConfig, BuilderDebRelease]
     if: ${{ !failure() && !cancelled() }}
@@ -506,6 +506,7 @@ jobs:
       - RegressionTestsAarch64
       - GrypeScan
       - SignRelease
+      - SignAarch64
     runs-on: [self-hosted, altinity-on-demand, altinity-style-checker-aarch64]
     steps:
       - name: Check out repository code
