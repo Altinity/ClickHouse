@@ -175,6 +175,9 @@ def main():
     if info.is_local_run or info.is_community_pr:
         print("NOTE: Community contribution or local run - set sccache to run without AWS credentials")
         os.environ["SCCACHE_S3_NO_CREDENTIALS"] = "true"
+        # NOTE (strtgbb): sccache will throw an error if AWS credentials are present with SCCACHE_S3_NO_CREDENTIALS=1
+        os.environ.pop("AWS_SECRET_ACCESS_KEY", None)
+        os.environ.pop("AWS_ACCESS_KEY_ID", None)
     else:
         pass
         # NOTE (strtgbb): Not used yet, but we should look into setting up the secrets for it

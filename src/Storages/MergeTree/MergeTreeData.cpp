@@ -17,6 +17,7 @@
 #include <Common/Config/ConfigHelper.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/Increment.h>
+#include <Common/MemoryTracker.h>
 #include <Common/ProfileEventsScope.h>
 #include <Common/Stopwatch.h>
 #include <Common/StringUtils.h>
@@ -178,6 +179,7 @@ namespace ProfileEvents
     extern const Event PartsExportTotalMilliseconds;
     extern const Event PartsExportFailures;
     extern const Event PartsExportDuplicated;
+    extern const Event ExportPartsRejectedByMemoryLimit;
 }
 
 namespace CurrentMetrics
@@ -6360,8 +6362,11 @@ void MergeTreeData::checkAlterPartitionIsPossible(
                 const auto * partition_ast = command.partition->as<ASTPartition>();
                 if (partition_ast && partition_ast->all)
                 {
-                    if (command.type != PartitionCommand::DROP_PARTITION && command.type != PartitionCommand::ATTACH_PARTITION && !(command.type == PartitionCommand::REPLACE_PARTITION && !command.replace))
-                        throw DB::Exception(ErrorCodes::SUPPORT_IS_DISABLED, "Only support DROP/DETACH/ATTACH PARTITION ALL currently");
+                    if (command.type != PartitionCommand::DROP_PARTITION
+                        && command.type != PartitionCommand::ATTACH_PARTITION
+                        && command.type != PartitionCommand::EXPORT_PARTITION
+                        && !(command.type == PartitionCommand::REPLACE_PARTITION && !command.replace))
+                        throw DB::Exception(ErrorCodes::SUPPORT_IS_DISABLED, "Only support DROP/DETACH/ATTACH/EXPORT PARTITION ALL currently");
                 }
                 else
                 {
@@ -6702,7 +6707,7 @@ void MergeTreeData::exportPartToTable(
         {
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
                 "Iceberg writes are experimental. "
-                "To allow its usage, enable the setting allow_experimental_insert_into_iceberg");
+                "To allow its usage, enable the setting `allow_insert_into_iceberg`.");
         }
 
 #if USE_AVRO
@@ -6806,6 +6811,17 @@ void MergeTreeData::exportPartToTable(
     }
 
     {
+        if (!canEnqueueBackgroundTask())
+        {
+            ProfileEvents::increment(ProfileEvents::ExportPartsRejectedByMemoryLimit);
+            throw Exception(ErrorCodes::ABORTED,
+                "Failed to schedule export part task for data part '{}'. "
+                "Reached memory limit for the background tasks ({}). Current background tasks memory usage: {}.",
+                part_name,
+                formatReadableSizeWithBinarySuffix(background_memory_tracker.getSoftLimit()),
+                formatReadableSizeWithBinarySuffix(background_memory_tracker.get()));
+        }
+
         MergeTreePartExportManifest manifest(
             dest_storage,
             part,
