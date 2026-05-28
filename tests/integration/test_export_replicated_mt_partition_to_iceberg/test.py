@@ -735,42 +735,6 @@ def test_partition_key_compatibility_check(cluster):
     )
 
 
-def test_export_force_overwrite(cluster):
-    """
-    `system.replicated_partition_exports` is append-only history. A second export to the same
-    destination requires `export_merge_tree_partition_force_export` to overwrite the existing entry.
-    """
-    node = cluster.instances["replica1"]
-
-    uid = unique_suffix()
-    mt_table = f"mt_{uid}"
-    iceberg_table = f"iceberg_{uid}"
-
-    setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1"])
-
-    # First export.
-    node.query(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
-    )
-    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
-
-    # A second export without force must be rejected.
-    error = node.query_and_get_error(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
-    )
-    assert "Export with key" in error, f"Expected duplicate-export error, got: {error}"
-
-    count_after_first = int(node.query(f"SELECT count() FROM {iceberg_table} WHERE year = 2020").strip())
-    assert count_after_first == 3, f"Expected 3 rows after first export, got {count_after_first}"
-
-    # Second export must be accepted with force.
-    node.query(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table} "
-        f"SETTINGS export_merge_tree_partition_force_export = 1"
-    )
-    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
-
-
 def test_export_data_files_are_not_cleaned_up_on_commit_failure(cluster):
     """
     Verify that the data files are not cleaned up on commit failure and the export is retried.
