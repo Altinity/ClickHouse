@@ -272,11 +272,6 @@ bool TableMetadata::hasStorageCredentials() const
     return storage_credentials != nullptr;
 }
 
-bool TableMetadata::hasDataLakeSpecificProperties() const
-{
-    return data_lake_specific_metadata.has_value();
-}
-
 std::string TableMetadata::getMetadataLocation(const std::string & iceberg_metadata_file_location) const
 {
     std::string metadata_location = iceberg_metadata_file_location;

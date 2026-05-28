@@ -44,6 +44,8 @@ public:
 
     void dropTable(const String & namespace_name, const String & table_name) const override;
 
+    ICatalog::CredentialsRefreshCallback getCredentialsConfigurationCallback(const DB::StorageID & storage_id) override;
+
 protected:
     DB::HTTPHeaderEntries getAuthHeaders(
         bool update_token,
@@ -55,7 +57,6 @@ protected:
 private:
     const String region;
     const String storage_endpoint;
-    const String signing_service;
     std::shared_ptr<Aws::Auth::AWSCredentialsProvider> credentials_provider;
     std::unique_ptr<Aws::Client::AWSAuthV4Signer> signer;
 };

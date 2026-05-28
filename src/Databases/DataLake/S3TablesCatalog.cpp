@@ -4,6 +4,7 @@
 
 #include <Databases/DataLake/S3TablesCatalog.h>
 #include <Databases/DataLake/AWSV4Signer.h>
+#include <Databases/DataLake/S3TablesCredentialRefresh.h>
 
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
@@ -17,7 +18,6 @@
 #include <IO/S3/Client.h>
 #include <IO/S3/URI.h>
 #include <IO/ReadHelpers.h>
-#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergWrites.h>
 #include <Poco/JSON/Object.h>
 #include <Poco/JSON/Stringifier.h>
 #include <Poco/Net/HTTPRequest.h>
@@ -37,13 +37,10 @@ namespace DB::ErrorCodes
 
 namespace DB::Setting
 {
-    extern const SettingsUInt64 s3_max_connections;
     extern const SettingsUInt64 s3_max_redirects;
     extern const SettingsUInt64 s3_retry_attempts;
     extern const SettingsBool s3_slow_all_threads_after_network_error;
     extern const SettingsBool enable_s3_requests_logging;
-    extern const SettingsUInt64 s3_connect_timeout_ms;
-    extern const SettingsUInt64 s3_request_timeout_ms;
 }
 
 namespace DB::ServerSetting
@@ -65,7 +62,6 @@ S3TablesCatalog::S3TablesCatalog(
     : RestCatalog(warehouse_, base_url_, "", "", false, namespaces_, context_)
     , region(region_)
     , storage_endpoint(catalog_settings_.storage_endpoint)
-    , signing_service("s3tables")
 {
     if (region.empty())
         throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "S3 Tables catalog requires non-empty `region` setting");
@@ -209,6 +205,26 @@ bool S3TablesCatalog::tryGetTableMetadata(
     return true;
 }
 
+ICatalog::CredentialsRefreshCallback S3TablesCatalog::getCredentialsConfigurationCallback(const DB::StorageID & storage_id)
+{
+    auto base_cb = RestCatalog::getCredentialsConfigurationCallback(storage_id);
+    return [this, base_callback = std::move(base_cb)] () -> std::shared_ptr<IStorageCredentials>
+    {
+        if (base_callback)
+        {
+            if (auto creds = (*base_callback)())
+            {
+                auto s3_creds = std::dynamic_pointer_cast<S3Credentials>(creds);
+                if (s3_creds && !s3_creds->isEmpty())
+                    return creds;
+            }
+            LOG_DEBUG(log, "S3 Tables: vended credentials unavailable on refresh, falling back to catalog IAM credentials");
+        }
+
+        return resolveS3TablesRefreshCredentials(std::nullopt, *credentials_provider);
+    };
+}
+
 void S3TablesCatalog::dropTable(const String & namespace_name, const String & table_name) const
 {
     if (!allowed_namespaces.isNamespaceAllowed(namespace_name, /*nested*/ false))
@@ -242,7 +258,7 @@ DB::HTTPHeaderEntries S3TablesCatalog::getAuthHeaders(
     const String & body) const
 {
     DB::HTTPHeaderEntries all_signed;
-    signRequestWithAWSV4(method, url, extra_headers, body, *signer, region, signing_service, all_signed);
+    signRequestWithAWSV4(method, url, extra_headers, body, *signer, region, "s3tables", all_signed);
 
     DB::HTTPHeaderEntries auth_headers;
     for (auto & h : all_signed)
