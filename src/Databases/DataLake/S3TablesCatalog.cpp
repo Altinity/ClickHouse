@@ -188,20 +188,6 @@ bool S3TablesCatalog::tryGetTableMetadata(
         result.setEndpoint(endpoint);
     }
 
-    if (auto props = result.getDataLakeSpecificProperties();
-        props && !props->iceberg_metadata_file_location.empty())
-    {
-        const String & loc = props->iceberg_metadata_file_location;
-        auto scheme_end = loc.find("://");
-        if (scheme_end != String::npos)
-        {
-            auto path_start = loc.find('/', scheme_end + 3);
-            if (path_start != String::npos)
-                props->iceberg_metadata_file_location = loc.substr(path_start + 1);
-        }
-        result.setDataLakeSpecificProperties(std::move(props));
-    }
-
     return true;
 }
 
