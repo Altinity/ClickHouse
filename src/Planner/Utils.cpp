@@ -84,8 +84,6 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
     extern const int UNION_ALL_RESULT_STRUCTURES_MISMATCH;
     extern const int INTERSECT_OR_EXCEPT_RESULT_STRUCTURES_MISMATCH;
-    extern const int THERE_IS_NO_COLUMN;
-    extern const int NUMBER_OF_COLUMNS_DOESNT_MATCH;
 }
 
 String dumpQueryPlan(const QueryPlan & query_plan)
@@ -711,63 +709,25 @@ QueryPlanStepPtr projectOnlyUsedColumns(
     return step;
 }
 
-static void logPositionConversionMismatch(
-    const ColumnsWithTypeAndName & source_columns,
-    const ColumnsWithTypeAndName & result_columns,
-    const ContextPtr & context,
-    std::string_view location)
+static bool canMatchByNameWithoutAmbiguity(
+    const ColumnsWithTypeAndName & source,
+    const ColumnsWithTypeAndName & result)
 {
-    static auto log = getLogger("PositionConversion");
+    if (source.size() != result.size())
+        return false;
 
-    /// Everything below is purely diagnostic; skip the work when TRACE is disabled.
-    if (!log->is(Poco::Message::PRIO_TRACE))
-        return;
+    NameSet source_names;
+    NameSet result_names;
 
-    if (source_columns.size() != result_columns.size())
-    {
-        LOG_TRACE(
-            log,
-            "Position conversion fallback at {}. query_id={} columns_count_mismatch source={} result={} source_header=[{}] result_header=[{}]",
-            location,
-            context ? context->getCurrentQueryId() : "",
-            source_columns.size(),
-            result_columns.size(),
-            Block(source_columns).dumpNames(),
-            Block(result_columns).dumpNames());
-        return;
-    }
+    for (const auto & source_column : source)
+        if (!source_names.insert(source_column.name).second)
+            return false;
 
-    std::vector<std::string> mismatches;
-    mismatches.reserve(source_columns.size());
+    for (const auto & result_column : result)
+        if (!result_names.insert(result_column.name).second)
+            return false;
 
-    for (size_t i = 0; i < source_columns.size(); ++i)
-    {
-        const auto & source_column = source_columns[i];
-        const auto & result_column = result_columns[i];
-
-        if (source_column.name == result_column.name && source_column.type->equals(*result_column.type))
-            continue;
-
-        mismatches.push_back(fmt::format(
-            "#{} {}:{} -> {}:{}",
-            i,
-            source_column.name,
-            source_column.type->getName(),
-            result_column.name,
-            result_column.type->getName()));
-    }
-
-    if (mismatches.empty())
-        return;
-
-    LOG_TRACE(
-        log,
-        "Position conversion fallback at {}. query_id={} source_header=[{}] result_header=[{}] mismatches=[{}]",
-        location,
-        context ? context->getCurrentQueryId() : "",
-        Block(source_columns).dumpNames(),
-        Block(result_columns).dumpNames(),
-        fmt::join(mismatches, "; "));
+    return source_names == result_names;
 }
 
 ActionsDAG makeConvertingActionsPreferNameThenPosition(
@@ -779,49 +739,29 @@ ActionsDAG makeConvertingActionsPreferNameThenPosition(
     bool add_cast_columns,
     NameToNameMap * new_names)
 {
-    static auto log = getLogger("PositionConversion");
+    const auto mode = canMatchByNameWithoutAmbiguity(source_columns, result_columns)
+        ? ActionsDAG::MatchColumnsMode::Name
+        : ActionsDAG::MatchColumnsMode::Position;
 
-    try
+    if (mode == ActionsDAG::MatchColumnsMode::Position)
     {
-        return ActionsDAG::makeConvertingActions(
-            source_columns,
-            result_columns,
-            ActionsDAG::MatchColumnsMode::Name,
-            context,
-            ignore_constant_values,
-            add_cast_columns,
-            new_names);
-    }
-    catch (const Exception & e)
-    {
-        /// Only fall back to positional matching for the cases name-matching legitimately
-        /// cannot handle (a column absent by name, or a differing column count - e.g. a remote
-        /// shard emitting an aggregate state column matched by ordinal). Any other error from
-        /// name-mode conversion is a genuine schema/type problem and must propagate rather than
-        /// be silently masked into a wrong-column association.
-        if (e.code() != ErrorCodes::THERE_IS_NO_COLUMN && e.code() != ErrorCodes::NUMBER_OF_COLUMNS_DOESNT_MATCH)
-            throw;
-
-        /// Positional fallback is a normal, expected path here (e.g. a remote shard emitting an
-        /// aggregate-state column matched by ordinal), so this stays at TRACE to avoid noise.
-        LOG_TRACE(
+        static auto log = getLogger("ConversionDiag");
+        LOG_TEST(
             log,
-            "Name conversion is not possible at {}, falling back to positional matching. query_id={} reason={}",
+            "Position match at {} (names not matchable as a set): source_count={} result_count={}",
             location,
-            context ? context->getCurrentQueryId() : "",
-            e.message());
-
-        logPositionConversionMismatch(source_columns, result_columns, context, location);
-
-        return ActionsDAG::makeConvertingActions(
-            source_columns,
-            result_columns,
-            ActionsDAG::MatchColumnsMode::Position,
-            context,
-            ignore_constant_values,
-            add_cast_columns,
-            new_names);
+            source_columns.size(),
+            result_columns.size());
     }
+
+    return ActionsDAG::makeConvertingActions(
+        source_columns,
+        result_columns,
+        mode,
+        context,
+        ignore_constant_values,
+        add_cast_columns,
+        new_names);
 }
 
 }
