@@ -43,13 +43,6 @@ public:
 
     bool isTokenAuthEnabled() const;
 
-    /// Returns true if a token processor with the given name is currently
-    /// configured. Used by `Session::checkIfUserIsStillValid` to terminate
-    /// active sessions whose authenticating processor was removed by config
-    /// reload (M-28). Empty `name` is treated as "no specific pin" and
-    /// returns true (token auth must still be enabled, of course).
-    bool hasTokenProcessor(const String & name) const;
-
     // The name and readiness of the credentials must be verified before calling these.
     bool checkLDAPCredentials(const String & server, const BasicCredentials & credentials,
         const LDAPClient::RoleSearchParamsList * role_search_params = nullptr, LDAPClient::SearchResultsList * role_search_results = nullptr) const;

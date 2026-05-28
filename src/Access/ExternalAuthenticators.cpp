@@ -341,16 +341,6 @@ bool ExternalAuthenticators::isTokenAuthEnabled() const
     return token_auth_enabled;
 }
 
-bool ExternalAuthenticators::hasTokenProcessor(const String & name) const
-{
-    std::lock_guard lock(mutex);
-    if (!token_auth_enabled)
-        return false;
-    if (name.empty())
-        return true;
-    return token_processors.contains(name);
-}
-
 void ExternalAuthenticators::setConfiguration(const Poco::Util::AbstractConfiguration & config, LoggerPtr log, const ConnectionTimeouts & token_http_timeouts, bool token_auth_enabled_)
 {
     std::lock_guard lock(mutex);
