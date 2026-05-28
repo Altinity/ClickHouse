@@ -222,6 +222,66 @@ def test_export_partition_all_to_iceberg(cluster):
     assert count_2021 == 1, f"Expected 1 row for year=2021, got {count_2021}"
 
 
+def test_ttl_export_partition_to_iceberg(cluster):
+    """
+    Very basic TTL EXPORT happy path:
+        * ReplicatedMergeTree with `PARTITION BY toYear(d)` and
+          `TTL EXPORT INTERVAL 1 DAY TO TABLE <iceberg>`.
+        * Insert rows into partitions whose top boundary is well in the past
+          (years 2020, 2021), so both partitions are immediately eligible.
+        * The background `ExportPartitionTTLTask` must schedule the exports
+          and they must land COMPLETED in `system.replicated_partition_exports`
+          with `origin = 'TTL'`, and the data must appear in the Iceberg table.
+    """
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_ttl_{uid}"
+    iceberg_table = f"iceberg_ttl_{uid}"
+
+    # Iceberg destination must exist when the TTL EXPORT clause is validated
+    # at CREATE time, so create the destination first.
+    make_iceberg_s3(node, iceberg_table, "id Int64, d Date", partition_by="toYearNumSinceEpoch(d)")
+
+    node.query(
+        f"""
+        CREATE TABLE {mt_table} (id Int64, d Date)
+        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'r1')
+        PARTITION BY toYear(d)
+        ORDER BY tuple()
+        TTL EXPORT INTERVAL 1 DAY TO TABLE {iceberg_table}
+        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
+        """
+    )
+
+    node.query(
+        f"INSERT INTO {mt_table} VALUES (1, '2020-01-01'), (2, '2020-12-31'), (3, '2021-06-15')"
+    )
+
+    # The TTL task ticks every 60s by default; give it enough headroom for both partitions.
+    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED", timeout=180)
+    wait_for_export_status(node, mt_table, iceberg_table, "2021", "COMPLETED", timeout=180)
+
+    origins = node.query(
+        f"""
+        SELECT partition_id, origin
+        FROM system.replicated_partition_exports
+        WHERE source_table = '{mt_table}'
+          AND destination_table = '{iceberg_table}'
+        ORDER BY partition_id
+        FORMAT TabSeparated
+        """
+    ).strip()
+    assert origins == "2020\tTTL\n2021\tTTL", (
+        f"Expected both partitions to be exported via TTL, got:\n{origins}"
+    )
+
+    count_2020 = int(node.query(f"SELECT count() FROM {iceberg_table} WHERE toYear(d) = 2020").strip())
+    count_2021 = int(node.query(f"SELECT count() FROM {iceberg_table} WHERE toYear(d) = 2021").strip())
+    assert count_2020 == 2, f"Expected 2 rows for year=2020 in Iceberg, got {count_2020}"
+    assert count_2021 == 1, f"Expected 1 row for year=2021 in Iceberg, got {count_2021}"
+
+
 def test_failure_is_logged_in_system_table(cluster):
     """
     When S3 is unreachable the export must be marked FAILED in

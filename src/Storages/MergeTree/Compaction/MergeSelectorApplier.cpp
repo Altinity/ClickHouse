@@ -88,8 +88,7 @@ MergeSelectorChoices tryChooseTTLMerge(const ChooseContext & ctx)
     }
     const PartsRanges & ttl_ranges = *ttl_ranges_ptr;
 
-    /// Drop parts - 1 priority
-    if (!ctx.merge_constraints.empty())
+    if (!ctx.merge_constraints.empty() && !ttl_ranges.empty())
     {
         /// The size of the completely expired part of TTL drop is not affected by the merge pressure and the size of the storage space.
         std::vector<MergeConstraint> ttl_constraints(ctx.merge_constraints.size(), {std::numeric_limits<size_t>::max(), std::numeric_limits<size_t>::max()});
@@ -100,7 +99,7 @@ MergeSelectorChoices tryChooseTTLMerge(const ChooseContext & ctx)
     }
 
     /// Delete rows - 2 priority
-    if (!ctx.merge_constraints.empty() && !ctx.merge_tree_settings[MergeTreeSetting::ttl_only_drop_parts])
+    if (!ctx.merge_constraints.empty() && !ctx.merge_tree_settings[MergeTreeSetting::ttl_only_drop_parts] && !ttl_ranges.empty())
     {
         TTLRowDeleteMergeSelector delete_ttl_selector(ctx.next_delete_times, ctx.current_time);
 
