@@ -4,7 +4,6 @@
 #include <Access/AccessControl.h>
 #include <Access/Credentials.h>
 #include <Access/ContextAccess.h>
-#include <Access/ExternalAuthenticators.h>
 #include <Access/User.h>
 #include <Access/Role.h>
 #include <Common/logger_useful.h>
