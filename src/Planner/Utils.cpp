@@ -1,5 +1,7 @@
 #include <Planner/Utils.h>
 
+#include <Core/Block.h>
+
 #include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTSubquery.h>
@@ -745,13 +747,13 @@ ActionsDAG makeConvertingActionsPreferNameThenPosition(
 
     if (mode == ActionsDAG::MatchColumnsMode::Position)
     {
-        static auto log = getLogger("ConversionDiag");
+        static auto log = getLogger("Planner");
         LOG_TEST(
             log,
-            "Position match at {} (names not matchable as a set): source_count={} result_count={}",
+            "Position match at {} (names not matchable as a set): source=[{}] result=[{}]",
             location,
-            source_columns.size(),
-            result_columns.size());
+            Block(source_columns).dumpNames(),
+            Block(result_columns).dumpNames());
     }
 
     return ActionsDAG::makeConvertingActions(
