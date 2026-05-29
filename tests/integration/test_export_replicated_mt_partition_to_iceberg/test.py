@@ -230,13 +230,17 @@ def test_export_partition_all_to_iceberg(cluster):
 def test_ttl_export_partition_to_iceberg(cluster):
     """
     Very basic TTL EXPORT happy path:
-        * ReplicatedMergeTree with `PARTITION BY toYear(d)` and
+        * ReplicatedMergeTree with `PARTITION BY toYearNumSinceEpoch(d)` and
           `TTL EXPORT INTERVAL 1 DAY TO TABLE <iceberg>`.
-        * Insert rows into partitions whose top boundary is well in the past
-          (years 2020, 2021), so both partitions are immediately eligible.
-        * The background `ExportPartitionTTLTask` must schedule the exports
-          and they must land COMPLETED in `system.replicated_partition_exports`
-          with `origin = 'TTL'`, and the data must appear in the Iceberg table.
+        * The same partition function is used on the Iceberg side; it is the
+          only year-bucketing transform Iceberg accepts (`getPartitionField`
+          maps it to the Iceberg "year" transform).
+        * Rows are inserted into past-year partitions (2020, 2021), whose top
+          boundary plus 1 day is well in the past, so both partitions are
+          immediately eligible for the background `ExportPartitionTTLTask`.
+        * Both partitions must land COMPLETED in
+          `system.replicated_partition_exports` with `origin = 'TTL'`, and the
+          data must appear in the Iceberg table.
     """
     node = cluster.instances["replica1"]
 
@@ -252,7 +256,7 @@ def test_ttl_export_partition_to_iceberg(cluster):
         f"""
         CREATE TABLE {mt_table} (id Int64, d Date)
         ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'r1')
-        PARTITION BY toYear(d)
+        PARTITION BY toYearNumSinceEpoch(d)
         ORDER BY tuple()
         TTL EXPORT INTERVAL 1 DAY TO TABLE {iceberg_table}
         SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1
@@ -263,9 +267,13 @@ def test_ttl_export_partition_to_iceberg(cluster):
         f"INSERT INTO {mt_table} VALUES (1, '2020-01-01'), (2, '2020-12-31'), (3, '2021-06-15')"
     )
 
+    # toYearNumSinceEpoch returns (year - 1970), so partition_ids are "50" and "51".
+    p2020 = "50"
+    p2021 = "51"
+
     # The TTL task ticks every 60s by default; give it enough headroom for both partitions.
-    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED", timeout=180)
-    wait_for_export_status(node, mt_table, iceberg_table, "2021", "COMPLETED", timeout=180)
+    wait_for_export_status(node, mt_table, iceberg_table, p2020, "COMPLETED", timeout=180)
+    wait_for_export_status(node, mt_table, iceberg_table, p2021, "COMPLETED", timeout=180)
 
     origins = node.query(
         f"""
@@ -277,7 +285,7 @@ def test_ttl_export_partition_to_iceberg(cluster):
         FORMAT TabSeparated
         """
     ).strip()
-    assert origins == "2020\tTTL\n2021\tTTL", (
+    assert origins == f"{p2020}\tTTL\n{p2021}\tTTL", (
         f"Expected both partitions to be exported via TTL, got:\n{origins}"
     )
 
@@ -947,13 +955,8 @@ def test_export_task_timeout_kills_stuck_pending_task(cluster):
         node.query(
             f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}"
             f" SETTINGS export_merge_tree_partition_task_timeout_seconds = 5,"
-<<<<<<< HEAD
-            f"          export_merge_tree_partition_max_retries = 1000000"
-=======
             f"          export_merge_tree_partition_max_retries = 1000000,"
-            f"          export_merge_tree_partition_manifest_ttl = 3600,"
             f"          allow_insert_into_iceberg = 1"
->>>>>>> antalya-26.3
         )
 
         # Timeout budget must cover: the 5s task timeout + one manifest-updating

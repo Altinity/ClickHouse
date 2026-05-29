@@ -199,6 +199,68 @@ Status values include:
 - `FAILED` - Export failed
 - `KILLED` - Export was cancelled
 
+## TTL EXPORT
+
+Replicated*MergeTree tables can drive `EXPORT PARTITION` automatically through
+the `TTL EXPORT` clause. Once a partition's *top boundary* plus the configured
+interval lies in the past, a background task on the table schedules an export
+to the destination just as if the operator had run `ALTER TABLE ... EXPORT
+PARTITION`.
+
+### Syntax
+
+```sql
+CREATE TABLE rmt_table (id UInt64, d Date)
+ENGINE = ReplicatedMergeTree('/clickhouse/tables/{database}/rmt_table', 'r1')
+PARTITION BY toYearNumSinceEpoch(d)
+ORDER BY tuple()
+TTL EXPORT INTERVAL 30 DAY TO TABLE iceberg_table;
+```
+
+Multiple `TTL EXPORT` clauses are allowed on the same table; each rule
+maintains its own progress against its destination.
+
+### Eligibility
+
+A partition is eligible when
+
+```
+top_boundary(partition_id) + INTERVAL <= now()
+```
+
+`top_boundary` is the *inclusive supremum* of the time range that the
+partition can hold. For example, a partition keyed by `toYear(d) = 2020`
+has a top boundary of `2020-12-31 23:59:59`.
+
+### Supported `PARTITION BY` expressions
+
+`TTL EXPORT` requires a closed-form inverse for the partition function. The
+curated whitelist is:
+
+| Family                | Expressions                                                          |
+|-----------------------|----------------------------------------------------------------------|
+| Identity              | `Date`, `Date32`, `DateTime`, `DateTime64`                           |
+| Generic `to*`         | `toYear`, `toYYYYMM`, `toYYYYMMDD`, `toMonday`, `toStartOf{Year,Quarter,Month,Week,Day,Hour,Minute}` |
+| Iceberg-spec transforms | `toYearNumSinceEpoch`, `toMonthNumSinceEpoch`, `toRelativeDayNum`, `toRelativeHourNum` |
+
+**Pairing with Iceberg destinations:** Apache Iceberg only accepts the four
+*Iceberg-spec transforms* above as time-bucketing partition functions
+(mapping to the Iceberg `year`, `month`, `days`, `hours` transforms). When
+exporting into an Iceberg table both the source `PARTITION BY` and the
+destination `PARTITION BY` must use the same one of those functions. The
+generic `to*` family is appropriate for non-Iceberg destinations
+(e.g. Hive-partitioned object storage).
+
+`icebergTruncate` / `icebergBucket` are not temporal and are not accepted by
+`TTL EXPORT`; bare integer columns are also rejected because they carry no
+time semantics.
+
+### Origin column
+
+Entries scheduled by the background task carry `origin = 'TTL'` in
+`system.replicated_partition_exports`; entries from manual `ALTER ... EXPORT
+PARTITION` carry `origin = 'ALTER'`.
+
 ## Related Features
 
 - [ALTER TABLE EXPORT PART](/docs/en/engines/table-engines/mergetree-family/part_export.md) - Export individual parts (non-replicated)

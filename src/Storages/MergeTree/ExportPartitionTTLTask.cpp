@@ -27,7 +27,7 @@ namespace
 {
 
 /// Default cadence between iterations when there is nothing immediately ready to export.
-constexpr std::chrono::milliseconds kDefaultDelay{60'000};
+constexpr std::chrono::milliseconds kDefaultDelay{10'000};
 
 /// Soft cap on the per-rule wait so we don't sleep for an hour if a partition becomes
 /// eligible right after we exit run().
@@ -83,7 +83,11 @@ std::chrono::milliseconds ExportPartitionTTLTask::run()
 
     for (const auto & rule : metadata->table_ttl.export_ttl)
     {
-        QualifiedTableName destination{rule.destination_database, rule.destination_name};
+        /// Resolve the destination once, through the storage helper. This yields a non-empty
+        /// database (an omitted `db.` qualifier resolves to the source table's database) that is
+        /// used both for cache lookups below and as `command.to_database` when scheduling the
+        /// export, so the database written into the manifest always matches the lookup keys.
+        const QualifiedTableName destination = storage.resolveExportTTLDestination(rule);
 
         /// Quickly skip rules that already have an in-flight TTL entry for this destination
         /// (one-export-at-a-time per destination), and grab the marker.
@@ -177,6 +181,8 @@ std::chrono::milliseconds ExportPartitionTTLTask::run()
                 /// A new context — using the global query context — keeps server-level settings.
                 /// We don't want user-session overrides for the background scheduler.
                 auto background_context = Context::createCopy(storage.getContext());
+
+                background_context->setSetting("allow_insert_into_iceberg", 1);
 
                 storage.exportPartitionToTableWithOrigin(
                     command, background_context, ExportReplicatedMergeTreePartitionOrigin::TTL);

@@ -46,6 +46,10 @@ enum class PartitionKind : uint8_t
     ToStartOfDay,        /// output DateTime(start of day)    -> unix seconds
     ToStartOfHour,       /// output DateTime(start of hour)   -> unix seconds
     ToStartOfMinute,     /// output DateTime(start of minute) -> unix seconds
+    ToYearNumSinceEpoch, /// partition_id = years since 1970          (Iceberg "year"  transform)
+    ToMonthNumSinceEpoch,/// partition_id = months since 1970-01      (Iceberg "month" transform)
+    ToRelativeDayNum,    /// partition_id = days since 1970-01-01     (Iceberg "days"  transform)
+    ToRelativeHourNum,   /// partition_id = hours since 1970-01-01 00 (Iceberg "hours" transform)
 };
 
 struct Classification
@@ -114,6 +118,14 @@ std::optional<Classification> classify(const KeyDescription & partition_key)
             return Classification{PartitionKind::ToStartOfHour};
         if (name == "toStartOfMinute")
             return Classification{PartitionKind::ToStartOfMinute};
+        if (name == "toYearNumSinceEpoch")
+            return Classification{PartitionKind::ToYearNumSinceEpoch};
+        if (name == "toMonthNumSinceEpoch")
+            return Classification{PartitionKind::ToMonthNumSinceEpoch};
+        if (name == "toRelativeDayNum")
+            return Classification{PartitionKind::ToRelativeDayNum};
+        if (name == "toRelativeHourNum")
+            return Classification{PartitionKind::ToRelativeHourNum};
     }
 
     return {};
@@ -160,7 +172,8 @@ void checkPartitionExpressionSupported(const KeyDescription & partition_key)
     {
         throw Exception(ErrorCodes::BAD_TTL_EXPRESSION,
             "TTL EXPORT requires the PARTITION BY expression to be one of: identity Date/Date32/DateTime/DateTime64 column, "
-            "toYear, toYYYYMM, toYYYYMMDD, toMonday, toStartOf{{Year,Quarter,Month,Week,Day,Hour,Minute}}.");
+            "toYear, toYYYYMM, toYYYYMMDD, toMonday, toStartOf{{Year,Quarter,Month,Week,Day,Hour,Minute}}, "
+            "toYearNumSinceEpoch, toMonthNumSinceEpoch, toRelativeDayNum, toRelativeHourNum.");
     }
 }
 
@@ -245,6 +258,36 @@ time_t computeTopBoundary(const KeyDescription & partition_key, const String & p
         case PartitionKind::ToStartOfMinute:
         {
             return static_cast<time_t>(raw) + 60 - 1;
+        }
+        case PartitionKind::ToYearNumSinceEpoch:
+        {
+            /// N years since 1970 -> top boundary is the last second of year 1970 + N.
+            const Int16 year = static_cast<Int16>(1970 + raw);
+            return makeDateTimeAtEndOfDay(year, 12, 31);
+        }
+        case PartitionKind::ToMonthNumSinceEpoch:
+        {
+            /// N months since 1970-01 -> top boundary is the last second of that month.
+            const Int16 year = static_cast<Int16>(1970 + raw / 12);
+            const UInt8 month = static_cast<UInt8>((raw % 12) + 1);
+            const UInt8 last_day = lut.daysInMonth(year, month);
+            return makeDateTimeAtEndOfDay(year, month, last_day);
+        }
+        case PartitionKind::ToRelativeDayNum:
+        {
+            /// N days since 1970-01-01 in the server timezone -> top boundary is the last second of that day.
+            const ExtendedDayNum day_num{static_cast<ExtendedDayNum::UnderlyingType>(raw)};
+            const time_t start_of_day = lut.fromDayNum(day_num);
+            return start_of_day + 86400 - 1;
+        }
+        case PartitionKind::ToRelativeHourNum:
+        {
+            /// N hours since 1970-01-01 00:00 -> top boundary is the last second of that hour.
+            /// NOTE (strtgbb): for timezones whose offset is not a whole multiple of one hour at the
+            /// Unix epoch (Pacific/Pitcairn, Pacific/Kiritimati) this is off by a few seconds, which
+            /// is acceptable for TTL EXPORT (it errs on the side of treating the partition as
+            /// expired slightly later than ideal, never sooner).
+            return static_cast<time_t>(raw) * 3600 + 3600 - 1;
         }
     }
 

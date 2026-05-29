@@ -550,6 +550,16 @@ private:
     ///  - The TTL task uses the marker to skip past already-attempted partitions.
     std::string computeTTLExportMarkerLocked(const QualifiedTableName & destination) const;
 
+    /// Resolve the destination of a `TTL EXPORT` rule to a fully-qualified table name. An empty
+    /// `destination_database` (when the `TO TABLE` clause omits the `db.` qualifier) is resolved to
+    /// the source table's own database. This must be the single resolution point shared by every
+    /// consumer (the TTL task that schedules exports, the marker computation, insert blocking and
+    /// TTL DROP/DELETE deferral) so that the database written into the export manifest always matches
+    /// the database used for cache lookups. Resolving against the source table's database (rather
+    /// than a session/global current database) keeps the result stable across restarts and
+    /// replication metadata reloads, where no current database is reliably set.
+    QualifiedTableName resolveExportTTLDestination(const TTLDescription & rule) const;
+
     /// Background task that translates `TTL EXPORT` rules in the metadata into export entries.
     /// Created unconditionally (not gated by `allow_experimental_export_merge_tree_partition`).
     /// When the experimental flag is off, the task's call to `exportPartitionToTable` throws

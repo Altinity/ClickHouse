@@ -4690,6 +4690,17 @@ void StorageReplicatedMergeTree::runExportPartitionTTLTask()
     export_merge_tree_partition_ttl_schedule->scheduleAfter(static_cast<size_t>(delay.count()));
 }
 
+QualifiedTableName StorageReplicatedMergeTree::resolveExportTTLDestination(const TTLDescription & rule) const
+{
+    /// An omitted `db.` qualifier resolves to the source table's own database. We deliberately use
+    /// the source's database rather than a session/global current database: it is always set, stable
+    /// across restarts and replication metadata reloads, and yields a non-empty name that we then
+    /// feed verbatim into the export manifest, guaranteeing it matches the keys used for cache lookups.
+    return QualifiedTableName{
+        rule.destination_database.empty() ? getStorageID().getDatabaseName() : rule.destination_database,
+        rule.destination_name};
+}
+
 std::string StorageReplicatedMergeTree::computeTTLExportMarkerLocked(const QualifiedTableName & destination) const
 {
     /// Caller holds `export_merge_tree_partition_mutex`. Linear scan over the entries
@@ -4735,7 +4746,7 @@ bool StorageReplicatedMergeTree::isPartitionAllowedForTTLDropDelete(const String
     /// must explicitly resolve them (force_export) before TTL DROP can proceed.
     for (const auto & rule : export_ttls)
     {
-        QualifiedTableName destination{rule.destination_database, rule.destination_name};
+        const QualifiedTableName destination = resolveExportTTLDestination(rule);
         const auto composite_key = partition_id + "_" + destination.getFullName();
         auto it = export_merge_tree_partition_task_entries_by_key.find(composite_key);
         if (it == export_merge_tree_partition_task_entries_by_key.end())
@@ -4766,10 +4777,9 @@ void StorageReplicatedMergeTree::validateExportTTLDestinations(const StorageInMe
 
     for (const auto & rule : metadata.getExportTTLs())
     {
-        const String & dest_database = rule.destination_database.empty()
-            ? query_context->getCurrentDatabase()
-            : rule.destination_database;
-        const String & dest_table = rule.destination_name;
+        const QualifiedTableName destination = resolveExportTTLDestination(rule);
+        const String & dest_database = destination.database;
+        const String & dest_table = destination.table;
 
         StoragePtr dest_storage;
         try
@@ -4844,7 +4854,7 @@ void StorageReplicatedMergeTree::checkInsertAllowedByExportTTLMarker(const Strin
     std::lock_guard lock(export_merge_tree_partition_mutex);
     for (const auto & rule : metadata->getExportTTLs())
     {
-        QualifiedTableName destination{rule.destination_database, rule.destination_name};
+        const QualifiedTableName destination = resolveExportTTLDestination(rule);
         const auto marker = computeTTLExportMarkerLocked(destination);
         if (marker.empty())
             continue;
