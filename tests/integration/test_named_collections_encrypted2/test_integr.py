@@ -69,6 +69,7 @@ def test_s3_table_function_with_overrides(cluster):
     node.query(
         """
         INSERT INTO FUNCTION s3(s3_override, filename = 'override_test.csv', structure = 'x UInt32, y UInt32')
+        SETTINGS s3_truncate_on_insert = 1
         VALUES (10, 20),
                (30, 40)
         """)
@@ -96,6 +97,7 @@ def test_s3_multiple_formats(cluster):
 
         node.query(f"""
             INSERT INTO FUNCTION s3({coll_name}, filename='test.{ext}', structure='num UInt32')
+            SETTINGS s3_truncate_on_insert = 1
             VALUES (100), (200), (300)
         """)
 
@@ -265,7 +267,8 @@ def test_s3_with_compression(cluster):
     """)
 
     node.query(
-        "INSERT INTO FUNCTION s3(s3_gzip, filename='data.csv.gz', structure='val UInt64') SELECT number FROM numbers(1000)")
+        "INSERT INTO FUNCTION s3(s3_gzip, filename='data.csv.gz', structure='val UInt64') "
+        "SETTINGS s3_truncate_on_insert = 1 SELECT number FROM numbers(1000)")
 
     result = node.query("SELECT sum(val) FROM s3(s3_gzip, filename='data.csv.gz', structure='val UInt64')").strip()
     assert result == "499500"
@@ -284,7 +287,8 @@ def test_s3_with_schema_in_collection(cluster):
     """)
 
     node.query(
-        "INSERT INTO FUNCTION s3(s3_schema, filename='scores.tsv') VALUES (1, 'Alice', 95.5), (2, 'Bob', 87.3), (3, 'Charlie', 92.1)")
+        "INSERT INTO FUNCTION s3(s3_schema, filename='scores.tsv') "
+        "SETTINGS s3_truncate_on_insert = 1 VALUES (1, 'Alice', 95.5), (2, 'Bob', 87.3), (3, 'Charlie', 92.1)")
 
     result = float(node.query("SELECT avg(score) FROM s3(s3_schema, filename='scores.tsv')").strip())
     assert abs(result - 91.63) < 0.1
@@ -307,7 +311,7 @@ def test_shared_credentials_multiple_tables(cluster):
             CREATE TABLE {name}_s3 (id UInt32, data String)
             ENGINE = S3(shared_s3, filename='{name}.csv', format='CSV')
         """)
-        node.query(f"INSERT INTO {name}_s3 VALUES (1, '{name}_data')")
+        node.query(f"INSERT INTO {name}_s3 SETTINGS s3_truncate_on_insert = 1 VALUES (1, '{name}_data')")
 
     assert node.query("SELECT data FROM users_s3").strip() == "users_data"
     assert node.query("SELECT data FROM orders_s3").strip() == "orders_data"
