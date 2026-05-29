@@ -129,6 +129,7 @@ static struct InitFiu
     ONCE(database_iceberg_gcs) \
     REGULAR(rmt_delay_execute_drop_range) \
     REGULAR(rmt_delay_commit_part) \
+    REGULAR(patch_parts_reverse_column_order) \
     ONCE(smt_commit_exception_before_op) \
     ONCE(backup_add_empty_memory_table) \
     ONCE(local_object_storage_network_error_during_remove) \
@@ -136,7 +137,8 @@ static struct InitFiu
     REGULAR(lightweight_show_tables) \
     PAUSEABLE_ONCE(drop_database_before_exclusive_ddl_lock) \
     REGULAR(storage_merge_tree_background_schedule_merge_fail) \
-    REGULAR(refresh_task_stop_racing_for_running_refresh)
+    REGULAR(refresh_task_stop_racing_for_running_refresh) \
+    REGULAR(wide_part_writer_fail_in_add_streams)
 
 namespace FailPoints
 {

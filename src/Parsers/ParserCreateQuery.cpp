@@ -1706,6 +1706,10 @@ bool ParserCreateViewQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
     if (!sql_security)
         sql_security_p.parse(pos, sql_security, expected);
 
+    /// Accept COMMENT before AS SELECT for forward compatibility with newer versions
+    /// that may format views as: CREATE VIEW ... COMMENT 'text' AS SELECT ...
+    auto comment = parseComment(pos, expected);
+
     /// AS SELECT ...
     if (!s_as.ignore(pos, expected))
         return false;
@@ -1713,7 +1717,8 @@ bool ParserCreateViewQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
     if (!select_p.parse(pos, select, expected))
         return false;
 
-    auto comment = parseComment(pos, expected);
+    if (!comment)
+        comment = parseComment(pos, expected);
 
     auto query = std::make_shared<ASTCreateQuery>();
     node = query;
