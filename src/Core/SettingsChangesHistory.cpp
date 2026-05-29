@@ -42,6 +42,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         addSettingsChanges(settings_changes_history, "26.3.1.20001.altinityantalya",
         {
             {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
+            {"export_merge_tree_partition_task_timeout_seconds", "3600", "86400", "Increase default value to make it more realistic"},
         });
         addSettingsChanges(settings_changes_history, "26.3",
         {
