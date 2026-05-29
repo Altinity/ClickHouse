@@ -1579,6 +1579,15 @@ void ReadFromMerge::convertAndFilterSourceStream(
         for (const auto & column : header)
         {
             /// Strip the `__tableN.` analyzer prefix to get the logical column name.
+            /// NOTE(alias-marker): `splitName(..., reverse=true)` splits on the LAST dot,
+            /// so `__table1.Nested.sub` yields `sub`, not `Nested.sub`. The mismatch is
+            /// structurally latent: investigated 2026-05-29, the bug does not reproduce
+            /// because Nested subcolumns appear in the child stream with their dotted
+            /// name verbatim (`n.a`), so the alias expression resolves against the input
+            /// directly without going through the suffix-stripping bridge. If a future
+            /// analyzer change emits Nested subcolumns under split names, route through a
+            /// dedicated stripAnalyzerTablePrefix helper that strips only the
+            /// `__tableN.` segment.
             auto logical_name = Nested::splitName(column.name, /*reverse=*/ true).second;
             if (logical_name.empty())
                 logical_name = column.name;

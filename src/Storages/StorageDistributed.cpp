@@ -880,8 +880,9 @@ class ReplaseAliasColumnsVisitor : public InDepthQueryTreeVisitor<ReplaseAliasCo
         arguments.emplace_back(std::make_shared<ColumnNode>(column_node->getColumn(), column_source));
 
         auto alias_marker_node = std::make_shared<FunctionNode>("__aliasMarker");
-        alias_marker_node->getArguments().getNodes() = std::move(arguments);
-        alias_marker_node->getArguments().getNodes()[0]->removeAlias();
+        auto & nodes = alias_marker_node->getArguments().getNodes();
+        nodes = std::move(arguments);
+        nodes[0]->removeAlias();
         if (!output_alias.empty())
             alias_marker_node->setAlias(output_alias);
         resolveOrdinaryFunctionNodeByName(*alias_marker_node, "__aliasMarker", context);
