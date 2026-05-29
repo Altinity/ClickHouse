@@ -295,6 +295,123 @@ def test_ttl_export_partition_to_iceberg(cluster):
     assert count_2021 == 1, f"Expected 1 row for year=2021 in Iceberg, got {count_2021}"
 
 
+def test_ttl_export_staggered_expiry(cluster):
+    """
+    Staggered TTL EXPORT across four hourly partitions, each with three data parts.
+
+    `PARTITION BY toRelativeHourNum(dt)` gives one partition per hour (the Iceberg
+    "hours" transform), and `top_boundary = raw * 3600 + 3599` in UTC epoch seconds.
+    The TTL task compares `top_boundary + interval` against the current UTC time, so
+    we derive a per-test `INTERVAL N SECOND` from a single server-`now` snapshot to
+    place the four partitions' expiry windows precisely:
+
+        * h1 (3h ago), h2 (2h ago): already expired -> exported immediately
+        * h3 (1h ago): expires ~30s after `now` -> exported once its window elapses
+        * h4 (current hour): expires ~1h later -> never exported during the test
+
+    The background task exports one partition per (src, dst) per tick and keeps only
+    one PENDING at a time, so partitions land COMPLETED sequentially as the marker
+    advances. We verify ordering, `origin = 'TTL'`, the exported row count, and that
+    h4 is never picked up.
+    """
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_ttl_stag_{uid}"
+    iceberg_table = f"iceberg_ttl_stag_{uid}"
+
+    # Iceberg destination must exist when the TTL EXPORT clause is validated at
+    # CREATE time, so create it first with the same hourly partitioning.
+    make_iceberg_s3(node, iceberg_table, "id Int64, dt DateTime",
+                    partition_by="toRelativeHourNum(dt)")
+
+    # Single server-now snapshot (UTC epoch); all boundaries are derived from it.
+    server_now = int(node.query("SELECT toUnixTimestamp(now())").strip())
+    hour = 3600
+    cur = server_now - (server_now % hour)        # start of the current hour
+    secs_into_hour = server_now - cur
+    delta = 30                                     # h3 fires ~30s after now
+
+    # INTERVAL N SECOND chosen so fires(h3) = top_boundary(h3) + N = now + delta.
+    # top_boundary(h3) = (cur - hour) + 3599 = cur - 1, so N = secs_into_hour + delta + 1.
+    interval_seconds = secs_into_hour + delta + 1
+
+    h1_start = cur - 3 * hour
+    h2_start = cur - 2 * hour
+    h3_start = cur - 1 * hour
+    h4_start = cur
+
+    # partition_id == hours since epoch for toRelativeHourNum.
+    p1 = h1_start // hour
+    p2 = h2_start // hour
+    p3 = h3_start // hour
+    p4 = h4_start // hour
+
+    node.query(
+        f"""
+        CREATE TABLE {mt_table} (id Int64, dt DateTime)
+        ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'r1')
+        PARTITION BY toRelativeHourNum(dt)
+        ORDER BY tuple()
+        TTL EXPORT INTERVAL {interval_seconds} SECOND TO TABLE {iceberg_table}
+        SETTINGS enable_block_number_column = 1,
+                 enable_block_offset_column = 1,
+                 allow_inserts_into_exported_partition = 1
+        """
+    )
+
+    # Three separate inserts per partition -> three data parts per partition.
+    # A fixed offset inside each hour keeps the row in the intended bucket.
+    next_id = 1
+    for h_start in (h1_start, h2_start, h3_start, h4_start):
+        ts = h_start + 100
+        for _ in range(3):
+            node.query(f"INSERT INTO {mt_table} VALUES ({next_id}, toDateTime({ts}))")
+            next_id += 1
+
+    # The first three partitions must export in ascending order as the marker advances.
+    wait_for_export_status(node, mt_table, iceberg_table, str(p1), "COMPLETED", timeout=180)
+    wait_for_export_status(node, mt_table, iceberg_table, str(p2), "COMPLETED", timeout=180)
+    wait_for_export_status(node, mt_table, iceberg_table, str(p3), "COMPLETED", timeout=180)
+
+    origins = node.query(
+        f"""
+        SELECT partition_id, origin
+        FROM system.replicated_partition_exports
+        WHERE source_table = '{mt_table}'
+          AND destination_table = '{iceberg_table}'
+        ORDER BY toUInt64(partition_id)
+        FORMAT TabSeparated
+        """
+    ).strip()
+    assert origins == f"{p1}\tTTL\n{p2}\tTTL\n{p3}\tTTL", (
+        f"Expected partitions {p1}, {p2}, {p3} exported via TTL in ascending order, got:\n{origins}"
+    )
+
+    # h4 is ~1h away from expiring and must not be picked up. Re-check after a short
+    # delay (longer than the task's idle cadence) to confirm it stays unexported.
+    for _ in range(2):
+        p4_status = node.query(
+            f"SELECT status FROM system.replicated_partition_exports"
+            f" WHERE source_table = '{mt_table}'"
+            f"   AND destination_table = '{iceberg_table}'"
+            f"   AND partition_id = '{p4}'"
+        ).strip()
+        assert p4_status == "", (
+            f"Partition {p4} (current hour) must not be exported during the test, got status: {p4_status!r}"
+        )
+        time.sleep(12)
+
+    total = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert total == 9, f"Expected 9 exported rows (3 partitions x 3 rows), got {total}"
+
+    count_h4 = int(node.query(
+        f"SELECT count() FROM {iceberg_table}"
+        f" WHERE toRelativeHourNum(dt) = {p4}"
+    ).strip())
+    assert count_h4 == 0, f"Expected 0 rows for the unexpired current-hour partition, got {count_h4}"
+
+
 def test_failure_is_logged_in_system_table(cluster):
     """
     When S3 is unreachable the export must be marked FAILED in
