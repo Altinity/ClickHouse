@@ -298,6 +298,7 @@ private:
         const Block & header,
         SelectQueryInfo & modified_query_info,
         const StorageSnapshotPtr & snapshot,
+        const ColumnsDescription & merge_columns,
         const Aliases & aliases,
         const RowPolicyDataOpt & row_policy_data_opt,
         ContextPtr context,
