@@ -1641,11 +1641,15 @@ void ReadFromMerge::convertAndFilterSourceStream(
                 /// Otherwise look for the `<prefix>.<C>` or `<prefix>.\`<C>\`` shape where C is
                 /// a declared Merge column name. Skip any column that doesn't match a known
                 /// Merge column (e.g. intermediate expression outputs of the child plan).
+                /// The analyzer's quoting of dotted column names varies between branches: some
+                /// produce `__tableN.\`n.a\`` (backtick-quoted), others `__tableN.n.a` (raw).
+                /// Try both.
                 for (const auto & merge_column : merge_columns.getAll())
                 {
                     bool dotted = merge_column.name.find('.') != String::npos;
-                    String want = dotted ? ("." + backQuote(merge_column.name)) : ("." + merge_column.name);
-                    if (column.name.ends_with(want))
+                    String want_raw = "." + merge_column.name;
+                    String want_quoted = dotted ? ("." + backQuote(merge_column.name)) : want_raw;
+                    if (column.name.ends_with(want_quoted) || (dotted && column.name.ends_with(want_raw)))
                     {
                         if (!plain_to_identifier.emplace(merge_column.name, column.name).second)
                             ambiguous.insert(merge_column.name);
