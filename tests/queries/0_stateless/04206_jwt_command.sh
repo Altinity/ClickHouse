@@ -51,7 +51,7 @@ fi
 
 echo "Test 6: --jwt-command stderr should be forwarded to client stderr"
 MARKER="forwarded-from-script-stderr"
-output=$($CLICKHOUSE_CLIENT_BINARY --jwt-command "echo $MARKER 1>&2; echo $SAMPLE_JWT" --host nonexistent.invalid --query "SELECT 1" 2>&1)
+output=$($CLICKHOUSE_CLIENT_BINARY --jwt-command "echo $MARKER 1>&2; echo $SAMPLE_JWT" --host localhost --port 1 --query "SELECT 1" 2>&1)
 if echo "$output" | grep -q "$MARKER"; then
     echo "OK"
 else
@@ -79,7 +79,7 @@ fi
 echo "Test 9: --jwt-command is actually executed"
 MARKER_FILE="${CLICKHOUSE_TMP}/04206_jwt_command_marker_$$"
 rm -f "$MARKER_FILE"
-$CLICKHOUSE_CLIENT_BINARY --jwt-command "echo ran > '$MARKER_FILE'; echo $SAMPLE_JWT" --host nonexistent.invalid --query "SELECT 1" > /dev/null 2>&1
+$CLICKHOUSE_CLIENT_BINARY --jwt-command "echo ran > '$MARKER_FILE'; echo $SAMPLE_JWT" --host localhost --port 1 --query "SELECT 1" > /dev/null 2>&1
 if [ -f "$MARKER_FILE" ]; then
     echo "OK"
 else
@@ -109,7 +109,7 @@ echo "Test 11: stdin-reading script completes promptly (stdin is closed)"
 # the JWT is echoed before the 1s watchdog fires. If stdin were left open, 'read X' would
 # block and the watchdog would surface 'timed out after 1 seconds'. We assert on that
 # message rather than wall-clock time so the test is not flaky under loaded CI runs.
-output=$($CLICKHOUSE_CLIENT_BINARY --jwt-command "read X; echo $SAMPLE_JWT" --jwt-command-timeout 1 --host nonexistent.invalid --query "SELECT 1" 2>&1)
+output=$($CLICKHOUSE_CLIENT_BINARY --jwt-command "read X; echo $SAMPLE_JWT" --jwt-command-timeout 1 --host localhost --port 1 --query "SELECT 1" 2>&1)
 if echo "$output" | grep -qi "timed out"; then
     echo "FAILED: jwt-command child's stdin was not closed (got: $output)"
 else
