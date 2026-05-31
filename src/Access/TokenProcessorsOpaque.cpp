@@ -60,27 +60,7 @@ namespace
         return value.get<ValueType>();
     }
 
-    /// Bound every IdP-bound HTTP call (OIDC discovery, userinfo, introspection)
-    /// to a known limit. Without this, Poco's default `HTTPSession` timeout of
-    /// 60 seconds applies, and because `ExternalAuthenticators::mutex` is held
-    /// for the entire duration of `checkTokenCredentials` -- including the
-    /// outbound call this function makes -- a single slow or hung IdP would
-    /// stall the whole auth subsystem (LDAP, Kerberos, HTTP basic, every other
-    /// token auth) for up to a full minute per request.
-    ///
-    /// 10 seconds is a deliberately conservative cap: well above any healthy
-    /// IdP latency, well below the default. Operators who need a different
-    /// value would have to expose this via per-processor config; for now it
-    /// is hard-coded so deployments inherit the bounded behavior automatically.
-    constexpr int kIdpHttpTimeoutSeconds = 10;
-
-    void applyIdpSessionTimeouts(Poco::Net::HTTPClientSession & session)
-    {
-        const Poco::Timespan timeout(kIdpHttpTimeoutSeconds, 0);
-        session.setTimeout(timeout, timeout, timeout);
-    }
-
-    picojson::object getObjectFromURI(const Poco::URI & uri, const String & token = "")
+    picojson::object getObjectFromURI(const Poco::URI & uri, const ConnectionTimeouts & timeouts, const String & token = "")
     {
         Poco::Net::HTTPResponse response;
         std::ostringstream responseString;
@@ -92,14 +72,14 @@ namespace
 
         if (uri.getScheme() == "https") {
             Poco::Net::HTTPSClientSession session(uri.getHost(), uri.getPort());
-            applyIdpSessionTimeouts(session);
+            setTimeouts(session, timeouts);
             session.sendRequest(request);
             Poco::StreamCopier::copyStream(session.receiveResponse(response), responseString);
         }
         else
         {
             Poco::Net::HTTPClientSession session(uri.getHost(), uri.getPort());
-            applyIdpSessionTimeouts(session);
+            setTimeouts(session, timeouts);
             session.sendRequest(request);
             Poco::StreamCopier::copyStream(session.receiveResponse(response), responseString);
         }
@@ -125,7 +105,8 @@ namespace
     picojson::object postFormToURI(const Poco::URI & uri,
                                    const std::vector<std::pair<String, String>> & form,
                                    const String & basic_user,
-                                   const String & basic_password)
+                                   const String & basic_password,
+                                   const ConnectionTimeouts & timeouts)
     {
         Poco::Net::HTTPResponse response;
         std::ostringstream responseString;
@@ -155,7 +136,7 @@ namespace
 
         auto send_and_receive = [&](Poco::Net::HTTPClientSession & session)
         {
-            applyIdpSessionTimeouts(session);
+            setTimeouts(session, timeouts);
             session.sendRequest(request) << body;
             Poco::StreamCopier::copyStream(session.receiveResponse(response), responseString);
         };
@@ -192,9 +173,11 @@ GoogleTokenProcessor::GoogleTokenProcessor(const String & processor_name_,
                                            UInt64 token_cache_lifetime_,
                                            const String & username_claim_,
                                            const String & groups_claim_,
-                                           const String & expected_audience_)
+                                           const String & expected_audience_,
+                                           const ConnectionTimeouts & timeouts_)
     : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_)
     , expected_audience(expected_audience_)
+    , timeouts(timeouts_)
 {
     /// Without an audience pin, this processor accepts any Google access token
     /// that authenticates the user against Google -- including tokens minted for
@@ -215,7 +198,7 @@ bool GoogleTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
     const String & token = credentials.getToken();
 
     std::unordered_map<String, String> user_info;
-    picojson::object user_info_json = getObjectFromURI(Poco::URI("https://www.googleapis.com/oauth2/v3/userinfo"), token);
+    picojson::object user_info_json = getObjectFromURI(Poco::URI("https://www.googleapis.com/oauth2/v3/userinfo"), timeouts, token);
 
     if (!user_info_json.contains("email"))
         throw Exception(ErrorCodes::AUTHENTICATION_FAILED,
@@ -227,7 +210,7 @@ bool GoogleTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
 
     String user_name = user_info[username_claim];
 
-    auto token_info = getObjectFromURI(Poco::URI("https://www.googleapis.com/oauth2/v3/tokeninfo"), token);
+    auto token_info = getObjectFromURI(Poco::URI("https://www.googleapis.com/oauth2/v3/tokeninfo"), timeouts, token);
 
     /// Audience binding (H-10): the Google /tokeninfo endpoint authoritatively
     /// reports the OAuth client_id the access token was issued for in its 'aud'
@@ -274,7 +257,7 @@ bool GoogleTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
 
         try
         {
-            auto groups_response = getObjectFromURI(get_groups_uri, token);
+            auto groups_response = getObjectFromURI(get_groups_uri, timeouts, token);
 
             if (!groups_response.contains("memberships") || !groups_response["memberships"].is<picojson::array>())
             {
@@ -348,14 +331,16 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
                                            const String & userinfo_endpoint_,
                                            const String & token_introspection_endpoint_,
                                            const String & introspection_client_id_,
-                                           const String & introspection_client_secret_)
+                                           const String & introspection_client_secret_,
+                                           const ConnectionTimeouts & timeouts_)
         : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_),
           userinfo_endpoint(userinfo_endpoint_),
           token_introspection_endpoint(token_introspection_endpoint_),
           expected_issuer(expected_issuer_),
           expected_audience(expected_audience_),
           introspection_client_id(introspection_client_id_),
-          introspection_client_secret(introspection_client_secret_)
+          introspection_client_secret(introspection_client_secret_),
+          timeouts(timeouts_)
 {
 }
 
@@ -372,12 +357,14 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
                                            const String & introspection_client_id_,
                                            const String & introspection_client_secret_,
                                            const RemoteHostFilter & remote_host_filter_,
-                                           bool allow_http_discovery_urls_)
+                                           bool allow_http_discovery_urls_,
+                                           const ConnectionTimeouts & timeouts_)
     : ITokenProcessor(processor_name_, token_cache_lifetime_, username_claim_, groups_claim_),
       expected_issuer(expected_issuer_),
       expected_audience(expected_audience_),
       introspection_client_id(introspection_client_id_),
-      introspection_client_secret(introspection_client_secret_)
+      introspection_client_secret(introspection_client_secret_),
+      timeouts(timeouts_)
 {
     /// Defense in depth: the discovery endpoint itself was already validated by
     /// the parser, but re-check here in case this constructor is reached via a
@@ -393,7 +380,7 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
                         processor_name, openid_config_endpoint_, e.message());
     }
 
-    const picojson::object openid_config = getObjectFromURI(Poco::URI(openid_config_endpoint_));
+    const picojson::object openid_config = getObjectFromURI(Poco::URI(openid_config_endpoint_), timeouts);
 
     if (!openid_config.contains("userinfo_endpoint"))
         throw Exception(ErrorCodes::AUTHENTICATION_FAILED,
@@ -544,7 +531,8 @@ OpenIdTokenProcessor::OpenIdTokenProcessor(const String & processor_name_,
                               "",
                               verifier_leeway_,
                               getValueByKey(openid_config, "jwks_uri").value(),
-                              jwks_cache_lifetime_);
+                              jwks_cache_lifetime_,
+                              timeouts);
     }
 }
 
@@ -559,7 +547,8 @@ bool OpenIdTokenProcessor::runIntrospection(const String & token,
         response = postFormToURI(token_introspection_endpoint,
                                  {{"token", token}, {"token_type_hint", "access_token"}},
                                  introspection_client_id,
-                                 introspection_client_secret);
+                                 introspection_client_secret,
+                                 timeouts);
     }
     catch (const Exception & e)
     {
@@ -715,7 +704,7 @@ bool OpenIdTokenProcessor::resolveAndValidate(TokenCredentials & credentials) co
     {
         try
         {
-            user_info_json = getObjectFromURI(userinfo_endpoint, token);
+            user_info_json = getObjectFromURI(userinfo_endpoint, timeouts, token);
             username = getValueByKey(user_info_json, username_claim).value();
         }
         catch (...)
