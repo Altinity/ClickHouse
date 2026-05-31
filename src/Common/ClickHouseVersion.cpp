@@ -23,19 +23,37 @@ ClickHouseVersion::ClickHouseVersion(std::string_view version)
     if (split.empty())
         throw Exception{ErrorCodes::BAD_ARGUMENTS, "Cannot parse ClickHouse version here: {}", version};
 
-    for (const auto & split_element : split)
+    for (size_t i = 0; i < split.size(); ++i)
     {
         size_t component;
-        ReadBufferFromString buf(split_element);
+        ReadBufferFromString buf(split[i]);
         if (!tryReadIntText(component, buf) || !buf.eof())
-            throw Exception{ErrorCodes::BAD_ARGUMENTS, "Cannot parse ClickHouse version here: {}", version};
+        {
+            /// A non-numeric part is only allowed as a non-empty terminal suffix after at least
+            /// one numeric component (e.g. "altinityantalya" in "26.1.3.20001.altinityantalya").
+            const bool is_terminal = (i + 1 == split.size());
+            if (components.empty() || !is_terminal || split[i].empty())
+                throw Exception{ErrorCodes::BAD_ARGUMENTS, "Cannot parse ClickHouse version here: {}", version};
+            suffix = split[i];
+            break;
+        }
         components.push_back(component);
     }
 }
 
 String ClickHouseVersion::toString() const
 {
-    return fmt::format("{}", fmt::join(components, "."));
+    String result = fmt::format("{}", fmt::join(components, "."));
+    if (!suffix.empty())
+        result += "." + suffix;
+    return result;
+}
+
+std::strong_ordering ClickHouseVersion::operator<=>(const ClickHouseVersion & other) const
+{
+    if (auto cmp = components <=> other.components; cmp != 0)
+        return cmp;
+    return suffix <=> other.suffix;
 }
 
 }
