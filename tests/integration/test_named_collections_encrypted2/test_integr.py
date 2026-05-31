@@ -373,10 +373,11 @@ def test_server_starts_with_dropped_collection_table(cluster):
 
 def test_url_function_with_named_collection(cluster):
     node = cluster.instances["s3_node"]
+    uid = uuid.uuid4().hex[:8]
 
-    node.query("""
+    node.query(f"""
         CREATE NAMED COLLECTION url_write_nc AS
-        url = 'http://nginx:80/url_nc_test.tsv',
+        url = 'http://nginx:80/url_nc_test_{uid}.tsv',
         format = 'TSV',
         structure = 'id UInt32, name String, value Float32',
         method = 'PUT'
@@ -390,9 +391,9 @@ def test_url_function_with_named_collection(cluster):
                (3, 'charlie', 30.7)
         """)
 
-    node.query("""
+    node.query(f"""
         CREATE NAMED COLLECTION url_read_nc AS
-        url = 'http://nginx:80/url_nc_test.tsv',
+        url = 'http://nginx:80/url_nc_test_{uid}.tsv',
         format = 'TSV',
         structure = 'id UInt32, name String, value Float32'
     """)
@@ -403,12 +404,13 @@ def test_url_function_with_named_collection(cluster):
 
 def test_url_table_engine_with_named_collection(cluster):
     node = cluster.instances["s3_node"]
+    uid = uuid.uuid4().hex[:8]
 
     node.query("DROP TABLE IF EXISTS url_table_nc")
 
-    node.query("""
+    node.query(f"""
         CREATE NAMED COLLECTION url_engine_write_nc AS
-        url = 'http://nginx:80/url_engine_test.csv',
+        url = 'http://nginx:80/url_engine_test_{uid}.csv',
         format = 'CSV',
         structure = 'x Int32, y Int32, z Int32',
         method = 'PUT'
@@ -422,9 +424,9 @@ def test_url_table_engine_with_named_collection(cluster):
                (70, 80, 90)
         """)
 
-    node.query("""
+    node.query(f"""
         CREATE NAMED COLLECTION url_engine_read_nc AS
-        url = 'http://nginx:80/url_engine_test.csv',
+        url = 'http://nginx:80/url_engine_test_{uid}.csv',
         format = 'CSV'
     """)
 
@@ -450,10 +452,11 @@ def test_url_table_engine_with_named_collection(cluster):
 
 def test_url_with_overridable_params(cluster):
     node = cluster.instances["s3_node"]
+    uid = uuid.uuid4().hex[:8]
 
-    node.query("""
+    node.query(f"""
         CREATE NAMED COLLECTION url_override_write_nc AS
-        url = 'http://nginx:80/url_override_1.json' OVERRIDABLE,
+        url = 'http://nginx:80/url_override_{uid}_1.json' OVERRIDABLE,
         format = 'JSONEachRow',
         structure = 'a UInt32, b String',
         method = 'PUT'
@@ -461,11 +464,11 @@ def test_url_with_overridable_params(cluster):
 
     node.query("INSERT INTO FUNCTION url(url_override_write_nc) VALUES (100, 'first')")
     node.query(
-        "INSERT INTO FUNCTION url(url_override_write_nc, url='http://nginx:80/url_override_2.json') VALUES (200, 'second')")
+        f"INSERT INTO FUNCTION url(url_override_write_nc, url='http://nginx:80/url_override_{uid}_2.json') VALUES (200, 'second')")
 
-    node.query("""
+    node.query(f"""
         CREATE NAMED COLLECTION url_override_read_nc AS
-        url = 'http://nginx:80/url_override_1.json' OVERRIDABLE,
+        url = 'http://nginx:80/url_override_{uid}_1.json' OVERRIDABLE,
         format = 'JSONEachRow',
         structure = 'a UInt32, b String'
     """)
@@ -473,16 +476,17 @@ def test_url_with_overridable_params(cluster):
     result = node.query("SELECT b FROM url(url_override_read_nc)").strip()
     assert result == "first"
 
-    result = node.query("SELECT b FROM url(url_override_read_nc, url='http://nginx:80/url_override_2.json')").strip()
+    result = node.query(f"SELECT b FROM url(url_override_read_nc, url='http://nginx:80/url_override_{uid}_2.json')").strip()
     assert result == "second"
 
 
 def test_url_cluster_with_named_collection(cluster):
     node = cluster.instances["s3_node"]
+    uid = uuid.uuid4().hex[:8]
 
-    node.query("""
+    node.query(f"""
         CREATE NAMED COLLECTION url_cluster_write_nc AS
-        url = 'http://nginx:80/url_cluster_test.csv',
+        url = 'http://nginx:80/url_cluster_test_{uid}.csv',
         format = 'CSV',
         structure = 'key String, val UInt32',
         method = 'PUT'
@@ -490,9 +494,9 @@ def test_url_cluster_with_named_collection(cluster):
 
     node.query("INSERT INTO FUNCTION url(url_cluster_write_nc) VALUES ('alpha', 1), ('beta', 2), ('gamma', 3)")
 
-    node.query("""
+    node.query(f"""
         CREATE NAMED COLLECTION url_cluster_read_nc AS
-        url = 'http://nginx:80/url_cluster_test.csv',
+        url = 'http://nginx:80/url_cluster_test_{uid}.csv',
         format = 'CSV',
         structure = 'key String, val UInt32'
     """)
