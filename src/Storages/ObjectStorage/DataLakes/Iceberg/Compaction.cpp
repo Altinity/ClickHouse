@@ -1,5 +1,4 @@
 #include <string>
-#include <unordered_set>
 #include <Columns/IColumn.h>
 #include <Core/ColumnsWithTypeAndName.h>
 #include <Core/Settings.h>
@@ -73,9 +72,6 @@ struct Plan
     std::unordered_map<String, std::vector<String>> manifest_list_to_manifest_files;
     std::unordered_map<Int64, std::vector<std::shared_ptr<DataFilePlan>>> snapshot_id_to_data_files;
     std::unordered_map<String, std::shared_ptr<DataFilePlan>> path_to_data_file;
-    /// Raw paths of every file referenced by the snapshots being compacted, used at cleanup
-    /// time to also remove files that live outside the base object_storage.
-    std::unordered_set<String> referenced_file_paths;
     FileNamesGenerator generator;
     Poco::JSON::Object::Ptr initial_metadata_object;
 
@@ -117,7 +113,6 @@ Plan getPlan(
     const DataLakeStorageSettings & data_lake_settings,
     const PersistentTableComponents & persistent_table_components,
     ObjectStoragePtr object_storage,
-    SecondaryStorages & secondary_storages,
     const String & write_format,
     ContextPtr context,
     CompressionMethod compression_method)
@@ -160,16 +155,14 @@ Plan getPlan(
     std::unordered_map<String, std::shared_ptr<ManifestFilePlan>> manifest_files;
     for (const auto & snapshot : snapshots_info)
     {
-        plan.referenced_file_paths.insert(snapshot.manifest_list_path);
-        auto manifest_list = getManifestList(object_storage, persistent_table_components, context, snapshot.manifest_list_path, log, secondary_storages);
+        auto manifest_list = getManifestList(object_storage, persistent_table_components, context, snapshot.manifest_list_path, log);
         for (const auto & manifest_file : manifest_list)
         {
             plan.manifest_list_to_manifest_files[snapshot.manifest_list_path].push_back(manifest_file.manifest_file_path);
             if (!plan.manifest_file_to_first_snapshot.contains(manifest_file.manifest_file_path))
                 plan.manifest_file_to_first_snapshot[manifest_file.manifest_file_path] = snapshot.snapshot_id;
-            plan.referenced_file_paths.insert(manifest_file.manifest_file_path);
             auto files_handle = getManifestFileEntriesHandle(
-                object_storage, persistent_table_components, context, log, manifest_file, static_cast<Int32>(current_schema_id), secondary_storages);
+                object_storage, persistent_table_components, context, log, manifest_file, static_cast<Int32>(current_schema_id));
 
             if (!manifest_files.contains(manifest_file.manifest_file_path))
             {
@@ -178,39 +171,27 @@ Plan getPlan(
             }
             manifest_files[manifest_file.manifest_file_path]->manifest_lists_path.push_back(snapshot.manifest_list_path);
             for (const auto & pos_delete_file : files_handle.getFilesWithoutDeleted(FileContentType::POSITION_DELETE))
-            {
                 all_positional_delete_files.push_back(pos_delete_file);
-                plan.referenced_file_paths.insert(pos_delete_file->parsed_entry->file_path_key);
-            }
 
             for (const auto & data_file : files_handle.getFilesWithoutDeleted(FileContentType::DATA))
             {
-                plan.referenced_file_paths.insert(data_file->parsed_entry->file_path_key);
                 auto partition_index = plan.partition_encoder.encodePartition(data_file->parsed_entry->partition_key_value);
                 if (plan.partitions.size() <= partition_index)
                     plan.partitions.push_back({});
 
-                const auto & raw_metadata_path = data_file->parsed_entry->file_path_key;
-                auto [resolved_storage, resolved_key] = resolveObjectStorageForPath(
-                    persistent_table_components.table_location,
-                    raw_metadata_path, object_storage, secondary_storages, context);
-
-                IcebergDataObjectInfoPtr data_object_info = std::make_shared<IcebergDataObjectInfo>(
-                    data_file, raw_metadata_path, 0, resolved_storage, resolved_key);
+                IcebergDataObjectInfoPtr data_object_info = std::make_shared<IcebergDataObjectInfo>(data_file, 0);
                 std::shared_ptr<DataFilePlan> data_file_ptr;
-                std::string path_identifier
-                    = resolved_storage->getDescription() + '\0' + resolved_storage->getObjectsNamespace() + '\0' + resolved_key;
-                if (!plan.path_to_data_file.contains(path_identifier))
+                if (!plan.path_to_data_file.contains(manifest_file.manifest_file_path))
                 {
                     data_file_ptr = std::make_shared<DataFilePlan>(DataFilePlan{
                         .data_object_info = data_object_info,
                         .manifest_list = manifest_files[manifest_file.manifest_file_path],
                         .patched_path = plan.generator.generateDataFileName()});
-                    plan.path_to_data_file[path_identifier] = data_file_ptr;
+                    plan.path_to_data_file[manifest_file.manifest_file_path] = data_file_ptr;
                 }
                 else
                 {
-                    data_file_ptr = plan.path_to_data_file[path_identifier];
+                    data_file_ptr = plan.path_to_data_file[manifest_file.manifest_file_path];
                 }
                 plan.partitions[partition_index].push_back(data_file_ptr);
                 plan.snapshot_id_to_data_files[snapshot.snapshot_id].push_back(plan.partitions[partition_index].back());
@@ -243,9 +224,7 @@ static void writeDataFiles(
     const std::optional<FormatSettings> & format_settings,
     ContextPtr context,
     const String & write_format,
-    CompressionMethod write_compression_method,
-    const String & table_location,
-    std::shared_ptr<SecondaryStorages> secondary_storages)
+    CompressionMethod write_compression_method)
 {
     for (auto & [_, data_file] : initial_plan.path_to_data_file)
     {
@@ -256,15 +235,10 @@ static void writeDataFiles(
             format_settings,
             // todo make compaction using same FormatParserSharedResources
             std::make_shared<FormatParserSharedResources>(context->getSettingsRef(), 1),
-            context,
-            table_location,
-            secondary_storages);
+            context);
 
-        ObjectStoragePtr storage_to_use = data_file->data_object_info->getResolvedStorage();
-        if (!storage_to_use)
-            storage_to_use = object_storage;
-        RelativePathWithMetadata object_info(data_file->data_object_info->getPath());
-        auto read_buffer = createReadBuffer(object_info, storage_to_use, context, getLogger("IcebergCompaction"));
+        RelativePathWithMetadata relative_path(data_file->data_object_info->getPath());
+        auto read_buffer = createReadBuffer(relative_path, object_storage, context, getLogger("IcebergCompaction"));
 
         const Settings & settings = context->getSettingsRef();
         auto parser_shared_resources = std::make_shared<FormatParserSharedResources>(
@@ -418,8 +392,6 @@ void writeMetadataFiles(
         {
             manifest_entry->patched_path = plan.generator.generateManifestEntryName();
             manifest_file_renamings[manifest_entry->path] = manifest_entry->patched_path.path_in_metadata;
-
-            std::vector<String> manifest_data_filenames(data_filenames.begin(), data_filenames.end());
             auto buffer_manifest_entry = object_storage->writeObject(
                 StoredObject(manifest_entry->patched_path.path_in_storage),
                 WriteMode::Rewrite,
@@ -437,7 +409,7 @@ void writeMetadataFiles(
                 partition_columns,
                 plan.partition_encoder.getPartitionValue(grouped_by_manifest_files_partitions[manifest_entry]),
                 ChunkPartitioner(fields_from_partition_spec, current_schema, context, sample_block_).getResultTypes(),
-                manifest_data_filenames,
+                std::vector(data_filenames.begin(), data_filenames.end()),
                 manifest_entry->statistics,
                 sample_block_,
                 snapshot,
@@ -513,46 +485,22 @@ void writeMetadataFiles(
     }
 }
 
-/// Files to delete after compaction: a base-storage directory listing under `metadata/` and
-/// `data/` (covers historical metadata.json and any orphan files on the base storage), plus
-/// any paths from the compacted snapshots that resolve to a secondary storage.
-std::vector<std::pair<ObjectStoragePtr, String>> getOldFiles(
-    ObjectStoragePtr object_storage,
-    SecondaryStorages & secondary_storages,
-    ContextPtr context,
-    const PersistentTableComponents & persistent_table_components,
-    const Plan & plan)
+std::vector<String> getOldFiles(ObjectStoragePtr object_storage, const String & table_path)
 {
-    std::vector<std::pair<ObjectStoragePtr, String>> result;
+    auto metadata_files = listFiles(*object_storage, table_path, "metadata", "");
+    auto data_files = listFiles(*object_storage, table_path, "data", "");
 
-    for (auto && file : listFiles(*object_storage, persistent_table_components.table_path, "metadata", ""))
-        result.emplace_back(object_storage, std::move(file));
-    for (auto && file : listFiles(*object_storage, persistent_table_components.table_path, "data", ""))
-        result.emplace_back(object_storage, std::move(file));
+    for (auto && data_file : data_files)
+        metadata_files.push_back(data_file);
 
-    for (const auto & raw_path : plan.referenced_file_paths)
-    {
-        auto [storage_to_use, key_in_storage] = resolveObjectStorageForPath(
-            persistent_table_components.table_location,
-            raw_path,
-            object_storage,
-            secondary_storages,
-            context);
-
-        if (storage_to_use.get() != object_storage.get())
-            result.emplace_back(std::move(storage_to_use), std::move(key_in_storage));
-    }
-
-    return result;
+    return metadata_files;
 }
 
-void clearOldFiles(const std::vector<std::pair<ObjectStoragePtr, String>> & old_files)
+void clearOldFiles(ObjectStoragePtr object_storage, const std::vector<String> & old_files)
 {
-    auto log = getLogger("IcebergCompaction");
-    for (const auto & [storage, key] : old_files)
+    for (const auto & metadata_file : old_files)
     {
-        LOG_DEBUG(log, "Removing old file during compaction: storage={}, key={}", storage->getDescription(), key);
-        storage->removeObjectIfExists(StoredObject(key));
+        object_storage->removeObjectIfExists(StoredObject(metadata_file));
     }
 }
 
@@ -560,7 +508,6 @@ void compactIcebergTable(
     IcebergHistory snapshots_info,
     const PersistentTableComponents & persistent_table_components,
     ObjectStoragePtr object_storage_,
-    std::shared_ptr<SecondaryStorages> secondary_storages_,
     const DataLakeStorageSettings & data_lake_settings,
     const std::optional<FormatSettings> & format_settings_,
     SharedHeader sample_block_,
@@ -572,14 +519,12 @@ void compactIcebergTable(
         data_lake_settings,
         persistent_table_components,
         object_storage_,
-        *secondary_storages_,
         write_format,
         context_,
         persistent_table_components.metadata_compression_method);
     if (plan.need_optimize)
     {
-        auto old_files = getOldFiles(
-            object_storage_, *secondary_storages_, context_, persistent_table_components, plan);
+        auto old_files = getOldFiles(object_storage_, persistent_table_components.table_path);
         writeDataFiles(
             plan,
             sample_block_,
@@ -587,11 +532,9 @@ void compactIcebergTable(
             format_settings_,
             context_,
             write_format,
-            persistent_table_components.metadata_compression_method,
-            persistent_table_components.table_location,
-            secondary_storages_);
+            persistent_table_components.metadata_compression_method);
         writeMetadataFiles(plan, object_storage_, context_, sample_block_, write_format, persistent_table_components.table_path);
-        clearOldFiles(old_files);
+        clearOldFiles(object_storage_, old_files);
     }
 }
 

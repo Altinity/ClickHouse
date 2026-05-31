@@ -17,12 +17,10 @@ namespace DB
 
 struct URIConverter
 {
-    static void modifyURI(Poco::URI & uri, std::unordered_map<std::string, std::string> mapper, bool enable_url_encoding = true)
+    static void modifyURI(Poco::URI & uri, std::unordered_map<std::string, std::string> mapper)
     {
         Macros macros({{"bucket", uri.getHost()}});
-        uri = macros.expand(mapper[uri.getScheme()]).empty()
-            ? uri
-            : Poco::URI(macros.expand(mapper[uri.getScheme()]) + uri.getPathAndQuery(), enable_url_encoding);
+        uri = macros.expand(mapper[uri.getScheme()]).empty() ? uri : Poco::URI(macros.expand(mapper[uri.getScheme()]) + uri.getPathAndQuery());
     }
 };
 
@@ -34,7 +32,7 @@ namespace ErrorCodes
 namespace S3
 {
 
-URI::URI(const std::string & uri_, bool allow_archive_path_syntax, bool keep_presigned_query_parameters, bool enable_url_encoding)
+URI::URI(const std::string & uri_, bool allow_archive_path_syntax, bool keep_presigned_query_parameters)
 {
     /// Case when bucket name represented in domain name of S3 URL.
     /// E.g. (https://bucket-name.s3.region.amazonaws.com/key)
@@ -56,9 +54,9 @@ URI::URI(const std::string & uri_, bool allow_archive_path_syntax, bool keep_pre
     else
         uri_str = uri_;
 
-    uri = Poco::URI(uri_str, enable_url_encoding);
+    uri = Poco::URI(uri_str);
     /// Keep a copy of how Poco parsed the original string before any mapping
-    Poco::URI original_uri(uri_str, enable_url_encoding);
+    Poco::URI original_uri(uri_str);
     bool looks_like_presigned = false;
     for (const auto & [qk, qv] : original_uri.getQueryParameters())
     {
@@ -103,7 +101,7 @@ URI::URI(const std::string & uri_, bool allow_archive_path_syntax, bool keep_pre
         }
 
         if (!mapper.empty())
-            URIConverter::modifyURI(uri, mapper, enable_url_encoding);
+            URIConverter::modifyURI(uri, mapper);
     }
 
     storage_name = "S3";

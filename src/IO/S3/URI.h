@@ -39,8 +39,7 @@ struct URI
     explicit URI(
         const std::string & uri_,
         bool allow_archive_path_syntax = false,
-        bool keep_presigned_query_parameters = true,
-        bool enable_url_encoding = true);
+        bool keep_presigned_query_parameters = true);
     void addRegionToURI(const std::string & region);
 
     static void validateBucket(const std::string & bucket, const Poco::URI & uri);

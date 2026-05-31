@@ -25,7 +25,6 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PositionDeleteTransform.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/StatelessMetadataFileGetter.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
-#include <Storages/ObjectStorage/Utils.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSource.h>
 #include <Storages/VirtualColumnUtils.h>
@@ -250,14 +249,9 @@ static std::optional<WriteDataFilesResult> writeDataFiles(
                     Field cur_value;
                     col_data_filename.column->get(i, cur_value);
 
-                    /// The path stored in the position-delete file must match
-                    /// `data_object_file_path_key` (the raw path from the data manifest)
-                    /// at read time. Start from the original `_path` value and only
-                    /// strip a leading bucket/container prefix if it's actually there —
-                    /// otherwise the entry would be silently overwritten with just "/".
-                    String path_without_namespace = cur_value.safeGet<String>();
-                    if (path_without_namespace.starts_with(blob_storage_namespace_name))
-                        path_without_namespace = path_without_namespace.substr(blob_storage_namespace_name.size());
+                    String path_without_namespace;
+                    if (cur_value.safeGet<String>().starts_with(blob_storage_namespace_name))
+                        path_without_namespace = cur_value.safeGet<String>().substr(blob_storage_namespace_name.size());
 
                     if (!path_without_namespace.starts_with('/'))
                         path_without_namespace = "/" + path_without_namespace;
@@ -1016,18 +1010,18 @@ static void collectRetainedFiles(
         String manifest_list_path = snapshot->getValue<String>(Iceberg::f_manifest_list);
         retained_manifest_list_paths.insert(manifest_list_path);
 
-        String storage_manifest_list_path = makeAbsolutePath(persistent_table_components.table_location, manifest_list_path);
+        String storage_manifest_list_path = getProperFilePathFromMetadataInfo(
+            manifest_list_path, persistent_table_components.table_path, persistent_table_components.table_location);
 
-        SecondaryStorages local_secondary_storages;
         auto manifest_keys = getManifestList(
-            object_storage, persistent_table_components, context, storage_manifest_list_path, log, local_secondary_storages);
+            object_storage, persistent_table_components, context, storage_manifest_list_path, log);
 
         for (const auto & mf_key : manifest_keys)
         {
             retained_manifest_paths.insert(mf_key.manifest_file_path);
             auto entries_handle = getManifestFileEntriesHandle(
                 object_storage, persistent_table_components, context, log,
-                mf_key, current_schema_id, local_secondary_storages);
+                mf_key, current_schema_id);
             collectAllFilePaths(entries_handle, retained_data_file_paths);
         }
     }
@@ -1066,14 +1060,14 @@ static ExpiredFiles collectExpiredFiles(
         if (seen_expired_manifest_list_paths.contains(ml_path))
             continue;
 
-        String storage_ml_path = makeAbsolutePath(persistent_table_components.table_location, ml_path);
+        String storage_ml_path = getProperFilePathFromMetadataInfo(
+            ml_path, persistent_table_components.table_path, persistent_table_components.table_location);
 
         ManifestFileCacheKeys manifest_keys;
-        SecondaryStorages local_secondary_storages;
         try
         {
             manifest_keys = getManifestList(
-                object_storage, persistent_table_components, context, storage_ml_path, log, local_secondary_storages);
+                object_storage, persistent_table_components, context, storage_ml_path, log);
         }
         catch (...)
         {
@@ -1093,7 +1087,7 @@ static ExpiredFiles collectExpiredFiles(
             {
                 auto entries_handle = getManifestFileEntriesHandle(
                     object_storage, persistent_table_components, context, log,
-                    mf_key, current_schema_id, local_secondary_storages);
+                    mf_key, current_schema_id);
 
                 for (const auto & entry : entries_handle.getFilesWithoutDeleted(FileContentType::DATA))
                     if (!retained_data_file_paths.contains(entry->file_path))
