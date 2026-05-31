@@ -8,7 +8,6 @@
 #include <Processors/Formats/IInputFormat.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/ObjectStorage/IObjectIterator.h>
-#include <Storages/ObjectStorage/Utils.h>
 #include <Formats/FormatParserSharedResources.h>
 #include <Formats/FormatFilterInfo.h>
 #include <Storages/Cache/ObjectStorageListObjectsCache.h>
@@ -171,7 +170,6 @@ public:
         size_t max_threads_count,
         bool is_archive_,
         ObjectStoragePtr object_storage_,
-        const std::string & table_location_,
         ContextPtr context_);
 
     ObjectInfoPtr next(size_t) override;
@@ -186,10 +184,6 @@ private:
     std::atomic_size_t index = 0;
     bool is_archive;
     ObjectStoragePtr object_storage;
-    std::string table_location;
-#if USE_AVRO
-    SecondaryStorages secondary_storages; /// For Iceberg: cache of storages for external file locations
-#endif
     /// path_to_archive -> archive reader.
     std::unordered_map<std::string, std::shared_ptr<IArchiveReader>> archive_readers;
     std::mutex archive_readers_mutex;
