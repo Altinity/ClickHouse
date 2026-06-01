@@ -66,7 +66,7 @@ TEST(DatalakeStateSerde, DataLakeStateSerde)
 TEST(DatalakeStateSerde, IcebergObjectSerializableInfoRoundTrip)
 {
     Iceberg::IcebergObjectSerializableInfo info;
-    info.data_object_file_path_key = "s3://bucket/path/to/file.parquet";
+    info.data_object_file_path_key = DB::Iceberg::IcebergPathFromMetadata::deserialize("s3://bucket/path/to/file.parquet");
     info.underlying_format_read_schema_id = 42;
     info.schema_id_relevant_to_iterator = 7;
     info.sequence_number = 123456;
@@ -103,7 +103,7 @@ TEST(DatalakeStateSerde, IcebergObjectSerializableInfoRoundTrip)
 TEST(DatalakeStateSerde, IcebergObjectSerializableInfoWithoutFileStats)
 {
     Iceberg::IcebergObjectSerializableInfo info;
-    info.data_object_file_path_key = "s3://bucket/path/to/file.parquet";
+    info.data_object_file_path_key = DB::Iceberg::IcebergPathFromMetadata::deserialize("s3://bucket/path/to/file.parquet");
     info.underlying_format_read_schema_id = 1;
     info.schema_id_relevant_to_iterator = 1;
     info.sequence_number = 0;
@@ -134,7 +134,7 @@ TEST(DatalakeStateSerde, IcebergObjectSerializableInfoNulloptFileStats)
 {
     /// Test round-trip when the fields are explicitly nullopt
     Iceberg::IcebergObjectSerializableInfo info;
-    info.data_object_file_path_key = "s3://bucket/path/to/file.parquet";
+    info.data_object_file_path_key = DB::Iceberg::IcebergPathFromMetadata::deserialize("s3://bucket/path/to/file.parquet");
     info.underlying_format_read_schema_id = 1;
     info.schema_id_relevant_to_iterator = 1;
     info.sequence_number = 0;
