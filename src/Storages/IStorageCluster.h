@@ -67,7 +67,7 @@ protected:
         const StorageSnapshotPtr & /*storage_snapshot*/,
         const ContextPtr & /*context*/,
         bool /*make_cluster_function*/) {}
-    void updateQueryWithJoinToSendIfNeeded(ASTPtr & query_to_send, QueryTreeNodePtr query_tree, const ContextPtr & context);
+    void updateQueryWithJoinToSendIfNeeded(ASTPtr & query_to_send, SelectQueryInfo query_info, const ContextPtr & context);
 
     virtual void updateConfigurationIfNeeded(ContextPtr /* context */) {}
 
@@ -141,7 +141,8 @@ public:
         ASTPtr query_to_send_,
         QueryProcessingStage::Enum processed_stage_,
         ClusterPtr cluster_,
-        LoggerPtr log_)
+        LoggerPtr log_,
+        std::optional<Tables> external_tables_)
         : SourceStepWithFilter(
             std::move(sample_block),
             column_names_,
@@ -153,6 +154,7 @@ public:
         , processed_stage(processed_stage_)
         , cluster(std::move(cluster_))
         , log(log_)
+        , external_tables(external_tables_)
     {
     }
 
@@ -164,6 +166,7 @@ private:
     LoggerPtr log;
 
     std::optional<RemoteQueryExecutor::Extension> extension;
+    std::optional<Tables> external_tables;
 
     void createExtension(const ActionsDAG::Node * predicate);
     ContextPtr updateSettings(const Settings & settings);
