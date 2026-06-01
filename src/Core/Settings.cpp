@@ -7539,10 +7539,14 @@ Maximum number of retries for exporting a merge tree part in an export partition
 Determines how long the manifest will live in ZooKeeper. It prevents the same partition from being exported twice to the same destination.
 This setting does not affect / delete in progress tasks. It'll only cleanup the completed ones.
 )", 0) \
-    DECLARE(UInt64, export_merge_tree_partition_task_timeout_seconds, 3600, R"(
+    DECLARE(UInt64, export_merge_tree_partition_task_timeout_seconds, 86400, R"(
 Maximum wall-clock duration (in seconds) an export partition task is allowed to remain in the PENDING state before it is auto-killed by the background cleanup loop.
 The timeout is measured from the manifest's create_time. Set to 0 to disable the timeout.
 When the timeout is exceeded the task transitions to KILLED (same terminal state as `KILL QUERY ... EXPORT PARTITION`), and `last_exception` is populated with a timeout reason.
+
+IMPORTANT: In case the storage is managed by a 3rd party application that cleans up old manifest files, it is important that the TTL of such files are greater than the timeout of export partition tasks.
+If it is not configured in such a way, it is possible to accidentally duplicate data in the extremely rare case a ClickHouse node is the only node working on a given export task, commits the data to Iceberg, crashes before marking the task as done and only boots up after the manifest cleanup has deleted the commit manifest.
+In such scenario, ClickHouse would attempt to commit those files again producing duplicates. 
 
 Notes:
 - Enforcement is best-effort: actual kill latency is bounded by one manifest-updater poll cycle (~30s) plus ZooKeeper watch propagation.
@@ -7568,9 +7572,13 @@ Throw an error if there are pending mutations when exporting a merge tree part.
     DECLARE(Bool, export_merge_tree_part_throw_on_pending_patch_parts, true, R"(
 Throw an error if there are pending patch parts when exporting a merge tree part.
 )", 0) \
-    DECLARE(Bool, export_merge_tree_partition_system_table_prefer_remote_information, false, R"(
-Controls whether the system.replicated_partition_exports will prefer to query ZooKeeper to get the most up to date information or use the local information.
-Querying ZooKeeper is expensive, and only available if the ZooKeeper feature flag MULTI_READ is enabled.
+    DECLARE(ExportPartitionAllOnError, export_merge_tree_partition_all_on_error, ExportPartitionAllOnError::throw_first, R"(
+Failure handling for `ALTER TABLE ... EXPORT PARTITION ALL ...`.
+Possible values:
+- `throw_first` (default) - stop at the first failed partition; partitions already scheduled remain scheduled.
+- `collect` - try every partition and throw a single aggregated exception at the end if any failed; partitions that succeeded remain scheduled.
+- `skip_conflicts` - silently skip partitions that are already exported / being exported (errors with code EXPORT_PARTITION_ALREADY_EXPORTED); fail-fast on every other error.
+Has no effect on `EXPORT PARTITION <id>` (single-partition export).
 )", 0) \
     DECLARE(String, export_merge_tree_part_filename_pattern, "{part_name}_{checksum}", R"(
 Pattern for the filename of the exported merge tree part. The `part_name` and `checksum` are calculated and replaced on the fly. Additional macros are supported.
