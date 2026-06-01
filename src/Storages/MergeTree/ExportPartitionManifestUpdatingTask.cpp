@@ -406,6 +406,8 @@ std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::
         ExportReplicatedMergeTreePartitionManifest manifest;
         ExportReplicatedMergeTreePartitionTaskEntry::Status status;
         std::map<String, LastExceptionEntry> last_exception_per_replica;
+        std::map<String, std::vector<String>> destination_file_paths_per_part;
+        std::optional<ExportReplicatedMergeTreePartitionCommitInfoEntry> commit_info;
     };
 
     std::vector<EntrySnapshot> snapshots;
@@ -415,7 +417,12 @@ std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::
 
         snapshots.reserve(storage.export_merge_tree_partition_task_entries_by_key.size());
         for (const auto & entry : storage.export_merge_tree_partition_task_entries_by_key)
-            snapshots.push_back(EntrySnapshot{entry.manifest, entry.status, entry.last_exception_per_replica});
+            snapshots.emplace_back(
+                entry.manifest,
+                entry.status,
+                std::move(entry.last_exception_per_replica),
+                std::move(entry.destination_file_paths_per_part),
+                std::move(entry.commit_info));
     }
 
     std::vector<ReplicatedPartitionExportInfo> infos;
@@ -446,14 +453,14 @@ std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::
         }
         info.exception_count = total_exception_count;
 
-        info.destination_file_paths_per_part = entry.destination_file_paths_per_part;
+        info.destination_file_paths_per_part = std::move(snapshot.destination_file_paths_per_part);
 
-        if (entry.commit_info)
+        if (snapshot.commit_info)
         {
-            info.committed_metadata_file = entry.commit_info->iceberg_metadata_file;
-            info.committed_manifest_list = entry.commit_info->iceberg_manifest_list;
-            info.committed_manifest_file = entry.commit_info->iceberg_manifest_file;
-            info.committed_marker_file = entry.commit_info->commit_marker_file;
+            info.committed_metadata_file = snapshot.commit_info->iceberg_metadata_file;
+            info.committed_manifest_list = snapshot.commit_info->iceberg_manifest_list;
+            info.committed_manifest_file = snapshot.commit_info->iceberg_manifest_file;
+            info.committed_marker_file = snapshot.commit_info->commit_marker_file;
         }
 
         infos.emplace_back(std::move(info));
