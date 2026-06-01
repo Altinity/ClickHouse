@@ -509,7 +509,14 @@ std::optional<std::pair<DB::ObjectStoragePtr, std::string>> tryResolveObjectStor
                                 /*enable_url_encoding*/ false);
 
             if (s3URIMatches(s3_uri, base_s3_uri.bucket, base_s3_uri.endpoint, target_scheme_normalized))
-                use_base_storage = true;
+            {
+                /// The path points inside the table location but is spelled with a different
+                /// scheme/bucket than the base storage (e.g. a Spark-relocated table whose
+                /// metadata `location` is `s3a://spark-bucket/...`). The real object lives in the
+                /// base storage at `table_root` + suffix, which only `IcebergPathResolver::resolve`
+                /// can compute, so defer to it instead of using the raw metadata key.
+                return std::nullopt;
+            }
         }
 
         if (use_base_storage)
