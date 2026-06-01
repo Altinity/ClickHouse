@@ -47,6 +47,7 @@
 #include <Poco/StreamCopier.h>
 
 #include <sstream>
+#include <unordered_set>
 
 
 namespace DB::ErrorCodes
@@ -137,6 +138,66 @@ Poco::JSON::Object::Ptr cloneJsonObject(const Poco::JSON::Object::Ptr & obj)
     Poco::JSON::Parser parser;
     return parser.parse(oss.str()).extract<Poco::JSON::Object::Ptr>();
 }
+
+void collectSchemaFieldIdsFromFields(const Poco::JSON::Array::Ptr & fields, std::unordered_set<Int32> & ids)
+{
+    if (!fields)
+        return;
+
+    for (UInt32 i = 0; i < fields->size(); ++i)
+    {
+        auto field = fields->getObject(i);
+        ids.insert(field->getValue<Int32>(DB::Iceberg::f_id));
+        if (field->has(DB::Iceberg::f_fields))
+            collectSchemaFieldIdsFromFields(field->getArray(DB::Iceberg::f_fields), ids);
+    }
+}
+
+/// Returns true when the table default sort order references a column absent from the new schema.
+bool sortOrderIncompatibleWithSchema(
+    const Poco::JSON::Object::Ptr & metadata, const Poco::JSON::Object::Ptr & new_schema_obj)
+{
+    if (!metadata->has(DB::Iceberg::f_sort_orders) || !metadata->has(DB::Iceberg::f_default_sort_order_id))
+        return false;
+
+    const Int64 default_sort_order_id = metadata->getValue<Int64>(DB::Iceberg::f_default_sort_order_id);
+    auto sort_orders = metadata->getArray(DB::Iceberg::f_sort_orders);
+
+    Poco::JSON::Object::Ptr default_sort_order;
+    for (UInt32 i = 0; i < sort_orders->size(); ++i)
+    {
+        auto sort_order = sort_orders->getObject(i);
+        if (sort_order->getValue<Int64>(DB::Iceberg::f_order_id) == default_sort_order_id)
+        {
+            default_sort_order = sort_order;
+            break;
+        }
+    }
+
+    if (!default_sort_order || !default_sort_order->has(DB::Iceberg::f_fields))
+        return false;
+
+    auto sort_fields = default_sort_order->getArray(DB::Iceberg::f_fields);
+    if (sort_fields->size() == 0)
+        return false;
+
+    std::unordered_set<Int32> new_schema_field_ids;
+    if (new_schema_obj->has(DB::Iceberg::f_fields))
+        collectSchemaFieldIdsFromFields(new_schema_obj->getArray(DB::Iceberg::f_fields), new_schema_field_ids);
+
+    for (UInt32 i = 0; i < sort_fields->size(); ++i)
+    {
+        auto field = sort_fields->getObject(i);
+        if (!field->has(DB::Iceberg::f_source_id))
+            continue;
+
+        const Int32 source_id = field->getValue<Int32>(DB::Iceberg::f_source_id);
+        if (!new_schema_field_ids.contains(source_id))
+            return true;
+    }
+
+    return false;
+}
 }
 
 Poco::JSON::Object::Ptr buildUpdateMetadataRequestBody(
@@ -215,8 +276,24 @@ Poco::JSON::Object::Ptr buildUpdateMetadataRequestBody(
         {
             Poco::JSON::Object::Ptr set_current_schema = new Poco::JSON::Object;
             set_current_schema->set("action", "set-current-schema");
-            set_current_schema->set("schema-id", new_schema_id);
+            set_current_schema->set("schema-id", -1);
             updates->add(set_current_schema);
+        }
+        if (sortOrderIncompatibleWithSchema(new_snapshot, new_schema_obj))
+        {
+            Poco::JSON::Object::Ptr unsorted_sort_order = new Poco::JSON::Object;
+            unsorted_sort_order->set(DB::Iceberg::f_order_id, 0);
+            unsorted_sort_order->set(DB::Iceberg::f_fields, Poco::JSON::Array::Ptr(new Poco::JSON::Array));
+
+            Poco::JSON::Object::Ptr add_sort_order = new Poco::JSON::Object;
+            add_sort_order->set("action", "add-sort-order");
+            add_sort_order->set("sort-order", unsorted_sort_order);
+            updates->add(add_sort_order);
+
+            Poco::JSON::Object::Ptr set_default_sort_order = new Poco::JSON::Object;
+            set_default_sort_order->set("action", "set-default-sort-order");
+            set_default_sort_order->set("sort-order-id", -1);
+            updates->add(set_default_sort_order);
         }
         request_body->set("updates", updates);
     }

@@ -143,7 +143,6 @@ public:
         const std::vector<Field> & partition_values,
         SharedHeader sample_block,
         const std::vector<String> & data_file_paths,
-        StorageObjectStorageConfigurationPtr configuration,
         ContextPtr context) override;
 
     CompressionMethod getCompressionMethod() const { return persistent_components.metadata_compression_method; }
@@ -224,15 +223,13 @@ private:
         const std::vector<String> & partition_columns,
         const std::vector<DataTypePtr> & partition_types,
         SharedHeader sample_block,
-        const std::vector<String> & data_file_paths,
+        const std::vector<Iceberg::IcebergPathFromMetadata> & data_file_paths_in_metadata,
         const std::vector<IcebergSerializedFileStats> & per_file_stats,
         Int64 total_data_files,
         Int64 total_rows,
         Int64 total_chunks_size,
         std::shared_ptr<DataLake::ICatalog> catalog,
         const StorageID & table_id,
-        const String & blob_storage_type_name,
-        const String & blob_storage_namespace_name,
         ContextPtr context);
 
     LoggerPtr log;
