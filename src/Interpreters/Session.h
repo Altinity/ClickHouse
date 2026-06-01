@@ -121,10 +121,6 @@ private:
     std::vector<UUID> external_roles;
     AuthenticationData user_authenticated_with;
 
-    /// When the user was authenticated with a bearer/access token, this holds the
-    /// effective token expiry captured at authentication time.
-    std::optional<std::chrono::system_clock::time_point> auth_token_expires_at;
-
     ContextMutablePtr session_context;
     mutable bool query_context_created = false;
 
