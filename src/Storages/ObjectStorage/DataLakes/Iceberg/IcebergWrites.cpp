@@ -15,6 +15,7 @@
 #include <DataTypes/DataTypeTime64.h>
 #include <DataTypes/DataTypesDecimal.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <DataTypes/DataTypesDecimal.h>
 #include <DataTypes/IDataType.h>
 #include <Databases/DataLake/Common.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
