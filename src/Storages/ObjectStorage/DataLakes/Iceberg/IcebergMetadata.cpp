@@ -264,7 +264,7 @@ IcebergMetadata::IcebergMetadata(
     : log(getLogger("IcebergMetadata"))
     , object_storage(std::move(object_storage_))
     , persistent_components(initializePersistentTableComponents(configuration_, cache_ptr, context_))
-    , data_lake_settings(const_cast<DataLakeStorageSettings &>(configuration_->getDataLakeSettings()))
+    , data_lake_settings(configuration_->getDataLakeSettings())
     , write_format(configuration_->getFormat())
 {
     /// TODO: for now it's okay to start/stop the task via constructor/destructor. Once refactored, we'd need to plumb startup/shutdown and schedule the task from there

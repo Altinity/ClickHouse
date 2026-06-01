@@ -714,7 +714,7 @@ void alter(
     const AlterCommands & params,
     ContextPtr context,
     ObjectStoragePtr object_storage,
-    DataLakeStorageSettings & data_lake_settings,
+    const DataLakeStorageSettings & data_lake_settings,
     PersistentTableComponents & persistent_table_components,
     const String & write_format,
     StorageID storage_id,
@@ -787,14 +787,11 @@ void alter(
             compression_method,
             data_lake_settings[DataLakeStorageSetting::iceberg_use_version_hint]);
 
-        const bool file_exists = wrote_ok || object_storage->exists(StoredObject(storage_metadata_name));
-
         if (!wrote_ok)
         {
-            LOG_WARNING(log, "Iceberg alter: failed to write metadata to '{}' (attempt {}, file exists: {})",
-                storage_metadata_name, i + 1, file_exists);
-            if (!file_exists)
-                continue;
+            LOG_WARNING(log, "Iceberg alter: failed to write metadata to '{}' (attempt {}, file exists: {}), retrying",
+                storage_metadata_name, i + 1, object_storage->exists(StoredObject(storage_metadata_name)));
+            continue;
         }
 
         if (catalog)
@@ -823,12 +820,7 @@ void alter(
                 }
                 continue;
             }
-            if (!wrote_ok)
-                LOG_INFO(log, "Iceberg alter: adopted existing metadata file '{}' and updated catalog", storage_metadata_name);
         }
-
-        if (data_lake_settings[DataLakeStorageSetting::iceberg_metadata_file_path].changed)
-            data_lake_settings[DataLakeStorageSetting::iceberg_metadata_file_path] = metadata_name;
 
         if (persistent_table_components.metadata_cache)
         {
