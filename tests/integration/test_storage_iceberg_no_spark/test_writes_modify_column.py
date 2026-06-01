@@ -31,8 +31,8 @@ def test_modify_column_basic(started_cluster_iceberg_no_spark, format_version, s
 
     assert instance.query(f"SELECT id, value FROM {TABLE_NAME} ORDER BY id") == "1\thello\n2\tworld\n"
 
-    instance.query(f"INSERT INTO {TABLE_NAME} VALUES (3, 'foo');", settings=INSERT_SETTINGS)
-    assert instance.query(f"SELECT id, value FROM {TABLE_NAME} ORDER BY id") == "1\thello\n2\tworld\n3\tfoo\n"
+    instance.query(f"INSERT INTO {TABLE_NAME} VALUES (3000000000, 'foo');", settings=INSERT_SETTINGS)
+    assert instance.query(f"SELECT id, value FROM {TABLE_NAME} ORDER BY id") == "1\thello\n2\tworld\n3000000000\tfoo\n"
 
 
 @pytest.mark.parametrize("format_version", [1, 2])
