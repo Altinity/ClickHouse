@@ -227,7 +227,6 @@ public:
         const std::vector<Field> & /* partition_values */,
         SharedHeader /* sample_block */,
         const std::vector<String> & /* data_file_paths */,
-        StorageObjectStorageConfigurationPtr /* configuration */,
         ContextPtr /* context */)
         {
             throwNotImplemented("commitExportPartitionTransaction");
