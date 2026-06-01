@@ -1269,7 +1269,7 @@ MetadataFileWithInfo getLatestOrExplicitMetadataFileAndVersion(
 
     {
         return getLatestMetadataFileAndVersion(
-            object_storage, table_path, data_lake_settings, metadata_cache, local_context, table_uuid, false, force_fetch_latest_metadata);
+            object_storage, table_path, data_lake_settings, metadata_cache, local_context, table_uuid, table_uuid.has_value(), force_fetch_latest_metadata);
     }
 }
 
