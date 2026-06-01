@@ -277,7 +277,7 @@ jobs:
       build_sha: ${{ inputs.build_sha }}
       set_commit_status: true
       job_name: iceberg
-      extra_args: --only ${{ matrix.PART == 1 && '"/iceberg/iceberg engine/rest catalog/*" "/iceberg/s3 table function/*" "/iceberg/icebergS3 table function/*" "/iceberg/iceberg cache/*"' || '"/iceberg/iceberg engine/glue catalog/*" "/iceberg/iceberg table engine/*"' }}
+      extra_args: --only ${{ matrix.PART == 1 && '"/iceberg/iceberg engine/rest catalog/*" "/iceberg/s3 table function/*" "/iceberg/icebergS3 table function/*" "/iceberg/iceberg cache/*"' || '"/iceberg/iceberg engine/glue catalog/*" "/iceberg/iceberg table engine/*" "/iceberg/export partition/*"' }}
     secrets: inherit
   LDAP:
     if: |
