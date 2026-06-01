@@ -86,6 +86,12 @@ namespace ExportPartitionUtils
         context_copy->setSetting("export_merge_tree_part_filename_pattern", manifest.filename_pattern);
         context_copy->setSetting("write_full_path_in_iceberg_metadata", manifest.write_full_path_in_iceberg_metadata);
 
+        /// The request-time call to exportPartitionToTable has already validated allow_insert_into_iceberg
+        /// against the initiator's settings. Once the manifest is in ZooKeeper, every replica must be
+        /// able to execute the task regardless of its own profile - otherwise an export silently
+        /// stalls when the setting is only set at the query level.
+        context_copy->setSetting("allow_insert_into_iceberg", true);
+
 	    return context_copy;
     }
 
@@ -152,7 +158,8 @@ namespace ExportPartitionUtils
         const LoggerPtr & log,
         const std::string & entry_path,
         const ContextPtr & context_in,
-        MergeTreeData & source_storage)
+        MergeTreeData & source_storage,
+        const String & replica_name)
     {
         auto context = Context::createCopy(context_in);
         context->setSetting("write_full_path_in_iceberg_metadata", manifest.write_full_path_in_iceberg_metadata);
@@ -164,6 +171,19 @@ namespace ExportPartitionUtils
             throw Exception(ErrorCodes::FAULT_INJECTED,
                 "Failpoint: export_partition_commit_always_throw");
         });
+
+        /// Per-task ephemeral lock that serializes the commit phase across replicas.
+        /// Without it, `handlePartExportSuccess` (post-last-part path) and `tryCleanup`
+        /// (poll/recovery path) can drive `commitExportPartitionTransaction` concurrently
+        /// for the same task.
+        const auto commit_lock_path = fs::path(entry_path) / "commit_lock";
+        auto commit_lock = zkutil::EphemeralNodeHolder::tryCreate(commit_lock_path, *zk, replica_name);
+        if (!commit_lock)
+        {
+            LOG_INFO(log, "ExportPartition: commit_lock for {} is held by another replica, skipping commit on this replica", entry_path);
+            return;
+        }
+        LOG_INFO(log, "ExportPartition: commit_lock for {} acquired by replica {}", entry_path, replica_name);
 
         const auto exported_paths = ExportPartitionUtils::getExportedPaths(log, zk, entry_path);
 
