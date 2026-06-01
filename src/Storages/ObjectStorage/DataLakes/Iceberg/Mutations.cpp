@@ -990,6 +990,7 @@ static void collectRetainedFiles(
     std::set<Iceberg::IcebergPathFromMetadata> & retained_data_file_paths,
     std::set<Iceberg::IcebergPathFromMetadata> & retained_manifest_list_paths)
 {
+    SecondaryStorages secondary_storages;
     for (UInt32 i = 0; i < retained_snapshots->size(); ++i)
     {
         auto snapshot = retained_snapshots->getObject(i);
@@ -999,14 +1000,14 @@ static void collectRetainedFiles(
         auto manifest_list_path = IcebergPathFromMetadata::deserialize(snapshot->getValue<String>(Iceberg::f_manifest_list));
         retained_manifest_list_paths.insert(manifest_list_path);
 
-        auto manifest_keys = getManifestList(object_storage, persistent_table_components, context, manifest_list_path, log);
+        auto manifest_keys = getManifestList(object_storage, persistent_table_components, context, manifest_list_path, log, secondary_storages);
 
         for (const auto & mf_key : manifest_keys)
         {
             retained_manifest_paths.insert(mf_key.manifest_file_path);
             auto entries_handle = getManifestFileEntriesHandle(
                 object_storage, persistent_table_components, context, log,
-                mf_key, current_schema_id);
+                mf_key, current_schema_id, secondary_storages);
             collectAllFilePaths(entries_handle, retained_data_file_paths);
         }
     }
@@ -1035,6 +1036,7 @@ static ExpiredFiles collectExpiredFiles(
     Int32 current_schema_id)
 {
     ExpiredFiles result;
+    SecondaryStorages secondary_storages;
     std::set<Iceberg::IcebergPathFromMetadata> seen_expired_manifest_list_paths;
     std::set<Iceberg::IcebergPathFromMetadata> seen_expired_manifest_paths;
     for (const auto & manifest_list_path : expired_manifest_list_paths)
@@ -1048,7 +1050,7 @@ static ExpiredFiles collectExpiredFiles(
         ManifestFileCacheKeys manifest_keys;
         try
         {
-            manifest_keys = getManifestList(object_storage, persistent_table_components, context, manifest_list_path, log);
+            manifest_keys = getManifestList(object_storage, persistent_table_components, context, manifest_list_path, log, secondary_storages);
         }
         catch (...)
         {
@@ -1068,7 +1070,7 @@ static ExpiredFiles collectExpiredFiles(
             {
                 auto entries_handle = getManifestFileEntriesHandle(
                     object_storage, persistent_table_components, context, log,
-                    mf_key, current_schema_id);
+                    mf_key, current_schema_id, secondary_storages);
 
                 for (const auto & entry : entries_handle.getFilesWithoutDeleted(FileContentType::DATA))
                     if (!retained_data_file_paths.contains(entry->parsed_entry->file_path_key))
