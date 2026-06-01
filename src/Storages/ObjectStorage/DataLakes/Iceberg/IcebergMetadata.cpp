@@ -1812,9 +1812,9 @@ IStorage::ExportPartitionCommitInfo IcebergMetadata::commitImportPartitionTransa
                 "Post-publish work failed after Iceberg snapshot was committed; "
                 "skipping manifest cleanup to preserve published snapshot");
             IStorage::ExportPartitionCommitInfo published_info;
-            published_info.iceberg_metadata_file = storage_metadata_name;
+            published_info.iceberg_metadata_file = resolver.resolve(metadata_info.path);
             published_info.iceberg_manifest_list = storage_manifest_list_name;
-            published_info.iceberg_manifest_file = storage_manifest_entry_name;
+            published_info.iceberg_manifest_file = storage_manifest_entry_path;
             return published_info;
         }
 
@@ -1828,9 +1828,9 @@ IStorage::ExportPartitionCommitInfo IcebergMetadata::commitImportPartitionTransa
     /// (not on the retry / "already committed" paths) so the struct reflects
     /// exactly what this attempt produced.
     IStorage::ExportPartitionCommitInfo published_info;
-    published_info.iceberg_metadata_file = storage_metadata_name;
+    published_info.iceberg_metadata_file = resolver.resolve(metadata_info.path);
     published_info.iceberg_manifest_list = storage_manifest_list_name;
-    published_info.iceberg_manifest_file = storage_manifest_entry_name;
+    published_info.iceberg_manifest_file = storage_manifest_entry_path;
     return published_info;
 }
 
