@@ -832,8 +832,8 @@ def test_object_storage_remote_initiator(started_cluster):
         """
     ).splitlines()
 
-    # initial node + describe table + remote initiator + 2 subqueries on replicas
-    assert queries == ["5"]
+    # initial node + remote initiator + 2 subqueries on replicas
+    assert queries == ["4"]
 
     # Cluster with dots in the host names
     query_id = uuid.uuid4().hex
@@ -860,8 +860,8 @@ def test_object_storage_remote_initiator(started_cluster):
         """
     ).splitlines()
 
-    # initial node + describe table + remote initiator + 2 subqueries on replicas
-    assert queries == ["5"]
+    # initial node + remote initiator + 2 subqueries on replicas
+    assert queries == ["4"]
 
     users = node.query(
         f"""
@@ -902,8 +902,8 @@ def test_object_storage_remote_initiator(started_cluster):
         """
     ).splitlines()
 
-    # initial node + describe table + remote initiator + 2 subqueries on replicas
-    assert queries == ["5"]
+    # initial node + remote initiator + 2 subqueries on replicas
+    assert queries == ["4"]
 
     users = node.query(
         f"""
@@ -963,8 +963,8 @@ def test_object_storage_remote_initiator(started_cluster):
         """
     ).splitlines()
 
-    # initial node + describe table + remote initiator + 2 subqueries on replicas
-    assert queries == ["5"]
+    # initial node + remote initiator + 2 subqueries on replicas
+    assert queries == ["4"]
 
     users = node.query(
         f"""
@@ -1446,8 +1446,8 @@ def test_object_storage_remote_initiator_without_cluster_function(started_cluste
         """
     ).splitlines()
 
-    # initial node + describe table + remote initiator
-    assert queries == ["3"]
+    # initial node + remote initiator
+    assert queries == ["2"]
 
     users = node.query(
         f"""
@@ -1491,8 +1491,8 @@ def test_object_storage_remote_initiator_without_cluster_function(started_cluste
         """
     ).splitlines()
 
-    # initial node + describe table + remote initiator + 2 subqueries on replicas
-    assert queries == ["5"]
+    # initial node + remote initiator + 2 subqueries on replicas
+    assert queries == ["4"]
 
     users = node.query(
         f"""
