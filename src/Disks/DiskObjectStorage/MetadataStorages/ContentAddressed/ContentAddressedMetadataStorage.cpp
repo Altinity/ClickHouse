@@ -154,6 +154,18 @@ uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) 
 
 Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::string & path) const
 {
+    // A part directory (<uuid[:3]>/<uuid>/<part>) has no single blob; report the footer object's
+    // mtime. MergeTree calls this on the part directory while loading parts (modification_time).
+    // Timestamps are derived for content addressing, so the footer's mtime is a reasonable proxy.
+    if (auto p = ContentAddressed::parsePartFilePath(path); p && p->file.empty())
+    {
+        auto pid = readRefPartId(p->table_uuid, p->part_name);
+        if (!pid)
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
+        auto metadata = object_storage->getObjectMetadata(ContentAddressed::partKey(*pid), /*with_tags=*/false);
+        return metadata.last_modified;
+    }
+
     // Mirror MetadataStorageFromPlainObjectStorage: report the resolved blob object's mtime.
     auto objects = getStorageObjects(path);
     chassert(!objects.empty());
