@@ -1,14 +1,20 @@
 #include <gtest/gtest.h>
 #include <optional>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Footer.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
+#include <Disks/WriteMode.h>
 
+#include <IO/ReadHelpers.h>
+#include <IO/ReadSettings.h>
 #include <IO/SharedThreadPools.h>
 
 #include <Core/ServerUUID.h>
+#include <Common/Exception.h>
 
 #include <filesystem>
 #include <mutex>
@@ -68,14 +74,42 @@ public:
         }
     }
 
-    std::shared_ptr<DB::IMetadataStorage> getMetadataStorage(const std::string & key_prefix)
+    std::shared_ptr<DB::ContentAddressedMetadataStorage> getMetadataStorage(const std::string & key_prefix)
     {
         std::unique_lock<std::mutex> lock(active_metadatas_mutex);
 
         if (!active_metadatas[key_prefix])
             active_metadatas[key_prefix] = createMetadataStorage(key_prefix);
 
-        return active_metadatas[key_prefix];
+        return std::dynamic_pointer_cast<DB::ContentAddressedMetadataStorage>(active_metadatas[key_prefix]);
+    }
+
+    std::shared_ptr<DB::IObjectStorage> getObjectStorage(const std::string & key_prefix)
+    {
+        std::unique_lock<std::mutex> lock(active_metadatas_mutex);
+        if (!active_metadatas[key_prefix])
+            active_metadatas[key_prefix] = createMetadataStorage(key_prefix);
+        return active_object_storages.at(key_prefix);
+    }
+
+    static size_t writeObject(const std::shared_ptr<DB::IObjectStorage> & object_storage, const std::string & remote_path, const std::string & data)
+    {
+        DB::StoredObject object(remote_path);
+        auto buffer = object_storage->writeObject(object, DB::WriteMode::Rewrite);
+        buffer->write(data.data(), data.size());
+        buffer->preFinalize();
+        size_t written_bytes = buffer->count();
+        buffer->finalize();
+        return written_bytes;
+    }
+
+    static std::string readObject(const std::shared_ptr<DB::IObjectStorage> & object_storage, const std::string & remote_path)
+    {
+        DB::StoredObject object(remote_path);
+        auto buffer = object_storage->readObject(object, DB::getReadSettings(), /*read_hint=*/std::nullopt);
+        String content;
+        DB::readStringUntilEOF(content, *buffer);
+        return content;
     }
 
     void TearDown() override
@@ -118,4 +152,41 @@ TEST_F(ContentAddressedMetaTest, ConstructAndType)
     EXPECT_FALSE(ms->isReadOnly());
     EXPECT_FALSE(ms->areBlobPathsRandom());
     EXPECT_EQ(ms->getHardlinkCount("anything"), 0u);
+}
+
+TEST_F(ContentAddressedMetaTest, ResolvesAndReadsSeededPart)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_resolve");
+    auto os = getObjectStorage("cas_resolve");
+    const std::string sid = ms->serverIdForTest(); // "test-server"
+    const std::string uuid = "uuid-2", part = "all_1_1_0", file = "data.bin";
+    const std::string blob_data = "COLUMN-BYTES";
+    const std::string blob_csum = "deadbeef01";
+    const std::string part_id = "cafe112233";
+
+    writeObject(os, blobKey(blob_csum), blob_data);
+    Footer f;
+    f.blobs[file] = BlobEntry{blob_csum, blob_data.size(), blob_csum};
+    writeObject(os, partKey(part_id), f.serialize());
+    writeObject(os, refKey(sid, uuid, part), part_id);
+
+    const std::string logical = "uui/" + uuid + "/" + part + "/" + file; // <uuid[:3]>/<uuid>/<part>/<file>
+    EXPECT_TRUE(ms->existsFile(logical));
+    EXPECT_EQ(ms->getFileSize(logical), blob_data.size());
+    auto objs = ms->getStorageObjects(logical);
+    ASSERT_EQ(objs.size(), 1u);
+    EXPECT_EQ(objs[0].remote_path, blobKey(blob_csum));
+    EXPECT_EQ(readObject(os, objs[0].remote_path), blob_data);
+    EXPECT_FALSE(ms->existsFile("uui/" + uuid + "/" + part + "/absent.bin")); // file not in footer
+}
+
+TEST_F(ContentAddressedMetaTest, FailsClosedOnMissingFooter)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_failclose");
+    auto os = getObjectStorage("cas_failclose");
+    // ref present, but parts/<part_id> footer absent → must THROW (B18), not return empty
+    writeObject(os, refKey(ms->serverIdForTest(), "uuid-3", "all_1_1_0"), "missingpid");
+    EXPECT_THROW(ms->getStorageObjects("uui/uuid-3/all_1_1_0/data.bin"), DB::Exception);
 }
