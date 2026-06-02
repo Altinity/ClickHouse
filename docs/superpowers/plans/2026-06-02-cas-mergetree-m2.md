@@ -49,6 +49,16 @@ Before writing path math, the implementer MUST confirm what relative paths `Disk
 - [ ] **Step 2:** Read the mirror's path handling: `Plain/MetadataStorageFromPlainObjectStorage.cpp::listDirectory`/`getStorageObjects` (how it derives a key prefix from `path` via `getKeyForPath(object_storage->getCommonKeyPrefix(), path)`) and `getCommonKeyPrefix()`.
 - [ ] **Step 3:** Write findings as a short comment block at the top of `PoolPaths.h` documenting: the incoming path format, where the `<table_uuid>` and `<part_name>` and `<file>` sit, and the server-id source (`ServerUUID::get()`). No commit yet — this feeds Task 1.
 
+### Task 0 findings (CONFIRMED — supersede the `store/<uuid>/…` examples below) {#task-0-findings}
+
+- **Incoming path is disk-relative, no leading slash:** a part file is `<uuid[:3]>/<uuid>/<part_name>/<file>`; the table-parts directory passed to `iterateDirectory` is `<uuid[:3]>/<uuid>/` (from `DatabaseCatalog::getPathForUUID` = `toString(uuid).substr(0,3) + '/' + toString(uuid) + '/'`, `DatabaseCatalog.cpp:1662`). There is **no `store/` prefix** in the relative path. So `parsePartFilePath` splits on `/`: `[0]`=uuid-prefix (ignore), `[1]`=`table_uuid`, `[2]`=`part_name`, `[3..]`=`file` (≥3 comps = part dir, ≥4 = file).
+- **Internal pool keys are OUR layout** (the incoming path only yields `table_uuid`+`part_name`): `blobs/…` and `parts/…` GLOBAL; refs at `store/<server_id>/<table_uuid>/refs/<part_name>` with `server_id = ServerUUID::get()`. Use **bare internal keys** for `StoredObject.remote_path`, and seed the gtest at the same bare keys (the `LocalObjectStorage` harness writes/reads `remote_path` directly under its `key_prefix` dir). If a live disk reports a non-empty `object_storage->getCommonKeyPrefix()`, prepend it uniformly the way `Plain/MetadataStorageFromPlainObjectStorage.cpp:26 getKeyForPath` does.
+- **`iterateDirectory` returns `StaticDirectoryIterator`** (`…/MetadataStorages/StaticDirectoryIterator.h`), constructed from `std::vector<std::filesystem::path>` (mirror Plain: list names → `fs::path(path)/child` → `make_unique<StaticDirectoryIterator>`).
+- **`ServerUUID::get()`** (`src/Core/ServerUUID.h`) → `UUID`; `ServerUUID::setRandomForUnitTests()` for the gtest SetUp; also `getIOThreadPool().initialize(1,1,0)`.
+- **Harness:** `LocalObjectStorageSettings("test", "./" + key_prefix, false)` → `LocalObjectStorage`; the `writeObject(os, remote_path, data)` / `readObject(os, remote_path)` free helpers from `gtest_metadata_plain_rewritable_disk.cpp`.
+
+Apply these to the function names/tests below (replace `store/<uuid>/…` with `<uuid[:3]>/<uuid>/…`; keep the helper names).
+
 ## Task 1: `PoolPaths` — pure path math (TDD) {#task-1}
 
 **Files:** Create `…/ContentAddressed/PoolPaths.h` + `.cpp`; Create `src/Disks/tests/gtest_content_addressed_metadata.cpp`.
