@@ -161,7 +161,7 @@ jobs:
           SUITE=${{ matrix.SUITE }}
           EOF
       - name: Download json reports
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_report_package_${{ inputs.arch }}
@@ -205,7 +205,7 @@ jobs:
           SUITE=alter
           EOF
       - name: Download json reports
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_report_package_${{ inputs.arch }}
@@ -251,7 +251,7 @@ jobs:
           STORAGE=/${{ matrix.STORAGE }}
           EOF
       - name: Download json reports
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_report_package_${{ inputs.arch }}
@@ -300,7 +300,7 @@ jobs:
           STORAGE=/ssl
           EOF
       - name: Download json reports
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_report_package_${{ inputs.arch }}
@@ -345,7 +345,7 @@ jobs:
           SUITE=ldap/${{ matrix.SUITE }}
           EOF
       - name: Download json reports
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_report_package_${{ inputs.arch }}
@@ -385,7 +385,7 @@ jobs:
           SUITE=parquet
           EOF
       - name: Download json reports
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_report_package_${{ inputs.arch }}
@@ -430,7 +430,7 @@ jobs:
           STORAGE=${{ matrix.STORAGE}}
           EOF
       - name: Download json reports
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_report_package_${{ inputs.arch }}
@@ -481,7 +481,7 @@ jobs:
           STORAGE=/${{ matrix.STORAGE }}
           EOF
       - name: Download json reports
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_report_package_${{ inputs.arch }}
@@ -534,7 +534,7 @@ jobs:
           STORAGE=/${{ matrix.STORAGE }}
           EOF
       - name: Download json reports
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ${{ env.REPORTS_PATH }}
           name: build_report_package_${{ inputs.arch }}

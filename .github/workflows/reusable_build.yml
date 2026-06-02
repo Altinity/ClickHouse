@@ -123,7 +123,7 @@ jobs:
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Download changed images
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: changed_images
           path: ${{ env.IMAGES_PATH }}
