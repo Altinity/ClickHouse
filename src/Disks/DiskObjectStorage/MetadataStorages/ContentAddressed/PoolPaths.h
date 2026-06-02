@@ -15,6 +15,15 @@ namespace DB::ContentAddressed
 std::string blobKey(const std::string & key_prefix, const std::string & file_checksum);
 std::string partKey(const std::string & key_prefix, const std::string & part_id);
 
+// Pool roots for enumeration (GC scan). Each is the object-key prefix under which all objects of a
+// given kind live: footers under partsPrefix (<key_prefix>/parts), content blobs under blobsPrefix
+// (<key_prefix>/blobs), and every server's/table's refs under refsRootPrefix (<key_prefix>/store/).
+// They are empty-prefix-safe (an empty key_prefix yields the bare root) and consistent with the
+// per-object key builders above, so listing under them enumerates exactly those keys.
+std::string partsPrefix(const std::string & key_prefix);
+std::string blobsPrefix(const std::string & key_prefix);
+std::string refsRootPrefix(const std::string & key_prefix);
+
 // Per-server/per-table ref object key: <key_prefix>/store/<server_id>/<table_uuid>/refs/<part_name>.
 std::string refsPrefix(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid);
 std::string refKey(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid, const std::string & part_name);

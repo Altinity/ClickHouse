@@ -36,6 +36,21 @@ std::string partKey(const std::string & key_prefix, const std::string & part_id)
     return withPrefix(key_prefix, fanOut("parts", part_id));
 }
 
+std::string partsPrefix(const std::string & key_prefix)
+{
+    return withPrefix(key_prefix, "parts");
+}
+
+std::string blobsPrefix(const std::string & key_prefix)
+{
+    return withPrefix(key_prefix, "blobs");
+}
+
+std::string refsRootPrefix(const std::string & key_prefix)
+{
+    return withPrefix(key_prefix, "store/");
+}
+
 std::string refsPrefix(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid)
 {
     return withPrefix(key_prefix, "store/" + server_id + "/" + table_uuid + "/refs/");

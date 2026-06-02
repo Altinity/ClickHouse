@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedWriteBuffer.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartId.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolScan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
@@ -673,4 +674,65 @@ TEST_F(ContentAddressedMetaTest, DiskTransactionCarryForwardThroughCreateHardLin
     EXPECT_EQ(ms->getStorageObjects("uui/" + uuid + "/all_1_1_0_1/b.bin")[0].remote_path,
               ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/b.bin")[0].remote_path);
     EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/all_1_1_0_1/b.bin")[0].remote_path), "B0");
+}
+
+// Phase-4 GC scan + sweep. Seed a pool by hand (no transaction) so the live/orphan split is exact:
+//   - 2 live refs -> 2 distinct part ids (pidA, pidB), 2 footers, 3 referenced blobs (b1, b2 shared,
+//     b3); pidA footer = {b1, b2}, pidB footer = {b2, b3} so b2 is dedup-shared across both parts.
+//   - 1 orphan footer (pidO, no ref) -> 1 orphan blob (bO, referenced only by the orphan footer).
+// parts/ then has 3 footers, blobs/ has 4 blobs, and exactly 2 part ids are live.
+namespace
+{
+struct CasGcSeed
+{
+    std::string uuid = "uuid-gc";
+    std::string pid_a = "aaaa000000000000000000000000aaaa";
+    std::string pid_b = "bbbb000000000000000000000000bbbb";
+    std::string pid_orphan = "0000000000000000000000000000dead";
+    std::string b1 = "1111111111", b2 = "2222222222", b3 = "3333333333", b_orphan = "9999999999";
+};
+
+CasGcSeed seedGcPool(const std::shared_ptr<DB::IObjectStorage> & os, const std::string & sid)
+{
+    using namespace DB::ContentAddressed;
+    CasGcSeed s;
+    auto put_blob = [&](const std::string & csum) { ContentAddressedMetaTest::writeObject(os, blobKey("", csum), csum); };
+    put_blob(s.b1); put_blob(s.b2); put_blob(s.b3); put_blob(s.b_orphan);
+
+    auto put_footer = [&](const std::string & pid, const std::vector<std::pair<std::string, std::string>> & files)
+    {
+        Footer f;
+        for (const auto & [name, csum] : files)
+            f.blobs[name] = BlobEntry{blobKey("", csum), csum.size(), csum};
+        ContentAddressedMetaTest::writeObject(os, partKey("", pid), f.serialize());
+    };
+    put_footer(s.pid_a, {{"a.bin", s.b1}, {"shared.bin", s.b2}});
+    put_footer(s.pid_b, {{"shared.bin", s.b2}, {"c.bin", s.b3}});
+    put_footer(s.pid_orphan, {{"o.bin", s.b_orphan}});
+
+    ContentAddressedMetaTest::writeObject(os, refKey("", sid, s.uuid, "all_1_1_0"), s.pid_a);
+    ContentAddressedMetaTest::writeObject(os, refKey("", sid, s.uuid, "all_2_2_0"), s.pid_b);
+    return s;
+}
+}
+
+TEST_F(ContentAddressedMetaTest, PoolScanListsLivePartsAndObjects)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_scan");
+    auto os = getObjectStorage("cas_scan");
+    auto s = seedGcPool(os, ms->serverIdForTest());
+
+    // Exactly the 2 referenced part ids are live; the orphan footer's id is NOT (no ref points at it).
+    EXPECT_EQ(listLivePartIds(os, ""), (std::set<std::string>{s.pid_a, s.pid_b}));
+
+    // parts/ holds all 3 footers (2 live + 1 orphan); the keys match partKey.
+    auto part_keys = listKeysUnder(os, partsPrefix(""));
+    std::set<std::string> parts(part_keys.begin(), part_keys.end());
+    EXPECT_EQ(parts, (std::set<std::string>{partKey("", s.pid_a), partKey("", s.pid_b), partKey("", s.pid_orphan)}));
+
+    // blobs/ holds all 4 blobs (3 referenced + 1 orphan); the keys match blobKey.
+    auto blob_keys = listKeysUnder(os, blobsPrefix(""));
+    std::set<std::string> blobs(blob_keys.begin(), blob_keys.end());
+    EXPECT_EQ(blobs, (std::set<std::string>{blobKey("", s.b1), blobKey("", s.b2), blobKey("", s.b3), blobKey("", s.b_orphan)}));
 }
