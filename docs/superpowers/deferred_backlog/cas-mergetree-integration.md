@@ -34,5 +34,8 @@ Source design: `content_addressed_shared_mergetree_design.md` (v3) and PoC `poc/
 
 **Scale invariants baked into M1 (not deferred):** GC is **delta-driven, never a per-pass full `LIST`**; the refcount is a **derived cache** (S3 is ground truth, rebuildable by sharded reachability); the metadata storage is **lazy** (LRU footer cache, refs listed once at load) so RAM ≈ existing `data_parts`, with the only O(M-blobs) structure persisted off-heap.
 
+| B18 | **GC fail-close on a missing manifest** — `markReachableBlobs`'s `FooterResolver` must throw when a live ref's footer is missing (NOT return an empty `Footer`, which would silently widen the sweep set → data loss). | Surfaced by the Phase-1 final review; the Phase-1 pure library left it to the caller | Document the throw-on-missing contract on `FooterResolver` (or change it to `std::optional<Footer>` and have `markReachableBlobs` throw on `nullopt`); the GC reconcile path (Phase 4) enforces it. Matches the PoC (`cas.cpp:741`) and CLAUDE.md fail-close. |
+| B19 | **Little-endian on-disk footer encoding** — Phase-1 `Footer` (de)serialization uses host-byte-order `memcpy` of `uint64_t`; since footer bytes are content-addressed (hashed into `part_id`/manifest hash), host order would cause cross-arch hash divergence. | OK for the Phase-1 pure-logic library (footers are never persisted there); must change before the write path persists+hashes real footers | Switch the footer serializer to `writeBinaryLittleEndian`/varint (`IO/WriteHelpers.h`) in Phase 3 (write path); no interface change. Relates to B6 (determinism). |
+
 > Add new deferred items here as they arise during planning/implementation, always filling the
 > "where it plugs in" column so the architecture stays dead-end-free.
