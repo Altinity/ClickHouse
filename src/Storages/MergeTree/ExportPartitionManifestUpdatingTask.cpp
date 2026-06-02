@@ -530,26 +530,6 @@ void ExportPartitionManifestUpdatingTask::poll()
 
             const auto metadata = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
 
-            /// Read last_exception leaves (no watch). Surfacing exceptions in the system table relies
-            /// on this read being part of every poll cycle: per-part failures during PENDING do not
-            /// trigger a status watch, so the only refresh path while the task is still in-flight is
-            /// the periodic poll. An empty result collapses every "nothing actionable" case
-            /// (transient ZK error, no children, all leaves ZNONODE/malformed) into a no-op so the
-            /// in-memory copy stays intact.
-            auto last_exception_per_replica = readLastExceptionPerReplica(
-                zk, fs::path(entry_path), key, storage.log.load());
-          
-            /// Mirror per-part destination file paths from <entry_path>/processed/<part>.
-            /// Same lenient pattern: empty result = leave in-memory copy untouched.
-            auto destination_file_paths_per_part = readDestinationFilePathsPerPart(
-                zk, fs::path(entry_path), key, storage.log.load());
-
-            /// Mirror commit_info znode (present only after a successful commit). nullopt
-            /// means the znode does not exist yet (or transient ZK error); leave the
-            /// in-memory copy untouched in that case.
-            auto commit_info = readCommitInfo(
-                zk, fs::path(entry_path), key, storage.log.load());
-
             const auto local_entry = entries_by_key.find(key);
 
             /// If the zk entry has been replaced with export_merge_tree_partition_force_export, checking only for the export key is not enough
@@ -557,14 +537,42 @@ void ExportPartitionManifestUpdatingTask::poll()
             bool has_local_entry_and_is_up_to_date = local_entry != entries_by_key.end()
                 && local_entry->manifest.transaction_id == metadata.transaction_id;
 
-            /// If the entry is up to date and we don't have the cleanup lock, refresh the in-memory
-            /// last_exception (surfaced by system.replicated_partition_exports) and early exit.
-            /// Direct mutation of the `mutable` field is safe under export_merge_tree_partition_mutex,
-            /// which is held throughout poll().
+            /// Fast path: the entry is already mirrored, up to date, and we don't hold the cleanup
+            /// lock. The visible status of an existing entry is owned by handleStatusChanges (driven
+            /// by the per-entry status watch armed below when the entry was first added), so here we
+            /// only refresh the auxiliary leaves surfaced by system.replicated_partition_exports.
+            /// last_exception and destination paths are refreshed unconditionally so the table
+            /// converges even for transitions that do not flip the status leaf, e.g. transient
+            /// per-part exceptions accumulated during PENDING; commit_info is only fetched once the
+            /// entry has already been mirrored as COMPLETED (see below). No status read and no watch
+            /// is armed on this hot path. Direct mutation of the `mutable` fields is safe under
+            /// export_merge_tree_partition_mutex, which is held throughout poll().
             if (!cleanup_lock && has_local_entry_and_is_up_to_date)
             {
-                if (!last_exception_per_replica.empty())
+                if (auto last_exception_per_replica = readLastExceptionPerReplica(
+                        zk, fs::path(entry_path), key, storage.log.load());
+                    !last_exception_per_replica.empty())
                     local_entry->last_exception_per_replica = std::move(last_exception_per_replica);
+
+                if (auto destination_file_paths_per_part = readDestinationFilePathsPerPart(
+                        zk, fs::path(entry_path), key, storage.log.load());
+                    !destination_file_paths_per_part.empty())
+                    local_entry->destination_file_paths_per_part = std::move(destination_file_paths_per_part);
+
+                /// commit_info exists in ZK only once the export has COMPLETED (it is written in the
+                /// same atomic multi that flips the status). Gate the read on the already-mirrored
+                /// status so we never read a guaranteed-absent znode while still in flight, and only
+                /// when we have not captured it yet. This also repairs the rare case where
+                /// handleStatusChanges flipped the status to COMPLETED but its own commit_info read
+                /// hit a transient error and left the field empty.
+                if (local_entry->status == ExportReplicatedMergeTreePartitionTaskEntry::Status::COMPLETED
+                    && !local_entry->commit_info)
+                {
+                    if (auto commit_info = readCommitInfo(
+                            zk, fs::path(entry_path), key, storage.log.load()))
+                        local_entry->commit_info = std::move(commit_info);
+                }
+
                 continue;
             }
 
@@ -597,6 +605,29 @@ void ExportPartitionManifestUpdatingTask::poll()
                 continue;
             }
 
+            /// Read the auxiliary leaves AFTER the status leaf. The commit / failure paths write the
+            /// status leaf together with the corresponding aux leaves (commit_info, last_exception)
+            /// in a single atomic multi, so reading status first guarantees that a terminal status
+            /// observed here comes with its aux data already visible. Reading them in the other order
+            /// opens a race where a freshly observed entry is mirrored with a terminal status but
+            /// empty aux data, which (for an up-to-date entry on the fast path that no longer arms a
+            /// watch) would never get corrected. An empty result collapses every "nothing actionable"
+            /// case (transient ZK error, no children, all leaves ZNONODE/malformed) into a no-op so
+            /// the in-memory copy stays intact.
+            auto last_exception_per_replica = readLastExceptionPerReplica(
+                zk, fs::path(entry_path), key, storage.log.load());
+            auto destination_file_paths_per_part = readDestinationFilePathsPerPart(
+                zk, fs::path(entry_path), key, storage.log.load());
+            /// commit_info exists in ZK only once status == COMPLETED (written atomically with it).
+            /// Because we already read the status leaf above, ZooKeeper's per-session sequential
+            /// consistency guarantees a COMPLETED status read here is accompanied by a visible
+            /// commit_info. Gating the read avoids ever mirroring a PENDING entry together with
+            /// commit paths and skips a guaranteed-absent read while in flight.
+            std::optional<ExportReplicatedMergeTreePartitionCommitInfoEntry> commit_info;
+            if (*status == ExportReplicatedMergeTreePartitionTaskEntry::Status::COMPLETED)
+                commit_info = readCommitInfo(
+                    zk, fs::path(entry_path), key, storage.log.load());
+
             /// if we have the cleanup lock, try to cleanup
             /// if we successfully cleaned it up, early exit
             if (cleanup_lock)
@@ -620,8 +651,8 @@ void ExportPartitionManifestUpdatingTask::poll()
 
             if (has_local_entry_and_is_up_to_date)
             {
-                /// Same refresh as the early-exit branch above; we also reach this point when
-                /// holding the cleanup lock (cleanup did not consume the entry).
+                /// Same refresh as the fast path above; we only reach this point for an up-to-date
+                /// entry when holding the cleanup lock (cleanup did not consume the entry).
                 if (!last_exception_per_replica.empty())
                     local_entry->last_exception_per_replica = std::move(last_exception_per_replica);
                 if (!destination_file_paths_per_part.empty())
@@ -852,10 +883,16 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
                 it->destination_file_paths_per_part = std::move(fetched);
             }
 
-            if (auto fetched_commit_info = readCommitInfo(
-                    zk, fs::path(storage.zookeeper_path) / "exports" / key, key, storage.log.load()))
+            /// commit_info is written atomically with the COMPLETED status, so only read it on that
+            /// transition. The status leaf was read above, so this read observes the matching
+            /// commit_info; FAILED / KILLED never produce a commit_info znode.
+            if (*new_status == ExportReplicatedMergeTreePartitionTaskEntry::Status::COMPLETED)
             {
-                it->commit_info = std::move(fetched_commit_info);
+                if (auto fetched_commit_info = readCommitInfo(
+                        zk, fs::path(storage.zookeeper_path) / "exports" / key, key, storage.log.load()))
+                {
+                    it->commit_info = std::move(fetched_commit_info);
+                }
             }
 
             /// If status changed to KILLED, cancel local export operations
