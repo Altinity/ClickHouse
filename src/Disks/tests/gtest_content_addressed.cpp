@@ -64,3 +64,22 @@ TEST(ContentAddressedBlobRefIndex, DeltaCountAndDedup)
     EXPECT_TRUE(dead.count("hA"));
     EXPECT_FALSE(dead.count("hShared"));
 }
+
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Reachability.h>
+#include <unordered_map>
+
+TEST(ContentAddressedReachability, ReconcileMarksOnlyLiveRoots)
+{
+    using namespace DB::ContentAddressed;
+    std::unordered_map<std::string, Footer> parts;
+    Footer pm; pm.blobs["a.bin"] = {"hA1", 1, "hA1"}; pm.blobs["b.bin"] = {"hB0", 1, "hB0"}; parts["all_1_1_0_1"] = pm; // mutation: new a, carried b
+    Footer src; src.blobs["a.bin"] = {"hA0", 1, "hA0"}; src.blobs["b.bin"] = {"hB0", 1, "hB0"}; parts["all_1_1_0"] = src;   // outdated source
+
+    auto resolve = [&](const std::string & id) { return parts.at(id); };
+    std::set<std::string> roots = {"all_1_1_0_1"}; // only the mutated part is a live root
+    std::set<std::string> reachable = markReachableBlobs(roots, resolve);
+
+    EXPECT_TRUE(reachable.count("hA1"));
+    EXPECT_TRUE(reachable.count("hB0"));   // carried forward → still reachable
+    EXPECT_FALSE(reachable.count("hA0"));  // replaced column → unreachable
+}
