@@ -76,7 +76,14 @@ void registerDiskObjectStorage(DiskFactory & factory, bool global_skip_access_ch
         LOG_DEBUG(getLogger("registerDiskObjectStorage"), "Metadata type hint: {}", compatibility_metadata_type_hint);
         auto metadata_storage = MetadataStorageFactory::instance().create(name, config, config_prefix, cluster, object_storages, compatibility_metadata_type_hint);
 
-        bool use_fake_transaction = config.getBool(config_prefix + ".use_fake_transaction", metadata_storage->getType() != MetadataStorageType::Keeper);
+        /// Content-addressed metadata (like Keeper) requires real, deferred disk transactions: a part's
+        /// file->blob mappings are accumulated across the whole part write and the footer + ref are
+        /// published atomically when the transaction commits. A fake (per-file autocommit) transaction
+        /// would write each file independently with no commit point for the footer/ref publish.
+        const auto metadata_type = metadata_storage->getType();
+        const bool needs_real_transaction = metadata_type == MetadataStorageType::Keeper
+            || metadata_type == MetadataStorageType::ContentAddressed;
+        bool use_fake_transaction = config.getBool(config_prefix + ".use_fake_transaction", !needs_real_transaction);
         DiskPtr disk = std::make_shared<DiskObjectStorage>(
             name,
             std::move(cluster),
