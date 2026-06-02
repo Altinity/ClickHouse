@@ -127,6 +127,7 @@ OPTIONS_TO_INSTALL_ARGUMENTS = {
 
 OPTIONS_TO_TEST_RUNNER_ARGUMENTS = {
     "s3 storage": "--s3-storage --no-stateful",
+    "content_addressed storage": "--content-addressed-storage",
     "ParallelReplicas": "--no-zookeeper --no-shard --no-parallel-replicas",
     "AsyncInsert": " --no-async-insert",
     "DatabaseReplicated": " --no-stateful --replicated-database",

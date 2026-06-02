@@ -1220,6 +1220,7 @@ class FailureReason(enum.Enum):
     OBJECT_STORAGE = "object-storage"
     COVERAGE = "coverage"
     S3_STORAGE = "s3-storage"
+    CONTENT_ADDRESSED_STORAGE = "content-addressed-storage"
     AZURE_BLOB_STORAGE = "azure-blob-storage"
     BUILD = "not running for current build"
     NO_PARALLEL_REPLICAS = "smth is not supported with parallel replicas"
@@ -2714,6 +2715,12 @@ class TestCase:
 
         if tags and ("no-s3-storage" in tags) and args.s3_storage:
             return FailureReason.S3_STORAGE
+        if (
+            tags
+            and ("no-content-addressed-storage" in tags)
+            and args.content_addressed_storage
+        ):
+            return FailureReason.CONTENT_ADDRESSED_STORAGE
         if tags and ("no-azure-blob-storage" in tags) and args.azure_blob_storage:
             return FailureReason.AZURE_BLOB_STORAGE
         if (
@@ -5995,6 +6002,12 @@ def parse_args():
         action="store_true",
         default=False,
         help="Run tests over s3 storage",
+    )
+    parser.add_argument(
+        "--content-addressed-storage",
+        action="store_true",
+        default=False,
+        help="Run tests with a content_addressed disk as the default MergeTree storage",
     )
     parser.add_argument(
         "--distributed-cache",
