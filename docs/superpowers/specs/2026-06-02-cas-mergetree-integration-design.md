@@ -146,7 +146,7 @@ A new `metadata_type = content_addressed` on an object-storage disk (the `plain_
 - Whether `ALTER … FREEZE` writes frozen refs in M1 or defers entirely (namespace + GC-root reserved either way).
 - Manifest/footer canonicalization determinism (golden tests) — B6.
 - **Cross-producer dedup is settings-dependent** — identical content dedups only when compression / `index_granularity(_bytes)` / sparse-serialization settings match across producers; mismatch → no dedup (more storage), **never incorrect**. A quality caveat, not a correctness risk.
-- Whether **`coordination = keeper`** ships in M1 or as the immediate next milestone (the self-check + `coordination = none` ship in M1 regardless).
+- **Resolved:** `coordination = keeper` is the **immediate next milestone** (B11), not M1. M1 ships `coordination = none` + the `_pool_meta` self-check, which makes a multi-mounted pool *safe* (fail-closed) even though it is not yet *supported*.
 - Migration / mixed-version rollout — B13.
 
 ## 13. Deferred backlog {#deferred-backlog}
