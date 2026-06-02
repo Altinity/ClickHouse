@@ -2,7 +2,7 @@
 
 A **standalone, self-contained C++20 PoC** that validates the core algorithms and data
 model of the design in
-[`../../content_addressed_shared_mergetree_design.md`](../../content_addressed_shared_mergetree_design.md)
+[`docs/superpowers/specs/content_addressed_shared_mergetree_design.md`](../../docs/superpowers/specs/content_addressed_shared_mergetree_design.md)
 (v3). It is **not** integrated into ClickHouse — it deliberately reimplements just enough of
 the part lifecycle to prove the architecture end-to-end with executable tests.
 

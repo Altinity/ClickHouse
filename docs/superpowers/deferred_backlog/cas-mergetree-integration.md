@@ -6,7 +6,7 @@ brainstorming / planning / implementation. Each item records *what*, *why deferr
 minimal first step must not foreclose any of these.
 
 Companion to: `docs/superpowers/specs/` (design spec) and `docs/superpowers/plans/` (impl plans).
-Source design: `content_addressed_shared_mergetree_design.md` (v3) and PoC `poc/cas_mergetree/`.
+Source design: `../specs/content_addressed_shared_mergetree_design.md` (v3) and PoC `poc/cas_mergetree/`.
 
 | ID | Item | Why deferred | Where it plugs in (dead-end check) |
 |----|------|-------------|-------------------------------------|
