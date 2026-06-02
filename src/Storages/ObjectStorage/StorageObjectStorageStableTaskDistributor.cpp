@@ -1,4 +1,6 @@
 #include <Storages/ObjectStorage/StorageObjectStorageStableTaskDistributor.h>
+#include <Storages/ObjectStorage/Utils.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Common/SipHash.h>
 #include <consistent_hashing.h>
 #include <optional>
@@ -342,7 +344,9 @@ String StorageObjectStorageStableTaskDistributor::getFileIdentifier(ObjectInfoPt
         }
         return file_identifier;
     }
-    return file_object->getIdentifier();
+    /// Prefer the original Iceberg metadata path (possibly absolute / on another storage) when available,
+    /// so the same file is identified consistently across replicas.
+    return getMetadataPathFromObjectInfo(file_object).value_or(file_object->getIdentifier());
 }
 
 }
