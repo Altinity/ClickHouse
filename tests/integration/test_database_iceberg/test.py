@@ -942,8 +942,18 @@ def test_namespace_filter(started_cluster):
     assert "is filtered by `namespaces` database parameter." in node.query_and_get_error(f"SELECT count() FROM {CATALOG_NAME}.`{namespace_prefix}echo.{table_name}`")
     assert node.query(f"SELECT count() FROM {CATALOG_NAME}.`{namespace_prefix}echo.e1.{table_name}`") == "0\n"
 
-    node.query(f"CREATE TABLE {CATALOG_NAME}.`{namespace_prefix}alpha.{table2_name}` (x String) ENGINE = IcebergS3('http://minio:9000/warehouse-rest/{namespace_prefix}alpha/{table2_name}/', '{minio_access_key}', '{minio_secret_key}')")
-    node.query(f"CREATE TABLE {CATALOG_NAME}.`{namespace_prefix}alpha.a1.{table2_name}` (x String) ENGINE = IcebergS3('http://minio:9000/warehouse-rest/{namespace_prefix}alpha/a1/{table2_name}/', '{minio_access_key}', '{minio_secret_key}')")
+    node.query(f"CREATE TABLE {CATALOG_NAME}.`{namespace_prefix}alpha.{table2_name}` (x String) ENGINE = IcebergS3('http://minio:9000/warehouse-rest/{namespace_prefix}alpha/{table2_name}/', '{minio_access_key}', '{minio_secret_key}')",
+         settings={
+            "allow_database_iceberg": 1,
+            "write_full_path_in_iceberg_metadata": 1,
+        },
+    )
+    node.query(f"CREATE TABLE {CATALOG_NAME}.`{namespace_prefix}alpha.a1.{table2_name}` (x String) ENGINE = IcebergS3('http://minio:9000/warehouse-rest/{namespace_prefix}alpha/a1/{table2_name}/', '{minio_access_key}', '{minio_secret_key}')",
+         settings={
+            "allow_database_iceberg": 1,
+            "write_full_path_in_iceberg_metadata": 1,
+        },
+    )
     assert "is filtered by `namespaces` database parameter." in node.query_and_get_error(f"CREATE TABLE {CATALOG_NAME}.`{namespace_prefix}alpha.a2.{table2_name}` (x String) ENGINE = IcebergS3('http://minio:9000/warehouse-rest/{namespace_prefix}alpha/a2/{table2_name}/', '{minio_access_key}', '{minio_secret_key}')")
 
     node.query(f"DROP TABLE {CATALOG_NAME}.`{namespace_prefix}alpha.{table_name}`")
@@ -951,7 +961,8 @@ def test_namespace_filter(started_cluster):
     assert "is filtered by `namespaces` database parameter." in node.query_and_get_error(f"DROP TABLE {CATALOG_NAME}.`{namespace_prefix}alpha.a2.{table_name}`")
 
 
-def test_cluster_joins(started_cluster):
+@pytest.mark.parametrize("join_mode", ["local", "global"])
+def test_cluster_joins(started_cluster, join_mode):
     node = started_cluster.instances["node1"]
 
     test_ref = f"test_join_tables_{uuid.uuid4()}"
@@ -1019,7 +1030,7 @@ def test_cluster_joins(started_cluster):
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='local'
+                object_storage_cluster_join_mode='{join_mode}'
         """
     )
 
@@ -1036,7 +1047,7 @@ def test_cluster_joins(started_cluster):
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='local'
+                object_storage_cluster_join_mode='{join_mode}'
         """
     )
 
@@ -1052,7 +1063,7 @@ def test_cluster_joins(started_cluster):
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='local'
+                object_storage_cluster_join_mode='{join_mode}'
         """
     )
 
@@ -1069,7 +1080,7 @@ def test_cluster_joins(started_cluster):
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='local'
+                object_storage_cluster_join_mode='{join_mode}'
         """
     )
 
@@ -1084,7 +1095,7 @@ def test_cluster_joins(started_cluster):
             ORDER BY ALL
             SETTINGS
                 object_storage_cluster='cluster_simple',
-                object_storage_cluster_join_mode='local'
+                object_storage_cluster_join_mode='{join_mode}'
         """
     )
 
