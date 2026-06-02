@@ -7,8 +7,10 @@
 #endif
 #include <Disks/DiskObjectStorage/MetadataStorages/Plain/MetadataStorageFromPlainObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/PlainRewritable/MetadataStorageFromPlainRewritableObjectStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/Web/MetadataStorageFromStaticFilesWebServer.h>
 #include <Disks/DiskLocal.h>
+#include <Core/ServerUUID.h>
 #include <Interpreters/Context.h>
 
 
@@ -205,6 +207,24 @@ void registerPlainRewritableMetadataStorage(MetadataStorageFactory & factory)
     });
 }
 
+void registerContentAddressedMetadataStorage(MetadataStorageFactory & factory)
+{
+    factory.registerMetadataStorageType("content_addressed", [](
+        const std::string & /* name */,
+        const Poco::Util::AbstractConfiguration & config,
+        const std::string & config_prefix,
+        const ClusterConfigurationPtr & cluster,
+        const ObjectStorageRouterPtr & object_storages) -> MetadataStoragePtr
+    {
+        checkSingleLocation(cluster);
+
+        const auto local_object_storage = object_storages->takePointingTo(cluster->getLocalLocation());
+        std::string key_compatibility_prefix = getObjectKeyCompatiblePrefix(local_object_storage, config, config_prefix);
+
+        return std::make_shared<ContentAddressedMetadataStorage>(local_object_storage, key_compatibility_prefix, toString(ServerUUID::get()));
+    });
+}
+
 void registerMetadataStorageFromStaticFilesWebServer(MetadataStorageFactory & factory)
 {
     factory.registerMetadataStorageType("web", [](
@@ -228,6 +248,7 @@ void registerMetadataStorages()
     registerMetadataStorageFromDisk(factory);
     registerPlainMetadataStorage(factory);
     registerPlainRewritableMetadataStorage(factory);
+    registerContentAddressedMetadataStorage(factory);
     registerMetadataStorageFromStaticFilesWebServer(factory);
 #if CLICKHOUSE_CLOUD
     registerMetadataStorageFromKeeper(factory);

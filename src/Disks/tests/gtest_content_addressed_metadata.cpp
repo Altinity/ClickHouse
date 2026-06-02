@@ -1,6 +1,18 @@
 #include <gtest/gtest.h>
 #include <optional>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
+
+#include <IO/SharedThreadPools.h>
+
+#include <Core/ServerUUID.h>
+
+#include <filesystem>
+#include <mutex>
+#include <unordered_map>
 
 using namespace DB::ContentAddressed;
 
@@ -39,4 +51,71 @@ TEST(ContentAddressedPoolPaths, ParseTableUuid)
     EXPECT_EQ(parseTableUuid("123/uuid-1/"), std::optional<std::string>("uuid-1"));
     EXPECT_EQ(parseTableUuid("123/uuid-1"), std::optional<std::string>("uuid-1"));
     EXPECT_FALSE(parseTableUuid("123/uuid-1/all_1_1_0").has_value()); // part dir, not table dir
+}
+
+namespace fs = std::filesystem;
+
+class ContentAddressedMetaTest : public testing::Test
+{
+public:
+    void SetUp() override
+    {
+        if (!initialized)
+        {
+            DB::ServerUUID::setRandomForUnitTests();
+            DB::getIOThreadPool().initialize(1, 1, 0);
+            initialized = true;
+        }
+    }
+
+    std::shared_ptr<DB::IMetadataStorage> getMetadataStorage(const std::string & key_prefix)
+    {
+        std::unique_lock<std::mutex> lock(active_metadatas_mutex);
+
+        if (!active_metadatas[key_prefix])
+            active_metadatas[key_prefix] = createMetadataStorage(key_prefix);
+
+        return active_metadatas[key_prefix];
+    }
+
+    void TearDown() override
+    {
+        for (const auto & [_, metadata] : active_metadatas)
+            metadata->shutdown();
+
+        for (const auto & [_, object_storage] : active_object_storages)
+        {
+            object_storage->shutdown();
+            fs::remove_all(object_storage->getCommonKeyPrefix());
+        }
+    }
+
+private:
+    std::shared_ptr<DB::IMetadataStorage> createMetadataStorage(const std::string & key_prefix)
+    {
+        fs::remove_all("./" + key_prefix);
+        DB::LocalObjectStorageSettings settings("test", "./" + key_prefix, /*read_only_=*/false);
+        auto object_storage = std::make_shared<DB::LocalObjectStorage>(std::move(settings));
+        auto metadata_storage = std::make_shared<DB::ContentAddressedMetadataStorage>(object_storage, "", "test-server");
+
+        active_metadatas.emplace(key_prefix, metadata_storage);
+        active_object_storages.emplace(key_prefix, object_storage);
+
+        return metadata_storage;
+    }
+
+    static inline bool initialized = false;
+
+    std::mutex active_metadatas_mutex;
+    std::unordered_map<std::string, std::shared_ptr<DB::IMetadataStorage>> active_metadatas;
+    std::unordered_map<std::string, std::shared_ptr<DB::IObjectStorage>> active_object_storages;
+};
+
+TEST_F(ContentAddressedMetaTest, ConstructAndType)
+{
+    auto ms = getMetadataStorage("cas_construct");
+    EXPECT_EQ(ms->getType(), DB::MetadataStorageType::ContentAddressed);
+    EXPECT_FALSE(ms->isReadOnly());
+    EXPECT_FALSE(ms->areBlobPathsRandom());
+    EXPECT_EQ(ms->getHardlinkCount("anything"), 0u);
 }

@@ -6516,6 +6516,7 @@ void MergeTreeData::checkAlterPartitionIsPossible(
                     break;
                 }
                 case MetadataStorageType::PlainRewritable:
+                case MetadataStorageType::ContentAddressed:
                 {
                     const static auto supported_commands = {
                         PartitionCommand::DROP_PARTITION,
