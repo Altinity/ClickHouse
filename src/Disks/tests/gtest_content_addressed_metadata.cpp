@@ -10,6 +10,9 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
+#include <Disks/DiskObjectStorage/DiskObjectStorageTransaction.h>
+#include <Disks/DiskObjectStorage/Replication/ClusterConfiguration.h>
+#include <Disks/DiskObjectStorage/Replication/ObjectStorageRouter.h>
 #include <Disks/WriteMode.h>
 
 #include <IO/ReadHelpers.h>
@@ -378,4 +381,56 @@ TEST_F(ContentAddressedMetaTest, MutationCarryForwardReusesBlob)
     // b.bin carried forward → same blob object as the source
     EXPECT_EQ(ms->getStorageObjects("uui/" + uuid + "/all_1_1_0_1/b.bin")[0].remote_path,
               ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/b.bin")[0].remote_path);
+}
+
+// Task 3: the disk-transaction write path must route through the content-addressed buffer when
+// the metadata storage is content-addressed. This drives the real DiskObjectStorageTransaction
+// (the same object MergedBlockOutputStream writes through), so the gated hook is exercised
+// end-to-end: writeFile -> ContentAddressedWriteBuffer, commit -> ContentAddressedTransaction::commit
+// (footer + ref), and read-back via the Phase-2 resolution path.
+TEST_F(ContentAddressedMetaTest, DiskTransactionRoutesContentAddressedWrite)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_disktxn");
+    auto os = getObjectStorage("cas_disktxn");
+    const std::string uuid = "uuid-disktxn";
+
+    // A minimal single-location cluster: one local, enabled location. The content-addressed
+    // branch fires before any cluster/router use, so the router contents are not consulted, but
+    // the transaction constructor needs a valid local+enabled location to exist.
+    const DB::Location local_location = "local";
+    auto cluster = std::make_shared<DB::ClusterConfiguration>(
+        "cas_disktxn_disk",
+        std::unordered_map<DB::Location, DB::LocationInfo>{
+            {local_location, DB::LocationInfo{/*enabled=*/true, /*local=*/true, /*config_prefix=*/""}}});
+    auto router = std::make_shared<DB::ObjectStorageRouter>(
+        std::unordered_map<DB::Location, DB::ObjectStoragePtr>{{local_location, os}});
+
+    auto write_part = [&](const std::string & part, const std::map<std::string, std::string> & files)
+    {
+        auto disk_tx = std::make_shared<DB::DiskObjectStorageTransaction>(
+            cluster, ms, router, /*blob_killer=*/nullptr, /*wait_blob_removal=*/false,
+            /*read_resource_name=*/"", /*write_resource_name=*/"");
+        for (const auto & [name, bytes] : files)
+        {
+            auto buf = disk_tx->writeFile("uui/" + uuid + "/" + part + "/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        disk_tx->commit();
+    };
+
+    write_part("all_1_1_0", {{"a.bin", "AAA"}, {"b.bin", "SHARED"}, {"columns.txt", "a b"}});
+    write_part("all_2_2_0", {{"a.bin", "ZZZ"}, {"b.bin", "SHARED"}, {"columns.txt", "a b"}});
+
+    // The footer + ref published by commit make the part files resolvable, and the bytes read back.
+    auto objs = ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/a.bin");
+    ASSERT_EQ(objs.size(), 1u);
+    EXPECT_EQ(readObject(os, objs[0].remote_path), "AAA");
+    EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/a.bin")[0].remote_path), "ZZZ");
+
+    // Content addressing dedups the shared column to a single blob across both parts.
+    EXPECT_EQ(ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/b.bin")[0].remote_path,
+              ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/b.bin")[0].remote_path);
+    EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/b.bin")[0].remote_path), "SHARED");
 }

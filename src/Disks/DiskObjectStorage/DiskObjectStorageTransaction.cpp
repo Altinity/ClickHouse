@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/Replication/ClusterConfiguration.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/DiskObjectStorageTransaction.h>
 #include <Disks/DiskObjectStorage/DiskObjectStorage.h>
 #include <Disks/DiskObjectStorage/IOSchedulingSettings.h>
@@ -266,6 +267,29 @@ std::unique_ptr<WriteBufferFromFileBase> DiskObjectStorageTransaction::writeFile
     ///       undo of disk tx will actually remove existing data.
     if (mode == WriteMode::Append && !metadata_storage->supportWritingWithAppend())
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Disk does not support WriteMode::Append");
+
+    /// Gated content-addressed write path. For a content-addressed metadata storage the blob key
+    /// is the content hash, which is only known after all bytes have been written, so the up-front
+    /// `generateObjectKeyForPath` + streaming `writeObject` path below cannot be used. Instead we
+    /// delegate to the content-addressed transaction's own buffer, which spills + hashes + uploads
+    /// the content on finalize and records the resulting blob. The footer + ref are then published
+    /// when `commit` invokes `metadata_transaction->commit` (no `operations_to_execute` entry is
+    /// needed here). This branch leaves every other metadata type's behavior unchanged.
+    if (metadata_storage->isContentAddressed())
+    {
+        auto * content_addressed_transaction = dynamic_cast<ContentAddressedTransaction *>(metadata_transaction.get());
+        if (!content_addressed_transaction)
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "Content-addressed metadata storage did not produce a ContentAddressedTransaction");
+
+        if (autocommit)
+            throw Exception(
+                ErrorCodes::NOT_IMPLEMENTED,
+                "Autocommit writes are not supported on a content-addressed disk");
+
+        return content_addressed_transaction->writeFile(path, buf_size, mode, enriched_settings);
+    }
 
     StoredObject object(metadata_transaction->generateObjectKeyForPath(path).serialize(), path);
     ForkWriteBuffer::WriteBufferPtrs writers;

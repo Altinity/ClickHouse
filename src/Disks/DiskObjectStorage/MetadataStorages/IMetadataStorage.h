@@ -289,6 +289,12 @@ public:
         return false;
     }
 
+    /// Returns true if the metadata storage is content-addressed, i.e. blob keys are derived
+    /// from content hashes and are only known after all bytes have been written. Such a storage
+    /// cannot use the up-front-key streaming write path of `DiskObjectStorageTransaction`; the
+    /// disk transaction delegates writes to the metadata transaction's content-addressed buffer.
+    virtual bool isContentAddressed() const { return false; }
+
     using BlobsToRemove = std::unordered_map<StoredObject, LocationSet>;
     virtual BlobsToRemove getBlobsToRemove(const ClusterConfigurationPtr & /*cluster*/, int64_t /*max_count*/) { return {}; }
     virtual int64_t recordAsRemoved(const StoredObjects & /*blobs*/) { return 0; }

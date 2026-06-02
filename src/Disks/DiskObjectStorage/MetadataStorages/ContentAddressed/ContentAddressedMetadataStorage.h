@@ -20,6 +20,7 @@ public:
     bool supportsChmod() const override { return false; }
     bool supportsStat() const override { return false; }
     bool isReadOnly() const override { return false; }
+    bool isContentAddressed() const override { return true; }
     bool areBlobPathsRandom() const override { return false; }
     uint32_t getHardlinkCount(const std::string &) const override { return 0; }
 
