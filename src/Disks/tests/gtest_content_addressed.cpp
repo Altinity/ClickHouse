@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
+#include <cstring>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Footer.h>
+#include <Common/Exception.h>
 
 using namespace DB::ContentAddressed;
 
@@ -33,4 +35,13 @@ TEST(ContentAddressedFooter, RejectsBadMagicAndTruncation)
     EXPECT_THROW(Footer::deserialize("XXXX"), std::exception);
     std::string ok = Footer{}.serialize();
     EXPECT_THROW(Footer::deserialize(ok.substr(0, ok.size() - 1)), std::exception);
+}
+
+TEST(ContentAddressedFooter, RejectsForgedHugeLength)
+{
+    std::string b(Footer::MAGIC, sizeof(Footer::MAGIC));
+    auto put = [&](uint64_t v){ char t[8]; std::memcpy(t, &v, 8); b.append(t, 8); };
+    put(1);                          // blobs count = 1
+    put(0xFFFFFFFFFFFFFFFFull);      // forged key length → must throw, not wrap
+    EXPECT_THROW(Footer::deserialize(b), DB::Exception);
 }
