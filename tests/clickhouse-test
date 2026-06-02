@@ -169,7 +169,7 @@ def get_broken_tests_rules(broken_tests_file_path: str) -> dict:
     with open(broken_tests_file_path, "r", encoding="utf-8") as broken_tests_file:
         broken_tests = yaml.safe_load(broken_tests_file)
 
-    compiled_rules = {"exact": {}, "pattern": {}}
+    compiled_rules = {"exact": {}, "pattern": []}
 
     for test in broken_tests:
         regex = test.get("regex") is True
@@ -189,7 +189,7 @@ def get_broken_tests_rules(broken_tests_file_path: str) -> dict:
 
         if regex:
             rule["regex"] = True
-            compiled_rules["pattern"][re.compile(test["name"])] = rule
+            compiled_rules["pattern"].append((re.compile(test["name"]), rule))
         else:
             compiled_rules["exact"][test["name"]] = rule
 
@@ -224,7 +224,7 @@ def test_is_known_fail(test_name, test_logs, build_flags, broken_tests_file_path
             log_file.write(f"{test_name} - {exact_rule}\n")
             matching_rules.append(exact_rule)
 
-        for name_re, data in known_broken_tests["pattern"].items():
+        for name_re, data in known_broken_tests["pattern"]:
             if name_re.fullmatch(test_name):
                 log_file.write(f"{name_re} - {data}\n")
                 matching_rules.append(data)
