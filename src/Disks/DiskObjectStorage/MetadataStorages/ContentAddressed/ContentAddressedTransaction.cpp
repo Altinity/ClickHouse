@@ -125,21 +125,23 @@ void ContentAddressedTransaction::createHardLink(const std::string & from, const
 
     /// A MUTABLE per-part file carries forward by VALUE (its private bytes), not by blob reference:
     /// prefer the in-flight inline bytes from this commit, else read the committed source part's
-    /// sidecar. It never enters the manifest, so it must not go through recordBlob.
-    if (ContentAddressed::isMutablePerPartFile(dst->file))
+    /// sidecar. It never enters the manifest, so it must not go through recordBlob. The mutable
+    /// decision is made on the SOURCE file's basename: clone paths (e.g. DETACH into detached/) hand a
+    /// destination whose parsed "file" is a nested <part>/<file>, so only the source parses cleanly to
+    /// the logical file name; the carried bytes are keyed by the destination's basename.
+    if (auto src = ContentAddressed::parsePartFilePath(from); src && !src->file.empty()
+        && ContentAddressed::isMutablePerPartFile(src->file))
     {
-        if (auto src = ContentAddressed::parsePartFilePath(from); src && !src->file.empty())
+        const std::string dst_basename = fs::path(dst->file).filename().string();
+        if (src->table_uuid == table_uuid && src->part_name == part_name)
         {
-            if (src->table_uuid == table_uuid && src->part_name == part_name)
+            if (auto it = recorded_mutable.find(src->file); it != recorded_mutable.end())
             {
-                if (auto it = recorded_mutable.find(src->file); it != recorded_mutable.end())
-                {
-                    recorded_mutable[dst->file] = it->second;
-                    return;
-                }
+                recorded_mutable[dst_basename] = it->second;
+                return;
             }
         }
-        recorded_mutable[dst->file] = metadata_storage.resolveMutableFileBytes(from);
+        recorded_mutable[dst_basename] = metadata_storage.resolveMutableFileBytes(from);
         return;
     }
 
@@ -410,12 +412,37 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
     };
 
     /// Part directory <uuid[:3]>/<uuid>/<part> (a part path with no file component): delete the
-    /// single ref. Absent ref (e.g. an uncommitted tmp part) is a no-op. PartManifest + blobs are kept.
+    /// single ref AND the part's per-ref sidecar objects (the bundle <part>.meta and each per-file
+    /// <part>.<file>.meta). The sidecars are ref-scoped and NOT content-addressed, so the reachability
+    /// sweep (blobs/+parts/ only) would never reclaim them — they MUST be removed synchronously with
+    /// the ref here or they leak (B23 orphan concern). Absent ref (e.g. an uncommitted tmp part) is a
+    /// no-op. PartManifest + blobs are kept (deferred GC).
     if (auto p = ContentAddressed::parsePartFilePath(path); p && p->file.empty())
     {
-        const std::string ref_key
-            = ContentAddressed::refKey(key_prefix, metadata_storage.server_id, p->table_uuid, p->part_name).string();
-        metadata_storage.object_storage->removeObjectIfExists(StoredObject(ref_key));
+        /// List the whole refs/ directory (a real prefix on object storage and a real dir on the
+        /// local backend) and delete this part's ref plus its per-ref sidecars. The objects for part
+        /// P are: <refsPrefix>P (the ref), <refsPrefix>P.meta (the bundle), and <refsPrefix>P.<file>.meta
+        /// (per-file). Match the basename exactly P or beginning with "P." — never a different part
+        /// that merely shares a name prefix (e.g. all_1_1_0 must not reach all_1_1_0_1, whose next char
+        /// is '_', not '.'). The sidecars are ref-scoped and NOT content-addressed, so they MUST be
+        /// removed synchronously here or they leak (the reachability sweep scans only blobs/+parts/).
+        const std::string refs_prefix
+            = ContentAddressed::refsPrefix(key_prefix, metadata_storage.server_id, p->table_uuid);
+        RelativePathsWithMetadata children;
+        metadata_storage.object_storage->listObjects(refs_prefix, children, /*max_keys=*/0);
+        StoredObjects to_remove;
+        for (const auto & child : children)
+        {
+            const std::string & key = child->relative_path;
+            const auto pos = key.rfind(refs_prefix);
+            if (pos == std::string::npos)
+                continue;
+            const std::string name = key.substr(pos + refs_prefix.size());
+            if (name == p->part_name || name.rfind(p->part_name + ".", 0) == 0)
+                to_remove.emplace_back(key);
+        }
+        if (!to_remove.empty())
+            metadata_storage.object_storage->removeObjectsIfExist(to_remove);
         return;
     }
 

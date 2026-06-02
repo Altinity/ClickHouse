@@ -1101,6 +1101,78 @@ TEST_F(ContentAddressedMetaTest, GCKeepsLiveBlobsWrittenThroughRealWritePath)
     EXPECT_FALSE(objectExists(os, doomed_b));
 }
 
+// B23 Task 4: removeRecursive deletes the per-ref sidecar objects WITH the ref. A part's mutable
+// state is ref-scoped, so dropping the part (or the table) must reclaim its .meta sidecar(s)
+// synchronously — they are NOT content-addressed, so the reachability sweep (blobs/+parts/ only)
+// would never reclaim them; if removeRecursive left them they would leak. This pins both: the
+// sidecar is gone after drop, and it never appeared under blobs/ or parts/ (not a CA object).
+TEST_F(ContentAddressedMetaTest, RemoveDeletesSidecarsAndTheyAreNotContentAddressed)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_sidecar_gc");
+    auto os = getObjectStorage("cas_sidecar_gc");
+    const std::string sid = ms->serverIdForTest();
+    const std::string uuid = "uuid-sidecar-gc";
+
+    auto write_part = [&](const std::string & part, const std::map<std::string, std::string> & files)
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        for (const auto & [name, bytes] : files)
+        {
+            auto buf = tx.writeFile("uui/" + uuid + "/" + part + "/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    };
+
+    write_part("all_1_1_0", {{"a.bin", "AAA"}, {"uuid.txt", "U1"}, {"txn_version.txt", "1"}});
+    write_part("all_2_2_0", {{"a.bin", "AAA"}, {"uuid.txt", "U2"}, {"txn_version.txt", "2"}});
+
+    const std::string bundle_1 = refMetaKey("", sid, uuid, "all_1_1_0").string();
+    const std::string file_1_uuid = refMutableFileKey("", sid, uuid, "all_1_1_0", "uuid.txt").string();
+    const std::string file_1_txn = refMutableFileKey("", sid, uuid, "all_1_1_0", "txn_version.txt").string();
+    const std::string bundle_2 = refMetaKey("", sid, uuid, "all_2_2_0").string();
+    ASSERT_TRUE(objectExists(os, bundle_1));
+    ASSERT_TRUE(objectExists(os, file_1_uuid));
+    ASSERT_TRUE(objectExists(os, file_1_txn));
+
+    // The sidecar objects are NEVER content-addressed: they live under store/.../refs/, never blobs/ or parts/.
+    EXPECT_NE(bundle_1.rfind("store/", 0), std::string::npos);
+    EXPECT_EQ(bundle_1.rfind("blobs/", 0), std::string::npos);
+    EXPECT_EQ(bundle_1.rfind("parts/", 0), std::string::npos);
+    for (const auto & k : listKeysUnder(os, blobsPrefix("")))
+        EXPECT_FALSE(isRefMetaKey(k)) << k;
+    for (const auto & k : listKeysUnder(os, partsPrefix("")))
+        EXPECT_FALSE(isRefMetaKey(k)) << k;
+
+    // (1) Dropping a single part deletes ITS bundle + per-file sidecar objects, leaving the other part's.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.removeRecursive("uui/" + uuid + "/all_1_1_0", /*should_remove_objects=*/nullptr);
+        tx.commit(DB::NoCommitOptions{});
+    }
+    EXPECT_FALSE(objectExists(os, bundle_1));
+    EXPECT_FALSE(objectExists(os, file_1_uuid));
+    EXPECT_FALSE(objectExists(os, file_1_txn));
+    EXPECT_TRUE(objectExists(os, bundle_2)); // the surviving part keeps its sidecar
+    EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/uuid.txt")[0].remote_path), "U2");
+
+    // (2) Dropping the whole table reclaims the remaining sidecar objects too.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.removeRecursive("uui/" + uuid, /*should_remove_objects=*/nullptr);
+        tx.commit(DB::NoCommitOptions{});
+    }
+    EXPECT_FALSE(objectExists(os, bundle_2));
+    EXPECT_FALSE(objectExists(os, refMutableFileKey("", sid, uuid, "all_2_2_0", "uuid.txt").string()));
+
+    // A GC sweep does NOT need to (and does not) reclaim sidecars — they are already gone, and a
+    // sweep run now is a clean no-op for them (they are not under blobs/+parts/).
+    DB::ContentAddressed::ContentAddressedGC gc(os, "");
+    EXPECT_NO_THROW(gc.runSweepOnce(/*now=*/100, /*grace=*/0));
+}
+
 // --- Honest capability predicate (B31, Part A) -------------------------------------------------
 
 TEST_F(ContentAddressedMetaTest, IsContentAddressedPredicate)
