@@ -76,5 +76,23 @@ A close review surfaced one live data-loss bug, one corruption bug, and a set of
 
 **Recommended sequence (post-review):** (1) B29 typed identities → (2) B31 capability gate + reject-unsupported → (3) B23 split mutable state out of the manifest → (4) B19+B28 versioned little-endian formats + exact parse rules ("POCs become production data") → (5) B30 whole-part commit contract → (6) B32 safe GC protocol (then re-enable background GC). After (2) the disk is at least *honestly* scoped. See `plans/2026-06-02-cas-mergetree-m5-hardening.md`.
 
+## North star (overnight autonomous goal) {#north-star}
+
+**Goal:** a praktika **stateless test configuration** that swaps the *default* MergeTree disk for a `content_addressed` disk (mirroring the existing "s3 storage" stateless variant), under which **(almost) all existing, unpatched stateless tests pass** and **the S3 bucket is empty after the run** (no leftovers). This is the drop-in acceptance bar — it forces the CA disk to be a near-complete storage backend and the GC to actually reclaim on DROP.
+
+**Acceptance criteria:**
+- A `config.d` (+ praktika job flavor) makes the server's default storage a `content_addressed` disk (local-backed for the fast variant; S3/MinIO for the leftover check), with `content_addressed_gc_enabled=1` + a short grace so GC runs during the suite.
+- The bulk of the stateless suite passes; features the CA disk legitimately cannot support yet are explicitly **skipped/gated** (tracked), not silently broken — "almost all".
+- After the suite (all tables dropped), the pool's `blobs/` + `parts/` are empty (GC reclaimed everything) — a post-run bucket-empty assertion.
+
+**Path:** finish the **M5 hardening** sequence (B29→B32) so the disk is correct + honest + safely GC'd, then **M6 = the drop-in config + run-triage-fix loop** (the full suite is the oracle, as the smoke test was): run → classify failures (unsupported-feature → gate/skip + backlog; real bug → fix) → repeat until "almost all" pass + no leftovers. Adjust the design as needed per the trends here (typed IDs, whole-part contract, pin+lease GC). M6 gets its own plan when M5 lands.
+
+## Loose ends / tech-debt parking lot {#loose-ends}
+- **Background GC must be re-enabled** for the M6 test config (it's off by default now) — but only via the opt-in flag, and the safe protocol (B32) should land before any *shared/S3* multi-mounter use; for a single-owner test pool the reachability sweep + flag is acceptable.
+- **praktika `result_job.json` false `failure`** artifact: the stateless run shows `Failed: 0, Passed: N` + `Ok [...]` but `result_job.json` can say `status: failure` (a post-step/ownership-fix harness quirk). The per-test `test_result.txt` + the `Failed: 0` banner are authoritative. (Also: the integration job name `amd_binary, 1/5` is stale; use `Integration tests (arm_binary, distributed plan, 1/4)`.)
+- A pre-existing uncommitted edit to `plans/2026-06-02-cas-mergetree-m1.md` (a prior-session build-wiring note) is in the working tree, left out of commits; fold in or drop.
+- **`generateObjectKeyForPath` placeholder** (B24) still returns a bogus key on the CA transaction — make it throw.
+- **Detached/frozen namespaces** (B4/B12) unimplemented; DETACH currently allowed only as `DROP_PARTITION`-class (kept), not the ref-move detach — revisit with the whole-part contract.
+
 > Add new deferred items here as they arise during planning/implementation, always filling the
 > "where it plugs in" column so the architecture stays dead-end-free.
