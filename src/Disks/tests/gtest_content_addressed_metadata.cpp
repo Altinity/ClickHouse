@@ -44,26 +44,26 @@ TEST(ContentAddressedPoolPaths, RefKeys)
 
 TEST(ContentAddressedPoolPaths, ParsePartFilePath)
 {
-    auto file = parsePartFilePath("123/uuid-1/all_1_1_0/columns.txt");
+    auto file = parsePartFilePath("uui/uuid-1/all_1_1_0/columns.txt");
     ASSERT_TRUE(file.has_value());
     EXPECT_EQ(file->table_uuid, "uuid-1");
     EXPECT_EQ(file->part_name, "all_1_1_0");
     EXPECT_EQ(file->file, "columns.txt");
 
-    auto part_dir = parsePartFilePath("123/uuid-1/all_1_1_0/"); // trailing slash, no file
+    auto part_dir = parsePartFilePath("uui/uuid-1/all_1_1_0/"); // trailing slash, no file
     ASSERT_TRUE(part_dir.has_value());
     EXPECT_EQ(part_dir->part_name, "all_1_1_0");
     EXPECT_EQ(part_dir->file, "");
 
-    EXPECT_FALSE(parsePartFilePath("123/uuid-1").has_value());   // table dir, not a part
+    EXPECT_FALSE(parsePartFilePath("uui/uuid-1").has_value());   // table dir, not a part
     EXPECT_FALSE(parsePartFilePath("123").has_value());          // shallower
 }
 
 TEST(ContentAddressedPoolPaths, ParseTableUuid)
 {
-    EXPECT_EQ(parseTableUuid("123/uuid-1/"), std::optional<std::string>("uuid-1"));
-    EXPECT_EQ(parseTableUuid("123/uuid-1"), std::optional<std::string>("uuid-1"));
-    EXPECT_FALSE(parseTableUuid("123/uuid-1/all_1_1_0").has_value()); // part dir, not table dir
+    EXPECT_EQ(parseTableUuid("uui/uuid-1/"), std::optional<std::string>("uuid-1"));
+    EXPECT_EQ(parseTableUuid("uui/uuid-1"), std::optional<std::string>("uuid-1"));
+    EXPECT_FALSE(parseTableUuid("uui/uuid-1/all_1_1_0").has_value()); // part dir, not table dir
 }
 
 namespace fs = std::filesystem;
@@ -353,6 +353,57 @@ TEST_F(ContentAddressedMetaTest, WritePartThenReadBackAndDedup)
     // dedup: the shared "SHARED" column is one blob object
     EXPECT_EQ(ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/b.bin")[0].remote_path,
               ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/b.bin")[0].remote_path);
+}
+
+// P3.5: non-part / table-level files (e.g. format_version.txt) are written verbatim to a direct
+// object key (no content addressing, no ref, no footer) and resolve straight back. A part file in
+// the same table still resolves via the ref/footer/blob path, so the two schemes coexist.
+TEST_F(ContentAddressedMetaTest, NonPartFilePassthrough)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_nonpart");
+    auto os = getObjectStorage("cas_nonpart");
+    const std::string sid = ms->serverIdForTest();
+    const std::string uuid = "uuid-nonpart";
+    const std::string format_version = "uui/" + uuid + "/format_version.txt";
+
+    // Write a table-level file through the transaction.
+    {
+        DB::ContentAddressedTransaction tx(*ms);
+        auto buf = tx.writeFile(format_version, 4096, DB::WriteMode::Rewrite, {});
+        const std::string bytes = "1";
+        buf->write(bytes.data(), bytes.size());
+        buf->finalize();
+        tx.commit(DB::NoCommitOptions{}); // no part recorded → publishes nothing
+    }
+
+    // It resolves directly (no ref/footer) and reads back byte-for-byte.
+    EXPECT_TRUE(ms->existsFile(format_version));
+    EXPECT_EQ(ms->getFileSize(format_version), 1u);
+    auto objs = ms->getStorageObjects(format_version);
+    ASSERT_EQ(objs.size(), 1u);
+    EXPECT_EQ(objs[0].remote_path, tableFileKey(sid, uuid, "format_version.txt"));
+    EXPECT_EQ(readObject(os, objs[0].remote_path), "1");
+
+    // No content-addressed structures were created for it.
+    EXPECT_FALSE(ms->existsFile("uui/" + uuid + "/format_version.txt/anything"));
+
+    // A part file in the same table still resolves via the ref/footer/blob path.
+    {
+        DB::ContentAddressedTransaction tx(*ms);
+        auto buf = tx.writeFile("uui/" + uuid + "/all_1_1_0/data.bin", 4096, DB::WriteMode::Rewrite, {});
+        const std::string bytes = "PART-BYTES";
+        buf->write(bytes.data(), bytes.size());
+        buf->finalize();
+        tx.commit(DB::NoCommitOptions{});
+    }
+    auto part_objs = ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/data.bin");
+    ASSERT_EQ(part_objs.size(), 1u);
+    EXPECT_EQ(part_objs[0].remote_path.rfind("blobs/", 0), 0u); // content-addressed blob key
+    EXPECT_EQ(readObject(os, part_objs[0].remote_path), "PART-BYTES");
+
+    // The table-level file is unaffected by the part commit.
+    EXPECT_EQ(readObject(os, ms->getStorageObjects(format_version)[0].remote_path), "1");
 }
 
 TEST_F(ContentAddressedMetaTest, MutationCarryForwardReusesBlob)

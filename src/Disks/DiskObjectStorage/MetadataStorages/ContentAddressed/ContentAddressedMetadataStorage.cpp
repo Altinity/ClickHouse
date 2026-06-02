@@ -83,6 +83,15 @@ ContentAddressed::BlobEntry ContentAddressedMetadataStorage::resolveBlobEntry(co
 
 bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
 {
+    /// Non-part / table-level files (e.g. format_version.txt) resolve to a direct object key.
+    if (!ContentAddressed::isPartFilePath(path))
+    {
+        if (auto tf = ContentAddressed::parseTableFilePath(path))
+            return object_storage->tryGetObjectMetadata(
+                ContentAddressed::tableFileKey(server_id, tf->table_uuid, tf->tail), /*with_tags=*/false).has_value();
+        return false;
+    }
+
     auto p = ContentAddressed::parsePartFilePath(path);
     if (!p || p->file.empty())
         return false;
@@ -117,6 +126,19 @@ bool ContentAddressedMetadataStorage::existsFileOrDirectory(const std::string & 
 
 uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) const
 {
+    /// Non-part / table-level files resolve to a direct object key.
+    if (!ContentAddressed::isPartFilePath(path))
+    {
+        auto tf = ContentAddressed::parseTableFilePath(path);
+        if (!tf)
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a file path: {}", path);
+        auto meta = object_storage->tryGetObjectMetadata(
+            ContentAddressed::tableFileKey(server_id, tf->table_uuid, tf->tail), /*with_tags=*/false);
+        if (!meta)
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no table-level object for {}", path);
+        return meta->size_bytes;
+    }
+
     auto p = ContentAddressed::parsePartFilePath(path);
     if (!p || p->file.empty())
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);
@@ -197,6 +219,19 @@ DirectoryIteratorPtr ContentAddressedMetadataStorage::iterateDirectory(const std
 
 StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::string & path) const
 {
+    /// Non-part / table-level files resolve to a single direct object key (no footer/ref/blob).
+    if (!ContentAddressed::isPartFilePath(path))
+    {
+        auto tf = ContentAddressed::parseTableFilePath(path);
+        if (!tf)
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a file path: {}", path);
+        const std::string key = ContentAddressed::tableFileKey(server_id, tf->table_uuid, tf->tail);
+        auto meta = object_storage->tryGetObjectMetadata(key, /*with_tags=*/false);
+        if (!meta)
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no table-level object for {}", path);
+        return {StoredObject(key, path, meta->size_bytes)};
+    }
+
     auto p = ContentAddressed::parsePartFilePath(path);
     if (!p || p->file.empty())
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);

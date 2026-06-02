@@ -48,12 +48,29 @@ void ContentAddressedTransaction::recordBlob(const std::string & path, ContentAd
     recorded[p->file] = std::move(entry);
 }
 
-std::unique_ptr<ContentAddressed::ContentAddressedWriteBuffer> ContentAddressedTransaction::writeFile(
+std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     const std::string & path,
-    size_t /*buf_size*/,
-    WriteMode /*mode*/,
-    const WriteSettings & /*settings*/)
+    size_t buf_size,
+    WriteMode mode,
+    const WriteSettings & settings)
 {
+    /// Non-part / table-level files (e.g. format_version.txt) are written verbatim to a direct
+    /// object key — no content addressing, no ref, no footer. They are durable on finalize and
+    /// are not tracked by commit.
+    /// TODO(phase4-gc): non-part objects are GC roots.
+    if (!ContentAddressed::isPartFilePath(path))
+    {
+        auto tf = ContentAddressed::parseTableFilePath(path);
+        if (!tf)
+            throw Exception(
+                ErrorCodes::NOT_IMPLEMENTED,
+                "ContentAddressed: unsupported non-part write path: {}",
+                path);
+
+        const std::string key = ContentAddressed::tableFileKey(metadata_storage.server_id, tf->table_uuid, tf->tail);
+        return metadata_storage.object_storage->writeObject(StoredObject(key, path), mode, /*attributes=*/std::nullopt, buf_size, settings);
+    }
+
     rememberTarget(path);
 
     auto p = ContentAddressed::parsePartFilePath(path);
@@ -151,6 +168,22 @@ StoredObjects ContentAddressedTransaction::getSubmittedForRemovalBlobs()
 void ContentAddressedTransaction::createMetadataFile(const std::string &, const StoredObjects &)
 {
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "ContentAddressed: createMetadataFile implemented in Phase 3");
+}
+
+void ContentAddressedTransaction::createDirectory(const std::string &)
+{
+    /// No-op: object storage has no real directories. existsDirectory derives from the
+    /// refs/objects prefix. Mirrors the plain-rewritable transaction's treatment of directories.
+}
+
+void ContentAddressedTransaction::createDirectoryRecursive(const std::string &)
+{
+    /// No-op (see createDirectory).
+}
+
+void ContentAddressedTransaction::removeDirectory(const std::string &)
+{
+    /// No-op (see createDirectory).
 }
 
 }

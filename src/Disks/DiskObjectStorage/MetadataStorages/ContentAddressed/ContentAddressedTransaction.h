@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedWriteBuffer.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Footer.h>
 #include <Disks/WriteMode.h>
+#include <IO/WriteBufferFromFileBase.h>
 #include <IO/WriteSettings.h>
 
 #include <map>
@@ -37,16 +38,30 @@ public:
 
     void createMetadataFile(const std::string & path, const StoredObjects & objects) override;
 
-    // Open a content-addressed write buffer for a part file. The buffer hashes + uploads the
-    // content on finalize and, via its callback, records the resulting blob under the path's
-    // logical file name. The buffer-size and settings arguments mirror the disk-layer writeFile
-    // signature (they are forwarded to the underlying buffer in Task 3); content addressing
-    // ignores append mode, so only Rewrite is meaningful here.
-    std::unique_ptr<ContentAddressed::ContentAddressedWriteBuffer> writeFile(
+    // Open a write buffer for a file.
+    //
+    // For a part file (<uuid[:3]>/<uuid>/<part>/<file>) this returns a content-addressed buffer
+    // that hashes + uploads the content on finalize and, via its callback, records the resulting
+    // blob under the path's logical file name (footer + ref are published at commit).
+    //
+    // For a non-part / table-level file (e.g. <uuid[:3]>/<uuid>/format_version.txt) this returns a
+    // plain object-storage write buffer that writes the bytes verbatim to a direct object key
+    // (tableFileKey) — no content addressing, no ref, no footer. Such objects are durable on
+    // finalize and are not tracked by commit.
+    //
+    // The buffer-size and settings arguments mirror the disk-layer writeFile signature; content
+    // addressing ignores append mode, so only Rewrite is meaningful here.
+    std::unique_ptr<WriteBufferFromFileBase> writeFile(
         const std::string & path,
         size_t buf_size,
         WriteMode mode,
         const WriteSettings & settings);
+
+    // No-op directory operations: object storage has no real directories; existsDirectory derives
+    // from the refs/objects prefix. Mirrors how the plain-rewritable transaction treats directories.
+    void createDirectory(const std::string & path) override;
+    void createDirectoryRecursive(const std::string & path) override;
+    void removeDirectory(const std::string & path) override;
 
     // Carry a file forward from an already-committed (or in-flight) source part without
     // re-uploading: resolve the source blob and record it under the destination logical file.

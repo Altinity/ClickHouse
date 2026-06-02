@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/Replication/ClusterConfiguration.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <Disks/DiskObjectStorage/DiskObjectStorageTransaction.h>
 #include <Disks/DiskObjectStorage/DiskObjectStorage.h>
 #include <Disks/DiskObjectStorage/IOSchedulingSettings.h>
@@ -283,10 +284,15 @@ std::unique_ptr<WriteBufferFromFileBase> DiskObjectStorageTransaction::writeFile
                 ErrorCodes::LOGICAL_ERROR,
                 "Content-addressed metadata storage did not produce a ContentAddressedTransaction");
 
-        if (autocommit)
+        /// Autocommit cannot work for part files: their footer + ref are published only when
+        /// `commit` invokes `metadata_transaction->commit`, which the buffer finalize does not
+        /// trigger. Non-part / table-level files (e.g. format_version.txt) are written verbatim
+        /// to a direct object key and are durable on finalize with no commit involvement, so
+        /// autocommit is fine for them.
+        if (autocommit && ContentAddressed::isPartFilePath(path))
             throw Exception(
                 ErrorCodes::NOT_IMPLEMENTED,
-                "Autocommit writes are not supported on a content-addressed disk");
+                "Autocommit writes are not supported for part files on a content-addressed disk");
 
         return content_addressed_transaction->writeFile(path, buf_size, mode, enriched_settings);
     }
