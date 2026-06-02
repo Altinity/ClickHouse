@@ -1492,7 +1492,7 @@ def test_object_storage_remote_initiator_without_cluster_function(started_cluste
                      "s0_1_0\tfoo"]
 
 
-def test_hive_partitioning(started_cluster):
+def test_hive_partitioning_with_where_condition(started_cluster):
     node = started_cluster.instances["s0_0_0"]
 
     for i in range(1, 5):
