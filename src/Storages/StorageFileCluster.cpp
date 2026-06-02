@@ -68,16 +68,23 @@ StorageFileCluster::StorageFileCluster(
 
     auto & storage_columns = storage_metadata.columns;
 
+    const auto sample_path = paths.empty() ? "" : paths.front();
+
     /// Not grabbing the file_columns because it is not necessary to do it here.
     std::tie(hive_partition_columns_to_read_from_file_path, std::ignore) = HivePartitioningUtils::setupHivePartitioningForFileURLLikeStorage(
         storage_columns,
-        paths.empty() ? "" : paths.front(),
+        sample_path,
         columns_.empty(),
         std::nullopt,
         context);
 
     storage_metadata.setConstraints(constraints_);
-    setVirtuals(VirtualColumnUtils::getVirtualsForFileLikeStorage(storage_metadata.columns, context));
+    setVirtuals(VirtualColumnUtils::getVirtualsForFileLikeStorage(
+        storage_metadata.columns,
+        context,
+        std::nullopt,
+        PartitionStrategyFactory::StrategyType::NONE,
+        sample_path));
     setInMemoryMetadata(storage_metadata);
 }
 
@@ -134,12 +141,22 @@ private:
 RemoteQueryExecutor::Extension StorageFileCluster::getTaskIteratorExtension(
     const ActionsDAG::Node * predicate, const ActionsDAG * /* filter */, const ContextPtr & context, ClusterPtr, StorageMetadataPtr) const
 {
+    // Virtual columns can contain hive columns, so we remove these hive coulmns to avoid duplicates.
+    // In non-cluster case these columns are filtered in DB::prepareReadingFromFormat function.
+    auto virtual_columns = getVirtualsList();
+    NamesAndTypesList hive_partition_filtered;
+    for (const auto & hive_name_and_type : hive_partition_columns_to_read_from_file_path)
+    {
+        if (!virtual_columns.contains(hive_name_and_type.name))
+            hive_partition_filtered.emplace_back(hive_name_and_type);
+    }
+
     auto callback = std::make_shared<FileTaskIterator>(
         paths,
         std::nullopt,
         predicate,
-        getVirtualsList(),
-        hive_partition_columns_to_read_from_file_path,
+        virtual_columns,
+        hive_partition_filtered,
         context
     );
     return RemoteQueryExecutor::Extension{.task_iterator = std::move(callback)};

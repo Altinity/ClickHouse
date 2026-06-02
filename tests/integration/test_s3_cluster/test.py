@@ -1494,11 +1494,12 @@ def test_object_storage_remote_initiator_without_cluster_function(started_cluste
 
 def test_hive_partitioning_with_where_condition(started_cluster):
     node = started_cluster.instances["s0_0_0"]
+    test_id = uuid.uuid4().hex[:8]
 
     for i in range(1, 5):
         node.query(
             f"""
-            INSERT INTO FUNCTION s3('http://minio1:9001/root/hive/date=2000-01-0{i}/data.csv',
+            INSERT INTO FUNCTION s3('http://minio1:9001/root/hive/{test_id}/date=2000-01-0{i}/data.csv',
                 'minio','{minio_secret_key}','CSVWithNames','d UInt64')
             SELECT number FROM numbers(10)
             SETTINGS s3_truncate_on_insert=1
@@ -1507,7 +1508,7 @@ def test_hive_partitioning_with_where_condition(started_cluster):
     # Direct query
     result = node.query(
         f"""
-        SELECT count() FROM s3('http://minio1:9001/root/hive/date=*/data.csv',
+        SELECT count() FROM s3('http://minio1:9001/root/hive/{test_id}/date=*/data.csv',
             'minio','{minio_secret_key}','CSVWithNames','d UInt64')
         WHERE date='2000-01-02'
         SETTINGS use_hive_partitioning=1
@@ -1517,7 +1518,7 @@ def test_hive_partitioning_with_where_condition(started_cluster):
 
     result = node.query(
         f"""
-        SELECT count() FROM s3Cluster('cluster_simple', 'http://minio1:9001/root/hive/date=*/data.csv',
+        SELECT count() FROM s3Cluster('cluster_simple', 'http://minio1:9001/root/hive/{test_id}/date=*/data.csv',
             'minio','{minio_secret_key}','CSVWithNames','d UInt64')
         WHERE date='2000-01-02'
         SETTINGS use_hive_partitioning=1

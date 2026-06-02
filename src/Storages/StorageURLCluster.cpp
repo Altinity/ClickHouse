@@ -162,12 +162,22 @@ private:
 RemoteQueryExecutor::Extension StorageURLCluster::getTaskIteratorExtension(
     const ActionsDAG::Node * predicate, const ActionsDAG * /* filter */, const ContextPtr & context, ClusterPtr, StorageMetadataPtr) const
 {
+    // Virtual columns can contain hive columns, so we remove these hive coulmns to avoid duplicates.
+    // In non-cluster case these columns are filtered in DB::prepareReadingFromFormat function.
+    auto virtual_columns = getVirtualsList();
+    NamesAndTypesList hive_partition_filtered;
+    for (const auto & hive_name_and_type : hive_partition_columns_to_read_from_file_path)
+    {
+        if (!virtual_columns.contains(hive_name_and_type.name))
+            hive_partition_filtered.emplace_back(hive_name_and_type);
+    }
+
     auto callback = std::make_shared<UrlTaskIterator>(
         uri,
         context->getSettingsRef()[Setting::glob_expansion_max_elements],
         predicate,
-        getVirtualsList(),
-        hive_partition_columns_to_read_from_file_path,
+        virtual_columns,
+        hive_partition_filtered,
         context
     );
     return RemoteQueryExecutor::Extension{.task_iterator = std::move(callback)};
