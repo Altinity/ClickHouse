@@ -216,6 +216,29 @@ TEST_F(ContentAddressedMetaTest, ResolvesAndReadsSeededPart)
     EXPECT_FALSE(ms->existsFile("uui/" + uuid + "/" + part + "/absent.bin")); // file not in manifest
 }
 
+TEST_F(ContentAddressedMetaTest, ExistsFileOnDirectoryShapedPoolPathReturnsFalse)
+{
+    using namespace DB::ContentAddressed;
+    // B38: system.remote_data_paths traversal probes existsFile on pool sub-dirs (e.g. "store").
+    // Such a path resolves to a directory object key; existsFile/existsFileOrDirectory/getFileSize
+    // must treat a directory as not-a-file (return false / FILE_DOESNT_EXIST), never let the raw
+    // filesystem "Is a directory" error escape.
+    auto ms = getMetadataStorage("cas_dir_safe");
+
+    // existsFile resolves a generic (non-part) path "store" to a verbatim object key probed via
+    // LocalObjectStorage::tryGetObjectMetadata. With the unit-test empty key prefix that key is
+    // relative to the CWD; make it a real directory so the probe hits a directory, exactly as the
+    // pool sub-dir "store" is on a real server. The directory is cleaned up in TearDown.
+    fs::create_directories("store");
+    ASSERT_TRUE(fs::is_directory("store"));
+
+    // A directory-shaped pool path is not a file and must not let the raw "Is a directory" FS error
+    // escape: existsFile/existsFileOrDirectory return false; getFileSize fails closed (FILE_DOESNT_EXIST).
+    EXPECT_NO_THROW(EXPECT_FALSE(ms->existsFile("store")));
+    EXPECT_NO_THROW(EXPECT_FALSE(ms->existsFileOrDirectory("store")));
+    EXPECT_THROW(ms->getFileSize("store"), DB::Exception);
+}
+
 TEST_F(ContentAddressedMetaTest, FailsClosedOnMissingManifest)
 {
     using namespace DB::ContentAddressed;
@@ -266,6 +289,36 @@ TEST_F(ContentAddressedMetaTest, ListsPartsAndPartFiles)
 
     EXPECT_TRUE(ms->existsDirectory("uui/" + uuid + "/all_1_1_0"));
     EXPECT_TRUE(ms->existsFileOrDirectory("uui/" + uuid + "/all_1_1_0/data.bin"));
+}
+
+TEST_F(ContentAddressedMetaTest, DetachedDirListsPartDirNamesNotInnerFiles)
+{
+    using namespace DB::ContentAddressed;
+    // B36: a detached part clones file-by-file into detached/<detached_part>/<file>, so the ref named
+    // "detached" carries manifest keys shaped <detached_part>/<file> plus a dir-stripped mutable file.
+    // Enumerating the detached dir must yield the detached part DIRECTORY name (all_1_2_1), never the
+    // inner files nor the dir-stripped mutable sidecar file (metadata_version.txt).
+    auto ms = getMetadataStorage("cas_detached");
+    auto os = getObjectStorage("cas_detached");
+    const std::string sid = ms->serverIdForTest();
+    const std::string uuid = "uuid-det";
+
+    PartManifest f;
+    f.blobs["all_1_2_1/data.bin"] = {BlobHash("k1"), 3, "k1"};
+    f.blobs["all_1_2_1/columns.txt"] = {BlobHash("k2"), 2, "k2"};
+    // A dir-stripped mutable file (basename keying drops the all_1_2_1/ prefix): must NOT appear.
+    f.blobs["metadata_version.txt"] = {BlobHash("k3"), 1, "k3"};
+    writeObject(os, partKey("", PartId("dddd000000000000000000000000dddd")).string(), f.serialize());
+    writeObject(os, refKey("", sid, uuid, "detached").string(), serializeRefPayload(PartId("dddd000000000000000000000000dddd")));
+
+    auto names = ms->listDirectory("uui/" + uuid + "/detached");
+    std::set<std::string> got(names.begin(), names.end());
+    EXPECT_EQ(got, (std::set<std::string>{"all_1_2_1"}));
+
+    std::set<std::string> iter_names;
+    for (auto it = ms->iterateDirectory("uui/" + uuid + "/detached"); it->isValid(); it->next())
+        iter_names.insert(it->name());
+    EXPECT_EQ(iter_names, (std::set<std::string>{"all_1_2_1"}));
 }
 
 TEST_F(ContentAddressedMetaTest, TransactionWriteNotImplementedYet)
@@ -373,6 +426,49 @@ TEST_F(ContentAddressedMetaTest, WritePartThenReadBackAndDedup)
     // dedup: the shared "SHARED" column is one blob object
     EXPECT_EQ(ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/b.bin")[0].remote_path,
               ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/b.bin")[0].remote_path);
+}
+
+// B36: moveDirectory of a COMMITTED part into the detached namespace must re-publish a "detached"
+// ref whose manifest carries the source part's files re-keyed under the detached part dir name, so
+// listDirectory(detached) yields the detached part DIRECTORY name (not the inner files) and the
+// source ref is unlinked. This covers the rename-based detach path (renameToDetached on broken parts).
+TEST_F(ContentAddressedMetaTest, MoveCommittedPartIntoDetachedRekeysRef)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_movedetach");
+    auto os = getObjectStorage("cas_movedetach");
+    const std::string sid = ms->serverIdForTest();
+    const std::string uuid = "uuid-movedet";
+
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        for (const auto & [name, bytes] : std::map<std::string, std::string>{
+                 {"data.bin", "DATA"}, {"columns.txt", "a"}, {"metadata_version.txt", "7"}})
+        {
+            auto buf = tx.writeFile("uui/" + uuid + "/all_1_2_1/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    // Move the committed part dir into detached/<part>.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.moveDirectory("uui/" + uuid + "/all_1_2_1", "uui/" + uuid + "/detached/all_1_2_1");
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    // The active part dir no longer has the ref; the detached dir lists the part DIRECTORY name.
+    EXPECT_FALSE(ms->existsDirectory("uui/" + uuid + "/all_1_2_1"));
+    auto detached = ms->listDirectory("uui/" + uuid + "/detached");
+    std::set<std::string> got(detached.begin(), detached.end());
+    EXPECT_EQ(got, (std::set<std::string>{"all_1_2_1"}));
+
+    // The detached part's content is resolvable under detached/<part>/<file>.
+    auto objs = ms->getStorageObjects("uui/" + uuid + "/detached/all_1_2_1/data.bin");
+    ASSERT_EQ(objs.size(), 1u);
+    EXPECT_EQ(readObject(os, objs[0].remote_path), "DATA");
 }
 
 // B23 Task 2 (collision regression): two parts with IDENTICAL column content but DIFFERENT mutable
