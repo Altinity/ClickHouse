@@ -149,10 +149,95 @@ Distinct failure shapes:
 > larger run shows a gated feature dominates (then pull in B30). Category-(2) (`DETACH PARTITION`)
 > is a real bug to fix.
 
+### M6 Task B — baseline suite taxonomy + path-to-almost-all decision (2026-06-03) {#m6-task-b-taxonomy}
+
+**What was run.** A curated slice of **~584 distinct stateless tests** spread across the whole numbering
+range (substring stems `0000 0001 0002 0003 0050 … 02900 03000 … 03800`), under the drop-in mode
+`python3 -m ci.praktika run "Stateless tests (arm_binary, content_addressed storage, parallel)"`
+(CA disk over `object_storage_type=local` as the default MergeTree policy, GC enabled, `grace=60`,
+`interval=5`). Two passes were needed because of a server crash:
+
+- **Run 1** aborted at **129/658 selected tests** when the server took **SIGSEGV** during
+  `03008_deduplication_cases_from_docs` (the dedup-log bug → **B37** below). The hung-check killed the
+  run, so everything after the crash was truncated.
+- **Run 2** re-ran the **453 not-yet-run tests with the `*dedup*` family excluded** (13 tests held out
+  as the known B37 crash cluster, plus the crasher itself) and completed cleanly with **no crash**.
+
+Combined distinct coverage: **583 tests with a result (491 passed, 92 failed)** plus the **14 held-out
+dedup-family tests** (B37 cluster) ≈ **~597 tests covered**.
+
+**Counts table (combined, distinct).**
+
+| Bucket | Signature (first distinct error / diff) | Count | Example test |
+|---|---|---|---|
+| **Total run** | — | **583** (+14 dedup held out) | — |
+| **Passed** | `[ OK ]` | **491** | `00001_select_1`, `00203_full_join` |
+| **Failed** | `[ FAIL ]` | **92** | — |
+| (1) Replicated reject | `ReplicatedMergeTree is not supported on a content_addressed disk yet (B1)` (344) | 45 | `00509_extended_storage_definition_syntax_zookeeper`, `03100_lwu_02_basics` |
+| (1) ALTER-data gate | `ALTER TABLE commands are not supported on immutable disk … except setting and comment` (344) | 21 | `00030_alter_table`, `00804_test_alter_compression_codecs` |
+| (1) Mutations gate | `Mutations are not supported for immutable disk` (344) | 15 | `00806_alter_update`, `01200_mutations_memory_consumption` |
+| (1) Partition-clone gate | `Partition operation ALTER TABLE … is not supported on a content_addressed disk` (344) | 3 | `04005_empty_part_name`, `02009_array_join_partition` |
+| (1) Projections gate | `Table projections are not supported on a content_addressed disk yet` (344) | 3 | `03002_analyzer_prewhere`, `04004_part_log_projections_duration_ms` |
+| (1) RESTORE-onto-CA (**B35**) | `Autocommit writes are not supported for part files on a content-addressed disk` (48) | 2 | `03001_backup_matview_after_modify_query`, `03001_restore_from_old_backup_with_matview_inner_table_metadata` |
+| **(2) DETACH mis-list (B36)** | `system.detached_parts` shows `metadata_version.txt` not `all_1_2_1` (result-diff) | 1 | `00502_custom_partitioning_local` |
+| **(2) remote_data_paths (B38)** | `filesystem error: in file_size: Is a directory ["content_addressed_pool/store"]` (1001) | 1 | `03000_traverse_shadow_system_data_paths` |
+| **(2) dedup-log SIGSEGV (B37)** | SIGSEGV (signal 11, read 0x8) in `MergeTreeDeduplicationLog::addPart` during `INSERT … VALUES` | 1 (+13 held-out family) | `03008_deduplication_cases_from_docs` |
+| (3) infra/flaky | `Timeout!` — `stateful, long` test mis-selected into the stateless slice (needs `test.hits`, uses `parallel_replicas`) | 1 | `03800_autopr_reuse_index_analysis` |
+
+So of **92 failures: 89 are category-(1) expected gate firings**, **3 distinct category-(2) real-bug
+clusters** (B36, B37, B38 — one test each in this slice, but B37's whole `*dedup*` family ≈ 14 tests),
+and **1 category-(3)** infra mis-selection. **No leftover/flaky-passed-with-objects (the third "leftover"
+sub-bucket) was observed in this slice** — that is Task D's no-leftovers assertion to verify directly.
+
+**Top category-(2) real-bug clusters = Task C's queue:**
+1. **B37 — non-replicated dedup-log SIGSEGV (crash).** The dominant bug: `non_replicated_deduplication_window`
+   on a plain `MergeTree` (a SUPPORTED op) writes an append-mode dedup log the immutable CA disk cannot
+   host; `current_writer` stays null and `addPart` derefs it → server crash → aborts the whole run.
+   Fix or fail-closed before any unattended full run.
+2. **B38 — `system.remote_data_paths` traversal throws** `Is a directory` on the CA pool root (a SUPPORTED
+   introspection read path).
+3. **B36 — `DETACH PARTITION` mis-lists** a sidecar `metadata_version.txt` as the detached part in
+   `system.detached_parts` (carried over from Task A; reconfirmed identical here).
+
+**Decision — skip+fix is enough; do NOT pull in B30 yet.** Of the 89 category-(1) failures, the dominant
+gates are **Replicated (45)** and the **mutation/ALTER family (21 ALTER-data + 15 Mutations + 3 partition-clone
+= 39)**. Crucially, the Replicated bucket is heavily inflated by **one feature family in this numeric slice**
+— the `03100_lwu_*` lightweight-update tests, which create `ReplicatedMergeTree` and/or run mutations
+(≈30 of the 92 failures are `03100_lwu_*`). These are **legitimately un-runnable on CA** (replication = B1,
+mutations = B30, both deferred) and are exactly the kind of tests that get **skipped**, not fixed.
+
+Counting the path to "almost all":
+- **583 run − 89 category-(1) skips = 494 candidate-runnable**; of those, **491 already pass** and only
+  **3 distinct real bugs** (B36/B37/B38) fail. So after **skipping category-(1)** and **fixing the 3
+  category-(2) clusters**, the runnable suite is essentially **green (~494/494 ≈ 100% of runnable; ~85%
+  of all-selected stay, ~15% skipped as known-unsupported)**.
+- No single gated feature is so pervasive among *otherwise-passing* tests that we'd have to *support* it
+  to reach "almost all": the gated tests are concentrated in feature-specific files (lwu, mutations,
+  replicated, projections) that are themselves the unsupported feature, not incidental users of it.
+  Mutations/ALTER do NOT dominate the *passing-but-for-one-mutation* population — almost every
+  cat-(1) failure is a test whose *entire point* is the gated feature.
+
+**Conclusion:** "almost all pass" is reachable by **skip (category-1) + fix (B36/B37/B38)** alone. **B30
+(whole-part commit contract) is NOT required for the M6 north star** and stays deferred; it remains the
+right home for *supporting* mutations/clone/RESTORE later (B35), but is not on the critical path to
+"almost all".
+
+**Skip-tag gap (Task C prerequisite).** There is currently **no `no-content-addressed-storage` skip tag**
+in `tests/clickhouse-test` and the CA run passes no CA-aware flag, so category-(1) tests cannot yet be
+skipped by a tag — Task C must add the skip mechanism (mirror `no-s3-storage` / `no-object-storage`:
+an `args.content_addressed_storage` flag set by the praktika option + a `no-content-addressed-storage`
+tag honored in the test-selection guard). For THIS taxonomy run the only skip used was holding out the
+`*dedup*` family to stop the B37 crash from truncating the run (record-only, per the plan).
+
+> **Status:** taxonomy complete. Task C queue = **B37 (crash, top priority) → B38 → B36**, plus add the
+> `no-content-addressed-storage` skip tag for the 89 category-(1) tests.
+
 | ID | Item | Why / status | Where it plugs in |
 |----|------|-------------|-------------------|
 | B35 | **RESTORE onto a content_addressed disk fails closed (`NOT_IMPLEMENTED` autocommit-part-write).** A backup restores by writing each part file through `DiskObjectStorage::writeFile` autocommit, which CA rejects (only the whole-part transaction may write part files). So `RESTORE TABLE … (onto CA)` cannot work in M1 even though `BACKUP` (pointer-holding) does. Clean error, not corruption. | Surfaced by the B34 smoke (`04284`); ties to B30/B16 | Route restore's per-part file writes through the B30 whole-part write contract (begin-part → write files → commit-part), the same seam INSERT/merge will use; until then the fail-closed error is the M1 contract. |
-| B36 | **`DETACH PARTITION` on CA mis-lists in `system.detached_parts` (real bug, category-2).** `00502_custom_partitioning_local`: after `DETACH PARTITION`, `system.detached_parts` shows `\N metadata_version.txt …` instead of the detached part directory `all_1_2_1`. `DETACH PARTITION` is not in the gated clone-class set; the detached-part shape on CA exposes a per-file sidecar/mutable object where a part directory is expected. | First category-(2) real bug from the M6 smoke | The DETACH path's part-directory materialization / detached-parts enumeration over a CA disk (sidecar `.meta` objects must not be surfaced as detached parts; the `isRefMetaKey`/detached-listing boundary). Root-cause in M6 Task C. |
+| B36 | **`DETACH PARTITION` on CA mis-lists in `system.detached_parts` (real bug, category-2).** `00502_custom_partitioning_local`: after `DETACH PARTITION`, `system.detached_parts` shows `\N metadata_version.txt …` instead of the detached part directory `all_1_2_1`. `DETACH PARTITION` is not in the gated clone-class set; the detached-part shape on CA exposes a per-file sidecar/mutable object where a part directory is expected. | First category-(2) real bug from the M6 smoke; **reconfirmed in M6 Task B** (same single test, identical `metadata_version.txt`-instead-of-`all_1_2_1` diff). | The DETACH path's part-directory materialization / detached-parts enumeration over a CA disk (sidecar `.meta` objects must not be surfaced as detached parts; the `isRefMetaKey`/detached-listing boundary). Root-cause in M6 Task C. |
+| B37 | **Non-replicated deduplication log SIGSEGV on a CA disk (real bug, category-2, server crash).** `03008_deduplication_cases_from_docs` (and the whole `*deduplication*`/`*dedup*` family): a plain `MergeTree` with `non_replicated_deduplication_window` set builds a `MergeTreeDeduplicationLog` that writes `deduplication_logs/` files at the table root (non-part files → CA passthrough) via `disk->writeFile(…, WriteMode::Append)` (`MergeTreeDeduplicationLog.cpp:144`/`192`). On CA, `disk_supports_writing_with_append` is false and the append/rotate path leaves `current_writer == nullptr`; `addPart` then derefs it at `MergeTreeDeduplicationLog.cpp:281` (the `chassert(current_writer != nullptr)` at line 271 is a no-op in release) → **SIGSEGV (signal 11, read at 0x8) inside `INSERT INTO … VALUES`** → the server dies and aborts the whole stateless run (truncated run 1 at 129/658 tests). Non-replicated dedup is a SUPPORTED op (plain INSERT path), NOT a gated feature, so this is the dominant category-2 bug. | **Most severe finding of M6 Task B** — it kills the server, so it must be fixed (or the dedup-log creation fail-closed) before any unattended full CA run. | Either (a) fail-closed: refuse `non_replicated_deduplication_window > 0` / dedup-log creation on a `content_addressed` disk with a clear `SUPPORT_IS_DISABLED` (the dedup log is per-table mutable append state the immutable disk cannot host); or (b) support it via a CA-appropriate append surface for the non-part dedup-log file. (a) is the M6-safe choice. Plugs into `MergeTreeData`/`MergeTreeDeduplicationLog` ctor + the capability gate (B31). Replace the dead `chassert` with a throw regardless. |
+| B38 | **`system.remote_data_paths` traversal throws on a CA disk (real bug, category-2).** `03000_traverse_shadow_system_data_paths`: querying `system.remote_data_paths` (with `traverse_shadow_remote_data_paths=1`) walks the disk and calls `ContentAddressedMetadataStorage::existsFile` (`ContentAddressedMetadataStorage.cpp:167`) → `LocalObjectStorage::tryGetObjectMetadata` → `std::filesystem::file_size` on a path that resolves to a **directory** (`content_addressed_pool/store`) → `filesystem error: in file_size: Is a directory` (Code 1001). A supported introspection/read op throws instead of skipping or returning the metadata. | Surfaced by M6 Task B; a SUPPORTED system-table read path fails on CA. | Make `existsFile` / `tryGetObjectMetadata` directory-safe on the CA metadata storage (treat a directory path as not-a-file / skip it in the `system.remote_data_paths` source — `StorageSystemRemoteDataPaths.cpp:286`), or have the CA `existsFile` short-circuit non-object keys. Root-cause in M6 Task C. |
 
 > Add new deferred items here as they arise during planning/implementation, always filling the
 > "where it plugs in" column so the architecture stays dead-end-free.
