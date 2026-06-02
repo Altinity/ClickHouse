@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <cstring>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Footer.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/BlobRefIndex.h>
 #include <Common/Exception.h>
 
 using namespace DB::ContentAddressed;
@@ -44,4 +45,22 @@ TEST(ContentAddressedFooter, RejectsForgedHugeLength)
     put(1);                          // blobs count = 1
     put(0xFFFFFFFFFFFFFFFFull);      // forged key length → must throw, not wrap
     EXPECT_THROW(Footer::deserialize(b), DB::Exception);
+}
+
+TEST(ContentAddressedBlobRefIndex, DeltaCountAndDedup)
+{
+    using namespace DB::ContentAddressed;
+    InMemoryBlobRefIndex idx;
+    Footer p1; p1.blobs["a.bin"] = {"hA", 1, "hA"}; p1.blobs["b.bin"] = {"hShared", 1, "hShared"};
+    Footer p2; p2.blobs["a.bin"] = {"hZ", 1, "hZ"}; p2.blobs["b.bin"] = {"hShared", 1, "hShared"};
+    idx.addPart("part1", p1);
+    idx.addPart("part2", p2);
+    EXPECT_EQ(idx.refcount("hShared"), 2);
+    EXPECT_EQ(idx.refcount("hA"), 1);
+    idx.removePart("part1", p1);
+    EXPECT_EQ(idx.refcount("hShared"), 1);
+    EXPECT_EQ(idx.refcount("hA"), 0);
+    auto dead = idx.unreferenced();
+    EXPECT_TRUE(dead.count("hA"));
+    EXPECT_FALSE(dead.count("hShared"));
 }
