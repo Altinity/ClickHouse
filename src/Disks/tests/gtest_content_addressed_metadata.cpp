@@ -7,6 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolScan.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
@@ -735,4 +736,133 @@ TEST_F(ContentAddressedMetaTest, PoolScanListsLivePartsAndObjects)
     auto blob_keys = listKeysUnder(os, blobsPrefix(""));
     std::set<std::string> blobs(blob_keys.begin(), blob_keys.end());
     EXPECT_EQ(blobs, (std::set<std::string>{blobKey("", s.b1), blobKey("", s.b2), blobKey("", s.b3), blobKey("", s.b_orphan)}));
+}
+
+namespace
+{
+bool objectExists(const std::shared_ptr<DB::IObjectStorage> & os, const std::string & key)
+{
+    return os->tryGetObjectMetadata(key, /*with_tags=*/false).has_value();
+}
+}
+
+// Grace-from-unreachability sweep: nothing is deleted before grace elapses, and the orphans' timers
+// start at the first sweep that observes them unreferenced.
+TEST_F(ContentAddressedMetaTest, SweepHonoursGraceWindow)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_gc_grace");
+    auto os = getObjectStorage("cas_gc_grace");
+    auto s = seedGcPool(os, ms->serverIdForTest());
+
+    DB::ContentAddressed::ContentAddressedGC gc(os, "");
+
+    // (a) First sweep at t=0: the 2 orphans (footer + blob) just became unreachable → delete nothing.
+    auto r0 = gc.runSweepOnce(/*now=*/0, /*grace=*/100);
+    EXPECT_EQ(r0.deleted_parts, 0u);
+    EXPECT_EQ(r0.deleted_blobs, 0u);
+    EXPECT_TRUE(objectExists(os, partKey("", s.pid_orphan)));
+    EXPECT_TRUE(objectExists(os, blobKey("", s.b_orphan)));
+
+    // (b) Still within grace at t=50: nothing deleted.
+    auto r1 = gc.runSweepOnce(/*now=*/50, /*grace=*/100);
+    EXPECT_EQ(r1.deleted_parts, 0u);
+    EXPECT_EQ(r1.deleted_blobs, 0u);
+    EXPECT_TRUE(objectExists(os, partKey("", s.pid_orphan)));
+    EXPECT_TRUE(objectExists(os, blobKey("", s.b_orphan)));
+
+    // (c) Past grace at t=200: exactly the orphan footer + orphan blob are reclaimed; the 2 live
+    //     footers and 3 referenced blobs survive (reachable from the live refs).
+    auto r2 = gc.runSweepOnce(/*now=*/200, /*grace=*/100);
+    EXPECT_EQ(r2.deleted_parts, 1u);
+    EXPECT_EQ(r2.deleted_blobs, 1u);
+    EXPECT_FALSE(objectExists(os, partKey("", s.pid_orphan)));
+    EXPECT_FALSE(objectExists(os, blobKey("", s.b_orphan)));
+    EXPECT_TRUE(objectExists(os, partKey("", s.pid_a)));
+    EXPECT_TRUE(objectExists(os, partKey("", s.pid_b)));
+    EXPECT_TRUE(objectExists(os, blobKey("", s.b1)));
+    EXPECT_TRUE(objectExists(os, blobKey("", s.b2)));
+    EXPECT_TRUE(objectExists(os, blobKey("", s.b3)));
+}
+
+// Dedup safety: a blob referenced by TWO live parts (b2/shared.bin) stays reachable after one of the
+// two refs is unlinked, because the other live part's footer still references it.
+TEST_F(ContentAddressedMetaTest, SweepKeepsBlobStillReferencedByAnotherPart)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_gc_dedup");
+    auto os = getObjectStorage("cas_gc_dedup");
+    auto s = seedGcPool(os, ms->serverIdForTest());
+
+    DB::ContentAddressed::ContentAddressedGC gc(os, "");
+
+    // Unlink part A's ref. pidA's footer is now orphaned, but its blob b2 is also in pidB's footer.
+    os->removeObjectsIfExist({DB::StoredObject(refKey("", ms->serverIdForTest(), s.uuid, "all_1_1_0"))});
+
+    gc.runSweepOnce(/*now=*/0, /*grace=*/100);
+    auto r = gc.runSweepOnce(/*now=*/200, /*grace=*/100);
+
+    // pidA footer + b1 (only in pidA) are reclaimed; the orphan footer + orphan blob too.
+    EXPECT_FALSE(objectExists(os, partKey("", s.pid_a)));
+    EXPECT_FALSE(objectExists(os, blobKey("", s.b1)));
+    EXPECT_FALSE(objectExists(os, partKey("", s.pid_orphan)));
+    EXPECT_FALSE(objectExists(os, blobKey("", s.b_orphan)));
+    // The shared blob b2 SURVIVES — still reachable through pidB's live ref.
+    EXPECT_TRUE(objectExists(os, blobKey("", s.b2)));
+    EXPECT_TRUE(objectExists(os, partKey("", s.pid_b)));
+    EXPECT_TRUE(objectExists(os, blobKey("", s.b3)));
+    EXPECT_EQ(r.deleted_parts, 2u); // pidA + orphan
+    EXPECT_EQ(r.deleted_blobs, 2u); // b1 + orphan
+}
+
+// Reachable-again clears the timer: an object unreferenced at t0 then made reachable again before
+// grace elapses must never be deleted (its first_unreachable entry is dropped on the reachable sweep).
+TEST_F(ContentAddressedMetaTest, SweepClearsTimerWhenReachableAgain)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_gc_again");
+    auto os = getObjectStorage("cas_gc_again");
+    const std::string sid = ms->serverIdForTest();
+    auto s = seedGcPool(os, sid);
+
+    DB::ContentAddressed::ContentAddressedGC gc(os, "");
+
+    // Unlink pidA's ref so pidA's footer + its exclusive blob b1 become unreferenced at t=0.
+    os->removeObjectsIfExist({DB::StoredObject(refKey("", sid, s.uuid, "all_1_1_0"))});
+    gc.runSweepOnce(/*now=*/0, /*grace=*/100); // records first_unreachable for pidA footer + b1
+
+    // Re-add a ref pointing at pidA before grace elapses (e.g. an identical part re-inserted).
+    ContentAddressedMetaTest::writeObject(os, refKey("", sid, s.uuid, "all_1_1_0_redo"), s.pid_a);
+
+    // Past the original grace: pidA is reachable again, so its timer was cleared and nothing of it
+    // is deleted. Only the never-referenced orphan footer + orphan blob are reclaimed.
+    auto r = gc.runSweepOnce(/*now=*/200, /*grace=*/100);
+    EXPECT_TRUE(objectExists(os, partKey("", s.pid_a)));
+    EXPECT_TRUE(objectExists(os, blobKey("", s.b1)));
+    EXPECT_FALSE(objectExists(os, partKey("", s.pid_orphan)));
+    EXPECT_FALSE(objectExists(os, blobKey("", s.b_orphan)));
+    EXPECT_EQ(r.deleted_parts, 1u);
+    EXPECT_EQ(r.deleted_blobs, 1u);
+}
+
+// Fail-close (B18): a LIVE ref whose footer is missing makes the sweep THROW and delete nothing.
+TEST_F(ContentAddressedMetaTest, SweepThrowsAndDeletesNothingOnMissingFooter)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_gc_failclose");
+    auto os = getObjectStorage("cas_gc_failclose");
+    auto s = seedGcPool(os, ms->serverIdForTest());
+
+    // Corrupt the pool: a live ref points at a part id with no footer object.
+    ContentAddressedMetaTest::writeObject(os, refKey("", ms->serverIdForTest(), s.uuid, "all_3_3_0"), "deadc0de00000000000000000000beef");
+
+    DB::ContentAddressed::ContentAddressedGC gc(os, "");
+    EXPECT_THROW(gc.runSweepOnce(/*now=*/200, /*grace=*/100), DB::Exception);
+
+    // Nothing was deleted — even the otherwise-collectable orphans remain (the reachable set never
+    // computed cleanly, so the sweep aborted before any removal).
+    EXPECT_TRUE(objectExists(os, partKey("", s.pid_orphan)));
+    EXPECT_TRUE(objectExists(os, blobKey("", s.b_orphan)));
+    EXPECT_TRUE(objectExists(os, partKey("", s.pid_a)));
+    EXPECT_TRUE(objectExists(os, blobKey("", s.b1)));
 }
