@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGCThread.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
@@ -979,4 +980,111 @@ TEST_F(ContentAddressedMetaTest, GCKeepsLiveBlobsWrittenThroughRealWritePath)
     // (b) The DOOMED part's now-orphan blobs were deleted.
     EXPECT_FALSE(objectExists(os, doomed_a));
     EXPECT_FALSE(objectExists(os, doomed_b));
+}
+
+// --- Honest capability predicate (B31, Part A) -------------------------------------------------
+
+TEST_F(ContentAddressedMetaTest, IsContentAddressedPredicate)
+{
+    // The metadata storage advertises content-addressing; this is the single predicate the disk
+    // layer (DiskObjectStorage::isContentAddressed / supportsHardLinks / supportZeroCopyReplication)
+    // and MergeTree's CREATE/ATTACH gate consult to scope the disk honestly.
+    auto ms = getMetadataStorage("cas_predicate");
+    EXPECT_TRUE(ms->isContentAddressed());
+    EXPECT_EQ(ms->getType(), DB::MetadataStorageType::ContentAddressed);
+}
+
+// --- _pool_meta ownership self-check (B11, Part C) ---------------------------------------------
+
+TEST_F(ContentAddressedMetaTest, PoolMetaSerializeRoundTrips)
+{
+    PoolMeta meta;
+    meta.version = PoolMeta::CURRENT_VERSION;
+    meta.owner_server_id = "server-abc";
+    meta.claimed_at_unix = 1234567;
+
+    auto parsed = PoolMeta::deserialize(meta.serialize());
+    EXPECT_EQ(parsed.version, PoolMeta::CURRENT_VERSION);
+    EXPECT_EQ(parsed.owner_server_id, "server-abc");
+    EXPECT_EQ(parsed.claimed_at_unix, 1234567);
+}
+
+TEST_F(ContentAddressedMetaTest, PoolMetaRejectsBadMagic)
+{
+    EXPECT_ANY_THROW(PoolMeta::deserialize("not a pool meta object"));
+    EXPECT_ANY_THROW(PoolMeta::deserialize(""));
+}
+
+// These tests run claimPoolOwnership directly against a LocalObjectStorage. They use a NON-EMPTY
+// key prefix (equal to the per-test os key) so each marker object key (`<prefix>/_pool_meta`) has a
+// distinct parent directory: this fixture writes object keys verbatim relative to CWD, so an empty
+// prefix would put `_pool_meta` at the root with no parent dir to create, and a shared prefix would
+// collide across tests. In a real server the disk's key prefix is always non-empty and per-disk.
+
+TEST_F(ContentAddressedMetaTest, PoolMetaClaimCreatesMarkerWhenAbsent)
+{
+    const std::string prefix = "cas_pool_claim";
+    auto os = getObjectStorage(prefix);
+    const std::string key = poolMetaKey(prefix);
+    EXPECT_FALSE(os->tryGetObjectMetadata(key, /*with_tags=*/false).has_value());
+
+    DB::ContentAddressed::claimPoolOwnership(os, prefix, "server-one", /*allow_shared=*/false, getLogger("test"));
+
+    auto meta_after = os->tryGetObjectMetadata(key, /*with_tags=*/false);
+    ASSERT_TRUE(meta_after.has_value());
+    auto parsed = PoolMeta::deserialize(readObject(os, key));
+    EXPECT_EQ(parsed.owner_server_id, "server-one");
+    EXPECT_EQ(parsed.version, PoolMeta::CURRENT_VERSION);
+}
+
+TEST_F(ContentAddressedMetaTest, PoolMetaSameServerReMountIsOk)
+{
+    const std::string prefix = "cas_pool_same";
+    auto os = getObjectStorage(prefix);
+    // First mount claims, second mount by the SAME server must succeed without throwing and must
+    // not change the owner (the common case — every M6 test run re-mounts the same server id).
+    DB::ContentAddressed::claimPoolOwnership(os, prefix, "server-one", /*allow_shared=*/false, getLogger("test"));
+    EXPECT_NO_THROW(DB::ContentAddressed::claimPoolOwnership(os, prefix, "server-one", /*allow_shared=*/false, getLogger("test")));
+    EXPECT_EQ(PoolMeta::deserialize(readObject(os, poolMetaKey(prefix))).owner_server_id, "server-one");
+}
+
+TEST_F(ContentAddressedMetaTest, PoolMetaSecondMounterFailsClosed)
+{
+    const std::string prefix = "cas_pool_conflict";
+    auto os = getObjectStorage(prefix);
+    DB::ContentAddressed::claimPoolOwnership(os, prefix, "server-one", /*allow_shared=*/false, getLogger("test"));
+    // A DIFFERENT server mounting the same pool must fail closed (concurrent multi-mounter use is
+    // not supported yet), and the marker must still name the original owner.
+    EXPECT_THROW(
+        DB::ContentAddressed::claimPoolOwnership(os, prefix, "server-two", /*allow_shared=*/false, getLogger("test")),
+        DB::Exception);
+    EXPECT_EQ(PoolMeta::deserialize(readObject(os, poolMetaKey(prefix))).owner_server_id, "server-one");
+}
+
+TEST_F(ContentAddressedMetaTest, PoolMetaSecondMounterAllowedWithSharedFlag)
+{
+    const std::string prefix = "cas_pool_shared";
+    auto os = getObjectStorage(prefix);
+    DB::ContentAddressed::claimPoolOwnership(os, prefix, "server-one", /*allow_shared=*/false, getLogger("test"));
+    // With the explicit shared/takeover opt-in, a different server proceeds and does NOT rewrite the
+    // marker (so the other owner stays visible).
+    EXPECT_NO_THROW(
+        DB::ContentAddressed::claimPoolOwnership(os, prefix, "server-two", /*allow_shared=*/true, getLogger("test")));
+    EXPECT_EQ(PoolMeta::deserialize(readObject(os, poolMetaKey(prefix))).owner_server_id, "server-one");
+}
+
+TEST_F(ContentAddressedMetaTest, PoolMetaUnknownVersionFailsClosed)
+{
+    const std::string prefix = "cas_pool_badver";
+    auto os = getObjectStorage(prefix);
+    // Seed a marker with a version this build does not understand.
+    PoolMeta future;
+    future.version = PoolMeta::CURRENT_VERSION + 100;
+    future.owner_server_id = "server-future";
+    future.claimed_at_unix = 1;
+    writeObject(os, poolMetaKey(prefix), future.serialize());
+
+    EXPECT_THROW(
+        DB::ContentAddressed::claimPoolOwnership(os, prefix, "server-one", /*allow_shared=*/false, getLogger("test")),
+        DB::Exception);
 }

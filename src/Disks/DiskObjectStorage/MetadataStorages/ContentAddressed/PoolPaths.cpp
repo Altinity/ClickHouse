@@ -71,6 +71,11 @@ std::string tableFileKey(const std::string & key_prefix, const std::string & ser
     return tableFilesPrefix(key_prefix, server_id, table_uuid) + tail;
 }
 
+std::string poolMetaKey(const std::string & key_prefix)
+{
+    return withPrefix(key_prefix, "_pool_meta");
+}
+
 std::string diskFileKey(const std::string & key_prefix, const std::string & path)
 {
     /// Verbatim: the raw disk-relative path joined under the object-storage common key prefix with

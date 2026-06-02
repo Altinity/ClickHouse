@@ -39,6 +39,11 @@ RefObjectKey refKey(const std::string & key_prefix, const std::string & server_i
 std::string tableFilesPrefix(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid);
 std::string tableFileKey(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid, const std::string & tail);
 
+// Pool-ownership marker object key: <key_prefix>/_pool_meta. A single small object at the pool root
+// that records the on-disk pool format version and the owning server's identity (ServerUUID +
+// timestamp). Read/validated on mount to fail closed on an un-owned/second-mounter pool (B11).
+std::string poolMetaKey(const std::string & key_prefix);
+
 // Verbatim object key for a generic disk-level file: a path that is neither a part file nor a
 // table-level file (e.g. the server's startup access-check probe clickhouse_access_check_<uuid>
 // written at the disk root). Such files are stored verbatim at <key_prefix>/<path> (no content

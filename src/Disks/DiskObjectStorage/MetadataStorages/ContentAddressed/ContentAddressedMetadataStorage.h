@@ -27,7 +27,8 @@ public:
         String storage_path_prefix_,
         String server_id_,
         String local_scratch_path_,
-        ContextPtr context_ = nullptr);
+        ContextPtr context_ = nullptr,
+        bool allow_shared_pool_ = false);
 
     MetadataStorageType getType() const override { return MetadataStorageType::ContentAddressed; }
     const std::string & getPath() const override { return storage_path_full; }
@@ -88,6 +89,9 @@ private:
     const std::string server_id;
     /// Server-local scratch dir for the write-buffer spill (see ctor doc).
     const std::string local_scratch_path;
+    /// Operator opt-in to mount a pool already owned by a different server (B11). Default false:
+    /// fail closed on a second/concurrent mounter so background GC can never run un-coordinated.
+    const bool allow_shared_pool;
 
     /// Background pool garbage collector, present only on the disk-factory path (context non-null).
     ContentAddressedGCThreadPtr gc_thread;

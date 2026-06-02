@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/StaticDirectoryIterator.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 
@@ -33,12 +34,14 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     String storage_path_prefix_,
     String server_id_,
     String local_scratch_path_,
-    ContextPtr context_)
+    ContextPtr context_,
+    bool allow_shared_pool_)
     : object_storage(std::move(object_storage_))
     , storage_path_prefix(std::move(storage_path_prefix_))
     , storage_path_full(fs::path(object_storage->getRootPrefix()) / storage_path_prefix)
     , server_id(std::move(server_id_))
     , local_scratch_path(std::move(local_scratch_path_))
+    , allow_shared_pool(allow_shared_pool_)
 {
     /// The GC thread exists only on the disk-factory path. The GC scans the same object storage under
     /// the same key prefix used by the read/write sides (single source of truth), so its live set and
@@ -54,6 +57,17 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
 
 void ContentAddressedMetadataStorage::startup()
 {
+    /// Pool-ownership self-check FIRST (before the GC thread starts): claim a fresh pool, accept our
+    /// own pool, and fail closed on an unknown format version or a second/concurrent mounter (B11).
+    /// This is the guard that makes it safe to run background GC without the full coordination
+    /// protocol (B32): a pool another live server could be writing to is never swept here.
+    ContentAddressed::claimPoolOwnership(
+        object_storage,
+        storage_path_prefix,
+        server_id,
+        allow_shared_pool,
+        getLogger(fmt::format("{}::ContentAddressedPoolMeta", storage_path_full)));
+
     if (gc_thread)
         gc_thread->startup();
 }

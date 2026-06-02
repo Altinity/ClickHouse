@@ -229,9 +229,16 @@ void registerContentAddressedMetadataStorage(MetadataStorageFactory & factory)
                                                     fs::path(Context::getGlobalContextInstance()->getPath()) / "disks" / name / "cas_scratch" / "");
         fs::create_directories(local_scratch_path);
 
+        /// Operator opt-in to mount a pool already owned by a different server (B11). Default false:
+        /// the `_pool_meta` self-check fails closed on a second/concurrent mounter so background GC can
+        /// never run un-coordinated. Setting this only suppresses the hard error; it does NOT make
+        /// shared use safe (that needs the B32 lease/fence protocol) — background GC must stay off.
+        const bool allow_shared_pool = config.getBool(config_prefix + ".content_addressed_allow_shared_pool", false);
+
         auto global_context = Context::getGlobalContextInstance();
         auto metadata_storage = std::make_shared<ContentAddressedMetadataStorage>(
-            local_object_storage, key_compatibility_prefix, toString(ServerUUID::get()), local_scratch_path, global_context);
+            local_object_storage, key_compatibility_prefix, toString(ServerUUID::get()), local_scratch_path,
+            global_context, allow_shared_pool);
 
         /// Pass GC tuning (interval/grace) so the stateless GC test can request a short grace. The
         /// thread reads content_addressed_gc_interval_sec / content_addressed_gc_grace_sec atomics.
