@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Footer.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedWriteBuffer.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
@@ -132,6 +133,7 @@ public:
         fs::remove_all("blobs", ec);
         fs::remove_all("parts", ec);
         fs::remove_all("store", ec);
+        fs::remove_all("cas_wbuf_tmp", ec);
     }
 
 private:
@@ -247,4 +249,39 @@ TEST_F(ContentAddressedMetaTest, TransactionWriteNotImplementedYet)
     auto tx = ms->createTransaction();
     ASSERT_NE(tx, nullptr);
     EXPECT_THROW(tx->writeStringToFile("uui/uuid-5/all_1_1_0/x", "y"), DB::Exception); // Phase 3
+}
+
+TEST_F(ContentAddressedMetaTest, WriteBufferUploadsContentAddressed)
+{
+    using namespace DB::ContentAddressed;
+    auto os = getObjectStorage("cas_wbuf");
+    std::string hash1;
+    {
+        ContentAddressedWriteBuffer buf(os, "./cas_wbuf_tmp");
+        buf.write("HELLO-COLUMN", 12);
+        buf.finalize();
+        hash1 = buf.getBlobHash();
+        EXPECT_EQ(buf.getSize(), 12u);
+    }
+    EXPECT_FALSE(hash1.empty());
+    // bytes landed at blobs/<hash> and read back:
+    EXPECT_EQ(readObject(os, blobKey(hash1)), "HELLO-COLUMN");
+
+    // idempotent: identical content → same hash, no second upload (object already present)
+    {
+        ContentAddressedWriteBuffer buf2(os, "./cas_wbuf_tmp");
+        buf2.write("HELLO-COLUMN", 12);
+        buf2.finalize();
+        EXPECT_EQ(buf2.getBlobHash(), hash1);
+    }
+    // different content → different hash + its own object
+    std::string hash2;
+    {
+        ContentAddressedWriteBuffer buf3(os, "./cas_wbuf_tmp");
+        buf3.write("OTHER", 5);
+        buf3.finalize();
+        hash2 = buf3.getBlobHash();
+    }
+    EXPECT_NE(hash2, hash1);
+    EXPECT_EQ(readObject(os, blobKey(hash2)), "OTHER");
 }
