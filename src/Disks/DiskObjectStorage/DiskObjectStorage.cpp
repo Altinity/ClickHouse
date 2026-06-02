@@ -718,7 +718,22 @@ bool DiskObjectStorage::isSharedCompatible() const
 
 bool DiskObjectStorage::supportsHardLinks() const
 {
+    /// A content-addressed pool exposes `createHardLink` only as an in-transaction carry-forward of
+    /// unchanged files into a freshly built part. There is no correct whole-part hardlink/clone
+    /// contract yet (B30); the per-file clone path corrupts parts (B21, gated separately). MergeTree
+    /// consumes `supportsHardLinks` to decide whether mutations / data-`ALTER`s (and lightweight
+    /// delete, which is a mutation) are possible — none of which M1 supports — so advertise false.
+    /// This fails those closed with a clear "immutable disk" message while leaving INSERT / SELECT /
+    /// merge / DROP / DETACH / settings-and-comment `ALTER` working (they do not consult this flag).
+    if (metadata_storage->isContentAddressed())
+        return false;
+
     return !metadata_storage->isWriteOnce() && !metadata_storage->isPlain();
+}
+
+bool DiskObjectStorage::isContentAddressed() const
+{
+    return metadata_storage->isContentAddressed();
 }
 
 
