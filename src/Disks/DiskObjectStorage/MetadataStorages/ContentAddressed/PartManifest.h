@@ -65,9 +65,8 @@ struct PartManifest
 /// txn_version / metadata_version are private and overlaid on read. The bytes are tiny, so storing
 /// them inline (not as separate blobs) is correct and keeps each part's copy distinct.
 ///
-/// The format is versioned now so Step 4 (formal little-endian formats) only formalizes it: a 5-byte
-/// magic, a u64 version, then a u64 count and (name, bytes) string pairs in the same on-object layout
-/// PartManifest uses (host byte order, little-endian targets only).
+/// The format is on the shared codec: `MAGIC(4) + version(1)` then a varint count and (name, bytes)
+/// length-prefixed string pairs, all explicitly little-endian and fail-closed on an unknown version.
 struct RefSidecar
 {
     std::map<std::string, std::string> files;
@@ -75,8 +74,9 @@ struct RefSidecar
     std::string serialize() const;
     static RefSidecar deserialize(const std::string & bytes);
 
-    static constexpr char MAGIC[5] = {'C', 'A', 'S', 'C', '1'};
-    static constexpr uint64_t VERSION = 1;
+    /// 4-byte magic `CASC` ("Content-Addressed SideCar") + a 1-byte version, per the shared codec.
+    static constexpr FormatMagic MAGIC = makeMagic("CASC");
+    static constexpr uint8_t VERSION = 1;
 };
 
 /// Compute the deterministic content-addressed part identifier from a part's blob map.

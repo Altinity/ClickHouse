@@ -1,4 +1,5 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Codec.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Common/Logger.h>
 #include <cstdint>
@@ -17,13 +18,16 @@ namespace DB::ContentAddressed
 /// servers from silently sharing one pool.
 struct PoolMeta
 {
-    /// Bumped only on an INCOMPATIBLE on-disk format change. A reader that sees a version it does
+    /// Bumped only on an INCOMPATIBLE pool-content change. A reader that sees a version it does
     /// not understand fails closed (a newer server must not silently reinterpret an older pool, and
-    /// an older server must not touch a pool written by a newer one).
+    /// an older server must not touch a pool written by a newer one). This is the POOL-content version
+    /// carried in the body; it is distinct from the codec ENCODING version in the shared FormatHeader.
     static constexpr uint32_t CURRENT_VERSION = 1;
 
-    /// Magic line prefix, so a stray object at `_pool_meta` is rejected rather than misparsed.
-    static constexpr char MAGIC[] = "ClickHouseContentAddressedPool";
+    /// 4-byte magic `CAPM` ("Content-Addressed Pool Meta") + a 1-byte ENCODING version, per the shared
+    /// codec. A stray / foreign object at `_pool_meta` is rejected (bad magic) rather than misparsed.
+    static constexpr FormatMagic MAGIC = makeMagic("CAPM");
+    static constexpr uint8_t ENCODING_VERSION = 1;
 
     uint32_t version = CURRENT_VERSION;
     /// The owning server's identity (`ServerUUID`). Empty is never written.
@@ -32,12 +36,12 @@ struct PoolMeta
     /// time-based safety decision; time may protect failure detection, never live work).
     int64_t claimed_at_unix = 0;
 
-    /// Text, line-oriented, deterministic. Human-readable on purpose (an operator can inspect it).
+    /// Binary, deterministic, explicitly little-endian on the shared codec (cross-arch determinism).
     std::string serialize() const;
 
-    /// Parse the marker. Throws CORRUPTED_DATA on a malformed object (wrong magic, missing fields).
-    /// Does NOT enforce the version here — the caller decides what to do with an unknown version so
-    /// it can produce a precise fail-closed message.
+    /// Parse the marker. Throws on a malformed object (wrong magic, or an encoding version this build
+    /// does not understand). Does NOT enforce the POOL-content `version` here — the caller decides what
+    /// to do with an unknown pool version so it can produce a precise fail-closed message.
     static PoolMeta deserialize(const std::string & bytes);
 };
 

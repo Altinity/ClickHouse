@@ -1,15 +1,18 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolMeta.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Codec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 
+#include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
 #include <IO/ReadSettings.h>
+#include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
 
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 
 #include <ctime>
-#include <sstream>
 
 namespace DB
 {
@@ -25,50 +28,33 @@ namespace ContentAddressed
 
 std::string PoolMeta::serialize() const
 {
-    /// One key=value per line. version FIRST so a future reader can read it before anything else.
-    std::ostringstream out;
-    out << MAGIC << "\n";
-    out << "version=" << version << "\n";
-    out << "owner_server_id=" << owner_server_id << "\n";
-    out << "claimed_at_unix=" << claimed_at_unix << "\n";
-    return out.str();
+    /// MAGIC(4) + encoding version(1) + body, on the shared codec. The body carries the POOL-content
+    /// `version` FIRST (so the caller can gate compatibility) as a little-endian u32, then the owner
+    /// server id (length-prefixed string) and the informational claimed_at_unix (little-endian i64).
+    std::string out;
+    DB::WriteBufferFromString buf(out);
+    FormatHeader{MAGIC, ENCODING_VERSION}.write(buf);
+    DB::writeBinaryLittleEndian(version, buf);
+    DB::writeStringBinary(owner_server_id, buf);
+    DB::writeBinaryLittleEndian(claimed_at_unix, buf);
+    buf.finalize();
+    return out;
 }
 
 PoolMeta PoolMeta::deserialize(const std::string & bytes)
 {
-    std::istringstream in(bytes);
-    std::string line;
-
-    if (!std::getline(in, line) || line != MAGIC)
-        throw Exception(
-            ErrorCodes::CORRUPTED_DATA,
-            "ContentAddressed: _pool_meta object has an unexpected format (bad magic); refusing to mount the pool");
+    DB::ReadBufferFromString buf(bytes);
+    /// The shared header gates only the ENCODING version (a wrong magic or an unparseable encoding
+    /// fails closed here). The POOL-content `version` is a body field the CALLER checks, so this build
+    /// can read a future-pool-version marker far enough to produce a precise fail-closed message.
+    FormatHeader::readAndValidate(buf, MAGIC, ENCODING_VERSION, "_pool_meta");
 
     PoolMeta meta;
-    bool have_version = false;
-    while (std::getline(in, line))
-    {
-        if (line.empty())
-            continue;
-        auto eq = line.find('=');
-        if (eq == std::string::npos)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "ContentAddressed: malformed _pool_meta line '{}'", line);
-        const std::string key = line.substr(0, eq);
-        const std::string value = line.substr(eq + 1);
-        if (key == "version")
-        {
-            meta.version = parse<uint32_t>(value);
-            have_version = true;
-        }
-        else if (key == "owner_server_id")
-            meta.owner_server_id = value;
-        else if (key == "claimed_at_unix")
-            meta.claimed_at_unix = parse<int64_t>(value);
-        /// Unknown keys are ignored on purpose: a newer (but still version-compatible) writer may add
-        /// fields; the version byte is the hard compatibility gate.
-    }
+    DB::readBinaryLittleEndian(meta.version, buf);
+    DB::readStringBinary(meta.owner_server_id, buf);
+    DB::readBinaryLittleEndian(meta.claimed_at_unix, buf);
 
-    if (!have_version || meta.owner_server_id.empty())
+    if (meta.owner_server_id.empty())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "ContentAddressed: _pool_meta is missing required fields");
 
     return meta;

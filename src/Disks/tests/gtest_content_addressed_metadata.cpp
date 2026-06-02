@@ -1206,6 +1206,28 @@ TEST_F(ContentAddressedMetaTest, PoolMetaRejectsBadMagic)
     EXPECT_ANY_THROW(PoolMeta::deserialize(""));
 }
 
+// Task 4: `_pool_meta` is on the shared codec now. Pin the on-object bytes (cross-arch determinism)
+// and reject an unknown ENCODING version fail-closed (distinct from the body POOL-content version,
+// which the caller gates — see PoolMetaUnknownVersionFailsClosed).
+TEST_F(ContentAddressedMetaTest, PoolMetaGoldenBytesAndRejectsUnknownEncoding)
+{
+    PoolMeta meta;
+    meta.version = 1;
+    meta.owner_server_id = "srv";
+    meta.claimed_at_unix = 1;
+    const std::string expected =
+        std::string("CAPM\x01", 5)                              // magic(4) + encoding version(1)
+        + std::string("\x01\x00\x00\x00", 4)                    // pool content version u32 LE = 1
+        + std::string("\x03", 1) + "srv"                        // owner server id (length-prefixed)
+        + std::string("\x01\x00\x00\x00\x00\x00\x00\x00", 8);   // claimed_at_unix i64 LE = 1
+    EXPECT_EQ(meta.serialize(), expected);
+    EXPECT_EQ(PoolMeta::deserialize(meta.serialize()).owner_server_id, "srv");
+
+    std::string future = meta.serialize();
+    future[4] = static_cast<char>(PoolMeta::ENCODING_VERSION + 1); // bump the ENCODING version byte
+    EXPECT_THROW(PoolMeta::deserialize(future), DB::Exception);
+}
+
 // These tests run claimPoolOwnership directly against a LocalObjectStorage. They use a NON-EMPTY
 // key prefix (equal to the per-test os key) so each marker object key (`<prefix>/_pool_meta`) has a
 // distinct parent directory: this fixture writes object keys verbatim relative to CWD, so an empty

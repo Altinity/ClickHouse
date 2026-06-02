@@ -71,51 +71,33 @@ PartManifest PartManifest::deserialize(const std::string & bytes)
 
 std::string RefSidecar::serialize() const
 {
-    std::string b(MAGIC, sizeof(MAGIC));
-    auto putU64 = [&](uint64_t v)
-    {
-        std::string out;
-        DB::WriteBufferFromString buf(out);
-        DB::writeBinaryLittleEndian(v, buf);
-        buf.finalize();
-        b.append(out);
-    };
-    auto putStr = [&](const std::string & s) { putU64(s.size()); b.append(s); };
-    putU64(VERSION);
-    putU64(files.size());
+    /// MAGIC(4) + version(1) + body, on the shared codec: a varint count then (name, bytes) length-
+    /// prefixed string pairs, all explicitly little-endian (same shape as PartManifest's inlined map).
+    std::string out;
+    DB::WriteBufferFromString buf(out);
+    FormatHeader{MAGIC, VERSION}.write(buf);
+    DB::writeVarUInt(files.size(), buf);
     for (const auto & [k, v] : files)
     {
-        putStr(k);
-        putStr(v);
+        DB::writeStringBinary(k, buf);
+        DB::writeStringBinary(v, buf);
     }
-    return b;
+    buf.finalize();
+    return out;
 }
 
 RefSidecar RefSidecar::deserialize(const std::string & bytes)
 {
     DB::ReadBufferFromString buf(bytes);
-    std::array<char, sizeof(MAGIC)> got{};
-    buf.readStrict(got.data(), got.size());
-    if (std::memcmp(got.data(), MAGIC, sizeof(MAGIC)) != 0)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref sidecar: bad magic");
-    uint64_t version = 0;
-    DB::readBinaryLittleEndian(version, buf);
-    if (version != VERSION)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref sidecar: unknown version {}", version);
+    FormatHeader::readAndValidate(buf, MAGIC, VERSION, "ref sidecar");
     RefSidecar s;
     uint64_t n = 0;
-    DB::readBinaryLittleEndian(n, buf);
+    DB::readVarUInt(n, buf);
     for (uint64_t i = 0; i < n; ++i)
     {
-        uint64_t klen = 0;
-        DB::readBinaryLittleEndian(klen, buf);
-        std::string k(klen, '\0');
-        buf.readStrict(k.data(), klen);
-        uint64_t vlen = 0;
-        DB::readBinaryLittleEndian(vlen, buf);
-        std::string v(vlen, '\0');
-        buf.readStrict(v.data(), vlen);
-        s.files[k] = std::move(v);
+        std::string k;
+        DB::readStringBinary(k, buf);
+        DB::readStringBinary(s.files[k], buf);
     }
     return s;
 }

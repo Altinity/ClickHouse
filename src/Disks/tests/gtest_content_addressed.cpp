@@ -251,6 +251,24 @@ TEST(ContentAddressedRefSidecar, RejectsBadMagicAndTruncation)
     EXPECT_THROW(RefSidecar::deserialize(ok.substr(0, ok.size() - 1)), DB::Exception);
 }
 
+// Task 4: the sidecar is on the shared header now. A future (unknown) version fails closed, and the
+// on-object bytes are pinned (cross-arch determinism).
+TEST(ContentAddressedRefSidecar, GoldenBytesAndRejectsUnknownVersion)
+{
+    RefSidecar s;
+    s.files["uuid.txt"] = "ab";
+    const std::string expected =
+        std::string("CASC\x01", 5)               // magic(4) + version(1)
+        + std::string("\x01", 1)                 // varint files count = 1
+        + std::string("\x08", 1) + "uuid.txt"    // name
+        + std::string("\x02", 1) + "ab";         // bytes
+    EXPECT_EQ(s.serialize(), expected);
+
+    std::string future = s.serialize();
+    future[4] = static_cast<char>(RefSidecar::VERSION + 1); // bump the version byte
+    EXPECT_THROW(RefSidecar::deserialize(future), DB::Exception);
+}
+
 TEST(ContentAddressedBlobRefIndex, DeltaCountAndDedup)
 {
     using namespace DB::ContentAddressed;
