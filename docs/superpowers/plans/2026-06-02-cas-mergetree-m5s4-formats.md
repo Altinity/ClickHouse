@@ -29,23 +29,23 @@ doc_type: 'guide'
 ## Tasks {#tasks}
 
 ### Task 1 — the shared codec + format header (TDD)
-- [ ] Test: LE round-trip of u32/u64/varint/string across values incl. high bytes; `FormatHeader` rejects wrong magic and an unknown (future) version with a clear error; bytes are byte-identical regardless of host endianness (assert exact bytes for a known value).
-- [ ] Implement `Codec`/`FormatHeader`.
-- [ ] Commit `CAS M5.4: little-endian codec + versioned format header`.
+- [x] Test: LE round-trip of u32/u64/varint/string across values incl. high bytes; `FormatHeader` rejects wrong magic and an unknown (future) version with a clear error; bytes are byte-identical regardless of host endianness (assert exact bytes for a known value).
+- [x] Implement `Codec`/`FormatHeader`.
+- [x] Commit `CAS M5.4: little-endian codec + versioned format header`.
 
 ### Task 2 — PartManifest on the codec (TDD; determinism)
-- [ ] Test: a fixed manifest serializes to a FIXED, pinned byte string (golden), round-trips, rejects bad magic/version/truncation/overlong-length; **`part_id` for a fixed file set is unchanged** by this re-serialization (golden `part_id`).
-- [ ] Re-implement `PartManifest::serialize/deserialize` on the codec; keep `MAGIC`+version.
-- [ ] Commit `CAS M5.4: little-endian versioned PartManifest format + golden test`.
+- [x] Test: a fixed manifest serializes to a FIXED, pinned byte string (golden), round-trips, rejects bad magic/version/truncation/overlong-length; **`part_id` for a fixed file set is unchanged** by this re-serialization (golden `part_id`).
+- [x] Re-implement `PartManifest::serialize/deserialize` on the codec; keep `MAGIC`+version.
+- [x] Commit `CAS M5.4: little-endian versioned PartManifest format + golden test`.
 
 ### Task 3 — ref payload struct + single parser (B28) (TDD)
-- [ ] Test: the ref payload is written as `MAGIC+version+part_id(+reserved)`; `partIdFromRefPayload` reads it exactly; an unknown version fails closed; **the read path (`readRefPartId`) and the GC (`listLivePartIds`) call the SAME parser** (assert via a shared function / a test that feeds a versioned payload to both). Old "first hex run" behavior is gone.
-- [ ] Implement: `ContentAddressedTransaction::commit` writes the versioned ref payload; `partIdFromRefPayload` is the one parser; wire both call sites.
-- [ ] Commit `CAS M5.4: versioned ref payload + single shared parser (B28)`.
+- [x] Test: the ref payload is written as `MAGIC+version+part_id(+reserved)`; `partIdFromRefPayload` reads it exactly; an unknown version fails closed; **the read path (`readRefPartId`) and the GC (`listLivePartIds`) call the SAME parser** (assert via a shared function / a test that feeds a versioned payload to both). Old "first hex run" behavior is gone.
+- [x] Implement: `ContentAddressedTransaction::commit` writes the versioned ref payload; `partIdFromRefPayload` is the one parser; wire both call sites.
+- [x] Commit `CAS M5.4: versioned ref payload + single shared parser (B28)`.
 
 ### Task 4 — RefSidecar + _pool_meta onto the shared header
-- [ ] Re-base `RefSidecar` and `_pool_meta` (de)serialization on the shared codec/header (LE, versioned, fail-closed). Keep their existing semantics + tests green; add unknown-version-rejection tests.
-- [ ] Commit `CAS M5.4: RefSidecar + _pool_meta on the shared versioned codec`.
+- [x] Re-base `RefSidecar` and `_pool_meta` (de)serialization on the shared codec/header (LE, versioned, fail-closed). Keep their existing semantics + tests green; add unknown-version-rejection tests.
+- [x] Commit `CAS M5.4: RefSidecar + _pool_meta on the shared versioned codec`.
 
 ## Verify — HARD GATE
 - Build clean; `--gtest_filter='ContentAddressed*'` (≥47 + golden/version tests) + regression 66 green.
