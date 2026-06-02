@@ -6516,7 +6516,6 @@ void MergeTreeData::checkAlterPartitionIsPossible(
                     break;
                 }
                 case MetadataStorageType::PlainRewritable:
-                case MetadataStorageType::ContentAddressed:
                 {
                     const static auto supported_commands = {
                         PartitionCommand::DROP_PARTITION,
@@ -6527,6 +6526,35 @@ void MergeTreeData::checkAlterPartitionIsPossible(
                     };
 
                     can_execute_alter_on_disk = std::ranges::contains(supported_commands, command.type);
+                    break;
+                }
+                case MetadataStorageType::ContentAddressed:
+                {
+                    /// A content_addressed disk shares one pool across parts; the part-cloning
+                    /// partition commands clone parts via `cloneAndLoadDataPart` / Backup, which calls
+                    /// `DiskObjectStorage::createHardLink` once per file with NO enclosing transaction.
+                    /// Each call autocommits a one-file manifest/ref and overwrites the destination
+                    /// ref, leaving the clone with only its last file (the corruption is silent — the
+                    /// part reads back almost empty). This affects every command that materialises a
+                    /// new part by cloning: `MOVE PARTITION` (TO TABLE / DISK / VOLUME),
+                    /// `REPLACE PARTITION`, `ATTACH PARTITION ... FROM`, AND plain `ATTACH PARTITION`
+                    /// of the table's own detached parts (ATTACH re-clones the detached part into the
+                    /// active set). Until that clone path is made transactional, fail closed and reject
+                    /// all of them. Only the pointer-unlink commands are safe: `DROP PARTITION`,
+                    /// `DETACH PARTITION` (both `DROP_PARTITION`, with `detach` distinguishing them),
+                    /// and `DROP DETACHED PARTITION` — none of these clone a part. Note `ATTACH
+                    /// PARTITION ... FROM` parses to `REPLACE_PARTITION` (with `replace=false`).
+                    const static auto supported_commands = {
+                        PartitionCommand::DROP_PARTITION,
+                        PartitionCommand::DROP_DETACHED_PARTITION,
+                    };
+
+                    if (!std::ranges::contains(supported_commands, command.type))
+                        throw Exception(
+                            ErrorCodes::SUPPORT_IS_DISABLED,
+                            "Partition operation ALTER TABLE {} is not supported on a content_addressed disk yet "
+                            "(it clones parts file-by-file with no transaction, which would corrupt the clone); disk '{}'",
+                            command.typeToString(), disk->getName());
                     break;
                 }
                 case MetadataStorageType::StaticWeb:

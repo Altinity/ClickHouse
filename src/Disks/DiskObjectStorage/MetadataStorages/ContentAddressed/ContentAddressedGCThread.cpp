@@ -73,6 +73,15 @@ void ContentAddressedGCThread::run()
 
 void ContentAddressedGCThread::startup()
 {
+    /// Background deletion is OPT-IN (default OFF). Unattended sweeping is unsafe until pool-ownership
+    /// is enforced (Phase 5 `_pool_meta`) by a single coordinator, so we only activate the recurring
+    /// task when the disk config explicitly set `content_addressed_gc_enabled=true`. triggerAndWait
+    /// (manual / test one-shot) still runs regardless of this flag.
+    if (!background_enabled.load())
+    {
+        LOG_INFO(log, "Background content-addressed GC is disabled for disk {} (set content_addressed_gc_enabled=true to enable)", disk_name);
+        return;
+    }
     LOG_INFO(log, "Starting content-addressed GC thread for disk {}", disk_name);
     task->activateAndSchedule();
 }
@@ -104,7 +113,10 @@ void ContentAddressedGCThread::applyNewSettings(const Poco::Util::AbstractConfig
 {
     interval_sec = config.getInt64(config_prefix + ".content_addressed_gc_interval_sec", DEFAULT_GC_INTERVAL_SEC);
     grace_sec = config.getInt64(config_prefix + ".content_addressed_gc_grace_sec", DEFAULT_GC_GRACE_SEC);
-    LOG_INFO(log, "Applied content-addressed GC settings for disk {}: interval_sec={}, grace_sec={}", disk_name, interval_sec.load(), grace_sec.load());
+    /// Default OFF: the recurring background sweep only runs when explicitly opted in (see startup).
+    background_enabled = config.getBool(config_prefix + ".content_addressed_gc_enabled", false);
+    LOG_INFO(log, "Applied content-addressed GC settings for disk {}: enabled={}, interval_sec={}, grace_sec={}",
+             disk_name, background_enabled.load(), interval_sec.load(), grace_sec.load());
 }
 
 }

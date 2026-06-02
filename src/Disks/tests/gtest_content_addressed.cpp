@@ -66,6 +66,7 @@ TEST(ContentAddressedBlobRefIndex, DeltaCountAndDedup)
 }
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Reachability.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <unordered_map>
 
 TEST(ContentAddressedReachability, ReconcileMarksOnlyLiveRoots)
@@ -77,11 +78,13 @@ TEST(ContentAddressedReachability, ReconcileMarksOnlyLiveRoots)
 
     auto resolve = [&](const std::string & id) { return parts.at(id); };
     std::set<std::string> roots = {"all_1_1_0_1"}; // only the mutated part is a live root
-    std::set<std::string> reachable = markReachableBlobs(roots, resolve);
+    // markReachableBlobs returns FULL blob object keys (blobKey fan-out of the bare manifest hash),
+    // matching what the GC sweep lists under blobsPrefix; assert against the projected keys.
+    std::set<std::string> reachable = markReachableBlobs("", roots, resolve);
 
-    EXPECT_TRUE(reachable.count("hA1"));
-    EXPECT_TRUE(reachable.count("hB0"));   // carried forward → still reachable
-    EXPECT_FALSE(reachable.count("hA0"));  // replaced column → unreachable
+    EXPECT_TRUE(reachable.count(blobKey("", "hA1")));
+    EXPECT_TRUE(reachable.count(blobKey("", "hB0")));   // carried forward → still reachable
+    EXPECT_FALSE(reachable.count(blobKey("", "hA0")));  // replaced column → unreachable
 }
 
 TEST(ContentAddressedReachability, SweepUsesTimeSinceUnreachableNotAge)

@@ -712,7 +712,11 @@ CasGcSeed seedGcPool(const std::shared_ptr<DB::IObjectStorage> & os, const std::
     {
         PartManifest f;
         for (const auto & [name, csum] : files)
-            f.blobs[name] = BlobEntry{blobKey("", csum), csum.size(), csum};
+            /// Store the BARE content hash as the manifest key, exactly as the production write path
+            /// records it (BlobEntry{blob_hash, size, blob_hash}); the read path and the GC project it
+            /// to the full object key via blobKey. Seeding the full key here would mask the GC key-space
+            /// bug (the reachable set must be comparable to the listed blobs/ object keys).
+            f.blobs[name] = BlobEntry{csum, csum.size(), csum};
         ContentAddressedMetaTest::writeObject(os, partKey("", pid), f.serialize());
     };
     put_manifest(s.pid_a, {{"a.bin", s.b1}, {"shared.bin", s.b2}});
@@ -913,4 +917,66 @@ TEST_F(ContentAddressedMetaTest, GCThreadSweepsOrphansAndKeepsLive)
 
     /// Clean shutdown must not hang or crash (deactivates the scheduled task).
     thread.shutdown();
+}
+
+// Regression for the GC blob key-space bug (P1 data loss). This test does NOT hand-seed the pool: it
+// drives the REAL write path (ContentAddressedTransaction::writeFile + commit), so the production key
+// convention is exercised — the manifest stores the BARE content hash, the blob object lives at the
+// blobKey fan-out, and the read path projects the bare hash to the full key. Before Fix 1 the
+// reachable set held the bare hashes while the sweep listed full object keys, so they never matched
+// and the sweep deleted EVERY live blob; this test failed (LIVE blobs gone, getStorageObjects threw).
+// After Fix 1 markReachableBlobs projects through blobKey, so the LIVE part survives and only the
+// genuinely-orphaned DOOMED blobs are reclaimed.
+TEST_F(ContentAddressedMetaTest, GCKeepsLiveBlobsWrittenThroughRealWritePath)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_gc_realwrite");
+    auto os = getObjectStorage("cas_gc_realwrite");
+    const std::string uuid = "uuid-realwrite";
+
+    auto write_part = [&](const std::string & part, const std::map<std::string, std::string> & files)
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        for (const auto & [name, bytes] : files)
+        {
+            auto buf = tx.writeFile("uui/" + uuid + "/" + part + "/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    };
+
+    // Two parts with NO shared blobs: every column has distinct content across the two parts.
+    write_part("all_1_1_0", {{"a.bin", "LIVE-A"}, {"b.bin", "LIVE-B"}, {"columns.txt", "live-cols"}});
+    write_part("all_2_2_0", {{"a.bin", "DOOMED-A"}, {"b.bin", "DOOMED-B"}, {"columns.txt", "doomed-cols"}});
+
+    // Capture the LIVE part's backing blob object keys (full keys via getStorageObjects) — these must
+    // survive — and the DOOMED part's blob keys — these must be reclaimed once its ref is unlinked.
+    const std::string live_a = ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/a.bin")[0].remote_path;
+    const std::string live_b = ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/b.bin")[0].remote_path;
+    const std::string doomed_a = ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/a.bin")[0].remote_path;
+    const std::string doomed_b = ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/b.bin")[0].remote_path;
+    ASSERT_TRUE(objectExists(os, live_a));
+    ASSERT_TRUE(objectExists(os, doomed_a));
+
+    // Unlink the DOOMED part's ref (DROP-style); keep the LIVE ref.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.removeRecursive("uui/" + uuid + "/all_2_2_0", /*should_remove_objects=*/nullptr);
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    // One sweep with grace=0: anything unreferenced this round is reclaimed immediately.
+    DB::ContentAddressed::ContentAddressedGC gc(os, "");
+    gc.runSweepOnce(/*now=*/100, /*grace=*/0);
+
+    // (a) The LIVE part's blobs survive AND read back the original bytes through the resolution path.
+    EXPECT_TRUE(objectExists(os, live_a));
+    EXPECT_TRUE(objectExists(os, live_b));
+    EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/a.bin")[0].remote_path), "LIVE-A");
+    EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/b.bin")[0].remote_path), "LIVE-B");
+
+    // (b) The DOOMED part's now-orphan blobs were deleted.
+    EXPECT_FALSE(objectExists(os, doomed_a));
+    EXPECT_FALSE(objectExists(os, doomed_b));
 }

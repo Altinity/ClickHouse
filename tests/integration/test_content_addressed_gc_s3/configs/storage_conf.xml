@@ -8,7 +8,9 @@
                 <endpoint>http://minio1:9001/root/cas_gc_data/</endpoint>
                 <access_key_id>minio</access_key_id>
                 <secret_access_key>ClickHouse_Minio_P@ssw0rd</secret_access_key>
-                <!-- Aggressive GC so the background sweep actually reclaims orphaned blobs during the test. -->
+                <!-- Background GC is opt-in (default OFF); enable it and run aggressively so the
+                     background sweep actually reclaims orphaned blobs during the test. -->
+                <content_addressed_gc_enabled>1</content_addressed_gc_enabled>
                 <content_addressed_gc_grace_sec>1</content_addressed_gc_grace_sec>
                 <content_addressed_gc_interval_sec>1</content_addressed_gc_interval_sec>
             </disk_content_addressed_gc_s3>

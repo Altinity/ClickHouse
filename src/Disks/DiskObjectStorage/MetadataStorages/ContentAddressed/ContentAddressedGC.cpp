@@ -50,7 +50,7 @@ SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace)
         readStringUntilEOF(bytes, *buf);
         return PartManifest::deserialize(bytes);
     };
-    std::set<std::string> reachable_blobs = markReachableBlobs(live, resolve);
+    std::set<std::string> reachable_blobs = markReachableBlobs(key_prefix, live, resolve);
 
     /// 3. The full unreferenced object-key set: every manifest not backing a live part, plus every
     /// blob not reachable from a live manifest. Sweep scope is strictly parts/ and blobs/.

@@ -38,6 +38,11 @@ public:
         std::string key_prefix_,
         LoggerPtr log_);
 
+    /// Background deletion is OPT-IN. startup activates and schedules the recurring sweep ONLY when
+    /// the disk config sets `content_addressed_gc_enabled=true` (see setEnabled / applyNewSettings);
+    /// it is a no-op otherwise. Unattended background deletion is unsafe until pool-ownership is
+    /// enforced (Phase 5 `_pool_meta`) by a single coordinator, so it is disabled by default.
+    /// triggerAndWait (manual / test one-shot) runs a sweep regardless of this flag.
     void startup();
     void shutdown();
 
@@ -59,6 +64,8 @@ private:
     std::atomic<int64_t> finished_rounds{0};
     std::atomic<int64_t> interval_sec;
     std::atomic<int64_t> grace_sec;
+    /// Opt-in gate for the recurring background sweep (default OFF). See startup.
+    std::atomic<bool> background_enabled{false};
 
     BackgroundSchedulePoolTaskHolder task;
 };
