@@ -113,11 +113,62 @@ TEST(ContentAddressedPartManifest, RejectsBadMagicAndTruncation)
 
 TEST(ContentAddressedPartManifest, RejectsForgedHugeLength)
 {
-    std::string b(PartManifest::MAGIC, sizeof(PartManifest::MAGIC));
-    auto put = [&](uint64_t v){ char t[8]; std::memcpy(t, &v, 8); b.append(t, 8); };
-    put(1);                          // blobs count = 1
-    put(0xFFFFFFFFFFFFFFFFull);      // forged key length → must throw, not wrap
+    std::string b;
+    DB::WriteBufferFromString buf(b);
+    FormatHeader{PartManifest::MAGIC, PartManifest::VERSION}.write(buf);
+    DB::writeVarUInt(1, buf);                          // blobs count = 1
+    DB::writeVarUInt(0xFFFFFFFFFFFFFFFFull, buf);      // forged key length -> must throw, not wrap
+    buf.finalize();
     EXPECT_THROW(PartManifest::deserialize(b), DB::Exception);
+}
+
+// Task 2 (B19): a fixed manifest serialises to a FIXED, pinned byte string. This pins the on-object
+// format little-endian and locks cross-arch determinism (CI runs amd64 and arm64): the SAME logical
+// content must produce the SAME bytes on every architecture, and a format change must update this
+// golden value on purpose.
+TEST(ContentAddressedPartManifest, GoldenBytes)
+{
+    PartManifest f;
+    f.blobs["a.bin"] = BlobEntry{BlobHash("h1"), 0x0102u, "ck1"};
+    f.inlined["count.txt"] = std::string("5\0", 2); // embedded NUL
+
+    const std::string expected =
+        std::string("CAMF\x01", 5)                // magic(4) + version(1)
+        + std::string("\x01", 1)                  // varint blobs count = 1
+        + std::string("\x05", 1) + "a.bin"        // name "a.bin"
+        + std::string("\x02", 1) + "h1"           // blob key "h1"
+        + std::string("\x02\x01\x00\x00\x00\x00\x00\x00", 8) // size 0x0102 LE u64
+        + std::string("\x03", 1) + "ck1"          // checksum "ck1"
+        + std::string("\x01", 1)                  // varint inlined count = 1
+        + std::string("\x09", 1) + "count.txt"    // name "count.txt"
+        + std::string("\x02", 1) + std::string("5\0", 2); // value "5\0"
+    EXPECT_EQ(f.serialize(), expected);
+    // And it round-trips back to the same logical content.
+    PartManifest g = PartManifest::deserialize(f.serialize());
+    EXPECT_EQ(g.blobs.at("a.bin").size, 0x0102u);
+    EXPECT_EQ(g.inlined.at("count.txt"), std::string("5\0", 2));
+}
+
+// Task 2: a future (unknown) version fails closed instead of being misparsed.
+TEST(ContentAddressedPartManifest, RejectsUnknownVersion)
+{
+    std::string ok = PartManifest{}.serialize();
+    ASSERT_GE(ok.size(), 5u);
+    ok[4] = static_cast<char>(PartManifest::VERSION + 1); // bump the version byte
+    EXPECT_THROW(PartManifest::deserialize(ok), DB::Exception);
+}
+
+// Task 2 invariant (CRITICAL): part_id is computed over (filename, checksum), NOT over the manifest
+// bytes, so re-implementing the manifest format must NOT change part_id. This golden value pins it:
+// if this changes, the format change altered identities/dedup and is wrong.
+TEST(ContentAddressedPartManifest, GoldenPartIdUnchanged)
+{
+    std::map<std::string, BlobEntry> blobs;
+    blobs["a.bin"] = {BlobHash("h1"), 3, "ck1"};
+    blobs["b.bin"] = {BlobHash("h2"), 6, "ck2"};
+    // Mutable per-part files must NOT affect the identity.
+    blobs["uuid.txt"] = {BlobHash("u"), 1, "u"};
+    EXPECT_EQ(computePartId(blobs).string(), "8d45de9b773149cfb2e02c23e01d1fdf");
 }
 
 // B23 Task 1: the canonical predicate for mutable per-part files. The set is the SINGLE source of

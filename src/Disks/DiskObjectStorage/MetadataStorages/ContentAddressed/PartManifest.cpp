@@ -1,97 +1,70 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Codec.h>
+#include <IO/ReadBufferFromString.h>
+#include <IO/ReadHelpers.h>
+#include <IO/VarInt.h>
+#include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 #include <Common/SipHash.h>
 #include <base/hex.h>
-#include <cstring>
-
-namespace DB
-{
-namespace ErrorCodes
-{
-    extern const int CORRUPTED_DATA;
-}
-}
 
 namespace DB::ContentAddressed
 {
 
-/// On-object format: integers are serialized in host byte order (little-endian targets only).
-static void putU64(std::string & b, uint64_t v)
-{
-    char t[8];
-    std::memcpy(t, &v, 8);
-    b.append(t, 8);
-}
-
-static void putStr(std::string & b, const std::string & s)
-{
-    putU64(b, s.size());
-    b.append(s);
-}
-
-/// On-object format: integers are deserialized in host byte order (little-endian targets only).
-/// Overflow-safe length checks rely on the invariant p <= b.size() holding after each read.
-static uint64_t getU64(const std::string & b, size_t & p)
-{
-    if (b.size() - p < 8)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS manifest truncated (u64)");
-    uint64_t v;
-    std::memcpy(&v, b.data() + p, 8);
-    p += 8;
-    return v;
-}
-
-static std::string getStr(const std::string & b, size_t & p)
-{
-    uint64_t n = getU64(b, p);
-    if (n > b.size() - p)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS manifest truncated (str)");
-    std::string s = b.substr(p, n);
-    p += n;
-    return s;
-}
-
 std::string PartManifest::serialize() const
 {
-    std::string b(MAGIC, sizeof(MAGIC));
-    putU64(b, blobs.size());
+    /// MAGIC(4) + version(1) + body. Counts are varints; sizes are fixed-width little-endian u64;
+    /// names and bytes are length-prefixed strings (a varint length + the raw bytes), all explicitly
+    /// little-endian so the object is byte-identical regardless of the writer's architecture.
+    std::string out;
+    DB::WriteBufferFromString buf(out);
+    FormatHeader{MAGIC, VERSION}.write(buf);
+    DB::writeVarUInt(blobs.size(), buf);
     for (const auto & [k, v] : blobs)
     {
-        putStr(b, k);
-        putStr(b, v.key.string());
-        putU64(b, v.size);
-        putStr(b, v.checksum);
+        DB::writeStringBinary(k, buf);
+        DB::writeStringBinary(v.key.string(), buf);
+        DB::writeBinaryLittleEndian(v.size, buf);
+        DB::writeStringBinary(v.checksum, buf);
     }
-    putU64(b, inlined.size());
+    DB::writeVarUInt(inlined.size(), buf);
     for (const auto & [k, v] : inlined)
     {
-        putStr(b, k);
-        putStr(b, v);
+        DB::writeStringBinary(k, buf);
+        DB::writeStringBinary(v, buf);
     }
-    return b;
+    buf.finalize();
+    return out;
 }
 
 PartManifest PartManifest::deserialize(const std::string & bytes)
 {
-    if (bytes.size() < sizeof(MAGIC) || std::memcmp(bytes.data(), MAGIC, sizeof(MAGIC)) != 0)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS manifest: bad magic");
+    DB::ReadBufferFromString buf(bytes);
+    FormatHeader::readAndValidate(buf, MAGIC, VERSION, "manifest");
+
     PartManifest f;
-    size_t p = sizeof(MAGIC);
-    uint64_t nb = getU64(bytes, p);
+    uint64_t nb = 0;
+    DB::readVarUInt(nb, buf);
     for (uint64_t i = 0; i < nb; ++i)
     {
-        auto k = getStr(bytes, p);
+        std::string k;
+        DB::readStringBinary(k, buf);
         BlobEntry e;
-        e.key = BlobHash(getStr(bytes, p));
-        e.size = getU64(bytes, p);
-        e.checksum = getStr(bytes, p);
+        std::string key;
+        DB::readStringBinary(key, buf);
+        e.key = BlobHash(std::move(key));
+        DB::readBinaryLittleEndian(e.size, buf);
+        DB::readStringBinary(e.checksum, buf);
         f.blobs[k] = std::move(e);
     }
-    uint64_t ni = getU64(bytes, p);
+    uint64_t ni = 0;
+    DB::readVarUInt(ni, buf);
     for (uint64_t i = 0; i < ni; ++i)
     {
-        auto k = getStr(bytes, p);
-        f.inlined[k] = getStr(bytes, p);
+        std::string k;
+        DB::readStringBinary(k, buf);
+        DB::readStringBinary(f.inlined[k], buf);
     }
     return f;
 }
@@ -99,30 +72,50 @@ PartManifest PartManifest::deserialize(const std::string & bytes)
 std::string RefSidecar::serialize() const
 {
     std::string b(MAGIC, sizeof(MAGIC));
-    putU64(b, VERSION);
-    putU64(b, files.size());
+    auto putU64 = [&](uint64_t v)
+    {
+        std::string out;
+        DB::WriteBufferFromString buf(out);
+        DB::writeBinaryLittleEndian(v, buf);
+        buf.finalize();
+        b.append(out);
+    };
+    auto putStr = [&](const std::string & s) { putU64(s.size()); b.append(s); };
+    putU64(VERSION);
+    putU64(files.size());
     for (const auto & [k, v] : files)
     {
-        putStr(b, k);
-        putStr(b, v);
+        putStr(k);
+        putStr(v);
     }
     return b;
 }
 
 RefSidecar RefSidecar::deserialize(const std::string & bytes)
 {
-    if (bytes.size() < sizeof(MAGIC) || std::memcmp(bytes.data(), MAGIC, sizeof(MAGIC)) != 0)
+    DB::ReadBufferFromString buf(bytes);
+    std::array<char, sizeof(MAGIC)> got{};
+    buf.readStrict(got.data(), got.size());
+    if (std::memcmp(got.data(), MAGIC, sizeof(MAGIC)) != 0)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref sidecar: bad magic");
-    size_t p = sizeof(MAGIC);
-    const uint64_t version = getU64(bytes, p);
+    uint64_t version = 0;
+    DB::readBinaryLittleEndian(version, buf);
     if (version != VERSION)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref sidecar: unknown version {}", version);
     RefSidecar s;
-    const uint64_t n = getU64(bytes, p);
+    uint64_t n = 0;
+    DB::readBinaryLittleEndian(n, buf);
     for (uint64_t i = 0; i < n; ++i)
     {
-        auto k = getStr(bytes, p);
-        s.files[k] = getStr(bytes, p);
+        uint64_t klen = 0;
+        DB::readBinaryLittleEndian(klen, buf);
+        std::string k(klen, '\0');
+        buf.readStrict(k.data(), klen);
+        uint64_t vlen = 0;
+        DB::readBinaryLittleEndian(vlen, buf);
+        std::string v(vlen, '\0');
+        buf.readStrict(v.data(), vlen);
+        s.files[k] = std::move(v);
     }
     return s;
 }

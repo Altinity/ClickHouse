@@ -1,4 +1,5 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Codec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
 #include <array>
 #include <cstdint>
@@ -53,7 +54,9 @@ struct PartManifest
     std::string serialize() const;
     static PartManifest deserialize(const std::string & bytes);
 
-    static constexpr char MAGIC[5] = {'C', 'A', 'M', '0', '1'};
+    /// 4-byte magic `CAMF` ("Content-Addressed ManiFest") + a 1-byte version, per the shared codec.
+    static constexpr FormatMagic MAGIC = makeMagic("CAMF");
+    static constexpr uint8_t VERSION = 1;
 };
 
 /// Per-ref sidecar: a tiny versioned {filename -> raw bytes} blob holding a single part's MUTABLE
