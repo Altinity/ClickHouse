@@ -82,13 +82,16 @@ ContentAddressed::BlobEntry ContentAddressedMetadataStorage::resolveBlobEntry(co
 
 bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
 {
-    /// Non-part / table-level files (e.g. format_version.txt) resolve to a direct object key.
+    /// Non-part files resolve to a direct object key: a table-level file (e.g. format_version.txt)
+    /// at tableFileKey, any other (generic disk-level) file at its verbatim diskFileKey.
     if (!ContentAddressed::isPartFilePath(path))
     {
+        std::string key;
         if (auto tf = ContentAddressed::parseTableFilePath(path))
-            return object_storage->tryGetObjectMetadata(
-                ContentAddressed::tableFileKey(storage_path_prefix, server_id, tf->table_uuid, tf->tail), /*with_tags=*/false).has_value();
-        return false;
+            key = ContentAddressed::tableFileKey(storage_path_prefix, server_id, tf->table_uuid, tf->tail);
+        else
+            key = ContentAddressed::diskFileKey(storage_path_prefix, path);
+        return object_storage->tryGetObjectMetadata(key, /*with_tags=*/false).has_value();
     }
 
     auto p = ContentAddressed::parsePartFilePath(path);
@@ -125,16 +128,18 @@ bool ContentAddressedMetadataStorage::existsFileOrDirectory(const std::string & 
 
 uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) const
 {
-    /// Non-part / table-level files resolve to a direct object key.
+    /// Non-part files resolve to a direct object key: table-level (tableFileKey) or generic
+    /// disk-level (verbatim diskFileKey).
     if (!ContentAddressed::isPartFilePath(path))
     {
-        auto tf = ContentAddressed::parseTableFilePath(path);
-        if (!tf)
-            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a file path: {}", path);
-        auto meta = object_storage->tryGetObjectMetadata(
-            ContentAddressed::tableFileKey(storage_path_prefix, server_id, tf->table_uuid, tf->tail), /*with_tags=*/false);
+        std::string key;
+        if (auto tf = ContentAddressed::parseTableFilePath(path))
+            key = ContentAddressed::tableFileKey(storage_path_prefix, server_id, tf->table_uuid, tf->tail);
+        else
+            key = ContentAddressed::diskFileKey(storage_path_prefix, path);
+        auto meta = object_storage->tryGetObjectMetadata(key, /*with_tags=*/false);
         if (!meta)
-            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no table-level object for {}", path);
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no object for {}", path);
         return meta->size_bytes;
     }
 
@@ -230,16 +235,18 @@ DirectoryIteratorPtr ContentAddressedMetadataStorage::iterateDirectory(const std
 
 StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::string & path) const
 {
-    /// Non-part / table-level files resolve to a single direct object key (no footer/ref/blob).
+    /// Non-part files resolve to a single direct object key (no footer/ref/blob): a table-level
+    /// file at tableFileKey, any other (generic disk-level) file at its verbatim diskFileKey.
     if (!ContentAddressed::isPartFilePath(path))
     {
-        auto tf = ContentAddressed::parseTableFilePath(path);
-        if (!tf)
-            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a file path: {}", path);
-        const std::string key = ContentAddressed::tableFileKey(storage_path_prefix, server_id, tf->table_uuid, tf->tail);
+        std::string key;
+        if (auto tf = ContentAddressed::parseTableFilePath(path))
+            key = ContentAddressed::tableFileKey(storage_path_prefix, server_id, tf->table_uuid, tf->tail);
+        else
+            key = ContentAddressed::diskFileKey(storage_path_prefix, path);
         auto meta = object_storage->tryGetObjectMetadata(key, /*with_tags=*/false);
         if (!meta)
-            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no table-level object for {}", path);
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no object for {}", path);
         return {StoredObject(key, path, meta->size_bytes)};
     }
 

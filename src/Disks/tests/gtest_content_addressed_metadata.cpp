@@ -412,6 +412,60 @@ TEST_F(ContentAddressedMetaTest, NonPartFilePassthrough)
     EXPECT_EQ(readObject(os, ms->getStorageObjects(format_version)[0].remote_path), "1");
 }
 
+// P3.5 (B27): a generic disk-level file — one that is neither a part file nor a table-level file,
+// e.g. the server's startup access-check probe clickhouse_access_check_<uuid> written at the disk
+// root — is written verbatim to its diskFileKey, resolves straight back byte-for-byte, and is
+// removed by unlinkFile so the access-check write -> read -> unlink round-trip leaves nothing behind.
+TEST_F(ContentAddressedMetaTest, GenericDiskFilePassthroughRoundTrips)
+{
+    using namespace DB::ContentAddressed;
+    // A real disk always has a non-empty object-storage common key prefix, so the verbatim key for
+    // a disk-root file (e.g. clickhouse_access_check_<uuid>) has a parent directory. Mirror that by
+    // pairing a metadata storage and its transactions on the SAME non-empty prefix (read and write
+    // must agree on it). With an empty prefix the key for a disk-root file would be a bare filename
+    // whose (empty) parent the local-fs harness cannot create — not a production shape.
+    const std::string prefix = "cas_generic_pool";
+    auto os = getObjectStorage("cas_generic");
+    DB::ContentAddressedMetadataStorage ms(os, prefix, "test-server");
+
+    const std::string probe = "clickhouse_access_check_0123abcd";
+    const std::string bytes = "0123abcd"; // the access-check writes a uuid string and reads it back
+
+    // It is classified as neither a part file nor a table-level file (it has no <uuid[:3]>/<uuid>
+    // anchor), so it must take the generic verbatim passthrough.
+    ASSERT_FALSE(isPartFilePath(probe));
+    ASSERT_FALSE(parseTableFilePath(probe).has_value());
+
+    // Write through the transaction (commit publishes nothing — no part recorded).
+    {
+        DB::ContentAddressedTransaction tx(ms, prefix);
+        auto buf = tx.writeFile(probe, 4096, DB::WriteMode::Rewrite, {});
+        buf->write(bytes.data(), bytes.size());
+        buf->finalize();
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    // The verbatim object lands at <prefix>/<path> and resolves straight back byte-for-byte.
+    EXPECT_EQ(diskFileKey(prefix, probe), prefix + "/" + probe);
+    EXPECT_TRUE(ms.existsFile(probe));
+    EXPECT_EQ(ms.getFileSize(probe), bytes.size());
+    auto objs = ms.getStorageObjects(probe);
+    ASSERT_EQ(objs.size(), 1u);
+    EXPECT_EQ(objs[0].remote_path, diskFileKey(prefix, probe));
+    EXPECT_EQ(readObject(os, objs[0].remote_path), bytes);
+
+    // unlinkFile removes the verbatim object — afterwards it is gone.
+    {
+        DB::ContentAddressedTransaction tx(ms, prefix);
+        tx.unlinkFile(probe, /*if_exists=*/false, /*should_remove_objects=*/true);
+        tx.commit(DB::NoCommitOptions{});
+    }
+    EXPECT_FALSE(ms.existsFile(probe));
+
+    std::error_code ec;
+    fs::remove_all(prefix, ec); // CWD-relative pool dir created by the verbatim write
+}
+
 TEST_F(ContentAddressedMetaTest, MutationCarryForwardReusesBlob)
 {
     using namespace DB::ContentAddressed;

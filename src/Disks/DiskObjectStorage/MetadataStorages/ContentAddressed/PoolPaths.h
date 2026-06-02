@@ -27,6 +27,12 @@ std::string refKey(const std::string & key_prefix, const std::string & server_id
 std::string tableFilesPrefix(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid);
 std::string tableFileKey(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid, const std::string & tail);
 
+// Verbatim object key for a generic disk-level file: a path that is neither a part file nor a
+// table-level file (e.g. the server's startup access-check probe clickhouse_access_check_<uuid>
+// written at the disk root). Such files are stored verbatim at <key_prefix>/<path> (no content
+// addressing, no ref, no footer) using the same empty-prefix-safe join as every other key builder.
+std::string diskFileKey(const std::string & key_prefix, const std::string & path);
+
 struct PartFilePath
 {
     std::string table_uuid;

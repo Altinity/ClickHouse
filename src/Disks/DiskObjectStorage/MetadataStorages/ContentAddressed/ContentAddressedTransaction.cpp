@@ -55,20 +55,22 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     WriteMode mode,
     const WriteSettings & settings)
 {
-    /// Non-part / table-level files (e.g. format_version.txt) are written verbatim to a direct
-    /// object key — no content addressing, no ref, no footer. They are durable on finalize and
-    /// are not tracked by commit.
+    /// Classification of a non-part write path:
+    ///   - table-level file (e.g. format_version.txt) -> direct object key (tableFileKey);
+    ///   - any other (generic disk-level) file, e.g. the server's startup access-check probe
+    ///     clickhouse_access_check_<uuid> written at the disk root -> verbatim object key
+    ///     (diskFileKey).
+    /// Both are written verbatim — no content addressing, no ref, no footer. They are durable on
+    /// finalize and are not tracked by commit.
     /// TODO(phase4-gc): non-part objects are GC roots.
     if (!ContentAddressed::isPartFilePath(path))
     {
-        auto tf = ContentAddressed::parseTableFilePath(path);
-        if (!tf)
-            throw Exception(
-                ErrorCodes::NOT_IMPLEMENTED,
-                "ContentAddressed: unsupported non-part write path: {}",
-                path);
+        std::string key;
+        if (auto tf = ContentAddressed::parseTableFilePath(path))
+            key = ContentAddressed::tableFileKey(key_prefix, metadata_storage.server_id, tf->table_uuid, tf->tail);
+        else
+            key = ContentAddressed::diskFileKey(key_prefix, path);
 
-        const std::string key = ContentAddressed::tableFileKey(key_prefix, metadata_storage.server_id, tf->table_uuid, tf->tail);
         return metadata_storage.object_storage->writeObject(StoredObject(key, path), mode, /*attributes=*/std::nullopt, buf_size, settings);
     }
 
@@ -189,11 +191,24 @@ void ContentAddressedTransaction::moveFile(const std::string & from, const std::
 
 void ContentAddressedTransaction::unlinkFile(const std::string & path, bool, bool)
 {
-    /// Drop a staged blob so it is excluded from the footer. For a non-part file or a file that was
-    /// never recorded there is nothing CA-resolution-relevant to remove. The underlying content
+    /// Part file: drop the staged blob so it is excluded from the footer. The underlying content
     /// blob, if shared, is reclaimed by GC, not here.
     if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->file.empty())
+    {
         recorded.erase(p->file);
+        return;
+    }
+
+    /// Table-level file (e.g. format_version.txt): no CA-resolution-relevant state and no verbatim
+    /// removal in M1 — left to GC, matching the existing read/write treatment of such files.
+    if (ContentAddressed::parseTableFilePath(path))
+        return;
+
+    /// Generic disk-level file (e.g. the server's startup access-check probe): delete its verbatim
+    /// object so a write -> read -> unlink round-trip leaves nothing behind. removeObjectIfExists is
+    /// a no-op when the object is absent, mirroring an unlink of a never-written generic file.
+    metadata_storage.object_storage->removeObjectIfExists(
+        StoredObject(ContentAddressed::diskFileKey(key_prefix, path), path));
 }
 
 void ContentAddressedTransaction::truncateFile(const std::string &, size_t)
