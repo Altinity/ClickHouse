@@ -705,6 +705,13 @@ class JobConfigs:
             runs_on=RunnerLabels.ARM_SMALL,
             requires=[ArtifactNames.CH_ARM_BINARY],
         ),
+        # Content-addressed disk as the default MergeTree storage (CAS M6 drop-in). Mirrors the
+        # "s3 storage" variant but installs only content_addressed_storage_policy_for_merge_tree_by_default.xml.
+        Job.ParamSet(
+            parameter="arm_binary, content_addressed storage, parallel",
+            runs_on=RunnerLabels.ARM_MEDIUM_CPU,
+            requires=[ArtifactNames.CH_ARM_BINARY],
+        ),
     )
     functional_tests_jobs_coverage = common_ft_job_config.parametrize(
         *[

@@ -108,5 +108,51 @@ A close review surfaced one live data-loss bug, one corruption bug, and a set of
 
 Minors (acceptable for M1): `partIdFromRefPayload` throws on an empty ref payload (fail-closed; one corrupt ref aborts the sweep + fails that part's reads); `createHardLink` mutable-vs-content by source basename is safe (the 3 mutable names are reserved part-internal files).
 
+## M6 Task A — B33/B34 gates + drop-in config + first smoke (2026-06-03) {#m6-task-a}
+
+**B33 DONE.** `ReplicatedMergeTree` on a `content_addressed` disk is rejected at `CREATE`/`ATTACH`
+in `StorageReplicatedMergeTree`'s ctor (the existing disk loop that already rejects the `Keeper`
+metadata type — `StorageReplicatedMergeTree.cpp` ~451), via `disk->isContentAddressed()` →
+`SUPPORT_IS_DISABLED` "ReplicatedMergeTree is not supported on a content_addressed disk yet (B1)".
+This is the cleanest point: the disks are already materialized there, no new virtual on
+`MergeTreeData` was needed. Test: `04283_content_addressed_replicated_rejected.sql`.
+
+**B34 DONE (gate + honest behavior verified).** Two parts: (1) the temporary-hard-link BACKUP path
+(`DataPartStorageOnDiskBase::backup`, the Ordinary-DB path) now fails closed with a clear
+`SUPPORT_IS_DISABLED` instead of a raw `LOGICAL_ERROR` when `make_temporary_hard_links &&
+disk->isContentAddressed()`. (2) Empirically: in an Atomic (UUID) DB — the suite default — `BACKUP`
+uses the pointer-holding path (`make_temporary_hard_links=false`) and **succeeds** on CA, but
+`RESTORE` onto a CA disk **fails closed** with `NOT_IMPLEMENTED` "Autocommit writes are not supported
+for part files on a content-addressed disk" (restore writes part files via the disk autocommit path,
+which the B30 whole-part write contract is required to support — a separate known M1 gap, NOT
+corruption). Test: `04284_content_addressed_backup_pointer_holding.sh` (asserts BACKUP succeeds +
+RESTORE fails closed). **New deferred item B35** (restore-onto-CA) below.
+
+**Drop-in config + run mode.** `tests/config/config.d/content_addressed_storage_policy_for_merge_tree_by_default.xml`
+(content_addressed disk over `object_storage_type=local`, set as the default MergeTree policy,
+`content_addressed_gc_enabled=1`/`grace=60`/`interval=5`). Installed by a new
+`--content-addressed-storage` flag in `tests/config/install.sh` (mutually exclusive branch — installs
+ONLY this config, no s3/azure defaults), wired to a `content_addressed storage` praktika option in
+`ci/jobs/functional_tests.py`, exposed as the job parametrization
+`Stateless tests (arm_binary, content_addressed storage, parallel)` (`ci/defs/job_configs.py`).
+
+**First smoke taxonomy (seeds Task B).** ~19 tests run under CA-default (substring expansion of the
+chosen stems). Pass: `00001_select_1`, `00098_primary_key_memory_allocated`, `00203_full_join`,
+`00386_has_column_in_table`, `00564_temporary_table_management` (basic SELECT/INSERT/JOIN/temp).
+Distinct failure shapes:
+- **(1) unsupported-feature, gated (expected):** `Mutations are not supported for immutable disk` (`SUPPORT_IS_DISABLED` 344) — mutations + lightweight-delete (`02352_lightweight_delete*`, `00652_mergetree_mutations`); `Table projections are not supported on a content_addressed disk yet` (344) — projection tests at CREATE (`01710_projections*`); `ALTER TABLE commands are not supported on immutable disk … except setting/comment` (344) — `01278_alter_rename_combination`; `ReplicatedMergeTree is not supported on a content_addressed disk yet (B1)` (344) where a test created a Replicated table. These are the gates firing correctly → the tests legitimately can't run on CA (skip-candidates).
+- **(1-derived) cascade:** `No projection is used …` (`PROJECTION_NOT_USED` 584) and `Unknown table expression identifier` (`UNKNOWN_TABLE` 60) are downstream of an earlier gated CREATE in the same projection test (the table never got created), not independent bugs.
+- **(2) REAL BUG candidate:** `00502_custom_partitioning_local` — `DETACH PARTITION` on CA leaves a wrong `system.detached_parts` row (`\N  metadata_version.txt  \N …` instead of the part name `all_1_2_1`). `DETACH PARTITION` is NOT in the gated clone-class set (only MOVE/REPLACE/ATTACH/FREEZE are), so a supported-ish op misbehaves — the detached-part materialization on CA produces a sidecar/mutable file (`metadata_version.txt`) where the part dir is expected. First category-2 finding; needs root-cause in Task C.
+
+> M6 acceptance ("almost all pass") will be reached by **skipping** the category-(1) feature tests
+> (mutations/lwd/projections/data-ALTER/replicated) via the suite's tag mechanism, UNLESS Task B's
+> larger run shows a gated feature dominates (then pull in B30). Category-(2) (`DETACH PARTITION`)
+> is a real bug to fix.
+
+| ID | Item | Why / status | Where it plugs in |
+|----|------|-------------|-------------------|
+| B35 | **RESTORE onto a content_addressed disk fails closed (`NOT_IMPLEMENTED` autocommit-part-write).** A backup restores by writing each part file through `DiskObjectStorage::writeFile` autocommit, which CA rejects (only the whole-part transaction may write part files). So `RESTORE TABLE … (onto CA)` cannot work in M1 even though `BACKUP` (pointer-holding) does. Clean error, not corruption. | Surfaced by the B34 smoke (`04284`); ties to B30/B16 | Route restore's per-part file writes through the B30 whole-part write contract (begin-part → write files → commit-part), the same seam INSERT/merge will use; until then the fail-closed error is the M1 contract. |
+| B36 | **`DETACH PARTITION` on CA mis-lists in `system.detached_parts` (real bug, category-2).** `00502_custom_partitioning_local`: after `DETACH PARTITION`, `system.detached_parts` shows `\N metadata_version.txt …` instead of the detached part directory `all_1_2_1`. `DETACH PARTITION` is not in the gated clone-class set; the detached-part shape on CA exposes a per-file sidecar/mutable object where a part directory is expected. | First category-(2) real bug from the M6 smoke | The DETACH path's part-directory materialization / detached-parts enumeration over a CA disk (sidecar `.meta` objects must not be surfaced as detached parts; the `isRefMetaKey`/detached-listing boundary). Root-cause in M6 Task C. |
+
 > Add new deferred items here as they arise during planning/implementation, always filling the
 > "where it plugs in" column so the architecture stays dead-end-free.

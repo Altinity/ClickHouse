@@ -451,6 +451,17 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
     {
         if (disk->getDataSourceDescription().metadata_type == MetadataStorageType::Keeper)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "ReplicatedMergeTree doesn't work with 's3_with_keeper' disk type");
+
+        /// B33: replication-internal clones (fetch-fallback, queue-driven REPLACE/MOVE) reach
+        /// cloneAndLoadDataPart -> freeze -> Backup -> per-file createHardLink autocommit, which
+        /// bypasses the ALTER-partition gate (checkAlterPartitionIsPossible) and would corrupt a
+        /// content-addressed part (the per-file-autocommit B21 mode). Reject ReplicatedMergeTree on
+        /// a content_addressed disk at CREATE/ATTACH (this ctor runs for both) until B1 lands.
+        if (disk->isContentAddressed())
+            throw Exception(
+                ErrorCodes::SUPPORT_IS_DISABLED,
+                "ReplicatedMergeTree is not supported on a content_addressed disk yet (B1); disk '{}'",
+                disk->getName());
     }
 
     initializeDirectoriesAndFormatVersion(relative_data_path_, LoadingStrictnessLevel::ATTACH <= mode, date_column_name);

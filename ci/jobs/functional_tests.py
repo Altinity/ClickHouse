@@ -113,6 +113,7 @@ OPTIONS_TO_INSTALL_ARGUMENTS = {
     "old analyzer": "--analyzer",
     "WasmEdge": "--wasm-engine wasmedge",
     "s3 storage": "--s3-storage",
+    "content_addressed storage": "--content-addressed-storage",
     "DatabaseReplicated": "--db-replicated",
     "DatabaseOrdinary": "--db-ordinary",
     "wide parts enabled": "--wide-parts",

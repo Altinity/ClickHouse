@@ -32,6 +32,7 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
     extern const int FILE_DOESNT_EXIST;
     extern const int CORRUPTED_DATA;
+    extern const int SUPPORT_IS_DISABLED;
 }
 
 std::unique_ptr<ReadBufferFromFileBase> IDataPartStorage::readFile(
@@ -385,6 +386,18 @@ void DataPartStorageOnDiskBase::backup(
     fs::path part_path_in_backup = fs::path{path_in_backup} / part_dir;
 
     auto disk = volume->getDisk();
+
+    /// B34: the temporary-hard-link BACKUP path (used for Ordinary, non-UUID databases) calls
+    /// disk->createHardLink with a non-part-shaped temp path, which on a content_addressed disk
+    /// would otherwise surface as a raw LOGICAL_ERROR. Fail closed with a clear message instead.
+    /// The pointer-holding path (make_temporary_hard_links=false, used by Atomic/UUID databases)
+    /// uses getStorageObjects and round-trips on a content_addressed disk, so it is left untouched.
+    if (make_temporary_hard_links && disk->isContentAddressed())
+        throw Exception(
+            ErrorCodes::SUPPORT_IS_DISABLED,
+            "BACKUP via temporary hard links is not supported on a content_addressed disk yet (B16/B34); "
+            "use an Atomic database (which backs up via pointer-holding) instead; disk '{}'",
+            disk->getName());
 
     fs::path temp_part_dir;
     std::shared_ptr<TemporaryFileOnDisk> temp_dir_owner;
