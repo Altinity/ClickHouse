@@ -111,6 +111,94 @@ void ContentAddressedTransaction::createHardLink(const std::string & from, const
     recordBlob(to, metadata_storage.resolveBlobEntry(from));
 }
 
+void ContentAddressedTransaction::setLastModified(const std::string &, const Poco::Timestamp &)
+{
+    /// No-op: per-file timestamps are derived, not stored. They play no role in CA resolution
+    /// (ref -> part_id -> footer -> blob). Reached via DiskObjectStorageTransaction.cpp:459.
+}
+
+void ContentAddressedTransaction::chmod(const String &, mode_t)
+{
+    /// No-op: permission bits are not stored for content-addressed objects.
+}
+
+void ContentAddressedTransaction::setReadOnly(const std::string &)
+{
+    /// No-op: content-addressed parts are immutable by construction; a read-only flag is implicit.
+}
+
+void ContentAddressedTransaction::moveDirectory(const std::string & from, const std::string & to)
+{
+    /// MergeTree assembles a part under a temporary directory (e.g. tmp_insert_<part>) and renames
+    /// it to the final <part> at commit. Re-pin the (table_uuid, part_name) target to the
+    /// destination so the ref is published under the final part name. The recorded blobs are keyed
+    /// by their in-part file name only and need not change; the content is already addressed, so no
+    /// objects are moved in storage.
+    auto dst_part = ContentAddressed::parsePartFilePath(to);
+
+    /// Only the part-directory rename (<uuid[:3]>/<uuid>/<part>) is meaningful for CA. A part
+    /// directory has no file component (file is empty). Anything else (e.g. a deeper move) is not
+    /// reached for an INSERT and would indicate an unexpected path shape.
+    if (!dst_part || !dst_part->file.empty())
+        return;
+
+    /// Nothing staged yet (directory-only move before any file write): adopt the destination.
+    if (table_uuid.empty() && part_name.empty())
+    {
+        table_uuid = dst_part->table_uuid;
+        part_name = dst_part->part_name;
+        return;
+    }
+
+    /// The source must be the part we have been assembling.
+    auto src_part = ContentAddressed::parsePartFilePath(from);
+    if (src_part && src_part->file.empty()
+        && src_part->table_uuid == table_uuid && src_part->part_name == part_name)
+    {
+        table_uuid = dst_part->table_uuid;
+        part_name = dst_part->part_name;
+    }
+    else
+    {
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "ContentAddressed: moveDirectory from {} to {} does not match the staged part {}/{}",
+            from, to, table_uuid, part_name);
+    }
+}
+
+void ContentAddressedTransaction::moveFile(const std::string & from, const std::string & to)
+{
+    /// Rename of a single in-part file: re-key the recorded blob. No object is moved in storage.
+    auto src = ContentAddressed::parsePartFilePath(from);
+    auto dst = ContentAddressed::parsePartFilePath(to);
+    if (!src || src->file.empty() || !dst || dst->file.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "ContentAddressed: moveFile requires two part-file paths: {} -> {}", from, to);
+
+    rememberTarget(to);
+    auto it = recorded.find(src->file);
+    if (it == recorded.end())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "ContentAddressed: moveFile source not recorded: {}", from);
+
+    auto entry = it->second;
+    recorded.erase(it);
+    recorded[dst->file] = std::move(entry);
+}
+
+void ContentAddressedTransaction::unlinkFile(const std::string & path, bool, bool)
+{
+    /// Drop a staged blob so it is excluded from the footer. For a non-part file or a file that was
+    /// never recorded there is nothing CA-resolution-relevant to remove. The underlying content
+    /// blob, if shared, is reclaimed by GC, not here.
+    if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->file.empty())
+        recorded.erase(p->file);
+}
+
+void ContentAddressedTransaction::truncateFile(const std::string &, size_t)
+{
+    /// No-op: content-addressed blobs are immutable; committed part files are never truncated.
+}
+
 void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant & options)
 {
     if (!std::holds_alternative<NoCommitOptions>(options))

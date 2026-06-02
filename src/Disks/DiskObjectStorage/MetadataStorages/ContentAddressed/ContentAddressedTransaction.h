@@ -71,6 +71,39 @@ public:
     // so this override is what real mutations / ATTACH reach when hardlinking unchanged files.
     void createHardLink(const std::string & path_from, const std::string & path_to) override;
 
+    // ==== Derived per-file metadata: no-ops for content-addressing ====
+    //
+    // For a content-addressed disk, per-file timestamps, permission bits, read-only flags and
+    // hardlink counts are not stored — they are derived (or simply absent) when a part is resolved
+    // via ref -> part_id -> footer -> blob. None of them participate in CA resolution, so the
+    // commit-replay calls that the INSERT / merge code path records for them are no-ops here.
+    void setLastModified(const std::string & path, const Poco::Timestamp & timestamp) override;
+    void chmod(const String & path, mode_t mode) override;
+    void setReadOnly(const std::string & path) override;
+
+    // Move/rename of a part directory. MergeTree writes a part under a temporary directory name
+    // (e.g. tmp_insert_<part>) and renames it to the final <part> name at commit. Content
+    // addressing keys recorded blobs by their in-part file name only, and the (table_uuid,
+    // part_name) target is re-pinned to the destination so the ref is published under the final
+    // part name. The blobs are already content-addressed, so no objects are moved in storage.
+    void moveDirectory(const std::string & path_from, const std::string & path_to) override;
+
+    // Move/rename of a single file within a part (e.g. column rename during a part write).
+    // Re-key the recorded blob from the source in-part file name to the destination one; no object
+    // is moved in storage since the blob is content-addressed.
+    void moveFile(const std::string & path_from, const std::string & path_to) override;
+
+    // Unlink a logical file. For a part file still being assembled in this commit, drop the
+    // recorded blob so it is excluded from the footer. For files that were never recorded (or
+    // non-part files), there is nothing CA-resolution-relevant to remove, so it is a no-op.
+    // The underlying content blob, if shared, is reclaimed by GC, not by an unlink here.
+    void unlinkFile(const std::string & path, bool if_exists, bool should_remove_objects) override;
+
+    // Truncate is meaningless for an immutable content-addressed blob; MergeTree does not truncate
+    // committed part files, so this is a no-op (it would only ever be reached for a logical file
+    // that is not part of CA resolution).
+    void truncateFile(const std::string & path, size_t size) override;
+
     // Backwards-compatible alias used by the direct-call tests; forwards to createHardLink.
     void createHardLinkFrom(const std::string & from, const std::string & to) { createHardLink(from, to); }
 
