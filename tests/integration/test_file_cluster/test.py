@@ -215,11 +215,6 @@ def test_format_detection(started_cluster):
 
 
 def test_hive_partitioning_with_where_condition(started_cluster):
-    """
-    Hive partition columns are also exposed as virtual columns. fileCluster passes both
-    lists to createPathAndFileFilterDAG without deduplication (unlike s3Cluster), which
-    duplicates block columns and triggers SIZES_OF_COLUMNS_DOESNT_MATCH when filtering.
-    """
     test_id = uuid.uuid4().hex[:8]
     hive_glob = f"hive_file_cluster_{test_id}/date=*/data.csv"
 

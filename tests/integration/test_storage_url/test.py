@@ -43,10 +43,6 @@ def test_partition_by():
 
 
 def test_hive_partitioning_with_where_condition():
-    """
-    Same hive + virtual column overlap as s3Cluster/fileCluster: urlCluster must not pass
-    duplicate hive partition names into createPathAndFileFilterDAG.
-    """
     test_id = uuid.uuid4().hex[:8]
     base_url = f"http://nginx:80/hive_url_cluster_{test_id}"
 
