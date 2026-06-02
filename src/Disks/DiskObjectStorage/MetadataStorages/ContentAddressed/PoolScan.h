@@ -8,7 +8,7 @@ namespace DB::ContentAddressed
 {
 
 /// Enumerate the full set of LIVE part ids in a content-addressed pool: every published ref under
-/// the pool's refs root (store/<server>/<uuid>/refs/<part>) names a part id (its payload). These
+/// the pool's refs root (the store/server/uuid/refs/part layout) names a part id (its payload). These
 /// are the GC roots — a part id is live iff at least one ref points at it. Any list or read error
 /// PROPAGATES so the caller aborts the sweep: a partial scan must never drive deletion (fail-close).
 std::set<std::string> listLivePartIds(const ObjectStoragePtr & object_storage, const std::string & key_prefix);

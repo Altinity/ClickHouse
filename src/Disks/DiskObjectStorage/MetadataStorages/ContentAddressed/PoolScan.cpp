@@ -61,7 +61,7 @@ std::vector<std::string> listKeysUnder(const ObjectStoragePtr & object_storage, 
 std::set<std::string> listLivePartIds(const ObjectStoragePtr & object_storage, const std::string & key_prefix)
 {
     /// Every server's/table's refs live under refsRootPrefix. The same root also holds verbatim
-    /// table-level files under store/<server>/<uuid>/files/, so we keep only keys whose path has a
+    /// table-level files under the store/server/uuid/files/ layout, so we keep only keys whose path has a
     /// /refs/ segment (the ref objects); their payload is the live part id.
     static const std::string refs_segment = "/refs/";
     std::set<std::string> live;
