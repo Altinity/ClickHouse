@@ -434,3 +434,59 @@ TEST_F(ContentAddressedMetaTest, DiskTransactionRoutesContentAddressedWrite)
               ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/b.bin")[0].remote_path);
     EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/b.bin")[0].remote_path), "SHARED");
 }
+
+// C1: the production carry-forward path goes through the disk layer's createHardLink, which
+// delegates to metadata_transaction->createHardLink. This exercises a mutation that rewrites
+// one file and hardlinks an unchanged one through the same DiskObjectStorageTransaction the
+// real write path uses (the direct createHardLinkFrom tests above masked the missing override).
+TEST_F(ContentAddressedMetaTest, DiskTransactionCarryForwardThroughCreateHardLink)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_disktxn_cf");
+    auto os = getObjectStorage("cas_disktxn_cf");
+    const std::string uuid = "uuid-disktxn-cf";
+
+    const DB::Location local_location = "local";
+    auto cluster = std::make_shared<DB::ClusterConfiguration>(
+        "cas_disktxn_cf_disk",
+        std::unordered_map<DB::Location, DB::LocationInfo>{
+            {local_location, DB::LocationInfo{/*enabled=*/true, /*local=*/true, /*config_prefix=*/""}}});
+    auto router = std::make_shared<DB::ObjectStorageRouter>(
+        std::unordered_map<DB::Location, DB::ObjectStoragePtr>{{local_location, os}});
+
+    auto new_disk_tx = [&]
+    {
+        return std::make_shared<DB::DiskObjectStorageTransaction>(
+            cluster, ms, router, /*blob_killer=*/nullptr, /*wait_blob_removal=*/false,
+            /*read_resource_name=*/"", /*write_resource_name=*/"");
+    };
+
+    // Source part: a.bin = A0, b.bin = B0.
+    {
+        auto disk_tx = new_disk_tx();
+        for (const auto & [name, bytes] : std::map<std::string, std::string>{{"a.bin", "A0"}, {"b.bin", "B0"}})
+        {
+            auto buf = disk_tx->writeFile("uui/" + uuid + "/all_1_1_0/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        disk_tx->commit();
+    }
+
+    // Mutation: rewrite a.bin -> A1, carry forward b.bin via the disk-layer createHardLink.
+    {
+        auto disk_tx = new_disk_tx();
+        auto buf = disk_tx->writeFile("uui/" + uuid + "/all_1_1_0_1/a.bin", 4096, DB::WriteMode::Rewrite, {});
+        buf->write("A1", 2);
+        buf->finalize();
+        disk_tx->createHardLink("uui/" + uuid + "/all_1_1_0/b.bin", "uui/" + uuid + "/all_1_1_0_1/b.bin");
+        disk_tx->commit();
+    }
+
+    // Rewritten file holds the new content.
+    EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/all_1_1_0_1/a.bin")[0].remote_path), "A1");
+    // Carried-forward b.bin points at the same blob as the source (no new upload).
+    EXPECT_EQ(ms->getStorageObjects("uui/" + uuid + "/all_1_1_0_1/b.bin")[0].remote_path,
+              ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/b.bin")[0].remote_path);
+    EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/all_1_1_0_1/b.bin")[0].remote_path), "B0");
+}

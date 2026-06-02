@@ -73,7 +73,7 @@ std::unique_ptr<ContentAddressed::ContentAddressedWriteBuffer> ContentAddressedT
         });
 }
 
-void ContentAddressedTransaction::createHardLinkFrom(const std::string & from, const std::string & to)
+void ContentAddressedTransaction::createHardLink(const std::string & from, const std::string & to)
 {
     rememberTarget(to);
 

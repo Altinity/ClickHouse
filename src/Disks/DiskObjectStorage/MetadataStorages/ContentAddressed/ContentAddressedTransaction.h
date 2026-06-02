@@ -50,7 +50,14 @@ public:
 
     // Carry a file forward from an already-committed (or in-flight) source part without
     // re-uploading: resolve the source blob and record it under the destination logical file.
-    void createHardLinkFrom(const std::string & from, const std::string & to);
+    //
+    // This is the production carry-forward entry point: the disk layer's
+    // DiskObjectStorageTransaction::createHardLink delegates to metadata_transaction->createHardLink,
+    // so this override is what real mutations / ATTACH reach when hardlinking unchanged files.
+    void createHardLink(const std::string & path_from, const std::string & path_to) override;
+
+    // Backwards-compatible alias used by the direct-call tests; forwards to createHardLink.
+    void createHardLinkFrom(const std::string & from, const std::string & to) { createHardLink(from, to); }
 
 private:
     // Record (logical_file -> blob) for the part being written; the part_id is derived from this.
