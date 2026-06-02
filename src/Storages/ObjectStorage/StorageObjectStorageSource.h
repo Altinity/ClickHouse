@@ -11,6 +11,11 @@
 #include <Processors/Formats/IInputFormat.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/ObjectStorage/IObjectIterator.h>
+<<<<<<< HEAD
+=======
+#include <Storages/ObjectStorage/Utils.h>
+#include <Formats/FormatParserSharedResources.h>
+>>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
 #include <Formats/FormatFilterInfo.h>
 
 namespace DB
@@ -160,6 +165,7 @@ public:
         size_t max_threads_count,
         bool is_archive_,
         ObjectStoragePtr object_storage_,
+        const std::string & table_location_,
         ContextPtr context_);
 
     ObjectInfoPtr next(size_t) override;
@@ -169,11 +175,19 @@ public:
 private:
     ObjectInfoPtr createObjectInfoInArchive(const std::string & path_to_archive, const std::string & path_in_archive);
 
+    /// For Iceberg objects: resolve which storage the file lives in (possibly a secondary storage)
+    /// from the raw metadata path and record it on the object. No-op for non-Iceberg objects.
+    void resolveIcebergObjectStorageIfNeeded(const ObjectInfoPtr & object);
+
     ClusterFunctionReadTaskCallback callback;
     ObjectInfos buffer;
     std::atomic_size_t index = 0;
     bool is_archive;
     ObjectStoragePtr object_storage;
+    std::string table_location;
+#if USE_AVRO
+    SecondaryStorages secondary_storages; /// For Iceberg: cache of storages for external file locations
+#endif
     /// path_to_archive -> archive reader.
     std::unordered_map<std::string, std::shared_ptr<IArchiveReader>> archive_readers;
     std::mutex archive_readers_mutex;

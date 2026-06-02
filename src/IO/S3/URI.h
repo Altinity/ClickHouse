@@ -41,7 +41,11 @@ struct URI
         const std::string & uri_,
         bool allow_archive_path_syntax = false,
         bool keep_presigned_query_parameters = true,
+<<<<<<< HEAD
         S3UriStyle uri_style = S3UriStyle::AUTO);
+=======
+        bool enable_url_encoding = true);
+>>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
     void addRegionToURI(const std::string & region);
 
     static void validateBucket(const std::string & bucket, const Poco::URI & uri);

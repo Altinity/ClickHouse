@@ -159,6 +159,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"max_rand_distribution_parameter", 1e6, 1e6, "New setting to limit shape parameters in random distribution functions, preventing hangs with extreme inputs."},
             {"optimize_truncate_order_by_after_group_by_keys", false, true, "Remove trailing ORDER BY elements once all GROUP BY keys are covered in the ORDER BY prefix."},
             {"use_statistics_for_part_pruning", false, true, "New setting to use statistics for part pruning during query execution."},
+            {"s3_propagate_credentials_to_other_storages", false, false, "New setting"},
             {"http_max_fields", 1000000, 1000, "Reduce default to limit pre-authentication memory usage by HTTP connections."},
             {"http_max_field_name_size", 131072, 4096, "Reduce default to limit pre-authentication memory usage by HTTP connections."},
             {"http_max_request_header_size", 0, 10485760, "New setting to limit total HTTP request header size before authentication."},

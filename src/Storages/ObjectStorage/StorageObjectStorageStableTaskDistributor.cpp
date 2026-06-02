@@ -1,4 +1,6 @@
 #include <Storages/ObjectStorage/StorageObjectStorageStableTaskDistributor.h>
+#include <Storages/ObjectStorage/Utils.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Common/SipHash.h>
 #include <consistent_hashing.h>
 #include <optional>
@@ -191,4 +193,62 @@ ObjectInfoPtr StorageObjectStorageStableTaskDistributor::getAnyUnprocessedFile(s
     return {};
 }
 
+<<<<<<< HEAD
+=======
+void StorageObjectStorageStableTaskDistributor::saveLastNodeActivity(size_t number_of_current_replica)
+{
+    Poco::Timestamp now;
+    std::lock_guard lock(mutex);
+    last_node_activity[number_of_current_replica] = now;
+}
+
+void StorageObjectStorageStableTaskDistributor::rescheduleTasksFromReplica(size_t number_of_current_replica)
+{
+    LOG_INFO(log, "Replica {} is marked as lost, tasks are returned to queue", number_of_current_replica);
+    std::lock_guard lock(mutex);
+
+    auto processed_file_list_ptr = replica_to_files_to_be_processed.find(number_of_current_replica);
+    if (processed_file_list_ptr == replica_to_files_to_be_processed.end())
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "Replica number {} was marked as lost already",
+            number_of_current_replica
+        );
+
+    if (replica_to_files_to_be_processed.size() < 2)
+        throw Exception(
+            ErrorCodes::CANNOT_READ_ALL_DATA,
+            "All replicas were marked as lost"
+        );
+
+    auto files = std::move(processed_file_list_ptr->second);
+    replica_to_files_to_be_processed.erase(number_of_current_replica);
+    for (const auto & file : files)
+    {
+        auto file_identifier = getFileIdentifier(file);
+        auto file_replica_idx = getReplicaForFile(file_identifier);
+        unprocessed_files.emplace(file_identifier, std::make_pair(file, file_replica_idx));
+        connection_to_files[file_replica_idx].push_back(file);
+    }
+}
+
+String StorageObjectStorageStableTaskDistributor::getFileIdentifier(ObjectInfoPtr file_object, bool write_to_log) const
+{
+    if (send_over_whole_archive && file_object->isArchive())
+    {
+        auto file_identifier = file_object->getPathOrPathToArchiveIfArchive();
+        if (write_to_log)
+        {
+            LOG_TEST(log, "Will send over the whole archive {} to replicas. "
+                        "This will be suboptimal, consider turning on "
+                        "cluster_function_process_archive_on_multiple_nodes setting", file_identifier);
+        }
+        return file_identifier;
+    }
+    /// Prefer the original Iceberg metadata path (possibly absolute / on another storage) when available,
+    /// so the same file is identified consistently across replicas.
+    return getMetadataPathFromObjectInfo(file_object).value_or(file_object->getIdentifier());
+}
+
+>>>>>>> 6a83f974ee6 (Merge pull request #1859 from Altinity/feat/antalya-26.3/90740)
 }
