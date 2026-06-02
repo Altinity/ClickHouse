@@ -8,6 +8,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolScan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGCThread.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
@@ -23,6 +24,11 @@
 
 #include <Core/ServerUUID.h>
 #include <Common/Exception.h>
+#include <Common/Logger.h>
+#include <Common/tests/gtest_global_context.h>
+
+#include <Poco/AutoPtr.h>
+#include <Poco/Util/XMLConfiguration.h>
 
 #include <filesystem>
 #include <mutex>
@@ -235,10 +241,12 @@ TEST_F(ContentAddressedMetaTest, ListsPartsAndPartFiles)
         writeObject(os, partKey("", pid), f.serialize());
         writeObject(os, refKey("", sid, uuid, part), pid);
     };
+    /// Real part ids are 32-char lowercase hex (computePartId); the ref read path resolves the
+    /// payload through partIdFromRefPayload (B28), so use valid-hex ids here as in production.
     Footer fa; fa.blobs["data.bin"] = {"k1", 3, "k1"}; fa.blobs["columns.txt"] = {"k2", 2, "k2"};
-    seed("all_1_1_0", "pidA", fa);
+    seed("all_1_1_0", "aaaa000000000000000000000000aaaa", fa);
     Footer fb; fb.blobs["data.bin"] = {"k3", 4, "k3"};
-    seed("all_2_2_0", "pidB", fb);
+    seed("all_2_2_0", "bbbb000000000000000000000000bbbb", fb);
 
     // table dir → part names
     auto parts = ms->listDirectory("uui/" + uuid + "/");
@@ -865,4 +873,44 @@ TEST_F(ContentAddressedMetaTest, SweepThrowsAndDeletesNothingOnMissingFooter)
     EXPECT_TRUE(objectExists(os, blobKey("", s.b_orphan)));
     EXPECT_TRUE(objectExists(os, partKey("", s.pid_a)));
     EXPECT_TRUE(objectExists(os, blobKey("", s.b1)));
+}
+
+// Background-thread driver (Task 3a): the ContentAddressedGCThread runs runSweepOnce on the schedule
+// pool. With a tiny grace, one triggerAndWait() round must reclaim the orphan footer + orphan blob
+// while the live footers and referenced blobs survive — proving the thread starts, runs the sweep,
+// stops cleanly, and uses the round counter (not a sleep) for synchronisation.
+TEST_F(ContentAddressedMetaTest, GCThreadSweepsOrphansAndKeepsLive)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_gc_thread");
+    auto os = getObjectStorage("cas_gc_thread");
+    auto s = seedGcPool(os, ms->serverIdForTest());
+
+    DB::ContentAddressedGCThread thread(
+        "cas_gc_thread_disk",
+        getContext().context,
+        os,
+        "",
+        getLogger("ContentAddressedGCThreadTest"));
+
+    /// grace 0 so a single round past first-unreachable reclaims orphans immediately.
+    Poco::AutoPtr<Poco::Util::XMLConfiguration> cfg(new Poco::Util::XMLConfiguration());
+    cfg->setInt("disk.content_addressed_gc_grace_sec", 0);
+    cfg->setInt("disk.content_addressed_gc_interval_sec", 600);
+    thread.applyNewSettings(*cfg, "disk");
+
+    thread.startup();
+    thread.triggerAndWait();
+
+    /// The orphan footer + orphan blob are gone; the 2 live footers + 3 referenced blobs remain.
+    EXPECT_FALSE(objectExists(os, partKey("", s.pid_orphan)));
+    EXPECT_FALSE(objectExists(os, blobKey("", s.b_orphan)));
+    EXPECT_TRUE(objectExists(os, partKey("", s.pid_a)));
+    EXPECT_TRUE(objectExists(os, partKey("", s.pid_b)));
+    EXPECT_TRUE(objectExists(os, blobKey("", s.b1)));
+    EXPECT_TRUE(objectExists(os, blobKey("", s.b2)));
+    EXPECT_TRUE(objectExists(os, blobKey("", s.b3)));
+
+    /// Clean shutdown must not hang or crash (deactivates the scheduled task).
+    thread.shutdown();
 }

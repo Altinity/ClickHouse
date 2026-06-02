@@ -22,20 +22,6 @@ namespace ContentAddressed
 namespace
 {
 
-/// Parse a ref object payload into the part id it names. The write path stores the part id verbatim
-/// (a 32-char lowercase-hex string, see computePartId). Per B22(c) we tolerate a possible leading
-/// version byte and trailing whitespace/newline by extracting the longest run of lowercase-hex
-/// characters: an unversioned payload is unchanged, a future versioned one drops its marker byte.
-/// An empty hex run is corruption (a published ref must name a part) and throws fail-close.
-std::string parseRefPayload(const std::string & payload, const std::string & ref_key)
-{
-    size_t begin = payload.find_first_of("0123456789abcdef");
-    if (begin == std::string::npos)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "ContentAddressed: ref {} has no part id in its payload", ref_key);
-    size_t end = payload.find_first_not_of("0123456789abcdef", begin);
-    return payload.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
-}
-
 std::string readSmallObject(const ObjectStoragePtr & object_storage, const std::string & key)
 {
     StoredObject object(key);
@@ -45,6 +31,15 @@ std::string readSmallObject(const ObjectStoragePtr & object_storage, const std::
     return content;
 }
 
+}
+
+std::string partIdFromRefPayload(const std::string & payload)
+{
+    size_t begin = payload.find_first_of("0123456789abcdef");
+    if (begin == std::string::npos)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "ContentAddressed: ref payload has no part id");
+    size_t end = payload.find_first_not_of("0123456789abcdef", begin);
+    return payload.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
 }
 
 std::vector<std::string> listKeysUnder(const ObjectStoragePtr & object_storage, const std::string & prefix)
@@ -69,7 +64,7 @@ std::set<std::string> listLivePartIds(const ObjectStoragePtr & object_storage, c
     {
         if (key.find(refs_segment) == std::string::npos)
             continue;
-        live.insert(parseRefPayload(readSmallObject(object_storage, key), key));
+        live.insert(partIdFromRefPayload(readSmallObject(object_storage, key)));
     }
     return live;
 }

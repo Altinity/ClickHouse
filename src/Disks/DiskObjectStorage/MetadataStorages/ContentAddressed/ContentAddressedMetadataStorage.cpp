@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolScan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/StaticDirectoryIterator.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 
@@ -12,6 +13,9 @@
 #include <IO/ReadSettings.h>
 
 #include <Common/Exception.h>
+#include <Common/Logger.h>
+
+#include <fmt/format.h>
 
 namespace fs = std::filesystem;
 
@@ -24,13 +28,40 @@ namespace ErrorCodes
     extern const int FILE_DOESNT_EXIST;
 }
 
-ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(ObjectStoragePtr object_storage_, String storage_path_prefix_, String server_id_, String local_scratch_path_)
+ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
+    ObjectStoragePtr object_storage_,
+    String storage_path_prefix_,
+    String server_id_,
+    String local_scratch_path_,
+    ContextPtr context_)
     : object_storage(std::move(object_storage_))
     , storage_path_prefix(std::move(storage_path_prefix_))
     , storage_path_full(fs::path(object_storage->getRootPrefix()) / storage_path_prefix)
     , server_id(std::move(server_id_))
     , local_scratch_path(std::move(local_scratch_path_))
 {
+    /// The GC thread exists only on the disk-factory path. The GC scans the same object storage under
+    /// the same key prefix used by the read/write sides (single source of truth), so its live set and
+    /// the read path resolve refs identically (B28).
+    if (context_)
+        gc_thread = std::make_shared<ContentAddressedGCThread>(
+            storage_path_full,
+            context_,
+            object_storage,
+            storage_path_prefix,
+            getLogger(fmt::format("{}::ContentAddressedGC", storage_path_full)));
+}
+
+void ContentAddressedMetadataStorage::startup()
+{
+    if (gc_thread)
+        gc_thread->startup();
+}
+
+void ContentAddressedMetadataStorage::shutdown()
+{
+    if (gc_thread)
+        gc_thread->shutdown();
 }
 
 MetadataTransactionPtr ContentAddressedMetadataStorage::createTransaction()
@@ -52,7 +83,12 @@ std::optional<std::string> ContentAddressedMetadataStorage::readSmallObjectIfExi
 
 std::optional<std::string> ContentAddressedMetadataStorage::readRefPartId(const std::string & table_uuid, const std::string & part_name) const
 {
-    return readSmallObjectIfExists(ContentAddressed::refKey(storage_path_prefix, server_id, table_uuid, part_name));
+    auto payload = readSmallObjectIfExists(ContentAddressed::refKey(storage_path_prefix, server_id, table_uuid, part_name));
+    if (!payload)
+        return std::nullopt;
+    /// Resolve through the single ref-payload parser shared with the GC live-set scan (B28): the read
+    /// path and GC's reachability roots therefore name the SAME part id for a given ref by construction.
+    return ContentAddressed::partIdFromRefPayload(*payload);
 }
 
 ContentAddressed::Footer ContentAddressedMetadataStorage::loadFooterOrThrow(const std::string & part_id) const

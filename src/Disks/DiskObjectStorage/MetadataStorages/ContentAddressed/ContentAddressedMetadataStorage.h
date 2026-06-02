@@ -2,6 +2,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Footer.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGCThread.h>
+#include <Interpreters/Context_fwd.h>
 #include <optional>
 #include <string>
 
@@ -16,7 +18,15 @@ public:
     /// local_scratch_path_ is a real server-local filesystem directory used to spill part files
     /// while hashing them before upload. It must NOT be derived from the object-storage key prefix:
     /// for a remote object storage (e.g. s3) that prefix is a remote KEY prefix, not a local path.
-    ContentAddressedMetadataStorage(ObjectStoragePtr object_storage_, String storage_path_prefix_, String server_id_, String local_scratch_path_);
+    /// context_ is LAST and defaults to nullptr so unit tests that exercise the read/write paths
+    /// directly can construct the storage without spinning up a background GC thread. When non-null
+    /// (the disk-factory path), a ContentAddressedGCThread is created and driven by startup/shutdown.
+    ContentAddressedMetadataStorage(
+        ObjectStoragePtr object_storage_,
+        String storage_path_prefix_,
+        String server_id_,
+        String local_scratch_path_,
+        ContextPtr context_ = nullptr);
 
     MetadataStorageType getType() const override { return MetadataStorageType::ContentAddressed; }
     const std::string & getPath() const override { return storage_path_full; }
@@ -29,6 +39,10 @@ public:
 
     MetadataTransactionPtr createTransaction() override;
 
+    /// Disk lifecycle hooks (called by DiskObjectStorage start/stop): drive the background GC thread.
+    void startup() override;
+    void shutdown() override;
+
     bool existsFile(const std::string & path) const override;
     bool existsDirectory(const std::string & path) const override;
     bool existsFileOrDirectory(const std::string & path) const override;
@@ -39,6 +53,9 @@ public:
     StoredObjects getStorageObjects(const std::string & path) const override;
 
     const std::string & serverIdForTest() const { return server_id; }
+
+    /// Test hook: run one synchronous GC sweep round and wait for it (no-op if no GC thread).
+    const ContentAddressedGCThreadPtr & gcThreadForTest() const { return gc_thread; }
 
 private:
     friend class ContentAddressedTransaction;
@@ -70,6 +87,9 @@ private:
     const std::string server_id;
     /// Server-local scratch dir for the write-buffer spill (see ctor doc).
     const std::string local_scratch_path;
+
+    /// Background pool garbage collector, present only on the disk-factory path (context non-null).
+    ContentAddressedGCThreadPtr gc_thread;
 };
 
 }

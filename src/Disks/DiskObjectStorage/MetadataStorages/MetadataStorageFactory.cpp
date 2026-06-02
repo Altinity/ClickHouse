@@ -229,7 +229,16 @@ void registerContentAddressedMetadataStorage(MetadataStorageFactory & factory)
                                                     fs::path(Context::getGlobalContextInstance()->getPath()) / "disks" / name / "cas_scratch" / "");
         fs::create_directories(local_scratch_path);
 
-        return std::make_shared<ContentAddressedMetadataStorage>(local_object_storage, key_compatibility_prefix, toString(ServerUUID::get()), local_scratch_path);
+        auto global_context = Context::getGlobalContextInstance();
+        auto metadata_storage = std::make_shared<ContentAddressedMetadataStorage>(
+            local_object_storage, key_compatibility_prefix, toString(ServerUUID::get()), local_scratch_path, global_context);
+
+        /// Pass GC tuning (interval/grace) so the stateless GC test can request a short grace. The
+        /// thread reads content_addressed_gc_interval_sec / content_addressed_gc_grace_sec atomics.
+        if (const auto & gc_thread = metadata_storage->gcThreadForTest())
+            gc_thread->applyNewSettings(config, config_prefix);
+
+        return metadata_storage;
     });
 }
 
