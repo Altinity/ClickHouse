@@ -67,6 +67,23 @@ public:
     void createDirectoryRecursive(const std::string & path) override;
     void removeDirectory(const std::string & path) override;
 
+    // Recursive removal = pointer-unlink + deferred GC.
+    //
+    // DROP TABLE and outdated-part cleanup reach this via DiskObjectStorageTransaction's
+    // removeSharedRecursive / removeRecursive at commit. For a content-addressed pool, removal
+    // deletes only the POINTER objects that the incoming path covers — the per-(server,table) refs
+    // and the verbatim table-level / generic disk-level files — and NEVER the shared backing objects
+    // (blobs/ content, parts/ footers). Those are reclaimed later by the Phase-4 reachability GC, so
+    // an orphaned blob/footer leaks until then. That is the known, accepted M1 state (merges already
+    // leak this way).
+    //
+    // The should_remove_objects predicate governs whether the SHARED backing objects (blobs) are
+    // deleted. For content addressing the answer is always "no" (deferred GC), and the ref metadata
+    // is always removed, so the predicate does not gate ref deletion here. Deletion is scoped
+    // strictly by table_uuid / path so dropping one table never touches another table's refs in the
+    // shared pool.
+    void removeRecursive(const std::string & path, const ShouldRemoveObjectsPredicate & should_remove_objects) override;
+
     // Carry a file forward from an already-committed (or in-flight) source part without
     // re-uploading: resolve the source blob and record it under the destination logical file.
     //

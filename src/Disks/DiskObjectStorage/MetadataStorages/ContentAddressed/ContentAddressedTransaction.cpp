@@ -291,4 +291,56 @@ void ContentAddressedTransaction::removeDirectory(const std::string &)
     /// No-op (see createDirectory).
 }
 
+void ContentAddressedTransaction::removeRecursive(const std::string & path, const ShouldRemoveObjectsPredicate &)
+{
+    /// Removal = pointer-unlink + deferred GC. We delete only the pointer objects the path covers
+    /// (refs and verbatim table-level / generic files) and never the shared blobs/ content or
+    /// parts/ footers — the Phase-4 reachability GC reclaims those. The should_remove_objects
+    /// predicate is about whether to delete the shared backing objects (blobs); for content
+    /// addressing we always KEEP them (deferred GC) and always remove the ref metadata, so the
+    /// predicate does not gate ref deletion and is intentionally ignored here.
+    /// TODO(phase4-gc): orphaned blobs/footers leak until the reachability GC runs.
+
+    /// Enumerate every object under a key prefix and delete it. listObjects(prefix) returns objects
+    /// whose key starts with prefix, exactly as ContentAddressedMetadataStorage's directory listing
+    /// enumerates refs.
+    auto remove_under_prefix = [this](const std::string & prefix)
+    {
+        RelativePathsWithMetadata children;
+        metadata_storage.object_storage->listObjects(prefix, children, /*max_keys=*/0);
+
+        StoredObjects to_remove;
+        to_remove.reserve(children.size());
+        for (const auto & child : children)
+            to_remove.emplace_back(child->relative_path);
+
+        if (!to_remove.empty())
+            metadata_storage.object_storage->removeObjectsIfExist(to_remove);
+    };
+
+    /// Part directory <uuid[:3]>/<uuid>/<part> (a part path with no file component): delete the
+    /// single ref. Absent ref (e.g. an uncommitted tmp part) is a no-op. Footer + blobs are kept.
+    if (auto p = ContentAddressed::parsePartFilePath(path); p && p->file.empty())
+    {
+        const std::string ref_key
+            = ContentAddressed::refKey(key_prefix, metadata_storage.server_id, p->table_uuid, p->part_name);
+        metadata_storage.object_storage->removeObjectIfExists(StoredObject(ref_key));
+        return;
+    }
+
+    /// Table directory <uuid[:3]>/<uuid> (parses to a table uuid, no part): delete ALL refs and ALL
+    /// verbatim table-level files for this (server, table). Scoped by table_uuid so a DROP of one
+    /// table never touches another table's refs in the shared pool. Blobs/footers are kept.
+    if (auto uuid = ContentAddressed::parseTableUuid(path))
+    {
+        remove_under_prefix(ContentAddressed::refsPrefix(key_prefix, metadata_storage.server_id, *uuid));
+        remove_under_prefix(ContentAddressed::tableFilesPrefix(key_prefix, metadata_storage.server_id, *uuid));
+        return;
+    }
+
+    /// Generic disk-level path (neither a part nor a table dir, e.g. the disk root or an
+    /// access-check probe directory): delete the verbatim objects under its diskFileKey prefix.
+    remove_under_prefix(ContentAddressed::diskFileKey(key_prefix, path));
+}
+
 }

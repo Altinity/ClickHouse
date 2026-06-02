@@ -361,6 +361,73 @@ TEST_F(ContentAddressedMetaTest, WritePartThenReadBackAndDedup)
               ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/b.bin")[0].remote_path);
 }
 
+// P3.5: removeRecursive = pointer-unlink + deferred GC. Dropping a part / table deletes only the
+// ref pointer objects (and verbatim table-level files); the shared parts/ footer and blobs/ content
+// are intentionally KEPT — they are reclaimed later by the Phase-4 reachability GC. This proves the
+// unlink-not-GC behaviour that lets DROP TABLE complete without leaking through a hung retry loop.
+TEST_F(ContentAddressedMetaTest, RemoveUnlinksRefsKeepsBlobs)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_remove");
+    auto os = getObjectStorage("cas_remove");
+    const std::string sid = ms->serverIdForTest();
+    const std::string uuid = "uuid-remove";
+
+    auto write_part = [&](const std::string & part, const std::map<std::string, std::string> & files)
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"");
+        for (const auto & [name, bytes] : files)
+        {
+            auto buf = tx.writeFile("uui/" + uuid + "/" + part + "/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    };
+
+    // Two parts sharing one column ("SHARED") so we can confirm a single-part removal leaves the
+    // other part — and the shared blob — fully intact.
+    write_part("all_1_1_0", {{"a.bin", "AAA"}, {"b.bin", "SHARED"}, {"columns.txt", "a b"}});
+    write_part("all_2_2_0", {{"a.bin", "ZZZ"}, {"b.bin", "SHARED"}, {"columns.txt", "a b"}});
+
+    // Capture the backing object keys (footer + blobs) we expect to SURVIVE removal.
+    const std::string blob_a1 = ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/a.bin")[0].remote_path;
+    const std::string blob_shared = ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/b.bin")[0].remote_path;
+    const std::string ref_1 = refKey("", sid, uuid, "all_1_1_0");
+    const std::string ref_2 = refKey("", sid, uuid, "all_2_2_0");
+    ASSERT_TRUE(os->tryGetObjectMetadata(ref_1, /*with_tags=*/false).has_value());
+    ASSERT_TRUE(os->tryGetObjectMetadata(ref_2, /*with_tags=*/false).has_value());
+    ASSERT_TRUE(os->tryGetObjectMetadata(blob_a1, /*with_tags=*/false).has_value());
+    ASSERT_TRUE(os->tryGetObjectMetadata(blob_shared, /*with_tags=*/false).has_value());
+
+    // (1) Removing a single part directory deletes ONLY that part's ref.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"");
+        tx.removeRecursive("uui/" + uuid + "/all_1_1_0", /*should_remove_objects=*/nullptr);
+        tx.commit(DB::NoCommitOptions{});
+    }
+    EXPECT_FALSE(os->tryGetObjectMetadata(ref_1, /*with_tags=*/false).has_value()); // gone
+    EXPECT_TRUE(os->tryGetObjectMetadata(ref_2, /*with_tags=*/false).has_value());  // other part untouched
+    // The footer + blobs of the removed part survive (deferred GC); the surviving part still reads.
+    EXPECT_TRUE(os->tryGetObjectMetadata(blob_a1, /*with_tags=*/false).has_value());
+    EXPECT_TRUE(os->tryGetObjectMetadata(blob_shared, /*with_tags=*/false).has_value());
+    EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/a.bin")[0].remote_path), "ZZZ");
+    EXPECT_EQ(readObject(os, blob_shared), "SHARED");
+
+    // (2) Removing the whole table directory deletes ALL remaining refs but KEEPS the blobs.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"");
+        tx.removeRecursive("uui/" + uuid, /*should_remove_objects=*/nullptr);
+        tx.commit(DB::NoCommitOptions{});
+    }
+    EXPECT_FALSE(os->tryGetObjectMetadata(ref_2, /*with_tags=*/false).has_value()); // last ref gone
+    EXPECT_FALSE(ms->existsDirectory("uui/" + uuid + "/"));                          // table dir empty
+    // Unlink-not-GC: the footer object and both blob objects are STILL present after DROP.
+    EXPECT_TRUE(os->tryGetObjectMetadata(blob_a1, /*with_tags=*/false).has_value());
+    EXPECT_TRUE(os->tryGetObjectMetadata(blob_shared, /*with_tags=*/false).has_value());
+    EXPECT_EQ(readObject(os, blob_shared), "SHARED"); // blob content intact, reclaimable by GC
+}
+
 // P3.5: non-part / table-level files (e.g. format_version.txt) are written verbatim to a direct
 // object key (no content addressing, no ref, no footer) and resolve straight back. A part file in
 // the same table still resolves via the ref/footer/blob path, so the two schemes coexist.
