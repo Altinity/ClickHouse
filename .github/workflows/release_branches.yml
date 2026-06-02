@@ -91,13 +91,13 @@ jobs:
           DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Download changed aarch64 images
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: changed_images_aarch64
           path: ${{ runner.temp }}
 
       - name: Download changed amd64 images
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: changed_images_amd64
           path: ${{ runner.temp }}
@@ -669,7 +669,7 @@ jobs:
       - name: Check out repository code
         uses: actions/checkout@v4
       - name: Download json reports
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: build_report_package_release
           path: ${{ env.REPORTS_PATH }}
@@ -711,7 +711,7 @@ jobs:
       - name: Check out repository code
         uses: actions/checkout@v4
       - name: Download json reports
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: build_report_package_aarch64
           path: ${{ env.REPORTS_PATH }}
