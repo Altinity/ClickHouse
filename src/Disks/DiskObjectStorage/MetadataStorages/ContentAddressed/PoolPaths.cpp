@@ -61,6 +61,18 @@ RefObjectKey refKey(const std::string & key_prefix, const std::string & server_i
     return RefObjectKey(refsPrefix(key_prefix, server_id, table_uuid) + part_name);
 }
 
+RefMetaObjectKey refMetaKey(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid, const std::string & part_name)
+{
+    /// Sidecar sits next to the ref, under the same refs/ prefix (see header): refs/<part_name>.meta.
+    return RefMetaObjectKey(refsPrefix(key_prefix, server_id, table_uuid) + part_name + std::string(kRefMetaSuffix));
+}
+
+bool isRefMetaKey(const std::string & key)
+{
+    return key.size() >= kRefMetaSuffix.size()
+        && std::string_view(key).substr(key.size() - kRefMetaSuffix.size()) == kRefMetaSuffix;
+}
+
 std::string tableFilesPrefix(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid)
 {
     return withPrefix(key_prefix, "store/" + server_id + "/" + table_uuid + "/files/");

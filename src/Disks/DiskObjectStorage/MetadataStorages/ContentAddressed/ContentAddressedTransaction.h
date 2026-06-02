@@ -71,6 +71,33 @@ private:
     size_t size = 0;
 };
 
+/// Write buffer for a MUTABLE per-part file (uuid.txt / txn_version.txt / metadata_version.txt).
+///
+/// Unlike a content file, a mutable file must NOT be content-addressed: two parts with identical
+/// content share one manifest, but each keeps its own mutable bytes. So this buffer does NOT upload a
+/// blob — it accumulates the bytes in memory and, on finalize, hands them to the owning transaction
+/// to store inline in that part's per-ref sidecar (no orphan blob is ever created). The bytes are
+/// tiny (a uuid / a small integer), so in-memory accumulation is appropriate.
+class ContentAddressedInlineWriteBuffer : public WriteBufferFromFileBase
+{
+public:
+    /// Invoked from finalizeImpl with the fully-accumulated file bytes.
+    using OnInlined = std::function<void(std::string bytes)>;
+
+    explicit ContentAddressedInlineWriteBuffer(OnInlined on_inlined_);
+    ~ContentAddressedInlineWriteBuffer() override;
+
+    void sync() override;
+    std::string getFileName() const override;
+
+private:
+    void nextImpl() override;
+    void finalizeImpl() override;
+
+    OnInlined on_inlined;
+    std::string accumulated;
+};
+
 }
 
 // Transaction for the content-addressed metadata storage.
@@ -203,6 +230,9 @@ private:
     /// Server-local scratch dir for the write-buffer spill (see ctor).
     const std::string local_scratch_path;
     std::map<std::string, ContentAddressed::BlobEntry> recorded;
+    /// Mutable per-part files (isMutablePerPartFile): their raw bytes, stored inline in the per-ref
+    /// sidecar at commit instead of the shared manifest. Keyed by in-part logical file name.
+    std::map<std::string, std::string> recorded_mutable;
     std::string table_uuid;
     std::string part_name;
 };

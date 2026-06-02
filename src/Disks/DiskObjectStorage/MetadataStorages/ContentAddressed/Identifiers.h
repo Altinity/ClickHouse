@@ -44,6 +44,9 @@ CONTENT_ADDRESSED_STRONG_STRING(PartId)
 CONTENT_ADDRESSED_STRONG_STRING(PartObjectKey)
 /// The full ref object key <prefix>/store/<server>/<uuid>/refs/<part>.
 CONTENT_ADDRESSED_STRONG_STRING(RefObjectKey)
+/// The full per-ref sidecar object key <prefix>/store/<server>/<uuid>/refs/<part>.meta. It holds the
+/// part's mutable per-part files (RefSidecar); ref-scoped, removed with the ref, never the manifest.
+CONTENT_ADDRESSED_STRONG_STRING(RefMetaObjectKey)
 
 #undef CONTENT_ADDRESSED_STRONG_STRING
 
@@ -64,5 +67,6 @@ CONTENT_ADDRESSED_STRONG_STRING_HASH(BlobObjectKey)
 CONTENT_ADDRESSED_STRONG_STRING_HASH(PartId)
 CONTENT_ADDRESSED_STRONG_STRING_HASH(PartObjectKey)
 CONTENT_ADDRESSED_STRONG_STRING_HASH(RefObjectKey)
+CONTENT_ADDRESSED_STRONG_STRING_HASH(RefMetaObjectKey)
 
 #undef CONTENT_ADDRESSED_STRONG_STRING_HASH

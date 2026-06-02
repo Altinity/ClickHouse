@@ -66,6 +66,14 @@ private:
     // Throws if the path is not a part file, the ref is absent, or the file is not in the manifest.
     ContentAddressed::BlobEntry resolveBlobEntry(const std::string & path) const;
 
+    // Resolve a MUTABLE per-part file (uuid.txt / txn_version.txt / metadata_version.txt) path to its
+    // raw bytes from the part's per-ref sidecar (carry-forward source for mutations). Throws if the
+    // path is not such a file, the ref is absent, or the sidecar lacks the file (fail-close).
+    std::string resolveMutableFileBytes(const std::string & path) const;
+
+    // Read and deserialize the per-ref sidecar for (table_uuid, part_name) if present (else nullopt).
+    std::optional<ContentAddressed::RefSidecar> readRefSidecarIfExists(const std::string & table_uuid, const std::string & part_name) const;
+
     // Resolve helpers: part file -> ref -> part_id -> manifest -> blob. All object keys are built
     // under storage_path_prefix (the object-storage common key prefix), the single source of truth
     // shared with ContentAddressedTransaction so the read and write sides cannot disagree.

@@ -131,6 +131,28 @@ ContentAddressed::BlobEntry ContentAddressedMetadataStorage::resolveBlobEntry(co
     return it->second;
 }
 
+std::optional<ContentAddressed::RefSidecar> ContentAddressedMetadataStorage::readRefSidecarIfExists(const std::string & table_uuid, const std::string & part_name) const
+{
+    auto bytes = readSmallObjectIfExists(ContentAddressed::refMetaKey(storage_path_prefix, server_id, table_uuid, part_name).string());
+    if (!bytes)
+        return std::nullopt;
+    return ContentAddressed::RefSidecar::deserialize(*bytes);
+}
+
+std::string ContentAddressedMetadataStorage::resolveMutableFileBytes(const std::string & path) const
+{
+    auto p = ContentAddressed::parsePartFilePath(path);
+    if (!p || p->file.empty() || !ContentAddressed::isMutablePerPartFile(p->file))
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a mutable per-part file path: {}", path);
+    auto sidecar = readRefSidecarIfExists(p->table_uuid, p->part_name);
+    if (!sidecar)
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref sidecar for {}", path);
+    auto it = sidecar->files.find(p->file);
+    if (it == sidecar->files.end())
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: mutable file {} not in sidecar of {}", p->file, path);
+    return it->second;
+}
+
 bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
 {
     /// Non-part files resolve to a direct object key: a table-level file (e.g. format_version.txt)
@@ -159,10 +181,14 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
 {
     if (auto uuid = ContentAddressed::parseTableUuid(path))
     {
-        // Table dir exists iff it has at least one ref (part).
+        // Table dir exists iff it has at least one ref (part). Skip per-ref sidecars (.meta): they are
+        // not refs and a sidecar without a ref must not make a dropped table dir look non-empty.
         RelativePathsWithMetadata files;
         object_storage->listObjects(ContentAddressed::refsPrefix(storage_path_prefix, server_id, *uuid), files, 0);
-        return !files.empty();
+        for (const auto & file : files)
+            if (!ContentAddressed::isRefMetaKey(file->relative_path))
+                return true;
+        return false;
     }
     if (auto p = ContentAddressed::parsePartFilePath(path); p && p->file.empty())
     {
@@ -243,6 +269,10 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
         for (const auto & elem : files)
         {
             const auto & p = elem->relative_path;
+            // Per-ref sidecars (.meta) live under the same refs/ prefix but are not parts; skip them
+            // so a part dir never appears twice (once as <part>, once as <part>.meta).
+            if (ContentAddressed::isRefMetaKey(p))
+                continue;
             const auto child_pos = p.find(prefix);
             if (child_pos != 0)
                 continue;

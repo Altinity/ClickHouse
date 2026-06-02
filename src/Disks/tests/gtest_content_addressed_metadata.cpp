@@ -375,6 +375,68 @@ TEST_F(ContentAddressedMetaTest, WritePartThenReadBackAndDedup)
               ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/b.bin")[0].remote_path);
 }
 
+// B23 Task 2 (collision regression): two parts with IDENTICAL column content but DIFFERENT mutable
+// per-part files (uuid.txt / txn_version.txt). They MUST still dedup to the same part_id / manifest,
+// but each MUST keep its own per-ref .meta sidecar, so resolving a mutable file returns that part's
+// OWN bytes. Before the split both parts shared the one manifest (put-if-absent kept the first
+// writer's copy), so the second part read the FIRST part's txn_version — silent per-part corruption.
+TEST_F(ContentAddressedMetaTest, IdenticalContentDifferentMutableFilesDoNotCollide)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_collide");
+    auto os = getObjectStorage("cas_collide");
+    const std::string sid = ms->serverIdForTest();
+    const std::string uuid = "uuid-collide";
+
+    auto write_part = [&](const std::string & part, const std::map<std::string, std::string> & files)
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        for (const auto & [name, bytes] : files)
+        {
+            auto buf = tx.writeFile("uui/" + uuid + "/" + part + "/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    };
+
+    // Identical column data ("AAA"), identical columns.txt — but DIFFERENT mutable files.
+    write_part("all_1_1_0", {{"a.bin", "AAA"}, {"columns.txt", "a"}, {"uuid.txt", "UUID-ONE"}, {"txn_version.txt", "11"}});
+    write_part("all_2_2_0", {{"a.bin", "AAA"}, {"columns.txt", "a"}, {"uuid.txt", "UUID-TWO"}, {"txn_version.txt", "22"}});
+
+    // (a) Dedup preserved: both refs resolve to the SAME part_id / manifest object.
+    auto pid1 = partIdFromRefPayload(readObject(os, refKey("", sid, uuid, "all_1_1_0").string()));
+    auto pid2 = partIdFromRefPayload(readObject(os, refKey("", sid, uuid, "all_2_2_0").string()));
+    EXPECT_EQ(pid1, pid2);
+
+    // (b) Each part has its OWN per-ref sidecar object holding that part's DISTINCT mutable bytes.
+    const std::string meta1 = refMetaKey("", sid, uuid, "all_1_1_0").string();
+    const std::string meta2 = refMetaKey("", sid, uuid, "all_2_2_0").string();
+    EXPECT_NE(meta1, meta2);
+    ASSERT_TRUE(os->tryGetObjectMetadata(meta1, /*with_tags=*/false).has_value());
+    ASSERT_TRUE(os->tryGetObjectMetadata(meta2, /*with_tags=*/false).has_value());
+
+    // (c) The sidecars carry each part's OWN bytes (no collision). This is the regression the split
+    // fixes: before it, both parts shared the one manifest and the second read the first's bytes.
+    auto s1 = RefSidecar::deserialize(readObject(os, meta1));
+    auto s2 = RefSidecar::deserialize(readObject(os, meta2));
+    EXPECT_EQ(s1.files.at("txn_version.txt"), "11");
+    EXPECT_EQ(s2.files.at("txn_version.txt"), "22");
+    EXPECT_EQ(s1.files.at("uuid.txt"), "UUID-ONE");
+    EXPECT_EQ(s2.files.at("uuid.txt"), "UUID-TWO");
+
+    // (d) The shared manifest holds ONLY content-identical files — the mutable files are NOT in it.
+    auto manifest = PartManifest::deserialize(readObject(os, partKey("", pid1).string()));
+    EXPECT_TRUE(manifest.blobs.contains("a.bin"));
+    EXPECT_TRUE(manifest.blobs.contains("columns.txt"));
+    EXPECT_FALSE(manifest.blobs.contains("txn_version.txt"));
+    EXPECT_FALSE(manifest.blobs.contains("uuid.txt"));
+
+    // The content file still resolves via the shared manifest -> blob (one deduped blob for both).
+    EXPECT_EQ(ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/a.bin")[0].remote_path,
+              ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/a.bin")[0].remote_path);
+}
+
 // P3.5: removeRecursive = pointer-unlink + deferred GC. Dropping a part / table deletes only the
 // ref pointer objects (and verbatim table-level files); the shared parts/ manifest and blobs/ content
 // are intentionally KEPT — they are reclaimed later by the Phase-4 reachability GC. This proves the

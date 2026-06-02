@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace DB::ContentAddressed
 {
@@ -30,6 +31,22 @@ std::string refsRootPrefix(const std::string & key_prefix);
 // Per-server/per-table ref object key: <key_prefix>/store/<server_id>/<table_uuid>/refs/<part_name>.
 std::string refsPrefix(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid);
 RefObjectKey refKey(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid, const std::string & part_name);
+
+// Per-ref sidecar object key: <key_prefix>/store/<server_id>/<table_uuid>/refs/<part_name>.meta. It
+// holds the part's mutable per-part files (RefSidecar). It lives UNDER the same refs/ prefix the ref
+// itself does, so removeRecursive's ref-scoped deletion (which lists+deletes everything under
+// refsPrefix) already reclaims it — a crashed/aborted write leaves no orphan the reachability sweep
+// (which scans only blobs/+parts/) would miss, because the sidecar is never reachable as a blob/part.
+RefMetaObjectKey refMetaKey(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid, const std::string & part_name);
+
+// The suffix that distinguishes a per-ref sidecar object from a ref object under the SAME refs/
+// prefix. Every enumerator that treats a key under refsPrefix as a ref (the table-dir listing,
+// existsDirectory, and the GC live-set scan) must skip keys ending in this suffix, since a sidecar
+// is not a ref and its payload is a RefSidecar, not a part id.
+inline constexpr std::string_view kRefMetaSuffix = ".meta";
+
+// True iff key (a key under some refsPrefix) is a per-ref sidecar rather than a ref object.
+bool isRefMetaKey(const std::string & key);
 
 // Per-server/per-table direct object key for non-part / table-level files (e.g.
 // format_version.txt, later mutation_*.txt). These are stored verbatim (no content addressing,

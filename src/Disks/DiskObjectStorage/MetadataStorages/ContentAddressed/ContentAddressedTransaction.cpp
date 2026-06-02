@@ -91,6 +91,16 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     auto p = ContentAddressed::parsePartFilePath(path);
     const std::string file = p->file;
 
+    /// A MUTABLE per-part file (uuid.txt / txn_version.txt / metadata_version.txt) is NOT
+    /// content-addressed: it is stored inline in this part's per-ref sidecar so two parts with
+    /// identical content keep their own mutable bytes. Capture the bytes in memory and record them
+    /// for the sidecar at commit — no blob is uploaded (so no orphan blob is created).
+    if (ContentAddressed::isMutablePerPartFile(file))
+    {
+        return std::make_unique<ContentAddressed::ContentAddressedInlineWriteBuffer>(
+            [this, file](std::string bytes) { recorded_mutable[file] = std::move(bytes); });
+    }
+
     /// The blob is keyed under the same common key prefix as the read path (key_prefix, taken from
     /// the metadata storage). The write buffer spills the part file to a real server-local scratch
     /// dir while hashing it, then uploads to blobs/<hash>. The scratch dir is a local filesystem
@@ -109,6 +119,29 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
 void ContentAddressedTransaction::createHardLink(const std::string & from, const std::string & to)
 {
     rememberTarget(to);
+
+    auto dst = ContentAddressed::parsePartFilePath(to);
+    chassert(dst && !dst->file.empty());
+
+    /// A MUTABLE per-part file carries forward by VALUE (its private bytes), not by blob reference:
+    /// prefer the in-flight inline bytes from this commit, else read the committed source part's
+    /// sidecar. It never enters the manifest, so it must not go through recordBlob.
+    if (ContentAddressed::isMutablePerPartFile(dst->file))
+    {
+        if (auto src = ContentAddressed::parsePartFilePath(from); src && !src->file.empty())
+        {
+            if (src->table_uuid == table_uuid && src->part_name == part_name)
+            {
+                if (auto it = recorded_mutable.find(src->file); it != recorded_mutable.end())
+                {
+                    recorded_mutable[dst->file] = it->second;
+                    return;
+                }
+            }
+        }
+        recorded_mutable[dst->file] = metadata_storage.resolveMutableFileBytes(from);
+        return;
+    }
 
     /// Resolve the source blob: prefer an in-flight blob recorded earlier in this same commit,
     /// else fall back to the committed source part via the metadata storage.
@@ -192,6 +225,16 @@ void ContentAddressedTransaction::moveFile(const std::string & from, const std::
         throw Exception(ErrorCodes::LOGICAL_ERROR, "ContentAddressed: moveFile requires two part-file paths: {} -> {}", from, to);
 
     rememberTarget(to);
+
+    /// A mutable per-part file is staged inline (recorded_mutable), not as a blob; re-key it there.
+    if (auto mit = recorded_mutable.find(src->file); mit != recorded_mutable.end())
+    {
+        auto bytes = std::move(mit->second);
+        recorded_mutable.erase(mit);
+        recorded_mutable[dst->file] = std::move(bytes);
+        return;
+    }
+
     auto it = recorded.find(src->file);
     if (it == recorded.end())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "ContentAddressed: moveFile source not recorded: {}", from);
@@ -208,6 +251,7 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool, boo
     if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->file.empty())
     {
         recorded.erase(p->file);
+        recorded_mutable.erase(p->file);
         return;
     }
 
@@ -234,12 +278,16 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
         throwNotImplemented();
 
     /// Nothing was staged (e.g. a directory-only transaction): no part to publish.
-    if (recorded.empty())
+    if (recorded.empty() && recorded_mutable.empty())
         return;
 
     if (table_uuid.empty() || part_name.empty())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "ContentAddressed: commit without a resolved part target");
 
+    /// Partition: content-identical files go to the shared manifest (and dedup); the mutable per-part
+    /// files (recorded_mutable) go to this part's PRIVATE per-ref sidecar, never the manifest. The
+    /// manifest holds only content state, so two parts with identical content share one manifest while
+    /// each keeps its own uuid / txn / metadata version (B23).
     ContentAddressed::PartManifest manifest;
     manifest.blobs = recorded;
 
@@ -253,6 +301,22 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
         auto out = metadata_storage.object_storage->writeObject(StoredObject(part_key), WriteMode::Rewrite);
         out->write(bytes.data(), bytes.size());
         out->finalize();
+    }
+
+    /// Write the per-ref sidecar BEFORE the ref (the ref is the last, publishing step). A crashed
+    /// write that gets this far but never publishes the ref leaves a sidecar whose ref is absent; that
+    /// sidecar lives under the same refs/ prefix as the ref, so removeRecursive's ref-scoped deletion
+    /// reclaims it on the next DROP, and it is never a content-addressed object the reachability sweep
+    /// could miss (the sweep scans only blobs/+parts/). So sidecars cannot leak (B23 orphan concern).
+    if (!recorded_mutable.empty())
+    {
+        ContentAddressed::RefSidecar sidecar;
+        sidecar.files = recorded_mutable;
+        const std::string meta_key = ContentAddressed::refMetaKey(key_prefix, metadata_storage.server_id, table_uuid, part_name).string();
+        const std::string meta_bytes = sidecar.serialize();
+        auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite);
+        meta_out->write(meta_bytes.data(), meta_bytes.size());
+        meta_out->finalize();
     }
 
     // Publish the ref last: store/{server_id}/{table_uuid}/refs/{part_name} = part_id. The on-disk
@@ -457,6 +521,43 @@ void ContentAddressedWriteBuffer::removeTempFile() noexcept
         return;
     std::error_code ec;
     fs::remove(temp_path, ec);
+}
+
+ContentAddressedInlineWriteBuffer::ContentAddressedInlineWriteBuffer(OnInlined on_inlined_)
+    : WriteBufferFromFileBase(DBMS_DEFAULT_BUFFER_SIZE, nullptr, 0)
+    , on_inlined(std::move(on_inlined_))
+{
+}
+
+ContentAddressedInlineWriteBuffer::~ContentAddressedInlineWriteBuffer()
+{
+    /// Best-effort cleanup if finalize() was never called (e.g. an exception unwound the stack).
+    cancel();
+}
+
+void ContentAddressedInlineWriteBuffer::nextImpl()
+{
+    if (!offset())
+        return;
+    accumulated.append(working_buffer.begin(), offset());
+}
+
+void ContentAddressedInlineWriteBuffer::finalizeImpl()
+{
+    /// Flush our own buffered data into the accumulator first.
+    next();
+    if (on_inlined)
+        on_inlined(std::move(accumulated));
+}
+
+void ContentAddressedInlineWriteBuffer::sync()
+{
+    next();
+}
+
+std::string ContentAddressedInlineWriteBuffer::getFileName() const
+{
+    return "<content-addressed-inline>";
 }
 
 }

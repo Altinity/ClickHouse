@@ -64,12 +64,16 @@ std::set<PartId> listLivePartIds(const ObjectStoragePtr & object_storage, const 
 {
     /// Every server's/table's refs live under refsRootPrefix. The same root also holds verbatim
     /// table-level files under the store/server/uuid/files/ layout, so we keep only keys whose path has a
-    /// /refs/ segment (the ref objects); their payload is the live part id.
+    /// /refs/ segment (the ref objects); their payload is the live part id. Per-ref sidecars (.meta)
+    /// also live under /refs/ but are NOT refs (their payload is a RefSidecar, not a part id), so skip
+    /// them: a sidecar is ref-scoped, removed with the ref, and never a GC root.
     static const std::string refs_segment = "/refs/";
     std::set<PartId> live;
     for (const auto & key : listKeysUnder(object_storage, refsRootPrefix(key_prefix)))
     {
         if (key.find(refs_segment) == std::string::npos)
+            continue;
+        if (isRefMetaKey(key))
             continue;
         live.insert(partIdFromRefPayload(readSmallObject(object_storage, key)));
     }
