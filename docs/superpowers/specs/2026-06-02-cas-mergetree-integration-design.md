@@ -41,7 +41,7 @@ New code (all behind one new `metadata_type = content_addressed`):
 - **`RefCatalog`** (interface): list/put/drop refs. M1 impl = S3 objects under `store/<uuid>/{refs,detached,frozen}/`. Replicated impl (B1) = Keeper `/parts`.
 - **`BlobRefIndex`** (interface): blob/part refcount. M1 impl = in-memory; scale impl (B9) = RocksDB + prefix-sharded reconciliation.
 - **GC coordination/lock** (interface): M1 impl = in-process mutex (reuse `grab_old_parts_mutex`); multi-writer impl (B11) = Keeper leader-election + ephemeral lock + re-validate-at-delete.
-- **Pool-ownership lease** (`_pool_owner`): fail-closed guard so two uncoordinated processes can't silently share a pool.
+- **Pool coordinator + self-check**: a `_pool_meta` record (pool format version, `coordination = none | keeper` + Keeper path, owner/leader lease); validates config + detects concurrent mounters at startup/periodically and **fails closed** on conflict. The `keeper` mode plugs the GC-coordination + `RefCatalog` Keeper impls in for any multi-mounted pool (replication being one consumer).
 
 Reused unchanged: `MetadataStorageFactory` + `metadata_type=` config; part discovery (`loadDataParts` → `disk->iterateDirectory`); read (`prepareRead` → `getStorageObjects` → `FileCache`); commit (`renameTempPartAndReplace` → `IDataPartStorage::rename`); removal (`grabOldParts` → `IDataPartStorage::remove` → `removeSharedRecursive(keep_all_batch_data = true)`); in-process reader protection (`isSharedPtrUnique`); **all part classes (Wide/Compact), `MergedBlockOutputStream`, `MergeTreeData`, `StorageMergeTree`.**
 
@@ -64,6 +64,7 @@ Reused unchanged: `MetadataStorageFactory` + `metadata_type=` config; part disco
 - **blob key** = the file's existing `checksums.txt` cityHash128 **+ size** (collision guard, verified on read).
 - **refs** are the only mutable records and the listable directory entries, namespaced **per server/replica** (`store/<serverid>/<table_uuid>/`) so multiple writers' refs never collide and the GC can mark the **union across serverids** (this is the replicated per-replica `/parts`, B1). **`parts/`+`blobs/`** are content-addressed and **shared across the whole pool** (this is what makes replication no-copy).
 - **frozen** lives at `store/<serverid>/frozen/<snapshot>/<table_uuid>/` — *outside* the table's data path — so a freeze has an **independent lifetime** (survives `DROP TABLE`, like local `shadow/`); it remains a GC root.
+- **The footer and ref are versioned, extensible formats** (the core expandability rule). Because pool objects are immutable, deferred features extend the formats *additively* without breaking existing objects: the **footer** reserves a `projections` section (nested `part_id`s, B5) and patch-part references; the **ref** reserves the full `ReplicatedMergeTreePartHeader` (`columns_hash` + `MinimalisticDataPartChecksums`, required for B1 cross-replica divergence detection) plus the mutable `txn_version`/`metadata_version`. M1 writes the minimal version (`part_id` + columns_hash + size); later milestones bump the format version additively. A reader rejects a format version it does not understand (fail-closed).
 - **Hierarchy** is Git-shaped: `ref (name→part_id) → part (part_id→file checksums) → blob (checksum→bytes)`.
 
 ## 5. Data flow {#data-flow}
@@ -73,7 +74,7 @@ M1 **reuses `StorageMergeTree`'s in-memory active-set / covering / DROP** unchan
 - **INSERT/MERGE/MUTATE write** — the part is **built in local scratch**, where `HashingWriteBuffer` already computes each file's checksum as it writes (the merge runs entirely locally; S3 sees nothing). On commit (the temp→active `rename`): **upload each file directly to `blobs/<checksum>`** via `putIfAbsent` (idempotent, dedups — no S3 rename/copy because the checksum is known first), write the `parts/<part_id>` footer, publish the ref. Local scratch ≤ part size during the build (served by the local/`FileCache` volume).
 - **READ** — `iterateDirectory(refs)` → part names (existing discovery); file read → `getStorageObjects(part/file)` → ref → `part_id` → footer → `blobs/<csum>` (whole object) → existing read + `FileCache` stack. Footer cached. (One-GET open = B10.)
 - **MUTATION carry-forward** — `MutateTask` is **unchanged**; its existing `createHardLinkFrom` for unchanged columns *means*, on this metadata type, "the new footer entry points at the same blob checksum" — reference, no re-upload, no new object. Changed columns are written fresh. New `part_id`, new footer mixing old+new checksums, new ref. The source stays live through the mutation, so its carried-forward blobs are continuously reachable.
-- **REMOVAL** — `grabOldParts` → `IDataPartStorage::remove` → drop **only the ref** (`removeSharedRecursive(keep_all_batch_data = true)`); all global parts/blobs kept. Always safe. The part vanishes from `iterateDirectory`, never rediscovered.
+- **REMOVAL** — `grabOldParts` → `IDataPartStorage::remove`. The content-addressed metadata storage's `remove` deletes **only the ref object** and emits the **deref-delta** (−1 each blob in the part's footer) to the `BlobRefIndex`; the global `parts/`+`blobs/` are kept (content-addressed, GC-managed). This is the *spirit* of `keep_all_batch_data = true`, but the metadata storage controls exactly what is removed (the ref) vs kept (the pool) — the generic flag keeps *all* remote, which would wrongly keep the ref too. Always safe; the part vanishes from `iterateDirectory`, never rediscovered.
 - **DROP PARTITION/PART** — existing `StorageMergeTree` path removes covered parts → `remove` → drops refs. Blobs reclaimed by GC.
 - **DETACH/ATTACH** — move the ref between `refs/` and `detached/` (metadata only; content untouched; detached stays a GC root). External-part ATTACH (ingest foreign bytes) → B12.
 
@@ -108,14 +109,19 @@ Four pressure points and their mitigations, all designed in:
 **Invariant: one pool (disk root) = exactly one GC coordinator.**
 
 - **Multiple tables, same server, same disk** — fine; one metadata-storage instance, one GC, one pool (intended cross-table-dedup case).
-- **Independent processes sharing one pool** (two servers on one bucket, *or* replicas of one table) — the **same problem**: they need a single-leader Keeper-elected GC + lock, mark over the **union of all `store/<serverid>/…/refs`**, re-validate-at-delete, and a **global delta feed the leader can consume** — which the Keeper replication `/log` + per-replica `/parts` watches already provide (so the leader stays delta-driven, no full `LIST`; see §6). Refs become Keeper-backed via the `RefCatalog` seam. This is B1+B11. **The layout does not change** — replicas just mount the same pool; only a coordination layer is added, behind the `RefCatalog` and GC-coordination seams.
-- **M1 safety for the shared-pool case** — the **`_pool_owner` lease** makes an uncoordinated second process **fail closed** (refuse to GC/mount), so a shared bucket can never silently lose data even before B11 lands.
+- **Pool coordination is a *disk-level* property, orthogonal to table replication.** A CAS disk is configured `coordination = none | keeper`:
+  - **`none`** (single mounter) — the disk holds an S3 ownership lease and **fails closed** if it detects another live mounter. M1 default.
+  - **`keeper`** (multi-mounter — *including but not limited to replication*) — the disk joins a Keeper coordination path for **leader-elected GC + the GC lock**; refs are published through the **Keeper `RefCatalog`**, whose change-watches give the single-leader GC its **delta feed** (so even a *non-replicated* table on a multi-mounted pool stays delta-driven and safe, no full `LIST`, no replication `/log` required).
+- **Self-check (first-class in M1).** The pool carries a `_pool_meta` record (pool format version, `coordination` mode + Keeper path, owner/leader lease). Every mounter validates its config against `_pool_meta` at startup and periodically, and detects other live mounters; on any conflict/mismatch — two `none` mounters, `none`-vs-`keeper`, divergent Keeper paths, incompatible format version — it **fails closed**. This catches the misconfigurations that would otherwise corrupt the shared pool.
+- **Independent processes sharing one pool** (two servers on one bucket, *or* replicas of one table) are the **same problem**, solved by `coordination = keeper`: single-leader GC + lock, mark over the **union of all `store/<serverid>/…/refs`**, re-validate-at-delete. **The layout does not change** — mounters just share the pool; only the coordination layer differs, behind the `RefCatalog` and GC-coordination seams.
 
-**Replication readiness (B1):** content pool unchanged; `RefCatalog` swaps S3→Keeper; GC-coordination swaps in-process→Keeper leader+lock; mark becomes union-over-replicas. No layout or GC-logic rework.
+**Replication readiness (B1):** content pool unchanged; replication is a *consumer* of `keeper` pool coordination, adding only per-replica `/parts` semantics + the `/log`. `RefCatalog` swaps S3→Keeper; GC-coordination swaps in-process→Keeper leader+lock; mark becomes union-over-serverids. No layout or GC-logic rework.
 
 ## 9. Configuration / opt-in {#configuration}
 
-A new `metadata_type = content_addressed` on an object-storage disk (the `plain_rewritable` precedent). Users add that disk to a storage policy and point a normal non-replicated `MergeTree` at it — no engine, no DDL change. Disk/server settings: `grace`, `gc_period`, `BlobRefIndex` impl, scratch volume.
+A new `metadata_type = content_addressed` on an object-storage disk (the `plain_rewritable` precedent). Users add that disk to a storage policy and point a normal non-replicated `MergeTree` at it — no engine, no DDL change. Disk/server settings: `coordination` (`none` | `keeper`) + `coordination_keeper_path`, `grace`, `gc_period`, `BlobRefIndex` impl, scratch volume.
+
+**Fail-closed feature gate.** M1 must *reject* (at `CREATE`/`ATTACH`) what it does not yet implement, rather than silently mishandle it: tables with **projections** or **patch parts / lightweight delete** (B5), and `ALTER … FREEZE` if its DDL is deferred (B4). It also fails closed on an unrecognized pool/footer/ref **format version** and on the pool self-check (§8). Features are enabled incrementally per the backlog.
 
 ## 10. Error handling and failure modes {#error-handling}
 
@@ -139,6 +145,9 @@ A new `metadata_type = content_addressed` on an object-storage disk (the `plain_
 - `grace` default and clock/visibility-skew margin.
 - Whether `ALTER … FREEZE` writes frozen refs in M1 or defers entirely (namespace + GC-root reserved either way).
 - Manifest/footer canonicalization determinism (golden tests) — B6.
+- **Cross-producer dedup is settings-dependent** — identical content dedups only when compression / `index_granularity(_bytes)` / sparse-serialization settings match across producers; mismatch → no dedup (more storage), **never incorrect**. A quality caveat, not a correctness risk.
+- Whether **`coordination = keeper`** ships in M1 or as the immediate next milestone (the self-check + `coordination = none` ship in M1 regardless).
+- Migration / mixed-version rollout — B13.
 
 ## 13. Deferred backlog {#deferred-backlog}
 
