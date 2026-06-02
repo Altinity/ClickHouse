@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 #include <Disks/WriteMode.h>
 
+#include <Common/Exception.h>
 #include <Common/getRandomASCIIString.h>
 #include <IO/ReadBufferFromFile.h>
 #include <IO/copyData.h>
@@ -12,6 +13,14 @@
 #include <filesystem>
 
 namespace fs = std::filesystem;
+
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int CORRUPTED_DATA;
+}
+}
 
 namespace DB::ContentAddressed
 {
@@ -60,9 +69,26 @@ void ContentAddressedWriteBuffer::finalizeImpl()
 
     const std::string key = blobKey(key_prefix, blob_hash);
 
-    /// Put-if-absent: identical content deduplicates to the same blob, so skip the upload when
-    /// the object already exists.
-    if (!object_storage->tryGetObjectMetadata(key, /*with_tags=*/false).has_value())
+    /// Skip re-uploading when the blob already exists (content dedup). This is a check-then-write,
+    /// NOT an atomic put-if-absent — safe here because the key IS the content hash: a racing writer
+    /// to the same key writes identical bytes, so the worst case is a redundant upload, never wrong
+    /// content. In single-writer M1 a blob is never read until its part's ref is published at commit
+    /// (after this write completes), so there is no read-during-write. An atomic conditional PUT
+    /// (If-None-Match) and safe multi-writer are deferred (B7/B11). One thing we DO guard now: if an
+    /// object already exists at the key but with a different size, that is either a 128-bit hash
+    /// collision or a partially-written blob from a crashed writer (LocalObjectStorage writes in
+    /// place, no temp+rename) — fail closed rather than silently trust it.
+    auto existing = object_storage->tryGetObjectMetadata(key, /*with_tags=*/false);
+    if (existing.has_value())
+    {
+        if (existing->size_bytes != size)
+            throw Exception(
+                ErrorCodes::CORRUPTED_DATA,
+                "Content-addressed blob {} already exists with size {} but new content has size {} "
+                "(hash collision or partially-written blob)",
+                key, existing->size_bytes, size);
+    }
+    else
     {
         ReadBufferFromFile in(temp_path);
         auto out = object_storage->writeObject(StoredObject(key), WriteMode::Rewrite);
