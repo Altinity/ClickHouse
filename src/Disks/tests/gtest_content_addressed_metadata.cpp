@@ -4,6 +4,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Footer.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedWriteBuffer.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
@@ -284,4 +286,96 @@ TEST_F(ContentAddressedMetaTest, WriteBufferUploadsContentAddressed)
     }
     EXPECT_NE(hash2, hash1);
     EXPECT_EQ(readObject(os, blobKey(hash2)), "OTHER");
+}
+
+TEST(ContentAddressedPartId, DeterministicAndExcludesMutableFiles)
+{
+    using namespace DB::ContentAddressed;
+    std::map<std::string, BlobEntry> a;
+    a["a.bin"] = {"h1", 3, "h1"};
+    a["b.bin"] = {"h2", 6, "h2"};
+
+    // Order of insertion does not matter (std::map sorts), so an equal logical map => equal id.
+    std::map<std::string, BlobEntry> a2;
+    a2["b.bin"] = {"h2", 6, "h2"};
+    a2["a.bin"] = {"h1", 3, "h1"};
+    EXPECT_EQ(computePartId(a), computePartId(a2));
+
+    // Mutable files do not contribute to the identity.
+    std::map<std::string, BlobEntry> with_mutable = a;
+    with_mutable["uuid.txt"] = {"u", 1, "u"};
+    with_mutable["txn_version.txt"] = {"t", 1, "t"};
+    with_mutable["metadata_version.txt"] = {"m", 1, "m"};
+    EXPECT_EQ(computePartId(a), computePartId(with_mutable));
+
+    // A different column checksum changes the identity.
+    std::map<std::string, BlobEntry> b = a;
+    b["a.bin"] = {"h1x", 3, "h1x"};
+    EXPECT_NE(computePartId(a), computePartId(b));
+
+    // Lowercase hex of a 128-bit value.
+    const std::string id = computePartId(a);
+    EXPECT_EQ(id.size(), 32u);
+    EXPECT_EQ(id.find_first_not_of("0123456789abcdef"), std::string::npos);
+}
+
+TEST_F(ContentAddressedMetaTest, WritePartThenReadBackAndDedup)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_wtxn");
+    auto os = getObjectStorage("cas_wtxn");
+    const std::string uuid = "uuid-9";
+
+    auto write_part = [&](const std::string & part, const std::map<std::string,std::string> & files)
+    {
+        DB::ContentAddressedTransaction tx(*ms);
+        for (const auto & [name, bytes] : files)
+        {
+            auto buf = tx.writeFile("uui/" + uuid + "/" + part + "/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    };
+
+    write_part("all_1_1_0", {{"a.bin","AAA"}, {"b.bin","SHARED"}, {"columns.txt","a b"}});
+    write_part("all_2_2_0", {{"a.bin","ZZZ"}, {"b.bin","SHARED"}, {"columns.txt","a b"}});
+
+    // read back via the Phase-2 resolution path
+    auto objs = ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/a.bin");
+    ASSERT_EQ(objs.size(), 1u);
+    EXPECT_EQ(readObject(os, objs[0].remote_path), "AAA");
+    EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/b.bin")[0].remote_path), "SHARED");
+
+    // dedup: the shared "SHARED" column is one blob object
+    EXPECT_EQ(ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/b.bin")[0].remote_path,
+              ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/b.bin")[0].remote_path);
+}
+
+TEST_F(ContentAddressedMetaTest, MutationCarryForwardReusesBlob)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_cf");
+    auto os = getObjectStorage("cas_cf");
+    const std::string uuid = "uuid-10";
+    // source part
+    {
+        DB::ContentAddressedTransaction tx(*ms);
+        for (auto & [n,b] : std::map<std::string,std::string>{{"a.bin","A0"},{"b.bin","B0"},{"columns.txt","a b"}})
+        { auto buf = tx.writeFile("uui/" + uuid + "/all_1_1_0/" + n, 4096, DB::WriteMode::Rewrite, {}); buf->write(b.data(), b.size()); buf->finalize(); }
+        tx.commit(DB::NoCommitOptions{});
+    }
+    // mutation: rewrite a.bin, carry-forward b.bin + columns.txt
+    {
+        DB::ContentAddressedTransaction tx(*ms);
+        auto buf = tx.writeFile("uui/" + uuid + "/all_1_1_0_1/a.bin", 4096, DB::WriteMode::Rewrite, {});
+        buf->write("A1", 2); buf->finalize();
+        tx.createHardLinkFrom("uui/" + uuid + "/all_1_1_0/b.bin", "uui/" + uuid + "/all_1_1_0_1/b.bin");
+        tx.createHardLinkFrom("uui/" + uuid + "/all_1_1_0/columns.txt", "uui/" + uuid + "/all_1_1_0_1/columns.txt");
+        tx.commit(DB::NoCommitOptions{});
+    }
+    EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/all_1_1_0_1/a.bin")[0].remote_path), "A1");
+    // b.bin carried forward → same blob object as the source
+    EXPECT_EQ(ms->getStorageObjects("uui/" + uuid + "/all_1_1_0_1/b.bin")[0].remote_path,
+              ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/b.bin")[0].remote_path);
 }

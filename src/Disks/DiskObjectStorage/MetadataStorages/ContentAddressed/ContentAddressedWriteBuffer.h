@@ -5,6 +5,7 @@
 #include <IO/WriteBufferFromFile.h>
 #include <IO/WriteBufferFromFileBase.h>
 
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -25,7 +26,11 @@ namespace DB::ContentAddressed
 class ContentAddressedWriteBuffer : public WriteBufferFromFileBase
 {
 public:
-    ContentAddressedWriteBuffer(ObjectStoragePtr object_storage_, std::string temp_dir_);
+    /// Invoked from finalizeImpl once the content hash is known and the blob has been uploaded
+    /// (or found already present). Lets the owning transaction record (logical_file -> blob).
+    using OnFinalized = std::function<void(const std::string & blob_hash, size_t size)>;
+
+    ContentAddressedWriteBuffer(ObjectStoragePtr object_storage_, std::string temp_dir_, OnFinalized on_finalized_ = {});
     ~ContentAddressedWriteBuffer() override;
 
     void sync() override;
@@ -43,6 +48,7 @@ private:
 
     ObjectStoragePtr object_storage;
     std::string temp_path;
+    OnFinalized on_finalized;
 
     std::unique_ptr<WriteBufferFromFile> temp_file;
     std::unique_ptr<HashingWriteBuffer> hashing;

@@ -37,6 +37,12 @@ public:
     const std::string & serverIdForTest() const { return server_id; }
 
 private:
+    friend class ContentAddressedTransaction;
+
+    // Resolve a part-file path to its footer BlobEntry (carry-forward source for mutations).
+    // Throws if the path is not a part file, the ref is absent, or the file is not in the footer.
+    ContentAddressed::BlobEntry resolveBlobEntry(const std::string & path) const;
+
     // Resolve helpers: part file -> ref -> part_id -> footer -> blob.
     // TODO(phase3): honor object_storage->getCommonKeyPrefix() (bare keys for now).
     // No footer cache in M1 (read each time); caching is a later optimization.

@@ -66,6 +66,21 @@ ContentAddressed::Footer ContentAddressedMetadataStorage::loadFooterOrThrow(cons
     return ContentAddressed::Footer::deserialize(*bytes);
 }
 
+ContentAddressed::BlobEntry ContentAddressedMetadataStorage::resolveBlobEntry(const std::string & path) const
+{
+    auto p = ContentAddressed::parsePartFilePath(path);
+    if (!p || p->file.empty())
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);
+    auto pid = readRefPartId(p->table_uuid, p->part_name);
+    if (!pid)
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
+    auto footer = loadFooterOrThrow(*pid);
+    auto it = footer.blobs.find(p->file);
+    if (it == footer.blobs.end())
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in footer of {}", p->file, path);
+    return it->second;
+}
+
 bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
 {
     auto p = ContentAddressed::parsePartFilePath(path);

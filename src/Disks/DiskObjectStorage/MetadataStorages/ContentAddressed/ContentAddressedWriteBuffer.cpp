@@ -16,9 +16,10 @@ namespace fs = std::filesystem;
 namespace DB::ContentAddressed
 {
 
-ContentAddressedWriteBuffer::ContentAddressedWriteBuffer(ObjectStoragePtr object_storage_, std::string temp_dir_)
+ContentAddressedWriteBuffer::ContentAddressedWriteBuffer(ObjectStoragePtr object_storage_, std::string temp_dir_, OnFinalized on_finalized_)
     : WriteBufferFromFileBase(DBMS_DEFAULT_BUFFER_SIZE, nullptr, 0)
     , object_storage(std::move(object_storage_))
+    , on_finalized(std::move(on_finalized_))
 {
     fs::create_directories(temp_dir_);
     temp_path = temp_dir_ + "/" + getRandomASCIIString(32) + ".tmp";
@@ -69,6 +70,10 @@ void ContentAddressedWriteBuffer::finalizeImpl()
     }
 
     removeTempFile();
+
+    /// The hash is known and the blob is durable; let the owning transaction record it.
+    if (on_finalized)
+        on_finalized(blob_hash, size);
 }
 
 void ContentAddressedWriteBuffer::sync()
