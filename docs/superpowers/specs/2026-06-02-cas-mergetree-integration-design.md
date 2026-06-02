@@ -52,16 +52,18 @@ Reused unchanged: `MetadataStorageFactory` + `metadata_type=` config; part disco
   blobs/<h0>/<h1>/<file_checksum>          GLOBAL, immutable; one part file's bytes (.bin/marks/columns.txt/primary.idx/…)
   parts/<h0>/<h1>/<part_id>                GLOBAL, immutable; the footer (file→blob checksum) + deterministic small files
   _pool_owner                              ownership lease (concurrency guard)
-  store/<table_uuid>/
-    refs/<part_name>          → { part_id, columns_hash(header), mutable fields }   active   (GC root)
-    detached/<detached_name>  → part_id                                            detached (GC root, not active)
-    frozen/<snapshot>/<part>  → part_id                                            frozen   (GC root)
+  store/<serverid>/                        per server/replica (distinct refs in a shared pool)
+    <table_uuid>/
+      refs/<part_name>          → { part_id, columns_hash(header), mutable fields }   active   (GC root)
+      detached/<detached_name>  → part_id                                            detached (GC root, not active)
+    frozen/<snapshot>/<table_uuid>/<part>  → part_id                                 frozen   (GC root, table-lifetime-independent)
 ```
 
 - `<h0>/<h1>` = hash-prefix fan-out (S3 per-prefix rate limits; enables prefix-sharded reconciliation).
 - **`part_id`** = `MergeTreeDataPartChecksums::getTotalChecksumUInt128` computed over the **deterministic file subset** — excluding `uuid.txt`, `txn_version.txt`, `metadata_version.txt` (random/mutable per replica). Those excluded/mutable fields live in the ref.
 - **blob key** = the file's existing `checksums.txt` cityHash128 **+ size** (collision guard, verified on read).
-- **refs** are the only mutable, per-table records and the listable directory entries (per-replica when replicated → B1). **`parts/`+`blobs/`** are content-addressed and **shared across the pool** (this is what makes replication no-copy).
+- **refs** are the only mutable records and the listable directory entries, namespaced **per server/replica** (`store/<serverid>/<table_uuid>/`) so multiple writers' refs never collide and the GC can mark the **union across serverids** (this is the replicated per-replica `/parts`, B1). **`parts/`+`blobs/`** are content-addressed and **shared across the whole pool** (this is what makes replication no-copy).
+- **frozen** lives at `store/<serverid>/frozen/<snapshot>/<table_uuid>/` — *outside* the table's data path — so a freeze has an **independent lifetime** (survives `DROP TABLE`, like local `shadow/`); it remains a GC root.
 - **Hierarchy** is Git-shaped: `ref (name→part_id) → part (part_id→file checksums) → blob (checksum→bytes)`.
 
 ## 5. Data flow {#data-flow}
@@ -81,6 +83,7 @@ A background, per-disk, periodic sweeper over the global pool.
 
 - **Mark roots** = `refs/ ∪ detached/ ∪ frozen/` across all tables (via `RefCatalog`). Reachability is hierarchical: a `part_id` is reachable iff a ref points at it; a blob iff some reachable footer lists it.
 - **Steady state is delta-driven, never a full `LIST`.** The `BlobRefIndex` is maintained by part lifecycle events only: on commit, read the new footer and `+1` each blob/part; on ref-drop, `−1`. GC sweeps **refcount-0 objects past `grace`**. Cost = O(parts dropped since last pass × footer size) + the actual `DeleteObjects`.
+- **Delta-driven requires a single coordinator with a *complete* view of the pool's ref changes** — this is the load-bearing assumption. A per-process refcount that sees only its own commits/drops is wrong as soon as a second writer exists. Three regimes: **(M1, single process)** the only writer maintains the `BlobRefIndex` from its own events — complete by construction. **(coordinated multi-writer, B11)** the global delta feed already exists as the Keeper replication **`/log`** + per-replica `/parts` watches (every add/remove across all replicas); the **single-leader GC** consumes it incrementally — still no full `LIST`; the refcount is the leader's rebuildable derived cache. **(uncoordinated multi-writer)** no global delta feed exists → delta-driven is impossible safely → **fail-closed via `_pool_owner`**. The full prefix-sharded reachability scan is the rare reconciliation/recovery path, never the steady state.
 - **`grace` is measured from loss of reachability** (`first_unreachable[obj]` per pass; reachable ⇒ erased), and only needs to exceed the **longest part-upload window** (not merge/query duration — the merge is local). It is therefore small, which also keeps dropped-data retention short.
 - **Reconciliation** = a rare, prefix-sharded full reachability scan that rebuilds the `BlobRefIndex` from S3 ground truth (after crash / on drift audit / DR). The refcount is a *derived cache*; S3 is truth.
 - **Re-validate reachability at delete** (under the in-process lock for M1) so a just-committed ref is always seen.
@@ -105,7 +108,7 @@ Four pressure points and their mitigations, all designed in:
 **Invariant: one pool (disk root) = exactly one GC coordinator.**
 
 - **Multiple tables, same server, same disk** — fine; one metadata-storage instance, one GC, one pool (intended cross-table-dedup case).
-- **Independent processes sharing one pool** (two servers on one bucket, *or* replicas of one table) — the **same problem**: they need a single-leader Keeper-elected GC + lock, mark over the union of all refs, re-validate-at-delete, and refs visible to all writers (refs move to Keeper). This is B1+B11. **The layout does not change** — replicas just mount the same pool; only a coordination layer is added, behind the `RefCatalog` and GC-coordination seams.
+- **Independent processes sharing one pool** (two servers on one bucket, *or* replicas of one table) — the **same problem**: they need a single-leader Keeper-elected GC + lock, mark over the **union of all `store/<serverid>/…/refs`**, re-validate-at-delete, and a **global delta feed the leader can consume** — which the Keeper replication `/log` + per-replica `/parts` watches already provide (so the leader stays delta-driven, no full `LIST`; see §6). Refs become Keeper-backed via the `RefCatalog` seam. This is B1+B11. **The layout does not change** — replicas just mount the same pool; only a coordination layer is added, behind the `RefCatalog` and GC-coordination seams.
 - **M1 safety for the shared-pool case** — the **`_pool_owner` lease** makes an uncoordinated second process **fail closed** (refuse to GC/mount), so a shared bucket can never silently lose data even before B11 lands.
 
 **Replication readiness (B1):** content pool unchanged; `RefCatalog` swaps S3→Keeper; GC-coordination swaps in-process→Keeper leader+lock; mark becomes union-over-replicas. No layout or GC-logic rework.
