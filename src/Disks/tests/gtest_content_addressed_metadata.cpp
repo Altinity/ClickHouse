@@ -18,6 +18,7 @@
 
 #include <filesystem>
 #include <mutex>
+#include <system_error>
 #include <unordered_map>
 
 using namespace DB::ContentAddressed;
@@ -122,6 +123,15 @@ public:
             object_storage->shutdown();
             fs::remove_all(object_storage->getCommonKeyPrefix());
         }
+
+        // The tests seed BARE keys (common-key-prefix handling is deferred to Phase 3),
+        // so the content-pool roots are created at CWD and not covered by the per-storage
+        // cleanup above. Remove them so CI runs leave no stray dirs in the repo root.
+        // The std::error_code overload makes a missing dir a no-op.
+        std::error_code ec;
+        fs::remove_all("blobs", ec);
+        fs::remove_all("parts", ec);
+        fs::remove_all("store", ec);
     }
 
 private:
