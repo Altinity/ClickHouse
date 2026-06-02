@@ -67,7 +67,7 @@ void ContentAddressedWriteBuffer::finalizeImpl()
     hashing->finalize();
     temp_file->finalize();
 
-    const std::string key = blobKey(key_prefix, blob_hash);
+    const std::string key = blobKey(key_prefix, BlobHash(blob_hash)).string();
 
     /// Skip re-uploading when the blob already exists (content dedup). This is a check-then-write,
     /// NOT an atomic put-if-absent — safe here because the key IS the content hash: a racing writer
@@ -98,9 +98,9 @@ void ContentAddressedWriteBuffer::finalizeImpl()
 
     removeTempFile();
 
-    /// The hash is known and the blob is durable; let the owning transaction record it.
+    /// The hash is known and the blob is durable; let the owning transaction record it (typed).
     if (on_finalized)
-        on_finalized(blob_hash, size);
+        on_finalized(BlobHash(blob_hash), size);
 }
 
 void ContentAddressedWriteBuffer::sync()

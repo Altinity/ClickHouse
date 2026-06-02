@@ -1,4 +1,5 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
 #include <map>
 #include <string>
@@ -15,6 +16,6 @@ namespace DB::ContentAddressed
 /// The non-deterministic/mutable files uuid.txt, txn_version.txt and metadata_version.txt are
 /// excluded so that two parts with identical column data but a different UUID or mutation/txn
 /// version still resolve to the same part_id (and thus deduplicate).
-std::string computePartId(const std::map<std::string, BlobEntry> & blobs);
+PartId computePartId(const std::map<std::string, BlobEntry> & blobs);
 
 }

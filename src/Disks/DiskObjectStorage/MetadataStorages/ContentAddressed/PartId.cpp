@@ -19,7 +19,7 @@ static bool isExcludedFromPartId(std::string_view file)
     return false;
 }
 
-std::string computePartId(const std::map<std::string, BlobEntry> & blobs)
+PartId computePartId(const std::map<std::string, BlobEntry> & blobs)
 {
     /// std::map iterates in sorted key order, so the (logical_file, checksum) stream is canonical.
     SipHash hash;
@@ -30,7 +30,7 @@ std::string computePartId(const std::map<std::string, BlobEntry> & blobs)
         hash.update(file);
         hash.update(blob.checksum);
     }
-    return getHexUIntLowercase(hash.get128());
+    return PartId(getHexUIntLowercase(hash.get128()));
 }
 
 }

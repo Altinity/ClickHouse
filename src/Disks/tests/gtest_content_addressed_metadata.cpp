@@ -45,20 +45,20 @@ static const std::string kCasTestScratch = "./cas_test_scratch";
 TEST(ContentAddressedPoolPaths, ContentKeysFanOut)
 {
     // Empty prefix yields the bare key byte-for-byte (no leading slash).
-    EXPECT_EQ(blobKey("", "abcdef0123"), "blobs/ab/cd/abcdef0123");
-    EXPECT_EQ(partKey("", "0011223344"), "parts/00/11/0011223344");
-    EXPECT_EQ(blobKey("", "ab"), "blobs/ab"); // too short to fan out (test-only)
+    EXPECT_EQ(blobKey("", BlobHash("abcdef0123")).string(), "blobs/ab/cd/abcdef0123");
+    EXPECT_EQ(partKey("", PartId("0011223344")).string(), "parts/00/11/0011223344");
+    EXPECT_EQ(blobKey("", BlobHash("ab")).string(), "blobs/ab"); // too short to fan out (test-only)
 
     // A non-empty prefix is prepended with a single '/' join (trailing slash collapsed).
-    EXPECT_EQ(blobKey("pool", "abcdef0123"), "pool/blobs/ab/cd/abcdef0123");
-    EXPECT_EQ(partKey("pool/", "0011223344"), "pool/parts/00/11/0011223344");
+    EXPECT_EQ(blobKey("pool", BlobHash("abcdef0123")).string(), "pool/blobs/ab/cd/abcdef0123");
+    EXPECT_EQ(partKey("pool/", PartId("0011223344")).string(), "pool/parts/00/11/0011223344");
 }
 
 TEST(ContentAddressedPoolPaths, RefKeys)
 {
     EXPECT_EQ(refsPrefix("", "srvA", "uuid-1"), "store/srvA/uuid-1/refs/");
-    EXPECT_EQ(refKey("", "srvA", "uuid-1", "all_1_1_0"), "store/srvA/uuid-1/refs/all_1_1_0");
-    EXPECT_EQ(refKey("pool", "srvA", "uuid-1", "all_1_1_0"), "pool/store/srvA/uuid-1/refs/all_1_1_0");
+    EXPECT_EQ(refKey("", "srvA", "uuid-1", "all_1_1_0").string(), "store/srvA/uuid-1/refs/all_1_1_0");
+    EXPECT_EQ(refKey("pool", "srvA", "uuid-1", "all_1_1_0").string(), "pool/store/srvA/uuid-1/refs/all_1_1_0");
 }
 
 TEST(ContentAddressedPoolPaths, ParsePartFilePath)
@@ -202,18 +202,18 @@ TEST_F(ContentAddressedMetaTest, ResolvesAndReadsSeededPart)
     const std::string blob_csum = "deadbeef01";
     const std::string part_id = "cafe112233";
 
-    writeObject(os, blobKey("", blob_csum), blob_data);
+    writeObject(os, blobKey("", BlobHash(blob_csum)).string(), blob_data);
     PartManifest f;
-    f.blobs[file] = BlobEntry{blob_csum, blob_data.size(), blob_csum};
-    writeObject(os, partKey("", part_id), f.serialize());
-    writeObject(os, refKey("", sid, uuid, part), part_id);
+    f.blobs[file] = BlobEntry{BlobHash(blob_csum), blob_data.size(), blob_csum};
+    writeObject(os, partKey("", PartId(part_id)).string(), f.serialize());
+    writeObject(os, refKey("", sid, uuid, part).string(), part_id);
 
     const std::string logical = "uui/" + uuid + "/" + part + "/" + file; // <uuid[:3]>/<uuid>/<part>/<file>
     EXPECT_TRUE(ms->existsFile(logical));
     EXPECT_EQ(ms->getFileSize(logical), blob_data.size());
     auto objs = ms->getStorageObjects(logical);
     ASSERT_EQ(objs.size(), 1u);
-    EXPECT_EQ(objs[0].remote_path, blobKey("", blob_csum));
+    EXPECT_EQ(objs[0].remote_path, blobKey("", BlobHash(blob_csum)).string());
     EXPECT_EQ(readObject(os, objs[0].remote_path), blob_data);
     EXPECT_FALSE(ms->existsFile("uui/" + uuid + "/" + part + "/absent.bin")); // file not in manifest
 }
@@ -224,7 +224,7 @@ TEST_F(ContentAddressedMetaTest, FailsClosedOnMissingManifest)
     auto ms = getMetadataStorage("cas_failclose");
     auto os = getObjectStorage("cas_failclose");
     // ref present, but parts/<part_id> manifest absent → must THROW (B18), not return empty
-    writeObject(os, refKey("", ms->serverIdForTest(), "uuid-3", "all_1_1_0"), "missingpid");
+    writeObject(os, refKey("", ms->serverIdForTest(), "uuid-3", "all_1_1_0").string(), "missingpid");
     EXPECT_THROW(ms->getStorageObjects("uui/uuid-3/all_1_1_0/data.bin"), DB::Exception);
 }
 
@@ -238,14 +238,14 @@ TEST_F(ContentAddressedMetaTest, ListsPartsAndPartFiles)
 
     auto seed = [&](const std::string & part, const std::string & pid, const PartManifest & f)
     {
-        writeObject(os, partKey("", pid), f.serialize());
-        writeObject(os, refKey("", sid, uuid, part), pid);
+        writeObject(os, partKey("", PartId(pid)).string(), f.serialize());
+        writeObject(os, refKey("", sid, uuid, part).string(), pid);
     };
     /// Real part ids are 32-char lowercase hex (computePartId); the ref read path resolves the
     /// payload through partIdFromRefPayload (B28), so use valid-hex ids here as in production.
-    PartManifest fa; fa.blobs["data.bin"] = {"k1", 3, "k1"}; fa.blobs["columns.txt"] = {"k2", 2, "k2"};
+    PartManifest fa; fa.blobs["data.bin"] = {BlobHash("k1"), 3, "k1"}; fa.blobs["columns.txt"] = {BlobHash("k2"), 2, "k2"};
     seed("all_1_1_0", "aaaa000000000000000000000000aaaa", fa);
-    PartManifest fb; fb.blobs["data.bin"] = {"k3", 4, "k3"};
+    PartManifest fb; fb.blobs["data.bin"] = {BlobHash("k3"), 4, "k3"};
     seed("all_2_2_0", "bbbb000000000000000000000000bbbb", fb);
 
     // table dir → part names
@@ -292,7 +292,7 @@ TEST_F(ContentAddressedMetaTest, WriteBufferUploadsContentAddressed)
     }
     EXPECT_FALSE(hash1.empty());
     // bytes landed at blobs/<hash> and read back:
-    EXPECT_EQ(readObject(os, blobKey("", hash1)), "HELLO-COLUMN");
+    EXPECT_EQ(readObject(os, blobKey("", BlobHash(hash1)).string()), "HELLO-COLUMN");
 
     // idempotent: identical content → same hash, no second upload (object already present)
     {
@@ -310,36 +310,36 @@ TEST_F(ContentAddressedMetaTest, WriteBufferUploadsContentAddressed)
         hash2 = buf3.getBlobHash();
     }
     EXPECT_NE(hash2, hash1);
-    EXPECT_EQ(readObject(os, blobKey("", hash2)), "OTHER");
+    EXPECT_EQ(readObject(os, blobKey("", BlobHash(hash2)).string()), "OTHER");
 }
 
 TEST(ContentAddressedPartId, DeterministicAndExcludesMutableFiles)
 {
     using namespace DB::ContentAddressed;
     std::map<std::string, BlobEntry> a;
-    a["a.bin"] = {"h1", 3, "h1"};
-    a["b.bin"] = {"h2", 6, "h2"};
+    a["a.bin"] = {BlobHash("h1"), 3, "h1"};
+    a["b.bin"] = {BlobHash("h2"), 6, "h2"};
 
     // Order of insertion does not matter (std::map sorts), so an equal logical map => equal id.
     std::map<std::string, BlobEntry> a2;
-    a2["b.bin"] = {"h2", 6, "h2"};
-    a2["a.bin"] = {"h1", 3, "h1"};
+    a2["b.bin"] = {BlobHash("h2"), 6, "h2"};
+    a2["a.bin"] = {BlobHash("h1"), 3, "h1"};
     EXPECT_EQ(computePartId(a), computePartId(a2));
 
     // Mutable files do not contribute to the identity.
     std::map<std::string, BlobEntry> with_mutable = a;
-    with_mutable["uuid.txt"] = {"u", 1, "u"};
-    with_mutable["txn_version.txt"] = {"t", 1, "t"};
-    with_mutable["metadata_version.txt"] = {"m", 1, "m"};
+    with_mutable["uuid.txt"] = {BlobHash("u"), 1, "u"};
+    with_mutable["txn_version.txt"] = {BlobHash("t"), 1, "t"};
+    with_mutable["metadata_version.txt"] = {BlobHash("m"), 1, "m"};
     EXPECT_EQ(computePartId(a), computePartId(with_mutable));
 
     // A different column checksum changes the identity.
     std::map<std::string, BlobEntry> b = a;
-    b["a.bin"] = {"h1x", 3, "h1x"};
+    b["a.bin"] = {BlobHash("h1x"), 3, "h1x"};
     EXPECT_NE(computePartId(a), computePartId(b));
 
     // Lowercase hex of a 128-bit value.
-    const std::string id = computePartId(a);
+    const std::string id = computePartId(a).string();
     EXPECT_EQ(id.size(), 32u);
     EXPECT_EQ(id.find_first_not_of("0123456789abcdef"), std::string::npos);
 }
@@ -409,8 +409,8 @@ TEST_F(ContentAddressedMetaTest, RemoveUnlinksRefsKeepsBlobs)
     // Capture the backing object keys (manifest + blobs) we expect to SURVIVE removal.
     const std::string blob_a1 = ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/a.bin")[0].remote_path;
     const std::string blob_shared = ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/b.bin")[0].remote_path;
-    const std::string ref_1 = refKey("", sid, uuid, "all_1_1_0");
-    const std::string ref_2 = refKey("", sid, uuid, "all_2_2_0");
+    const std::string ref_1 = refKey("", sid, uuid, "all_1_1_0").string();
+    const std::string ref_2 = refKey("", sid, uuid, "all_2_2_0").string();
     ASSERT_TRUE(os->tryGetObjectMetadata(ref_1, /*with_tags=*/false).has_value());
     ASSERT_TRUE(os->tryGetObjectMetadata(ref_2, /*with_tags=*/false).has_value());
     ASSERT_TRUE(os->tryGetObjectMetadata(blob_a1, /*with_tags=*/false).has_value());
@@ -705,7 +705,7 @@ CasGcSeed seedGcPool(const std::shared_ptr<DB::IObjectStorage> & os, const std::
 {
     using namespace DB::ContentAddressed;
     CasGcSeed s;
-    auto put_blob = [&](const std::string & csum) { ContentAddressedMetaTest::writeObject(os, blobKey("", csum), csum); };
+    auto put_blob = [&](const std::string & csum) { ContentAddressedMetaTest::writeObject(os, blobKey("", BlobHash(csum)).string(), csum); };
     put_blob(s.b1); put_blob(s.b2); put_blob(s.b3); put_blob(s.b_orphan);
 
     auto put_manifest = [&](const std::string & pid, const std::vector<std::pair<std::string, std::string>> & files)
@@ -716,15 +716,15 @@ CasGcSeed seedGcPool(const std::shared_ptr<DB::IObjectStorage> & os, const std::
             /// records it (BlobEntry{blob_hash, size, blob_hash}); the read path and the GC project it
             /// to the full object key via blobKey. Seeding the full key here would mask the GC key-space
             /// bug (the reachable set must be comparable to the listed blobs/ object keys).
-            f.blobs[name] = BlobEntry{csum, csum.size(), csum};
-        ContentAddressedMetaTest::writeObject(os, partKey("", pid), f.serialize());
+            f.blobs[name] = BlobEntry{BlobHash(csum), csum.size(), csum};
+        ContentAddressedMetaTest::writeObject(os, partKey("", PartId(pid)).string(), f.serialize());
     };
     put_manifest(s.pid_a, {{"a.bin", s.b1}, {"shared.bin", s.b2}});
     put_manifest(s.pid_b, {{"shared.bin", s.b2}, {"c.bin", s.b3}});
     put_manifest(s.pid_orphan, {{"o.bin", s.b_orphan}});
 
-    ContentAddressedMetaTest::writeObject(os, refKey("", sid, s.uuid, "all_1_1_0"), s.pid_a);
-    ContentAddressedMetaTest::writeObject(os, refKey("", sid, s.uuid, "all_2_2_0"), s.pid_b);
+    ContentAddressedMetaTest::writeObject(os, refKey("", sid, s.uuid, "all_1_1_0").string(), s.pid_a);
+    ContentAddressedMetaTest::writeObject(os, refKey("", sid, s.uuid, "all_2_2_0").string(), s.pid_b);
     return s;
 }
 }
@@ -737,17 +737,20 @@ TEST_F(ContentAddressedMetaTest, PoolScanListsLivePartsAndObjects)
     auto s = seedGcPool(os, ms->serverIdForTest());
 
     // Exactly the 2 referenced part ids are live; the orphan manifest's id is NOT (no ref points at it).
-    EXPECT_EQ(listLivePartIds(os, ""), (std::set<std::string>{s.pid_a, s.pid_b}));
+    EXPECT_EQ(listLivePartIds(os, ""), (std::set<PartId>{PartId(s.pid_a), PartId(s.pid_b)}));
 
     // parts/ holds all 3 manifests (2 live + 1 orphan); the keys match partKey.
     auto part_keys = listKeysUnder(os, partsPrefix(""));
     std::set<std::string> parts(part_keys.begin(), part_keys.end());
-    EXPECT_EQ(parts, (std::set<std::string>{partKey("", s.pid_a), partKey("", s.pid_b), partKey("", s.pid_orphan)}));
+    EXPECT_EQ(parts, (std::set<std::string>{
+        partKey("", PartId(s.pid_a)).string(), partKey("", PartId(s.pid_b)).string(), partKey("", PartId(s.pid_orphan)).string()}));
 
     // blobs/ holds all 4 blobs (3 referenced + 1 orphan); the keys match blobKey.
     auto blob_keys = listKeysUnder(os, blobsPrefix(""));
     std::set<std::string> blobs(blob_keys.begin(), blob_keys.end());
-    EXPECT_EQ(blobs, (std::set<std::string>{blobKey("", s.b1), blobKey("", s.b2), blobKey("", s.b3), blobKey("", s.b_orphan)}));
+    EXPECT_EQ(blobs, (std::set<std::string>{
+        blobKey("", BlobHash(s.b1)).string(), blobKey("", BlobHash(s.b2)).string(),
+        blobKey("", BlobHash(s.b3)).string(), blobKey("", BlobHash(s.b_orphan)).string()}));
 }
 
 namespace
@@ -773,28 +776,28 @@ TEST_F(ContentAddressedMetaTest, SweepHonoursGraceWindow)
     auto r0 = gc.runSweepOnce(/*now=*/0, /*grace=*/100);
     EXPECT_EQ(r0.deleted_parts, 0u);
     EXPECT_EQ(r0.deleted_blobs, 0u);
-    EXPECT_TRUE(objectExists(os, partKey("", s.pid_orphan)));
-    EXPECT_TRUE(objectExists(os, blobKey("", s.b_orphan)));
+    EXPECT_TRUE(objectExists(os, partKey("", PartId(s.pid_orphan)).string()));
+    EXPECT_TRUE(objectExists(os, blobKey("", BlobHash(s.b_orphan)).string()));
 
     // (b) Still within grace at t=50: nothing deleted.
     auto r1 = gc.runSweepOnce(/*now=*/50, /*grace=*/100);
     EXPECT_EQ(r1.deleted_parts, 0u);
     EXPECT_EQ(r1.deleted_blobs, 0u);
-    EXPECT_TRUE(objectExists(os, partKey("", s.pid_orphan)));
-    EXPECT_TRUE(objectExists(os, blobKey("", s.b_orphan)));
+    EXPECT_TRUE(objectExists(os, partKey("", PartId(s.pid_orphan)).string()));
+    EXPECT_TRUE(objectExists(os, blobKey("", BlobHash(s.b_orphan)).string()));
 
     // (c) Past grace at t=200: exactly the orphan manifest + orphan blob are reclaimed; the 2 live
     //     manifests and 3 referenced blobs survive (reachable from the live refs).
     auto r2 = gc.runSweepOnce(/*now=*/200, /*grace=*/100);
     EXPECT_EQ(r2.deleted_parts, 1u);
     EXPECT_EQ(r2.deleted_blobs, 1u);
-    EXPECT_FALSE(objectExists(os, partKey("", s.pid_orphan)));
-    EXPECT_FALSE(objectExists(os, blobKey("", s.b_orphan)));
-    EXPECT_TRUE(objectExists(os, partKey("", s.pid_a)));
-    EXPECT_TRUE(objectExists(os, partKey("", s.pid_b)));
-    EXPECT_TRUE(objectExists(os, blobKey("", s.b1)));
-    EXPECT_TRUE(objectExists(os, blobKey("", s.b2)));
-    EXPECT_TRUE(objectExists(os, blobKey("", s.b3)));
+    EXPECT_FALSE(objectExists(os, partKey("", PartId(s.pid_orphan)).string()));
+    EXPECT_FALSE(objectExists(os, blobKey("", BlobHash(s.b_orphan)).string()));
+    EXPECT_TRUE(objectExists(os, partKey("", PartId(s.pid_a)).string()));
+    EXPECT_TRUE(objectExists(os, partKey("", PartId(s.pid_b)).string()));
+    EXPECT_TRUE(objectExists(os, blobKey("", BlobHash(s.b1)).string()));
+    EXPECT_TRUE(objectExists(os, blobKey("", BlobHash(s.b2)).string()));
+    EXPECT_TRUE(objectExists(os, blobKey("", BlobHash(s.b3)).string()));
 }
 
 // Dedup safety: a blob referenced by TWO live parts (b2/shared.bin) stays reachable after one of the
@@ -809,20 +812,20 @@ TEST_F(ContentAddressedMetaTest, SweepKeepsBlobStillReferencedByAnotherPart)
     DB::ContentAddressed::ContentAddressedGC gc(os, "");
 
     // Unlink part A's ref. pidA's manifest is now orphaned, but its blob b2 is also in pidB's manifest.
-    os->removeObjectsIfExist({DB::StoredObject(refKey("", ms->serverIdForTest(), s.uuid, "all_1_1_0"))});
+    os->removeObjectsIfExist({DB::StoredObject(refKey("", ms->serverIdForTest(), s.uuid, "all_1_1_0").string())});
 
     gc.runSweepOnce(/*now=*/0, /*grace=*/100);
     auto r = gc.runSweepOnce(/*now=*/200, /*grace=*/100);
 
     // pidA manifest + b1 (only in pidA) are reclaimed; the orphan manifest + orphan blob too.
-    EXPECT_FALSE(objectExists(os, partKey("", s.pid_a)));
-    EXPECT_FALSE(objectExists(os, blobKey("", s.b1)));
-    EXPECT_FALSE(objectExists(os, partKey("", s.pid_orphan)));
-    EXPECT_FALSE(objectExists(os, blobKey("", s.b_orphan)));
+    EXPECT_FALSE(objectExists(os, partKey("", PartId(s.pid_a)).string()));
+    EXPECT_FALSE(objectExists(os, blobKey("", BlobHash(s.b1)).string()));
+    EXPECT_FALSE(objectExists(os, partKey("", PartId(s.pid_orphan)).string()));
+    EXPECT_FALSE(objectExists(os, blobKey("", BlobHash(s.b_orphan)).string()));
     // The shared blob b2 SURVIVES — still reachable through pidB's live ref.
-    EXPECT_TRUE(objectExists(os, blobKey("", s.b2)));
-    EXPECT_TRUE(objectExists(os, partKey("", s.pid_b)));
-    EXPECT_TRUE(objectExists(os, blobKey("", s.b3)));
+    EXPECT_TRUE(objectExists(os, blobKey("", BlobHash(s.b2)).string()));
+    EXPECT_TRUE(objectExists(os, partKey("", PartId(s.pid_b)).string()));
+    EXPECT_TRUE(objectExists(os, blobKey("", BlobHash(s.b3)).string()));
     EXPECT_EQ(r.deleted_parts, 2u); // pidA + orphan
     EXPECT_EQ(r.deleted_blobs, 2u); // b1 + orphan
 }
@@ -840,19 +843,19 @@ TEST_F(ContentAddressedMetaTest, SweepClearsTimerWhenReachableAgain)
     DB::ContentAddressed::ContentAddressedGC gc(os, "");
 
     // Unlink pidA's ref so pidA's manifest + its exclusive blob b1 become unreferenced at t=0.
-    os->removeObjectsIfExist({DB::StoredObject(refKey("", sid, s.uuid, "all_1_1_0"))});
+    os->removeObjectsIfExist({DB::StoredObject(refKey("", sid, s.uuid, "all_1_1_0").string())});
     gc.runSweepOnce(/*now=*/0, /*grace=*/100); // records first_unreachable for pidA manifest + b1
 
     // Re-add a ref pointing at pidA before grace elapses (e.g. an identical part re-inserted).
-    ContentAddressedMetaTest::writeObject(os, refKey("", sid, s.uuid, "all_1_1_0_redo"), s.pid_a);
+    ContentAddressedMetaTest::writeObject(os, refKey("", sid, s.uuid, "all_1_1_0_redo").string(), s.pid_a);
 
     // Past the original grace: pidA is reachable again, so its timer was cleared and nothing of it
     // is deleted. Only the never-referenced orphan manifest + orphan blob are reclaimed.
     auto r = gc.runSweepOnce(/*now=*/200, /*grace=*/100);
-    EXPECT_TRUE(objectExists(os, partKey("", s.pid_a)));
-    EXPECT_TRUE(objectExists(os, blobKey("", s.b1)));
-    EXPECT_FALSE(objectExists(os, partKey("", s.pid_orphan)));
-    EXPECT_FALSE(objectExists(os, blobKey("", s.b_orphan)));
+    EXPECT_TRUE(objectExists(os, partKey("", PartId(s.pid_a)).string()));
+    EXPECT_TRUE(objectExists(os, blobKey("", BlobHash(s.b1)).string()));
+    EXPECT_FALSE(objectExists(os, partKey("", PartId(s.pid_orphan)).string()));
+    EXPECT_FALSE(objectExists(os, blobKey("", BlobHash(s.b_orphan)).string()));
     EXPECT_EQ(r.deleted_parts, 1u);
     EXPECT_EQ(r.deleted_blobs, 1u);
 }
@@ -866,17 +869,17 @@ TEST_F(ContentAddressedMetaTest, SweepThrowsAndDeletesNothingOnMissingManifest)
     auto s = seedGcPool(os, ms->serverIdForTest());
 
     // Corrupt the pool: a live ref points at a part id with no manifest object.
-    ContentAddressedMetaTest::writeObject(os, refKey("", ms->serverIdForTest(), s.uuid, "all_3_3_0"), "deadc0de00000000000000000000beef");
+    ContentAddressedMetaTest::writeObject(os, refKey("", ms->serverIdForTest(), s.uuid, "all_3_3_0").string(), "deadc0de00000000000000000000beef");
 
     DB::ContentAddressed::ContentAddressedGC gc(os, "");
     EXPECT_THROW(gc.runSweepOnce(/*now=*/200, /*grace=*/100), DB::Exception);
 
     // Nothing was deleted — even the otherwise-collectable orphans remain (the reachable set never
     // computed cleanly, so the sweep aborted before any removal).
-    EXPECT_TRUE(objectExists(os, partKey("", s.pid_orphan)));
-    EXPECT_TRUE(objectExists(os, blobKey("", s.b_orphan)));
-    EXPECT_TRUE(objectExists(os, partKey("", s.pid_a)));
-    EXPECT_TRUE(objectExists(os, blobKey("", s.b1)));
+    EXPECT_TRUE(objectExists(os, partKey("", PartId(s.pid_orphan)).string()));
+    EXPECT_TRUE(objectExists(os, blobKey("", BlobHash(s.b_orphan)).string()));
+    EXPECT_TRUE(objectExists(os, partKey("", PartId(s.pid_a)).string()));
+    EXPECT_TRUE(objectExists(os, blobKey("", BlobHash(s.b1)).string()));
 }
 
 // Background-thread driver (Task 3a): the ContentAddressedGCThread runs runSweepOnce on the schedule
@@ -907,13 +910,13 @@ TEST_F(ContentAddressedMetaTest, GCThreadSweepsOrphansAndKeepsLive)
     thread.triggerAndWait();
 
     /// The orphan manifest + orphan blob are gone; the 2 live manifests + 3 referenced blobs remain.
-    EXPECT_FALSE(objectExists(os, partKey("", s.pid_orphan)));
-    EXPECT_FALSE(objectExists(os, blobKey("", s.b_orphan)));
-    EXPECT_TRUE(objectExists(os, partKey("", s.pid_a)));
-    EXPECT_TRUE(objectExists(os, partKey("", s.pid_b)));
-    EXPECT_TRUE(objectExists(os, blobKey("", s.b1)));
-    EXPECT_TRUE(objectExists(os, blobKey("", s.b2)));
-    EXPECT_TRUE(objectExists(os, blobKey("", s.b3)));
+    EXPECT_FALSE(objectExists(os, partKey("", PartId(s.pid_orphan)).string()));
+    EXPECT_FALSE(objectExists(os, blobKey("", BlobHash(s.b_orphan)).string()));
+    EXPECT_TRUE(objectExists(os, partKey("", PartId(s.pid_a)).string()));
+    EXPECT_TRUE(objectExists(os, partKey("", PartId(s.pid_b)).string()));
+    EXPECT_TRUE(objectExists(os, blobKey("", BlobHash(s.b1)).string()));
+    EXPECT_TRUE(objectExists(os, blobKey("", BlobHash(s.b2)).string()));
+    EXPECT_TRUE(objectExists(os, blobKey("", BlobHash(s.b3)).string()));
 
     /// Clean shutdown must not hang or crash (deactivates the scheduled task).
     thread.shutdown();

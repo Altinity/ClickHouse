@@ -1,4 +1,5 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
 #include <optional>
 #include <string>
 
@@ -11,9 +12,11 @@ namespace DB::ContentAddressed
 // truth for the prefix is ContentAddressedMetadataStorage::storage_path_prefix, threaded through
 // the metadata storage and its transaction so the read and write sides can never disagree.
 
-// Content-addressed object keys with 2x2 hex prefix fan-out (S3 per-prefix limits).
-std::string blobKey(const std::string & key_prefix, const std::string & file_checksum);
-std::string partKey(const std::string & key_prefix, const std::string & part_id);
+// Content-addressed object keys with 2x2 hex prefix fan-out (S3 per-prefix limits). The builders
+// take a typed bare identity (BlobHash / PartId) and return a typed full object key
+// (BlobObjectKey / PartObjectKey) so a bare hash and a full key can never be confused.
+BlobObjectKey blobKey(const std::string & key_prefix, const BlobHash & blob_hash);
+PartObjectKey partKey(const std::string & key_prefix, const PartId & part_id);
 
 // Pool roots for enumeration (GC scan). Each is the object-key prefix under which all objects of a
 // given kind live: manifests under partsPrefix (<key_prefix>/parts), content blobs under blobsPrefix
@@ -26,7 +29,7 @@ std::string refsRootPrefix(const std::string & key_prefix);
 
 // Per-server/per-table ref object key: <key_prefix>/store/<server_id>/<table_uuid>/refs/<part_name>.
 std::string refsPrefix(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid);
-std::string refKey(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid, const std::string & part_name);
+RefObjectKey refKey(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid, const std::string & part_name);
 
 // Per-server/per-table direct object key for non-part / table-level files (e.g.
 // format_version.txt, later mutation_*.txt). These are stored verbatim (no content addressing,

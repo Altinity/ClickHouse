@@ -26,14 +26,14 @@ static std::string fanOut(const std::string & prefix, const std::string & hash)
     return prefix + "/" + hash.substr(0, 2) + "/" + hash.substr(2, 2) + "/" + hash;
 }
 
-std::string blobKey(const std::string & key_prefix, const std::string & file_checksum)
+BlobObjectKey blobKey(const std::string & key_prefix, const BlobHash & blob_hash)
 {
-    return withPrefix(key_prefix, fanOut("blobs", file_checksum));
+    return BlobObjectKey(withPrefix(key_prefix, fanOut("blobs", blob_hash.string())));
 }
 
-std::string partKey(const std::string & key_prefix, const std::string & part_id)
+PartObjectKey partKey(const std::string & key_prefix, const PartId & part_id)
 {
-    return withPrefix(key_prefix, fanOut("parts", part_id));
+    return PartObjectKey(withPrefix(key_prefix, fanOut("parts", part_id.string())));
 }
 
 std::string partsPrefix(const std::string & key_prefix)
@@ -56,9 +56,9 @@ std::string refsPrefix(const std::string & key_prefix, const std::string & serve
     return withPrefix(key_prefix, "store/" + server_id + "/" + table_uuid + "/refs/");
 }
 
-std::string refKey(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid, const std::string & part_name)
+RefObjectKey refKey(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid, const std::string & part_name)
 {
-    return refsPrefix(key_prefix, server_id, table_uuid) + part_name;
+    return RefObjectKey(refsPrefix(key_prefix, server_id, table_uuid) + part_name);
 }
 
 std::string tableFilesPrefix(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid)

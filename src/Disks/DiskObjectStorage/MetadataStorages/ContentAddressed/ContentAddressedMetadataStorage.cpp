@@ -81,9 +81,9 @@ std::optional<std::string> ContentAddressedMetadataStorage::readSmallObjectIfExi
     return content;
 }
 
-std::optional<std::string> ContentAddressedMetadataStorage::readRefPartId(const std::string & table_uuid, const std::string & part_name) const
+std::optional<ContentAddressed::PartId> ContentAddressedMetadataStorage::readRefPartId(const std::string & table_uuid, const std::string & part_name) const
 {
-    auto payload = readSmallObjectIfExists(ContentAddressed::refKey(storage_path_prefix, server_id, table_uuid, part_name));
+    auto payload = readSmallObjectIfExists(ContentAddressed::refKey(storage_path_prefix, server_id, table_uuid, part_name).string());
     if (!payload)
         return std::nullopt;
     /// Resolve through the single ref-payload parser shared with the GC live-set scan (B28): the read
@@ -91,14 +91,14 @@ std::optional<std::string> ContentAddressedMetadataStorage::readRefPartId(const 
     return ContentAddressed::partIdFromRefPayload(*payload);
 }
 
-ContentAddressed::PartManifest ContentAddressedMetadataStorage::loadPartManifestOrThrow(const std::string & part_id) const
+ContentAddressed::PartManifest ContentAddressedMetadataStorage::loadPartManifestOrThrow(const ContentAddressed::PartId & part_id) const
 {
-    auto bytes = readSmallObjectIfExists(ContentAddressed::partKey(storage_path_prefix, part_id));
+    auto bytes = readSmallObjectIfExists(ContentAddressed::partKey(storage_path_prefix, part_id).string());
     if (!bytes)
         throw Exception(
             ErrorCodes::CORRUPTED_DATA,
             "ContentAddressed: live ref points at missing manifest parts/{}",
-            part_id);
+            part_id.string());
     return ContentAddressed::PartManifest::deserialize(*bytes);
 }
 
@@ -203,7 +203,7 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
         auto pid = readRefPartId(p->table_uuid, p->part_name);
         if (!pid)
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
-        auto metadata = object_storage->getObjectMetadata(ContentAddressed::partKey(storage_path_prefix, *pid), /*with_tags=*/false);
+        auto metadata = object_storage->getObjectMetadata(ContentAddressed::partKey(storage_path_prefix, *pid).string(), /*with_tags=*/false);
         return metadata.last_modified;
     }
 
@@ -301,7 +301,9 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
     const auto & e = it->second;
     /// Resolve under the same common key prefix used on the write side (single source of truth:
     /// storage_path_prefix), so blobs are read from where ContentAddressedWriteBuffer stored them.
-    return {StoredObject(ContentAddressed::blobKey(storage_path_prefix, e.key), path, e.size)};
+    /// e.key is the BARE BlobHash; blobKey projects it to the full BlobObjectKey, .string() at the
+    /// object-storage boundary.
+    return {StoredObject(ContentAddressed::blobKey(storage_path_prefix, e.key).string(), path, e.size)};
 }
 
 }

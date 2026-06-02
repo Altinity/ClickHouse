@@ -1,6 +1,7 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGCThread.h>
 #include <Interpreters/Context_fwd.h>
@@ -70,13 +71,13 @@ private:
     // No manifest cache in M1 (read each time); caching is a later optimization.
 
     // Read the ref object at refKey(server_id, table_uuid, part_name).
-    // Returns nullopt if the ref object is absent, else its content (the part_id).
-    std::optional<std::string> readRefPartId(const std::string & table_uuid, const std::string & part_name) const;
+    // Returns nullopt if the ref object is absent, else the part id it names.
+    std::optional<ContentAddressed::PartId> readRefPartId(const std::string & table_uuid, const std::string & part_name) const;
 
     // Load and deserialize the manifest at partKey(part_id).
     // B18 fail-close: if the manifest object is absent, throw CORRUPTED_DATA (a live ref must
     // never point at a missing manifest); never treat it as "file doesn't exist".
-    ContentAddressed::PartManifest loadPartManifestOrThrow(const std::string & part_id) const;
+    ContentAddressed::PartManifest loadPartManifestOrThrow(const ContentAddressed::PartId & part_id) const;
 
     // Read a small object (ref/manifest) into a string. Returns nullopt if the object is absent.
     std::optional<std::string> readSmallObjectIfExists(const std::string & key) const;

@@ -56,7 +56,7 @@ std::string PartManifest::serialize() const
     for (const auto & [k, v] : blobs)
     {
         putStr(b, k);
-        putStr(b, v.key);
+        putStr(b, v.key.string());
         putU64(b, v.size);
         putStr(b, v.checksum);
     }
@@ -80,7 +80,7 @@ PartManifest PartManifest::deserialize(const std::string & bytes)
     {
         auto k = getStr(bytes, p);
         BlobEntry e;
-        e.key = getStr(bytes, p);
+        e.key = BlobHash(getStr(bytes, p));
         e.size = getU64(bytes, p);
         e.checksum = getStr(bytes, p);
         f.blobs[k] = std::move(e);

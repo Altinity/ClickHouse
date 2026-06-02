@@ -9,8 +9,8 @@ using namespace DB::ContentAddressed;
 TEST(ContentAddressedPartManifest, RoundTripBasic)
 {
     PartManifest f;
-    f.blobs["col_a.bin"] = BlobEntry{"hashA", 100, "ckA"};
-    f.blobs["col_b.bin"] = BlobEntry{"hashB", 200, "ckB"};
+    f.blobs["col_a.bin"] = BlobEntry{BlobHash("hashA"), 100, "ckA"};
+    f.blobs["col_b.bin"] = BlobEntry{BlobHash("hashB"), 200, "ckB"};
     f.inlined["columns.txt"] = "a b";
     f.inlined["count.txt"] = std::string("100\n\0binary", 11); // embedded NUL
 
@@ -18,7 +18,7 @@ TEST(ContentAddressedPartManifest, RoundTripBasic)
     PartManifest g = PartManifest::deserialize(bytes);
 
     EXPECT_EQ(g.blobs.size(), 2u);
-    EXPECT_EQ(g.blobs.at("col_a.bin").key, "hashA");
+    EXPECT_EQ(g.blobs.at("col_a.bin").key, BlobHash("hashA"));
     EXPECT_EQ(g.blobs.at("col_a.bin").size, 100u);
     EXPECT_EQ(g.inlined.at("columns.txt"), "a b");
     EXPECT_EQ(g.inlined.at("count.txt"), std::string("100\n\0binary", 11));
@@ -26,8 +26,8 @@ TEST(ContentAddressedPartManifest, RoundTripBasic)
 
 TEST(ContentAddressedPartManifest, StableHashIsCanonical)
 {
-    PartManifest a; a.blobs["y"] = {"hy", 2, "c2"}; a.blobs["x"] = {"hx", 1, "c1"};
-    PartManifest b; b.blobs["x"] = {"hx", 1, "c1"}; b.blobs["y"] = {"hy", 2, "c2"};
+    PartManifest a; a.blobs["y"] = {BlobHash("hy"), 2, "c2"}; a.blobs["x"] = {BlobHash("hx"), 1, "c1"};
+    PartManifest b; b.blobs["x"] = {BlobHash("hx"), 1, "c1"}; b.blobs["y"] = {BlobHash("hy"), 2, "c2"};
     EXPECT_EQ(a.serialize(), b.serialize());
 }
 
@@ -51,18 +51,18 @@ TEST(ContentAddressedBlobRefIndex, DeltaCountAndDedup)
 {
     using namespace DB::ContentAddressed;
     InMemoryBlobRefIndex idx;
-    PartManifest p1; p1.blobs["a.bin"] = {"hA", 1, "hA"}; p1.blobs["b.bin"] = {"hShared", 1, "hShared"};
-    PartManifest p2; p2.blobs["a.bin"] = {"hZ", 1, "hZ"}; p2.blobs["b.bin"] = {"hShared", 1, "hShared"};
-    idx.addPart("part1", p1);
-    idx.addPart("part2", p2);
-    EXPECT_EQ(idx.refcount("hShared"), 2);
-    EXPECT_EQ(idx.refcount("hA"), 1);
-    idx.removePart("part1", p1);
-    EXPECT_EQ(idx.refcount("hShared"), 1);
-    EXPECT_EQ(idx.refcount("hA"), 0);
+    PartManifest p1; p1.blobs["a.bin"] = {BlobHash("hA"), 1, "hA"}; p1.blobs["b.bin"] = {BlobHash("hShared"), 1, "hShared"};
+    PartManifest p2; p2.blobs["a.bin"] = {BlobHash("hZ"), 1, "hZ"}; p2.blobs["b.bin"] = {BlobHash("hShared"), 1, "hShared"};
+    idx.addPart(PartId("part1"), p1);
+    idx.addPart(PartId("part2"), p2);
+    EXPECT_EQ(idx.refcount(BlobHash("hShared")), 2);
+    EXPECT_EQ(idx.refcount(BlobHash("hA")), 1);
+    idx.removePart(PartId("part1"), p1);
+    EXPECT_EQ(idx.refcount(BlobHash("hShared")), 1);
+    EXPECT_EQ(idx.refcount(BlobHash("hA")), 0);
     auto dead = idx.unreferenced();
-    EXPECT_TRUE(dead.count("hA"));
-    EXPECT_FALSE(dead.count("hShared"));
+    EXPECT_TRUE(dead.count(BlobHash("hA")));
+    EXPECT_FALSE(dead.count(BlobHash("hShared")));
 }
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Reachability.h>
@@ -72,19 +72,19 @@ TEST(ContentAddressedBlobRefIndex, DeltaCountAndDedup)
 TEST(ContentAddressedReachability, ReconcileMarksOnlyLiveRoots)
 {
     using namespace DB::ContentAddressed;
-    std::unordered_map<std::string, PartManifest> parts;
-    PartManifest pm; pm.blobs["a.bin"] = {"hA1", 1, "hA1"}; pm.blobs["b.bin"] = {"hB0", 1, "hB0"}; parts["all_1_1_0_1"] = pm; // mutation: new a, carried b
-    PartManifest src; src.blobs["a.bin"] = {"hA0", 1, "hA0"}; src.blobs["b.bin"] = {"hB0", 1, "hB0"}; parts["all_1_1_0"] = src;   // outdated source
+    std::unordered_map<PartId, PartManifest> parts;
+    PartManifest pm; pm.blobs["a.bin"] = {BlobHash("hA1"), 1, "hA1"}; pm.blobs["b.bin"] = {BlobHash("hB0"), 1, "hB0"}; parts[PartId("all_1_1_0_1")] = pm; // mutation: new a, carried b
+    PartManifest src; src.blobs["a.bin"] = {BlobHash("hA0"), 1, "hA0"}; src.blobs["b.bin"] = {BlobHash("hB0"), 1, "hB0"}; parts[PartId("all_1_1_0")] = src;   // outdated source
 
-    auto resolve = [&](const std::string & id) { return parts.at(id); };
-    std::set<std::string> roots = {"all_1_1_0_1"}; // only the mutated part is a live root
+    auto resolve = [&](const PartId & id) { return parts.at(id); };
+    std::set<PartId> roots = {PartId("all_1_1_0_1")}; // only the mutated part is a live root
     // markReachableBlobs returns FULL blob object keys (blobKey fan-out of the bare manifest hash),
     // matching what the GC sweep lists under blobsPrefix; assert against the projected keys.
-    std::set<std::string> reachable = markReachableBlobs("", roots, resolve);
+    std::set<BlobObjectKey> reachable = markReachableBlobs("", roots, resolve);
 
-    EXPECT_TRUE(reachable.count(blobKey("", "hA1")));
-    EXPECT_TRUE(reachable.count(blobKey("", "hB0")));   // carried forward → still reachable
-    EXPECT_FALSE(reachable.count(blobKey("", "hA0")));  // replaced column → unreachable
+    EXPECT_TRUE(reachable.count(blobKey("", BlobHash("hA1"))));
+    EXPECT_TRUE(reachable.count(blobKey("", BlobHash("hB0"))));   // carried forward → still reachable
+    EXPECT_FALSE(reachable.count(blobKey("", BlobHash("hA0"))));  // replaced column → unreachable
 }
 
 TEST(ContentAddressedReachability, SweepUsesTimeSinceUnreachableNotAge)
@@ -115,25 +115,29 @@ TEST(ContentAddressedScenario, MutationCarryForwardThenGC)
     InMemoryBlobRefIndex idx;
 
     PartManifest base;
-    base.blobs["a.bin"] = {"A0", 1, "A0"};
-    base.blobs["b.bin"] = {"B0", 1, "B0"};
-    base.blobs["c.bin"] = {"C0", 1, "C0"};
-    idx.addPart("all_1_1_0", base);
+    base.blobs["a.bin"] = {BlobHash("A0"), 1, "A0"};
+    base.blobs["b.bin"] = {BlobHash("B0"), 1, "B0"};
+    base.blobs["c.bin"] = {BlobHash("C0"), 1, "C0"};
+    idx.addPart(PartId("all_1_1_0"), base);
 
     PartManifest mut; // mutation rewrites only a.bin; b/c carried forward by reference
-    mut.blobs["a.bin"] = {"A1", 1, "A1"};
-    mut.blobs["b.bin"] = {"B0", 1, "B0"};
-    mut.blobs["c.bin"] = {"C0", 1, "C0"};
-    idx.addPart("all_1_1_0_1", mut);
+    mut.blobs["a.bin"] = {BlobHash("A1"), 1, "A1"};
+    mut.blobs["b.bin"] = {BlobHash("B0"), 1, "B0"};
+    mut.blobs["c.bin"] = {BlobHash("C0"), 1, "C0"};
+    idx.addPart(PartId("all_1_1_0_1"), mut);
 
-    idx.removePart("all_1_1_0", base); // lifecycle drops the covered source ref
+    idx.removePart(PartId("all_1_1_0"), base); // lifecycle drops the covered source ref
 
     auto dead = idx.unreferenced();
     EXPECT_EQ(dead.size(), 1u);          // only the replaced column is dead
-    EXPECT_TRUE(dead.count("A0"));
+    EXPECT_TRUE(dead.count(BlobHash("A0")));
 
-    auto r = selectForSweep(dead, {}, /*now*/ 1000, /*grace*/ 0);
+    /// selectForSweep operates on raw object-key strings; reduce the typed dead set to that space.
+    std::set<std::string> dead_keys;
+    for (const auto & h : dead)
+        dead_keys.insert(h.string());
+    auto r = selectForSweep(dead_keys, {}, /*now*/ 1000, /*grace*/ 0);
     EXPECT_EQ(r.to_delete, std::vector<std::string>{"A0"}); // A0 swept; B0/C0 kept by reachability
-    EXPECT_EQ(idx.refcount("B0"), 1);
-    EXPECT_EQ(idx.refcount("C0"), 1);
+    EXPECT_EQ(idx.refcount(BlobHash("B0")), 1);
+    EXPECT_EQ(idx.refcount(BlobHash("C0")), 1);
 }

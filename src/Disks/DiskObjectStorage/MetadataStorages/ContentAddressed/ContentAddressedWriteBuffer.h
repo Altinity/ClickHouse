@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <IO/HashingWriteBuffer.h>
 #include <IO/WriteBufferFromFile.h>
@@ -27,8 +28,9 @@ class ContentAddressedWriteBuffer : public WriteBufferFromFileBase
 {
 public:
     /// Invoked from finalizeImpl once the content hash is known and the blob has been uploaded
-    /// (or found already present). Lets the owning transaction record (logical_file -> blob).
-    using OnFinalized = std::function<void(const std::string & blob_hash, size_t size)>;
+    /// (or found already present). Lets the owning transaction record (logical_file -> blob). The
+    /// hash is handed over as a typed BlobHash so the transaction cannot confuse it with an object key.
+    using OnFinalized = std::function<void(const BlobHash & blob_hash, size_t size)>;
 
     /// key_prefix_ is the object-storage common key prefix to prepend to the blob key; an empty
     /// prefix yields the bare blobs/<hash> key. It is threaded from the owning transaction so the

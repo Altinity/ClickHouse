@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolScan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
@@ -34,39 +35,42 @@ ContentAddressedGC::ContentAddressedGC(ObjectStoragePtr object_storage_, std::st
 SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace)
 {
     /// 1. The live roots: every part id named by a published ref.
-    std::set<std::string> live = listLivePartIds(object_storage, key_prefix);
+    std::set<PartId> live = listLivePartIds(object_storage, key_prefix);
 
     /// 2. The reachable blob set, computed from the live parts' manifests. B18 fail-close: a live ref
     /// whose manifest is missing throws CORRUPTED_DATA so the sweep aborts WITHOUT deleting anything
     /// (a partial reachable set must never drive deletion — it would drop a live part's blobs).
-    PartManifestResolver resolve = [this](const std::string & part_id) -> PartManifest
+    PartManifestResolver resolve = [this](const PartId & part_id) -> PartManifest
     {
-        const std::string manifest_key = partKey(key_prefix, part_id);
-        if (!object_storage->tryGetObjectMetadata(manifest_key, /*with_tags=*/false))
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "ContentAddressed GC: live ref points at missing manifest {}", manifest_key);
-        StoredObject object(manifest_key);
+        const PartObjectKey manifest_key = partKey(key_prefix, part_id);
+        if (!object_storage->tryGetObjectMetadata(manifest_key.string(), /*with_tags=*/false))
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "ContentAddressed GC: live ref points at missing manifest {}", manifest_key.string());
+        StoredObject object(manifest_key.string());
         auto buf = object_storage->readObject(object, getReadSettings(), /*read_hint=*/std::nullopt);
         String bytes;
         readStringUntilEOF(bytes, *buf);
         return PartManifest::deserialize(bytes);
     };
-    std::set<std::string> reachable_blobs = markReachableBlobs(key_prefix, live, resolve);
+    /// Reachable is a std::set<BlobObjectKey>: it can only be tested against listed blobs after those
+    /// are wrapped into BlobObjectKey too, so a bare-hash-vs-object-key mismatch cannot compile.
+    std::set<BlobObjectKey> reachable_blobs = markReachableBlobs(key_prefix, live, resolve);
 
     /// 3. The full unreferenced object-key set: every manifest not backing a live part, plus every
-    /// blob not reachable from a live manifest. Sweep scope is strictly parts/ and blobs/.
-    std::set<std::string> live_part_keys;
+    /// blob not reachable from a live manifest. Sweep scope is strictly parts/ and blobs/. This is the
+    /// ONE well-marked boundary where the raw listed strings are wrapped into their typed object keys.
+    std::set<PartObjectKey> live_part_keys;
     for (const auto & part_id : live)
         live_part_keys.insert(partKey(key_prefix, part_id));
 
     std::set<std::string> unreferenced;
     for (const auto & key : listKeysUnder(object_storage, partsPrefix(key_prefix)))
     {
-        if (!live_part_keys.contains(key))
+        if (!live_part_keys.contains(PartObjectKey(key)))
             unreferenced.insert(key);
     }
     for (const auto & key : listKeysUnder(object_storage, blobsPrefix(key_prefix)))
     {
-        if (!reachable_blobs.contains(key))
+        if (!reachable_blobs.contains(BlobObjectKey(key)))
             unreferenced.insert(key);
     }
 

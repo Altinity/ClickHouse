@@ -89,9 +89,9 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
         metadata_storage.object_storage,
         key_prefix,
         local_scratch_path,
-        [this, file](const std::string & blob_hash, size_t size)
+        [this, file](const ContentAddressed::BlobHash & blob_hash, size_t size)
         {
-            recorded[file] = ContentAddressed::BlobEntry{blob_hash, size, blob_hash};
+            recorded[file] = ContentAddressed::BlobEntry{blob_hash, size, blob_hash.string()};
         });
 }
 
@@ -232,10 +232,10 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     ContentAddressed::PartManifest manifest;
     manifest.blobs = recorded;
 
-    const std::string part_id = ContentAddressed::computePartId(recorded);
+    const ContentAddressed::PartId part_id = ContentAddressed::computePartId(recorded);
 
     /// Put-if-absent the manifest: identical parts (same deterministic blobs) share one manifest object.
-    const std::string part_key = ContentAddressed::partKey(key_prefix, part_id);
+    const std::string part_key = ContentAddressed::partKey(key_prefix, part_id).string();
     if (!metadata_storage.object_storage->tryGetObjectMetadata(part_key, /*with_tags=*/false).has_value())
     {
         const std::string bytes = manifest.serialize();
@@ -244,10 +244,11 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
         out->finalize();
     }
 
-    // Publish the ref last: store/{server_id}/{table_uuid}/refs/{part_name} = part_id.
-    const std::string ref_key = ContentAddressed::refKey(key_prefix, metadata_storage.server_id, table_uuid, part_name);
+    // Publish the ref last: store/{server_id}/{table_uuid}/refs/{part_name} = part_id. The on-disk
+    // payload is the bare part-id string (.string() at the object-storage boundary).
+    const std::string ref_key = ContentAddressed::refKey(key_prefix, metadata_storage.server_id, table_uuid, part_name).string();
     auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(ref_key), WriteMode::Rewrite);
-    ref_out->write(part_id.data(), part_id.size());
+    ref_out->write(part_id.string().data(), part_id.string().size());
     ref_out->finalize();
 }
 
@@ -324,7 +325,7 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
     if (auto p = ContentAddressed::parsePartFilePath(path); p && p->file.empty())
     {
         const std::string ref_key
-            = ContentAddressed::refKey(key_prefix, metadata_storage.server_id, p->table_uuid, p->part_name);
+            = ContentAddressed::refKey(key_prefix, metadata_storage.server_id, p->table_uuid, p->part_name).string();
         metadata_storage.object_storage->removeObjectIfExists(StoredObject(ref_key));
         return;
     }
