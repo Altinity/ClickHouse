@@ -175,7 +175,7 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: ${{ env.SUITE }}-${{ inputs.arch }}-artifacts
@@ -228,7 +228,7 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: benchmark-${{ matrix.STORAGE }}-${{ inputs.arch }}-artifacts
@@ -270,7 +270,7 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: ${{ env.SUITE }}-${{ inputs.arch }}-ssl-artifacts
@@ -314,7 +314,7 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: ldap-${{ matrix.SUITE }}-${{ inputs.arch }}-artifacts
@@ -354,7 +354,7 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: ${{ env.SUITE }}-${{ inputs.arch }}-artifacts
@@ -404,7 +404,7 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: ${{ env.SUITE }}-${{ env.STORAGE }}-${{ inputs.arch }}-artifacts
@@ -457,7 +457,7 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: ${{ env.SUITE }}-${{ matrix.STORAGE }}-${{ inputs.arch }}-artifacts
@@ -508,7 +508,7 @@ jobs:
       - name: Create and upload logs
         if: always()
         run: .github/create_and_upload_logs.sh 1
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: ${{ env.SUITE }}-${{ matrix.STORAGE }}-${{ inputs.arch }}-artifacts
