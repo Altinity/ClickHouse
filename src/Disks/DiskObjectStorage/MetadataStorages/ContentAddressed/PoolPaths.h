@@ -5,21 +5,27 @@
 namespace DB::ContentAddressed
 {
 
-// Content-addressed object keys with 2x2 hex prefix fan-out (S3 per-prefix limits).
-std::string blobKey(const std::string & file_checksum);
-std::string partKey(const std::string & part_id);
+// Every key builder takes the object-storage common key prefix as its FIRST argument and prepends
+// it to the bare key. An EMPTY prefix yields exactly the old bare key (no leading slash), so the
+// fan-out / store layout below is unchanged when no prefix is configured. The single source of
+// truth for the prefix is ContentAddressedMetadataStorage::storage_path_prefix, threaded through
+// the metadata storage and its transaction so the read and write sides can never disagree.
 
-// Per-server/per-table ref object key: store/<server_id>/<table_uuid>/refs/<part_name>.
-std::string refsPrefix(const std::string & server_id, const std::string & table_uuid);
-std::string refKey(const std::string & server_id, const std::string & table_uuid, const std::string & part_name);
+// Content-addressed object keys with 2x2 hex prefix fan-out (S3 per-prefix limits).
+std::string blobKey(const std::string & key_prefix, const std::string & file_checksum);
+std::string partKey(const std::string & key_prefix, const std::string & part_id);
+
+// Per-server/per-table ref object key: <key_prefix>/store/<server_id>/<table_uuid>/refs/<part_name>.
+std::string refsPrefix(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid);
+std::string refKey(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid, const std::string & part_name);
 
 // Per-server/per-table direct object key for non-part / table-level files (e.g.
 // format_version.txt, later mutation_*.txt). These are stored verbatim (no content addressing,
-// no ref, no footer) under store/<server_id>/<table_uuid>/files/<tail>, where <tail> is the
-// path beyond the table dir <uuid[:3]>/<uuid>/.
+// no ref, no footer) under <key_prefix>/store/<server_id>/<table_uuid>/files/<tail>, where <tail>
+// is the path beyond the table dir <uuid[:3]>/<uuid>/.
 // TODO(phase4-gc): non-part objects are GC roots.
-std::string tableFilesPrefix(const std::string & server_id, const std::string & table_uuid);
-std::string tableFileKey(const std::string & server_id, const std::string & table_uuid, const std::string & tail);
+std::string tableFilesPrefix(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid);
+std::string tableFileKey(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid, const std::string & tail);
 
 struct PartFilePath
 {

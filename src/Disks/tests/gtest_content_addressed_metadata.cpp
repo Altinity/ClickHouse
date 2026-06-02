@@ -31,15 +31,21 @@ using namespace DB::ContentAddressed;
 
 TEST(ContentAddressedPoolPaths, ContentKeysFanOut)
 {
-    EXPECT_EQ(blobKey("abcdef0123"), "blobs/ab/cd/abcdef0123");
-    EXPECT_EQ(partKey("0011223344"), "parts/00/11/0011223344");
-    EXPECT_EQ(blobKey("ab"), "blobs/ab"); // too short to fan out (test-only)
+    // Empty prefix yields the bare key byte-for-byte (no leading slash).
+    EXPECT_EQ(blobKey("", "abcdef0123"), "blobs/ab/cd/abcdef0123");
+    EXPECT_EQ(partKey("", "0011223344"), "parts/00/11/0011223344");
+    EXPECT_EQ(blobKey("", "ab"), "blobs/ab"); // too short to fan out (test-only)
+
+    // A non-empty prefix is prepended with a single '/' join (trailing slash collapsed).
+    EXPECT_EQ(blobKey("pool", "abcdef0123"), "pool/blobs/ab/cd/abcdef0123");
+    EXPECT_EQ(partKey("pool/", "0011223344"), "pool/parts/00/11/0011223344");
 }
 
 TEST(ContentAddressedPoolPaths, RefKeys)
 {
-    EXPECT_EQ(refsPrefix("srvA", "uuid-1"), "store/srvA/uuid-1/refs/");
-    EXPECT_EQ(refKey("srvA", "uuid-1", "all_1_1_0"), "store/srvA/uuid-1/refs/all_1_1_0");
+    EXPECT_EQ(refsPrefix("", "srvA", "uuid-1"), "store/srvA/uuid-1/refs/");
+    EXPECT_EQ(refKey("", "srvA", "uuid-1", "all_1_1_0"), "store/srvA/uuid-1/refs/all_1_1_0");
+    EXPECT_EQ(refKey("pool", "srvA", "uuid-1", "all_1_1_0"), "pool/store/srvA/uuid-1/refs/all_1_1_0");
 }
 
 TEST(ContentAddressedPoolPaths, ParsePartFilePath)
@@ -130,10 +136,10 @@ public:
             fs::remove_all(object_storage->getCommonKeyPrefix());
         }
 
-        // The tests seed BARE keys (common-key-prefix handling is deferred to Phase 3),
-        // so the content-pool roots are created at CWD and not covered by the per-storage
-        // cleanup above. Remove them so CI runs leave no stray dirs in the repo root.
-        // The std::error_code overload makes a missing dir a no-op.
+        // These tests deliberately seed with an EMPTY key prefix (to prove the empty-prefix path is
+        // byte-identical to the old bare keys), so the content-pool roots are created at CWD and not
+        // covered by the per-storage cleanup above. Remove them so CI runs leave no stray dirs in the
+        // repo root. The std::error_code overload makes a missing dir a no-op.
         std::error_code ec;
         fs::remove_all("blobs", ec);
         fs::remove_all("parts", ec);
@@ -182,18 +188,18 @@ TEST_F(ContentAddressedMetaTest, ResolvesAndReadsSeededPart)
     const std::string blob_csum = "deadbeef01";
     const std::string part_id = "cafe112233";
 
-    writeObject(os, blobKey(blob_csum), blob_data);
+    writeObject(os, blobKey("", blob_csum), blob_data);
     Footer f;
     f.blobs[file] = BlobEntry{blob_csum, blob_data.size(), blob_csum};
-    writeObject(os, partKey(part_id), f.serialize());
-    writeObject(os, refKey(sid, uuid, part), part_id);
+    writeObject(os, partKey("", part_id), f.serialize());
+    writeObject(os, refKey("", sid, uuid, part), part_id);
 
     const std::string logical = "uui/" + uuid + "/" + part + "/" + file; // <uuid[:3]>/<uuid>/<part>/<file>
     EXPECT_TRUE(ms->existsFile(logical));
     EXPECT_EQ(ms->getFileSize(logical), blob_data.size());
     auto objs = ms->getStorageObjects(logical);
     ASSERT_EQ(objs.size(), 1u);
-    EXPECT_EQ(objs[0].remote_path, blobKey(blob_csum));
+    EXPECT_EQ(objs[0].remote_path, blobKey("", blob_csum));
     EXPECT_EQ(readObject(os, objs[0].remote_path), blob_data);
     EXPECT_FALSE(ms->existsFile("uui/" + uuid + "/" + part + "/absent.bin")); // file not in footer
 }
@@ -204,7 +210,7 @@ TEST_F(ContentAddressedMetaTest, FailsClosedOnMissingFooter)
     auto ms = getMetadataStorage("cas_failclose");
     auto os = getObjectStorage("cas_failclose");
     // ref present, but parts/<part_id> footer absent → must THROW (B18), not return empty
-    writeObject(os, refKey(ms->serverIdForTest(), "uuid-3", "all_1_1_0"), "missingpid");
+    writeObject(os, refKey("", ms->serverIdForTest(), "uuid-3", "all_1_1_0"), "missingpid");
     EXPECT_THROW(ms->getStorageObjects("uui/uuid-3/all_1_1_0/data.bin"), DB::Exception);
 }
 
@@ -218,8 +224,8 @@ TEST_F(ContentAddressedMetaTest, ListsPartsAndPartFiles)
 
     auto seed = [&](const std::string & part, const std::string & pid, const Footer & f)
     {
-        writeObject(os, partKey(pid), f.serialize());
-        writeObject(os, refKey(sid, uuid, part), pid);
+        writeObject(os, partKey("", pid), f.serialize());
+        writeObject(os, refKey("", sid, uuid, part), pid);
     };
     Footer fa; fa.blobs["data.bin"] = {"k1", 3, "k1"}; fa.blobs["columns.txt"] = {"k2", 2, "k2"};
     seed("all_1_1_0", "pidA", fa);
@@ -262,7 +268,7 @@ TEST_F(ContentAddressedMetaTest, WriteBufferUploadsContentAddressed)
     auto os = getObjectStorage("cas_wbuf");
     std::string hash1;
     {
-        ContentAddressedWriteBuffer buf(os, "./cas_wbuf_tmp");
+        ContentAddressedWriteBuffer buf(os, "", "./cas_wbuf_tmp");
         buf.write("HELLO-COLUMN", 12);
         buf.finalize();
         hash1 = buf.getBlobHash();
@@ -270,11 +276,11 @@ TEST_F(ContentAddressedMetaTest, WriteBufferUploadsContentAddressed)
     }
     EXPECT_FALSE(hash1.empty());
     // bytes landed at blobs/<hash> and read back:
-    EXPECT_EQ(readObject(os, blobKey(hash1)), "HELLO-COLUMN");
+    EXPECT_EQ(readObject(os, blobKey("", hash1)), "HELLO-COLUMN");
 
     // idempotent: identical content → same hash, no second upload (object already present)
     {
-        ContentAddressedWriteBuffer buf2(os, "./cas_wbuf_tmp");
+        ContentAddressedWriteBuffer buf2(os, "", "./cas_wbuf_tmp");
         buf2.write("HELLO-COLUMN", 12);
         buf2.finalize();
         EXPECT_EQ(buf2.getBlobHash(), hash1);
@@ -282,13 +288,13 @@ TEST_F(ContentAddressedMetaTest, WriteBufferUploadsContentAddressed)
     // different content → different hash + its own object
     std::string hash2;
     {
-        ContentAddressedWriteBuffer buf3(os, "./cas_wbuf_tmp");
+        ContentAddressedWriteBuffer buf3(os, "", "./cas_wbuf_tmp");
         buf3.write("OTHER", 5);
         buf3.finalize();
         hash2 = buf3.getBlobHash();
     }
     EXPECT_NE(hash2, hash1);
-    EXPECT_EQ(readObject(os, blobKey(hash2)), "OTHER");
+    EXPECT_EQ(readObject(os, blobKey("", hash2)), "OTHER");
 }
 
 TEST(ContentAddressedPartId, DeterministicAndExcludesMutableFiles)
@@ -331,7 +337,7 @@ TEST_F(ContentAddressedMetaTest, WritePartThenReadBackAndDedup)
 
     auto write_part = [&](const std::string & part, const std::map<std::string,std::string> & files)
     {
-        DB::ContentAddressedTransaction tx(*ms);
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"");
         for (const auto & [name, bytes] : files)
         {
             auto buf = tx.writeFile("uui/" + uuid + "/" + part + "/" + name, 4096, DB::WriteMode::Rewrite, {});
@@ -369,7 +375,7 @@ TEST_F(ContentAddressedMetaTest, NonPartFilePassthrough)
 
     // Write a table-level file through the transaction.
     {
-        DB::ContentAddressedTransaction tx(*ms);
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"");
         auto buf = tx.writeFile(format_version, 4096, DB::WriteMode::Rewrite, {});
         const std::string bytes = "1";
         buf->write(bytes.data(), bytes.size());
@@ -382,7 +388,7 @@ TEST_F(ContentAddressedMetaTest, NonPartFilePassthrough)
     EXPECT_EQ(ms->getFileSize(format_version), 1u);
     auto objs = ms->getStorageObjects(format_version);
     ASSERT_EQ(objs.size(), 1u);
-    EXPECT_EQ(objs[0].remote_path, tableFileKey(sid, uuid, "format_version.txt"));
+    EXPECT_EQ(objs[0].remote_path, tableFileKey("", sid, uuid, "format_version.txt"));
     EXPECT_EQ(readObject(os, objs[0].remote_path), "1");
 
     // No content-addressed structures were created for it.
@@ -390,7 +396,7 @@ TEST_F(ContentAddressedMetaTest, NonPartFilePassthrough)
 
     // A part file in the same table still resolves via the ref/footer/blob path.
     {
-        DB::ContentAddressedTransaction tx(*ms);
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"");
         auto buf = tx.writeFile("uui/" + uuid + "/all_1_1_0/data.bin", 4096, DB::WriteMode::Rewrite, {});
         const std::string bytes = "PART-BYTES";
         buf->write(bytes.data(), bytes.size());
@@ -414,14 +420,14 @@ TEST_F(ContentAddressedMetaTest, MutationCarryForwardReusesBlob)
     const std::string uuid = "uuid-10";
     // source part
     {
-        DB::ContentAddressedTransaction tx(*ms);
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"");
         for (auto & [n,b] : std::map<std::string,std::string>{{"a.bin","A0"},{"b.bin","B0"},{"columns.txt","a b"}})
         { auto buf = tx.writeFile("uui/" + uuid + "/all_1_1_0/" + n, 4096, DB::WriteMode::Rewrite, {}); buf->write(b.data(), b.size()); buf->finalize(); }
         tx.commit(DB::NoCommitOptions{});
     }
     // mutation: rewrite a.bin, carry-forward b.bin + columns.txt
     {
-        DB::ContentAddressedTransaction tx(*ms);
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"");
         auto buf = tx.writeFile("uui/" + uuid + "/all_1_1_0_1/a.bin", 4096, DB::WriteMode::Rewrite, {});
         buf->write("A1", 2); buf->finalize();
         tx.createHardLinkFrom("uui/" + uuid + "/all_1_1_0/b.bin", "uui/" + uuid + "/all_1_1_0_1/b.bin");

@@ -26,7 +26,11 @@ protected:
     ContentAddressedMetadataStorage & metadata_storage;
 
 public:
-    explicit ContentAddressedTransaction(ContentAddressedMetadataStorage & metadata_storage_);
+    /// key_prefix_ is the object-storage common key prefix, taken from the metadata storage
+    /// (its storage_path_prefix) so the write side keys objects exactly where the read side looks.
+    /// Never re-derive it from object_storage->getCommonKeyPrefix() here: a config
+    /// key_compatibility_prefix override would otherwise make read and write disagree.
+    ContentAddressedTransaction(ContentAddressedMetadataStorage & metadata_storage_, std::string key_prefix_);
 
     bool supportsChmod() const override { return false; }
 
@@ -113,6 +117,8 @@ private:
     // Pin/verify the (table_uuid, part_name) all files of one commit must agree on.
     void rememberTarget(const std::string & path);
 
+    /// Object-storage common key prefix; authoritative copy from the metadata storage (see ctor).
+    const std::string key_prefix;
     std::map<std::string, ContentAddressed::BlobEntry> recorded;
     std::string table_uuid;
     std::string part_name;

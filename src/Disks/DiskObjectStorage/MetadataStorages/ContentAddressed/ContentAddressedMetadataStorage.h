@@ -44,8 +44,9 @@ private:
     // Throws if the path is not a part file, the ref is absent, or the file is not in the footer.
     ContentAddressed::BlobEntry resolveBlobEntry(const std::string & path) const;
 
-    // Resolve helpers: part file -> ref -> part_id -> footer -> blob.
-    // TODO(phase3): honor object_storage->getCommonKeyPrefix() (bare keys for now).
+    // Resolve helpers: part file -> ref -> part_id -> footer -> blob. All object keys are built
+    // under storage_path_prefix (the object-storage common key prefix), the single source of truth
+    // shared with ContentAddressedTransaction so the read and write sides cannot disagree.
     // No footer cache in M1 (read each time); caching is a later optimization.
 
     // Read the ref object at refKey(server_id, table_uuid, part_name).

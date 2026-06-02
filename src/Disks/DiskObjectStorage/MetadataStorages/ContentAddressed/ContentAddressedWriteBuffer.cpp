@@ -16,9 +16,10 @@ namespace fs = std::filesystem;
 namespace DB::ContentAddressed
 {
 
-ContentAddressedWriteBuffer::ContentAddressedWriteBuffer(ObjectStoragePtr object_storage_, std::string temp_dir_, OnFinalized on_finalized_)
+ContentAddressedWriteBuffer::ContentAddressedWriteBuffer(ObjectStoragePtr object_storage_, std::string key_prefix_, std::string temp_dir_, OnFinalized on_finalized_)
     : WriteBufferFromFileBase(DBMS_DEFAULT_BUFFER_SIZE, nullptr, 0)
     , object_storage(std::move(object_storage_))
+    , key_prefix(std::move(key_prefix_))
     , on_finalized(std::move(on_finalized_))
 {
     fs::create_directories(temp_dir_);
@@ -57,7 +58,7 @@ void ContentAddressedWriteBuffer::finalizeImpl()
     hashing->finalize();
     temp_file->finalize();
 
-    const std::string key = blobKey(blob_hash);
+    const std::string key = blobKey(key_prefix, blob_hash);
 
     /// Put-if-absent: identical content deduplicates to the same blob, so skip the upload when
     /// the object already exists.

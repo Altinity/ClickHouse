@@ -15,8 +15,9 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
-ContentAddressedTransaction::ContentAddressedTransaction(ContentAddressedMetadataStorage & metadata_storage_)
+ContentAddressedTransaction::ContentAddressedTransaction(ContentAddressedMetadataStorage & metadata_storage_, std::string key_prefix_)
     : metadata_storage(metadata_storage_)
+    , key_prefix(std::move(key_prefix_))
 {
 }
 
@@ -67,7 +68,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
                 "ContentAddressed: unsupported non-part write path: {}",
                 path);
 
-        const std::string key = ContentAddressed::tableFileKey(metadata_storage.server_id, tf->table_uuid, tf->tail);
+        const std::string key = ContentAddressed::tableFileKey(key_prefix, metadata_storage.server_id, tf->table_uuid, tf->tail);
         return metadata_storage.object_storage->writeObject(StoredObject(key, path), mode, /*attributes=*/std::nullopt, buf_size, settings);
     }
 
@@ -76,13 +77,14 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     auto p = ContentAddressed::parsePartFilePath(path);
     const std::string file = p->file;
 
-    /// The content pool root mirrors the read path: bare keys for now (Phase 3 TODO honors the
-    /// common key prefix). Spill temp files under the object-storage common key prefix so they
+    /// The blob is keyed under the same common key prefix as the read path (key_prefix, taken from
+    /// the metadata storage). Spill temp files under the object-storage common key prefix so they
     /// share its disk and are cleaned up alongside it.
     const std::string temp_dir = metadata_storage.object_storage->getCommonKeyPrefix() + "/cas_wbuf_tmp";
 
     return std::make_unique<ContentAddressed::ContentAddressedWriteBuffer>(
         metadata_storage.object_storage,
+        key_prefix,
         temp_dir,
         [this, file](const std::string & blob_hash, size_t size)
         {
@@ -217,7 +219,7 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     const std::string part_id = ContentAddressed::computePartId(recorded);
 
     /// Put-if-absent the footer: identical parts (same deterministic blobs) share one footer object.
-    const std::string part_key = ContentAddressed::partKey(part_id);
+    const std::string part_key = ContentAddressed::partKey(key_prefix, part_id);
     if (!metadata_storage.object_storage->tryGetObjectMetadata(part_key, /*with_tags=*/false).has_value())
     {
         const std::string bytes = footer.serialize();
@@ -227,7 +229,7 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     }
 
     // Publish the ref last: store/{server_id}/{table_uuid}/refs/{part_name} = part_id.
-    const std::string ref_key = ContentAddressed::refKey(metadata_storage.server_id, table_uuid, part_name);
+    const std::string ref_key = ContentAddressed::refKey(key_prefix, metadata_storage.server_id, table_uuid, part_name);
     auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(ref_key), WriteMode::Rewrite);
     ref_out->write(part_id.data(), part_id.size());
     ref_out->finalize();

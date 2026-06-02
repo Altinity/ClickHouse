@@ -30,7 +30,10 @@ public:
     /// (or found already present). Lets the owning transaction record (logical_file -> blob).
     using OnFinalized = std::function<void(const std::string & blob_hash, size_t size)>;
 
-    ContentAddressedWriteBuffer(ObjectStoragePtr object_storage_, std::string temp_dir_, OnFinalized on_finalized_ = {});
+    /// key_prefix_ is the object-storage common key prefix to prepend to the blob key; an empty
+    /// prefix yields the bare blobs/<hash> key. It is threaded from the owning transaction so the
+    /// blob is uploaded exactly where the read side resolves it.
+    ContentAddressedWriteBuffer(ObjectStoragePtr object_storage_, std::string key_prefix_, std::string temp_dir_, OnFinalized on_finalized_ = {});
     ~ContentAddressedWriteBuffer() override;
 
     void sync() override;
@@ -47,6 +50,7 @@ private:
     void removeTempFile() noexcept;
 
     ObjectStoragePtr object_storage;
+    std::string key_prefix;
     std::string temp_path;
     OnFinalized on_finalized;
 

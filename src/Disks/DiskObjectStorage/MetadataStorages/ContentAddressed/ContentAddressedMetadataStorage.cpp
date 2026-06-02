@@ -34,12 +34,11 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(ObjectStoragePt
 
 MetadataTransactionPtr ContentAddressedMetadataStorage::createTransaction()
 {
-    return std::make_shared<ContentAddressedTransaction>(*this);
+    return std::make_shared<ContentAddressedTransaction>(*this, storage_path_prefix);
 }
 
 std::optional<std::string> ContentAddressedMetadataStorage::readSmallObjectIfExists(const std::string & key) const
 {
-    // TODO(phase3): honor object_storage->getCommonKeyPrefix() (bare keys for now).
     if (!object_storage->tryGetObjectMetadata(key, /*with_tags=*/false))
         return std::nullopt;
 
@@ -52,12 +51,12 @@ std::optional<std::string> ContentAddressedMetadataStorage::readSmallObjectIfExi
 
 std::optional<std::string> ContentAddressedMetadataStorage::readRefPartId(const std::string & table_uuid, const std::string & part_name) const
 {
-    return readSmallObjectIfExists(ContentAddressed::refKey(server_id, table_uuid, part_name));
+    return readSmallObjectIfExists(ContentAddressed::refKey(storage_path_prefix, server_id, table_uuid, part_name));
 }
 
 ContentAddressed::Footer ContentAddressedMetadataStorage::loadFooterOrThrow(const std::string & part_id) const
 {
-    auto bytes = readSmallObjectIfExists(ContentAddressed::partKey(part_id));
+    auto bytes = readSmallObjectIfExists(ContentAddressed::partKey(storage_path_prefix, part_id));
     if (!bytes)
         throw Exception(
             ErrorCodes::CORRUPTED_DATA,
@@ -88,7 +87,7 @@ bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
     {
         if (auto tf = ContentAddressed::parseTableFilePath(path))
             return object_storage->tryGetObjectMetadata(
-                ContentAddressed::tableFileKey(server_id, tf->table_uuid, tf->tail), /*with_tags=*/false).has_value();
+                ContentAddressed::tableFileKey(storage_path_prefix, server_id, tf->table_uuid, tf->tail), /*with_tags=*/false).has_value();
         return false;
     }
 
@@ -108,7 +107,7 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
     {
         // Table dir exists iff it has at least one ref (part).
         RelativePathsWithMetadata files;
-        object_storage->listObjects(ContentAddressed::refsPrefix(server_id, *uuid), files, 0);
+        object_storage->listObjects(ContentAddressed::refsPrefix(storage_path_prefix, server_id, *uuid), files, 0);
         return !files.empty();
     }
     if (auto p = ContentAddressed::parsePartFilePath(path); p && p->file.empty())
@@ -133,7 +132,7 @@ uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) 
         if (!tf)
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a file path: {}", path);
         auto meta = object_storage->tryGetObjectMetadata(
-            ContentAddressed::tableFileKey(server_id, tf->table_uuid, tf->tail), /*with_tags=*/false);
+            ContentAddressed::tableFileKey(storage_path_prefix, server_id, tf->table_uuid, tf->tail), /*with_tags=*/false);
         if (!meta)
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no table-level object for {}", path);
         return meta->size_bytes;
@@ -162,7 +161,7 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
         auto pid = readRefPartId(p->table_uuid, p->part_name);
         if (!pid)
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
-        auto metadata = object_storage->getObjectMetadata(ContentAddressed::partKey(*pid), /*with_tags=*/false);
+        auto metadata = object_storage->getObjectMetadata(ContentAddressed::partKey(storage_path_prefix, *pid), /*with_tags=*/false);
         return metadata.last_modified;
     }
 
@@ -180,7 +179,7 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
     {
         // Mirror MetadataStorageFromPlainObjectStorage::listDirectory child-derivation:
         // list under the prefix, strip it, and take the immediate child component.
-        std::string prefix = ContentAddressed::refsPrefix(server_id, *uuid);
+        std::string prefix = ContentAddressed::refsPrefix(storage_path_prefix, server_id, *uuid);
         RelativePathsWithMetadata files;
         object_storage->listObjects(prefix, files, 0);
 
@@ -237,7 +236,7 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
         auto tf = ContentAddressed::parseTableFilePath(path);
         if (!tf)
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a file path: {}", path);
-        const std::string key = ContentAddressed::tableFileKey(server_id, tf->table_uuid, tf->tail);
+        const std::string key = ContentAddressed::tableFileKey(storage_path_prefix, server_id, tf->table_uuid, tf->tail);
         auto meta = object_storage->tryGetObjectMetadata(key, /*with_tags=*/false);
         if (!meta)
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no table-level object for {}", path);
@@ -256,9 +255,9 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in footer of {}", p->file, path);
 
     const auto & e = it->second;
-    // BARE key (no common-prefix prepend); must match what the gtest seeds and what blobs are stored under.
-    // TODO(phase3): honor object_storage->getCommonKeyPrefix().
-    return {StoredObject(ContentAddressed::blobKey(e.key), path, e.size)};
+    /// Resolve under the same common key prefix used on the write side (single source of truth:
+    /// storage_path_prefix), so blobs are read from where ContentAddressedWriteBuffer stored them.
+    return {StoredObject(ContentAddressed::blobKey(storage_path_prefix, e.key), path, e.size)};
 }
 
 }

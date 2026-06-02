@@ -4,6 +4,21 @@
 namespace DB::ContentAddressed
 {
 
+/// Prepend the object-storage common key prefix to a bare key. An empty prefix yields exactly the
+/// bare key (no leading slash), so existing layouts and seeded tests are byte-for-byte unchanged.
+/// A non-empty prefix is joined with a single '/' (any trailing '/' on the prefix is collapsed).
+static std::string withPrefix(const std::string & key_prefix, const std::string & bare)
+{
+    if (key_prefix.empty())
+        return bare;
+    std::string p = key_prefix;
+    while (!p.empty() && p.back() == '/')
+        p.pop_back();
+    if (p.empty())
+        return bare;
+    return p + "/" + bare;
+}
+
 static std::string fanOut(const std::string & prefix, const std::string & hash)
 {
     if (hash.size() < 4)
@@ -11,34 +26,34 @@ static std::string fanOut(const std::string & prefix, const std::string & hash)
     return prefix + "/" + hash.substr(0, 2) + "/" + hash.substr(2, 2) + "/" + hash;
 }
 
-std::string blobKey(const std::string & file_checksum)
+std::string blobKey(const std::string & key_prefix, const std::string & file_checksum)
 {
-    return fanOut("blobs", file_checksum);
+    return withPrefix(key_prefix, fanOut("blobs", file_checksum));
 }
 
-std::string partKey(const std::string & part_id)
+std::string partKey(const std::string & key_prefix, const std::string & part_id)
 {
-    return fanOut("parts", part_id);
+    return withPrefix(key_prefix, fanOut("parts", part_id));
 }
 
-std::string refsPrefix(const std::string & server_id, const std::string & table_uuid)
+std::string refsPrefix(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid)
 {
-    return "store/" + server_id + "/" + table_uuid + "/refs/";
+    return withPrefix(key_prefix, "store/" + server_id + "/" + table_uuid + "/refs/");
 }
 
-std::string refKey(const std::string & server_id, const std::string & table_uuid, const std::string & part_name)
+std::string refKey(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid, const std::string & part_name)
 {
-    return refsPrefix(server_id, table_uuid) + part_name;
+    return refsPrefix(key_prefix, server_id, table_uuid) + part_name;
 }
 
-std::string tableFilesPrefix(const std::string & server_id, const std::string & table_uuid)
+std::string tableFilesPrefix(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid)
 {
-    return "store/" + server_id + "/" + table_uuid + "/files/";
+    return withPrefix(key_prefix, "store/" + server_id + "/" + table_uuid + "/files/");
 }
 
-std::string tableFileKey(const std::string & server_id, const std::string & table_uuid, const std::string & tail)
+std::string tableFileKey(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid, const std::string & tail)
 {
-    return tableFilesPrefix(server_id, table_uuid) + tail;
+    return tableFilesPrefix(key_prefix, server_id, table_uuid) + tail;
 }
 
 static std::vector<std::string> splitNonEmpty(const std::string & path)
