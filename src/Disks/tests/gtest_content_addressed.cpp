@@ -105,3 +105,32 @@ TEST(ContentAddressedReachability, SweepUsesTimeSinceUnreachableNotAge)
     auto r4 = selectForSweep(/*unreferenced*/ {}, r2.first_unreachable, /*now*/ 1400, 300);
     EXPECT_TRUE(r4.first_unreachable.empty());
 }
+
+TEST(ContentAddressedScenario, MutationCarryForwardThenGC)
+{
+    using namespace DB::ContentAddressed;
+    InMemoryBlobRefIndex idx;
+
+    Footer base;
+    base.blobs["a.bin"] = {"A0", 1, "A0"};
+    base.blobs["b.bin"] = {"B0", 1, "B0"};
+    base.blobs["c.bin"] = {"C0", 1, "C0"};
+    idx.addPart("all_1_1_0", base);
+
+    Footer mut; // mutation rewrites only a.bin; b/c carried forward by reference
+    mut.blobs["a.bin"] = {"A1", 1, "A1"};
+    mut.blobs["b.bin"] = {"B0", 1, "B0"};
+    mut.blobs["c.bin"] = {"C0", 1, "C0"};
+    idx.addPart("all_1_1_0_1", mut);
+
+    idx.removePart("all_1_1_0", base); // lifecycle drops the covered source ref
+
+    auto dead = idx.unreferenced();
+    EXPECT_EQ(dead.size(), 1u);          // only the replaced column is dead
+    EXPECT_TRUE(dead.count("A0"));
+
+    auto r = selectForSweep(dead, {}, /*now*/ 1000, /*grace*/ 0);
+    EXPECT_EQ(r.to_delete, std::vector<std::string>{"A0"}); // A0 swept; B0/C0 kept by reachability
+    EXPECT_EQ(idx.refcount("B0"), 1);
+    EXPECT_EQ(idx.refcount("C0"), 1);
+}
