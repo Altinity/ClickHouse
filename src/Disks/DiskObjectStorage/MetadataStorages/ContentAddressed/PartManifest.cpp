@@ -98,23 +98,47 @@ PartManifest PartManifest::deserialize(const std::string & bytes)
     return f;
 }
 
-/// Mutable/non-deterministic files that must not contribute to the part identity.
-static bool isExcludedFromPartId(std::string_view file)
+std::string RefSidecar::serialize() const
 {
-    static constexpr std::array excluded{"uuid.txt", "txn_version.txt", "metadata_version.txt"};
-    for (const auto & e : excluded)
-        if (file == e)
-            return true;
-    return false;
+    std::string b(MAGIC, sizeof(MAGIC));
+    putU64(b, VERSION);
+    putU64(b, files.size());
+    for (const auto & [k, v] : files)
+    {
+        putStr(b, k);
+        putStr(b, v);
+    }
+    return b;
+}
+
+RefSidecar RefSidecar::deserialize(const std::string & bytes)
+{
+    if (bytes.size() < sizeof(MAGIC) || std::memcmp(bytes.data(), MAGIC, sizeof(MAGIC)) != 0)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref sidecar: bad magic");
+    size_t p = sizeof(MAGIC);
+    const uint64_t version = getU64(bytes, p);
+    if (version != VERSION)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS ref sidecar: unknown version {}", version);
+    RefSidecar s;
+    const uint64_t n = getU64(bytes, p);
+    for (uint64_t i = 0; i < n; ++i)
+    {
+        auto k = getStr(bytes, p);
+        s.files[k] = getStr(bytes, p);
+    }
+    return s;
 }
 
 PartId computePartId(const std::map<std::string, BlobEntry> & blobs)
 {
     /// std::map iterates in sorted key order, so the (logical_file, checksum) stream is canonical.
+    /// Mutable per-part files (isMutablePerPartFile) are excluded so two parts with identical column
+    /// data but a different uuid / txn / metadata version still resolve to the same part_id (dedup);
+    /// those files live per-ref in the sidecar, never in the shared manifest (single source of truth).
     SipHash hash;
     for (const auto & [file, blob] : blobs)
     {
-        if (isExcludedFromPartId(file))
+        if (isMutablePerPartFile(file))
             continue;
         hash.update(file);
         hash.update(blob.checksum);

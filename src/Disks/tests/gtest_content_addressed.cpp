@@ -47,6 +47,51 @@ TEST(ContentAddressedPartManifest, RejectsForgedHugeLength)
     EXPECT_THROW(PartManifest::deserialize(b), DB::Exception);
 }
 
+// B23 Task 1: the canonical predicate for mutable per-part files. The set is the SINGLE source of
+// truth shared with computePartId's exclusion: anything excluded from the part identity is exactly a
+// mutable per-part file (they live per-ref, never in the shared manifest).
+TEST(ContentAddressedMutablePerPartFile, PredicateMatchesPartIdExclusion)
+{
+    EXPECT_TRUE(isMutablePerPartFile("uuid.txt"));
+    EXPECT_TRUE(isMutablePerPartFile("txn_version.txt"));
+    EXPECT_TRUE(isMutablePerPartFile("metadata_version.txt"));
+    EXPECT_FALSE(isMutablePerPartFile("a.bin"));
+    EXPECT_FALSE(isMutablePerPartFile("columns.txt"));
+    EXPECT_FALSE(isMutablePerPartFile("count.txt"));
+
+    // The set is derived from one shared constant: assert the predicate agrees with the part-id
+    // exclusion for every name in the canonical list (single source of truth).
+    for (const auto & name : mutablePerPartFiles())
+        EXPECT_TRUE(isMutablePerPartFile(name)) << name;
+    EXPECT_EQ(mutablePerPartFiles().size(), 3u);
+}
+
+// B23 Task 1: the per-ref sidecar is a tiny versioned {filename -> bytes} blob. Round-trip preserves
+// names and bytes (including embedded NULs), and a bad magic / truncation is rejected (fail-close).
+TEST(ContentAddressedRefSidecar, RoundTripsNamesAndBytes)
+{
+    RefSidecar s;
+    s.files["uuid.txt"] = "0c9d8e7f-1234-5678-9abc-def012345678\n";
+    s.files["txn_version.txt"] = std::string("42\n\0binary", 9); // embedded NUL
+    s.files["metadata_version.txt"] = "7";
+
+    std::string bytes = s.serialize();
+    RefSidecar g = RefSidecar::deserialize(bytes);
+
+    EXPECT_EQ(g.files.size(), 3u);
+    EXPECT_EQ(g.files.at("uuid.txt"), "0c9d8e7f-1234-5678-9abc-def012345678\n");
+    EXPECT_EQ(g.files.at("txn_version.txt"), std::string("42\n\0binary", 9));
+    EXPECT_EQ(g.files.at("metadata_version.txt"), "7");
+}
+
+TEST(ContentAddressedRefSidecar, RejectsBadMagicAndTruncation)
+{
+    EXPECT_THROW(RefSidecar::deserialize("XXXX"), DB::Exception);
+    RefSidecar s; s.files["uuid.txt"] = "abc";
+    std::string ok = s.serialize();
+    EXPECT_THROW(RefSidecar::deserialize(ok.substr(0, ok.size() - 1)), DB::Exception);
+}
+
 TEST(ContentAddressedBlobRefIndex, DeltaCountAndDedup)
 {
     using namespace DB::ContentAddressed;
