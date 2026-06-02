@@ -1,0 +1,26 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <disk_content_addressed_gc_s3>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>content_addressed</metadata_type>
+                <endpoint>http://minio1:9001/root/cas_gc_data/</endpoint>
+                <access_key_id>minio</access_key_id>
+                <secret_access_key>ClickHouse_Minio_P@ssw0rd</secret_access_key>
+                <!-- Aggressive GC so the background sweep actually reclaims orphaned blobs during the test. -->
+                <content_addressed_gc_grace_sec>1</content_addressed_gc_grace_sec>
+                <content_addressed_gc_interval_sec>1</content_addressed_gc_interval_sec>
+            </disk_content_addressed_gc_s3>
+        </disks>
+        <policies>
+            <content_addressed_gc_s3>
+                <volumes>
+                    <main>
+                        <disk>disk_content_addressed_gc_s3</disk>
+                    </main>
+                </volumes>
+            </content_addressed_gc_s3>
+        </policies>
+    </storage_configuration>
+</clickhouse>
