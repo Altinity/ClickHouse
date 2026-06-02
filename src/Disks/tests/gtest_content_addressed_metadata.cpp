@@ -190,3 +190,51 @@ TEST_F(ContentAddressedMetaTest, FailsClosedOnMissingFooter)
     writeObject(os, refKey(ms->serverIdForTest(), "uuid-3", "all_1_1_0"), "missingpid");
     EXPECT_THROW(ms->getStorageObjects("uui/uuid-3/all_1_1_0/data.bin"), DB::Exception);
 }
+
+TEST_F(ContentAddressedMetaTest, ListsPartsAndPartFiles)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_list");
+    auto os = getObjectStorage("cas_list");
+    const std::string sid = ms->serverIdForTest();
+    const std::string uuid = "uuid-4";
+
+    auto seed = [&](const std::string & part, const std::string & pid, const Footer & f)
+    {
+        writeObject(os, partKey(pid), f.serialize());
+        writeObject(os, refKey(sid, uuid, part), pid);
+    };
+    Footer fa; fa.blobs["data.bin"] = {"k1", 3, "k1"}; fa.blobs["columns.txt"] = {"k2", 2, "k2"};
+    seed("all_1_1_0", "pidA", fa);
+    Footer fb; fb.blobs["data.bin"] = {"k3", 4, "k3"};
+    seed("all_2_2_0", "pidB", fb);
+
+    // table dir → part names
+    auto parts = ms->listDirectory("uui/" + uuid + "/");
+    std::set<std::string> got(parts.begin(), parts.end());
+    EXPECT_EQ(got, (std::set<std::string>{"all_1_1_0", "all_2_2_0"}));
+
+    // part dir → file names
+    auto files = ms->listDirectory("uui/" + uuid + "/all_1_1_0");
+    std::set<std::string> gotf(files.begin(), files.end());
+    EXPECT_EQ(gotf, (std::set<std::string>{"data.bin", "columns.txt"}));
+
+    // iterateDirectory over the table dir yields the same part names
+    // StaticDirectoryIterator::name() returns the basename (filename component),
+    // i.e. the part name, of each prepended child path.
+    std::set<std::string> iter_names;
+    for (auto it = ms->iterateDirectory("uui/" + uuid + "/"); it->isValid(); it->next())
+        iter_names.insert(it->name());
+    EXPECT_EQ(iter_names, (std::set<std::string>{"all_1_1_0", "all_2_2_0"}));
+
+    EXPECT_TRUE(ms->existsDirectory("uui/" + uuid + "/all_1_1_0"));
+    EXPECT_TRUE(ms->existsFileOrDirectory("uui/" + uuid + "/all_1_1_0/data.bin"));
+}
+
+TEST_F(ContentAddressedMetaTest, TransactionWriteNotImplementedYet)
+{
+    auto ms = getMetadataStorage("cas_tx");
+    auto tx = ms->createTransaction();
+    ASSERT_NE(tx, nullptr);
+    EXPECT_THROW(tx->writeStringToFile("uui/uuid-5/all_1_1_0/x", "y"), DB::Exception); // Phase 3
+}

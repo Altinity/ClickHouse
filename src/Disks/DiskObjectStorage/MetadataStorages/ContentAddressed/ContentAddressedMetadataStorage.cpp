@@ -1,7 +1,10 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/StaticDirectoryIterator.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
+
+#include <unordered_set>
 
 #include <filesystem>
 
@@ -17,7 +20,6 @@ namespace DB
 
 namespace ErrorCodes
 {
-    extern const int NOT_IMPLEMENTED;
     extern const int CORRUPTED_DATA;
     extern const int FILE_DOESNT_EXIST;
 }
@@ -76,14 +78,26 @@ bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
     return footer.blobs.contains(p->file);
 }
 
-bool ContentAddressedMetadataStorage::existsDirectory(const std::string &) const
+bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) const
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "ContentAddressed: existsDirectory implemented in Phase 2 Task 3/4");
+    if (auto uuid = ContentAddressed::parseTableUuid(path))
+    {
+        // Table dir exists iff it has at least one ref (part).
+        RelativePathsWithMetadata files;
+        object_storage->listObjects(ContentAddressed::refsPrefix(server_id, *uuid), files, 0);
+        return !files.empty();
+    }
+    if (auto p = ContentAddressed::parsePartFilePath(path); p && p->file.empty())
+    {
+        // Part dir exists iff its ref is present.
+        return readRefPartId(p->table_uuid, p->part_name).has_value();
+    }
+    return false;
 }
 
-bool ContentAddressedMetadataStorage::existsFileOrDirectory(const std::string &) const
+bool ContentAddressedMetadataStorage::existsFileOrDirectory(const std::string & path) const
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "ContentAddressed: existsFileOrDirectory implemented in Phase 2 Task 3/4");
+    return existsFile(path) || existsDirectory(path);
 }
 
 uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) const
@@ -110,14 +124,60 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
     return metadata.last_modified;
 }
 
-std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const std::string &) const
+std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const std::string & path) const
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "ContentAddressed: listDirectory implemented in Phase 2 Task 3/4");
+    // Table dir <uuid[:3]>/<uuid>[/]: list the part names from refs/.
+    if (auto uuid = ContentAddressed::parseTableUuid(path))
+    {
+        // Mirror MetadataStorageFromPlainObjectStorage::listDirectory child-derivation:
+        // list under the prefix, strip it, and take the immediate child component.
+        std::string prefix = ContentAddressed::refsPrefix(server_id, *uuid);
+        RelativePathsWithMetadata files;
+        object_storage->listObjects(prefix, files, 0);
+
+        std::unordered_set<std::string> result;
+        for (const auto & elem : files)
+        {
+            const auto & p = elem->relative_path;
+            const auto child_pos = p.find(prefix);
+            if (child_pos != 0)
+                continue;
+            const auto rest = p.substr(prefix.size());
+            const auto slash_pos = rest.find('/');
+            // string::npos is ok: take the whole remainder.
+            result.emplace(rest.substr(0, slash_pos));
+        }
+        return std::vector<std::string>(std::make_move_iterator(result.begin()), std::make_move_iterator(result.end()));
+    }
+
+    // Part dir <uuid[:3]>/<uuid>/<part>[/]: list the logical file names from the footer.
+    if (auto p = ContentAddressed::parsePartFilePath(path); p && p->file.empty())
+    {
+        auto pid = readRefPartId(p->table_uuid, p->part_name);
+        if (!pid)
+            return {}; // absent ref => empty listing
+        auto footer = loadFooterOrThrow(*pid); // missing footer for a present ref => CORRUPTED_DATA
+        std::vector<std::string> result;
+        result.reserve(footer.blobs.size());
+        for (const auto & [file, _] : footer.blobs)
+            result.push_back(file);
+        return result;
+    }
+
+    // Root or unrecognized path.
+    return {};
 }
 
-DirectoryIteratorPtr ContentAddressedMetadataStorage::iterateDirectory(const std::string &) const
+DirectoryIteratorPtr ContentAddressedMetadataStorage::iterateDirectory(const std::string & path) const
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "ContentAddressed: iterateDirectory implemented in Phase 2 Task 3/4");
+    // Mirror MetadataStorageFromPlainObjectStorage::iterateDirectory: prepend the path to each
+    // child name, since iterateDirectory includes the path while listDirectory does not.
+    auto names = listDirectory(path);
+    std::vector<fs::path> fs_paths;
+    fs_paths.reserve(names.size());
+    for (const auto & child : names)
+        fs_paths.push_back(fs::path(path) / child);
+    return std::make_unique<StaticDirectoryIterator>(std::move(fs_paths));
 }
 
 StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::string & path) const
