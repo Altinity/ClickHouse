@@ -310,6 +310,20 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     /// could miss (the sweep scans only blobs/+parts/). So sidecars cannot leak (B23 orphan concern).
     if (!recorded_mutable.empty())
     {
+        /// Per-file objects FIRST: each mutable file's bytes verbatim in its own tiny object so the
+        /// read path (getStorageObjects -> readObject) returns exactly that file's bytes.
+        for (const auto & [file, bytes] : recorded_mutable)
+        {
+            const std::string file_key = ContentAddressed::refMutableFileKey(key_prefix, metadata_storage.server_id, table_uuid, part_name, file).string();
+            auto file_out = metadata_storage.object_storage->writeObject(StoredObject(file_key), WriteMode::Rewrite);
+            file_out->write(bytes.data(), bytes.size());
+            file_out->finalize();
+        }
+
+        /// The bundle sidecar (the atomic per-part index of mutable files) written before the ref. It
+        /// is the list/carry-forward source; per-file objects back the byte reads. Both live under the
+        /// refs/ prefix, so a crashed write that never publishes the ref leaves only ref-scoped objects
+        /// that removeRecursive reclaims and the reachability sweep (blobs/+parts/ only) cannot miss.
         ContentAddressed::RefSidecar sidecar;
         sidecar.files = recorded_mutable;
         const std::string meta_key = ContentAddressed::refMetaKey(key_prefix, metadata_storage.server_id, table_uuid, part_name).string();

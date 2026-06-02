@@ -170,6 +170,14 @@ bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
     auto p = ContentAddressed::parsePartFilePath(path);
     if (!p || p->file.empty())
         return false;
+
+    /// A mutable per-part file is overlaid from the per-ref sidecar, never the manifest. A missing
+    /// sidecar entry is a missing file (fail-close): the manifest never carries these files.
+    if (ContentAddressed::isMutablePerPartFile(p->file))
+        return object_storage->tryGetObjectMetadata(
+            ContentAddressed::refMutableFileKey(storage_path_prefix, server_id, p->table_uuid, p->part_name, p->file).string(),
+            /*with_tags=*/false).has_value();
+
     auto pid = readRefPartId(p->table_uuid, p->part_name);
     if (!pid)
         return false;
@@ -223,6 +231,18 @@ uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) 
     auto p = ContentAddressed::parsePartFilePath(path);
     if (!p || p->file.empty())
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);
+
+    /// Mutable per-part file: size of the per-file sidecar object (fail-close if absent).
+    if (ContentAddressed::isMutablePerPartFile(p->file))
+    {
+        auto meta = object_storage->tryGetObjectMetadata(
+            ContentAddressed::refMutableFileKey(storage_path_prefix, server_id, p->table_uuid, p->part_name, p->file).string(),
+            /*with_tags=*/false);
+        if (!meta)
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no sidecar object for {}", path);
+        return meta->size_bytes;
+    }
+
     auto pid = readRefPartId(p->table_uuid, p->part_name);
     if (!pid)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
@@ -295,6 +315,11 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
         result.reserve(manifest.blobs.size());
         for (const auto & [file, _] : manifest.blobs)
             result.push_back(file);
+        /// Overlay the mutable per-part files from the per-ref sidecar (they live per-ref, not in the
+        /// shared manifest), so the part dir lists its full file set just like a normal part.
+        if (auto sidecar = readRefSidecarIfExists(p->table_uuid, p->part_name))
+            for (const auto & [file, _] : sidecar->files)
+                result.push_back(file);
         return result;
     }
 
@@ -334,6 +359,19 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
     auto p = ContentAddressed::parsePartFilePath(path);
     if (!p || p->file.empty())
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);
+
+    /// Mutable per-part file: resolve to its OWN per-file sidecar object, whose bytes are EXACTLY this
+    /// file's content (not the manifest -> blob path). Fail-close if the part never wrote this file.
+    if (ContentAddressed::isMutablePerPartFile(p->file))
+    {
+        const std::string file_key
+            = ContentAddressed::refMutableFileKey(storage_path_prefix, server_id, p->table_uuid, p->part_name, p->file).string();
+        auto meta = object_storage->tryGetObjectMetadata(file_key, /*with_tags=*/false);
+        if (!meta)
+            throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no sidecar object for {}", path);
+        return {StoredObject(file_key, path, meta->size_bytes)};
+    }
+
     auto pid = readRefPartId(p->table_uuid, p->part_name);
     if (!pid)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);

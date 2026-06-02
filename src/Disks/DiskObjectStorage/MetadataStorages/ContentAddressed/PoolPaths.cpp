@@ -67,6 +67,12 @@ RefMetaObjectKey refMetaKey(const std::string & key_prefix, const std::string & 
     return RefMetaObjectKey(refsPrefix(key_prefix, server_id, table_uuid) + part_name + std::string(kRefMetaSuffix));
 }
 
+RefMetaObjectKey refMutableFileKey(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid, const std::string & part_name, const std::string & file)
+{
+    /// Per-file object next to the ref: refs/<part_name>.<file>.meta (see header).
+    return RefMetaObjectKey(refsPrefix(key_prefix, server_id, table_uuid) + part_name + "." + file + std::string(kRefMetaSuffix));
+}
+
 bool isRefMetaKey(const std::string & key)
 {
     return key.size() >= kRefMetaSuffix.size()

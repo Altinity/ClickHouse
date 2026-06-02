@@ -39,6 +39,14 @@ RefObjectKey refKey(const std::string & key_prefix, const std::string & server_i
 // (which scans only blobs/+parts/) would miss, because the sidecar is never reachable as a blob/part.
 RefMetaObjectKey refMetaKey(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid, const std::string & part_name);
 
+// Per-mutable-file object key: <key_prefix>/store/<server_id>/<table_uuid>/refs/<part_name>.<file>.meta.
+// Each mutable per-part file's bytes are stored verbatim in its OWN tiny object so the read path
+// (getStorageObjects -> readObject) returns EXACTLY that file's bytes — the bundle .meta sidecar
+// (refMetaKey) is the atomic per-part index used for listing / carry-forward, while these per-file
+// objects back the byte reads. Both end in the .meta suffix and live under refsPrefix, so the
+// ref-enumerators skip them (isRefMetaKey) and removeRecursive's ref-scoped deletion reclaims them.
+RefMetaObjectKey refMutableFileKey(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid, const std::string & part_name, const std::string & file);
+
 // The suffix that distinguishes a per-ref sidecar object from a ref object under the SAME refs/
 // prefix. Every enumerator that treats a key under refsPrefix as a ref (the table-dir listing,
 // existsDirectory, and the GC live-set scan) must skip keys ending in this suffix, since a sidecar

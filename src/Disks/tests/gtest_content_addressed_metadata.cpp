@@ -437,6 +437,63 @@ TEST_F(ContentAddressedMetaTest, IdenticalContentDifferentMutableFilesDoNotColli
               ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/a.bin")[0].remote_path);
 }
 
+// B23 Task 3: the read path overlays the per-ref sidecar for mutable per-part files. existsFile /
+// getFileSize / getStorageObjects / listDirectory resolve a mutable file from the sidecar (correct
+// per-part bytes), a missing sidecar entry behaves like a missing file (fail-close), and content
+// files still resolve via manifest -> blob.
+TEST_F(ContentAddressedMetaTest, ReadPathOverlaysMutableFilesFromSidecar)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_overlay");
+    auto os = getObjectStorage("cas_overlay");
+    const std::string uuid = "uuid-overlay";
+    const std::string part = "all_1_1_0";
+
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        for (const auto & [name, bytes] : std::map<std::string, std::string>{
+                 {"a.bin", "COLDATA"}, {"columns.txt", "a"}, {"uuid.txt", "THE-UUID"}, {"txn_version.txt", "123"}})
+        {
+            auto buf = tx.writeFile("uui/" + uuid + "/" + part + "/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    const std::string txn_path = "uui/" + uuid + "/" + part + "/txn_version.txt";
+    const std::string uuid_path = "uui/" + uuid + "/" + part + "/uuid.txt";
+
+    // existsFile / getFileSize resolve the mutable file from the sidecar.
+    EXPECT_TRUE(ms->existsFile(txn_path));
+    EXPECT_TRUE(ms->existsFile(uuid_path));
+    EXPECT_EQ(ms->getFileSize(txn_path), 3u);   // "123"
+    EXPECT_EQ(ms->getFileSize(uuid_path), 8u);  // "THE-UUID"
+
+    // getStorageObjects returns an object whose bytes are EXACTLY that mutable file's content.
+    auto txn_objs = ms->getStorageObjects(txn_path);
+    ASSERT_EQ(txn_objs.size(), 1u);
+    EXPECT_EQ(readObject(os, txn_objs[0].remote_path), "123");
+    EXPECT_EQ(readObject(os, ms->getStorageObjects(uuid_path)[0].remote_path), "THE-UUID");
+
+    // The content file still resolves via the manifest -> blob path (a blobs/ key).
+    auto a_objs = ms->getStorageObjects("uui/" + uuid + "/" + part + "/a.bin");
+    ASSERT_EQ(a_objs.size(), 1u);
+    EXPECT_EQ(a_objs[0].remote_path.rfind("blobs/", 0), 0u);
+    EXPECT_EQ(readObject(os, a_objs[0].remote_path), "COLDATA");
+
+    // listDirectory on the part dir includes BOTH content files and mutable files (overlaid).
+    auto files = ms->listDirectory("uui/" + uuid + "/" + part);
+    std::set<std::string> got(files.begin(), files.end());
+    EXPECT_EQ(got, (std::set<std::string>{"a.bin", "columns.txt", "uuid.txt", "txn_version.txt"}));
+
+    // Fail-close: a mutable file the part never wrote (no sidecar entry) behaves like a missing file.
+    const std::string absent = "uui/" + uuid + "/" + part + "/metadata_version.txt";
+    EXPECT_FALSE(ms->existsFile(absent));
+    EXPECT_THROW(ms->getStorageObjects(absent), DB::Exception);
+    EXPECT_THROW(ms->getFileSize(absent), DB::Exception);
+}
+
 // P3.5: removeRecursive = pointer-unlink + deferred GC. Dropping a part / table deletes only the
 // ref pointer objects (and verbatim table-level files); the shared parts/ manifest and blobs/ content
 // are intentionally KEPT — they are reclaimed later by the Phase-4 reachability GC. This proves the
