@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
@@ -335,11 +336,13 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
         meta_out->finalize();
     }
 
-    // Publish the ref last: store/{server_id}/{table_uuid}/refs/{part_name} = part_id. The on-disk
-    // payload is the bare part-id string (.string() at the object-storage boundary).
+    // Publish the ref last: store/{server_id}/{table_uuid}/refs/{part_name}. The on-disk payload is the
+    // versioned ref-payload struct (MAGIC+version+part_id) written by serializeRefPayload and parsed by
+    // the single partIdFromRefPayload shared with the read path and the GC live-set scan (B28).
     const std::string ref_key = ContentAddressed::refKey(key_prefix, metadata_storage.server_id, table_uuid, part_name).string();
+    const std::string ref_payload = ContentAddressed::serializeRefPayload(part_id);
     auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(ref_key), WriteMode::Rewrite);
-    ref_out->write(part_id.string().data(), part_id.string().size());
+    ref_out->write(ref_payload.data(), ref_payload.size());
     ref_out->finalize();
 }
 

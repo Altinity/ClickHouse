@@ -171,6 +171,41 @@ TEST(ContentAddressedPartManifest, GoldenPartIdUnchanged)
     EXPECT_EQ(computePartId(blobs).string(), "8d45de9b773149cfb2e02c23e01d1fdf");
 }
 
+// ==== Task 3 (B28): the ref payload is a versioned struct, parsed by ONE function ====
+
+// The ref payload is `MAGIC+version+part_id` (length-prefixed). `serializeRefPayload` writes it and
+// `partIdFromRefPayload` reads it back exactly. Pin the on-object bytes (cross-arch determinism).
+TEST(ContentAddressedRefPayload, GoldenBytesAndRoundTrip)
+{
+    const PartId pid("8d45de9b773149cfb2e02c23e01d1fdf");
+    const std::string payload = serializeRefPayload(pid);
+    const std::string expected =
+        std::string("CARF\x01", 5)                          // magic(4) + version(1)
+        + std::string("\x20", 1) + pid.string();            // length-prefixed part_id (32 bytes)
+    EXPECT_EQ(payload, expected);
+    EXPECT_EQ(partIdFromRefPayload(payload), pid);
+}
+
+// A future (unknown) version must fail closed, not be misparsed.
+TEST(ContentAddressedRefPayload, RejectsUnknownVersion)
+{
+    std::string payload = serializeRefPayload(PartId("abc"));
+    ASSERT_GE(payload.size(), 5u);
+    payload[4] = static_cast<char>(payload[4] + 1); // bump version byte
+    EXPECT_THROW(partIdFromRefPayload(payload), DB::Exception);
+}
+
+// A bad magic / truncation is rejected (fail close). The old "first hex run" parse is gone, so a bare
+// hex string with no header is no longer accepted as a payload.
+TEST(ContentAddressedRefPayload, RejectsBadMagicAndBareHex)
+{
+    EXPECT_THROW(partIdFromRefPayload("XXXX"), DB::Exception);
+    EXPECT_THROW(partIdFromRefPayload(""), DB::Exception);
+    // A bare hex part id (the OLD unversioned payload) is no longer a valid payload: the parser is
+    // now exact and requires the versioned header.
+    EXPECT_THROW(partIdFromRefPayload("8d45de9b773149cfb2e02c23e01d1fdf"), DB::Exception);
+}
+
 // B23 Task 1: the canonical predicate for mutable per-part files. The set is the SINGLE source of
 // truth shared with computePartId's exclusion: anything excluded from the part identity is exactly a
 // mutable per-part file (they live per-ref, never in the shared manifest).

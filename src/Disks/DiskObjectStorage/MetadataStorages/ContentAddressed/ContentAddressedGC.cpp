@@ -5,8 +5,13 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Codec.h>
+
+#include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
 #include <IO/ReadSettings.h>
+#include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
 
 #include <Common/Exception.h>
 
@@ -40,13 +45,29 @@ std::string readSmallObject(const ObjectStoragePtr & object_storage, const std::
 
 /// ==== Pool enumeration (was PoolScan) ====
 
+std::string serializeRefPayload(const PartId & part_id)
+{
+    /// MAGIC(4) + version(1) + part_id (length-prefixed). Explicit little-endian via the shared codec.
+    std::string out;
+    WriteBufferFromString buf(out);
+    FormatHeader{kRefPayloadMagic, kRefPayloadVersion}.write(buf);
+    writeStringBinary(part_id.string(), buf);
+    buf.finalize();
+    return out;
+}
+
 PartId partIdFromRefPayload(const std::string & payload)
 {
-    size_t begin = payload.find_first_of("0123456789abcdef");
-    if (begin == std::string::npos)
+    ReadBufferFromString buf(payload);
+    FormatHeader::readAndValidate(buf, kRefPayloadMagic, kRefPayloadVersion, "ref payload");
+    std::string part_id;
+    readStringBinary(part_id, buf);
+    if (part_id.empty())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "ContentAddressed: ref payload has no part id");
-    size_t end = payload.find_first_not_of("0123456789abcdef", begin);
-    return PartId(payload.substr(begin, end == std::string::npos ? std::string::npos : end - begin));
+    /// v1 holds only the part id. A future version that appends fields (B1's part header, per-ref
+    /// mutable state) bumps the version byte, which `readAndValidate` rejects fail-closed in this
+    /// build; that is the intended forward-compat gate (never misinterpret a newer payload).
+    return PartId(std::move(part_id));
 }
 
 std::vector<std::string> listKeysUnder(const ObjectStoragePtr & object_storage, const std::string & prefix)

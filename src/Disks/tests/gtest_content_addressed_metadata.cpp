@@ -204,7 +204,7 @@ TEST_F(ContentAddressedMetaTest, ResolvesAndReadsSeededPart)
     PartManifest f;
     f.blobs[file] = BlobEntry{BlobHash(blob_csum), blob_data.size(), blob_csum};
     writeObject(os, partKey("", PartId(part_id)).string(), f.serialize());
-    writeObject(os, refKey("", sid, uuid, part).string(), part_id);
+    writeObject(os, refKey("", sid, uuid, part).string(), serializeRefPayload(PartId(part_id)));
 
     const std::string logical = "uui/" + uuid + "/" + part + "/" + file; // <uuid[:3]>/<uuid>/<part>/<file>
     EXPECT_TRUE(ms->existsFile(logical));
@@ -222,7 +222,7 @@ TEST_F(ContentAddressedMetaTest, FailsClosedOnMissingManifest)
     auto ms = getMetadataStorage("cas_failclose");
     auto os = getObjectStorage("cas_failclose");
     // ref present, but parts/<part_id> manifest absent → must THROW (B18), not return empty
-    writeObject(os, refKey("", ms->serverIdForTest(), "uuid-3", "all_1_1_0").string(), "missingpid");
+    writeObject(os, refKey("", ms->serverIdForTest(), "uuid-3", "all_1_1_0").string(), serializeRefPayload(PartId("missingpid")));
     EXPECT_THROW(ms->getStorageObjects("uui/uuid-3/all_1_1_0/data.bin"), DB::Exception);
 }
 
@@ -237,7 +237,7 @@ TEST_F(ContentAddressedMetaTest, ListsPartsAndPartFiles)
     auto seed = [&](const std::string & part, const std::string & pid, const PartManifest & f)
     {
         writeObject(os, partKey("", PartId(pid)).string(), f.serialize());
-        writeObject(os, refKey("", sid, uuid, part).string(), pid);
+        writeObject(os, refKey("", sid, uuid, part).string(), serializeRefPayload(PartId(pid)));
     };
     /// Real part ids are 32-char lowercase hex (computePartId); the ref read path resolves the
     /// payload through partIdFromRefPayload (B28), so use valid-hex ids here as in production.
@@ -840,8 +840,8 @@ CasGcSeed seedGcPool(const std::shared_ptr<DB::IObjectStorage> & os, const std::
     put_manifest(s.pid_b, {{"shared.bin", s.b2}, {"c.bin", s.b3}});
     put_manifest(s.pid_orphan, {{"o.bin", s.b_orphan}});
 
-    ContentAddressedMetaTest::writeObject(os, refKey("", sid, s.uuid, "all_1_1_0").string(), s.pid_a);
-    ContentAddressedMetaTest::writeObject(os, refKey("", sid, s.uuid, "all_2_2_0").string(), s.pid_b);
+    ContentAddressedMetaTest::writeObject(os, refKey("", sid, s.uuid, "all_1_1_0").string(), serializeRefPayload(PartId(s.pid_a)));
+    ContentAddressedMetaTest::writeObject(os, refKey("", sid, s.uuid, "all_2_2_0").string(), serializeRefPayload(PartId(s.pid_b)));
     return s;
 }
 }
@@ -964,7 +964,7 @@ TEST_F(ContentAddressedMetaTest, SweepClearsTimerWhenReachableAgain)
     gc.runSweepOnce(/*now=*/0, /*grace=*/100); // records first_unreachable for pidA manifest + b1
 
     // Re-add a ref pointing at pidA before grace elapses (e.g. an identical part re-inserted).
-    ContentAddressedMetaTest::writeObject(os, refKey("", sid, s.uuid, "all_1_1_0_redo").string(), s.pid_a);
+    ContentAddressedMetaTest::writeObject(os, refKey("", sid, s.uuid, "all_1_1_0_redo").string(), serializeRefPayload(PartId(s.pid_a)));
 
     // Past the original grace: pidA is reachable again, so its timer was cleared and nothing of it
     // is deleted. Only the never-referenced orphan manifest + orphan blob are reclaimed.
@@ -986,7 +986,7 @@ TEST_F(ContentAddressedMetaTest, SweepThrowsAndDeletesNothingOnMissingManifest)
     auto s = seedGcPool(os, ms->serverIdForTest());
 
     // Corrupt the pool: a live ref points at a part id with no manifest object.
-    ContentAddressedMetaTest::writeObject(os, refKey("", ms->serverIdForTest(), s.uuid, "all_3_3_0").string(), "deadc0de00000000000000000000beef");
+    ContentAddressedMetaTest::writeObject(os, refKey("", ms->serverIdForTest(), s.uuid, "all_3_3_0").string(), serializeRefPayload(PartId("deadc0de00000000000000000000beef")));
 
     DB::ContentAddressed::ContentAddressedGC gc(os, "");
     EXPECT_THROW(gc.runSweepOnce(/*now=*/200, /*grace=*/100), DB::Exception);
