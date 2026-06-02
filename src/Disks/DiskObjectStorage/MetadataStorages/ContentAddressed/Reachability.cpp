@@ -15,4 +15,21 @@ std::set<std::string> markReachableBlobs(const std::set<std::string> & live_part
     return reachable;
 }
 
+SweepResult selectForSweep(const std::set<std::string> & unreferenced,
+                           const std::unordered_map<std::string, int64_t> & first_unreachable,
+                           int64_t now, int64_t grace)
+{
+    SweepResult res;
+    for (const auto & key : unreferenced)
+    {
+        auto it = first_unreachable.find(key);
+        int64_t since = (it == first_unreachable.end()) ? now : it->second;
+        if (now - since >= grace)
+            res.to_delete.push_back(key);
+        else
+            res.first_unreachable[key] = since; /// keep ageing
+    }
+    return res; /// objects no longer unreferenced are dropped from first_unreachable (timer cleared)
+}
+
 }

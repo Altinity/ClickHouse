@@ -83,3 +83,25 @@ TEST(ContentAddressedReachability, ReconcileMarksOnlyLiveRoots)
     EXPECT_TRUE(reachable.count("hB0"));   // carried forward → still reachable
     EXPECT_FALSE(reachable.count("hA0"));  // replaced column → unreachable
 }
+
+TEST(ContentAddressedReachability, SweepUsesTimeSinceUnreachableNotAge)
+{
+    using namespace DB::ContentAddressed;
+    std::set<std::string> unreferenced = {"old_blob"};
+    std::unordered_map<std::string, int64_t> first_unreachable; // empty: just became unreachable
+
+    auto r1 = selectForSweep(unreferenced, first_unreachable, /*now*/ 1000, /*grace*/ 300);
+    EXPECT_TRUE(r1.to_delete.empty());                 // first sighting → not yet
+    EXPECT_EQ(r1.first_unreachable.at("old_blob"), 1000);
+
+    auto r2 = selectForSweep(unreferenced, r1.first_unreachable, /*now*/ 1250, 300);
+    EXPECT_TRUE(r2.to_delete.empty());                 // 250 < 300
+
+    auto r3 = selectForSweep(unreferenced, r2.first_unreachable, /*now*/ 1400, 300);
+    EXPECT_EQ(r3.to_delete.size(), 1u);                // 400 >= 300 → delete
+    EXPECT_EQ(r3.to_delete.at(0), "old_blob");
+
+    // becoming reachable again clears the timer:
+    auto r4 = selectForSweep(/*unreferenced*/ {}, r2.first_unreachable, /*now*/ 1400, 300);
+    EXPECT_TRUE(r4.first_unreachable.empty());
+}
