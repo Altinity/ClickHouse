@@ -1,0 +1,33 @@
+# Deferred Backlog — Content-Addressed Shared MergeTree integration
+
+Living list of work intentionally **deferred** out of the first milestone, captured during
+brainstorming / planning / implementation. Each item records *what*, *why deferred*, and
+**where it plugs in** — the last field is the "no architectural dead-ends" proof: choosing the
+minimal first step must not foreclose any of these.
+
+Companion to: `docs/superpowers/specs/` (design spec) and `docs/superpowers/plans/` (impl plans).
+Source design: `content_addressed_shared_mergetree_design.md` (v3) and PoC `poc/cas_mergetree/`.
+
+| ID | Item | Why deferred | Where it plugs in (dead-end check) |
+|----|------|-------------|-------------------------------------|
+| B1 | **Replicated / shared-storage**: replicas reference shared blobs; commit under the existing Keeper `/log`; delete the zero-copy subsystem | Largest surface; touches commit + replication consensus | Catalog = existing per-replica Keeper `/parts` znode with `manifest_hash` appended; commit stays in `commitPart`/`getCommitPartOps` (ABOVE the metadata seam). M1's layout objects are reused unchanged. |
+| B2 | ~~Cross-table dedup / global pool~~ **PULLED INTO M1** (decision): `parts/`+`blobs/` are a **global per-disk pool** from day one; GC reachability is global (marks all tables' refs); cross-table ATTACH is **ref-only, no copy**. Deferred-but-pool-compatible: the *distributed/multi-coordinator* global reachability and GC-coordinator election (→ B3), and cross-cluster pool sharing. | Pool scope is architecturally load-bearing — retrofitting global onto per-table reaches into GC mark-roots, removal, and ATTACH, so it is built global up front. | INVARIANT: one disk root = one pool = one coordinator/GC owner; no cross-cluster sharing of a disk root without a shared catalog+GC (else cross-catalog reachability is blind → data loss). |
+| B3 | **Reachability GC hardening**: grace-from-loss-of-reachability, ephemeral reader pins (stateless compute), self-healing GC coordinator, MARK-epoch revalidation | Distributed concerns; M1 is single-process | M1's removal hook is the same `grabOldParts`→`IDataPartStorage::remove` path; the hardened GC is a drop-in replacement of the removal decision, not a new lifecycle. |
+| B4 | **FREEZE: two flavors.** (i) native cheap freeze = a `frozen/<snapshot>/<part>` **ref-set that is a GC root** (no copy; blobs stay in the pool; survives table drop). (ii) **materialized self-contained export** = real bytes copied out (filesystem-backup contract). | M1 reserves the `frozen/` namespace and makes GC **root-aware** of it; the `ALTER … FREEZE` DDL (i) and the materialized export (ii) are deferred | (i) is just another root namespace via `RefCatalog`. (ii) overrides `freeze`/`freezeRemote` (independent `IDataPartStorage` virtuals) to copy bytes. Neither changes the pool layout. |
+| B5 | **Projections as nested manifests; patch parts (lightweight delete) as a separate ref class** | Extra manifest structure + a second active-set namespace | Manifest (footer) reserves a `projections` section (nested `part_id`s); patch parts are a separate reachability root in the GC. M1 can reject/ignore until added. |
+| B12 | **DETACHED namespace** `store/<uuid>/detached/<name>` → `part_id` (GC root, not active). DETACH/ATTACH = ref move (no byte movement). **In M1.** Foreign-part ATTACH-FROM-external (ingest bytes into the pool) is deferred. | DETACH/ATTACH ship in M1 (cheap ref move); only external-part ingestion is deferred | Detached is one more GC-root ref namespace via `RefCatalog`; ingestion reuses the normal content-addressed write path. |
+| B6 | **Manifest determinism & cross-version golden tests** (canonicalization, exclude `MergeTreePartInfo`/`uuid`/`txn_version`/`metadata_version`) | Quality gate, matters for dedup not correctness | Pinned by tests around the manifest serializer; no structural impact. |
+| B7 | **Hardening**: `(cityHash128, size)` collision guard; conditional-write capability probe for non-AWS S3; long-key/path handling | Production-robustness, not needed to prove the model | Local to the object-store write path and key generator. |
+| B8 | **REPLACE_RANGE multi-ref / MOVE PARTITION; DROP_PART vs concurrent-merge race** | Edge ops in the covering/removal model | Expressed via the existing `/log` entries (replicated) or multi-ref commits; the tombstone-covering primitive generalizes to them. |
+
+| B9 | **Persisted refcount + prefix-sharded reconciliation** (RocksDB-backed `BlobRefIndex`; sharded full-reachability rebuild for crash/drift/DR) | M1 ships an in-memory `BlobRefIndex` impl; persistence is a scale concern | M1 puts the refcount **behind the `BlobRefIndex` interface** and GC consumes the **deref-delta** (never a full scan) from day one → swapping in-memory→RocksDB and adding sharded reconciliation is an impl change, no rework. |
+| B10 | **#7 one-GET part open** (pack small files into the footer object, serve from an in-memory copy) | Needs a sub-object/in-memory-serve hook in the read path (new surface); `FileCache` amortizes cold opens meanwhile | Read-cost-at-scale optimization on the content-addressed metadata type; `getStorageObjects` resolution already in-memory, so only the byte-serving path changes. |
+
+| B11 | **Multi-writer coordination** (replicas of one table OR independent tables/servers sharing one pool — same problem): single-leader Keeper-elected GC + GC lock + mark-over-union-of-refs + re-validate-at-delete; refs move to Keeper (`RefCatalog` Keeper impl), S3 refs demoted to DR projection | Distributed concern; M1 is single-process | Layout UNCHANGED (pool shared by pointing disks at one root). M1 reserves the seams: **`RefCatalog`** (S3 impl → Keeper impl), **GC coordination/lock** (in-process mutex → Keeper leader+lock). Swapping impls needs no layout/GC-logic change. |
+
+**Concurrency invariant baked into M1 (not deferred):** one pool (disk root) = exactly one GC coordinator. M1 ships a **pool-ownership lease/marker**: a process fail-closes (refuses to GC/mount) if another live, non-coordinated owner holds the pool — so two independent servers sharing a bucket are *safe by default* even before multi-writer support (B11) lands.
+
+**Scale invariants baked into M1 (not deferred):** GC is **delta-driven, never a per-pass full `LIST`**; the refcount is a **derived cache** (S3 is ground truth, rebuildable by sharded reachability); the metadata storage is **lazy** (LRU footer cache, refs listed once at load) so RAM ≈ existing `data_parts`, with the only O(M-blobs) structure persisted off-heap.
+
+> Add new deferred items here as they arise during planning/implementation, always filling the
+> "where it plugs in" column so the architecture stays dead-end-free.
