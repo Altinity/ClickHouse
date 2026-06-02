@@ -20,6 +20,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int ABORTED;
+    extern const int LOGICAL_ERROR;
 }
 
 namespace
@@ -268,7 +269,15 @@ std::vector<MergeTreeDeduplicationLog::AddPartResult> MergeTreeDeduplicationLog:
         throw Exception(ErrorCodes::ABORTED, "Storage has been shutdown when we add this part.");
     }
 
-    chassert(current_writer != nullptr);
+    /// A disk that cannot host the append-mode log leaves current_writer null; the release-build
+    /// chassert above is a no-op, so dereferencing it would segfault. Fail closed with a clear
+    /// exception instead of crashing the server (B37).
+    if (!current_writer)
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "MergeTree deduplication log has no writer (the disk does not support the on-disk "
+            "deduplication log); cannot add part {}",
+            part_info.getPartNameAndCheckFormat(format_version));
 
     for (const auto & block_id : block_ids)
     {
@@ -306,7 +315,13 @@ void MergeTreeDeduplicationLog::dropPart(const MergeTreePartInfo & drop_part_inf
         throw Exception(ErrorCodes::ABORTED, "Storage has been shutdown when we drop this part.");
     }
 
-    chassert(current_writer != nullptr);
+    /// As in addPart: a null writer must produce a clear exception, never a segfault (B37).
+    if (!current_writer)
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "MergeTree deduplication log has no writer (the disk does not support the on-disk "
+            "deduplication log); cannot drop part {}",
+            drop_part_info.getPartNameAndCheckFormat(format_version));
 
     for (auto itr = deduplication_map.begin(); itr != deduplication_map.end(); /* no increment here, we erasing from map */)
     {
