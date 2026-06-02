@@ -1,4 +1,4 @@
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Footer.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
 #include <Common/Exception.h>
 #include <cstring>
 
@@ -32,7 +32,7 @@ static void putStr(std::string & b, const std::string & s)
 static uint64_t getU64(const std::string & b, size_t & p)
 {
     if (b.size() - p < 8)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS footer truncated (u64)");
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS manifest truncated (u64)");
     uint64_t v;
     std::memcpy(&v, b.data() + p, 8);
     p += 8;
@@ -43,13 +43,13 @@ static std::string getStr(const std::string & b, size_t & p)
 {
     uint64_t n = getU64(b, p);
     if (n > b.size() - p)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS footer truncated (str)");
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS manifest truncated (str)");
     std::string s = b.substr(p, n);
     p += n;
     return s;
 }
 
-std::string Footer::serialize() const
+std::string PartManifest::serialize() const
 {
     std::string b(MAGIC, sizeof(MAGIC));
     putU64(b, blobs.size());
@@ -69,11 +69,11 @@ std::string Footer::serialize() const
     return b;
 }
 
-Footer Footer::deserialize(const std::string & bytes)
+PartManifest PartManifest::deserialize(const std::string & bytes)
 {
     if (bytes.size() < sizeof(MAGIC) || std::memcmp(bytes.data(), MAGIC, sizeof(MAGIC)) != 0)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS footer: bad magic");
-    Footer f;
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS manifest: bad magic");
+    PartManifest f;
     size_t p = sizeof(MAGIC);
     uint64_t nb = getU64(bytes, p);
     for (uint64_t i = 0; i < nb; ++i)

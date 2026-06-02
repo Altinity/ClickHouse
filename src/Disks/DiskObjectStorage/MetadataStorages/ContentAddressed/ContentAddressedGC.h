@@ -16,7 +16,7 @@ struct SweepStats
 
 /// Reachability garbage collector for one content-addressed pool (single process — see the M1 GC
 /// safety invariants). It enumerates the live part ids (the published refs), computes the reachable
-/// blob set from their footers, and deletes ONLY footers under parts/ and blobs under blobs/ that
+/// blob set from their manifests, and deletes ONLY manifests under parts/ and blobs under blobs/ that
 /// have been continuously unreferenced for at least `grace` seconds. Refs, table-level files and
 /// generic disk files are owned by the table and never touched here.
 ///
@@ -30,7 +30,7 @@ public:
     ContentAddressedGC(ObjectStoragePtr object_storage_, std::string key_prefix_);
 
     /// Run one sweep. Deletes nothing if any step before the removal throws (fail-close): a missing
-    /// footer for a live ref (B18), or any list/read error, aborts the sweep with the pool intact.
+    /// manifest for a live ref (B18), or any list/read error, aborts the sweep with the pool intact.
     SweepStats runSweepOnce(int64_t now, int64_t grace);
 
 private:

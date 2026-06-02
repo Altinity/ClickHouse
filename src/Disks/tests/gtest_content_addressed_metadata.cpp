@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include <optional>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Footer.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedWriteBuffer.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
@@ -203,7 +203,7 @@ TEST_F(ContentAddressedMetaTest, ResolvesAndReadsSeededPart)
     const std::string part_id = "cafe112233";
 
     writeObject(os, blobKey("", blob_csum), blob_data);
-    Footer f;
+    PartManifest f;
     f.blobs[file] = BlobEntry{blob_csum, blob_data.size(), blob_csum};
     writeObject(os, partKey("", part_id), f.serialize());
     writeObject(os, refKey("", sid, uuid, part), part_id);
@@ -215,15 +215,15 @@ TEST_F(ContentAddressedMetaTest, ResolvesAndReadsSeededPart)
     ASSERT_EQ(objs.size(), 1u);
     EXPECT_EQ(objs[0].remote_path, blobKey("", blob_csum));
     EXPECT_EQ(readObject(os, objs[0].remote_path), blob_data);
-    EXPECT_FALSE(ms->existsFile("uui/" + uuid + "/" + part + "/absent.bin")); // file not in footer
+    EXPECT_FALSE(ms->existsFile("uui/" + uuid + "/" + part + "/absent.bin")); // file not in manifest
 }
 
-TEST_F(ContentAddressedMetaTest, FailsClosedOnMissingFooter)
+TEST_F(ContentAddressedMetaTest, FailsClosedOnMissingManifest)
 {
     using namespace DB::ContentAddressed;
     auto ms = getMetadataStorage("cas_failclose");
     auto os = getObjectStorage("cas_failclose");
-    // ref present, but parts/<part_id> footer absent → must THROW (B18), not return empty
+    // ref present, but parts/<part_id> manifest absent → must THROW (B18), not return empty
     writeObject(os, refKey("", ms->serverIdForTest(), "uuid-3", "all_1_1_0"), "missingpid");
     EXPECT_THROW(ms->getStorageObjects("uui/uuid-3/all_1_1_0/data.bin"), DB::Exception);
 }
@@ -236,16 +236,16 @@ TEST_F(ContentAddressedMetaTest, ListsPartsAndPartFiles)
     const std::string sid = ms->serverIdForTest();
     const std::string uuid = "uuid-4";
 
-    auto seed = [&](const std::string & part, const std::string & pid, const Footer & f)
+    auto seed = [&](const std::string & part, const std::string & pid, const PartManifest & f)
     {
         writeObject(os, partKey("", pid), f.serialize());
         writeObject(os, refKey("", sid, uuid, part), pid);
     };
     /// Real part ids are 32-char lowercase hex (computePartId); the ref read path resolves the
     /// payload through partIdFromRefPayload (B28), so use valid-hex ids here as in production.
-    Footer fa; fa.blobs["data.bin"] = {"k1", 3, "k1"}; fa.blobs["columns.txt"] = {"k2", 2, "k2"};
+    PartManifest fa; fa.blobs["data.bin"] = {"k1", 3, "k1"}; fa.blobs["columns.txt"] = {"k2", 2, "k2"};
     seed("all_1_1_0", "aaaa000000000000000000000000aaaa", fa);
-    Footer fb; fb.blobs["data.bin"] = {"k3", 4, "k3"};
+    PartManifest fb; fb.blobs["data.bin"] = {"k3", 4, "k3"};
     seed("all_2_2_0", "bbbb000000000000000000000000bbbb", fb);
 
     // table dir → part names
@@ -378,7 +378,7 @@ TEST_F(ContentAddressedMetaTest, WritePartThenReadBackAndDedup)
 }
 
 // P3.5: removeRecursive = pointer-unlink + deferred GC. Dropping a part / table deletes only the
-// ref pointer objects (and verbatim table-level files); the shared parts/ footer and blobs/ content
+// ref pointer objects (and verbatim table-level files); the shared parts/ manifest and blobs/ content
 // are intentionally KEPT — they are reclaimed later by the Phase-4 reachability GC. This proves the
 // unlink-not-GC behaviour that lets DROP TABLE complete without leaking through a hung retry loop.
 TEST_F(ContentAddressedMetaTest, RemoveUnlinksRefsKeepsBlobs)
@@ -406,7 +406,7 @@ TEST_F(ContentAddressedMetaTest, RemoveUnlinksRefsKeepsBlobs)
     write_part("all_1_1_0", {{"a.bin", "AAA"}, {"b.bin", "SHARED"}, {"columns.txt", "a b"}});
     write_part("all_2_2_0", {{"a.bin", "ZZZ"}, {"b.bin", "SHARED"}, {"columns.txt", "a b"}});
 
-    // Capture the backing object keys (footer + blobs) we expect to SURVIVE removal.
+    // Capture the backing object keys (manifest + blobs) we expect to SURVIVE removal.
     const std::string blob_a1 = ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/a.bin")[0].remote_path;
     const std::string blob_shared = ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/b.bin")[0].remote_path;
     const std::string ref_1 = refKey("", sid, uuid, "all_1_1_0");
@@ -424,7 +424,7 @@ TEST_F(ContentAddressedMetaTest, RemoveUnlinksRefsKeepsBlobs)
     }
     EXPECT_FALSE(os->tryGetObjectMetadata(ref_1, /*with_tags=*/false).has_value()); // gone
     EXPECT_TRUE(os->tryGetObjectMetadata(ref_2, /*with_tags=*/false).has_value());  // other part untouched
-    // The footer + blobs of the removed part survive (deferred GC); the surviving part still reads.
+    // The manifest + blobs of the removed part survive (deferred GC); the surviving part still reads.
     EXPECT_TRUE(os->tryGetObjectMetadata(blob_a1, /*with_tags=*/false).has_value());
     EXPECT_TRUE(os->tryGetObjectMetadata(blob_shared, /*with_tags=*/false).has_value());
     EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/a.bin")[0].remote_path), "ZZZ");
@@ -438,15 +438,15 @@ TEST_F(ContentAddressedMetaTest, RemoveUnlinksRefsKeepsBlobs)
     }
     EXPECT_FALSE(os->tryGetObjectMetadata(ref_2, /*with_tags=*/false).has_value()); // last ref gone
     EXPECT_FALSE(ms->existsDirectory("uui/" + uuid + "/"));                          // table dir empty
-    // Unlink-not-GC: the footer object and both blob objects are STILL present after DROP.
+    // Unlink-not-GC: the manifest object and both blob objects are STILL present after DROP.
     EXPECT_TRUE(os->tryGetObjectMetadata(blob_a1, /*with_tags=*/false).has_value());
     EXPECT_TRUE(os->tryGetObjectMetadata(blob_shared, /*with_tags=*/false).has_value());
     EXPECT_EQ(readObject(os, blob_shared), "SHARED"); // blob content intact, reclaimable by GC
 }
 
 // P3.5: non-part / table-level files (e.g. format_version.txt) are written verbatim to a direct
-// object key (no content addressing, no ref, no footer) and resolve straight back. A part file in
-// the same table still resolves via the ref/footer/blob path, so the two schemes coexist.
+// object key (no content addressing, no ref, no manifest) and resolve straight back. A part file in
+// the same table still resolves via the ref/manifest/blob path, so the two schemes coexist.
 TEST_F(ContentAddressedMetaTest, NonPartFilePassthrough)
 {
     using namespace DB::ContentAddressed;
@@ -466,7 +466,7 @@ TEST_F(ContentAddressedMetaTest, NonPartFilePassthrough)
         tx.commit(DB::NoCommitOptions{}); // no part recorded → publishes nothing
     }
 
-    // It resolves directly (no ref/footer) and reads back byte-for-byte.
+    // It resolves directly (no ref/manifest) and reads back byte-for-byte.
     EXPECT_TRUE(ms->existsFile(format_version));
     EXPECT_EQ(ms->getFileSize(format_version), 1u);
     auto objs = ms->getStorageObjects(format_version);
@@ -477,7 +477,7 @@ TEST_F(ContentAddressedMetaTest, NonPartFilePassthrough)
     // No content-addressed structures were created for it.
     EXPECT_FALSE(ms->existsFile("uui/" + uuid + "/format_version.txt/anything"));
 
-    // A part file in the same table still resolves via the ref/footer/blob path.
+    // A part file in the same table still resolves via the ref/manifest/blob path.
     {
         DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
         auto buf = tx.writeFile("uui/" + uuid + "/all_1_1_0/data.bin", 4096, DB::WriteMode::Rewrite, {});
@@ -581,7 +581,7 @@ TEST_F(ContentAddressedMetaTest, MutationCarryForwardReusesBlob)
 // the metadata storage is content-addressed. This drives the real DiskObjectStorageTransaction
 // (the same object MergedBlockOutputStream writes through), so the gated hook is exercised
 // end-to-end: writeFile -> ContentAddressedWriteBuffer, commit -> ContentAddressedTransaction::commit
-// (footer + ref), and read-back via the Phase-2 resolution path.
+// (manifest + ref), and read-back via the Phase-2 resolution path.
 TEST_F(ContentAddressedMetaTest, DiskTransactionRoutesContentAddressedWrite)
 {
     using namespace DB::ContentAddressed;
@@ -617,7 +617,7 @@ TEST_F(ContentAddressedMetaTest, DiskTransactionRoutesContentAddressedWrite)
     write_part("all_1_1_0", {{"a.bin", "AAA"}, {"b.bin", "SHARED"}, {"columns.txt", "a b"}});
     write_part("all_2_2_0", {{"a.bin", "ZZZ"}, {"b.bin", "SHARED"}, {"columns.txt", "a b"}});
 
-    // The footer + ref published by commit make the part files resolvable, and the bytes read back.
+    // The manifest + ref published by commit make the part files resolvable, and the bytes read back.
     auto objs = ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/a.bin");
     ASSERT_EQ(objs.size(), 1u);
     EXPECT_EQ(readObject(os, objs[0].remote_path), "AAA");
@@ -686,10 +686,10 @@ TEST_F(ContentAddressedMetaTest, DiskTransactionCarryForwardThroughCreateHardLin
 }
 
 // Phase-4 GC scan + sweep. Seed a pool by hand (no transaction) so the live/orphan split is exact:
-//   - 2 live refs -> 2 distinct part ids (pidA, pidB), 2 footers, 3 referenced blobs (b1, b2 shared,
-//     b3); pidA footer = {b1, b2}, pidB footer = {b2, b3} so b2 is dedup-shared across both parts.
-//   - 1 orphan footer (pidO, no ref) -> 1 orphan blob (bO, referenced only by the orphan footer).
-// parts/ then has 3 footers, blobs/ has 4 blobs, and exactly 2 part ids are live.
+//   - 2 live refs -> 2 distinct part ids (pidA, pidB), 2 manifests, 3 referenced blobs (b1, b2 shared,
+//     b3); pidA manifest = {b1, b2}, pidB manifest = {b2, b3} so b2 is dedup-shared across both parts.
+//   - 1 orphan manifest (pidO, no ref) -> 1 orphan blob (bO, referenced only by the orphan manifest).
+// parts/ then has 3 manifests, blobs/ has 4 blobs, and exactly 2 part ids are live.
 namespace
 {
 struct CasGcSeed
@@ -708,16 +708,16 @@ CasGcSeed seedGcPool(const std::shared_ptr<DB::IObjectStorage> & os, const std::
     auto put_blob = [&](const std::string & csum) { ContentAddressedMetaTest::writeObject(os, blobKey("", csum), csum); };
     put_blob(s.b1); put_blob(s.b2); put_blob(s.b3); put_blob(s.b_orphan);
 
-    auto put_footer = [&](const std::string & pid, const std::vector<std::pair<std::string, std::string>> & files)
+    auto put_manifest = [&](const std::string & pid, const std::vector<std::pair<std::string, std::string>> & files)
     {
-        Footer f;
+        PartManifest f;
         for (const auto & [name, csum] : files)
             f.blobs[name] = BlobEntry{blobKey("", csum), csum.size(), csum};
         ContentAddressedMetaTest::writeObject(os, partKey("", pid), f.serialize());
     };
-    put_footer(s.pid_a, {{"a.bin", s.b1}, {"shared.bin", s.b2}});
-    put_footer(s.pid_b, {{"shared.bin", s.b2}, {"c.bin", s.b3}});
-    put_footer(s.pid_orphan, {{"o.bin", s.b_orphan}});
+    put_manifest(s.pid_a, {{"a.bin", s.b1}, {"shared.bin", s.b2}});
+    put_manifest(s.pid_b, {{"shared.bin", s.b2}, {"c.bin", s.b3}});
+    put_manifest(s.pid_orphan, {{"o.bin", s.b_orphan}});
 
     ContentAddressedMetaTest::writeObject(os, refKey("", sid, s.uuid, "all_1_1_0"), s.pid_a);
     ContentAddressedMetaTest::writeObject(os, refKey("", sid, s.uuid, "all_2_2_0"), s.pid_b);
@@ -732,10 +732,10 @@ TEST_F(ContentAddressedMetaTest, PoolScanListsLivePartsAndObjects)
     auto os = getObjectStorage("cas_scan");
     auto s = seedGcPool(os, ms->serverIdForTest());
 
-    // Exactly the 2 referenced part ids are live; the orphan footer's id is NOT (no ref points at it).
+    // Exactly the 2 referenced part ids are live; the orphan manifest's id is NOT (no ref points at it).
     EXPECT_EQ(listLivePartIds(os, ""), (std::set<std::string>{s.pid_a, s.pid_b}));
 
-    // parts/ holds all 3 footers (2 live + 1 orphan); the keys match partKey.
+    // parts/ holds all 3 manifests (2 live + 1 orphan); the keys match partKey.
     auto part_keys = listKeysUnder(os, partsPrefix(""));
     std::set<std::string> parts(part_keys.begin(), part_keys.end());
     EXPECT_EQ(parts, (std::set<std::string>{partKey("", s.pid_a), partKey("", s.pid_b), partKey("", s.pid_orphan)}));
@@ -765,7 +765,7 @@ TEST_F(ContentAddressedMetaTest, SweepHonoursGraceWindow)
 
     DB::ContentAddressed::ContentAddressedGC gc(os, "");
 
-    // (a) First sweep at t=0: the 2 orphans (footer + blob) just became unreachable → delete nothing.
+    // (a) First sweep at t=0: the 2 orphans (manifest + blob) just became unreachable → delete nothing.
     auto r0 = gc.runSweepOnce(/*now=*/0, /*grace=*/100);
     EXPECT_EQ(r0.deleted_parts, 0u);
     EXPECT_EQ(r0.deleted_blobs, 0u);
@@ -779,8 +779,8 @@ TEST_F(ContentAddressedMetaTest, SweepHonoursGraceWindow)
     EXPECT_TRUE(objectExists(os, partKey("", s.pid_orphan)));
     EXPECT_TRUE(objectExists(os, blobKey("", s.b_orphan)));
 
-    // (c) Past grace at t=200: exactly the orphan footer + orphan blob are reclaimed; the 2 live
-    //     footers and 3 referenced blobs survive (reachable from the live refs).
+    // (c) Past grace at t=200: exactly the orphan manifest + orphan blob are reclaimed; the 2 live
+    //     manifests and 3 referenced blobs survive (reachable from the live refs).
     auto r2 = gc.runSweepOnce(/*now=*/200, /*grace=*/100);
     EXPECT_EQ(r2.deleted_parts, 1u);
     EXPECT_EQ(r2.deleted_blobs, 1u);
@@ -794,7 +794,7 @@ TEST_F(ContentAddressedMetaTest, SweepHonoursGraceWindow)
 }
 
 // Dedup safety: a blob referenced by TWO live parts (b2/shared.bin) stays reachable after one of the
-// two refs is unlinked, because the other live part's footer still references it.
+// two refs is unlinked, because the other live part's manifest still references it.
 TEST_F(ContentAddressedMetaTest, SweepKeepsBlobStillReferencedByAnotherPart)
 {
     using namespace DB::ContentAddressed;
@@ -804,13 +804,13 @@ TEST_F(ContentAddressedMetaTest, SweepKeepsBlobStillReferencedByAnotherPart)
 
     DB::ContentAddressed::ContentAddressedGC gc(os, "");
 
-    // Unlink part A's ref. pidA's footer is now orphaned, but its blob b2 is also in pidB's footer.
+    // Unlink part A's ref. pidA's manifest is now orphaned, but its blob b2 is also in pidB's manifest.
     os->removeObjectsIfExist({DB::StoredObject(refKey("", ms->serverIdForTest(), s.uuid, "all_1_1_0"))});
 
     gc.runSweepOnce(/*now=*/0, /*grace=*/100);
     auto r = gc.runSweepOnce(/*now=*/200, /*grace=*/100);
 
-    // pidA footer + b1 (only in pidA) are reclaimed; the orphan footer + orphan blob too.
+    // pidA manifest + b1 (only in pidA) are reclaimed; the orphan manifest + orphan blob too.
     EXPECT_FALSE(objectExists(os, partKey("", s.pid_a)));
     EXPECT_FALSE(objectExists(os, blobKey("", s.b1)));
     EXPECT_FALSE(objectExists(os, partKey("", s.pid_orphan)));
@@ -835,15 +835,15 @@ TEST_F(ContentAddressedMetaTest, SweepClearsTimerWhenReachableAgain)
 
     DB::ContentAddressed::ContentAddressedGC gc(os, "");
 
-    // Unlink pidA's ref so pidA's footer + its exclusive blob b1 become unreferenced at t=0.
+    // Unlink pidA's ref so pidA's manifest + its exclusive blob b1 become unreferenced at t=0.
     os->removeObjectsIfExist({DB::StoredObject(refKey("", sid, s.uuid, "all_1_1_0"))});
-    gc.runSweepOnce(/*now=*/0, /*grace=*/100); // records first_unreachable for pidA footer + b1
+    gc.runSweepOnce(/*now=*/0, /*grace=*/100); // records first_unreachable for pidA manifest + b1
 
     // Re-add a ref pointing at pidA before grace elapses (e.g. an identical part re-inserted).
     ContentAddressedMetaTest::writeObject(os, refKey("", sid, s.uuid, "all_1_1_0_redo"), s.pid_a);
 
     // Past the original grace: pidA is reachable again, so its timer was cleared and nothing of it
-    // is deleted. Only the never-referenced orphan footer + orphan blob are reclaimed.
+    // is deleted. Only the never-referenced orphan manifest + orphan blob are reclaimed.
     auto r = gc.runSweepOnce(/*now=*/200, /*grace=*/100);
     EXPECT_TRUE(objectExists(os, partKey("", s.pid_a)));
     EXPECT_TRUE(objectExists(os, blobKey("", s.b1)));
@@ -853,15 +853,15 @@ TEST_F(ContentAddressedMetaTest, SweepClearsTimerWhenReachableAgain)
     EXPECT_EQ(r.deleted_blobs, 1u);
 }
 
-// Fail-close (B18): a LIVE ref whose footer is missing makes the sweep THROW and delete nothing.
-TEST_F(ContentAddressedMetaTest, SweepThrowsAndDeletesNothingOnMissingFooter)
+// Fail-close (B18): a LIVE ref whose manifest is missing makes the sweep THROW and delete nothing.
+TEST_F(ContentAddressedMetaTest, SweepThrowsAndDeletesNothingOnMissingManifest)
 {
     using namespace DB::ContentAddressed;
     auto ms = getMetadataStorage("cas_gc_failclose");
     auto os = getObjectStorage("cas_gc_failclose");
     auto s = seedGcPool(os, ms->serverIdForTest());
 
-    // Corrupt the pool: a live ref points at a part id with no footer object.
+    // Corrupt the pool: a live ref points at a part id with no manifest object.
     ContentAddressedMetaTest::writeObject(os, refKey("", ms->serverIdForTest(), s.uuid, "all_3_3_0"), "deadc0de00000000000000000000beef");
 
     DB::ContentAddressed::ContentAddressedGC gc(os, "");
@@ -876,8 +876,8 @@ TEST_F(ContentAddressedMetaTest, SweepThrowsAndDeletesNothingOnMissingFooter)
 }
 
 // Background-thread driver (Task 3a): the ContentAddressedGCThread runs runSweepOnce on the schedule
-// pool. With a tiny grace, one triggerAndWait() round must reclaim the orphan footer + orphan blob
-// while the live footers and referenced blobs survive — proving the thread starts, runs the sweep,
+// pool. With a tiny grace, one triggerAndWait() round must reclaim the orphan manifest + orphan blob
+// while the live manifests and referenced blobs survive — proving the thread starts, runs the sweep,
 // stops cleanly, and uses the round counter (not a sleep) for synchronisation.
 TEST_F(ContentAddressedMetaTest, GCThreadSweepsOrphansAndKeepsLive)
 {
@@ -902,7 +902,7 @@ TEST_F(ContentAddressedMetaTest, GCThreadSweepsOrphansAndKeepsLive)
     thread.startup();
     thread.triggerAndWait();
 
-    /// The orphan footer + orphan blob are gone; the 2 live footers + 3 referenced blobs remain.
+    /// The orphan manifest + orphan blob are gone; the 2 live manifests + 3 referenced blobs remain.
     EXPECT_FALSE(objectExists(os, partKey("", s.pid_orphan)));
     EXPECT_FALSE(objectExists(os, blobKey("", s.b_orphan)));
     EXPECT_TRUE(objectExists(os, partKey("", s.pid_a)));

@@ -2,7 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedWriteBuffer.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Footer.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
 #include <Disks/WriteMode.h>
 #include <IO/WriteBufferFromFileBase.h>
 #include <IO/WriteSettings.h>
@@ -19,7 +19,7 @@ namespace DB
 // through a finalize callback, and the transaction accumulates a (logical_file -> BlobEntry) map.
 // Carried-forward files (mutations / hardlinks) copy their source BlobEntry without re-uploading.
 // At commit the transaction derives the part_id from the accumulated blobs, writes the
-// parts/<part_id> footer (put-if-absent) and publishes the ref.
+// parts/<part_id> manifest (put-if-absent) and publishes the ref.
 class ContentAddressedTransaction : public IMetadataTransaction
 {
 protected:
@@ -50,11 +50,11 @@ public:
     //
     // For a part file (<uuid[:3]>/<uuid>/<part>/<file>) this returns a content-addressed buffer
     // that hashes + uploads the content on finalize and, via its callback, records the resulting
-    // blob under the path's logical file name (footer + ref are published at commit).
+    // blob under the path's logical file name (manifest + ref are published at commit).
     //
     // For a non-part / table-level file (e.g. <uuid[:3]>/<uuid>/format_version.txt) this returns a
     // plain object-storage write buffer that writes the bytes verbatim to a direct object key
-    // (tableFileKey) — no content addressing, no ref, no footer. Such objects are durable on
+    // (tableFileKey) — no content addressing, no ref, no manifest. Such objects are durable on
     // finalize and are not tracked by commit.
     //
     // The buffer-size and settings arguments mirror the disk-layer writeFile signature; content
@@ -77,8 +77,8 @@ public:
     // removeSharedRecursive / removeRecursive at commit. For a content-addressed pool, removal
     // deletes only the POINTER objects that the incoming path covers — the per-(server,table) refs
     // and the verbatim table-level / generic disk-level files — and NEVER the shared backing objects
-    // (blobs/ content, parts/ footers). Those are reclaimed later by the Phase-4 reachability GC, so
-    // an orphaned blob/footer leaks until then. That is the known, accepted M1 state (merges already
+    // (blobs/ content, parts/ manifests). Those are reclaimed later by the Phase-4 reachability GC, so
+    // an orphaned blob/manifest leaks until then. That is the known, accepted M1 state (merges already
     // leak this way).
     //
     // The should_remove_objects predicate governs whether the SHARED backing objects (blobs) are
@@ -100,7 +100,7 @@ public:
     //
     // For a content-addressed disk, per-file timestamps, permission bits, read-only flags and
     // hardlink counts are not stored — they are derived (or simply absent) when a part is resolved
-    // via ref -> part_id -> footer -> blob. None of them participate in CA resolution, so the
+    // via ref -> part_id -> manifest -> blob. None of them participate in CA resolution, so the
     // commit-replay calls that the INSERT / merge code path records for them are no-ops here.
     void setLastModified(const std::string & path, const Poco::Timestamp & timestamp) override;
     void chmod(const String & path, mode_t mode) override;
@@ -119,7 +119,7 @@ public:
     void moveFile(const std::string & path_from, const std::string & path_to) override;
 
     // Unlink a logical file. For a part file still being assembled in this commit, drop the
-    // recorded blob so it is excluded from the footer. For files that were never recorded (or
+    // recorded blob so it is excluded from the manifest. For files that were never recorded (or
     // non-part files), there is nothing CA-resolution-relevant to remove, so it is a no-op.
     // The underlying content blob, if shared, is reclaimed by GC, not by an unlink here.
     void unlinkFile(const std::string & path, bool if_exists, bool should_remove_objects) override;

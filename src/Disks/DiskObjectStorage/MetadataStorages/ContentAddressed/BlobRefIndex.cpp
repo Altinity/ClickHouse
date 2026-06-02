@@ -3,21 +3,21 @@
 namespace DB::ContentAddressed
 {
 
-void InMemoryBlobRefIndex::addPart(const std::string & part_id, const Footer & footer)
+void InMemoryBlobRefIndex::addPart(const std::string & part_id, const PartManifest & manifest)
 {
     if (!applied_parts.insert(part_id).second)
         return; /// idempotent: this part's refs are already counted
 
-    for (const auto & blob : footer.blobs)
+    for (const auto & blob : manifest.blobs)
         counts[blob.second.key] += 1;
 }
 
-void InMemoryBlobRefIndex::removePart(const std::string & part_id, const Footer & footer)
+void InMemoryBlobRefIndex::removePart(const std::string & part_id, const PartManifest & manifest)
 {
     if (applied_parts.erase(part_id) == 0)
         return; /// this part was not applied
 
-    for (const auto & blob : footer.blobs)
+    for (const auto & blob : manifest.blobs)
     {
         auto it = counts.find(blob.second.key);
         if (it != counts.end() && --it->second <= 0)

@@ -16,7 +16,7 @@ std::string blobKey(const std::string & key_prefix, const std::string & file_che
 std::string partKey(const std::string & key_prefix, const std::string & part_id);
 
 // Pool roots for enumeration (GC scan). Each is the object-key prefix under which all objects of a
-// given kind live: footers under partsPrefix (<key_prefix>/parts), content blobs under blobsPrefix
+// given kind live: manifests under partsPrefix (<key_prefix>/parts), content blobs under blobsPrefix
 // (<key_prefix>/blobs), and every server's/table's refs under refsRootPrefix (<key_prefix>/store/).
 // They are empty-prefix-safe (an empty key_prefix yields the bare root) and consistent with the
 // per-object key builders above, so listing under them enumerates exactly those keys.
@@ -30,7 +30,7 @@ std::string refKey(const std::string & key_prefix, const std::string & server_id
 
 // Per-server/per-table direct object key for non-part / table-level files (e.g.
 // format_version.txt, later mutation_*.txt). These are stored verbatim (no content addressing,
-// no ref, no footer) under <key_prefix>/store/<server_id>/<table_uuid>/files/<tail>, where <tail>
+// no ref, no manifest) under <key_prefix>/store/<server_id>/<table_uuid>/files/<tail>, where <tail>
 // is the path beyond the table dir <uuid[:3]>/<uuid>/.
 // TODO(phase4-gc): non-part objects are GC roots.
 std::string tableFilesPrefix(const std::string & key_prefix, const std::string & server_id, const std::string & table_uuid);
@@ -39,7 +39,7 @@ std::string tableFileKey(const std::string & key_prefix, const std::string & ser
 // Verbatim object key for a generic disk-level file: a path that is neither a part file nor a
 // table-level file (e.g. the server's startup access-check probe clickhouse_access_check_<uuid>
 // written at the disk root). Such files are stored verbatim at <key_prefix>/<path> (no content
-// addressing, no ref, no footer) using the same empty-prefix-safe join as every other key builder.
+// addressing, no ref, no manifest) using the same empty-prefix-safe join as every other key builder.
 std::string diskFileKey(const std::string & key_prefix, const std::string & path);
 
 struct PartFilePath
@@ -57,7 +57,7 @@ std::optional<PartFilePath> parsePartFilePath(const std::string & path);
 std::optional<std::string> parseTableUuid(const std::string & path);
 
 // True iff the path addresses a file inside a part dir, i.e. <uuid[:3]>/<uuid>/<part>/<file>
-// (4+ components, non-empty file). These are content-addressed (ref + footer + blob). Everything
+// (4+ components, non-empty file). These are content-addressed (ref + manifest + blob). Everything
 // else handled by writeFile / file reads (e.g. <uuid[:3]>/<uuid>/format_version.txt, 3 components)
 // is a non-part / table-level file handled by plain passthrough.
 bool isPartFilePath(const std::string & path);

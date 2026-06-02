@@ -77,9 +77,9 @@ void registerDiskObjectStorage(DiskFactory & factory, bool global_skip_access_ch
         auto metadata_storage = MetadataStorageFactory::instance().create(name, config, config_prefix, cluster, object_storages, compatibility_metadata_type_hint);
 
         /// Content-addressed metadata (like Keeper) requires real, deferred disk transactions: a part's
-        /// file->blob mappings are accumulated across the whole part write and the footer + ref are
+        /// file->blob mappings are accumulated across the whole part write and the manifest + ref are
         /// published atomically when the transaction commits. A fake (per-file autocommit) transaction
-        /// would write each file independently with no commit point for the footer/ref publish.
+        /// would write each file independently with no commit point for the manifest/ref publish.
         const auto metadata_type = metadata_storage->getType();
         const bool needs_real_transaction = metadata_type == MetadataStorageType::Keeper
             || metadata_type == MetadataStorageType::ContentAddressed;

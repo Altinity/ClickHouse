@@ -1,5 +1,5 @@
 #pragma once
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Footer.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
 #include <map>
 #include <string>
 

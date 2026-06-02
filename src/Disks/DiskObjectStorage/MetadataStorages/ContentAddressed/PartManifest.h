@@ -14,15 +14,15 @@ struct BlobEntry
     auto operator<=>(const BlobEntry &) const = default;
 };
 
-struct Footer
+struct PartManifest
 {
     std::map<std::string, BlobEntry> blobs;
     std::map<std::string, std::string> inlined;
 
     std::string serialize() const;
-    static Footer deserialize(const std::string & bytes);
+    static PartManifest deserialize(const std::string & bytes);
 
-    static constexpr char MAGIC[5] = {'C', 'A', 'F', '0', '1'};
+    static constexpr char MAGIC[5] = {'C', 'A', 'M', '0', '1'};
 };
 
 }

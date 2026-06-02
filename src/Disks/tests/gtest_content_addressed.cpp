@@ -1,21 +1,21 @@
 #include <gtest/gtest.h>
 #include <cstring>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Footer.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/BlobRefIndex.h>
 #include <Common/Exception.h>
 
 using namespace DB::ContentAddressed;
 
-TEST(ContentAddressedFooter, RoundTripBasic)
+TEST(ContentAddressedPartManifest, RoundTripBasic)
 {
-    Footer f;
+    PartManifest f;
     f.blobs["col_a.bin"] = BlobEntry{"hashA", 100, "ckA"};
     f.blobs["col_b.bin"] = BlobEntry{"hashB", 200, "ckB"};
     f.inlined["columns.txt"] = "a b";
     f.inlined["count.txt"] = std::string("100\n\0binary", 11); // embedded NUL
 
     std::string bytes = f.serialize();
-    Footer g = Footer::deserialize(bytes);
+    PartManifest g = PartManifest::deserialize(bytes);
 
     EXPECT_EQ(g.blobs.size(), 2u);
     EXPECT_EQ(g.blobs.at("col_a.bin").key, "hashA");
@@ -24,35 +24,35 @@ TEST(ContentAddressedFooter, RoundTripBasic)
     EXPECT_EQ(g.inlined.at("count.txt"), std::string("100\n\0binary", 11));
 }
 
-TEST(ContentAddressedFooter, StableHashIsCanonical)
+TEST(ContentAddressedPartManifest, StableHashIsCanonical)
 {
-    Footer a; a.blobs["y"] = {"hy", 2, "c2"}; a.blobs["x"] = {"hx", 1, "c1"};
-    Footer b; b.blobs["x"] = {"hx", 1, "c1"}; b.blobs["y"] = {"hy", 2, "c2"};
+    PartManifest a; a.blobs["y"] = {"hy", 2, "c2"}; a.blobs["x"] = {"hx", 1, "c1"};
+    PartManifest b; b.blobs["x"] = {"hx", 1, "c1"}; b.blobs["y"] = {"hy", 2, "c2"};
     EXPECT_EQ(a.serialize(), b.serialize());
 }
 
-TEST(ContentAddressedFooter, RejectsBadMagicAndTruncation)
+TEST(ContentAddressedPartManifest, RejectsBadMagicAndTruncation)
 {
-    EXPECT_THROW(Footer::deserialize("XXXX"), std::exception);
-    std::string ok = Footer{}.serialize();
-    EXPECT_THROW(Footer::deserialize(ok.substr(0, ok.size() - 1)), std::exception);
+    EXPECT_THROW(PartManifest::deserialize("XXXX"), std::exception);
+    std::string ok = PartManifest{}.serialize();
+    EXPECT_THROW(PartManifest::deserialize(ok.substr(0, ok.size() - 1)), std::exception);
 }
 
-TEST(ContentAddressedFooter, RejectsForgedHugeLength)
+TEST(ContentAddressedPartManifest, RejectsForgedHugeLength)
 {
-    std::string b(Footer::MAGIC, sizeof(Footer::MAGIC));
+    std::string b(PartManifest::MAGIC, sizeof(PartManifest::MAGIC));
     auto put = [&](uint64_t v){ char t[8]; std::memcpy(t, &v, 8); b.append(t, 8); };
     put(1);                          // blobs count = 1
     put(0xFFFFFFFFFFFFFFFFull);      // forged key length → must throw, not wrap
-    EXPECT_THROW(Footer::deserialize(b), DB::Exception);
+    EXPECT_THROW(PartManifest::deserialize(b), DB::Exception);
 }
 
 TEST(ContentAddressedBlobRefIndex, DeltaCountAndDedup)
 {
     using namespace DB::ContentAddressed;
     InMemoryBlobRefIndex idx;
-    Footer p1; p1.blobs["a.bin"] = {"hA", 1, "hA"}; p1.blobs["b.bin"] = {"hShared", 1, "hShared"};
-    Footer p2; p2.blobs["a.bin"] = {"hZ", 1, "hZ"}; p2.blobs["b.bin"] = {"hShared", 1, "hShared"};
+    PartManifest p1; p1.blobs["a.bin"] = {"hA", 1, "hA"}; p1.blobs["b.bin"] = {"hShared", 1, "hShared"};
+    PartManifest p2; p2.blobs["a.bin"] = {"hZ", 1, "hZ"}; p2.blobs["b.bin"] = {"hShared", 1, "hShared"};
     idx.addPart("part1", p1);
     idx.addPart("part2", p2);
     EXPECT_EQ(idx.refcount("hShared"), 2);
@@ -71,9 +71,9 @@ TEST(ContentAddressedBlobRefIndex, DeltaCountAndDedup)
 TEST(ContentAddressedReachability, ReconcileMarksOnlyLiveRoots)
 {
     using namespace DB::ContentAddressed;
-    std::unordered_map<std::string, Footer> parts;
-    Footer pm; pm.blobs["a.bin"] = {"hA1", 1, "hA1"}; pm.blobs["b.bin"] = {"hB0", 1, "hB0"}; parts["all_1_1_0_1"] = pm; // mutation: new a, carried b
-    Footer src; src.blobs["a.bin"] = {"hA0", 1, "hA0"}; src.blobs["b.bin"] = {"hB0", 1, "hB0"}; parts["all_1_1_0"] = src;   // outdated source
+    std::unordered_map<std::string, PartManifest> parts;
+    PartManifest pm; pm.blobs["a.bin"] = {"hA1", 1, "hA1"}; pm.blobs["b.bin"] = {"hB0", 1, "hB0"}; parts["all_1_1_0_1"] = pm; // mutation: new a, carried b
+    PartManifest src; src.blobs["a.bin"] = {"hA0", 1, "hA0"}; src.blobs["b.bin"] = {"hB0", 1, "hB0"}; parts["all_1_1_0"] = src;   // outdated source
 
     auto resolve = [&](const std::string & id) { return parts.at(id); };
     std::set<std::string> roots = {"all_1_1_0_1"}; // only the mutated part is a live root
@@ -111,13 +111,13 @@ TEST(ContentAddressedScenario, MutationCarryForwardThenGC)
     using namespace DB::ContentAddressed;
     InMemoryBlobRefIndex idx;
 
-    Footer base;
+    PartManifest base;
     base.blobs["a.bin"] = {"A0", 1, "A0"};
     base.blobs["b.bin"] = {"B0", 1, "B0"};
     base.blobs["c.bin"] = {"C0", 1, "C0"};
     idx.addPart("all_1_1_0", base);
 
-    Footer mut; // mutation rewrites only a.bin; b/c carried forward by reference
+    PartManifest mut; // mutation rewrites only a.bin; b/c carried forward by reference
     mut.blobs["a.bin"] = {"A1", 1, "A1"};
     mut.blobs["b.bin"] = {"B0", 1, "B0"};
     mut.blobs["c.bin"] = {"C0", 1, "C0"};

@@ -273,7 +273,7 @@ std::unique_ptr<WriteBufferFromFileBase> DiskObjectStorageTransaction::writeFile
     /// is the content hash, which is only known after all bytes have been written, so the up-front
     /// `generateObjectKeyForPath` + streaming `writeObject` path below cannot be used. Instead we
     /// delegate to the content-addressed transaction's own buffer, which spills + hashes + uploads
-    /// the content on finalize and records the resulting blob. The footer + ref are then published
+    /// the content on finalize and records the resulting blob. The manifest + ref are then published
     /// when `commit` invokes `metadata_transaction->commit` (no `operations_to_execute` entry is
     /// needed here). This branch leaves every other metadata type's behavior unchanged.
     if (metadata_storage->isContentAddressed())
@@ -284,7 +284,7 @@ std::unique_ptr<WriteBufferFromFileBase> DiskObjectStorageTransaction::writeFile
                 ErrorCodes::LOGICAL_ERROR,
                 "Content-addressed metadata storage did not produce a ContentAddressedTransaction");
 
-        /// Autocommit cannot work for part files: their footer + ref are published only when
+        /// Autocommit cannot work for part files: their manifest + ref are published only when
         /// `commit` invokes `metadata_transaction->commit`, which the buffer finalize does not
         /// trigger. Non-part / table-level files (e.g. format_version.txt) are written verbatim
         /// to a direct object key and are durable on finalize with no commit involvement, so

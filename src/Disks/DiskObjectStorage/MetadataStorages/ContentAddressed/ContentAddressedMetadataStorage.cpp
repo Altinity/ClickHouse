@@ -91,15 +91,15 @@ std::optional<std::string> ContentAddressedMetadataStorage::readRefPartId(const 
     return ContentAddressed::partIdFromRefPayload(*payload);
 }
 
-ContentAddressed::Footer ContentAddressedMetadataStorage::loadFooterOrThrow(const std::string & part_id) const
+ContentAddressed::PartManifest ContentAddressedMetadataStorage::loadPartManifestOrThrow(const std::string & part_id) const
 {
     auto bytes = readSmallObjectIfExists(ContentAddressed::partKey(storage_path_prefix, part_id));
     if (!bytes)
         throw Exception(
             ErrorCodes::CORRUPTED_DATA,
-            "ContentAddressed: live ref points at missing footer parts/{}",
+            "ContentAddressed: live ref points at missing manifest parts/{}",
             part_id);
-    return ContentAddressed::Footer::deserialize(*bytes);
+    return ContentAddressed::PartManifest::deserialize(*bytes);
 }
 
 ContentAddressed::BlobEntry ContentAddressedMetadataStorage::resolveBlobEntry(const std::string & path) const
@@ -110,10 +110,10 @@ ContentAddressed::BlobEntry ContentAddressedMetadataStorage::resolveBlobEntry(co
     auto pid = readRefPartId(p->table_uuid, p->part_name);
     if (!pid)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
-    auto footer = loadFooterOrThrow(*pid);
-    auto it = footer.blobs.find(p->file);
-    if (it == footer.blobs.end())
-        throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in footer of {}", p->file, path);
+    auto manifest = loadPartManifestOrThrow(*pid);
+    auto it = manifest.blobs.find(p->file);
+    if (it == manifest.blobs.end())
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in manifest of {}", p->file, path);
     return it->second;
 }
 
@@ -137,8 +137,8 @@ bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
     auto pid = readRefPartId(p->table_uuid, p->part_name);
     if (!pid)
         return false;
-    auto footer = loadFooterOrThrow(*pid);
-    return footer.blobs.contains(p->file);
+    auto manifest = loadPartManifestOrThrow(*pid);
+    return manifest.blobs.contains(p->file);
 }
 
 bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) const
@@ -186,18 +186,18 @@ uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) 
     auto pid = readRefPartId(p->table_uuid, p->part_name);
     if (!pid)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
-    auto footer = loadFooterOrThrow(*pid);
-    auto it = footer.blobs.find(p->file);
-    if (it == footer.blobs.end())
-        throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in footer of {}", p->file, path);
+    auto manifest = loadPartManifestOrThrow(*pid);
+    auto it = manifest.blobs.find(p->file);
+    if (it == manifest.blobs.end())
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in manifest of {}", p->file, path);
     return it->second.size;
 }
 
 Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::string & path) const
 {
-    // A part directory (<uuid[:3]>/<uuid>/<part>) has no single blob; report the footer object's
+    // A part directory (<uuid[:3]>/<uuid>/<part>) has no single blob; report the manifest object's
     // mtime. MergeTree calls this on the part directory while loading parts (modification_time).
-    // Timestamps are derived for content addressing, so the footer's mtime is a reasonable proxy.
+    // Timestamps are derived for content addressing, so the manifest's mtime is a reasonable proxy.
     if (auto p = ContentAddressed::parsePartFilePath(path); p && p->file.empty())
     {
         auto pid = readRefPartId(p->table_uuid, p->part_name);
@@ -240,16 +240,16 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
         return std::vector<std::string>(std::make_move_iterator(result.begin()), std::make_move_iterator(result.end()));
     }
 
-    // Part dir <uuid[:3]>/<uuid>/<part>[/]: list the logical file names from the footer.
+    // Part dir <uuid[:3]>/<uuid>/<part>[/]: list the logical file names from the manifest.
     if (auto p = ContentAddressed::parsePartFilePath(path); p && p->file.empty())
     {
         auto pid = readRefPartId(p->table_uuid, p->part_name);
         if (!pid)
             return {}; // absent ref => empty listing
-        auto footer = loadFooterOrThrow(*pid); // missing footer for a present ref => CORRUPTED_DATA
+        auto manifest = loadPartManifestOrThrow(*pid); // missing manifest for a present ref => CORRUPTED_DATA
         std::vector<std::string> result;
-        result.reserve(footer.blobs.size());
-        for (const auto & [file, _] : footer.blobs)
+        result.reserve(manifest.blobs.size());
+        for (const auto & [file, _] : manifest.blobs)
             result.push_back(file);
         return result;
     }
@@ -272,7 +272,7 @@ DirectoryIteratorPtr ContentAddressedMetadataStorage::iterateDirectory(const std
 
 StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::string & path) const
 {
-    /// Non-part files resolve to a single direct object key (no footer/ref/blob): a table-level
+    /// Non-part files resolve to a single direct object key (no manifest/ref/blob): a table-level
     /// file at tableFileKey, any other (generic disk-level) file at its verbatim diskFileKey.
     if (!ContentAddressed::isPartFilePath(path))
     {
@@ -293,10 +293,10 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
     auto pid = readRefPartId(p->table_uuid, p->part_name);
     if (!pid)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
-    auto footer = loadFooterOrThrow(*pid);
-    auto it = footer.blobs.find(p->file);
-    if (it == footer.blobs.end())
-        throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in footer of {}", p->file, path);
+    auto manifest = loadPartManifestOrThrow(*pid);
+    auto it = manifest.blobs.find(p->file);
+    if (it == manifest.blobs.end())
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in manifest of {}", p->file, path);
 
     const auto & e = it->second;
     /// Resolve under the same common key prefix used on the write side (single source of truth:

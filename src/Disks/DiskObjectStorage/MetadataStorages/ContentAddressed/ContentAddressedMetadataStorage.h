@@ -1,7 +1,7 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Footer.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGCThread.h>
 #include <Interpreters/Context_fwd.h>
 #include <optional>
@@ -10,7 +10,7 @@
 namespace DB
 {
 
-// Content-addressed metadata storage: resolves part files via ref to part_id to footer to blob.
+// Content-addressed metadata storage: resolves part files via ref to part_id to manifest to blob.
 // Read/resolve only in Phase 2; the write path is Phase 3.
 class ContentAddressedMetadataStorage final : public IMetadataStorage
 {
@@ -60,25 +60,25 @@ public:
 private:
     friend class ContentAddressedTransaction;
 
-    // Resolve a part-file path to its footer BlobEntry (carry-forward source for mutations).
-    // Throws if the path is not a part file, the ref is absent, or the file is not in the footer.
+    // Resolve a part-file path to its manifest BlobEntry (carry-forward source for mutations).
+    // Throws if the path is not a part file, the ref is absent, or the file is not in the manifest.
     ContentAddressed::BlobEntry resolveBlobEntry(const std::string & path) const;
 
-    // Resolve helpers: part file -> ref -> part_id -> footer -> blob. All object keys are built
+    // Resolve helpers: part file -> ref -> part_id -> manifest -> blob. All object keys are built
     // under storage_path_prefix (the object-storage common key prefix), the single source of truth
     // shared with ContentAddressedTransaction so the read and write sides cannot disagree.
-    // No footer cache in M1 (read each time); caching is a later optimization.
+    // No manifest cache in M1 (read each time); caching is a later optimization.
 
     // Read the ref object at refKey(server_id, table_uuid, part_name).
     // Returns nullopt if the ref object is absent, else its content (the part_id).
     std::optional<std::string> readRefPartId(const std::string & table_uuid, const std::string & part_name) const;
 
-    // Load and deserialize the footer at partKey(part_id).
-    // B18 fail-close: if the footer object is absent, throw CORRUPTED_DATA (a live ref must
-    // never point at a missing footer); never treat it as "file doesn't exist".
-    ContentAddressed::Footer loadFooterOrThrow(const std::string & part_id) const;
+    // Load and deserialize the manifest at partKey(part_id).
+    // B18 fail-close: if the manifest object is absent, throw CORRUPTED_DATA (a live ref must
+    // never point at a missing manifest); never treat it as "file doesn't exist".
+    ContentAddressed::PartManifest loadPartManifestOrThrow(const std::string & part_id) const;
 
-    // Read a small object (ref/footer) into a string. Returns nullopt if the object is absent.
+    // Read a small object (ref/manifest) into a string. Returns nullopt if the object is absent.
     std::optional<std::string> readSmallObjectIfExists(const std::string & key) const;
 
     const ObjectStoragePtr object_storage;

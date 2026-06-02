@@ -61,7 +61,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     ///   - any other (generic disk-level) file, e.g. the server's startup access-check probe
     ///     clickhouse_access_check_<uuid> written at the disk root -> verbatim object key
     ///     (diskFileKey).
-    /// Both are written verbatim — no content addressing, no ref, no footer. They are durable on
+    /// Both are written verbatim — no content addressing, no ref, no manifest. They are durable on
     /// finalize and are not tracked by commit.
     /// TODO(phase4-gc): non-part objects are GC roots.
     if (!ContentAddressed::isPartFilePath(path))
@@ -119,7 +119,7 @@ void ContentAddressedTransaction::createHardLink(const std::string & from, const
 void ContentAddressedTransaction::setLastModified(const std::string &, const Poco::Timestamp &)
 {
     /// No-op: per-file timestamps are derived, not stored. They play no role in CA resolution
-    /// (ref -> part_id -> footer -> blob). Reached via DiskObjectStorageTransaction.cpp:459.
+    /// (ref -> part_id -> manifest -> blob). Reached via DiskObjectStorageTransaction.cpp:459.
 }
 
 void ContentAddressedTransaction::chmod(const String &, mode_t)
@@ -192,7 +192,7 @@ void ContentAddressedTransaction::moveFile(const std::string & from, const std::
 
 void ContentAddressedTransaction::unlinkFile(const std::string & path, bool, bool)
 {
-    /// Part file: drop the staged blob so it is excluded from the footer. The underlying content
+    /// Part file: drop the staged blob so it is excluded from the manifest. The underlying content
     /// blob, if shared, is reclaimed by GC, not here.
     if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->file.empty())
     {
@@ -229,16 +229,16 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     if (table_uuid.empty() || part_name.empty())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "ContentAddressed: commit without a resolved part target");
 
-    ContentAddressed::Footer footer;
-    footer.blobs = recorded;
+    ContentAddressed::PartManifest manifest;
+    manifest.blobs = recorded;
 
     const std::string part_id = ContentAddressed::computePartId(recorded);
 
-    /// Put-if-absent the footer: identical parts (same deterministic blobs) share one footer object.
+    /// Put-if-absent the manifest: identical parts (same deterministic blobs) share one manifest object.
     const std::string part_key = ContentAddressed::partKey(key_prefix, part_id);
     if (!metadata_storage.object_storage->tryGetObjectMetadata(part_key, /*with_tags=*/false).has_value())
     {
-        const std::string bytes = footer.serialize();
+        const std::string bytes = manifest.serialize();
         auto out = metadata_storage.object_storage->writeObject(StoredObject(part_key), WriteMode::Rewrite);
         out->write(bytes.data(), bytes.size());
         out->finalize();
@@ -296,11 +296,11 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
 {
     /// Removal = pointer-unlink + deferred GC. We delete only the pointer objects the path covers
     /// (refs and verbatim table-level / generic files) and never the shared blobs/ content or
-    /// parts/ footers — the Phase-4 reachability GC reclaims those. The should_remove_objects
+    /// parts/ manifests — the Phase-4 reachability GC reclaims those. The should_remove_objects
     /// predicate is about whether to delete the shared backing objects (blobs); for content
     /// addressing we always KEEP them (deferred GC) and always remove the ref metadata, so the
     /// predicate does not gate ref deletion and is intentionally ignored here.
-    /// TODO(phase4-gc): orphaned blobs/footers leak until the reachability GC runs.
+    /// TODO(phase4-gc): orphaned blobs/manifests leak until the reachability GC runs.
 
     /// Enumerate every object under a key prefix and delete it. listObjects(prefix) returns objects
     /// whose key starts with prefix, exactly as ContentAddressedMetadataStorage's directory listing
@@ -320,7 +320,7 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
     };
 
     /// Part directory <uuid[:3]>/<uuid>/<part> (a part path with no file component): delete the
-    /// single ref. Absent ref (e.g. an uncommitted tmp part) is a no-op. Footer + blobs are kept.
+    /// single ref. Absent ref (e.g. an uncommitted tmp part) is a no-op. PartManifest + blobs are kept.
     if (auto p = ContentAddressed::parsePartFilePath(path); p && p->file.empty())
     {
         const std::string ref_key
@@ -331,7 +331,7 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
 
     /// Table directory <uuid[:3]>/<uuid> (parses to a table uuid, no part): delete ALL refs and ALL
     /// verbatim table-level files for this (server, table). Scoped by table_uuid so a DROP of one
-    /// table never touches another table's refs in the shared pool. Blobs/footers are kept.
+    /// table never touches another table's refs in the shared pool. Blobs/manifests are kept.
     if (auto uuid = ContentAddressed::parseTableUuid(path))
     {
         remove_under_prefix(ContentAddressed::refsPrefix(key_prefix, metadata_storage.server_id, *uuid));
