@@ -31,6 +31,16 @@ std::string refKey(const std::string & server_id, const std::string & table_uuid
     return refsPrefix(server_id, table_uuid) + part_name;
 }
 
+std::string tableFilesPrefix(const std::string & server_id, const std::string & table_uuid)
+{
+    return "store/" + server_id + "/" + table_uuid + "/files/";
+}
+
+std::string tableFileKey(const std::string & server_id, const std::string & table_uuid, const std::string & tail)
+{
+    return tableFilesPrefix(server_id, table_uuid) + tail;
+}
+
 static std::vector<std::string> splitNonEmpty(const std::string & path)
 {
     std::vector<std::string> parts;
@@ -53,19 +63,39 @@ static std::vector<std::string> splitNonEmpty(const std::string & path)
     return parts;
 }
 
+// Locate the <uuid[:3]>/<uuid> anchor inside a split path. ClickHouse table data paths look like
+// <prefix...>/<uuid[:3]>/<uuid>/<rest...>, where <uuid[:3]> is exactly the first 3 characters of
+// the following <uuid> component. The leading <prefix...> is "store" on a real server but is
+// absent in the unit tests, so anchoring on the uuid pair makes parsing robust to either shape.
+// Returns the index of the <uuid> component (so components after it are the part/file/tail).
+static std::optional<size_t> findTableUuidComponent(const std::vector<std::string> & p)
+{
+    for (size_t i = 1; i < p.size(); ++i)
+    {
+        const auto & prefix = p[i - 1];
+        const auto & uuid = p[i];
+        if (prefix.size() == 3 && uuid.size() > 3 && uuid.compare(0, 3, prefix) == 0)
+            return i;
+    }
+    return std::nullopt;
+}
+
 std::optional<PartFilePath> parsePartFilePath(const std::string & path)
 {
     auto p = splitNonEmpty(path);
-    if (p.size() < 3)
+    auto uuid_idx = findTableUuidComponent(p);
+    // Need at least the part component after the uuid: <uuid[:3]>/<uuid>/<part>.
+    if (!uuid_idx || *uuid_idx + 1 >= p.size())
         return std::nullopt;
 
+    const size_t part_idx = *uuid_idx + 1;
     PartFilePath r;
-    r.table_uuid = p[1];
-    r.part_name = p[2];
-    if (p.size() >= 4)
+    r.table_uuid = p[*uuid_idx];
+    r.part_name = p[part_idx];
+    if (part_idx + 1 < p.size())
     {
-        std::string file = p[3];
-        for (size_t i = 4; i < p.size(); ++i)
+        std::string file = p[part_idx + 1];
+        for (size_t i = part_idx + 2; i < p.size(); ++i)
             file += "/" + p[i];
         r.file = file;
     }
@@ -75,9 +105,35 @@ std::optional<PartFilePath> parsePartFilePath(const std::string & path)
 std::optional<std::string> parseTableUuid(const std::string & path)
 {
     auto p = splitNonEmpty(path);
-    if (p.size() == 2)
-        return p[1];
+    auto uuid_idx = findTableUuidComponent(p);
+    // Exactly the table dir <prefix...>/<uuid[:3]>/<uuid>[/]: nothing after the uuid.
+    if (uuid_idx && *uuid_idx + 1 == p.size())
+        return p[*uuid_idx];
     return std::nullopt;
+}
+
+bool isPartFilePath(const std::string & path)
+{
+    // A file inside a part dir: <uuid[:3]>/<uuid>/<part>/<file> => at least 2 components after
+    // the uuid (the part dir and the file within it).
+    auto p = splitNonEmpty(path);
+    auto uuid_idx = findTableUuidComponent(p);
+    return uuid_idx && *uuid_idx + 2 < p.size();
+}
+
+std::optional<TableFilePath> parseTableFilePath(const std::string & path)
+{
+    auto p = splitNonEmpty(path);
+    auto uuid_idx = findTableUuidComponent(p);
+    // Table-level files live directly under the table dir, i.e. exactly one component after the
+    // uuid (e.g. format_version.txt). Deeper paths are part files (see isPartFilePath).
+    if (!uuid_idx || *uuid_idx + 2 != p.size())
+        return std::nullopt;
+
+    TableFilePath r;
+    r.table_uuid = p[*uuid_idx];
+    r.tail = p[*uuid_idx + 1];
+    return r;
 }
 
 }
