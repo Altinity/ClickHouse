@@ -13,6 +13,7 @@
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/PositionDeleteTransform.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
+#include <Storages/ObjectStorage/Utils.h>
 
 #include <Core/TypeId.h>
 #include <DataTypes/DataTypesDecimal.h>
@@ -385,8 +386,6 @@ ProcessedManifestFileEntryPtr ManifestFileIterator::processRow(size_t row_index)
             std::nullopt);
         return nullptr;
     }
-
-    /// Compute inherited/resolved fields
 
     Int64 resolved_snapshot_id;
     if (parsed_entry->parsed_snapshot_id.has_value())
