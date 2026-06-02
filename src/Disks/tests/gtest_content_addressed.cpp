@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include <cstring>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/BlobRefIndex.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
 #include <Common/Exception.h>
 
 using namespace DB::ContentAddressed;
@@ -65,7 +65,6 @@ TEST(ContentAddressedBlobRefIndex, DeltaCountAndDedup)
     EXPECT_FALSE(dead.count(BlobHash("hShared")));
 }
 
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Reachability.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <unordered_map>
 

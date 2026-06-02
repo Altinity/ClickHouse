@@ -1,7 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolScan.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/StaticDirectoryIterator.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 

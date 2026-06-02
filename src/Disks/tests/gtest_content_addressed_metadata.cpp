@@ -3,10 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedWriteBuffer.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartId.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolScan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGCThread.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>

@@ -1,12 +1,102 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage_fwd.h>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace DB::ContentAddressed
 {
+
+/// The whole garbage-collection concern for a content-addressed pool lives here: the pure
+/// reachability/sweep algorithms, the pool enumeration primitives, the un-wired refcount seam, and
+/// the sweep driver `ContentAddressedGC`. The threading/lifecycle driver is `ContentAddressedGCThread`.
+
+/// ==== Pool enumeration (was PoolScan) ====
+
+/// Resolve a ref object payload into the part id it names. The write path stores the part id verbatim
+/// (a 32-char lowercase-hex string, see computePartId). Per B22(c) we tolerate a possible leading
+/// version byte and trailing whitespace/newline by extracting the longest run of lowercase-hex
+/// characters: an unversioned payload is unchanged, a future versioned one drops its marker byte.
+/// An empty hex run is corruption (a published ref must name a part) and throws CORRUPTED_DATA
+/// fail-close. This is the SINGLE ref-payload parser: both the GC live-set scan and the read path
+/// resolve a ref through it, so they cannot disagree on the part id by construction (B28).
+PartId partIdFromRefPayload(const std::string & payload);
+
+/// Enumerate the full set of LIVE part ids in a content-addressed pool: every published ref under
+/// the pool's refs root (the store/server/uuid/refs/part layout) names a part id (its payload). These
+/// are the GC roots — a part id is live iff at least one ref points at it. Any list or read error
+/// PROPAGATES so the caller aborts the sweep: a partial scan must never drive deletion (fail-close).
+std::set<PartId> listLivePartIds(const ObjectStoragePtr & object_storage, const std::string & key_prefix);
+
+/// List the object keys of every object under a pool root prefix (e.g. partsPrefix / blobsPrefix).
+/// Thin wrapper over object_storage->listObjects; errors propagate. The returned strings are the raw
+/// object keys; the GC wraps them into the right typed key (BlobObjectKey / PartObjectKey) at the one
+/// well-marked boundary in runSweepOnce so reachable-vs-listed can only be compared in one key space.
+std::vector<std::string> listKeysUnder(const ObjectStoragePtr & object_storage, const std::string & prefix);
+
+/// ==== Pure reachability/sweep algorithms (was Reachability) ====
+
+using PartManifestResolver = std::function<PartManifest(const PartId & part_id)>;
+
+/// Reachable blob object-key set from the live roots (refs -> part manifests -> blob object keys).
+/// A manifest stores the BARE content hash in each `BlobEntry.key` (the production write path records
+/// `BlobEntry{blob_hash, size, blob_hash}`), while the GC sweep enumerates FULL object keys under
+/// `blobsPrefix(key_prefix)`. To make the two comparable the reachable set is built with the SAME
+/// `blobKey(key_prefix, bare_hash)` fan-out the read path uses, so reachable == full blob object key.
+/// The return type is `std::set<BlobObjectKey>`: the sweep can ONLY compare it against listed blobs
+/// after wrapping those into `BlobObjectKey` too, so a bare-hash-vs-object-key mismatch cannot compile.
+std::set<BlobObjectKey> markReachableBlobs(
+    const std::string & key_prefix, const std::set<PartId> & live_part_ids, const PartManifestResolver & resolve);
+
+struct SweepResult
+{
+    std::vector<std::string> to_delete;
+    std::unordered_map<std::string, int64_t> first_unreachable; /// updated timers (cleared for reachable-again)
+};
+
+/// `grace` is measured from first loss of reachability (NOT object age). Reachable-again clears the timer.
+/// Operates on raw object-key strings — the GC has already reduced both blob and part keys to the
+/// same unreferenced-object-key space before calling this, so no typed distinction is needed here.
+SweepResult selectForSweep(const std::set<std::string> & unreferenced,
+                           const std::unordered_map<std::string, int64_t> & first_unreachable,
+                           int64_t now, int64_t grace);
+
+/// ==== Un-wired refcount seam (was BlobRefIndex) ====
+
+/// NOTE: BlobRefIndex is an un-wired future seam (B9), not on the M1 GC path.
+/// Seam (B9): the delta refcount over content-addressed blob hashes.
+/// M1 ships InMemoryBlobRefIndex; a RocksDB-backed impl plugs in here unchanged.
+class IBlobRefIndex
+{
+public:
+    virtual ~IBlobRefIndex() = default;
+    virtual void addPart(const PartId & part_id, const PartManifest & manifest) = 0;
+    virtual void removePart(const PartId & part_id, const PartManifest & manifest) = 0;
+    virtual int64_t refcount(const BlobHash & blob_hash) const = 0;
+    virtual std::set<BlobHash> unreferenced() const = 0;
+};
+
+class InMemoryBlobRefIndex : public IBlobRefIndex
+{
+public:
+    void addPart(const PartId & part_id, const PartManifest & manifest) override;
+    void removePart(const PartId & part_id, const PartManifest & manifest) override;
+    int64_t refcount(const BlobHash & blob_hash) const override;
+    std::set<BlobHash> unreferenced() const override;
+
+private:
+    std::unordered_map<BlobHash, int64_t> counts;
+    std::unordered_set<PartId> applied_parts; /// idempotency guard for add/remove
+};
+
+/// ==== Sweep driver ====
 
 struct SweepStats
 {

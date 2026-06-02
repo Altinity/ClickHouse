@@ -1,9 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolScan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Reachability.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 
@@ -25,6 +23,135 @@ namespace ErrorCodes
 
 namespace ContentAddressed
 {
+
+namespace
+{
+
+std::string readSmallObject(const ObjectStoragePtr & object_storage, const std::string & key)
+{
+    StoredObject object(key);
+    auto buf = object_storage->readObject(object, getReadSettings(), /*read_hint=*/std::nullopt);
+    String content;
+    readStringUntilEOF(content, *buf);
+    return content;
+}
+
+}
+
+/// ==== Pool enumeration (was PoolScan) ====
+
+PartId partIdFromRefPayload(const std::string & payload)
+{
+    size_t begin = payload.find_first_of("0123456789abcdef");
+    if (begin == std::string::npos)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "ContentAddressed: ref payload has no part id");
+    size_t end = payload.find_first_not_of("0123456789abcdef", begin);
+    return PartId(payload.substr(begin, end == std::string::npos ? std::string::npos : end - begin));
+}
+
+std::vector<std::string> listKeysUnder(const ObjectStoragePtr & object_storage, const std::string & prefix)
+{
+    RelativePathsWithMetadata children;
+    object_storage->listObjects(prefix, children, /*max_keys=*/0);
+    std::vector<std::string> keys;
+    keys.reserve(children.size());
+    for (const auto & child : children)
+        keys.push_back(child->relative_path);
+    return keys;
+}
+
+std::set<PartId> listLivePartIds(const ObjectStoragePtr & object_storage, const std::string & key_prefix)
+{
+    /// Every server's/table's refs live under refsRootPrefix. The same root also holds verbatim
+    /// table-level files under the store/server/uuid/files/ layout, so we keep only keys whose path has a
+    /// /refs/ segment (the ref objects); their payload is the live part id.
+    static const std::string refs_segment = "/refs/";
+    std::set<PartId> live;
+    for (const auto & key : listKeysUnder(object_storage, refsRootPrefix(key_prefix)))
+    {
+        if (key.find(refs_segment) == std::string::npos)
+            continue;
+        live.insert(partIdFromRefPayload(readSmallObject(object_storage, key)));
+    }
+    return live;
+}
+
+/// ==== Pure reachability/sweep algorithms (was Reachability) ====
+
+std::set<BlobObjectKey> markReachableBlobs(
+    const std::string & key_prefix, const std::set<PartId> & live_part_ids, const PartManifestResolver & resolve)
+{
+    std::set<BlobObjectKey> reachable;
+    for (const auto & id : live_part_ids)
+    {
+        PartManifest manifest = resolve(id);
+        for (const auto & blob : manifest.blobs)
+            /// `blob.second.key` is the BARE content hash (BlobHash); project it to the FULL blob
+            /// object key (`blobKey` fan-out) so it matches the keys listed under `blobsPrefix`.
+            reachable.insert(blobKey(key_prefix, blob.second.key));
+    }
+    return reachable;
+}
+
+SweepResult selectForSweep(const std::set<std::string> & unreferenced,
+                           const std::unordered_map<std::string, int64_t> & first_unreachable,
+                           int64_t now, int64_t grace)
+{
+    SweepResult res;
+    for (const auto & key : unreferenced)
+    {
+        auto it = first_unreachable.find(key);
+        int64_t since = (it == first_unreachable.end()) ? now : it->second;
+        if (now - since >= grace)
+            res.to_delete.push_back(key);
+        else
+            res.first_unreachable[key] = since; /// keep ageing
+    }
+    return res; /// objects no longer unreferenced are dropped from first_unreachable (timer cleared)
+}
+
+/// ==== Un-wired refcount seam (was BlobRefIndex) ====
+///
+/// NOTE: BlobRefIndex is an un-wired future seam (B9), not on the M1 GC path.
+
+void InMemoryBlobRefIndex::addPart(const PartId & part_id, const PartManifest & manifest)
+{
+    if (!applied_parts.insert(part_id).second)
+        return; /// idempotent: this part's refs are already counted
+
+    for (const auto & blob : manifest.blobs)
+        counts[blob.second.key] += 1;
+}
+
+void InMemoryBlobRefIndex::removePart(const PartId & part_id, const PartManifest & manifest)
+{
+    if (applied_parts.erase(part_id) == 0)
+        return; /// this part was not applied
+
+    for (const auto & blob : manifest.blobs)
+    {
+        auto it = counts.find(blob.second.key);
+        if (it != counts.end() && --it->second <= 0)
+            it->second = 0;
+    }
+}
+
+int64_t InMemoryBlobRefIndex::refcount(const BlobHash & blob_hash) const
+{
+    auto it = counts.find(blob_hash);
+    return it == counts.end() ? 0 : it->second;
+}
+
+std::set<BlobHash> InMemoryBlobRefIndex::unreferenced() const
+{
+    std::set<BlobHash> result;
+    for (const auto & item : counts)
+        if (item.second <= 0)
+            result.insert(item.first);
+    return result;
+}
+
+/// ==== Sweep driver ====
 
 ContentAddressedGC::ContentAddressedGC(ObjectStoragePtr object_storage_, std::string key_prefix_)
     : object_storage(std::move(object_storage_))

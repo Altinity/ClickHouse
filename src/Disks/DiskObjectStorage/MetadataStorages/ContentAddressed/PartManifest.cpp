@@ -1,6 +1,10 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
 #include <Common/Exception.h>
+#include <Common/SipHash.h>
+#include <base/hex.h>
+#include <array>
 #include <cstring>
+#include <string_view>
 
 namespace DB
 {
@@ -92,6 +96,30 @@ PartManifest PartManifest::deserialize(const std::string & bytes)
         f.inlined[k] = getStr(bytes, p);
     }
     return f;
+}
+
+/// Mutable/non-deterministic files that must not contribute to the part identity.
+static bool isExcludedFromPartId(std::string_view file)
+{
+    static constexpr std::array excluded{"uuid.txt", "txn_version.txt", "metadata_version.txt"};
+    for (const auto & e : excluded)
+        if (file == e)
+            return true;
+    return false;
+}
+
+PartId computePartId(const std::map<std::string, BlobEntry> & blobs)
+{
+    /// std::map iterates in sorted key order, so the (logical_file, checksum) stream is canonical.
+    SipHash hash;
+    for (const auto & [file, blob] : blobs)
+    {
+        if (isExcludedFromPartId(file))
+            continue;
+        hash.update(file);
+        hash.update(blob.checksum);
+    }
+    return PartId(getHexUIntLowercase(hash.get128()));
 }
 
 }
