@@ -100,3 +100,14 @@ tests/queries/0_stateless/<NNNNN>_content_addressed_gc.sql  # NEW: DROP-then-rec
 
 ## Execution {#execution}
 Task 1 → Task 5 via `superpowers:subagent-driven-development`, two-stage review each. After Phase 4 (GC reclaims orphans without data loss), Phase 5 = the `_pool_meta` self-check + fail-closed feature gate (reject projections/patch parts/unknown format version) — the last M1 safety piece. Append new deferrals to the backlog with plug-in points.
+
+---
+
+## ⚠ Post-review revision (2026-06-02) — supersedes the GC design above {#post-review-revision}
+This plan shipped a **grace-based, default-on background reachability sweep**. A subsequent design review found that to be unsafe and buggy; **do not treat the above as the final GC design.** Specifically:
+- **P1 data-loss bug (fixed):** `markReachableBlobs` returned *bare hashes* while the sweep listed *full fan-out object keys* → the reachable set never matched → the sweep would delete **live** blobs after grace. The Task-2 tests missed it (they hand-seed a self-consistent key convention) and the integration test missed it (no *live* table during a sweep). Fixed: reachable set uses full object keys + a regression test that builds parts through the real transaction and asserts a live part survives a sweep.
+- **`grace` is not a safety mechanism.** Time may protect only failure detection, never live work — a write→commit slower than `grace` (or a GC pause / clock skew) loses data. The safe design is **pin + lease + fence** (backlog **B32**): in-flight writes are made visible to the GC via leased pins; GC marks `refs ∪ live pins`, re-validates under a leader lock before delete; time only reclaims a *crashed* writer's orphans; a fencing token closes the paused-writer hazard. Works without Keeper (object-store conditional writes) — Keeper (B11) is just a faster catalog.
+- **Background deletion must not run un-coordinated.** The background sweep is now **OFF by default** (`content_addressed_gc_enabled`, default false); only `triggerAndWait` (manual/test) runs. Re-enable only after **B32** + the `_pool_meta` ownership self-check (Step 2 / Step 6 of the M5 hardening plan).
+- `BlobRefIndex` is an **un-wired seam** (quarantined; reachability is the explicit M1 GC) until B9.
+
+The real forward path for GC and the surrounding structural fixes is **`plans/2026-06-02-cas-mergetree-m5-hardening.md`** (Step 6 = the B32 protocol).
