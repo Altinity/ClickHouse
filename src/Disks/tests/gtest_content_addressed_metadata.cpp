@@ -29,6 +29,11 @@
 
 using namespace DB::ContentAddressed;
 
+/// A real server-local scratch dir for the write-buffer spill. The content-addressed write buffer
+/// spills each part file here while hashing it before upload; this is a local filesystem path, never
+/// an object-storage key prefix. The directory is created lazily by the buffer (create_directories).
+static const std::string kCasTestScratch = "./cas_test_scratch";
+
 TEST(ContentAddressedPoolPaths, ContentKeysFanOut)
 {
     // Empty prefix yields the bare key byte-for-byte (no leading slash).
@@ -145,6 +150,7 @@ public:
         fs::remove_all("parts", ec);
         fs::remove_all("store", ec);
         fs::remove_all("cas_wbuf_tmp", ec);
+        fs::remove_all(kCasTestScratch, ec);
     }
 
 private:
@@ -153,7 +159,7 @@ private:
         fs::remove_all("./" + key_prefix);
         DB::LocalObjectStorageSettings settings("test", "./" + key_prefix, /*read_only_=*/false);
         auto object_storage = std::make_shared<DB::LocalObjectStorage>(std::move(settings));
-        auto metadata_storage = std::make_shared<DB::ContentAddressedMetadataStorage>(object_storage, "", "test-server");
+        auto metadata_storage = std::make_shared<DB::ContentAddressedMetadataStorage>(object_storage, "", "test-server", kCasTestScratch);
 
         active_metadatas.emplace(key_prefix, metadata_storage);
         active_object_storages.emplace(key_prefix, object_storage);
@@ -337,7 +343,7 @@ TEST_F(ContentAddressedMetaTest, WritePartThenReadBackAndDedup)
 
     auto write_part = [&](const std::string & part, const std::map<std::string,std::string> & files)
     {
-        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"");
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
         for (const auto & [name, bytes] : files)
         {
             auto buf = tx.writeFile("uui/" + uuid + "/" + part + "/" + name, 4096, DB::WriteMode::Rewrite, {});
@@ -375,7 +381,7 @@ TEST_F(ContentAddressedMetaTest, RemoveUnlinksRefsKeepsBlobs)
 
     auto write_part = [&](const std::string & part, const std::map<std::string, std::string> & files)
     {
-        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"");
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
         for (const auto & [name, bytes] : files)
         {
             auto buf = tx.writeFile("uui/" + uuid + "/" + part + "/" + name, 4096, DB::WriteMode::Rewrite, {});
@@ -402,7 +408,7 @@ TEST_F(ContentAddressedMetaTest, RemoveUnlinksRefsKeepsBlobs)
 
     // (1) Removing a single part directory deletes ONLY that part's ref.
     {
-        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"");
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
         tx.removeRecursive("uui/" + uuid + "/all_1_1_0", /*should_remove_objects=*/nullptr);
         tx.commit(DB::NoCommitOptions{});
     }
@@ -416,7 +422,7 @@ TEST_F(ContentAddressedMetaTest, RemoveUnlinksRefsKeepsBlobs)
 
     // (2) Removing the whole table directory deletes ALL remaining refs but KEEPS the blobs.
     {
-        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"");
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
         tx.removeRecursive("uui/" + uuid, /*should_remove_objects=*/nullptr);
         tx.commit(DB::NoCommitOptions{});
     }
@@ -442,7 +448,7 @@ TEST_F(ContentAddressedMetaTest, NonPartFilePassthrough)
 
     // Write a table-level file through the transaction.
     {
-        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"");
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
         auto buf = tx.writeFile(format_version, 4096, DB::WriteMode::Rewrite, {});
         const std::string bytes = "1";
         buf->write(bytes.data(), bytes.size());
@@ -463,7 +469,7 @@ TEST_F(ContentAddressedMetaTest, NonPartFilePassthrough)
 
     // A part file in the same table still resolves via the ref/footer/blob path.
     {
-        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"");
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
         auto buf = tx.writeFile("uui/" + uuid + "/all_1_1_0/data.bin", 4096, DB::WriteMode::Rewrite, {});
         const std::string bytes = "PART-BYTES";
         buf->write(bytes.data(), bytes.size());
@@ -493,7 +499,7 @@ TEST_F(ContentAddressedMetaTest, GenericDiskFilePassthroughRoundTrips)
     // whose (empty) parent the local-fs harness cannot create — not a production shape.
     const std::string prefix = "cas_generic_pool";
     auto os = getObjectStorage("cas_generic");
-    DB::ContentAddressedMetadataStorage ms(os, prefix, "test-server");
+    DB::ContentAddressedMetadataStorage ms(os, prefix, "test-server", kCasTestScratch);
 
     const std::string probe = "clickhouse_access_check_0123abcd";
     const std::string bytes = "0123abcd"; // the access-check writes a uuid string and reads it back
@@ -505,7 +511,7 @@ TEST_F(ContentAddressedMetaTest, GenericDiskFilePassthroughRoundTrips)
 
     // Write through the transaction (commit publishes nothing — no part recorded).
     {
-        DB::ContentAddressedTransaction tx(ms, prefix);
+        DB::ContentAddressedTransaction tx(ms, prefix, kCasTestScratch);
         auto buf = tx.writeFile(probe, 4096, DB::WriteMode::Rewrite, {});
         buf->write(bytes.data(), bytes.size());
         buf->finalize();
@@ -523,7 +529,7 @@ TEST_F(ContentAddressedMetaTest, GenericDiskFilePassthroughRoundTrips)
 
     // unlinkFile removes the verbatim object — afterwards it is gone.
     {
-        DB::ContentAddressedTransaction tx(ms, prefix);
+        DB::ContentAddressedTransaction tx(ms, prefix, kCasTestScratch);
         tx.unlinkFile(probe, /*if_exists=*/false, /*should_remove_objects=*/true);
         tx.commit(DB::NoCommitOptions{});
     }
@@ -541,14 +547,14 @@ TEST_F(ContentAddressedMetaTest, MutationCarryForwardReusesBlob)
     const std::string uuid = "uuid-10";
     // source part
     {
-        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"");
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
         for (auto & [n,b] : std::map<std::string,std::string>{{"a.bin","A0"},{"b.bin","B0"},{"columns.txt","a b"}})
         { auto buf = tx.writeFile("uui/" + uuid + "/all_1_1_0/" + n, 4096, DB::WriteMode::Rewrite, {}); buf->write(b.data(), b.size()); buf->finalize(); }
         tx.commit(DB::NoCommitOptions{});
     }
     // mutation: rewrite a.bin, carry-forward b.bin + columns.txt
     {
-        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"");
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
         auto buf = tx.writeFile("uui/" + uuid + "/all_1_1_0_1/a.bin", 4096, DB::WriteMode::Rewrite, {});
         buf->write("A1", 2); buf->finalize();
         tx.createHardLinkFrom("uui/" + uuid + "/all_1_1_0/b.bin", "uui/" + uuid + "/all_1_1_0_1/b.bin");

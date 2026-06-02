@@ -24,17 +24,18 @@ namespace ErrorCodes
     extern const int FILE_DOESNT_EXIST;
 }
 
-ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(ObjectStoragePtr object_storage_, String storage_path_prefix_, String server_id_)
+ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(ObjectStoragePtr object_storage_, String storage_path_prefix_, String server_id_, String local_scratch_path_)
     : object_storage(std::move(object_storage_))
     , storage_path_prefix(std::move(storage_path_prefix_))
     , storage_path_full(fs::path(object_storage->getRootPrefix()) / storage_path_prefix)
     , server_id(std::move(server_id_))
+    , local_scratch_path(std::move(local_scratch_path_))
 {
 }
 
 MetadataTransactionPtr ContentAddressedMetadataStorage::createTransaction()
 {
-    return std::make_shared<ContentAddressedTransaction>(*this, storage_path_prefix);
+    return std::make_shared<ContentAddressedTransaction>(*this, storage_path_prefix, local_scratch_path);
 }
 
 std::optional<std::string> ContentAddressedMetadataStorage::readSmallObjectIfExists(const std::string & key) const

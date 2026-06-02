@@ -15,9 +15,10 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
-ContentAddressedTransaction::ContentAddressedTransaction(ContentAddressedMetadataStorage & metadata_storage_, std::string key_prefix_)
+ContentAddressedTransaction::ContentAddressedTransaction(ContentAddressedMetadataStorage & metadata_storage_, std::string key_prefix_, std::string local_scratch_path_)
     : metadata_storage(metadata_storage_)
     , key_prefix(std::move(key_prefix_))
+    , local_scratch_path(std::move(local_scratch_path_))
 {
 }
 
@@ -80,14 +81,14 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     const std::string file = p->file;
 
     /// The blob is keyed under the same common key prefix as the read path (key_prefix, taken from
-    /// the metadata storage). Spill temp files under the object-storage common key prefix so they
-    /// share its disk and are cleaned up alongside it.
-    const std::string temp_dir = metadata_storage.object_storage->getCommonKeyPrefix() + "/cas_wbuf_tmp";
-
+    /// the metadata storage). The write buffer spills the part file to a real server-local scratch
+    /// dir while hashing it, then uploads to blobs/<hash>. The scratch dir is a local filesystem
+    /// path, NOT the object-storage key prefix: for a remote object storage (e.g. s3) that prefix is
+    /// a remote key prefix and is not a usable local path.
     return std::make_unique<ContentAddressed::ContentAddressedWriteBuffer>(
         metadata_storage.object_storage,
         key_prefix,
-        temp_dir,
+        local_scratch_path,
         [this, file](const std::string & blob_hash, size_t size)
         {
             recorded[file] = ContentAddressed::BlobEntry{blob_hash, size, blob_hash};

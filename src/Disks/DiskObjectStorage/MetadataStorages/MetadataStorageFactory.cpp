@@ -210,7 +210,7 @@ void registerPlainRewritableMetadataStorage(MetadataStorageFactory & factory)
 void registerContentAddressedMetadataStorage(MetadataStorageFactory & factory)
 {
     factory.registerMetadataStorageType("content_addressed", [](
-        const std::string & /* name */,
+        const std::string & name,
         const Poco::Util::AbstractConfiguration & config,
         const std::string & config_prefix,
         const ClusterConfigurationPtr & cluster,
@@ -221,7 +221,15 @@ void registerContentAddressedMetadataStorage(MetadataStorageFactory & factory)
         const auto local_object_storage = object_storages->takePointingTo(cluster->getLocalLocation());
         std::string key_compatibility_prefix = getObjectKeyCompatiblePrefix(local_object_storage, config, config_prefix);
 
-        return std::make_shared<ContentAddressedMetadataStorage>(local_object_storage, key_compatibility_prefix, toString(ServerUUID::get()));
+        /// Server-local scratch dir for the write-buffer spill. Mirrors how other metadata storages
+        /// compute their local working dir (see the `local` registration above): it is a real
+        /// filesystem path under the server data path, NEVER the object-storage key prefix (which for
+        /// a remote object storage such as s3 is a remote key prefix and not a usable local path).
+        auto local_scratch_path = config.getString(config_prefix + ".cas_scratch_path",
+                                                    fs::path(Context::getGlobalContextInstance()->getPath()) / "disks" / name / "cas_scratch" / "");
+        fs::create_directories(local_scratch_path);
+
+        return std::make_shared<ContentAddressedMetadataStorage>(local_object_storage, key_compatibility_prefix, toString(ServerUUID::get()), local_scratch_path);
     });
 }
 

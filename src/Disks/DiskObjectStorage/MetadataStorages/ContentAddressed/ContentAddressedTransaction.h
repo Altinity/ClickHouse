@@ -30,7 +30,11 @@ public:
     /// (its storage_path_prefix) so the write side keys objects exactly where the read side looks.
     /// Never re-derive it from object_storage->getCommonKeyPrefix() here: a config
     /// key_compatibility_prefix override would otherwise make read and write disagree.
-    ContentAddressedTransaction(ContentAddressedMetadataStorage & metadata_storage_, std::string key_prefix_);
+    ///
+    /// local_scratch_path_ is a real server-local filesystem directory where the write buffer spills
+    /// each part file while hashing it, before upload. It is a local path, NOT an object key prefix:
+    /// for a remote object storage (e.g. s3) the key prefix is not a usable local path.
+    ContentAddressedTransaction(ContentAddressedMetadataStorage & metadata_storage_, std::string key_prefix_, std::string local_scratch_path_);
 
     bool supportsChmod() const override { return false; }
 
@@ -136,6 +140,8 @@ private:
 
     /// Object-storage common key prefix; authoritative copy from the metadata storage (see ctor).
     const std::string key_prefix;
+    /// Server-local scratch dir for the write-buffer spill (see ctor).
+    const std::string local_scratch_path;
     std::map<std::string, ContentAddressed::BlobEntry> recorded;
     std::string table_uuid;
     std::string part_name;

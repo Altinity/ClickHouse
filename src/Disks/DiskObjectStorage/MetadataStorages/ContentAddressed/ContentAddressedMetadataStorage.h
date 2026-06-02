@@ -13,7 +13,10 @@ namespace DB
 class ContentAddressedMetadataStorage final : public IMetadataStorage
 {
 public:
-    ContentAddressedMetadataStorage(ObjectStoragePtr object_storage_, String storage_path_prefix_, String server_id_);
+    /// local_scratch_path_ is a real server-local filesystem directory used to spill part files
+    /// while hashing them before upload. It must NOT be derived from the object-storage key prefix:
+    /// for a remote object storage (e.g. s3) that prefix is a remote KEY prefix, not a local path.
+    ContentAddressedMetadataStorage(ObjectStoragePtr object_storage_, String storage_path_prefix_, String server_id_, String local_scratch_path_);
 
     MetadataStorageType getType() const override { return MetadataStorageType::ContentAddressed; }
     const std::string & getPath() const override { return storage_path_full; }
@@ -65,6 +68,8 @@ private:
     const std::string storage_path_prefix;
     const std::string storage_path_full;
     const std::string server_id;
+    /// Server-local scratch dir for the write-buffer spill (see ctor doc).
+    const std::string local_scratch_path;
 };
 
 }
