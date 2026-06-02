@@ -1,10 +1,83 @@
 #include <gtest/gtest.h>
 #include <cstring>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Codec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
+#include <IO/ReadBufferFromString.h>
+#include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
 
 using namespace DB::ContentAddressed;
+
+// ==== Task 1: the shared little-endian codec + versioned format header ====
+
+// The codec serialises integers explicitly little-endian regardless of host byte order, so a content-
+// addressed object written on one architecture is byte-identical to one written on another. Assert the
+// exact bytes for a known value (the high byte lands LAST), and that varint/string round-trip including
+// high values and embedded NULs.
+TEST(ContentAddressedCodec, LittleEndianAndVarintAndStringRoundTrip)
+{
+    std::string out;
+    {
+        DB::WriteBufferFromString buf(out);
+        DB::writeBinaryLittleEndian(static_cast<uint32_t>(0x01020304u), buf);
+        DB::writeBinaryLittleEndian(static_cast<uint64_t>(0x0102030405060708ull), buf);
+        DB::writeVarUInt(static_cast<uint64_t>(300), buf);
+        DB::writeStringBinary(std::string("hi\0there", 8), buf);
+    }
+    // u32 0x01020304 little-endian == 04 03 02 01; u64 high byte 0x01 last.
+    const std::string expected =
+        std::string("\x04\x03\x02\x01", 4) +
+        std::string("\x08\x07\x06\x05\x04\x03\x02\x01", 8) +
+        std::string("\xAC\x02", 2) /* varint 300 */ +
+        std::string("\x08", 1) /* varint length 8 */ + std::string("hi\0there", 8);
+    EXPECT_EQ(out, expected);
+
+    DB::ReadBufferFromString in(out);
+    uint32_t a = 0;
+    uint64_t b = 0;
+    uint64_t v = 0;
+    std::string s;
+    DB::readBinaryLittleEndian(a, in);
+    DB::readBinaryLittleEndian(b, in);
+    DB::readVarUInt(v, in);
+    DB::readStringBinary(s, in);
+    EXPECT_EQ(a, 0x01020304u);
+    EXPECT_EQ(b, 0x0102030405060708ull);
+    EXPECT_EQ(v, 300u);
+    EXPECT_EQ(s, std::string("hi\0there", 8));
+}
+
+TEST(ContentAddressedCodec, FormatHeaderRoundTrips)
+{
+    constexpr FormatMagic kMagic = makeMagic("CAXX");
+    std::string out;
+    {
+        DB::WriteBufferFromString buf(out);
+        FormatHeader{kMagic, 3}.write(buf);
+    }
+    EXPECT_EQ(out, std::string("CAXX\x03", 5)); // 4 magic + 1 version byte
+    DB::ReadBufferFromString in(out);
+    EXPECT_EQ(FormatHeader::readAndValidate(in, kMagic, /*max=*/5, "test"), 3);
+}
+
+TEST(ContentAddressedCodec, FormatHeaderRejectsWrongMagic)
+{
+    constexpr FormatMagic kMagic = makeMagic("CAXX");
+    DB::ReadBufferFromString in(std::string("ZZZZ\x01", 5));
+    EXPECT_THROW(FormatHeader::readAndValidate(in, kMagic, /*max=*/5, "test"), DB::Exception);
+}
+
+TEST(ContentAddressedCodec, FormatHeaderFailsClosedOnUnknownVersion)
+{
+    constexpr FormatMagic kMagic = makeMagic("CAXX");
+    // A future version (above what this build understands) must fail closed, not be misparsed.
+    DB::ReadBufferFromString future(std::string("CAXX\x09", 5));
+    EXPECT_THROW(FormatHeader::readAndValidate(future, kMagic, /*max=*/5, "test"), DB::Exception);
+    // Version 0 is never written and is rejected too.
+    DB::ReadBufferFromString zero(std::string("CAXX\x00", 5));
+    EXPECT_THROW(FormatHeader::readAndValidate(zero, kMagic, /*max=*/5, "test"), DB::Exception);
+}
 
 TEST(ContentAddressedPartManifest, RoundTripBasic)
 {
