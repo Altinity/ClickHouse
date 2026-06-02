@@ -179,8 +179,115 @@ void ContentAddressedTransaction::setReadOnly(const std::string &)
     /// No-op: content-addressed parts are immutable by construction; a read-only flag is implicit.
 }
 
+void ContentAddressedTransaction::republishCommittedPartIntoDetached(
+    const ContentAddressed::PartFilePath & src_committed, const ContentAddressed::PartFilePath & dst_detached)
+{
+    /// dst_detached->file is the detached part directory name (e.g. all_1_2_1); re-key the source
+    /// part's files under it so detached/<detached_part>/<file> resolves and enumeration lists it.
+    const std::string & detached_dir = dst_detached.file;
+
+    auto src_pid = metadata_storage.readRefPartId(src_committed.table_uuid, src_committed.part_name);
+    if (!src_pid)
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "ContentAddressed: moveDirectory of {}/{} into detached, but the source ref is absent",
+            src_committed.table_uuid, src_committed.part_name);
+
+    auto src_manifest = metadata_storage.loadPartManifestOrThrow(*src_pid);
+
+    /// Merge into the existing detached ref (if any) so several detached parts can coexist under the
+    /// one "detached" ref, each under its own <detached_part>/ key prefix. Re-key the source part's
+    /// content blobs under the detached part dir component; the blob entries (hash/size) are unchanged
+    /// — the same shared content is referenced — only the logical file name changes.
+    ContentAddressed::PartManifest detached_manifest;
+    if (auto existing_pid = metadata_storage.readRefPartId(dst_detached.table_uuid, dst_detached.part_name))
+        detached_manifest = metadata_storage.loadPartManifestOrThrow(*existing_pid);
+    for (const auto & [file, entry] : src_manifest.blobs)
+        detached_manifest.blobs[detached_dir + "/" + file] = entry;
+
+    const ContentAddressed::PartId detached_pid = ContentAddressed::computePartId(detached_manifest.blobs);
+
+    const std::string detached_part_key = ContentAddressed::partKey(key_prefix, detached_pid).string();
+    if (!metadata_storage.object_storage->tryGetObjectMetadata(detached_part_key, /*with_tags=*/false).has_value())
+    {
+        const std::string bytes = detached_manifest.serialize();
+        auto out = metadata_storage.object_storage->writeObject(StoredObject(detached_part_key), WriteMode::Rewrite);
+        out->write(bytes.data(), bytes.size());
+        out->finalize();
+    }
+
+    /// Re-key the mutable per-part files (the per-ref sidecar) under the detached part dir too, so the
+    /// detached part keeps its private uuid/txn/metadata_version bytes. Merge into the existing detached
+    /// sidecar so several detached parts coexist.
+    if (auto src_sidecar = metadata_storage.readRefSidecarIfExists(src_committed.table_uuid, src_committed.part_name))
+    {
+        ContentAddressed::RefSidecar detached_sidecar;
+        if (auto existing = metadata_storage.readRefSidecarIfExists(dst_detached.table_uuid, dst_detached.part_name))
+            detached_sidecar = *existing;
+        for (const auto & [file, bytes] : src_sidecar->files)
+        {
+            const std::string detached_file = detached_dir + "/" + file;
+            detached_sidecar.files[detached_file] = bytes;
+
+            const std::string file_key = ContentAddressed::refMutableFileKey(
+                key_prefix, metadata_storage.server_id, dst_detached.table_uuid, dst_detached.part_name, detached_file).string();
+            auto file_out = metadata_storage.object_storage->writeObject(StoredObject(file_key), WriteMode::Rewrite);
+            file_out->write(bytes.data(), bytes.size());
+            file_out->finalize();
+        }
+
+        const std::string meta_key = ContentAddressed::refMetaKey(
+            key_prefix, metadata_storage.server_id, dst_detached.table_uuid, dst_detached.part_name).string();
+        const std::string meta_bytes = detached_sidecar.serialize();
+        auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite);
+        meta_out->write(meta_bytes.data(), meta_bytes.size());
+        meta_out->finalize();
+    }
+
+    /// Publish the detached ref last (the commit point), then unlink the source ref + its sidecars so
+    /// the part disappears from the active set and appears under detached.
+    const std::string detached_ref_key = ContentAddressed::refKey(
+        key_prefix, metadata_storage.server_id, dst_detached.table_uuid, dst_detached.part_name).string();
+    const std::string ref_payload = ContentAddressed::serializeRefPayload(detached_pid);
+    auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(detached_ref_key), WriteMode::Rewrite);
+    ref_out->write(ref_payload.data(), ref_payload.size());
+    ref_out->finalize();
+
+    /// Unlink the source ref and any of its per-ref sidecar objects (ref-scoped, never the shared
+    /// blobs/manifest). List under refsPrefix and remove the source ref + its <part>.* sidecars.
+    const std::string src_refs_prefix = ContentAddressed::refsPrefix(key_prefix, metadata_storage.server_id, src_committed.table_uuid);
+    RelativePathsWithMetadata refs;
+    metadata_storage.object_storage->listObjects(src_refs_prefix, refs, 0);
+    const std::string src_ref = src_refs_prefix + src_committed.part_name;
+    const std::string src_ref_sidecar_prefix = src_ref + ".";
+    for (const auto & elem : refs)
+    {
+        const auto & rp = elem->relative_path;
+        if (rp == src_ref || rp.starts_with(src_ref_sidecar_prefix))
+            metadata_storage.object_storage->removeObjectIfExists(StoredObject(rp));
+    }
+}
+
 void ContentAddressedTransaction::moveDirectory(const std::string & from, const std::string & to)
 {
+    /// DETACH PARTITION moves a COMMITTED part directory <uuid[:3]>/<uuid>/<part> into the detached
+    /// namespace <uuid[:3]>/<uuid>/detached/<detached_part>. Content addressing has no rename, and the
+    /// committed part is not staged in this transaction, so re-publish the ref: the detached ref is
+    /// named "detached" and carries the source part's blob entries (and mutable sidecar files) re-keyed
+    /// under the detached part directory component, so the read/enumeration path resolves
+    /// detached/<detached_part>/<file> and system.detached_parts lists <detached_part> (B36). The shared
+    /// content blobs and the source manifest are untouched (immutable, content-addressed); only the
+    /// small ref/manifest/sidecar pointer objects are written, and the source ref is unlinked.
+    if (auto src_committed = ContentAddressed::parsePartFilePath(from); src_committed && src_committed->file.empty())
+    {
+        if (auto dst_detached = ContentAddressed::parsePartFilePath(to);
+            dst_detached && dst_detached->part_name == ContentAddressed::kDetachedDirName && !dst_detached->file.empty())
+        {
+            republishCommittedPartIntoDetached(*src_committed, *dst_detached);
+            return;
+        }
+    }
+
     /// MergeTree assembles a part under a temporary directory (e.g. tmp_insert_<part>) and renames
     /// it to the final <part> at commit. Re-pin the (table_uuid, part_name) target to the
     /// destination so the ref is published under the final part name. The recorded blobs are keyed

@@ -53,6 +53,12 @@ RefMetaObjectKey refMutableFileKey(const std::string & key_prefix, const std::st
 // is not a ref and its payload is a RefSidecar, not a part id.
 inline constexpr std::string_view kRefMetaSuffix = ".meta";
 
+// The MergeTree detached-parts namespace. A part-dir component equal to this name is not a real part
+// but a container of detached part directories (detached/<detached_part>/<file>); the listing must
+// yield the detached part directory names, not the files inside (B36). Mirrors
+// MergeTreeData::DETACHED_DIR_NAME (kept here to avoid a Storages dependency from the disk layer).
+inline constexpr std::string_view kDetachedDirName = "detached";
+
 // True iff key (a key under some refsPrefix) is a per-ref sidecar rather than a ref object.
 bool isRefMetaKey(const std::string & key);
 

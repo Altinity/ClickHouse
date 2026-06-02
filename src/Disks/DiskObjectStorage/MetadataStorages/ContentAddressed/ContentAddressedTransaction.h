@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Identifiers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <Disks/WriteMode.h>
 #include <IO/HashingWriteBuffer.h>
 #include <IO/WriteBufferFromFile.h>
@@ -224,6 +225,13 @@ private:
     void recordBlob(const std::string & path, ContentAddressed::BlobEntry entry);
     // Pin/verify the (table_uuid, part_name) all files of one commit must agree on.
     void rememberTarget(const std::string & path);
+
+    // DETACH PARTITION: re-publish a committed part directory as a detached ref. The detached ref is
+    // named "detached" and carries the source part's manifest blob entries and mutable sidecar files
+    // re-keyed under the detached part directory component, then the source ref is unlinked. Content
+    // blobs and the source manifest are untouched (immutable). See moveDirectory (B36).
+    void republishCommittedPartIntoDetached(
+        const ContentAddressed::PartFilePath & src_committed, const ContentAddressed::PartFilePath & dst_detached);
 
     /// Object-storage common key prefix; authoritative copy from the metadata storage (see ctor).
     const std::string key_prefix;

@@ -504,8 +504,20 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
     const ClonePartParams & params) const
 {
     auto disk = volume->getDisk();
-    if (params.external_transaction)
-        params.external_transaction->createDirectories(to);
+
+    /// A content_addressed disk models a part as one atomic unit (N files -> one manifest -> one ref).
+    /// The per-file createHardLink autocommit Backup uses with no enclosing transaction would publish a
+    /// one-file ref per file and overwrite the destination, leaving the clone with only its last file
+    /// (the B21 corruption mode — seen as system.detached_parts listing metadata_version.txt instead of
+    /// the detached part dir, B36). When the caller did not supply a transaction, run the whole clone
+    /// through ONE self-created disk transaction so all files land in a single content-addressed part.
+    DiskTransactionPtr owned_transaction;
+    if (!params.external_transaction && disk->isContentAddressed())
+        owned_transaction = disk->createTransaction();
+    const DiskTransactionPtr & clone_transaction = params.external_transaction ? params.external_transaction : owned_transaction;
+
+    if (clone_transaction)
+        clone_transaction->createDirectories(to);
     else
         disk->createDirectories(to);
 
@@ -520,17 +532,17 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
         /* max_level= */ {},
         params.copy_instead_of_hardlink,
         params.files_to_copy_instead_of_hardlinks,
-        params.external_transaction);
+        clone_transaction);
 
     if (save_metadata_callback)
         save_metadata_callback(disk);
 
-    if (params.external_transaction)
+    if (clone_transaction)
     {
-        params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / "delete-on-destroy.txt");
-        params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TXN_VERSION_METADATA_FILE_NAME);
+        clone_transaction->removeFileIfExists(fs::path(to) / dir_path / "delete-on-destroy.txt");
+        clone_transaction->removeFileIfExists(fs::path(to) / dir_path / VersionMetadata::TXN_VERSION_METADATA_FILE_NAME);
         if (!params.keep_metadata_version)
-            params.external_transaction->removeFileIfExists(fs::path(to) / dir_path / IMergeTreeDataPart::METADATA_VERSION_FILE_NAME);
+            clone_transaction->removeFileIfExists(fs::path(to) / dir_path / IMergeTreeDataPart::METADATA_VERSION_FILE_NAME);
     }
     else
     {
@@ -539,6 +551,11 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
         if (!params.keep_metadata_version)
             disk->removeFileIfExists(fs::path(to) / dir_path / IMergeTreeDataPart::METADATA_VERSION_FILE_NAME);
     }
+
+    /// Commit the self-created transaction (the whole-part clone commit point for CA). An external
+    /// transaction is committed by its owner, as before.
+    if (owned_transaction)
+        owned_transaction->commit();
 
     auto single_disk_volume = std::make_shared<SingleDiskVolume>(disk->getName(), disk, 0);
 

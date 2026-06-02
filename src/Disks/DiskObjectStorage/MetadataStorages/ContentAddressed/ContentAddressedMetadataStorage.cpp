@@ -311,6 +311,28 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
         if (!pid)
             return {}; // absent ref => empty listing
         auto manifest = loadPartManifestOrThrow(*pid); // missing manifest for a present ref => CORRUPTED_DATA
+
+        // The "detached" namespace is not a part: it is a container of detached part *directories*
+        // (detached/<detached_part>/<file>). A detach clones a part file-by-file into
+        // detached/<detached_part>/<file>, so the ref named "detached" carries manifest keys shaped
+        // <detached_part>/<file>. Enumerating it (system.detached_parts via getDetachedParts) must
+        // yield the detached part DIRECTORY names, not the files inside them (and never a dir-stripped
+        // mutable sidecar file such as metadata_version.txt) — B36.
+        if (p->part_name == ContentAddressed::kDetachedDirName)
+        {
+            std::unordered_set<std::string> dirs;
+            for (const auto & [file, _] : manifest.blobs)
+            {
+                const auto slash_pos = file.find('/');
+                // A nested <detached_part>/<file> key contributes its first component. A bare key with
+                // no '/' is not a valid detached part directory entry (e.g. a mutable file whose
+                // directory prefix was dropped) and is skipped, so it never surfaces as a part dir.
+                if (slash_pos != std::string::npos)
+                    dirs.emplace(file.substr(0, slash_pos));
+            }
+            return std::vector<std::string>(std::make_move_iterator(dirs.begin()), std::make_move_iterator(dirs.end()));
+        }
+
         std::vector<std::string> result;
         result.reserve(manifest.blobs.size());
         for (const auto & [file, _] : manifest.blobs)
