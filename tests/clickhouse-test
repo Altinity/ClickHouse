@@ -2726,13 +2726,21 @@ class TestCase:
         if (
             tags
             and ("no-object-storage" in tags)
-            and (args.azure_blob_storage or args.s3_storage)
+            and (
+                args.azure_blob_storage
+                or args.s3_storage
+                or args.content_addressed_storage
+            )
         ):
             return FailureReason.OBJECT_STORAGE
         if (
             tags
             and "no-object-storage-with-slow-build" in tags
-            and (args.s3_storage or args.azure_blob_storage)
+            and (
+                args.s3_storage
+                or args.azure_blob_storage
+                or args.content_addressed_storage
+            )
             and BuildFlags.RELEASE not in args.build_flags
         ):
             return FailureReason.OBJECT_STORAGE

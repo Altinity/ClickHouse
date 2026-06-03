@@ -239,5 +239,55 @@ tag honored in the test-selection guard). For THIS taxonomy run the only skip us
 | B37 | **DONE (M6 Task C — CRITICAL crash fixed).** Non-replicated deduplication log SIGSEGV on a CA disk (real bug, category-2, server crash). A plain `MergeTree` with `non_replicated_deduplication_window > 0` builds a `MergeTreeDeduplicationLog` that writes `deduplication_logs/` files at the table root via `disk->writeFile(…, WriteMode::Append)`. On CA `disk_supports_writing_with_append` is false and the rotate path left `current_writer == nullptr`; `addPart` derefed it (the `chassert` at line 271 is a release no-op) → SIGSEGV inside `INSERT … VALUES` → the server died and aborted the whole run. **Fix (both halves done):** (1) **targeted gate** — `MergeTreeData::checkContentAddressedDiskRestrictions` now rejects `non_replicated_deduplication_window != 0` at `CREATE`/`ATTACH` on a `content_addressed` disk with a clear `SUPPORT_IS_DISABLED` message; (2) **defensive no-crash** — `MergeTreeDeduplicationLog::addPart`/`dropPart` now throw a clear `LOGICAL_ERROR` if `current_writer` is null instead of dereferencing it (general, helps non-CA too). | **Most severe M6 Task B finding — fixed.** Verified: a `CREATE … SETTINGS non_replicated_deduplication_window=…, disk=<CA>` throws cleanly; `03008_deduplication_cases_from_docs` under CA-default now fails with the clean gate error (no crash — the whole 13-test run completed, server survived, only `Received signal 15` SIGTERM at shutdown). | `MergeTreeData::checkContentAddressedDiskRestrictions` (gate), `MergeTreeDeduplicationLog::addPart`/`dropPart` (null-writer throw). Tests: stateless `04285_content_addressed_dedup_window_rejected`; example `03008_deduplication_cases_from_docs` (clean `SUPPORT_IS_DISABLED`, no SIGSEGV). |
 | B38 | **DONE (M6 Task C).** `system.remote_data_paths` traversal threw on a CA disk (real bug, category-2). `03000_traverse_shadow_system_data_paths`: the traversal probes `disk->existsFile` on pool sub-dirs (e.g. `…/store`); CA's `existsFile` resolves a non-part path to a verbatim object key and called `LocalObjectStorage::tryGetObjectMetadata` → `std::filesystem::file_size` on a **directory** → `Is a directory` (Code 1001) escaped. **Fix:** `LocalObjectStorage::tryGetObjectMetadata` now treats a directory path as a missing object (returns `nullopt`) instead of calling `file_size` on it — general (helps any caller probing whether a path is a readable object), and exactly what CA's `existsFile`/`getFileSize`/`existsFileOrDirectory` need (a directory is not-a-file → false / `FILE_DOESNT_EXIST`, never a raw FS error). | Surfaced by M6 Task B; fixed. Verified: `03000_traverse_shadow_system_data_paths` under CA-default now `[ OK ]`; `system.remote_data_paths` is queryable on a CA table (no throw). | `LocalObjectStorage::tryGetObjectMetadata` (directory-safe). Tests: unit `ExistsFileOnDirectoryShapedPoolPathReturnsFalse`; stateless `04286_content_addressed_remote_data_paths`; example `03000_traverse_shadow_system_data_paths` `[ OK ]`. |
 
+### M6 Task C2 — `no-content-addressed-storage` skip tag + suite tagging + new backlog (2026-06-03) {#m6-task-c2}
+
+**Tag mechanism added.** Mirroring `no-s3-storage`: `tests/clickhouse-test` got a `--content-addressed-storage`
+arg, a `CONTENT_ADDRESSED_STORAGE` `FailureReason`, and a `no-content-addressed-storage` tag check that
+skips when the arg is set; `ci/jobs/functional_tests.py` passes `--content-addressed-storage` to the test
+runner for the `content_addressed storage` praktika option. Verified end-to-end: a tagged test (`00030_alter_table`,
+`00509_extended_storage_definition_syntax_zookeeper`) is `[ SKIPPED ]` under the CA-default mode and `[ OK ]`
+under the normal mode.
+
+**`no-object-storage` now also fires for CA.** The `content_addressed` disk is object-storage-backed
+(`object_storage_type=local`), so the existing `no-object-storage` / `no-object-storage-with-slow-build`
+guards in `tests/clickhouse-test` were widened to also trigger on `args.content_addressed_storage`. This
+cleanly skips the class of tests that assert local-disk-specific behaviour on CA (local mmap counters,
+hard-coded `disk = 'default'` in `system.tables`, opened-files counts) — e.g. `01343_min_bytes_to_use_mmap_io`,
+`01344_min_bytes_to_use_mmap_io_index`, `00753_system_columns_and_system_tables_long`, `01475_read_subcolumns`,
+`01533_multiple_nested`, `00731_long_merge_tree_select_opened_files`, `04201_trivial_count_with_additional_filter`.
+These are NOT CA bugs — they are object-storage-incompatible tests (exactly the S3 variant's behaviour).
+
+**Tagged 429 capability-gated tests** in the `00 01` substring slice (~4013 distinct tests run under
+`Stateless tests (arm_binary, content_addressed storage, parallel)`). Each tagged test's failure is a
+recognized CA capability-gate (signature counts): ALTER-data 163, Replicated 155, projections 41,
+mutations 41, partition-clone 27, RESTORE-onto-CA/B35 2, plus the projection-merge failpoint hang
+`04000_system_merges_projection_progress` (which *hangs* on a `SYSTEM WAIT FAILPOINT … PAUSE` because the
+gated projection merge never reaches the failpoint — gated, tagged). Counts for the covered slice:
+**~4013 run, 3551 passed, 3 pre-tagged-skipped, 459 FAIL lines → 429 distinct cat-1 (now tagged), ~31
+distinct cat-2 real-bug/infra**. Of the runnable (non-gated) set, the suite is green except the cat-2
+clusters below. NB: the run was force-killed by its 1h `timeout` during the serial failed-test *rerun*
+phase (a property of the huge 4k-test slice, not a server crash) — the per-test `[ FAIL ]/[ OK ]` results
+used for classification were already complete; **no server crash / fatal signal anywhere in the slice**
+(only benign SIGTSTP=20 job-control stops from the harness timeout-killer).
+
+**New real-bug backlog rows (category-2, NOT tag-hidden):**
+
+| ID | Item | Why / status | Where it plugs in |
+|----|------|-------------|-------------------|
+| B39 | **CA disables MergeTree transactions** (`Storage MergeTree … does not support transactions`, `NOT_IMPLEMENTED`, Code 48). The experimental `BEGIN/COMMIT` transaction feature is unavailable on a `content_addressed` default disk. Cluster (≥10 tests): `01133_begin_commit_race`, `01167_isolation_hermitage`, `01168_mutations_isolation`, `01169_alter_partition_isolation_stress`, `01169_old_alter_partition_isolation_stress`, `01170_alter_partition_isolation`, `01171_mv_select_insert_isolation_long`, `01172_transaction_counters`, `01173_transaction_control_queries`, `01174_select_insert_isolation`. NOT one of the recognized capability-gate messages, so NOT tagged — decide: either (a) an honest CA gate at `BEGIN TRANSACTION` with a clear message + a `no-content-addressed-storage` tag for these txn tests, or (b) support per-part transaction CSN metadata on CA. | Real cat-2; surfaced by M6 Task C2. MergeTree transactions need per-part `txn_version.txt`/CSN sidecars the immutable CA part contract doesn't model yet. | `MergeTreeData::supportsTransactions`/the txn-version part-file path; ties to B30 whole-part contract (transaction metadata as part sidecars) and the honest-gate pattern from B33/B37. |
+| B40 | **CA read-miss: `ContentAddressed: no object / no ref for <part-file>` (`FILE_DOESNT_EXIST`, Code 107)** on a SUPPORTED read after a SUPPORTED write — a genuine data-integrity bug, not a gate. Examples: `00542_access_to_temporary_table_in_readonly_mode` (temp-table part `data.bin` missing), `01069_database_memory` (`Memory`-DB-attached MergeTree `data.cmrk4` missing), `01114_database_atomic` (`Atomic`-DB part `data.cmrk4` no-ref after a merge: `4_5_5_0`), `01516_create_table_primary_key` (`primary.idx` no-object). The committed part's manifest/ref is missing some files at read time (likely a non-default-DB-engine or merge-output commit path that doesn't route every part file through the CA whole-part commit). | **Most important new finding.** A supported INSERT/merge/temp-table path drops part files from the CA manifest → later read throws. Must root-cause before "almost all". | The part-file write/commit seam for non-`Ordinary`/non-default-DB tables + merge output (`MergeTreeDataWriter`/`MergedBlockOutputStream` → CA whole-part commit); ties to B30. |
+| B41 | **CA concurrent-blob corruption: `blob … already exists with size 0 but new content has size N (hash collision or partially-written blob)` (`CORRUPTED_DATA`, Code 246)** under parallel/concurrent inserts. Examples: `00276_sample`, `01825_json_type_parallel_insert`. A blob is registered (size 0 placeholder) by one writer and a concurrent writer races on the same content-hash key → the dedup/placeholder protocol is not concurrency-safe. | Real cat-2; concurrency bug in the blob put/dedup path. Surfaced by M6 Task C2. | `ContentAddressedObjectStorage` blob put + placeholder/commit protocol (atomic create-or-verify by content hash); ties to the GC pin/lease design (B32) and B30. |
+| B42 | **CA part-lifecycle: `Directory <part> (part to remove) doesn't exist … Most likely … manual removing`** warning + result/stderr mismatch on `01625_constraints_index_append` (a `Memory`-engine DB with a MergeTree table). A part the engine expects to remove is already gone from the CA pool (premature GC reclaim or a double-unlink in the outdated-part path). Likely the same root family as B40 (non-default-DB-engine part lifecycle). | Real cat-2; part removal/GC vs. metadata race or non-`Atomic`-DB path. | CA outdated-part removal + GC reachability for non-`Atomic` databases; ties to B40 + the single-owner GC sweep. |
+| B43 | **CA result-diff on supported ops (misc):** `00427_alter_primary_key` (ALTER-PK then SELECT returns different rows on CA) and `03008_deduplication_random_settings` (dedup-family result diff when random settings don't set a dedup window — adjacent to B37). Distinct from the `no-object-storage` diffs (those are now skipped). Small cluster; root-cause individually. | Real cat-2 result diffs; low volume. | Per-test root cause; `00427` likely an ALTER-PK re-read path on CA, `03008` ties to the B37 dedup family. |
+
+**Infra/flaky (NOT CA, NOT tagged):** `00091_prewhere_two_conditions` (Timeout/hang — investigate separately),
+`01103_check_cpu_instructions_at_startup` (Timeout; needs `lldb` python module), `01880_remote_ipv6`
+(`All connection tries failed`), `00163_shard_join_with_empty_table` (`TOO_MANY_ROWS` random-settings flake).
+
+> **Status (Task C2):** tag mechanism DONE + verified; `no-object-storage`→CA widening DONE; 429 cat-1
+> tests tagged + committed; cat-2 real bugs filed as B39–B43 (NOT tag-hidden). Covered ~4013 tests of the
+> `00 01` slice. Remaining for a final full run: the `02*`/`03*`/`04*` numeric ranges not in this slice,
+> and re-running the tagged batch to confirm green (tagged→skip, rest→pass).
+
 > Add new deferred items here as they arise during planning/implementation, always filling the
 > "where it plugs in" column so the architecture stays dead-end-free.
