@@ -301,31 +301,41 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
 
 std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const std::string & path) const
 {
-    // Table dir <uuid[:3]>/<uuid>[/]: list the part names from refs/.
+    // Table dir <uuid[:3]>/<uuid>[/]: list the part names from refs/ AND the table-level file names
+    // from files/ (e.g. format_version.txt, mutation_N.txt). A real disk's table data dir lists both
+    // its part directories and its table-level files, and consumers depend on it: in particular
+    // StorageMergeTree::loadMutations scans this dir for `mutation_*` entries to populate
+    // system.mutations, so omitting the verbatim table-level files made every CA table report an empty
+    // mutation list even though the mutations ran.
     if (auto uuid = ContentAddressed::parseTableUuid(path))
     {
-        // Mirror MetadataStorageFromPlainObjectStorage::listDirectory child-derivation:
-        // list under the prefix, strip it, and take the immediate child component.
-        std::string prefix = ContentAddressed::refsPrefix(storage_path_prefix, server_id, *uuid);
-        RelativePathsWithMetadata files;
-        object_storage->listObjects(prefix, files, 0);
-
         std::unordered_set<std::string> result;
-        for (const auto & elem : files)
+
+        // Mirror MetadataStorageFromPlainObjectStorage::listDirectory child-derivation: list under the
+        // prefix, strip it, and take the immediate child component.
+        auto collect_children = [&](const std::string & prefix, bool skip_ref_meta)
         {
-            const auto & p = elem->relative_path;
-            // Per-ref sidecars (.meta) live under the same refs/ prefix but are not parts; skip them
-            // so a part dir never appears twice (once as <part>, once as <part>.meta).
-            if (ContentAddressed::isRefMetaKey(p))
-                continue;
-            const auto child_pos = p.find(prefix);
-            if (child_pos != 0)
-                continue;
-            const auto rest = p.substr(prefix.size());
-            const auto slash_pos = rest.find('/');
-            // string::npos is ok: take the whole remainder.
-            result.emplace(rest.substr(0, slash_pos));
-        }
+            RelativePathsWithMetadata objects;
+            object_storage->listObjects(prefix, objects, 0);
+            for (const auto & elem : objects)
+            {
+                const auto & p = elem->relative_path;
+                // Per-ref sidecars (.meta) live under the refs/ prefix but are not parts; skip them so a
+                // part dir never appears twice (once as <part>, once as <part>.meta).
+                if (skip_ref_meta && ContentAddressed::isRefMetaKey(p))
+                    continue;
+                if (p.find(prefix) != 0)
+                    continue;
+                const auto rest = p.substr(prefix.size());
+                const auto slash_pos = rest.find('/');
+                // string::npos is ok: take the whole remainder.
+                result.emplace(rest.substr(0, slash_pos));
+            }
+        };
+
+        collect_children(ContentAddressed::refsPrefix(storage_path_prefix, server_id, *uuid), /*skip_ref_meta=*/true);
+        collect_children(ContentAddressed::tableFilesPrefix(storage_path_prefix, server_id, *uuid), /*skip_ref_meta=*/false);
+
         return std::vector<std::string>(std::make_move_iterator(result.begin()), std::make_move_iterator(result.end()));
     }
 
