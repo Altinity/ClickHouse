@@ -133,3 +133,17 @@ Write the implementation plan to `docs/superpowers/plans/2026-06-04-cas-mergetre
   multiple temp blocks. B59 needs a design decision (in-flight read-overlay vs early standalone
   sub-commit) — documented with both options; not a 1am hack. B5 projection half = DONE except B59.
   Pushed through `5f1422f748c`. → Starting Stage B (minio + CA stateless config).
+- Stage B config DONE (`3dfbc6fe3b4`): new job `Stateless tests (arm_binary, content_addressed s3 storage,
+  parallel)` — CA disk over minio S3 as default. Smoke-tested 10/10, full CAS layout written to minio,
+  minio auto-starts for every stateless job. Full-suite minio+CA triage running in a BACKGROUND subagent
+  (bounded per-shard; finds the S3-specific delta = passes-on-local-CA-but-fails-on-s3-CA). Awaiting it.
+- Stage C (replication brainstorm) DONE while minio ran: spec `2026-06-04-cas-mergetree-replication-design.md`
+  (`0f24cea5ab2`), adversarially reviewed + revised (`de2cfa5e8ed`). Core: refs ARE the cross-replica
+  tracking (GC already roots at union of `store/*/refs/`), fetch = publish-a-ref (no download, no ZK
+  blob-locks). Review found ONE data-loss hole (relink must pin source blobs before publishing the ref —
+  now mandatory in §4), pool identity must be a `pool_uuid` in `_pool_meta` (not endpoint+prefix), 2nd
+  replica throws on mount until `allow_shared_pool` wired on, and the replication-QUEUE clone paths
+  (never run on CA) need a guilty-until-audited pass.
+- Stage D plan DONE: `2026-06-04-cas-mergetree-replication.md` (`caad12e850d`), 5 phases. Implementation
+  (builds) BLOCKED on the minio subagent finishing (no concurrent ninja). → Awaiting minio, then: triage
+  minio S3-delta + fix → implement replication Phase 1+ → Stage E (un-gate replicated tests on minio+CA).
