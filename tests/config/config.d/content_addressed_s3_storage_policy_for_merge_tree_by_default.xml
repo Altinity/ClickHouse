@@ -1,0 +1,35 @@
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <content_addressed_s3>
+                <type>object_storage</type>
+                <object_storage_type>s3</object_storage_type>
+                <metadata_type>content_addressed</metadata_type>
+                <!-- minio: port 11111, bucket `test`, a dedicated key prefix for this disk. -->
+                <endpoint>http://localhost:11111/test/content_addressed_s3/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
+                <!-- Real server-local scratch dir for the write-buffer spill. -->
+                <cas_scratch_path>content_addressed_s3_scratch/</cas_scratch_path>
+                <!-- Single-owner background GC: a grace comfortably larger than any single test
+                     op so the write-vs-GC race cannot bite, and a short interval so reclamation
+                     happens during the run. -->
+                <content_addressed_gc_enabled>1</content_addressed_gc_enabled>
+                <content_addressed_gc_grace_sec>60</content_addressed_gc_grace_sec>
+                <content_addressed_gc_interval_sec>5</content_addressed_gc_interval_sec>
+            </content_addressed_s3>
+        </disks>
+        <policies>
+            <content_addressed_s3>
+                <volumes>
+                    <main>
+                        <disk>content_addressed_s3</disk>
+                    </main>
+                </volumes>
+            </content_addressed_s3>
+        </policies>
+    </storage_configuration>
+    <merge_tree>
+        <storage_policy>content_addressed_s3</storage_policy>
+    </merge_tree>
+</clickhouse>

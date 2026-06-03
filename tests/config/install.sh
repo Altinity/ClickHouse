@@ -28,6 +28,7 @@ while [[ "$#" -gt 0 ]]; do
         --analyzer) USE_OLD_ANALYZER=1 ;;
         --s3-storage) EXPORT_S3_STORAGE_POLICIES=1 && USE_S3_STORAGE_FOR_MERGE_TREE=1 && RANDOMIZE_OBJECT_KEY_TYPE=1 ;;
         --content-addressed-storage) USE_CONTENT_ADDRESSED_STORAGE_FOR_MERGE_TREE=1 ;;
+        --content-addressed-s3-storage) USE_CONTENT_ADDRESSED_S3_STORAGE_FOR_MERGE_TREE=1 ;;
         --parallel-rep) USE_PARALLEL_REPLICAS=1 ;;
         --db-replicated) USE_DATABASE_REPLICATED=1 ;;
         --distributed-plan) USE_DISTRIBUTED_PLAN=1 ;;
@@ -352,6 +353,15 @@ elif [[ "$USE_CONTENT_ADDRESSED_STORAGE_FOR_MERGE_TREE" == "1" ]]; then
     # Installs ONLY this config so the suite runs with CA-as-default without disturbing
     # other storage variants (no s3/azure default policies are set up in this mode).
     ln -sf $SRC_PATH/config.d/content_addressed_storage_policy_for_merge_tree_by_default.xml $DEST_SERVER_PATH/config.d/
+elif [[ "$USE_CONTENT_ADDRESSED_S3_STORAGE_FOR_MERGE_TREE" == "1" ]]; then
+    # Content-addressed disk over S3 (minio) as the default MergeTree policy. This is the
+    # real-S3 (north star) counterpart of --content-addressed-storage, which uses local
+    # object storage. minio is started unconditionally by the stateless praktika job (see
+    # ci/jobs/functional_tests.py start_minio), so the disk just needs minio reachable at
+    # localhost:11111 with the `test` bucket and the clickhouse/clickhouse creds, which
+    # setup_minio.sh provides. Installs ONLY this policy to keep the variant clean (no s3/azure
+    # default policies are set up in this mode).
+    ln -sf $SRC_PATH/config.d/content_addressed_s3_storage_policy_for_merge_tree_by_default.xml $DEST_SERVER_PATH/config.d/
 elif [[ "$USE_AZURE_STORAGE_FOR_MERGE_TREE" == "1" ]]; then
     if [[ -n "$USE_ENCRYPTED_STORAGE" ]] && [[ "$USE_ENCRYPTED_STORAGE" -eq 1 ]]; then
         ln -sf $SRC_PATH/config.d/azure_encrypted_storage_policy_by_default.xml $DEST_SERVER_PATH/config.d/

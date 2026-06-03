@@ -712,6 +712,15 @@ class JobConfigs:
             runs_on=RunnerLabels.ARM_MEDIUM_CPU,
             requires=[ArtifactNames.CH_ARM_BINARY],
         ),
+        # Content-addressed disk over S3 (minio) as the default MergeTree storage — the real-S3
+        # (north star) counterpart of the local-object-storage variant above. minio is started
+        # by the stateless job itself; installs only
+        # content_addressed_s3_storage_policy_for_merge_tree_by_default.xml.
+        Job.ParamSet(
+            parameter="arm_binary, content_addressed s3 storage, parallel",
+            runs_on=RunnerLabels.ARM_MEDIUM_CPU,
+            requires=[ArtifactNames.CH_ARM_BINARY],
+        ),
     )
     functional_tests_jobs_coverage = common_ft_job_config.parametrize(
         *[

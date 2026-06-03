@@ -114,6 +114,7 @@ OPTIONS_TO_INSTALL_ARGUMENTS = {
     "WasmEdge": "--wasm-engine wasmedge",
     "s3 storage": "--s3-storage",
     "content_addressed storage": "--content-addressed-storage",
+    "content_addressed s3 storage": "--content-addressed-s3-storage",
     "DatabaseReplicated": "--db-replicated",
     "DatabaseOrdinary": "--db-ordinary",
     "wide parts enabled": "--wide-parts",
@@ -240,7 +241,10 @@ def main():
             is_excluded_from_llvm = True
         if "per_test_coverage" in to:
             is_per_test_coverage = True
-        if "s3 storage" in to:
+        if "s3 storage" in to and "content_addressed" not in to:
+            # The content-addressed-over-s3 variant ("content_addressed s3 storage") installs
+            # only its own default policy and must not pull in the s3 stateful-data / encrypted
+            # storage machinery, so it is deliberately excluded from is_s3_storage.
             is_s3_storage = True
         if "azure" in to:
             is_azure_storage = True
