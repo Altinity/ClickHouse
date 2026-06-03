@@ -122,3 +122,14 @@ Write the implementation plan to `docs/superpowers/plans/2026-06-04-cas-mergetre
 
 ## Progress log (append as we go)
 - Stage A: Phase 1 + Phase 2 of the projections plan DONE (commits through `84272e9774f`). Starting A1.
+- Stage A DONE (2026-06-04). Projections work on CA (Approach A): CREATE/INSERT/SELECT/merge + ALTER
+  ADD/DROP/MATERIALIZE + durability across DETACH/ATTACH. Fixes: temp-projection `.tmp_proj` rekey
+  (Phase 3), B58 merge/mutate durability (route projection sub-part through the parent whole-part
+  transaction, CA-conditional — `24f89d7ce78`), B60 projection-subdir removal noise (`5f1422f748c`).
+  Cleaned up stale gate-rejection tests (04281 removed, 04285 corrected — `d85f289c754`). **131
+  projection stateless tests un-gated and passing**, ~24 orthogonal re-gated (replication/ATTACH-MOVE/
+  BACKUP), and **B59 (7 tests) DEFERRED** — a real correctness gap: the CA whole-part transaction can't
+  read its own in-flight staged temp projection sub-parts during a mutation/MATERIALIZE that merges
+  multiple temp blocks. B59 needs a design decision (in-flight read-overlay vs early standalone
+  sub-commit) — documented with both options; not a 1am hack. B5 projection half = DONE except B59.
+  Pushed through `5f1422f748c`. → Starting Stage B (minio + CA stateless config).
