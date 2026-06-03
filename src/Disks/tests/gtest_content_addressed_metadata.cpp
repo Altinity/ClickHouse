@@ -1512,6 +1512,7 @@ TEST_F(ContentAddressedMetaTest, GCThreadSweepsOrphansAndKeepsLive)
         getContext().context,
         os,
         "",
+        std::make_shared<std::mutex>(),
         getLogger("ContentAddressedGCThreadTest"));
 
     /// grace 0 so a single round past first-unreachable reclaims orphans immediately.
@@ -1596,6 +1597,118 @@ TEST_F(ContentAddressedMetaTest, GCKeepsLiveBlobsWrittenThroughRealWritePath)
     // (b) The DOOMED part's now-orphan blobs were deleted.
     EXPECT_FALSE(objectExists(os, doomed_a));
     EXPECT_FALSE(objectExists(os, doomed_b));
+}
+
+// B49 (CRITICAL, GC-on): the dedup / carry-forward old-blob race. With background GC enabled, an
+// in-flight identical-content INSERT that dedup-skips re-uploading an existing blob B (finalizeImpl)
+// must NOT publish a ref if a concurrent sweep reclaimed B in the window between the skip and the
+// publish. The fix is a per-pool in-process GC lock shared by the sweep and the commit: the sweep
+// holds it for mark+delete; the commit holds it to re-HEAD every referenced blob and fail closed if
+// any is gone, never publishing a dangling ref. This deterministic variant runs the sweep BEFORE the
+// commit (the reclaim wins the race): the commit MUST throw and MUST NOT publish refs/<P2>.
+TEST_F(ContentAddressedMetaTest, DedupCommitFailsClosedWhenBlobConcurrentlyReclaimed)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_b49_failclose");
+    auto os = getObjectStorage("cas_b49_failclose");
+    const std::string sid = ms->serverIdForTest();
+    const std::string uuid = "uuid-b49-fc";
+    const std::string content = "B49-SHARED-CONTENT";
+
+    // P1 is the SOLE referencer of blob B (a single-file part). Write + commit it through the real path.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        auto buf = tx.writeFile("uui/" + uuid + "/all_1_1_0/a.bin", 4096, DB::WriteMode::Rewrite, {});
+        buf->write(content.data(), content.size());
+        buf->finalize();
+        tx.commit(DB::NoCommitOptions{});
+    }
+    const std::string blob_b = ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/a.bin")[0].remote_path;
+    ASSERT_TRUE(objectExists(os, blob_b));
+
+    // Drop P1's ref (T0): B is now unreferenced, but still PRESENT (GC has not run yet).
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.removeRecursive("uui/" + uuid + "/all_1_1_0", /*should_remove_objects=*/nullptr);
+        tx.commit(DB::NoCommitOptions{});
+    }
+    EXPECT_TRUE(objectExists(os, blob_b));
+
+    // T2: a dedup INSERT of IDENTICAL content. finalizeImpl finds B already present and SKIPS the
+    // upload (B stays present), recording B for the part — the staged state of the race.
+    DB::ContentAddressedTransaction t2(*ms, /*key_prefix=*/"", kCasTestScratch);
+    {
+        auto buf = t2.writeFile("uui/" + uuid + "/all_2_2_0/a.bin", 4096, DB::WriteMode::Rewrite, {});
+        buf->write(content.data(), content.size());
+        buf->finalize();
+    }
+    EXPECT_TRUE(objectExists(os, blob_b)); // dedup-skip: B was NOT re-uploaded, still present
+
+    // The sweep wins the race: it shares the SAME per-pool GC lock as the commit (production wiring),
+    // and with grace=0 it reclaims the now-unreferenced B (T2's ref is not yet published).
+    DB::ContentAddressed::ContentAddressedGC gc(os, "", ms->gcLock());
+    gc.runSweepOnce(/*now=*/100, /*grace=*/0);
+    EXPECT_FALSE(objectExists(os, blob_b)); // B was reclaimed
+
+    // T2.commit must FAIL CLOSED: the re-validate under the lock HEADs B, finds it gone, and throws a
+    // retryable error WITHOUT publishing a dangling ref.
+    EXPECT_THROW(t2.commit(DB::NoCommitOptions{}), DB::Exception);
+
+    // No ref was published for P2 — the dangling-ref data-loss path is closed.
+    EXPECT_FALSE(objectExists(os, refKey("", sid, uuid, "all_2_2_0").string()));
+}
+
+// B49 companion: the SAME setup, but the commit wins the race — the dedup INSERT publishes its ref
+// BEFORE the sweep runs. The legitimately-reused blob B must SURVIVE (it is reachable again through
+// the new ref), and the part reads back the original bytes. This proves the lock + ordering does not
+// over-reclaim a blob that a concurrent insert is legitimately reusing.
+TEST_F(ContentAddressedMetaTest, DedupCommitBeforeSweepKeepsReusedBlobAlive)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_b49_survive");
+    auto os = getObjectStorage("cas_b49_survive");
+    const std::string sid = ms->serverIdForTest();
+    const std::string uuid = "uuid-b49-sv";
+    const std::string content = "B49-REUSED-CONTENT";
+
+    // P1 is the sole referencer of blob B.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        auto buf = tx.writeFile("uui/" + uuid + "/all_1_1_0/a.bin", 4096, DB::WriteMode::Rewrite, {});
+        buf->write(content.data(), content.size());
+        buf->finalize();
+        tx.commit(DB::NoCommitOptions{});
+    }
+    const std::string blob_b = ms->getStorageObjects("uui/" + uuid + "/all_1_1_0/a.bin")[0].remote_path;
+    ASSERT_TRUE(objectExists(os, blob_b));
+
+    // Drop P1's ref: B is unreferenced but still present.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.removeRecursive("uui/" + uuid + "/all_1_1_0", /*should_remove_objects=*/nullptr);
+        tx.commit(DB::NoCommitOptions{});
+    }
+    EXPECT_TRUE(objectExists(os, blob_b));
+
+    // T2: dedup INSERT of identical content (finalizeImpl skips the upload) AND commits — the commit
+    // wins the race, publishing the ref while B is still present (re-validate passes).
+    {
+        DB::ContentAddressedTransaction t2(*ms, /*key_prefix=*/"", kCasTestScratch);
+        auto buf = t2.writeFile("uui/" + uuid + "/all_2_2_0/a.bin", 4096, DB::WriteMode::Rewrite, {});
+        buf->write(content.data(), content.size());
+        buf->finalize();
+        EXPECT_TRUE(objectExists(os, blob_b)); // dedup-skip
+        EXPECT_NO_THROW(t2.commit(DB::NoCommitOptions{}));
+    }
+    EXPECT_TRUE(objectExists(os, refKey("", sid, uuid, "all_2_2_0").string()));
+
+    // Now the sweep runs (sharing the same lock). B is reachable again through P2's ref, so it SURVIVES.
+    DB::ContentAddressed::ContentAddressedGC gc(os, "", ms->gcLock());
+    gc.runSweepOnce(/*now=*/100, /*grace=*/0);
+    EXPECT_TRUE(objectExists(os, blob_b));
+
+    // P2 reads back the original content through the resolution path.
+    EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/a.bin")[0].remote_path), content);
 }
 
 // B23 Task 4: removeRecursive deletes the per-ref sidecar objects WITH the ref. A part's mutable

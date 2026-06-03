@@ -15,6 +15,7 @@
 #include <base/hex.h>
 
 #include <filesystem>
+#include <mutex>
 
 namespace fs = std::filesystem;
 
@@ -597,6 +598,29 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     }
 
     const ContentAddressed::PartId part_id = ContentAddressed::computePartId(manifest.blobs);
+
+    /// B49: take the per-pool in-process GC lock for the publish, and re-validate every referenced blob
+    /// UNDER it before writing the manifest or publishing the ref. finalizeImpl skips re-uploading a
+    /// blob that already exists (dedup); in the window between that skip and this publish a concurrent
+    /// background sweep could reclaim such a blob (it was unreferenced + past grace), leaving the ref we
+    /// are about to publish dangling -> data loss on read. The sweep holds this SAME lock for its whole
+    /// mark+delete, so once we hold it the live set is stable: re-HEAD every blob the manifest names and,
+    /// if any is missing, FAIL CLOSED (a retryable error) WITHOUT publishing a dangling ref. The insert
+    /// is then retried and re-uploads the blob. With mutual exclusion the only outcomes are: we publish
+    /// first (the sweep's next pass sees the blob reachable and keeps it) or the sweep reclaimed it first
+    /// (we throw and retry) — never a published ref to a deleted blob.
+    std::lock_guard<std::mutex> gc_guard(*metadata_storage.gc_lock);
+
+    for (const auto & [file, entry] : manifest.blobs)
+    {
+        const std::string blob_key = ContentAddressed::blobKey(key_prefix, entry.key).string();
+        if (!metadata_storage.object_storage->tryGetObjectMetadata(blob_key, /*with_tags=*/false).has_value())
+            throw Exception(
+                ErrorCodes::CORRUPTED_DATA,
+                "ContentAddressed: blob {} (file {}) referenced by part {}/{} was concurrently reclaimed "
+                "by GC before the ref could be published; retry the insert",
+                blob_key, file, table_uuid, part_name);
+    }
 
     /// Put-if-absent the manifest: identical parts (same deterministic blobs) share one manifest object.
     const std::string part_key = ContentAddressed::partKey(key_prefix, part_id).string();

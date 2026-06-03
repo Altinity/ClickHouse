@@ -5,6 +5,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGCThread.h>
 #include <Interpreters/Context_fwd.h>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 
@@ -60,6 +62,12 @@ public:
     /// Test hook: run one synchronous GC sweep round and wait for it (no-op if no GC thread).
     const ContentAddressedGCThreadPtr & gcThreadForTest() const { return gc_thread; }
 
+    /// The per-pool in-process GC lock (B49). Shared with both the background sweep
+    /// (ContentAddressedGC, via ContentAddressedGCThread) and every transaction commit
+    /// (ContentAddressedTransaction::commit). Exposed so a test can build a ContentAddressedGC that
+    /// truly excludes the same storage's commits (the production wiring threads the same shared_ptr).
+    const std::shared_ptr<std::mutex> & gcLock() const { return gc_lock; }
+
 private:
     friend class ContentAddressedTransaction;
 
@@ -101,6 +109,11 @@ private:
     /// Operator opt-in to mount a pool already owned by a different server (B11). Default false:
     /// fail closed on a second/concurrent mounter so background GC can never run un-coordinated.
     const bool allow_shared_pool;
+
+    /// Per-pool in-process GC lock (B49), shared with the background sweep and the commit path so a
+    /// dedup-skipped blob cannot be reclaimed in the finalize -> commit window. Created eagerly so the
+    /// unit tests that drive commits + a directly-built ContentAddressedGC can share it via gcLock().
+    const std::shared_ptr<std::mutex> gc_lock = std::make_shared<std::mutex>();
 
     /// Background pool garbage collector, present only on the disk-factory path (context non-null).
     ContentAddressedGCThreadPtr gc_thread;

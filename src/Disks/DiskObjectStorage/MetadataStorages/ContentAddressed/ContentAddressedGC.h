@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -128,15 +130,26 @@ struct SweepStats
 class ContentAddressedGC
 {
 public:
-    ContentAddressedGC(ObjectStoragePtr object_storage_, std::string key_prefix_);
+    /// `gc_lock_` is the per-pool in-process GC mutex shared with the transaction commit path (B49). The
+    /// sweep holds it across the live-set computation + delete so a delete can never interleave with a
+    /// commit's blob re-validate + ref publish, and a commit fails closed if a blob it references was
+    /// reclaimed in the finalize -> commit window. When null (legacy direct construction) a private
+    /// mutex is created so the sweep is still internally consistent; production and the B49 regression
+    /// tests pass the metadata storage's shared lock so the sweep and commit truly exclude each other.
+    ContentAddressedGC(ObjectStoragePtr object_storage_, std::string key_prefix_, std::shared_ptr<std::mutex> gc_lock_ = nullptr);
 
     /// Run one sweep. Deletes nothing if any step before the removal throws (fail-close): a missing
     /// manifest for a live ref (B18), or any list/read error, aborts the sweep with the pool intact.
+    /// The whole sweep is run under the per-pool GC lock (B49); holding it for the entire sweep rather
+    /// than only mark+delete is acceptable for the PoC — the contention is a B9/B32 optimization.
     SweepStats runSweepOnce(int64_t now, int64_t grace);
 
 private:
     const ObjectStoragePtr object_storage;
     const std::string key_prefix;
+    /// Per-pool in-process GC lock, shared with ContentAddressedTransaction::commit (B49). Never null
+    /// after construction.
+    const std::shared_ptr<std::mutex> gc_lock;
     std::unordered_map<std::string, int64_t> first_unreachable;
 };
 

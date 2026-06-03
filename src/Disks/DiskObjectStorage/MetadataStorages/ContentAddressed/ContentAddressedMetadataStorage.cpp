@@ -52,6 +52,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
             context_,
             object_storage,
             storage_path_prefix,
+            gc_lock,
             getLogger(fmt::format("{}::ContentAddressedGC", storage_path_full)));
 }
 

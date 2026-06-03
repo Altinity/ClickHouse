@@ -178,14 +178,24 @@ std::set<BlobHash> InMemoryBlobRefIndex::unreferenced() const
 
 /// ==== Sweep driver ====
 
-ContentAddressedGC::ContentAddressedGC(ObjectStoragePtr object_storage_, std::string key_prefix_)
+ContentAddressedGC::ContentAddressedGC(ObjectStoragePtr object_storage_, std::string key_prefix_, std::shared_ptr<std::mutex> gc_lock_)
     : object_storage(std::move(object_storage_))
     , key_prefix(std::move(key_prefix_))
+    , gc_lock(gc_lock_ ? std::move(gc_lock_) : std::make_shared<std::mutex>())
 {
 }
 
 SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace)
 {
+    /// Hold the per-pool GC lock for the whole sweep (B49): the live-set computation, the
+    /// reachable-blob mark and the delete must not interleave with a transaction commit's
+    /// re-validate + ref publish, or a blob just deemed unreferenced could be deleted in the window
+    /// between a dedup commit's blob HEAD and its ref publish (dangling ref -> data loss). The commit
+    /// path takes the SAME lock and re-HEADs every referenced blob before publishing, failing closed
+    /// if any is gone, so the two are mutually exclusive and a reused blob is either kept reachable
+    /// (commit published its ref first) or the commit retries (sweep reclaimed it first).
+    std::lock_guard<std::mutex> gc_guard(*gc_lock);
+
     /// 1. The live roots: every part id named by a published ref.
     std::set<PartId> live = listLivePartIds(object_storage, key_prefix);
 
