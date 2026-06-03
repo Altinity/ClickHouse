@@ -8,6 +8,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGCThread.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolCoordination.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/WriteSession.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
@@ -1892,6 +1893,36 @@ TEST_F(ContentAddressedMetaTest, PoolMetaRejectsBadMagic)
 {
     EXPECT_ANY_THROW(PoolMeta::deserialize("not a pool meta object"));
     EXPECT_ANY_THROW(PoolMeta::deserialize(""));
+}
+
+// CAS M8 Phase B: the WriteSession PIN object is on the shared codec. A full round-trip preserves every
+// field (incl. the pending hash vector in order), and a corrupted magic or a bumped/unknown ENCODING
+// version both fail closed (a remote GC must never misparse a foreign object, and an older build must
+// never reinterpret a session written by a newer one — both would risk reclaiming pinned blobs).
+TEST_F(ContentAddressedMetaTest, WriteSessionRoundTripsAndRejectsBadVersion)
+{
+    WriteSession session;
+    session.server_id = "server-write-1";
+    session.lease_deadline_unix = 1700000123;
+    session.fence_token = 42;
+    session.part_id = PartId("aaaa000000000000000000000000aaaa");
+    session.pending = {BlobHash("deadbeef01"), BlobHash("cafef00d02"), BlobHash("0badc0de03")};
+
+    auto parsed = WriteSession::deserialize(session.serialize());
+    EXPECT_EQ(parsed.server_id, session.server_id);
+    EXPECT_EQ(parsed.lease_deadline_unix, session.lease_deadline_unix);
+    EXPECT_EQ(parsed.fence_token, session.fence_token);
+    EXPECT_EQ(parsed.part_id, session.part_id);
+    EXPECT_EQ(parsed.pending, session.pending);
+
+    // A stray / foreign object is rejected (bad magic), as is an empty body.
+    EXPECT_THROW(WriteSession::deserialize("not a write session object"), DB::Exception);
+    EXPECT_THROW(WriteSession::deserialize(""), DB::Exception);
+
+    // A bumped ENCODING version is rejected fail-closed (never reinterpret a newer object).
+    std::string future = session.serialize();
+    future[4] = static_cast<char>(WriteSession::ENCODING_VERSION + 1); // bump the ENCODING version byte
+    EXPECT_THROW(WriteSession::deserialize(future), DB::Exception);
 }
 
 // Task 4: `_pool_meta` is on the shared codec now. Pin the on-object bytes (cross-arch determinism)
