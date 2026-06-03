@@ -1,5 +1,4 @@
--- Tags: long, no-content-addressed-storage
--- no-content-addressed-storage: CA part-removal does not recurse into projection .proj subdir on merge cleanup (B60)
+-- Tags: long
 
 -- Statistics-based part pruning can skip parts before they appear in EXPLAIN output
 SET use_statistics_for_part_pruning = 0;

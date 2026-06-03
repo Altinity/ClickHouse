@@ -541,6 +541,20 @@ bool ContentAddressedMetadataStorage::isDirectoryEmpty(const std::string & path)
         p && p->file.empty() && p->part_name != ContentAddressed::kDetachedDirName)
         return true;
 
+    // A projection subdirectory <uuid[:3]>/<uuid>/<part>/<proj>.proj has the same shape: its files are
+    // virtual, nested in the PARENT part's manifest under the <proj>.proj/ prefix (Approach A — no separate
+    // part/ref). Removing a projection subdir on CA is a no-op — the projection's blobs are reclaimed when
+    // the part's ref is unlinked — but the default iterateDirectory-based check lists the projection's inner
+    // files and reports the subdir as NON-empty, so DiskObjectStorage::removeDirectory would attempt rmdir on
+    // it and throw CANNOT_RMDIR (logged as <Error>), forcing a noisy recursive fallback even though the result
+    // is correct (B60). Report it empty so removeDirectory skips the failing rmdir, exactly as for the part dir
+    // itself (B45). Gated on a SINGLE-component .proj/.tmp_proj file, the same gate the projection branches in
+    // existsDirectory/listDirectory use — so this never matches the detached namespace or a real table dir.
+    if (auto p = ContentAddressed::parsePartFilePath(path);
+        p && !p->file.empty() && p->file.find('/') == std::string::npos
+        && (p->file.ends_with(".proj") || p->file.ends_with(".tmp_proj")))
+        return true;
+
     return !iterateDirectory(path)->isValid();
 }
 

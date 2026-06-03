@@ -3121,6 +3121,36 @@ TEST_F(ContentAddressedMetaTest, ProjectionSubdirListsInnerFiles)
     EXPECT_EQ(got, (std::set<std::string>{"columns.txt", "data.bin", "checksums.txt"}));
 }
 
+// isDirectoryEmpty reports a projection subdir <part>/<proj>.proj as empty so DiskObjectStorage::removeDirectory
+// proceeds straight to the authoritative ref-unlink (the projection's blobs live in the parent part's manifest)
+// instead of attempting rmdir on a manifest-derived non-empty listing and throwing CANNOT_RMDIR (B60). Mirrors the
+// part-dir-empty branch (B45). A real table dir with live refs stays non-empty so the DROP non-empty-data guard holds.
+TEST_F(ContentAddressedMetaTest, ProjectionSubdirReportsEmptyForRemoval)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_proj_empty");
+    const std::string uuid = "uuid-proj-empty";
+    const std::string part = "all_1_1_0";
+    const std::string base = "uui/" + uuid + "/" + part + "/";
+
+    DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+    for (const auto & f : {std::string("columns.txt"), std::string("data.bin"),
+                           std::string("p_sum.proj/columns.txt"), std::string("p_sum.proj/data.bin")})
+    {
+        auto buf = tx.writeFile(base + f, 4096, DB::WriteMode::Rewrite, {});
+        const std::string bytes = "x";
+        buf->write(bytes.data(), bytes.size());
+        buf->finalize();
+    }
+    tx.commit(DB::NoCommitOptions{});
+
+    // The projection subdir reports empty (lets removeDirectory skip the failing rmdir); the part dir itself
+    // also reports empty (B45); but the TABLE dir with a live ref stays non-empty (DROP guard intact).
+    EXPECT_TRUE(ms->isDirectoryEmpty(base + "p_sum.proj"));
+    EXPECT_TRUE(ms->isDirectoryEmpty("uui/" + uuid + "/" + part));
+    EXPECT_FALSE(ms->isDirectoryEmpty("uui/" + uuid));
+}
+
 // listDirectory("<part>") collapses nested projection keys (<proj>.proj/<file>) to a SINGLE <proj>.proj
 // directory entry, alongside top-level files emitted verbatim. This is what iterate()-based projection
 // discovery expects and keeps the top-level column listing free of nested projection files.
