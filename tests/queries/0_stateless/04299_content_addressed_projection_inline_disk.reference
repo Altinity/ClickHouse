@@ -1,0 +1,26 @@
+count	2000
+sum_b	9000
+by_b	0	200
+by_b	1	200
+by_b	2	200
+by_b	3	200
+by_b	4	200
+by_b	5	200
+by_b	6	200
+by_b	7	200
+by_b	8	200
+by_b	9	200
+after_merge_count	2000
+after_merge_by_b	0	200
+after_merge_by_b	1	200
+after_merge_by_b	2	200
+after_merge_by_b	3	200
+after_merge_by_b	4	200
+after_merge_by_b	5	200
+after_merge_by_b	6	200
+after_merge_by_b	7	200
+after_merge_by_b	8	200
+after_merge_by_b	9	200
+has_projection	1
+uses_projection	1
+dropped_ok
