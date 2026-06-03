@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 CREATE TABLE t (
     c0 DateTime,
     c1 DateTime,

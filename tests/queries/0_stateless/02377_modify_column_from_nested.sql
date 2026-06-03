@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_nested_modify;
 
 CREATE TABLE t_nested_modify (id UInt64, `n.a` Array(UInt32), `n.b` Array(String))
