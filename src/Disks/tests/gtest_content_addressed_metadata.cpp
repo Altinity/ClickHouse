@@ -1404,11 +1404,14 @@ struct CasGcSeed
     std::string b1 = "1111111111", b2 = "2222222222", b3 = "3333333333", b_orphan = "9999999999";
 };
 
-CasGcSeed seedGcPool(const std::shared_ptr<DB::IObjectStorage> & os, const std::string & sid)
+/// `prefix` is the pool key prefix the seeded objects live under (default empty for the legacy direct
+/// tests). The coordinated-GC tests pass a NON-empty prefix so the GC-leader lock / fence objects have a
+/// parent dir — the LocalObjectStorage O_EXCL create cannot materialize a file at the empty-prefix root.
+CasGcSeed seedGcPool(const std::shared_ptr<DB::IObjectStorage> & os, const std::string & sid, const std::string & prefix = "")
 {
     using namespace DB::ContentAddressed;
     CasGcSeed s;
-    auto put_blob = [&](const std::string & csum) { ContentAddressedMetaTest::writeObject(os, blobKey("", BlobHash(csum)).string(), csum); };
+    auto put_blob = [&](const std::string & csum) { ContentAddressedMetaTest::writeObject(os, blobKey(prefix, BlobHash(csum)).string(), csum); };
     put_blob(s.b1); put_blob(s.b2); put_blob(s.b3); put_blob(s.b_orphan);
 
     auto put_manifest = [&](const std::string & pid, const std::vector<std::pair<std::string, std::string>> & files)
@@ -1420,14 +1423,14 @@ CasGcSeed seedGcPool(const std::shared_ptr<DB::IObjectStorage> & os, const std::
             /// to the full object key via blobKey. Seeding the full key here would mask the GC key-space
             /// bug (the reachable set must be comparable to the listed blobs/ object keys).
             f.blobs[name] = BlobEntry{BlobHash(csum), csum.size(), csum};
-        ContentAddressedMetaTest::writeObject(os, partKey("", PartId(pid)).string(), f.serialize());
+        ContentAddressedMetaTest::writeObject(os, partKey(prefix, PartId(pid)).string(), f.serialize());
     };
     put_manifest(s.pid_a, {{"a.bin", s.b1}, {"shared.bin", s.b2}});
     put_manifest(s.pid_b, {{"shared.bin", s.b2}, {"c.bin", s.b3}});
     put_manifest(s.pid_orphan, {{"o.bin", s.b_orphan}});
 
-    ContentAddressedMetaTest::writeObject(os, refKey("", sid, s.uuid, "all_1_1_0").string(), serializeRefPayload(PartId(s.pid_a)));
-    ContentAddressedMetaTest::writeObject(os, refKey("", sid, s.uuid, "all_2_2_0").string(), serializeRefPayload(PartId(s.pid_b)));
+    ContentAddressedMetaTest::writeObject(os, refKey(prefix, sid, s.uuid, "all_1_1_0").string(), serializeRefPayload(PartId(s.pid_a)));
+    ContentAddressedMetaTest::writeObject(os, refKey(prefix, sid, s.uuid, "all_2_2_0").string(), serializeRefPayload(PartId(s.pid_b)));
     return s;
 }
 }
@@ -1706,15 +1709,20 @@ TEST_F(ContentAddressedMetaTest, SweepStopsWhenLeadershipLost)
 TEST_F(ContentAddressedMetaTest, GCThreadSweepsOrphansAndKeepsLive)
 {
     using namespace DB::ContentAddressed;
-    auto ms = getMetadataStorage("cas_gc_thread");
-    auto os = getObjectStorage("cas_gc_thread");
-    auto s = seedGcPool(os, ms->serverIdForTest());
+    /// A NON-empty key prefix so the GC-leader lock objects (gc.lock, fence/<n>) the coordinated
+    /// background thread now creates have a parent dir — the LocalObjectStorage O_EXCL create cannot
+    /// materialize a file at the empty-prefix root. Seed + GC + assertions all use the SAME prefix.
+    const std::string p = "cas_gc_thread";
+    auto ms = getMetadataStorage(p);
+    auto os = getObjectStorage(p);
+    auto s = seedGcPool(os, ms->serverIdForTest(), p);
 
     DB::ContentAddressedGCThread thread(
         "cas_gc_thread_disk",
         getContext().context,
         os,
-        "",
+        p,
+        ms->serverIdForTest(),
         std::make_shared<std::mutex>(),
         std::make_shared<const std::set<std::string>>(),
         getLogger("ContentAddressedGCThreadTest"));
@@ -1729,16 +1737,120 @@ TEST_F(ContentAddressedMetaTest, GCThreadSweepsOrphansAndKeepsLive)
     thread.triggerAndWait();
 
     /// The orphan manifest + orphan blob are gone; the 2 live manifests + 3 referenced blobs remain.
-    EXPECT_FALSE(objectExists(os, partKey("", PartId(s.pid_orphan)).string()));
-    EXPECT_FALSE(objectExists(os, blobKey("", BlobHash(s.b_orphan)).string()));
-    EXPECT_TRUE(objectExists(os, partKey("", PartId(s.pid_a)).string()));
-    EXPECT_TRUE(objectExists(os, partKey("", PartId(s.pid_b)).string()));
-    EXPECT_TRUE(objectExists(os, blobKey("", BlobHash(s.b1)).string()));
-    EXPECT_TRUE(objectExists(os, blobKey("", BlobHash(s.b2)).string()));
-    EXPECT_TRUE(objectExists(os, blobKey("", BlobHash(s.b3)).string()));
+    EXPECT_FALSE(objectExists(os, partKey(p, PartId(s.pid_orphan)).string()));
+    EXPECT_FALSE(objectExists(os, blobKey(p, BlobHash(s.b_orphan)).string()));
+    EXPECT_TRUE(objectExists(os, partKey(p, PartId(s.pid_a)).string()));
+    EXPECT_TRUE(objectExists(os, partKey(p, PartId(s.pid_b)).string()));
+    EXPECT_TRUE(objectExists(os, blobKey(p, BlobHash(s.b1)).string()));
+    EXPECT_TRUE(objectExists(os, blobKey(p, BlobHash(s.b2)).string()));
+    EXPECT_TRUE(objectExists(os, blobKey(p, BlobHash(s.b3)).string()));
 
     /// Clean shutdown must not hang or crash (deactivates the scheduled task).
     thread.shutdown();
+}
+
+// CAS M8 (multi-mount + exclusive coordinated GC): TWO ContentAddressedMetadataStorage with DISTINCT
+// server ids share ONE object storage / key prefix (the shared-pool case). Storage A writes and COMMITS
+// a part (publishes a ref). Storage B writes a part but holds its transaction OPEN — its blobs are
+// uploaded and pinned by a LIVE cross-mounter write session (no ref yet). A coordinated sweep run as the
+// GC-leader (holding the fenced GcLock) must delete NEITHER A's referenced blobs NOR B's session-pinned
+// blobs, and both parts must read back (A immediately; B after it commits). This proves a shared pool is
+// safe: the fence-guarded sweep keeps reachable + session-pinned data while reclaiming only true orphans.
+TEST_F(ContentAddressedMetaTest, TwoMetadataStoragesShareOnePoolGcIsExclusiveAndPinSafe)
+{
+    using namespace DB::ContentAddressed;
+
+    /// A NON-empty pool key prefix so the GC-leader lock / fence objects have a parent dir (the
+    /// LocalObjectStorage O_EXCL create cannot materialize a file at the empty-prefix root). Both
+    /// mounters AND the leader sweep use the SAME prefix so refs, manifests, blobs and the lock key
+    /// all live in one consistent pool. Resolved verbatim from CWD by LocalObjectStorage.
+    const std::string p = "cas_share_pool";
+    fs::remove_all("./" + p);
+
+    DB::LocalObjectStorageSettings settings("test", "./" + p, /*read_only_=*/false);
+    auto os = std::make_shared<DB::LocalObjectStorage>(std::move(settings));
+
+    /// Two storages over the SAME object storage + key prefix, distinct server ids, allow_shared=true.
+    /// No context => no background GC thread (we drive the coordinated sweep by hand below).
+    auto make_storage = [&](const std::string & sid)
+    {
+        return std::make_shared<DB::ContentAddressedMetadataStorage>(
+            os, /*storage_path_prefix=*/p, sid, kCasTestScratch, /*context=*/nullptr, /*allow_shared_pool=*/true);
+    };
+    auto a = make_storage("serverA");
+    auto b = make_storage("serverB");
+
+    /// startup registers each mounter in the registry; the second (B) must NOT fail-close because
+    /// allow_shared is set (it registers and proceeds — the coordination makes it safe).
+    a->startup();
+    b->startup();
+    EXPECT_TRUE(objectExists(os, poolMounterKey(p, "serverA")));
+    EXPECT_TRUE(objectExists(os, poolMounterKey(p, "serverB")));
+
+    const std::string uuid_a = "uuid-a";
+    const std::string uuid_b = "uuid-b";
+
+    /// Storage A writes + COMMITS a part: blobs uploaded, manifest written, ref published.
+    {
+        DB::ContentAddressedTransaction tx(*a, /*key_prefix=*/p, kCasTestScratch);
+        auto buf = tx.writeFile("uui/" + uuid_a + "/all_1_1_0/a.bin", 4096, DB::WriteMode::Rewrite, {});
+        const std::string data_a = "A-DATA";
+        buf->write(data_a.data(), data_a.size());
+        buf->finalize();
+        tx.commit(DB::NoCommitOptions{});
+    }
+    /// Record A's blob object key (the resolution path projects the bare hash to the full key).
+    auto a_objs = a->getStorageObjects("uui/" + uuid_a + "/all_1_1_0/a.bin");
+    ASSERT_EQ(a_objs.size(), 1u);
+    const std::string a_blob_key = a_objs[0].remote_path;
+    EXPECT_TRUE(objectExists(os, a_blob_key));
+
+    /// Storage B writes a part but holds the transaction OPEN: its blob is uploaded and a LIVE write
+    /// session pins it, but no ref is published yet. The transaction object must outlive the sweep.
+    auto tx_b = std::make_unique<DB::ContentAddressedTransaction>(*b, /*key_prefix=*/p, kCasTestScratch);
+    {
+        auto buf = tx_b->writeFile("uui/" + uuid_b + "/all_1_1_0/b.bin", 4096, DB::WriteMode::Rewrite, {});
+        const std::string data_b = "B-DATA-UNCOMMITTED";
+        buf->write(data_b.data(), data_b.size());
+        buf->finalize();
+    }
+    /// B's blob exists on disk and exactly one live write session pins it (no ref yet).
+    auto session_keys = listKeysUnder(os, sessionsPrefix(p));
+    ASSERT_EQ(session_keys.size(), 1u) << "B's open transaction must leave one live write-session pin";
+    auto b_session = WriteSession::deserialize(readObject(os, session_keys[0]));
+    ASSERT_EQ(b_session.pending.size(), 1u);
+    const std::string b_blob_key = blobKey(p, b_session.pending.front()).string();
+    EXPECT_TRUE(objectExists(os, b_blob_key)) << "B's uploaded blob must exist before commit";
+
+    /// Run a coordinated sweep as the GC-LEADER: acquire the fenced GcLock and pass it to runSweepOnce.
+    /// The session lease is wall-clock seconds (set by the transaction); use a `now` below the lease so
+    /// B's session is LIVE, with grace 0 so any true orphan would be reclaimed this round.
+    const int64_t now = 1;
+    auto held = tryAcquireGcLock(*os, p, "serverGc", /*lease_seconds=*/100, /*now_unix=*/static_cast<uint64_t>(now));
+    ASSERT_TRUE(held.has_value());
+
+    DB::ContentAddressed::ContentAddressedGC gc(os, p);
+    gc.runSweepOnce(now, /*grace=*/0, /*held=*/held);
+
+    /// Neither A's referenced blob nor B's session-pinned blob was deleted.
+    EXPECT_TRUE(objectExists(os, a_blob_key)) << "A's referenced blob must survive the coordinated sweep";
+    EXPECT_TRUE(objectExists(os, b_blob_key)) << "B's live-session-pinned blob must survive the coordinated sweep";
+
+    /// A's part reads back unchanged.
+    EXPECT_EQ(readObject(os, a->getStorageObjects("uui/" + uuid_a + "/all_1_1_0/a.bin")[0].remote_path), "A-DATA");
+
+    /// B commits AFTER the sweep (its blob survived), then its part reads back too — the pin held the
+    /// just-uploaded blob reachable across the window between upload and ref publish.
+    tx_b->commit(DB::NoCommitOptions{});
+    tx_b.reset();
+    EXPECT_EQ(readObject(os, b->getStorageObjects("uui/" + uuid_b + "/all_1_1_0/b.bin")[0].remote_path), "B-DATA-UNCOMMITTED");
+
+    releaseGcLock(*os, p, *held);
+
+    a->shutdown();
+    b->shutdown();
+    os->shutdown();
+    fs::remove_all("./" + p);
 }
 
 // Regression for the GC blob key-space bug (P1 data loss). This test does NOT hand-seed the pool: it

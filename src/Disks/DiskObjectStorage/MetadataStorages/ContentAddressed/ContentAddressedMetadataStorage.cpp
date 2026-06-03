@@ -52,6 +52,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
             context_,
             object_storage,
             storage_path_prefix,
+            server_id,
             gc_lock,
             in_flight_pinned_blobs,
             getLogger(fmt::format("{}::ContentAddressedGC", storage_path_full)));

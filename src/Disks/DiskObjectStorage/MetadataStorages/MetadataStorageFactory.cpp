@@ -229,10 +229,13 @@ void registerContentAddressedMetadataStorage(MetadataStorageFactory & factory)
                                                     fs::path(Context::getGlobalContextInstance()->getPath()) / "disks" / name / "cas_scratch" / "");
         fs::create_directories(local_scratch_path);
 
-        /// Operator opt-in to mount a pool already owned by a different server (B11). Default false:
-        /// the `_pool_meta` self-check fails closed on a second/concurrent mounter so background GC can
-        /// never run un-coordinated. Setting this only suppresses the hard error; it does NOT make
-        /// shared use safe (that needs the B32 lease/fence protocol) — background GC must stay off.
+        /// Operator opt-in to share one content-addressed pool across mounters (M8). Default false: the
+        /// `_pool_meta` self-check fails closed on a second/concurrent mounter (single-owner). When set,
+        /// a second distinct-owner mounter REGISTERS in the mounter registry and proceeds — the M8
+        /// coordination (write-session pins + the fenced GC-leader lock) makes a shared pool safe: the
+        /// background sweep deletes ONLY while it holds the per-pool GC-leader lock and is fenced, so at
+        /// most one mounter ever deletes at a time and a paused leader cannot delete after a successor
+        /// took a higher fence.
         const bool allow_shared_pool = config.getBool(config_prefix + ".content_addressed_allow_shared_pool", false);
 
         auto global_context = Context::getGlobalContextInstance();

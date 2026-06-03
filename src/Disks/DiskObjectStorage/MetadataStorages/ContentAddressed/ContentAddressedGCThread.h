@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedGC.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolCoordination.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage_fwd.h>
 
 #include <Core/BackgroundSchedulePoolTaskHolder.h>
@@ -13,6 +14,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 
@@ -37,11 +39,15 @@ public:
     /// it is forwarded to the owned ContentAddressedGC so the sweep and commits mutually exclude.
     /// `in_flight_pinned_blobs_` is the per-pool set of blob keys staged by uncommitted transactions
     /// (B52), shared by reference so the sweep treats them as reachable (guarded by `gc_lock_`).
+    /// `server_id_` is THIS mounter's id (the `ServerUUID`); it is the identity recorded in the
+    /// per-pool GC-leader lock (`pool/gc.lock`) so a coordinated cross-mounter sweep can attribute and
+    /// fence leadership. The background loop deletes ONLY while it holds that lock (see run).
     ContentAddressedGCThread(
         std::string disk_name_,
         ContextPtr context,
         ObjectStoragePtr object_storage_,
         std::string key_prefix_,
+        std::string server_id_,
         std::shared_ptr<std::mutex> gc_lock_,
         std::shared_ptr<const std::set<std::string>> in_flight_pinned_blobs_,
         LoggerPtr log_);
@@ -67,7 +73,20 @@ private:
     const std::string disk_name;
     const LoggerPtr log;
 
+    /// The object storage + key prefix + server id used to acquire/renew/release the per-pool GC-leader
+    /// lock (`pool/gc.lock`). They mirror what the owned `gc` scans (single source of truth), kept here
+    /// because the lock primitives (PoolCoordination) operate on the bucket directly, not through `gc`.
+    const ObjectStoragePtr object_storage;
+    const std::string key_prefix;
+    const std::string server_id;
+
     ContentAddressed::ContentAddressedGC gc;
+
+    /// The GC-leader lock this thread currently holds across rounds while leading (nullopt when it does
+    /// NOT lead). Only ever touched by the single schedule-pool task (run / shutdown), so no lock guards
+    /// it. While set, each round renews it; if a successor stole leadership (renew fails), it is cleared
+    /// and the round is skipped. Released best-effort on shutdown.
+    std::optional<ContentAddressed::GcLock> held_lock;
 
     std::atomic<int64_t> finished_rounds{0};
     std::atomic<int64_t> interval_sec;

@@ -10,6 +10,7 @@
 
 #include <Poco/Util/AbstractConfiguration.h>
 
+#include <algorithm>
 #include <chrono>
 
 namespace DB
@@ -36,12 +37,16 @@ ContentAddressedGCThread::ContentAddressedGCThread(
     ContextPtr context,
     ObjectStoragePtr object_storage_,
     std::string key_prefix_,
+    std::string server_id_,
     std::shared_ptr<std::mutex> gc_lock_,
     std::shared_ptr<const std::set<std::string>> in_flight_pinned_blobs_,
     LoggerPtr log_)
     : disk_name(std::move(disk_name_))
     , log(std::move(log_))
-    , gc(std::move(object_storage_), std::move(key_prefix_), std::move(gc_lock_), std::move(in_flight_pinned_blobs_))
+    , object_storage(object_storage_)
+    , key_prefix(key_prefix_)
+    , server_id(std::move(server_id_))
+    , gc(object_storage_, key_prefix_, std::move(gc_lock_), std::move(in_flight_pinned_blobs_))
     , interval_sec(DEFAULT_GC_INTERVAL_SEC)
     , grace_sec(DEFAULT_GC_GRACE_SEC)
 {
@@ -54,12 +59,55 @@ void ContentAddressedGCThread::run()
     LOG_TEST(log, "Starting content-addressed GC sweep");
 
     const int64_t grace = grace_sec.load();
+    const int64_t interval = interval_sec.load();
+
+    /// The GC-leader lease (`pool/gc.lock`). It must comfortably outlive one sweep PLUS one round so a
+    /// leader that is mid-sweep when the next round is due is not declared dead by a peer. We size it as
+    /// a few intervals (and at least one grace window): the lease is only a LIVENESS hint — the fence
+    /// token re-checked at delete time (`runSweepOnce(..., held)`) is the real safety authority — so a
+    /// modest, generous lease is fine. Clamp to >= 1 so an interval of 0 (tests) still yields a live lease.
+    const uint64_t lease_seconds = static_cast<uint64_t>(std::max<int64_t>(1, std::max(grace, interval * 4)));
+
+    /// One consistent clock for BOTH the sweep timers and the lock-lease comparisons: the existing
+    /// monotonic seconds the thread already feeds to runSweepOnce. Reusing it keeps the lease deadlines
+    /// this thread writes and re-reads coherent across rounds (steady, immune to wall-clock jumps).
+    const int64_t now = monotonicSeconds();
+    const auto now_unix = static_cast<uint64_t>(std::max<int64_t>(0, now));
+
     try
     {
-        /// runSweepOnce is fail-close (deletes nothing if any step before removal throws), so a throw
-        /// here leaves the pool intact; we only log and retry next round (fail-SAFE loop).
-        auto stats = gc.runSweepOnce(monotonicSeconds(), grace);
-        LOG_TEST(log, "Content-addressed GC sweep removed {} parts, {} blobs", stats.deleted_parts, stats.deleted_blobs);
+        /// Acquire-or-renew leadership for THIS round. We delete ONLY while we hold the lock: at most one
+        /// mounter sweeps a shared pool at a time, and a paused leader is fenced (a successor's higher
+        /// fence stops our delete in runSweepOnce). If we do NOT lead this round we skip the sweep
+        /// entirely — never sweep un-coordinated.
+        if (held_lock)
+        {
+            /// Renew our existing lease. If a successor stole leadership (a higher fence on disk), renew
+            /// fails: drop our stale lock and skip this round (we are no longer the leader).
+            if (!ContentAddressed::renewGcLock(*object_storage, key_prefix, *held_lock, lease_seconds, now_unix))
+            {
+                LOG_INFO(log, "Content-addressed GC: lost leadership for disk {} (a peer took a higher fence); skipping this round", disk_name);
+                held_lock.reset();
+            }
+        }
+        else
+        {
+            /// Try to take (or steal an expired) leadership.
+            held_lock = ContentAddressed::tryAcquireGcLock(*object_storage, key_prefix, server_id, lease_seconds, now_unix);
+        }
+
+        if (held_lock)
+        {
+            /// runSweepOnce is fail-close (deletes nothing if any step before removal throws), so a throw
+            /// here leaves the pool intact; we only log and retry next round (fail-SAFE loop). The held
+            /// lock is forwarded so the fence-ownership guard re-confirms leadership before each delete.
+            auto stats = gc.runSweepOnce(now, grace, held_lock);
+            LOG_TEST(log, "Content-addressed GC sweep removed {} parts, {} blobs", stats.deleted_parts, stats.deleted_blobs);
+        }
+        else
+        {
+            LOG_TEST(log, "Content-addressed GC: another mounter leads for disk {}; skipping this round", disk_name);
+        }
     }
     catch (...)
     {
@@ -69,7 +117,6 @@ void ContentAddressedGCThread::run()
     finished_rounds.fetch_add(1);
     finished_rounds.notify_all();
 
-    const int64_t interval = interval_sec.load();
     task->scheduleAfter(interval * 1000);
 }
 
@@ -91,7 +138,24 @@ void ContentAddressedGCThread::startup()
 void ContentAddressedGCThread::shutdown()
 {
     LOG_INFO(log, "Shutting down content-addressed GC thread for disk {}", disk_name);
+    /// deactivate joins any in-flight round, so after it returns no run() touches held_lock concurrently.
     task->deactivate();
+
+    /// Release leadership best-effort so a peer can take over promptly instead of waiting out the lease
+    /// (an expired lock is stolen anyway, so this is only a liveness courtesy). releaseGcLock is itself
+    /// a fenced read-check (it never deletes a successor's lock) and a missing lock is a no-op.
+    if (held_lock)
+    {
+        try
+        {
+            ContentAddressed::releaseGcLock(*object_storage, key_prefix, *held_lock);
+        }
+        catch (...)
+        {
+            tryLogCurrentException(log, "Content-addressed GC: best-effort GC-lock release on shutdown failed");
+        }
+        held_lock.reset();
+    }
 }
 
 void ContentAddressedGCThread::waitRound(int64_t expected_round)

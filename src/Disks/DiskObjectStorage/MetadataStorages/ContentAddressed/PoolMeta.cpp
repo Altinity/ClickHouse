@@ -131,12 +131,15 @@ void claimPoolOwnership(
             "'content_addressed_allow_shared_pool' on the disk to acknowledge shared/takeover use.",
             key, existing.owner_server_id);
 
-    /// Operator explicitly acknowledged shared/takeover use. Do NOT rewrite the marker (that would
-    /// hide the other owner); proceed but log loudly so the unsafe configuration is visible.
-    LOG_WARNING(
+    /// Operator explicitly acknowledged shared use. Do NOT rewrite the marker (that would hide the
+    /// first owner); register THIS mounter in the registry and proceed. Shared use is coordinated (M8):
+    /// the background sweep deletes only while it holds the fenced per-pool GC-leader lock, and live
+    /// write-session pins keep just-uploaded blobs reachable across mounters, so concurrent mounters are
+    /// safe. Log at INFO so the shared configuration stays visible without implying it is unsafe.
+    LOG_INFO(
         log,
-        "ContentAddressed: pool at '{}' is owned by another server '{}' but 'content_addressed_allow_shared_pool' "
-        "is set; proceeding without coordination (unsafe — background GC must stay disabled). Server '{}'.",
+        "ContentAddressed: pool at '{}' is owned by another server '{}' and 'content_addressed_allow_shared_pool' "
+        "is set; registering as a shared mounter (coordinated GC-leader lock + write-session pins). Server '{}'.",
         key, existing.owner_server_id, server_id);
     register_mounter();
 }
