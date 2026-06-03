@@ -269,6 +269,86 @@ void ContentAddressedTransaction::republishCommittedPartIntoDetached(
     }
 }
 
+void ContentAddressedTransaction::rekeyDetachedPartDir(
+    const std::string & table_id, const std::string & old_dir, const std::string & new_dir)
+{
+    if (old_dir == new_dir)
+        return;
+
+    /// The detached parts share the one "detached" ref whose manifest/sidecar keys are
+    /// <detached_part>/<file> (B36/B46). Re-key only this part's keys (prefix old_dir + "/") to
+    /// new_dir + "/" in the shared manifest and sidecar bundle, rewrite the per-file sidecar objects
+    /// under their new key, and re-publish the trimmed/rewritten ref. Other detached parts are
+    /// untouched. The content blobs are content-addressed and never move.
+    const std::string detached = std::string(ContentAddressed::kDetachedDirName);
+    auto existing_pid = metadata_storage.readRefPartId(table_id, detached);
+    if (!existing_pid)
+        return; /// no detached ref => nothing to rename (a no-op rename of an absent part)
+
+    const std::string old_pfx = old_dir + "/";
+    const std::string new_pfx = new_dir + "/";
+
+    auto manifest = metadata_storage.loadPartManifestOrThrow(*existing_pid);
+    ContentAddressed::PartManifest rekeyed;
+    for (const auto & [file, entry] : manifest.blobs)
+    {
+        if (file.rfind(old_pfx, 0) == 0)
+            rekeyed.blobs[new_pfx + file.substr(old_pfx.size())] = entry;
+        else
+            rekeyed.blobs[file] = entry;
+    }
+
+    ContentAddressed::RefSidecar sidecar;
+    if (auto existing_sidecar = metadata_storage.readRefSidecarIfExists(table_id, detached))
+        sidecar = *existing_sidecar;
+    ContentAddressed::RefSidecar rekeyed_sidecar;
+    StoredObjects old_file_objects;
+    for (const auto & [file, bytes] : sidecar.files)
+    {
+        std::string new_file = file;
+        if (file.rfind(old_pfx, 0) == 0)
+        {
+            new_file = new_pfx + file.substr(old_pfx.size());
+            /// Move the per-file sidecar object to its new key (delete the old one below).
+            old_file_objects.emplace_back(
+                ContentAddressed::refMutableFileKey(key_prefix, metadata_storage.server_id, table_id, detached, file).string());
+            const std::string new_key
+                = ContentAddressed::refMutableFileKey(key_prefix, metadata_storage.server_id, table_id, detached, new_file).string();
+            auto file_out = metadata_storage.object_storage->writeObject(StoredObject(new_key), WriteMode::Rewrite);
+            file_out->write(bytes.data(), bytes.size());
+            file_out->finalize();
+        }
+        rekeyed_sidecar.files[new_file] = bytes;
+    }
+
+    /// Republish the manifest, sidecar bundle and ref (then drop the stale per-file objects).
+    const ContentAddressed::PartId new_pid = ContentAddressed::computePartId(rekeyed.blobs);
+    const std::string new_part_key = ContentAddressed::partKey(key_prefix, new_pid).string();
+    if (!metadata_storage.object_storage->tryGetObjectMetadata(new_part_key, /*with_tags=*/false).has_value())
+    {
+        const std::string bytes = rekeyed.serialize();
+        auto out = metadata_storage.object_storage->writeObject(StoredObject(new_part_key), WriteMode::Rewrite);
+        out->write(bytes.data(), bytes.size());
+        out->finalize();
+    }
+    {
+        const std::string meta_key = ContentAddressed::refMetaKey(key_prefix, metadata_storage.server_id, table_id, detached).string();
+        const std::string meta_bytes = rekeyed_sidecar.serialize();
+        auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite);
+        meta_out->write(meta_bytes.data(), meta_bytes.size());
+        meta_out->finalize();
+    }
+    {
+        const std::string ref_key = ContentAddressed::refKey(key_prefix, metadata_storage.server_id, table_id, detached).string();
+        const std::string ref_payload = ContentAddressed::serializeRefPayload(new_pid);
+        auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(ref_key), WriteMode::Rewrite);
+        ref_out->write(ref_payload.data(), ref_payload.size());
+        ref_out->finalize();
+    }
+    if (!old_file_objects.empty())
+        metadata_storage.object_storage->removeObjectsIfExist(old_file_objects);
+}
+
 void ContentAddressedTransaction::republishTableRefs(const std::string & src_table_id, const std::string & dst_table_id)
 {
     if (src_table_id == dst_table_id)
@@ -332,6 +412,26 @@ void ContentAddressedTransaction::moveDirectory(const std::string & from, const 
             dst_detached && dst_detached->part_name == ContentAddressed::kDetachedDirName && !dst_detached->file.empty())
         {
             republishCommittedPartIntoDetached(*src_committed, *dst_detached);
+            return;
+        }
+    }
+
+    /// A DETACHED part rename WITHIN the detached namespace: detached/OLD -> detached/NEW. DROP DETACHED
+    /// PARTITION renames the detached part to "deleting_OLD" before removing it (MergeTreeData::dropDetached
+    /// -> PartsTemporaryRename), and ATTACH renames "attaching_OLD" -> OLD. Both detached parts share the
+    /// one "detached" ref whose manifest/sidecar keys are PART/FILE (B36/B46), so this re-keys the OLD/
+    /// key prefix to NEW/ in the shared detached manifest and sidecar (the per-file sidecar objects too),
+    /// leaving the other detached parts intact. No content blobs move (content-addressed).
+    if (auto src_detached = ContentAddressed::parsePartFilePath(from);
+        src_detached && src_detached->part_name == ContentAddressed::kDetachedDirName && !src_detached->file.empty()
+        && src_detached->file.find('/') == std::string::npos)
+    {
+        if (auto dst_detached = ContentAddressed::parsePartFilePath(to);
+            dst_detached && dst_detached->part_name == ContentAddressed::kDetachedDirName && !dst_detached->file.empty()
+            && dst_detached->file.find('/') == std::string::npos
+            && src_detached->table_uuid == dst_detached->table_uuid)
+        {
+            rekeyDetachedPartDir(src_detached->table_uuid, src_detached->file, dst_detached->file);
             return;
         }
     }
@@ -466,7 +566,25 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     ContentAddressed::PartManifest manifest;
     manifest.blobs = recorded;
 
-    const ContentAddressed::PartId part_id = ContentAddressed::computePartId(recorded);
+    /// The "detached" ref is a SHARED container of detached part directories: each DETACH PARTITION
+    /// clones one part into detached/<detached_part>/ via a fresh freeze transaction whose recorded keys
+    /// are <detached_part>/<file> (B36). Several partitions detach independently and must COEXIST under
+    /// the one "detached" ref. The default publish below rewrites the ref, which would make each detach
+    /// overwrite the previous one (only the last detached part would be listed — B46). So when the target
+    /// is the detached namespace, merge the new keys into the existing detached ref's manifest first,
+    /// mirroring the moveDirectory-based republishCommittedPartIntoDetached path. (A regular part_name is
+    /// never re-committed with new content under the same name, so this only affects "detached".)
+    if (part_name == ContentAddressed::kDetachedDirName)
+    {
+        if (auto existing_pid = metadata_storage.readRefPartId(table_uuid, part_name))
+        {
+            auto existing = metadata_storage.loadPartManifestOrThrow(*existing_pid);
+            for (const auto & [file, entry] : existing.blobs)
+                manifest.blobs.emplace(file, entry); /// keep the new entry on a key collision (re-detach)
+        }
+    }
+
+    const ContentAddressed::PartId part_id = ContentAddressed::computePartId(manifest.blobs);
 
     /// Put-if-absent the manifest: identical parts (same deterministic blobs) share one manifest object.
     const std::string part_key = ContentAddressed::partKey(key_prefix, part_id).string();
@@ -483,10 +601,26 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     /// sidecar lives under the same refs/ prefix as the ref, so removeRecursive's ref-scoped deletion
     /// reclaims it on the next DROP, and it is never a content-addressed object the reachability sweep
     /// could miss (the sweep scans only blobs/+parts/). So sidecars cannot leak (B23 orphan concern).
-    if (!recorded_mutable.empty())
+    /// For the shared "detached" ref the bundle sidecar must MERGE with any prior detached part's
+    /// mutable files (same B46 reason as the manifest above): each detached part keeps its own
+    /// uuid/txn/metadata_version under its <detached_part>/ key prefix and they must coexist. The
+    /// per-file objects are keyed per <detached_part>/<file> so they never collide across detached parts;
+    /// only the bundle index overwrites, so merge the existing bundle in. The merged map also drives
+    /// whether the sidecar must be (re)written even when this detach contributed no mutable files but a
+    /// prior one did.
+    std::map<std::string, std::string> merged_mutable(recorded_mutable.begin(), recorded_mutable.end());
+    if (part_name == ContentAddressed::kDetachedDirName)
+    {
+        if (auto existing = metadata_storage.readRefSidecarIfExists(table_uuid, part_name))
+            for (const auto & [file, bytes] : existing->files)
+                merged_mutable.emplace(file, bytes); /// keep the new bytes on a key collision (re-detach)
+    }
+
+    if (!merged_mutable.empty())
     {
         /// Per-file objects FIRST: each mutable file's bytes verbatim in its own tiny object so the
-        /// read path (getStorageObjects -> readObject) returns exactly that file's bytes.
+        /// read path (getStorageObjects -> readObject) returns exactly that file's bytes. Only this
+        /// detach's NEW files need writing; prior detached parts' per-file objects already exist.
         for (const auto & [file, bytes] : recorded_mutable)
         {
             const std::string file_key = ContentAddressed::refMutableFileKey(key_prefix, metadata_storage.server_id, table_uuid, part_name, file).string();
@@ -500,7 +634,7 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
         /// refs/ prefix, so a crashed write that never publishes the ref leaves only ref-scoped objects
         /// that removeRecursive reclaims and the reachability sweep (blobs/+parts/ only) cannot miss.
         ContentAddressed::RefSidecar sidecar;
-        sidecar.files = recorded_mutable;
+        sidecar.files = merged_mutable;
         const std::string meta_key = ContentAddressed::refMetaKey(key_prefix, metadata_storage.server_id, table_uuid, part_name).string();
         const std::string meta_bytes = sidecar.serialize();
         auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite);
@@ -592,6 +726,83 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
     /// sweep (blobs/+parts/ only) would never reclaim them — they MUST be removed synchronously with
     /// the ref here or they leak (B23 orphan concern). Absent ref (e.g. an uncommitted tmp part) is a
     /// no-op. PartManifest + blobs are kept (deferred GC).
+    /// A detached part DIRECTORY <uuid[:3]>/<uuid>/detached/<detached_part>: the detached parts share the
+    /// one "detached" ref whose manifest/sidecar keys are <detached_part>/<file> (B36/B46). DROP DETACHED
+    /// PARTITION reaches here; it must remove ONLY this <detached_part>/ key prefix from the shared
+    /// detached ref (manifest + sidecar bundle) and the matching per-file sidecar objects, leaving the
+    /// other detached parts intact. When the last detached part is removed the ref+bundle are unlinked.
+    /// (Blobs/manifests are kept for deferred GC, as everywhere.)
+    if (auto p = ContentAddressed::parsePartFilePath(path);
+        p && p->part_name == ContentAddressed::kDetachedDirName && !p->file.empty() && p->file.find('/') == std::string::npos)
+    {
+        const std::string detached_dir = p->file;
+        const std::string key_pfx = detached_dir + "/";
+
+        auto existing_pid = metadata_storage.readRefPartId(p->table_uuid, p->part_name);
+        if (!existing_pid)
+            return; /// no detached ref at all => nothing to drop
+
+        /// Rebuild the manifest without this detached part's keys.
+        auto manifest = metadata_storage.loadPartManifestOrThrow(*existing_pid);
+        std::erase_if(manifest.blobs, [&](const auto & kv) { return kv.first.rfind(key_pfx, 0) == 0; });
+
+        /// Rebuild the sidecar bundle without this detached part's keys, and delete the per-file sidecar
+        /// objects (refs/<detached>.<detached_part>/<file>.meta) backing this detached part's byte reads.
+        ContentAddressed::RefSidecar sidecar;
+        if (auto existing_sidecar = metadata_storage.readRefSidecarIfExists(p->table_uuid, p->part_name))
+            sidecar = *existing_sidecar;
+        StoredObjects mutable_to_remove;
+        for (auto it = sidecar.files.begin(); it != sidecar.files.end();)
+        {
+            if (it->first.rfind(key_pfx, 0) == 0)
+            {
+                mutable_to_remove.emplace_back(
+                    ContentAddressed::refMutableFileKey(key_prefix, metadata_storage.server_id, p->table_uuid, p->part_name, it->first).string());
+                it = sidecar.files.erase(it);
+            }
+            else
+                ++it;
+        }
+        if (!mutable_to_remove.empty())
+            metadata_storage.object_storage->removeObjectsIfExist(mutable_to_remove);
+
+        const std::string ref_key
+            = ContentAddressed::refKey(key_prefix, metadata_storage.server_id, p->table_uuid, p->part_name).string();
+        const std::string meta_key
+            = ContentAddressed::refMetaKey(key_prefix, metadata_storage.server_id, p->table_uuid, p->part_name).string();
+
+        if (manifest.blobs.empty())
+        {
+            /// No detached parts remain: unlink the shared ref and its bundle sidecar.
+            metadata_storage.object_storage->removeObjectsIfExist({StoredObject(ref_key), StoredObject(meta_key)});
+            return;
+        }
+
+        /// Republish the trimmed manifest under its new part id and re-point the ref; rewrite the bundle.
+        const ContentAddressed::PartId new_pid = ContentAddressed::computePartId(manifest.blobs);
+        const std::string new_part_key = ContentAddressed::partKey(key_prefix, new_pid).string();
+        if (!metadata_storage.object_storage->tryGetObjectMetadata(new_part_key, /*with_tags=*/false).has_value())
+        {
+            const std::string bytes = manifest.serialize();
+            auto out = metadata_storage.object_storage->writeObject(StoredObject(new_part_key), WriteMode::Rewrite);
+            out->write(bytes.data(), bytes.size());
+            out->finalize();
+        }
+        {
+            const std::string meta_bytes = sidecar.serialize();
+            auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite);
+            meta_out->write(meta_bytes.data(), meta_bytes.size());
+            meta_out->finalize();
+        }
+        {
+            const std::string ref_payload = ContentAddressed::serializeRefPayload(new_pid);
+            auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(ref_key), WriteMode::Rewrite);
+            ref_out->write(ref_payload.data(), ref_payload.size());
+            ref_out->finalize();
+        }
+        return;
+    }
+
     if (auto p = ContentAddressed::parsePartFilePath(path); p && p->file.empty())
     {
         /// List the whole refs/ directory (a real prefix on object storage and a real dir on the

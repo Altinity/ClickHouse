@@ -239,6 +239,14 @@ private:
     void republishCommittedPartIntoDetached(
         const ContentAddressed::PartFilePath & src_committed, const ContentAddressed::PartFilePath & dst_detached);
 
+    // DETACHED part rename within the detached namespace (detached/<old> -> detached/<new>), used by
+    // DROP DETACHED PARTITION ("deleting_" rename before removal) and ATTACH ("attaching_" rename). The
+    // detached parts share the one "detached" ref whose keys are <detached_part>/<file> (B36/B46); this
+    // re-keys only this part's <old>/ prefix to <new>/ in the shared manifest + sidecar bundle (and the
+    // per-file sidecar objects), leaving the other detached parts intact. No content blobs move. Reached
+    // only from moveDirectory.
+    void rekeyDetachedPartDir(const std::string & table_id, const std::string & old_dir, const std::string & new_dir);
+
     // RENAME TABLE / cross-engine table move: re-key every ref + per-ref sidecar (and verbatim
     // table-level file) from the source table identifier to the destination table identifier, then
     // unlink the source pointer objects. The table identifier is part of the ref/store object key, so
