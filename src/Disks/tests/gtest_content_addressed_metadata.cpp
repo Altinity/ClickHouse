@@ -2626,3 +2626,79 @@ TEST_F(ContentAddressedMetaTest, PatchPartIsReachableThenReclaimedLikeAnyPart)
     EXPECT_FALSE(objectExists(os, data_blob))
         << "patch-part data blob was NOT reclaimed after ref removal and sweep past grace";
 }
+
+// M9 W2 / B21 (whole-part clone contract): cloning an entire committed part to a NEW name — the shape
+// of ATTACH/REPLACE/FREEZE — carries every source file forward by reference through ONE transaction.
+// Because the cloned part has IDENTICAL content, computePartId yields the SAME part_id, so the commit
+// publishes ONE ref pointing at the source's existing part_id (no new manifest, no new blob). The B21
+// regression this pins: a previous clone path linked only ONE file (the last), corrupting the clone —
+// here EVERY file must resolve under the clone and read back its original bytes, and every clone blob
+// must be the SAME object as the source's (pure re-reference).
+TEST_F(ContentAddressedMetaTest, WholePartClonePublishesOneRefToSourcePartId)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_wholeclone");
+    auto os = getObjectStorage("cas_wholeclone");
+    const std::string uuid = "uuid-clone";
+    const std::string src = "all_1_1_0";
+    const std::string dst = "all_2_2_0"; // clone target (ATTACH/REPLACE shape)
+
+    const std::map<std::string, std::string> files{
+        {"a.bin", "AAA"}, {"b.bin", "BBB"}, {"c.bin", "CCC"}, {"columns.txt", "a b c"}};
+
+    // Step 1: build the SOURCE part through a transaction + commit.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        for (const auto & [name, bytes] : files)
+        {
+            auto buf = tx.writeFile("uui/" + uuid + "/" + src + "/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    // Read the source's part_id via the public ref payload (the same parser the GC live-set scan uses),
+    // since readRefPartId is a private resolution helper.
+    const std::string sid = ms->serverIdForTest();
+    ASSERT_TRUE(objectExists(os, refKey("", sid, uuid, src).string()));
+    const PartId src_pid = partIdFromRefPayload(readObject(os, refKey("", sid, uuid, src).string()));
+
+    // Capture each source file's backing blob remote_path so we can prove pure re-reference below.
+    std::map<std::string, std::string> src_blob;
+    for (const auto & [name, bytes] : files)
+    {
+        auto objs = ms->getStorageObjects("uui/" + uuid + "/" + src + "/" + name);
+        ASSERT_EQ(objs.size(), 1u) << name;
+        src_blob[name] = objs[0].remote_path;
+    }
+
+    // Step 2: CLONE the whole part to a NEW name through ONE transaction — link EVERY source file
+    // forward by reference (this is what DataPartStorageOnDiskBase::freeze does on a CA disk).
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        for (const auto & [name, bytes] : files)
+            tx.createHardLinkFrom("uui/" + uuid + "/" + src + "/" + name, "uui/" + uuid + "/" + dst + "/" + name);
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    // (a) the clone resolves a SINGLE ref whose part_id EQUALS the source's (identical content → same
+    // manifest → same part_id).
+    ASSERT_TRUE(objectExists(os, refKey("", sid, uuid, dst).string()));
+    const PartId dst_pid = partIdFromRefPayload(readObject(os, refKey("", sid, uuid, dst).string()));
+    EXPECT_EQ(dst_pid.string(), src_pid.string());
+
+    // (b) ALL files resolve under the clone and read back their ORIGINAL bytes — not just the last file
+    // (the B21 corruption mode was a one-file clone).
+    for (const auto & [name, bytes] : files)
+    {
+        auto objs = ms->getStorageObjects("uui/" + uuid + "/" + dst + "/" + name);
+        ASSERT_EQ(objs.size(), 1u) << name;
+        EXPECT_EQ(readObject(os, objs[0].remote_path), bytes) << name;
+        // (c) each clone file's blob remote_path EQUALS the source's — pure re-reference, no new blob.
+        EXPECT_EQ(objs[0].remote_path, src_blob.at(name)) << name;
+    }
+
+    // The source part is untouched by the clone.
+    EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/" + src + "/a.bin")[0].remote_path), "AAA");
+}
