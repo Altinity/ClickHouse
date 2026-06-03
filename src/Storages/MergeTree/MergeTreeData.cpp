@@ -6576,6 +6576,7 @@ void MergeTreeData::checkAlterPartitionIsPossible(
                         PartitionCommand::ATTACH_PARTITION,
                         PartitionCommand::MOVE_PARTITION,
                         PartitionCommand::REPLACE_PARTITION,
+                        PartitionCommand::MOVE_PARTITION,
                     };
 
                     can_execute_alter_on_disk = std::ranges::contains(supported_commands, command.type);
@@ -6583,23 +6584,27 @@ void MergeTreeData::checkAlterPartitionIsPossible(
                 }
                 case MetadataStorageType::ContentAddressed:
                 {
-                    /// A content_addressed disk shares one pool across parts; the part-cloning
-                    /// partition commands clone parts via `cloneAndLoadDataPart` / Backup, which calls
-                    /// `DiskObjectStorage::createHardLink` once per file with NO enclosing transaction.
-                    /// Each call autocommits a one-file manifest/ref and overwrites the destination
-                    /// ref, leaving the clone with only its last file (the corruption is silent — the
-                    /// part reads back almost empty). This affects every command that materialises a
-                    /// new part by cloning: `MOVE PARTITION` (TO TABLE / DISK / VOLUME),
-                    /// `REPLACE PARTITION`, `ATTACH PARTITION ... FROM`, AND plain `ATTACH PARTITION`
-                    /// of the table's own detached parts (ATTACH re-clones the detached part into the
-                    /// active set). Until that clone path is made transactional, fail closed and reject
-                    /// all of them. Only the pointer-unlink commands are safe: `DROP PARTITION`,
-                    /// `DETACH PARTITION` (both `DROP_PARTITION`, with `detach` distinguishing them),
-                    /// and `DROP DETACHED PARTITION` — none of these clone a part. Note `ATTACH
-                    /// PARTITION ... FROM` parses to `REPLACE_PARTITION` (with `replace=false`).
+                    /// On a content_addressed disk a part clone is cheap: identical content has the same
+                    /// `part_id`, so cloning is publishing a ref (no byte copy). The clone path is now
+                    /// transactional — `DataPartStorageOnDiskBase::freeze` runs the whole clone through ONE
+                    /// CA transaction, and `moveDirectory` re-keys the detached-staging → active rename into
+                    /// a complete active ref — so these are SUPPORTED and verified (read back identical data,
+                    /// survive restart): `ATTACH PARTITION`/`ATTACH PART` (re-clone of the table's own
+                    /// detached parts), `REPLACE PARTITION`/`ATTACH PARTITION ... FROM` (parses to
+                    /// `REPLACE_PARTITION`), and `MOVE PARTITION ... TO TABLE`. The pointer-unlink commands
+                    /// `DROP PARTITION` / `DETACH PARTITION` / `DROP DETACHED PARTITION` are also fine.
+                    /// STILL GATED (fail closed): `FREEZE`/`UNFREEZE` (the `shadow/` snapshot namespace is
+                    /// not handled on CA — it would silently produce no usable snapshot; B4 frozen-ref-set)
+                    /// and `FETCH PARTITION` (replication, B1). NOTE: `MOVE_PARTITION` also admits cross-disk
+                    /// `MOVE ... TO DISK/VOLUME` (this check cannot distinguish the destination); that uses
+                    /// the byte-copy `clonePart` path (NOT the corrupting per-file hardlink), but only
+                    /// same-disk `MOVE ... TO TABLE` is verified here — cross-disk is a follow-up to verify.
                     const static auto supported_commands = {
                         PartitionCommand::DROP_PARTITION,
                         PartitionCommand::DROP_DETACHED_PARTITION,
+                        PartitionCommand::ATTACH_PARTITION,
+                        PartitionCommand::REPLACE_PARTITION,
+                        PartitionCommand::MOVE_PARTITION,
                     };
 
                     if (!std::ranges::contains(supported_commands, command.type))
