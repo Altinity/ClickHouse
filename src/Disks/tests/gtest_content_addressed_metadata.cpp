@@ -264,6 +264,74 @@ TEST_F(ContentAddressedMetaTest, CondCreateIfAbsentIsAtomic)
     EXPECT_EQ(readObject(os, key), "A");             // first writer's bytes are preserved
 }
 
+// The fence-token allocator built on create-if-absent only: repeated allocations are strictly
+// increasing and never repeat (each token is a uniquely-created fence/<n> object). Two interleaved
+// allocators that share the same pool never collide on a token.
+TEST_F(ContentAddressedMetaTest, FenceTokensAreMonotonicAndUnique)
+{
+    using namespace DB::ContentAddressed;
+    auto os = getObjectStorage("cas_fence");
+    const std::string prefix = "cas_fence";
+
+    // Sequential allocations from hint 1 yield 1, 2, 3 (the first free token each time).
+    EXPECT_EQ(allocateFenceToken(*os, prefix, 1), 1u);
+    EXPECT_EQ(allocateFenceToken(*os, prefix, 1), 2u); // 1 is taken; scan up to 2
+    EXPECT_EQ(allocateFenceToken(*os, prefix, 1), 3u); // 1,2 taken; scan up to 3
+
+    // A hint at/below the high-water mark still converges by scanning upward; never repeats.
+    uint64_t t4 = allocateFenceToken(*os, prefix, 2);
+    EXPECT_EQ(t4, 4u);
+
+    // A hint above the high-water mark jumps straight there (strictly higher than anything before).
+    uint64_t t10 = allocateFenceToken(*os, prefix, 10);
+    EXPECT_EQ(t10, 10u);
+    EXPECT_GT(t10, t4);
+
+    // Two distinct callers can never be handed the same token.
+    uint64_t a = allocateFenceToken(*os, prefix, 1);
+    uint64_t b = allocateFenceToken(*os, prefix, 1);
+    EXPECT_NE(a, b);
+}
+
+// The fenced GC-leader lock: one holder at a time while the lease is live; an expired lease can be
+// stolen, and the steal takes a STRICTLY HIGHER fence token. The previous holder then loses the renew
+// (its fence is no longer on disk), while the successor renews fine. The lock object is only a liveness
+// hint — the fence token is the authority a later task re-checks before deleting.
+TEST_F(ContentAddressedMetaTest, GcLockGrantsOneHolderAndStealsAfterLease)
+{
+    using namespace DB::ContentAddressed;
+    auto os = getObjectStorage("cas_gclock");
+    const std::string prefix = "cas_gclock";
+
+    // A takes the lock at now=1000 with a 100s lease (deadline 1100), getting some fence fA.
+    auto a = tryAcquireGcLock(*os, prefix, "serverA", /*lease_seconds=*/100, /*now_unix=*/1000);
+    ASSERT_TRUE(a.has_value());
+    const uint64_t fA = a->fence_token;
+
+    // B tries at now=1050 while A's lease (1100) is still live -> denied.
+    auto b = tryAcquireGcLock(*os, prefix, "serverB", /*lease_seconds=*/100, /*now_unix=*/1050);
+    EXPECT_FALSE(b.has_value());
+
+    // C tries at now=1200 after A's lease expired -> steals with a STRICTLY HIGHER fence.
+    auto c = tryAcquireGcLock(*os, prefix, "serverC", /*lease_seconds=*/100, /*now_unix=*/1200);
+    ASSERT_TRUE(c.has_value());
+    EXPECT_GT(c->fence_token, fA);
+    EXPECT_EQ(c->server_id, "serverC");
+
+    // A tries to renew at now=1300 -> false: C took over with a higher fence, A lost leadership.
+    EXPECT_FALSE(renewGcLock(*os, prefix, *a, /*lease_seconds=*/100, /*now_unix=*/1300));
+
+    // C renews fine (its fence is still the one on disk).
+    EXPECT_TRUE(renewGcLock(*os, prefix, *c, /*lease_seconds=*/100, /*now_unix=*/1300));
+    EXPECT_EQ(c->lease_deadline_unix, 1400u);
+
+    // C releases; the lock is now free for a fresh acquire.
+    releaseGcLock(*os, prefix, *c);
+    auto d = tryAcquireGcLock(*os, prefix, "serverD", /*lease_seconds=*/100, /*now_unix=*/1500);
+    ASSERT_TRUE(d.has_value());
+    EXPECT_GT(d->fence_token, c->fence_token); // a re-create after release still allocates a higher fence
+}
+
 TEST_F(ContentAddressedMetaTest, ResolvesAndReadsSeededPart)
 {
     using namespace DB::ContentAddressed;

@@ -98,6 +98,23 @@ std::string poolMounterKey(const std::string & key_prefix, const std::string & s
 std::string sessionsPrefix(const std::string & key_prefix);
 std::string sessionKey(const std::string & key_prefix, const std::string & session_id);
 
+// GC-leader coordination, built entirely on the create-if-absent CAS primitive (the bucket is the
+// single source of truth; no Keeper). Two keyspaces:
+//   - the FENCE allocator: monotonically-increasing tokens at <key_prefix>/fence/<n> (n = 1,2,3...).
+//     A token is allocated by cond-creating fence/<n> scanning n upward until one create SUCCEEDS;
+//     because only one caller can create fence/<n> for a given n, no two callers ever get the same
+//     token. The fence token is the real GC-safety authority (a later task re-checks the max fence at
+//     delete time so a paused leader cannot delete).
+//   - the GC LEADER lock: a single small record at <key_prefix>/gc.lock holding the current leader's
+//     server id, lease deadline and fence token. It is a liveness/coordination HINT only — the fence,
+//     not the lock object, is the safety backstop.
+//   - fencePrefix: <key_prefix>/fence/     (list this to find the high-water token; the allocator scan)
+//   - fenceKey:    <key_prefix>/fence/<n>  (one tiny object per allocated token)
+//   - gcLockKey:   <key_prefix>/gc.lock    (the single leader-lock record)
+std::string fencePrefix(const std::string & key_prefix);
+std::string fenceKey(const std::string & key_prefix, uint64_t n);
+std::string gcLockKey(const std::string & key_prefix);
+
 // Verbatim object key for a generic disk-level file: a path that is neither a part file nor a
 // table-level file (e.g. the server's startup access-check probe clickhouse_access_check_<uuid>
 // written at the disk root). Such files are stored verbatim at <key_prefix>/<path> (no content

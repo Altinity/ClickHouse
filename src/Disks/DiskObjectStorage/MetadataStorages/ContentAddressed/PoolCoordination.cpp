@@ -1,8 +1,15 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolCoordination.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Codec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 #include <Disks/WriteMode.h>
 
+#include <IO/ReadBufferFromString.h>
+#include <IO/ReadHelpers.h>
+#include <IO/ReadSettings.h>
+#include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
 #include <IO/WriteSettings.h>
 
 #include <Common/Exception.h>
@@ -183,6 +190,162 @@ bool condCreateIfAbsent(IObjectStorage & object_storage, const std::string & key
     /// Any other backend: it must honor `If-None-Match: *`. Probe unknown backends once (fail closed).
     ensureConditionalCreateSupported(object_storage);
     return condCreateViaIfNoneMatch(object_storage, key, bytes);
+}
+
+namespace
+{
+
+/// Read the bytes at `key`, or nullopt if it does not exist. Used by the lock acquire/renew/release
+/// read-checks (the fence is the authority, but the lock object is read to make the liveness/steal
+/// decision and to avoid clobbering a successor's lock).
+std::optional<std::string> readIfExists(IObjectStorage & object_storage, const std::string & key)
+{
+    StoredObject object(key);
+    if (!object_storage.exists(object))
+        return std::nullopt;
+    auto buf = object_storage.readObject(object, getReadSettings(), /*read_hint=*/std::nullopt);
+    std::string content;
+    readStringUntilEOF(content, *buf);
+    return content;
+}
+
+/// Rewrite (unconditionally overwrite) `key` with `bytes`. Used only on the steal / renew paths, where
+/// the fence token — not the lock object — is the safety authority, so a non-atomic overwrite is safe.
+void rewriteObject(IObjectStorage & object_storage, const std::string & key, const std::string & bytes)
+{
+    auto buf = object_storage.writeObject(StoredObject(key), WriteMode::Rewrite);
+    buf->write(bytes.data(), bytes.size());
+    buf->finalize();
+}
+
+}
+
+uint64_t allocateFenceToken(IObjectStorage & object_storage, const std::string & key_prefix, uint64_t start_hint)
+{
+    /// Scan n upward from the hint (never below 1) and take the FIRST n we can create. Only one caller
+    /// can win `condCreateIfAbsent(fence/<n>)` for a given n, so the returned token is unique; a token
+    /// already taken just makes us advance, so a later allocation can only land strictly higher than any
+    /// earlier-completed one. The hint is an optimization (skip known-taken tokens), never a correctness
+    /// requirement: even a stale hint converges by scanning. The fence object's bytes are irrelevant
+    /// (only the key's existence matters), so we store the token itself for debuggability.
+    uint64_t n = start_hint < 1 ? 1 : start_hint;
+    while (true)
+    {
+        if (condCreateIfAbsent(object_storage, fenceKey(key_prefix, n), std::to_string(n)))
+            return n;
+        ++n;
+    }
+}
+
+std::string GcLock::serialize() const
+{
+    /// MAGIC(4) + encoding version(1) + body, on the shared codec. The body carries the owning server id
+    /// (length-prefixed string), then the lease deadline and fence token (fixed-width little-endian u64).
+    /// All explicitly little-endian so the object is byte-identical regardless of the writer's arch.
+    std::string out;
+    DB::WriteBufferFromString buf(out);
+    FormatHeader{MAGIC, ENCODING_VERSION}.write(buf);
+    DB::writeStringBinary(server_id, buf);
+    DB::writeBinaryLittleEndian(lease_deadline_unix, buf);
+    DB::writeBinaryLittleEndian(fence_token, buf);
+    buf.finalize();
+    return out;
+}
+
+GcLock GcLock::deserialize(const std::string & bytes)
+{
+    DB::ReadBufferFromString buf(bytes);
+    FormatHeader::readAndValidate(buf, MAGIC, ENCODING_VERSION, "gc.lock");
+
+    GcLock lock;
+    DB::readStringBinary(lock.server_id, buf);
+    DB::readBinaryLittleEndian(lock.lease_deadline_unix, buf);
+    DB::readBinaryLittleEndian(lock.fence_token, buf);
+    return lock;
+}
+
+std::optional<GcLock> tryAcquireGcLock(
+    IObjectStorage & object_storage,
+    const std::string & key_prefix,
+    const std::string & server_id,
+    uint64_t lease_seconds,
+    uint64_t now_unix)
+{
+    const std::string key = gcLockKey(key_prefix);
+
+    /// Absent -> cond-create with a freshly-allocated fence (start_hint = 1). The CAS makes the create
+    /// atomic: only one of two truly-concurrent first-takers can create the lock object. If WE created
+    /// it, we are the leader. (We allocate the fence BEFORE the cond-create; a fence consumed by a lost
+    /// create is simply skipped by the next allocation — fence tokens are cheap and monotonic.)
+    {
+        GcLock fresh;
+        fresh.server_id = server_id;
+        fresh.fence_token = allocateFenceToken(object_storage, key_prefix, /*start_hint=*/1);
+        fresh.lease_deadline_unix = now_unix + lease_seconds;
+        if (condCreateIfAbsent(object_storage, key, fresh.serialize()))
+            return fresh;
+    }
+
+    /// The lock already existed: read it and decide live-vs-steal.
+    auto existing_bytes = readIfExists(object_storage, key);
+    if (!existing_bytes)
+        /// Raced with a release between the cond-create and the read; the caller can simply retry.
+        return std::nullopt;
+
+    const GcLock existing = GcLock::deserialize(*existing_bytes);
+
+    /// Still live: someone holds leadership. We do not take it.
+    if (existing.lease_deadline_unix >= now_unix)
+        return std::nullopt;
+
+    /// Expired -> STEAL. Allocate a fence strictly higher than the dead holder's, then rewrite the lock.
+    /// A two-stealer race here is acceptable: each stealer allocates a DISTINCT (and both strictly
+    /// higher) fence token, and the fence — not this lock object — is the safety authority a later task
+    /// re-checks before deleting. The rewrite only records the most-recent steal for the liveness hint.
+    GcLock stolen;
+    stolen.server_id = server_id;
+    stolen.fence_token = allocateFenceToken(object_storage, key_prefix, /*start_hint=*/existing.fence_token + 1);
+    stolen.lease_deadline_unix = now_unix + lease_seconds;
+    rewriteObject(object_storage, key, stolen.serialize());
+    return stolen;
+}
+
+bool renewGcLock(
+    IObjectStorage & object_storage,
+    const std::string & key_prefix,
+    GcLock & held,
+    uint64_t lease_seconds,
+    uint64_t now_unix)
+{
+    const std::string key = gcLockKey(key_prefix);
+
+    /// Read-check: we may only renew while the on-disk lock still carries OUR fence token. If it is gone
+    /// or a higher fence took over, a successor stole leadership and we lost it — never rewrite then.
+    auto on_disk_bytes = readIfExists(object_storage, key);
+    if (!on_disk_bytes)
+        return false;
+    if (GcLock::deserialize(*on_disk_bytes).fence_token != held.fence_token)
+        return false;
+
+    held.lease_deadline_unix = now_unix + lease_seconds;
+    rewriteObject(object_storage, key, held.serialize());
+    return true;
+}
+
+void releaseGcLock(IObjectStorage & object_storage, const std::string & key_prefix, const GcLock & held)
+{
+    const std::string key = gcLockKey(key_prefix);
+
+    /// Read-check before delete: only remove the lock while it still carries OUR fence token, so we
+    /// never delete a successor's lock (which would let a third party take leadership while the
+    /// successor still believes it holds it). A missing or superseded lock is a no-op.
+    auto on_disk_bytes = readIfExists(object_storage, key);
+    if (!on_disk_bytes)
+        return;
+    if (GcLock::deserialize(*on_disk_bytes).fence_token != held.fence_token)
+        return;
+
+    object_storage.removeObjectIfExists(StoredObject(key));
 }
 
 }
