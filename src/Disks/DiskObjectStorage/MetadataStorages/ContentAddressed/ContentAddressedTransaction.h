@@ -13,6 +13,8 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <string>
 
 namespace DB
@@ -44,7 +46,18 @@ public:
     /// key_prefix_ is the object-storage common key prefix to prepend to the blob key; an empty
     /// prefix yields the bare blobs/<hash> key. It is threaded from the owning transaction so the
     /// blob is uploaded exactly where the read side resolves it.
-    ContentAddressedWriteBuffer(ObjectStoragePtr object_storage_, std::string key_prefix_, std::string temp_dir_, OnFinalized on_finalized_ = {});
+    /// `gc_lock_` + `in_flight_pinned_blobs_` are the per-pool GC lock and in-flight pin set (B52). On
+    /// finalize, the buffer takes the lock, pins the blob key, then makes its dedup existence-check
+    /// decision under that lock so the pin is visible to a concurrent sweep before the skip — closing
+    /// the window where a reused (skip-uploaded) blob could be reclaimed before the ref is published.
+    /// Both may be null (legacy / unit construction with no background GC): then no pin is taken.
+    ContentAddressedWriteBuffer(
+        ObjectStoragePtr object_storage_,
+        std::string key_prefix_,
+        std::string temp_dir_,
+        std::shared_ptr<std::mutex> gc_lock_ = nullptr,
+        std::shared_ptr<std::set<std::string>> in_flight_pinned_blobs_ = nullptr,
+        OnFinalized on_finalized_ = {});
     ~ContentAddressedWriteBuffer() override;
 
     void sync() override;
@@ -69,6 +82,9 @@ private:
     ObjectStoragePtr object_storage;
     std::string key_prefix;
     std::string temp_path;
+    /// Per-pool GC lock + in-flight blob pin set (B52); see the ctor doc. May be null.
+    std::shared_ptr<std::mutex> gc_lock;
+    std::shared_ptr<std::set<std::string>> in_flight_pinned_blobs;
     OnFinalized on_finalized;
 
     std::unique_ptr<WriteBufferFromFile> temp_file;
@@ -129,6 +145,10 @@ public:
     /// each part file while hashing it, before upload. It is a local path, NOT an object key prefix:
     /// for a remote object storage (e.g. s3) the key prefix is not a usable local path.
     ContentAddressedTransaction(ContentAddressedMetadataStorage & metadata_storage_, std::string key_prefix_, std::string local_scratch_path_);
+
+    /// B52: release any still-held in-flight blob pins. A transaction that was never committed (an
+    /// aborted/cancelled insert) would otherwise pin its staged blobs forever, defeating GC.
+    ~ContentAddressedTransaction() override;
 
     bool supportsChmod() const override { return false; }
 
@@ -232,6 +252,10 @@ private:
     // Pin/verify the (table_uuid, part_name) all files of one commit must agree on.
     void rememberTarget(const std::string & path);
 
+    // B52: release all in-flight blob pins this transaction holds (after the ref is published, or on
+    // destruction of an uncommitted transaction). Idempotent.
+    void releasePinnedBlobs() noexcept;
+
     // DETACH PARTITION: re-publish a committed part directory as a detached ref. The detached ref is
     // named "detached" and carries the source part's manifest blob entries and mutable sidecar files
     // re-keyed under the detached part directory component, then the source ref is unlinked. Content
@@ -284,6 +308,9 @@ private:
     std::map<std::string, std::string> recorded_mutable;
     std::string table_uuid;
     std::string part_name;
+    /// B52: full blob object keys this transaction pinned in the pool's in-flight set (via the write
+    /// buffer, under the GC lock). Released once the ref is published or the transaction is destroyed.
+    std::set<std::string> pinned_blob_keys;
 };
 
 }

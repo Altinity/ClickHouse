@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 
 namespace Poco::Util
@@ -34,12 +35,15 @@ class ContentAddressedGCThread
 public:
     /// `gc_lock_` is the per-pool in-process GC mutex shared with the transaction commit path (B49);
     /// it is forwarded to the owned ContentAddressedGC so the sweep and commits mutually exclude.
+    /// `in_flight_pinned_blobs_` is the per-pool set of blob keys staged by uncommitted transactions
+    /// (B52), shared by reference so the sweep treats them as reachable (guarded by `gc_lock_`).
     ContentAddressedGCThread(
         std::string disk_name_,
         ContextPtr context,
         ObjectStoragePtr object_storage_,
         std::string key_prefix_,
         std::shared_ptr<std::mutex> gc_lock_,
+        std::shared_ptr<const std::set<std::string>> in_flight_pinned_blobs_,
         LoggerPtr log_);
 
     /// Background deletion is OPT-IN. startup activates and schedules the recurring sweep ONLY when

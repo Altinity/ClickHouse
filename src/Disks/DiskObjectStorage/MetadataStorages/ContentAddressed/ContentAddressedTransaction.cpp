@@ -36,6 +36,32 @@ ContentAddressedTransaction::ContentAddressedTransaction(ContentAddressedMetadat
 {
 }
 
+ContentAddressedTransaction::~ContentAddressedTransaction()
+{
+    /// B52: an uncommitted transaction (an aborted/cancelled insert, or a directory-only transaction
+    /// that staged blobs then threw) still holds its in-flight pins; release them so they do not block
+    /// GC forever. A committed transaction already cleared pinned_blob_keys under gc_lock, so this is a
+    /// no-op for it.
+    releasePinnedBlobs();
+}
+
+void ContentAddressedTransaction::releasePinnedBlobs() noexcept
+{
+    if (pinned_blob_keys.empty())
+        return;
+    try
+    {
+        for (const auto & key : pinned_blob_keys)
+            metadata_storage.unpinBlob(key);
+    }
+    catch (...) // NOLINT(bugprone-empty-catch)
+    {
+        /// Best-effort: a failure to drop a pin only over-retains a blob (conservative — never data
+        /// loss). Never let it escape a destructor.
+    }
+    pinned_blob_keys.clear();
+}
+
 void ContentAddressedTransaction::rememberTarget(const std::string & path)
 {
     auto p = ContentAddressed::parsePartFilePath(path);
@@ -113,9 +139,14 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
         metadata_storage.object_storage,
         key_prefix,
         local_scratch_path,
+        metadata_storage.gcLock(),
+        metadata_storage.inFlightPinnedBlobs(),
         [this, file](const ContentAddressed::BlobHash & blob_hash, size_t size)
         {
             recorded[file] = ContentAddressed::BlobEntry{blob_hash, size, blob_hash.string()};
+            /// B52: track the pinned blob key so it is released when the ref is published (commit) or
+            /// when an uncommitted transaction is destroyed. The write buffer pinned it under the GC lock.
+            pinned_blob_keys.insert(ContentAddressed::blobKey(key_prefix, blob_hash).string());
         });
 }
 
@@ -686,6 +717,16 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(ref_key), WriteMode::Rewrite);
     ref_out->write(ref_payload.data(), ref_payload.size());
     ref_out->finalize();
+
+    /// B52: the ref now names this part and keeps every referenced blob reachable, so the in-flight
+    /// pins are no longer needed. Release them while STILL holding gc_lock (gc_guard above) so the pin
+    /// drop and the ref publish are atomic w.r.t. the sweep: it can never observe a blob this commit
+    /// reused as both unpinned AND not-yet-referenced. Erase directly here (do NOT call the lock-taking
+    /// releasePinnedBlobs / unpinBlob — gc_lock is already held) and clear the local set so the
+    /// destructor's release is a no-op.
+    for (const auto & key : pinned_blob_keys)
+        metadata_storage.inFlightPinnedBlobs()->erase(key);
+    pinned_blob_keys.clear();
 }
 
 TransactionCommitOutcomeVariant ContentAddressedTransaction::tryCommit(const TransactionCommitOptionsVariant & options)
@@ -976,10 +1017,18 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
 namespace DB::ContentAddressed
 {
 
-ContentAddressedWriteBuffer::ContentAddressedWriteBuffer(ObjectStoragePtr object_storage_, std::string key_prefix_, std::string temp_dir_, OnFinalized on_finalized_)
+ContentAddressedWriteBuffer::ContentAddressedWriteBuffer(
+    ObjectStoragePtr object_storage_,
+    std::string key_prefix_,
+    std::string temp_dir_,
+    std::shared_ptr<std::mutex> gc_lock_,
+    std::shared_ptr<std::set<std::string>> in_flight_pinned_blobs_,
+    OnFinalized on_finalized_)
     : WriteBufferFromFileBase(DBMS_DEFAULT_BUFFER_SIZE, nullptr, 0)
     , object_storage(std::move(object_storage_))
     , key_prefix(std::move(key_prefix_))
+    , gc_lock(std::move(gc_lock_))
+    , in_flight_pinned_blobs(std::move(in_flight_pinned_blobs_))
     , on_finalized(std::move(on_finalized_))
 {
     fs::create_directories(temp_dir_);
@@ -1063,11 +1112,38 @@ void ContentAddressedWriteBuffer::finalizeImpl()
 
     const std::string key = blobKey(key_prefix, BlobHash(blob_hash)).string();
 
+    /// B52: PIN the blob key for the lifetime of this transaction BEFORE deciding whether to skip the
+    /// upload, and make that existence-check decision UNDER the GC lock. The background sweep holds the
+    /// SAME lock for its whole mark+delete and treats every pinned key as reachable, so the only two
+    /// orderings are: (a) we pin first -> the next sweep sees the pin and keeps the blob, even though no
+    /// ref names it yet; (b) the sweep deleted the blob just before we took the lock -> our existence
+    /// check now sees it absent and we RE-UPLOAD it (we still hold the local temp file). Either way the
+    /// blob this transaction reuses is alive when the ref is later published. The pin is released by the
+    /// owning transaction once the ref is published (commit) or when an uncommitted transaction is
+    /// destroyed. Without the background GC wiring (unit/legacy construction) gc_lock is null and we
+    /// fall back to a plain existence check (no concurrent sweep can race).
+    auto decide_and_pin = [&]() -> std::optional<ObjectMetadata>
+    {
+        if (in_flight_pinned_blobs)
+            in_flight_pinned_blobs->insert(key);
+        return object_storage->tryGetObjectMetadata(key, /*with_tags=*/false);
+    };
+
+    std::optional<ObjectMetadata> existing;
+    if (gc_lock)
+    {
+        std::lock_guard<std::mutex> gc_guard(*gc_lock);
+        existing = decide_and_pin();
+    }
+    else
+    {
+        existing = decide_and_pin();
+    }
+
     /// Skip re-uploading when the blob already exists (content dedup). The key IS the content hash, so
     /// a racing writer to the same key has identical bytes; the worst case is a redundant upload, never
     /// wrong content. We DO guard one thing: if an object already exists at the key with a DIFFERENT
     /// size, that is either a 128-bit hash collision or a genuinely corrupt blob — fail closed.
-    auto existing = object_storage->tryGetObjectMetadata(key, /*with_tags=*/false);
     if (existing.has_value())
     {
         if (existing->size_bytes != size)

@@ -53,7 +53,14 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
             object_storage,
             storage_path_prefix,
             gc_lock,
+            in_flight_pinned_blobs,
             getLogger(fmt::format("{}::ContentAddressedGC", storage_path_full)));
+}
+
+void ContentAddressedMetadataStorage::unpinBlob(const std::string & blob_key)
+{
+    std::lock_guard<std::mutex> gc_guard(*gc_lock);
+    in_flight_pinned_blobs->erase(blob_key);
 }
 
 void ContentAddressedMetadataStorage::startup()

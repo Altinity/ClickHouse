@@ -1513,6 +1513,7 @@ TEST_F(ContentAddressedMetaTest, GCThreadSweepsOrphansAndKeepsLive)
         os,
         "",
         std::make_shared<std::mutex>(),
+        std::make_shared<const std::set<std::string>>(),
         getLogger("ContentAddressedGCThreadTest"));
 
     /// grace 0 so a single round past first-unreachable reclaims orphans immediately.
@@ -1599,13 +1600,20 @@ TEST_F(ContentAddressedMetaTest, GCKeepsLiveBlobsWrittenThroughRealWritePath)
     EXPECT_FALSE(objectExists(os, doomed_b));
 }
 
-// B49 (CRITICAL, GC-on): the dedup / carry-forward old-blob race. With background GC enabled, an
-// in-flight identical-content INSERT that dedup-skips re-uploading an existing blob B (finalizeImpl)
-// must NOT publish a ref if a concurrent sweep reclaimed B in the window between the skip and the
-// publish. The fix is a per-pool in-process GC lock shared by the sweep and the commit: the sweep
-// holds it for mark+delete; the commit holds it to re-HEAD every referenced blob and fail closed if
-// any is gone, never publishing a dangling ref. This deterministic variant runs the sweep BEFORE the
-// commit (the reclaim wins the race): the commit MUST throw and MUST NOT publish refs/<P2>.
+// B49/B52 (CRITICAL, GC-on): the dedup / carry-forward old-blob race, now PREVENTED by the in-process
+// blob PIN (B52). With background GC enabled, an in-flight identical-content INSERT that dedup-skips
+// re-uploading an existing blob B (finalizeImpl) PINS B in the pool's in-flight set under the GC lock
+// BEFORE making the skip decision. A concurrent sweep — sharing the SAME lock AND pin set — therefore
+// observes the pin and treats B as reachable even though no committed ref names it yet, so it does NOT
+// reclaim B. The insert then COMMITS SUCCESSFULLY (no fail-close, no dangling ref, no data loss). This
+// deterministic variant runs the sweep BEFORE the commit (the reclaim would have won the race without
+// the pin); with the pin B survives and T2.commit succeeds. The B49 commit re-validate stays as a
+// never-expected safety net (see DedupCommitBeforeSweepKeepsReusedBlobAlive for the commit-wins order).
+//
+// Pre-pin, the old behavior of this test was: sweep deletes B, commit FAILS CLOSED with "concurrently
+// reclaimed by GC". That fail-close fired on ~20 ordinary stateless tests under the shared-pool GC-on
+// default (tiny deduped files becoming transiently unreferenced then reused), so it was a real
+// availability bug; the pin converts those into SUCCESSFUL inserts.
 TEST_F(ContentAddressedMetaTest, DedupCommitFailsClosedWhenBlobConcurrentlyReclaimed)
 {
     using namespace DB::ContentAddressed;
@@ -1635,7 +1643,8 @@ TEST_F(ContentAddressedMetaTest, DedupCommitFailsClosedWhenBlobConcurrentlyRecla
     EXPECT_TRUE(objectExists(os, blob_b));
 
     // T2: a dedup INSERT of IDENTICAL content. finalizeImpl finds B already present and SKIPS the
-    // upload (B stays present), recording B for the part — the staged state of the race.
+    // upload (B stays present), but PINS B in the pool's in-flight set under the GC lock (B52). The
+    // transaction is NOT yet committed.
     DB::ContentAddressedTransaction t2(*ms, /*key_prefix=*/"", kCasTestScratch);
     {
         auto buf = t2.writeFile("uui/" + uuid + "/all_2_2_0/a.bin", 4096, DB::WriteMode::Rewrite, {});
@@ -1643,19 +1652,26 @@ TEST_F(ContentAddressedMetaTest, DedupCommitFailsClosedWhenBlobConcurrentlyRecla
         buf->finalize();
     }
     EXPECT_TRUE(objectExists(os, blob_b)); // dedup-skip: B was NOT re-uploaded, still present
+    EXPECT_TRUE(ms->inFlightPinnedBlobs()->contains(blob_b)); // pinned by the in-flight insert
 
-    // The sweep wins the race: it shares the SAME per-pool GC lock as the commit (production wiring),
-    // and with grace=0 it reclaims the now-unreferenced B (T2's ref is not yet published).
-    DB::ContentAddressed::ContentAddressedGC gc(os, "", ms->gcLock());
+    // The sweep runs while T2 is in-flight, sharing the SAME per-pool GC lock AND the SAME pin set as
+    // the storage (production wiring). With grace=0 B would otherwise be reclaimed (T2's ref is not yet
+    // published) — but the pin makes B reachable, so the sweep MUST NOT delete it.
+    DB::ContentAddressed::ContentAddressedGC gc(os, "", ms->gcLock(), ms->inFlightPinnedBlobs());
     gc.runSweepOnce(/*now=*/100, /*grace=*/0);
-    EXPECT_FALSE(objectExists(os, blob_b)); // B was reclaimed
+    EXPECT_TRUE(objectExists(os, blob_b)); // pinned -> kept (NOT reclaimed)
 
-    // T2.commit must FAIL CLOSED: the re-validate under the lock HEADs B, finds it gone, and throws a
-    // retryable error WITHOUT publishing a dangling ref.
-    EXPECT_THROW(t2.commit(DB::NoCommitOptions{}), DB::Exception);
+    // T2.commit must SUCCEED: B is still present, so the re-validate passes (the fail-close is the
+    // never-expected safety net). The pin is released once the ref is published.
+    EXPECT_NO_THROW(t2.commit(DB::NoCommitOptions{}));
 
-    // No ref was published for P2 — the dangling-ref data-loss path is closed.
-    EXPECT_FALSE(objectExists(os, refKey("", sid, uuid, "all_2_2_0").string()));
+    // The ref WAS published for P2, B survives a post-commit sweep (reachable via the ref), and the
+    // part reads back the original bytes — no data loss, no fail-close.
+    EXPECT_TRUE(objectExists(os, refKey("", sid, uuid, "all_2_2_0").string()));
+    EXPECT_FALSE(ms->inFlightPinnedBlobs()->contains(blob_b)); // released on commit
+    gc.runSweepOnce(/*now=*/200, /*grace=*/0);
+    EXPECT_TRUE(objectExists(os, blob_b));
+    EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/a.bin")[0].remote_path), content);
 }
 
 // B49 companion: the SAME setup, but the commit wins the race — the dedup INSERT publishes its ref
@@ -1709,6 +1725,49 @@ TEST_F(ContentAddressedMetaTest, DedupCommitBeforeSweepKeepsReusedBlobAlive)
 
     // P2 reads back the original content through the resolution path.
     EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/a.bin")[0].remote_path), content);
+}
+
+// B52: a blob pinned by an in-flight transaction is KEPT by a sweep during the transaction, then once
+// the transaction unpins it (here: an ABORTED insert destroyed without commit), a LATER sweep DOES
+// reclaim it. This proves both halves of the pin lifecycle in one test: (a) the pin blocks the sweep
+// while the transaction is live, and (b) unpin restores GC eligibility so true orphans are still
+// collected. The companion DedupCommitFailsClosedWhenBlobConcurrentlyReclaimed proves the commit (not
+// abort) unpin path: there the ref published at commit keeps the blob reachable after the pin drops.
+TEST_F(ContentAddressedMetaTest, OrphanBlobReclaimedAfterTransactionUnpins)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_b52_abort");
+    auto os = getObjectStorage("cas_b52_abort");
+    const std::string uuid = "uuid-b52-abort";
+    const std::string content = "B52-ABORTED-CONTENT";
+
+    // The sweep shares the SAME per-pool GC lock AND in-flight pin set as the storage (production wiring).
+    DB::ContentAddressed::ContentAddressedGC gc(os, "", ms->gcLock(), ms->inFlightPinnedBlobs());
+
+    std::string blob_key;
+    {
+        // A fresh insert that uploads B then is ABANDONED (never committed) — e.g. a cancelled query.
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        auto buf = tx.writeFile("uui/" + uuid + "/all_1_1_0/a.bin", 4096, DB::WriteMode::Rewrite, {});
+        buf->write(content.data(), content.size());
+        buf->finalize();
+        // The part's ref is NOT published (uncommitted), so resolve the blob key from the pin set the
+        // write buffer just populated under the GC lock (exactly one staged blob in this transaction).
+        ASSERT_EQ(ms->inFlightPinnedBlobs()->size(), 1u);
+        blob_key = *ms->inFlightPinnedBlobs()->begin();
+        EXPECT_TRUE(objectExists(os, blob_key)); // freshly uploaded
+
+        // (a) A sweep DURING the live transaction must NOT reclaim B: it is pinned (no ref names it yet).
+        gc.runSweepOnce(/*now=*/100, /*grace=*/0);
+        EXPECT_TRUE(objectExists(os, blob_key)); // pinned -> kept
+
+        // tx goes out of scope WITHOUT commit -> destructor must release the pin.
+    }
+    EXPECT_FALSE(ms->inFlightPinnedBlobs()->contains(blob_key)); // released on destruction
+
+    // (b) The orphaned blob (no ref ever published, pin dropped) is now reclaimable by a LATER sweep.
+    gc.runSweepOnce(/*now=*/200, /*grace=*/0);
+    EXPECT_FALSE(objectExists(os, blob_key));
 }
 
 // B23 Task 4: removeRecursive deletes the per-ref sidecar objects WITH the ref. A part's mutable

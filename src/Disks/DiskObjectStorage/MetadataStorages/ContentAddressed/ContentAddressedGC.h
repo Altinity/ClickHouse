@@ -136,7 +136,16 @@ public:
     /// reclaimed in the finalize -> commit window. When null (legacy direct construction) a private
     /// mutex is created so the sweep is still internally consistent; production and the B49 regression
     /// tests pass the metadata storage's shared lock so the sweep and commit truly exclude each other.
-    ContentAddressedGC(ObjectStoragePtr object_storage_, std::string key_prefix_, std::shared_ptr<std::mutex> gc_lock_ = nullptr);
+    /// `in_flight_pinned_blobs_` is the per-pool set of blob object keys staged by uncommitted
+    /// transactions (B52), shared by reference and read under `gc_lock_`. The sweep treats every pinned
+    /// key as reachable so a blob a dedup-skipping insert decided to reuse (and so did NOT re-upload)
+    /// cannot be deleted in the window between that skip and the ref publish. May be null (legacy direct
+    /// construction / tests that drive no concurrent inserts): then nothing is pinned.
+    ContentAddressedGC(
+        ObjectStoragePtr object_storage_,
+        std::string key_prefix_,
+        std::shared_ptr<std::mutex> gc_lock_ = nullptr,
+        std::shared_ptr<const std::set<std::string>> in_flight_pinned_blobs_ = nullptr);
 
     /// Run one sweep. Deletes nothing if any step before the removal throws (fail-close): a missing
     /// manifest for a live ref (B18), or any list/read error, aborts the sweep with the pool intact.
@@ -150,6 +159,9 @@ private:
     /// Per-pool in-process GC lock, shared with ContentAddressedTransaction::commit (B49). Never null
     /// after construction.
     const std::shared_ptr<std::mutex> gc_lock;
+    /// Per-pool in-flight blob pins (B52), read under gc_lock; pinned keys are excluded from sweep.
+    /// Null when the GC was built without a metadata storage (no concurrent inserts to protect).
+    const std::shared_ptr<const std::set<std::string>> in_flight_pinned_blobs;
     std::unordered_map<std::string, int64_t> first_unreachable;
 };
 

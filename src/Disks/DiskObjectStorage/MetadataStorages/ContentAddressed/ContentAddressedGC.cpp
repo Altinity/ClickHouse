@@ -178,10 +178,15 @@ std::set<BlobHash> InMemoryBlobRefIndex::unreferenced() const
 
 /// ==== Sweep driver ====
 
-ContentAddressedGC::ContentAddressedGC(ObjectStoragePtr object_storage_, std::string key_prefix_, std::shared_ptr<std::mutex> gc_lock_)
+ContentAddressedGC::ContentAddressedGC(
+    ObjectStoragePtr object_storage_,
+    std::string key_prefix_,
+    std::shared_ptr<std::mutex> gc_lock_,
+    std::shared_ptr<const std::set<std::string>> in_flight_pinned_blobs_)
     : object_storage(std::move(object_storage_))
     , key_prefix(std::move(key_prefix_))
     , gc_lock(gc_lock_ ? std::move(gc_lock_) : std::make_shared<std::mutex>())
+    , in_flight_pinned_blobs(std::move(in_flight_pinned_blobs_))
 {
 }
 
@@ -232,8 +237,17 @@ SweepStats ContentAddressedGC::runSweepOnce(int64_t now, int64_t grace)
     }
     for (const auto & key : listKeysUnder(object_storage, blobsPrefix(key_prefix)))
     {
-        if (!reachable_blobs.contains(BlobObjectKey(key)))
-            unreferenced.insert(key);
+        if (reachable_blobs.contains(BlobObjectKey(key)))
+            continue;
+        /// B52: a blob staged by an in-flight (uncommitted) transaction is not yet named by any
+        /// published ref, so it would look unreferenced — but a dedup-skipping insert decided to reuse
+        /// it (and did NOT re-upload it), and is about to publish a ref to it. Deleting it here would
+        /// leave that ref dangling. We hold gc_lock for the whole sweep and the insert holds the SAME
+        /// lock while it pins the key and makes its skip decision, so the pin set we read here is a
+        /// consistent snapshot: treat every pinned key as reachable.
+        if (in_flight_pinned_blobs && in_flight_pinned_blobs->contains(key))
+            continue;
+        unreferenced.insert(key);
     }
 
     /// 4. Apply the grace-from-unreachability policy and carry the updated timer state forward.

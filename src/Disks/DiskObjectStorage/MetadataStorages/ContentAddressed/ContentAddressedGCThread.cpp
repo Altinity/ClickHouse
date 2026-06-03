@@ -37,10 +37,11 @@ ContentAddressedGCThread::ContentAddressedGCThread(
     ObjectStoragePtr object_storage_,
     std::string key_prefix_,
     std::shared_ptr<std::mutex> gc_lock_,
+    std::shared_ptr<const std::set<std::string>> in_flight_pinned_blobs_,
     LoggerPtr log_)
     : disk_name(std::move(disk_name_))
     , log(std::move(log_))
-    , gc(std::move(object_storage_), std::move(key_prefix_), std::move(gc_lock_))
+    , gc(std::move(object_storage_), std::move(key_prefix_), std::move(gc_lock_), std::move(in_flight_pinned_blobs_))
     , interval_sec(DEFAULT_GC_INTERVAL_SEC)
     , grace_sec(DEFAULT_GC_GRACE_SEC)
 {

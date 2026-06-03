@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 
 namespace DB
@@ -68,6 +69,19 @@ public:
     /// truly excludes the same storage's commits (the production wiring threads the same shared_ptr).
     const std::shared_ptr<std::mutex> & gcLock() const { return gc_lock; }
 
+    /// The per-pool set of in-flight blob object keys staged by transactions not yet committed (B52).
+    /// Guarded by gc_lock. The sweep (which holds gc_lock) treats these as reachable so a blob a
+    /// dedup-skipping insert decided to reuse cannot be reclaimed in the finalize -> commit window.
+    const std::shared_ptr<std::set<std::string>> & inFlightPinnedBlobs() const { return in_flight_pinned_blobs; }
+
+    /// Pin a blob object key for the lifetime of an in-flight transaction (B52). Must be called with
+    /// gc_lock held so the pin is visible to a concurrent sweep before the caller's dedup-skip decision.
+    void pinBlobLocked(const std::string & blob_key) { in_flight_pinned_blobs->insert(blob_key); }
+
+    /// Release an in-flight blob pin (B52). Takes gc_lock internally; called after the ref is published
+    /// (the ref now keeps the blob reachable) or when an uncommitted transaction is destroyed.
+    void unpinBlob(const std::string & blob_key);
+
 private:
     friend class ContentAddressedTransaction;
 
@@ -114,6 +128,11 @@ private:
     /// dedup-skipped blob cannot be reclaimed in the finalize -> commit window. Created eagerly so the
     /// unit tests that drive commits + a directly-built ContentAddressedGC can share it via gcLock().
     const std::shared_ptr<std::mutex> gc_lock = std::make_shared<std::mutex>();
+
+    /// Per-pool set of blob object keys staged by in-flight (not-yet-committed) transactions (B52).
+    /// Guarded by gc_lock and shared by reference with the background sweep so a blob a dedup-skipping
+    /// insert decided to reuse is treated as reachable until the insert commits its ref (or aborts).
+    const std::shared_ptr<std::set<std::string>> in_flight_pinned_blobs = std::make_shared<std::set<std::string>>();
 
     /// Background pool garbage collector, present only on the disk-factory path (context non-null).
     ContentAddressedGCThreadPtr gc_thread;
