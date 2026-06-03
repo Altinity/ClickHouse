@@ -212,6 +212,28 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
         // Part dir exists iff its ref is present.
         return readRefPartId(p->table_uuid, p->part_name).has_value();
     }
+    // A single detached part DIRECTORY <uuid[:3]>/<uuid>/detached/<detached_part>: its files do not
+    // live as their own ref — they are re-keyed inside the shared "detached" ref's manifest (and the
+    // per-ref sidecar) as <detached_part>/<file> (B36). The directory exists iff that shared ref carries
+    // at least one key with prefix <detached_part>/. MergeTreeData::getDiskForDetachedPart relies on this
+    // to locate a detached part for ATTACH PART.
+    if (auto p = ContentAddressed::parsePartFilePath(path);
+        p && p->part_name == ContentAddressed::kDetachedDirName && !p->file.empty() && p->file.find('/') == std::string::npos)
+    {
+        const std::string prefix = p->file + "/";
+        if (auto pid = readRefPartId(p->table_uuid, p->part_name))
+        {
+            auto manifest = loadPartManifestOrThrow(*pid);
+            for (const auto & [file, _] : manifest.blobs)
+                if (file.starts_with(prefix))
+                    return true;
+        }
+        if (auto sidecar = readRefSidecarIfExists(p->table_uuid, p->part_name))
+            for (const auto & [file, _] : sidecar->files)
+                if (file.starts_with(prefix))
+                    return true;
+        return false;
+    }
     return false;
 }
 
@@ -379,6 +401,34 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
             for (const auto & [file, _] : sidecar->files)
                 result.push_back(file);
         return result;
+    }
+
+    // A single detached part DIRECTORY <uuid[:3]>/<uuid>/detached/<detached_part>: this is NOT a part of
+    // its own (no ref named <detached_part>) — its files are re-keyed inside the shared "detached" ref's
+    // manifest (and the per-ref sidecar) as <detached_part>/<file> (B36). List the detached part's
+    // complete inner file set exactly as an active part dir lists its files: load the shared "detached"
+    // ref, then for every key shaped <detached_part>/<inner> strip the <detached_part>/ prefix and emit
+    // <inner>. Overlay the per-ref sidecar the same way so the mutable per-part files (e.g.
+    // metadata_version.txt) appear too. A whole-part clone of a detached source (ATTACH PARTITION /
+    // ATTACH PART) enumerates this dir; returning the inner files (not the <detached_part>/<inner> keys,
+    // not empty) is what makes the clone's manifest complete (B-Task W2).
+    if (auto p = ContentAddressed::parsePartFilePath(path);
+        p && p->part_name == ContentAddressed::kDetachedDirName && !p->file.empty() && p->file.find('/') == std::string::npos)
+    {
+        const std::string prefix = p->file + "/";
+        std::unordered_set<std::string> result;
+        if (auto pid = readRefPartId(p->table_uuid, p->part_name))
+        {
+            auto manifest = loadPartManifestOrThrow(*pid);
+            for (const auto & [file, _] : manifest.blobs)
+                if (file.starts_with(prefix))
+                    result.emplace(file.substr(prefix.size()));
+        }
+        if (auto sidecar = readRefSidecarIfExists(p->table_uuid, p->part_name))
+            for (const auto & [file, _] : sidecar->files)
+                if (file.starts_with(prefix))
+                    result.emplace(file.substr(prefix.size()));
+        return std::vector<std::string>(std::make_move_iterator(result.begin()), std::make_move_iterator(result.end()));
     }
 
     // Root or unrecognized path.

@@ -821,6 +821,71 @@ TEST_F(ContentAddressedMetaTest, MoveCommittedPartIntoDetachedRekeysRef)
     EXPECT_EQ(readObject(os, objs[0].remote_path), "DATA");
 }
 
+// B-Task W2: listing/existence of a SINGLE detached part DIRECTORY (detached/<detached_part>). Its files
+// are re-keyed inside the shared "detached" ref's manifest (and per-ref sidecar) as <detached_part>/<file>
+// (B36), so the dir is NOT a ref of its own. listDirectory on it must return the detached part's COMPLETE
+// inner file set — the <inner> names (NOT the <detached_part>/<inner> keys, NOT empty), including the
+// mutable sidecar file — exactly as an active part dir lists its files. Before the fix the part-dir branch
+// was gated on file.empty() and fell through to {}, producing an incomplete clone manifest (no ref for
+// .../primary.idx|data.cmrk4) on ATTACH PARTITION / ATTACH PART of a detached source, and existsDirectory
+// returned false so getDiskForDetachedPart threw BAD_DATA_PART_NAME.
+TEST_F(ContentAddressedMetaTest, ListDetachedPartDirReturnsInnerFiles)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_detlist");
+    auto os = getObjectStorage("cas_detlist");
+    const std::string uuid = "uuid-detlist";
+
+    // Commit an active part with several content files + a mutable per-part file, then move it into
+    // detached/<part> so it goes through the real re-keying path (republishCommittedPartIntoDetached).
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        for (const auto & [name, bytes] : std::map<std::string, std::string>{
+                 {"a.bin", "AAA"},
+                 {"primary.idx", "IDX"},
+                 {"data.cmrk4", "MRK"},
+                 {"columns.txt", "cols"},
+                 {"metadata_version.txt", "0"}})
+        {
+            auto buf = tx.writeFile("uui/" + uuid + "/all_1_2_1/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    }
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.moveDirectory("uui/" + uuid + "/all_1_2_1", "uui/" + uuid + "/detached/all_1_2_1");
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    const std::string detached_part = "uui/" + uuid + "/detached/all_1_2_1";
+
+    // The single detached part dir lists its COMPLETE inner file set: content blobs (incl. primary.idx /
+    // data.cmrk4) AND the mutable per-part sidecar file (metadata_version.txt) — as <inner> names only.
+    auto names = ms->listDirectory(detached_part);
+    std::set<std::string> got(names.begin(), names.end());
+    EXPECT_EQ(
+        got,
+        (std::set<std::string>{"a.bin", "primary.idx", "data.cmrk4", "columns.txt", "metadata_version.txt"}));
+
+    // existsDirectory is true for the single detached part dir.
+    EXPECT_TRUE(ms->existsDirectory(detached_part));
+
+    // iterateDirectory mirrors listDirectory (path-prefixed child names).
+    std::set<std::string> iter_names;
+    for (auto it = ms->iterateDirectory(detached_part); it->isValid(); it->next())
+        iter_names.insert(it->name());
+    EXPECT_EQ(
+        iter_names,
+        (std::set<std::string>{"a.bin", "primary.idx", "data.cmrk4", "columns.txt", "metadata_version.txt"}));
+
+    // The CONTAINER detached/ still lists the part-DIRECTORY name, not the inner files (unbroken).
+    auto container = ms->listDirectory("uui/" + uuid + "/detached");
+    std::set<std::string> container_got(container.begin(), container.end());
+    EXPECT_EQ(container_got, (std::set<std::string>{"all_1_2_1"}));
+}
+
 // B23 Task 2 (collision regression): two parts with IDENTICAL column content but DIFFERENT mutable
 // per-part files (uuid.txt / txn_version.txt). They MUST still dedup to the same part_id / manifest,
 // but each MUST keep its own per-ref .meta sidecar, so resolving a mutable file returns that part's
