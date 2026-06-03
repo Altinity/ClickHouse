@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Codec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolCoordination.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 
@@ -69,47 +70,56 @@ void claimPoolOwnership(
 {
     const std::string key = poolMetaKey(key_prefix);
 
-    auto write_marker = [&]
+    /// Register THIS mounter in the per-mounter registry so the live set is listable from the bucket
+    /// (the bucket is the single source of truth) — needed for the multi-mounter milestone. Idempotent:
+    /// a re-mount loses the CAS (false), which is fine. This does NOT gate ownership; the single-owner
+    /// check below is unchanged. Done first so even a fail-closed mount leaves a record it was attempted.
+    auto register_mounter = [&]
     {
-        PoolMeta meta;
-        meta.version = PoolMeta::CURRENT_VERSION;
-        meta.owner_server_id = server_id;
-        meta.claimed_at_unix = static_cast<int64_t>(std::time(nullptr));
-        const std::string bytes = meta.serialize();
-        auto out = object_storage->writeObject(StoredObject(key), WriteMode::Rewrite);
-        out->write(bytes.data(), bytes.size());
-        out->finalize();
+        PoolMeta marker;
+        marker.version = PoolMeta::CURRENT_VERSION;
+        marker.owner_server_id = server_id;
+        marker.claimed_at_unix = static_cast<int64_t>(std::time(nullptr));
+        condCreateIfAbsent(*object_storage, poolMounterKey(key_prefix, server_id), marker.serialize());
     };
 
-    if (!object_storage->tryGetObjectMetadata(key, /*with_tags=*/false))
+    PoolMeta meta;
+    meta.version = PoolMeta::CURRENT_VERSION;
+    meta.owner_server_id = server_id;
+    meta.claimed_at_unix = static_cast<int64_t>(std::time(nullptr));
+
+    /// Absent -> claim, ATOMICALLY. `condCreateIfAbsent` is the compare-and-set: exactly one of two
+    /// truly-concurrent first-mounters can create the marker (B51 — the old read-then-write let both
+    /// see "absent" and both claim). If we created it we are the first owner — done.
+    if (condCreateIfAbsent(*object_storage, key, meta.serialize()))
     {
-        /// Absent -> claim. Single-process-correct: there is no compare-and-set here (that is B32);
-        /// two truly concurrent first-mounters could both claim, which is exactly the case the full
-        /// lease protocol closes. For M1 single-owner pools this is sound.
-        LOG_INFO(log, "ContentAddressed: claiming pool ownership at '{}' for server '{}'", key, server_id);
-        write_marker();
+        LOG_INFO(log, "ContentAddressed: claimed pool ownership at '{}' for server '{}'", key, server_id);
+        register_mounter();
         return;
     }
 
+    /// The CAS was lost: the marker already existed (a prior mount of ours, or another mounter that won
+    /// the concurrent claim). Read it and apply the EXISTING single-owner compatibility rules unchanged.
     StoredObject object(key);
     auto buf = object_storage->readObject(object, getReadSettings(), /*read_hint=*/std::nullopt);
     String content;
     readStringUntilEOF(content, *buf);
 
-    const PoolMeta meta = PoolMeta::deserialize(content);
+    const PoolMeta existing = PoolMeta::deserialize(content);
 
-    if (meta.version != PoolMeta::CURRENT_VERSION)
+    if (existing.version != PoolMeta::CURRENT_VERSION)
         throw Exception(
             ErrorCodes::SUPPORT_IS_DISABLED,
             "ContentAddressed: pool at '{}' was written with format version {} which this build does not "
             "understand (supported version {}); refusing to mount to avoid misinterpreting the pool",
-            key, meta.version, PoolMeta::CURRENT_VERSION);
+            key, existing.version, PoolMeta::CURRENT_VERSION);
 
-    if (meta.owner_server_id == server_id)
+    if (existing.owner_server_id == server_id)
     {
         /// The same server re-mounting its own pool — the normal case (incl. each M6 test run, which
         /// uses a stable server id and a fresh pool). Nothing to do; keep the existing marker.
         LOG_TRACE(log, "ContentAddressed: pool at '{}' already owned by this server '{}'", key, server_id);
+        register_mounter();
         return;
     }
 
@@ -119,7 +129,7 @@ void claimPoolOwnership(
             "ContentAddressed: pool at '{}' is already owned by another mounter (server '{}'); concurrent "
             "multi-mounter use of a content_addressed pool is not supported yet (B11/B32). Set "
             "'content_addressed_allow_shared_pool' on the disk to acknowledge shared/takeover use.",
-            key, meta.owner_server_id);
+            key, existing.owner_server_id);
 
     /// Operator explicitly acknowledged shared/takeover use. Do NOT rewrite the marker (that would
     /// hide the other owner); proceed but log loudly so the unsafe configuration is visible.
@@ -127,7 +137,8 @@ void claimPoolOwnership(
         log,
         "ContentAddressed: pool at '{}' is owned by another server '{}' but 'content_addressed_allow_shared_pool' "
         "is set; proceeding without coordination (unsafe — background GC must stay disabled). Server '{}'.",
-        key, meta.owner_server_id, server_id);
+        key, existing.owner_server_id, server_id);
+    register_mounter();
 }
 
 }

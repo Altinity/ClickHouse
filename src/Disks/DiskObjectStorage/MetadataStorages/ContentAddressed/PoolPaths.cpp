@@ -94,6 +94,16 @@ std::string poolMetaKey(const std::string & key_prefix)
     return withPrefix(key_prefix, "_pool_meta");
 }
 
+std::string poolMountersPrefix(const std::string & key_prefix)
+{
+    return withPrefix(key_prefix, "_pool_meta.mounters/");
+}
+
+std::string poolMounterKey(const std::string & key_prefix, const std::string & server_id)
+{
+    return poolMountersPrefix(key_prefix) + server_id;
+}
+
 std::string diskFileKey(const std::string & key_prefix, const std::string & path)
 {
     /// Verbatim: the raw disk-relative path joined under the object-storage common key prefix with

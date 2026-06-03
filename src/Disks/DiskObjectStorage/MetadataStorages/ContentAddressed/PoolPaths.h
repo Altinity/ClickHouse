@@ -75,6 +75,16 @@ std::string tableFileKey(const std::string & key_prefix, const std::string & ser
 // timestamp). Read/validated on mount to fail closed on an un-owned/second-mounter pool (B11).
 std::string poolMetaKey(const std::string & key_prefix);
 
+// Per-mounter registry. Each live mounter registers itself by creating one small marker object under
+// the mounters prefix, so the full set of mounters is listable from the bucket alone (the bucket is
+// the single source of truth) — needed for the multi-mounter milestone. The registry lives UNDER the
+// `_pool_meta.mounters/` prefix so it shares the pool-meta namespace but is a distinct keyspace from
+// the single `_pool_meta` ownership marker (one is a key, the other a prefix; they never collide).
+//   - poolMountersPrefix: <key_prefix>/_pool_meta.mounters/  (list this to enumerate mounters)
+//   - poolMounterKey:      <key_prefix>/_pool_meta.mounters/<server_id>  (one per live mounter)
+std::string poolMountersPrefix(const std::string & key_prefix);
+std::string poolMounterKey(const std::string & key_prefix, const std::string & server_id);
+
 // Verbatim object key for a generic disk-level file: a path that is neither a part file nor a
 // table-level file (e.g. the server's startup access-check probe clickhouse_access_check_<uuid>
 // written at the disk root). Such files are stored verbatim at <key_prefix>/<path> (no content

@@ -32,6 +32,7 @@
 #include <atomic>
 #include <filesystem>
 #include <mutex>
+#include <set>
 #include <system_error>
 #include <thread>
 #include <unordered_map>
@@ -1987,6 +1988,48 @@ TEST_F(ContentAddressedMetaTest, PoolMetaUnknownVersionFailsClosed)
     EXPECT_THROW(
         DB::ContentAddressed::claimPoolOwnership(os, prefix, "server-one", /*allow_shared=*/false, getLogger("test")),
         DB::Exception);
+}
+
+// B51: the absent->claim step is now an atomic compare-and-set (condCreateIfAbsent), not a
+// read-then-write. Against ONE shared object storage, two first-mounters race: exactly one creates
+// the marker and wins; the other loses the CAS, reads the surviving marker, and (allow_shared=false)
+// fails closed. The old read-then-write would let the second see "absent" too and co-claim/overwrite.
+TEST_F(ContentAddressedMetaTest, PoolMetaConcurrentClaimResolvesViaCAS)
+{
+    const std::string prefix = "cas_pool_concurrent";
+    auto os = getObjectStorage(prefix);
+
+    // "server-a" claims first (creates the marker via CAS).
+    DB::ContentAddressed::claimPoolOwnership(os, prefix, "server-a", /*allow_shared=*/false, getLogger("test"));
+    // "server-b" loses the CAS, reads the existing marker, and fails closed.
+    EXPECT_THROW(
+        DB::ContentAddressed::claimPoolOwnership(os, prefix, "server-b", /*allow_shared=*/false, getLogger("test")),
+        DB::Exception);
+
+    // The surviving marker names the first claimant — the second never overwrote/co-claimed it.
+    EXPECT_EQ(PoolMeta::deserialize(readObject(os, poolMetaKey(prefix))).owner_server_id, "server-a");
+}
+
+// The per-mounter registry: every mounter registers itself under poolMountersPrefix, so the live set
+// is listable from the bucket alone. With allow_shared=true, "server-a" and "server-b" both register;
+// listing the mounters prefix returns both server ids (needed for the multi-mounter milestone).
+TEST_F(ContentAddressedMetaTest, PoolMounterRegistryListsAllMounters)
+{
+    const std::string prefix = "cas_pool_registry";
+    auto os = getObjectStorage(prefix);
+
+    DB::ContentAddressed::claimPoolOwnership(os, prefix, "server-a", /*allow_shared=*/false, getLogger("test"));
+    DB::ContentAddressed::claimPoolOwnership(os, prefix, "server-b", /*allow_shared=*/true, getLogger("test"));
+
+    DB::RelativePathsWithMetadata listed;
+    os->listObjects(DB::ContentAddressed::poolMountersPrefix(prefix), listed, /*max_keys=*/0);
+
+    std::set<std::string> ids;
+    for (const auto & e : listed)
+        ids.insert(e->relative_path.substr(e->relative_path.find_last_of('/') + 1));
+
+    EXPECT_TRUE(ids.contains("server-a")) << "server-a not registered";
+    EXPECT_TRUE(ids.contains("server-b")) << "server-b not registered";
 }
 
 // M7 T1: a mutation rewrites ONE column and carries the rest forward by reference — the new part's
