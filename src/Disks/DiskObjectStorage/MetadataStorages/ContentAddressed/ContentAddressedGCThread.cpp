@@ -22,12 +22,16 @@ namespace
 constexpr int64_t DEFAULT_GC_INTERVAL_SEC = 600;
 constexpr int64_t DEFAULT_GC_GRACE_SEC = 3600;
 
-/// Monotonic wall-clock-independent seconds. The grace timer in ContentAddressedGC measures the
-/// duration an object has stayed unreferenced across sweeps; a steady clock makes that immune to
-/// system clock jumps.
-int64_t monotonicSeconds()
+/// Wall-clock (Unix) seconds. The sweep's `now` is fed to BOTH the in-process grace timer AND the
+/// cross-process leases (write-session `lease_deadline_unix`, the `gc.lock` lease). Those leases are
+/// written by other processes/servers, so the clock MUST be a shared wall-clock domain — a per-process
+/// steady_clock is not comparable across mounters (and its epoch ≈ uptime would make every wall-clock
+/// `lease_deadline_unix` look perpetually live, so a crashed writer's session pins would never expire).
+/// The grace timer is a duration comparison, so wall-clock is fine for it too; `first_unreachable` is
+/// in-memory (reset on restart), so a clock jump only shifts one grace window, never corrupts state.
+int64_t wallClockSeconds()
 {
-    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
 }
@@ -68,10 +72,10 @@ void ContentAddressedGCThread::run()
     /// modest, generous lease is fine. Clamp to >= 1 so an interval of 0 (tests) still yields a live lease.
     const uint64_t lease_seconds = static_cast<uint64_t>(std::max<int64_t>(1, std::max(grace, interval * 4)));
 
-    /// One consistent clock for BOTH the sweep timers and the lock-lease comparisons: the existing
-    /// monotonic seconds the thread already feeds to runSweepOnce. Reusing it keeps the lease deadlines
+    /// One consistent WALL-CLOCK domain for BOTH the sweep timers and the cross-process lease
+    /// comparisons (write-session pins + the gc.lock lease are written by other servers). Reusing it keeps the lease deadlines
     /// this thread writes and re-reads coherent across rounds (steady, immune to wall-clock jumps).
-    const int64_t now = monotonicSeconds();
+    const int64_t now = wallClockSeconds();
     const auto now_unix = static_cast<uint64_t>(std::max<int64_t>(0, now));
 
     try
