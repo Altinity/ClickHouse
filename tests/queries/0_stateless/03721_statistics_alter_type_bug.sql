@@ -1,4 +1,4 @@
--- Tags: no-fasttest, no-content-addressed-storage
+-- Tags: no-fasttest
 
 DROP TABLE IF EXISTS column_modify_test;
 set use_statistics=1;

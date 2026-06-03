@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- Regression test: lightweight update values must NOT be silently dropped
 -- when a pending ALTER MODIFY COLUMN changes the column type.
 -- A naive fix that skips mismatched-type patches causes data loss:

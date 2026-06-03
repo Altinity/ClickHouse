@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Tags: no-content-addressed-storage
 # Tag no-content-addressed-storage: relies on ALTER ... MODIFY COLUMN (a data ALTER), which is gated
 # off on an immutable content_addressed disk, so the downstream rows diverge from the reference.
 

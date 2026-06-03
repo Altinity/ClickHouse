@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-shared-merge-tree, no-content-addressed-storage
+# Tags: no-shared-merge-tree
 # Tag no-shared-merge-tree: depend on events with local disk
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

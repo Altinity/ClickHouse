@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t0;
 CREATE TABLE t0 (c0 Bool) ENGINE = MergeTree() ORDER BY tuple() PARTITION BY (c0);
 INSERT INTO TABLE t0 (c0) VALUES (FALSE), (TRUE);

@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS prop_table;
 
 CREATE TABLE prop_table

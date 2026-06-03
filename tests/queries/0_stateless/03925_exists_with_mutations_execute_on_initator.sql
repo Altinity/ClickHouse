@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_mutations_nondeterministic;
 
 SET mutations_execute_subqueries_on_initiator = 1;

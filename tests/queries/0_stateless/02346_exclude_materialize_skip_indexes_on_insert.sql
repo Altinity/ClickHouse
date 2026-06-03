@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- add_minmax_index_for_numeric_columns=0: Changes the plan and rows read
 SET parallel_replicas_local_plan = 1; -- this setting may skip index analysis when false
 SET use_skip_indexes_on_data_read = 0;

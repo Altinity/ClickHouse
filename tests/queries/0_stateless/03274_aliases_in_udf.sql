@@ -1,4 +1,4 @@
--- Tags: no-parallel, no-content-addressed-storage
+-- Tags: no-parallel
 
 SET enable_analyzer = 1;
 SET skip_redundant_aliases_in_udf = 0;

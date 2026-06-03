@@ -1,4 +1,4 @@
--- Tags: no-parallel-replicas, no-content-addressed-storage
+-- Tags: no-parallel-replicas
 -- no-parallel-replicas: Different plan
 -- Implicit indices should not prevent any ALTERs, even if `alter_column_secondary_index_mode` is set to 'throw'
 

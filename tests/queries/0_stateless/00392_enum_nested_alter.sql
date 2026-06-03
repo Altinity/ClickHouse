@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS enum_nested_alter;
 set allow_deprecated_syntax_for_merge_tree=1;
 CREATE TABLE enum_nested_alter

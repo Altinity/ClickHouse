@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 SET enable_lightweight_update=1;
 
 DROP TABLE IF EXISTS lwu_on_fly;

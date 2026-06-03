@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- Testing basic functionality with compact parts
 set mutations_sync = 2;
 drop table if exists mt_compact;

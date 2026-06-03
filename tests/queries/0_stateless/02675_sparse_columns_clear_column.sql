@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_sparse_columns_clear;
 
 CREATE TABLE t_sparse_columns_clear (arr Array(UInt64), v UInt64)

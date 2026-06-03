@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS table_02513;
 
 CREATE TABLE table_02513 (n UInt64) ENGINE=MergeTree() ORDER BY tuple() SETTINGS index_granularity=100;

@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 set allow_suspicious_low_cardinality_types = 1;
 drop table if exists tab_00718;
 create table tab_00718 (a String, b LowCardinality(UInt32)) engine = MergeTree order by a;

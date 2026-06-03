@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS tab;
 
 -- Tests vertical merges for columns with text index

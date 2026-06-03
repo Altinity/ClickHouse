@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS test_wide_nested;
 
 CREATE TABLE test_wide_nested

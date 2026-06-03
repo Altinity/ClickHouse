@@ -1,4 +1,4 @@
--- Tags: no-parallel, no-content-addressed-storage
+-- Tags: no-parallel
 
 DROP TABLE IF EXISTS table_for_ttl;
 

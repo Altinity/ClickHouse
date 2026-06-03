@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS mutation_table;
 
 CREATE TABLE mutation_table

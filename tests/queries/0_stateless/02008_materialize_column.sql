@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS tmp;
 
 SET mutations_sync = 2;

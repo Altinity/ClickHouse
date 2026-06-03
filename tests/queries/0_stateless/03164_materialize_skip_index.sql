@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- add_minmax_index_for_numeric_columns=0: Changes the plan FOR b
 DROP TABLE IF EXISTS t_skip_index_insert;
 

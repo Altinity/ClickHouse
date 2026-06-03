@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_lwu_drop_column;
 
 CREATE TABLE t_lwu_drop_column

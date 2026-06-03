@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS crash_02919;
 
 CREATE TABLE crash_02919 (

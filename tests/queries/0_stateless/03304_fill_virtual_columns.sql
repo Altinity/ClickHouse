@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS test_virtual_columns;
 
 -- { echoOn }

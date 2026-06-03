@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 drop table if exists cdp_segments;
 drop table if exists cdp_customers;
 

@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS simple_agf_summing_mt;
 
 CREATE TABLE simple_agf_summing_mt

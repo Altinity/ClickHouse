@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_sparse_mutation;
 
 CREATE TABLE t_sparse_mutation (id UInt64, v UInt64)

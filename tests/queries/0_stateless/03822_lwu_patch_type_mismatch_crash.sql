@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_lwu_patch_type_crash SYNC;
 SET enable_lightweight_update = 1;
 

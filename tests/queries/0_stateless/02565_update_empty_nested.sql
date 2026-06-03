@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_update_empty_nested;
 
 CREATE TABLE t_update_empty_nested

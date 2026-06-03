@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_modify_to_nullable;
 
 CREATE TABLE t_modify_to_nullable (key UInt64, id UInt64, s String)

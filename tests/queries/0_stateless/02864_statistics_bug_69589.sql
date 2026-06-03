@@ -1,4 +1,4 @@
--- Tags: no-fasttest, no-content-addressed-storage
+-- Tags: no-fasttest
 -- no-fasttest: 'countmin' sketches need a 3rd party library
 
 SET allow_statistics = 1;

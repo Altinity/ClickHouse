@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_lwu_defaults;
 DROP TABLE IF EXISTS t_mutation_defaults;
 

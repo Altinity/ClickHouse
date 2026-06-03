@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest, no-replicated-database, no-content-addressed-storage
+# Tags: no-fasttest, no-replicated-database
 # Tag no-fasttest: requires lightweight_delete_mode setting
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

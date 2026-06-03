@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_modify_from_lc_1;
 DROP TABLE IF EXISTS t_modify_from_lc_2;
 

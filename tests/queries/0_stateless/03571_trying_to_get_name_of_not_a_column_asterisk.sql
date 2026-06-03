@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t0;
 CREATE TABLE t0 (c0 Int) ENGINE = MergeTree ORDER BY tuple();
 ALTER TABLE t0 MODIFY COLUMN c0 Int TTL indexHint(*); -- { serverError UNKNOWN_IDENTIFIER }

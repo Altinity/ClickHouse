@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS `03604_test`;
 
 SET allow_experimental_lightweight_update = 1;

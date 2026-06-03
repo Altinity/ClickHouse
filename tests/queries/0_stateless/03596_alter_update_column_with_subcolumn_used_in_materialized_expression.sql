@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 drop table if exists test;
 create table test (t Tuple(a UInt32), a UInt32 materialized t.a) engine=MergeTree() order by tuple();
 insert into test select tuple(1);

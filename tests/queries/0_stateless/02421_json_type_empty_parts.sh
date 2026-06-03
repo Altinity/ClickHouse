@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest, no-content-addressed-storage
+# Tags: no-fasttest
 
 set -euo pipefail
 

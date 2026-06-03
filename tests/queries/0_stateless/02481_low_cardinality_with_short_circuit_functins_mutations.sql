@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 drop table if exists issue_46128;
 
 create table issue_46128 (

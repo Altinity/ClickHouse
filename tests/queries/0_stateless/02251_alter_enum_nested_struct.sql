@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS alter_enum_array;
 
 CREATE TABLE alter_enum_array(

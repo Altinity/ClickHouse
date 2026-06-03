@@ -1,4 +1,4 @@
--- Tags: no-parallel-replicas, no-content-addressed-storage
+-- Tags: no-parallel-replicas
 
 DROP TABLE IF EXISTS t_lwd_indexes;
 

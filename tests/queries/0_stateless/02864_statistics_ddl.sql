@@ -1,4 +1,4 @@
--- Tags: no-fasttest, long, no-content-addressed-storage
+-- Tags: no-fasttest, long
 -- no-fasttest: 'countmin' sketches need a 3rd party library
 
 -- Tests that DDL statements which create / drop / materialize statistics

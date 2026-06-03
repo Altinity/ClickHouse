@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- Some tests for lightweight deleted on a column with text index
 
 DROP TABLE IF EXISTS tab;

@@ -1,4 +1,4 @@
--- Tags: no-fasttest, long, no-asan, no-ubsan, no-msan, no-tsan, no-debug, no-content-addressed-storage
+-- Tags: no-fasttest, long, no-asan, no-ubsan, no-msan, no-tsan, no-debug
 -- Test for Bug 78161
 
 SET enable_analyzer = 1;

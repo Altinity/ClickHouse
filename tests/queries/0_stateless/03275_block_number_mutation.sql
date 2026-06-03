@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_block_number_delete sync;
 
 SET mutations_sync = 2;

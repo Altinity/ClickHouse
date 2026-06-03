@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 CREATE TABLE kv
 (
     `key` UInt64,

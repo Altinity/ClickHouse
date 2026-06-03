@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS non_metadata_alters;
 
 CREATE TABLE non_metadata_alters (

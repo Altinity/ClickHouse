@@ -1,4 +1,4 @@
--- Tags: long, no-content-addressed-storage
+-- Tags: long
 
 set mutations_sync=1;
 

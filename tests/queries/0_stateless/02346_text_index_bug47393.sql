@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- Test for Bug 47393
 
 DROP TABLE IF EXISTS tab;

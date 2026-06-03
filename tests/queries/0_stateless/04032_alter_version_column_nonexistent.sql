@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- Regression test: special MergeTree columns (version, sign, is_deleted) must not
 -- be changed to EPHEMERAL or ALIAS. Previously, making the version column EPHEMERAL
 -- removed it from physical columns, causing a null pointer dereference (UBSan) on

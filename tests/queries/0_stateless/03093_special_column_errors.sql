@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 CREATE TABLE replacing_wrong (key Int64, ver Int64, is_deleted UInt16) ENGINE = ReplacingMergeTree(ver, is_deleted) ORDER BY key; -- { serverError BAD_TYPE_OF_FIELD }
 CREATE TABLE replacing_wrong (key Int64, ver String, is_deleted UInt8) ENGINE = ReplacingMergeTree(ver, is_deleted) ORDER BY key; -- { serverError BAD_TYPE_OF_FIELD }
 CREATE TABLE replacing_wrong (key Int64, ver Int64, is_deleted UInt8) ENGINE = ReplacingMergeTree(is_deleted, is_deleted) ORDER BY key; -- { serverError BAD_ARGUMENTS }

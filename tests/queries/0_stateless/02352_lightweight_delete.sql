@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS lwd_test;
 
 CREATE TABLE lwd_test (id UInt64 , value String) ENGINE MergeTree() ORDER BY id SETTINGS index_granularity=8192, index_granularity_bytes='10Mi';

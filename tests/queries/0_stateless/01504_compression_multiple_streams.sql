@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS columns_with_multiple_streams;
 
 SET mutations_sync = 2;

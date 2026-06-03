@@ -1,4 +1,4 @@
--- Tags: no-parallel-replicas, no-content-addressed-storage
+-- Tags: no-parallel-replicas
 -- add_minmax_index_for_numeric_columns=0: We are checking the size of secondary indices and we want to check only manually created indices
 
 SET enable_analyzer = 1;

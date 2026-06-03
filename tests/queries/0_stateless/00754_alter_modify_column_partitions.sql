@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- check ALTER MODIFY COLUMN with partitions
 
 SET send_logs_level = 'fatal';

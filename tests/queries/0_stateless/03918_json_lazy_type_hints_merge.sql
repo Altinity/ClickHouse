@@ -1,4 +1,4 @@
--- Tags: no-fasttest, no-random-settings, no-content-addressed-storage
+-- Tags: no-fasttest, no-random-settings
 
 SET enable_json_type = 1;
 SET allow_suspicious_types_in_order_by = 1;

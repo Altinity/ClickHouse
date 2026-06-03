@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- Test the `table_readonly` MergeTree setting.
 
 DROP TABLE IF EXISTS t_readonly;

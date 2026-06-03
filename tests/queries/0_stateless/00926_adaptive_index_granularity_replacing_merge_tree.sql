@@ -1,4 +1,4 @@
--- Tags: no-random-merge-tree-settings, no-content-addressed-storage
+-- Tags: no-random-merge-tree-settings
 
 ----- Group of very similar simple tests ------
 DROP TABLE IF EXISTS zero_rows_per_granule;

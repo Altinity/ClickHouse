@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_lightweight_mut_5;
 
 SET apply_mutations_on_fly = 1;

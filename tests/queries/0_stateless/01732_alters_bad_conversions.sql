@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS bad_conversions;
 DROP TABLE IF EXISTS bad_conversions_2;
 

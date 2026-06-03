@@ -1,4 +1,4 @@
--- Tags: no-msan, no-content-addressed-storage
+-- Tags: no-msan
 -- (because the INSERT with 300k rows sometimes takes >5 minutes in msan build, I didn't investigate why)
 
 SET send_logs_level = 'fatal';

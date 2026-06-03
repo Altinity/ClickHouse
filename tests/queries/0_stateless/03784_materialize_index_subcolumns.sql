@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_index;
 
 CREATE TABLE t_index (data JSON(a UInt64)) ENGINE = MergeTree ORDER BY tuple();

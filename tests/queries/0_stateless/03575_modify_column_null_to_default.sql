@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS nullable_test;
 
 CREATE TABLE nullable_test(

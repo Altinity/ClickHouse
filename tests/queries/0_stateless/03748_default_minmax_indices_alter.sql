@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- { echoOn }
 DROP TABLE IF EXISTS t_implicit;
 

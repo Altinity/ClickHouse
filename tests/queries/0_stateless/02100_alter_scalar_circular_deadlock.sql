@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS foo;
 
 CREATE TABLE foo (ts DateTime, x UInt64)

@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS lwd_test;
 
 SET enable_lightweight_update = 1;

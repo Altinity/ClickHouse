@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS compress_table;
 
 CREATE TABLE compress_table

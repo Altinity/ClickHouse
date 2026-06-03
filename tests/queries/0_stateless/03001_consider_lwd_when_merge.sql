@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS lwd_merge;
 
 CREATE TABLE lwd_merge (id UInt64 CODEC(NONE))

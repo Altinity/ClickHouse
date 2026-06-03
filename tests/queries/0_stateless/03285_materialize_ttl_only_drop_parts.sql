@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS test_03285_mat_ttl;
 
 CREATE TABLE test_03285_mat_ttl (id UInt64, value String, event_time DateTime)

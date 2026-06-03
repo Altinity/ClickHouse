@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 -- Random settings limits: index_granularity=(100, None)
 
 set allow_experimental_dynamic_type=1;

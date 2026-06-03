@@ -1,4 +1,4 @@
--- Tags: no-replicated-database, no-content-addressed-storage
+-- Tags: no-replicated-database
 -- Test that mutations work correctly with the new analyzer path.
 
 SET allow_experimental_analyzer = 1;

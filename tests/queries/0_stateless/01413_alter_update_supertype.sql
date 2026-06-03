@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t;
 CREATE TABLE t (x UInt64) ENGINE = MergeTree ORDER BY tuple();
 INSERT INTO t SELECT number FROM numbers(10);

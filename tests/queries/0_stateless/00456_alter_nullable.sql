@@ -1,4 +1,3 @@
--- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS nullable_alter;
 
 set allow_deprecated_syntax_for_merge_tree=1;
