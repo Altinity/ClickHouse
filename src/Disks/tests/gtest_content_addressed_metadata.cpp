@@ -28,10 +28,13 @@
 #include <Poco/AutoPtr.h>
 #include <Poco/Util/XMLConfiguration.h>
 
+#include <atomic>
 #include <filesystem>
 #include <mutex>
 #include <system_error>
+#include <thread>
 #include <unordered_map>
+#include <vector>
 
 using namespace DB::ContentAddressed;
 
@@ -533,6 +536,66 @@ TEST_F(ContentAddressedMetaTest, WriteNonAtomicPartViaTmpRenameThenReadBack)
         tx.commit(DB::NoCommitOptions{});
     }
     EXPECT_FALSE(ms->existsDirectory(table));
+}
+
+// B41 (concurrent-blob race): two writers racing the SAME content hash must BOTH succeed — neither
+// may observe a partially-written (size-0 / short) blob at the final key and fail closed with
+// CORRUPTED_DATA. LocalObjectStorage writes objects in place, so before the temp+atomic-rename fix a
+// second writer could see the first's half-written object. Drive many concurrent ContentAddressedWrite
+// Buffers writing identical bytes to the same blob key and assert all finalize cleanly and the blob is
+// correct. This mirrors a parallel INSERT that produces identical content (00276_sample,
+// 01825_json_type_parallel_insert).
+TEST_F(ContentAddressedMetaTest, ConcurrentIdenticalBlobWritesAreAtomic)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_concurrent");
+    auto os = getObjectStorage("cas_concurrent");
+
+    // Large enough that the in-place copy is not instantaneous, so a racing reader has a real window.
+    const std::string payload(2 * 1024 * 1024, 'x');
+    constexpr size_t kThreads = 16;
+
+    std::atomic<size_t> failures = 0;
+    std::mutex hash_mutex;
+    std::string observed_hash;
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (size_t i = 0; i < kThreads; ++i)
+    {
+        threads.emplace_back([&]
+        {
+            try
+            {
+                ContentAddressedWriteBuffer buf(os, /*key_prefix=*/"", kCasTestScratch);
+                buf.write(payload.data(), payload.size());
+                buf.finalize();
+                std::lock_guard lock(hash_mutex);
+                observed_hash = buf.getBlobHash();
+            }
+            catch (...)
+            {
+                failures.fetch_add(1);
+            }
+        });
+    }
+    for (auto & t : threads)
+        t.join();
+
+    EXPECT_EQ(failures.load(), 0u);
+    ASSERT_FALSE(observed_hash.empty());
+
+    // All writers deduplicate to ONE blob key that holds exactly the written content.
+    const std::string blob_key = blobKey("", BlobHash(observed_hash)).string();
+    auto meta = os->tryGetObjectMetadata(blob_key, /*with_tags=*/false);
+    ASSERT_TRUE(meta.has_value());
+    EXPECT_EQ(meta->size_bytes, payload.size());
+    EXPECT_EQ(readObject(os, blob_key), payload);
+
+    // No temporary publish objects leaked next to the final blob.
+    DB::RelativePathsWithMetadata listed;
+    os->listObjects(blobsPrefix(""), listed, /*max_keys=*/0);
+    for (const auto & e : listed)
+        EXPECT_EQ(e->relative_path.find(".tmp."), std::string::npos) << e->relative_path;
 }
 
 // B40 (table rename): RENAME TABLE / a cross-engine table move renames the whole table data dir via

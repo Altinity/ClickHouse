@@ -60,6 +60,12 @@ private:
     void finalizeImpl() override;
     void removeTempFile() noexcept;
 
+    /// Publish the spilled temp file to the final content-hash blob key so a concurrent reader/writer
+    /// never observes a partially-written object (B41). For the local backend (in-place writes) this
+    /// uploads to a unique temp object key in the same directory and atomically renames it onto the
+    /// final key; for an atomic-PUT backend (S3/Azure) it uploads the final key in one shot.
+    void uploadBlobAtomically(const std::string & key);
+
     ObjectStoragePtr object_storage;
     std::string key_prefix;
     std::string temp_path;

@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartManifest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PoolPaths.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
+#include <Disks/DiskType.h>
 #include <Disks/WriteMode.h>
 
 #include <Common/Exception.h>
@@ -667,6 +668,49 @@ void ContentAddressedWriteBuffer::nextImpl()
     hashing->write(working_buffer.begin(), offset());
 }
 
+void ContentAddressedWriteBuffer::uploadBlobAtomically(const std::string & key)
+{
+    /// Publish the blob so a concurrent reader/writer NEVER observes a partially-written object at the
+    /// final content-hash key (B41). LocalObjectStorage writes objects IN PLACE (no temp+rename), so a
+    /// plain writeObject(key) followed by a streaming copy is visible at `key` while it is still being
+    /// filled — a second writer racing the same content hash then sees a size-0 (or short) object and
+    /// the size-guard above fires `CORRUPTED_DATA` on a perfectly valid concurrent insert. So for the
+    /// local backend we upload to a UNIQUE temp object key in the SAME directory (same filesystem, so
+    /// rename is a cheap metadata op) and then atomically rename it onto the final key — the final key
+    /// only ever appears fully written. For an object storage whose single PUT is already atomic (S3,
+    /// Azure: an object is not visible until the PUT completes) the plain one-shot upload is sufficient.
+    if (object_storage->getType() == ObjectStorageType::Local)
+    {
+        /// For LocalObjectStorage the object "key" IS the on-disk path, so a temp key in the same
+        /// parent directory shares the filesystem and std::filesystem::rename is atomic.
+        const std::string temp_key = key + ".tmp." + getRandomASCIIString(16);
+        {
+            ReadBufferFromFile in(temp_path);
+            auto out = object_storage->writeObject(StoredObject(temp_key), WriteMode::Rewrite);
+            copyData(in, *out);
+            out->finalize();
+        }
+
+        std::error_code ec;
+        fs::rename(temp_key, key, ec);
+        if (ec)
+        {
+            /// Clean up the temp object on failure; the final key is untouched (never partial).
+            object_storage->removeObjectIfExists(StoredObject(temp_key));
+            throw Exception(
+                ErrorCodes::CORRUPTED_DATA,
+                "Failed to atomically publish content-addressed blob {} (rename from {} failed: {})",
+                key, temp_key, ec.message());
+        }
+        return;
+    }
+
+    ReadBufferFromFile in(temp_path);
+    auto out = object_storage->writeObject(StoredObject(key), WriteMode::Rewrite);
+    copyData(in, *out);
+    out->finalize();
+}
+
 void ContentAddressedWriteBuffer::finalizeImpl()
 {
     /// Flush our own buffered data into the hashing buffer first.
@@ -684,15 +728,10 @@ void ContentAddressedWriteBuffer::finalizeImpl()
 
     const std::string key = blobKey(key_prefix, BlobHash(blob_hash)).string();
 
-    /// Skip re-uploading when the blob already exists (content dedup). This is a check-then-write,
-    /// NOT an atomic put-if-absent — safe here because the key IS the content hash: a racing writer
-    /// to the same key writes identical bytes, so the worst case is a redundant upload, never wrong
-    /// content. In single-writer M1 a blob is never read until its part's ref is published at commit
-    /// (after this write completes), so there is no read-during-write. An atomic conditional PUT
-    /// (If-None-Match) and safe multi-writer are deferred (B7/B11). One thing we DO guard now: if an
-    /// object already exists at the key but with a different size, that is either a 128-bit hash
-    /// collision or a partially-written blob from a crashed writer (LocalObjectStorage writes in
-    /// place, no temp+rename) — fail closed rather than silently trust it.
+    /// Skip re-uploading when the blob already exists (content dedup). The key IS the content hash, so
+    /// a racing writer to the same key has identical bytes; the worst case is a redundant upload, never
+    /// wrong content. We DO guard one thing: if an object already exists at the key with a DIFFERENT
+    /// size, that is either a 128-bit hash collision or a genuinely corrupt blob — fail closed.
     auto existing = object_storage->tryGetObjectMetadata(key, /*with_tags=*/false);
     if (existing.has_value())
     {
@@ -705,10 +744,7 @@ void ContentAddressedWriteBuffer::finalizeImpl()
     }
     else
     {
-        ReadBufferFromFile in(temp_path);
-        auto out = object_storage->writeObject(StoredObject(key), WriteMode::Rewrite);
-        copyData(in, *out);
-        out->finalize();
+        uploadBlobAtomically(key);
     }
 
     removeTempFile();
