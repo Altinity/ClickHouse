@@ -427,16 +427,24 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
             return std::vector<std::string>(std::make_move_iterator(dirs.begin()), std::make_move_iterator(dirs.end()));
         }
 
-        std::vector<std::string> result;
-        result.reserve(manifest.blobs.size());
+        /// Collapse nested keys to their first path component so a projection's files (stored as
+        /// <proj>.proj/<file> in this same manifest, Approach A) surface as a SINGLE <proj>.proj
+        /// directory entry rather than a flood of nested files; top-level files (no '/') are emitted
+        /// verbatim. Both projection discovery (iterate() + existsDirectory("<proj>.proj")) and a clean
+        /// top-level column listing depend on this. Overlay the mutable per-part files from the per-ref
+        /// sidecar (they live per-ref, not in the shared manifest) the same way.
+        std::unordered_set<std::string> result;
+        auto add_first_component = [&result](const std::string & file)
+        {
+            const auto slash = file.find('/');
+            result.emplace(slash == std::string::npos ? file : file.substr(0, slash));
+        };
         for (const auto & [file, _] : manifest.blobs)
-            result.push_back(file);
-        /// Overlay the mutable per-part files from the per-ref sidecar (they live per-ref, not in the
-        /// shared manifest), so the part dir lists its full file set just like a normal part.
+            add_first_component(file);
         if (auto sidecar = readRefSidecarIfExists(p->table_uuid, p->part_name))
             for (const auto & [file, _] : sidecar->files)
-                result.push_back(file);
-        return result;
+                add_first_component(file);
+        return std::vector<std::string>(std::make_move_iterator(result.begin()), std::make_move_iterator(result.end()));
     }
 
     // A single detached part DIRECTORY <uuid[:3]>/<uuid>/detached/<detached_part>: this is NOT a part of

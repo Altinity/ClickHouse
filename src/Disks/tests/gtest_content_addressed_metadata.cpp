@@ -3065,3 +3065,31 @@ TEST_F(ContentAddressedMetaTest, ProjectionSubdirListsInnerFiles)
     std::set<std::string> got(inner.begin(), inner.end());
     EXPECT_EQ(got, (std::set<std::string>{"columns.txt", "data.bin", "checksums.txt"}));
 }
+
+// listDirectory("<part>") collapses nested projection keys (<proj>.proj/<file>) to a SINGLE <proj>.proj
+// directory entry, alongside top-level files emitted verbatim. This is what iterate()-based projection
+// discovery expects and keeps the top-level column listing free of nested projection files.
+TEST_F(ContentAddressedMetaTest, PartDirListingCollapsesProjectionToDirEntry)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_proj_collapse");
+    const std::string uuid = "uuid-proj-collapse";
+    const std::string part = "all_1_1_0";
+    const std::string base = "uui/" + uuid + "/" + part + "/";
+
+    DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+    for (const auto & f : {std::string("columns.txt"), std::string("data.bin"),
+                           std::string("p_sum.proj/columns.txt"), std::string("p_sum.proj/data.bin"),
+                           std::string("p_max.proj/data.bin")})
+    {
+        auto buf = tx.writeFile(base + f, 4096, DB::WriteMode::Rewrite, {});
+        const std::string bytes = "x";
+        buf->write(bytes.data(), bytes.size());
+        buf->finalize();
+    }
+    tx.commit(DB::NoCommitOptions{});
+
+    auto names = ms->listDirectory("uui/" + uuid + "/" + part);
+    std::set<std::string> got(names.begin(), names.end());
+    EXPECT_EQ(got, (std::set<std::string>{"columns.txt", "data.bin", "p_sum.proj", "p_max.proj"}));
+}
