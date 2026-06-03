@@ -79,16 +79,8 @@ void ContentAddressedTransaction::recordBlobInSession(const ContentAddressed::Bl
     {
         session_id = metadata_storage.server_id + "-" + getRandomASCIIString(24);
 
-        /// A fixed advisory lease for now: a liveness HINT only. A remote GC treats an EXPIRED session
-        /// as reclaimable so a crashed writer cannot pin blobs forever; the deadline is NEVER the basis
-        /// of a positive "still live" decision (see WriteSession.h).
-        constexpr UInt64 lease_seconds = 300;
-        const UInt64 now_unix = static_cast<UInt64>(
-            std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
-
         session = ContentAddressed::WriteSession{};
         session.server_id = metadata_storage.server_id;
-        session.lease_deadline_unix = now_unix + lease_seconds;
         session.fence_token = 0;
         /// The committed content PartId is only known at commit (it is derived from the full blob set),
         /// so the session identifies the part by the writer's part name — enough for a remote GC to
@@ -98,11 +90,27 @@ void ContentAddressedTransaction::recordBlobInSession(const ContentAddressed::Bl
     }
 
     session.pending.push_back(blob_hash);
+    persistSession();
+}
 
-    /// Per-blob rewrite of the OWNER's uniquely-keyed session object: no CAS needed (no other writer
-    /// touches this key). Rewriting per blob is the simple correct approach; batching the rewrites is a
-    /// future optimization. Persisting BEFORE the blob is uploaded is the whole point — the cross-mounter
-    /// pin must be durable before the blob can be observed by a remote sweep.
+void ContentAddressedTransaction::persistSession()
+{
+    /// RENEW the advisory lease on EVERY rewrite. The lease is a liveness HINT only — a remote GC treats
+    /// an EXPIRED session as reclaimable so a crashed writer cannot pin blobs forever — but it MUST stay
+    /// live while THIS write is making progress. If the deadline were stamped only once at open, a part
+    /// whose write (or commit) outran the lease would expire its OWN session mid-flight; a remote sweep
+    /// would then drop the pin and could reclaim an already-uploaded-but-not-yet-referenced blob before
+    /// the ref is published → a dangling ref / data loss. Advancing the deadline on each rewrite (per
+    /// blob, and again at commit before the ref is published) keeps a live root over every blob this
+    /// part is about to reference, for as long as the writer is alive and progressing.
+    constexpr UInt64 lease_seconds = 300;
+    const UInt64 now_unix = static_cast<UInt64>(
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+    session.lease_deadline_unix = now_unix + lease_seconds;
+
+    /// Rewrite of the OWNER's uniquely-keyed session object: no CAS needed (no other writer touches this
+    /// key). Persisting BEFORE the blob is uploaded is the whole point — the cross-mounter pin must be
+    /// durable before the blob can be observed by a remote sweep.
     const std::string key = ContentAddressed::sessionKey(key_prefix, session_id);
     const std::string bytes = session.serialize();
     auto out = metadata_storage.object_storage->writeObject(StoredObject(key), WriteMode::Rewrite);
@@ -744,6 +752,17 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     /// is then retried and re-uploads the blob. With mutual exclusion the only outcomes are: we publish
     /// first (the sweep's next pass sees the blob reachable and keeps it) or the sweep reclaimed it first
     /// (we throw and retry) — never a published ref to a deleted blob.
+    /// Renew the write-session pin so it is FRESHLY live across the ref publish below (cross-process
+    /// data-loss fix): the per-blob renewals kept it live during the write, but the session must not be
+    /// allowed to lapse before the ref is published. A live session root covers every freshly-written
+    /// blob this part is about to reference; a REMOTE mounter's sweep re-reads sessions in its
+    /// re-validate-under-lock step immediately before deleting, so a live session makes it skip these
+    /// blobs. (Carried-forward blobs are instead covered by their source part's ref.) The in-process
+    /// re-HEAD below is the same-process backstop (B49). Renew before taking the in-process lock since
+    /// this is a bucket write coordinating with OTHER mounters, not the local sweep.
+    if (session_open)
+        persistSession();
+
     std::lock_guard<std::mutex> gc_guard(*metadata_storage.gc_lock);
 
     for (const auto & [file, entry] : manifest.blobs)

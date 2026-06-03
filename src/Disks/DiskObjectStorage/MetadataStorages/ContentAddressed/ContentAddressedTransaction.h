@@ -275,6 +275,12 @@ private:
     // by this transaction at a unique key, so the owner rewrites its OWN object (no CAS needed).
     void recordBlobInSession(const ContentAddressed::BlobHash & blob_hash);
 
+    // M8: persist (and RENEW the lease of) this transaction's WriteSession object. Called per recorded
+    // blob and again at commit before the ref publish, so the advisory lease stays live while this write
+    // is progressing — a stale lease would let a remote sweep drop the pin and reclaim an
+    // about-to-be-referenced blob (cross-process data-loss window).
+    void persistSession();
+
     // M8: best-effort remove this transaction's WriteSession object (after the ref is published, or on
     // destruction of an uncommitted transaction). The ref now keeps the blobs reachable, so the pin is
     // no longer needed; an aborted session would expire by its lease anyway, but clean it up eagerly.
