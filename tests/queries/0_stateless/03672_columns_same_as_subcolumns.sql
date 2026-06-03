@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- https://github.com/ClickHouse/ClickHouse/issues/89599
 DROP TABLE IF EXISTS opentelemetry_span_log_9997438610282160742;
 

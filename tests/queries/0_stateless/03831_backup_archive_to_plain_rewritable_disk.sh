@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest, no-encrypted-storage
+# Tags: no-fasttest, no-encrypted-storage, no-content-addressed-storage
 # Backup with an archive extension to a plain_rewritable disk.
 # The archive format causes root_path to be empty (parent_path of "name.zip"),
 # which previously led to stack overflow during cleanup by traversing the entire disk.

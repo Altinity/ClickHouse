@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- This tests shouldn't deadlock or crash the server
 
 DROP DICTIONARY IF EXISTS filesystem_dict;

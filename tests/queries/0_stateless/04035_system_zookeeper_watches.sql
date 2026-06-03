@@ -1,4 +1,4 @@
--- Tags: zookeeper, no-replicated-database, no-shared-merge-tree
+-- Tags: zookeeper, no-replicated-database, no-shared-merge-tree, no-content-addressed-storage
 -- Tag no-replicated-database: Old syntax is not allowed
 -- Tag no-shared-merge-tree: Old syntax is not allowed
 

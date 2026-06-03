@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS weird_projections;
 
 CREATE TABLE weird_projections(

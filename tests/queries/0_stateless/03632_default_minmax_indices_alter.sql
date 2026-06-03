@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- Test for issue #75677
 
 drop table if exists t;

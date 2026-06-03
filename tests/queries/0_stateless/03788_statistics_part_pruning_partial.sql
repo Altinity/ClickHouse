@@ -1,4 +1,4 @@
--- Tags: no-fasttest
+-- Tags: no-fasttest, no-content-addressed-storage
 -- This test validates Statistics-based part pruning functionality when some parts have MinMax statistics
 -- and other parts don't (parts inserted before statistics were added).
 

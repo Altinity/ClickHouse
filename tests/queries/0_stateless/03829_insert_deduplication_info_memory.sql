@@ -1,4 +1,4 @@
--- Tags: no-random-settings
+-- Tags: no-random-settings, no-content-addressed-storage
 -- Verify that DeduplicationInfo does not store original_block when deduplication is disabled,
 -- which would otherwise roughly double the peak memory during INSERT.
 

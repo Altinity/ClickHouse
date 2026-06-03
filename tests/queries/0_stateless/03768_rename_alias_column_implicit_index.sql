@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- Test that renaming ALIAS columns correctly updates implicit minmax indices
 
 DROP TABLE IF EXISTS test_rename_alias;

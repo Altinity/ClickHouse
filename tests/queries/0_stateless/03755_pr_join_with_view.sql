@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 drop table if exists v;
 drop table if exists t0 sync;
 drop table if exists t1 sync;

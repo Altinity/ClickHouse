@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- Regression test for type mismatch between DISTINCT query and aggregate projection
 -- when removeTrivialWrappers strips materialize() causing LowCardinality type differences.
 -- https://s3.amazonaws.com/clickhouse-test-reports/json.html?PR=98364&sha=b2717e3450567925a17d2f72dd771aa17df6fec9&name_0=PR&name_1=AST%20fuzzer%20%28amd_tsan%29

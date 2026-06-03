@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS nest;
 CREATE TABLE nest (nested_field Nested(e1 Int32)) ENGINE = MergeTree() ORDER BY nested_field.e1;
 INSERT INTO nest (nested_field.e1) VALUES ([1, 2, 3]);

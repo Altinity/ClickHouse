@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 drop table if exists test_lazy;
 create table test_lazy (id UInt64) engine=MergeTree order by tuple() settings min_bytes_for_wide_part=1, min_rows_for_wide_part=1;
 insert into test_lazy select * from numbers(100);

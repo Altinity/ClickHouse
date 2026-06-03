@@ -1,4 +1,4 @@
--- Tags: no-msan
+-- Tags: no-msan, no-content-addressed-storage
 
 CREATE TABLE 03593_backup_with_broken_projection
 (

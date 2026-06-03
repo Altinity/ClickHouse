@@ -1,4 +1,4 @@
--- Tags: long, zookeeper, no-replicated-database, no-shared-merge-tree
+-- Tags: long, zookeeper, no-replicated-database, no-shared-merge-tree, no-content-addressed-storage
 -- Tag no-replicated-database: Fails due to additional replicas or shards
 -- Tag no-shared-merge-tree: no-shared-merge-tree: No quorum
 

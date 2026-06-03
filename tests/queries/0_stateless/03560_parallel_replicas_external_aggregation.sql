@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_proj_external_agg;
 
 CREATE TABLE t_proj_external_agg

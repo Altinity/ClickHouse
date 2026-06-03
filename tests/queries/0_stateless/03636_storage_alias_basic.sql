@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- { echo }
 -- Tags: long
 

@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS 03717_table;
 CREATE TABLE 03717_table
 (

@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 drop table if exists test;
 create table test (id UInt32, t Tuple(a UInt32)) engine=MergeTree order by t.a;
 insert into test select 1, tuple(1);

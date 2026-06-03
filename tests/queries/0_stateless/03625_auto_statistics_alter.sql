@@ -1,4 +1,4 @@
--- Tags: no-fasttest
+-- Tags: no-fasttest, no-content-addressed-storage
 -- no-fasttest: 'countmin' sketches need a 3rd party library
 
 SET mutations_sync = 2;

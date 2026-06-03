@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 drop table if exists test;
 drop table if exists test2;
 create table test (id UInt64, json JSON) engine=MergeTree order by id;

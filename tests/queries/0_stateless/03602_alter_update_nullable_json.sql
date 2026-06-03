@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 set mutations_sync=1;
 set max_block_size=1000;
 

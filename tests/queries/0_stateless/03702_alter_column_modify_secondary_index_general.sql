@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- Tests the behavior of MergeTree setting 'alter_column_secondary_index_mode' with tables in compact and wide format
 -- for UPDATE MODIFY COLUMN operations.
 

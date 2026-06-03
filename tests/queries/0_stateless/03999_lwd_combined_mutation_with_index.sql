@@ -1,4 +1,4 @@
--- Tags: no-replicated-database
+-- Tags: no-replicated-database, no-content-addressed-storage
 -- Regression test: combined UPDATE + ALTER DELETE on a compact part with
 -- a prior lightweight delete and a secondary index used to fail with
 -- NOT_FOUND_COLUMN_IN_BLOCK because `affects_all_columns` was not copied

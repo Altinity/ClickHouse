@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- https://github.com/ClickHouse/ClickHouse/issues/85834
 
 DROP TABLE IF EXISTS test_generic_events_all;

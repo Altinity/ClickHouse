@@ -1,4 +1,4 @@
--- Tags: no-parallel-replicas
+-- Tags: no-parallel-replicas, no-content-addressed-storage
 -- no-parallel-replicas: use_skip_indexes_on_data_read is not supported with parallel replicas
 -- add_minmax_index_for_numeric_columns=0: Changes the plan and rows read
 

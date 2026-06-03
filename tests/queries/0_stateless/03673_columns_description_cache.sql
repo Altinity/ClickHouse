@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- Cache is only for MergeTree
 drop table if exists t_mem;
 create table t_mem (key Int) engine=Memory();

@@ -1,4 +1,4 @@
--- Tags: no-parallel-replicas
+-- Tags: no-parallel-replicas, no-content-addressed-storage
 
 set enable_analyzer = 1;
 set mutations_sync = 2;

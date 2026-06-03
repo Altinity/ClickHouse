@@ -1,4 +1,4 @@
--- Tags: long, zookeeper, no-random-merge-tree-settings, no-replicated-database
+-- Tags: long, zookeeper, no-random-merge-tree-settings, no-replicated-database, no-content-addressed-storage
 -- { echo ON }
 
 DROP TABLE IF EXISTS x1;

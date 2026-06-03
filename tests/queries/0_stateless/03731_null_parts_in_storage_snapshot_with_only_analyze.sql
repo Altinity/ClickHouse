@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- Possible crash in case of mutations contains subquery, that will use
 -- InterpreterSelectQuery() with only_analyze=true, which uses
 -- getStorageSnapshotWithoutData(), and may crash in

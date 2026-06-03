@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 SET mutations_sync = 1;
 
 -- No dependencies

@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- https://github.com/ClickHouse/ClickHouse/issues/88150
 DROP TABLE IF EXISTS t0;
 CREATE TABLE t0 (c0 Nullable(String)) ENGINE = MergeTree() ORDER BY tuple() SETTINGS allow_nullable_key = 1;

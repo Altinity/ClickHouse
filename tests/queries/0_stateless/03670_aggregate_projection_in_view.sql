@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- { echo ON }
 
 SET enable_parallel_replicas = 0;

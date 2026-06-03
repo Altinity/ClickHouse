@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 SET insert_keeper_fault_injection_probability = 0;
 
 DROP TABLE IF EXISTS t_dry_run;

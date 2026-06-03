@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-fasttest
+# Tags: no-fasttest, no-content-addressed-storage
 
 # Regression test for a race condition between REPLACE PARTITION and background mutations.
 #

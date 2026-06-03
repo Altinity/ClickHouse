@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- { echoOn }
 
 drop table if exists mt1;

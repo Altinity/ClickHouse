@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_dry_run_proj;
 
 CREATE TABLE t_dry_run_proj (key UInt64, value UInt64, PROJECTION p_sum (SELECT key, sum(value) GROUP BY key))

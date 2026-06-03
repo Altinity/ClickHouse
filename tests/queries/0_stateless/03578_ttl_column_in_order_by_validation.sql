@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- Test for issue #84442: ALTER MODIFY ORDER BY does not check if the new column has TTL
 -- This test verifies that ALTER TABLE properly validates TTL columns in ORDER BY clauses
 

@@ -1,4 +1,4 @@
--- Tags: no-fasttest, no-random-settings
+-- Tags: no-fasttest, no-random-settings, no-content-addressed-storage
 -- Test: Verify that without lazy type hints setting, mutations are triggered
 
 SET enable_json_type = 1;

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Tags: no-parallel-replicas, no-random-merge-tree-settings
+# Tags: no-parallel-replicas, no-random-merge-tree-settings, no-content-addressed-storage
 # no-parallel-replicas: The EXPLAIN output is completely different
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

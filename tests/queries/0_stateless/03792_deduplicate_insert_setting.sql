@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 CREATE TABLE test
     (id UInt64, value String)
 ENGINE = ReplicatedMergeTree('/clickhouse/tables/{database}/test/test_table', '1')

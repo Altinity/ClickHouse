@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_mutation_rows_counter;
 
 CREATE TABLE t_mutation_rows_counter (x UInt64) ENGINE = MergeTree ORDER BY tuple();

@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 SET mutations_sync = 1;
 
 -- Case 1: MATERIALIZED depends only on EPHEMERAL — UPDATE and DELETE should work

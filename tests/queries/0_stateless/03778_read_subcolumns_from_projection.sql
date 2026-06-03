@@ -1,4 +1,4 @@
--- Tags: no-parallel-replicas
+-- Tags: no-parallel-replicas, no-content-addressed-storage
 -- Tag no-parallel-replicas: output of explain is different
 
 SET enable_analyzer=1;
