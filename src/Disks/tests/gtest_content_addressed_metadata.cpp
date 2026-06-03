@@ -3112,3 +3112,34 @@ TEST(ContentAddressedPartId, IncludesProjectionFiles)
     EXPECT_NE(computePartId(base), computePartId(with_proj));
     EXPECT_EQ(computePartId(with_proj), computePartId(with_proj));
 }
+
+// The projection-subdir gate also covers .tmp_proj (temp projections used by MATERIALIZE-merges, Phase
+// 3): existsDirectory finds it and listDirectory lists its inner files, exactly as for .proj.
+TEST_F(ContentAddressedMetaTest, TempProjectionSubdirIsRecognized)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_tmp_proj");
+    const std::string uuid = "uuid-tmp-proj";
+    const std::string part = "all_1_1_0";
+    const std::string base = "uui/" + uuid + "/" + part + "/";
+
+    DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+    for (const auto & f : {std::string("columns.txt"), std::string("data.bin"),
+                           std::string("p_sum.tmp_proj/columns.txt"), std::string("p_sum.tmp_proj/data.bin")})
+    {
+        auto buf = tx.writeFile(base + f, 4096, DB::WriteMode::Rewrite, {});
+        const std::string bytes = "x";
+        buf->write(bytes.data(), bytes.size());
+        buf->finalize();
+    }
+    tx.commit(DB::NoCommitOptions{});
+
+    EXPECT_TRUE(ms->existsDirectory(base + "p_sum.tmp_proj"));
+    auto inner = ms->listDirectory(base + "p_sum.tmp_proj");
+    std::set<std::string> got(inner.begin(), inner.end());
+    EXPECT_EQ(got, (std::set<std::string>{"columns.txt", "data.bin"}));
+    // The parent listing collapses it to a single dir entry too.
+    auto names = ms->listDirectory("uui/" + uuid + "/" + part);
+    std::set<std::string> top(names.begin(), names.end());
+    EXPECT_TRUE(top.count("p_sum.tmp_proj") == 1);
+}
