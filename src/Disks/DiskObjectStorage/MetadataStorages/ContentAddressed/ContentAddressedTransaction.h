@@ -302,6 +302,18 @@ private:
     // only from moveDirectory.
     void rekeyDetachedPartDir(const std::string & table_id, const std::string & old_dir, const std::string & new_dir);
 
+    // ATTACH PARTITION / ATTACH PART: publish an ACTIVE ref from a DETACHED staging directory. ATTACH
+    // stages the detached part as detached/attaching_<part> (a single component under the shared
+    // "detached" ref), then renames it to the active part dir <uuid[:3]>/<uuid>/<active_part>. This is
+    // the inverse of republishCommittedPartIntoDetached: take the staging dir's <staging>/<inner> keys
+    // from the shared detached ref, re-key them to the bare <inner> names of a NEW active part manifest,
+    // publish the active ref (the commit point), then strip the <staging>/ keys from the detached ref
+    // (rewriting it without them, or unlinking it when no detached parts remain). No content blobs move
+    // (content-addressed); only the small ref/manifest/sidecar pointer objects are written. Reached only
+    // from moveDirectory.
+    void republishDetachedStagingIntoActive(
+        const ContentAddressed::PartFilePath & src_staging, const ContentAddressed::PartFilePath & dst_active);
+
     // RENAME TABLE / cross-engine table move: re-key every ref + per-ref sidecar (and verbatim
     // table-level file) from the source table identifier to the destination table identifier, then
     // unlink the source pointer objects. The table identifier is part of the ref/store object key, so

@@ -2767,3 +2767,83 @@ TEST_F(ContentAddressedMetaTest, WholePartClonePublishesOneRefToSourcePartId)
     // The source part is untouched by the clone.
     EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/" + src + "/a.bin")[0].remote_path), "AAA");
 }
+
+// CAS M9 W2: ATTACH PARTITION / ATTACH PART publishes an ACTIVE ref out of a DETACHED staging dir.
+// ATTACH stages the detached part as detached/attaching_<part>, then renames it to the active part dir
+// <uuid>/<active_part>. moveDirectory must publish an active ref whose manifest carries the COMPLETE
+// BARE file set (no attaching_/all_X/ prefix) and strip the staging entry from the shared "detached"
+// ref. Before the fix this fell through with no branch, so the attached part had no on-disk ref and
+// reads threw "ContentAddressed: no ref for .../<active_part>/<file>" (data loss on restart).
+TEST_F(ContentAddressedMetaTest, MoveDetachedStagingToActivePublishesActiveRef)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_attach");
+    auto os = getObjectStorage("cas_attach");
+    const std::string sid = ms->serverIdForTest();
+    const std::string uuid = "uuid-attach";
+
+    const std::map<std::string, std::string> files{
+        {"a.bin", "AAA"},
+        {"primary.idx", "IDX"},
+        {"data.cmrk4", "MRK"},
+        {"columns.txt", "cols"},
+        {"metadata_version.txt", "0"}};
+
+    // Commit an active part, then move it into detached/<part> (mirror MoveCommittedPartIntoDetached).
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        for (const auto & [name, bytes] : files)
+        {
+            auto buf = tx.writeFile("uui/" + uuid + "/all_1_2_1/" + name, 4096, DB::WriteMode::Rewrite, {});
+            buf->write(bytes.data(), bytes.size());
+            buf->finalize();
+        }
+        tx.commit(DB::NoCommitOptions{});
+    }
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.moveDirectory("uui/" + uuid + "/all_1_2_1", "uui/" + uuid + "/detached/all_1_2_1");
+        tx.commit(DB::NoCommitOptions{});
+    }
+    // ATTACH renames detached/all_1_2_1 -> detached/attaching_all_1_2_1 (the staging rekey).
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.moveDirectory("uui/" + uuid + "/detached/all_1_2_1", "uui/" + uuid + "/detached/attaching_all_1_2_1");
+        tx.commit(DB::NoCommitOptions{});
+    }
+    // The NEW branch: detached/attaching_all_1_2_1 -> active <uuid>/all_2_2_0.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.moveDirectory("uui/" + uuid + "/detached/attaching_all_1_2_1", "uui/" + uuid + "/all_2_2_0");
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    // (a) the active ref resolves to a part_id whose manifest lists the COMPLETE BARE file set — every
+    // original file (incl. primary.idx / data.cmrk4), with NO attaching_/all_X/ prefix. Resolve through
+    // the same public parser the GC live-set scan uses (partIdFromRefPayload), since readRefPartId is a
+    // private resolution helper.
+    ASSERT_TRUE(objectExists(os, refKey("", sid, uuid, "all_2_2_0").string()));
+    const PartId active_pid = partIdFromRefPayload(readObject(os, refKey("", sid, uuid, "all_2_2_0").string()));
+    auto active_manifest = PartManifest::deserialize(readObject(os, partKey("", active_pid).string()));
+    std::set<std::string> manifest_files;
+    for (const auto & [file, entry] : active_manifest.blobs)
+        manifest_files.insert(file);
+    // metadata_version.txt is a mutable per-part file (sidecar, not the manifest), so the manifest holds
+    // the content files only.
+    EXPECT_EQ(manifest_files, (std::set<std::string>{"a.bin", "primary.idx", "data.cmrk4", "columns.txt"}));
+
+    // (b) each file resolves via getStorageObjects("<uuid>/all_2_2_0/<file>") and reads back its bytes.
+    for (const auto & [name, bytes] : files)
+    {
+        auto objs = ms->getStorageObjects("uui/" + uuid + "/all_2_2_0/" + name);
+        ASSERT_EQ(objs.size(), 1u) << name;
+        EXPECT_EQ(readObject(os, objs[0].remote_path), bytes) << name;
+    }
+
+    // (c) the shared "detached" ref no longer lists the staging entry (it held exactly one detached part,
+    // so it is unlinked entirely).
+    EXPECT_FALSE(objectExists(os, refKey("", sid, uuid, "detached").string()));
+    auto container = ms->listDirectory("uui/" + uuid + "/detached");
+    std::set<std::string> container_got(container.begin(), container.end());
+    EXPECT_TRUE(container_got.empty()) << "detached still lists staging entries";
+}

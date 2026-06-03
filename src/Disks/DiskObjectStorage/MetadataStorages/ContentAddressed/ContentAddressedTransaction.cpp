@@ -458,6 +458,149 @@ void ContentAddressedTransaction::rekeyDetachedPartDir(
         metadata_storage.object_storage->removeObjectsIfExist(old_file_objects);
 }
 
+void ContentAddressedTransaction::republishDetachedStagingIntoActive(
+    const ContentAddressed::PartFilePath & src_staging, const ContentAddressed::PartFilePath & dst_active)
+{
+    /// The staging directory name under the shared "detached" ref (e.g. attaching_all_2_2_0); its keys
+    /// are <staging>/<inner> (B36/B46). The active part takes the BARE <inner> names.
+    const std::string & staging_dir = src_staging.file;
+    const std::string staging_pfx = staging_dir + "/";
+    const std::string detached = std::string(ContentAddressed::kDetachedDirName);
+
+    auto detached_pid = metadata_storage.readRefPartId(src_staging.table_uuid, detached);
+    if (!detached_pid)
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "ContentAddressed: moveDirectory of detached/{} into active {}/{}, but the detached ref is absent",
+            staging_dir, dst_active.table_uuid, dst_active.part_name);
+
+    auto detached_manifest = metadata_storage.loadPartManifestOrThrow(*detached_pid);
+
+    /// Build the active manifest from the staging dir's entries re-keyed to bare <inner>. The blob
+    /// entries (hash/size) are unchanged — the same shared content is referenced — only the logical file
+    /// name loses its <staging>/ prefix.
+    ContentAddressed::PartManifest active_manifest;
+    for (const auto & [file, entry] : detached_manifest.blobs)
+    {
+        if (file.rfind(staging_pfx, 0) == 0)
+            active_manifest.blobs[file.substr(staging_pfx.size())] = entry;
+    }
+    if (active_manifest.blobs.empty())
+        throw Exception(
+            ErrorCodes::LOGICAL_ERROR,
+            "ContentAddressed: moveDirectory of detached/{} into active {}/{}, but the detached ref has no "
+            "entries under that staging directory",
+            staging_dir, dst_active.table_uuid, dst_active.part_name);
+
+    const ContentAddressed::PartId active_pid = ContentAddressed::computePartId(active_manifest.blobs);
+    const std::string active_part_key = ContentAddressed::partKey(key_prefix, active_pid).string();
+    if (!metadata_storage.object_storage->tryGetObjectMetadata(active_part_key, /*with_tags=*/false).has_value())
+    {
+        const std::string bytes = active_manifest.serialize();
+        auto out = metadata_storage.object_storage->writeObject(StoredObject(active_part_key), WriteMode::Rewrite);
+        out->write(bytes.data(), bytes.size());
+        out->finalize();
+    }
+
+    /// Build the active part's per-ref sidecar from the detached sidecar's <staging>/<inner> entries
+    /// re-keyed to bare <inner>, so the active part keeps its private uuid/txn/metadata_version bytes.
+    if (auto detached_sidecar = metadata_storage.readRefSidecarIfExists(src_staging.table_uuid, detached))
+    {
+        ContentAddressed::RefSidecar active_sidecar;
+        for (const auto & [file, bytes] : detached_sidecar->files)
+        {
+            if (file.rfind(staging_pfx, 0) != 0)
+                continue;
+            const std::string bare_file = file.substr(staging_pfx.size());
+            active_sidecar.files[bare_file] = bytes;
+
+            const std::string file_key = ContentAddressed::refMutableFileKey(
+                key_prefix, metadata_storage.server_id, dst_active.table_uuid, dst_active.part_name, bare_file).string();
+            auto file_out = metadata_storage.object_storage->writeObject(StoredObject(file_key), WriteMode::Rewrite);
+            file_out->write(bytes.data(), bytes.size());
+            file_out->finalize();
+        }
+
+        if (!active_sidecar.files.empty())
+        {
+            const std::string meta_key = ContentAddressed::refMetaKey(
+                key_prefix, metadata_storage.server_id, dst_active.table_uuid, dst_active.part_name).string();
+            const std::string meta_bytes = active_sidecar.serialize();
+            auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(meta_key), WriteMode::Rewrite);
+            meta_out->write(meta_bytes.data(), meta_bytes.size());
+            meta_out->finalize();
+        }
+    }
+
+    /// Publish the active ref (the commit point), then strip the staging keys from the detached ref.
+    const std::string active_ref_key = ContentAddressed::refKey(
+        key_prefix, metadata_storage.server_id, dst_active.table_uuid, dst_active.part_name).string();
+    const std::string active_ref_payload = ContentAddressed::serializeRefPayload(active_pid);
+    auto active_ref_out = metadata_storage.object_storage->writeObject(StoredObject(active_ref_key), WriteMode::Rewrite);
+    active_ref_out->write(active_ref_payload.data(), active_ref_payload.size());
+    active_ref_out->finalize();
+
+    /// Remove the <staging>/ keys from the shared detached ref (manifest + sidecar bundle + per-file
+    /// sidecar objects), leaving any other detached parts intact. This mirrors removeRecursive's
+    /// detached-part removal: rewrite the trimmed detached ref under a new part id, or unlink the ref +
+    /// bundle when no detached parts remain.
+    std::erase_if(detached_manifest.blobs, [&](const auto & kv) { return kv.first.rfind(staging_pfx, 0) == 0; });
+
+    ContentAddressed::RefSidecar detached_sidecar;
+    if (auto existing_sidecar = metadata_storage.readRefSidecarIfExists(src_staging.table_uuid, detached))
+        detached_sidecar = *existing_sidecar;
+    StoredObjects mutable_to_remove;
+    for (auto it = detached_sidecar.files.begin(); it != detached_sidecar.files.end();)
+    {
+        if (it->first.rfind(staging_pfx, 0) == 0)
+        {
+            mutable_to_remove.emplace_back(
+                ContentAddressed::refMutableFileKey(
+                    key_prefix, metadata_storage.server_id, src_staging.table_uuid, detached, it->first).string());
+            it = detached_sidecar.files.erase(it);
+        }
+        else
+            ++it;
+    }
+    if (!mutable_to_remove.empty())
+        metadata_storage.object_storage->removeObjectsIfExist(mutable_to_remove);
+
+    const std::string detached_ref_key
+        = ContentAddressed::refKey(key_prefix, metadata_storage.server_id, src_staging.table_uuid, detached).string();
+    const std::string detached_meta_key
+        = ContentAddressed::refMetaKey(key_prefix, metadata_storage.server_id, src_staging.table_uuid, detached).string();
+
+    if (detached_manifest.blobs.empty())
+    {
+        /// No detached parts remain: unlink the shared detached ref and its bundle sidecar.
+        metadata_storage.object_storage->removeObjectsIfExist({StoredObject(detached_ref_key), StoredObject(detached_meta_key)});
+        return;
+    }
+
+    /// Republish the trimmed detached manifest under its new part id, rewrite the bundle, re-point the ref.
+    const ContentAddressed::PartId new_detached_pid = ContentAddressed::computePartId(detached_manifest.blobs);
+    const std::string new_detached_part_key = ContentAddressed::partKey(key_prefix, new_detached_pid).string();
+    if (!metadata_storage.object_storage->tryGetObjectMetadata(new_detached_part_key, /*with_tags=*/false).has_value())
+    {
+        const std::string bytes = detached_manifest.serialize();
+        auto out = metadata_storage.object_storage->writeObject(StoredObject(new_detached_part_key), WriteMode::Rewrite);
+        out->write(bytes.data(), bytes.size());
+        out->finalize();
+    }
+    {
+        const std::string meta_bytes = detached_sidecar.serialize();
+        auto meta_out = metadata_storage.object_storage->writeObject(StoredObject(detached_meta_key), WriteMode::Rewrite);
+        meta_out->write(meta_bytes.data(), meta_bytes.size());
+        meta_out->finalize();
+    }
+    {
+        const std::string ref_payload = ContentAddressed::serializeRefPayload(new_detached_pid);
+        auto ref_out = metadata_storage.object_storage->writeObject(StoredObject(detached_ref_key), WriteMode::Rewrite);
+        ref_out->write(ref_payload.data(), ref_payload.size());
+        ref_out->finalize();
+    }
+}
+
 void ContentAddressedTransaction::republishTableRefs(const std::string & src_table_id, const std::string & dst_table_id)
 {
     if (src_table_id == dst_table_id)
@@ -541,6 +684,26 @@ void ContentAddressedTransaction::moveDirectory(const std::string & from, const 
             && src_detached->table_uuid == dst_detached->table_uuid)
         {
             rekeyDetachedPartDir(src_detached->table_uuid, src_detached->file, dst_detached->file);
+            return;
+        }
+    }
+
+    /// ATTACH PARTITION / ATTACH PART publishes an ACTIVE part out of a DETACHED staging directory.
+    /// MergeTree stages the detached source as detached/attaching_<part> (a single component under the
+    /// shared "detached" ref, B36/B46), then renames it to the final active part dir
+    /// <uuid[:3]>/<uuid>/<active_part>. Content addressing has no rename and the staging dir is not a ref
+    /// of its own, so re-publish: the inverse of republishCommittedPartIntoDetached. Fire only when `from`
+    /// is detached/<staging> (part_name == "detached", file a SINGLE non-empty component) and `to` is an
+    /// ACTIVE part dir (file empty, part_name != "detached"). Both guards are exclusive with the
+    /// committed->detached, detached->detached and tmp->active branches above.
+    if (auto src_staging = ContentAddressed::parsePartFilePath(from);
+        src_staging && src_staging->part_name == ContentAddressed::kDetachedDirName && !src_staging->file.empty()
+        && src_staging->file.find('/') == std::string::npos)
+    {
+        if (auto dst_active = ContentAddressed::parsePartFilePath(to);
+            dst_active && dst_active->file.empty() && dst_active->part_name != ContentAddressed::kDetachedDirName)
+        {
+            republishDetachedStagingIntoActive(*src_staging, *dst_active);
             return;
         }
     }
