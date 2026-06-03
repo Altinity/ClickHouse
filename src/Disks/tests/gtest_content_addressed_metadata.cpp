@@ -2020,3 +2020,43 @@ TEST_F(ContentAddressedMetaTest, MutationCarryForwardReusesUnchangedBlobs)
     // (c) the source part is untouched (its b.bin still resolves to BBB)
     EXPECT_EQ(readObject(os, ms->getStorageObjects("uui/" + uuid + "/" + src + "/b.bin")[0].remote_path), "BBB");
 }
+
+// A mutation writes a table-level entry file `tmp_mutation_N.txt` then renames it to `mutation_N.txt`
+// (MergeTreeMutationEntry::commit -> DiskObjectStorage::moveFile). These are NOT part files: they are
+// stored verbatim under a path-derived key. moveFile must physically move the verbatim object to the
+// new key so the read path (which recomputes the key from the path) finds it under the new name.
+// Before the fix moveFile threw LOGICAL_ERROR ("requires two part-file paths"), aborting the server
+// under abort_on_logical_error on the very first ALTER ... UPDATE.
+TEST_F(ContentAddressedMetaTest, MoveTableLevelFileRenamesVerbatimObject)
+{
+    using namespace DB::ContentAddressed;
+    auto ms = getMetadataStorage("cas_mv_tf");
+    auto os = getObjectStorage("cas_mv_tf");
+    const std::string uuid = "uuid-mv";
+    const std::string from = "uui/" + uuid + "/tmp_mutation_5.txt";
+    const std::string to   = "uui/" + uuid + "/mutation_5.txt";
+    const std::string bytes = "format version: 1\n1\n";
+
+    // Write the table-level file verbatim (writeFile's non-part branch is durable on finalize).
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        auto buf = tx.writeFile(from, 4096, DB::WriteMode::Rewrite, {});
+        buf->write(bytes.data(), bytes.size());
+        buf->finalize();
+    }
+    EXPECT_TRUE(ms->existsFile(from));
+
+    // Rename it, as the mutation entry commit does.
+    {
+        DB::ContentAddressedTransaction tx(*ms, /*key_prefix=*/"", kCasTestScratch);
+        tx.moveFile(from, to);
+        tx.commit(DB::NoCommitOptions{});
+    }
+
+    // The file resolves under the NEW name with the original bytes; the old name is gone.
+    EXPECT_TRUE(ms->existsFile(to));
+    EXPECT_FALSE(ms->existsFile(from));
+    auto objs = ms->getStorageObjects(to);
+    ASSERT_EQ(objs.size(), 1u);
+    EXPECT_EQ(readObject(os, objs[0].remote_path), bytes);
+}

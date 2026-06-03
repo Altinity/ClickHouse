@@ -10,6 +10,7 @@
 #include <Common/ObjectStorageKey.h>
 #include <Common/getRandomASCIIString.h>
 #include <IO/ReadBufferFromFile.h>
+#include <IO/ReadSettings.h>
 #include <IO/copyData.h>
 
 #include <base/hex.h>
@@ -537,6 +538,34 @@ void ContentAddressedTransaction::moveDirectory(const std::string & from, const 
 
 void ContentAddressedTransaction::moveFile(const std::string & from, const std::string & to)
 {
+    /// A table-level / generic file (e.g. the mutation entry `mutation_N.txt`, renamed from
+    /// `tmp_mutation_N.txt` by `MergeTreeMutationEntry::commit`) is stored verbatim under a key derived
+    /// from its PATH (`writeFile`'s non-part branch: `tableFileKey` / `diskFileKey`). It is not
+    /// content-addressed and not tracked by this transaction's commit, and the source object is already
+    /// durable (the write buffer finalized before the rename). A rename therefore physically moves the
+    /// verbatim object from the source key to the destination key, mirroring a filesystem rename so the
+    /// read path (which recomputes the key from the path) finds it under the new name.
+    if (!ContentAddressed::isPartFilePath(from) && !ContentAddressed::isPartFilePath(to))
+    {
+        auto verbatimKey = [&](const std::string & path) -> std::string
+        {
+            if (auto tf = ContentAddressed::parseTableFilePath(path))
+                return ContentAddressed::tableFileKey(key_prefix, metadata_storage.server_id, tf->table_uuid, tf->tail);
+            return ContentAddressed::diskFileKey(key_prefix, path);
+        };
+
+        const std::string from_key = verbatimKey(from);
+        const std::string to_key = verbatimKey(to);
+        if (from_key == to_key)
+            return;
+
+        const StoredObject from_obj(from_key, from);
+        const StoredObject to_obj(to_key, to);
+        metadata_storage.object_storage->copyObject(from_obj, to_obj, ReadSettings{}, WriteSettings{});
+        metadata_storage.object_storage->removeObjectIfExists(from_obj);
+        return;
+    }
+
     /// Rename of a single in-part file: re-key the recorded blob. No object is moved in storage.
     auto src = ContentAddressed::parsePartFilePath(from);
     auto dst = ContentAddressed::parsePartFilePath(to);
