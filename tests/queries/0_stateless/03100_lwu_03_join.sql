@@ -1,4 +1,4 @@
--- Tags: no-parallel-replicas, no-replicated-database, long
+-- Tags: no-parallel-replicas, no-replicated-database, long, no-content-addressed-storage
 -- no-parallel-replicas: profile events may differ with parallel replicas.
 -- no-replicated-database: fails due to additional shard.
 

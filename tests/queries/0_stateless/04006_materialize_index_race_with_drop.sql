@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- Test that MATERIALIZE INDEX mutation does not get stuck
 -- when the index is dropped before the mutation executes.
 -- https://github.com/ClickHouse/ClickHouse/issues/38643

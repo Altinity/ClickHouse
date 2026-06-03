@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 SET use_variant_as_common_type = 0;
 SET optimize_on_insert = 1;
 

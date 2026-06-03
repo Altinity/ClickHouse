@@ -1,4 +1,4 @@
--- Tags: long, replica, no-replicated-database, no-shared-merge-tree
+-- Tags: long, replica, no-replicated-database, no-shared-merge-tree, no-content-addressed-storage
 -- Tag no-replicated-database: Fails due to additional replicas or shards
 -- no-shared-merge-tree: depends on max_replicated_merges_in_queue
 

@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS compression_codec_on_alias;
 
 select 'create table compression_codec_on_alias with CODEC on ALIAS type';

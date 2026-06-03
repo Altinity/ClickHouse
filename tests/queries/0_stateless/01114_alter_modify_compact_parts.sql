@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS mt_compact;
 
 CREATE TABLE mt_compact (d Date, id UInt32, s String)

@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS mmm;
 
 CREATE TABLE mmm ENGINE=MergeTree ORDER BY number

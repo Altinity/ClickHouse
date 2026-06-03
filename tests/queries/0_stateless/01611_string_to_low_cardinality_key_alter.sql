@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS table_with_lc_key;
 
 CREATE TABLE table_with_lc_key

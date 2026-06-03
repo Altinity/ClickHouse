@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: zookeeper, no-shared-merge-tree
+# Tags: zookeeper, no-shared-merge-tree, no-content-addressed-storage
 # no-shared-merge-tree: no fetches in shared merge tree
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

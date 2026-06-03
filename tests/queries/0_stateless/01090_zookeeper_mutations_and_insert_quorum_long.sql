@@ -1,4 +1,4 @@
--- Tags: long, zookeeper, no-replicated-database, no-async-insert
+-- Tags: long, zookeeper, no-replicated-database, no-async-insert, no-content-addressed-storage
 -- Tag no-replicated-database: Fails due to additional replicas or shards
 -- Tag no-async-insert: async inserts with quorum inserts are only have sence with enabled quorum_parallel setting
 

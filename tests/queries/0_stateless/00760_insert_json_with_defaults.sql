@@ -1,4 +1,4 @@
--- Tags: no-fasttest
+-- Tags: no-fasttest, no-content-addressed-storage
 
 SET input_format_defaults_for_omitted_fields=1;
 

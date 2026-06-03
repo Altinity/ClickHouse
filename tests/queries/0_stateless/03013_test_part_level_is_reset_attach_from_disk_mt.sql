@@ -1,4 +1,4 @@
--- Tags: no-shared-merge-tree
+-- Tags: no-shared-merge-tree, no-content-addressed-storage
 SET alter_sync = 2;
 -- {echoOn}
 DROP TABLE IF EXISTS test;

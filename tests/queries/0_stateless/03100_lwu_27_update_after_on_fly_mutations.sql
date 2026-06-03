@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_lwu_on_fly SYNC;
 SET enable_lightweight_update = 1;
 

@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS enum_test;
 
 CREATE TABLE enum_test(timestamp DateTime, host String, e Enum8('IU' = 1, 'WS' = 2)) Engine = MergeTree PARTITION BY toDate(timestamp) ORDER BY (timestamp, host);

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: long, no-fasttest, no-parallel, no-object-storage, no-flaky-check, no-msan
+# Tags: long, no-fasttest, no-parallel, no-object-storage, no-flaky-check, no-msan, no-content-addressed-storage
 # Tag no-flaky-check -- not compatible with ThreadFuzzer
 # Tag no-msan -- too long for MSAN
 

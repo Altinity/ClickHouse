@@ -1,4 +1,4 @@
--- Tags: no-replicated-database
+-- Tags: no-replicated-database, no-content-addressed-storage
 -- no-replicated-database: OPTIMIZE is replicated which affects the part names.
 
 SET insert_keeper_fault_injection_probability = 0.0;

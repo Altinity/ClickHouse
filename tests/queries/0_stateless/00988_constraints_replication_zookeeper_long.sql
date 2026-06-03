@@ -1,4 +1,4 @@
--- Tags: long, replica
+-- Tags: long, replica, no-content-addressed-storage
 
 DROP TABLE IF EXISTS replicated_constraints1;
 DROP TABLE IF EXISTS replicated_constraints2;

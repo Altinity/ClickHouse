@@ -1,4 +1,4 @@
--- Tags: replica, no-tsan, no-parallel
+-- Tags: replica, no-tsan, no-parallel, no-content-addressed-storage
 -- Tag no-tsan: RESTART REPLICAS can acquire too much locks, while only 64 is possible from one thread under TSan
 
 DROP TABLE IF EXISTS data_01646;

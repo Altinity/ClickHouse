@@ -1,4 +1,4 @@
--- Tags: zookeeper, no-replicated-database
+-- Tags: zookeeper, no-replicated-database, no-content-addressed-storage
 -- Tag no-replicated-database: Fails due to additional replicas or shards
 
 drop table if exists enum_alter_issue;

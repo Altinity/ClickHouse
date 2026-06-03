@@ -1,4 +1,4 @@
--- Tags: no-replicated-database
+-- Tags: no-replicated-database, no-content-addressed-storage
 -- no-replicated-database: read_rows in query_log differs because of replicated database.
 -- add_minmax_index_for_numeric_columns=0: Less read_rows
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: zookeeper, no-replicated-database, no-fasttest, no-shared-merge-tree, no-async-insert
+# Tags: zookeeper, no-replicated-database, no-fasttest, no-shared-merge-tree, no-async-insert, no-content-addressed-storage
 # Tag no-replicated-database: Requires investigation
 # no-shared-merge-tree: relies on zookeeper structure of rmt
 # Tag no-async-insert: relies on synchronous inserts

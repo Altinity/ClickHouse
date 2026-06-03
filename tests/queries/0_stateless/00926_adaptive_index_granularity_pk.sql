@@ -1,4 +1,4 @@
--- Tags: no-random-merge-tree-settings
+-- Tags: no-random-merge-tree-settings, no-content-addressed-storage
 
 SET send_logs_level = 'fatal';
 -- The PartsSplitter injection (merge_tree_read_split_ranges_into_intersecting_and_non_intersecting_injection_probability)

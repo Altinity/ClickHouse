@@ -1,4 +1,4 @@
--- Tags: replica
+-- Tags: replica, no-content-addressed-storage
 
 DROP TABLE IF EXISTS t_lwu_sequential_1 SYNC;
 DROP TABLE IF EXISTS t_lwu_sequential_2 SYNC;

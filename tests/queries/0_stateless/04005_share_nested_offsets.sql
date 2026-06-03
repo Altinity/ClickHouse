@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- Test for share_nested_offsets MergeTree setting.
 -- Covers: wide/compact parts, merges (horizontal + vertical), missing columns,
 -- immutability, ALTER UPDATE/RENAME, flatten_nested interaction, scalar+dotted coexistence.

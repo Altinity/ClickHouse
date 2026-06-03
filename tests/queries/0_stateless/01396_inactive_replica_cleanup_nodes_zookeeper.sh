@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: replica, no-debug, no-shared-merge-tree, long, no-msan, no-asan, no-tsan, no-replicated-database
+# Tags: replica, no-debug, no-shared-merge-tree, long, no-msan, no-asan, no-tsan, no-replicated-database, no-content-addressed-storage
 # no-shared-merge-tree: depends on zookeeper, specific logs of rmt and so on
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

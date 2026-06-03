@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS table_for_rename;
 
 CREATE TABLE table_for_rename

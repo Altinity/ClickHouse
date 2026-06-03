@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 drop table if exists proj;
 
 create table proj (

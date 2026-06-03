@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS dst_00753;
 DROP TABLE IF EXISTS buffer_00753;
 SET send_logs_level = 'error';

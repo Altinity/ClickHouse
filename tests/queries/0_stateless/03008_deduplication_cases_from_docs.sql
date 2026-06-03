@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 select 'Different materialized view insert into one underlayed table equal data.';
 
 DROP TABLE IF EXISTS dst;

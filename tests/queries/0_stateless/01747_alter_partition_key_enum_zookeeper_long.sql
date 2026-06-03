@@ -1,4 +1,4 @@
--- Tags: long, zookeeper
+-- Tags: long, zookeeper, no-content-addressed-storage
 
 DROP TABLE IF EXISTS report;
 

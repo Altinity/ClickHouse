@@ -1,4 +1,4 @@
--- Tags: replica
+-- Tags: replica, no-content-addressed-storage
 
 DROP TABLE IF EXISTS replicated_mutations_empty_partitions SYNC;
 

@@ -1,4 +1,4 @@
--- Tags: no-replicated-database, long
+-- Tags: no-replicated-database, long, no-content-addressed-storage
 -- Tag no-replicated-database: profile events for mutations may differ because of additional replicas.
 
 DROP TABLE IF EXISTS t_apply_patches SYNC;

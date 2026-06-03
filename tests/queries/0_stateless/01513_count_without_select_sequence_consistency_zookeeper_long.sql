@@ -1,4 +1,4 @@
--- Tags: long, zookeeper, no-shared-merge-tree, no-async-insert
+-- Tags: long, zookeeper, no-shared-merge-tree, no-async-insert, no-content-addressed-storage
 -- Tag no-shared-merge-tree: no-shared-merge-tree: No quorum
 --- Tag no-async-insert: async inserts are not supported with non-parallel quorum inserts
 

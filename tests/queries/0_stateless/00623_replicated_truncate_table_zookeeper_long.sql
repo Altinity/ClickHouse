@@ -1,4 +1,4 @@
--- Tags: long, replica, no-shared-merge-tree
+-- Tags: long, replica, no-shared-merge-tree, no-content-addressed-storage
 -- no-shared-merge-tree: require sync replica, added new test
 
 DROP TABLE IF EXISTS replicated_truncate1;

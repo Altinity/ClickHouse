@@ -1,4 +1,4 @@
--- Tags: no-parallel
+-- Tags: no-parallel, no-content-addressed-storage
 
 DROP TABLE IF EXISTS test_alter_attach_01901S;
 DROP TABLE IF EXISTS test_alter_attach_01901D;

@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 -- Test from https://github.com/ClickHouse/ClickHouse/issues/37673
 
 drop table if exists  data_proj_order_by_comp;

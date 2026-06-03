@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 drop table if exists alter_ttl;
 
 SET allow_suspicious_ttl_expressions = 1;

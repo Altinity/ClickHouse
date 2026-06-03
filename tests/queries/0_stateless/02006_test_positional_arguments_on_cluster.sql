@@ -1,4 +1,4 @@
--- Tags: no-ordinary-database, no-replicated-database, distributed, zookeeper
+-- Tags: no-ordinary-database, no-replicated-database, distributed, zookeeper, no-content-addressed-storage
 
 DROP TABLE IF EXISTS t02006 on cluster test_shard_localhost format Null;
 DROP TABLE IF EXISTS m02006 on cluster test_shard_localhost format Null;

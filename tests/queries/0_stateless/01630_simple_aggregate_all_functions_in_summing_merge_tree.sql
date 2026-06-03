@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS simple_agf_aggregating_mt;
 
 CREATE TABLE simple_agf_aggregating_mt

@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 drop table if exists t;
 
 create table t (a Int) engine = MergeTree order by a;

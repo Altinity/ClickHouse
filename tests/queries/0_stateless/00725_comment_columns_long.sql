@@ -1,4 +1,4 @@
--- Tags: long, no-replicated-database
+-- Tags: long, no-replicated-database, no-content-addressed-storage
 -- Tag no-replicated-database: Unsupported type of ALTER query
 SET output_format_pretty_row_numbers = 0;
 

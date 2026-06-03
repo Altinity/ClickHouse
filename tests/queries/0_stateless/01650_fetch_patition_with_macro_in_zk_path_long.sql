@@ -1,4 +1,4 @@
--- Tags: long, no-shared-merge-tree
+-- Tags: long, no-shared-merge-tree, no-content-addressed-storage
 
 DROP TABLE IF EXISTS test_01640;
 DROP TABLE IF EXISTS restore_01640;

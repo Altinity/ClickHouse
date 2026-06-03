@@ -1,4 +1,4 @@
--- Tags: no-tsan, no-asan, no-msan, no-debug, no-random-settings, no-replicated-database
+-- Tags: no-tsan, no-asan, no-msan, no-debug, no-random-settings, no-replicated-database, no-content-addressed-storage
 -- memory usage can differ with sanitizers and in debug mode
 -- no-replicated-database because test may fail due to adding additional shard
 

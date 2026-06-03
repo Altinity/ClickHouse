@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 CREATE TABLE 03014_async_with_dedup_part_log (x UInt64)
 ENGINE=ReplicatedMergeTree('/clickhouse/table/{database}/03014_async_with_dedup_part_log', 'r1') ORDER BY tuple();
 

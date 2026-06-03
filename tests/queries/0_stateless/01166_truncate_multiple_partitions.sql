@@ -1,4 +1,4 @@
--- Tags: no-shared-catalog
+-- Tags: no-shared-catalog, no-content-addressed-storage
 -- no-shared-catalog: standard MergeTree is not supported
 
 drop table if exists trunc;

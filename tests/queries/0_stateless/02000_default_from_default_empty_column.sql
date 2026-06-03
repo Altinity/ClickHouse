@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS test;
 
 CREATE TABLE test (col Int8) ENGINE=MergeTree ORDER BY tuple()

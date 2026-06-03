@@ -1,4 +1,4 @@
--- Tags: zookeeper
+-- Tags: zookeeper, no-content-addressed-storage
 
 DROP TABLE IF EXISTS r_prop_table1;
 DROP TABLE IF EXISTS r_prop_table2;

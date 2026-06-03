@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Tags: no-content-addressed-storage
 
 # Test for optimize_aggregation_in_order with partial projections, i.e.:
 # - first part will not have projection

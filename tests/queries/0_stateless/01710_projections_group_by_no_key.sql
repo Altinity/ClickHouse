@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 drop table if exists projection_without_key;
 
 create table projection_without_key (key UInt32, PROJECTION x (SELECT sum(key) group by key % 3)) engine MergeTree order by key;

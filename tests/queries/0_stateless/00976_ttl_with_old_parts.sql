@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 drop table if exists ttl;
 
 create table ttl (d Date, a Int) engine = MergeTree order by a partition by toDayOfMonth(d) settings remove_empty_parts = 0;

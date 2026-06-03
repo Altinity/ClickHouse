@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Tags: no-content-addressed-storage
 # add_minmax_index_for_numeric_columns=0: Changes the plan and rows read
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

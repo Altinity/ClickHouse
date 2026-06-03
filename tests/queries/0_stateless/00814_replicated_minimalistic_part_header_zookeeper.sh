@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: replica, no-shared-merge-tree
+# Tags: replica, no-shared-merge-tree, no-content-addressed-storage
 # no-shared-merge-tree -- non minimalistic header is not supported
 
 set -e

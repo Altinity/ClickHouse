@@ -1,4 +1,4 @@
--- Tags: shard
+-- Tags: shard, no-content-addressed-storage
 
 set max_threads = 1;
 drop table if exists enums;

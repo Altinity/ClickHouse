@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_lwu_deletes_3 SYNC;
 
 CREATE TABLE t_lwu_deletes_3 (id UInt64, dt Date, v1 UInt64, v2 String)

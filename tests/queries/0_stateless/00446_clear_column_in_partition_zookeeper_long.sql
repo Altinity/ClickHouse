@@ -1,4 +1,4 @@
--- Tags: long, zookeeper, no-shared-merge-tree
+-- Tags: long, zookeeper, no-shared-merge-tree, no-content-addressed-storage
 -- no-shared-merge-tree: different sychronization, replaced with another test
 
 SELECT '===Ordinary case===';

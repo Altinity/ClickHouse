@@ -1,4 +1,4 @@
--- Tags: no-random-merge-tree-settings
+-- Tags: no-random-merge-tree-settings, no-content-addressed-storage
 
 -- Aggregate projections with constant GROUP BY keys produce 1 row from 0 input rows.
 -- When TTL deletes all rows during merge, the input block has 0 rows.

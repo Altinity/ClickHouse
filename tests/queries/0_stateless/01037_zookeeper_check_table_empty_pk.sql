@@ -1,4 +1,4 @@
--- Tags: zookeeper
+-- Tags: zookeeper, no-content-addressed-storage
 
 SET insert_keeper_fault_injection_probability=0; -- disable fault injection; part ids are non-deterministic in case of insert retries
 SET check_query_single_value_result = 0;

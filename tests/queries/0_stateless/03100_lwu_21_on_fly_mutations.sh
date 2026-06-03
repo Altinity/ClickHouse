@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-shared-catalog, no-parallel
+# Tags: no-shared-catalog, no-parallel, no-content-addressed-storage
 # no-shared-catalog: STOP MERGES will only stop them only on one replica
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

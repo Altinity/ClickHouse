@@ -1,4 +1,5 @@
 
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS test_generic_events_all;
 
 CREATE TABLE test_generic_events_all (APIKey UInt8, SessionType UInt8) ENGINE = MergeTree() PARTITION BY APIKey ORDER BY tuple();

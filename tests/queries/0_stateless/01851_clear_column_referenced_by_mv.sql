@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS `01851_merge_tree`;
 CREATE TABLE `01851_merge_tree`
 (

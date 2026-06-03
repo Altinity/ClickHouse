@@ -1,4 +1,4 @@
--- Tags: no-random-merge-tree-settings
+-- Tags: no-random-merge-tree-settings, no-content-addressed-storage
 
 ----- Group of very similar simple tests ------
 select '----HORIZONTAL MERGE TESTS----';

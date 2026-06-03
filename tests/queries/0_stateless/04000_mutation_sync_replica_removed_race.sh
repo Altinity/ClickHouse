@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: zookeeper, no-parallel, no-shared-merge-tree, no-replicated-database
+# Tags: zookeeper, no-parallel, no-shared-merge-tree, no-replicated-database, no-content-addressed-storage
 
 # Regression test for https://github.com/ClickHouse/ClickHouse/issues/97309
 #

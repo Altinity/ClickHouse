@@ -1,4 +1,4 @@
--- Tags: replica, no-replicated-database
+-- Tags: replica, no-replicated-database, no-content-addressed-storage
 -- Tag no-replicated-database: Fails due to additional replicas or shards
 
 -- The test is mostly outdated as now every replica is leader and can do OPTIMIZE locally.

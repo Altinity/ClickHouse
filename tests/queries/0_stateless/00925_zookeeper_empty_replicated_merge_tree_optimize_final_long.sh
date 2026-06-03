@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: long, replica, no-replicated-database, no-shared-merge-tree
+# Tags: long, replica, no-replicated-database, no-shared-merge-tree, no-content-addressed-storage
 # Tag no-replicated-database: Old syntax is not allowed
 # no-shared-merge-tree: implemented another test with new syntax
 

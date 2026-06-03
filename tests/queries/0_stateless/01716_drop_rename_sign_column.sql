@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS signed_table;
 
 CREATE TABLE signed_table (

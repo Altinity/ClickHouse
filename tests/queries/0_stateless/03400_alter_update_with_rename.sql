@@ -1,4 +1,4 @@
--- Tags: no-replicated-database
+-- Tags: no-replicated-database, no-content-addressed-storage
 -- For Replicated databases it's not allowed to execute ALTERs of different types (replicated and non replicated) in single query. (NOT_IMPLEMENTED)
 
 -- Test for issue #70678: ALTER UPDATE with RENAME unexpected behavior

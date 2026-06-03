@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS buf_dest;
 DROP TABLE IF EXISTS buf;
 

@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 set send_logs_level = 'fatal';
 
 drop table if exists ttl;

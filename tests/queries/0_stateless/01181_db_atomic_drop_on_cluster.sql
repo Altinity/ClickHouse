@@ -1,4 +1,4 @@
--- Tags: no-replicated-database
+-- Tags: no-replicated-database, no-content-addressed-storage
 -- Tag no-replicated-database: ON CLUSTER is not allowed
 
 DROP TABLE IF EXISTS test_repl ON CLUSTER test_shard_localhost NO DELAY;

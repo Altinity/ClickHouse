@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS t_data_version;
 
 CREATE TABLE t_data_version (a UInt64, b UInt64) ENGINE = MergeTree ORDER BY a;

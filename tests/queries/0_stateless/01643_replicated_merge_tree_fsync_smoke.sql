@@ -1,4 +1,4 @@
--- Tags: no-object-storage, no-flaky-check
+-- Tags: no-object-storage, no-flaky-check, no-content-addressed-storage
 
 -- Temporarily skip warning 'table was created by another server at the same moment, will retry'
 set send_logs_level='error';

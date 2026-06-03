@@ -1,4 +1,4 @@
--- Tags: distributed
+-- Tags: distributed, no-content-addressed-storage
 
 set enable_memory_bound_merging_of_aggregation_results=0;
 

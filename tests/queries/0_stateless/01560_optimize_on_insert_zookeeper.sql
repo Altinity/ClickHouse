@@ -1,4 +1,4 @@
--- Tags: zookeeper
+-- Tags: zookeeper, no-content-addressed-storage
 SET optimize_on_insert = 1;
 
 DROP TABLE IF EXISTS empty1;

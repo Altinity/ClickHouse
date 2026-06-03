@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 drop table if exists prewhere_column_missing;
 
 set allow_deprecated_syntax_for_merge_tree=1;

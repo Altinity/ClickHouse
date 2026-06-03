@@ -1,4 +1,4 @@
--- Tags: long, replica, no-shared-merge-tree
+-- Tags: long, replica, no-shared-merge-tree, no-content-addressed-storage
 -- no-shared-merge-tree: not possible to stop replicated sends
 
 DROP TABLE IF EXISTS r1;

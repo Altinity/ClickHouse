@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: no-debug
+# Tags: no-debug, no-content-addressed-storage
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh

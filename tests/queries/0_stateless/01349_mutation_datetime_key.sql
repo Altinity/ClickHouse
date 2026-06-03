@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS cdp_orders;
 
 CREATE TABLE cdp_orders

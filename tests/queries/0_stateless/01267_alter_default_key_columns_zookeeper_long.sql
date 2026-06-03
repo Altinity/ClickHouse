@@ -1,4 +1,4 @@
--- Tags: long, zookeeper
+-- Tags: long, zookeeper, no-content-addressed-storage
 
 DROP TABLE IF EXISTS test_alter;
 CREATE TABLE test_alter (x Date, s String) ENGINE = MergeTree ORDER BY s PARTITION BY x;

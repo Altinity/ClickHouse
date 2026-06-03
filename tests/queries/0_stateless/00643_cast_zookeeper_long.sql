@@ -1,4 +1,4 @@
--- Tags: long, zookeeper
+-- Tags: long, zookeeper, no-content-addressed-storage
 
 SET database_atomic_wait_for_drop_and_detach_synchronously=1;
 

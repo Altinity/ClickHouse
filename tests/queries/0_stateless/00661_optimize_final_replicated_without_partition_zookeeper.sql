@@ -1,4 +1,4 @@
--- Tags: replica
+-- Tags: replica, no-content-addressed-storage
 
 -- May affect part names
 SET prefer_warmed_unmerged_parts_seconds=0;

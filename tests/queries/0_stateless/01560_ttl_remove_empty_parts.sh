@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Tags: no-content-addressed-storage
 set -euo pipefail
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

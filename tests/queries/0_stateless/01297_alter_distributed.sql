@@ -1,4 +1,4 @@
--- Tags: distributed
+-- Tags: distributed, no-content-addressed-storage
 
 drop table if exists merge_distributed;
 drop table if exists merge_distributed1;

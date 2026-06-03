@@ -1,3 +1,4 @@
+-- Tags: no-content-addressed-storage
 DROP TABLE IF EXISTS mv;
 DROP TABLE IF EXISTS mv_source;
 DROP TABLE IF EXISTS mv_target;
